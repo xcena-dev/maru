@@ -61,8 +61,9 @@ flowchart TB
 
 ---
 
-Benchmark chart image will be update in here.
-<!-- TODO: Add benchmark chart image -->
+![Performance benchmark](./figure0_benchmark.png)
+
+*MARU serves as a persistent KV cache layer for large-context and high-concurrency inference workloads.*
 
 ---
 
