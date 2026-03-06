@@ -19,6 +19,8 @@ The left shows how KV cache is shared without Maru; the right shows how it works
   <img src="docs/_static/kvcache_all.gif" alt="KV Cache Sharing: Without Maru (left) vs With Maru (right)" width="720">
 </p>
 
+| [**Documentation**](https://xcena-dev.github.io/maru/) |
+
 ## Why Maru?
 
 - **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization.
