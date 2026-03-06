@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """MaruShmClient — shared memory client for the Maru Resource Manager.
 
 Communicates with the resource manager over UDS using the binary IPC protocol

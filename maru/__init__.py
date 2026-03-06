@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Maru - Shared memory KV cache for LLM inference.
 
 Maru (마루, /mɑːruː/) — named after the central open floor

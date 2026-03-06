@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Console script entry point for installing the Maru Resource Manager.
 
 Wraps the cmake build + install workflow so that after `pip install -e .`,

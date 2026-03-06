@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Tests for AllocationManager."""
 
 from maru_server.allocation_manager import AllocationManager

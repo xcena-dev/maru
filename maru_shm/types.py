@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Shared memory types for maru_shm.
 
 Defines MaruHandle, MaruPoolInfo, and DaxType — the core data structures

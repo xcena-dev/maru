@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Maru Protocol - Message definitions for RPC communication.
 
 This module defines the protocol for communication between Maru
 clients and the MaruServer using binary format (MessagePack).
 
-Binary Format:
+Binary Format::
+
     [Header (16 bytes)] [Payload (MessagePack encoded)]
 
 See docs/protocol.md for full specification.
@@ -92,7 +93,8 @@ class MessageHeader:
     """
     Protocol message header (16 bytes).
 
-    Format (network byte order):
+    Format (network byte order)::
+
         magic: 2 bytes - 0xCF00
         version: 1 byte - Protocol version (currently 1)
         msg_type: 1 byte - MessageType code

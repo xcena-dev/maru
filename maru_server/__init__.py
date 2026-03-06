@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """MaruServer - Central metadata server for Maru shared memory KV cache."""
 
 from maru_common.logging_setup import setup_package_logging  # noqa: E402

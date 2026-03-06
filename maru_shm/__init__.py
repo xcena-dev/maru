@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """maru_shm — Shared memory client library and shared types for Maru.
 
 This package provides the types, IPC protocol, and client for communicating

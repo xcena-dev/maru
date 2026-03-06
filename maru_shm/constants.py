@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Constants for maru_shm.
 
 Defines protection flags, mapping flags, default paths, and alignment constants.

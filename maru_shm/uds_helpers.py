@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """UDS (Unix Domain Socket) helper utilities.
 
 Provides SCM_RIGHTS FD passing, SO_PEERCRED peer credentials,
