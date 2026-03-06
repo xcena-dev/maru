@@ -564,6 +564,61 @@ class TestRpcClientApiMethods:
         assert result.results == [True, False, True, False]
 
     # =========================================================================
+    # list_allocations
+    # =========================================================================
+
+    def test_list_allocations_success(self):
+        """list_allocations returns ListAllocationsResponse with handles on success."""
+        from maru_common import ListAllocationsResponse
+
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {
+            "success": True,
+            "allocations": [
+                {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
+                {"region_id": 2, "offset": 0, "length": 8192, "auth_token": 0},
+            ],
+        }
+
+        result = client.list_allocations(exclude_instance_id="inst1")
+
+        mock_send.assert_called_once_with(
+            MessageType.LIST_ALLOCATIONS, {"exclude_instance_id": "inst1"}
+        )
+        assert isinstance(result, ListAllocationsResponse)
+        assert result.success is True
+        assert len(result.allocations) == 2
+        assert result.allocations[0].region_id == 1
+        assert result.allocations[1].region_id == 2
+
+    def test_list_allocations_no_exclude(self):
+        """list_allocations without exclude_instance_id sends empty data."""
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {
+            "success": True,
+            "allocations": [],
+        }
+
+        result = client.list_allocations()
+
+        mock_send.assert_called_once_with(MessageType.LIST_ALLOCATIONS, {})
+        assert result.success is True
+        assert len(result.allocations) == 0
+
+    def test_list_allocations_failure(self):
+        """list_allocations returns error on failure."""
+        from maru_common import ListAllocationsResponse
+
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {"success": False, "error": "server error"}
+
+        result = client.list_allocations()
+
+        assert isinstance(result, ListAllocationsResponse)
+        assert result.success is False
+        assert result.error == "server error"
+
+    # =========================================================================
     # 10. get_stats
     # =========================================================================
 

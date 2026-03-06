@@ -606,6 +606,63 @@ class TestRpcAsyncClientApiMethods:
 
         assert len(result.entries) == 0
 
+    def test_parse_list_allocations_success(self):
+        """Test _parse_list_allocations with success response (lines 329-337)."""
+        response = {
+            "success": True,
+            "allocations": [
+                {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
+                {"region_id": 2, "offset": 0, "length": 8192, "auth_token": 0},
+            ],
+        }
+
+        result = RpcAsyncClient._parse_list_allocations(response)
+
+        assert result.success is True
+        assert len(result.allocations) == 2
+        assert result.allocations[0].region_id == 1
+        assert result.allocations[1].region_id == 2
+
+    def test_parse_list_allocations_failure(self):
+        """Test _parse_list_allocations with failure response."""
+        response = {"success": False, "error": "server error"}
+
+        result = RpcAsyncClient._parse_list_allocations(response)
+
+        assert result.success is False
+        assert result.error == "server error"
+
+    def test_list_allocations_blocking(self):
+        """Test list_allocations blocking path (line 377)."""
+        client = self._make_client()
+        client._send_request.return_value = {
+            "success": True,
+            "allocations": [
+                {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
+            ],
+        }
+
+        result = client.list_allocations(exclude_instance_id="inst1")
+
+        client._send_request.assert_called_once_with(
+            MessageType.LIST_ALLOCATIONS, {"exclude_instance_id": "inst1"}
+        )
+        assert result.success is True
+        assert len(result.allocations) == 1
+
+    def test_list_allocations_no_exclude(self):
+        """Test list_allocations without exclude sends empty data."""
+        client = self._make_client()
+        client._send_request.return_value = {
+            "success": True,
+            "allocations": [],
+        }
+
+        result = client.list_allocations()
+
+        client._send_request.assert_called_once_with(MessageType.LIST_ALLOCATIONS, {})
+        assert result.success is True
+
 
 class TestRpcAsyncClientLifecycle:
     """Test connection lifecycle methods for 100% coverage."""
@@ -823,6 +880,52 @@ class TestRpcAsyncClientAsyncMethods:
         result = future.result(timeout=2.0)
 
         assert result is True
+
+        self._teardown_loop(loop, thread)
+
+    def test_list_allocations_async(self):
+        """Test list_allocations_async returns Future[ListAllocationsResponse] (lines 501-508)."""
+        from maru_common import ListAllocationsResponse
+
+        client, loop, thread = self._setup_client_with_loop()
+
+        async def mock_send_async(msg_type, data):
+            return {
+                "success": True,
+                "allocations": [
+                    {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
+                ],
+            }
+
+        client._send_async = mock_send_async
+
+        future = client.list_allocations_async(exclude_instance_id="inst1")
+        result = future.result(timeout=2.0)
+
+        assert isinstance(result, ListAllocationsResponse)
+        assert result.success is True
+        assert len(result.allocations) == 1
+        assert result.allocations[0].region_id == 1
+
+        self._teardown_loop(loop, thread)
+
+    def test_list_allocations_async_no_exclude(self):
+        """Test list_allocations_async without exclude_instance_id."""
+        from maru_common import ListAllocationsResponse
+
+        client, loop, thread = self._setup_client_with_loop()
+
+        async def mock_send_async(msg_type, data):
+            return {"success": True, "allocations": []}
+
+        client._send_async = mock_send_async
+
+        future = client.list_allocations_async()
+        result = future.result(timeout=2.0)
+
+        assert isinstance(result, ListAllocationsResponse)
+        assert result.success is True
+        assert len(result.allocations) == 0
 
         self._teardown_loop(loop, thread)
 

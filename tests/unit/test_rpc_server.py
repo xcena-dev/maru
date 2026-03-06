@@ -466,6 +466,12 @@ class TestRpcHandlerCoverage:
         resp = rpc._handle_message(MessageType.REQUEST_ALLOC.value, req)
         assert resp["success"] is True
 
+        # Test LIST_ALLOCATIONS
+        req = MockRequest(exclude_instance_id=None)
+        resp = rpc._handle_message(MessageType.LIST_ALLOCATIONS.value, req)
+        assert resp["success"] is True
+        assert len(resp["allocations"]) >= 1
+
         # Test RETURN_ALLOC
         req = MockRequest(instance_id="instance1", region_id=region_id)
         resp = rpc._handle_message(MessageType.RETURN_ALLOC.value, req)
