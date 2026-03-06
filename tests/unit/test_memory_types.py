@@ -241,3 +241,50 @@ class TestMemoryInfo:
         # Modify through the view
         info.view[0] = ord(b"W")
         assert bytes(info.view) == b"Writable"
+
+
+class TestMappedRegionRelease:
+    """Test MappedRegion.release() edge cases."""
+
+    def test_release_already_released_memoryview(self):
+        """release() catches ValueError when memoryview.release() raises (lines 88-89)."""
+        from unittest.mock import MagicMock
+
+        mmap_obj = mmap.mmap(-1, 4096)
+        handle = _make_handle(1, 4096)
+
+        region = MappedRegion(
+            region_id=1,
+            handle=handle,
+            size=4096,
+            _mmap_obj=mmap_obj,
+        )
+
+        # Replace _buffer_view with a mock that raises ValueError on release()
+        mock_view = MagicMock()
+        mock_view.release.side_effect = ValueError("already released")
+        region._buffer_view = mock_view
+
+        # release() should catch ValueError and not raise
+        region.release()
+
+        assert region._buffer_view is None
+        assert region._mmap_obj is None
+
+        mmap_obj.close()
+
+
+class TestAllocHandle:
+    """Test AllocHandle properties (lines 121, 126, 131)."""
+
+    def test_alloc_handle_properties(self):
+        """AllocHandle.region_id, page_index, size return correct values."""
+        from maru_handler.memory.types import AllocHandle
+
+        data = bytearray(256)
+        buf = memoryview(data)
+        handle = AllocHandle(buf=buf, _region_id=42, _page_index=7, _size=256)
+
+        assert handle.region_id == 42
+        assert handle.page_index == 7
+        assert handle.size == 256
