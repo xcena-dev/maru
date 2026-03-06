@@ -2,51 +2,51 @@
 
 ## Overview
 
-We evaluated MARU against the existing LMCache p2p backend in order to understand the performance impact of different remote KV storage paths.
+We evaluated Maru against the existing LMCache p2p backend in order to understand the performance impact of different remote KV storage paths.
 
-The primary difference between the two approaches lies in how KV cache data is accessed and transferred. The LMCache p2p backend relies on CPU DRAM and network-based data transfer, whereas MARU leverages CXL-attached memory together with the MARU meta server to manage remote KV access. As a result, the two systems differ mainly in the memory tier used for KV storage and the data transfer path involved in retrieving cached KV blocks.
+The primary difference between the two approaches lies in how KV cache data is accessed and transferred. The LMCache p2p backend relies on CPU DRAM and network-based data transfer, whereas Maru leverages CXL-attached memory together with the Maru meta server to manage remote KV access. As a result, the two systems differ mainly in the memory tier used for KV storage and the data transfer path involved in retrieving cached KV blocks.
 
 ![Figure 1: TTFT P50 comparison](image/ttft_p50_comparison.png)
-*Figure 1: TTFT (P50) comparison between MARU and the LMCache p2p backend across context sizes during warmup (first KV transfer) and query (KV reuse). MARU consistently achieves lower latency, with larger gains for bigger KV cache sizes.*
+*Figure 1: TTFT (P50) comparison between Maru and the LMCache p2p backend across context sizes during warmup (first KV transfer) and query (KV reuse). Maru consistently achieves lower latency, with larger gains for bigger KV cache sizes.*
 
-Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). Across all context sizes, MARU consistently achieves lower TTFT compared to the p2p backend. The gap becomes increasingly pronounced as the context size grows, indicating that the MARU remote connector handles larger KV transfers more efficiently.
+Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). Across all context sizes, Maru consistently achieves lower TTFT compared to the p2p backend. The gap becomes increasingly pronounced as the context size grows, indicating that the Maru remote connector handles larger KV transfers more efficiently.
 
 ## Concurrency Scaling
 
 ![Figure 2: Cache-hit TTFT under concurrency](image/ttft_concurrency_scaling.png)
-*Figure 2: Cache-hit TTFT (P50) under different concurrency levels. MARU maintains 2.7×–4.2× lower latency compared to the LMCache p2p backend while scaling to higher request concurrency.*
+*Figure 2: Cache-hit TTFT (P50) under different concurrency levels. Maru maintains 2.7×–4.2× lower latency compared to the LMCache p2p backend while scaling to higher request concurrency.*
 
-To further evaluate scalability, we measured cache-hit TTFT under different concurrency levels (Figure 2). Even as concurrency increases, MARU maintains significantly lower latency. Depending on the context size and concurrency level, MARU reduces TTFT by approximately **2.7×–4.2×** compared to the p2p backend.
+To further evaluate scalability, we measured cache-hit TTFT under different concurrency levels (Figure 2). Even as concurrency increases, Maru maintains significantly lower latency. Depending on the context size and concurrency level, Maru reduces TTFT by approximately **2.7×–4.2×** compared to the p2p backend.
 
-These results suggest that reducing CPU-mediated network transfers and utilizing CXL-backed remote memory can significantly improve KV cache reuse latency. In particular, MARU demonstrates better scaling behavior as both context size and request concurrency increase, making it well-suited for high-throughput inference workloads with large KV cache footprints.
+These results suggest that reducing CPU-mediated network transfers and utilizing CXL-backed remote memory can significantly improve KV cache reuse latency. In particular, Maru demonstrates better scaling behavior as both context size and request concurrency increase, making it well-suited for high-throughput inference workloads with large KV cache footprints.
 
 ## Power Efficiency
 
 ![Figure 3: Power comparison](image/128k_power_comparison.png)
-*Figure 3: System-level power traces during P2P KV cache reuse (128K context). The LMCache p2p backend exhibits a prolonged KV retrieval phase (103s) with low GPU utilization, while MARU completes retrieval in 53s with higher GPU utilization throughout.*
+*Figure 3: System-level power traces during P2P KV cache reuse (128K context). The LMCache p2p backend exhibits a prolonged KV retrieval phase (103s) with low GPU utilization, while Maru completes retrieval in 53s with higher GPU utilization throughout.*
 
 Figure 3 compares the full power timeline for both backends during a 128K-context P2P benchmark. The populate phase (where GPU0 performs prefill and stores KV cache) is nearly identical in both duration and power draw, confirming that the two systems share the same computation workload.
 
 The key difference emerges during the KV retrieval phase: the LMCache p2p backend requires 103 seconds for GPU1 to retrieve cached KV blocks over the network, during which GPU1 remains largely underutilized — waiting on data transfer rather than performing useful computation.
 
-In contrast, MARU completes retrieval in 53 seconds, a 49% reduction, because GPU1 can access KV data directly from CXL shared memory via zero-copy mmap without network round-trips.
+In contrast, Maru completes retrieval in 53 seconds, a 49% reduction, because GPU1 can access KV data directly from CXL shared memory via zero-copy mmap without network round-trips.
 
-Notably, MARU draws slightly higher instantaneous power during retrieval (1,365W vs. 1,260W), which reflects higher GPU utilization — the GPU is actively computing rather than idling on network transfers. Despite the higher power draw, MARU consumes 44% less total energy for KV retrieval (20.1 Wh vs. 36.1 Wh), as the shorter retrieval time more than compensates for the increased power.
+Notably, Maru draws slightly higher instantaneous power during retrieval (1,365W vs. 1,260W), which reflects higher GPU utilization — the GPU is actively computing rather than idling on network transfers. Despite the higher power draw, Maru consumes 44% less total energy for KV retrieval (20.1 Wh vs. 36.1 Wh), as the shorter retrieval time more than compensates for the increased power.
 
-This has a direct implication for serving efficiency: by completing KV retrieval in roughly half the time, MARU frees GPU cycles sooner, allowing the system to begin processing subsequent requests earlier. In high-concurrency deployments, this means higher effective throughput — the GPU spends less time stalled on data movement and more time on useful inference computation.
+This has a direct implication for serving efficiency: by completing KV retrieval in roughly half the time, Maru frees GPU cycles sooner, allowing the system to begin processing subsequent requests earlier. In high-concurrency deployments, this means higher effective throughput — the GPU spends less time stalled on data movement and more time on useful inference computation.
 
 ## Energy Efficiency
 
-| Length | Recompute | MARU | LMCache P2P | MARU / LMCache P2P |
+| Length | Recompute | Maru | LMCache P2P | Maru / LMCache P2P |
 |--------|-----------|------|-------------|---------------------|
 | 16K    | 19.7      | 59.8 | 50.7        | 1.18                |
 | 32K    | 22        | 101.2| 73.2        | 1.38                |
 | 64K    | 18.2      | 130.5| 83          | 1.57                |
 | 128K   | 13.6      | 173.7| 121.7       | 1.43                |
 
-*Table 1: Tokens / Joule (active energy) at 128K. MARU can generate 18~43% more tokens using the same amount of active energy than LMCache p2p backend.*
+*Table 1: Tokens / Joule (active energy) at 128K. Maru can generate 18~43% more tokens using the same amount of active energy than LMCache p2p backend.*
 
-Both MARU and the LMCache p2p backend become more energy-efficient as context size grows — MARU rises from 59.8 to 173.7 tokens/J and the p2p backend from 50.7 to 121.7 — because the energy overhead of KV transfer scales sublinearly relative to context length. This contrasts with recompute, which becomes less efficient at larger contexts (19.7 → 13.6 tokens/J) due to linearly increasing computation cost. Notably, MARU's efficiency advantage over the p2p backend widens with context size, peaking at 1.57× for 64K before slightly relaxing to 1.43× at 128K, indicating that the zero-copy CXL path benefits most when large KV transfers would otherwise bottleneck on CPU-mediated network I/O.
+Both Maru and the LMCache p2p backend become more energy-efficient as context size grows — Maru rises from 59.8 to 173.7 tokens/J and the p2p backend from 50.7 to 121.7 — because the energy overhead of KV transfer scales sublinearly relative to context length. This contrasts with recompute, which becomes less efficient at larger contexts (19.7 → 13.6 tokens/J) due to linearly increasing computation cost. Notably, Maru's efficiency advantage over the p2p backend widens with context size, peaking at 1.57× for 64K before slightly relaxing to 1.43× at 128K, indicating that the zero-copy CXL path benefits most when large KV transfers would otherwise bottleneck on CPU-mediated network I/O.
 
 ---
 
@@ -71,7 +71,7 @@ Both MARU and the LMCache p2p backend become more energy-efficient as context si
 - **LMCache Version**: 0.3.13.dev97
 - **NIXL Version**: 0.10.1
 - **Transfer Methods**:
-  - **MARU**:
+  - **Maru**:
     - CXL shared memory pool (200 GB, /dev/dax)
     - Zero-copy mmap between vLLM instances via maru_meta_server
   - **LMCache P2P backend (NIXL)**:
