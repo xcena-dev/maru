@@ -61,8 +61,9 @@ flowchart TB
 
 ---
 
-Benchmark chart image will be update in here.
-<!-- TODO: Add benchmark chart image -->
+![Benchmark](source/image/benchmark.png)
+
+*This benchmark is based on single-node testing. Multi-node test data will be updated soon.*
 
 ---
 
