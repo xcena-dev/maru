@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Maru Handler package.
 
 This package provides the main client interface for Maru shared memory KV cache.

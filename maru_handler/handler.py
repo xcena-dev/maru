@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """MaruHandler - Main interface for Maru shared memory KV cache client.
 
 This module provides the primary entry point for clients to interact with
@@ -76,7 +76,8 @@ class MaruHandler:
     - ``close()`` sets ``_closing`` event to reject new operations, then
       acquires ``_write_lock`` to wait for in-flight writes before teardown.
 
-    Architecture:
+    Architecture::
+
         MaruHandler
             ├── RpcClient (server communication, sole RPC owner)
             ├── DaxMapper (memory mapping via MaruShmClient, owns all mmap/munmap)

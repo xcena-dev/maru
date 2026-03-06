@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Unit test configuration — MockShmClient for tests without a running resource manager."""
 
 import mmap

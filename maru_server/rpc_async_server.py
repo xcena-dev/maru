@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """RpcAsyncServer - Async ZeroMQ RPC server using ROUTER/DEALER proxy with worker pool.
 
 Uses zmq.proxy to distribute incoming requests across N worker threads,
 enabling concurrent request handling while maintaining the same interface
 as the synchronous RpcServer.
 
-Architecture:
+Architecture::
+
     ROUTER socket (tcp://host:port, frontend)
         |
         zmq.proxy() — runs in proxy_thread (blocking)

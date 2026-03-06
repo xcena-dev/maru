@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """OwnedRegionManager - Manages multiple owned regions with PagedMemoryAllocator.
 
 Handles allocation, write, and region lifecycle via DaxMapper.
@@ -28,7 +28,8 @@ class OwnedRegionManager:
     allocate() returns None and the caller (Handler) is responsible
     for requesting a new region via RPC and calling add_region().
 
-    Architecture:
+    Architecture::
+
         OwnedRegionManager
             ├── DaxMapper (shared, for mmap/munmap)
             └── OwnedRegion[]

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Paged memory allocator for shared memory regions.
 
 Fixed-size page allocator over a pre-mapped memory region.
