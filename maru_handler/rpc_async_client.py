@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Async RPC Client for connecting to MaruServer (v1 — asyncio).
 
 Uses a background asyncio event loop with zmq.asyncio DEALER socket.
 Supports both blocking (_send_request) and non-blocking (_send_request_nonblocking)
 call patterns, enabling pipelining for concurrent in-flight requests.
 
-Architecture:
+Architecture::
+
     Caller Thread (MaruHandler)
         |
         v

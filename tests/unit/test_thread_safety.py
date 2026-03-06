@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Thread-safety tests for MaruHandler, OwnedRegionManager, and DaxMapper.
 
 Unit tests — no RPC server needed.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Unit tests for MaruServer orchestration logic."""
 
 from maru_server.server import MaruServer

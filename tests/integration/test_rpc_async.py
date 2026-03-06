@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Integration tests for RpcAsyncServer + RpcAsyncClient.
 
 Tests cover all message types end-to-end through the async RPC layer:

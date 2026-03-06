@@ -1,204 +1,155 @@
-# Maru (마루)
+<p align="center">
+  <img src="docs/source/image/maru.png" alt="Maru" height="120">
+</p>
 
-**A High-Performance KV Cache Manager for CXL Shared Memory**
+<h3 align="center">Maru: High-Performance KV Cache Storage Engine on CXL Shared Memory</h3>
 
-*Maru* (/mɑːruː/) — named after the central open floor in traditional Korean architecture where all rooms connect and family members freely gather and share.
+<p align="center">
+  <a href="https://xcena-dev.github.io/maru/"><img src="https://img.shields.io/badge/docs-live-blue" alt="Documentation"></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="License"></a>
+</p>
+
+**Maru** is a high-performance **KV cache storage engine built on CXL shared memory**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency.
+
+Every existing KV cache sharing solution assumes that sharing means transferring — copying data across the network, byte by byte. As models get larger and contexts get longer, that assumption becomes a structural bottleneck. Maru rejects the premise entirely: **don't move data, share the memory.** Instances read and write KV cache data directly in CXL shared memory. Only lightweight metadata (tens of bytes) travels between components.
+
+The left shows how KV cache is shared without Maru; the right shows how it works with Maru. No copies — just direct access to CXL shared memory.
+
+<p align="center">
+  <img src="docs/_static/kvcache_all.gif" alt="KV Cache Sharing: Without Maru (left) vs With Maru (right)" width="720">
+</p>
+
+## Why Maru?
+
+- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization.
+
+- **Scales with Context Length and Concurrency** — Network-based sharing degrades as contexts grow and more consumers hit the same KV. Maru never fans out KV payloads — scaling is bounded by shared-memory bandwidth, not network transfer.
+
+- **Higher Hardware Utilization** — Instead of duplicating KV caches per instance, all instances draw from a shared CXL pool. Less duplication means more usable memory and higher effective cache capacity.
+
+- **Lower System Energy** — Eliminating bulk data transfer cuts NIC and CPU power draw. Shorter data paths also reduce GPU idle time per request.
 
 ## Overview
-
-Maru enables zero-copy KV cache sharing across multiple LLM inference instances using CXL shared memory. Instead of transferring KV data over the network, instances exchange only metadata via the central `MaruServer`, then directly access KV data through memory-mapped CXL devices.
-
-Maru can be used standalone or integrated as a storage backend for [LMCache](../LMCache-CXL/) via `CxlConnector`.
-
-## Architecture
-
 ```mermaid
 flowchart TB
-    subgraph Instances["LLM Inference Instances"]
-        V1["vLLM #1"]
-        V2["vLLM #2"]
-        V3["vLLM #3"]
+    subgraph S1["Server 1"]
+        direction TB
+        I1(["LLM Instance"])
+        H1{{"MaruHandler"}}
+        I1 --- H1
+    end
+    subgraph S2["Server 2"]
+        direction TB
+        I2(["LLM Instance"])
+        H2{{"MaruHandler"}}
+        I2 --- H2
+    end
+    subgraph S3["Server 3"]
+        direction TB
+        I3(["LLM Instance"])
+        H3{{"MaruHandler"}}
+        I3 --- H3
     end
 
-    subgraph Handlers["Maru Clients (maru_handler/)"]
-        H1["MaruHandler"]
-        H2["MaruHandler"]
-        H3["MaruHandler"]
-    end
-
-    V1 --> H1
-    V2 --> H2
-    V3 --> H3
-
-    MS["MaruServer<br/>(metadata only)"]
-
-    H1 <-->|"RPC (ZeroMQ)<br/>metadata"| MS
-    H2 <-->|"RPC (ZeroMQ)<br/>metadata"| MS
-    H3 <-->|"RPC (ZeroMQ)<br/>metadata"| MS
-
-    DD["Maru Resource Manager"]
-
-    MS <-->|"UDS"| DD
-    H1 <-->|"UDS"| DD
-    H2 <-->|"UDS"| DD
-    H3 <-->|"UDS"| DD
+    M["Maru Control Plane"]
 
     subgraph CXL["CXL Shared Memory"]
-        P1["Region 1"]
-        P2["Region 2"]
-        P3["Region N"]
+        KV["KV Cache"]
     end
 
-    DD ---|"manages"| CXL
-
-    H1 <-.->|"zero-copy<br/>direct access"| CXL
-    H2 <-.->|"zero-copy<br/>direct access"| CXL
-    H3 <-.->|"zero-copy<br/>direct access"| CXL
+    H1 & H2 & H3 <-.->|"store/retrieve"| M
+    H1 & H2 & H3 <==>|"direct read/write"| CXL
+    M -.->|"manage"| CXL
 ```
 
-## Project Structure
+> **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
+>
+> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
 
-```
-maru/
-├── maru_handler/                      # Client library
-│   ├── handler.py                     # MaruHandler - Main client interface
-│   ├── rpc_client.py                  # Synchronous RPC client (REQ-REP)
-│   ├── rpc_async_client.py            # Async RPC client (DEALER-ROUTER)
-│   └── memory/                        # Memory management
-│       ├── types.py                   # MemoryInfo, MappedRegion types
-│       ├── mapper.py                  # DaxMapper - mmap/munmap lifecycle
-│       ├── allocator.py               # PagedMemoryAllocator (O(1) alloc)
-│       └── owned_region_manager.py    # OwnedRegionManager - region + page mgmt
-│
-├── maru_server/                  # Metadata server
-│   ├── server.py                      # MaruServer - Main server
-│   ├── rpc_server.py                  # Synchronous ZeroMQ RPC server
-│   ├── rpc_async_server.py            # Async ZeroMQ RPC server (ROUTER)
-│   ├── kv_manager.py                  # KV metadata store
-│   ├── allocation_manager.py          # Allocation lifecycle management
-│   └── __main__.py                    # Module entry point
-│
-├── maru_shm/                          # Shared memory client library + types
-│   ├── types.py                       # Handle, PoolInfo, DaxType
-│   ├── ipc.py                         # Binary IPC protocol (resource manager <-> client)
-│   ├── constants.py                   # PROT_*, MAP_*, paths, defaults
-│   ├── uds_helpers.py                 # SCM_RIGHTS, SO_PEERCRED helpers
-│   └── client.py                      # ShmClient: alloc, free, mmap, stats
-│
-├── maru_resource_manager/             # Maru Resource Manager (maru_resourced)
-│   ├── CMakeLists.txt                 # Build configuration
-│   ├── include/                       # Public headers (↔ maru_shm/ mirror)
-│   │   ├── types.h                    # Handle, PoolInfo, DaxType
-│   │   └── ipc.h                      # IPC protocol structs
-│   ├── src/                           # Resource manager source files
-│   │   ├── main.cpp                   # Entry point, signal handling
-│   │   ├── pool_manager.{cpp,h}       # Pool discovery, first-fit allocator
-│   │   ├── uds_server.{cpp,h}         # UDS server, per-client threads
-│   │   ├── wal.{cpp,h}               # Write-ahead log (crash recovery)
-│   │   ├── metadata.{cpp,h}          # State persistence (JSON)
-│   │   ├── reaper.{cpp,h}            # Dead PID cleanup
-│   │   ├── log.{cpp,h}               # Logging utilities
-│   │   └── util.{cpp,h}              # Common helpers
-│   ├── tools/
-│   │   └── maru_test_client.cpp       # CLI test client
-│   └── systemd/                       # systemd service + udev rules
-│
-├── maru_common/                       # Shared utilities
-│   ├── protocol.py                    # Maru RPC message definitions
-│   ├── serializer.py                  # MessagePack serialization
-│   ├── config.py                      # MaruConfig
-│   ├── logging_setup.py              # Shared logging configuration
-│   └── resource_manager_installer.py # install-maru-resource-manager entry point
-│
-├── tests/                             # Unit + integration tests
-├── docs/                              # Documentation
-├── pyproject.toml
-└── README.md
-```
+## Quick Start
 
-## Installation
+### Prerequisites
 
-### 1. Python packages
+- OS: Ubuntu 24.04 LTS+
+- Python: 3.12+
+- gcc: 13.3.0+, cmake: 3.28.3+
+- CXL DAX device (`/dev/dax*`) or emulation environment
 
 ```bash
-pip install -e .
-
-# With dev dependencies
-pip install -e ".[dev]"
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip git \
+    build-essential cmake libnuma-dev
 ```
 
-### 2. Shared memory resource manager (maru_resourced)
+### Installation
 
 ```bash
-# Build and install (with systemd service)
-sudo $(which install-maru-resource-manager)
+git clone https://github.com/xcena-dev/maru
+cd maru
 
-# Without systemd (containers, WSL, etc.)
-sudo $(which install-maru-resource-manager) --no-systemd
-
-# Clean rebuild
-sudo $(which install-maru-resource-manager) --clean
-
-# Uninstall
-sudo $(which install-maru-resource-manager) --uninstall
+python3 -m venv .venv
+source .venv/bin/activate
+./install.sh
 ```
 
-## Usage
-
-### Start the metadata server
+Verify the Maru Resource Manager daemon is running:
 
 ```bash
-# Default (localhost:5555)
+systemctl status maru-resourced
+```
+
+### Start Services
+
+```bash
+# Start MaruServer (metadata server)
 maru-server
 
-# Specify host and port
-maru-server --host 0.0.0.0 --port 5556
-
-# With debug logging
-maru-server --log-level DEBUG
+# With custom host/port
+maru-server --host 0.0.0.0 --port 5555
 ```
 
-### Client Usage
+### Basic Usage
 
 ```python
 from maru import MaruConfig, MaruHandler
-from maru_handler.memory import MemoryInfo
 
-# Configuration
 config = MaruConfig(
     server_url="tcp://localhost:5555",
     pool_size=1024 * 1024 * 100,  # 100MB
 )
 
-# Connect and use
 with MaruHandler(config) as handler:
-    # Store data (MemoryInfo wraps a memoryview)
-    info = MemoryInfo(view=memoryview(b"hello world"))
-    handler.store(key=12345, info=info)
+    data = b"A" * (1024 * 1024)  # 1MB KV chunk
 
-    # Check if key exists
-    exists = handler.exists(key=12345)
+    # 1. Allocate a page in CXL shared memory
+    handle = handler.alloc(size=len(data))
 
-    # Retrieve data (returns MemoryInfo with zero-copy memoryview)
-    result = handler.retrieve(key=12345)  # MemoryInfo | None
+    # 2. Write directly to CXL memory (mmap — no intermediate buffer)
+    handle.buf[:] = data
 
-    # Get server stats
-    stats = handler.get_stats()
+    # 3. Register the key — only metadata (key → region, offset) is sent
+    handler.store(key=42, handle=handle)
+
+    # Retrieve: returns a memoryview pointing into CXL memory
+    result = handler.retrieve(key=42)
+    assert result is not None
+    assert bytes(result.view[:5]) == b"AAAAA"
 ```
 
-## Test
+## LMCache Integration
 
-```bash
-# Unit tests
-python3 -m pytest tests/ -v -m "not integration"
+Maru works as a drop-in remote storage backend for [LMCache](https://github.com/LMCache/LMCache) via the `maru://` URL scheme. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
 
-# Integration tests (requires running maru_resourced + ZMQ)
-python3 -m pytest tests/ -v -m integration
-
-# All tests
-python3 -m pytest tests/ -v
+```yaml
+# LMCache config
+remote_url: "maru://localhost:5555"
+extra_config:
+  maru_pool_size: "4G"
 ```
+
+For full configuration details, see the [documentation](https://xcena-dev.github.io/maru-dev/source/getting_started/examples/lmcache/).
+
 
 ## License
 
-Apache-2.0
+Copyright 2026 [XCENA Inc.](https://xcena.com) Licensed under the Apache License 2.0.

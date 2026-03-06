@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """DaxMapper - Memory mapping via MaruShmClient.
 
 Single owner of MaruShmClient for mmap/munmap operations.

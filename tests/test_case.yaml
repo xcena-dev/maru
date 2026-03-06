@@ -8,7 +8,7 @@
     - scheduled
   setup:
     - echo "Setting up pytest environment"
-    - source venv/bin/activate
+    - source .venv/bin/activate
   command:
     - pytest -m "not integration" --cov=maru_handler --cov=maru_server --cov=maru_common --cov=maru_shm --cov-report=term-missing --cov-report=xml:coverage.xml -v tests/
   teardown:

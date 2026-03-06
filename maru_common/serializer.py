@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Message serialization for RPC protocol.
 
 Binary-only serialization using MessagePack with protocol header.
@@ -48,7 +48,8 @@ class Serializer:
     """
     Binary message serializer using MessagePack.
 
-    Message format:
+    Message format::
+
         [Header 16 bytes][MessagePack payload]
     """
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Maru Common - Shared types and utilities for Maru shared memory KV cache system."""
 
 from .logging_setup import setup_package_logging  # noqa: E402

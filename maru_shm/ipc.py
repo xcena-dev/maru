@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 XCENA
+# Copyright 2026 XCENA Inc.
 """Binary IPC protocol for resource manager <-> client communication.
 
 This protocol is used over UDS (Unix Domain Sockets) between the Maru Resource Manager
 and MaruShmClient. It is separate from the maru RPC protocol in
 maru_common/protocol.py which uses MessagePack over ZMQ.
 
-Wire format:
+Wire format::
+
     [MsgHeader (12 bytes)] [payload (variable)]
 """
 
@@ -47,7 +48,8 @@ HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
 class MsgHeader:
     """IPC message header (12 bytes).
 
-    Wire layout (native byte order):
+    Wire layout (native byte order)::
+
         magic:       4 bytes (0x4D415255)
         version:     2 bytes
         msg_type:    2 bytes (MsgType)
