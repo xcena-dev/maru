@@ -593,8 +593,6 @@ class TestRpcClientApiMethods:
 
     def test_list_allocations_no_exclude(self):
         """list_allocations without exclude_instance_id sends empty data."""
-        from maru_common import ListAllocationsResponse
-
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {
             "success": True,
