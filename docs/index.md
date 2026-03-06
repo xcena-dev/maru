@@ -14,7 +14,7 @@ The left shows how KV cache is shared without Maru; the right shows how it works
 <img src="_static/kvcache_all.gif" alt="KV Cache Sharing: Without vs With Maru">
 </div>
 
-Maru provides:
+## Key Features
 
 - **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization.
 
@@ -25,6 +25,8 @@ Maru provides:
 - **Lower System Energy** — Eliminating bulk data transfer cuts NIC and CPU power draw. Shorter data paths also reduce GPU idle time per request.
 
 ---
+
+## Architecture
 
 ```mermaid
 flowchart TB
@@ -59,11 +61,17 @@ flowchart TB
 
 ```
 
+See {doc}`Architecture Overview <source/design_doc/architecture_overview>` for the full design.  
+
 ---
+
+## Benchmark
 
 ![Benchmark](source/image/benchmark.png)
 
-*This benchmark is based on single-node testing. Multi-node test data will be updated soon.*
+*P2P KV cache reuse, meta-llama/Llama-3.1-8B-Instruct, single-node. TTFT P50 (ms), lower is better. Multi-node results coming soon.*
+
+See {doc}`full benchmark results <source/performance/lmcache>` for detailed TTFT, concurrency, and power efficiency comparisons.
 
 ---
 
@@ -83,6 +91,8 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 ::::
 
 ---
+
+## Getting Started
 
 - {doc}`Installation <source/getting_started/installation>`
 - {doc}`Quick Start <source/getting_started/quick_start>`
