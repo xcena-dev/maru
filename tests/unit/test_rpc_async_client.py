@@ -660,9 +660,7 @@ class TestRpcAsyncClientApiMethods:
 
         result = client.list_allocations()
 
-        client._send_request.assert_called_once_with(
-            MessageType.LIST_ALLOCATIONS, {}
-        )
+        client._send_request.assert_called_once_with(MessageType.LIST_ALLOCATIONS, {})
         assert result.success is True
 
 
