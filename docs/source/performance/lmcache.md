@@ -126,8 +126,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 chunk_size: 256
 local_cpu: true
 max_local_cpu_size: 64.0          # per-instance DRAM (GB)
-use_layerwise: False
-enable_async_loading: true
+use_layerwise: false
 
 # P2P
 enable_p2p: true
@@ -151,8 +150,7 @@ use_cxl: false
 chunk_size: 256
 local_cpu: true
 max_local_cpu_size: 64.0          # DRAM scratch buffer
-use_layerwise: true
-enable_async_loading: true
+use_layerwise: false
 
 # P2P/Controller disabled (Maru uses shared storage)
 enable_p2p: false
