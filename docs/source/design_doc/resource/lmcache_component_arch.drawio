@@ -1,0 +1,193 @@
+<mxfile host="65bd71144e">
+    <diagram id="Q6tu2j-AV3KgjyDcXyuX" name="Page-1">
+        <mxGraphModel background="#FFFFFF" dx="1386" dy="973" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-51" value="LMCache Instance 1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="90" y="130" width="420" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-52" value="StorageManager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="230" y="160" width="140" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-53" value="LocalCpuBackend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="120" y="220" width="150" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-54" value="RemoteBackend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="330" y="220" width="150" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-55" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-52" target="Vb-pQWG6SS1dQ26InM_s-53">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-56" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-52" target="Vb-pQWG6SS1dQ26InM_s-54">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-57" value="LMCache Instance 2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="710" y="130" width="420" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-58" value="StorageManager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="850" y="160" width="140" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-59" value="LocalCpuBackend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="740" y="220" width="150" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-60" value="RemoteBackend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="220" width="150" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-61" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-58" target="Vb-pQWG6SS1dQ26InM_s-59">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-62" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-58" target="Vb-pQWG6SS1dQ26InM_s-60">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-63" value="MaruConnector (Instance 1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=5;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="90" y="320" width="420" height="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-64" value="MaruHandler" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;spacingTop=4;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="110" y="350" width="240" height="160" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-65" value="OwnedRegionManager&#xa;(write ownership tracking)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="130" y="380" width="200" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-66" value="DaxMapper&#xa;(mmap CXL memory)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="130" y="450" width="200" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-67" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-65" target="Vb-pQWG6SS1dQ26InM_s-66">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-68" value="RpcClient" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="380" y="470" width="110" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-69" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-54" target="Vb-pQWG6SS1dQ26InM_s-63">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-70" value="MaruConnector (Instance 2)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=5;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="710" y="320" width="420" height="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-71" value="MaruHandler" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;spacingTop=4;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="730" y="350" width="240" height="160" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-72" value="OwnedRegionManager&#xa;(write ownership tracking)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="750" y="380" width="200" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-73" value="DaxMapper&#xa;(mmap CXL memory)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="750" y="450" width="200" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-74" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-72" target="Vb-pQWG6SS1dQ26InM_s-73">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-75" value="RpcClient" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="1000" y="470" width="110" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-76" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-60" target="Vb-pQWG6SS1dQ26InM_s-70">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-79" value="MaruServer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="300" y="610" width="540" height="260" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-80" value="RpcServer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="510" y="640" width="120" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-81" value="Internal Services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#cccccc;verticalAlign=top;fontStyle=0;fontSize=11;spacingTop=4;fontColor=#888888;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="330" y="695" width="480" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-82" value="AllocationManager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="360" y="725" width="160" height="35" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-83" value="KVManager&#xa;key → (region_id, offset)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="600" y="720" width="180" height="42" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-84" value="RpcClient" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="380" y="795" width="110" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-85" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-80" target="Vb-pQWG6SS1dQ26InM_s-82">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-86" style="endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-80" target="Vb-pQWG6SS1dQ26InM_s-83">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-87" value="lookup" style="endArrow=block;endFill=1;strokeColor=#7c3aed;dashed=1;dashPattern=4 3;fontColor=#7c3aed;fontSize=9;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-82" target="Vb-pQWG6SS1dQ26InM_s-83">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-88" value="alloc / free" style="endArrow=block;endFill=1;strokeColor=#e53e3e;fontColor=#e53e3e;fontSize=9;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-82" target="Vb-pQWG6SS1dQ26InM_s-84">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-90" value="MaruResourceManager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="370" y="940" width="400" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-91" value="RpcServer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="410" y="980" width="120" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-92" value="PoolManager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="610" y="980" width="120" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-93" value="manage" style="endArrow=block;endFill=1;strokeColor=#6366f1;fontSize=10;fontColor=#6366f1;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-90" target="Vb-pQWG6SS1dQ26InM_s-94">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-94" value="CXL Shared Memory" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;arcSize=4;" vertex="1" parent="1">
+                    <mxGeometry x="210" y="1120" width="720" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-95" value="Region 1&#xa;Instance 1 owned (W)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="250" y="1160" width="170" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-96" value="Region 2&#xa;Instance 2 owned (W)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="480" y="1160" width="170" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-97" value="Region N&#xa;free" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="710" y="1160" width="170" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-98" value="Data Plane (mmap direct write)" style="endArrow=block;endFill=1;strokeColor=#e53e3e;strokeWidth=2;fontColor=#e53e3e;fontSize=10;fontStyle=1;exitX=0;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-66" target="Vb-pQWG6SS1dQ26InM_s-94">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="100" y="810"/>
+                            <mxPoint x="100" y="1150"/>
+                            <mxPoint x="210" y="1150"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-99" value="Data Plane (mmap direct read)" style="endArrow=block;endFill=1;strokeColor=#e53e3e;strokeWidth=2;fontColor=#e53e3e;fontSize=10;fontStyle=1;exitX=1;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-73" target="Vb-pQWG6SS1dQ26InM_s-94">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1040" y="810"/>
+                            <mxPoint x="1040" y="1150"/>
+                            <mxPoint x="930" y="1150"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-100" value="Ownership Model: Write-owner has exclusive write access. Other instances read-only via DaxMapper.&#xa;Owner tracks regions via OwnedRegionManager. Readers resolve location via KVManager meta lookup." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=none;fontSize=10;align=center;spacingTop=6;arcSize=8;fontStyle=1;" vertex="1" parent="1">
+                    <mxGeometry x="250" y="1240" width="640" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-101" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#e2e8f0;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="1190" y="130" width="310" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-102" value="Legend" style="text;html=1;fontSize=14;fontStyle=1;align=center;" vertex="1" parent="1">
+                    <mxGeometry x="1295" y="138" width="100" height="25" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-113" value="── ── ▶  Control Plane / RPC (RPC)" style="text;fontSize=11;align=left;fontColor=#6366f1;" vertex="1" parent="1">
+                    <mxGeometry x="1210" y="180" width="260" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-114" value="━ ━ ━ ▶  Data Plane (mmap direct CXL)" style="text;fontSize=11;align=left;fontColor=#e53e3e;" vertex="1" parent="1">
+                    <mxGeometry x="1210" y="206" width="260" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-115" value="━━━━▶  Internal dependency" style="text;fontSize=11;align=left;fontColor=#666666;" vertex="1" parent="1">
+                    <mxGeometry x="1210" y="232" width="260" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-117" value="vLLM Instance 1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="90" y="40" width="420" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-118" value="vLLM Instance 2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="710" y="40" width="420" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-89" value="RPC" style="endArrow=block;endFill=1;strokeColor=#6366f1;dashed=1;dashPattern=6 4;fontColor=#6366f1;fontSize=10;fontStyle=1;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-84" target="Vb-pQWG6SS1dQ26InM_s-91">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-77" value="RPC" style="endArrow=block;endFill=1;strokeColor=#6366f1;dashed=1;dashPattern=6 4;fontColor=#6366f1;fontSize=10;fontStyle=1;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-68" target="Vb-pQWG6SS1dQ26InM_s-80">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="Vb-pQWG6SS1dQ26InM_s-78" value="RPC" style="endArrow=block;endFill=1;strokeColor=#6366f1;dashed=1;dashPattern=6 4;fontColor=#6366f1;fontSize=10;fontStyle=1;" edge="1" parent="1" source="Vb-pQWG6SS1dQ26InM_s-75" target="Vb-pQWG6SS1dQ26InM_s-80">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

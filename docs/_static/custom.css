@@ -1,0 +1,162 @@
+/* Neutral gray accent (DuckDB-style) using Radix slate scale */
+:root {
+    --accent-1: #fcfcfd;
+    --accent-2: #f9f9fb;
+    --accent-3: #f0f0f3;
+    --accent-4: #e8e8ec;
+    --accent-5: #e0e1e6;
+    --accent-6: #d9d9e0;
+    --accent-7: #cdced6;
+    --accent-8: #b9bbc6;
+    --accent-9: #8b8d98;
+    --accent-10: #80838d;
+    --accent-11: #60646c;
+    --accent-12: #1c2024;
+    --accent-a1: #fcfcfd;
+    --accent-a2: #f0f0f3;
+    --accent-a3: #f0f0f3;
+    --accent-a4: #e8e8ec;
+    --accent-a5: #e0e1e6;
+    --accent-a6: #d9d9e0;
+    --accent-a7: #cdced6;
+    --accent-a8: #b9bbc6;
+    --accent-a9: #8b8d98;
+    --accent-a10: #80838d;
+    --accent-a11: #60646c;
+    --accent-a12: #1c2024;
+    --accent-contrast: #fff;
+    --color-surface-accent: #f0f0f3cc;   /* neutral gray table header */
+    --yue-c-quote-border: #FFC300;       /* XCENA Yellow blockquote border */
+}
+
+/* Blockquote: subtle yellow background */
+.yue blockquote {
+    background: #FFC30010;               /* very light XCENA Yellow tint */
+    padding-top: 0.15rem;
+    padding-bottom: 0.15rem;
+}
+
+/* Page background: light gray instead of white (DuckDB-style) */
+:root,
+html.light {
+    --sy-c-background: #f9f9fb;           /* slate-2: light gray */
+    --sy-c-background-dropback: #f9f9fbcc; /* translucent match */
+}
+
+/* Sidebar: full-width links with padding */
+.globaltoc>ul a {
+    display: block;                      /* full width, not just text */
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+/* Sidebar: DuckDB-style active/hover */
+.globaltoc>ul a.current {
+    background-color: #e8e8ec;           /* slate-4: visible gray bg */
+    color: var(--sy-c-heading);          /* black text, not accent */
+}
+
+.globaltoc>ul a:hover {
+    background-color: #f0f0f3;           /* slate-3: subtle hover bg */
+    color: var(--sy-c-heading);
+}
+
+/* Right TOC: dim non-active, bold active */
+.localtoc>ul a {
+    color: #8b8d98;                      /* dim gray for non-active */
+    font-size: 0.85rem;
+    transition: color 0.2s ease;
+}
+
+.localtoc>ul li.active>a {
+    color: var(--sy-c-heading);          /* dark text for active */
+}
+
+/* Dark mode: accent-a overrides for code blocks, quotes, etc. */
+html.dark {
+    --accent-a2: #191b1f;
+    --accent-a3: #21242a;
+    --accent-a4: #272b31;
+    --accent-a5: #2e3237;
+    --accent-a8: #4a4f57;
+    --accent-a9: #636971;
+    --accent-a11: #b0b4ba;
+    --accent-a12: #ededef;
+    --color-surface-accent: #21242a80;   /* neutral gray table header */
+}
+
+/* Sidebar: dark mode overrides */
+html.dark .globaltoc>ul a.current {
+    background-color: #2e3135;           /* dark slate-5 */
+    color: #ededef;                      /* bright white text */
+}
+
+html.dark .globaltoc>ul a:hover {
+    background-color: #272a2d;           /* dark slate-4 */
+}
+
+/* Right TOC: dim non-active, bright active (DuckDB-style) */
+html.dark .localtoc>ul a {
+    color: #8b8d98;                      /* dim gray for non-active */
+}
+
+html.dark .localtoc>ul li.active>a {
+    color: #fff;                         /* bright white for active */
+}
+
+/* Text selection: XCENA Yellow */
+::selection {
+    background: #FFC300;
+    color: #222835;                    /* XCENA Navy text */
+}
+
+/* autodoc: method/class signature boxes */
+dl.py > dt.sig {
+    margin-top: 2em;
+    background: #e8e8ec;                /* slate-4: visible against page bg */
+    border-left: 3px solid #cdced6;     /* slate-7: left accent border */
+}
+
+dl.py > dt.sig:first-child {
+    margin-top: 0;
+}
+
+html.dark dl.py > dt.sig {
+    background: #272b31;               /* dark slate-4 */
+    border-left-color: #4a4f57;        /* dark slate-8 */
+}
+
+dt.sig > a.internal:before {
+    content: none;                     /* remove forced newline */
+}
+
+dt.sig > a.internal {
+    float: right;                      /* move [source] to right side */
+}
+
+/* Sidebar: always expand Architecture Overview children */
+.globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > ul,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > ul {
+    display: block !important;
+}
+
+.globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > button,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > button {
+    display: none !important;
+}
+
+/* Admonition: soft blue accent (complements XCENA Yellow) */
+.admonition.docutils {
+    --color-1: #eef3fa;                /* background */
+    --color-2: #dce6f5;                /* title bar background */
+    --color-3: #4a7fb5;                /* icon circle + border-left */
+    --color-4: #3a6a9a;                /* title text */
+}
+
+html.dark .admonition.docutils {
+    --color-1: #1a2433;                /* dark blue-gray background */
+    --color-2: #1e2a3a;                /* dark title bar */
+    --color-3: #5a8fbf;                /* lighter steel blue for visibility */
+    --color-4: #7ab0d8;                /* light blue title text */
+}

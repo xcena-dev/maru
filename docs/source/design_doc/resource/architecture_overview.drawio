@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2026-03-05" agent="Claude" version="24.0.0" type="device">
+  <diagram id="system-architecture" name="System Architecture">
+    <mxGraphModel background="#FFFFFF" dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ========== LLM Inference Instances ========== -->
+        <mxCell id="instances-group" value="LLM Inference Instances" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F3FF;strokeColor=#4A90D9;dashed=0;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="1">
+          <mxGeometry x="200" y="30" width="1200" height="200" as="geometry" />
+        </mxCell>
+
+        <!-- Instance 1 -->
+        <mxCell id="inst1-box" value="" style="rounded=1;whiteSpace=wrap;fillColor=#FFFFFF;strokeColor=#CCCCCC;container=1;collapsible=0;" vertex="1" parent="instances-group">
+          <mxGeometry x="60" y="45" width="300" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="v1" value="LLM Instance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontStyle=1;fontSize=12;" vertex="1" parent="inst1-box">
+          <mxGeometry x="75" y="15" width="150" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="h1" value="MaruHandler" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#FFF2CC;strokeColor=#D6B656;fontStyle=1;fontSize=12;" vertex="1" parent="inst1-box">
+          <mxGeometry x="55" y="80" width="190" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="v1-h1" style="endArrow=none;html=1;strokeWidth=2;strokeColor=#666666;" edge="1" source="v1" target="h1" parent="inst1-box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Instance 2 -->
+        <mxCell id="inst2-box" value="" style="rounded=1;whiteSpace=wrap;fillColor=#FFFFFF;strokeColor=#CCCCCC;container=1;collapsible=0;" vertex="1" parent="instances-group">
+          <mxGeometry x="450" y="45" width="300" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="v2" value="LLM Instance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontStyle=1;fontSize=12;" vertex="1" parent="inst2-box">
+          <mxGeometry x="75" y="15" width="150" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="h2" value="MaruHandler" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#FFF2CC;strokeColor=#D6B656;fontStyle=1;fontSize=12;" vertex="1" parent="inst2-box">
+          <mxGeometry x="55" y="80" width="190" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="v2-h2" style="endArrow=none;html=1;strokeWidth=2;strokeColor=#666666;" edge="1" source="v2" target="h2" parent="inst2-box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Instance 3 -->
+        <mxCell id="inst3-box" value="" style="rounded=1;whiteSpace=wrap;fillColor=#FFFFFF;strokeColor=#CCCCCC;container=1;collapsible=0;" vertex="1" parent="instances-group">
+          <mxGeometry x="840" y="45" width="300" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="v3" value="LLM Instance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontStyle=1;fontSize=12;" vertex="1" parent="inst3-box">
+          <mxGeometry x="75" y="15" width="150" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="h3" value="MaruHandler" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#FFF2CC;strokeColor=#D6B656;fontStyle=1;fontSize=12;" vertex="1" parent="inst3-box">
+          <mxGeometry x="55" y="80" width="190" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="v3-h3" style="endArrow=none;html=1;strokeWidth=2;strokeColor=#666666;" edge="1" source="v3" target="h3" parent="inst3-box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Control Plane ========== -->
+        <mxCell id="control-group" value="Control Plane" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#999999;dashed=1;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="1">
+          <mxGeometry x="200" y="310" width="1200" height="220" as="geometry" />
+        </mxCell>
+
+        <!-- Remote Mode -->
+        <mxCell id="remote-group" value="Remote Mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FDE8E8;strokeColor=#B85450;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="control-group">
+          <mxGeometry x="60" y="40" width="500" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="ms" value="&lt;b&gt;MaruServer&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;KVManager + AllocationManager&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;" vertex="1" parent="remote-group">
+          <mxGeometry x="30" y="50" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="daemon" value="&lt;b&gt;MaruResourceManager&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Pool Manager + WAL&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;" vertex="1" parent="remote-group">
+          <mxGeometry x="270" y="50" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="ms-daemon" style="endArrow=classic;startArrow=classic;html=1;strokeWidth=2;strokeColor=#B85450;" edge="1" source="ms" target="daemon" parent="remote-group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Filesystem Mode -->
+        <mxCell id="fs-group" value="Filesystem Mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F0FE;strokeColor=#6C8EBF;verticalAlign=top;fontStyle=1;fontSize=13;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="control-group">
+          <mxGeometry x="680" y="40" width="440" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="fs" value="&lt;b&gt;marufs.ko&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Global Index + RAT&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="fs-group">
+          <mxGeometry x="120" y="40" width="200" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ========== CXL Shared Memory ========== -->
+        <mxCell id="cxl-group" value="CXL Shared Memory" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8D5F5;strokeColor=#9673A6;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="1">
+          <mxGeometry x="350" y="620" width="900" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="r0" value="&lt;b&gt;Region 0&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4C4E8;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="cxl-group">
+          <mxGeometry x="80" y="40" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r1" value="&lt;b&gt;Region 1&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4C4E8;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="cxl-group">
+          <mxGeometry x="350" y="40" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r2" value="&lt;b&gt;Region 2&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4C4E8;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="cxl-group">
+          <mxGeometry x="620" y="40" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Control Plane Arrows (dashed) ========== -->
+        <!-- H1 -> MaruServer (metadata RPC) -->
+        <mxCell id="h1-ms" value="RPC" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#B85450;dashed=1;dashPattern=6 4;fontStyle=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" source="h1" target="ms" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- H2 -> MaruServer (metadata RPC) -->
+        <mxCell id="h2-ms" value="RPC" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#B85450;dashed=1;dashPattern=6 4;fontStyle=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" source="h2" target="ms" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- H3 -> marufs (VFS syscalls) -->
+        <mxCell id="h3-fs" value="VFS syscalls" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#6C8EBF;dashed=1;dashPattern=6 4;fontStyle=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" source="h3" target="fs" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Daemon -> CXL -->
+        <mxCell id="daemon-cxl" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#B85450;dashed=1;dashPattern=6 4;" edge="1" source="daemon" target="cxl-group" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- marufs -> CXL -->
+        <mxCell id="fs-cxl" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#6C8EBF;dashed=1;dashPattern=6 4;" edge="1" source="fs" target="cxl-group" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Data Plane Arrows (solid) ========== -->
+        <!-- H1 -> CXL (direct access) -->
+        <mxCell id="h1-cxl" value="" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#9673A6;" edge="1" source="h1" target="r0" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- H2 -> CXL (direct access) -->
+        <mxCell id="h2-cxl" value="" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#9673A6;" edge="1" source="h2" target="r1" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- H3 -> CXL (direct access) -->
+        <mxCell id="h3-cxl" value="" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#9673A6;" edge="1" source="h3" target="r2" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Legend ========== -->
+        <mxCell id="legend-box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#CCCCCC;container=1;collapsible=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="620" width="270" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;" vertex="1" parent="legend-box">
+          <mxGeometry x="10" y="5" width="100" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-solid" value="" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#B85450;dashed=1;dashPattern=6 4;" edge="1" parent="legend-box">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="15" y="50" as="sourcePoint" />
+            <mxPoint x="65" y="50" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="legend-solid-label" value="Control Plane" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;" vertex="1" parent="legend-box">
+          <mxGeometry x="75" y="37" width="180" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-dashed" value="" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#9673A6;" edge="1" parent="legend-box">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="15" y="80" as="sourcePoint" />
+            <mxPoint x="65" y="80" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="legend-dashed-label" value="Data Plane" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;" vertex="1" parent="legend-box">
+          <mxGeometry x="75" y="67" width="180" height="25" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

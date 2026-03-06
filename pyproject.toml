@@ -7,7 +7,7 @@ name = "maru"
 version = "0.1.0"
 description = "Maru - A high-performance KV cache manager for CXL shared memory"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [
     {name = "XCENA"}
 ]
@@ -16,7 +16,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
@@ -34,7 +33,7 @@ dev = [
 ]
 docs = [
     "sphinx>=7.0",
-    "furo>=2024.1.29",
+    "shibuya",
     "myst-parser>=2.0",
     "sphinxcontrib-mermaid",
     "sphinx-autobuild",

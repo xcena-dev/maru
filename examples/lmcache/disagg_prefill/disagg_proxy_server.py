@@ -330,14 +330,16 @@ async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
     """
     Wait for prefill node to signal that KV cache is ready for decode.
 
-    For Mooncake Store backend, this is skipped because Mooncake uses
-    distributed shared memory and doesn't send ZMQ ProxyNotif messages.
+    For shared storage backends (Maru, Mooncake Store), this is skipped
+    because KV data is available immediately via shared memory — no ZMQ
+    ProxyNotif messages are needed.
 
     For LMCache (nixl) backend, we wait for ZMQ notifications from PDBackend.
     """
     if global_args.skip_kv_wait:
-        # Mooncake Store doesn't use PDBackend's ZMQ notification mechanism
-        # KV is available immediately via distributed shared memory
+        # Shared storage (Maru/Mooncake) doesn't use PDBackend's ZMQ
+        # notification mechanism — KV is available immediately via
+        # shared memory (CXL for Maru, distributed for Mooncake)
         return
 
     while app.state.finished_reqs[req_id] < num_tp_rank:
