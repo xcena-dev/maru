@@ -19,8 +19,10 @@ __all__ = ["MaruConnectorAdapter", "MaruConnector"]
 def __getattr__(name: str):
     if name == "MaruConnectorAdapter":
         from maru_lmcache.adapter import MaruConnectorAdapter
+
         return MaruConnectorAdapter
     if name == "MaruConnector":
         from maru_lmcache.connector import MaruConnector
+
         return MaruConnector
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

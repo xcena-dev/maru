@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MaruConnectorAdapter and plugin discovery."""
 
-import asyncio
-
 import pytest
 
 pytest.importorskip(
@@ -49,9 +47,7 @@ class TestMaruConnectorAdapter:
 class TestPluginDiscovery:
     """Test that upstream LMCache discovers our adapter via plugin system."""
 
-    def test_connector_manager_loads_maru_adapter(
-        self, async_loop, lmcache_config
-    ):
+    def test_connector_manager_loads_maru_adapter(self, async_loop, lmcache_config):
         from lmcache.v1.storage_backend.connector import ConnectorManager
 
         manager = ConnectorManager(
@@ -64,9 +60,7 @@ class TestPluginDiscovery:
         adapter_names = [a.__class__.__name__ for a in manager.adapters]
         assert "MaruConnectorAdapter" in adapter_names
 
-    def test_connector_manager_can_parse_maru_url(
-        self, async_loop, lmcache_config
-    ):
+    def test_connector_manager_can_parse_maru_url(self, async_loop, lmcache_config):
         from lmcache.v1.storage_backend.connector import ConnectorManager
 
         manager = ConnectorManager(
@@ -76,10 +70,7 @@ class TestPluginDiscovery:
             config=lmcache_config,
         )
 
-        matched = [
-            a for a in manager.adapters
-            if a.can_parse("maru://localhost:5555")
-        ]
+        matched = [a for a in manager.adapters if a.can_parse("maru://localhost:5555")]
         assert len(matched) == 1
         assert matched[0].__class__.__name__ == "MaruConnectorAdapter"
 

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MaruConnector and MaruConnectorConfig."""
 
-import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,22 +17,24 @@ from maru_lmcache.connector import (
     parse_size,
 )
 
-
 # ---------------------------------------------------------------------------
 # parse_size
 # ---------------------------------------------------------------------------
 
-class TestParseSize:
 
-    @pytest.mark.parametrize("input_val, expected", [
-        ("1G", 1024**3),
-        ("2g", 2 * 1024**3),
-        ("500M", 500 * 1024**2),
-        ("1024K", 1024 * 1024),
-        ("4GB", 4 * 1024**3),
-        ("100", 100),
-        (42, 42),
-    ])
+class TestParseSize:
+    @pytest.mark.parametrize(
+        "input_val, expected",
+        [
+            ("1G", 1024**3),
+            ("2g", 2 * 1024**3),
+            ("500M", 500 * 1024**2),
+            ("1024K", 1024 * 1024),
+            ("4GB", 4 * 1024**3),
+            ("100", 100),
+            (42, 42),
+        ],
+    )
     def test_valid_sizes(self, input_val, expected):
         assert parse_size(input_val) == expected
 
@@ -42,8 +43,8 @@ class TestParseSize:
 # MaruConnectorConfig
 # ---------------------------------------------------------------------------
 
-class TestMaruConnectorConfig:
 
+class TestMaruConnectorConfig:
     def test_from_url_defaults(self):
         cfg = MaruConnectorConfig.from_url("maru://localhost:5555")
         assert cfg.server_url == "tcp://localhost:5555"
@@ -100,8 +101,8 @@ class TestMaruConnectorConfig:
 # cache_key_to_int
 # ---------------------------------------------------------------------------
 
-class TestCacheKeyToInt:
 
+class TestCacheKeyToInt:
     def test_deterministic(self):
         key = MagicMock()
         key.to_string.return_value = "model|layer|token_range|fmt"
@@ -127,6 +128,7 @@ class TestCacheKeyToInt:
 # MaruConnector (with mocked MaruHandler)
 # ---------------------------------------------------------------------------
 
+
 def _make_connector(async_loop, mock_handler):
     """Create a MaruConnector with a pre-injected mock handler."""
     from lmcache.v1.config import LMCacheEngineConfig
@@ -140,6 +142,7 @@ def _make_connector(async_loop, mock_handler):
 
     # Mock metadata to avoid needing a real vLLM model config
     import torch
+
     metadata = MagicMock(spec=LMCacheMetadata)
     metadata.get_shapes.return_value = [torch.Size([2, 32, 256, 128])]
     metadata.get_dtypes.return_value = [torch.float16]
@@ -149,14 +152,18 @@ def _make_connector(async_loop, mock_handler):
 
     maru_config = MaruConnectorConfig(auto_connect=False)
 
-    with patch(
-        "lmcache.v1.storage_backend.connector.base_connector.get_size_bytes",
-        return_value=256 * 2 * 32 * 128 * 2,  # fake chunk size
-    ), patch(
-        "lmcache.v1.storage_backend.connector.base_connector.init_remote_metadata_info"
-    ), patch(
-        "lmcache.v1.storage_backend.connector.base_connector.get_remote_metadata_bytes",
-        return_value=0,
+    with (
+        patch(
+            "lmcache.v1.storage_backend.connector.base_connector.get_size_bytes",
+            return_value=256 * 2 * 32 * 128 * 2,  # fake chunk size
+        ),
+        patch(
+            "lmcache.v1.storage_backend.connector.base_connector.init_remote_metadata_info"
+        ),
+        patch(
+            "lmcache.v1.storage_backend.connector.base_connector.get_remote_metadata_bytes",
+            return_value=0,
+        ),
     ):
         connector = MaruConnector(
             url="maru://localhost:5555",
@@ -173,7 +180,6 @@ def _make_connector(async_loop, mock_handler):
 
 
 class TestMaruConnector:
-
     def test_exists(self, async_loop, mock_maru_handler):
         connector = _make_connector(async_loop, mock_maru_handler)
         mock_maru_handler.exists.return_value = True
@@ -186,8 +192,6 @@ class TestMaruConnector:
         mock_maru_handler.exists.assert_called_once()
 
     def test_exists_returns_false_when_disconnected(self, async_loop):
-        from lmcache.v1.config import LMCacheEngineConfig
-
         maru_config = MaruConnectorConfig(auto_connect=False)
 
         # Can't create a real connector without metadata, so test the
@@ -233,8 +237,10 @@ class TestMaruConnector:
         mock_maru_handler.store.assert_called_once()
 
         # get
-        with patch.object(connector, "_decode_memory_obj") as dec, \
-             patch.object(connector, "reshape_partial_chunk") as reshape:
+        with (
+            patch.object(connector, "_decode_memory_obj") as dec,
+            patch.object(connector, "reshape_partial_chunk") as reshape,
+        ):
             dec.return_value = MagicMock()
             reshape.return_value = dec.return_value
             result = async_loop.run_until_complete(connector.get(key))
@@ -288,8 +294,8 @@ class TestMaruConnector:
 # Batch operations
 # ---------------------------------------------------------------------------
 
-class TestBatchOperations:
 
+class TestBatchOperations:
     def test_support_flags(self, async_loop, mock_maru_handler):
         connector = _make_connector(async_loop, mock_maru_handler)
         assert connector.support_batched_get() is True
@@ -326,15 +332,19 @@ class TestBatchOperations:
     def test_batched_get(self, async_loop, mock_maru_handler, mock_memory_info):
         connector = _make_connector(async_loop, mock_maru_handler)
         mock_maru_handler.batch_retrieve.return_value = [
-            mock_memory_info, None, mock_memory_info
+            mock_memory_info,
+            None,
+            mock_memory_info,
         ]
 
         keys = [MagicMock() for _ in range(3)]
         for i, k in enumerate(keys):
             k.to_string.return_value = f"key_{i}"
 
-        with patch.object(connector, "_decode_memory_obj") as dec, \
-             patch.object(connector, "reshape_partial_chunk") as reshape:
+        with (
+            patch.object(connector, "_decode_memory_obj") as dec,
+            patch.object(connector, "reshape_partial_chunk") as reshape,
+        ):
             obj = MagicMock()
             dec.return_value = obj
             reshape.return_value = obj
@@ -357,9 +367,7 @@ class TestBatchOperations:
         for obj in objs:
             obj.byte_array = memoryview(bytearray(1024))
 
-        with patch(
-            "maru_lmcache.connector.MaruConnector._encode_memory_obj"
-        ) as enc:
+        with patch("maru_lmcache.connector.MaruConnector._encode_memory_obj") as enc:
             enc.return_value = mock_memory_info
             async_loop.run_until_complete(connector.batched_put(keys, objs))
 
@@ -371,15 +379,19 @@ class TestBatchOperations:
         connector = _make_connector(async_loop, mock_maru_handler)
         # Second key is a miss → only first returned
         mock_maru_handler.batch_retrieve.return_value = [
-            mock_memory_info, None, mock_memory_info
+            mock_memory_info,
+            None,
+            mock_memory_info,
         ]
 
         keys = [MagicMock() for _ in range(3)]
         for i, k in enumerate(keys):
             k.to_string.return_value = f"key_{i}"
 
-        with patch.object(connector, "_decode_memory_obj") as dec, \
-             patch.object(connector, "reshape_partial_chunk") as reshape:
+        with (
+            patch.object(connector, "_decode_memory_obj") as dec,
+            patch.object(connector, "reshape_partial_chunk") as reshape,
+        ):
             obj = MagicMock()
             dec.return_value = obj
             reshape.return_value = obj

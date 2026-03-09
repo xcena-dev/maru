@@ -11,16 +11,16 @@ Key design points:
 """
 
 import asyncio
+import builtins
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import torch
-
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
@@ -41,6 +41,7 @@ def _perf_log(elapsed_ms: float, msg: str) -> None:
 # Size parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_size(size_str: str) -> int:
     """Parse human-readable size string (e.g., '1G', '500M') to bytes."""
     if isinstance(size_str, int):
@@ -57,20 +58,21 @@ def parse_size(size_str: str) -> int:
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class MaruConnectorConfig:
     """Configuration for the Maru connector."""
 
     server_url: str = "tcp://localhost:5555"
     pool_size: int = 1024 * 1024 * 1024  # 1 GB
-    instance_id: Optional[str] = None
+    instance_id: str | None = None
     auto_connect: bool = True
     connection_timeout: float = 30.0
     operation_timeout: float = 10.0
     timeout_ms: int = 2000
     use_async_rpc: bool = True
     max_inflight: int = 64
-    eager_map: Optional[bool] = None
+    eager_map: bool | None = None
 
     @staticmethod
     def from_url(url: str) -> "MaruConnectorConfig":
@@ -118,6 +120,7 @@ class MaruConnectorConfig:
 # Key conversion
 # ---------------------------------------------------------------------------
 
+
 def cache_key_to_str(key: CacheEngineKey) -> str:
     """Convert CacheEngineKey to string key for Maru storage."""
     return key.to_string()
@@ -135,6 +138,7 @@ PING_RPC_ERROR = 2
 # ---------------------------------------------------------------------------
 # MaruConnector
 # ---------------------------------------------------------------------------
+
 
 class MaruConnector(RemoteConnector):
     """
@@ -174,22 +178,20 @@ class MaruConnector(RemoteConnector):
         try:
             from maru import MaruConfig, MaruHandler
         except ImportError:
-            logger.warning(
-                "maru package not installed. Install with: pip install maru"
-            )
+            logger.warning("maru package not installed. Install with: pip install maru")
             return False
 
         try:
-            cfg_kwargs = dict(
-                server_url=self.maru_config.server_url,
-                instance_id=self.maru_config.instance_id,
-                pool_size=self.maru_config.pool_size,
-                chunk_size_bytes=self.full_chunk_size_bytes,
-                auto_connect=False,
-                timeout_ms=self.maru_config.timeout_ms,
-                use_async_rpc=self.maru_config.use_async_rpc,
-                max_inflight=self.maru_config.max_inflight,
-            )
+            cfg_kwargs = {
+                "server_url": self.maru_config.server_url,
+                "instance_id": self.maru_config.instance_id,
+                "pool_size": self.maru_config.pool_size,
+                "chunk_size_bytes": self.full_chunk_size_bytes,
+                "auto_connect": False,
+                "timeout_ms": self.maru_config.timeout_ms,
+                "use_async_rpc": self.maru_config.use_async_rpc,
+                "max_inflight": self.maru_config.max_inflight,
+            }
             if self.maru_config.eager_map is not None:
                 cfg_kwargs["eager_map"] = self.maru_config.eager_map
 
@@ -217,7 +219,7 @@ class MaruConnector(RemoteConnector):
     # Zero-copy encode / decode
     # ------------------------------------------------------------------
 
-    def _decode_memory_obj(self, info) -> Optional[MemoryObj]:
+    def _decode_memory_obj(self, info) -> MemoryObj | None:
         """MemoryInfo (memoryview) → TensorMemoryObj (zero-copy)."""
         from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
 
@@ -269,7 +271,7 @@ class MaruConnector(RemoteConnector):
                 f"exists key_hash={key_hash} result={result}",
             )
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("exists timed out for key_hash=%s", key_hash)
             return False
         except Exception as e:
@@ -287,7 +289,7 @@ class MaruConnector(RemoteConnector):
             logger.error("exists_sync failed: %s", e)
             return False
 
-    async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+    async def get(self, key: CacheEngineKey) -> MemoryObj | None:
         if not self._ensure_connected():
             return None
         assert self._handle is not None
@@ -314,7 +316,7 @@ class MaruConnector(RemoteConnector):
                 f"get key_hash={key_hash} bytes={data_size}",
             )
             return memory_obj
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("get timed out for key_hash=%s", key_hash)
             return None
         except Exception as e:
@@ -344,13 +346,13 @@ class MaruConnector(RemoteConnector):
             )
             if not success:
                 logger.warning("put failed for key_hash=%s", key_hash)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("put timed out for key_hash=%s", key_hash)
         except Exception as e:
             logger.error("put failed: %s", e)
             raise
 
-    async def list(self) -> List[str]:
+    async def list(self) -> list[str]:
         logger.warning("list() not supported by Maru connector")
         return []
 
@@ -418,7 +420,7 @@ class MaruConnector(RemoteConnector):
     def support_batched_get_non_blocking(self) -> bool:
         return True
 
-    def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+    def batched_contains(self, keys: builtins.list[CacheEngineKey]) -> int:
         if not self._ensure_connected() or not keys:
             return 0
         assert self._handle is not None
@@ -438,7 +440,7 @@ class MaruConnector(RemoteConnector):
     async def batched_async_contains(
         self,
         lookup_id: str,
-        keys: List[CacheEngineKey],
+        keys: builtins.list[CacheEngineKey],
         pin: bool = False,
     ) -> int:
         if not self._ensure_connected() or not keys:
@@ -461,7 +463,7 @@ class MaruConnector(RemoteConnector):
                 f"batch_contains n={len(keys)} hits={count}",
             )
             return count
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("batched_async_contains timed out")
             return 0
         except Exception as e:
@@ -469,8 +471,8 @@ class MaruConnector(RemoteConnector):
             return 0
 
     async def batched_get(
-        self, keys: List[CacheEngineKey]
-    ) -> List[Optional[MemoryObj]]:
+        self, keys: builtins.list[CacheEngineKey]
+    ) -> builtins.list[MemoryObj | None]:
         if not self._ensure_connected() or not keys:
             return [None] * len(keys)
         assert self._handle is not None
@@ -481,7 +483,7 @@ class MaruConnector(RemoteConnector):
                 asyncio.to_thread(self._handle.batch_retrieve, key_hashes),
                 timeout=self.maru_config.operation_timeout,
             )
-            objs: List[Optional[MemoryObj]] = []
+            objs: list[MemoryObj | None] = []
             for info in raw_results:
                 if info is None:
                     objs.append(None)
@@ -496,7 +498,7 @@ class MaruConnector(RemoteConnector):
                 f"batch_get n={len(keys)} hits={hits}",
             )
             return objs
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("batched_get timed out for %d keys", len(keys))
             return [None] * len(keys)
         except Exception as e:
@@ -505,8 +507,8 @@ class MaruConnector(RemoteConnector):
 
     async def batched_put(
         self,
-        keys: List[CacheEngineKey],
-        memory_objs: List[MemoryObj],
+        keys: builtins.list[CacheEngineKey],
+        memory_objs: builtins.list[MemoryObj],
     ) -> None:
         if not self._ensure_connected() or not keys:
             return
@@ -536,7 +538,7 @@ class MaruConnector(RemoteConnector):
                 logger.warning(
                     "batch_put partial: stored %d/%d keys", stored, len(keys)
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("batched_put timed out for %d keys", len(keys))
         except Exception as e:
             logger.error("batched_put failed: %s", e)
@@ -545,8 +547,8 @@ class MaruConnector(RemoteConnector):
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
-        keys: List[CacheEngineKey],
-    ) -> List[MemoryObj]:
+        keys: builtins.list[CacheEngineKey],
+    ) -> builtins.list[MemoryObj]:
         if not self._ensure_connected() or not keys:
             return []
         assert self._handle is not None
@@ -558,7 +560,7 @@ class MaruConnector(RemoteConnector):
                 timeout=self.maru_config.operation_timeout,
             )
             # Consecutive prefix of hits only
-            objs: List[MemoryObj] = []
+            objs: list[MemoryObj] = []
             for info in raw_results:
                 if info is None:
                     break
@@ -572,7 +574,7 @@ class MaruConnector(RemoteConnector):
                 f"batch_get_nb n={len(keys)} hits={len(objs)}",
             )
             return objs
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("batched_get_non_blocking timed out")
             return []
         except Exception as e:
