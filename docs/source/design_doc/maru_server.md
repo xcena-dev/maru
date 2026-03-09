@@ -87,7 +87,7 @@ When a client calls `return_alloc` or disconnects, the allocation's `owner_conne
 
 ## 3. KV Registry
 
-`KVManager` stores a mapping from integer keys (chunk hashes) to location records containing the region ID, offset within the region, and data length.
+`KVManager` stores a mapping from string keys to location records containing the region ID, offset within the region, and data length.
 
 When a new key is registered, an entry is created and the allocation's KV reference count is incremented. If the key already exists, the registration is treated as idempotent — no new entry is created.
 
