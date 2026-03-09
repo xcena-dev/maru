@@ -13,7 +13,7 @@ pytest.importorskip(
 from maru_lmcache.connector import (
     MaruConnector,
     MaruConnectorConfig,
-    cache_key_to_int,
+    cache_key_to_str,
     parse_size,
 )
 
@@ -98,30 +98,30 @@ class TestMaruConnectorConfig:
 
 
 # ---------------------------------------------------------------------------
-# cache_key_to_int
+# cache_key_to_str
 # ---------------------------------------------------------------------------
 
 
-class TestCacheKeyToInt:
+class TestCacheKeyToStr:
     def test_deterministic(self):
         key = MagicMock()
         key.to_string.return_value = "model|layer|token_range|fmt"
-        h1 = cache_key_to_int(key)
-        h2 = cache_key_to_int(key)
+        h1 = cache_key_to_str(key)
+        h2 = cache_key_to_str(key)
         assert h1 == h2
 
     def test_different_keys_differ(self):
         k1, k2 = MagicMock(), MagicMock()
         k1.to_string.return_value = "key_a"
         k2.to_string.return_value = "key_b"
-        assert cache_key_to_int(k1) != cache_key_to_int(k2)
+        assert cache_key_to_str(k1) != cache_key_to_str(k2)
 
-    def test_returns_unsigned_int(self):
+    def test_returns_string(self):
         key = MagicMock()
         key.to_string.return_value = "test_key"
-        result = cache_key_to_int(key)
-        assert isinstance(result, int)
-        assert result >= 0
+        result = cache_key_to_str(key)
+        assert isinstance(result, str)
+        assert result == "test_key"
 
 
 # ---------------------------------------------------------------------------
