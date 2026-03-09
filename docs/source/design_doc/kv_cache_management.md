@@ -10,7 +10,7 @@ Maru treats keys as **opaque identifiers** — it does not interpret or validate
 
 | Property | Description |
 |----------|-------------|
-| Key type | `int` (64-bit hash) |
+| Key type | `str` |
 | Uniqueness | Caller-guaranteed |
 | Duplicate handling | Idempotent — first writer wins, subsequent registrations are no-ops |
 | Deletion | Explicit `delete` by the owning client |
@@ -33,6 +33,6 @@ The server returns the full location plus a capability-based handle that authori
 
 | Lookup Request | Lookup Response |
 |---------------|-----------------|
-| `LOOKUP_KV(key: int)` | `(handle, kv_offset, kv_length)` |
+| `LOOKUP_KV(key: str)` | `(handle, kv_offset, kv_length)` |
 
 > See also: [MaruHandler — Data Flows](maru_handler.md#4-data-flows)

@@ -39,7 +39,7 @@ any change to the cache engine logic. MaruConnector slots in as one such plugin.
 
 The key translation between the two APIs involves:
 
-- **Key conversion** — LMCache uses structured `CacheEngineKey` objects; MaruHandler uses integer keys. The connector hashes LMCache keys via SHA-256 to produce 64-bit integer keys.
+- **Key conversion** — LMCache uses structured `CacheEngineKey` objects; MaruHandler uses string keys (`CacheEngineKey.to_string()`).
 - **Zero-copy bridging** — MaruHandler returns `MemoryInfo` (a memoryview wrapper) which the connector wraps as LMCache's `MemoryObj` without copying data.
 - **Batch optimization** — The connector maps LMCache's batch operations to MaruHandler's batch RPC calls, reducing round-trip overhead.
 
@@ -60,11 +60,10 @@ sequenceDiagram
 
     IE->>CE: KV tensors (GPU)
     CE->>MC: put(key, MemoryObj)
-    MC->>MC: Hash key → int64
     MC->>MH: alloc(size)
     MH-->>MC: handle (page in CXL region)
     MC->>CXL: write data via handle buffer (zero-copy)
-    MC->>MH: store(key_hash, handle)
+    MC->>MH: store(key, handle)
     MH->>MS: register_kv(key, region_id, offset, length)
     MS-->>MH: success
     MH-->>MC: True
@@ -86,9 +85,8 @@ sequenceDiagram
 
     IE->>CE: Request KV for prompt prefix
     CE->>MC: get(key)
-    MC->>MC: Hash key → int64
-    MC->>MH: retrieve(key_hash)
-    MH->>MS: lookup_kv(key_hash)
+    MC->>MH: retrieve(key)
+    MH->>MS: lookup_kv(key)
     MS-->>MH: region_id, offset, length
     MH->>CXL: Map shared region (if not already mapped)
     MH-->>MC: MemoryInfo (zero-copy memoryview)
@@ -116,10 +114,10 @@ For runnable examples, see
 
 MaruHandler is designed to be **framework-independent**. It knows nothing about
 LMCache, vLLM, or any specific inference engine. Its interface operates on
-integer keys and memory views — a minimal, framework-neutral contract.
+string keys and memory views — a minimal, framework-neutral contract.
 
 Any framework can integrate with Maru by writing a thin adapter layer that
-converts framework-specific cache keys to integer hashes, uses the handler's
+converts framework-specific cache keys to strings, uses the handler's
 alloc/store API for zero-copy writes, and manages the handler's lifecycle.
 MaruConnector serves as the reference implementation for this pattern — typically
 under 200 lines of code.
