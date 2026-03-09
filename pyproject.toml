@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+lmcache = ["lmcache>=0.3.12"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -50,7 +51,7 @@ Documentation = "https://xcena-dev.github.io/maru/"
 Organization = "https://xcena.com"
 
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_lmcache*"]
 
 [tool.ruff]
 line-length = 88

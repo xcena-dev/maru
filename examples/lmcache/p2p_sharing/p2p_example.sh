@@ -47,31 +47,37 @@ ensure_python_library_installed() {
     fi
 }
 
+kill_tree() {
+    # Recursively kill a process and all its descendants
+    local pid=$1 sig=${2:-TERM}
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null
+}
+
 cleanup() {
     echo "Stopping everything…"
-    trap - INT TERM USR1   # prevent re-entrancy
+    trap - INT TERM USR1 EXIT   # prevent re-entrancy
 
-    # Kill all tracked PIDs
+    # Graceful: recursively kill all tracked process trees
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Killing process $pid"
-            kill "$pid" 2>/dev/null
+            echo "Killing process tree of $pid"
+            kill_tree "$pid" TERM
         fi
     done
 
     # Wait a moment for graceful shutdown
     sleep 2
 
-    # Force kill any remaining processes
+    # Force kill any survivors
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Force killing process $pid"
-            kill -9 "$pid" 2>/dev/null
+            echo "Force killing process tree of $pid"
+            kill_tree "$pid" 9
         fi
     done
-
-    # Kill the entire process group as backup
-    kill -- -$$ 2>/dev/null
 
     echo "All processes stopped."
     exit 0
@@ -139,9 +145,7 @@ main() {
     ensure_python_library_installed datasets
     ensure_python_library_installed vllm
 
-    trap cleanup INT
-    trap cleanup USR1
-    trap cleanup TERM
+    trap cleanup INT TERM USR1 EXIT
 
     # Launch MaruServer
     if timeout 1 bash -c "echo >/dev/tcp/localhost/$MARU_SERVER_PORT" 2>/dev/null; then
@@ -149,7 +153,8 @@ main() {
     else
         echo "[$(date +%T)] Launching MaruServer on port $MARU_SERVER_PORT..."
         echo "[$(date +%T)] maru package: $(python3 -c 'import maru; print(maru.__file__)' 2>&1)"
-        python3 -m maru_server --port $MARU_SERVER_PORT --log-level "${_LOG_LEVEL:-INFO}" > "${LOG_DIR:-.}/maru_server.log" 2>&1 &
+        PYTHONUNBUFFERED=1 python3 -m maru_server --port $MARU_SERVER_PORT --log-level "${_LOG_LEVEL:-INFO}" \
+            > >(tee "${LOG_DIR:-.}/maru_server.log") 2>&1 &
         maru_server_pid=$!
         PIDS+=($maru_server_pid)
         echo "[$(date +%T)] MaruServer PID: $maru_server_pid (log: ${LOG_DIR:-.}/maru_server.log)"
