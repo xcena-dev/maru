@@ -39,7 +39,7 @@ any change to the cache engine logic. MaruConnector slots in as one such plugin.
 
 The key translation between the two APIs involves:
 
-- **Key conversion** — LMCache uses structured `CacheEngineKey` objects; MaruHandler uses string keys. The connector converts LMCache keys via `CacheEngineKey.to_string()`.
+- **Key conversion** — LMCache uses structured `CacheEngineKey` objects; MaruHandler uses string keys (`CacheEngineKey.to_string()`).
 - **Zero-copy bridging** — MaruHandler returns `MemoryInfo` (a memoryview wrapper) which the connector wraps as LMCache's `MemoryObj` without copying data.
 - **Batch optimization** — The connector maps LMCache's batch operations to MaruHandler's batch RPC calls, reducing round-trip overhead.
 

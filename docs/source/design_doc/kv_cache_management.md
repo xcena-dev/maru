@@ -10,7 +10,7 @@ Maru treats keys as **opaque identifiers** — it does not interpret or validate
 
 | Property | Description |
 |----------|-------------|
-| Key type | `str` (e.g. `CacheEngineKey.to_string()`) |
+| Key type | `str` |
 | Uniqueness | Caller-guaranteed |
 | Duplicate handling | Idempotent — first writer wins, subsequent registrations are no-ops |
 | Deletion | Explicit `delete` by the owning client |
