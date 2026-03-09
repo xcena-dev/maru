@@ -102,7 +102,7 @@ class RpcHandlerMixin:
 
     def _handle_register_kv(self, req: Any) -> dict:
         logger.debug(
-            "[PUT] key=%d, region_id=%d, kv_offset=%d, kv_length=%d",
+            "[PUT] key=%s, region_id=%d, kv_offset=%d, kv_length=%d",
             req.key,
             req.region_id,
             req.kv_offset,
@@ -119,10 +119,10 @@ class RpcHandlerMixin:
     def _handle_lookup_kv(self, req: Any) -> dict:
         result = self._server.lookup_kv(key=req.key)
         if result is None:
-            logger.debug("[GET] key=%d -> NOT FOUND", req.key)
+            logger.debug("[GET] key=%s -> NOT FOUND", req.key)
             return {"found": False}
         logger.debug(
-            "[GET] key=%d -> region_id=%d, kv_offset=%d, kv_length=%d",
+            "[GET] key=%s -> region_id=%d, kv_offset=%d, kv_length=%d",
             req.key,
             result["handle"].region_id,
             result["kv_offset"],

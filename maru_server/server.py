@@ -71,7 +71,7 @@ class MaruServer:
     # =========================================================================
 
     def register_kv(
-        self, key: int, region_id: int, kv_offset: int, kv_length: int
+        self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> bool:
         """Register a KV entry."""
         with self._lock:
@@ -82,10 +82,10 @@ class MaruServer:
             if alloc_to_ref is not None:
                 self._allocation_manager.increment_kv_ref(alloc_to_ref)
 
-        logger.debug("Registered KV: key=%d, region_id=%d", key, region_id)
+        logger.debug("Registered KV: key=%s, region_id=%d", key, region_id)
         return is_new
 
-    def lookup_kv(self, key: int) -> dict | None:
+    def lookup_kv(self, key: str) -> dict | None:
         """Lookup a KV entry and return handle with KV location info."""
         with self._lock:
             entry = self._kv_manager.lookup(key)
@@ -102,11 +102,11 @@ class MaruServer:
                 "kv_length": entry.kv_length,
             }
 
-    def exists_kv(self, key: int) -> bool:
+    def exists_kv(self, key: str) -> bool:
         """Check if a KV entry exists."""
         return self._kv_manager.exists(key)
 
-    def delete_kv(self, key: int) -> bool:
+    def delete_kv(self, key: str) -> bool:
         """Delete a KV entry."""
         with self._lock:
             existed, region_to_deref = self._kv_manager.delete(key)
@@ -120,7 +120,7 @@ class MaruServer:
     # Batch KV Operations
     # =========================================================================
 
-    def batch_register_kv(self, entries: list[tuple[int, int, int, int]]) -> list[bool]:
+    def batch_register_kv(self, entries: list[tuple[str, int, int, int]]) -> list[bool]:
         """
         Register multiple KV entries in a single operation.
 
@@ -141,12 +141,12 @@ class MaruServer:
                 results.append(is_new)
             return results
 
-    def batch_lookup_kv(self, keys: list[int]) -> list[dict | None]:
+    def batch_lookup_kv(self, keys: list[str]) -> list[dict | None]:
         """
         Lookup multiple KV entries in a single operation.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of dicts with handle/kv_offset/kv_length, or None for each key
@@ -173,12 +173,12 @@ class MaruServer:
 
             return results
 
-    def batch_exists_kv(self, keys: list[int]) -> list[bool]:
+    def batch_exists_kv(self, keys: list[str]) -> list[bool]:
         """
         Check existence of multiple KV entries in a single operation.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of booleans indicating if each key exists

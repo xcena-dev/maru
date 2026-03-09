@@ -19,7 +19,7 @@ class TestMaruBatch:
         results = []
         for i in range(5):
             is_new = server.register_kv(
-                key=i, region_id=handle.region_id, kv_offset=i * 100, kv_length=100
+                key=str(i), region_id=handle.region_id, kv_offset=i * 100, kv_length=100
             )
             results.append(is_new)
 
@@ -32,16 +32,16 @@ class TestMaruBatch:
 
         # Register some entries
         server.register_kv(
-            key=1, region_id=handle.region_id, kv_offset=0, kv_length=100
+            key="1", region_id=handle.region_id, kv_offset=0, kv_length=100
         )
         server.register_kv(
-            key=3, region_id=handle.region_id, kv_offset=200, kv_length=300
+            key="3", region_id=handle.region_id, kv_offset=200, kv_length=300
         )
 
         # Lookup: found, not-found, found
-        result1 = server.lookup_kv(1)
-        result2 = server.lookup_kv(2)
-        result3 = server.lookup_kv(3)
+        result1 = server.lookup_kv("1")
+        result2 = server.lookup_kv("2")
+        result3 = server.lookup_kv("3")
 
         assert result1 is not None
         assert result1["handle"].region_id == handle.region_id
@@ -56,13 +56,13 @@ class TestMaruBatch:
         handle = server.request_alloc("instance1", 4096)
 
         server.register_kv(
-            key=1, region_id=handle.region_id, kv_offset=0, kv_length=100
+            key="1", region_id=handle.region_id, kv_offset=0, kv_length=100
         )
         server.register_kv(
-            key=3, region_id=handle.region_id, kv_offset=200, kv_length=300
+            key="3", region_id=handle.region_id, kv_offset=200, kv_length=300
         )
 
-        results = [server.exists_kv(k) for k in [1, 2, 3, 4]]
+        results = [server.exists_kv(k) for k in ["1", "2", "3", "4"]]
         assert results == [True, False, True, False]
 
 
@@ -75,7 +75,7 @@ class TestKVManagerScaleOperations:
         n = 1000
         for i in range(n):
             is_new, region_id = manager.register(
-                key=i, region_id=1, kv_offset=i * 100, kv_length=100
+                key=str(i), region_id=1, kv_offset=i * 100, kv_length=100
             )
             assert is_new is True
 
@@ -88,12 +88,12 @@ class TestKVManagerScaleOperations:
 
         # Register half the keys
         for i in range(0, n, 2):
-            manager.register(key=i, region_id=1, kv_offset=i, kv_length=100)
+            manager.register(key=str(i), region_id=1, kv_offset=i, kv_length=100)
 
         # Lookup all keys
         found_count = 0
         for i in range(n):
-            entry = manager.lookup(i)
+            entry = manager.lookup(str(i))
             if entry is not None:
                 found_count += 1
 

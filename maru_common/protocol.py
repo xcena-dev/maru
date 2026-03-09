@@ -210,7 +210,7 @@ class ListAllocationsResponse:
 class RegisterKVRequest:
     """REGISTER_KV (0x10) - Register KV entry."""
 
-    key: int  # chunk_hash (64-bit)
+    key: str  # chunk key string (e.g. CacheEngineKey.to_string())
     region_id: int  # Handle's region_id
     kv_offset: int  # offset within allocation
     kv_length: int  # KV data size
@@ -228,7 +228,7 @@ class RegisterKVResponse:
 class LookupKVRequest:
     """LOOKUP_KV (0x11) - Lookup KV entry by key."""
 
-    key: int
+    key: str
 
 
 @dataclass
@@ -245,7 +245,7 @@ class LookupKVResponse:
 class ExistsKVRequest:
     """EXISTS_KV (0x12) - Check if KV entry exists."""
 
-    key: int
+    key: str
 
 
 @dataclass
@@ -259,7 +259,7 @@ class ExistsKVResponse:
 class DeleteKVRequest:
     """DELETE_KV (0x13) - Delete KV entry."""
 
-    key: int
+    key: str
 
 
 @dataclass
@@ -278,7 +278,7 @@ class DeleteKVResponse:
 class BatchKVEntry:
     """Single KV entry for batch operations."""
 
-    key: int
+    key: str
     region_id: int
     kv_offset: int
     kv_length: int
@@ -303,7 +303,7 @@ class BatchRegisterKVResponse:
 class BatchLookupKVRequest:
     """BATCH_LOOKUP_KV (0x21) - Batch lookup KV entries."""
 
-    keys: list[int] = field(default_factory=list)
+    keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -327,7 +327,7 @@ class BatchLookupKVResponse:
 class BatchExistsKVRequest:
     """BATCH_EXISTS_KV (0x22) - Batch check KV existence."""
 
-    keys: list[int] = field(default_factory=list)
+    keys: list[str] = field(default_factory=list)
 
 
 @dataclass

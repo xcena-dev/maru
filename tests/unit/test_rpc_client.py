@@ -347,12 +347,12 @@ class TestRpcClientApiMethods:
         mock_send.return_value = {"is_new": True}
 
         result = client.register_kv(
-            key=12345, region_id=1, kv_offset=100, kv_length=200
+            key="12345", region_id=1, kv_offset=100, kv_length=200
         )
 
         mock_send.assert_called_once_with(
             MessageType.REGISTER_KV,
-            {"key": 12345, "region_id": 1, "kv_offset": 100, "kv_length": 200},
+            {"key": "12345", "region_id": 1, "kv_offset": 100, "kv_length": 200},
         )
         assert result is True
 
@@ -362,7 +362,7 @@ class TestRpcClientApiMethods:
         mock_send.return_value = {"is_new": False}
 
         result = client.register_kv(
-            key=12345, region_id=1, kv_offset=100, kv_length=200
+            key="12345", region_id=1, kv_offset=100, kv_length=200
         )
 
         assert result is False
@@ -381,9 +381,9 @@ class TestRpcClientApiMethods:
             "kv_length": 200,
         }
 
-        result = client.lookup_kv(key=54321)
+        result = client.lookup_kv(key="54321")
 
-        mock_send.assert_called_once_with(MessageType.LOOKUP_KV, {"key": 54321})
+        mock_send.assert_called_once_with(MessageType.LOOKUP_KV, {"key": "54321"})
         assert isinstance(result, LookupKVResponse)
         assert result.found is True
         assert isinstance(result.handle, MaruHandle)
@@ -396,9 +396,9 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"found": False}
 
-        result = client.lookup_kv(key=99999)
+        result = client.lookup_kv(key="99999")
 
-        mock_send.assert_called_once_with(MessageType.LOOKUP_KV, {"key": 99999})
+        mock_send.assert_called_once_with(MessageType.LOOKUP_KV, {"key": "99999"})
         assert isinstance(result, LookupKVResponse)
         assert result.found is False
         assert result.handle is None
@@ -412,9 +412,9 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"exists": True}
 
-        result = client.exists_kv(key=12345)
+        result = client.exists_kv(key="12345")
 
-        mock_send.assert_called_once_with(MessageType.EXISTS_KV, {"key": 12345})
+        mock_send.assert_called_once_with(MessageType.EXISTS_KV, {"key": "12345"})
         assert result is True
 
     def test_exists_kv_false(self):
@@ -422,7 +422,7 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"exists": False}
 
-        result = client.exists_kv(key=99999)
+        result = client.exists_kv(key="99999")
 
         assert result is False
 
@@ -435,9 +435,9 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"success": True}
 
-        result = client.delete_kv(key=12345)
+        result = client.delete_kv(key="12345")
 
-        mock_send.assert_called_once_with(MessageType.DELETE_KV, {"key": 12345})
+        mock_send.assert_called_once_with(MessageType.DELETE_KV, {"key": "12345"})
         assert result is True
 
     def test_delete_kv_failure(self):
@@ -445,7 +445,7 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"success": False}
 
-        result = client.delete_kv(key=99999)
+        result = client.delete_kv(key="99999")
 
         assert result is False
 
@@ -461,13 +461,13 @@ class TestRpcClientApiMethods:
             "results": [True, False, True],
         }
 
-        entries = [(1, 1, 100, 200), (2, 1, 300, 400), (3, 2, 500, 600)]
+        entries = [("1", 1, 100, 200), ("2", 1, 300, 400), ("3", 2, 500, 600)]
         result = client.batch_register_kv(entries)
 
         expected_entries = [
-            {"key": 1, "region_id": 1, "kv_offset": 100, "kv_length": 200},
-            {"key": 2, "region_id": 1, "kv_offset": 300, "kv_length": 400},
-            {"key": 3, "region_id": 2, "kv_offset": 500, "kv_length": 600},
+            {"key": "1", "region_id": 1, "kv_offset": 100, "kv_length": 200},
+            {"key": "2", "region_id": 1, "kv_offset": 300, "kv_length": 400},
+            {"key": "3", "region_id": 2, "kv_offset": 500, "kv_length": 600},
         ]
         mock_send.assert_called_once_with(
             MessageType.BATCH_REGISTER_KV, {"entries": expected_entries}
@@ -511,7 +511,7 @@ class TestRpcClientApiMethods:
             ]
         }
 
-        keys = [111, 222, 333]
+        keys = ["111", "222", "333"]
         result = client.batch_lookup_kv(keys)
 
         mock_send.assert_called_once_with(MessageType.BATCH_LOOKUP_KV, {"keys": keys})
@@ -541,7 +541,7 @@ class TestRpcClientApiMethods:
             "entries": [{"found": True, "handle": None, "kv_offset": 0, "kv_length": 0}]
         }
 
-        result = client.batch_lookup_kv([123])
+        result = client.batch_lookup_kv(["123"])
 
         assert len(result.entries) == 1
         assert result.entries[0].found is True
@@ -556,7 +556,7 @@ class TestRpcClientApiMethods:
         client, mock_send = self._make_client_with_mock()
         mock_send.return_value = {"results": [True, False, True, False]}
 
-        keys = [10, 20, 30, 40]
+        keys = ["10", "20", "30", "40"]
         result = client.batch_exists_kv(keys)
 
         mock_send.assert_called_once_with(MessageType.BATCH_EXISTS_KV, {"keys": keys})

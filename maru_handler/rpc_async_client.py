@@ -390,7 +390,7 @@ class RpcAsyncClient:
     # =========================================================================
 
     def register_kv(
-        self, key: int, region_id: int, kv_offset: int, kv_length: int
+        self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> bool:
         """Register a KV entry."""
         response = self._send_request(
@@ -404,17 +404,17 @@ class RpcAsyncClient:
         )
         return response.get("is_new", False)
 
-    def lookup_kv(self, key: int) -> LookupKVResponse:
+    def lookup_kv(self, key: str) -> LookupKVResponse:
         """Lookup a KV entry by key."""
         response = self._send_request(MessageType.LOOKUP_KV, {"key": key})
         return self._parse_lookup_kv(response)
 
-    def exists_kv(self, key: int) -> bool:
+    def exists_kv(self, key: str) -> bool:
         """Check if a KV entry exists."""
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
-    def delete_kv(self, key: int) -> bool:
+    def delete_kv(self, key: str) -> bool:
         """Delete a KV entry."""
         response = self._send_request(MessageType.DELETE_KV, {"key": key})
         return response.get("success", False)
@@ -424,7 +424,7 @@ class RpcAsyncClient:
     # =========================================================================
 
     def batch_register_kv(
-        self, entries: list[tuple[int, int, int, int]]
+        self, entries: list[tuple[str, int, int, int]]
     ) -> BatchRegisterKVResponse:
         """Register multiple KV entries in a single RPC call."""
         entries_data = [
@@ -444,12 +444,12 @@ class RpcAsyncClient:
             results=response.get("results", []),
         )
 
-    def batch_lookup_kv(self, keys: list[int]) -> BatchLookupKVResponse:
+    def batch_lookup_kv(self, keys: list[str]) -> BatchLookupKVResponse:
         """Lookup multiple KV entries in a single RPC call."""
         response = self._send_request(MessageType.BATCH_LOOKUP_KV, {"keys": keys})
         return self._parse_batch_lookup_kv(response)
 
-    def batch_exists_kv(self, keys: list[int]) -> BatchExistsKVResponse:
+    def batch_exists_kv(self, keys: list[str]) -> BatchExistsKVResponse:
         """Check existence of multiple KV entries in a single RPC call."""
         response = self._send_request(MessageType.BATCH_EXISTS_KV, {"keys": keys})
         return BatchExistsKVResponse(results=response.get("results", []))
@@ -521,7 +521,7 @@ class RpcAsyncClient:
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
     def register_kv_async(
-        self, key: int, region_id: int, kv_offset: int, kv_length: int
+        self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> Future:
         """Non-blocking register_kv. Returns Future[bool]."""
 
@@ -539,7 +539,7 @@ class RpcAsyncClient:
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
-    def lookup_kv_async(self, key: int) -> Future:
+    def lookup_kv_async(self, key: str) -> Future:
         """Non-blocking lookup_kv. Returns Future[LookupKVResponse]."""
 
         async def _coro():
@@ -548,7 +548,7 @@ class RpcAsyncClient:
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
-    def exists_kv_async(self, key: int) -> Future:
+    def exists_kv_async(self, key: str) -> Future:
         """Non-blocking exists_kv. Returns Future[bool]."""
 
         async def _coro():
@@ -557,7 +557,7 @@ class RpcAsyncClient:
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
-    def delete_kv_async(self, key: int) -> Future:
+    def delete_kv_async(self, key: str) -> Future:
         """Non-blocking delete_kv. Returns Future[bool]."""
 
         async def _coro():
@@ -567,7 +567,7 @@ class RpcAsyncClient:
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
     def batch_register_kv_async(
-        self, entries: list[tuple[int, int, int, int]]
+        self, entries: list[tuple[str, int, int, int]]
     ) -> Future:
         """Non-blocking batch_register_kv. Returns Future[BatchRegisterKVResponse]."""
 
@@ -591,7 +591,7 @@ class RpcAsyncClient:
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
-    def batch_lookup_kv_async(self, keys: list[int]) -> Future:
+    def batch_lookup_kv_async(self, keys: list[str]) -> Future:
         """Non-blocking batch_lookup_kv. Returns Future[BatchLookupKVResponse]."""
 
         async def _coro():
@@ -602,7 +602,7 @@ class RpcAsyncClient:
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 
-    def batch_exists_kv_async(self, keys: list[int]) -> Future:
+    def batch_exists_kv_async(self, keys: list[str]) -> Future:
         """Non-blocking batch_exists_kv. Returns Future[BatchExistsKVResponse]."""
 
         async def _coro():

@@ -209,13 +209,13 @@ class RpcClient:
     # =========================================================================
 
     def register_kv(
-        self, key: int, region_id: int, kv_offset: int, kv_length: int
+        self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> bool:
         """
         Register a KV entry.
 
         Args:
-            key: Chunk hash (64-bit)
+            key: Chunk key string
             region_id: Region ID of the allocation
             kv_offset: Offset within the allocation
             kv_length: Size of the KV data
@@ -234,12 +234,12 @@ class RpcClient:
         )
         return response.get("is_new", False)
 
-    def lookup_kv(self, key: int) -> LookupKVResponse:
+    def lookup_kv(self, key: str) -> LookupKVResponse:
         """
         Lookup a KV entry by key.
 
         Args:
-            key: Chunk hash
+            key: Chunk key string
 
         Returns:
             LookupKVResponse with handle and kv location if found
@@ -261,12 +261,12 @@ class RpcClient:
             kv_length=response.get("kv_length", 0),
         )
 
-    def exists_kv(self, key: int) -> bool:
+    def exists_kv(self, key: str) -> bool:
         """
         Check if a KV entry exists.
 
         Args:
-            key: Chunk hash
+            key: Chunk key string
 
         Returns:
             True if exists
@@ -274,12 +274,12 @@ class RpcClient:
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
-    def delete_kv(self, key: int) -> bool:
+    def delete_kv(self, key: str) -> bool:
         """
         Delete a KV entry.
 
         Args:
-            key: Chunk hash
+            key: Chunk key string
 
         Returns:
             True if deleted successfully
@@ -292,7 +292,7 @@ class RpcClient:
     # =========================================================================
 
     def batch_register_kv(
-        self, entries: list[tuple[int, int, int, int]]
+        self, entries: list[tuple[str, int, int, int]]
     ) -> BatchRegisterKVResponse:
         """
         Register multiple KV entries in a single RPC call.
@@ -320,12 +320,12 @@ class RpcClient:
             success=response.get("success", False), results=response.get("results", [])
         )
 
-    def batch_lookup_kv(self, keys: list[int]) -> BatchLookupKVResponse:
+    def batch_lookup_kv(self, keys: list[str]) -> BatchLookupKVResponse:
         """
         Lookup multiple KV entries in a single RPC call.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             BatchLookupKVResponse with results for each key
@@ -349,12 +349,12 @@ class RpcClient:
 
         return BatchLookupKVResponse(entries=entries)
 
-    def batch_exists_kv(self, keys: list[int]) -> BatchExistsKVResponse:
+    def batch_exists_kv(self, keys: list[str]) -> BatchExistsKVResponse:
         """
         Check existence of multiple KV entries in a single RPC call.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             BatchExistsKVResponse with results for each key

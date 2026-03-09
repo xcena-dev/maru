@@ -118,7 +118,7 @@ class MaruHandler:
         self._closing = threading.Event()
 
         # Connection state
-        self._key_to_location: dict[int, tuple[int, int]] = {}
+        self._key_to_location: dict[str, tuple[int, int]] = {}
         self._connected = False
 
         logger.debug("Created MaruHandler with config: %s", self._config)
@@ -336,7 +336,7 @@ class MaruHandler:
 
     def store(
         self,
-        key: int,
+        key: str,
         info: MemoryInfo | memoryview | None = None,
         prefix: bytes | None = None,
         *,
@@ -350,7 +350,7 @@ class MaruHandler:
         Otherwise, allocate + memcpy + register are performed in one call.
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
             info: MemoryInfo or memoryview with data
             prefix: Optional bytes to prepend (e.g., serialized metadata header)
             data: memoryview with data (preferred, keyword-only)
@@ -369,12 +369,12 @@ class MaruHandler:
             if key in self._key_to_location:
                 if handle is not None:
                     self._owned.free(handle._region_id, handle._page_index)
-                logger.debug("store: key=%d already in local map, skipping", key)
+                logger.debug("store: key=%s already in local map, skipping", key)
                 return True
             elif self._rpc.exists_kv(key):
                 if handle is not None:
                     self._owned.free(handle._region_id, handle._page_index)
-                logger.debug("store: key=%d already exists on server, skipping", key)
+                logger.debug("store: key=%s already exists on server, skipping", key)
                 return True
 
             if handle is not None:
@@ -397,7 +397,7 @@ class MaruHandler:
                 if not is_new:
                     self._owned.free(region_id, page_index)
                     logger.debug(
-                        "store: key=%d lost register race, freed page "
+                        "store: key=%s lost register race, freed page "
                         "(region=%d, page=%d)",
                         key,
                         region_id,
@@ -408,7 +408,7 @@ class MaruHandler:
                 self._key_to_location[key] = (region_id, page_index)
 
                 logger.debug(
-                    "Stored (zero-copy) key=%d: region=%d, page=%d, offset=%d, size=%d",
+                    "Stored (zero-copy) key=%s: region=%d, page=%d, offset=%d, size=%d",
                     key,
                     region_id,
                     page_index,
@@ -439,7 +439,7 @@ class MaruHandler:
             total_size = prefix_len + data_size
 
             logger.debug(
-                "store: key=%d, data=%d bytes, prefix=%d bytes, "
+                "store: key=%s, data=%d bytes, prefix=%d bytes, "
                 "total=%d bytes, readonly=%s",
                 key,
                 data_size,
@@ -460,7 +460,7 @@ class MaruHandler:
             result = self._owned.allocate()
             if result is None:
                 if not self._expand_region():
-                    logger.error("Cannot allocate page for key %d", key)
+                    logger.error("Cannot allocate page for key %s", key)
                     return False
                 result = self._owned.allocate()
                 if result is None:
@@ -500,7 +500,7 @@ class MaruHandler:
                 # Free the page we just wrote — the data is identical anyway.
                 self._owned.free(region_id, page_index)
                 logger.debug(
-                    "store: key=%d lost register race, freed page (region=%d, page=%d)",
+                    "store: key=%s lost register race, freed page (region=%d, page=%d)",
                     key,
                     region_id,
                     page_index,
@@ -511,7 +511,7 @@ class MaruHandler:
             self._key_to_location[key] = (region_id, page_index)
 
             logger.debug(
-                "Stored key=%d: region=%d, page=%d, offset=%d, size=%d",
+                "Stored key=%s: region=%d, page=%d, offset=%d, size=%d",
                 key,
                 region_id,
                 page_index,
@@ -520,7 +520,7 @@ class MaruHandler:
             )
             return True
 
-    def retrieve(self, key: int) -> MemoryInfo | None:
+    def retrieve(self, key: str) -> MemoryInfo | None:
         """Retrieve a zero-copy MemoryInfo from the KV cache.
 
         Returns a MemoryInfo with a memoryview slice of the mmap region.
@@ -530,7 +530,7 @@ class MaruHandler:
         remains mapped. Do not use after calling close().
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
 
         Returns:
             MemoryInfo with memoryview, or None if not found
@@ -539,7 +539,7 @@ class MaruHandler:
 
         result = self._rpc.lookup_kv(key)
         if not result.found or result.handle is None:
-            logger.debug("Key %d not found", key)
+            logger.debug("Key %s not found", key)
             return None
 
         handle = result.handle
@@ -564,7 +564,7 @@ class MaruHandler:
             return None
 
         logger.debug(
-            "retrieve: key=%d, region=%d, page=%d, offset=%d, size=%d, "
+            "retrieve: key=%s, region=%d, page=%d, offset=%d, size=%d, "
             "readonly=%s, owned=%s",
             key,
             region_id,
@@ -576,11 +576,11 @@ class MaruHandler:
         )
         return MemoryInfo(view=buf)
 
-    def exists(self, key: int) -> bool:
+    def exists(self, key: str) -> bool:
         """Check if a key exists.
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
 
         Returns:
             True if exists
@@ -588,11 +588,11 @@ class MaruHandler:
         self._ensure_connected()
         return self._rpc.exists_kv(key)
 
-    def delete(self, key: int) -> bool:
+    def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
 
         Returns:
             True if deleted
@@ -610,9 +610,9 @@ class MaruHandler:
                 if location is not None:
                     region_id, page_index = location
                     self._owned.free(region_id, page_index)
-                logger.debug("Deleted key=%d", key)
+                logger.debug("Deleted key=%s", key)
             else:
-                logger.debug("Delete key=%d: not found on server", key)
+                logger.debug("Delete key=%s: not found on server", key)
 
             return result
 
@@ -665,7 +665,7 @@ class MaruHandler:
     # Batch Operations
     # =========================================================================
 
-    def batch_retrieve(self, keys: list[int]) -> list[MemoryInfo | None]:
+    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
         Uses a single batch RPC call for lookup, returns zero-copy
@@ -678,7 +678,7 @@ class MaruHandler:
         registered with the server and will be overwritten on reuse.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of MemoryInfo (None for keys not found)
@@ -723,7 +723,7 @@ class MaruHandler:
                 continue
 
             logger.debug(
-                "batch_retrieve: key=%d, region=%d, page=%d, "
+                "batch_retrieve: key=%s, region=%d, page=%d, "
                 "offset=%d, size=%d, readonly=%s",
                 keys[i],
                 region_id,
@@ -747,7 +747,7 @@ class MaruHandler:
 
     def batch_store(
         self,
-        keys: list[int],
+        keys: list[str],
         infos: list[MemoryInfo | memoryview],
         prefixes: list[bytes | None] | None = None,
     ) -> list[bool]:
@@ -756,7 +756,7 @@ class MaruHandler:
         Uses a single batch RPC call for registration.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
             infos: List of MemoryInfo or memoryview with data
             prefixes: Optional list of prefix bytes per entry
 
@@ -803,13 +803,13 @@ class MaruHandler:
                 if is_local:
                     # Same instance already stored — same key = same content, skip
                     logger.debug(
-                        "batch_store: key=%d already in local map, skipping", key
+                        "batch_store: key=%s already in local map, skipping", key
                     )
                     continue  # results[i] stays True (idempotent)
                 if exists_results[i]:
                     # Another instance already registered — skip CXL write
                     logger.debug(
-                        "batch_store: key=%d already exists on server, skipping", key
+                        "batch_store: key=%s already exists on server, skipping", key
                     )
                     continue  # results[i] stays True (idempotent)
 
@@ -824,7 +824,7 @@ class MaruHandler:
 
                 if total_size > chunk_size:
                     logger.error(
-                        "Total size %d exceeds chunk_size %d for key %d",
+                        "Total size %d exceeds chunk_size %d for key %s",
                         total_size,
                         chunk_size,
                         key,
@@ -836,7 +836,7 @@ class MaruHandler:
                 alloc_result = self._owned.allocate()
                 if alloc_result is None:
                     if not self._expand_region():
-                        logger.error("Cannot allocate page for key %d", key)
+                        logger.error("Cannot allocate page for key %s", key)
                         results[i] = False
                         continue
                     alloc_result = self._owned.allocate()
@@ -910,13 +910,13 @@ class MaruHandler:
             )
             return results
 
-    def batch_exists(self, keys: list[int]) -> list[bool]:
+    def batch_exists(self, keys: list[str]) -> list[bool]:
         """Check if multiple keys exist.
 
         Uses a single batch RPC call instead of N individual calls.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of booleans indicating existence for each key

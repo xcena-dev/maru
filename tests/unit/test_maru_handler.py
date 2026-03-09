@@ -161,7 +161,7 @@ class TestMaruHandlerEnsureConnected:
 
         # Try to store — should raise RuntimeError
         with pytest.raises(RuntimeError, match="Not connected"):
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
 
 
 # =============================================================================
@@ -380,7 +380,7 @@ class TestMaruHandlerCoverage:
         lookup_result.handle = None
         handler._rpc.lookup_kv = MagicMock(return_value=lookup_result)
 
-        result = handler.retrieve(key=999)
+        result = handler.retrieve(key="999")
         assert result is None
 
         handler.close()
@@ -390,7 +390,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         # Store something first so handler is set up
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
 
         # lookup_kv returns a handle pointing to a DIFFERENT region (shared)
         shared_handle = _make_handle(200, 4096)
@@ -402,7 +402,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.lookup_kv = MagicMock(return_value=lookup_result)
 
         # The mapper should map the shared region on-demand
-        result = handler.retrieve(key=2)
+        result = handler.retrieve(key="2")
         assert result is not None
 
         # Verify the shared region was mapped
@@ -432,7 +432,7 @@ class TestMaruHandlerCoverage:
 
         handler._mapper.map_region = failing_map
 
-        result = handler.retrieve(key=2)
+        result = handler.retrieve(key="2")
         assert result is None
 
         handler.close()
@@ -449,7 +449,7 @@ class TestMaruHandlerCoverage:
         lookup_result.kv_length = 4
         handler._rpc.lookup_kv = MagicMock(return_value=lookup_result)
 
-        result = handler.retrieve(key=1)
+        result = handler.retrieve(key="1")
         assert result is None
 
         handler.close()
@@ -465,7 +465,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.delete_kv = MagicMock(return_value=True)
 
         # key 999 was never stored locally
-        result = handler.delete(key=999)
+        result = handler.delete(key="999")
         assert result is True
 
         handler.close()
@@ -480,7 +480,7 @@ class TestMaruHandlerCoverage:
 
         handler._rpc.batch_lookup_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
 
-        results = handler.batch_retrieve(keys=[1, 2, 3])
+        results = handler.batch_retrieve(keys=["1", "2", "3"])
         assert results == [None, None, None]
 
         handler.close()
@@ -503,7 +503,7 @@ class TestMaruHandlerCoverage:
         batch_resp.entries = [entry_found, entry_not_found, entry_found]
         handler._rpc.batch_lookup_kv = MagicMock(return_value=batch_resp)
 
-        results = handler.batch_retrieve(keys=[1, 2, 3])
+        results = handler.batch_retrieve(keys=["1", "2", "3"])
         assert results[0] is not None
         assert results[1] is None
         assert results[2] is not None
@@ -526,7 +526,7 @@ class TestMaruHandlerCoverage:
         batch_resp.entries = [entry]
         handler._rpc.batch_lookup_kv = MagicMock(return_value=batch_resp)
 
-        results = handler.batch_retrieve(keys=[1])
+        results = handler.batch_retrieve(keys=["1"])
         assert results[0] is not None
         assert handler._mapper.get_region(200) is not None
 
@@ -556,7 +556,7 @@ class TestMaruHandlerCoverage:
 
         handler._mapper.map_region = failing_map
 
-        results = handler.batch_retrieve(keys=[1])
+        results = handler.batch_retrieve(keys=["1"])
         assert results[0] is None
 
         handler.close()
@@ -575,7 +575,7 @@ class TestMaruHandlerCoverage:
         batch_resp.entries = [entry]
         handler._rpc.batch_lookup_kv = MagicMock(return_value=batch_resp)
 
-        results = handler.batch_retrieve(keys=[1])
+        results = handler.batch_retrieve(keys=["1"])
         assert results[0] is None
 
         handler.close()
@@ -594,7 +594,7 @@ class TestMaruHandlerCoverage:
 
         with pytest.raises(RuntimeError, match="Handler is closing"):
             handler.batch_store(
-                keys=[1],
+                keys=["1"],
                 infos=[MemoryInfo(view=memoryview(b"data"))],
             )
 
@@ -608,7 +608,7 @@ class TestMaruHandlerCoverage:
 
         with pytest.raises(ValueError, match="prefixes must have the same length"):
             handler.batch_store(
-                keys=[1, 2],
+                keys=["1", "2"],
                 infos=[
                     MemoryInfo(view=memoryview(b"d1")),
                     MemoryInfo(view=memoryview(b"d2")),
@@ -643,7 +643,7 @@ class TestMaruHandlerCoverage:
 
         # The data size after cast to 'B' is 12 bytes (3 ints * 4 bytes)
         # chunk_size is 1024, so it should fit
-        results = handler.batch_store(keys=[1], infos=[info])
+        results = handler.batch_store(keys=["1"], infos=[info])
         assert results == [True]
 
         handler.close()
@@ -659,7 +659,7 @@ class TestMaruHandlerCoverage:
 
         big_data = b"x" * 100  # exceeds 64-byte chunk
         results = handler.batch_store(
-            keys=[1],
+            keys=["1"],
             infos=[MemoryInfo(view=memoryview(big_data))],
         )
         assert results == [False]
@@ -671,8 +671,8 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         # First store
-        handler.store(key=42, info=MemoryInfo(view=memoryview(b"old")))
-        assert 42 in handler._key_to_location
+        handler.store(key="42", info=MemoryInfo(view=memoryview(b"old")))
+        assert "42" in handler._key_to_location
 
         # batch_exists_kv mock (Phase 1 check): key not on server either
         batch_exists_resp = MagicMock()
@@ -681,7 +681,7 @@ class TestMaruHandlerCoverage:
 
         # batch_store with same key — should skip via local map check, return True
         results = handler.batch_store(
-            keys=[42],
+            keys=["42"],
             infos=[MemoryInfo(view=memoryview(b"new"))],
         )
         assert results == [True]
@@ -695,7 +695,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # batch_exists_kv: key 2 not on server
         batch_exists_resp = MagicMock()
@@ -709,7 +709,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.request_alloc = MagicMock(return_value=alloc_fail)
 
         results = handler.batch_store(
-            keys=[2],
+            keys=["2"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
         )
         assert results == [False]
@@ -734,7 +734,7 @@ class TestMaruHandlerCoverage:
         handler._mapper.get_buffer_view = return_none_buf
 
         results = handler.batch_store(
-            keys=[1],
+            keys=["1"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
         )
         assert results == [False]
@@ -757,7 +757,7 @@ class TestMaruHandlerCoverage:
         )
 
         results = handler.batch_store(
-            keys=[1, 2],
+            keys=["1", "2"],
             infos=[
                 MemoryInfo(view=memoryview(b"d1")),
                 MemoryInfo(view=memoryview(b"d2")),
@@ -781,7 +781,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
 
         results = handler.batch_store(
-            keys=[1],
+            keys=["1"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
         )
         assert results == [False]
@@ -798,7 +798,7 @@ class TestMaruHandlerCoverage:
 
         handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
 
-        results = handler.batch_exists(keys=[1, 2, 3])
+        results = handler.batch_exists(keys=["1", "2", "3"])
         assert results == [False, False, False]
 
         handler.close()
@@ -855,13 +855,13 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # Make request_alloc raise
         handler._rpc.request_alloc = MagicMock(side_effect=RuntimeError("RPC timeout"))
 
         # Try to store another key, triggering expand
-        result = handler.store(key=2, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="2", info=MemoryInfo(view=memoryview(b"data")))
         assert result is False
 
         handler.close()
@@ -873,7 +873,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # request_alloc succeeds with a new region
         expand_response = MagicMock()
@@ -887,7 +887,7 @@ class TestMaruHandlerCoverage:
 
         monkeypatch.setattr(OwnedRegionManager, "add_region", failing_add)
 
-        result = handler.store(key=2, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="2", info=MemoryInfo(view=memoryview(b"data")))
         assert result is False
         # return_alloc should have been called for the failed region
         handler._rpc.return_alloc.assert_called()
@@ -944,9 +944,9 @@ class TestMaruHandlerCoverage:
 
         data = b"hello world"
         info = MemoryInfo(view=memoryview(data))
-        result = handler.store(key=42, info=info)
+        result = handler.store(key="42", info=info)
         assert result is True
-        assert 42 in handler._key_to_location
+        assert "42" in handler._key_to_location
 
         handler._rpc.register_kv.assert_called_once()
 
@@ -957,9 +957,9 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         data = b"hello memoryview"
-        result = handler.store(key=100, info=memoryview(data))
+        result = handler.store(key="100", info=memoryview(data))
         assert result is True
-        assert 100 in handler._key_to_location
+        assert "100" in handler._key_to_location
 
         handler._rpc.register_kv.assert_called_once()
         handler.close()
@@ -969,9 +969,9 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         data = b"hello data kwarg"
-        result = handler.store(key=200, data=memoryview(data))
+        result = handler.store(key="200", data=memoryview(data))
         assert result is True
-        assert 200 in handler._key_to_location
+        assert "200" in handler._key_to_location
 
         handler._rpc.register_kv.assert_called_once()
         handler.close()
@@ -981,7 +981,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         with pytest.raises(TypeError, match="Must provide data"):
-            handler.store(key=300)
+            handler.store(key="300")
 
         handler.close()
 
@@ -994,7 +994,7 @@ class TestMaruHandlerCoverage:
         handler._closing.set()
 
         with pytest.raises(RuntimeError, match="Handler is closing"):
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
 
         handler._closing.clear()
         handler.close()
@@ -1009,7 +1009,7 @@ class TestMaruHandlerCoverage:
         mv = memoryview(arr)
         assert mv.format != "B"
 
-        result = handler.store(key=1, info=MemoryInfo(view=mv))
+        result = handler.store(key="1", info=MemoryInfo(view=mv))
         assert result is True
 
         handler.close()
@@ -1019,7 +1019,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(chunk_size=64)
 
         big_data = b"x" * 100
-        result = handler.store(key=1, info=MemoryInfo(view=memoryview(big_data)))
+        result = handler.store(key="1", info=MemoryInfo(view=memoryview(big_data)))
         assert result is False
 
         handler.close()
@@ -1028,18 +1028,18 @@ class TestMaruHandlerCoverage:
         """store() now skips duplicates — second store is a no-op via local map check."""
         handler = _make_mock_handler()
 
-        result1 = handler.store(key=1, info=MemoryInfo(view=memoryview(b"v1")))
+        result1 = handler.store(key="1", info=MemoryInfo(view=memoryview(b"v1")))
         assert result1 is True
-        assert 1 in handler._key_to_location
+        assert "1" in handler._key_to_location
 
         # Second store same key: skipped via local _key_to_location check, returns True
-        result2 = handler.store(key=1, info=MemoryInfo(view=memoryview(b"v2")))
+        result2 = handler.store(key="1", info=MemoryInfo(view=memoryview(b"v2")))
         assert result2 is True
         # register_kv called only once (second store skipped before allocation)
         handler._rpc.register_kv.assert_called_once()
         # delete_kv never called — no overwrite logic
         handler._rpc.delete_kv.assert_not_called()
-        assert 1 in handler._key_to_location
+        assert "1" in handler._key_to_location
 
         handler.close()
 
@@ -1048,7 +1048,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # expand succeeds but the new region also has no free pages
         expand_response = MagicMock()
@@ -1068,7 +1068,7 @@ class TestMaruHandlerCoverage:
 
         handler._owned.allocate = always_none_after_first
 
-        result = handler.store(key=2, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="2", info=MemoryInfo(view=memoryview(b"data")))
         assert result is False
 
         handler._owned.allocate = original_allocate
@@ -1085,7 +1085,7 @@ class TestMaruHandlerCoverage:
 
         handler._mapper.get_buffer_view = return_none
 
-        result = handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
         assert result is False
 
         handler._mapper.get_buffer_view = original_get_buf
@@ -1098,7 +1098,7 @@ class TestMaruHandlerCoverage:
         prefix = b"\x01\x02"
         data = b"hello"
         result = handler.store(
-            key=1, info=MemoryInfo(view=memoryview(data)), prefix=prefix
+            key="1", info=MemoryInfo(view=memoryview(data)), prefix=prefix
         )
         assert result is True
 
@@ -1117,7 +1117,7 @@ class TestMaruHandlerCoverage:
         handler._closing.set()
 
         with pytest.raises(RuntimeError, match="Handler is closing"):
-            handler.delete(key=1)
+            handler.delete(key="1")
 
         handler._closing.clear()
         handler.close()
@@ -1128,7 +1128,7 @@ class TestMaruHandlerCoverage:
 
         handler._rpc.delete_kv = MagicMock(return_value=False)
 
-        result = handler.delete(key=999)
+        result = handler.delete(key="999")
         assert result is False
 
         handler.close()
@@ -1137,12 +1137,12 @@ class TestMaruHandlerCoverage:
         """L396-397: delete key that IS in _key_to_location — frees page."""
         handler = _make_mock_handler()
 
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
-        assert 1 in handler._key_to_location
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
+        assert "1" in handler._key_to_location
 
-        result = handler.delete(key=1)
+        result = handler.delete(key="1")
         assert result is True
-        assert 1 not in handler._key_to_location
+        assert "1" not in handler._key_to_location
 
         handler.close()
 
@@ -1190,15 +1190,15 @@ class TestMaruHandlerCoverage:
         handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
 
         results = handler.batch_store(
-            keys=[1, 2],
+            keys=["1", "2"],
             infos=[
                 MemoryInfo(view=memoryview(b"d1")),
                 MemoryInfo(view=memoryview(b"d2")),
             ],
         )
         assert results == [True, True]
-        assert 1 in handler._key_to_location
-        assert 2 in handler._key_to_location
+        assert "1" in handler._key_to_location
+        assert "2" in handler._key_to_location
 
         handler.close()
 
@@ -1217,7 +1217,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
 
         results = handler.batch_store(
-            keys=[1],
+            keys=["1"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
             prefixes=[b"\x01\x02"],
         )
@@ -1230,7 +1230,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # batch_exists_kv: key 2 not on server
         batch_exists_resp = MagicMock()
@@ -1257,7 +1257,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
 
         results = handler.batch_store(
-            keys=[2],
+            keys=["2"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
         )
         assert results == [False]
@@ -1277,7 +1277,7 @@ class TestMaruHandlerCoverage:
         batch_resp.results = [True, False, True]
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_resp)
 
-        results = handler.batch_exists(keys=[1, 2, 3])
+        results = handler.batch_exists(keys=["1", "2", "3"])
         assert results == [True, False, True]
 
         handler.close()
@@ -1324,7 +1324,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         # request_alloc returns a new valid region
         expand_response = MagicMock()
@@ -1333,7 +1333,7 @@ class TestMaruHandlerCoverage:
         handler._rpc.request_alloc = MagicMock(return_value=expand_response)
 
         # Store another key — triggers expansion
-        result = handler.store(key=2, info=MemoryInfo(view=memoryview(b"data2")))
+        result = handler.store(key="2", info=MemoryInfo(view=memoryview(b"data2")))
         assert result is True
         assert handler._owned.get_stats()["num_regions"] == 2
 
@@ -1346,7 +1346,7 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
 
         # Fill the single page
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"fill")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"fill")))
 
         expand_response = MagicMock()
         expand_response.success = True
@@ -1363,7 +1363,7 @@ class TestMaruHandlerCoverage:
 
         monkeypatch.setattr(OwnedRegionManager, "add_region", failing_add)
 
-        result = handler.store(key=2, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="2", info=MemoryInfo(view=memoryview(b"data")))
         assert result is False
 
         handler.close()
@@ -1451,10 +1451,10 @@ class TestMaruHandlerCoverage:
         handler = _make_mock_handler()
 
         handler._rpc.exists_kv = MagicMock(return_value=True)
-        assert handler.exists(key=1) is True
+        assert handler.exists(key="1") is True
 
         handler._rpc.exists_kv = MagicMock(return_value=False)
-        assert handler.exists(key=999) is False
+        assert handler.exists(key="999") is False
 
         handler.close()
 
@@ -1470,7 +1470,7 @@ class TestMaruHandlerCoverage:
             ValueError, match="keys and infos must have the same length"
         ):
             handler.batch_store(
-                keys=[1, 2],
+                keys=["1", "2"],
                 infos=[MemoryInfo(view=memoryview(b"only_one"))],
             )
 
@@ -1486,7 +1486,7 @@ class TestMaruHandlerCoverage:
         handler._closing.set()
 
         with pytest.raises(RuntimeError, match="Handler is closing"):
-            handler.exists(key=1)
+            handler.exists(key="1")
 
         handler._closing.clear()
         handler.close()
@@ -1501,11 +1501,11 @@ class TestMaruHandlerDuplicateSkip:
 
         # Key NOT in local map, but server says it exists
         handler._rpc.exists_kv = MagicMock(return_value=True)
-        result = handler.store(key=42, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="42", info=MemoryInfo(view=memoryview(b"data")))
         assert result is True
         # Should not have allocated or registered
         handler._rpc.register_kv.assert_not_called()
-        assert 42 not in handler._key_to_location
+        assert "42" not in handler._key_to_location
 
         handler.close()
 
@@ -1518,10 +1518,10 @@ class TestMaruHandlerDuplicateSkip:
         # register_kv returns False (another instance registered between check and register)
         handler._rpc.register_kv = MagicMock(return_value=False)
 
-        result = handler.store(key=77, info=MemoryInfo(view=memoryview(b"data")))
+        result = handler.store(key="77", info=MemoryInfo(view=memoryview(b"data")))
         assert result is True
         # Key should NOT be in local map (race lost)
-        assert 77 not in handler._key_to_location
+        assert "77" not in handler._key_to_location
 
         handler.close()
 
@@ -1535,7 +1535,7 @@ class TestMaruHandlerDuplicateSkip:
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
 
         results = handler.batch_store(
-            keys=[1, 2],
+            keys=["1", "2"],
             infos=[
                 MemoryInfo(view=memoryview(b"data1")),
                 MemoryInfo(view=memoryview(b"data2")),
@@ -1544,8 +1544,8 @@ class TestMaruHandlerDuplicateSkip:
         # Both should succeed (key 1 skipped as dup, key 2 stored)
         assert results == [True, True]
         # Only key 2 should be in local map
-        assert 1 not in handler._key_to_location
-        assert 2 in handler._key_to_location
+        assert "1" not in handler._key_to_location
+        assert "2" in handler._key_to_location
 
         handler.close()
 
@@ -1556,12 +1556,12 @@ class TestMaruHandlerDuplicateSkip:
         handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
 
         results = handler.batch_store(
-            keys=[1],
+            keys=["1"],
             infos=[MemoryInfo(view=memoryview(b"data"))],
         )
         # Should still succeed — fallback treats all keys as new
         assert results == [True]
-        assert 1 in handler._key_to_location
+        assert "1" in handler._key_to_location
 
         handler.close()
 
@@ -1575,7 +1575,7 @@ class TestMaruHandlerDuplicateSkip:
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
 
         results = handler.batch_store(
-            keys=[1, 2, 3],
+            keys=["1", "2", "3"],
             infos=[
                 MemoryInfo(view=memoryview(b"a")),
                 MemoryInfo(view=memoryview(b"b")),
@@ -1636,8 +1636,8 @@ class TestMaruHandlerExpandFailure:
         handler = _make_mock_handler(pool_size=2048, chunk_size=1024)
 
         # Fill all 2 pages in the initial region
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
-        handler.store(key=2, info=MemoryInfo(view=memoryview(b"data2")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+        handler.store(key="2", info=MemoryInfo(view=memoryview(b"data2")))
 
         assert handler.allocator.num_free_pages == 0
 
@@ -1647,7 +1647,7 @@ class TestMaruHandlerExpandFailure:
         )
 
         # Try to store a new key — should trigger expansion and fail
-        result = handler.store(key=3, info=MemoryInfo(view=memoryview(b"data3")))
+        result = handler.store(key="3", info=MemoryInfo(view=memoryview(b"data3")))
         assert result is False
 
         handler.close()
@@ -1915,11 +1915,11 @@ class TestFree:
         handler = _make_mock_handler()
         handle = handler.alloc(size=64)
         handle.buf[:5] = b"hello"
-        handler.store(key=42, handle=handle)
-        assert 42 in handler._key_to_location
+        handler.store(key="42", handle=handle)
+        assert "42" in handler._key_to_location
 
         handler.free(handle)
-        assert 42 not in handler._key_to_location
+        assert "42" not in handler._key_to_location
         handler.close()
 
     def test_free_reclaims_page(self):
@@ -1952,9 +1952,9 @@ class TestStoreWithHandle:
         handle = handler.alloc(size=64)
         handle.buf[:5] = b"hello"
 
-        result = handler.store(key=42, handle=handle)
+        result = handler.store(key="42", handle=handle)
         assert result is True
-        assert 42 in handler._key_to_location
+        assert "42" in handler._key_to_location
 
         handler._rpc.register_kv.assert_called_once()
         handler.close()
@@ -1968,7 +1968,7 @@ class TestStoreWithHandle:
         handle.buf[:5] = b"hello"
 
         with mock_patch("maru_handler.handler._gil_free_memcpy") as mock_memcpy:
-            handler.store(key=42, handle=handle)
+            handler.store(key="42", handle=handle)
             mock_memcpy.assert_not_called()
         handler.close()
 
@@ -1976,10 +1976,10 @@ class TestStoreWithHandle:
         """store(handle=) skips when key already exists."""
         handler = _make_mock_handler()
 
-        handler.store(key=42, data=memoryview(b"first"))
+        handler.store(key="42", data=memoryview(b"first"))
 
         handle = handler.alloc(size=64)
-        result = handler.store(key=42, handle=handle)
+        result = handler.store(key="42", handle=handle)
         assert result is True
         assert handler._rpc.register_kv.call_count == 1
         handler.close()
@@ -1992,9 +1992,9 @@ class TestStoreWithHandle:
         handle = handler.alloc(size=64)
         handle.buf[:5] = b"hello"
 
-        result = handler.store(key=42, handle=handle)
+        result = handler.store(key="42", handle=handle)
         assert result is True
-        assert 42 not in handler._key_to_location
+        assert "42" not in handler._key_to_location
         handler.close()
 
     def test_store_with_handle_and_data_raises(self):
@@ -2003,7 +2003,7 @@ class TestStoreWithHandle:
         handle = handler.alloc(size=64)
 
         with pytest.raises(ValueError, match="Cannot specify both"):
-            handler.store(key=42, handle=handle, data=memoryview(b"conflict"))
+            handler.store(key="42", handle=handle, data=memoryview(b"conflict"))
         handler.close()
 
     def test_store_with_handle_and_info_raises(self):
@@ -2012,7 +2012,7 @@ class TestStoreWithHandle:
         handle = handler.alloc(size=64)
 
         with pytest.raises(ValueError, match="Cannot specify both"):
-            handler.store(key=42, handle=handle, info=MemoryInfo(view=memoryview(b"x")))
+            handler.store(key="42", handle=handle, info=MemoryInfo(view=memoryview(b"x")))
         handler.close()
 
 
@@ -2022,9 +2022,9 @@ class TestStoreWithHandleCompat:
     def test_store_without_handle(self):
         """store() without handle uses allocate+memcpy path."""
         handler = _make_mock_handler()
-        result = handler.store(key=42, data=memoryview(b"hello"))
+        result = handler.store(key="42", data=memoryview(b"hello"))
         assert result is True
-        assert 42 in handler._key_to_location
+        assert "42" in handler._key_to_location
         handler._rpc.register_kv.assert_called_once()
         handler.close()
 
@@ -2032,7 +2032,7 @@ class TestStoreWithHandleCompat:
         """store() with prefix still works without handle."""
         handler = _make_mock_handler()
         result = handler.store(
-            key=42,
+            key="42",
             info=MemoryInfo(view=memoryview(b"data")),
             prefix=b"\x01\x02",
         )
@@ -2043,16 +2043,16 @@ class TestStoreWithHandleCompat:
         """Interleaving store with and without handle works correctly."""
         handler = _make_mock_handler(pool_size=8192, chunk_size=1024)
 
-        handler.store(key=1, data=memoryview(b"data1"))
-        assert 1 in handler._key_to_location
+        handler.store(key="1", data=memoryview(b"data1"))
+        assert "1" in handler._key_to_location
 
         h = handler.alloc(size=64)
         h.buf[:6] = b"handle"
-        handler.store(key=2, handle=h)
-        assert 2 in handler._key_to_location
+        handler.store(key="2", handle=h)
+        assert "2" in handler._key_to_location
 
-        handler.store(key=3, data=memoryview(b"data2"))
-        assert 3 in handler._key_to_location
+        handler.store(key="3", data=memoryview(b"data2"))
+        assert "3" in handler._key_to_location
 
         assert handler._rpc.register_kv.call_count == 3
         handler.close()
@@ -2073,10 +2073,10 @@ class TestAllocCleanup:
         handler = _make_mock_handler()
         handle = handler.alloc(size=64)
         handle.buf[:4] = b"hell"
-        handler.store(key=42, handle=handle)
+        handler.store(key="42", handle=handle)
 
         # Mock lookup_kv returns kv_length=4, so retrieve returns 4 bytes
-        result = handler.retrieve(key=42)
+        result = handler.retrieve(key="42")
         assert result is not None
         assert bytes(result.view[:4]) == b"hell"
         handler.close()

@@ -191,8 +191,8 @@ class TestKVMessages:
     """Test KV operation messages."""
 
     def test_register_kv_request(self):
-        req = RegisterKVRequest(key=12345, region_id=1, kv_offset=4096, kv_length=1024)
-        assert req.key == 12345
+        req = RegisterKVRequest(key="12345", region_id=1, kv_offset=4096, kv_length=1024)
+        assert req.key == "12345"
         assert req.region_id == 1
         assert req.kv_offset == 4096
         assert req.kv_length == 1024
@@ -203,8 +203,8 @@ class TestKVMessages:
         assert resp.is_new is True
 
     def test_lookup_kv_request(self):
-        req = LookupKVRequest(key=12345)
-        assert req.key == 12345
+        req = LookupKVRequest(key="12345")
+        assert req.key == "12345"
 
     def test_lookup_kv_response_found(self):
         handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=456)
@@ -222,15 +222,15 @@ class TestKVMessages:
         assert resp.handle is None
 
     def test_exists_kv(self):
-        req = ExistsKVRequest(key=12345)
+        req = ExistsKVRequest(key="12345")
         resp = ExistsKVResponse(exists=True)
-        assert req.key == 12345
+        assert req.key == "12345"
         assert resp.exists is True
 
     def test_delete_kv(self):
-        req = DeleteKVRequest(key=12345)
+        req = DeleteKVRequest(key="12345")
         resp = DeleteKVResponse(success=True)
-        assert req.key == 12345
+        assert req.key == "12345"
         assert resp.success is True
 
 
@@ -239,12 +239,12 @@ class TestBatchMessages:
 
     def test_batch_register_kv_request(self):
         entries = [
-            BatchKVEntry(key=1, region_id=1, kv_offset=0, kv_length=100),
-            BatchKVEntry(key=2, region_id=1, kv_offset=100, kv_length=200),
+            BatchKVEntry(key="1", region_id=1, kv_offset=0, kv_length=100),
+            BatchKVEntry(key="2", region_id=1, kv_offset=100, kv_length=200),
         ]
         req = BatchRegisterKVRequest(entries=entries)
         assert len(req.entries) == 2
-        assert req.entries[0].key == 1
+        assert req.entries[0].key == "1"
 
     def test_batch_register_kv_response(self):
         resp = BatchRegisterKVResponse(success=True, results=[True, True, False])
@@ -252,7 +252,7 @@ class TestBatchMessages:
         assert len(resp.results) == 3
 
     def test_batch_lookup_kv_request(self):
-        req = BatchLookupKVRequest(keys=[1, 2, 3])
+        req = BatchLookupKVRequest(keys=["1", "2", "3"])
         assert len(req.keys) == 3
 
     def test_batch_lookup_kv_response(self):
@@ -267,7 +267,7 @@ class TestBatchMessages:
         assert resp.entries[1].found is False
 
     def test_batch_exists_kv(self):
-        req = BatchExistsKVRequest(keys=[1, 2, 3])
+        req = BatchExistsKVRequest(keys=["1", "2", "3"])
         resp = BatchExistsKVResponse(results=[True, False, True])
         assert len(req.keys) == 3
         assert resp.results == [True, False, True]

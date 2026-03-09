@@ -81,10 +81,10 @@ class TestMaruHandler:
         with MaruHandler(config) as handler:
             data = b"hello world"
             info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key=12345, info=info) is True
-            assert handler.exists(key=12345) is True
+            assert handler.store(key="12345", info=info) is True
+            assert handler.exists(key="12345") is True
 
-            result = handler.retrieve(key=12345)
+            result = handler.retrieve(key="12345")
             assert result is not None
             assert bytes(result.view[: len(data)]) == data
 
@@ -97,10 +97,10 @@ class TestMaruHandler:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
             assert handler.allocator.num_allocated == 1
 
-            handler.delete(key=1)
+            handler.delete(key="1")
             assert handler.allocator.num_allocated == 0
             assert handler.allocator.num_free_pages == handler.allocator.page_count
 
@@ -117,7 +117,7 @@ class TestMaruHandler:
             page_count = handler.allocator.page_count
             for i in range(page_count):
                 assert (
-                    handler.store(key=i, info=MemoryInfo(view=memoryview(b"x" * 100)))
+                    handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100)))
                     is True
                 )
 
@@ -125,7 +125,7 @@ class TestMaruHandler:
             overflow_data = b"overflow"
             assert (
                 handler.store(
-                    key=page_count + 1,
+                    key=str(page_count + 1),
                     info=MemoryInfo(view=memoryview(overflow_data)),
                 )
                 is True
@@ -137,7 +137,7 @@ class TestMaruHandler:
             assert stats["num_regions"] == 2
 
             # Data should be retrievable
-            result = handler.retrieve(key=page_count + 1)
+            result = handler.retrieve(key=str(page_count + 1))
             assert result is not None
             assert bytes(result.view[: len(overflow_data)]) == overflow_data
 
@@ -153,16 +153,16 @@ class TestMaruHandler:
             # Fill all pages
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                handler.store(key=i, info=MemoryInfo(view=memoryview(b"data")))
+                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"data")))
 
             assert handler.allocator.num_free_pages == 0
 
             # Delete one
-            handler.delete(key=2)
+            handler.delete(key="2")
             assert handler.allocator.num_free_pages == 1
 
             # Store new key — should succeed using freed page
-            new_key = page_count + 100  # key not in range(page_count)
+            new_key = str(page_count + 100)  # key not in range(page_count)
             assert (
                 handler.store(
                     key=new_key, info=MemoryInfo(view=memoryview(b"new data"))
@@ -181,15 +181,15 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             v1 = b"version1"
-            handler.store(key=1, info=MemoryInfo(view=memoryview(v1)))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(v1)))
             assert handler.allocator.num_allocated == 1
 
             # Second store with same key is skipped
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"version2")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"version2")))
             assert handler.allocator.num_allocated == 1  # still 1 page
 
             # Original value is preserved
-            result = handler.retrieve(key=1)
+            result = handler.retrieve(key="1")
             assert result is not None
             assert bytes(result.view[: len(v1)]) == v1
 
@@ -203,7 +203,7 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             data = b"x" * 1025  # exceeds 1024
-            assert handler.store(key=1, info=MemoryInfo(view=memoryview(data))) is False
+            assert handler.store(key="1", info=MemoryInfo(view=memoryview(data))) is False
 
 
 class TestMaruHandlerMultiRegion:
@@ -221,20 +221,20 @@ class TestMaruHandlerMultiRegion:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             d1, d2, d3 = b"region1_data1", b"region1_data2", b"region2_data1"
-            handler.store(key=1, info=MemoryInfo(view=memoryview(d1)))
-            handler.store(key=2, info=MemoryInfo(view=memoryview(d2)))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(d1)))
+            handler.store(key="2", info=MemoryInfo(view=memoryview(d2)))
             for i in range(3, page_count + 1):
-                handler.store(key=i, info=MemoryInfo(view=memoryview(b"filler")))
+                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
 
             # Next store triggers auto-expand to region 2
-            overflow_key = page_count + 1
+            overflow_key = str(page_count + 1)
             handler.store(key=overflow_key, info=MemoryInfo(view=memoryview(d3)))
 
             assert handler.owned_region_manager.get_stats()["num_regions"] == 2
 
             # All data should be retrievable
-            assert bytes(handler.retrieve(key=1).view[: len(d1)]) == d1
-            assert bytes(handler.retrieve(key=2).view[: len(d2)]) == d2
+            assert bytes(handler.retrieve(key="1").view[: len(d1)]) == d1
+            assert bytes(handler.retrieve(key="2").view[: len(d2)]) == d2
             assert bytes(handler.retrieve(key=overflow_key).view[: len(d3)]) == d3
 
     def test_delete_from_expanded_region(self, server_thread, server_port):
@@ -248,12 +248,12 @@ class TestMaruHandlerMultiRegion:
         with MaruHandler(config) as handler:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
             for i in range(2, page_count + 1):
-                handler.store(key=i, info=MemoryInfo(view=memoryview(b"filler")))
+                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
 
             # Next store triggers expansion
-            overflow_key = page_count + 1
+            overflow_key = str(page_count + 1)
             handler.store(
                 key=overflow_key,
                 info=MemoryInfo(view=memoryview(b"data2")),
@@ -278,12 +278,12 @@ class TestMaruHandlerMultiRegion:
 
         with MaruHandler(config) as handler:
             v1 = b"version1"
-            handler.store(key=1, info=MemoryInfo(view=memoryview(v1)))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(v1)))
             # Second store with same key is skipped
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"version2")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"version2")))
 
             # Original value is preserved
-            result = handler.retrieve(key=1)
+            result = handler.retrieve(key="1")
             assert result is not None
             assert bytes(result.view[: len(v1)]) == v1
 
@@ -302,10 +302,10 @@ class TestMaruHandlerMultiRegion:
         # Fill first region and trigger expansion
         page_count = handler.allocator.page_count
         for i in range(page_count):
-            handler.store(key=i, info=MemoryInfo(view=memoryview(b"filler")))
+            handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
         # Next store triggers expansion
         handler.store(
-            key=page_count + 1,
+            key=str(page_count + 1),
             info=MemoryInfo(view=memoryview(b"overflow")),
         )
 
@@ -332,7 +332,7 @@ class TestMaruHandlerMultiRegion:
             assert handler.allocator is not None
             assert handler.allocator.page_count == handler.pool_handle.length // 1024
 
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"test")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"test")))
             assert handler.allocator.num_allocated == 1
 
     def test_stats_with_multiple_regions(self, server_thread, server_port):
@@ -347,10 +347,10 @@ class TestMaruHandlerMultiRegion:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                handler.store(key=i, info=MemoryInfo(view=memoryview(b"filler")))
+                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
             # Next store triggers expansion
             handler.store(
-                key=page_count + 1,
+                key=str(page_count + 1),
                 info=MemoryInfo(view=memoryview(b"overflow")),
             )
 
@@ -381,10 +381,10 @@ class TestMaruHandlerStorePrefix:
             data = b"hello"
             info = MemoryInfo(view=memoryview(data))
 
-            assert handler.store(key=1, info=info, prefix=prefix) is True
+            assert handler.store(key="1", info=info, prefix=prefix) is True
 
             # Retrieve and verify prefix+data layout
-            result = handler.retrieve(key=1)
+            result = handler.retrieve(key="1")
             assert result is not None
             expected = prefix + data
             assert bytes(result.view[: len(expected)]) == expected
@@ -402,10 +402,10 @@ class TestMaruHandlerStorePrefix:
             info = MemoryInfo(view=memoryview(data))
 
             # Store with empty prefix
-            assert handler.store(key=1, info=info, prefix=b"") is True
+            assert handler.store(key="1", info=info, prefix=b"") is True
 
             # Retrieve and verify data only
-            result = handler.retrieve(key=1)
+            result = handler.retrieve(key="1")
             assert result is not None
             assert bytes(result.view[: len(data)]) == data
 
@@ -422,7 +422,7 @@ class TestMaruHandlerBatch:
         )
 
         with MaruHandler(config) as handler:
-            keys = [1, 2, 3]
+            keys = ["1", "2", "3"]
             data = [b"data1", b"data2", b"data3"]
             infos = [MemoryInfo(view=memoryview(d)) for d in data]
 
@@ -446,7 +446,7 @@ class TestMaruHandlerBatch:
         )
 
         with MaruHandler(config) as handler:
-            keys = [1, 2]
+            keys = ["1", "2"]
             data = [b"data1", b"data2"]
             prefixes = [b"\x01", b"\x02\x03"]
             infos = [MemoryInfo(view=memoryview(d)) for d in data]
@@ -471,7 +471,7 @@ class TestMaruHandlerBatch:
         )
 
         with MaruHandler(config) as handler:
-            keys = [1, 2]
+            keys = ["1", "2"]
             infos = [MemoryInfo(view=memoryview(b"data1"))]
 
             with pytest.raises(
@@ -489,11 +489,11 @@ class TestMaruHandlerBatch:
 
         with MaruHandler(config) as handler:
             # Store keys 1 and 3
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
-            handler.store(key=3, info=MemoryInfo(view=memoryview(b"data3")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            handler.store(key="3", info=MemoryInfo(view=memoryview(b"data3")))
 
             # Check existence of keys 1, 2, 3
-            results = handler.batch_exists(keys=[1, 2, 3])
+            results = handler.batch_exists(keys=["1", "2", "3"])
             assert results == [True, False, True]
 
 
@@ -555,10 +555,10 @@ class TestMaruHandlerWithAsyncServer:
         with MaruHandler(config) as handler:
             data = b"hello async world"
             info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key=42, info=info) is True
-            assert handler.exists(key=42) is True
+            assert handler.store(key="42", info=info) is True
+            assert handler.exists(key="42") is True
 
-            result = handler.retrieve(key=42)
+            result = handler.retrieve(key="42")
             assert result is not None
             assert bytes(result.view[: len(data)]) == data
 
@@ -572,11 +572,11 @@ class TestMaruHandlerWithAsyncServer:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
-            assert handler.exists(key=1) is True
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            assert handler.exists(key="1") is True
 
-            handler.delete(key=1)
-            assert handler.exists(key=1) is False
+            handler.delete(key="1")
+            assert handler.exists(key="1") is False
 
     def test_auto_expansion_with_async_server(
         self, async_server_thread, async_server_port
@@ -594,13 +594,13 @@ class TestMaruHandlerWithAsyncServer:
             page_count = handler.allocator.page_count
             for i in range(page_count):
                 assert (
-                    handler.store(key=i, info=MemoryInfo(view=memoryview(b"x" * 100)))
+                    handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100)))
                     is True
                 )
 
             # Trigger expansion
             overflow_data = b"overflow"
-            overflow_key = page_count + 1
+            overflow_key = str(page_count + 1)
             assert (
                 handler.store(
                     key=overflow_key,
@@ -630,7 +630,7 @@ class TestMaruHandlerWithAsyncServer:
         )
 
         with MaruHandler(config) as handler:
-            keys = [10, 20, 30]
+            keys = ["10", "20", "30"]
             data = [b"batch1", b"batch2", b"batch3"]
             infos = [MemoryInfo(view=memoryview(d)) for d in data]
 
@@ -688,10 +688,10 @@ class TestMaruHandlerSyncRpc:
         with MaruHandler(config) as handler:
             data = b"sync rpc data"
             info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key=100, info=info) is True
-            assert handler.exists(key=100) is True
+            assert handler.store(key="100", info=info) is True
+            assert handler.exists(key="100") is True
 
-            result = handler.retrieve(key=100)
+            result = handler.retrieve(key="100")
             assert result is not None
             assert bytes(result.view[: len(data)]) == data
 
@@ -705,11 +705,11 @@ class TestMaruHandlerSyncRpc:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data1")))
-            assert handler.exists(key=1) is True
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            assert handler.exists(key="1") is True
 
-            handler.delete(key=1)
-            assert handler.exists(key=1) is False
+            handler.delete(key="1")
+            assert handler.exists(key="1") is False
 
     def test_batch_operations_with_sync_rpc(self, server_thread, server_port):
         """Test batch store and retrieve with sync RPC client."""
@@ -721,7 +721,7 @@ class TestMaruHandlerSyncRpc:
         )
 
         with MaruHandler(config) as handler:
-            keys = [50, 60, 70]
+            keys = ["50", "60", "70"]
             data = [b"sync1", b"sync2", b"sync3"]
             infos = [MemoryInfo(view=memoryview(d)) for d in data]
 
@@ -771,16 +771,16 @@ class TestCrossHandlerSharing:
             # Handler A stores data
             data = b"shared metadata"
             info = MemoryInfo(view=memoryview(data))
-            assert handler_a.store(key=999, info=info) is True
+            assert handler_a.store(key="999", info=info) is True
 
             # Handler B can see the key exists in KV registry
-            assert handler_b.exists(key=999) is True
+            assert handler_b.exists(key="999") is True
 
             # Handler A deletes the key
-            handler_a.delete(key=999)
+            handler_a.delete(key="999")
 
             # Handler B sees it's gone
-            assert handler_b.exists(key=999) is False
+            assert handler_b.exists(key="999") is False
 
     def test_batch_exists_across_handlers(self, server_thread, server_port):
         """Handler B checks existence of multiple keys stored by Handler A."""
@@ -793,11 +793,11 @@ class TestCrossHandlerSharing:
         # Both handlers alive concurrently
         with MaruHandler(config) as handler_a, MaruHandler(config) as handler_b:
             # Handler A stores keys 2000 and 2002
-            handler_a.store(key=2000, info=MemoryInfo(view=memoryview(b"data2000")))
-            handler_a.store(key=2002, info=MemoryInfo(view=memoryview(b"data2002")))
+            handler_a.store(key="2000", info=MemoryInfo(view=memoryview(b"data2000")))
+            handler_a.store(key="2002", info=MemoryInfo(view=memoryview(b"data2002")))
 
             # Handler B checks existence via shared KV registry
-            results = handler_b.batch_exists(keys=[2000, 2001, 2002])
+            results = handler_b.batch_exists(keys=["2000", "2001", "2002"])
             assert results == [True, False, True]
 
     def test_concurrent_stores_different_keys(self, server_thread, server_port):
@@ -814,19 +814,19 @@ class TestCrossHandlerSharing:
             data_b = b"from handler B"
 
             assert (
-                handler_a.store(key=100, info=MemoryInfo(view=memoryview(data_a)))
+                handler_a.store(key="100", info=MemoryInfo(view=memoryview(data_a)))
                 is True
             )
             assert (
-                handler_b.store(key=200, info=MemoryInfo(view=memoryview(data_b)))
+                handler_b.store(key="200", info=MemoryInfo(view=memoryview(data_b)))
                 is True
             )
 
             # Both keys visible to both handlers
-            assert handler_a.exists(key=100) is True
-            assert handler_a.exists(key=200) is True
-            assert handler_b.exists(key=100) is True
-            assert handler_b.exists(key=200) is True
+            assert handler_a.exists(key="100") is True
+            assert handler_a.exists(key="200") is True
+            assert handler_b.exists(key="100") is True
+            assert handler_b.exists(key="200") is True
 
     def test_read_only_mapping_code_path(self, server_thread, server_port):
         """Verify retrieve uses read-only mapping for non-owned regions.
@@ -845,10 +845,10 @@ class TestCrossHandlerSharing:
             # Handler A stores data
             data = b"test read-only mapping"
             info = MemoryInfo(view=memoryview(data))
-            assert handler_a.store(key=3000, info=info) is True
+            assert handler_a.store(key="3000", info=info) is True
 
             # Handler B retrieves via read-only mapping of handler A's region
-            result = handler_b.retrieve(key=3000)
+            result = handler_b.retrieve(key="3000")
             assert result is not None
             # With real CXL shared memory, data should match
             assert bytes(result.view[: len(data)]) == data
@@ -866,7 +866,7 @@ class TestMaruHandlerFailureScenarios:
         )
 
         with MaruHandler(config) as handler:
-            result = handler.retrieve(key=99999)
+            result = handler.retrieve(key="99999")
             assert result is None
 
     def test_delete_nonexistent_key(self, server_thread, server_port):
@@ -878,7 +878,7 @@ class TestMaruHandlerFailureScenarios:
         )
 
         with MaruHandler(config) as handler:
-            result = handler.delete(key=99999)
+            result = handler.delete(key="99999")
             assert result is False
 
     def test_exists_nonexistent_key(self, server_thread, server_port):
@@ -890,7 +890,7 @@ class TestMaruHandlerFailureScenarios:
         )
 
         with MaruHandler(config) as handler:
-            result = handler.exists(key=99999)
+            result = handler.exists(key="99999")
             assert result is False
 
     def test_double_delete(self, server_thread, server_port):
@@ -903,13 +903,13 @@ class TestMaruHandlerFailureScenarios:
 
         with MaruHandler(config) as handler:
             # Store a key
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
 
             # First delete succeeds
-            assert handler.delete(key=1) is True
+            assert handler.delete(key="1") is True
 
             # Second delete fails (key already gone)
-            assert handler.delete(key=1) is False
+            assert handler.delete(key="1") is False
 
     def test_batch_retrieve_partial(self, server_thread, server_port):
         """Store keys 1,3 but batch_retrieve [1,2,3] returns [not None, None, not None]."""
@@ -923,11 +923,11 @@ class TestMaruHandlerFailureScenarios:
             # Store only keys 1 and 3
             data1 = b"data1"
             data3 = b"data3"
-            handler.store(key=1, info=MemoryInfo(view=memoryview(data1)))
-            handler.store(key=3, info=MemoryInfo(view=memoryview(data3)))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(data1)))
+            handler.store(key="3", info=MemoryInfo(view=memoryview(data3)))
 
             # Batch retrieve keys 1, 2, 3
-            results = handler.batch_retrieve(keys=[1, 2, 3])
+            results = handler.batch_retrieve(keys=["1", "2", "3"])
             assert len(results) == 3
 
             # Key 1 exists
@@ -955,4 +955,4 @@ class TestMaruHandlerFailureScenarios:
         handler.close()
 
         with pytest.raises(RuntimeError):
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))

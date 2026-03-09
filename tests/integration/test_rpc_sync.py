@@ -179,14 +179,14 @@ class TestKVOperations:
         client, handle = client_with_alloc
 
         is_new = client.register_kv(
-            key=1001, region_id=handle.region_id, kv_offset=0, kv_length=256
+            key="1001", region_id=handle.region_id, kv_offset=0, kv_length=256
         )
         assert is_new is True
 
     def test_register_duplicate_kv(self, client_with_alloc):
         """Test registering duplicate key."""
         client, handle = client_with_alloc
-        key = 2001
+        key = "2001"
 
         is_new1 = client.register_kv(key, handle.region_id, 0, 256)
         assert is_new1 is True
@@ -198,7 +198,7 @@ class TestKVOperations:
     def test_lookup_kv(self, client_with_alloc):
         """Test looking up a KV entry."""
         client, handle = client_with_alloc
-        key = 3001
+        key = "3001"
 
         client.register_kv(key, handle.region_id, 100, 512)
 
@@ -211,13 +211,13 @@ class TestKVOperations:
 
     def test_lookup_nonexistent_kv(self, client):
         """Test looking up non-existent key."""
-        result = client.lookup_kv(999999)
+        result = client.lookup_kv("999999")
         assert result.found is False
 
     def test_exists_kv(self, client_with_alloc):
         """Test checking KV existence."""
         client, handle = client_with_alloc
-        key = 4001
+        key = "4001"
 
         assert client.exists_kv(key) is False
 
@@ -228,7 +228,7 @@ class TestKVOperations:
     def test_delete_kv(self, client_with_alloc):
         """Test deleting a KV entry."""
         client, handle = client_with_alloc
-        key = 5001
+        key = "5001"
 
         client.register_kv(key, handle.region_id, 0, 100)
         assert client.exists_kv(key) is True
@@ -240,7 +240,7 @@ class TestKVOperations:
 
     def test_delete_nonexistent_kv(self, client):
         """Test deleting non-existent key."""
-        success = client.delete_kv(999998)
+        success = client.delete_kv("999998")
         assert success is False
 
 
@@ -256,7 +256,7 @@ class TestBatchOperations:
         """Test batch registration."""
         client, handle = client_with_alloc
 
-        entries = [(10001 + i, handle.region_id, i * 100, 100) for i in range(10)]
+        entries = [(str(10001 + i), handle.region_id, i * 100, 100) for i in range(10)]
         response = client.batch_register_kv(entries)
 
         assert response.success is True
@@ -270,14 +270,14 @@ class TestBatchOperations:
         # Register some keys
         for i in [1, 3, 5]:
             client.register_kv(
-                key=20000 + i,
+                key=str(20000 + i),
                 region_id=handle.region_id,
                 kv_offset=i * 100,
                 kv_length=100,
             )
 
         # Batch lookup (mix of found and not found)
-        keys = [20001, 20002, 20003, 20004, 20005]
+        keys = ["20001", "20002", "20003", "20004", "20005"]
         response = client.batch_lookup_kv(keys)
 
         assert len(response.entries) == 5
@@ -294,14 +294,14 @@ class TestBatchOperations:
         # Register some keys
         for i in [1, 3, 5]:
             client.register_kv(
-                key=30000 + i,
+                key=str(30000 + i),
                 region_id=handle.region_id,
                 kv_offset=i * 100,
                 kv_length=100,
             )
 
         # Batch exists
-        keys = [30001, 30002, 30003, 30004, 30005]
+        keys = ["30001", "30002", "30003", "30004", "30005"]
         response = client.batch_exists_kv(keys)
 
         assert response.results == [True, False, True, False, True]
@@ -324,8 +324,8 @@ class TestMultipleClients:
                 resp = client.request_alloc(f"client_{i}", 1024)
                 assert resp.success is True
 
-                client.register_kv(40000 + i, resp.handle.region_id, 0, 100)
-                results.append(client.exists_kv(40000 + i))
+                client.register_kv(str(40000 + i), resp.handle.region_id, 0, 100)
+                results.append(client.exists_kv(str(40000 + i)))
 
         assert all(results)
 
@@ -339,7 +339,7 @@ class TestMultipleClients:
                 if not resp.success:
                     return False
 
-                key = 50000 + client_id
+                key = str(50000 + client_id)
                 client.register_kv(key, resp.handle.region_id, 0, 100)
                 return client.exists_kv(key)
 
@@ -351,7 +351,7 @@ class TestMultipleClients:
 
     def test_clients_share_kv_visibility(self, server_port, rpc_server):
         """Test that KV entries are visible across clients."""
-        key = 60001
+        key = "60001"
 
         # Client 1: Register KV
         with RpcClient(f"tcp://127.0.0.1:{server_port}") as client1:
@@ -376,7 +376,7 @@ class TestErrorHandling:
 
     def test_lookup_with_large_key(self, client):
         """Test lookup returns not found for any integer key."""
-        result = client.lookup_kv(2**60)
+        result = client.lookup_kv(str(2**60))
         assert result.found is False
 
     def test_return_nonexistent_region(self, client):
@@ -400,7 +400,7 @@ class TestErrorHandling:
     def test_double_delete_kv(self, client_with_alloc):
         """Test deleting the same KV entry twice."""
         client, handle = client_with_alloc
-        key = 100001
+        key = "100001"
 
         # Register and delete first time
         client.register_kv(key, handle.region_id, 0, 100)
@@ -413,12 +413,12 @@ class TestErrorHandling:
 
     def test_exists_nonexistent_kv(self, client):
         """Test exists_kv for a key that was never registered."""
-        result = client.exists_kv(999997)
+        result = client.exists_kv("999997")
         assert result is False
 
     def test_batch_lookup_all_nonexistent(self, client):
         """Test batch_lookup_kv with all non-existent keys."""
-        keys = [100002, 100003, 100004, 100005, 100006]
+        keys = ["100002", "100003", "100004", "100005", "100006"]
         response = client.batch_lookup_kv(keys)
 
         assert len(response.entries) == 5
@@ -426,7 +426,7 @@ class TestErrorHandling:
 
     def test_batch_exists_all_nonexistent(self, client):
         """Test batch_exists_kv with all non-existent keys."""
-        keys = [100007, 100008, 100009, 100010, 100011]
+        keys = ["100007", "100008", "100009", "100010", "100011"]
         response = client.batch_exists_kv(keys)
 
         assert len(response.results) == 5
@@ -457,7 +457,7 @@ class TestServerStats:
 
         # Add some entries
         for i in range(5):
-            client.register_kv(70000 + i, handle.region_id, i * 100, 100)
+            client.register_kv(str(70000 + i), handle.region_id, i * 100, 100)
 
         stats_after = client.get_stats()
         final_count = stats_after.kv_manager.total_entries
@@ -484,7 +484,7 @@ class TestStress:
         # Register many entries
         for i in range(num_ops):
             client.register_kv(
-                key=base_key + i,
+                key=str(base_key + i),
                 region_id=handle.region_id,
                 kv_offset=i * 64,
                 kv_length=64,
@@ -492,11 +492,11 @@ class TestStress:
 
         # Verify all exist
         for i in range(num_ops):
-            assert client.exists_kv(base_key + i) is True
+            assert client.exists_kv(str(base_key + i)) is True
 
         # Lookup all
         for i in range(num_ops):
-            result = client.lookup_kv(base_key + i)
+            result = client.lookup_kv(str(base_key + i))
             assert result.found is True
 
     @pytest.mark.slow
@@ -522,7 +522,7 @@ class TestStress:
                     return [False]
 
                 for i in range(ops_per_thread):
-                    key = 90000 + thread_id * 1000 + i
+                    key = str(90000 + thread_id * 1000 + i)
                     client.register_kv(
                         key=key,
                         region_id=resp.handle.region_id,
@@ -606,7 +606,7 @@ class TestClientOffline:
         client.connect()
 
         # exists_kv should timeout and return False
-        result = client.exists_kv(1)
+        result = client.exists_kv("1")
         assert result is False
 
         client.close()

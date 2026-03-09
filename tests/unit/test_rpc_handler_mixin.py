@@ -94,7 +94,7 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         req = MockRequest(
-            key=100, region_id=handle.region_id, kv_offset=0, kv_length=256
+            key="100", region_id=handle.region_id, kv_offset=0, kv_length=256
         )
         resp = handler._handle_register_kv(req)
         assert resp["success"] is True
@@ -104,16 +104,16 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         server.register_kv(
-            key=100, region_id=handle.region_id, kv_offset=0, kv_length=256
+            key="100", region_id=handle.region_id, kv_offset=0, kv_length=256
         )
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = handler._handle_lookup_kv(req)
         assert resp["found"] is True
         assert "handle" in resp
 
     def test_handle_lookup_kv_not_found(self):
         handler, _ = self._make_handler()
-        req = MockRequest(key=99999)
+        req = MockRequest(key="99999")
         resp = handler._handle_lookup_kv(req)
         assert resp["found"] is False
 
@@ -121,9 +121,9 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         server.register_kv(
-            key=100, region_id=handle.region_id, kv_offset=0, kv_length=256
+            key="100", region_id=handle.region_id, kv_offset=0, kv_length=256
         )
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = handler._handle_exists_kv(req)
         assert resp["exists"] is True
 
@@ -131,9 +131,9 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         server.register_kv(
-            key=100, region_id=handle.region_id, kv_offset=0, kv_length=256
+            key="100", region_id=handle.region_id, kv_offset=0, kv_length=256
         )
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = handler._handle_delete_kv(req)
         assert resp["success"] is True
 
@@ -142,10 +142,10 @@ class TestRpcHandlerMixin:
         handle = server.request_alloc("inst1", 4096)
         entries = [
             MockRequest(
-                key=200, region_id=handle.region_id, kv_offset=0, kv_length=128
+                key="200", region_id=handle.region_id, kv_offset=0, kv_length=128
             ),
             MockRequest(
-                key=201, region_id=handle.region_id, kv_offset=128, kv_length=128
+                key="201", region_id=handle.region_id, kv_offset=128, kv_length=128
             ),
         ]
         req = MockRequest(entries=entries)
@@ -157,9 +157,9 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         server.register_kv(
-            key=300, region_id=handle.region_id, kv_offset=0, kv_length=128
+            key="300", region_id=handle.region_id, kv_offset=0, kv_length=128
         )
-        req = MockRequest(keys=[300, 999])
+        req = MockRequest(keys=["300", "999"])
         resp = handler._handle_batch_lookup_kv(req)
         assert len(resp["entries"]) == 2
         assert resp["entries"][0]["found"] is True
@@ -169,9 +169,9 @@ class TestRpcHandlerMixin:
         handler, server = self._make_handler()
         handle = server.request_alloc("inst1", 4096)
         server.register_kv(
-            key=400, region_id=handle.region_id, kv_offset=0, kv_length=128
+            key="400", region_id=handle.region_id, kv_offset=0, kv_length=128
         )
-        req = MockRequest(keys=[400, 999])
+        req = MockRequest(keys=["400", "999"])
         resp = handler._handle_batch_exists_kv(req)
         assert resp["results"] == [True, False]
 

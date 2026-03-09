@@ -362,11 +362,11 @@ class TestRpcAsyncClientApiMethods:
         client = self._make_client()
         client._send_request.return_value = {"is_new": True}
 
-        result = client.register_kv(key=100, region_id=1, kv_offset=0, kv_length=64)
+        result = client.register_kv(key="100", region_id=1, kv_offset=0, kv_length=64)
 
         client._send_request.assert_called_once_with(
             MessageType.REGISTER_KV,
-            {"key": 100, "region_id": 1, "kv_offset": 0, "kv_length": 64},
+            {"key": "100", "region_id": 1, "kv_offset": 0, "kv_length": 64},
         )
         assert result is True
 
@@ -381,10 +381,10 @@ class TestRpcAsyncClientApiMethods:
             "kv_length": 64,
         }
 
-        result = client.lookup_kv(100)
+        result = client.lookup_kv("100")
 
         client._send_request.assert_called_once_with(
-            MessageType.LOOKUP_KV, {"key": 100}
+            MessageType.LOOKUP_KV, {"key": "100"}
         )
         assert result.found is True
         assert result.handle is not None
@@ -396,10 +396,10 @@ class TestRpcAsyncClientApiMethods:
         client = self._make_client()
         client._send_request.return_value = {"exists": True}
 
-        result = client.exists_kv(100)
+        result = client.exists_kv("100")
 
         client._send_request.assert_called_once_with(
-            MessageType.EXISTS_KV, {"key": 100}
+            MessageType.EXISTS_KV, {"key": "100"}
         )
         assert result is True
 
@@ -408,10 +408,10 @@ class TestRpcAsyncClientApiMethods:
         client = self._make_client()
         client._send_request.return_value = {"success": True}
 
-        result = client.delete_kv(100)
+        result = client.delete_kv("100")
 
         client._send_request.assert_called_once_with(
-            MessageType.DELETE_KV, {"key": 100}
+            MessageType.DELETE_KV, {"key": "100"}
         )
         assert result is True
 
@@ -423,13 +423,13 @@ class TestRpcAsyncClientApiMethods:
             "results": [True, False, True],
         }
 
-        entries = [(100, 1, 0, 64), (101, 1, 64, 64), (102, 1, 128, 64)]
+        entries = [("100", 1, 0, 64), ("101", 1, 64, 64), ("102", 1, 128, 64)]
         result = client.batch_register_kv(entries)
 
         expected_entries = [
-            {"key": 100, "region_id": 1, "kv_offset": 0, "kv_length": 64},
-            {"key": 101, "region_id": 1, "kv_offset": 64, "kv_length": 64},
-            {"key": 102, "region_id": 1, "kv_offset": 128, "kv_length": 64},
+            {"key": "100", "region_id": 1, "kv_offset": 0, "kv_length": 64},
+            {"key": "101", "region_id": 1, "kv_offset": 64, "kv_length": 64},
+            {"key": "102", "region_id": 1, "kv_offset": 128, "kv_length": 64},
         ]
         client._send_request.assert_called_once_with(
             MessageType.BATCH_REGISTER_KV, {"entries": expected_entries}
@@ -448,10 +448,10 @@ class TestRpcAsyncClientApiMethods:
             ]
         }
 
-        result = client.batch_lookup_kv([100, 101])
+        result = client.batch_lookup_kv(["100", "101"])
 
         client._send_request.assert_called_once_with(
-            MessageType.BATCH_LOOKUP_KV, {"keys": [100, 101]}
+            MessageType.BATCH_LOOKUP_KV, {"keys": ["100", "101"]}
         )
         assert len(result.entries) == 2
         assert result.entries[0].found is True
@@ -463,10 +463,10 @@ class TestRpcAsyncClientApiMethods:
         client = self._make_client()
         client._send_request.return_value = {"results": [True, False, True]}
 
-        result = client.batch_exists_kv([100, 101, 102])
+        result = client.batch_exists_kv(["100", "101", "102"])
 
         client._send_request.assert_called_once_with(
-            MessageType.BATCH_EXISTS_KV, {"keys": [100, 101, 102]}
+            MessageType.BATCH_EXISTS_KV, {"keys": ["100", "101", "102"]}
         )
         assert result.results == [True, False, True]
 
@@ -938,7 +938,7 @@ class TestRpcAsyncClientAsyncMethods:
 
         client._send_async = mock_send_async
 
-        future = client.register_kv_async(100, 1, 0, 64)
+        future = client.register_kv_async("100", 1, 0, 64)
         result = future.result(timeout=2.0)
 
         assert result is True
@@ -1015,7 +1015,7 @@ class TestRpcAsyncClientAsyncMethods:
 
         client._send_async = mock_send_async
 
-        entries = [(100, 1, 0, 64), (101, 1, 64, 64), (102, 1, 128, 64)]
+        entries = [("100", 1, 0, 64), ("101", 1, 64, 64), ("102", 1, 128, 64)]
         future = client.batch_register_kv_async(entries)
         result = future.result(timeout=2.0)
 

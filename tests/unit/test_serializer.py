@@ -42,7 +42,7 @@ class TestEncode:
 
     def test_encode_dict_payload(self):
         serializer = Serializer()
-        data = {"key": 12345, "value": "test"}
+        data = {"key": "12345", "value": "test"}
         encoded = serializer.encode(MessageType.REGISTER_KV, data)
 
         assert len(encoded) > HEADER_SIZE
@@ -52,7 +52,7 @@ class TestEncode:
     def test_encode_dataclass_payload(self):
         serializer = Serializer()
         request = RegisterKVRequest(
-            key=12345, region_id=1, kv_offset=4096, kv_length=1024
+            key="12345", region_id=1, kv_offset=4096, kv_length=1024
         )
         encoded = serializer.encode(MessageType.REGISTER_KV, request)
 
@@ -97,27 +97,27 @@ class TestDecode:
 
     def test_decode_roundtrip(self):
         serializer = Serializer()
-        original_data = {"key": 12345, "value": "hello"}
+        original_data = {"key": "12345", "value": "hello"}
         encoded = serializer.encode(MessageType.LOOKUP_KV, original_data)
 
         header, payload = serializer.decode(encoded)
 
         assert header.magic == PROTOCOL_MAGIC
         assert header.msg_type == MessageType.LOOKUP_KV
-        assert payload["key"] == 12345
+        assert payload["key"] == "12345"
         assert payload["value"] == "hello"
 
     def test_decode_dataclass_roundtrip(self):
         serializer = Serializer()
         request = RegisterKVRequest(
-            key=99999, region_id=1, kv_offset=4096, kv_length=1024
+            key="99999", region_id=1, kv_offset=4096, kv_length=1024
         )
         encoded = serializer.encode(MessageType.REGISTER_KV, request)
 
         header, payload = serializer.decode(encoded)
 
         assert header.msg_type == MessageType.REGISTER_KV
-        assert payload["key"] == 99999
+        assert payload["key"] == "99999"
         assert payload["region_id"] == 1
         assert payload["kv_offset"] == 4096
         assert payload["kv_length"] == 1024
@@ -152,7 +152,7 @@ class TestEncodeResponse:
         serializer = Serializer()
 
         # First encode a request
-        request_data = {"key": 123}
+        request_data = {"key": "123"}
         request_encoded = serializer.encode(MessageType.REGISTER_KV, request_data)
         request_header, _ = serializer.decode(request_encoded)
 
@@ -236,14 +236,14 @@ class TestDecodeTyped:
     def test_decode_request_register_kv(self):
         serializer = Serializer()
         request = RegisterKVRequest(
-            key=12345, region_id=1, kv_offset=4096, kv_length=1024
+            key="12345", region_id=1, kv_offset=4096, kv_length=1024
         )
         encoded = serializer.encode(MessageType.REGISTER_KV, request)
 
         header, decoded_request = serializer.decode_request(encoded)
 
         assert isinstance(decoded_request, RegisterKVRequest)
-        assert decoded_request.key == 12345
+        assert decoded_request.key == "12345"
         assert decoded_request.region_id == 1
         assert decoded_request.kv_offset == 4096
         assert decoded_request.kv_length == 1024
@@ -281,13 +281,13 @@ class TestDecodeTyped:
 
     def test_decode_as_specific_type(self):
         serializer = Serializer()
-        data = {"key": 99999}
+        data = {"key": "99999"}
         encoded = serializer.encode(MessageType.LOOKUP_KV, data)
 
         header, decoded = serializer.decode_as(encoded, LookupKVRequest)
 
         assert isinstance(decoded, LookupKVRequest)
-        assert decoded.key == 99999
+        assert decoded.key == "99999"
 
     def test_decode_request_unknown_type(self):
         import msgpack

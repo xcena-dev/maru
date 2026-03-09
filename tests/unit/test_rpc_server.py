@@ -459,7 +459,7 @@ class TestRpcHandlerCoverage:
         region_id = handle.region_id
 
         # Register KV for testing
-        server.register_kv(key=100, region_id=region_id, kv_offset=0, kv_length=256)
+        server.register_kv(key="100", region_id=region_id, kv_offset=0, kv_length=256)
 
         # Test REQUEST_ALLOC
         req = MockRequest(instance_id="instance2", size=2048)
@@ -478,42 +478,42 @@ class TestRpcHandlerCoverage:
         assert resp["success"] is True
 
         # Test REGISTER_KV
-        req = MockRequest(key=200, region_id=region_id, kv_offset=256, kv_length=512)
+        req = MockRequest(key="200", region_id=region_id, kv_offset=256, kv_length=512)
         resp = rpc._handle_message(MessageType.REGISTER_KV.value, req)
         assert resp["success"] is True
 
         # Test LOOKUP_KV
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = rpc._handle_message(MessageType.LOOKUP_KV.value, req)
         assert resp["found"] is True
 
         # Test EXISTS_KV
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = rpc._handle_message(MessageType.EXISTS_KV.value, req)
         assert resp["exists"] is True
 
         # Test DELETE_KV
-        req = MockRequest(key=100)
+        req = MockRequest(key="100")
         resp = rpc._handle_message(MessageType.DELETE_KV.value, req)
         assert resp["success"] is True
 
         # Test BATCH_REGISTER_KV
         entries = [
-            MockRequest(key=300, region_id=region_id, kv_offset=0, kv_length=128),
-            MockRequest(key=400, region_id=region_id, kv_offset=128, kv_length=256),
+            MockRequest(key="300", region_id=region_id, kv_offset=0, kv_length=128),
+            MockRequest(key="400", region_id=region_id, kv_offset=128, kv_length=256),
         ]
         req = MockRequest(entries=entries)
         resp = rpc._handle_message(MessageType.BATCH_REGISTER_KV.value, req)
         assert resp["success"] is True
 
         # Test BATCH_LOOKUP_KV
-        req = MockRequest(keys=[300, 400, 500])
+        req = MockRequest(keys=["300", "400", "500"])
         resp = rpc._handle_message(MessageType.BATCH_LOOKUP_KV.value, req)
         assert "entries" in resp
         assert len(resp["entries"]) == 3
 
         # Test BATCH_EXISTS_KV
-        req = MockRequest(keys=[300, 400, 500])
+        req = MockRequest(keys=["300", "400", "500"])
         resp = rpc._handle_message(MessageType.BATCH_EXISTS_KV.value, req)
         assert "results" in resp
         assert len(resp["results"]) == 3
@@ -602,7 +602,7 @@ class TestRpcServerAdditionalCoverage:
         server = MaruServer()
         rpc = RpcServer(server, host="127.0.0.1", port=5555)
 
-        req = MockRequest(key=99999)  # Non-existent key
+        req = MockRequest(key="99999")  # Non-existent key
         response = rpc._handle_lookup_kv(req)
         assert response == {"found": False}
 
@@ -718,6 +718,6 @@ class TestRpcAsyncServerAdditionalCoverage:
         server = MaruServer()
         srv = RpcAsyncServer(server, host="127.0.0.1", port=5556, num_workers=1)
 
-        req = MockRequest(key=99999)  # Non-existent key
+        req = MockRequest(key="99999")  # Non-existent key
         response = srv._handle_lookup_kv(req)
         assert response == {"found": False}

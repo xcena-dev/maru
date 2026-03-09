@@ -259,7 +259,7 @@ class TestConcurrentStore:
 
         def store_one(idx):
             return handler.store(
-                key=42, info=MemoryInfo(view=memoryview(f"v{idx}".encode()))
+                key="42", info=MemoryInfo(view=memoryview(f"v{idx}".encode()))
             )
 
         results = _run_threads(store_one, [() for _ in range(num_threads)])
@@ -268,7 +268,7 @@ class TestConcurrentStore:
         assert all(r is True for r in results)
 
         # Exactly one location tracked for key 42
-        assert 42 in handler._key_to_location
+        assert "42" in handler._key_to_location
 
         handler.close()
 
@@ -281,12 +281,12 @@ class TestConcurrentRetrieve:
         handler = _make_mock_handler()
 
         # Store some data first
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"test")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"test")))
 
         num_threads = 8
 
         def retrieve_one(idx):
-            return handler.retrieve(key=1)
+            return handler.retrieve(key="1")
 
         results = _run_threads(retrieve_one, [() for _ in range(num_threads)])
 
@@ -306,7 +306,7 @@ class TestConcurrentExists:
         num_threads = 8
 
         def exists_one(idx):
-            return handler.exists(key=1)
+            return handler.exists(key="1")
 
         results = _run_threads(exists_one, [() for _ in range(num_threads)])
 
@@ -324,7 +324,7 @@ class TestStoreAndRetrieveConcurrent:
         handler = _make_mock_handler()
 
         # Store initial data
-        handler.store(key=1, info=MemoryInfo(view=memoryview(b"init")))
+        handler.store(key="1", info=MemoryInfo(view=memoryview(b"init")))
 
         store_started = threading.Event()
         store_proceed = threading.Event()
@@ -342,12 +342,12 @@ class TestStoreAndRetrieveConcurrent:
         retrieve_result = [None]
 
         def do_store():
-            handler.store(key=2, info=MemoryInfo(view=memoryview(b"slow")))
+            handler.store(key="2", info=MemoryInfo(view=memoryview(b"slow")))
 
         def do_retrieve():
             store_started.wait(timeout=5)
             # retrieve should NOT be blocked by _write_lock
-            result = handler.retrieve(key=1)
+            result = handler.retrieve(key="1")
             retrieve_result[0] = result
             retrieve_done.set()
 
@@ -398,7 +398,7 @@ class TestCloseThreadSafety:
             # _closing should be True now, but close hasn't finished
             time.sleep(0.01)  # small delay to ensure _closing is set
             try:
-                handler.store(key=99, info=MemoryInfo(view=memoryview(b"rejected")))
+                handler.store(key="99", info=MemoryInfo(view=memoryview(b"rejected")))
             except RuntimeError as e:
                 store_error[0] = e
 
@@ -439,7 +439,7 @@ class TestCloseThreadSafety:
         close_done = threading.Event()
 
         def do_store():
-            handler.store(key=1, info=MemoryInfo(view=memoryview(b"data")))
+            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
 
         def do_close():
             store_started.wait(timeout=5)

@@ -168,14 +168,14 @@ class TestAsyncKVOperations:
         assert alloc_resp.success is True
 
         is_new = async_client.register_kv(
-            key=12345,
+            key="12345",
             region_id=alloc_resp.handle.region_id,
             kv_offset=0,
             kv_length=1024,
         )
         assert is_new is True
 
-        lookup_resp = async_client.lookup_kv(key=12345)
+        lookup_resp = async_client.lookup_kv(key="12345")
         assert lookup_resp.found is True
         assert lookup_resp.handle is not None
         assert lookup_resp.kv_length == 1024
@@ -183,18 +183,18 @@ class TestAsyncKVOperations:
 
     def test_exists_kv(self, async_client):
         """Test KV existence check."""
-        assert async_client.exists_kv(key=99999) is False
+        assert async_client.exists_kv(key="99999") is False
 
         alloc_resp = async_client.request_alloc(
             instance_id="test-exists-instance", size=1024 * 1024
         )
         async_client.register_kv(
-            key=11111,
+            key="11111",
             region_id=alloc_resp.handle.region_id,
             kv_offset=0,
             kv_length=100,
         )
-        assert async_client.exists_kv(key=11111) is True
+        assert async_client.exists_kv(key="11111") is True
 
     def test_delete_kv(self, async_client):
         """Test KV deletion."""
@@ -202,20 +202,20 @@ class TestAsyncKVOperations:
             instance_id="test-delete-instance", size=1024 * 1024
         )
         async_client.register_kv(
-            key=22222,
+            key="22222",
             region_id=alloc_resp.handle.region_id,
             kv_offset=0,
             kv_length=100,
         )
-        assert async_client.exists_kv(key=22222) is True
+        assert async_client.exists_kv(key="22222") is True
 
-        success = async_client.delete_kv(key=22222)
+        success = async_client.delete_kv(key="22222")
         assert success is True
-        assert async_client.exists_kv(key=22222) is False
+        assert async_client.exists_kv(key="22222") is False
 
     def test_lookup_nonexistent(self, async_client):
         """Test lookup of non-existent key."""
-        result = async_client.lookup_kv(key=999999)
+        result = async_client.lookup_kv(key="999999")
         assert result.found is False
 
     def test_register_duplicate(self, async_client):
@@ -226,12 +226,12 @@ class TestAsyncKVOperations:
         region_id = alloc_resp.handle.region_id
 
         is_new1 = async_client.register_kv(
-            key=33333, region_id=region_id, kv_offset=0, kv_length=256
+            key="33333", region_id=region_id, kv_offset=0, kv_length=256
         )
         assert is_new1 is True
 
         is_new2 = async_client.register_kv(
-            key=33333, region_id=region_id, kv_offset=256, kv_length=128
+            key="33333", region_id=region_id, kv_offset=256, kv_length=128
         )
         assert is_new2 is False
 
@@ -251,7 +251,7 @@ class TestAsyncBatchOperations:
         )
         assert alloc_resp.success is True
 
-        entries = [(i, alloc_resp.handle.region_id, i * 100, 100) for i in range(10)]
+        entries = [(str(i), alloc_resp.handle.region_id, i * 100, 100) for i in range(10)]
         response = async_client.batch_register_kv(entries)
 
         assert response.success is True
@@ -267,14 +267,14 @@ class TestAsyncBatchOperations:
         # Register some keys
         for i in [100, 300, 500]:
             async_client.register_kv(
-                key=i,
+                key=str(i),
                 region_id=alloc_resp.handle.region_id,
                 kv_offset=i * 10,
                 kv_length=100,
             )
 
         # Batch lookup (mix of found and not found)
-        response = async_client.batch_lookup_kv([100, 200, 300, 400, 500])
+        response = async_client.batch_lookup_kv(["100", "200", "300", "400", "500"])
 
         assert len(response.entries) == 5
         assert response.entries[0].found is True  # key 100
@@ -291,13 +291,13 @@ class TestAsyncBatchOperations:
 
         for i in [100, 300, 500]:
             async_client.register_kv(
-                key=i,
+                key=str(i),
                 region_id=alloc_resp.handle.region_id,
                 kv_offset=i * 10,
                 kv_length=100,
             )
 
-        response = async_client.batch_exists_kv([100, 200, 300, 400, 500])
+        response = async_client.batch_exists_kv(["100", "200", "300", "400", "500"])
         assert response.results == [True, False, True, False, True]
 
 
@@ -326,7 +326,7 @@ class TestAsyncStats:
 
         for i in range(5):
             async_client.register_kv(
-                key=60000 + i,
+                key=str(60000 + i),
                 region_id=alloc_resp.handle.region_id,
                 kv_offset=i * 100,
                 kv_length=100,
@@ -356,7 +356,7 @@ class TestAsyncMultipleClients:
                 if not resp.success:
                     return False
 
-                key = 80000 + client_id
+                key = str(80000 + client_id)
                 client.register_kv(key, resp.handle.region_id, 0, 100)
                 return client.exists_kv(key)
 
@@ -368,7 +368,7 @@ class TestAsyncMultipleClients:
 
     def test_clients_share_kv_visibility(self, async_server_port, async_server):
         """Test that KV entries are visible across async clients."""
-        key = 90001
+        key = "90001"
 
         # Client 1: Register KV
         with RpcAsyncClient(f"tcp://127.0.0.1:{async_server_port}") as client1:
@@ -398,16 +398,16 @@ class TestAsyncMultipleClients:
 
                 # Register
                 for i in range(ops_per_client):
-                    client.register_kv(base_key + i, region_id, i * 64, 64)
+                    client.register_kv(str(base_key + i), region_id, i * 64, 64)
 
                 # Verify all exist
                 for i in range(ops_per_client):
-                    if not client.exists_kv(base_key + i):
+                    if not client.exists_kv(str(base_key + i)):
                         return False
 
                 # Lookup all
                 for i in range(ops_per_client):
-                    result = client.lookup_kv(base_key + i)
+                    result = client.lookup_kv(str(base_key + i))
                     if not result.found:
                         return False
 
@@ -439,23 +439,23 @@ class TestAsyncCrossCompat:
         # 2. Register KVs
         for i in range(10):
             is_new = async_client.register_kv(
-                key=50000 + i, region_id=region_id, kv_offset=i * 100, kv_length=100
+                key=str(50000 + i), region_id=region_id, kv_offset=i * 100, kv_length=100
             )
             assert is_new is True
 
         # 3. Batch register
-        batch_entries = [(50100 + i, region_id, 1000 + i * 100, 100) for i in range(10)]
+        batch_entries = [(str(50100 + i), region_id, 1000 + i * 100, 100) for i in range(10)]
         batch_resp = async_client.batch_register_kv(batch_entries)
         assert batch_resp.success is True
 
         # 4. Lookup individual
         for i in range(10):
-            result = async_client.lookup_kv(50000 + i)
+            result = async_client.lookup_kv(str(50000 + i))
             assert result.found is True
             assert result.kv_length == 100
 
         # 5. Batch lookup
-        batch_lookup = async_client.batch_lookup_kv([50000, 50001, 59999, 50100, 50101])
+        batch_lookup = async_client.batch_lookup_kv(["50000", "50001", "59999", "50100", "50101"])
         assert batch_lookup.entries[0].found is True
         assert batch_lookup.entries[1].found is True
         assert batch_lookup.entries[2].found is False  # not registered
@@ -463,12 +463,12 @@ class TestAsyncCrossCompat:
         assert batch_lookup.entries[4].found is True
 
         # 6. Batch exists
-        batch_exists = async_client.batch_exists_kv([50000, 59999, 50100])
+        batch_exists = async_client.batch_exists_kv(["50000", "59999", "50100"])
         assert batch_exists.results == [True, False, True]
 
         # 7. Delete
-        assert async_client.delete_kv(50000) is True
-        assert async_client.exists_kv(50000) is False
+        assert async_client.delete_kv("50000") is True
+        assert async_client.exists_kv("50000") is False
 
         # 8. Stats
         stats = async_client.get_stats()
@@ -496,7 +496,7 @@ class TestAsyncNonBlockingAPI:
         region_id = alloc_resp.handle.region_id
 
         future = async_client.register_kv_async(
-            key=200000, region_id=region_id, kv_offset=0, kv_length=100
+            key="200000", region_id=region_id, kv_offset=0, kv_length=100
         )
         assert isinstance(future, Future)
         result = future.result(timeout=5.0)
@@ -507,10 +507,10 @@ class TestAsyncNonBlockingAPI:
         alloc_resp = async_client.request_alloc("test-nb-lookup", 1024 * 1024)
         region_id = alloc_resp.handle.region_id
         async_client.register_kv(
-            key=200001, region_id=region_id, kv_offset=0, kv_length=256
+            key="200001", region_id=region_id, kv_offset=0, kv_length=256
         )
 
-        future = async_client.lookup_kv_async(key=200001)
+        future = async_client.lookup_kv_async(key="200001")
         assert isinstance(future, Future)
         result = future.result(timeout=5.0)
         assert result.found is True
@@ -518,7 +518,7 @@ class TestAsyncNonBlockingAPI:
 
     def test_exists_kv_async(self, async_client):
         """Test non-blocking exists_kv_async."""
-        future = async_client.exists_kv_async(key=999888)
+        future = async_client.exists_kv_async(key="999888")
         assert isinstance(future, Future)
         assert future.result(timeout=5.0) is False
 
@@ -527,13 +527,13 @@ class TestAsyncNonBlockingAPI:
         alloc_resp = async_client.request_alloc("test-nb-delete", 1024 * 1024)
         region_id = alloc_resp.handle.region_id
         async_client.register_kv(
-            key=200002, region_id=region_id, kv_offset=0, kv_length=100
+            key="200002", region_id=region_id, kv_offset=0, kv_length=100
         )
 
-        future = async_client.delete_kv_async(key=200002)
+        future = async_client.delete_kv_async(key="200002")
         result = future.result(timeout=5.0)
         assert result is True
-        assert async_client.exists_kv(200002) is False
+        assert async_client.exists_kv("200002") is False
 
     def test_heartbeat_async(self, async_client):
         """Test non-blocking heartbeat_async."""
@@ -554,7 +554,7 @@ class TestAsyncNonBlockingAPI:
         alloc_resp = async_client.request_alloc("test-nb-batch-reg", 1024 * 1024)
         region_id = alloc_resp.handle.region_id
 
-        entries = [(200100 + i, region_id, i * 100, 100) for i in range(5)]
+        entries = [(str(200100 + i), region_id, i * 100, 100) for i in range(5)]
         future = async_client.batch_register_kv_async(entries)
         result = future.result(timeout=5.0)
         assert result.success is True
@@ -567,10 +567,10 @@ class TestAsyncNonBlockingAPI:
 
         for i in [200200, 200202]:
             async_client.register_kv(
-                key=i, region_id=region_id, kv_offset=i, kv_length=64
+                key=str(i), region_id=region_id, kv_offset=i, kv_length=64
             )
 
-        future = async_client.batch_lookup_kv_async([200200, 200201, 200202])
+        future = async_client.batch_lookup_kv_async(["200200", "200201", "200202"])
         result = future.result(timeout=5.0)
         assert len(result.entries) == 3
         assert result.entries[0].found is True
@@ -583,10 +583,10 @@ class TestAsyncNonBlockingAPI:
         region_id = alloc_resp.handle.region_id
 
         async_client.register_kv(
-            key=200300, region_id=region_id, kv_offset=0, kv_length=64
+            key="200300", region_id=region_id, kv_offset=0, kv_length=64
         )
 
-        future = async_client.batch_exists_kv_async([200300, 200301])
+        future = async_client.batch_exists_kv_async(["200300", "200301"])
         result = future.result(timeout=5.0)
         assert result.results == [True, False]
 
@@ -622,7 +622,7 @@ class TestAsyncPipeline:
         futures = []
         for i in range(n):
             f = async_client.register_kv_async(
-                key=300000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                key=str(300000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
             )
             futures.append(f)
 
@@ -632,7 +632,7 @@ class TestAsyncPipeline:
 
         # Verify all keys exist
         for i in range(n):
-            assert async_client.exists_kv(300000 + i) is True
+            assert async_client.exists_kv(str(300000 + i)) is True
 
     def test_pipeline_lookup_prefetch(self, async_client):
         """Prefetch pattern: send multiple lookups concurrently."""
@@ -640,7 +640,7 @@ class TestAsyncPipeline:
         region_id = alloc_resp.handle.region_id
 
         # Register keys first
-        keys = list(range(300100, 300110))
+        keys = [str(i) for i in range(300100, 300110)]
         for k in keys:
             async_client.register_kv(
                 key=k, region_id=region_id, kv_offset=k * 10, kv_length=100
@@ -662,15 +662,15 @@ class TestAsyncPipeline:
 
         # Register a key first (blocking)
         async_client.register_kv(
-            key=300200, region_id=region_id, kv_offset=0, kv_length=100
+            key="300200", region_id=region_id, kv_offset=0, kv_length=100
         )
 
         # Fire mixed ops concurrently
         f_reg = async_client.register_kv_async(
-            key=300201, region_id=region_id, kv_offset=100, kv_length=64
+            key="300201", region_id=region_id, kv_offset=100, kv_length=64
         )
-        f_lookup = async_client.lookup_kv_async(key=300200)
-        f_exists = async_client.exists_kv_async(key=300200)
+        f_lookup = async_client.lookup_kv_async(key="300200")
+        f_exists = async_client.exists_kv_async(key="300200")
         f_hb = async_client.heartbeat_async()
 
         # Collect all
@@ -690,20 +690,20 @@ class TestAsyncPipeline:
         t0 = time.monotonic()
         for i in range(n):
             async_client.register_kv(
-                key=400000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                key=str(400000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
             )
         seq_time = time.monotonic() - t0
 
         # Clean up for pipeline test
         for i in range(n):
-            async_client.delete_kv(400000 + i)
+            async_client.delete_kv(str(400000 + i))
 
         # Pipeline timing
         t0 = time.monotonic()
         futures = []
         for i in range(n):
             f = async_client.register_kv_async(
-                key=400000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                key=str(400000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
             )
             futures.append(f)
         # Wait for all
@@ -747,7 +747,7 @@ class TestAsyncSemaphoreBackpressure:
             futures = []
             for i in range(10):
                 f = client.register_kv_async(
-                    key=500000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                    key=str(500000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
                 )
                 futures.append(f)
 
@@ -770,7 +770,7 @@ class TestAsyncSemaphoreBackpressure:
             futures = []
             for i in range(100):
                 f = client.register_kv_async(
-                    key=510000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                    key=str(510000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
                 )
                 futures.append(f)
 
@@ -797,9 +797,9 @@ class TestAsyncFuturePatterns:
         futures = {}
         for i in range(n):
             f = async_client.register_kv_async(
-                key=600000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                key=str(600000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
             )
-            futures[f] = 600000 + i
+            futures[f] = str(600000 + i)
 
         completed_keys = []
         for f in as_completed(futures, timeout=10.0):
@@ -817,7 +817,7 @@ class TestAsyncFuturePatterns:
         futures = []
         for i in range(10):
             f = async_client.register_kv_async(
-                key=610000 + i, region_id=region_id, kv_offset=i * 64, kv_length=64
+                key=str(610000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
             )
             futures.append(f)
 
@@ -838,7 +838,7 @@ class TestAsyncFailureScenarios:
 
     def test_delete_nonexistent_kv(self, async_client):
         """Delete a key that was never registered should return False."""
-        success = async_client.delete_kv(key=800001)
+        success = async_client.delete_kv(key="800001")
         assert success is False
 
     def test_double_delete_kv(self, async_client):
@@ -847,18 +847,18 @@ class TestAsyncFailureScenarios:
         assert alloc_resp.success is True
 
         async_client.register_kv(
-            key=700001,
+            key="700001",
             region_id=alloc_resp.handle.region_id,
             kv_offset=0,
             kv_length=100,
         )
 
         # First delete should succeed
-        success1 = async_client.delete_kv(key=700001)
+        success1 = async_client.delete_kv(key="700001")
         assert success1 is True
 
         # Second delete should fail
-        success2 = async_client.delete_kv(key=700001)
+        success2 = async_client.delete_kv(key="700001")
         assert success2 is False
 
     def test_return_alloc_wrong_instance(self, async_client):
@@ -887,18 +887,18 @@ class TestAsyncFailureScenarios:
 
     def test_exists_nonexistent_kv(self, async_client):
         """Explicitly test exists_kv for a key that was never registered."""
-        exists = async_client.exists_kv(key=800002)
+        exists = async_client.exists_kv(key="800002")
         assert exists is False
 
     def test_batch_lookup_all_nonexistent(self, async_client):
         """Batch lookup with all non-existent keys should return all found=False."""
-        response = async_client.batch_lookup_kv([999001, 999002, 999003])
+        response = async_client.batch_lookup_kv(["999001", "999002", "999003"])
         assert len(response.entries) == 3
         assert all(entry.found is False for entry in response.entries)
 
     def test_batch_exists_all_nonexistent(self, async_client):
         """Batch exists with all non-existent keys should return all False."""
-        response = async_client.batch_exists_kv([999001, 999002, 999003])
+        response = async_client.batch_exists_kv(["999001", "999002", "999003"])
         assert response.results == [False, False, False]
 
 
@@ -947,13 +947,13 @@ class TestAsyncNonBlockingFailures:
 
     def test_delete_kv_async_nonexistent(self, async_client):
         """delete_kv_async for non-existent key should resolve to False."""
-        future = async_client.delete_kv_async(key=800003)
+        future = async_client.delete_kv_async(key="800003")
         result = future.result(timeout=5.0)
         assert result is False
 
     def test_lookup_kv_async_nonexistent(self, async_client):
         """lookup_kv_async for non-existent key should resolve with found=False."""
-        future = async_client.lookup_kv_async(key=800004)
+        future = async_client.lookup_kv_async(key="800004")
         result = future.result(timeout=5.0)
         assert result.found is False
 

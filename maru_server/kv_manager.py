@@ -29,17 +29,17 @@ class KVManager:
     """
 
     def __init__(self):
-        self._store: dict[int, KVEntry] = {}
+        self._store: dict[str, KVEntry] = {}
         self._lock = RLock()
 
     def register(
-        self, key: int, region_id: int, kv_offset: int, kv_length: int
+        self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> tuple[bool, int | None]:
         """
         Register a KV entry.
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
             region_id: Region ID of the allocation
             kv_offset: Offset within the allocation
             kv_length: Size of the KV data
@@ -57,15 +57,15 @@ class KVManager:
                 kv_offset=kv_offset,
                 kv_length=kv_length,
             )
-            logger.debug("Registered KV: key=%d, region_id=%d", key, region_id)
+            logger.debug("Registered KV: key=%s, region_id=%d", key, region_id)
             return (True, region_id)  # New entry, need to increment alloc ref
 
-    def lookup(self, key: int) -> KVEntry | None:
+    def lookup(self, key: str) -> KVEntry | None:
         """
         Lookup a KV entry by its key.
 
         Args:
-            key: The chunk hash
+            key: The chunk key string
 
         Returns:
             KVEntry if found, None otherwise
@@ -73,12 +73,12 @@ class KVManager:
         with self._lock:
             return self._store.get(key)
 
-    def exists(self, key: int) -> bool:
+    def exists(self, key: str) -> bool:
         """Check if a KV entry exists."""
         with self._lock:
             return key in self._store
 
-    def delete(self, key: int) -> tuple[bool, int | None]:
+    def delete(self, key: str) -> tuple[bool, int | None]:
         """
         Delete a KV entry.
 
@@ -92,7 +92,7 @@ class KVManager:
                 return (False, None)
 
             region_id = self._store.pop(key).region_id
-            logger.debug("Deleted KV: key=%d, region_id=%d", key, region_id)
+            logger.debug("Deleted KV: key=%s, region_id=%d", key, region_id)
             return (True, region_id)
 
     def get_stats(self) -> dict:
@@ -107,7 +107,7 @@ class KVManager:
     # Batch Operations
     # =========================================================================
 
-    def batch_register(self, entries: list[tuple[int, int, int, int]]) -> list[bool]:
+    def batch_register(self, entries: list[tuple[str, int, int, int]]) -> list[bool]:
         """
         Register multiple KV entries in a single operation.
 
@@ -132,12 +132,12 @@ class KVManager:
                     results.append(True)
         return results
 
-    def batch_lookup(self, keys: list[int]) -> list[KVEntry | None]:
+    def batch_lookup(self, keys: list[str]) -> list[KVEntry | None]:
         """
         Lookup multiple KV entries in a single operation.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of KVEntry or None for each key
@@ -145,12 +145,12 @@ class KVManager:
         with self._lock:
             return [self._store.get(key) for key in keys]
 
-    def batch_exists(self, keys: list[int]) -> list[bool]:
+    def batch_exists(self, keys: list[str]) -> list[bool]:
         """
         Check existence of multiple KV entries in a single operation.
 
         Args:
-            keys: List of chunk hashes
+            keys: List of chunk key strings
 
         Returns:
             List of booleans indicating if each key exists
