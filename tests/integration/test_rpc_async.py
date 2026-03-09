@@ -251,7 +251,9 @@ class TestAsyncBatchOperations:
         )
         assert alloc_resp.success is True
 
-        entries = [(str(i), alloc_resp.handle.region_id, i * 100, 100) for i in range(10)]
+        entries = [
+            (str(i), alloc_resp.handle.region_id, i * 100, 100) for i in range(10)
+        ]
         response = async_client.batch_register_kv(entries)
 
         assert response.success is True
@@ -439,12 +441,17 @@ class TestAsyncCrossCompat:
         # 2. Register KVs
         for i in range(10):
             is_new = async_client.register_kv(
-                key=str(50000 + i), region_id=region_id, kv_offset=i * 100, kv_length=100
+                key=str(50000 + i),
+                region_id=region_id,
+                kv_offset=i * 100,
+                kv_length=100,
             )
             assert is_new is True
 
         # 3. Batch register
-        batch_entries = [(str(50100 + i), region_id, 1000 + i * 100, 100) for i in range(10)]
+        batch_entries = [
+            (str(50100 + i), region_id, 1000 + i * 100, 100) for i in range(10)
+        ]
         batch_resp = async_client.batch_register_kv(batch_entries)
         assert batch_resp.success is True
 
@@ -455,7 +462,9 @@ class TestAsyncCrossCompat:
             assert result.kv_length == 100
 
         # 5. Batch lookup
-        batch_lookup = async_client.batch_lookup_kv(["50000", "50001", "59999", "50100", "50101"])
+        batch_lookup = async_client.batch_lookup_kv(
+            ["50000", "50001", "59999", "50100", "50101"]
+        )
         assert batch_lookup.entries[0].found is True
         assert batch_lookup.entries[1].found is True
         assert batch_lookup.entries[2].found is False  # not registered
@@ -747,7 +756,10 @@ class TestAsyncSemaphoreBackpressure:
             futures = []
             for i in range(10):
                 f = client.register_kv_async(
-                    key=str(500000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
+                    key=str(500000 + i),
+                    region_id=region_id,
+                    kv_offset=i * 64,
+                    kv_length=64,
                 )
                 futures.append(f)
 
@@ -770,7 +782,10 @@ class TestAsyncSemaphoreBackpressure:
             futures = []
             for i in range(100):
                 f = client.register_kv_async(
-                    key=str(510000 + i), region_id=region_id, kv_offset=i * 64, kv_length=64
+                    key=str(510000 + i),
+                    region_id=region_id,
+                    kv_offset=i * 64,
+                    kv_length=64,
                 )
                 futures.append(f)
 

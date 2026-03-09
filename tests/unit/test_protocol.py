@@ -191,7 +191,9 @@ class TestKVMessages:
     """Test KV operation messages."""
 
     def test_register_kv_request(self):
-        req = RegisterKVRequest(key="12345", region_id=1, kv_offset=4096, kv_length=1024)
+        req = RegisterKVRequest(
+            key="12345", region_id=1, kv_offset=4096, kv_length=1024
+        )
         assert req.key == "12345"
         assert req.region_id == 1
         assert req.kv_offset == 4096

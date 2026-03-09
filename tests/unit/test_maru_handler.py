@@ -2012,7 +2012,9 @@ class TestStoreWithHandle:
         handle = handler.alloc(size=64)
 
         with pytest.raises(ValueError, match="Cannot specify both"):
-            handler.store(key="42", handle=handle, info=MemoryInfo(view=memoryview(b"x")))
+            handler.store(
+                key="42", handle=handle, info=MemoryInfo(view=memoryview(b"x"))
+            )
         handler.close()
 
 

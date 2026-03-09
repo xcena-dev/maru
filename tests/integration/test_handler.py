@@ -117,7 +117,9 @@ class TestMaruHandler:
             page_count = handler.allocator.page_count
             for i in range(page_count):
                 assert (
-                    handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100)))
+                    handler.store(
+                        key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100))
+                    )
                     is True
                 )
 
@@ -203,7 +205,9 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             data = b"x" * 1025  # exceeds 1024
-            assert handler.store(key="1", info=MemoryInfo(view=memoryview(data))) is False
+            assert (
+                handler.store(key="1", info=MemoryInfo(view=memoryview(data))) is False
+            )
 
 
 class TestMaruHandlerMultiRegion:
@@ -594,7 +598,9 @@ class TestMaruHandlerWithAsyncServer:
             page_count = handler.allocator.page_count
             for i in range(page_count):
                 assert (
-                    handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100)))
+                    handler.store(
+                        key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100))
+                    )
                     is True
                 )
 

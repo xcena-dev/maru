@@ -180,9 +180,13 @@ class TestClientDisconnected:
 
         # 2. Register KV from both on their regions
         server.register_kv(key="100", region_id=region_id1, kv_offset=0, kv_length=256)
-        server.register_kv(key="200", region_id=region_id1, kv_offset=256, kv_length=512)
+        server.register_kv(
+            key="200", region_id=region_id1, kv_offset=256, kv_length=512
+        )
         server.register_kv(key="300", region_id=region_id2, kv_offset=0, kv_length=256)
-        server.register_kv(key="400", region_id=region_id2, kv_offset=256, kv_length=512)
+        server.register_kv(
+            key="400", region_id=region_id2, kv_offset=256, kv_length=512
+        )
 
         stats_before = server.get_stats()
         assert stats_before["allocation_manager"]["num_allocations"] == 2
@@ -335,7 +339,9 @@ class TestMaruServerEdgeCases:
         region_id2 = handle2.region_id
 
         server.register_kv(key="100", region_id=region_id1, kv_offset=0, kv_length=256)
-        server.register_kv(key="200", region_id=region_id2, kv_offset=256, kv_length=512)
+        server.register_kv(
+            key="200", region_id=region_id2, kv_offset=256, kv_length=512
+        )
 
         # Manually delete one allocation (simulating orphaned KV entry)
         with server._allocation_manager._lock:
