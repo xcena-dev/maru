@@ -34,7 +34,7 @@ from marufs import MarufsClient
 from marufs.ioctl import MARUFS_NAME_MAX
 
 from .handler import MaruHandler
-from .memory import MemoryInfo, OwnedRegionManagerFs, PagedMemoryAllocator
+from .memory import AllocHandle, MemoryInfo, OwnedRegionManagerFs, PagedMemoryAllocator
 from .memory.marufs_mapper import MarufsMapper
 
 logger = logging.getLogger(__name__)
@@ -49,12 +49,20 @@ def _key_to_name(key: str) -> str:
     encoded = key.encode("utf-8")
     if len(encoded) <= MARUFS_NAME_MAX:
         return key
-    # Hash the full key and append truncated hash to avoid collisions
+    # Hash the full key and append truncated hash to avoid collisions.
+    # 64-bit hash → collision probability ~1% at ~600M keys (birthday paradox).
     digest = hashlib.sha256(encoded).hexdigest()[:16]
     # Reserve space: 63 - 1 (separator '#') - 16 (hash) = 30 bytes for prefix
     prefix_max = MARUFS_NAME_MAX - 1 - 16
     prefix = encoded[:prefix_max].decode("utf-8", errors="ignore")
-    return f"{prefix}#{digest}"
+    truncated = f"{prefix}#{digest}"
+    logger.warning(
+        "_key_to_name: key exceeds MARUFS_NAME_MAX (%d bytes > %d), truncated to '%s'",
+        len(encoded),
+        MARUFS_NAME_MAX,
+        truncated,
+    )
+    return truncated
 
 
 def _parse_chunk_hash(key: str) -> int:
@@ -86,7 +94,7 @@ def _region_name_for_instance(instance_id: str, index: int) -> str:
     return f"maru_{short}_{index:04d}"
 
 
-def _gil_free_memcpy(
+def _gil_free_memcpy_at(
     dst: memoryview, dst_offset: int, src: bytes | memoryview, length: int
 ) -> None:
     """Copy bytes without holding the GIL (via ctypes.memmove)."""
@@ -281,20 +289,41 @@ class MaruHandlerFs(MaruHandler):
     # KV Operations
     # =========================================================================
 
-    def store(self, key: str, info: MemoryInfo, prefix: bytes | None = None) -> bool:
+    def store(
+        self,
+        key: str,
+        info: MemoryInfo | memoryview | None = None,
+        prefix: bytes | None = None,
+        *,
+        data: memoryview | None = None,
+        handle: AllocHandle | None = None,
+    ) -> bool:
         """Store data in the marufs KV cache.
 
         Allocates a page in an owned region, writes data via mmap, and
         registers a name-ref in the marufs global index.
 
+        Note: The zero-copy ``handle`` path (alloc + store) is not supported
+        in marufs mode. If ``handle`` is provided, a NotImplementedError is raised.
+        Use ``info`` or ``data`` instead.
+
         Args:
             key: CacheEngineKey string (e.g. "model@ws@wid@hash@dtype").
-            info: MemoryInfo with source memoryview.
+            info: MemoryInfo or memoryview with source data.
             prefix: Optional bytes to prepend before the data.
+            data: Alternative to info — raw memoryview of data.
+            handle: Not supported in marufs mode.
 
         Returns:
             True if successful.
         """
+        if handle is not None:
+            raise NotImplementedError(
+                "Zero-copy alloc/store(handle=) is not supported in marufs mode. "
+                "Use info= or data= instead."
+            )
+        if info is None and data is not None:
+            info = MemoryInfo(view=data)
         self._ensure_connected()
 
         with self._write_lock:
@@ -360,9 +389,9 @@ class MaruHandlerFs(MaruHandler):
 
             write_offset = 0
             if prefix:
-                _gil_free_memcpy(buf, write_offset, prefix, prefix_len)
+                _gil_free_memcpy_at(buf, write_offset, prefix, prefix_len)
                 write_offset += prefix_len
-            _gil_free_memcpy(buf, write_offset, src, data_size)
+            _gil_free_memcpy_at(buf, write_offset, src, data_size)
 
             # Register name-ref in marufs global index
             key_name = self._get_name(key)
@@ -557,7 +586,11 @@ class MaruHandlerFs(MaruHandler):
         if prefixes is not None and len(prefixes) != len(keys):
             raise ValueError("prefixes must have the same length as keys")
 
-        # Phase 1: Separate local-hit vs miss, batch ioctl for misses
+        # Phase 1: Separate local-hit vs miss, batch ioctl for misses.
+        # Note: global index check runs outside _write_lock (benign TOCTOU race).
+        # If another instance deletes a key between Phase 1 and Phase 2, we skip
+        # re-storing it. The caller sees success and the key will be re-stored on
+        # the next retrieval miss.
         local_hits: set[int] = set()
         miss_indices: list[int] = []
         miss_key_names: list[str] = []
@@ -662,9 +695,9 @@ class MaruHandlerFs(MaruHandler):
 
                 write_offset = 0
                 if prefix:
-                    _gil_free_memcpy(buf, write_offset, prefix, prefix_len)
+                    _gil_free_memcpy_at(buf, write_offset, prefix, prefix_len)
                     write_offset += prefix_len
-                _gil_free_memcpy(buf, write_offset, src, data_size)
+                _gil_free_memcpy_at(buf, write_offset, src, data_size)
 
                 # Collect for batch registration (reuse Phase 1 encoding)
                 key_name = name_cache[i]
@@ -756,13 +789,18 @@ class MaruHandlerFs(MaruHandler):
                     continue
                 page_index = byte_offset // chunk_size
                 locations[idx] = (region_name, page_index)
-                # Cache the result (with hash for future reuse)
-                if not self._closing.is_set():
-                    self._key_to_location[keys[idx]] = (
-                        region_name,
-                        page_index,
-                        miss_hashes[j],
-                    )
+
+        # 2b. Cache discovered locations under lock to avoid race with close()
+        with self._write_lock:
+            if not self._closing.is_set():
+                for j, idx in enumerate(miss_indices):
+                    if locations[idx] is not None:
+                        rn, pi = locations[idx]
+                        self._key_to_location[keys[idx]] = (
+                            rn,
+                            pi,
+                            miss_hashes[j],
+                        )
 
         # 3. Pre-map all needed regions (deduplicated)
         regions_to_map: set[str] = set()
@@ -843,6 +881,7 @@ class MaruHandlerFs(MaruHandler):
                 self._marufs.get_dir_fd(), miss_key_names, miss_hashes
             )
 
+            cache_updates: list[tuple[int, str, int, int]] = []
             for j, idx in enumerate(miss_indices):
                 result = batch_results[j]
                 if result is None:
@@ -851,14 +890,14 @@ class MaruHandlerFs(MaruHandler):
                 if not region_name or "/" in region_name or "\x00" in region_name:
                     continue
                 page_index = byte_offset // chunk_size
-                # Cache the result (with hash for future reuse)
-                if not self._closing.is_set():
-                    self._key_to_location[keys[idx]] = (
-                        region_name,
-                        page_index,
-                        miss_hashes[j],
-                    )
+                cache_updates.append((idx, region_name, page_index, miss_hashes[j]))
                 results[idx] = True
+
+            # Cache discovered locations under lock to avoid race with close()
+            with self._write_lock:
+                if not self._closing.is_set():
+                    for idx, rn, pi, h in cache_updates:
+                        self._key_to_location[keys[idx]] = (rn, pi, h)
                 logger.debug(
                     "batch_exists: found key=%s in region=%s offset=%d (owned=%s)",
                     miss_key_names[j][:32],
@@ -933,9 +972,10 @@ class MaruHandlerFs(MaruHandler):
         chunk_size = owned.get_chunk_size()
         page_index = byte_offset // chunk_size
 
-        # Cache the result (dict assignment is GIL-atomic in CPython)
-        if not self._closing.is_set():
-            self._key_to_location[key] = (region_name, page_index, key_hash)
+        # Cache the result under lock to avoid race with close()
+        with self._write_lock:
+            if not self._closing.is_set():
+                self._key_to_location[key] = (region_name, page_index, key_hash)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "_lookup_global: key=%s → region=%s page=%d",
@@ -970,11 +1010,11 @@ class MaruHandlerFs(MaruHandler):
             return
 
         # Set _key_hash_start LAST — it is the "ready" flag checked in fast path.
-        # This prevents torn reads where another thread sees _key_hash_start >= 0
-        # but _key_suffix_len is still 0.
+        # CPython GIL serializes these assignments, so no torn reads occur.
+        # On non-CPython runtimes, a threading.Lock would be needed here.
         self._key_suffix_len = len(key) - hash_end
         self._key_is_ascii = key.isascii()
-        self._key_hash_start = idx  # must be last (publication fence)
+        self._key_hash_start = idx  # must be last (acts as ready flag)
 
     def _get_name(self, key: str) -> str:
         """Convert key to global index name (fast path when calibrated)."""

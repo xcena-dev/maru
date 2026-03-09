@@ -63,6 +63,10 @@ class OwnedRegionManagerFs:
     def add_region(self, name: str) -> OwnedRegionFs:
         """Create and map a new owned region via MarufsMapper.
 
+        Note: This method must be called under the caller's write lock
+        (e.g. MaruHandlerFs._write_lock) to prevent concurrent add_region
+        calls with the same name.
+
         Args:
             name: Region filename (unique)
 

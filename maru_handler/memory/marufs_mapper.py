@@ -185,6 +185,8 @@ class MarufsMapper:
             if name in self._regions:
                 return self._regions[name]
 
+            # O_RDWR + PROT_WRITE required for cudaHostRegister compatibility.
+            # Without PROT_WRITE, CUDA pinning fails on shared CXL memory.
             fd = self._marufs.open_region(name, readonly=False)
             size = os.fstat(fd).st_size
             mm = self._marufs.mmap_region(
