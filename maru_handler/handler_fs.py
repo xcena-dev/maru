@@ -790,17 +790,19 @@ class MaruHandlerFs(MaruHandler):
                 page_index = byte_offset // chunk_size
                 locations[idx] = (region_name, page_index)
 
-        # 2b. Cache discovered locations under lock to avoid race with close()
+        # 2b. Cache only owned-region keys — shared-region entries may be
+        # evicted by the remote owner without notification.
         with self._write_lock:
             if not self._closing.is_set():
                 for j, idx in enumerate(miss_indices):
                     if locations[idx] is not None:
                         rn, pi = locations[idx]
-                        self._key_to_location[keys[idx]] = (
-                            rn,
-                            pi,
-                            miss_hashes[j],
-                        )
+                        if owned.is_owned(rn):
+                            self._key_to_location[keys[idx]] = (
+                                rn,
+                                pi,
+                                miss_hashes[j],
+                            )
 
         # 3. Pre-map all needed regions (deduplicated)
         regions_to_map: set[str] = set()
@@ -893,18 +895,23 @@ class MaruHandlerFs(MaruHandler):
                 cache_updates.append((idx, region_name, page_index, miss_hashes[j]))
                 results[idx] = True
 
-            # Cache discovered locations under lock to avoid race with close()
+            # Cache only owned-region keys — shared-region entries may be
+            # evicted by the remote owner without notification.
             with self._write_lock:
                 if not self._closing.is_set():
                     for idx, rn, pi, h in cache_updates:
-                        self._key_to_location[keys[idx]] = (rn, pi, h)
-                logger.debug(
-                    "batch_exists: found key=%s in region=%s offset=%d (owned=%s)",
-                    miss_key_names[j][:32],
-                    region_name,
-                    byte_offset,
-                    owned.is_owned(region_name),
-                )
+                        if owned.is_owned(rn):
+                            self._key_to_location[keys[idx]] = (rn, pi, h)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                for idx, rn, pi, _h in cache_updates:
+                    logger.debug(
+                        "batch_exists: found key=%s in region=%s page=%d (owned=%s)",
+                        keys[idx],
+                        rn,
+                        pi,
+                        owned.is_owned(rn),
+                    )
 
         return results
 
@@ -972,10 +979,12 @@ class MaruHandlerFs(MaruHandler):
         chunk_size = owned.get_chunk_size()
         page_index = byte_offset // chunk_size
 
-        # Cache the result under lock to avoid race with close()
-        with self._write_lock:
-            if not self._closing.is_set():
-                self._key_to_location[key] = (region_name, page_index, key_hash)
+        # Cache only owned-region keys — shared-region entries may be evicted
+        # by the remote owner without notification, leading to stale cache.
+        if owned.is_owned(region_name):
+            with self._write_lock:
+                if not self._closing.is_set():
+                    self._key_to_location[key] = (region_name, page_index, key_hash)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "_lookup_global: key=%s → region=%s page=%d",
