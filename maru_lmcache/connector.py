@@ -48,7 +48,14 @@ def parse_size(size_str: str) -> int:
         return size_str
     match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", str(size_str).upper())
     if not match:
-        return int(size_str)
+        try:
+            return int(size_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid size string: {size_str!r}. "
+                "Expected a number or human-readable size "
+                "(e.g., '1G', '500M', '1024')."
+            ) from None
     value, unit = float(match.group(1)), match.group(2)
     multipliers = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
     return int(value * multipliers.get(unit, 1))
