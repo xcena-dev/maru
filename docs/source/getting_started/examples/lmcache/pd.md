@@ -9,7 +9,7 @@ Disaggregated prefill separates the compute-intensive **prefill** phase from the
 ## Prerequisites
 
 - At least **2 GPUs**
-- [LMCache](https://github.com/LMCache/LMCache) installed (`pip install lmcache`)
+- [LMCache](https://github.com/LMCache/LMCache) **>= v0.3.14** installed (`pip install lmcache`)
 - [vLLM](https://docs.vllm.ai/) installed
 - Maru installed (see {doc}`../../installation`)
 
@@ -60,15 +60,31 @@ Wait until you see:
 All servers are up. You can send request now...
 ```
 
-### 2. Send a request
+### 2. Try a simple query
 
-Open a new terminal and run the benchmark script:
+Open a new terminal and send a single prompt through the proxy:
 
 ```bash
 cd examples/lmcache/disagg_prefill/1p1d
-./run_request.sh
+
+# Send a prompt — the proxy routes it to prefiller (KV generation) then decoder (token generation)
+./run_simple_query.sh
 ```
 
-This sends benchmark requests to the proxy, which routes them to the prefiller and decoder for disaggregated inference.
+You'll see the prompt and the generated response printed directly. Check `decoder.log` for cache hit messages:
+
+```
+LMCache INFO: [req_id=cmpl-a5a94ea4577d4025-0] Retrieved 256 out of 256 required tokens (from 256 total tokens). size: 0.0029 gb, cost 3.0579 ms, throughput: 0.9581 GB/s; (cache_engine.py:874:lmcache.v1.cache_engine)
+```
+
+### 3. Run a benchmark
+
+Once you've confirmed the setup works, measure throughput with a larger workload:
+
+```bash
+./run_benchmark.sh
+```
+
+This runs `vllm bench serve` with 30 random prompts against the proxy, measuring request throughput and latency under disaggregated inference.
 
 Press `Ctrl+C` in the first terminal to stop all servers.
