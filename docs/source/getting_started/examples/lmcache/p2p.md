@@ -28,14 +28,17 @@ enable_controller: False
 
 remote_url: "maru://localhost:${MARU_SERVER_PORT}"
 remote_serde: "naive"
+remote_storage_plugins: ["maru"]
 
 extra_config:
+  remote_storage_plugin.maru.module_path: maru_lmcache.adapter
+  remote_storage_plugin.maru.class_name: MaruConnectorAdapter
   maru_pool_size: "4G"
   save_chunk_meta: False
   lookup_backoff_time: 0.001
 ```
 
-The key setting is `remote_url: "maru://..."` — this tells LMCache to use Maru as the shared storage backend. With `enable_p2p: False` and `enable_controller: False`, no controller or direct peer connections are needed. All sharing happens through CXL shared memory.
+Maru is loaded as an LMCache [remote storage plugin](https://docs.lmcache.ai/developer_guide/extending_lmcache/remote_storage_plugins.html). For details on each configuration field, see {doc}`../../../integration/lmcache`.
 
 ## How to Run
 

@@ -166,6 +166,24 @@ sequenceDiagram
 
 Every retrieve requires one metadata lookup via the control plane. Once a region is mapped, the mapping is cached for subsequent accesses to the same region — only the first access to a given region incurs the mmap cost.
 
+---
+
+## Extensibility
+
+MaruHandler is **framework-independent**. Its interface operates on string keys and memory views — a minimal, framework-neutral contract. Any inference framework can integrate with Maru by writing a thin adapter layer (typically under 200 lines) that converts framework-specific cache keys to strings and delegates to MaruHandler's store/retrieve API.
+
+```mermaid
+graph LR
+    A[LMCache] -->|MaruConnector| D[MaruHandler]
+    B[SGLang] -->|Future Adapter| D
+    C[Other Framework] -->|Custom Adapter| D
+    D --> E[MaruServer]
+    D --> F[CXL Shared Memory]
+```
+
+> **See also:** [LMCache Integration](../integration/lmcache.md),
+> [MaruHandler Design](maru_handler.md)
+
 ```{toctree}
 :hidden:
 
