@@ -10,7 +10,7 @@ namespace maru {
 
 class UdsServer {
 public:
-  explicit UdsServer(PoolManager &pm);
+  UdsServer(PoolManager &pm, const std::string &socketPath);
   ~UdsServer();
 
   int start();
@@ -22,6 +22,7 @@ private:
 
   PoolManager &pm_;
   RequestHandler handler_;
+  std::string socketPath_;
   std::atomic<bool> stop_{false};
   std::thread th_;
   int listenFd_{-1};
