@@ -51,10 +51,10 @@ class TestRpcServerHandlerDispatch:
 
         # Mock allocation to fail
         monkeypatch.setattr(
-            server._allocation_manager, "allocate", lambda instance_id, size: None
+            server._allocation_manager, "allocate", lambda instance_id, size, pool_id=0xFFFFFFFF: None
         )
 
-        request = MockRequest(instance_id="instance1", size=4096)
+        request = MockRequest(instance_id="instance1", size=4096, pool_id=0xFFFFFFFF)
         response = rpc._handle_request_alloc(request)
 
         assert response["success"] is False
@@ -462,7 +462,7 @@ class TestRpcHandlerCoverage:
         server.register_kv(key="100", region_id=region_id, kv_offset=0, kv_length=256)
 
         # Test REQUEST_ALLOC
-        req = MockRequest(instance_id="instance2", size=2048)
+        req = MockRequest(instance_id="instance2", size=2048, pool_id=0xFFFFFFFF)
         resp = rpc._handle_message(MessageType.REQUEST_ALLOC.value, req)
         assert resp["success"] is True
 

@@ -270,6 +270,7 @@ class RpcAsyncServer:
         handle = self._server.request_alloc(
             instance_id=req.instance_id,
             size=req.size,
+            pool_id=req.pool_id,
         )
         if handle is None:
             logger.debug(

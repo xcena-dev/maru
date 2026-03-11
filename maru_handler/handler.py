@@ -95,6 +95,7 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
+        self._pool_id = self._config.pool_id if self._config.pool_id is not None else 0xFFFFFFFF
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
@@ -150,6 +151,7 @@ class MaruHandler:
             response = self._rpc.request_alloc(
                 instance_id=self._config.instance_id,
                 size=self._config.pool_size,
+                pool_id=self._pool_id,
             )
             if not response.success or response.handle is None:
                 logger.error(
@@ -981,6 +983,7 @@ class MaruHandler:
             response = self._rpc.request_alloc(
                 instance_id=self._config.instance_id,
                 size=self._config.pool_size,
+                pool_id=self._pool_id,
             )
         except Exception:
             logger.error("RPC request_alloc failed during expand", exc_info=True)

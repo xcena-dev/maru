@@ -29,9 +29,11 @@ class AllocationManager:
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
 
-    def allocate(self, instance_id: str, size: int) -> MaruHandle | None:
+    def allocate(
+        self, instance_id: str, size: int, pool_id: int = 0xFFFFFFFF
+    ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership."""
-        handle = self._client.alloc(size)
+        handle = self._client.alloc(size, pool_id=pool_id)
         if handle is None:
             return None
 

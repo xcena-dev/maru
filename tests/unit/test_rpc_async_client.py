@@ -339,7 +339,7 @@ class TestRpcAsyncClientApiMethods:
         result = client.request_alloc("instance-1", 4096)
 
         client._send_request.assert_called_once_with(
-            MessageType.REQUEST_ALLOC, {"instance_id": "instance-1", "size": 4096}
+            MessageType.REQUEST_ALLOC, {"instance_id": "instance-1", "size": 4096, "pool_id": 0xFFFFFFFF}
         )
         assert result.success is True
         assert result.handle is not None

@@ -50,6 +50,7 @@ class MaruConfig:
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
+    pool_id: int | None = None  # None means any pool (ANY_POOL_ID = 0xFFFFFFFF)
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""

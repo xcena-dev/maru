@@ -158,6 +158,7 @@ class RequestAllocRequest:
 
     instance_id: str
     size: int
+    pool_id: int = 0xFFFFFFFF  # ANY_POOL_ID
 
 
 @dataclass
