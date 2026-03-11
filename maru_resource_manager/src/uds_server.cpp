@@ -22,8 +22,8 @@
 namespace maru
 {
 
-UdsServer::UdsServer(PoolManager &pm)
-    : pm_(pm), handler_(pm)
+UdsServer::UdsServer(PoolManager &pm, const std::string &socketPath)
+    : pm_(pm), handler_(pm), socketPath_(socketPath)
 {
 }
 
@@ -35,14 +35,14 @@ UdsServer::~UdsServer()
 int UdsServer::start()
 {
     // Initialize HMAC secret - must exist if there are recovered allocations
-    int rc = initSecret(pm_.hasExistingAllocations());
+    int rc = initSecret(pm_.stateDir(), pm_.hasExistingAllocations());
     if (rc != 0)
     {
         logf(LogLevel::Error, "Failed to init secret: %d", rc);
         return rc;
     }
 
-    std::string path = defaultSocketPath();
+    const std::string &path = socketPath_;
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
