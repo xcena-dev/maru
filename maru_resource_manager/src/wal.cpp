@@ -38,7 +38,7 @@ WalStore::~WalStore() {
 }
 
 std::string WalStore::walPath() const {
-  return stateDir_ + "/maru_resourced.wal";
+  return stateDir_ + "/maru-resource-manager.wal";
 }
 
 int WalStore::ensureOpen() {

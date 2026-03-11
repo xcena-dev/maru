@@ -51,18 +51,10 @@ int readFull(int fd, void *buf, size_t len) {
 }
 
 std::string defaultSocketPath() {
-  const char *env = std::getenv("MARU_SOCKET_PATH");
-  if (env && env[0] != '\0') {
-    return std::string(env);
-  }
-  return std::string("/run/maru-resourced/maru-resourced.sock");
+  return std::string("/tmp/maru-resourced/maru-resourced.sock");
 }
 
 std::string defaultStateDir() {
-  const char *env = std::getenv("MARU_STATE_DIR");
-  if (env && env[0] != '\0') {
-    return std::string(env);
-  }
   return std::string("/var/lib/maru-resourced");
 }
 

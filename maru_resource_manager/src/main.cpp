@@ -33,14 +33,14 @@ int main(int argc, char **argv)
     int rc = pm.loadPools();
     if (rc != 0)
     {
-        std::fprintf(stderr, "maru_resourced: failed to load pools: %d\n", rc);
+        std::fprintf(stderr, "maru-resource-manager: failed to load pools: %d\n", rc);
     }
 
     maru::UdsServer server(pm);
     rc = server.start();
     if (rc != 0)
     {
-        std::fprintf(stderr, "maru_resourced: failed to start server: %d\n", rc);
+        std::fprintf(stderr, "maru-resource-manager: failed to start server: %d\n", rc);
         return 1;
     }
 

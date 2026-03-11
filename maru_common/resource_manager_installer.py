@@ -4,7 +4,7 @@
 
 Wraps the cmake build + install workflow so that after `pip install -e .`,
 a single `sudo $(which install-maru-resource-manager)` builds and installs
-the Maru Resource Manager with systemd integration.
+the Maru Resource Manager.
 """
 
 from __future__ import annotations
@@ -15,10 +15,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-_SERVICE_NAME = "maru-resourced"
-_SERVICE_FILE = Path("/etc/systemd/system/maru-resourced.service")
-_UDEV_RULES_FILE = Path("/etc/udev/rules.d/99-maru-resourced.rules")
 
 
 def _find_resource_manager_source() -> Path:
@@ -60,30 +56,13 @@ def _check_root() -> int | None:
 
 
 def _do_uninstall(prefix: str) -> int:
-    """Stop, disable, and remove the resource manager and its systemd/udev files."""
-    binary = Path(prefix) / "bin" / "maru_resourced"
-
-    # Stop and disable systemd service
-    _run(["systemctl", "stop", _SERVICE_NAME], check=False)
-    _run(["systemctl", "disable", _SERVICE_NAME], check=False)
-
-    # Remove files
-    removed = []
-    for path in (_SERVICE_FILE, _UDEV_RULES_FILE, binary):
-        if path.exists():
-            path.unlink()
-            removed.append(str(path))
-
-    if removed:
-        _run(["systemctl", "daemon-reload"], check=False)
-        if str(_UDEV_RULES_FILE) in removed:
-            _run(["udevadm", "control", "--reload-rules"], check=False)
-            _run(["udevadm", "trigger"], check=False)
-        for p in removed:
-            fprintf(sys.stderr, "  Removed: %s\n", p)
+    """Remove the installed resource manager binary."""
+    binary = Path(prefix) / "bin" / "maru-resource-manager"
+    if binary.exists():
+        binary.unlink()
+        fprintf(sys.stderr, "  Removed: %s\n", binary)
     else:
         fprintf(sys.stderr, "Nothing to remove.\n")
-
     fprintf(sys.stderr, "Uninstall complete.\n")
     return 0
 
@@ -136,15 +115,13 @@ def _do_install(args: argparse.Namespace) -> int:
         str(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",
     ]
-    if args.no_systemd:
-        configure_cmd.append("-DMARU_INSTALL_SYSTEMD=OFF")
     _run(configure_cmd)
 
     # -- cmake build ----------------------------------------------------------
     _run(["cmake", "--build", str(build_dir)])
 
     # -- verify build output --------------------------------------------------
-    binary = build_dir / "maru_resourced"
+    binary = build_dir / "maru-resource-manager"
     if not binary.is_file() or binary.stat().st_size == 0:
         fprintf(sys.stderr, "Error: build output not found or empty: %s\n", binary)
         return 1
@@ -155,7 +132,7 @@ def _do_install(args: argparse.Namespace) -> int:
     _run(["cmake", "--install", str(build_dir), "--prefix", args.prefix])
 
     fprintf(sys.stderr, "Installation complete!\n")
-    fprintf(sys.stderr, "  Binary: %s/bin/maru_resourced\n", args.prefix)
+    fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
     return 0
 
 
@@ -179,14 +156,9 @@ def main(argv: list[str] | None = None) -> int:
         help="remove build directory before building",
     )
     parser.add_argument(
-        "--no-systemd",
-        action="store_true",
-        help="skip systemd service and udev rules installation",
-    )
-    parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="stop, disable, and remove the installed resource manager",
+        help="remove the installed resource manager",
     )
     args = parser.parse_args(argv)
 

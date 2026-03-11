@@ -71,7 +71,7 @@ int UdsServer::start()
     }
     if (::chmod(path.c_str(), 0666) != 0)
     {
-        logf(LogLevel::Warn, "maru_resourced: chmod 666 failed for %s (%d)", path.c_str(), errno);
+        logf(LogLevel::Warn, "maru-resource-manager: chmod 666 failed for %s (%d)", path.c_str(), errno);
     }
     if (::listen(fd, 64) != 0)
     {
@@ -337,7 +337,7 @@ void UdsServer::acceptLoop()
         if (activeClients_.load() >= kMaxClients)
         {
             logf(LogLevel::Warn,
-                 "maru_resourced: max clients reached (%d), rejecting connection",
+                 "maru-resource-manager: max clients reached (%d), rejecting connection",
                  kMaxClients);
             ::close(cfd);
             continue;

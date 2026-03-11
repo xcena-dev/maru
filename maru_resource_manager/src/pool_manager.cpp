@@ -400,7 +400,7 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
     int rc = getDeviceSize(path, size);
     if (rc != 0 || size == 0)
     {
-        logf(LogLevel::Error, "maru_resourced: failed to get size for %s (%d)", path.c_str(), rc);
+        logf(LogLevel::Error, "maru-resource-manager: failed to get size for %s (%d)", path.c_str(), rc);
         return rc != 0 ? rc : -EINVAL;
     }
 
@@ -476,7 +476,7 @@ int PoolManager::loadPoolsLocked()
         rc = loadPoolFromDevice(dev.poolId, dev.devPath, dev.type);
         if (rc != 0)
         {
-            logf(LogLevel::Warn, "maru_resourced: failed to load pool %u from %s: %d", dev.poolId, dev.devPath.c_str(), rc);
+            logf(LogLevel::Warn, "maru-resource-manager: failed to load pool %u from %s: %d", dev.poolId, dev.devPath.c_str(), rc);
         }
     }
 
