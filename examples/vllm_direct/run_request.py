@@ -74,7 +74,10 @@ async def stream_completion(
 
     try:
         stream = await client.completions.create(
-            model=model, prompt=prompt, max_tokens=max_tokens, stream=True,
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            stream=True,
         )
         async for chunk in stream:
             if first_token_time is None:
@@ -103,8 +106,12 @@ async def stream_completion(
 
 
 async def run_session(
-    label: str, base_url: str, model: str, prompt: str,
-    max_tokens: int, repeat_count: int,
+    label: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    repeat_count: int,
 ) -> list:
     results = []
     for i in range(repeat_count):
@@ -142,47 +149,74 @@ def print_summary(s1: list, s2: list, wait: float) -> dict:
     print(f"\n{_B}{'=' * 60}{_NC}", file=sys.stderr)
     print(f"{_B}  Maru-vLLM Direct P2P KV Cache Sharing{_NC}", file=sys.stderr)
     print(f"{_B}{'=' * 60}{_NC}", file=sys.stderr)
-    print(f"  {_G}Instance 1 (store){_NC}:    TTFT = "
-          f"{f'{t1:.1f} ms' if t1 else 'N/A'}", file=sys.stderr)
-    print(f"  {_G}Instance 2 (retrieve){_NC}: TTFT = "
-          f"{f'{t2:.1f} ms' if t2 else 'N/A'}", file=sys.stderr)
+    print(
+        f"  {_G}Instance 1 (store){_NC}:    TTFT = {f'{t1:.1f} ms' if t1 else 'N/A'}",
+        file=sys.stderr,
+    )
+    print(
+        f"  {_G}Instance 2 (retrieve){_NC}: TTFT = {f'{t2:.1f} ms' if t2 else 'N/A'}",
+        file=sys.stderr,
+    )
     if speedup:
         print(f"  {_C}TTFT Speedup{_NC}:         {speedup:.2f}x", file=sys.stderr)
-    print(f"  {_C}Cache Hit{_NC}:            {'Yes' if hit else 'No'}",
-          file=sys.stderr)
+    print(f"  {_C}Cache Hit{_NC}:            {'Yes' if hit else 'No'}", file=sys.stderr)
     print(f"  Wait between sessions: {wait}s", file=sys.stderr)
     print(f"{_B}{'=' * 60}{_NC}\n", file=sys.stderr)
 
     return {
-        "session1_ttft_ms": t1, "session2_ttft_ms": t2,
-        "ttft_speedup": speedup, "cache_hit": hit, "wait_time_s": wait,
+        "session1_ttft_ms": t1,
+        "session2_ttft_ms": t2,
+        "ttft_speedup": speedup,
+        "cache_hit": hit,
+        "wait_time_s": wait,
     }
 
 
 async def main():
     p = argparse.ArgumentParser(description="Maru-vLLM P2P KV cache test")
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--port1", type=int, default=int(os.environ.get("MARU_INST1_PORT", 8000)))
-    p.add_argument("--port2", type=int, default=int(os.environ.get("MARU_INST2_PORT", 8001)))
+    p.add_argument(
+        "--port1", type=int, default=int(os.environ.get("MARU_INST1_PORT", 8000))
+    )
+    p.add_argument(
+        "--port2", type=int, default=int(os.environ.get("MARU_INST2_PORT", 8001))
+    )
     p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("--repeat-count", type=int, default=DEFAULT_REPEAT_COUNT)
     p.add_argument("--wait-time", type=float, default=DEFAULT_WAIT_TIME)
     args = p.parse_args()
 
     prompt = build_prompt()
-    print(f"\nModel: {args.model}, Ports: {args.port1}/{args.port2}, "
-          f"MaxTokens: {args.max_tokens}", file=sys.stderr)
+    print(
+        f"\nModel: {args.model}, Ports: {args.port1}/{args.port2}, "
+        f"MaxTokens: {args.max_tokens}",
+        file=sys.stderr,
+    )
 
     print(f"\n[Session 1] Instance 1 (port {args.port1}) - Store KV", file=sys.stderr)
-    s1 = await run_session("store", f"http://localhost:{args.port1}",
-                           args.model, prompt, args.max_tokens, args.repeat_count)
+    s1 = await run_session(
+        "store",
+        f"http://localhost:{args.port1}",
+        args.model,
+        prompt,
+        args.max_tokens,
+        args.repeat_count,
+    )
 
     print(f"\nWaiting {args.wait_time}s for CXL propagation...", file=sys.stderr)
     await asyncio.sleep(args.wait_time)
 
-    print(f"\n[Session 2] Instance 2 (port {args.port2}) - Retrieve KV", file=sys.stderr)
-    s2 = await run_session("retrieve", f"http://localhost:{args.port2}",
-                           args.model, prompt, args.max_tokens, args.repeat_count)
+    print(
+        f"\n[Session 2] Instance 2 (port {args.port2}) - Retrieve KV", file=sys.stderr
+    )
+    s2 = await run_session(
+        "retrieve",
+        f"http://localhost:{args.port2}",
+        args.model,
+        prompt,
+        args.max_tokens,
+        args.repeat_count,
+    )
 
     summary = print_summary(s1, s2, args.wait_time)
     print(json.dumps(summary))

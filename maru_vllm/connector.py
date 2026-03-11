@@ -71,6 +71,7 @@ def _align_down(num_tokens: int, block_size: int) -> int:
 def _token_hash(token_ids: torch.Tensor) -> str:
     """Generate a stable hash string from token IDs."""
     from vllm.utils.hashing import safe_hash
+
     token_bytes = token_ids.numpy().tobytes()
     return safe_hash(token_bytes, usedforsecurity=False).hexdigest()[:16]
 
@@ -135,9 +136,9 @@ class MaruReqMeta:
     """Metadata for a single request's KV cache operation."""
 
     req_id: str
-    token_ids: list[int]         # Full prompt token IDs
-    block_ids: list[int]         # vLLM block IDs for this request
-    is_store: bool               # True = save to maru, False = load from maru
+    token_ids: list[int]  # Full prompt token IDs
+    block_ids: list[int]  # vLLM block IDs for this request
+    is_store: bool  # True = save to maru, False = load from maru
     num_matched_chunks: int = 0  # For load: how many chunks to load
 
 
@@ -191,14 +192,15 @@ class MaruKVConnector(KVConnectorBase_V1):
         if self._kv_chunk_tokens % self._block_size != 0:
             old = self._kv_chunk_tokens
             self._kv_chunk_tokens = (
-                (self._kv_chunk_tokens // self._block_size) * self._block_size
-            )
+                self._kv_chunk_tokens // self._block_size
+            ) * self._block_size
             if self._kv_chunk_tokens == 0:
                 self._kv_chunk_tokens = self._block_size
             logger.warning(
-                "maru_kv_chunk_tokens %d not aligned to block_size %d, "
-                "adjusted to %d",
-                old, self._block_size, self._kv_chunk_tokens,
+                "maru_kv_chunk_tokens %d not aligned to block_size %d, adjusted to %d",
+                old,
+                self._block_size,
+                self._kv_chunk_tokens,
             )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -226,9 +228,7 @@ class MaruKVConnector(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         assert self._scheduler is not None
-        return self._scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
+        return self._scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(
         self,
@@ -237,9 +237,7 @@ class MaruKVConnector(KVConnectorBase_V1):
         num_external_tokens: int,
     ):
         assert self._scheduler is not None
-        self._scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens
-        )
+        self._scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
     def build_connector_meta(
         self,
@@ -256,9 +254,7 @@ class MaruKVConnector(KVConnectorBase_V1):
         assert self._worker is not None
         self._worker.register_kv_caches(kv_caches)
 
-    def start_load_kv(
-        self, forward_context: ForwardContext, **kwargs: Any
-    ) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self._worker is not None
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, MaruConnectorMetadata)
@@ -428,21 +424,25 @@ class MaruSchedulerConnector:
             if new_req.req_id in self._requests_need_load:
                 # Load cached chunks from maru
                 _, num_chunks = self._requests_need_load[new_req.req_id]
-                meta.requests.append(MaruReqMeta(
-                    req_id=new_req.req_id,
-                    token_ids=token_ids,
-                    block_ids=new_req.block_ids[0],
-                    is_store=False,
-                    num_matched_chunks=num_chunks,
-                ))
+                meta.requests.append(
+                    MaruReqMeta(
+                        req_id=new_req.req_id,
+                        token_ids=token_ids,
+                        block_ids=new_req.block_ids[0],
+                        is_store=False,
+                        num_matched_chunks=num_chunks,
+                    )
+                )
             else:
                 # Store new prompt chunks to maru
-                meta.requests.append(MaruReqMeta(
-                    req_id=new_req.req_id,
-                    token_ids=token_ids,
-                    block_ids=new_req.block_ids[0],
-                    is_store=True,
-                ))
+                meta.requests.append(
+                    MaruReqMeta(
+                        req_id=new_req.req_id,
+                        token_ids=token_ids,
+                        block_ids=new_req.block_ids[0],
+                        is_store=True,
+                    )
+                )
 
         # Handle resumed requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -459,13 +459,15 @@ class MaruSchedulerConnector:
             token_ids = list(request.all_token_ids[:total_tokens])
 
             assert new_block_ids is not None
-            meta.requests.append(MaruReqMeta(
-                req_id=req_id,
-                token_ids=token_ids,
-                block_ids=new_block_ids[0],
-                is_store=False,
-                num_matched_chunks=num_chunks,
-            ))
+            meta.requests.append(
+                MaruReqMeta(
+                    req_id=req_id,
+                    token_ids=token_ids,
+                    block_ids=new_block_ids[0],
+                    is_store=False,
+                    num_matched_chunks=num_chunks,
+                )
+            )
 
         self._requests_need_load.clear()
         return meta
@@ -539,14 +541,10 @@ class MaruWorkerConnector:
             total_tokens = num_chunks * self._kv_chunk_tokens
 
             # Build slot mapping for the tokens we're loading
-            slot_mapping = self._build_slot_mapping(
-                req_meta.block_ids, total_tokens
-            )
+            slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
 
             num_layers_loaded = 0
-            for layer_idx, layer_name in enumerate(
-                forward_context.no_compile_layers
-            ):
+            for layer_idx, layer_name in enumerate(forward_context.no_compile_layers):
                 layer = forward_context.no_compile_layers[layer_name]
                 kv_cache_attr = getattr(layer, "kv_cache", None)
                 if kv_cache_attr is None:
@@ -564,7 +562,9 @@ class MaruWorkerConnector:
                         if info is None:
                             logger.warning(
                                 "Maru load miss: %s (layer %s, chunk %d)",
-                                maru_key, layer_name, ci,
+                                maru_key,
+                                layer_name,
+                                ci,
                             )
                             success = False
                             break
@@ -587,9 +587,7 @@ class MaruWorkerConnector:
                             layer_name,
                         )
                     except Exception as e:
-                        logger.error(
-                            "Maru load error: %s: %s", maru_key, e
-                        )
+                        logger.error("Maru load error: %s: %s", maru_key, e)
                         success = False
                         break
 
@@ -598,9 +596,10 @@ class MaruWorkerConnector:
 
             if num_layers_loaded > 0:
                 logger.info(
-                    "Maru: loaded %d layers x %d chunks (%d tokens) "
-                    "for req %s",
-                    num_layers_loaded, num_chunks, total_tokens,
+                    "Maru: loaded %d layers x %d chunks (%d tokens) for req %s",
+                    num_layers_loaded,
+                    num_chunks,
+                    total_tokens,
                     req_meta.req_id,
                 )
 
@@ -627,9 +626,7 @@ class MaruWorkerConnector:
                 continue
 
             total_tokens = len(chunk_keys) * self._kv_chunk_tokens
-            slot_mapping = self._build_slot_mapping(
-                req_meta.block_ids, total_tokens
-            )
+            slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
 
             for ci, base_key in enumerate(chunk_keys):
                 maru_key = f"{base_key}_L{layer_idx}"
@@ -643,7 +640,9 @@ class MaruWorkerConnector:
 
                 try:
                     kv_data = self._extract_kv_from_layer(
-                        kv_layer, chunk_slots, attn_metadata,
+                        kv_layer,
+                        chunk_slots,
+                        attn_metadata,
                     )
                     kv_contig = kv_data.detach().contiguous()
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
@@ -655,9 +654,7 @@ class MaruWorkerConnector:
                     ).reshape(kv_contig.shape)
                     dst.copy_(kv_contig)  # GPU→CXL mmap (single cudaMemcpy)
 
-                    success = self._handler.store(
-                        maru_key, handle=handle
-                    )
+                    success = self._handler.store(maru_key, handle=handle)
                     if success:
                         self._stored_keys.add(maru_key)
                     else:
@@ -724,9 +721,7 @@ class MaruWorkerConnector:
         elif isinstance(layer_meta, TritonAttentionMetadata):
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
-            src = src_kv_data.reshape(
-                slot_mapping.shape[0], dst_kv_cache.shape[1], -1
-            )
+            src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
             # Flash attention: [2, num_pages, page_size, ...]
