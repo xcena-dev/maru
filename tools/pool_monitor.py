@@ -86,19 +86,33 @@ def print_csv_row(pools: list, ts: str) -> None:
     for p in sorted(pools, key=lambda x: x.pool_id):
         used = p.total_size - p.free_size
         pct = (used / p.total_size * 100) if p.total_size > 0 else 0
-        print(f"{ts},{p.pool_id},{p.dax_type.name},{p.total_size},{p.free_size},{used},{pct:.2f}")
+        print(
+            f"{ts},{p.pool_id},{p.dax_type.name},{p.total_size},{p.free_size},{used},{pct:.2f}"
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Maru pool usage monitor")
-    parser.add_argument("-w", "--watch", type=float, default=0,
-                        help="Refresh interval in seconds (0 = one-shot)")
-    parser.add_argument("-c", "--count", type=int, default=0,
-                        help="Number of iterations (0 = unlimited)")
-    parser.add_argument("--csv", action="store_true",
-                        help="Output in CSV format")
-    parser.add_argument("--scroll", action="store_true",
-                        help="Scrolling log instead of top-style refresh")
+    parser.add_argument(
+        "-w",
+        "--watch",
+        type=float,
+        default=0,
+        help="Refresh interval in seconds (0 = one-shot)",
+    )
+    parser.add_argument(
+        "-c",
+        "--count",
+        type=int,
+        default=0,
+        help="Number of iterations (0 = unlimited)",
+    )
+    parser.add_argument("--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument(
+        "--scroll",
+        action="store_true",
+        help="Scrolling log instead of top-style refresh",
+    )
     args = parser.parse_args()
 
     client = MaruShmClient()
@@ -138,10 +152,7 @@ def main() -> None:
                 sys.stdout.flush()
 
             # Track previous for delta
-            prev_used = {
-                p.pool_id: p.total_size - p.free_size
-                for p in pools
-            }
+            prev_used = {p.pool_id: p.total_size - p.free_size for p in pools}
 
             iteration += 1
             if args.count > 0 and iteration >= args.count:
