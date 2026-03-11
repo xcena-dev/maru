@@ -122,7 +122,8 @@ class AllocReq:
         return cls(size=size, pool_id=pool_id, reserved=reserved)
 
 
-# AllocResp: status(i32) + pad(4) + Handle(32) + requested_size(u64) = 48 bytes
+# AllocResp: status(i32) + accessType(u32) + Handle(32) + requested_size(u64) = 48 bytes
+# accessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE (future multi-node)
 _ALLOC_RESP_FORMAT = "=iIQQQQQ"
 _ALLOC_RESP_SIZE = struct.calcsize(_ALLOC_RESP_FORMAT)
 
@@ -140,7 +141,7 @@ class AllocResp:
         return struct.pack(
             _ALLOC_RESP_FORMAT,
             self.status,
-            0,  # pad
+            0,  # accessType (LOCAL)
             h.region_id,
             h.offset,
             h.length,
@@ -154,7 +155,7 @@ class AllocResp:
             raise ValueError(f"AllocResp too short: {len(data)} < {_ALLOC_RESP_SIZE}")
         vals = struct.unpack(_ALLOC_RESP_FORMAT, data[:_ALLOC_RESP_SIZE])
         status = vals[0]
-        # vals[1] is pad
+        # vals[1] is accessType (0=LOCAL, 1=REMOTE)
         handle = MaruHandle(
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )

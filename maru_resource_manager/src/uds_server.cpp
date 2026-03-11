@@ -23,7 +23,7 @@ namespace maru
 {
 
 UdsServer::UdsServer(PoolManager &pm)
-    : pm_(pm)
+    : pm_(pm), handler_(pm)
 {
 }
 
@@ -420,7 +420,9 @@ void UdsServer::handleClient(int clientFd)
         }
     }
 
+    RequestContext ctx{cred.pid, cred.uid};
     MsgType type = static_cast<MsgType>(hdr.type);
+
     if (type == MsgType::ALLOC_REQ)
     {
         if (payload.size() != sizeof(AllocReq))
@@ -431,32 +433,12 @@ void UdsServer::handleClient(int clientFd)
         }
         AllocReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
-        Handle handle{};
-        std::string devPath;
-        uint64_t requestedSize = 0;
-        int32_t status = pm_.alloc(req.size, cred.pid, handle, devPath, req.poolId, requestedSize);
 
-        AllocResp resp{};
-        resp.status = status;
-        resp.handle = handle;
-        resp.requestedSize = requestedSize;
-
-        int daxFd = -1;
-        if (status == 0)
+        auto result = handler_.handleAlloc(req, ctx);
+        sendAllocRespWithFd(clientFd, result.resp, result.daxFd);
+        if (result.daxFd >= 0)
         {
-            daxFd = ::open(devPath.c_str(), O_RDWR | O_CLOEXEC);
-            if (daxFd < 0)
-            {
-                pm_.free(handle, 0);
-                resp.status = -errno;
-                resp.handle = Handle{};
-            }
-        }
-
-        sendAllocRespWithFd(clientFd, resp, daxFd);
-        if (daxFd >= 0)
-        {
-            ::close(daxFd);
+            ::close(result.daxFd);
         }
     }
     else if (type == MsgType::FREE_REQ)
@@ -470,63 +452,37 @@ void UdsServer::handleClient(int clientFd)
         FreeReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        if (!pm_.verifyAuthToken(req.handle))
+        auto result = handler_.handleFree(req, ctx);
+        if (result.resp.status == -EACCES)
         {
             sendError(clientFd, -EACCES, "invalid authToken");
             ::close(clientFd);
             return;
         }
 
-        uint64_t ownerId = (cred.uid == 0) ? 0 : static_cast<uint64_t>(cred.pid);
-        int32_t status = pm_.free(req.handle, ownerId);
-
-        FreeResp resp{};
-        resp.status = status;
         MsgHeader rh{};
         rh.magic = kMagic;
         rh.version = kVersion;
         rh.type = static_cast<uint16_t>(MsgType::FREE_RESP);
-        rh.payloadLen = sizeof(resp);
+        rh.payloadLen = sizeof(result.resp);
 
         writeFull(clientFd, &rh, sizeof(rh));
-        writeFull(clientFd, &resp, sizeof(resp));
+        writeFull(clientFd, &result.resp, sizeof(result.resp));
     }
     else if (type == MsgType::STATS_REQ)
     {
-        std::vector<PoolState> pools;
-        pm_.getStats(pools);
-
-        StatsRespHeader sh{};
-        sh.numPools = pools.size();
-
-        std::vector<uint8_t> out;
-        out.resize(sizeof(sh));
-        std::memcpy(out.data(), &sh, sizeof(sh));
-
-        for (const auto &p : pools)
-        {
-            PoolInfo pi{};
-            pi.poolId = p.poolId;
-            pi.type = p.type;
-            pi.totalSize = p.totalSize;
-            pi.freeSize = p.freeSize;
-            pi.alignBytes = p.alignBytes;
-
-            size_t old = out.size();
-            out.resize(old + sizeof(pi));
-            std::memcpy(out.data() + old, &pi, sizeof(pi));
-        }
+        auto result = handler_.handleStats();
 
         MsgHeader rh{};
         rh.magic = kMagic;
         rh.version = kVersion;
         rh.type = static_cast<uint16_t>(MsgType::STATS_RESP);
-        rh.payloadLen = out.size();
+        rh.payloadLen = result.payload.size();
 
         writeFull(clientFd, &rh, sizeof(rh));
-        if (!out.empty())
+        if (!result.payload.empty())
         {
-            writeFull(clientFd, out.data(), out.size());
+            writeFull(clientFd, result.payload.data(), result.payload.size());
         }
     }
     else if (type == MsgType::GET_FD_REQ)
@@ -540,37 +496,18 @@ void UdsServer::handleClient(int clientFd)
         GetFdReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        if (!pm_.verifyAuthToken(req.handle))
+        auto result = handler_.handleGetFd(req, ctx);
+        if (result.resp.status == -EACCES)
         {
             sendError(clientFd, -EACCES, "invalid auth token");
             ::close(clientFd);
             return;
         }
 
-        GetFdResp resp{};
-        resp.status = 0;
-
-        std::string pathToOpen;
-        int status = pm_.getPathForHandle(req.handle, pathToOpen);
-
-        int daxFd = -1;
-        if (status == 0)
+        sendGetFdRespWithFd(clientFd, result.resp, result.daxFd);
+        if (result.daxFd >= 0)
         {
-            daxFd = ::open(pathToOpen.c_str(), O_RDWR | O_CLOEXEC);
-            if (daxFd < 0)
-            {
-                resp.status = -errno;
-            }
-        }
-        else
-        {
-            resp.status = status;
-        }
-
-        sendGetFdRespWithFd(clientFd, resp, daxFd);
-        if (daxFd >= 0)
-        {
-            ::close(daxFd);
+            ::close(result.daxFd);
         }
     }
     else

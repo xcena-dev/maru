@@ -9,6 +9,12 @@ namespace maru {
 static constexpr uint32_t kMagic = 0x4D415255; // 'MARU'
 static constexpr uint16_t kVersion = 1;
 
+/// Memory access type — LOCAL for fd-based mmap, REMOTE for future multi-node.
+enum class AccessType : uint32_t {
+  LOCAL  = 0,   // fd via SCM_RIGHTS + mmap (current)
+  REMOTE = 1,   // reserved: RDMA or software-based remote memory access
+};
+
 enum class MsgType : uint16_t {
   ALLOC_REQ = 1,
   ALLOC_RESP = 2,
@@ -36,7 +42,7 @@ struct AllocReq {
 
 struct AllocResp {
   int32_t status;
-  uint32_t _pad{0}; // explicit padding for Handle alignment
+  uint32_t accessType{0}; // AccessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE
   Handle handle;
   uint64_t requestedSize;
 };

@@ -16,6 +16,7 @@ add_executable(maru_resource_manager
     src/metadata.cpp
     src/wal.cpp
     src/reaper.cpp
+    src/request_handler.cpp
     src/uds_server.cpp
 )
 
