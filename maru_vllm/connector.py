@@ -555,8 +555,8 @@ class MaruWorkerConnector:
 
                 kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
 
-                # Load all chunks for this layer and concatenate
-                all_chunk_data = []
+                # Load and inject each chunk independently to preserve
+                # K/V layout (concatenating 1D bytes breaks interleaving)
                 success = True
                 for ci in range(num_chunks):
                     maru_key = f"{chunk_keys[ci]}_L{layer_idx}"
@@ -569,10 +569,24 @@ class MaruWorkerConnector:
                             )
                             success = False
                             break
+                        # CXL mmap is already cudaHostRegistered by
+                        # DaxMapper — no clone() needed, .cuda() uses
+                        # DMA directly from pinned CXL memory
                         chunk_tensor = torch.frombuffer(
                             info.view, dtype=kv_cache_layer.dtype
-                        ).clone()
-                        all_chunk_data.append(chunk_tensor)
+                        )
+
+                        # Inject this chunk directly into the KV cache
+                        chunk_start = ci * self._kv_chunk_tokens
+                        chunk_end = chunk_start + self._kv_chunk_tokens
+                        chunk_slots = slot_mapping[chunk_start:chunk_end]
+                        self._inject_kv_into_layer(
+                            kv_cache_layer,
+                            chunk_tensor.cuda(),
+                            chunk_slots,
+                            attn_metadata,
+                            layer_name,
+                        )
                     except Exception as e:
                         logger.error(
                             "Maru load error: %s: %s", maru_key, e
@@ -580,16 +594,8 @@ class MaruWorkerConnector:
                         success = False
                         break
 
-                if not success or not all_chunk_data:
-                    continue
-
-                # Concatenate chunks and inject into GPU
-                kv_data = torch.cat(all_chunk_data, dim=0).cuda()
-                self._inject_kv_into_layer(
-                    kv_cache_layer, kv_data, slot_mapping,
-                    attn_metadata, layer_name,
-                )
-                num_layers_loaded += 1
+                if success:
+                    num_layers_loaded += 1
 
             if num_layers_loaded > 0:
                 logger.info(
@@ -640,11 +646,18 @@ class MaruWorkerConnector:
                     kv_data = self._extract_kv_from_layer(
                         kv_layer, chunk_slots, attn_metadata,
                     )
-                    cpu_data = kv_data.detach().cpu().contiguous()
-                    data_bytes = cpu_data.numpy().tobytes()
+                    kv_contig = kv_data.detach().contiguous()
+                    nbytes = kv_contig.nelement() * kv_contig.element_size()
+
+                    # Zero-copy path: alloc CXL page, GPU→CXL direct copy
+                    handle = self._handler.alloc(nbytes)
+                    dst = torch.frombuffer(
+                        handle.buf[:nbytes], dtype=kv_contig.dtype
+                    ).reshape(kv_contig.shape)
+                    dst.copy_(kv_contig)  # GPU→CXL mmap (single cudaMemcpy)
 
                     success = self._handler.store(
-                        maru_key, data=memoryview(data_bytes)
+                        maru_key, handle=handle
                     )
                     if success:
                         self._stored_keys.add(maru_key)

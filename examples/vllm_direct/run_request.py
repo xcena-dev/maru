@@ -18,14 +18,46 @@ import os
 import sys
 import time
 
-BASE_PROMPT = "Explain the significance of KV cache in language models."
+BASE_PROMPT = (
+    "The KV cache is a critical optimization in modern large language models. "
+    "During autoregressive generation, each new token requires attending to all "
+    "previous tokens. Without caching, this means recomputing the key and value "
+    "projections for every prior token at each generation step, leading to "
+    "quadratic computational cost. The KV cache stores these previously computed "
+    "key-value pairs, allowing the model to only compute projections for the new "
+    "token while reusing cached values for all previous positions. This reduces "
+    "the per-step complexity from O(n) to O(1) for the projection computation. "
+    "In distributed inference systems, sharing KV caches between instances "
+    "enables even greater efficiency by avoiding redundant prefill computation "
+    "for common prompt prefixes. Technologies like CXL shared memory make this "
+    "possible with near-zero latency data transfer between nodes. "
+    "The architecture of a typical KV cache sharing system involves several "
+    "components: a metadata server that tracks which KV entries exist and where "
+    "they are stored, a shared memory layer that provides the actual data plane "
+    "for transferring cache entries, and connector plugins in each inference "
+    "engine that intercept KV operations to store and retrieve from the shared "
+    "pool. When a new request arrives at any instance, the scheduler first "
+    "checks if a matching prefix exists in the shared cache. If found, the "
+    "worker loads the cached KV tensors directly into its GPU memory, skipping "
+    "the expensive prefill phase entirely. The key challenge is designing an "
+    "efficient chunk-based storage scheme where each chunk represents a fixed "
+    "number of tokens, and chunk keys encode the full prefix context up to that "
+    "point using rolling hashes. This enables partial prefix reuse: even if "
+    "only the first N chunks of a long prompt are cached, those chunks can be "
+    "loaded while the remaining tokens are computed normally. The system must "
+    "also handle concurrent access from multiple instances, cache eviction "
+    "policies, and memory pressure management across the shared pool.\n\n"
+    "Question: Summarize the three main components of a KV cache sharing "
+    "system and explain why chunk-based storage enables partial prefix reuse.\n\n"
+    "Answer:"
+)
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B"
-DEFAULT_MAX_TOKENS = 32
+DEFAULT_MAX_TOKENS = 64
 DEFAULT_REPEAT_COUNT = 1
 DEFAULT_WAIT_TIME = 3.0
 
 
-def build_prompt(base: str = BASE_PROMPT, repeat: int = 100) -> str:
+def build_prompt(base: str = BASE_PROMPT, repeat: int = 1) -> str:
     return base * repeat
 
 
@@ -86,6 +118,8 @@ async def run_session(
             f"TTFT={ttft_str}, total={result['total_time_ms']:.1f} ms",
             file=sys.stderr,
         )
+        if result["text"]:
+            print(f"  [{label}] answer: {result['text']}", file=sys.stderr)
     return results
 
 
