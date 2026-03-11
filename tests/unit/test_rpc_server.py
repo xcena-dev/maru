@@ -51,7 +51,9 @@ class TestRpcServerHandlerDispatch:
 
         # Mock allocation to fail
         monkeypatch.setattr(
-            server._allocation_manager, "allocate", lambda instance_id, size, pool_id=0xFFFFFFFF: None
+            server._allocation_manager,
+            "allocate",
+            lambda instance_id, size, pool_id=0xFFFFFFFF: None,
         )
 
         request = MockRequest(instance_id="instance1", size=4096, pool_id=0xFFFFFFFF)

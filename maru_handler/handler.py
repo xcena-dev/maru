@@ -95,7 +95,9 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        self._pool_id = self._config.pool_id if self._config.pool_id is not None else 0xFFFFFFFF
+        self._pool_id = (
+            self._config.pool_id if self._config.pool_id is not None else 0xFFFFFFFF
+        )
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 

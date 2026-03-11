@@ -278,7 +278,8 @@ class TestRpcClientApiMethods:
         result = client.request_alloc(instance_id="test_instance", size=4096)
 
         mock_send.assert_called_once_with(
-            MessageType.REQUEST_ALLOC, {"instance_id": "test_instance", "size": 4096, "pool_id": 0xFFFFFFFF}
+            MessageType.REQUEST_ALLOC,
+            {"instance_id": "test_instance", "size": 4096, "pool_id": 0xFFFFFFFF},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is True
@@ -295,7 +296,8 @@ class TestRpcClientApiMethods:
         result = client.request_alloc(instance_id="test_instance", size=999999)
 
         mock_send.assert_called_once_with(
-            MessageType.REQUEST_ALLOC, {"instance_id": "test_instance", "size": 999999, "pool_id": 0xFFFFFFFF}
+            MessageType.REQUEST_ALLOC,
+            {"instance_id": "test_instance", "size": 999999, "pool_id": 0xFFFFFFFF},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is False
