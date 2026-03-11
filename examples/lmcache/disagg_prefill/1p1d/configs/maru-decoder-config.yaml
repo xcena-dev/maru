@@ -3,11 +3,14 @@ chunk_size: 256
 # Maru remote backend
 remote_url: "maru://localhost:${MARU_SERVER_PORT}"
 remote_serde: "naive"
+remote_storage_plugins: ["maru"]
 local_cpu: False
 max_local_cpu_size: 100
 save_unfull_chunk: True
 
 extra_config:
+  remote_storage_plugin.maru.module_path: maru_lmcache.adapter
+  remote_storage_plugin.maru.class_name: MaruConnectorAdapter
   maru_pool_size: "4G"
   save_chunk_meta: False
   lookup_backoff_time: 0.001

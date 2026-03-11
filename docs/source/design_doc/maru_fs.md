@@ -228,7 +228,7 @@ Filesystem mode introduces three components that replace their Remote mode count
 
 All components are thread-safe. Write operations (store, delete, region map/unmap, allocation/free) are serialized. Read operations (retrieve, buffer view access) are lock-free. This follows the same concurrency model as Remote mode.
 
-> **See also:** [Consistency and Safety](consistency_and_safety.md) — detailed concurrency semantics and guarantees across both modes
+> **See also:** [Consistency and Safety](consistency_and_safety.md)
 
 ---
 

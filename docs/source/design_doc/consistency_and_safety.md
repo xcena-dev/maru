@@ -40,7 +40,7 @@ The visibility point is when `register_kv` RPC completes. The server holds the
 key in an in-memory registry protected by a lock, ensuring that concurrent
 lookups always see a fully committed entry or no entry at all.
 
-> **See also:** [MaruHandler Architecture](maru_handler.md) -- store/retrieve data flows
+> **See also:** [MaruHandler Architecture](maru_handler.md)
 
 ---
 
@@ -131,8 +131,8 @@ The reaper defends against PID reuse by caching each client's process start
 time at allocation time. If the PID is recycled by the OS, the start-time
 mismatch triggers reclamation.
 
-> **See also:** [MaruResourceManager Architecture](maru_resource_manager.md) -- WAL + Checkpoint, Reaper;
-> [MaruServer Architecture](maru_server.md) -- Deferred Freeing State Machine
+> **See also:** [MaruResourceManager Architecture](maru_resource_manager.md),
+> [MaruServer Architecture](maru_server.md)
 
 ---
 

@@ -223,7 +223,7 @@ sequenceDiagram
     H-->>C: success
 ```
 
-> **See also:** [Architecture Overview](architecture_overview.md) — system-level data flows;
-> [Memory Model](memory_model.md) — page allocation and region lifecycle;
-> [KV Cache Management](kv_cache_management.md) — key semantics and location model;
-> [Consistency and Safety](consistency_and_safety.md) — write-then-register ordering guarantees
+> **See also:** [Architecture Overview](architecture_overview.md),
+> [Memory Model](memory_model.md),
+> [KV Cache Management](kv_cache_management.md),
+> [Consistency and Safety](consistency_and_safety.md)

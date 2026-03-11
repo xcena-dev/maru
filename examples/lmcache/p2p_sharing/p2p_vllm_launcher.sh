@@ -55,5 +55,6 @@ PYTHONHASHSEED=123 \
     vllm serve $MODEL \
     --gpu-memory-utilization $GPU_MEM_UTIL \
     --port $PORT \
+    --no-enable-prefix-caching \
     --kv-transfer-config \
     '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
