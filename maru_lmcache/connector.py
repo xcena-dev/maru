@@ -72,6 +72,7 @@ class MaruConnectorConfig:
 
     server_url: str = "tcp://localhost:5555"
     pool_size: int = 1024 * 1024 * 1024  # 1 GB
+    pool_id: int | None = None  # None means any pool (ANY_POOL_ID)
     instance_id: str | None = None
     auto_connect: bool = True
     connection_timeout: float = 30.0
@@ -88,9 +89,11 @@ class MaruConnectorConfig:
         host = parsed.hostname or "localhost"
         port = parsed.port or 5555
         params = parse_qs(parsed.query)
+        raw_pool_id = params.get("pool_id", [None])[0]
         return MaruConnectorConfig(
             server_url=f"tcp://{host}:{port}",
             pool_size=parse_size(params.get("pool_size", ["1G"])[0]),
+            pool_id=int(raw_pool_id) if raw_pool_id is not None else None,
             instance_id=params.get("instance_id", [None])[0],
             connection_timeout=float(params.get("timeout", ["30.0"])[0]),
             operation_timeout=float(params.get("op_timeout", ["10.0"])[0]),
@@ -108,9 +111,13 @@ class MaruConnectorConfig:
         raw_pool = extra.get("maru_pool_size", fb.pool_size)
         pool_size = parse_size(raw_pool) if isinstance(raw_pool, str) else int(raw_pool)
 
+        raw_pool_id = extra.get("maru_pool_id", fb.pool_id)
+        pool_id_val = int(raw_pool_id) if raw_pool_id is not None else None
+
         return MaruConnectorConfig(
             server_url=extra.get("maru_server_url", fb.server_url),
             pool_size=pool_size,
+            pool_id=pool_id_val,
             instance_id=extra.get("maru_instance_id", fb.instance_id),
             auto_connect=extra.get("maru_auto_connect", fb.auto_connect),
             operation_timeout=float(
@@ -193,6 +200,7 @@ class MaruConnector(RemoteConnector):
                 "server_url": self.maru_config.server_url,
                 "instance_id": self.maru_config.instance_id,
                 "pool_size": self.maru_config.pool_size,
+                "pool_id": self.maru_config.pool_id,
                 "chunk_size_bytes": self.full_chunk_size_bytes,
                 "auto_connect": False,
                 "timeout_ms": self.maru_config.timeout_ms,
