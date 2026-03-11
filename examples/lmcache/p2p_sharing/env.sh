@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export VLLM_LOG_LEVEL=${VLLM_LOG_LEVEL:-DEBUG}
-export LMCACHE_LOG_LEVEL=${LMCACHE_LOG_LEVEL:-ERROR}
+export LMCACHE_LOG_LEVEL=${LMCACHE_LOG_LEVEL:-INFO}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.1}
 
 # Port base configuration

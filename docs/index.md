@@ -117,7 +117,14 @@ Architecture Overview <source/design_doc/architecture_overview>
 Memory Model <source/design_doc/memory_model>
 KV Cache Management <source/design_doc/kv_cache_management>
 Consistency and Safety <source/design_doc/consistency_and_safety>
-LMCache Integration <source/design_doc/integration>
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Integration
+:hidden:
+
+LMCache Integration <source/integration/lmcache>
 ```
 
 ```{toctree}

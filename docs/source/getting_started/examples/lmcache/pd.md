@@ -9,7 +9,7 @@ Disaggregated prefill separates the compute-intensive **prefill** phase from the
 ## Prerequisites
 
 - At least **2 GPUs**
-- [LMCache](https://github.com/LMCache/LMCache) installed (`pip install lmcache`)
+- [LMCache](https://github.com/LMCache/LMCache) **>= v0.3.14** installed (`pip install lmcache`)
 - [vLLM](https://docs.vllm.ai/) installed
 - Maru installed (see {doc}`../../installation`)
 
@@ -24,17 +24,20 @@ enable_pd: False
 chunk_size: 256
 remote_url: "maru://localhost:${MARU_SERVER_PORT}"
 remote_serde: "naive"
+remote_storage_plugins: ["maru"]
 local_cpu: False
 max_local_cpu_size: 100
 save_unfull_chunk: True
 
 extra_config:
+  remote_storage_plugin.maru.module_path: maru_lmcache.adapter
+  remote_storage_plugin.maru.class_name: MaruConnectorAdapter
   maru_pool_size: "4G"
   save_chunk_meta: False
   lookup_backoff_time: 0.001
 ```
 
-The key setting is `remote_url: "maru://..."` — this tells LMCache to use Maru as the shared storage backend instead of nixl or Mooncake. All Maru-specific parameters (pool size, etc.) are configured via `extra_config`.
+Maru is loaded as an LMCache [remote storage plugin](https://docs.lmcache.ai/developer_guide/extending_lmcache/remote_storage_plugins.html). For details on each configuration field, see {doc}`../../../integration/lmcache`.
 
 ## How to Run
 
@@ -60,15 +63,31 @@ Wait until you see:
 All servers are up. You can send request now...
 ```
 
-### 2. Send a request
+### 2. Try a simple query
 
-Open a new terminal and run the benchmark script:
+Open a new terminal and send a single prompt through the proxy:
 
 ```bash
 cd examples/lmcache/disagg_prefill/1p1d
-./run_request.sh
+
+# Send a prompt — the proxy routes it to prefiller (KV generation) then decoder (token generation)
+./run_simple_query.sh
 ```
 
-This sends benchmark requests to the proxy, which routes them to the prefiller and decoder for disaggregated inference.
+You'll see the prompt and the generated response printed directly. Check `decoder.log` for cache hit messages:
+
+```
+LMCache INFO: [req_id=cmpl-a5a94ea4577d4025-0] Retrieved 256 out of 256 required tokens (from 256 total tokens). size: 0.0029 gb, cost 3.0579 ms, throughput: 0.9581 GB/s; (cache_engine.py:874:lmcache.v1.cache_engine)
+```
+
+### 3. Run a benchmark
+
+Once you've confirmed the setup works, measure throughput with a larger workload:
+
+```bash
+./run_benchmark.sh
+```
+
+This runs `vllm bench serve` with 30 random prompts against the proxy, measuring request throughput and latency under disaggregated inference.
 
 Press `Ctrl+C` in the first terminal to stop all servers.

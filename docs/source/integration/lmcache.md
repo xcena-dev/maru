@@ -4,7 +4,7 @@
 
 The full stack from inference engine to shared memory:
 
-![System-level architecture](resource/lmcache_arch.png)
+![System-level architecture](../design_doc/resource/lmcache_arch.png)
 
 > **Control Plane** (dashed arrows) — metadata RPC: KV registration, region claim/release.
 >
@@ -12,7 +12,7 @@ The full stack from inference engine to shared memory:
 
 ### Component Architecture
 
-![Component-level architecture](resource/lmcache_component_arch.png)
+![Component-level architecture](../design_doc/resource/lmcache_component_arch.png)
 
 **Layer responsibilities:**
 
@@ -101,37 +101,62 @@ accessed directly from CXL shared memory through memory-mapped regions.
 
 ## Configuration
 
-MaruConnector accepts configuration through the LMCache YAML config file.
-The `remote_url` field activates Maru as the remote backend (format: `maru://<host>:<port>`),
-and fine-grained parameters can be set via `extra_config`.
+Maru is loaded as an LMCache [remote storage plugin](https://docs.lmcache.ai/developer_guide/extending_lmcache/remote_storage_plugins.html) (requires LMCache >= v0.3.14). Configuration is done via the LMCache YAML config file.
 
-For the complete parameter reference, see
-[Configuration — LMCache Integration](../api_reference/config.md#lmcache-integration).
+```yaml
+chunk_size: 256
+local_cpu: True
+max_local_cpu_size: 5
+enable_async_loading: True
+
+# Disable P2P for Maru shared storage mode
+enable_p2p: False
+enable_controller: False
+
+# Maru backend — format: maru://<host>:<port>
+remote_url: "maru://localhost:5555"
+remote_serde: "naive"
+remote_storage_plugins: ["maru"]
+
+extra_config:
+  remote_storage_plugin.maru.module_path: maru_lmcache.adapter
+  remote_storage_plugin.maru.class_name: MaruConnectorAdapter
+  maru_pool_size: "4G"              # CXL memory pool size ("1G", "500M", etc.)
+  save_chunk_meta: False
+  lookup_backoff_time: 0.001
+  # maru_instance_id: "my-id"       # Unique client ID (default: auto UUID)
+  # maru_operation_timeout: 10.0    # Per-operation timeout in seconds
+  # maru_timeout_ms: 2000           # ZMQ socket timeout (ms)
+  # maru_use_async_rpc: true        # Async DEALER-ROUTER RPC
+  # maru_max_inflight: 64           # Max in-flight async requests
+```
+
+### Plugin settings
+
+| Field | Description |
+| --- | --- |
+| `remote_storage_plugins: ["maru"]` | Registers Maru as a plugin backend |
+| `remote_storage_plugin.maru.module_path` | Python module containing the adapter class |
+| `remote_storage_plugin.maru.class_name` | Adapter class name (`MaruConnectorAdapter`) |
+
+### Maru extra_config parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `maru_pool_size` | `"1G"` | CXL memory pool size. Supports human-readable strings (`"4G"`, `"500M"`) or integer bytes |
+| `maru_instance_id` | auto-generated UUID | Unique client instance identifier |
+| `maru_operation_timeout` | `10.0` | Timeout in seconds for individual KV operations |
+| `maru_timeout_ms` | `2000` | ZMQ socket timeout in milliseconds for RPC communication |
+| `maru_use_async_rpc` | `true` | Use async DEALER-ROUTER pattern for higher throughput |
+| `maru_max_inflight` | `64` | Max concurrent in-flight async RPC requests |
+| `maru_server_url` | (from `remote_url`) | Override server URL. Normally not needed |
+| `maru_auto_connect` | `true` | Auto-connect to MaruServer on initialization |
+| `maru_eager_map` | `true` | Pre-map all shared regions on connect |
+
 For runnable examples, see
 [LMCache Examples](../getting_started/examples/lmcache/index.md).
 
-## Extensibility
-
-MaruHandler is designed to be **framework-independent**. It knows nothing about
-LMCache, vLLM, or any specific inference engine. Its interface operates on
-string keys and memory views — a minimal, framework-neutral contract.
-
-Any framework can integrate with Maru by writing a thin adapter layer that
-converts framework-specific cache keys to strings, uses the handler's
-alloc/store API for zero-copy writes, and manages the handler's lifecycle.
-MaruConnector serves as the reference implementation for this pattern — typically
-under 200 lines of code.
-
-```mermaid
-graph LR
-    A[LMCache] -->|MaruConnector| D[MaruHandler]
-    B[SGLang] -->|Future Adapter| D
-    C[Other Framework] -->|Custom Adapter| D
-    D --> E[MaruServer]
-    D --> F[CXL Shared Memory]
-```
-
-> **See also:** [MaruHandler Design](maru_handler.md) — handler internals;
-> [Architecture Overview](architecture_overview.md) — system-level design;
-> [Python API Reference](../api_reference/api.md) — MaruHandler API;
-> [Configuration Reference](../api_reference/config.md) — all config parameters
+> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
+> [MaruHandler Design](../design_doc/maru_handler.md),
+> [Python API Reference](../api_reference/api.md),
+> [Configuration Reference](../api_reference/config.md)

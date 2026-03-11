@@ -1,6 +1,6 @@
 # Quickstart
 
-## Start the Server
+## 1. Start the Server
 
 ```bash
 # Default (localhost:5555)
@@ -13,7 +13,9 @@ maru-server --host 0.0.0.0 --port 5556
 maru-server --log-level DEBUG
 ```
 
-## Basic Usage
+## 2. Run a Client Example
+
+> `maru-server` must be running before proceeding. See step 1 above.
 
 ### Zero-Copy Store & Retrieve
 
