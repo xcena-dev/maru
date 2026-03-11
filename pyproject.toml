@@ -50,7 +50,7 @@ Documentation = "https://xcena-dev.github.io/maru/"
 Organization = "https://xcena.com"
 
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*"]
 
 [tool.ruff]
 line-length = 88
