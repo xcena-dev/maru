@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "pool_manager.h"
+#include "request_handler.h"
 
 namespace maru {
 
@@ -20,6 +21,7 @@ private:
   void handleClient(int clientFd);
 
   PoolManager &pm_;
+  RequestHandler handler_;
   std::atomic<bool> stop_{false};
   std::thread th_;
   int listenFd_{-1};
