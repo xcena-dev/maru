@@ -49,14 +49,84 @@ class MaruShmClient:
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
 
+    def _ensure_resource_manager(self) -> None:
+        """Ensure the resource manager is running, starting it if needed.
+
+        Uses flock to prevent multiple processes from starting the resource
+        manager simultaneously. After acquiring the lock, re-checks connectivity
+        in case another process already started it.
+        """
+        import fcntl
+        import subprocess
+        import time
+        from pathlib import Path
+
+        # Quick check — maybe it's already running
+        if self._try_connect():
+            return
+
+        lock_path = Path(self._socket_path).parent / "rm.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            # Re-check after acquiring lock (another process may have started it)
+            if self._try_connect():
+                return
+
+            # Start resource manager in background
+            logger.info(
+                "Starting maru-resource-manager (socket: %s)", self._socket_path
+            )
+            subprocess.Popen(
+                ["maru-resource-manager", "--socket-path", self._socket_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            # Wait for socket to become available
+            for _ in range(50):  # max 5 seconds, 100ms intervals
+                time.sleep(0.1)
+                if self._try_connect():
+                    logger.info("maru-resource-manager is ready")
+                    return
+
+            raise RuntimeError(
+                f"maru-resource-manager failed to start within 5s "
+                f"(socket: {self._socket_path})"
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _try_connect(self) -> bool:
+        """Test if the resource manager socket is connectable."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+            sock.close()
+            return True
+        except OSError:
+            sock.close()
+            return False
+
     def _connect(self) -> socket.socket:
-        """Create a new UDS connection to the resource manager."""
+        """Create a new UDS connection to the resource manager.
+
+        If connection fails, attempts to auto-start the resource manager
+        and retries once.
+        """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(self._socket_path)
         except OSError:
             sock.close()
-            raise
+            # Connection failed — resource manager may not be running or crashed
+            self._ensure_resource_manager()
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(self._socket_path)
         return sock
 
     def _send_request(

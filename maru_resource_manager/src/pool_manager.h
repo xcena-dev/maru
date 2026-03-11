@@ -47,8 +47,11 @@ class WalStore;
 class PoolManager
 {
 public:
-    PoolManager();
+    explicit PoolManager(const std::string &stateDir);
     ~PoolManager();
+
+    const std::string &stateDir() const { return stateDir_; }
+    uint32_t allocationCount() const;
 
     int loadPools();
     int rescanDevices();
@@ -84,7 +87,8 @@ private:
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
+    std::string stateDir_;
     std::vector<PoolState> pools_;
     uint64_t opCount_{0};
     uint64_t checkpointInterval_{100};

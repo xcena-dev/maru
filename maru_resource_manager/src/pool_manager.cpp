@@ -255,13 +255,19 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
-PoolManager::PoolManager()
+PoolManager::PoolManager(const std::string &stateDir)
+    : stateDir_(stateDir)
 {
-    metadata_ = std::make_unique<MetadataStore>(defaultStateDir());
-    wal_ = std::make_unique<WalStore>(defaultStateDir());
+    metadata_ = std::make_unique<MetadataStore>(stateDir);
+    wal_ = std::make_unique<WalStore>(stateDir);
 }
 
 PoolManager::~PoolManager() = default;
+
+uint32_t PoolManager::allocationCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return static_cast<uint32_t>(allocations_.size());
+}
 
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
