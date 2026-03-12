@@ -65,6 +65,7 @@ public:
     bool verifyAuthToken(const Handle &handle);
 
     void reapExpired(uint64_t &reapedCount);
+    void checkpoint();
 
 private:
     struct DeviceInfo

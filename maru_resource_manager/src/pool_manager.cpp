@@ -995,6 +995,12 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     }
 }
 
+void PoolManager::checkpoint()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+}
+
 bool PoolManager::verifyAuthToken(const Handle &handle)
 {
     std::lock_guard<std::mutex> lock(mu_);

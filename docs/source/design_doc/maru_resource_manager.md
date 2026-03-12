@@ -7,20 +7,22 @@ The `MaruResourceManager` is a server that manages physical CXL DAX device pools
 ```mermaid
 flowchart TB
     subgraph RM["Maru Resource Manager"]
-        Main["Main<br/>Signal handling<br/>Component init"]
-        PM["PoolManager<br/>Pool management<br/>Alloc / Free"]
+        Main["Main<br/>CLI parsing<br/>Signal handling<br/>Idle timeout"]
         RPC["RpcServer<br/>IPC protocol<br/>Handle issuance"]
+        RH["RequestHandler<br/>Business logic<br/>Alloc / Free / Stats"]
+        PM["PoolManager<br/>Pool management<br/>Free list tracking"]
         Reaper["Reaper<br/>Dead process detection<br/>Auto-cleanup"]
         Meta["MetadataStore<br/>Checkpoint save/load<br/>CRC32 verification"]
         WAL["WalStore<br/>Write-ahead log<br/>Crash recovery"]
     end
 
-    Main --> PM
     Main --> RPC
+    Main --> PM
     Main --> Reaper
+    RPC --> RH
+    RH --> PM
     PM --> Meta
     PM --> WAL
-    RPC --> PM
 
     subgraph Clients["Python Clients (maru_shm)"]
         C1["MaruShmClient #1"]
@@ -40,7 +42,9 @@ flowchart TB
 
 `PoolManager` is the central component that owns all shared state — pool metadata, allocation maps, and free lists. It performs device discovery by scanning sysfs for DEV_DAX and FS_DAX devices, and supports hot-plug via signal-triggered rescans.
 
-`RpcServer` accepts client connections and issues region handles in response to allocation requests.
+`RpcServer` accepts client connections and dispatches requests to `RequestHandler`. It handles transport concerns including client identity verification and file descriptor passing.
+
+`RequestHandler` contains all business logic — allocation, deallocation, fd lookup, and stats queries. It depends only on `PoolManager` and has no transport code, enabling reuse with future transport layers.
 
 `Reaper` runs a background thread that periodically detects terminated client processes and reclaims their leaked allocations through `PoolManager`.
 
@@ -48,7 +52,19 @@ flowchart TB
 
 ---
 
-## 2. IPC Protocol
+## 2. Lifecycle
+
+The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager is designed to require no manual management — it starts and stops automatically based on demand.
+
+**Auto-start:** When `AllocationManager` initializes (as part of `MaruServer` startup), it calls `MaruShmClient._ensure_resource_manager()`. This method checks if the resource manager is already running; if not, it starts the binary in the background and waits for the socket to become available. A file lock prevents multiple processes from starting it simultaneously.
+
+**Crash recovery:** Every `MaruShmClient._connect()` call that fails triggers `_ensure_resource_manager()`, which restarts the binary. The resource manager recovers its previous state from the WAL on startup.
+
+**Idle shutdown:** The main loop tracks the number of active allocations. When the count remains at zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The next `MaruServer` startup will auto-start it again.
+
+---
+
+## 3. IPC Protocol
 
 All messages use a fixed-size binary header containing protocol version, message type, and payload length, followed by a type-specific payload.
 
@@ -57,16 +73,28 @@ All messages use a fixed-size binary header containing protocol version, message
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes a region handle |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
 | `GET_FD_REQ` / `GET_FD_RESP` | client ↔ server | Request access to an existing allocation (requires valid auth token) |
-| `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics (pool ID, total/free sizes) |
+| `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
 
 Every allocation returns a **Handle** containing the region ID (globally unique), mmap offset, allocation length, and a cryptographic auth token. The Handle serves as both the allocation identifier and the authorization credential — clients must present it for free and access operations.
 
-The server verifies client identity at connection time, ensuring PID and UID match.
+The `ALLOC_RESP` includes an `accessType` field (`LOCAL=0`, `REMOTE=1`) to distinguish local fd-based access from future remote memory access mechanisms.
+
+The `STATS_RESP` returns per-pool statistics. Each pool entry contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pool_id` | uint32 | Pool identifier |
+| `dax_type` | enum | `DEV_DAX` (character device) or `FS_DAX` (filesystem DAX) |
+| `total_size` | uint64 | Total pool capacity in bytes |
+| `free_size` | uint64 | Currently available space in bytes |
+| `align_bytes` | uint64 | Alignment requirement in bytes |
+
+Stats can be queried via `MaruShmClient.stats()` in Python or the `maru_test_client stats` CLI tool.
 
 ---
 
-## 3. Memory Management
+## 4. Memory Management
 
 Each discovered CXL device becomes a **pool** with a sorted free list of extents (offset + length pairs). The allocation algorithm uses **first-fit with alignment**: it scans the free list for the first extent that can accommodate the aligned request size, splits the extent into residual fragments if needed, and returns a Handle pointing to the allocated region.
 
@@ -76,7 +104,7 @@ All allocation sizes are rounded up to the pool's alignment boundary. For DEV_DA
 
 ---
 
-## 4. Persistence & Recovery
+## 5. Persistence & Recovery
 
 The Resource Manager ensures durability through a combination of write-ahead logging and periodic checkpoints.
 
@@ -86,7 +114,7 @@ On startup, the **recovery sequence** proceeds as: (1) scan for current hardware
 
 ---
 
-## 5. Reaper
+## 6. Reaper
 
 The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
 
@@ -94,10 +122,35 @@ To defend against **PID reuse**, the server caches each client's process start t
 
 ---
 
-## 6. Security
+## 7. Security
 
 Every allocation receives a **cryptographic auth token** derived from the Handle fields and a server-side secret. Free and access requests must present a valid token; invalid tokens are rejected.
 
 The secret is generated on first start and persisted to the state directory. On restart, if allocations exist from a previous run, the secret is loaded; if it is missing, startup is aborted to prevent token verification failures.
 
 **Owner verification** ensures that non-root clients can only free their own allocations — the owner PID is recorded at allocation time and must match the freeing client's PID.
+
+---
+
+## 8. Server Configuration
+
+The server is configured via CLI arguments. Under normal usage these are not needed — `MaruServer` auto-starts the resource manager with defaults.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--socket-path` | `/tmp/maru-resourced/maru-resourced.sock` | RPC socket path |
+| `--state-dir` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
+| `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `--idle-timeout` | `60` | Auto-shutdown after N seconds idle (0 to disable) |
+
+```bash
+# Manual start with custom configuration
+maru-resource-manager --socket-path /var/run/maru/maru.sock \
+                      --state-dir /var/lib/maru \
+                      --log-level debug \
+                      --idle-timeout 120
+```
+
+> **See also:** [Architecture Overview](architecture_overview.md),
+> [MaruServer Architecture](maru_server.md),
+> [Memory Model](memory_model.md)
