@@ -24,60 +24,19 @@ import pytest
 
 from maru_shm.client import MaruShmClient
 
-# Source directory for the C++ resource manager
-RM_SOURCE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "maru_resource_manager")
-)
-
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="session")
-def rm_binary(tmp_path_factory):
-    """Build the maru-resource-manager binary from source via cmake.
+def rm_binary():
+    """Locate the installed maru-resource-manager binary.
 
-    This is session-scoped so the binary is built only once per test session.
-    Skips all tests if cmake is not available or the build fails.
+    Expects the binary to already be installed (e.g. via ./install.sh).
+    Skips all tests if the binary is not found.
     """
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("cmake not found — cannot build maru-resource-manager")
-    assert cmake is not None  # type narrowing for Pylance
-
-    cmake_file = os.path.join(RM_SOURCE_DIR, "CMakeLists.txt")
-    if not os.path.isfile(cmake_file):
-        pytest.skip(
-            f"maru_resource_manager source not found at {RM_SOURCE_DIR}"
-        )
-
-    build_dir = str(tmp_path_factory.mktemp("rm_build"))
-
-    # Configure
-    try:
-        subprocess.run(
-            [cmake, "-S", RM_SOURCE_DIR, "-B", build_dir],
-            check=True,
-            capture_output=True,
-            timeout=60,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"cmake configure failed: {exc}")
-
-    # Build
-    try:
-        subprocess.run(
-            [cmake, "--build", build_dir, "-j"],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"cmake build failed: {exc}")
-
-    binary = os.path.join(build_dir, "maru-resource-manager")
-    if not os.path.isfile(binary):
-        pytest.skip(f"Binary not produced at {binary}")
-
+    binary = shutil.which("maru-resource-manager")
+    if binary is None:
+        pytest.skip("maru-resource-manager not installed — run ./install.sh first")
     return binary
 
 
