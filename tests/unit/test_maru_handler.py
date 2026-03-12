@@ -822,9 +822,9 @@ class TestMaruHandlerCoverage:
         config = MaruConfig(auto_connect=False, use_async_rpc=False)
         handler = MaruHandler(config)
         # Set _owned to an empty OwnedRegionManager (no regions)
-        handler._owned = OwnedRegionManager(mapper=DaxMapper(), chunk_size=1024)
+        handler._owned = OwnedRegionManager(chunk_size=1024)
 
-        assert handler._owned.get_first_region_id() is None
+        assert handler._owned.get_first_key() is None
         assert handler.pool_handle is None
 
     def test_allocator_owned_is_none(self):

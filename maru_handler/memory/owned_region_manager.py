@@ -2,20 +2,21 @@
 # Copyright 2026 XCENA Inc.
 """OwnedRegionManager - Manages multiple owned regions with PagedMemoryAllocator.
 
-Handles allocation, write, and region lifecycle via DaxMapper.
-Does NOT own RPC — expansion and return_alloc are Handler's responsibility.
+Unified manager for both remote (DaxMapper) and fs (MarufsMapper) modes.
+Does NOT own mapper — the caller (Handler) is responsible for mapping
+regions before calling add_region(), and for unmapping on close.
 """
 
 import logging
 import threading
 
-from maru_shm.types import MaruHandle
-
 from .allocator import PagedMemoryAllocator
-from .mapper import DaxMapper
 from .types import OwnedRegion
 
 logger = logging.getLogger(__name__)
+
+# Type alias for region key: int (region_id) in remote mode, str (name) in fs mode
+RegionKey = str | int
 
 
 class OwnedRegionManager:
@@ -26,12 +27,14 @@ class OwnedRegionManager:
 
     Does NOT handle expansion — when all regions are exhausted,
     allocate() returns None and the caller (Handler) is responsible
-    for requesting a new region via RPC and calling add_region().
+    for creating a new region and calling add_region().
+
+    Does NOT own mapper — the caller maps/unmaps regions directly.
+    This class is a pure allocator manager.
 
     Architecture::
 
         OwnedRegionManager
-            ├── DaxMapper (shared, for mmap/munmap)
             └── OwnedRegion[]
                 └── PagedMemoryAllocator (deque-based, per-region)
 
@@ -41,83 +44,81 @@ class OwnedRegionManager:
         3. Return None if all exhausted (caller handles expansion)
     """
 
-    def __init__(self, mapper: DaxMapper, chunk_size: int):
+    def __init__(self, chunk_size: int):
         """Initialize the OwnedRegionManager.
 
         Args:
-            mapper: DaxMapper for mmap/munmap operations
             chunk_size: Page/chunk size for PagedMemoryAllocator
         """
-        self._mapper = mapper
         self._chunk_size = chunk_size
         self._lock = threading.Lock()
 
-        self._regions: dict[int, OwnedRegion] = {}
-        self._region_order: list[int] = []
-        self._active_region_id: int | None = None
+        self._regions: dict[RegionKey, OwnedRegion] = {}
+        self._region_order: list[RegionKey] = []
+        self._active_region: RegionKey | None = None
+        self._region_counter: int = 0
 
     # =========================================================================
     # Lifecycle
     # =========================================================================
 
-    def add_region(self, handle: MaruHandle) -> OwnedRegion:
-        """Map a region via DaxMapper and create a PagedMemoryAllocator.
+    def add_region(self, key: RegionKey, pool_size: int) -> OwnedRegion:
+        """Register an already-mapped region and create a PagedMemoryAllocator.
 
-        Called by Handler during connect() and _expand_region().
+        The caller is responsible for mapping the region (via DaxMapper or
+        MarufsMapper) before calling this method.
+
         Thread-safe: protected by internal lock.
 
         Args:
-            handle: MaruHandle from server allocation
+            key: Region identifier — region_id (int) for remote mode,
+                 region_name (str) for fs mode.
+            pool_size: Size in bytes of the region.
 
         Returns:
             The created OwnedRegion
-
-        Raises:
-            RuntimeError: If mmap fails
-            ValueError: If allocator initialization fails
         """
-        self._mapper.map_region(handle)
-
         allocator = PagedMemoryAllocator(
-            region_id=handle.region_id,
-            pool_size=handle.length,
+            region_id=self._region_counter,
+            pool_size=pool_size,
             chunk_size=self._chunk_size,
         )
 
         region = OwnedRegion(
-            region_id=handle.region_id,
+            key=key,
             allocator=allocator,
         )
         with self._lock:
-            self._regions[handle.region_id] = region
-            self._region_order.append(handle.region_id)
+            self._regions[key] = region
+            self._region_order.append(key)
+            self._region_counter += 1
 
-            if self._active_region_id is None:
-                self._active_region_id = handle.region_id
+            if self._active_region is None:
+                self._active_region = key
 
         logger.info(
-            "Added owned region %d: pages=%d, chunk_size=%d",
-            handle.region_id,
+            "Added owned region %s: pages=%d, chunk_size=%d",
+            key,
             allocator.page_count,
             self._chunk_size,
         )
         return region
 
-    def close(self) -> list[int]:
+    def close(self) -> list[RegionKey]:
         """Close all owned regions: allocator cleanup only.
 
-        Does NOT unmap — DaxMapper.close() handles all unmaps.
-        Returns list of region_ids for the caller to return_alloc via RPC.
+        Does NOT unmap — the caller's mapper handles all unmaps.
+        Returns list of region keys for the caller to clean up.
         Thread-safe: protected by internal lock.
 
         Returns:
-            List of region_ids that were closed.
+            List of region keys that were closed.
         """
         with self._lock:
-            region_ids = list(self._region_order)
+            region_keys = list(self._region_order)
 
-            for rid in region_ids:
-                region = self._regions.get(rid)
+            for key in region_keys:
+                region = self._regions.get(key)
                 if region is None:
                     continue
 
@@ -125,20 +126,20 @@ class OwnedRegionManager:
                     region.allocator.close()
                 except Exception:
                     logger.error(
-                        "Error closing owned region %d allocator", rid, exc_info=True
+                        "Error closing owned region %s allocator", key, exc_info=True
                     )
 
             self._regions.clear()
             self._region_order.clear()
-            self._active_region_id = None
+            self._active_region = None
 
-            return region_ids
+            return region_keys
 
     # =========================================================================
     # Allocation
     # =========================================================================
 
-    def allocate(self) -> tuple[int, int] | None:
+    def allocate(self) -> tuple[RegionKey, int] | None:
         """Allocate a page from any available owned region.
 
         Thread-safe: protected by internal lock.
@@ -149,52 +150,52 @@ class OwnedRegionManager:
             3. Return None if all exhausted (caller handles expansion)
 
         Returns:
-            (region_id, page_index) on success, None on failure.
+            (region_key, page_index) on success, None on failure.
         """
         with self._lock:
             # 1. Fast path: try active region
-            if self._active_region_id is not None:
-                active = self._regions.get(self._active_region_id)
+            if self._active_region is not None:
+                active = self._regions.get(self._active_region)
                 if active is not None:
                     page_index = active.allocator.allocate()
                     if page_index is not None:
-                        return (self._active_region_id, page_index)
+                        return (self._active_region, page_index)
 
             # 2. Scan other regions
-            for rid in self._region_order:
-                if rid == self._active_region_id:
+            for key in self._region_order:
+                if key == self._active_region:
                     continue
-                region = self._regions[rid]
+                region = self._regions[key]
                 if region.allocator.num_free_pages > 0:
                     page_index = region.allocator.allocate()
                     if page_index is not None:
-                        self._active_region_id = rid
-                        logger.debug("Switched active region to %d", rid)
-                        return (rid, page_index)
+                        self._active_region = key
+                        logger.debug("Switched active region to %s", key)
+                        return (key, page_index)
 
             return None
 
-    def free(self, region_id: int, page_index: int) -> None:
+    def free(self, key: RegionKey, page_index: int) -> None:
         """Free a page in the specified owned region.
 
         Thread-safe: protected by internal lock.
 
         Raises:
-            KeyError: If region_id not found
+            KeyError: If region key not found
         """
         with self._lock:
-            region = self._regions.get(region_id)
+            region = self._regions.get(key)
             if region is None:
-                raise KeyError(f"Owned region {region_id} not found")
+                raise KeyError(f"Owned region {key} not found")
             region.allocator.free(page_index)
 
     # =========================================================================
     # Query
     # =========================================================================
 
-    def is_owned(self, region_id: int) -> bool:
+    def is_owned(self, key: RegionKey) -> bool:
         """Check if a region is owned by this manager."""
-        return region_id in self._regions
+        return key in self._regions
 
     @property
     def is_full(self) -> bool:
@@ -207,20 +208,20 @@ class OwnedRegionManager:
         """Return the chunk size."""
         return self._chunk_size
 
-    def get_owned_region(self, region_id: int) -> OwnedRegion | None:
-        """Get an owned region by ID."""
-        return self._regions.get(region_id)
+    def get_owned_region(self, key: RegionKey) -> OwnedRegion | None:
+        """Get an owned region by key."""
+        return self._regions.get(key)
 
-    def get_first_region_id(self) -> int | None:
-        """Get the first region's ID."""
+    def get_first_key(self) -> RegionKey | None:
+        """Get the first region's key."""
         return self._region_order[0] if self._region_order else None
 
     def get_first_allocator(self) -> PagedMemoryAllocator | None:
         """Get the first region's allocator (backward compat)."""
-        first_rid = self.get_first_region_id()
-        if first_rid is None:
+        first_key = self.get_first_key()
+        if first_key is None:
             return None
-        first_region = self._regions.get(first_rid)
+        first_region = self._regions.get(first_key)
         return first_region.allocator if first_region else None
 
     # =========================================================================
@@ -235,10 +236,10 @@ class OwnedRegionManager:
         total_free = 0
         total_allocated = 0
 
-        for rid in self._region_order:
-            region = self._regions[rid]
+        for key in self._region_order:
+            region = self._regions[key]
             s = region.allocator.get_stats()
-            s["region_id"] = rid
+            s["region_key"] = key
             regions_stats.append(s)
             total_pool_size += s["pool_size"]
             total_page_count += s["page_count"]

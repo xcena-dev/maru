@@ -69,9 +69,11 @@ class TestConcurrentAllocateFree:
     @pytest.fixture
     def mgr(self):
         mapper = DaxMapper()
-        mgr = OwnedRegionManager(mapper=mapper, chunk_size=1024)
+        mgr = OwnedRegionManager(chunk_size=1024)
         # Add a region with 8 pages
-        mgr.add_region(_make_handle(10, length=8192))
+        handle = _make_handle(10, length=8192)
+        mapper.map_region(handle)
+        mgr.add_region(10, 8192)
         return mgr
 
     def test_concurrent_allocate_no_duplicate(self, mgr):

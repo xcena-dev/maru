@@ -1,4 +1,4 @@
-"""Unit tests for OwnedRegionManagerFs.
+"""Unit tests for OwnedRegionManager (fs mode).
 
 VFS operations exercised against a real tmpfs directory.
 """
@@ -9,10 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from maru_handler.memory.marufs_mapper import MarufsMapper
-from maru_handler.memory.owned_region_manager_fs import (
-    OwnedRegionFs,
-    OwnedRegionManagerFs,
-)
+from maru_handler.memory.owned_region_manager import OwnedRegionManager
+from maru_handler.memory.types import OwnedRegion
 from marufs.client import MarufsClient
 
 # 64 KiB pool, 4 KiB chunk → 16 pages per region
@@ -45,11 +43,15 @@ def mapper(marufs_client):
 
 
 @pytest.fixture()
-def mgr(mapper):
-    """OwnedRegionManagerFs with default chunk/pool sizes."""
-    return OwnedRegionManagerFs(
-        mapper=mapper, chunk_size=CHUNK_SIZE, pool_size=POOL_SIZE
-    )
+def mgr():
+    """OwnedRegionManager with default chunk size."""
+    return OwnedRegionManager(chunk_size=CHUNK_SIZE)
+
+
+def _add_region(mgr, mapper, name):
+    """Helper: map region via MarufsMapper, then add to manager."""
+    mapper.map_owned_region(name, POOL_SIZE)
+    return mgr.add_region(name, POOL_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -58,24 +60,24 @@ def mgr(mapper):
 
 
 class TestAddRegion:
-    def test_add_region_returns_owned_region_fs(self, mgr):
-        """add_region returns an OwnedRegionFs instance."""
-        region = mgr.add_region("region1")
-        assert isinstance(region, OwnedRegionFs)
+    def test_add_region_returns_owned_region(self, mgr, mapper):
+        """add_region returns an OwnedRegion instance."""
+        region = _add_region(mgr, mapper, "region1")
+        assert isinstance(region, OwnedRegion)
 
-    def test_add_region_name_set(self, mgr):
-        """OwnedRegionFs has the correct name."""
-        region = mgr.add_region("region1")
-        assert region.name == "region1"
+    def test_add_region_key_set(self, mgr, mapper):
+        """OwnedRegion has the correct key."""
+        region = _add_region(mgr, mapper, "region1")
+        assert region.key == "region1"
 
-    def test_add_region_allocator_initialized(self, mgr):
+    def test_add_region_allocator_initialized(self, mgr, mapper):
         """Region allocator has the expected page count."""
-        region = mgr.add_region("region1")
+        region = _add_region(mgr, mapper, "region1")
         assert region.allocator.page_count == POOL_SIZE // CHUNK_SIZE
 
-    def test_add_region_is_owned(self, mgr):
+    def test_add_region_is_owned(self, mgr, mapper):
         """is_owned returns True after add_region."""
-        mgr.add_region("region1")
+        _add_region(mgr, mapper, "region1")
         assert mgr.is_owned("region1") is True
 
     def test_add_region_not_owned_before_add(self, mgr):
@@ -84,7 +86,7 @@ class TestAddRegion:
 
     def test_add_region_mapper_has_mapping(self, mgr, mapper):
         """MarufsMapper has the region mapped after add_region."""
-        mgr.add_region("region1")
+        _add_region(mgr, mapper, "region1")
         assert mapper.is_mapped("region1") is True
 
 
@@ -94,31 +96,31 @@ class TestAddRegion:
 
 
 class TestAllocate:
-    def test_allocate_returns_tuple(self, mgr):
+    def test_allocate_returns_tuple(self, mgr, mapper):
         """allocate returns (region_name, page_index) tuple."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         result = mgr.allocate()
         assert result is not None
         name, page_index = result
         assert isinstance(name, str)
         assert isinstance(page_index, int)
 
-    def test_allocate_page_index_in_range(self, mgr):
+    def test_allocate_page_index_in_range(self, mgr, mapper):
         """Allocated page_index is within valid range."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         _, page_index = mgr.allocate()
         assert 0 <= page_index < POOL_SIZE // CHUNK_SIZE
 
-    def test_allocate_multiple_unique(self, mgr):
+    def test_allocate_multiple_unique(self, mgr, mapper):
         """Consecutive allocations return different page indices."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         results = [mgr.allocate() for _ in range(5)]
         page_indices = [r[1] for r in results]
         assert len(set(page_indices)) == 5
 
-    def test_allocate_region_name_matches(self, mgr):
+    def test_allocate_region_name_matches(self, mgr, mapper):
         """Allocated region name matches the added region."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         name, _ = mgr.allocate()
         assert name == "r1"
 
@@ -129,25 +131,25 @@ class TestAllocate:
 
 
 class TestAllocateExhausted:
-    def test_allocate_returns_none_when_full(self, mgr):
+    def test_allocate_returns_none_when_full(self, mgr, mapper):
         """allocate returns None after all pages are consumed."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
         for _ in range(pages_per_region):
             assert mgr.allocate() is not None
         assert mgr.allocate() is None
 
-    def test_is_full_after_exhaustion(self, mgr):
+    def test_is_full_after_exhaustion(self, mgr, mapper):
         """is_full is True after all pages are consumed."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
         for _ in range(pages_per_region):
             mgr.allocate()
         assert mgr.is_full is True
 
-    def test_is_full_false_when_pages_available(self, mgr):
+    def test_is_full_false_when_pages_available(self, mgr, mapper):
         """is_full is False when pages are available."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         assert mgr.is_full is False
 
 
@@ -157,10 +159,10 @@ class TestAllocateExhausted:
 
 
 class TestAllocateMultiRegion:
-    def test_allocate_spans_both_regions(self, mgr):
+    def test_allocate_spans_both_regions(self, mgr, mapper):
         """Allocation uses second region after first is exhausted."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
 
         # Exhaust r1
@@ -173,10 +175,10 @@ class TestAllocateMultiRegion:
         name, _ = result
         assert name == "r2"
 
-    def test_allocate_total_pages(self, mgr):
+    def test_allocate_total_pages(self, mgr, mapper):
         """Total allocatable pages equals sum across both regions."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
         total = pages_per_region * 2
 
@@ -191,24 +193,24 @@ class TestAllocateMultiRegion:
 
 
 class TestFree:
-    def test_free_allows_reallocation(self, mgr):
+    def test_free_allows_reallocation(self, mgr, mapper):
         """Freed page can be re-allocated."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         name, page_index = mgr.allocate()
         mgr.free(name, page_index)
         # After free, a new allocation should succeed
         result = mgr.allocate()
         assert result is not None
 
-    def test_free_invalid_region_raises(self, mgr):
+    def test_free_invalid_region_raises(self, mgr, mapper):
         """free raises KeyError for unknown region name."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         with pytest.raises(KeyError):
             mgr.free("nonexistent", 0)
 
-    def test_free_restores_page_count(self, mgr):
+    def test_free_restores_page_count(self, mgr, mapper):
         """Freeing a page restores free_pages count."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
 
         # Exhaust all pages
@@ -230,8 +232,8 @@ class TestFree:
 
 
 class TestIsOwnedIsFull:
-    def test_is_owned_true(self, mgr):
-        mgr.add_region("r1")
+    def test_is_owned_true(self, mgr, mapper):
+        _add_region(mgr, mapper, "r1")
         assert mgr.is_owned("r1") is True
 
     def test_is_owned_false(self, mgr):
@@ -248,17 +250,17 @@ class TestIsOwnedIsFull:
 
 
 class TestClose:
-    def test_close_returns_region_names(self, mgr):
+    def test_close_returns_region_names(self, mgr, mapper):
         """close returns the list of region names."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         names = mgr.close()
         assert sorted(names) == ["r1", "r2"]
 
-    def test_close_clears_regions(self, mgr):
+    def test_close_clears_regions(self, mgr, mapper):
         """After close, is_owned returns False for all regions."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         mgr.close()
         assert mgr.is_owned("r1") is False
         assert mgr.is_owned("r2") is False
@@ -275,9 +277,9 @@ class TestClose:
 
 
 class TestGetStats:
-    def test_get_stats_structure(self, mgr):
+    def test_get_stats_structure(self, mgr, mapper):
         """get_stats returns a dict with expected keys."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         stats = mgr.get_stats()
         assert "num_regions" in stats
         assert "total_pool_size" in stats
@@ -287,38 +289,38 @@ class TestGetStats:
         assert "utilization" in stats
         assert "regions" in stats
 
-    def test_get_stats_num_regions(self, mgr):
+    def test_get_stats_num_regions(self, mgr, mapper):
         """num_regions matches the number of added regions."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         stats = mgr.get_stats()
         assert stats["num_regions"] == 2
 
-    def test_get_stats_region_name_key(self, mgr):
-        """Each region entry in stats has region_name."""
-        mgr.add_region("r1")
+    def test_get_stats_region_key(self, mgr, mapper):
+        """Each region entry in stats has region_key."""
+        _add_region(mgr, mapper, "r1")
         stats = mgr.get_stats()
-        assert stats["regions"][0]["region_name"] == "r1"
+        assert stats["regions"][0]["region_key"] == "r1"
 
-    def test_get_stats_utilization_zero_when_empty(self, mgr):
+    def test_get_stats_utilization_zero_when_empty(self, mgr, mapper):
         """utilization is 0.0 when no pages are allocated."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         stats = mgr.get_stats()
         assert stats["utilization"] == 0.0
 
-    def test_get_stats_utilization_after_alloc(self, mgr):
+    def test_get_stats_utilization_after_alloc(self, mgr, mapper):
         """utilization increases after allocation."""
-        mgr.add_region("r1")
+        _add_region(mgr, mapper, "r1")
         pages_per_region = POOL_SIZE // CHUNK_SIZE
         for _ in range(pages_per_region // 2):
             mgr.allocate()
         stats = mgr.get_stats()
         assert stats["utilization"] == pytest.approx(0.5)
 
-    def test_get_stats_total_page_count(self, mgr):
+    def test_get_stats_total_page_count(self, mgr, mapper):
         """total_page_count equals sum of pages across all regions."""
-        mgr.add_region("r1")
-        mgr.add_region("r2")
+        _add_region(mgr, mapper, "r1")
+        _add_region(mgr, mapper, "r2")
         stats = mgr.get_stats()
         pages_per_region = POOL_SIZE // CHUNK_SIZE
         assert stats["total_page_count"] == pages_per_region * 2

@@ -156,7 +156,6 @@ class MaruHandler:
 
             # 2. Initialize managers
             self._owned = OwnedRegionManager(
-                mapper=self._mapper,
                 chunk_size=self._config.chunk_size_bytes,
             )
 
@@ -174,9 +173,10 @@ class MaruHandler:
                 self._rpc.close()
                 return False
 
-            # 4. Add region to OwnedRegionManager (mmap + allocator)
+            # 4. Map region + add to OwnedRegionManager
             try:
-                self._owned.add_region(response.handle)
+                self._mapper.map_region(response.handle)
+                self._owned.add_region(response.handle.region_id, response.handle.length)
             except Exception:
                 logger.error("Failed to init initial region", exc_info=True)
                 try:
@@ -953,10 +953,10 @@ class MaruHandler:
         """Get initial pool handle (backward compat)."""
         if self._owned is None:
             return None
-        first_rid = self._owned.get_first_region_id()
-        if first_rid is None:
+        first_key = self._owned.get_first_key()
+        if first_key is None:
             return None
-        mapped = self._mapper.get_region(first_rid)
+        mapped = self._mapper.get_region(first_key)
         return mapped.handle if mapped else None
 
     @property
@@ -1009,7 +1009,8 @@ class MaruHandler:
 
         handle = response.handle
         try:
-            self._owned.add_region(handle)
+            self._mapper.map_region(handle)
+            self._owned.add_region(handle.region_id, handle.length)
             logger.info("Expanded: new store region %d", handle.region_id)
             return True
         except Exception:

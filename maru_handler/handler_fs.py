@@ -34,7 +34,7 @@ from marufs import MarufsClient
 from marufs.ioctl import MARUFS_NAME_MAX
 
 from .handler import MaruHandler
-from .memory import AllocHandle, MemoryInfo, OwnedRegionManagerFs, PagedMemoryAllocator
+from .memory import AllocHandle, MemoryInfo, OwnedRegionManager, PagedMemoryAllocator
 from .memory.marufs_mapper import MarufsMapper
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class MaruHandlerFs(MaruHandler):
         MaruHandlerFs
             ├── MarufsClient (marufs VFS + ioctl)
             ├── MarufsMapper (mmap owned + shared regions)
-            ├── OwnedRegionManagerFs (page allocator over owned marufs files)
+            ├── OwnedRegionManager (page allocator over owned marufs files)
             └── _key_to_location (key → (region_name, page_index, key_hash))
     """
 
@@ -157,7 +157,7 @@ class MaruHandlerFs(MaruHandler):
 
         self._marufs: MarufsClient = MarufsClient(self._config.mount_path)
         self._mapper: MarufsMapper = MarufsMapper(self._marufs)
-        self._owned: OwnedRegionManagerFs | None = None
+        self._owned: OwnedRegionManager | None = None
 
         # Thread-safety
         self._write_lock = threading.Lock()
@@ -205,15 +205,14 @@ class MaruHandlerFs(MaruHandler):
             self._marufs.get_dir_fd()
 
             # 2. Initialize owned region manager
-            self._owned = OwnedRegionManagerFs(
-                mapper=self._mapper,
+            self._owned = OwnedRegionManager(
                 chunk_size=self._config.chunk_size_bytes,
-                pool_size=self._config.pool_size,
             )
 
             # 3. Create initial owned data region
             region_name = self._next_region_name()
-            self._owned.add_region(region_name)
+            self._mapper.map_owned_region(region_name, self._config.pool_size)
+            self._owned.add_region(region_name, self._config.pool_size)
 
             self._connected = True
 
@@ -937,7 +936,7 @@ class MaruHandlerFs(MaruHandler):
         return self._owned.get_first_allocator()
 
     @property
-    def owned_region_manager(self) -> OwnedRegionManagerFs | None:
+    def owned_region_manager(self) -> OwnedRegionManager | None:
         """Get the owned region manager."""
         return self._owned
 
@@ -1067,7 +1066,8 @@ class MaruHandlerFs(MaruHandler):
         """
         try:
             region_name = self._next_region_name()
-            self._owned.add_region(region_name)
+            self._mapper.map_owned_region(region_name, self._config.pool_size)
+            self._owned.add_region(region_name, self._config.pool_size)
             logger.info("Expanded: created new owned region %s", region_name)
             return True
         except Exception as e:

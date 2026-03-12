@@ -145,7 +145,7 @@ The diagrams below show the lifecycle of Filesystem mode — from initialization
 sequenceDiagram
     participant C as LMCache
     participant H as MaruHandlerFs
-    participant ORM as OwnedRegionManagerFs
+    participant ORM as OwnedRegionManager
     participant XM as MarufsMapper
     participant XC as MarufsClient
     participant K as marufs (kernel)
@@ -154,17 +154,17 @@ sequenceDiagram
     C->>H: connect()
 
     Note over H: Step 1 — Initialize owned region manager
-    H->>ORM: OwnedRegionManagerFs(mapper, chunk_size, pool_size)
+    H->>ORM: OwnedRegionManager(chunk_size)
 
     Note over H,CXL: Step 2 — Create initial owned region
-    H->>ORM: add_region(region_name)
-    ORM->>XM: map_owned_region(name, size)
+    H->>XM: map_owned_region(name, size)
     XM->>XC: create_region(name, size)
     XC->>K: open(O_CREAT | O_RDWR) + ftruncate(size)
     Note over K,CXL: Allocate contiguous CXL memory
     XM->>XC: perm_set_default(fd, PERM_ALL)
     XM->>XC: mmap_region(fd, size)
     XC->>K: mmap(fd, size)
+    H->>ORM: add_region(name, pool_size)
 
     H-->>C: True
 ```
@@ -175,7 +175,7 @@ sequenceDiagram
 sequenceDiagram
     participant C as LMCache
     participant H as MaruHandlerFs
-    participant ORM as OwnedRegionManagerFs
+    participant ORM as OwnedRegionManager
     participant XM as MarufsMapper
     participant XC as MarufsClient
     participant K as marufs (kernel)
@@ -236,7 +236,7 @@ Subsequent accesses to the same region reuse the cached mmap (0 open/mmap).
 sequenceDiagram
     participant C as LMCache
     participant H as MaruHandlerFs
-    participant ORM as OwnedRegionManagerFs
+    participant ORM as OwnedRegionManager
     participant XC as MarufsClient
     participant K as marufs (kernel)
 
@@ -256,7 +256,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant H as MaruHandlerFs
-    participant ORM as OwnedRegionManagerFs
+    participant ORM as OwnedRegionManager
     participant XM as MarufsMapper
     participant XC as MarufsClient
     participant K as marufs (kernel)
@@ -294,7 +294,7 @@ graph TB
         LM[LMCache]
         subgraph "Maru Handler"
             H[MaruHandlerFs]
-            ORM[OwnedRegionManagerFs<br/>page allocator]
+            ORM[OwnedRegionManager<br/>page allocator]
             XM[MarufsMapper<br/>mmap + CUDA pin]
             XC[MarufsClient<br/>VFS + ioctl wrapper]
         end
@@ -322,7 +322,7 @@ Horizontal layout (for presentations):
 graph LR
     subgraph "LLM Instance (vLLM)"
         LM[LMCache] --> H[MaruHandlerFs]
-        H --> ORM[OwnedRegionManagerFs]
+        H --> ORM[OwnedRegionManager]
         H --> XM[MarufsMapper]
         ORM --> XM
         XM --> XC[MarufsClient]
@@ -332,11 +332,11 @@ graph LR
     K --- CXL[(CXL Memory)]
 ```
 
-Filesystem mode introduces three components that replace their Remote mode counterparts:
+Filesystem mode introduces two new components and shares OwnedRegionManager with Remote mode:
 
 | Component | Replaces | Role |
 |-----------|----------|------|
-| **OwnedRegionManagerFs** | OwnedRegionManager | Page-level allocator for multiple owned regions, using the same O(1) free-list strategy as Remote mode. Allocation follows the same fast-path: active region → scan others → create new. |
+| **OwnedRegionManager** | _(shared)_ | Unified page-level allocator for multiple owned regions, used by both Remote and Filesystem modes. Mapper-agnostic — the handler maps regions before registering them. Same O(1) free-list allocation: active region → scan others → create new. |
 | **MarufsMapper** | DaxMapper | Memory-mapping lifecycle manager. All regions are mapped with CUDA pinning for owned regions; shared region size is auto-detected via fstat. Performs bulk unmap on close. |
 | **MarufsClient** | RpcClient + MaruShmClient | Wraps kernel filesystem interface — region CRUD via VFS, global hash table operations via ioctl, permission management. Caches file descriptors internally and validates region names against path traversal. |
 

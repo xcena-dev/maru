@@ -91,14 +91,58 @@ class MappedRegion:
         self._mmap_obj = None
 
 
+class MarufsMappedRegion:
+    """A memory-mapped marufs region.
+
+    Tracks fd, mmap, memoryview, and metadata for one region file.
+    Eagerly creates memoryview(mmap_obj) at construction time.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        fd: int,
+        mmap_obj: mmap_module.mmap,
+        size: int,
+        owned: bool,
+    ):
+        self.name = name
+        self.fd = fd
+        self.size = size
+        self.owned = owned
+        self._mmap_obj: mmap_module.mmap | None = mmap_obj
+        self._buffer_view: memoryview | None = memoryview(mmap_obj)
+        self._cuda_pinned = False
+
+    @property
+    def is_mapped(self) -> bool:
+        return self._mmap_obj is not None
+
+    def get_buffer_view(self, offset: int, size: int) -> memoryview | None:
+        """Return a zero-copy memoryview slice."""
+        if self._buffer_view is None:
+            return None
+        if offset < 0 or size < 0 or offset + size > len(self._buffer_view):
+            return None
+        return self._buffer_view[offset : offset + size]
+
+    def release(self) -> None:
+        """Release memoryview and mmap references."""
+        self._buffer_view = None
+        if self._mmap_obj is not None:
+            self._mmap_obj.close()
+            self._mmap_obj = None
+
+
 @dataclass
 class OwnedRegion:
     """An owned (write-enabled) region with its own allocator.
 
     Used by OwnedRegionManager to track multiple owned regions.
+    key is region_id (int) for remote mode, region_name (str) for fs mode.
     """
 
-    region_id: int
+    key: "str | int"
     allocator: "PagedMemoryAllocator"
 
 
