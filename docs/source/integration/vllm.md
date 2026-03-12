@@ -125,14 +125,9 @@ Instance B:
 
 1. **Maru installed** (includes maru-server, maru-resourced)
 2. **vLLM v0.14+** (KVConnectorBase_V1 support)
-3. **CXL DAX device** with `maru-resourced` daemon running
+3. **CXL DAX device** with `maru-resourced` running
 
-### Installation
-
-```bash
-cd /path/to/maru
-pip install -e .
-```
+See {doc}`Installation <../getting_started/installation>` for full setup instructions.
 
 ### Launch
 

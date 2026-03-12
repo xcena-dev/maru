@@ -29,7 +29,7 @@ Instance 1 (GPU 0)                    Instance 2 (GPU 1)
 Run everything with a single script:
 
 ```bash
-cd examples/vllm_direct
+cd examples/vllm
 ./p2p_example.sh [model]
 
 # Examples:
@@ -48,7 +48,7 @@ This will:
 **1. Start maru-server:**
 
 ```bash
-source examples/vllm_direct/env.sh
+source examples/vllm/env.sh
 maru-server --port $MARU_SERVER_PORT
 ```
 
@@ -56,16 +56,16 @@ maru-server --port $MARU_SERVER_PORT
 
 ```bash
 # Terminal 1: Instance 1 (GPU 0)
-./examples/vllm_direct/launch_vllm.sh inst1 Qwen/Qwen2.5-0.5B
+./examples/vllm/launch_vllm.sh inst1 Qwen/Qwen2.5-0.5B
 
 # Terminal 2: Instance 2 (GPU 1)
-./examples/vllm_direct/launch_vllm.sh inst2 Qwen/Qwen2.5-0.5B
+./examples/vllm/launch_vllm.sh inst2 Qwen/Qwen2.5-0.5B
 ```
 
 **3. Run the test:**
 
 ```bash
-python examples/vllm_direct/run_request.py \
+python examples/vllm/run_request.py \
     --model Qwen/Qwen2.5-0.5B \
     --port1 $MARU_INST1_PORT \
     --port2 $MARU_INST2_PORT \
@@ -97,7 +97,7 @@ Instance 2 shows lower TTFT because it loads KV cache from CXL instead of recomp
 
 ### Configuration
 
-All settings are in `examples/vllm_direct/env.sh`:
+All settings are in `examples/vllm/env.sh`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -111,7 +111,7 @@ All settings are in `examples/vllm_direct/env.sh`:
 ### Test Options
 
 ```bash
-python examples/vllm_direct/run_request.py --help
+python examples/vllm/run_request.py --help
 
 Options:
   --model MODEL          Model name (default: Qwen/Qwen2.5-0.5B)
