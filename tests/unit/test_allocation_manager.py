@@ -272,3 +272,61 @@ class TestListAllocations:
 
         handles = manager.list_allocations(exclude_instance_id="no-such-inst")
         assert len(handles) == 1
+
+
+class TestAllocationManagerStatsEdgeCases:
+    """Additional stats and lifecycle edge cases."""
+
+    def test_get_stats_with_disconnected_owner(self):
+        """active_clients excludes disconnected owners."""
+        manager = AllocationManager()
+        manager.allocate("inst1", 1024)
+        h2 = manager.allocate("inst2", 2048)
+        manager.increment_kv_ref(h2.region_id)
+
+        manager.disconnect_client("inst2")
+
+        stats = manager.get_stats()
+        assert stats["num_allocations"] == 2  # h1 + h2 (kv ref kept h2 alive)
+        assert stats["total_allocated"] == 1024 + 2048
+        assert stats["active_clients"] == 1  # Only inst1 is active
+
+    def test_get_stats_empty(self):
+        """Stats on empty manager."""
+        manager = AllocationManager()
+        stats = manager.get_stats()
+        assert stats["num_allocations"] == 0
+        assert stats["total_allocated"] == 0
+        assert stats["active_clients"] == 0
+
+    def test_disconnect_nonexistent_client(self):
+        """disconnect_client with unknown instance_id is a no-op."""
+        manager = AllocationManager()
+        h = manager.allocate("inst1", 1024)
+        manager.disconnect_client("no-such-inst")
+        # inst1's allocation should be untouched
+        assert manager.get_handle(h.region_id) is not None
+
+    def test_multiple_kv_ref_increments_and_decrements(self):
+        """Multiple increment/decrement cycles before owner disconnect."""
+        manager = AllocationManager()
+        h = manager.allocate("inst1", 4096)
+
+        # Increment 3 times
+        manager.increment_kv_ref(h.region_id)
+        manager.increment_kv_ref(h.region_id)
+        manager.increment_kv_ref(h.region_id)
+
+        # Owner disconnects
+        manager.release("inst1", h.region_id)
+        # Still alive (kv_ref_count = 3)
+        assert manager.get_handle(h.region_id) is not None
+
+        # Decrement to 1
+        manager.decrement_kv_ref(h.region_id)
+        manager.decrement_kv_ref(h.region_id)
+        assert manager.get_handle(h.region_id) is not None
+
+        # Final decrement triggers free
+        manager.decrement_kv_ref(h.region_id)
+        assert manager.get_handle(h.region_id) is None

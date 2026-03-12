@@ -23,6 +23,9 @@ class MockShmClient:
     def __init__(self, *args, **kwargs):
         pass
 
+    def _ensure_resource_manager(self):
+        pass
+
     def stats(self):
         return []
 
