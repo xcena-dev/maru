@@ -11,6 +11,7 @@ import os
 import socket
 import tempfile
 import threading
+from unittest.mock import patch
 
 import pytest
 
@@ -25,9 +26,6 @@ from maru_shm.ipc import (
 )
 from maru_shm.types import MaruHandle
 from maru_shm.uds_helpers import read_full, send_with_fd, write_full
-
-from unittest.mock import patch
-
 
 # =============================================================================
 # Helpers (same pattern as test_shm_client.py)
@@ -125,9 +123,7 @@ class TestTryConnect:
 
     def test_failure_when_no_server(self):
         """_try_connect returns False when no server is listening."""
-        client = MaruShmClient(
-            socket_path="/tmp/_maru_nonexistent_test_sock.sock"
-        )
+        client = MaruShmClient(socket_path="/tmp/_maru_nonexistent_test_sock.sock")
         assert client._try_connect() is False
 
 
@@ -276,9 +272,7 @@ class TestMmapEdgeCases:
         def handler(sock):
             hdr, _ = _recv_request(sock)
             if hdr.msg_type == MsgType.ALLOC_REQ:
-                handle = MaruHandle(
-                    region_id=1, offset=0, length=4096, auth_token=999
-                )
+                handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=999)
                 resp = AllocResp(status=0, handle=handle, requested_size=4096)
                 _send_response_with_fd(sock, MsgType.ALLOC_RESP, resp)
 
@@ -306,9 +300,7 @@ class TestMmapEdgeCases:
         def handler(sock):
             hdr, _ = _recv_request(sock)
             if hdr.msg_type == MsgType.ALLOC_REQ:
-                handle = MaruHandle(
-                    region_id=1, offset=0, length=4096, auth_token=999
-                )
+                handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=999)
                 resp = AllocResp(status=0, handle=handle, requested_size=4096)
                 _send_response_with_fd(sock, MsgType.ALLOC_RESP, resp)
 
@@ -368,9 +360,7 @@ class TestDel:
     def test_del_calls_close(self):
         """__del__ delegates to close()."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            client = MaruShmClient(
-                socket_path=os.path.join(tmpdir, "fake.sock")
-            )
+            client = MaruShmClient(socket_path=os.path.join(tmpdir, "fake.sock"))
             with patch.object(client, "close") as mock_close:
                 client.__del__()
                 mock_close.assert_called_once()
