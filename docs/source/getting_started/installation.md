@@ -47,12 +47,16 @@ Install the Maru Python package and resource manager:
 
 ## 2. Verify Installation
 
-Verify that the Maru Resource Manager daemon is running:
+Verify that the Maru Resource Manager binary is installed:
 
 ```bash
-systemctl status maru-resourced
+which maru-resource-manager
 ```
 
-> **Deprecation Notice**: The local systemd daemon (`maru-resourced`) will be replaced by an RPC-based Resource Manager server in a future release. This change enables multi-node resource management without requiring a daemon on each node.
+The resource manager starts automatically when `MaruServer` launches — no manual startup is needed. To check pool status while it is running:
+
+```bash
+maru_test_client stats
+```
 
 Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.
