@@ -137,6 +137,7 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "shutting down...");
     reaper.stop();
     server.stop();
+    pm.checkpoint();
     maru::logf(maru::LogLevel::Info, "shutdown complete");
     return 0;
 }
