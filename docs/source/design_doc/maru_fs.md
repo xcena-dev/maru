@@ -8,11 +8,10 @@ Maru's architecture separates the **data plane** (direct zero-copy access to CXL
 
 The first control plane implementation, **Remote mode**, uses a centralized MaruServer and Maru Resource Manager communicating over RPC:
 
-```
-┌─────────────┐     RPC      ┌─────────────┐     RPC      ┌──────────────────────┐
-│  LMCache    │ ──────────── │  MaruServer  │ ──────────── │ Maru Resource Manager│
-│  (Client)   │   (ZMQ)      │  (Python)    │              │         │
-└─────────────┘              └─────────────┘              └──────────────────────┘
+```mermaid
+graph LR
+    A[LMCache<br/>Client] -->|RPC<br/>ZMQ| B[MaruServer<br/>Python]
+    B -->|RPC| C[Maru Resource Manager]
 ```
 
 ### Why a filesystem?
@@ -34,11 +33,10 @@ In summary, Remote mode has the following limitations — including the security
 
 **Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level.
 
-```
-┌─────────────┐   VFS + ioctl   ┌─────────────────┐
-│  LMCache    │ ──────────────── │  marufs (kernel) │ ─── CXL Memory
-│  (Client)   │   (syscall)      │                  │
-└─────────────┘                  └─────────────────┘
+```mermaid
+graph LR
+    A[LMCache<br/>Client] -->|VFS + ioctl<br/>syscall| B[marufs<br/>kernel module]
+    B --- C[CXL Memory]
 ```
 
 The data plane remains identical — clients still access CXL memory directly via mmap. Only the control plane changes.
