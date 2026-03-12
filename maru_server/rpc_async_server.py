@@ -27,8 +27,11 @@ from typing import TYPE_CHECKING, Any
 import zmq
 
 from maru_common import MessageHeader, MessageType, Serializer
+from maru_common.protocol import NewAllocationNotification
 
 if TYPE_CHECKING:
+    from maru_shm import MaruHandle
+
     from .server import MaruServer
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,8 @@ class RpcAsyncServer:
         self._context: zmq.Context | None = None
         self._frontend: zmq.Socket | None = None
         self._backend: zmq.Socket | None = None
+        self._pub_socket: zmq.Socket | None = None
+        self._pub_serializer: Serializer | None = None
         self._running = False
         self._stop_event = threading.Event()
         self._proxy_thread: threading.Thread | None = None
@@ -89,6 +94,17 @@ class RpcAsyncServer:
         self._backend = self._context.socket(zmq.DEALER)
         self._backend.setsockopt(zmq.LINGER, 0)
         self._backend.bind(_WORKER_ENDPOINT)
+
+        # PUB socket for allocation notifications (port + 1)
+        self._pub_socket = self._context.socket(zmq.PUB)
+        self._pub_socket.setsockopt(zmq.LINGER, 0)
+        pub_address = f"tcp://{self._host}:{self._port + 1}"
+        self._pub_socket.bind(pub_address)
+        self._pub_serializer = Serializer()
+        logger.info("PUB notification socket bound on %s", pub_address)
+
+        # Wire up MaruServer → PUB socket notification
+        self._server.set_notification_callback(self.publish_notification)
 
         self._running = True
         self._stop_event.clear()
@@ -138,6 +154,9 @@ class RpcAsyncServer:
         if self._backend:
             self._backend.close()
             self._backend = None
+        if self._pub_socket:
+            self._pub_socket.close()
+            self._pub_socket = None
 
         # 3. Wait for proxy thread to exit
         if self._proxy_thread and self._proxy_thread.is_alive():
@@ -152,6 +171,38 @@ class RpcAsyncServer:
             self._context = None
 
         logger.info("RPC Async Server stopped")
+
+    # =========================================================================
+    # PUB/SUB Notification
+    # =========================================================================
+
+    def publish_notification(
+        self, instance_id: str, handle: "MaruHandle"
+    ) -> None:
+        """Publish a new-allocation notification to all subscribers.
+
+        Called by MaruServer after a successful request_alloc().
+        Thread-safe: PUB socket send is atomic in ZMQ.
+
+        Args:
+            instance_id: Instance that received the allocation.
+            handle: The newly allocated region handle.
+        """
+        if self._pub_socket is None or self._pub_serializer is None:
+            return
+        try:
+            data = {"instance_id": instance_id, "handle": handle.to_dict()}
+            encoded = self._pub_serializer.encode(
+                MessageType.NOTIFY_NEW_ALLOCATION, data, seq=0
+            )
+            self._pub_socket.send(encoded, zmq.NOBLOCK)
+            logger.debug(
+                "Published new-allocation notification: instance=%s region=%d",
+                instance_id,
+                handle.region_id,
+            )
+        except zmq.ZMQError as e:
+            logger.warning("Failed to publish notification: %s", e)
 
     # =========================================================================
     # Internal Routines

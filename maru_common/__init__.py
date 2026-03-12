@@ -32,6 +32,7 @@ from .protocol import (  # noqa: E402
     ListAllocationsRequest,
     ListAllocationsResponse,
     LookupKVRequest,
+    NewAllocationNotification,
     LookupKVResponse,
     LookupResult,
     MessageFlags,
@@ -90,6 +91,8 @@ __all__ = [
     # List allocations messages
     "ListAllocationsRequest",
     "ListAllocationsResponse",
+    # Notification messages
+    "NewAllocationNotification",
     # Handshake messages
     "HandshakeRequest",
     "HandshakeResponse",

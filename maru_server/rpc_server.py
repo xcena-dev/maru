@@ -12,6 +12,8 @@ import zmq
 from maru_common import MessageHeader, MessageType, Serializer
 
 if TYPE_CHECKING:
+    from maru_shm import MaruHandle
+
     from .server import MaruServer
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ class RpcServer:
         self._port = port
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
+        self._pub_socket: zmq.Socket | None = None
+        self._pub_serializer: Serializer | None = None
         self._running = False
         self._stopped_event = threading.Event()
         self._serializer = Serializer()
@@ -47,9 +51,20 @@ class RpcServer:
         self._socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout to check _running
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.bind(self.address)
+
+        # PUB socket for allocation notifications (port + 1)
+        self._pub_socket = self._context.socket(zmq.PUB)
+        self._pub_socket.setsockopt(zmq.LINGER, 0)
+        pub_address = f"tcp://{self._host}:{self._port + 1}"
+        self._pub_socket.bind(pub_address)
+        self._pub_serializer = Serializer()
+
+        # Wire up MaruServer → PUB socket notification
+        self._server.set_notification_callback(self.publish_notification)
+
         self._running = True
 
-        logger.info("RPC Server started on %s", self.address)
+        logger.info("RPC Server started on %s (PUB: %s)", self.address, pub_address)
 
         while self._running:
             header = None
@@ -97,6 +112,9 @@ class RpcServer:
         self._running = False
         # Wait for server loop to exit (it checks _running every 100ms)
         self._stopped_event.wait(timeout=2.0)
+        if self._pub_socket:
+            self._pub_socket.close()
+            self._pub_socket = None
         if self._socket:
             self._socket.close()
             self._socket = None
@@ -104,6 +122,26 @@ class RpcServer:
             self._context.term()
             self._context = None
         logger.info("RPC Server stopped")
+
+    def publish_notification(
+        self, instance_id: str, handle: "MaruHandle"
+    ) -> None:
+        """Publish a new-allocation notification to all subscribers."""
+        if self._pub_socket is None or self._pub_serializer is None:
+            return
+        try:
+            data = {"instance_id": instance_id, "handle": handle.to_dict()}
+            encoded = self._pub_serializer.encode(
+                MessageType.NOTIFY_NEW_ALLOCATION, data, seq=0
+            )
+            self._pub_socket.send(encoded, zmq.NOBLOCK)
+            logger.debug(
+                "Published new-allocation notification: instance=%s region=%d",
+                instance_id,
+                handle.region_id,
+            )
+        except zmq.ZMQError as e:
+            logger.warning("Failed to publish notification: %s", e)
 
     def _handle_message(self, msg_type: int, request: Any) -> dict:
         """Dispatch message to appropriate handler."""

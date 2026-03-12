@@ -28,7 +28,16 @@ class MaruServer:
         self._allocation_manager = AllocationManager()
         self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
+        self._notification_callback: callable | None = None
         logger.info("MaruServer initialized")
+
+    def set_notification_callback(self, callback: callable) -> None:
+        """Register a callback for new-allocation notifications.
+
+        Called by RpcAsyncServer to wire up PUB/SUB publishing.
+        Signature: callback(instance_id: str, handle: MaruHandle)
+        """
+        self._notification_callback = callback
 
     # =========================================================================
     # Allocation Management
@@ -44,6 +53,17 @@ class MaruServer:
                 instance_id,
                 handle.region_id,
             )
+            # Notify other handlers about the new allocation (PUB/SUB)
+            if self._notification_callback:
+                try:
+                    self._notification_callback(
+                        instance_id=instance_id, handle=handle
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to publish allocation notification",
+                        exc_info=True,
+                    )
         else:
             logger.error("Failed to allocate %d bytes for %s", size, instance_id)
         return handle

@@ -98,10 +98,19 @@ class MaruHandler:
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
+            # Derive notify port from server URL (port + 1)
+            notify_port = None
+            if self._config.enable_notifications:
+                try:
+                    port = int(self._config.server_url.rsplit(":", 1)[1])
+                    notify_port = port + 1
+                except (ValueError, IndexError):
+                    pass
             self._rpc = RpcAsyncClient(
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
                 max_inflight=self._config.max_inflight,
+                notify_port=notify_port,
             )
         else:
             self._rpc = RpcClient(
@@ -180,7 +189,13 @@ class MaruHandler:
 
             self._connected = True
 
-            # 5. Pre-map shared regions (eager mapping)
+            # 5. Register notification callback (PUB/SUB)
+            if self._config.enable_notifications and hasattr(
+                self._rpc, "set_notification_callback"
+            ):
+                self._rpc.set_notification_callback(self._on_new_allocation)
+
+            # 6. Pre-map shared regions (eager mapping)
             if self._config.eager_map:
                 self._premap_shared_regions()
 
@@ -1054,6 +1069,42 @@ class MaruHandler:
             mapped_count,
             len(response.allocations),
         )
+
+    def _on_new_allocation(self, notification) -> None:
+        """Handle server PUB/SUB notification of a new region allocation.
+
+        Called from the RPC client's asyncio event loop thread when a
+        NOTIFY_NEW_ALLOCATION message arrives. map_region() is
+        thread-safe and idempotent, so concurrent calls from retrieve()
+        and this callback are safe.
+        """
+        if not self._connected or self._closing.is_set():
+            return
+
+        instance_id = notification.instance_id
+        handle = notification.handle
+
+        # Skip own allocations
+        if instance_id == self._config.instance_id:
+            return
+
+        # Skip already-mapped regions
+        if self._mapper.get_region(handle.region_id) is not None:
+            return
+
+        try:
+            self._mapper.map_region(handle, prefault=False)
+            logger.info(
+                "Notification: mapped shared region %d from %s",
+                handle.region_id,
+                instance_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Notification: failed to map region %d: %s",
+                handle.region_id,
+                e,
+            )
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""

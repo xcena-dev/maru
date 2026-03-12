@@ -71,10 +71,17 @@ class RpcAsyncClient:
         server_url: str = "tcp://localhost:5555",
         timeout_ms: int = 5000,
         max_inflight: int = 64,
+        notify_port: int | None = None,
     ):
         self._server_url = server_url
         self._timeout_ms = timeout_ms
         self._max_inflight = max_inflight
+
+        # Derive notification URL from server_url if notify_port given
+        self._notify_url: str | None = None
+        if notify_port is not None:
+            base = server_url.rsplit(":", 1)[0]  # "tcp://host"
+            self._notify_url = f"{base}:{notify_port}"
 
         # Event loop (created in connect)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -83,6 +90,7 @@ class RpcAsyncClient:
         # ZMQ (created on event loop thread via _async_init)
         self._context: zmq.asyncio.Context | None = None
         self._socket: zmq.asyncio.Socket | None = None
+        self._sub_socket: zmq.asyncio.Socket | None = None
 
         # State
         self._running = False
@@ -90,6 +98,8 @@ class RpcAsyncClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._inflight_sem: asyncio.Semaphore | None = None
         self._listener_task: asyncio.Task | None = None
+        self._notify_task: asyncio.Task | None = None
+        self._notification_callback: callable | None = None
 
     # =========================================================================
     # Connection Lifecycle
@@ -111,6 +121,14 @@ class RpcAsyncClient:
         init_future.result(timeout=5.0)
 
         logger.info("Connected to MaruServer at %s", self._server_url)
+
+    def set_notification_callback(self, callback: callable) -> None:
+        """Register a callback for new-allocation notifications from server.
+
+        The callback is invoked on the asyncio event loop thread.
+        Signature: callback(notification: NewAllocationNotification)
+        """
+        self._notification_callback = callback
 
     def close(self) -> None:
         """Close the connection and stop the event loop."""
@@ -165,6 +183,17 @@ class RpcAsyncClient:
         self._inflight_sem = asyncio.Semaphore(self._max_inflight)
         self._listener_task = asyncio.ensure_future(self._response_listener())
 
+        # SUB socket for server notifications (PUB/SUB)
+        if self._notify_url:
+            self._sub_socket = self._context.socket(zmq.SUB)
+            self._sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+            self._sub_socket.setsockopt(zmq.LINGER, 0)
+            self._sub_socket.connect(self._notify_url)
+            self._notify_task = asyncio.ensure_future(
+                self._notification_listener()
+            )
+            logger.debug("SUB notification socket connected to %s", self._notify_url)
+
     async def _async_cleanup(self) -> None:
         """Close socket, wait for listener to exit, and fail pending futures.
 
@@ -173,6 +202,17 @@ class RpcAsyncClient:
         the Cython recv mid-operation (which leaves orphaned state that causes
         KeyError: '__builtins__' during GC).
         """
+        # 1a. Close SUB socket + cancel notification listener
+        if self._sub_socket:
+            self._sub_socket.close()
+            self._sub_socket = None
+        if self._notify_task:
+            self._notify_task.cancel()
+            try:
+                await self._notify_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # 1. Close socket — causes recv_multipart to raise ZMQError
         if self._socket:
             self._socket.close()
@@ -222,6 +262,43 @@ class RpcAsyncClient:
                 break
             except Exception:
                 logger.error("Response listener error", exc_info=True)
+                continue
+
+    # =========================================================================
+    # Notification Listener (PUB/SUB)
+    # =========================================================================
+
+    async def _notification_listener(self) -> None:
+        """Receive PUB/SUB notifications from server and invoke callback."""
+        while self._running:
+            try:
+                data = await self._sub_socket.recv()
+                header = MessageHeader.unpack(data[:HEADER_SIZE])
+
+                if header.msg_type != MessageType.NOTIFY_NEW_ALLOCATION:
+                    continue
+
+                payload = self._serializer.decode(data)[1]
+                handle_data = payload.get("handle")
+                if handle_data is None:
+                    continue
+
+                if self._notification_callback:
+                    from maru_common.protocol import NewAllocationNotification
+
+                    notification = NewAllocationNotification(
+                        instance_id=payload.get("instance_id", ""),
+                        handle=MaruHandle.from_dict(handle_data),
+                    )
+                    self._notification_callback(notification)
+
+            except asyncio.CancelledError:
+                break
+            except zmq.ZMQError:
+                if not self._running:
+                    break
+            except Exception:
+                logger.warning("Notification listener error", exc_info=True)
                 continue
 
     # =========================================================================

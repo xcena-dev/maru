@@ -624,7 +624,8 @@ class TestRpcAsyncServerAdditionalCoverage:
         mock_ctx = MagicMock()
         mock_frontend = MagicMock()
         mock_backend = MagicMock()
-        sockets = [mock_frontend, mock_backend]
+        mock_pub = MagicMock()
+        sockets = [mock_frontend, mock_backend, mock_pub]
         mock_ctx.socket.side_effect = sockets
 
         # Make _worker_routine and _proxy_routine no-ops

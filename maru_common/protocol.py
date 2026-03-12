@@ -41,6 +41,7 @@ class MessageType(IntEnum):
     REQUEST_ALLOC = 0x01
     RETURN_ALLOC = 0x03
     LIST_ALLOCATIONS = 0x04
+    NOTIFY_NEW_ALLOCATION = 0x05  # Server → Handler (PUB/SUB)
 
     # KV Operations (0x10 - 0x1F)
     REGISTER_KV = 0x10
@@ -199,6 +200,18 @@ class ListAllocationsResponse:
     success: bool
     allocations: list[MaruHandle] = field(default_factory=list)
     error: str | None = None
+
+
+@dataclass
+class NewAllocationNotification:
+    """NOTIFY_NEW_ALLOCATION (0x05) - Server→Handler PUB/SUB notification.
+
+    Published when a new region is allocated (initial or expand).
+    Handlers use this to eagerly map shared regions in the background.
+    """
+
+    instance_id: str  # Instance that received the allocation
+    handle: MaruHandle  # The newly allocated region handle
 
 
 # =============================================================================
@@ -431,6 +444,7 @@ MESSAGE_CLASSES = {
     MessageType.REQUEST_ALLOC: (RequestAllocRequest, RequestAllocResponse),
     MessageType.RETURN_ALLOC: (ReturnAllocRequest, ReturnAllocResponse),
     MessageType.LIST_ALLOCATIONS: (ListAllocationsRequest, ListAllocationsResponse),
+    MessageType.NOTIFY_NEW_ALLOCATION: (NewAllocationNotification, None),
     # KV Operations
     MessageType.REGISTER_KV: (RegisterKVRequest, RegisterKVResponse),
     MessageType.LOOKUP_KV: (LookupKVRequest, LookupKVResponse),
