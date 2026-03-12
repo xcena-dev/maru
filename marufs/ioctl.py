@@ -138,7 +138,7 @@ class MarufsBatchNameOffsetReq(ctypes.Structure):
     ]
 
 
-MARUFS_BATCH_STORE_MAX = 512  # max entries per batch store ioctl call
+MARUFS_BATCH_STORE_MAX = 32  # max entries per batch store ioctl call
 
 
 class MarufsPermReq(ctypes.Structure):

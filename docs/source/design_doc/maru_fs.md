@@ -15,18 +15,24 @@ The first control plane implementation, **Remote mode**, uses a centralized Maru
 └─────────────┘              └─────────────┘              └──────────────────────┘
 ```
 
-While functional, this design carries operational burdens:
+### Why a filesystem?
 
-| Problem | Description |
-|---------|-------------|
-| **Multi-process management** | MaruServer and Maru Resource Manager must be deployed and monitored separately |
-| **RPC overhead** | Every KV lookup and region allocation goes through network serialization |
-| **Single point of failure** | If MaruServer crashes, all KV metadata is lost |
-| **No access control** | No authentication or authorization on the RPC endpoint — any process that can reach MaruServer can read, write, or delete any KV entry and region |
-| **IPC complexity** | Multi-hop RPC protocol between MaruServer and Resource Manager is hard to debug and maintain |
-| **Single-node only** | Remote mode assumes all instances share one CXL pool behind a single MaruServer; there is no built-in mechanism for cross-node KV sharing or federated metadata |
+The fundamental limitation of Remote mode is **security**. In Remote mode, clients access CXL shared memory by directly `mmap`-ing `/dev/dax` devices. The Linux DAX driver provides no isolation — any process that can open the device has unrestricted read-write access to the entire CXL memory pool. There is no way to enforce per-region or per-instance access control at the hardware or driver level. The RPC endpoint is equally open: any process that can reach MaruServer can read, write, or delete any KV entry and region without authentication or authorization.
 
-**Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level for stronger security than user-space RPC.
+Moving access control into the kernel is necessary, but the question is *how* — a custom character device (`/dev/maru`) could also interpose the kernel. The reason a **filesystem** is the right choice is that Maru's data model maps naturally onto it: each CXL memory region is a file, and each file has its own inode. The VFS layer already provides per-inode ownership, permission checks on `open` and `mmap`, and fd-scoped access — exactly the per-region security granularity Maru needs. A character device offers only device-level access control (can open `/dev/maru` or not); implementing per-region permissions on top of a single chardev would mean reinventing the inode permission infrastructure that VFS already provides.
+
+The underlying `/dev/dax` device is still used — but only the marufs kernel module accesses it directly. User-space processes access CXL memory through marufs region files instead, and the kernel mediates every `open`, `mmap`, and `ioctl` — enforcing per-region ownership and permission checks that cannot be bypassed without kernel privilege.
+
+In summary, Remote mode has the following limitations — including the security problem described above:
+
+| Label | Problem | Description |
+|-------|---------|-------------|
+| **M1** | **No access control** | `/dev/dax` direct mmap and unauthenticated RPC — no per-region security enforcement possible |
+| **M2** | **Multi-process management** | MaruServer and Maru Resource Manager must be deployed and monitored separately |
+| **M3** | **RPC overhead** | Every KV lookup and region allocation goes through multi-hop RPC serialization (Client → MaruServer → Resource Manager), adding latency and debugging complexity |
+| **M4** | **Single-node only** | Remote mode assumes all instances share one CXL pool behind a single MaruServer; there is no built-in mechanism for cross-node KV sharing or federated metadata |
+
+**Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level.
 
 ```
 ┌─────────────┐   VFS + ioctl   ┌─────────────────┐
@@ -41,20 +47,18 @@ The data plane remains identical — clients still access CXL memory directly vi
 
 ## Key Improvements over Remote Mode
 
-### 1. Serverless Control Plane
+### 1. Serverless Control Plane — addresses M2 multi-process management, M3 RPC overhead
 
 Three separate server-side processes are consolidated into a single kernel module:
 
 | Remote Mode Component | Role | Filesystem Mode Replacement |
 |-------------|------|---------------|
-| MaruServer (KVManager) | KV metadata registry | marufs global partitioned index (ioctl) |
+| MaruServer (KVManager) | KV metadata registry | marufs global hash table (ioctl) |
 | MaruServer (AllocationManager) | Region allocation tracking | POSIX VFS (`open` / `ftruncate` / `unlink`) |
 | Maru Resource Manager | CXL memory pool, GC | marufs kernel module (GC kthread) |
 | MaruShmClient (RPC) | Region handle issuance, memory mapping | MarufsClient (VFS + ioctl) |
 
-Deployment is as simple as loading `marufs.ko` and mounting. No server processes to manage.
-
-### 2. Kernel-level Access Control
+### 2. Kernel-level Access Control — addresses M1 no access control
 
 Remote mode enforces memory access control in user-space via RPC — any process that can reach the server can potentially bypass authorization. Filesystem mode moves access control into the kernel:
 
@@ -65,18 +69,18 @@ Remote mode enforces memory access control in user-space via RPC — any process
 - **Default permissions** are set at region creation via `perm_set_default`
 - The kernel mediates all region access — no way to bypass without kernel privilege
 
-### 3. Kernel-managed Global KV Index
+### 3. Kernel-managed Global KV Index — addresses M3 RPC overhead, M4 single-node only
 
 In Remote mode, KV metadata lives in a Python dictionary inside MaruServer — volatile and bottlenecked by RPC.
 
-In Filesystem mode, the kernel maintains a **global partitioned index** directly in CXL memory:
+In Filesystem mode, the kernel maintains a **global hash table** directly in CXL memory:
 
 - **O(1) lookup**: A single ioctl call returns `(region_name, byte_offset)`
 - **Lock-free concurrency**: CAS-based hash table allows safe multi-instance concurrent access
 - **Global search**: One ioctl searches across all regions — no region scanning needed
-- **Batch operations**: Up to 512 keys per ioctl call for bulk lookup/registration
+- **Batch operations**: Up to 32 keys per ioctl call for both lookup and registration
 
-### 4. File-based Region Management
+### 4. File-based Region Management — addresses M2 multi-process management, M3 RPC overhead
 
 Region lifecycle is handled through ordinary file operations, eliminating the RPC round-trips:
 
@@ -103,11 +107,16 @@ marufs presents CXL shared memory as a flat directory of region files:
 └── ...
 ```
 
-Each region file is a contiguous CXL memory allocation, divided into fixed-size pages (chunks). A page holds exactly one KV cache entry. Region files are created with `open(O_CREAT) + ftruncate(pool_size)` and memory-mapped directly for zero-copy access.
+Each region file is a physically contiguous CXL memory allocation. A single region holds multiple KV cache entries, each identified by a byte offset within the region. Region files are created with `open(O_CREAT) + ftruncate(size)` and memory-mapped directly for zero-copy access.
 
-### Global Partitioned Index
+### Global Hash Table
 
-The kernel maintains a **global partitioned index** in CXL memory — a lock-free hash table that maps KV cache keys to their physical locations. Each entry (name-ref) contains:
+The kernel maintains a **global hash table** in CXL memory that serves both filesystem metadata and KV cache metadata in a single unified structure. The same hash table, same entry layout, and same lookup path are shared by:
+
+1. **File lookup (VFS path)** — `open()`, `stat()`, `ls` etc. The kernel's `marufs_lookup()` hashes the filename to find the region's inode.
+2. **Name-ref lookup (ioctl path)** — `MARUFS_IOC_FIND_NAME` / `MARUFS_IOC_NAME_OFFSET`. Applications register and query KV cache key → (region, offset) mappings.
+
+Each name-ref entry contains:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -124,44 +133,6 @@ The kernel maintains a **global partitioned index** in CXL memory — a lock-fre
 - **region_name**: The region file that holds the data.
 - **offset**: Byte offset within the region where the data starts.
 - **hash** (`name_hash`): Pre-computed hash used for shard selection. Upper 16 bits determine the index partition for concurrent access. Derived from `chunk_hash` field in the key with bit spreading to ensure non-zero upper bits.
-
-The index is partitioned by `name_hash` upper bits, allowing CAS-based concurrent insertion and lookup without global locks.
-
-### How KV Cache Lookup Works
-
-A key lookup follows a three-level hierarchy:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Level 1: Local Cache (_key_to_location)           O(1)      │
-│   In-process dict: key → (region_name, page_index, hash)    │
-│   Hit → skip ioctl, go directly to mmap read               │
-├─────────────────────────────────────────────────────────────┤
-│ Level 2: Kernel Global Index (ioctl)              O(1)      │
-│   find_name(dir_fd, key, hash) → (region_name, offset)      │
-│   Searches the CAS hash table in CXL memory                │
-│   Result cached in Level 1 for future hits                  │
-├─────────────────────────────────────────────────────────────┤
-│ Level 3: CXL Memory (mmap)                        O(1)      │
-│   map_shared_region(region_name) if first access            │
-│   Direct memoryview read from mmap'd region at offset       │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Retrieve path:**
-
-1. **Local cache hit** → Return cached `(region_name, page_index)` without any syscall.
-2. **Local cache miss** → Issue `MARUFS_IOC_FIND_NAME` ioctl. The kernel searches the global partitioned index and returns `(region_name, byte_offset)`. Cache the result locally.
-3. **Region mapping** → If the region is not yet mmap'd, `open()` + `mmap()` it (one-time cost per region). The mapping is reused for all subsequent accesses to the same region.
-4. **Data read** → Compute a memoryview slice into the mmap'd region at the given offset. Zero-copy — no data movement.
-
-**Store path:**
-
-1. **Allocate page** → `OwnedRegionManagerFs` returns `(region_name, page_index)` from the active owned region's free-list (O(1)).
-2. **Write data** → `memmove()` into the mmap'd region at `page_index * chunk_size`. GIL-released via ctypes for concurrent I/O.
-3. **Register name-ref** → `MARUFS_IOC_NAME_OFFSET` ioctl inserts the key into the global index via CAS. The key becomes visible to other instances only after this step completes.
-
-**Batch operations** (`batch_store`, `batch_retrieve`, `batch_exists`) use `MARUFS_IOC_BATCH_FIND_NAME` and `MARUFS_IOC_BATCH_NAME_OFFSET` to process up to 32 keys per ioctl call (512 for registration), amortizing syscall overhead.
 
 ---
 
@@ -190,10 +161,10 @@ sequenceDiagram
     XM-->>H: memoryview slice
     H->>CXL: buf[:] = data
 
-    Note over H,K: Step 2 — Register in kernel global index
+    Note over H,K: Step 2 — Register in kernel global hash table
     H->>XC: name_offset(fd, key, byte_offset)
     XC->>K: ioctl(fd, MARUFS_IOC_NAME_OFFSET)
-    Note over K: CAS insert into global index
+    Note over K: Insert into global hash table
 
     H-->>C: True
 ```
@@ -204,36 +175,30 @@ sequenceDiagram
 sequenceDiagram
     participant C as LMCache (Instance B)
     participant H as MaruHandlerFs (B)
-    participant XC as MarufsClient
     participant XM as MarufsMapper
+    participant XC as MarufsClient
     participant K as marufs (kernel)
     participant CXL as CXL Memory
 
     C->>H: retrieve(key)
 
-    Note over H: Step 1 — Local cache miss
-    H->>H: _key_to_location.get(key) → None
-
-    Note over H,K: Step 2 — Kernel global index lookup
+    Note over H,K: Step 1 — Kernel global hash table lookup
     H->>XC: find_name(dir_fd, key)
     XC->>K: ioctl(dir_fd, MARUFS_IOC_FIND_NAME)
     K-->>XC: (region_name, byte_offset)
     XC-->>H: (region_name, byte_offset)
 
-    Note over H: Cache locally for future hits
-
-    Note over H,CXL: Step 3 — Map shared region (first access only)
+    Note over H,CXL: Step 2 — Map shared region (first access only)
     H->>XM: map_shared_region(region_name)
     XM->>XC: open_region(name, readonly=True)
     XM->>XC: mmap_region(fd, size)
 
-    Note over H,CXL: Step 4 — Read from CXL (zero-copy, same as Remote mode)
+    Note over H,CXL: Step 3 — Read from CXL (zero-copy)
     H->>XM: get_buffer_view(region_name, offset, size)
     XM-->>H: memoryview
     H-->>C: MemoryInfo(view)
 ```
 
-Subsequent retrievals of the same key hit the local cache (0 ioctl).
 Subsequent accesses to the same region reuse the cached mmap (0 open/mmap).
 
 ### Delete
@@ -242,8 +207,8 @@ Subsequent accesses to the same region reuse the cached mmap (0 open/mmap).
 sequenceDiagram
     participant C as LMCache
     participant H as MaruHandlerFs
-    participant XC as MarufsClient
     participant ORM as OwnedRegionManagerFs
+    participant XC as MarufsClient
     participant K as marufs (kernel)
 
     C->>H: delete(key)
@@ -262,12 +227,12 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant H as MaruHandlerFs
-    participant XC as MarufsClient
-    participant XM as MarufsMapper
     participant ORM as OwnedRegionManagerFs
+    participant XM as MarufsMapper
+    participant XC as MarufsClient
     participant K as marufs (kernel)
 
-    Note over H: Step 1 — Clear own name-refs from global index
+    Note over H: Step 1 — Clear own name-refs from global hash table
     loop Each own key in _key_to_location
         H->>XC: clear_name(region_fd, key)
     end
@@ -298,9 +263,9 @@ Filesystem mode introduces three components that replace their Remote mode count
 
 | Component | Replaces | Role |
 |-----------|----------|------|
-| **MarufsClient** | RpcClient + MaruShmClient | Wraps kernel filesystem interface — region CRUD via VFS, global index operations via ioctl, permission management. Caches file descriptors internally and validates region names against path traversal. |
-| **MarufsMapper** | DaxMapper | Memory-mapping lifecycle manager. All regions are mapped with CUDA pinning for owned regions; shared region size is auto-detected via fstat. Performs bulk unmap on close. |
 | **OwnedRegionManagerFs** | OwnedRegionManager | Page-level allocator for multiple owned regions, using the same O(1) free-list strategy as Remote mode. Allocation follows the same fast-path: active region → scan others → create new. |
+| **MarufsMapper** | DaxMapper | Memory-mapping lifecycle manager. All regions are mapped with CUDA pinning for owned regions; shared region size is auto-detected via fstat. Performs bulk unmap on close. |
+| **MarufsClient** | RpcClient + MaruShmClient | Wraps kernel filesystem interface — region CRUD via VFS, global hash table operations via ioctl, permission management. Caches file descriptors internally and validates region names against path traversal. |
 
 ---
 
@@ -314,21 +279,20 @@ All components are thread-safe. Write operations (store, delete, region map/unma
 
 ## Kernel Interface Reference
 
-The marufs kernel module exposes its interface through standard VFS operations (open, close, mmap, unlink) and a set of ioctl commands for global index and permission management.
+The marufs kernel module exposes its interface through standard VFS operations (open, close, mmap, unlink) and a set of ioctl commands for global hash table and permission management.
 
 <details>
 <summary>ioctl Command Table (click to expand)</summary>
 
 | ioctl | nr | Direction | Size | Description |
 |-------|----|-----------|------|-------------|
-| `MARUFS_IOC_NAME_OFFSET` | 1 | `_IOW` | 80B | Register name-ref in global index |
+| `MARUFS_IOC_NAME_OFFSET` | 1 | `_IOW` | 80B | Register name-ref in global hash table |
 | `MARUFS_IOC_FIND_NAME` | 2 | `_IOWR` | 144B | Global name lookup → (region_name, offset) |
-| `MARUFS_IOC_CLEAR_NAME` | 3 | `_IOW` | 80B | Remove name-ref from global index |
-| `MARUFS_IOC_BATCH_FIND_NAME` | 4 | `_IOWR` | 16B | Batch name lookup (up to 512/call) |
-| `MARUFS_IOC_BATCH_NAME_OFFSET` | 6 | `_IOWR` | 16B | Batch name-ref registration (up to 512/call) |
+| `MARUFS_IOC_CLEAR_NAME` | 3 | `_IOW` | 80B | Remove name-ref from global hash table |
+| `MARUFS_IOC_BATCH_FIND_NAME` | 4 | `_IOWR` | 16B | Batch name lookup (up to 32/call) |
+| `MARUFS_IOC_BATCH_NAME_OFFSET` | 6 | `_IOWR` | 16B | Batch name-ref registration (up to 32/call) |
 | `MARUFS_IOC_PERM_GRANT` | 10 | `_IOW` | 16B | Grant permissions |
 | `MARUFS_IOC_PERM_SET_DEFAULT` | 13 | `_IOW` | 16B | Set default permissions |
-| `MARUFS_IOC_DMABUF_EXPORT` | 0x50 | `_IOWR` | 16B | DMA-BUF export |
 
 Magic byte: `0x58` (ASCII `'X'`).
 
@@ -383,7 +347,7 @@ struct marufs_batch_find_req {            // header (16B)
 };
 ```
 
-Batch limit: **512 entries** per ioctl call. The Python client automatically splits larger batches.
+Batch limit: **32 entries** per ioctl call (configurable in the kernel module). The Python client automatically splits larger batches.
 
 </details>
 
@@ -419,6 +383,10 @@ CUDA does not support `cudaHostRegisterReadOnly` — `cudaHostRegister` requires
 
 ### 3. Cross-node duplicate key in prefix caching
 
-In multi-node prefix caching, multiple nodes may independently compute and store the same KV cache key (e.g., a shared prompt prefix). The global index maps each name to exactly one `(region_name, offset)` — the second `NAME_OFFSET` ioctl silently overwrites the first entry, leaving the original node's page allocated but unreferenced (memory leak on that node).
+In multi-node prefix caching, multiple nodes may independently compute and store the same KV cache key (e.g., a shared prompt prefix). The global hash table maps each name to exactly one `(region_name, offset)` — the second `NAME_OFFSET` ioctl silently overwrites the first entry, leaving the original node's page allocated but unreferenced (memory leak on that node).
 
-**Approach:** Include node-identifying information in the key name (e.g., `"{original_key}:{instance_id}"`) so that each node's entry is distinct in the global index. This avoids kernel changes while keeping keys unique. The alternative — allowing the global index to store multiple entries per name (`FIND_NAME` returning an array) — would require significant kernel UAPI changes and is considered overkill for this use case.
+**Approach:** Include node-identifying information in the key name (e.g., `"{original_key}:{instance_id}"`) so that each node's entry is distinct in the global hash table. This avoids kernel changes while keeping keys unique. The alternative — allowing the global hash table to store multiple entries per name (`FIND_NAME` returning an array) — would require significant kernel UAPI changes and is considered overkill for this use case.
+
+### 4. CXL pool fragmentation
+
+Region creation and deletion over time can fragment the CXL memory pool. Within a region, page-level allocation/free does not cause external fragmentation (pages are fixed-size and non-contiguous allocation is fine). However, at the pool level, repeated region create/delete cycles can leave the CXL address space fragmented, making it impossible to allocate large contiguous regions even when total free memory is sufficient.
