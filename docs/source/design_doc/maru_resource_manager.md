@@ -60,7 +60,9 @@ The binary is installed via `./install.sh`, which builds it with cmake and place
 
 **Crash recovery:** Every `MaruShmClient._connect()` call that fails triggers `_ensure_resource_manager()`, which restarts the binary. The resource manager recovers its previous state from the WAL on startup.
 
-**Idle shutdown:** The main loop tracks the number of active allocations. When the count remains at zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The next `MaruServer` startup will auto-start it again.
+**Server registration:** After auto-start, the `MaruServer` registers itself via `REGISTER_SERVER_REQ`. This adds its PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
+
+**Idle shutdown:** The main loop checks both registered server count and active allocation count. When both are zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The next `MaruServer` startup will auto-start it again.
 
 ---
 
@@ -72,7 +74,9 @@ All messages use a fixed-size binary header containing protocol version, message
 |------|-----------|-------------|
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes a region handle |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
+| `REGISTER_SERVER_REQ` / `RESP` | client ↔ server | Register caller's PID as an active server (prevents idle shutdown) |
 | `GET_FD_REQ` / `GET_FD_RESP` | client ↔ server | Request access to an existing allocation (requires valid auth token) |
+| `UNREGISTER_SERVER_REQ` / `RESP` | client ↔ server | Unregister caller's PID (allows idle shutdown) |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
 
@@ -116,7 +120,7 @@ On startup, the **recovery sequence** proceeds as: (1) scan for current hardware
 
 ## 6. Reaper
 
-The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
+The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map. It also removes dead PIDs from the registered server set, ensuring idle shutdown proceeds after a server crash.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
@@ -150,7 +154,3 @@ maru-resource-manager --socket-path /var/run/maru/maru.sock \
                       --log-level debug \
                       --idle-timeout 120
 ```
-
-> **See also:** [Architecture Overview](architecture_overview.md),
-> [MaruServer Architecture](maru_server.md),
-> [Memory Model](memory_model.md)

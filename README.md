@@ -152,6 +152,10 @@ extra_config:
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
 
 
+## Tools
+
+- **[pool_monitor](tools/)** — Real-time pool usage monitor (`top`-style TUI, CSV export)
+
 ## License
 
 Copyright 2026 [XCENA Inc.](https://xcena.com) Licensed under the Apache License 2.0.

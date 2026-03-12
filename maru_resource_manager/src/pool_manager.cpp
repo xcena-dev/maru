@@ -269,6 +269,25 @@ uint32_t PoolManager::allocationCount() const {
     return static_cast<uint32_t>(allocations_.size());
 }
 
+uint32_t PoolManager::registeredServerCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return static_cast<uint32_t>(registeredServers_.size());
+}
+
+void PoolManager::registerServer(pid_t pid) {
+    std::lock_guard<std::mutex> lock(mu_);
+    registeredServers_.insert(pid);
+    logf(LogLevel::Info, "server registered: pid=%d (total=%zu)",
+         pid, registeredServers_.size());
+}
+
+void PoolManager::unregisterServer(pid_t pid) {
+    std::lock_guard<std::mutex> lock(mu_);
+    registeredServers_.erase(pid);
+    logf(LogLevel::Info, "server unregistered: pid=%d (total=%zu)",
+         pid, registeredServers_.size());
+}
+
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
     // Scan for DEV_DAX devices
@@ -914,6 +933,20 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 {
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
+
+    // Reap dead registered servers
+    for (auto it = registeredServers_.begin(); it != registeredServers_.end(); )
+    {
+        if (::kill(*it, 0) != 0 && errno == ESRCH)
+        {
+            logf(LogLevel::Info, "reaper: removing dead server pid=%d", *it);
+            it = registeredServers_.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 
     std::vector<uint64_t> toFree;
     for (const auto &kv : allocations_)

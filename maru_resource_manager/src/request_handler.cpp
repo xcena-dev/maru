@@ -105,4 +105,20 @@ StatsResult RequestHandler::handleStats() {
     return result;
 }
 
+RegisterServerResult RequestHandler::handleRegisterServer(
+    const RequestContext &ctx) {
+    RegisterServerResult result;
+    pm_.registerServer(ctx.pid);
+    result.resp.status = 0;
+    return result;
+}
+
+UnregisterServerResult RequestHandler::handleUnregisterServer(
+    const RequestContext &ctx) {
+    UnregisterServerResult result;
+    pm_.unregisterServer(ctx.pid);
+    result.resp.status = 0;
+    return result;
+}
+
 }  // namespace maru

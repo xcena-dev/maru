@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
 
         // Idle timeout check
         if (cfg.idleTimeout > 0) {
-            if (pm.allocationCount() == 0) {
+            if (pm.allocationCount() == 0 && pm.registeredServerCount() == 0) {
                 ++idleSeconds;
             } else {
                 idleSeconds = 0;

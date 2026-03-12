@@ -510,6 +510,32 @@ void UdsServer::handleClient(int clientFd)
             ::close(result.daxFd);
         }
     }
+    else if (type == MsgType::REGISTER_SERVER_REQ)
+    {
+        auto result = handler_.handleRegisterServer(ctx);
+
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::REGISTER_SERVER_RESP);
+        rh.payloadLen = sizeof(result.resp);
+
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &result.resp, sizeof(result.resp));
+    }
+    else if (type == MsgType::UNREGISTER_SERVER_REQ)
+    {
+        auto result = handler_.handleUnregisterServer(ctx);
+
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::UNREGISTER_SERVER_RESP);
+        rh.payloadLen = sizeof(result.resp);
+
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &result.resp, sizeof(result.resp));
+    }
     else
     {
         sendError(clientFd, -ENOSYS, "unknown request");

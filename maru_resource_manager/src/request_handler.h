@@ -38,6 +38,16 @@ struct FreeResult {
     FreeResp resp{};
 };
 
+/// Result of handleRegisterServer.
+struct RegisterServerResult {
+    RegisterServerResp resp{};
+};
+
+/// Result of handleUnregisterServer.
+struct UnregisterServerResult {
+    UnregisterServerResp resp{};
+};
+
 /// Result of makeError.
 struct ErrorResult {
     int32_t status;
@@ -56,6 +66,8 @@ public:
     FreeResult handleFree(const FreeReq &req, const RequestContext &ctx);
     GetFdResult handleGetFd(const GetFdReq &req, const RequestContext &ctx);
     StatsResult handleStats();
+    RegisterServerResult handleRegisterServer(const RequestContext &ctx);
+    UnregisterServerResult handleUnregisterServer(const RequestContext &ctx);
 
 private:
     PoolManager &pm_;

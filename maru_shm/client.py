@@ -24,8 +24,12 @@ from .ipc import (
     GetFdResp,
     MsgHeader,
     MsgType,
+    RegisterServerReq,
+    RegisterServerResp,
     StatsReq,
     StatsResp,
+    UnregisterServerReq,
+    UnregisterServerResp,
 )
 from .types import MaruHandle, MaruPoolInfo
 from .uds_helpers import read_full, recv_with_fd, write_full
@@ -165,6 +169,69 @@ class MaruShmClient:
             payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
             resp = StatsResp.unpack(payload)
             return resp.pools or []
+        finally:
+            sock.close()
+
+    def register_server(self) -> None:
+        """Register this process as an active MaruServer with the resource manager.
+
+        Prevents idle shutdown while the server is running.
+        PID is automatically extracted from the UDS connection (SO_PEERCRED).
+        """
+        sock = self._connect()
+        try:
+            self._send_request(
+                sock, MsgType.REGISTER_SERVER_REQ, RegisterServerReq().pack()
+            )
+            hdr = self._recv_header(sock)
+
+            if hdr.msg_type == MsgType.ERROR_RESP:
+                payload = (
+                    read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+                )
+                err = ErrorResp.unpack(payload)
+                raise RuntimeError(
+                    f"Register server failed ({err.status}): {err.message}"
+                )
+
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+            resp = RegisterServerResp.unpack(payload)
+            if resp.status != 0:
+                raise RuntimeError(f"Register server failed with status {resp.status}")
+
+            logger.info("Registered as active server with resource manager")
+        finally:
+            sock.close()
+
+    def unregister_server(self) -> None:
+        """Unregister this process as an active MaruServer.
+
+        Allows idle shutdown to proceed if no allocations remain.
+        """
+        sock = self._connect()
+        try:
+            self._send_request(
+                sock, MsgType.UNREGISTER_SERVER_REQ, UnregisterServerReq().pack()
+            )
+            hdr = self._recv_header(sock)
+
+            if hdr.msg_type == MsgType.ERROR_RESP:
+                payload = (
+                    read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+                )
+                err = ErrorResp.unpack(payload)
+                raise RuntimeError(
+                    f"Unregister server failed ({err.status}): {err.message}"
+                )
+
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+            resp = UnregisterServerResp.unpack(payload)
+            if resp.status != 0:
+                raise RuntimeError(
+                    f"Unregister server failed with status {resp.status}"
+                )
+
+            logger.info("Unregistered from resource manager")
         finally:
             sock.close()
 

@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,9 @@ public:
 
     const std::string &stateDir() const { return stateDir_; }
     uint32_t allocationCount() const;
+    uint32_t registeredServerCount() const;
+    void registerServer(pid_t pid);
+    void unregisterServer(pid_t pid);
 
     int loadPools();
     int rescanDevices();
@@ -106,6 +110,9 @@ private:
     std::map<pid_t, uint64_t> pidStartTimes_;
     // PID allocation refcount for O(1) reaper cleanup
     std::map<pid_t, uint32_t> pidAllocCounts_;
+
+    // Registered server PIDs (in-memory only, not persisted)
+    std::set<pid_t> registeredServers_;
 };
 
 }  // namespace maru
