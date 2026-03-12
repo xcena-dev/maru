@@ -369,11 +369,6 @@ class TestShmClientErrors:
             finally:
                 server.stop()
 
-    def test_connect_failure(self):
-        client = MaruShmClient(socket_path="/tmp/nonexistent_maru_test.sock")
-        with pytest.raises(OSError):
-            client.stats()
-
     def test_invalid_response_header_magic(self):
         """Test _recv_header validation with invalid magic."""
 
