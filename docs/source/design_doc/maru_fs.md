@@ -135,9 +135,39 @@ Each name-ref entry contains:
 
 ---
 
-## Data Flows
+## Operation Flows
 
-The data plane (zero-copy mmap access to CXL memory) is shared across both modes. The diagrams below show Filesystem mode's control plane interactions.
+The diagrams below show the lifecycle of Filesystem mode — from initialization through KV operations to cleanup.
+
+### Init (connect)
+
+```mermaid
+sequenceDiagram
+    participant C as LMCache
+    participant H as MaruHandlerFs
+    participant ORM as OwnedRegionManagerFs
+    participant XM as MarufsMapper
+    participant XC as MarufsClient
+    participant K as marufs (kernel)
+    participant CXL as CXL Memory
+
+    C->>H: connect()
+
+    Note over H: Step 1 — Initialize owned region manager
+    H->>ORM: OwnedRegionManagerFs(mapper, chunk_size, pool_size)
+
+    Note over H,CXL: Step 2 — Create initial owned region
+    H->>ORM: add_region(region_name)
+    ORM->>XM: map_owned_region(name, size)
+    XM->>XC: create_region(name, size)
+    XC->>K: open(O_CREAT | O_RDWR) + ftruncate(size)
+    Note over K,CXL: Allocate contiguous CXL memory
+    XM->>XC: perm_set_default(fd, PERM_ALL)
+    XM->>XC: mmap_region(fd, size)
+    XC->>K: mmap(fd, size)
+
+    H-->>C: True
+```
 
 ### Store (saving KV cache)
 
