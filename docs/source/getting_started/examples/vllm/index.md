@@ -65,7 +65,7 @@ maru-server --port $MARU_SERVER_PORT
 **3. Run the test:**
 
 ```bash
-python examples/vllm/run_request.py \
+python examples/vllm/run_benchmark.py \
     --model Qwen/Qwen2.5-0.5B \
     --port1 $MARU_INST1_PORT \
     --port2 $MARU_INST2_PORT \
@@ -111,7 +111,7 @@ All settings are in `examples/vllm/env.sh`:
 ### Test Options
 
 ```bash
-python examples/vllm/run_request.py --help
+python examples/vllm/run_benchmark.py --help
 
 Options:
   --model MODEL          Model name (default: Qwen/Qwen2.5-0.5B)

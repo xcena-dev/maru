@@ -90,7 +90,7 @@ echo ""
 # Step 4: Run test
 echo "[Step 4] Running P2P KV cache sharing test..."
 echo ""
-python "$SCRIPT_DIR/run_request.py" \
+python "$SCRIPT_DIR/run_benchmark.py" \
     --model "$MODEL" \
     --port1 "$MARU_INST1_PORT" \
     --port2 "$MARU_INST2_PORT" \

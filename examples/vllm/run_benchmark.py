@@ -7,7 +7,7 @@ Sends identical prompts to Instance 1 (store) then Instance 2 (retrieve),
 measuring TTFT to validate KV cache sharing through CXL.
 
 Usage:
-    python run_request.py [--model MODEL] [--port1 PORT] [--port2 PORT]
+    python run_benchmark.py [--model MODEL] [--port1 PORT] [--port2 PORT]
                           [--max-tokens N] [--repeat-count N] [--wait-time SEC]
 """
 

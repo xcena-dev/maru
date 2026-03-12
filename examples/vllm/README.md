@@ -63,14 +63,22 @@ maru-server --port $MARU_SERVER_PORT
 
 ### 3. Run the test
 
+Simple query test (prompt + output verification):
+
 ```bash
-./run_test.sh --model Qwen/Qwen2.5-0.5B
+./run_simple_query.sh
+```
+
+Benchmark (TTFT measurement):
+
+```bash
+./run_benchmark.sh --model Qwen/Qwen2.5-0.5B
 ```
 
 Or directly:
 
 ```bash
-python run_request.py \
+python run_benchmark.py \
     --model Qwen/Qwen2.5-0.5B \
     --port1 $MARU_INST1_PORT \
     --port2 $MARU_INST2_PORT \
@@ -117,7 +125,7 @@ Instance 2 should show lower TTFT because it loads KV cache from CXL instead of 
 ## Test Options
 
 ```bash
-python run_request.py --help
+python run_benchmark.py --help
 
 Options:
   --model MODEL          Model name (default: Qwen/Qwen2.5-0.5B)
@@ -156,6 +164,7 @@ tail -f maru_server.log
 |------|-------------|
 | `env.sh` | Environment variables (ports, pool size, chunk tokens) |
 | `launch_vllm.sh` | Launch a single vLLM instance with MaruKVConnector |
-| `run_test.sh` | Run P2P test (wrapper around run_request.py) |
-| `run_request.py` | TTFT measurement: store on inst1, retrieve on inst2 |
+| `run_simple_query.sh` | Simple query test: prompt + output verification |
+| `run_benchmark.sh` | Run P2P benchmark (wrapper around run_benchmark.py) |
+| `run_benchmark.py` | TTFT measurement: store on inst1, retrieve on inst2 |
 | `p2p_example.sh` | Full automated example (server + 2x vLLM + test) |
