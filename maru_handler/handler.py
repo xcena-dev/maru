@@ -24,7 +24,7 @@ import threading
 
 import numpy as np
 
-from maru_common import MaruConfig
+from maru_common import ANY_POOL_ID, MaruConfig
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -96,7 +96,7 @@ class MaruHandler:
         """
         self._config = config or MaruConfig()
         self._pool_id = (
-            self._config.pool_id if self._config.pool_id is not None else 0xFFFFFFFF
+            self._config.pool_id if self._config.pool_id is not None else ANY_POOL_ID
         )
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient

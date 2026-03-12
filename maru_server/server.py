@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_common.protocol import ANY_POOL_ID
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -35,7 +36,7 @@ class MaruServer:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = 0xFFFFFFFF
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
     ) -> MaruHandle | None:
         """Handle allocation request from client."""
         handle = self._allocation_manager.allocate(instance_id, size, pool_id=pool_id)

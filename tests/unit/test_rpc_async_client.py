@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from maru_common import (
+    ANY_POOL_ID,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
     BatchRegisterKVResponse,
@@ -340,7 +341,7 @@ class TestRpcAsyncClientApiMethods:
 
         client._send_request.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "instance-1", "size": 4096, "pool_id": 0xFFFFFFFF},
+            {"instance_id": "instance-1", "size": 4096, "pool_id": ANY_POOL_ID},
         )
         assert result.success is True
         assert result.handle is not None

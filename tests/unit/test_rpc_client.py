@@ -8,6 +8,7 @@ import pytest
 import zmq
 
 from maru_common import (
+    ANY_POOL_ID,
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -279,7 +280,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 4096, "pool_id": 0xFFFFFFFF},
+            {"instance_id": "test_instance", "size": 4096, "pool_id": ANY_POOL_ID},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is True
@@ -297,12 +298,44 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 999999, "pool_id": 0xFFFFFFFF},
+            {"instance_id": "test_instance", "size": 999999, "pool_id": ANY_POOL_ID},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is False
         assert result.error == "Out of memory"
         assert result.handle is None
+
+    def test_request_alloc_with_specific_pool_id(self):
+        """request_alloc forwards specific pool_id correctly."""
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {
+            "success": True,
+            "handle": {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
+        }
+
+        result = client.request_alloc(instance_id="inst-1", size=4096, pool_id=0)
+
+        mock_send.assert_called_once_with(
+            MessageType.REQUEST_ALLOC,
+            {"instance_id": "inst-1", "size": 4096, "pool_id": 0},
+        )
+        assert result.success is True
+
+    def test_request_alloc_with_pool_id_1(self):
+        """request_alloc forwards pool_id=1 correctly."""
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {
+            "success": True,
+            "handle": {"region_id": 2, "offset": 0, "length": 8192, "auth_token": 0},
+        }
+
+        result = client.request_alloc(instance_id="inst-2", size=8192, pool_id=1)
+
+        mock_send.assert_called_once_with(
+            MessageType.REQUEST_ALLOC,
+            {"instance_id": "inst-2", "size": 8192, "pool_id": 1},
+        )
+        assert result.success is True
 
     def test_request_alloc_no_handle(self):
         """request_alloc handles success without handle data."""

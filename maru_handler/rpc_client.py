@@ -8,6 +8,7 @@ from typing import Any
 import zmq
 
 from maru_common import (
+    ANY_POOL_ID,
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -126,7 +127,7 @@ class RpcClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = 0xFFFFFFFF
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
     ) -> RequestAllocResponse:
         """
         Request a new memory allocation.
@@ -134,7 +135,7 @@ class RpcClient:
         Args:
             instance_id: Client instance identifier
             size: Requested size in bytes
-            pool_id: Pool to allocate from (0xFFFFFFFF means any pool)
+            pool_id: Pool to allocate from (ANY_POOL_ID means any pool)
 
         Returns:
             RequestAllocResponse with handle on success

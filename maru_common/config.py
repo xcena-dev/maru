@@ -50,7 +50,7 @@ class MaruConfig:
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
-    pool_id: int | None = None  # None means any pool (ANY_POOL_ID = 0xFFFFFFFF)
+    pool_id: int | None = None  # None means any pool (ANY_POOL_ID)
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -63,6 +63,12 @@ class MaruConfig:
         env_eager_map = _parse_env_bool("MARU_EAGER_MAP")
         if env_eager_map is not None:
             self.eager_map = env_eager_map
+
+        if self.pool_id is not None and not (0 <= self.pool_id <= 0xFFFFFFFE):
+            raise ValueError(
+                f"pool_id must be in range [0, 0xFFFFFFFE], got {self.pool_id}. "
+                "Use None (or omit) to allow any pool."
+            )
 
         if self.chunk_size_bytes <= 0:
             raise ValueError(

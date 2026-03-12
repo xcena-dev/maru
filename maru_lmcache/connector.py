@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 _PERF_ENABLED = os.environ.get("LMCACHE_PERF_LOG", "0") == "1"
 
 
+def _parse_pool_id(raw: object) -> int | None:
+    """Parse a pool_id value, returning None if unset or int if valid."""
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(raw)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Invalid pool_id: {raw!r}. Must be a non-negative integer."
+        ) from e
+
+
 def _perf_log(elapsed_ms: float, msg: str) -> None:
     if _PERF_ENABLED:
         print(f"[PERF][{elapsed_ms:.2f}ms][maru_connector]: {msg}", flush=True)
@@ -93,7 +107,7 @@ class MaruConnectorConfig:
         return MaruConnectorConfig(
             server_url=f"tcp://{host}:{port}",
             pool_size=parse_size(params.get("pool_size", ["1G"])[0]),
-            pool_id=int(raw_pool_id) if raw_pool_id is not None else None,
+            pool_id=_parse_pool_id(raw_pool_id),
             instance_id=params.get("instance_id", [None])[0],
             connection_timeout=float(params.get("timeout", ["30.0"])[0]),
             operation_timeout=float(params.get("op_timeout", ["10.0"])[0]),
@@ -112,7 +126,7 @@ class MaruConnectorConfig:
         pool_size = parse_size(raw_pool) if isinstance(raw_pool, str) else int(raw_pool)
 
         raw_pool_id = extra.get("maru_pool_id", fb.pool_id)
-        pool_id_val = int(raw_pool_id) if raw_pool_id is not None else None
+        pool_id_val = _parse_pool_id(raw_pool_id)
 
         return MaruConnectorConfig(
             server_url=extra.get("maru_server_url", fb.server_url),

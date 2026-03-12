@@ -18,6 +18,9 @@ from enum import IntEnum, IntFlag
 
 from maru_shm.types import MaruHandle
 
+# Sentinel: allocate from any pool
+ANY_POOL_ID: int = 0xFFFFFFFF
+
 # =============================================================================
 # Protocol Constants
 # =============================================================================
@@ -158,7 +161,7 @@ class RequestAllocRequest:
 
     instance_id: str
     size: int
-    pool_id: int = 0xFFFFFFFF  # ANY_POOL_ID
+    pool_id: int = ANY_POOL_ID
 
 
 @dataclass
