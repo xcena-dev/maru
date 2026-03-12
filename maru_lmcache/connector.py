@@ -32,14 +32,33 @@ logger = logging.getLogger(__name__)
 _PERF_ENABLED = os.environ.get("LMCACHE_PERF_LOG", "0") == "1"
 
 
-def _parse_pool_id(raw: object) -> int | None:
-    """Parse a pool_id value, returning None if unset or int if valid."""
+def _parse_pool_id(raw: object) -> list[int] | int | None:
+    """Parse a pool_id value.
+
+    Returns:
+        - None if unset
+        - int for a single value (MaruConfig normalizes to list[int])
+        - list[int] for multiple values (comma-separated string or list)
+    """
     if raw is None:
         return None
     if isinstance(raw, int):
         return raw
+    if isinstance(raw, list):
+        return raw
+    # String: may be comma-separated (e.g. "0,1,2") or single ("1")
+    s = str(raw).strip()
+    if "," in s:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        try:
+            return [int(p) for p in parts]
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid pool_id: {raw!r}. "
+                "Comma-separated values must all be non-negative integers."
+            ) from e
     try:
-        return int(raw)
+        return int(s)
     except (ValueError, TypeError) as e:
         raise ValueError(
             f"Invalid pool_id: {raw!r}. Must be a non-negative integer."
@@ -86,7 +105,7 @@ class MaruConnectorConfig:
 
     server_url: str = "tcp://localhost:5555"
     pool_size: int = 1024 * 1024 * 1024  # 1 GB
-    pool_id: int | None = None  # None means any pool (ANY_POOL_ID)
+    pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
     instance_id: str | None = None
     auto_connect: bool = True
     connection_timeout: float = 30.0

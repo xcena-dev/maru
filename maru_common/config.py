@@ -50,7 +50,7 @@ class MaruConfig:
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
-    pool_id: int | None = None  # None means any pool (ANY_POOL_ID)
+    pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -64,11 +64,25 @@ class MaruConfig:
         if env_eager_map is not None:
             self.eager_map = env_eager_map
 
-        if self.pool_id is not None and not (0 <= self.pool_id <= 0xFFFFFFFE):
-            raise ValueError(
-                f"pool_id must be in range [0, 0xFFFFFFFE], got {self.pool_id}. "
-                "Use None (or omit) to allow any pool."
-            )
+        # Normalize pool_id to list[int] | None
+        if self.pool_id is None:
+            pass  # None stays None (means ANY_POOL_ID)
+        elif isinstance(self.pool_id, int):
+            if not (0 <= self.pool_id <= 0xFFFFFFFE):
+                raise ValueError(
+                    f"pool_id must be in range [0, 0xFFFFFFFE], got {self.pool_id}. "
+                    "Use None (or omit) to allow any pool."
+                )
+            self.pool_id = [self.pool_id]
+        else:
+            # list[int]
+            for pid in self.pool_id:
+                if not (0 <= pid <= 0xFFFFFFFE):
+                    raise ValueError(
+                        f"pool_id must be in range [0, 0xFFFFFFFE], got {pid}. "
+                        "Use None (or omit) to allow any pool."
+                    )
+            self.pool_id = list(self.pool_id)
 
         if self.chunk_size_bytes <= 0:
             raise ValueError(

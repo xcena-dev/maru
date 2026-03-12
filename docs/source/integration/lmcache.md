@@ -123,6 +123,7 @@ extra_config:
   remote_storage_plugin.maru.class_name: MaruConnectorAdapter
   maru_pool_size: "4G"              # CXL memory pool size ("1G", "500M", etc.)
   # maru_pool_id: 1                 # Pin to specific DAX pool (default: any)
+  # maru_pool_id: "0,1"             # Multi-pool fallback (try pool 0, then 1)
   save_chunk_meta: False
   lookup_backoff_time: 0.001
   # maru_instance_id: "my-id"       # Unique client ID (default: auto UUID)
@@ -145,7 +146,7 @@ extra_config:
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `maru_pool_size` | `"1G"` | CXL memory pool size. Supports human-readable strings (`"4G"`, `"500M"`) or integer bytes |
-| `maru_pool_id` | `None` (any pool) | Pin allocations to a specific DAX device pool index. Can also be set via URL query: `maru://host:port?pool_id=1` |
+| `maru_pool_id` | `None` (any pool) | Pin allocations to specific DAX device pool(s). Single int (`1`) or comma-separated (`"0,1"`) for ordered fallback. Can also be set via URL query: `maru://host:port?pool_id=1` |
 | `maru_instance_id` | auto-generated UUID | Unique client instance identifier |
 | `maru_operation_timeout` | `10.0` | Timeout in seconds for individual KV operations |
 | `maru_timeout_ms` | `2000` | ZMQ socket timeout in milliseconds for RPC communication |

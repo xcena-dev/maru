@@ -20,7 +20,7 @@ class MaruConfig:
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
-    pool_id: int | None = None
+    pool_id: list[int] | int | None = None
 ```
 
 ### Parameters
@@ -36,7 +36,7 @@ class MaruConfig:
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
 | `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
-| `pool_id` | `int \| None` | `None` (any pool) | Pin allocations to a specific DAX device pool. `None` lets the resource manager choose. Valid range: `[0, 0xFFFFFFFE]` |
+| `pool_id` | `list[int] \| int \| None` | `None` (any pool) | Pin allocations to specific DAX device pool(s). A single `int` pins to one pool; a `list[int]` enables ordered fallback — when the first pool is exhausted, the next is tried. `None` lets the resource manager choose. Valid range per element: `[0, 0xFFFFFFFE]` |
 
 ### Examples
 
@@ -67,6 +67,16 @@ config = MaruConfig(
     server_url="tcp://10.0.0.1:5555",
     pool_size=1024 * 1024 * 1024,    # 1GB
     pool_id=1,                        # Use pool 1 (/dev/dax1.0)
+)
+```
+
+**Multi-pool fallback (try pool 0 first, then pool 1):**
+
+```python
+config = MaruConfig(
+    server_url="tcp://10.0.0.1:5555",
+    pool_size=1024 * 1024 * 1024,    # 1GB
+    pool_id=[0, 1],                   # Try pool 0 first, fall back to pool 1
 )
 ```
 
