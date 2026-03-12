@@ -288,6 +288,50 @@ sequenceDiagram
 
 ## Component Overview
 
+```mermaid
+graph TB
+    subgraph "LLM Instance (vLLM)"
+        LM[LMCache]
+        subgraph "Maru Handler"
+            H[MaruHandlerFs]
+            ORM[OwnedRegionManagerFs<br/>page allocator]
+            XM[MarufsMapper<br/>mmap + CUDA pin]
+            XC[MarufsClient<br/>VFS + ioctl wrapper]
+        end
+    end
+
+    subgraph "Kernel"
+        K[marufs.ko<br/>kernel module]
+    end
+
+    CXL[(CXL Memory)]
+
+    LM --> H
+    H --> ORM
+    H --> XM
+    H --> XC
+    ORM --> XM
+    XM --> XC
+    XC -->|syscall| K
+    K --- CXL
+```
+
+Horizontal layout (for presentations):
+
+```mermaid
+graph LR
+    subgraph "LLM Instance (vLLM)"
+        LM[LMCache] --> H[MaruHandlerFs]
+        H --> ORM[OwnedRegionManagerFs]
+        H --> XM[MarufsMapper]
+        ORM --> XM
+        XM --> XC[MarufsClient]
+    end
+
+    XC -->|syscall| K[marufs.ko]
+    K --- CXL[(CXL Memory)]
+```
+
 Filesystem mode introduces three components that replace their Remote mode counterparts:
 
 | Component | Replaces | Role |
