@@ -100,7 +100,7 @@ class MaruHandler:
 
             # Derive notify port from server URL (port + 1)
             notify_port = None
-            if self._config.enable_notifications:
+            if self._config.eager_map:
                 try:
                     port = int(self._config.server_url.rsplit(":", 1)[1])
                     notify_port = port + 1
@@ -190,7 +190,7 @@ class MaruHandler:
             self._connected = True
 
             # 5. Register notification callback (PUB/SUB)
-            if self._config.enable_notifications and hasattr(
+            if self._config.eager_map and hasattr(
                 self._rpc, "set_notification_callback"
             ):
                 self._rpc.set_notification_callback(self._on_new_allocation)

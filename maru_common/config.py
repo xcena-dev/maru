@@ -49,8 +49,7 @@ class MaruConfig:
     timeout_ms: int = 2000  # Socket timeout in milliseconds
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
-    eager_map: bool = True  # Pre-map all shared regions on connect
-    enable_notifications: bool = True  # Subscribe to PUB/SUB allocation notifications
+    eager_map: bool = True  # Pre-map shared regions on connect + subscribe to PUB/SUB notifications
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -63,9 +62,6 @@ class MaruConfig:
         env_eager_map = _parse_env_bool("MARU_EAGER_MAP")
         if env_eager_map is not None:
             self.eager_map = env_eager_map
-        env_notifications = _parse_env_bool("MARU_ENABLE_NOTIFICATIONS")
-        if env_notifications is not None:
-            self.enable_notifications = env_notifications
 
         if self.chunk_size_bytes <= 0:
             raise ValueError(

@@ -133,7 +133,7 @@ class TestHandlerOnNewAllocation:
         config = MaruConfig(
             auto_connect=False,
             instance_id=instance_id,
-            enable_notifications=False,  # don't create SUB socket
+            eager_map=False,  # don't create SUB socket
         )
         handler = MaruHandler(config)
         handler._connected = True
@@ -213,21 +213,21 @@ class TestHandlerOnNewAllocation:
         handler._mapper.map_region.assert_not_called()
 
 
-class TestConfigNotification:
-    """Test MaruConfig notification settings."""
+class TestConfigEagerMap:
+    """Test MaruConfig eager_map controls both pre-map and notifications."""
 
     def test_default_enabled(self):
         config = MaruConfig(auto_connect=False)
-        assert config.enable_notifications is True
+        assert config.eager_map is True
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("MARU_ENABLE_NOTIFICATIONS", "false")
+        monkeypatch.setenv("MARU_EAGER_MAP", "false")
         config = MaruConfig(auto_connect=False)
-        assert config.enable_notifications is False
+        assert config.eager_map is False
 
     def test_explicit_disable(self):
-        config = MaruConfig(auto_connect=False, enable_notifications=False)
-        assert config.enable_notifications is False
+        config = MaruConfig(auto_connect=False, eager_map=False)
+        assert config.eager_map is False
 
 
 class TestAsyncClientNotifyPort:
@@ -251,7 +251,7 @@ class TestAsyncClientNotifyPort:
         config = MaruConfig(
             auto_connect=False,
             server_url="tcp://localhost:11001",
-            enable_notifications=True,
+            eager_map=True,
         )
         handler = MaruHandler(config)
         assert handler._rpc._notify_url == "tcp://localhost:11002"
@@ -260,7 +260,7 @@ class TestAsyncClientNotifyPort:
         config = MaruConfig(
             auto_connect=False,
             server_url="tcp://localhost:11001",
-            enable_notifications=False,
+            eager_map=False,
         )
         handler = MaruHandler(config)
         assert handler._rpc._notify_url is None
