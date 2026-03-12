@@ -18,6 +18,8 @@ from maru_shm import MaruShmClient
 
 
 def _fmt_size(nbytes: int) -> str:
+    if nbytes == 0:
+        return "0B"
     if nbytes >= 1024**4:
         return f"{nbytes / 1024**4:.1f}T"
     if nbytes >= 1024**3:
@@ -35,7 +37,7 @@ def _usage_bar(used: int, total: int, width: int = 30) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + f"] {ratio * 100:.1f}%"
 
 
-def snapshot(client: MaruShmClient) -> list:
+def snapshot(client: MaruShmClient) -> list[object]:
     return client.stats()
 
 
@@ -44,7 +46,9 @@ def _clear_screen() -> None:
     sys.stdout.flush()
 
 
-def render_table(pools: list, ts: str, prev: dict | None = None) -> str:
+def render_table(
+    pools: list[object], ts: str, prev: dict[int, int] | None = None
+) -> str:
     """Render table to string. prev maps pool_id -> previous used bytes for delta."""
     lines = []
     lines.append(f"  Maru Pool Monitor  —  {ts}  (Ctrl+C to quit)")
@@ -82,7 +86,7 @@ def print_csv_header() -> None:
     print("timestamp,pool_id,dax_type,total_bytes,free_bytes,used_bytes,usage_pct")
 
 
-def print_csv_row(pools: list, ts: str) -> None:
+def print_csv_row(pools: list[object], ts: str) -> None:
     for p in sorted(pools, key=lambda x: x.pool_id):
         used = p.total_size - p.free_size
         pct = (used / p.total_size * 100) if p.total_size > 0 else 0
@@ -115,7 +119,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    client = MaruShmClient()
+    try:
+        client = MaruShmClient()
+    except Exception as e:
+        print(f"Error: cannot connect to maru_resourced: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.watch <= 0:
         # One-shot
@@ -137,7 +145,12 @@ def main() -> None:
     try:
         while True:
             ts = datetime.now().isoformat(timespec="seconds")
-            pools = snapshot(client)
+            try:
+                pools = snapshot(client)
+            except Exception as e:
+                print(f"  [error] {e}", file=sys.stderr)
+                time.sleep(args.watch)
+                continue
             if args.csv:
                 print_csv_row(pools, ts)
                 sys.stdout.flush()
