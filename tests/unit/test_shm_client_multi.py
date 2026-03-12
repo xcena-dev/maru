@@ -12,13 +12,13 @@ import os
 import socket
 import tempfile
 import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from maru_shm.client import MaruShmClient
 from maru_shm.ipc import (
     HEADER_SIZE,
-    AllocReq,
     AllocResp,
     FreeReq,
     FreeResp,
@@ -26,11 +26,8 @@ from maru_shm.ipc import (
     MsgType,
     StatsResp,
 )
-from maru_shm.types import MaruHandle, MaruPoolInfo, DaxType
+from maru_shm.types import DaxType, MaruHandle, MaruPoolInfo
 from maru_shm.uds_helpers import read_full, send_with_fd, write_full
-
-from unittest.mock import MagicMock, patch
-
 
 # =============================================================================
 # Helpers
@@ -221,8 +218,7 @@ class TestMultiClientAllocFree:
                         errors.append(e)
 
                 threads = [
-                    threading.Thread(target=alloc_thread, args=(i,))
-                    for i in range(4)
+                    threading.Thread(target=alloc_thread, args=(i,)) for i in range(4)
                 ]
                 for t in threads:
                     t.start()
@@ -266,9 +262,7 @@ class TestClientIsolation:
                     free_size=1 << 29,
                     align_bytes=2 << 20,
                 )
-                _send_response(
-                    sock, MsgType.STATS_RESP, StatsResp(pools=[pool])
-                )
+                _send_response(sock, MsgType.STATS_RESP, StatsResp(pools=[pool]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = MockResourceManagerServer(handler)
@@ -319,9 +313,7 @@ class TestClientIsolation:
                     handle = MaruHandle(
                         region_id=n, offset=0, length=4096, auth_token=n * 100
                     )
-                    resp = AllocResp(
-                        status=0, handle=handle, requested_size=4096
-                    )
+                    resp = AllocResp(status=0, handle=handle, requested_size=4096)
                     _send_response_with_fd(sock, MsgType.ALLOC_RESP, resp)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -383,9 +375,7 @@ class TestConcurrentEnsureResourceManager:
                 patch("subprocess.Popen", side_effect=fake_popen),
                 patch("time.sleep"),
             ):
-                threads = [
-                    threading.Thread(target=ensure_thread) for _ in range(4)
-                ]
+                threads = [threading.Thread(target=ensure_thread) for _ in range(4)]
                 for t in threads:
                     t.start()
                 for t in threads:

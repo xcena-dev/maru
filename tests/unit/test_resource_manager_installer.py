@@ -20,7 +20,6 @@ from maru_common.resource_manager_installer import (
     main,
 )
 
-
 # =============================================================================
 # fprintf tests
 # =============================================================================
@@ -55,9 +54,7 @@ class TestCheckRoot:
             assert _check_root() == 1
 
     def test_returns_none_when_root(self):
-        with patch(
-            "maru_common.resource_manager_installer.os.getuid", return_value=0
-        ):
+        with patch("maru_common.resource_manager_installer.os.getuid", return_value=0):
             assert _check_root() is None
 
 
@@ -95,9 +92,7 @@ class TestRun:
     """Tests for _run."""
 
     def test_runs_command_with_check(self):
-        with patch(
-            "maru_common.resource_manager_installer.subprocess.run"
-        ) as mock_run:
+        with patch("maru_common.resource_manager_installer.subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["echo", "test"], returncode=0
             )
@@ -106,9 +101,7 @@ class TestRun:
             assert result.returncode == 0
 
     def test_runs_command_without_check(self):
-        with patch(
-            "maru_common.resource_manager_installer.subprocess.run"
-        ) as mock_run:
+        with patch("maru_common.resource_manager_installer.subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["cmd"], returncode=1
             )
@@ -376,16 +369,12 @@ class TestMain:
             assert main([]) == 1
 
     def test_uninstall(self, tmp_path):
-        with patch(
-            "maru_common.resource_manager_installer.os.getuid", return_value=0
-        ):
+        with patch("maru_common.resource_manager_installer.os.getuid", return_value=0):
             assert main(["--uninstall", "--prefix", str(tmp_path)]) == 0
 
     def test_install_delegates_to_do_install(self):
         with (
-            patch(
-                "maru_common.resource_manager_installer.os.getuid", return_value=0
-            ),
+            patch("maru_common.resource_manager_installer.os.getuid", return_value=0),
             patch(
                 "maru_common.resource_manager_installer._do_install", return_value=0
             ) as mock_install,
@@ -395,9 +384,7 @@ class TestMain:
 
     def test_install_with_custom_prefix(self):
         with (
-            patch(
-                "maru_common.resource_manager_installer.os.getuid", return_value=0
-            ),
+            patch("maru_common.resource_manager_installer.os.getuid", return_value=0),
             patch(
                 "maru_common.resource_manager_installer._do_install", return_value=0
             ) as mock_install,
@@ -408,9 +395,7 @@ class TestMain:
 
     def test_install_with_clean(self):
         with (
-            patch(
-                "maru_common.resource_manager_installer.os.getuid", return_value=0
-            ),
+            patch("maru_common.resource_manager_installer.os.getuid", return_value=0),
             patch(
                 "maru_common.resource_manager_installer._do_install", return_value=0
             ) as mock_install,
@@ -421,9 +406,7 @@ class TestMain:
 
     def test_default_prefix(self):
         with (
-            patch(
-                "maru_common.resource_manager_installer.os.getuid", return_value=0
-            ),
+            patch("maru_common.resource_manager_installer.os.getuid", return_value=0),
             patch(
                 "maru_common.resource_manager_installer._do_install", return_value=0
             ) as mock_install,

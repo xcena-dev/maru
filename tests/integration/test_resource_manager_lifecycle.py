@@ -97,9 +97,7 @@ class TestIdleTimeout:
                 time.sleep(4)
 
                 # Server should have auto-exited
-                assert proc.poll() is not None, (
-                    "Server did not exit after idle timeout"
-                )
+                assert proc.poll() is not None, "Server did not exit after idle timeout"
                 assert proc.returncode == 0
             finally:
                 if proc.poll() is None:
@@ -151,13 +149,9 @@ class TestAutoRestart:
 
             # Stale socket file may remain -- new server should handle it
             # Start a new instance on the same socket
-            proc2 = _start_rm(
-                rm_binary, sock_path, state_dir, idle_timeout=10
-            )
+            proc2 = _start_rm(rm_binary, sock_path, state_dir, idle_timeout=10)
             try:
-                assert _wait_for_socket(sock_path), (
-                    "Restarted server failed to start"
-                )
+                assert _wait_for_socket(sock_path), "Restarted server failed to start"
 
                 client = MaruShmClient(socket_path=sock_path)
                 pools = client.stats()
