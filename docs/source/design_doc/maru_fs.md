@@ -12,6 +12,7 @@ The first control plane implementation, **Remote mode**, uses a centralized Maru
 graph LR
     A[LMCache<br/>Client] -->|RPC<br/>ZMQ| B[MaruServer<br/>Python]
     B -->|RPC| C[Maru Resource Manager]
+    C --- D[CXL Memory]
 ```
 
 ### Why a filesystem?
