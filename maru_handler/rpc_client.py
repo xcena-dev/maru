@@ -158,7 +158,11 @@ class RpcClient:
         handle_data = response.get("handle", {})
         handle = MaruHandle.from_dict(handle_data) if handle_data else None
 
-        return RequestAllocResponse(success=True, handle=handle)
+        return RequestAllocResponse(
+            success=True,
+            handle=handle,
+            mount_path=response.get("mount_path"),
+        )
 
     def list_allocations(
         self, exclude_instance_id: str | None = None

@@ -22,7 +22,7 @@ graph TB
         end
 
         subgraph DM_box["DaxMapper"]
-            SHM["Shared Memory Client"]
+            SHM["Memory Backend<br/>(MaruShmClient | MarufsClient)"]
             MR["Mapped Regions"]
         end
 
@@ -61,7 +61,7 @@ graph TB
 
 **RpcClient** handles all communication with the MaruServer over ZeroMQ. It serializes requests using a binary header plus MessagePack payload, and supports both synchronous and asynchronous modes. The handler is the sole owner of the RPC client — no other component communicates with the server directly.
 
-**DaxMapper** manages the mmap/munmap lifecycle of CXL regions. It creates mapped region objects that provide buffer views for direct memory access. It performs bulk unmap of all regions (both owned and shared) on `close()`.
+**DaxMapper** manages the mmap/munmap lifecycle of CXL regions. It auto-selects between `MaruShmClient` (direct DAX device access) and `MarufsClient` (marufs VFS access) based on the server's `mount_path` response — this selection is transparent to all other components. It creates mapped region objects that provide buffer views for direct memory access, and performs bulk unmap of all regions (both owned and shared) on `close()`.
 
 **OwnedRegionManager** tracks the set of regions owned by this client. Each region is paired 1:1 with a page allocator that manages free pages. The manager exposes add, allocate, and free operations, and returns all region IDs on `close()` so the handler can release them back to the MaruServer.
 

@@ -23,17 +23,35 @@ class AllocationInfo:
 
 
 class AllocationManager:
-    """Manages memory allocation lifecycle."""
+    """Manages memory allocation lifecycle.
 
-    def __init__(self):
-        self._client = MaruShmClient()
+    Supports two backends:
+    - DAX mode (default): Uses MaruShmClient to allocate CXL memory via
+      the resource manager daemon.
+    - marufs mode: Uses MarufsClient to create region files on a marufs
+      kernel filesystem mount. Enabled by passing ``mount_path``.
+
+    Both backends implement the same interface (alloc/free), so the
+    allocation logic is identical regardless of backend.
+    """
+
+    def __init__(self, mount_path: str | None = None):
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
+
+        if mount_path is not None:
+            from marufs import MarufsClient
+
+            self._client = MarufsClient(mount_path)
+            logger.info("AllocationManager: marufs mode (mount_path=%s)", mount_path)
+        else:
+            self._client = MaruShmClient()
+            logger.info("AllocationManager: DAX mode")
 
     def allocate(
         self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
     ) -> MaruHandle | None:
-        """Allocate memory via ShmClient and track ownership."""
+        """Allocate memory via backend and track ownership."""
         try:
             handle = self._client.alloc(size, pool_id=pool_id)
         except RuntimeError as e:

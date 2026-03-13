@@ -1,119 +1,167 @@
 # marufs — Shared Filesystem Mode
 
-> **Status**: Under active development, release coming soon.
+> **Status**: VFS backend mode implemented and operational.
 
 ## Motivation
 
-Maru's architecture separates the **data plane** (direct zero-copy access to CXL shared memory) from the **control plane** (KV metadata registry and region lifecycle management). The control plane is pluggable — its implementation can change without affecting how data is read or written.
+Maru's architecture separates the **data plane** (direct zero-copy access to CXL shared memory) from the **control plane** (KV metadata registry and region lifecycle management).
 
-The first control plane implementation, **Remote mode**, uses a centralized MaruServer and Maru Resource Manager communicating over RPC:
+The first data plane implementation, **DAX mode**, uses MaruShmClient to access CXL memory via `/dev/dax` devices through the Maru Resource Manager daemon:
 
-```
-┌─────────────┐     RPC      ┌─────────────┐     RPC      ┌──────────────────────┐
-│  LMCache    │ ──────────── │  MaruServer  │ ──────────── │ Maru Resource Manager│
-│  (Client)   │   (ZMQ)      │  (Python)    │              │         │
-└─────────────┘              └─────────────┘              └──────────────────────┘
-```
-
-While functional, this design carries operational burdens:
-
-| Problem | Description |
-|---------|-------------|
-| **Multi-process management** | MaruServer and Maru Resource Manager must be deployed and monitored separately |
-| **RPC overhead** | Every KV lookup and region allocation goes through network serialization |
-| **Single point of failure** | If MaruServer crashes, all KV metadata is lost |
-| **User-space access control** | Memory access control is enforced in user-space RPC, which is weaker than kernel-level enforcement |
-| **IPC complexity** | Multi-hop RPC protocol between MaruServer and Resource Manager is hard to debug and maintain |
-
-**Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level for stronger security than user-space RPC.
-
-```
-┌─────────────┐   VFS + ioctl   ┌─────────────────┐
-│  LMCache    │ ──────────────── │  marufs (kernel) │ ─── CXL Memory
-│  (Client)   │   (syscall)      │                  │
-└─────────────┘                  └─────────────────┘
+```mermaid
+graph LR
+    A[LMCache<br/>Client] -->|RPC<br/>ZMQ| B[MaruServer]
+    B -->|RPC| C[Maru Resource Manager]
+    C --- D["/dev/dax<br/>CXL Memory"]
 ```
 
-The data plane remains identical — clients still access CXL memory directly via mmap. Only the control plane changes.
+### Why a filesystem?
+
+The fundamental limitation of DAX mode is **security**. Clients access CXL shared memory by directly `mmap`-ing `/dev/dax` devices. The Linux DAX driver provides no isolation — any process that can open the device has unrestricted read-write access to the entire CXL memory pool. There is no way to enforce per-region or per-instance access control at the hardware or driver level.
+
+A **filesystem** is the right solution because Maru's data model maps naturally onto it: each CXL memory region is a file, and each file has its own inode. The VFS layer already provides per-inode ownership, permission checks on `open` and `mmap`, and fd-scoped access — exactly the per-region security granularity Maru needs.
+
+The underlying `/dev/dax` device is still used — but only the marufs kernel module accesses it directly. User-space processes access CXL memory through marufs region files, and the kernel mediates every `open`, `mmap`, and `ioctl`.
+
+### DAX Mode Limitation
+
+The core limitation of DAX mode is **no access control** — `/dev/dax` direct mmap provides no per-region security enforcement. Any process that can open the device has unrestricted read-write access to the entire CXL memory pool.
+
+**marufs mode** replaces the DAX device path with a kernel filesystem, enabling **per-region kernel-level access control** while keeping the same RPC control plane.
+
+```mermaid
+graph LR
+    A[LMCache<br/>Client] -->|RPC<br/>ZMQ| B[MaruServer]
+    B -->|VFS| C[marufs<br/>kernel module]
+    C --- D[CXL Memory]
+    A -->|mmap<br/>VFS| C
+```
 
 ---
 
-## Key Improvements over Remote Mode
+## Architecture
 
-### 1. Serverless Control Plane
+### What changes from DAX mode
 
-Three separate server-side processes are consolidated into a single kernel module:
+| Concern | DAX Mode | marufs Mode |
+|---------|----------|-------------|
+| Region allocation | MaruShmClient → Resource Manager → `/dev/dax` | MarufsClient → `open(O_CREAT)` + `ftruncate(size)` |
+| Region mapping | MaruShmClient.mmap() → Resource Manager | MarufsClient → `open(region_file)` + `mmap(fd)` |
+| Region deletion | MaruShmClient → Resource Manager | `close(fd)` + `unlink(path)` |
+| Access control | **None** (`/dev/dax` wide open) | **Kernel VFS** — per-region permission checks on `open`/`mmap` |
+| Server process | MaruServer + Resource Manager | MaruServer only (Resource Manager not needed) |
+| KV metadata | MaruServer KVManager | MaruServer KVManager — unchanged |
 
-| Remote Mode Component | Role | Filesystem Mode Replacement |
-|-------------|------|---------------|
-| MaruServer (KVManager) | KV metadata registry | marufs global partitioned index (ioctl) |
-| MaruServer (AllocationManager) | Region allocation tracking | POSIX VFS (`open` / `ftruncate` / `unlink`) |
-| Maru Resource Manager | CXL memory pool, GC | marufs kernel module (GC kthread) |
-| MaruShmClient (RPC) | Region handle issuance, memory mapping | MarufsClient (VFS + ioctl) |
+### Mode Auto-Detection
 
-Deployment is as simple as loading `marufs.ko` and mounting. No server processes to manage.
+Server signals its backend mode via the `mount_path` field in `request_alloc` RPC response:
 
-### 2. Kernel-level Access Control
+- `mount_path = None` → DAX mode (client uses MaruShmClient)
+- `mount_path = "/mnt/marufs"` → marufs mode (client uses MarufsClient)
 
-Remote mode enforces memory access control in user-space via RPC — any process that can reach the server can potentially bypass authorization. Filesystem mode moves access control into the kernel:
+Clients don't need any configuration change — DaxMapper automatically selects the appropriate backend based on server response.
 
-- **Permission flags** (`PERM_READ`, `PERM_WRITE`, `PERM_DELETE`, `PERM_ADMIN`, `PERM_IOCTL`) are enforced at the VFS layer
-- **Default permissions** are set at region creation via `perm_set_default`
-- The kernel mediates all region access — no way to bypass without kernel privilege
+### Component Mapping
 
-### 3. Kernel-managed Global KV Index
-
-In Remote mode, KV metadata lives in a Python dictionary inside MaruServer — volatile and bottlenecked by RPC.
-
-In Filesystem mode, the kernel maintains a **global partitioned index** directly in CXL memory:
-
-- **O(1) lookup**: A single ioctl call returns `(region_name, byte_offset)`
-- **Lock-free concurrency**: CAS-based hash table allows safe multi-instance concurrent access
-- **Global search**: One ioctl searches across all regions — no region scanning needed
-- **Batch operations**: Up to 512 keys per ioctl call for bulk lookup/registration
-
-### 4. File-based Region Management
-
-Region lifecycle is handled through ordinary file operations, eliminating the RPC round-trips:
-
-| Operation | Remote Mode | Filesystem Mode |
-|-----------|-------------|-----------------|
-| Create region | RPC → MaruServer → Resource Manager | `open(O_CREAT)` + `ftruncate(size)` |
-| Delete region | RPC → MaruServer → Resource Manager | `unlink(path)` |
-| List regions | RPC → MaruServer | `listdir(mount_path)` |
-| Map region | RPC → Resource Manager → handle → mmap | `open()` → `mmap()` |
+| Component | DAX Mode | marufs Mode |
+|-----------|----------|-------------|
+| **MaruServer** | AllocationManager(MaruShmClient) | AllocationManager(**MarufsClient**) |
+| **DaxMapper** | MaruShmClient | **MarufsClient** (auto-detected) |
+| **RPC** | ZMQ client-server | ZMQ client-server — unchanged |
+| **OwnedRegionManager** | PagedMemoryAllocator | PagedMemoryAllocator — unchanged |
+| **MaruHandler** | Same handler | Same handler — unchanged |
 
 ---
 
-## Data Flows
+## Kernel-level Access Control
 
-The data plane (zero-copy mmap access to CXL memory) is shared across both modes. The diagrams below show Filesystem mode's control plane interactions.
+DAX mode has no access control — any process can mmap `/dev/dax`. marufs moves access control into the kernel:
+
+- **Per-region permissions**: Each region file has its own permission state, enforced by the kernel on `open` and `mmap`
+- **Owner identification**: Each region tracks its owner by `(node_id, pid, birth_time)` triple. The kernel verifies the caller's identity on every access
+- **Permission flags**: `PERM_READ`, `PERM_WRITE`, `PERM_DELETE`, `PERM_ADMIN`, `PERM_IOCTL` — enforced at the VFS layer
+- **Default permissions**: Set at region creation via `perm_set_default` ioctl. Current implementation uses `PERM_ALL` for simplicity; future work will implement least-privilege defaults with explicit grants
+- **Explicit grant model**: `perm_grant(node_id, pid, perms)` allows fine-grained per-process permission delegation. Requires `PERM_ADMIN`
+- **`PERM_ADMIN` delegation**: Owners implicitly hold all permissions. A process that receives `PERM_ADMIN` via grant can itself grant permissions to other processes
+
+### Current Permission Model
+
+In the current implementation, `perm_set_default(PERM_ALL)` is called during region allocation — all processes can access all regions. This is acceptable for single-tenant deployments.
+
+### Planned Permission Model
+
+For multi-tenant or security-sensitive environments, the planned model is:
+
+1. Region created with `perm_set_default(PERM_READ)` or no default permissions
+2. Authenticated instances receive explicit `perm_grant` after certificate verification
+3. See [Instance Authentication Design](instance_auth_design.md) for the authentication design
+
+---
+
+## Operation Flows
+
+### Init (connect)
+
+```mermaid
+sequenceDiagram
+    participant C as LMCache
+    participant H as MaruHandler
+    participant RPC as RpcClient
+    participant S as MaruServer
+    participant AM as AllocationManager
+    participant XC as MarufsClient
+    participant K as marufs (kernel)
+    participant CXL as CXL Memory
+
+    C->>H: connect()
+
+    Note over H,S: Step 1 — Request initial region via RPC
+    H->>RPC: request_alloc(instance_id, size)
+    RPC->>S: ZMQ request
+    S->>AM: request_alloc(instance_id, size)
+    AM->>XC: alloc(size)
+    XC->>K: open(O_CREAT | O_RDWR) + ftruncate(size)
+    Note over K,CXL: Allocate contiguous CXL memory
+    XC->>K: perm_set_default(fd, PERM_ALL)
+    AM-->>S: MaruHandle
+    S-->>RPC: {handle, mount_path="/mnt/marufs"}
+
+    Note over H: Step 2 — Auto-detect mode from mount_path
+    H->>H: DaxMapper(mount_path="/mnt/marufs") → MarufsClient
+
+    Note over H,CXL: Step 3 — Map owned region
+    H->>H: DaxMapper.map_region(handle)
+    H->>XC: open(region_file) + mmap(fd, size)
+    H->>H: OwnedRegionManager.add_region(handle)
+
+    H-->>C: True
+```
 
 ### Store (saving KV cache)
 
 ```mermaid
 sequenceDiagram
     participant C as LMCache
-    participant H as MaruHandlerV3
-    participant ORM as OwnedRegionManagerV3
-    participant XM as MarufsMapper
-    participant XC as MarufsClient
-    participant K as marufs (kernel)
+    participant H as MaruHandler
+    participant ORM as OwnedRegionManager
+    participant DM as DaxMapper
+    participant RPC as RpcClient
+    participant S as MaruServer
     participant CXL as CXL Memory
 
     C->>H: store(key, data)
     H->>ORM: allocate()
-    ORM-->>H: (region_name, page_index)
+    ORM-->>H: (region_id, page_index)
 
-    Note over H,CXL: Step 1 — Write to CXL (zero-copy, same as Remote mode)
-    H->>XM: get_buffer_view(region_name, offset, size)
-    XM-->>H: memoryview slice
-    H->>CXL: buf[:] = data
+    Note over H,CXL: Step 1 — Write to CXL (zero-copy via mmap)
+    H->>DM: get_buffer_view(region_id, offset, size)
+    DM-->>H: memoryview slice
+    H->>CXL: _gil_free_memcpy(buf, data)
 
-    Note over H,K: Step 2 — Register in kernel global index
-    H->>XC: name_offset(fd, key, byte_offset)
-    XC->>K: ioctl(fd, MARUFS_IOC_NAME_OFFSET)
-    Note over K: CAS insert into global index
+    Note over H,S: Step 2 — Register KV metadata via RPC
+    H->>RPC: register_kv(key, region_id, offset, length)
+    RPC->>S: ZMQ request
+    S->>S: KVManager.register(key, region_id, offset, length)
 
     H-->>C: True
 ```
@@ -123,158 +171,145 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as LMCache (Instance B)
-    participant H as MaruHandlerV3 (B)
+    participant H as MaruHandler (B)
+    participant DM as DaxMapper
     participant XC as MarufsClient
-    participant XM as MarufsMapper
+    participant RPC as RpcClient
+    participant S as MaruServer
     participant K as marufs (kernel)
     participant CXL as CXL Memory
 
     C->>H: retrieve(key)
 
-    Note over H: Step 1 — Local cache miss
-    H->>H: _key_to_location.get(key) → None
+    Note over H,S: Step 1 — KV metadata lookup via RPC
+    H->>RPC: lookup_kv(key)
+    RPC->>S: ZMQ request
+    S->>S: KVManager.lookup(key)
+    S-->>RPC: {handle, kv_offset, kv_length}
 
-    Note over H,K: Step 2 — Kernel global index lookup
-    H->>XC: find_name(dir_fd, key)
-    XC->>K: ioctl(dir_fd, MARUFS_IOC_FIND_NAME)
-    K-->>XC: (region_name, byte_offset)
-    XC-->>H: (region_name, byte_offset)
+    Note over H,K: Step 2 — Map shared region (first access only)
+    H->>DM: map_region(handle)
+    DM->>XC: open(region_file) + mmap(fd, size)
+    Note over K: Kernel checks permissions on open/mmap
 
-    Note over H: Cache locally for future hits
-
-    Note over H,CXL: Step 3 — Map shared region (first access only)
-    H->>XM: map_shared_region(region_name)
-    XM->>XC: open_region(name, readonly=True)
-    XM->>XC: mmap_region(fd, size)
-
-    Note over H,CXL: Step 4 — Read from CXL (zero-copy, same as Remote mode)
-    H->>XM: get_buffer_view(region_name, offset, size)
-    XM-->>H: memoryview
+    Note over H,CXL: Step 3 — Read from CXL (zero-copy)
+    H->>DM: get_buffer_view(region_id, offset, size)
+    DM-->>H: memoryview
     H-->>C: MemoryInfo(view)
 ```
 
-Subsequent retrievals of the same key hit the local cache (0 ioctl).
-Subsequent accesses to the same region reuse the cached mmap (0 open/mmap).
-
-### Delete
-
-```mermaid
-sequenceDiagram
-    participant C as LMCache
-    participant H as MaruHandlerV3
-    participant XC as MarufsClient
-    participant ORM as OwnedRegionManagerV3
-    participant K as marufs (kernel)
-
-    C->>H: delete(key)
-    H->>H: _key_to_location.get(key) → (region_name, page_index)
-
-    H->>XC: clear_name(fd, key)
-    XC->>K: ioctl(fd, MARUFS_IOC_CLEAR_NAME)
-
-    H->>ORM: free(region_name, page_index)
-    H->>H: _key_to_location.pop(key)
-    H-->>C: True
-```
+Subsequent accesses to the same region reuse the cached mmap (0 open/mmap overhead).
 
 ### Close / Cleanup
 
 ```mermaid
 sequenceDiagram
-    participant H as MaruHandlerV3
-    participant XC as MarufsClient
-    participant XM as MarufsMapper
-    participant ORM as OwnedRegionManagerV3
-    participant K as marufs (kernel)
+    participant H as MaruHandler
+    participant ORM as OwnedRegionManager
+    participant DM as DaxMapper
+    participant RPC as RpcClient
+    participant S as MaruServer
 
-    Note over H: Step 1 — Clear own name-refs from global index
-    loop Each own key in _key_to_location
-        H->>XC: clear_name(region_fd, key)
+    Note over H: Step 1 — Close allocators
+    H->>ORM: close() → list of region_ids
+
+    Note over H: Step 2 — Return allocations to server
+    loop Each owned region_id
+        H->>RPC: return_alloc(instance_id, region_id)
     end
 
-    Note over H: Step 2 — Close allocators
-    H->>ORM: close()
+    Note over H: Step 3 — Unmap all regions + close client
+    H->>DM: close()
+    Note over DM: munmap + close(fd) for all regions
 
-    Note over H: Step 3 — Unmap all regions
-    H->>XM: close()
-    Note over XM: cudaHostUnregister + munmap + close(fd)
-
-    Note over H: Step 4 — Delete owned region files
-    loop Each owned region
-        H->>XC: delete_region(name)
-        XC->>K: unlink(name)
-        Note over K: GC reclaims CXL memory
-    end
-
-    Note over H: Step 5 — Close remaining fds
-    H->>XC: close()
+    Note over H: Step 4 — Disconnect RPC
+    H->>RPC: close()
 ```
 
 ---
 
-## Component Overview
+## Component Overview (marufs mode)
 
-Filesystem mode introduces three components that replace their Remote mode counterparts:
+```mermaid
+graph TB
+    subgraph "LLM Instance (vLLM)"
+        LM[LMCache]
+        subgraph "Maru Handler"
+            H[MaruHandler]
+            ORM[OwnedRegionManager<br/>page allocator]
+            DM[DaxMapper<br/>mmap + CUDA pin]
+            XC["MarufsClient"]
+            RPC[RpcClient<br/>ZMQ]
+        end
+    end
 
-| Component | Replaces | Role |
-|-----------|----------|------|
-| **MarufsClient** | RpcClient + MaruShmClient | Wraps kernel filesystem interface — region CRUD via VFS, global index operations via ioctl, permission management. Caches file descriptors internally and validates region names against path traversal. |
-| **MarufsMapper** | DaxMapper | Memory-mapping lifecycle manager. All regions are mapped with CUDA pinning for owned regions; shared region size is auto-detected via fstat. Performs bulk unmap on close. |
-| **OwnedRegionManagerV3** | OwnedRegionManager | Page-level allocator for multiple owned regions, using the same O(1) free-list strategy as Remote mode. Allocation follows the same fast-path: active region → scan others → create new. |
+    subgraph "Server Process"
+        S[MaruServer]
+        KV[KVManager<br/>in-memory dict]
+        AM[AllocationManager<br/>MarufsClient]
+    end
 
----
+    subgraph "Kernel"
+        K[marufs.ko<br/>kernel module]
+    end
 
-## Concurrency Guarantees
+    CXL[(CXL Memory)]
 
-All components are thread-safe. Write operations (store, delete, region map/unmap, allocation/free) are serialized. Read operations (retrieve, buffer view access) are lock-free. This follows the same concurrency model as Remote mode.
-
-> **See also:** [Consistency and Safety](consistency_and_safety.md)
+    LM --> H
+    H --> ORM
+    H --> DM
+    H --> RPC
+    ORM --> DM
+    DM --> XC
+    RPC -->|ZMQ| S
+    S --> KV
+    S --> AM
+    AM -->|VFS| K
+    XC -->|VFS| K
+    K --- CXL
+```
 
 ---
 
 ## Kernel Interface Reference
 
-The marufs kernel module exposes its interface through standard VFS operations (open, close, mmap, unlink) and a set of ioctl commands for global index and permission management.
+### VFS Operations
+
+| Operation | Usage |
+|-----------|-------|
+| `open(O_CREAT \| O_RDWR)` | Create region file (server-side allocation) |
+| `ftruncate(fd, size)` | Set region size |
+| `open(O_RDWR)` | Open existing region (client-side mapping) |
+| `mmap(fd, size, prot)` | Map region into process address space |
+| `munmap(addr, size)` | Unmap region |
+| `close(fd)` | Close file descriptor |
+| `unlink(path)` | Delete region file |
+
+### Permission ioctl
+
+| ioctl | Description |
+|-------|-------------|
+| `MARUFS_IOC_PERM_SET_DEFAULT` | Set default permissions for new accessors |
+| `MARUFS_IOC_PERM_GRANT` | Grant permissions to specific process (node_id, pid) |
 
 <details>
-<summary>ioctl Command Table (click to expand)</summary>
+<summary>Permission Flags (click to expand)</summary>
 
-| ioctl | nr | Direction | Size | Description |
-|-------|----|-----------|------|-------------|
-| `MARUFS_IOC_NAME_OFFSET` | 1 | `_IOW` | 80B | Register name-ref in global index |
-| `MARUFS_IOC_FIND_NAME` | 2 | `_IOWR` | 144B | Global name lookup → (region_name, offset) |
-| `MARUFS_IOC_CLEAR_NAME` | 3 | `_IOW` | 80B | Remove name-ref from global index |
-| `MARUFS_IOC_BATCH_FIND_NAME` | 4 | `_IOWR` | 16B | Batch name lookup (up to 512/call) |
-| `MARUFS_IOC_DAX_MMAP` | 5 | `_IOWR` | 16B | DAX mmap |
-| `MARUFS_IOC_BATCH_NAME_OFFSET` | 6 | `_IOWR` | 16B | Batch name-ref registration (up to 512/call) |
-| `MARUFS_IOC_PERM_GRANT` | 10 | `_IOW` | 16B | Grant permissions |
-| `MARUFS_IOC_PERM_REVOKE` | 11 | `_IOW` | 16B | Revoke permissions |
-| `MARUFS_IOC_PERM_SET_DEFAULT` | 13 | `_IOW` | 16B | Set default permissions |
-| `MARUFS_IOC_DMABUF_EXPORT` | 0x50 | `_IOWR` | 16B | DMA-BUF export |
-
-Magic byte: `0x58` (ASCII `'X'`).
+| Flag | Value | Description |
+|------|-------|-------------|
+| `PERM_READ` | `0x0001` | Read access |
+| `PERM_WRITE` | `0x0002` | Write access |
+| `PERM_DELETE` | `0x0004` | Delete access |
+| `PERM_ADMIN` | `0x0008` | Permission management — required for `perm_grant` and `perm_set_default` |
+| `PERM_IOCTL` | `0x0010` | ioctl access |
+| `PERM_ALL` | `0x001F` | All permissions |
 
 </details>
 
 <details>
-<summary>Key Structures (click to expand)</summary>
+<summary>Permission Structures (click to expand)</summary>
 
 ```c
-#define MARUFS_NAME_MAX 63    // max name length
-
-struct marufs_name_offset_req {           // 80 bytes
-    char     name[MARUFS_NAME_MAX + 1];   // 64B — key string
-    __le64   offset;                      // 8B  — byte offset in region
-    __le64   name_hash;                   // 8B  — pre-computed hash (0 = djb2 fallback)
-};
-
-struct marufs_find_name_req {             // 144 bytes
-    char     name[MARUFS_NAME_MAX + 1];         // 64B — input: search key
-    char     region_name[MARUFS_NAME_MAX + 1];  // 64B — output: region filename
-    __le64   offset;                            // 8B  — output: byte offset
-    __le64   name_hash;                         // 8B  — pre-computed hash
-};
-
 struct marufs_perm_req {                  // 16 bytes
     __le32   node_id;                     // CXL node ID
     __le32   pid;                         // target process ID
@@ -285,40 +320,124 @@ struct marufs_perm_req {                  // 16 bytes
 
 </details>
 
-<details>
-<summary>Batch Structures (click to expand)</summary>
+---
 
-```c
-struct marufs_batch_find_entry {          // per-entry
-    char     name[MARUFS_NAME_MAX + 1];
-    char     region_name[MARUFS_NAME_MAX + 1];
-    __le64   offset;
-    __le64   name_hash;
-    __le32   status;                      // 0 = found, -ENOENT = not found
-    __u8     _pad[4];
-};
+## On-disk Layout
 
-struct marufs_batch_find_req {            // header (16B)
-    __le32   count;                       // number of entries
-    __le32   found;                       // output: number found
-    __le64   entries;                     // pointer to entry array
-};
+marufs presents CXL shared memory as a flat directory of region files:
+
+```
+/mnt/marufs/                          ← mount point
+├── region_0                          ← owned region (instance A)
+├── region_1                          ← owned region (instance A, 2nd)
+├── region_2                          ← owned region (instance B)
+└── ...
 ```
 
-Batch limit: **512 entries** per ioctl call. The Python client automatically splits larger batches.
+Each region file is a physically contiguous CXL memory allocation. A single region holds multiple KV cache entries, each identified by a byte offset within the region. Region files are created with `open(O_CREAT) + ftruncate(size)` and memory-mapped directly for zero-copy access.
 
-</details>
+---
 
-<details>
-<summary>Permission Flags (click to expand)</summary>
+## Multi-Node Considerations
 
-| Flag | Value | Description |
-|------|-------|-------------|
-| `PERM_READ` | `0x0001` | Read access |
-| `PERM_WRITE` | `0x0002` | Write access |
-| `PERM_DELETE` | `0x0004` | Delete access |
-| `PERM_ADMIN` | `0x0008` | Admin access |
-| `PERM_IOCTL` | `0x0010` | ioctl access |
-| `PERM_ALL` | `0x001F` | All permissions |
+### CXL Shared Memory Across Nodes
 
-</details>
+CXL Type 3 devices allow multiple nodes to share the same physical memory pool. marufs stores **all metadata (inodes, dentries, global index) in CXL memory**, so mounting marufs from the same CXL device on each node makes all region files visible everywhere.
+
+```
+[CXL Shared Memory Pool]
+├── marufs metadata (inode, dentry)   ← stored in CXL
+└── region data (KV cache)            ← stored in CXL
+
+[Node A] mount -t marufs /dev/dax0.0 /mnt/marufs  → all files visible
+[Node B] mount -t marufs /dev/dax1.0 /mnt/marufs  → all files visible (same CXL pool)
+```
+
+### CXL 2.0 Multi-Node: CAS Atomicity & Cache Coherency
+
+CXL 2.0 only guarantees host-to-device coherency. **Multi-host cache coherency and cross-host CAS atomicity are not guaranteed by the spec.** The marufs architecture addresses each concern:
+
+#### 1. CAS Atomicity → Single Writer Serialization
+
+All metadata modifications (`open`, `create`, `delete`, `ftruncate`, `perm_set_default`, etc.) are performed exclusively by a single MaruServer instance. Clients only receive handles via RPC and perform `open + mmap` (read path). Cross-host concurrent CAS operations never occur.
+
+#### 2. Cache Coherency → Explicit Cache Flush (`clwb`/`clflushopt`)
+
+The marufs kernel module provides two barrier macros for CXL 2.0 environments:
+
+- **`MARUFS_CXL_WMB`**: `wmb()` + `clwb()` per cache line + `sfence` — flushes dirty cache lines to the CXL device, ensuring writes are visible to other nodes
+- **`MARUFS_CXL_RMB`**: `clflushopt()` per cache line + `mb()` — invalidates stale cache and forces re-read from CXL memory
+
+These macros are enabled by the **`CONFIG_MARUFS_CXL2_COMPAT`** build flag. On CXL 3.0 (which provides hardware multi-host coherency), the macros are compiled as no-ops (passthrough).
+
+#### 3. VFS Cache Stale → No Metadata Caching
+
+The marufs kernel module follows a **"No metadata caching"** principle, eliminating cross-node visibility issues at the kernel level:
+
+- **dentry cache**: `d_revalidate()` always returns 0 → VFS calls `marufs_lookup()` on every `open()`, reading directly from CXL memory
+- **inode cache**: `marufs_iget()` reads from CXL hot/cold entries on every call → no DRAM caching
+
+```c
+// dir.c — d_revalidate always returns 0, forcing re-lookup from CXL memory
+static int marufs_d_revalidate(...)
+{
+    return 0;  // Always invalid → VFS re-does lookup from CXL
+}
+```
+
+### Multi-Node Operation Flow
+
+```mermaid
+sequenceDiagram
+    participant S as MaruServer (Node A)
+    participant K_A as marufs kernel (Node A)
+    participant CXL as CXL Shared Memory
+    participant K_B as marufs kernel (Node B)
+    participant C as Client (Node B)
+
+    Note over S,CXL: Step 1 — Server creates region (Node A)
+    S->>K_A: open(O_CREAT) + ftruncate(size)
+    K_A->>CXL: Allocate metadata + data area
+    S->>K_A: perm_set_default(PERM_ALL)
+    S->>K_A: clflushopt (flush to CXL)
+
+    Note over S,C: Step 2 — Client gets handle via RPC
+    S-->>C: {handle, mount_path} (ZMQ response)
+    Note over C: RPC response receipt guarantees server flush is complete (ordering barrier)
+
+    Note over C,CXL: Step 3 — Client opens region (Node B)
+    C->>K_B: open("/mnt/marufs/region_42")
+    K_B->>K_B: d_revalidate() → 0 (cache invalidated)
+    K_B->>CXL: marufs_lookup() — direct search from CXL
+    K_B-->>C: fd
+    C->>K_B: mmap(fd, size)
+    Note over C,CXL: Zero-copy CXL memory access
+```
+
+**Key guarantee**: The RPC response itself serves as an ordering barrier — by the time the client calls `open()`, the server's `open + ftruncate + flush` has already completed, so CXL metadata is always up to date.
+
+### Prerequisites
+
+- MaruServer must run as a **single instance** — multiple MaruServer instances creating files concurrently would break CAS serialization guarantees
+- All nodes must mount marufs from the same CXL device (pool)
+- MaruServer RPC address must use TCP (UDS is single-node only)
+
+---
+
+## Known Issues
+
+### 1. No exclusive open on `/dev/dax`
+
+The Linux DAX device driver does not support exclusive open — multiple processes can open the same `/dev/dax` device simultaneously, bypassing marufs's permission model.
+
+**Workaround:** Restrict `/dev/dax` device file permissions to root only (`chmod 600 /dev/dax*`). Only the marufs kernel module (running in kernel context) accesses the DAX device directly; user-space processes access CXL memory through marufs region files.
+
+### 2. `cudaHostRegister` requires read-write mapping
+
+CUDA does not support `cudaHostRegisterReadOnly` — `cudaHostRegister` requires `PROT_READ | PROT_WRITE`.
+
+**Current behavior:** All regions are mapped with `PROT_READ | PROT_WRITE`. Fine-grained read-only mapping for shared regions is planned.
+
+### 3. CXL pool fragmentation
+
+Region creation and deletion over time can fragment the CXL memory pool. Within a region, page-level allocation/free does not cause external fragmentation (pages are fixed-size). However, at the pool level, repeated region create/delete cycles can fragment the CXL address space.

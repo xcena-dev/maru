@@ -111,7 +111,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper()
+        self._mapper: DaxMapper | None = None
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -143,13 +143,7 @@ class MaruHandler:
             # 1. Connect RPC client
             self._rpc.connect()
 
-            # 2. Initialize managers
-            self._owned = OwnedRegionManager(
-                mapper=self._mapper,
-                chunk_size=self._config.chunk_size_bytes,
-            )
-
-            # 3. Request initial owned region via RPC — try each pool in order
+            # 2. Request initial owned region via RPC — try each pool in order
             response = None
             for pool_id in self._pool_ids:
                 try:
@@ -178,6 +172,14 @@ class MaruHandler:
                 self._owned = None
                 self._rpc.close()
                 return False
+
+            # 3. Initialize mapper and OwnedRegionManager
+            if self._mapper is None:
+                self._mapper = DaxMapper(mount_path=response.mount_path)
+            self._owned = OwnedRegionManager(
+                mapper=self._mapper,
+                chunk_size=self._config.chunk_size_bytes,
+            )
 
             # 4. Add region to OwnedRegionManager (mmap + allocator)
             try:
@@ -239,7 +241,8 @@ class MaruHandler:
                         logger.error("Failed to return region %d", rid, exc_info=True)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
-                self._mapper.close()
+                if self._mapper is not None:
+                    self._mapper.close()
 
                 # 4. Close RPC connection
                 self._rpc.close()

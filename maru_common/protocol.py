@@ -169,6 +169,7 @@ class RequestAllocResponse:
     success: bool
     handle: MaruHandle | None = None
     error: str | None = None
+    mount_path: str | None = None  # marufs mount path (None = DAX mode)
 
 
 @dataclass

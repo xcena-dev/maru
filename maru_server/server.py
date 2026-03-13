@@ -25,11 +25,20 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    def __init__(self):
-        self._allocation_manager = AllocationManager()
+    def __init__(self, mount_path: str | None = None):
+        self._allocation_manager = AllocationManager(mount_path=mount_path)
         self._kv_manager = KVManager()
+        self._mount_path = mount_path
         self._lock = RLock()  # Coordinates cross-manager operations
-        logger.info("MaruServer initialized")
+        logger.info(
+            "MaruServer initialized (mode=%s)",
+            "marufs" if mount_path else "dax",
+        )
+
+    @property
+    def mount_path(self) -> str | None:
+        """Return marufs mount path, or None for DAX mode."""
+        return self._mount_path
 
     # =========================================================================
     # Allocation Management
@@ -231,6 +240,12 @@ def main() -> None:
         help="Port to bind the server to (default: 5555)",
     )
     parser.add_argument(
+        "--mount-path",
+        type=str,
+        default=None,
+        help="marufs mount path (enables marufs mode instead of DAX mode)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -242,7 +257,7 @@ def main() -> None:
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer()
+    server = MaruServer(mount_path=args.mount_path)
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

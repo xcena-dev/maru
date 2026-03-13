@@ -142,7 +142,9 @@ The Resource Manager also verifies process identity at connection time, ensuring
 
 The **data path is untrusted** — clients read and write shared memory directly without server mediation. The **metadata path is trusted** — only the server can update the key-to-location index. This separation means a compromised client can corrupt data in its own regions but cannot redirect other clients' keys to arbitrary locations.
 
-> See also: [MaruResourceManager — Security](maru_resource_manager.md#6-security)
+When marufs is used as the memory backend, the kernel enforces additional permission control via `perm_set_default` and `perm_grant`. The server sets default permissions on allocated regions so that only authorized clients can map them, providing stronger isolation than user-space capability tokens alone.
+
+> See also: [MaruResourceManager — Security](maru_resource_manager.md#6-security), [Maru FS — Kernel-Level Access Control](maru_fs.md)
 
 ---
 
