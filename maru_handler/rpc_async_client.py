@@ -189,9 +189,7 @@ class RpcAsyncClient:
             self._sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
             self._sub_socket.setsockopt(zmq.LINGER, 0)
             self._sub_socket.connect(self._notify_url)
-            self._notify_task = asyncio.ensure_future(
-                self._notification_listener()
-            )
+            self._notify_task = asyncio.ensure_future(self._notification_listener())
             logger.debug("SUB notification socket connected to %s", self._notify_url)
 
     async def _async_cleanup(self) -> None:

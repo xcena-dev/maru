@@ -123,9 +123,7 @@ class RpcServer:
             self._context = None
         logger.info("RPC Server stopped")
 
-    def publish_notification(
-        self, instance_id: str, handle: "MaruHandle"
-    ) -> None:
+    def publish_notification(self, instance_id: str, handle: "MaruHandle") -> None:
         """Publish a new-allocation notification to all subscribers."""
         if self._pub_socket is None or self._pub_serializer is None:
             return

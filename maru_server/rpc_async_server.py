@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any
 import zmq
 
 from maru_common import MessageHeader, MessageType, Serializer
-from maru_common.protocol import NewAllocationNotification
 
 if TYPE_CHECKING:
     from maru_shm import MaruHandle
@@ -176,9 +175,7 @@ class RpcAsyncServer:
     # PUB/SUB Notification
     # =========================================================================
 
-    def publish_notification(
-        self, instance_id: str, handle: "MaruHandle"
-    ) -> None:
+    def publish_notification(self, instance_id: str, handle: "MaruHandle") -> None:
         """Publish a new-allocation notification to all subscribers.
 
         Called by MaruServer after a successful request_alloc().

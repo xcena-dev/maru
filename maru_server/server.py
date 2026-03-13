@@ -56,9 +56,7 @@ class MaruServer:
             # Notify other handlers about the new allocation (PUB/SUB)
             if self._notification_callback:
                 try:
-                    self._notification_callback(
-                        instance_id=instance_id, handle=handle
-                    )
+                    self._notification_callback(instance_id=instance_id, handle=handle)
                 except Exception:
                     logger.warning(
                         "Failed to publish allocation notification",

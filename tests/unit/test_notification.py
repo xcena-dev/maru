@@ -2,12 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for PUB/SUB allocation notification (Phase 2)."""
 
-import threading
-import time
-from unittest.mock import MagicMock, patch
-
-import pytest
-import zmq
+from unittest.mock import MagicMock
 
 from maru_common import MaruConfig, MessageType, Serializer
 from maru_common.protocol import NewAllocationNotification
@@ -236,9 +231,7 @@ class TestAsyncClientNotifyPort:
     def test_notify_url_derived(self):
         from maru_handler.rpc_async_client import RpcAsyncClient
 
-        client = RpcAsyncClient(
-            server_url="tcp://localhost:5555", notify_port=5556
-        )
+        client = RpcAsyncClient(server_url="tcp://localhost:5555", notify_port=5556)
         assert client._notify_url == "tcp://localhost:5556"
 
     def test_notify_url_none_when_no_port(self):
