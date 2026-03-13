@@ -31,38 +31,46 @@ flowchart TB
         end
     end
 
-    subgraph ControlPlane["Control Plane"]
+    MS["MaruServer"]:::maru
+
+    H1 <-.->|"metadata RPC"| MS
+    H2 <-.->|"metadata RPC"| MS
+    H3 <-.->|"metadata RPC"| MS
+
+    subgraph Backend["Memory Backend"]
         direction LR
-        subgraph Remote["Remote Mode"]
+        subgraph DAX_Mode["DAX Mode (default)"]
             direction TB
-            MS["MaruServer"]:::maru
-            D["MaruResourceManager"]:::maru
-            MS <--> D
+            SHM["MaruShmClient"]:::shm
+            RM["MaruResourceManager"]:::shm
+            SHM -->|"IPC"| RM
         end
-        subgraph Filesystem["Shared Filesystem Mode"]
+        subgraph Marufs_Mode["marufs Mode"]
             direction TB
-            FS["MaruFs"]:::fs
+            MFS["MarufsClient"]:::fs
+            KFS["marufs kernel"]:::fs
+            MFS -->|"syscall"| KFS
         end
     end
 
-    H1 <-.->|"store / retrieve"| FS
-    H2 <-.->|"store / retrieve"| MS
-    H3 <-.->|"store / retrieve"| MS
+    MS -.->|"alloc / free"| SHM
+    MS -.->|"alloc / free"| MFS
 
     subgraph CXL["CXL Shared Memory"]
         direction LR
         R0["Region 0"] ~~~ R1["Region 1"] ~~~ R2["Region 2"]
     end
 
-    D -.->|"allocate / free regions"| CXL
-    FS -.-> CXL
+    RM -.->|"manage"| CXL
+    KFS -.->|"manage"| CXL
 
-    H1 <==>|"read / write"| CXL
-    H2 <==>|"read / write"| CXL
-    H3 <==>|"read / write"| CXL
+    H1 <==>|"mmap read / write"| CXL
+    H2 <==>|"mmap read / write"| CXL
+    H3 <==>|"mmap read / write"| CXL
 
     classDef maru fill:#f8cecc,stroke:#b85450,font-weight:bold
     classDef fs fill:#dae8fc,stroke:#6c8ebf,font-weight:bold
+    classDef shm fill:#d5e8d4,stroke:#82b366,font-weight:bold
 ```
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
@@ -74,8 +82,11 @@ The system has three layers:
 | Layer | Role | Components |
 |-------|------|------------|
 | **Client** | KV operations, page allocation, region mapping | MaruHandler |
-| **Metadata** | Key registry, allocation lifecycle | MaruServer (Remote) / marufs (Filesystem) |
-| **Memory** | Shared memory pool, capability issuance, crash recovery | MaruResourceManager (Remote) / marufs (Filesystem) |
+| **Metadata** | Key registry, allocation lifecycle | MaruServer |
+| **Memory** | Physical region alloc/free, mmap | MaruShmClient → MaruResourceManager (DAX mode) |
+| | | MarufsClient → marufs kernel (marufs mode) |
+
+Both the server (AllocationManager) and clients (DaxMapper) use the same memory backend. The backend is selected by the server's `mount_path` configuration: when set, `MarufsClient` is used; otherwise, `MaruShmClient` communicates with `MaruResourceManager`. In marufs mode, MaruResourceManager is not used — the marufs kernel manages CXL memory directly. The choice is transparent to MaruHandler and all upper layers.
 
 ---
 
@@ -83,7 +94,7 @@ The system has three layers:
 
 **Zero-copy data path.** Clients access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead.
 
-**Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
+**Per-application control plane.** Each application group runs its own MaruServer for metadata isolation (e.g., app A with 2 instances, app B with 3 instances). In DAX mode, a single MaruResourceManager manages the shared memory pool across all groups. In marufs mode, the marufs kernel manages CXL memory directly.
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -103,26 +114,33 @@ flowchart LR
 
     MSA["MaruServer A"]:::maru
     MSB["MaruServer B"]:::maru
-    RM["MaruResourceManager"]:::rm
 
     A1 & A2 --> MSA
     B1 & B2 & B3 --> MSB
-    MSA & MSB --> RM
+
+    subgraph Backend["Memory Backend"]
+        direction TB
+        RM["MaruResourceManager<br/>(DAX mode)"]:::rm
+        KFS["marufs kernel<br/>(marufs mode)"]:::fs
+    end
+
+    MSA & MSB --> Backend
 
     subgraph CXL["CXL Shared Memory Pool"]
         direction TB
         R0["Region 0"] ~~~ R1["Region 1"] ~~~ R2["Region 2"] ~~~ R3["Region 3"]
     end
 
-    RM --> CXL
+    Backend --> CXL
 
     classDef maru fill:#f8cecc,stroke:#b85450,font-weight:bold
     classDef rm fill:#d5e8d4,stroke:#82b366,font-weight:bold
+    classDef fs fill:#dae8fc,stroke:#6c8ebf,font-weight:bold
 ```
 
-**Pluggable control plane.** The control plane is isolated behind a stable interface, so its implementation can change without affecting the data path. Remote mode (current) uses a centralized MaruServer + MaruResourceManager. Shared Filesystem mode (in development) replaces both with MaruFs, enforcing memory access control at the kernel level for stronger security than user-space RPC.
+**Pluggable memory backend.** The data access layer is isolated behind the `DaxMapper` abstraction, so the memory backend can change without affecting the control plane or upper layers. The default backend (`MaruShmClient`) accesses CXL devices directly via DAX. When the server is configured with a marufs mount path, `MarufsClient` is selected instead, accessing CXL memory through the marufs VFS — adding kernel-level permission control (via `perm_set_default` / `perm_grant`) without changing the data flow.
 
-**Capability-based memory access.** Clients never open shared memory devices directly. The Resource Manager acts as a capability broker, issuing authorized handles that grant access to specific memory regions (the Memory layer in the diagram). This confines hardware access to a single trusted process and decouples clients from the underlying memory technology.
+**Capability-based memory access.** In DAX mode, clients never open shared memory devices directly — the Resource Manager acts as a capability broker, issuing authorized handles that grant access to specific memory regions. In marufs mode, the kernel enforces access control via `perm_set_default` and `perm_grant`, restricting which processes can open and mmap region files. In both cases, clients are decoupled from the underlying memory technology.
 
 ---
 
