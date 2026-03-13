@@ -72,8 +72,9 @@ class MaruShmClient:
         lock_path = Path(self._socket_path).parent / "rm.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-        lock_fd = open(lock_path, "w")
+        lock_fd = None
         try:
+            lock_fd = open(lock_path, "w")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
             # Re-check after acquiring lock (another process may have started it)
@@ -107,12 +108,15 @@ class MaruShmClient:
             logger.info(
                 "Starting maru-resource-manager (socket: %s)", self._socket_path
             )
+            stderr_path = Path(self._socket_path).parent / "rm.stderr.log"
+            stderr_file = open(stderr_path, "a")
             subprocess.Popen(
                 ["maru-resource-manager", "--socket-path", self._socket_path]
                 + extra_args,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_file,
             )
+            stderr_file.close()
 
             # Wait for socket to become available
             for _ in range(50):  # max 5 seconds, 100ms intervals
@@ -121,13 +125,21 @@ class MaruShmClient:
                     logger.info("maru-resource-manager is ready")
                     return
 
+            # Include stderr output in error message for diagnosis
+            stderr_output = ""
+            try:
+                stderr_output = stderr_path.read_text().strip()[-500:]
+            except Exception:
+                pass
             raise RuntimeError(
                 f"maru-resource-manager failed to start within 5s "
                 f"(socket: {self._socket_path})"
+                + (f"\nstderr: {stderr_output}" if stderr_output else "")
             )
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
 
     def _try_connect(self) -> bool:
         """Test if the resource manager socket is connectable."""
@@ -154,7 +166,11 @@ class MaruShmClient:
             # Connection failed — resource manager may not be running or crashed
             self._ensure_resource_manager()
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(self._socket_path)
+            try:
+                sock.connect(self._socket_path)
+            except OSError:
+                sock.close()
+                raise
         return sock
 
     def _send_request(

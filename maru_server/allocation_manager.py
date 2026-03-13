@@ -27,7 +27,6 @@ class AllocationManager:
 
     def __init__(self):
         self._client = MaruShmClient()
-        self._client._ensure_resource_manager()  # Ensure RM is running at startup
         self._client.register_server()  # Register as active server (prevents idle shutdown)
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
