@@ -17,4 +17,7 @@ enum class LogLevel {
 void setLogLevel(LogLevel level);
 void logf(LogLevel level, const char *fmt, ...);
 
+LogLevel parseLogLevel(const char *s);
+const char *logLevelStr(LogLevel level);
+
 } // namespace maru

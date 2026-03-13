@@ -192,6 +192,11 @@ class MaruServer:
             "allocation_manager": self._allocation_manager.get_stats(),
         }
 
+    def close(self) -> None:
+        """Shutdown the server and release resources."""
+        self._allocation_manager.close()
+        logger.info("MaruServer closed")
+
 
 # =============================================================================
 # CLI Utilities
@@ -248,7 +253,10 @@ def main() -> None:
 
     # Start server
     logger.info("Starting MaruServer on %s:%d", args.host, args.port)
-    rpc_server.start()
+    try:
+        rpc_server.start()
+    finally:
+        server.close()
 
 
 if __name__ == "__main__":

@@ -50,22 +50,6 @@ int readFull(int fd, void *buf, size_t len) {
   return 0;
 }
 
-std::string defaultSocketPath() {
-  const char *env = std::getenv("MARU_SOCKET_PATH");
-  if (env && env[0] != '\0') {
-    return std::string(env);
-  }
-  return std::string("/run/maru-resourced/maru-resourced.sock");
-}
-
-std::string defaultStateDir() {
-  const char *env = std::getenv("MARU_STATE_DIR");
-  if (env && env[0] != '\0') {
-    return std::string(env);
-  }
-  return std::string("/var/lib/maru-resourced");
-}
-
 uint64_t nowSec() {
   using namespace std::chrono;
   return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
@@ -114,12 +98,11 @@ static bool saveSecretToFile(const std::string &stateDir,
   return written == static_cast<ssize_t>(g_hmacSecret.size());
 }
 
-int initSecret(bool hasExistingAllocations) {
+int initSecret(const std::string &stateDir, bool hasExistingAllocations) {
   if (g_secretInitialized) {
     return 0;
   }
 
-  std::string stateDir = defaultStateDir();
   std::string secretPath = stateDir + "/secret";
 
   if (loadSecretFromFile(secretPath)) {
@@ -291,6 +274,23 @@ uint64_t getPidStartTime(pid_t pid) {
     ++p;
   }
   return std::strtoull(p, nullptr, 10);
+}
+
+std::string parentDir(const std::string &path) {
+  auto pos = path.rfind('/');
+  if (pos == std::string::npos || pos == 0) return "/";
+  return path.substr(0, pos);
+}
+
+bool ensureDirExists(const std::string &path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+  // Recursively create parent
+  ensureDirExists(parentDir(path));
+  if (::mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+    return false;
+  }
+  return true;
 }
 
 } // namespace maru

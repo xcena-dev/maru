@@ -9,6 +9,12 @@ namespace maru {
 static constexpr uint32_t kMagic = 0x4D415255; // 'MARU'
 static constexpr uint16_t kVersion = 1;
 
+/// Memory access type — LOCAL for fd-based mmap, REMOTE for future multi-node.
+enum class AccessType : uint32_t {
+  LOCAL  = 0,   // fd via SCM_RIGHTS + mmap (current)
+  REMOTE = 1,   // reserved: RDMA or software-based remote memory access
+};
+
 enum class MsgType : uint16_t {
   ALLOC_REQ = 1,
   ALLOC_RESP = 2,
@@ -16,8 +22,12 @@ enum class MsgType : uint16_t {
   FREE_RESP = 4,
   STATS_REQ = 5,
   STATS_RESP = 6,
+  REGISTER_SERVER_REQ = 7,
+  REGISTER_SERVER_RESP = 8,
   GET_FD_REQ = 9,
   GET_FD_RESP = 10,
+  UNREGISTER_SERVER_REQ = 11,
+  UNREGISTER_SERVER_RESP = 12,
   ERROR_RESP = 255
 };
 
@@ -36,7 +46,7 @@ struct AllocReq {
 
 struct AllocResp {
   int32_t status;
-  uint32_t _pad{0}; // explicit padding for Handle alignment
+  uint32_t accessType{0}; // AccessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE
   Handle handle;
   uint64_t requestedSize;
 };
@@ -61,6 +71,14 @@ struct StatsRespHeader {
   uint32_t numPools;
 };
 
+struct RegisterServerResp {
+  int32_t status;
+};
+
+struct UnregisterServerResp {
+  int32_t status;
+};
+
 struct ErrorResp {
   int32_t status;
   uint32_t msgLen;
@@ -75,6 +93,8 @@ static_assert(sizeof(FreeResp) == 4, "FreeResp must be 4 bytes");
 static_assert(sizeof(GetFdReq) == 32, "GetFdReq must be 32 bytes (Handle)");
 static_assert(sizeof(GetFdResp) == 4, "GetFdResp must be 4 bytes");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
+static_assert(sizeof(RegisterServerResp) == 4, "RegisterServerResp must be 4 bytes");
+static_assert(sizeof(UnregisterServerResp) == 4, "UnregisterServerResp must be 4 bytes");
 static_assert(sizeof(ErrorResp) == 8, "ErrorResp must be 8 bytes");
 
 } // namespace maru

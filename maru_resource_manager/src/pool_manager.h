@@ -47,8 +47,14 @@ class WalStore;
 class PoolManager
 {
 public:
-    PoolManager();
+    explicit PoolManager(const std::string &stateDir);
     ~PoolManager();
+
+    const std::string &stateDir() const { return stateDir_; }
+    uint32_t allocationCount() const;
+    uint32_t registeredServerCount() const;
+    void registerServer(pid_t pid);
+    void unregisterServer(pid_t pid);
 
     int loadPools();
     int rescanDevices();
@@ -62,6 +68,7 @@ public:
     bool verifyAuthToken(const Handle &handle);
 
     void reapExpired(uint64_t &reapedCount);
+    void checkpoint();
 
 private:
     struct DeviceInfo
@@ -84,7 +91,8 @@ private:
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
+    std::string stateDir_;
     std::vector<PoolState> pools_;
     uint64_t opCount_{0};
     uint64_t checkpointInterval_{100};
@@ -101,6 +109,9 @@ private:
     std::map<pid_t, uint64_t> pidStartTimes_;
     // PID allocation refcount for O(1) reaper cleanup
     std::map<pid_t, uint32_t> pidAllocCounts_;
+
+    // Registered server PIDs → start time (in-memory only, not persisted)
+    std::map<pid_t, uint64_t> registeredServers_;
 };
 
 }  // namespace maru

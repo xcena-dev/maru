@@ -34,8 +34,12 @@ class MsgType(IntEnum):
     FREE_RESP = 4
     STATS_REQ = 5
     STATS_RESP = 6
+    REGISTER_SERVER_REQ = 7
+    REGISTER_SERVER_RESP = 8
     GET_FD_REQ = 9
     GET_FD_RESP = 10
+    UNREGISTER_SERVER_REQ = 11
+    UNREGISTER_SERVER_RESP = 12
     ERROR_RESP = 255
 
 
@@ -121,7 +125,8 @@ class AllocReq:
         return cls(size=size, pool_id=pool_id, reserved=reserved)
 
 
-# AllocResp: status(i32) + pad(4) + Handle(32) + requested_size(u64) = 48 bytes
+# AllocResp: status(i32) + accessType(u32) + Handle(32) + requested_size(u64) = 48 bytes
+# accessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE (future multi-node)
 _ALLOC_RESP_FORMAT = "=iIQQQQQ"
 _ALLOC_RESP_SIZE = struct.calcsize(_ALLOC_RESP_FORMAT)
 
@@ -139,7 +144,7 @@ class AllocResp:
         return struct.pack(
             _ALLOC_RESP_FORMAT,
             self.status,
-            0,  # pad
+            0,  # accessType (LOCAL)
             h.region_id,
             h.offset,
             h.length,
@@ -153,7 +158,7 @@ class AllocResp:
             raise ValueError(f"AllocResp too short: {len(data)} < {_ALLOC_RESP_SIZE}")
         vals = struct.unpack(_ALLOC_RESP_FORMAT, data[:_ALLOC_RESP_SIZE])
         status = vals[0]
-        # vals[1] is pad
+        # vals[1] is accessType (0=LOCAL, 1=REMOTE)
         handle = MaruHandle(
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
@@ -313,6 +318,84 @@ class StatsResp:
             )
             offset += _STATS_POOL_SIZE
         return cls(pools=pools)
+
+
+# RegisterServerReq: empty payload (0 bytes) — PID comes from SO_PEERCRED
+@dataclass
+class RegisterServerReq:
+    """Register server request payload (empty)."""
+
+    def pack(self) -> bytes:
+        return b""
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "RegisterServerReq":
+        return cls()
+
+
+# RegisterServerResp: status(i32) = 4 bytes
+_REGISTER_SERVER_RESP_FORMAT = "=i"
+_REGISTER_SERVER_RESP_SIZE = struct.calcsize(_REGISTER_SERVER_RESP_FORMAT)
+
+
+@dataclass
+class RegisterServerResp:
+    """Register server response payload."""
+
+    status: int = 0
+
+    def pack(self) -> bytes:
+        return struct.pack(_REGISTER_SERVER_RESP_FORMAT, self.status)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "RegisterServerResp":
+        if len(data) < _REGISTER_SERVER_RESP_SIZE:
+            raise ValueError(
+                f"RegisterServerResp too short: {len(data)} < {_REGISTER_SERVER_RESP_SIZE}"
+            )
+        (status,) = struct.unpack(
+            _REGISTER_SERVER_RESP_FORMAT, data[:_REGISTER_SERVER_RESP_SIZE]
+        )
+        return cls(status=status)
+
+
+# UnregisterServerReq: empty payload (0 bytes) — PID comes from SO_PEERCRED
+@dataclass
+class UnregisterServerReq:
+    """Unregister server request payload (empty)."""
+
+    def pack(self) -> bytes:
+        return b""
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "UnregisterServerReq":
+        return cls()
+
+
+# UnregisterServerResp: status(i32) = 4 bytes
+_UNREGISTER_SERVER_RESP_FORMAT = "=i"
+_UNREGISTER_SERVER_RESP_SIZE = struct.calcsize(_UNREGISTER_SERVER_RESP_FORMAT)
+
+
+@dataclass
+class UnregisterServerResp:
+    """Unregister server response payload."""
+
+    status: int = 0
+
+    def pack(self) -> bytes:
+        return struct.pack(_UNREGISTER_SERVER_RESP_FORMAT, self.status)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "UnregisterServerResp":
+        if len(data) < _UNREGISTER_SERVER_RESP_SIZE:
+            raise ValueError(
+                f"UnregisterServerResp too short: {len(data)} < {_UNREGISTER_SERVER_RESP_SIZE}"
+            )
+        (status,) = struct.unpack(
+            _UNREGISTER_SERVER_RESP_FORMAT, data[:_UNREGISTER_SERVER_RESP_SIZE]
+        )
+        return cls(status=status)
 
 
 # ErrorResp: status(i32) + msg_len(u32) + message(variable)

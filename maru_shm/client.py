@@ -24,8 +24,12 @@ from .ipc import (
     GetFdResp,
     MsgHeader,
     MsgType,
+    RegisterServerReq,
+    RegisterServerResp,
     StatsReq,
     StatsResp,
+    UnregisterServerReq,
+    UnregisterServerResp,
 )
 from .types import MaruHandle, MaruPoolInfo
 from .uds_helpers import read_full, recv_with_fd, write_full
@@ -49,14 +53,124 @@ class MaruShmClient:
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
 
+    def _ensure_resource_manager(self) -> None:
+        """Ensure the resource manager is running, starting it if needed.
+
+        Uses flock to prevent multiple processes from starting the resource
+        manager simultaneously. After acquiring the lock, re-checks connectivity
+        in case another process already started it.
+        """
+        import fcntl
+        import subprocess
+        import time
+        from pathlib import Path
+
+        # Quick check — maybe it's already running
+        if self._try_connect():
+            return
+
+        lock_path = Path(self._socket_path).parent / "rm.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock_fd = None
+        try:
+            lock_fd = open(lock_path, "w")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            # Re-check after acquiring lock (another process may have started it)
+            if self._try_connect():
+                return
+
+            # Read saved config from previous RM instance (if any)
+            conf_path = Path(self._socket_path).parent / "rm.conf"
+            extra_args: list[str] = []
+            if conf_path.exists():
+                try:
+                    for line in conf_path.read_text().strip().splitlines():
+                        key, _, value = line.partition("=")
+                        if not value:
+                            continue
+                        if key == "state_dir":
+                            extra_args += ["--state-dir", value]
+                        elif key == "log_level":
+                            extra_args += ["--log-level", value]
+                        elif key == "idle_timeout":
+                            extra_args += ["--idle-timeout", value]
+                    logger.info("Loaded RM config from %s", conf_path)
+                except Exception:
+                    logger.warning(
+                        "Failed to read RM config from %s, using defaults",
+                        conf_path,
+                        exc_info=True,
+                    )
+
+            # Start resource manager in background
+            logger.info(
+                "Starting maru-resource-manager (socket: %s)", self._socket_path
+            )
+            stderr_path = Path(self._socket_path).parent / "rm.stderr.log"
+            stderr_file = open(stderr_path, "a")
+            subprocess.Popen(
+                ["maru-resource-manager", "--socket-path", self._socket_path]
+                + extra_args,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+            )
+            stderr_file.close()
+
+            # Wait for socket to become available
+            for _ in range(50):  # max 5 seconds, 100ms intervals
+                time.sleep(0.1)
+                if self._try_connect():
+                    logger.info("maru-resource-manager is ready")
+                    return
+
+            # Include stderr output in error message for diagnosis
+            stderr_output = ""
+            try:
+                stderr_output = stderr_path.read_text().strip()[-500:]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"maru-resource-manager failed to start within 5s "
+                f"(socket: {self._socket_path})"
+                + (f"\nstderr: {stderr_output}" if stderr_output else "")
+            )
+        finally:
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+
+    def _try_connect(self) -> bool:
+        """Test if the resource manager socket is connectable."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+            sock.close()
+            return True
+        except OSError:
+            sock.close()
+            return False
+
     def _connect(self) -> socket.socket:
-        """Create a new UDS connection to the resource manager."""
+        """Create a new UDS connection to the resource manager.
+
+        If connection fails, attempts to auto-start the resource manager
+        and retries once.
+        """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(self._socket_path)
         except OSError:
             sock.close()
-            raise
+            # Connection failed — resource manager may not be running or crashed
+            self._ensure_resource_manager()
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(self._socket_path)
+            except OSError:
+                sock.close()
+                raise
         return sock
 
     def _send_request(
@@ -95,6 +209,69 @@ class MaruShmClient:
             payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
             resp = StatsResp.unpack(payload)
             return resp.pools or []
+        finally:
+            sock.close()
+
+    def register_server(self) -> None:
+        """Register this process as an active MaruServer with the resource manager.
+
+        Prevents idle shutdown while the server is running.
+        PID is automatically extracted from the UDS connection (SO_PEERCRED).
+        """
+        sock = self._connect()
+        try:
+            self._send_request(
+                sock, MsgType.REGISTER_SERVER_REQ, RegisterServerReq().pack()
+            )
+            hdr = self._recv_header(sock)
+
+            if hdr.msg_type == MsgType.ERROR_RESP:
+                payload = (
+                    read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+                )
+                err = ErrorResp.unpack(payload)
+                raise RuntimeError(
+                    f"Register server failed ({err.status}): {err.message}"
+                )
+
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+            resp = RegisterServerResp.unpack(payload)
+            if resp.status != 0:
+                raise RuntimeError(f"Register server failed with status {resp.status}")
+
+            logger.info("Registered as active server with resource manager")
+        finally:
+            sock.close()
+
+    def unregister_server(self) -> None:
+        """Unregister this process as an active MaruServer.
+
+        Allows idle shutdown to proceed if no allocations remain.
+        """
+        sock = self._connect()
+        try:
+            self._send_request(
+                sock, MsgType.UNREGISTER_SERVER_REQ, UnregisterServerReq().pack()
+            )
+            hdr = self._recv_header(sock)
+
+            if hdr.msg_type == MsgType.ERROR_RESP:
+                payload = (
+                    read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+                )
+                err = ErrorResp.unpack(payload)
+                raise RuntimeError(
+                    f"Unregister server failed ({err.status}): {err.message}"
+                )
+
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+            resp = UnregisterServerResp.unpack(payload)
+            if resp.status != 0:
+                raise RuntimeError(
+                    f"Unregister server failed with status {resp.status}"
+                )
+
+            logger.info("Unregistered from resource manager")
         finally:
             sock.close()
 

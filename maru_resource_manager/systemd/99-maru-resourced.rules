@@ -1,3 +1,0 @@
-# Notify running maru-resourced daemon to rescan devices on hotplug
-SUBSYSTEM=="dax", KERNEL=="dax*", ACTION=="add|remove", RUN+="/bin/systemctl kill --signal=HUP maru-resourced.service"
-SUBSYSTEM=="block", KERNEL=="pmem*", ACTION=="add|remove", RUN+="/bin/systemctl kill --signal=HUP maru-resourced.service"

@@ -26,6 +26,7 @@ class AllocationManager:
 
     def __init__(self):
         self._client = MaruShmClient()
+        self._client.register_server()  # Register as active server (prevents idle shutdown)
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
 
@@ -183,3 +184,10 @@ class AllocationManager:
                     }
                 ),
             }
+
+    def close(self) -> None:
+        """Unregister from the resource manager on shutdown."""
+        try:
+            self._client.unregister_server()
+        except Exception:
+            logger.warning("Failed to unregister from resource manager", exc_info=True)

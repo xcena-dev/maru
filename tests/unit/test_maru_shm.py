@@ -469,6 +469,76 @@ class TestIPCUnpackValidation:
 # =============================================================================
 
 
+class TestIPCNoneDefaults:
+    """Test pack() with None defaults for 100% branch coverage."""
+
+    def test_free_req_none_handle(self):
+        """FreeReq with handle=None uses default MaruHandle."""
+        req = FreeReq(handle=None)
+        data = req.pack()
+        req2 = FreeReq.unpack(data)
+        assert req2.handle.region_id == 0
+        assert req2.handle.length == 0
+
+    def test_get_fd_req_none_handle(self):
+        """GetFdReq with handle=None uses default MaruHandle."""
+        req = GetFdReq(handle=None)
+        data = req.pack()
+        req2 = GetFdReq.unpack(data)
+        assert req2.handle.region_id == 0
+
+    def test_alloc_resp_none_handle(self):
+        """AllocResp with handle=None uses default MaruHandle."""
+        resp = AllocResp(status=0, handle=None, requested_size=1024)
+        data = resp.pack()
+        resp2 = AllocResp.unpack(data)
+        assert resp2.handle.region_id == 0
+        assert resp2.requested_size == 1024
+
+    def test_stats_resp_none_pools(self):
+        """StatsResp with pools=None packs as empty list."""
+        resp = StatsResp(pools=None)
+        data = resp.pack()
+        resp2 = StatsResp.unpack(data)
+        assert resp2.pools == []
+
+
+class TestPoolInfoFromDictDefaults:
+    """Test MaruPoolInfo.from_dict with missing optional fields."""
+
+    def test_missing_dax_type_defaults_to_dev_dax(self):
+        d = {"pool_id": 1, "total_size": 1000, "free_size": 500}
+        p = MaruPoolInfo.from_dict(d)
+        assert p.dax_type == DaxType.DEV_DAX
+
+    def test_missing_align_bytes_defaults_to_zero(self):
+        d = {"pool_id": 2, "total_size": 2000, "free_size": 1000}
+        p = MaruPoolInfo.from_dict(d)
+        assert p.align_bytes == 0
+
+    def test_all_optional_fields_missing(self):
+        d = {"pool_id": 3, "total_size": 3000, "free_size": 1500}
+        p = MaruPoolInfo.from_dict(d)
+        assert p.pool_id == 3
+        assert p.dax_type == DaxType.DEV_DAX
+        assert p.align_bytes == 0
+
+
+class TestMsgTypeValues:
+    """Test MsgType enum values match C++ header."""
+
+    def test_message_type_values(self):
+        assert MsgType.ALLOC_REQ == 1
+        assert MsgType.ALLOC_RESP == 2
+        assert MsgType.FREE_REQ == 3
+        assert MsgType.FREE_RESP == 4
+        assert MsgType.STATS_REQ == 5
+        assert MsgType.STATS_RESP == 6
+        assert MsgType.GET_FD_REQ == 9
+        assert MsgType.GET_FD_RESP == 10
+        assert MsgType.ERROR_RESP == 255
+
+
 class TestMaruPoolInfoRepr:
     """Test MaruPoolInfo.__repr__ for 100% coverage (line 166)."""
 

@@ -5,8 +5,6 @@
 Defines protection flags, mapping flags, default paths, and alignment constants.
 """
 
-import os
-
 # Memory protection flags (same as POSIX mmap)
 PROT_NONE = 0x0
 PROT_READ = 0x1
@@ -18,10 +16,9 @@ MAP_SHARED = 0x01
 MAP_PRIVATE = 0x02
 
 # Default socket and state paths
-DEFAULT_SOCKET_PATH = os.environ.get(
-    "MARU_SOCKET_PATH", "/run/maru-resourced/maru-resourced.sock"
-)
-DEFAULT_STATE_DIR = os.environ.get("MARU_STATE_DIR", "/var/lib/maru-resourced")
+# no env var override, use MaruShmClient(socket_path=...) for custom paths
+DEFAULT_SOCKET_PATH = "/tmp/maru-resourced/maru-resourced.sock"
+DEFAULT_STATE_DIR = "/var/lib/maru-resourced"
 
 # Alignment
 DEFAULT_ALIGN_BYTES = 2 * 1024 * 1024  # 2 MiB (DAX hugepage alignment)

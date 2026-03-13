@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""
-    echo "Build and install Maru (Python package + maru_resourced daemon)."
+    echo "Build and install Maru (Python package + maru-resource-manager)."
     echo ""
     echo "Options:"
     echo "  -h, --help    Show this help message"
@@ -58,10 +58,10 @@ fi
 echo "Installing Maru Python package ..."
 pip install -e "${SCRIPT_DIR}"
 
-# --- Build and install daemon ----------------------------------------------
+# --- Build and install resource manager ------------------------------------
 
 echo ""
-echo "Building and installing maru_resourced daemon ..."
+echo "Building and installing maru-resource-manager ..."
 echo "This step requires root privileges."
 sudo "$(which install-maru-resource-manager)"
 

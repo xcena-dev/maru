@@ -13,9 +13,6 @@
 //   stats                    Query pool statistics
 //   alloc <size> [pool_id]   Allocate shared memory
 //   mmap <size> [pool_id]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
-//
-// Environment:
-//   MARU_SOCKET_PATH   Override default resource manager socket path
 
 #include <getopt.h>
 #include <sys/mman.h>
@@ -37,7 +34,7 @@
 
 using namespace maru;
 
-static const char *kDefaultSocketPath = "/run/maru-resourced/maru-resourced.sock";
+static const char *kDefaultSocketPath = "/tmp/maru-resourced/maru-resourced.sock";
 static const char *g_socketPath = nullptr;
 static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
 
@@ -133,9 +130,6 @@ static const char *resolveSocketPath()
 {
     if (g_socketPath)
         return g_socketPath;
-    const char *env = std::getenv("MARU_SOCKET_PATH");
-    if (env && env[0] != '\0')
-        return env;
     return kDefaultSocketPath;
 }
 
@@ -622,8 +616,7 @@ static void printUsage(const char *prog)
             "\n"
             "Options:\n"
             "  -s <path>  Resource manager socket path\n"
-            "             (default: $MARU_SOCKET_PATH or\n"
-            "              /run/maru-resourced/maru-resourced.sock)\n"
+            "             (default: /tmp/maru-resourced/maru-resourced.sock)\n"
             "\n"
             "Size accepts decimal or hex (0x prefix).\n"
             "pool_id 0xFFFFFFFF = any pool (default).\n",
