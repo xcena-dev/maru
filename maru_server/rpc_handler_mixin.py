@@ -155,7 +155,10 @@ class RpcHandlerMixin:
         for e in req.entries:
             logger.debug(
                 "[BATCH_PUT] key=%s, region_id=%d, kv_offset=%d, kv_length=%d",
-                e.key, e.region_id, e.kv_offset, e.kv_length,
+                e.key,
+                e.region_id,
+                e.kv_offset,
+                e.kv_length,
             )
         results = self._server.batch_register_kv(entries)
         return {"success": True, "results": results}
