@@ -329,6 +329,62 @@ class TestIoctlFindName:
             client.find_name(fd=5, name="key1")
 
 
+class TestIoctlChown:
+    @patch("marufs.client.fcntl.ioctl")
+    def test_chown(self, mock_ioctl, client):
+        client.chown(fd=5)
+        mock_ioctl.assert_called_once()
+
+    @patch("marufs.client.fcntl.ioctl")
+    def test_chown_no_admin_raises(self, mock_ioctl, client):
+        mock_ioctl.side_effect = OSError(13, "Permission denied")
+        with pytest.raises(OSError):
+            client.chown(fd=5)
+
+    @patch("marufs.client.MarufsClient.perm_set_default")
+    @patch("marufs.client.MarufsClient.chown")
+    def test_mmap_calls_chown_on_first_open(self, mock_chown, mock_perm, client, mount_dir):
+        """Simulate mapping a region not yet opened (e.g. shared region)."""
+        region_name = "region_99"
+        path = os.path.join(mount_dir, region_name)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 4096)
+
+        handle = MaruHandle(region_id=99, offset=0, length=4096, auth_token=0)
+        client.mmap(handle, prot=mmap_module.PROT_READ)
+        mock_chown.assert_called_once()
+        mock_perm.assert_called_once()
+
+    @patch("marufs.client.MarufsClient.perm_set_default")
+    @patch("marufs.client.MarufsClient.chown")
+    def test_mmap_skips_chown_on_cached(self, mock_chown, mock_perm, client, mount_dir):
+        region_name = "region_88"
+        path = os.path.join(mount_dir, region_name)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 4096)
+
+        handle = MaruHandle(region_id=88, offset=0, length=4096, auth_token=0)
+        client.mmap(handle, prot=mmap_module.PROT_READ)
+        mock_chown.reset_mock()
+        mock_perm.reset_mock()
+        # Second mmap returns cached, no chown
+        client.mmap(handle, prot=mmap_module.PROT_READ)
+        mock_chown.assert_not_called()
+        mock_perm.assert_not_called()
+
+    def test_mmap_chown_failure_does_not_block(self, client, mount_dir):
+        """chown failure (e.g. not on marufs) should not prevent mmap."""
+        region_name = "region_77"
+        path = os.path.join(mount_dir, region_name)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 4096)
+
+        handle = MaruHandle(region_id=77, offset=0, length=4096, auth_token=0)
+        with patch("marufs.client.fcntl.ioctl", side_effect=OSError(25, "Not a typewriter")):
+            mm = client.mmap(handle, prot=mmap_module.PROT_READ)
+        assert mm is not None
+
+
 class TestIoctlClearName:
     @patch("marufs.client.fcntl.ioctl")
     def test_clear_name(self, mock_ioctl, client):

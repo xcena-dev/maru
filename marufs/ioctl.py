@@ -153,6 +153,15 @@ class MarufsPermReq(ctypes.Structure):
     ]
 
 
+class MarufsChownReq(ctypes.Structure):
+    """Argument for MARUFS_IOC_CHOWN (ownership transfer to caller)."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Permission flags
 # ---------------------------------------------------------------------------
@@ -186,6 +195,9 @@ MARUFS_IOC_PERM_REVOKE = _IOW(
 MARUFS_IOC_PERM_SET_DEFAULT = _IOW(
     MARUFS_MAGIC, 13, ctypes.sizeof(MarufsPermReq)
 )  # set default perms
+MARUFS_IOC_CHOWN = _IOW(
+    MARUFS_MAGIC, 14, ctypes.sizeof(MarufsChownReq)
+)  # transfer ownership to caller
 MARUFS_IOC_BATCH_FIND_NAME = _IOWR(
     MARUFS_MAGIC, 4, ctypes.sizeof(MarufsBatchFindReq)
 )  # batch global name lookup

@@ -30,15 +30,19 @@ from .ioctl import (
     MARUFS_IOC_CLEAR_NAME,
     MARUFS_IOC_FIND_NAME,
     MARUFS_IOC_NAME_OFFSET,
+    MARUFS_IOC_CHOWN,
     MARUFS_IOC_PERM_GRANT,
     MARUFS_IOC_PERM_REVOKE,
     MARUFS_IOC_PERM_SET_DEFAULT,
     MARUFS_NAME_MAX,
     PERM_ALL,
+    PERM_READ,
+    PERM_WRITE,
     MarufsBatchFindEntry,
     MarufsBatchFindReq,
     MarufsBatchNameOffsetEntry,
     MarufsBatchNameOffsetReq,
+    MarufsChownReq,
     MarufsFindNameReq,
     MarufsNameOffsetReq,
     MarufsPermReq,
@@ -83,7 +87,6 @@ class MarufsClient:
         self._next_region_id = 1
         self._region_names: dict[int, str] = {}  # region_id → filename
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id → mmap
-        self._perm_all = PERM_ALL
 
         logger.debug("MarufsClient initialised with mount_path=%s", mount_path)
 
@@ -545,6 +548,20 @@ class MarufsClient:
         logger.debug("perm_set_default: fd=%d perms=0x%x", fd, perms)
         fcntl.ioctl(fd, MARUFS_IOC_PERM_SET_DEFAULT, req)
 
+    def chown(self, fd: int) -> None:
+        """Transfer ownership of a region to the calling process.
+
+        Issues ``ioctl(MARUFS_IOC_CHOWN)``. The kernel sets the new owner's
+        node_id, pid, and birth_time from the caller's task context.
+        Requires ADMIN permission (owner or delegated).
+
+        Args:
+            fd: Open file descriptor for the region.
+        """
+        req = MarufsChownReq(reserved=0)
+        logger.debug("chown: fd=%d pid=%d", fd, os.getpid())
+        fcntl.ioctl(fd, MARUFS_IOC_CHOWN, req)
+
     # ------------------------------------------------------------------
     # Memory mapping
     # ------------------------------------------------------------------
@@ -596,7 +613,7 @@ class MarufsClient:
 
         region_name = f"region_{region_id}"
         fd = self._create_region(region_name, size)
-        self.perm_set_default(fd, self._perm_all)
+        self.perm_set_default(fd, PERM_ALL)
 
         handle = MaruHandle(
             region_id=region_id,
@@ -665,11 +682,22 @@ class MarufsClient:
                 self._region_names[handle.region_id] = region_name
 
         # Open if not already open
-        if self._get_fd(region_name) is None:
+        first_open = self._get_fd(region_name) is None
+        if first_open:
             readonly = not (prot & mmap_module.PROT_WRITE)
             self._open_region(region_name, readonly=readonly)
 
         fd = self._get_fd(region_name)
+
+        # Transfer ownership on first open (requires ADMIN permission),
+        # then restrict default permissions to READ | WRITE only.
+        if first_open:
+            try:
+                self.chown(fd)
+                self.perm_set_default(fd, PERM_READ | PERM_WRITE)
+            except OSError:
+                logger.debug("chown skipped for region %s (not on marufs or no ADMIN)", region_name)
+
         mm = self._mmap_region(fd, handle.length, prot)
 
         with self._lock:
