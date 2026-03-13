@@ -56,7 +56,7 @@ flowchart TB
 
 The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager is designed to require no manual management — it starts and stops automatically based on demand.
 
-**Auto-start:** When `AllocationManager` initializes (as part of `MaruServer` startup), it calls `MaruShmClient._ensure_resource_manager()`. This method checks if the resource manager is already running; if not, it starts the binary in the background and waits for the socket to become available. A file lock prevents multiple processes from starting it simultaneously.
+**Auto-start:** When `AllocationManager` initializes (as part of `MaruServer` startup), it calls `MaruShmClient._ensure_resource_manager()`. This method checks if the resource manager is already running; if not, it reads `rm.conf` from the socket directory to recover the previous instance's settings (state-dir, log-level, idle-timeout), starts the binary with those arguments, and waits for the socket to become available. If `rm.conf` does not exist, defaults are used. A file lock prevents multiple processes from starting it simultaneously.
 
 **Crash recovery:** Every `MaruShmClient._connect()` call that fails triggers `_ensure_resource_manager()`, which restarts the binary. The resource manager recovers its previous state from the WAL on startup.
 
@@ -138,7 +138,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 ## 8. Server Configuration
 
-The server is configured via CLI arguments. Under normal usage these are not needed — `MaruServer` auto-starts the resource manager with defaults.
+The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the socket directory (atomic tmp+rename). When `_ensure_resource_manager()` auto-restarts the server, it reads this file and passes the saved settings, ensuring custom configuration survives crashes and idle shutdowns.
 
 | Option | Default | Description |
 |--------|---------|-------------|
