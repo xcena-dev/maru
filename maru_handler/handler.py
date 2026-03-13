@@ -143,13 +143,7 @@ class MaruHandler:
             # 1. Connect RPC client
             self._rpc.connect()
 
-            # 2. Initialize managers
-            self._owned = OwnedRegionManager(
-                mapper=self._mapper,
-                chunk_size=self._config.chunk_size_bytes,
-            )
-
-            # 3. Request initial owned region via RPC — try each pool in order
+            # 2. Request initial owned region via RPC — try each pool in order
             response = None
             for pool_id in self._pool_ids:
                 try:
@@ -179,7 +173,7 @@ class MaruHandler:
                 self._rpc.close()
                 return False
 
-            # 3. Initialize DaxMapper (mount_path from server determines mode)
+            # 3. Initialize mapper and OwnedRegionManager
             if self._mapper is None:
                 self._mapper = DaxMapper(mount_path=response.mount_path)
             self._owned = OwnedRegionManager(
