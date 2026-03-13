@@ -356,17 +356,24 @@ CXL Type 3 devices allow multiple nodes to share the same physical memory pool. 
 [Node B] mount -t marufs /dev/dax1.0 /mnt/marufs  → all files visible (same CXL pool)
 ```
 
-### Potential Issues and Solutions
+### CXL 2.0 Multi-Node: CAS Atomicity & Cache Coherency
 
-Three issues arise when multiple nodes concurrently access the same CXL memory:
+CXL 2.0 only guarantees host-to-device coherency. **Multi-host cache coherency and cross-host CAS atomicity are not guaranteed by the spec.** The marufs architecture addresses each concern:
 
-| Issue | Description | Solution |
-|-------|-------------|----------|
-| **CAS atomicity** | Concurrent metadata modifications from multiple nodes may not be atomic across CXL fabric | Single MaruServer instance serializes all metadata writes |
-| **Cache coherency** | CPU cache on one node may not reflect modifications made by another node | Explicit `clflushopt`/`clwb` flush to CXL memory |
-| **VFS cache stale** | Node B's kernel VFS cache may not recognize files created by Node A | `d_revalidate() → 0` forces re-lookup from CXL on every access (see below) |
+#### 1. CAS Atomicity → Single Writer Serialization
 
-### VFS Cache Invalidation Design
+All metadata modifications (`open`, `create`, `delete`, `ftruncate`, `perm_set_default`, etc.) are performed exclusively by a single MaruServer instance. Clients only receive handles via RPC and perform `open + mmap` (read path). Cross-host concurrent CAS operations never occur.
+
+#### 2. Cache Coherency → Explicit Cache Flush (`clwb`/`clflushopt`)
+
+The marufs kernel module provides two barrier macros for CXL 2.0 environments:
+
+- **`MARUFS_CXL_WMB`**: `wmb()` + `clwb()` per cache line + `sfence` — flushes dirty cache lines to the CXL device, ensuring writes are visible to other nodes
+- **`MARUFS_CXL_RMB`**: `clflushopt()` per cache line + `mb()` — invalidates stale cache and forces re-read from CXL memory
+
+These macros are enabled by the **`CONFIG_MARUFS_CXL2_COMPAT`** build flag. On CXL 3.0 (which provides hardware multi-host coherency), the macros are compiled as no-ops (passthrough).
+
+#### 3. VFS Cache Stale → No Metadata Caching
 
 The marufs kernel module follows a **"No metadata caching"** principle, eliminating cross-node visibility issues at the kernel level:
 
