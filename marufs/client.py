@@ -547,7 +547,9 @@ class MarufsClient:
     # Memory mapping
     # ------------------------------------------------------------------
 
-    def _mmap_region(self, fd: int, size: int, prot: int = mmap_module.PROT_READ) -> mmap_module.mmap:
+    def _mmap_region(
+        self, fd: int, size: int, prot: int = mmap_module.PROT_READ
+    ) -> mmap_module.mmap:
         """Memory-map a region file.
 
         Args:
@@ -606,7 +608,9 @@ class MarufsClient:
 
         logger.info(
             "alloc: created region %s (id=%d, size=%d)",
-            region_name, region_id, size,
+            region_name,
+            region_id,
+            size,
         )
         return handle
 
