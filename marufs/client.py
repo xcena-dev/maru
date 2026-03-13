@@ -169,10 +169,12 @@ class MarufsClient:
         self._fd_modes[name] = readonly
         return fd
 
-    def _delete_region(self, name: str) -> None:
+    def delete_region(self, name: str) -> None:
         """Delete a region file (unlink).
 
         Closes and removes the cached fd before unlinking.
+        Not called during normal operation — intended for GC
+        or explicit cleanup.
 
         Args:
             name: Region filename to delete.
@@ -617,7 +619,8 @@ class MarufsClient:
     def free(self, handle: "MaruHandle") -> None:
         """Free a region (MaruShmClient compat).
 
-        Closes the fd, unmaps if mapped, and deletes the region file.
+        Closes the fd and unmaps if mapped. Does NOT delete the region file —
+        file deletion is handled by GC (orphaned region cleanup).
 
         Args:
             handle: MaruHandle from a previous alloc() call.
@@ -631,10 +634,6 @@ class MarufsClient:
 
         if region_name is not None:
             self._close_fd(region_name)
-            try:
-                self._delete_region(region_name)
-            except OSError as e:
-                logger.warning("free: delete_region failed for %s: %s", region_name, e)
         else:
             logger.warning("free: unknown region_id=%d", handle.region_id)
 

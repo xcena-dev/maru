@@ -106,14 +106,14 @@ class TestDeleteRegion:
         path = os.path.join(mount_dir, "to_delete")
         assert os.path.exists(path)
 
-        client._delete_region("to_delete")
+        client.delete_region("to_delete")
         assert not os.path.exists(path)
 
     def test_delete_clears_fd_cache(self, client):
         client._create_region("to_delete", 1024)
         assert client._get_fd("to_delete") is not None
 
-        client._delete_region("to_delete")
+        client.delete_region("to_delete")
         assert client._get_fd("to_delete") is None
 
 
@@ -223,14 +223,15 @@ class TestAllocFree:
         assert h1.region_id != h2.region_id
 
     @patch("marufs.client.MarufsClient.perm_set_default")
-    def test_free_deletes_file(self, mock_perm, client, mount_dir):
+    def test_free_does_not_delete_file(self, mock_perm, client, mount_dir):
         handle = client.alloc(4096)
         region_name = f"region_{handle.region_id}"
         path = os.path.join(mount_dir, region_name)
         assert os.path.exists(path)
 
         client.free(handle)
-        assert not os.path.exists(path)
+        # free() only closes fd, does NOT delete — GC handles deletion
+        assert os.path.exists(path)
 
     @patch("marufs.client.MarufsClient.perm_set_default")
     def test_free_unknown_region(self, mock_perm, client):
