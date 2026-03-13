@@ -1,11 +1,24 @@
 # marufs Instance Authentication and Authorization System Design
 
-- marufs KV cache access control is implemented — the inter-instance permission delegation mechanism remains unresolved
+> **Status**: Design proposal. Not yet implemented. Current Hybrid mode uses `perm_set_default(PERM_ALL)` — all processes have full access to all regions.
+
+- marufs kernel module supports per-region permission enforcement via `perm_grant` and `perm_set_default` ioctl
+- The inter-instance permission delegation mechanism (who grants what to whom) is the subject of this design document
 - Design an authentication and authorization system based on pre-provisioned X.509 certificates
 
 ---
 
 ## 1. Background
+
+### Current State (Hybrid Mode)
+
+In the current Hybrid mode (RPC server + marufs VFS backend):
+
+- **Server-side**: `AllocationManager` creates regions via `MarufsClient.alloc()`, which calls `perm_set_default(PERM_ALL)` — granting all permissions to every process by default
+- **Client-side**: `DaxMapper` opens and mmaps region files — no authentication required
+- **No access control enforcement**: Any process that can reach the marufs mount point can open and mmap any region
+
+This is acceptable for single-tenant deployments but insufficient for multi-tenant or security-sensitive environments.
 
 ### Security Requirements
 
@@ -43,6 +56,29 @@ KV cache contains user prompts and model response state. Sharing without authent
 - Support two authentication models:
   - **Option A (P2P)**: Direct mTLS between instances — owner decides permissions based on its own policy
   - **Option B (marufs-mediated)**: marufs acts as proxy authenticator + automatically grants permissions according to pre-defined policy
+
+### Integration with Current Architecture
+
+In Hybrid mode, the authentication flow would be added between the RPC alloc response and the client-side mmap:
+
+```mermaid
+sequenceDiagram
+    participant C as LMCache Client
+    participant S as MaruServer
+    participant Auth as Auth Layer
+    participant K as marufs (kernel)
+
+    C->>S: request_alloc() → {handle, mount_path}
+    Note over C: Client knows region exists
+
+    C->>Auth: Authenticate + request access
+    Auth->>K: perm_grant(fd, node_id, pid, perms)
+
+    C->>K: open(region_file) + mmap()
+    Note over K: Kernel checks permissions on open/mmap
+```
+
+The key change from current behavior: `perm_set_default(PERM_ALL)` would be replaced with `perm_set_default(PERM_READ)` or even no default permissions, requiring explicit grants after authentication.
 
 ### Architecture
 
@@ -123,7 +159,7 @@ sequenceDiagram
 
     rect rgb(255, 240, 240)
     Note over B: Data access
-    B->>B: map_shared_region() → mmap
+    B->>B: open(region_file) + mmap()
     B->>B: Zero-copy CXL memory access (kernel enforces permissions)
     end
 ```
@@ -180,7 +216,7 @@ sequenceDiagram
 
     rect rgb(255, 240, 240)
     Note over B: Data access
-    B->>B: map_shared_region() → mmap
+    B->>B: open(region_file) + mmap()
     B->>B: Zero-copy CXL memory access (kernel enforces permissions)
     end
 ```
