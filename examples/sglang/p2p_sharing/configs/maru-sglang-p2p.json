@@ -1,0 +1,8 @@
+{
+  "backend_name": "maru",
+  "module_path": "maru_sglang.backend",
+  "class_name": "MaruHiCacheStorage",
+  "maru_server_url": "tcp://localhost:${MARU_SERVER_PORT}",
+  "maru_pool_size": "${MARU_POOL_SIZE}",
+  "maru_instance_id": "${MARU_INSTANCE_ID}"
+}

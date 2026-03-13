@@ -31,6 +31,7 @@ dev = [
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
+sglang = ["sglang[all]"]
 docs = [
     "sphinx>=7.0",
     "shibuya",
@@ -50,7 +51,7 @@ Documentation = "https://xcena-dev.github.io/maru/"
 Organization = "https://xcena.com"
 
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_lmcache*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_lmcache*", "maru_sglang*"]
 
 [tool.ruff]
 line-length = 88
