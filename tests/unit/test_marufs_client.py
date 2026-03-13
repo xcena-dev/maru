@@ -343,7 +343,9 @@ class TestIoctlChown:
 
     @patch("marufs.client.MarufsClient.perm_set_default")
     @patch("marufs.client.MarufsClient.chown")
-    def test_mmap_calls_chown_on_first_open(self, mock_chown, mock_perm, client, mount_dir):
+    def test_mmap_calls_chown_on_first_open(
+        self, mock_chown, mock_perm, client, mount_dir
+    ):
         """Simulate mapping a region not yet opened (e.g. shared region)."""
         region_name = "region_99"
         path = os.path.join(mount_dir, region_name)
@@ -380,7 +382,9 @@ class TestIoctlChown:
             f.write(b"\x00" * 4096)
 
         handle = MaruHandle(region_id=77, offset=0, length=4096, auth_token=0)
-        with patch("marufs.client.fcntl.ioctl", side_effect=OSError(25, "Not a typewriter")):
+        with patch(
+            "marufs.client.fcntl.ioctl", side_effect=OSError(25, "Not a typewriter")
+        ):
             mm = client.mmap(handle, prot=mmap_module.PROT_READ)
         assert mm is not None
 
