@@ -23,12 +23,9 @@ A **filesystem** is the right solution because Maru's data model maps naturally 
 
 The underlying `/dev/dax` device is still used — but only the marufs kernel module accesses it directly. User-space processes access CXL memory through marufs region files, and the kernel mediates every `open`, `mmap`, and `ioctl`.
 
-### DAX Mode Limitations
+### DAX Mode Limitation
 
-| Label | Problem | Description |
-|-------|---------|-------------|
-| **M1** | **No access control** | `/dev/dax` direct mmap — no per-region security enforcement |
-| **M2** | **Multi-process management** | MaruServer and Maru Resource Manager must be deployed separately |
+The core limitation of DAX mode is **no access control** — `/dev/dax` direct mmap provides no per-region security enforcement. Any process that can open the device has unrestricted read-write access to the entire CXL memory pool.
 
 **marufs mode** replaces the DAX device path with a kernel filesystem, enabling **per-region kernel-level access control** while keeping the same RPC control plane.
 
@@ -52,8 +49,8 @@ graph LR
 | Region mapping | MaruShmClient.mmap() → Resource Manager | MarufsClient → `open(region_file)` + `mmap(fd)` |
 | Region deletion | MaruShmClient → Resource Manager | `close(fd)` + `unlink(path)` |
 | Access control | **None** (`/dev/dax` wide open) | **Kernel VFS** — per-region permission checks on `open`/`mmap` |
-| Server process | MaruServer + Resource Manager | MaruServer only (Resource Manager 불필요) — **addresses M2** |
-| KV metadata | MaruServer KVManager | MaruServer KVManager — **동일** |
+| Server process | MaruServer + Resource Manager | MaruServer only (Resource Manager not needed) |
+| KV metadata | MaruServer KVManager | MaruServer KVManager — unchanged |
 
 ### Mode Auto-Detection
 
@@ -70,13 +67,13 @@ Clients don't need any configuration change — DaxMapper automatically selects 
 |-----------|----------|-------------|
 | **MaruServer** | AllocationManager(MaruShmClient) | AllocationManager(**MarufsClient**) |
 | **DaxMapper** | MaruShmClient | **MarufsClient** (auto-detected) |
-| **RPC** | ZMQ client-server | ZMQ client-server — 동일 |
-| **OwnedRegionManager** | PagedMemoryAllocator | PagedMemoryAllocator — 동일 |
-| **MaruHandler** | Same handler | Same handler — 동일 |
+| **RPC** | ZMQ client-server | ZMQ client-server — unchanged |
+| **OwnedRegionManager** | PagedMemoryAllocator | PagedMemoryAllocator — unchanged |
+| **MaruHandler** | Same handler | Same handler — unchanged |
 
 ---
 
-## Kernel-level Access Control — addresses M1
+## Kernel-level Access Control
 
 DAX mode has no access control — any process can mmap `/dev/dax`. marufs moves access control into the kernel:
 
@@ -231,7 +228,7 @@ sequenceDiagram
 
 ---
 
-## Component Overview
+## Component Overview (marufs mode)
 
 ```mermaid
 graph TB
@@ -241,7 +238,7 @@ graph TB
             H[MaruHandler]
             ORM[OwnedRegionManager<br/>page allocator]
             DM[DaxMapper<br/>mmap + CUDA pin]
-            XC["MarufsClient<br/>(or MaruShmClient)"]
+            XC["MarufsClient"]
             RPC[RpcClient<br/>ZMQ]
         end
     end
