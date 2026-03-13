@@ -67,6 +67,8 @@ class MaruConfig:
         # Normalize pool_id to list[int] | None
         if self.pool_id is None:
             pass  # None stays None (means ANY_POOL_ID)
+        elif isinstance(self.pool_id, (list, tuple)) and len(self.pool_id) == 0:
+            self.pool_id = None  # empty list/tuple → any pool
         elif isinstance(self.pool_id, int):
             if not (0 <= self.pool_id <= 0xFFFFFFFE):
                 raise ValueError(

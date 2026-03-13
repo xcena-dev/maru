@@ -152,11 +152,19 @@ class MaruHandler:
             # 3. Request initial owned region via RPC — try each pool in order
             response = None
             for pool_id in self._pool_ids:
-                response = self._rpc.request_alloc(
-                    instance_id=self._config.instance_id,
-                    size=self._config.pool_size,
-                    pool_id=pool_id,
-                )
+                try:
+                    response = self._rpc.request_alloc(
+                        instance_id=self._config.instance_id,
+                        size=self._config.pool_size,
+                        pool_id=pool_id,
+                    )
+                except Exception:
+                    logger.error(
+                        "RPC request_alloc failed during connect (pool_id=%s)",
+                        pool_id,
+                        exc_info=True,
+                    )
+                    continue
                 if response.success and response.handle is not None:
                     break
                 logger.warning(

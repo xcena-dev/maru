@@ -204,9 +204,9 @@ class MaruServer:
 def setup_logging(level: str) -> None:
     """Setup logging level for the MaruServer package."""
     log_level = getattr(logging, level.upper(), logging.INFO)
-    logger = logging.getLogger("maru_server")
-    logger.setLevel(log_level)
-    for handler in logger.handlers:
+    pkg_logger = logging.getLogger("maru_server")
+    pkg_logger.setLevel(log_level)
+    for handler in pkg_logger.handlers:
         handler.setLevel(log_level)
 
 

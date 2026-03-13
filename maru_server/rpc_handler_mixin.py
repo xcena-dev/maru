@@ -63,15 +63,17 @@ class RpcHandlerMixin:
         )
         if handle is None:
             logger.debug(
-                "[REQUEST_ALLOC] instance=%s, size=%d -> FAILED",
+                "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> FAILED",
                 req.instance_id,
                 req.size,
+                req.pool_id,
             )
             return {"success": False, "error": "Allocation failed"}
         logger.debug(
-            "[REQUEST_ALLOC] instance=%s, size=%d -> region_id=%d",
+            "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> region_id=%d",
             req.instance_id,
             req.size,
+            req.pool_id,
             handle.region_id,
         )
         return {"success": True, "handle": handle.to_dict()}

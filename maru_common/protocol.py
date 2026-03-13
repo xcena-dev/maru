@@ -16,10 +16,8 @@ import struct
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
+from maru_shm.constants import ANY_POOL_ID
 from maru_shm.types import MaruHandle
-
-# Sentinel: allocate from any pool
-ANY_POOL_ID: int = 0xFFFFFFFF
 
 # =============================================================================
 # Protocol Constants
