@@ -97,7 +97,7 @@ For multi-tenant or security-sensitive environments, the planned model is:
 
 1. Region created with `perm_set_default(PERM_READ)` or no default permissions
 2. Authenticated instances receive explicit `perm_grant` after certificate verification
-3. See [mTLS Authentication Guide](mtls_auth_guide.md) for the authentication design
+3. See [Instance Authentication Design](instance_auth_design.md) for the authentication design
 
 ---
 
