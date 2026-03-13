@@ -341,6 +341,85 @@ Each region file is a physically contiguous CXL memory allocation. A single regi
 
 ---
 
+## Multi-Node Considerations
+
+### CXL Shared Memory Across Nodes
+
+CXL Type 3 장치는 여러 노드가 동일한 물리 메모리 풀을 공유할 수 있다. marufs는 **모든 메타데이터(inode, dentry, global index)를 CXL 메모리에 저장**하므로, 각 노드에서 동일한 CXL 디바이스로 marufs를 마운트하면 모든 region 파일이 보인다.
+
+```
+[CXL Shared Memory Pool]
+├── marufs 메타데이터 (inode, dentry)   ← CXL에 저장
+└── region 데이터 (KV cache)            ← CXL에 저장
+
+[Node A] mount -t marufs /dev/dax0.0 /mnt/marufs  → 전체 파일 보임
+[Node B] mount -t marufs /dev/dax1.0 /mnt/marufs  → 전체 파일 보임 (같은 CXL 풀)
+```
+
+### 잠재적 문제와 해결
+
+멀티 노드에서 동일 CXL 메모리에 동시 접근할 때 세 가지 문제가 발생할 수 있다:
+
+| 문제 | 설명 | 해결 |
+|------|------|------|
+| **CAS atomicity** | 여러 노드가 동시에 메타데이터를 수정하면 CXL fabric을 넘는 CAS 연산이 atomic하지 않을 수 있음 | MaruServer 단일 인스턴스가 모든 메타데이터 수정을 직렬화 |
+| **캐시 코히런시** | 한 노드의 CPU 캐시에 있는 CXL 데이터가 다른 노드의 수정을 반영하지 못할 수 있음 | `clflushopt`/`clwb` 매크로로 CXL 메모리에 명시적 flush |
+| **VFS 캐시 stale** | Node A가 생성한 파일을 Node B의 커널 VFS 캐시가 인식하지 못할 수 있음 | `d_revalidate() → 0`으로 항상 CXL에서 재검색 (아래 참조) |
+
+### VFS 캐시 무효화 설계
+
+marufs 커널 모듈은 **"No metadata caching"** 원칙으로 설계되어 cross-node visibility 문제를 원천 차단한다:
+
+- **dentry 캐시**: `d_revalidate()`가 항상 0을 리턴 → VFS가 매 `open()`마다 `marufs_lookup()`을 호출하여 CXL 메모리에서 직접 검색
+- **inode 캐시**: `marufs_iget()`이 매번 CXL의 hot/cold entry에서 직접 읽음 → DRAM 캐시 없음
+
+```c
+// dir.c — d_revalidate always returns 0, forcing re-lookup from CXL memory
+static int marufs_d_revalidate(...)
+{
+    return 0;  // Always invalid → VFS re-does lookup from CXL
+}
+```
+
+### 멀티 노드 동작 흐름
+
+```mermaid
+sequenceDiagram
+    participant S as MaruServer (Node A)
+    participant K_A as marufs kernel (Node A)
+    participant CXL as CXL Shared Memory
+    participant K_B as marufs kernel (Node B)
+    participant C as Client (Node B)
+
+    Note over S,CXL: Step 1 — Server creates region (Node A)
+    S->>K_A: open(O_CREAT) + ftruncate(size)
+    K_A->>CXL: 메타데이터 + 데이터 영역 할당
+    S->>K_A: perm_set_default(PERM_ALL)
+    S->>K_A: clflushopt (CXL에 flush)
+
+    Note over S,C: Step 2 — Client gets handle via RPC
+    S-->>C: {handle, mount_path} (ZMQ response)
+    Note over C: RPC 응답 수신 = 서버 flush 완료 보장 (ordering barrier)
+
+    Note over C,CXL: Step 3 — Client opens region (Node B)
+    C->>K_B: open("/mnt/marufs/region_42")
+    K_B->>K_B: d_revalidate() → 0 (캐시 무효)
+    K_B->>CXL: marufs_lookup() — CXL에서 직접 검색
+    K_B-->>C: fd
+    C->>K_B: mmap(fd, size)
+    Note over C,CXL: Zero-copy CXL 메모리 접근
+```
+
+**핵심 보장**: RPC 응답 자체가 ordering barrier 역할 — Client가 `open()`하는 시점은 Server의 `open + ftruncate + flush`가 반드시 완료된 이후이므로, CXL 메타데이터는 항상 최신 상태다.
+
+### 전제 조건
+
+- MaruServer는 **단일 인스턴스**로 운영 — 여러 MaruServer가 동시에 파일을 생성하면 CAS 직렬화 보장이 깨짐
+- 모든 노드에서 동일한 CXL 디바이스(풀)로 marufs를 마운트
+- MaruServer의 RPC 주소는 TCP로 설정 (UDS는 싱글 노드 전용)
+
+---
+
 ## Known Issues
 
 ### 1. No exclusive open on `/dev/dax`
