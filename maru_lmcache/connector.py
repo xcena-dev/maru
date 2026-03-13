@@ -32,6 +32,44 @@ logger = logging.getLogger(__name__)
 _PERF_ENABLED = os.environ.get("LMCACHE_PERF_LOG", "0") == "1"
 
 
+def _parse_pool_id(raw: object) -> list[int] | int | None:
+    """Parse a pool_id value.
+
+    Returns:
+        - None if unset
+        - int for a single value (MaruConfig normalizes to list[int])
+        - list[int] for multiple values (comma-separated string or list)
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, list):
+        try:
+            return [int(v) for v in raw]
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Invalid pool_id list: {raw!r}. All elements must be integers."
+            ) from e
+    # String: may be comma-separated (e.g. "0,1,2") or single ("1")
+    s = str(raw).strip()
+    if "," in s:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        try:
+            return [int(p) for p in parts]
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid pool_id: {raw!r}. "
+                "Comma-separated values must all be non-negative integers."
+            ) from e
+    try:
+        return int(s)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Invalid pool_id: {raw!r}. Must be a non-negative integer."
+        ) from e
+
+
 def _perf_log(elapsed_ms: float, msg: str) -> None:
     if _PERF_ENABLED:
         print(f"[PERF][{elapsed_ms:.2f}ms][maru_connector]: {msg}", flush=True)
@@ -72,6 +110,7 @@ class MaruConnectorConfig:
 
     server_url: str = "tcp://localhost:5555"
     pool_size: int = 1024 * 1024 * 1024  # 1 GB
+    pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
     instance_id: str | None = None
     auto_connect: bool = True
     connection_timeout: float = 30.0
@@ -88,9 +127,11 @@ class MaruConnectorConfig:
         host = parsed.hostname or "localhost"
         port = parsed.port or 5555
         params = parse_qs(parsed.query)
+        raw_pool_id = params.get("pool_id", [None])[0]
         return MaruConnectorConfig(
             server_url=f"tcp://{host}:{port}",
             pool_size=parse_size(params.get("pool_size", ["1G"])[0]),
+            pool_id=_parse_pool_id(raw_pool_id),
             instance_id=params.get("instance_id", [None])[0],
             connection_timeout=float(params.get("timeout", ["30.0"])[0]),
             operation_timeout=float(params.get("op_timeout", ["10.0"])[0]),
@@ -108,9 +149,13 @@ class MaruConnectorConfig:
         raw_pool = extra.get("maru_pool_size", fb.pool_size)
         pool_size = parse_size(raw_pool) if isinstance(raw_pool, str) else int(raw_pool)
 
+        raw_pool_id = extra.get("maru_pool_id", fb.pool_id)
+        pool_id_val = _parse_pool_id(raw_pool_id)
+
         return MaruConnectorConfig(
             server_url=extra.get("maru_server_url", fb.server_url),
             pool_size=pool_size,
+            pool_id=pool_id_val,
             instance_id=extra.get("maru_instance_id", fb.instance_id),
             auto_connect=extra.get("maru_auto_connect", fb.auto_connect),
             operation_timeout=float(
@@ -193,6 +238,7 @@ class MaruConnector(RemoteConnector):
                 "server_url": self.maru_config.server_url,
                 "instance_id": self.maru_config.instance_id,
                 "pool_size": self.maru_config.pool_size,
+                "pool_id": self.maru_config.pool_id,
                 "chunk_size_bytes": self.full_chunk_size_bytes,
                 "auto_connect": False,
                 "timeout_ms": self.maru_config.timeout_ms,

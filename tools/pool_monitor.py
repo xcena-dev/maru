@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime
 
-from maru_shm import MaruShmClient
+from maru_shm import MaruPoolInfo, MaruShmClient
 
 
 def _fmt_size(nbytes: int) -> str:
@@ -37,7 +37,7 @@ def _usage_bar(used: int, total: int, width: int = 30) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + f"] {ratio * 100:.1f}%"
 
 
-def snapshot(client: MaruShmClient) -> list[object]:
+def snapshot(client: MaruShmClient) -> list[MaruPoolInfo]:
     return client.stats()
 
 
@@ -47,7 +47,7 @@ def _clear_screen() -> None:
 
 
 def render_table(
-    pools: list[object], ts: str, prev: dict[int, int] | None = None
+    pools: list[MaruPoolInfo], ts: str, prev: dict[int, int] | None = None
 ) -> str:
     """Render table to string. prev maps pool_id -> previous used bytes for delta."""
     lines = []
@@ -86,7 +86,7 @@ def print_csv_header() -> None:
     print("timestamp,pool_id,dax_type,total_bytes,free_bytes,used_bytes,usage_pct")
 
 
-def print_csv_row(pools: list[object], ts: str) -> None:
+def print_csv_row(pools: list[MaruPoolInfo], ts: str) -> None:
     for p in sorted(pools, key=lambda x: x.pool_id):
         used = p.total_size - p.free_size
         pct = (used / p.total_size * 100) if p.total_size > 0 else 0
