@@ -111,7 +111,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper()
+        self._mapper: DaxMapper | None = None
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -179,6 +179,13 @@ class MaruHandler:
                 self._rpc.close()
                 return False
 
+            # 3. Initialize DaxMapper (mount_path from server determines mode)
+            self._mapper = DaxMapper(mount_path=response.mount_path)
+            self._owned = OwnedRegionManager(
+                mapper=self._mapper,
+                chunk_size=self._config.chunk_size_bytes,
+            )
+
             # 4. Add region to OwnedRegionManager (mmap + allocator)
             try:
                 self._owned.add_region(response.handle)
@@ -239,7 +246,8 @@ class MaruHandler:
                         logger.error("Failed to return region %d", rid, exc_info=True)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
-                self._mapper.close()
+                if self._mapper is not None:
+                    self._mapper.close()
 
                 # 4. Close RPC connection
                 self._rpc.close()

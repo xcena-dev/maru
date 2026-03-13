@@ -38,8 +38,13 @@ class DaxMapper:
         mapper.unmap_region(handle.region_id)
     """
 
-    def __init__(self):
-        self._client = MaruShmClient()
+    def __init__(self, mount_path: str | None = None):
+        if mount_path is not None:
+            from marufs import MarufsClient
+
+            self._client = MarufsClient(mount_path)
+        else:
+            self._client = MaruShmClient()
         self._lock = threading.Lock()
         self._regions: dict[int, MappedRegion] = {}
 

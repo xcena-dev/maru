@@ -309,7 +309,11 @@ class RpcAsyncClient:
             )
         handle_data = response.get("handle", {})
         handle = MaruHandle.from_dict(handle_data) if handle_data else None
-        return RequestAllocResponse(success=True, handle=handle)
+        return RequestAllocResponse(
+            success=True,
+            handle=handle,
+            mount_path=response.get("mount_path"),
+        )
 
     @staticmethod
     def _parse_lookup_kv(response: dict) -> LookupKVResponse:
