@@ -76,7 +76,10 @@ class RpcHandlerMixin:
             req.pool_id,
             handle.region_id,
         )
-        return {"success": True, "handle": handle.to_dict()}
+        resp = {"success": True, "handle": handle.to_dict()}
+        if self._server.mount_path is not None:
+            resp["mount_path"] = self._server.mount_path
+        return resp
 
     def _handle_return_alloc(self, req: Any) -> dict:
         success = self._server.return_alloc(
