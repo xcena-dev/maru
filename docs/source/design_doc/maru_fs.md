@@ -345,33 +345,33 @@ Each region file is a physically contiguous CXL memory allocation. A single regi
 
 ### CXL Shared Memory Across Nodes
 
-CXL Type 3 장치는 여러 노드가 동일한 물리 메모리 풀을 공유할 수 있다. marufs는 **모든 메타데이터(inode, dentry, global index)를 CXL 메모리에 저장**하므로, 각 노드에서 동일한 CXL 디바이스로 marufs를 마운트하면 모든 region 파일이 보인다.
+CXL Type 3 devices allow multiple nodes to share the same physical memory pool. marufs stores **all metadata (inodes, dentries, global index) in CXL memory**, so mounting marufs from the same CXL device on each node makes all region files visible everywhere.
 
 ```
 [CXL Shared Memory Pool]
-├── marufs 메타데이터 (inode, dentry)   ← CXL에 저장
-└── region 데이터 (KV cache)            ← CXL에 저장
+├── marufs metadata (inode, dentry)   ← stored in CXL
+└── region data (KV cache)            ← stored in CXL
 
-[Node A] mount -t marufs /dev/dax0.0 /mnt/marufs  → 전체 파일 보임
-[Node B] mount -t marufs /dev/dax1.0 /mnt/marufs  → 전체 파일 보임 (같은 CXL 풀)
+[Node A] mount -t marufs /dev/dax0.0 /mnt/marufs  → all files visible
+[Node B] mount -t marufs /dev/dax1.0 /mnt/marufs  → all files visible (same CXL pool)
 ```
 
-### 잠재적 문제와 해결
+### Potential Issues and Solutions
 
-멀티 노드에서 동일 CXL 메모리에 동시 접근할 때 세 가지 문제가 발생할 수 있다:
+Three issues arise when multiple nodes concurrently access the same CXL memory:
 
-| 문제 | 설명 | 해결 |
-|------|------|------|
-| **CAS atomicity** | 여러 노드가 동시에 메타데이터를 수정하면 CXL fabric을 넘는 CAS 연산이 atomic하지 않을 수 있음 | MaruServer 단일 인스턴스가 모든 메타데이터 수정을 직렬화 |
-| **캐시 코히런시** | 한 노드의 CPU 캐시에 있는 CXL 데이터가 다른 노드의 수정을 반영하지 못할 수 있음 | `clflushopt`/`clwb` 매크로로 CXL 메모리에 명시적 flush |
-| **VFS 캐시 stale** | Node A가 생성한 파일을 Node B의 커널 VFS 캐시가 인식하지 못할 수 있음 | `d_revalidate() → 0`으로 항상 CXL에서 재검색 (아래 참조) |
+| Issue | Description | Solution |
+|-------|-------------|----------|
+| **CAS atomicity** | Concurrent metadata modifications from multiple nodes may not be atomic across CXL fabric | Single MaruServer instance serializes all metadata writes |
+| **Cache coherency** | CPU cache on one node may not reflect modifications made by another node | Explicit `clflushopt`/`clwb` flush to CXL memory |
+| **VFS cache stale** | Node B's kernel VFS cache may not recognize files created by Node A | `d_revalidate() → 0` forces re-lookup from CXL on every access (see below) |
 
-### VFS 캐시 무효화 설계
+### VFS Cache Invalidation Design
 
-marufs 커널 모듈은 **"No metadata caching"** 원칙으로 설계되어 cross-node visibility 문제를 원천 차단한다:
+The marufs kernel module follows a **"No metadata caching"** principle, eliminating cross-node visibility issues at the kernel level:
 
-- **dentry 캐시**: `d_revalidate()`가 항상 0을 리턴 → VFS가 매 `open()`마다 `marufs_lookup()`을 호출하여 CXL 메모리에서 직접 검색
-- **inode 캐시**: `marufs_iget()`이 매번 CXL의 hot/cold entry에서 직접 읽음 → DRAM 캐시 없음
+- **dentry cache**: `d_revalidate()` always returns 0 → VFS calls `marufs_lookup()` on every `open()`, reading directly from CXL memory
+- **inode cache**: `marufs_iget()` reads from CXL hot/cold entries on every call → no DRAM caching
 
 ```c
 // dir.c — d_revalidate always returns 0, forcing re-lookup from CXL memory
@@ -381,7 +381,7 @@ static int marufs_d_revalidate(...)
 }
 ```
 
-### 멀티 노드 동작 흐름
+### Multi-Node Operation Flow
 
 ```mermaid
 sequenceDiagram
@@ -393,30 +393,30 @@ sequenceDiagram
 
     Note over S,CXL: Step 1 — Server creates region (Node A)
     S->>K_A: open(O_CREAT) + ftruncate(size)
-    K_A->>CXL: 메타데이터 + 데이터 영역 할당
+    K_A->>CXL: Allocate metadata + data area
     S->>K_A: perm_set_default(PERM_ALL)
-    S->>K_A: clflushopt (CXL에 flush)
+    S->>K_A: clflushopt (flush to CXL)
 
     Note over S,C: Step 2 — Client gets handle via RPC
     S-->>C: {handle, mount_path} (ZMQ response)
-    Note over C: RPC 응답 수신 = 서버 flush 완료 보장 (ordering barrier)
+    Note over C: RPC response receipt guarantees server flush is complete (ordering barrier)
 
     Note over C,CXL: Step 3 — Client opens region (Node B)
     C->>K_B: open("/mnt/marufs/region_42")
-    K_B->>K_B: d_revalidate() → 0 (캐시 무효)
-    K_B->>CXL: marufs_lookup() — CXL에서 직접 검색
+    K_B->>K_B: d_revalidate() → 0 (cache invalidated)
+    K_B->>CXL: marufs_lookup() — direct search from CXL
     K_B-->>C: fd
     C->>K_B: mmap(fd, size)
-    Note over C,CXL: Zero-copy CXL 메모리 접근
+    Note over C,CXL: Zero-copy CXL memory access
 ```
 
-**핵심 보장**: RPC 응답 자체가 ordering barrier 역할 — Client가 `open()`하는 시점은 Server의 `open + ftruncate + flush`가 반드시 완료된 이후이므로, CXL 메타데이터는 항상 최신 상태다.
+**Key guarantee**: The RPC response itself serves as an ordering barrier — by the time the client calls `open()`, the server's `open + ftruncate + flush` has already completed, so CXL metadata is always up to date.
 
-### 전제 조건
+### Prerequisites
 
-- MaruServer는 **단일 인스턴스**로 운영 — 여러 MaruServer가 동시에 파일을 생성하면 CAS 직렬화 보장이 깨짐
-- 모든 노드에서 동일한 CXL 디바이스(풀)로 marufs를 마운트
-- MaruServer의 RPC 주소는 TCP로 설정 (UDS는 싱글 노드 전용)
+- MaruServer must run as a **single instance** — multiple MaruServer instances creating files concurrently would break CAS serialization guarantees
+- All nodes must mount marufs from the same CXL device (pool)
+- MaruServer RPC address must use TCP (UDS is single-node only)
 
 ---
 
