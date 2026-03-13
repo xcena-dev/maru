@@ -42,7 +42,16 @@ static void writeConfigFile(const ServerConfig &cfg) {
     std::fprintf(fp, "state_dir=%s\n", cfg.stateDir.c_str());
     std::fprintf(fp, "log_level=%s\n", maru::logLevelStr(cfg.logLevel));
     std::fprintf(fp, "idle_timeout=%d\n", cfg.idleTimeout);
+    bool writeOk = (std::ferror(fp) == 0);
     std::fclose(fp);
+
+    if (!writeOk) {
+        maru::logf(maru::LogLevel::Warn,
+                    "write error for config %s, not applying",
+                    tmpPath.c_str());
+        std::remove(tmpPath.c_str());
+        return;
+    }
 
     if (std::rename(tmpPath.c_str(), confPath.c_str()) != 0) {
         maru::logf(maru::LogLevel::Warn,

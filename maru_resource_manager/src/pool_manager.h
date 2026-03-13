@@ -4,7 +4,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -111,8 +110,8 @@ private:
     // PID allocation refcount for O(1) reaper cleanup
     std::map<pid_t, uint32_t> pidAllocCounts_;
 
-    // Registered server PIDs (in-memory only, not persisted)
-    std::set<pid_t> registeredServers_;
+    // Registered server PIDs → start time (in-memory only, not persisted)
+    std::map<pid_t, uint64_t> registeredServers_;
 };
 
 }  // namespace maru

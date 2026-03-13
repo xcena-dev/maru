@@ -276,7 +276,8 @@ uint32_t PoolManager::registeredServerCount() const {
 
 void PoolManager::registerServer(pid_t pid) {
     std::lock_guard<std::mutex> lock(mu_);
-    registeredServers_.insert(pid);
+    uint64_t st = getPidStartTime(pid);
+    registeredServers_[pid] = st;
     logf(LogLevel::Info, "server registered: pid=%d (total=%zu)",
          pid, registeredServers_.size());
 }
@@ -934,13 +935,29 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
 
-    // Reap dead registered servers
+    // Reap dead registered servers (with PID-reuse detection)
     for (auto it = registeredServers_.begin(); it != registeredServers_.end(); )
     {
-        if (::kill(*it, 0) != 0 && errno == ESRCH)
+        pid_t pid = it->first;
+        uint64_t savedSt = it->second;
+        if (::kill(pid, 0) != 0 && errno == ESRCH)
         {
-            logf(LogLevel::Info, "reaper: removing dead server pid=%d", *it);
+            logf(LogLevel::Info, "reaper: removing dead server pid=%d", pid);
             it = registeredServers_.erase(it);
+        }
+        else if (savedSt != 0)
+        {
+            uint64_t currentSt = getPidStartTime(pid);
+            if (currentSt != 0 && currentSt != savedSt)
+            {
+                logf(LogLevel::Info,
+                     "reaper: removing server pid=%d (PID reused)", pid);
+                it = registeredServers_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
         else
         {
