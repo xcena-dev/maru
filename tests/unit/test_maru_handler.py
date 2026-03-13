@@ -192,6 +192,7 @@ def _make_mock_handler(pool_size=8192, chunk_size=1024):
     alloc_response = MagicMock()
     alloc_response.success = True
     alloc_response.handle = _make_handle(100, pool_size)
+    alloc_response.mount_path = None  # DAX mode (no marufs)
     mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
     # register_kv returns True (is_new=True)
@@ -290,6 +291,7 @@ class TestMaruHandlerCoverage:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
         mock_rpc.return_alloc = MagicMock()
         mock_rpc.close = MagicMock()
@@ -916,6 +918,7 @@ class TestMaruHandlerCoverage:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
         # return_alloc ALSO raises
         mock_rpc.return_alloc = MagicMock(
@@ -1388,6 +1391,7 @@ class TestMaruHandlerCoverage:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
         mock_rpc.return_alloc = MagicMock()
         mock_rpc.close = MagicMock()
@@ -1675,6 +1679,7 @@ class TestPremapSharedRegions:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
         # list_allocations returns 2 shared regions
@@ -1718,6 +1723,7 @@ class TestPremapSharedRegions:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
         # list_allocations raises an exception
@@ -1751,6 +1757,7 @@ class TestPremapSharedRegions:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
         list_resp = ListAllocationsResponse(success=False, error="internal error")
@@ -1783,6 +1790,7 @@ class TestPremapSharedRegions:
         alloc_response = MagicMock()
         alloc_response.success = True
         alloc_response.handle = _make_handle(100, 4096)
+        alloc_response.mount_path = None  # DAX mode (no marufs)
         mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
         shared_h1 = _make_handle(200, 2048)
@@ -1795,7 +1803,11 @@ class TestPremapSharedRegions:
 
         handler._rpc = mock_rpc
 
-        # Make map_region fail for region 200 only
+        # Pre-initialize _mapper before connect() so we can patch map_region
+        # before the eager_map premap phase runs inside connect().
+        from maru_handler.memory import DaxMapper
+
+        handler._mapper = DaxMapper()
         original_map = handler._mapper.map_region
 
         def selective_fail(handle, prefault=True):

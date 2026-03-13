@@ -17,6 +17,10 @@ import mmap as mmap_module
 import os
 import re
 import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from maru_shm.types import MaruHandle
 
 from .ioctl import (
     MARUFS_BATCH_FIND_MAX,
@@ -30,6 +34,7 @@ from .ioctl import (
     MARUFS_IOC_PERM_REVOKE,
     MARUFS_IOC_PERM_SET_DEFAULT,
     MARUFS_NAME_MAX,
+    PERM_ALL,
     MarufsBatchFindEntry,
     MarufsBatchFindReq,
     MarufsBatchNameOffsetEntry,
@@ -37,7 +42,6 @@ from .ioctl import (
     MarufsFindNameReq,
     MarufsNameOffsetReq,
     MarufsPermReq,
-    PERM_ALL,
 )
 
 logger = logging.getLogger(__name__)

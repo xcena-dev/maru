@@ -197,6 +197,7 @@ def _make_mock_handler():
     alloc_response = MagicMock()
     alloc_response.success = True
     alloc_response.handle = _make_handle(100, 8192)
+    alloc_response.mount_path = None  # DAX mode (no marufs)
     mock_rpc.request_alloc = MagicMock(return_value=alloc_response)
 
     # register_kv succeeds

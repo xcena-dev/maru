@@ -180,7 +180,8 @@ class MaruHandler:
                 return False
 
             # 3. Initialize DaxMapper (mount_path from server determines mode)
-            self._mapper = DaxMapper(mount_path=response.mount_path)
+            if self._mapper is None:
+                self._mapper = DaxMapper(mount_path=response.mount_path)
             self._owned = OwnedRegionManager(
                 mapper=self._mapper,
                 chunk_size=self._config.chunk_size_bytes,
