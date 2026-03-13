@@ -238,6 +238,121 @@ class TestEnsureResourceManager:
                 with pytest.raises(RuntimeError, match="failed to start within 5s"):
                     client._ensure_resource_manager()
 
+    def test_loads_config_from_rm_conf(self):
+        """Reads rm.conf and passes saved settings to Popen."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = os.path.join(tmpdir, "rm.sock")
+            conf_path = os.path.join(tmpdir, "rm.conf")
+
+            # Write a config file as the C++ RM would
+            with open(conf_path, "w") as f:
+                f.write("state_dir=/data/maru-state\n")
+                f.write("log_level=debug\n")
+                f.write("idle_timeout=0\n")
+
+            client = MaruShmClient(socket_path=sock_path)
+            call_results = iter([False, False, True])
+
+            with (
+                patch.object(
+                    client,
+                    "_try_connect",
+                    side_effect=lambda: next(call_results),
+                ),
+                patch("subprocess.Popen") as mock_popen,
+                patch("time.sleep"),
+            ):
+                client._ensure_resource_manager()
+                mock_popen.assert_called_once()
+                args = mock_popen.call_args[0][0]
+                assert "--state-dir" in args
+                assert "/data/maru-state" in args
+                assert "--log-level" in args
+                assert "debug" in args
+                assert "--idle-timeout" in args
+                assert "0" in args
+
+    def test_ignores_missing_rm_conf(self):
+        """Falls back to defaults when rm.conf does not exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = os.path.join(tmpdir, "rm.sock")
+            # No rm.conf written
+
+            client = MaruShmClient(socket_path=sock_path)
+            call_results = iter([False, False, True])
+
+            with (
+                patch.object(
+                    client,
+                    "_try_connect",
+                    side_effect=lambda: next(call_results),
+                ),
+                patch("subprocess.Popen") as mock_popen,
+                patch("time.sleep"),
+            ):
+                client._ensure_resource_manager()
+                mock_popen.assert_called_once()
+                args = mock_popen.call_args[0][0]
+                # Only socket-path should be present, no extra args
+                assert "--state-dir" not in args
+                assert "--log-level" not in args
+                assert "--idle-timeout" not in args
+
+    def test_handles_corrupt_rm_conf(self):
+        """Gracefully handles a corrupted rm.conf file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = os.path.join(tmpdir, "rm.sock")
+            conf_path = os.path.join(tmpdir, "rm.conf")
+
+            # Write garbage
+            with open(conf_path, "wb") as f:
+                f.write(b"\x00\xff\xfe invalid binary content")
+
+            client = MaruShmClient(socket_path=sock_path)
+            call_results = iter([False, False, True])
+
+            with (
+                patch.object(
+                    client,
+                    "_try_connect",
+                    side_effect=lambda: next(call_results),
+                ),
+                patch("subprocess.Popen") as mock_popen,
+                patch("time.sleep"),
+            ):
+                # Should not raise — falls back to defaults
+                client._ensure_resource_manager()
+                mock_popen.assert_called_once()
+
+    def test_skips_empty_values_in_rm_conf(self):
+        """Lines with empty values (key= or just key) are skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = os.path.join(tmpdir, "rm.sock")
+            conf_path = os.path.join(tmpdir, "rm.conf")
+
+            with open(conf_path, "w") as f:
+                f.write("state_dir=\n")  # empty value
+                f.write("bad_line_no_equals\n")  # no = sign
+                f.write("log_level=warn\n")  # valid
+
+            client = MaruShmClient(socket_path=sock_path)
+            call_results = iter([False, False, True])
+
+            with (
+                patch.object(
+                    client,
+                    "_try_connect",
+                    side_effect=lambda: next(call_results),
+                ),
+                patch("subprocess.Popen") as mock_popen,
+                patch("time.sleep"),
+            ):
+                client._ensure_resource_manager()
+                args = mock_popen.call_args[0][0]
+                assert "--state-dir" not in args  # empty value skipped
+                assert "--log-level" in args
+                assert "warn" in args
+
     def test_another_process_starts_server(self):
         """When re-check after lock finds server already running (started by another process)."""
         with tempfile.TemporaryDirectory() as tmpdir:

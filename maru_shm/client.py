@@ -80,12 +80,36 @@ class MaruShmClient:
             if self._try_connect():
                 return
 
+            # Read saved config from previous RM instance (if any)
+            conf_path = Path(self._socket_path).parent / "rm.conf"
+            extra_args: list[str] = []
+            if conf_path.exists():
+                try:
+                    for line in conf_path.read_text().strip().splitlines():
+                        key, _, value = line.partition("=")
+                        if not value:
+                            continue
+                        if key == "state_dir":
+                            extra_args += ["--state-dir", value]
+                        elif key == "log_level":
+                            extra_args += ["--log-level", value]
+                        elif key == "idle_timeout":
+                            extra_args += ["--idle-timeout", value]
+                    logger.info("Loaded RM config from %s", conf_path)
+                except Exception:
+                    logger.warning(
+                        "Failed to read RM config from %s, using defaults",
+                        conf_path,
+                        exc_info=True,
+                    )
+
             # Start resource manager in background
             logger.info(
                 "Starting maru-resource-manager (socket: %s)", self._socket_path
             )
             subprocess.Popen(
-                ["maru-resource-manager", "--socket-path", self._socket_path],
+                ["maru-resource-manager", "--socket-path", self._socket_path]
+                + extra_args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

@@ -27,6 +27,30 @@ struct ServerConfig {
     int idleTimeout = 60;  // seconds, 0=disable
 };
 
+static void writeConfigFile(const ServerConfig &cfg) {
+    std::string confDir = maru::parentDir(cfg.socketPath);
+    std::string confPath = confDir + "/rm.conf";
+    std::string tmpPath = confPath + ".tmp";
+
+    FILE *fp = std::fopen(tmpPath.c_str(), "w");
+    if (!fp) {
+        maru::logf(maru::LogLevel::Warn,
+                    "failed to write config to %s: %s",
+                    confPath.c_str(), std::strerror(errno));
+        return;
+    }
+    std::fprintf(fp, "state_dir=%s\n", cfg.stateDir.c_str());
+    std::fprintf(fp, "log_level=%s\n", maru::logLevelStr(cfg.logLevel));
+    std::fprintf(fp, "idle_timeout=%d\n", cfg.idleTimeout);
+    std::fclose(fp);
+
+    if (std::rename(tmpPath.c_str(), confPath.c_str()) != 0) {
+        maru::logf(maru::LogLevel::Warn,
+                    "failed to rename config %s -> %s: %s",
+                    tmpPath.c_str(), confPath.c_str(), std::strerror(errno));
+    }
+}
+
 static void printUsage(const char *prog) {
     std::fprintf(stderr,
         "Usage: %s [OPTIONS]\n\n"
@@ -72,6 +96,9 @@ int main(int argc, char **argv) {
     // Ensure directories exist
     maru::ensureDirExists(maru::parentDir(cfg.socketPath));
     maru::ensureDirExists(cfg.stateDir);
+
+    // Persist config so auto-start can recover the same settings
+    writeConfigFile(cfg);
 
     // Startup banner
     maru::logf(maru::LogLevel::Info, "maru-resource-manager starting");
