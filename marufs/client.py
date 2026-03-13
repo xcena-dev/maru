@@ -27,10 +27,10 @@ from .ioctl import (
     MARUFS_BATCH_STORE_MAX,
     MARUFS_IOC_BATCH_FIND_NAME,
     MARUFS_IOC_BATCH_NAME_OFFSET,
+    MARUFS_IOC_CHOWN,
     MARUFS_IOC_CLEAR_NAME,
     MARUFS_IOC_FIND_NAME,
     MARUFS_IOC_NAME_OFFSET,
-    MARUFS_IOC_CHOWN,
     MARUFS_IOC_PERM_GRANT,
     MARUFS_IOC_PERM_REVOKE,
     MARUFS_IOC_PERM_SET_DEFAULT,
@@ -696,7 +696,10 @@ class MarufsClient:
                 self.chown(fd)
                 self.perm_set_default(fd, PERM_READ | PERM_WRITE)
             except OSError:
-                logger.debug("chown skipped for region %s (not on marufs or no ADMIN)", region_name)
+                logger.debug(
+                    "chown skipped for region %s (not on marufs or no ADMIN)",
+                    region_name,
+                )
 
         mm = self._mmap_region(fd, handle.length, prot)
 
