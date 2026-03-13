@@ -9,12 +9,11 @@ module and are tested with mocked fcntl.ioctl.
 
 import mmap as mmap_module
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from maru_shm.types import MaruHandle
-
 
 # ============================================================================
 # Fixtures
@@ -371,9 +370,7 @@ class TestBatchNameOffset:
             pass  # entries[i].status defaults to 0
 
         mock_ioctl.side_effect = side_effect
-        result = client.batch_name_offset(
-            fd=5, names=["k1", "k2"], offsets=[0, 1024]
-        )
+        result = client.batch_name_offset(fd=5, names=["k1", "k2"], offsets=[0, 1024])
         assert len(result) == 2
         mock_ioctl.assert_called_once()
 
