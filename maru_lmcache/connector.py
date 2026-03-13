@@ -49,8 +49,7 @@ def _parse_pool_id(raw: object) -> list[int] | int | None:
             return [int(v) for v in raw]
         except (ValueError, TypeError) as e:
             raise ValueError(
-                f"Invalid pool_id list: {raw!r}. "
-                "All elements must be integers."
+                f"Invalid pool_id list: {raw!r}. All elements must be integers."
             ) from e
     # String: may be comma-separated (e.g. "0,1,2") or single ("1")
     s = str(raw).strip()
