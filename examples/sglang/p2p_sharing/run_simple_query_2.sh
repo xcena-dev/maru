@@ -1,5 +1,9 @@
 #!/bin/bash
-# Send a single query to each instance. Quick sanity check.
+# P2P query test: inst1 gets TWO queries (to trigger write-through completion),
+# then inst2 queries to verify L3 cache hit.
+#
+# Flow: inst1 query1 (prefill+store) → inst1 query2 (writing_check flushes to L3)
+#       → sleep → inst2 query (should hit L3 via batch_exists/batch_get)
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 [ -f "env.sh" ] && source env.sh
@@ -53,7 +57,7 @@ print(''.join(output))
 "
 }
 
-echo "=== Simple Query Test ==="
+echo "=== P2P Query Test (2-query write-through) ==="
 echo "Model: $MODEL"
 echo ""
 
@@ -66,9 +70,9 @@ check_health "Instance 1" "$PORT1" || INST1_OK=false
 check_health "Instance 2" "$PORT2" || INST2_OK=false
 echo ""
 
-echo "--- Instance 1 (port $PORT1) ---"
+# Step 1: Query inst1 — triggers prefill, starts write-through (GPU→Host async)
+echo "--- Instance 1: Query 1 (prefill + write-through start) (port $PORT1) ---"
 if [ "${INST1_OK:-}" != false ]; then
-    echo "=== Response ==="
     send_query "$PORT1"
 else
     echo "(skipped — server not reachable)"
@@ -77,9 +81,20 @@ echo ""
 
 sleep 3
 
-echo "--- Instance 2 (port $PORT2) ---"
+# Step 2: Query inst1 again — writing_check() flushes write-through to L3
+echo "--- Instance 1: Query 2 (flush write-through to L3) (port $PORT1) ---"
+if [ "${INST1_OK:-}" != false ]; then
+    send_query "$PORT1"
+else
+    echo "(skipped — server not reachable)"
+fi
+echo ""
+
+sleep 3
+
+# Step 3: Query inst2 — should hit L3 via batch_exists/batch_get
+echo "--- Instance 2: Query (should hit L3 P2P cache) (port $PORT2) ---"
 if [ "${INST2_OK:-}" != false ]; then
-    echo "=== Response ==="
     send_query "$PORT2"
 else
     echo "(skipped — server not reachable)"

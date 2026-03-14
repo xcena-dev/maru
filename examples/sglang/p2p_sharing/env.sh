@@ -3,7 +3,8 @@
 export MODEL=${MODEL:-"Qwen/Qwen2.5-0.5B"}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.1}
 export SGLANG_LOG_LEVEL=${SGLANG_LOG_LEVEL:-info}
-export MARU_LOG_LEVEL=${MARU_LOG_LEVEL:-INFO}
+export MARU_LOG_LEVEL=${MARU_LOG_LEVEL:-DEBUG}
+# export MARU_LOG_LEVEL=${MARU_LOG_LEVEL:-INFO}
 
 # Ports: UID-based dynamic allocation (avoids collision in multi-user env)
 export MARU_SERVER_PORT=${MARU_SERVER_PORT:-$((10000 + $(id -u)))}

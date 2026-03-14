@@ -175,19 +175,21 @@ main() {
     echo "[$(date +%T)] Launching vLLM instances (MODEL=$MODEL, GPU_MEM_UTIL=$GPU_MEM_UTIL)..."
     echo "Please check $LOG_INST1 and $LOG_INST2 for logs."
 
-    # Launch Instance 1 (GPU 0)
+    # Launch Instance 1 (GPU 0) — must be ready before inst2
+    # so inst2 sees inst1's shared memory regions on connect
     bash p2p_vllm_launcher.sh inst1 ${_MODEL:+"$_MODEL"} \
         > >(tee "$LOG_INST1")  2>&1 &
     inst1_pid=$!
     PIDS+=($inst1_pid)
 
-    # Launch Instance 2 (GPU 1)
+    wait_for_server $LMCACHE_INST1_PORT
+
+    # Launch Instance 2 (GPU 1) — after inst1 is ready
     bash p2p_vllm_launcher.sh inst2 ${_MODEL:+"$_MODEL"} \
         > >(tee "$LOG_INST2") 2>&1 &
     inst2_pid=$!
     PIDS+=($inst2_pid)
 
-    wait_for_server $LMCACHE_INST1_PORT
     wait_for_server $LMCACHE_INST2_PORT
 
     echo "==================================================="

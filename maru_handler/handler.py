@@ -796,6 +796,12 @@ class MaruHandler:
                     skipped,
                     len(keys),
                 )
+            logger.info(
+                "batch_store precheck: server_exists=%d/%d, first_5=%s",
+                skipped,
+                len(keys),
+                list(zip(keys[:5], exists_results[:5], strict=False)),
+            )
 
             # Phase 2: Only process new keys (skip duplicates)
             for i, (key, info) in enumerate(zip(keys, infos, strict=True)):
@@ -867,6 +873,11 @@ class MaruHandler:
 
             # Batch register
             if register_entries:
+                logger.info(
+                    "batch_store register request: %d entries, first_5=%s",
+                    len(register_entries),
+                    [entry[0] for entry in register_entries[:5]],
+                )
                 try:
                     batch_resp = self._rpc.batch_register_kv(register_entries)
                 except Exception:
@@ -880,6 +891,19 @@ class MaruHandler:
                     for _idx, (rid, pidx) in allocations.items():
                         self._owned.free(rid, pidx)
                     return [False] * len(keys)
+
+                logger.info(
+                    "batch_store register response: new=%d/%d, first_5=%s",
+                    sum(batch_resp.results),
+                    len(batch_resp.results),
+                    list(
+                        zip(
+                            [entry[0] for entry in register_entries[:5]],
+                            batch_resp.results[:5],
+                            strict=False,
+                        )
+                    ),
+                )
 
                 batch_idx = 0
                 for i in range(len(keys)):
@@ -928,6 +952,12 @@ class MaruHandler:
         except Exception:
             logger.error("batch_exists RPC failed", exc_info=True)
             return [False] * len(keys)
+        logger.info(
+            "handler.batch_exists response: hits=%d/%d, first_5=%s",
+            sum(batch_resp.results),
+            len(keys),
+            list(zip(keys[:5], batch_resp.results[:5], strict=False)),
+        )
         return batch_resp.results
 
     # =========================================================================

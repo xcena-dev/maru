@@ -139,6 +139,18 @@ class MaruServer:
                 if alloc_to_ref is not None:
                     self._allocation_manager.increment_kv_ref(alloc_to_ref)
                 results.append(is_new)
+            logger.info(
+                "batch_register_kv: new=%d/%d, first_5=%s",
+                sum(results),
+                len(entries),
+                list(
+                    zip(
+                        [entry[0] for entry in entries[:5]],
+                        results[:5],
+                        strict=False,
+                    )
+                ),
+            )
             return results
 
     def batch_lookup_kv(self, keys: list[str]) -> list[dict | None]:
@@ -183,7 +195,14 @@ class MaruServer:
         Returns:
             List of booleans indicating if each key exists
         """
-        return self._kv_manager.batch_exists(keys)
+        results = self._kv_manager.batch_exists(keys)
+        logger.info(
+            "batch_exists_kv: hits=%d/%d, first_5=%s",
+            sum(results),
+            len(keys),
+            list(zip(keys[:5], results[:5], strict=False)),
+        )
+        return results
 
     def get_stats(self) -> dict:
         """Get server statistics."""

@@ -133,11 +133,7 @@ build_sglang_args() {
             )
             ;;
         maru)
-            MARU_EXTRA_CONFIG=$(cat <<'EOJSON'
-{"backend_name":"maru","module_path":"maru_sglang.backend","class_name":"MaruHiCacheStorage","maru_server_url":"tcp://localhost:MARU_PORT_PLACEHOLDER","maru_pool_size":"4G"}
-EOJSON
-            )
-            MARU_EXTRA_CONFIG="${MARU_EXTRA_CONFIG//MARU_PORT_PLACEHOLDER/$MARU_SERVER_PORT}"
+            MARU_EXTRA_CONFIG="{\"backend_name\":\"maru\",\"module_path\":\"maru_sglang.backend\",\"class_name\":\"MaruHiCacheStorage\",\"maru_server_url\":\"tcp://localhost:${MARU_SERVER_PORT}\",\"maru_pool_size\":\"${MARU_POOL_SIZE:-4G}\"}"
             SGLANG_ARGS+=(
                 --enable-hierarchical-cache
                 --hicache-ratio 2.0
@@ -182,6 +178,36 @@ main() {
     # Launch SGLang
     LOG_SGLANG="${LOG_SGLANG:-sglang_server.log}"
     build_sglang_args
+
+    # Save resolved commands to file
+    CMD_FILE="$SCRIPT_DIR/commands.log"
+    {
+        echo "# SGLang Single Instance — Resolved Commands ($(date '+%Y-%m-%d %H:%M:%S'))"
+        echo "# Mode: $MODE"
+        echo ""
+        if [[ "$MODE" == "maru" ]]; then
+            echo "# 1. Maru Meta Server"
+            echo "python -m maru_server --port $MARU_SERVER_PORT"
+            echo ""
+            echo "# 2. SGLang Server"
+        else
+            echo "# 1. SGLang Server"
+        fi
+        local i=0
+        local cmd="sglang serve"
+        while (( i < ${#SGLANG_ARGS[@]} )); do
+            if [[ "${SGLANG_ARGS[$i]}" == --* ]] && (( i + 1 < ${#SGLANG_ARGS[@]} )) && [[ "${SGLANG_ARGS[$((i+1))]}" != --* ]]; then
+                cmd+=" \\\\\n    ${SGLANG_ARGS[$i]} ${SGLANG_ARGS[$((i+1))]}"
+                (( i += 2 ))
+            else
+                cmd+=" \\\\\n    ${SGLANG_ARGS[$i]}"
+                (( i += 1 ))
+            fi
+        done
+        echo -e "$cmd"
+        echo ""
+    } > "$CMD_FILE"
+    echo "[$(date +%T)] Saved resolved commands to $CMD_FILE"
 
     sglang serve "${SGLANG_ARGS[@]}" \
         > >(tee "$LOG_SGLANG") 2>&1 &

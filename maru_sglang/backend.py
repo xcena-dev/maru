@@ -19,7 +19,7 @@ Usage (SGLang dynamic backend):
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+from typing import Any
 
 import torch
 
@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 try:
     from sglang.srt.mem_cache.hicache_storage import (
         HiCacheStorage as _HiCacheStorageBase,
+    )
+    from sglang.srt.mem_cache.hicache_storage import (
         HiCacheStorageExtraInfo,
     )
 except ImportError:
@@ -53,9 +55,11 @@ def _get_base_class():
         def register_mem_pool_host(self, mem_pool_host):
             self.mem_pool_host = mem_pool_host
 
+        @abstractmethod
         def batch_get_v1(self, keys, host_indices, extra_info=None):
             pass
 
+        @abstractmethod
         def batch_set_v1(self, keys, host_indices, extra_info=None):
             pass
 
@@ -72,7 +76,9 @@ def _get_base_class():
             pass
 
         @abstractmethod
-        def batch_set(self, keys, values=None, target_locations=None, target_sizes=None):
+        def batch_set(
+            self, keys, values=None, target_locations=None, target_sizes=None
+        ):
             pass
 
         @abstractmethod
@@ -85,6 +91,7 @@ def _get_base_class():
                     return i
             return len(keys)
 
+        @abstractmethod
         def clear(self):
             pass
 
@@ -136,9 +143,7 @@ class MaruHiCacheStorage(_get_base_class()):
                 cfg.chunk_size_bytes,
             )
         else:
-            raise RuntimeError(
-                f"Failed to connect MaruHandler to {cfg.server_url}"
-            )
+            raise RuntimeError(f"Failed to connect MaruHandler to {cfg.server_url}")
 
     # ------------------------------------------------------------------
     # Key management
@@ -166,10 +171,14 @@ class MaruHiCacheStorage(_get_base_class()):
             return False
         return self._handler.exists(self._make_key(key))
 
-    def batch_exists(self, keys: List[str], extra_info=None) -> int:
+    def batch_exists(self, keys: list[str], extra_info=None) -> int:
         """Return number of consecutive existing keys from the start."""
         if self._handler is None or not keys:
-            logger.debug("batch_exists: skip (handler=%s, keys=%d)", self._handler is not None, len(keys) if keys else 0)
+            logger.debug(
+                "batch_exists: skip (handler=%s, keys=%d)",
+                self._handler is not None,
+                len(keys) if keys else 0,
+            )
             return 0
         full_keys = [self._make_key(k) for k in keys]
         logger.info(
@@ -189,8 +198,8 @@ class MaruHiCacheStorage(_get_base_class()):
     def get(
         self,
         key: str,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        target_location: Any | None = None,
+        target_sizes: Any | None = None,
     ) -> torch.Tensor | None:
         if self._handler is None:
             return None
@@ -214,9 +223,9 @@ class MaruHiCacheStorage(_get_base_class()):
     def set(
         self,
         key: str,
-        value: Optional[Any] = None,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        value: Any | None = None,
+        target_location: Any | None = None,
+        target_sizes: Any | None = None,
     ) -> bool:
         if self._handler is None or value is None:
             return False
@@ -229,16 +238,21 @@ class MaruHiCacheStorage(_get_base_class()):
 
     def batch_get(
         self,
-        keys: List[str],
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+        keys: list[str],
+        target_locations: Any | None = None,
+        target_sizes: Any | None = None,
+    ) -> list[torch.Tensor | None]:
         if self._handler is None or not keys:
             return [None] * len(keys)
         full_keys = [self._make_key(k) for k in keys]
+        logger.info(
+            "batch_get called: %d keys, first_5=%s",
+            len(full_keys),
+            full_keys[:5],
+        )
         results = self._handler.batch_retrieve(full_keys)
 
-        outputs: List[torch.Tensor | None] = []
+        outputs: list[torch.Tensor | None] = []
         for i, info in enumerate(results):
             if info is None:
                 outputs.append(None)
@@ -253,14 +267,16 @@ class MaruHiCacheStorage(_get_base_class()):
                     outputs.append(target)
                     continue
             outputs.append(data)
+        hits = sum(output is not None for output in outputs)
+        logger.info("batch_get result: %d/%d hits", hits, len(keys))
         return outputs
 
     def batch_set(
         self,
-        keys: List[str],
-        values: Optional[Any] = None,
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        keys: list[str],
+        values: Any | None = None,
+        target_locations: Any | None = None,
+        target_sizes: Any | None = None,
     ) -> bool:
         if self._handler is None or values is None or not keys:
             return False
@@ -275,6 +291,13 @@ class MaruHiCacheStorage(_get_base_class()):
             src = v.contiguous().view(torch.uint8).numpy()
             infos.append(memoryview(src))
         results = self._handler.batch_store(full_keys, infos)
+        succeeded = sum(results)
+        logger.info(
+            "batch_set result: %d/%d succeeded, first_5_results=%s",
+            succeeded,
+            len(keys),
+            results[:5],
+        )
         return all(results)
 
     # ------------------------------------------------------------------
@@ -291,10 +314,10 @@ class MaruHiCacheStorage(_get_base_class()):
 
     def batch_get_v1(
         self,
-        keys: List[str],
+        keys: list[str],
         host_indices: torch.Tensor,
         extra_info=None,
-    ) -> List[bool]:
+    ) -> list[bool]:
         """Retrieve KV pages from Maru into host memory pool.
 
         For page_first layouts, uses direct memory copy via ctypes.memmove.
@@ -304,21 +327,24 @@ class MaruHiCacheStorage(_get_base_class()):
             return [False] * len(keys)
 
         full_keys = [self._make_key(k) for k in keys]
+        logger.info(
+            "batch_get_v1 called: %d keys, first_5=%s",
+            len(full_keys),
+            full_keys[:5],
+        )
         infos = self._handler.batch_retrieve(full_keys)
 
         if not getattr(self, "_is_page_first", False):
             results = self._fallback_batch_get_v1(keys, host_indices, infos)
             hits = sum(results)
-            logger.debug(
-                "batch_get_v1 (fallback) %d/%d hits", hits, len(keys)
-            )
+            logger.info("batch_get_v1 (fallback) result: %d/%d hits", hits, len(keys))
             return results
 
         import ctypes
 
-        results: List[bool] = []
+        results: list[bool] = []
         page_metas = self.mem_pool_host.get_page_buffer_meta(host_indices)
-        for (ptr, size), info in zip(page_metas, infos):
+        for (ptr, size), info in zip(page_metas, infos, strict=False):
             if info is None:
                 results.append(False)
                 continue
@@ -331,15 +357,15 @@ class MaruHiCacheStorage(_get_base_class()):
             )
             results.append(True)
         hits = sum(results)
-        logger.debug("batch_get_v1 %d/%d hits", hits, len(keys))
+        logger.info("batch_get_v1 result: %d/%d hits", hits, len(keys))
         return results
 
     def batch_set_v1(
         self,
-        keys: List[str],
+        keys: list[str],
         host_indices: torch.Tensor,
         extra_info=None,
-    ) -> List[bool]:
+    ) -> list[bool]:
         """Store KV pages from host memory pool into Maru.
 
         For page_first layouts, uses direct memory copy via ctypes.memmove.
@@ -375,13 +401,11 @@ class MaruHiCacheStorage(_get_base_class()):
             valid_indices.append(i)
 
         # Batch register via store with handle (zero-copy path)
-        results: List[bool] = [False] * len(keys)
+        results: list[bool] = [False] * len(keys)
         for i in valid_indices:
             handle = handles[i]
             if handle is not None:
-                success = self._handler.store(
-                    full_keys[i], handle=handle
-                )
+                success = self._handler.store(full_keys[i], handle=handle)
                 results[i] = success
         stored = sum(results)
         logger.debug("batch_set_v1 %d/%d stored", stored, len(keys))
@@ -391,14 +415,14 @@ class MaruHiCacheStorage(_get_base_class()):
     # Fallback paths for non-page_first layouts
     # ------------------------------------------------------------------
 
-    def _fallback_batch_get_v1(self, keys, host_indices, infos) -> List[bool]:
+    def _fallback_batch_get_v1(self, keys, host_indices, infos) -> list[bool]:
         """Fallback: use tensor copy for non-page_first layouts."""
-        results: List[bool] = []
+        results: list[bool] = []
         for info in infos:
             results.append(info is not None)
         return results
 
-    def _fallback_batch_set_v1(self, keys, host_indices) -> List[bool]:
+    def _fallback_batch_set_v1(self, keys, host_indices) -> list[bool]:
         """Fallback: return all False to signal caller should use legacy API."""
         return [False] * len(keys)
 

@@ -65,6 +65,49 @@ start() {
     echo "Instance2: port=$SGLANG_INST2_PORT, gpu=$INST2_GPU"
     echo ""
 
+    # Resolve Maru extra config for command logging
+    MARU_EXTRA_CONFIG_INST1=$(MARU_INSTANCE_ID=inst1 MARU_SERVER_PORT=$MARU_SERVER_PORT MARU_POOL_SIZE=$MARU_POOL_SIZE envsubst < "$SCRIPT_DIR/configs/maru-sglang-p2p.json")
+    MARU_EXTRA_CONFIG_INST2=$(MARU_INSTANCE_ID=inst2 MARU_SERVER_PORT=$MARU_SERVER_PORT MARU_POOL_SIZE=$MARU_POOL_SIZE envsubst < "$SCRIPT_DIR/configs/maru-sglang-p2p.json")
+
+    # Save resolved commands to file
+    CMD_FILE="$SCRIPT_DIR/commands.log"
+    cat > "$CMD_FILE" <<CMDS
+# P2P KV Sharing — Resolved Commands ($(date '+%Y-%m-%d %H:%M:%S'))
+# Run each in a separate terminal.
+
+# 1. Maru Meta Server
+python -m maru_server --port $MARU_SERVER_PORT
+
+# 2. SGLang Instance 1 (GPU $INST1_GPU)
+CUDA_VISIBLE_DEVICES=$INST1_GPU sglang serve \\
+    --model-path $MODEL \\
+    --port $SGLANG_INST1_PORT \\
+    --mem-fraction-static $GPU_MEM_UTIL \\
+    --log-level $SGLANG_LOG_LEVEL \\
+    --enable-hierarchical-cache \\
+    --hicache-ratio 2.0 \\
+    --hicache-write-policy write_through \\
+    --hicache-mem-layout page_first_direct \\
+    --hicache-storage-backend dynamic \\
+    --hicache-storage-backend-extra-config '$MARU_EXTRA_CONFIG_INST1' \\
+    --hicache-storage-prefetch-policy wait_complete
+
+# 3. SGLang Instance 2 (GPU $INST2_GPU)
+CUDA_VISIBLE_DEVICES=$INST2_GPU sglang serve \\
+    --model-path $MODEL \\
+    --port $SGLANG_INST2_PORT \\
+    --mem-fraction-static $GPU_MEM_UTIL \\
+    --log-level $SGLANG_LOG_LEVEL \\
+    --enable-hierarchical-cache \\
+    --hicache-ratio 2.0 \\
+    --hicache-write-policy write_through \\
+    --hicache-mem-layout page_first_direct \\
+    --hicache-storage-backend dynamic \\
+    --hicache-storage-backend-extra-config '$MARU_EXTRA_CONFIG_INST2' \\
+    --hicache-storage-prefetch-policy wait_complete
+CMDS
+    echo "[$(date +%T)] Saved resolved commands to $CMD_FILE"
+
     # 1. Maru Meta Server
     if timeout 1 bash -c "echo >/dev/tcp/localhost/$MARU_SERVER_PORT" 2>/dev/null; then
         echo "[$(date +%T)] MaruServer already running on port $MARU_SERVER_PORT"
@@ -103,7 +146,7 @@ start() {
     echo "All servers ready!"
     echo ""
     echo "Quick test:"
-    echo "  bash run_simple_query.sh    # Verify P2P KV sharing"
+    echo "  bash run_simple_query.sh    # Warm inst1 twice and verify inst2 P2P hit"
     echo ""
     echo "Benchmark:"
     echo "  bash run_benchmark.sh       # Measure TTFT speedup"
@@ -118,30 +161,39 @@ start() {
 }
 
 stop() {
-    if [ ! -f "$PID_FILE" ]; then
-        echo "No PID file found. Nothing to stop."
-        return
+    echo "Stopping all servers..."
+
+    # Stop PID-tracked processes
+    if [ -f "$PID_FILE" ]; then
+        while read -r pid; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill_tree "$pid" TERM
+                echo "  Stopped PID $pid"
+            fi
+        done < "$PID_FILE"
+
+        sleep 1
+
+        # Force kill survivors
+        while read -r pid; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill_tree "$pid" 9
+                echo "  Force-killed PID $pid"
+            fi
+        done < "$PID_FILE"
+
+        rm -f "$PID_FILE"
     fi
 
-    echo "Stopping all servers..."
-    while read -r pid; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill_tree "$pid" TERM
-            echo "  Stopped PID $pid"
-        fi
-    done < "$PID_FILE"
+    # Also kill any MaruServer on our port (handles pre-existing servers)
+    local maru_pid
+    maru_pid=$(lsof -ti "tcp:$MARU_SERVER_PORT" 2>/dev/null || true)
+    if [ -n "$maru_pid" ]; then
+        kill $maru_pid 2>/dev/null && echo "  Stopped MaruServer (PID $maru_pid) on port $MARU_SERVER_PORT"
+        sleep 1
+        kill -9 $maru_pid 2>/dev/null || true
+    fi
 
-    sleep 1
-
-    # Force kill survivors
-    while read -r pid; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill_tree "$pid" 9
-            echo "  Force-killed PID $pid"
-        fi
-    done < "$PID_FILE"
-
-    rm -f "$PID_FILE"
     echo "All processes stopped."
 }
 
