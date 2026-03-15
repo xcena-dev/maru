@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """
+.. deprecated::
+    MaruConnectorAdapter is deprecated. Use MaruBackend (storage backend) instead.
+    See ``LMCache/lmcache/v1/storage_backend/maru_backend.py``.
+
 MaruConnectorAdapter — registers the ``maru://`` URL scheme with LMCache's
 plugin discovery system (``remote_storage_plugins``).
 

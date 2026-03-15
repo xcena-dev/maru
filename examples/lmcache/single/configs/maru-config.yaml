@@ -1,0 +1,11 @@
+chunk_size: 256
+local_cpu: False
+
+enable_async_loading: False
+
+maru_path: "tcp://localhost:${MARU_SERVER_PORT}"
+maru_pool_size: 4G
+
+extra_config:
+  save_chunk_meta: False
+  lookup_backoff_time: 0.001

@@ -229,10 +229,11 @@ class TestMaruConnector:
         # put
         memory_obj = MagicMock()
         memory_obj.byte_array = memoryview(bytearray(1024))
+        mock_handle = MagicMock()
+        mock_handle.buf = bytearray(1024)
+        mock_maru_handler.alloc.return_value = mock_handle
 
-        with patch("maru_lmcache.connector.MaruConnector._encode_memory_obj") as enc:
-            enc.return_value = mock_memory_info
-            async_loop.run_until_complete(connector.put(key, memory_obj))
+        async_loop.run_until_complete(connector.put(key, memory_obj))
 
         mock_maru_handler.store.assert_called_once()
 
@@ -366,10 +367,11 @@ class TestBatchOperations:
         objs = [MagicMock() for _ in range(2)]
         for obj in objs:
             obj.byte_array = memoryview(bytearray(1024))
+        mock_handle = MagicMock()
+        mock_handle.buf = bytearray(1024)
+        mock_maru_handler.alloc.return_value = mock_handle
 
-        with patch("maru_lmcache.connector.MaruConnector._encode_memory_obj") as enc:
-            enc.return_value = mock_memory_info
-            async_loop.run_until_complete(connector.batched_put(keys, objs))
+        async_loop.run_until_complete(connector.batched_put(keys, objs))
 
         mock_maru_handler.batch_store.assert_called_once()
 

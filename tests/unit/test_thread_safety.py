@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 from conftest import _make_handle
 
-from maru_handler.memory import DaxMapper, MemoryInfo, OwnedRegionManager
+from maru_handler.memory import DaxMapper, OwnedRegionManager
 
 # =============================================================================
 # Helpers
@@ -228,6 +228,14 @@ def _make_mock_handler():
     return handler
 
 
+def _store_data(handler, key: str, data: bytes) -> bool:
+    """Helper: alloc → handle.buf → write → store(handle)."""
+    handle = handler.alloc(size=len(data))
+    buf = handle.buf
+    buf[: len(data)] = data
+    return handler.store(key=key, handle=handle)
+
+
 class TestConcurrentStore:
     """Concurrent store operations — data integrity."""
 
@@ -237,7 +245,7 @@ class TestConcurrentStore:
         num_threads = 8  # 8 pages available
 
         def store_one(idx):
-            return handler.store(key=idx, info=MemoryInfo(view=memoryview(b"data")))
+            return _store_data(handler, key=str(idx), data=b"data")
 
         results = _run_threads(store_one, [() for _ in range(num_threads)])
 
@@ -258,9 +266,7 @@ class TestConcurrentStore:
         num_threads = 4
 
         def store_one(idx):
-            return handler.store(
-                key="42", info=MemoryInfo(view=memoryview(f"v{idx}".encode()))
-            )
+            return _store_data(handler, key="42", data=f"v{idx}".encode())
 
         results = _run_threads(store_one, [() for _ in range(num_threads)])
 
@@ -281,7 +287,7 @@ class TestConcurrentRetrieve:
         handler = _make_mock_handler()
 
         # Store some data first
-        handler.store(key="1", info=MemoryInfo(view=memoryview(b"test")))
+        _store_data(handler, key="1", data=b"test")
 
         num_threads = 8
 
@@ -324,7 +330,7 @@ class TestStoreAndRetrieveConcurrent:
         handler = _make_mock_handler()
 
         # Store initial data
-        handler.store(key="1", info=MemoryInfo(view=memoryview(b"init")))
+        _store_data(handler, key="1", data=b"init")
 
         store_started = threading.Event()
         store_proceed = threading.Event()
@@ -342,7 +348,7 @@ class TestStoreAndRetrieveConcurrent:
         retrieve_result = [None]
 
         def do_store():
-            handler.store(key="2", info=MemoryInfo(view=memoryview(b"slow")))
+            _store_data(handler, key="2", data=b"slow")
 
         def do_retrieve():
             store_started.wait(timeout=5)
@@ -398,7 +404,7 @@ class TestCloseThreadSafety:
             # _closing should be True now, but close hasn't finished
             time.sleep(0.01)  # small delay to ensure _closing is set
             try:
-                handler.store(key="99", info=MemoryInfo(view=memoryview(b"rejected")))
+                _store_data(handler, key="99", data=b"rejected")
             except RuntimeError as e:
                 store_error[0] = e
 
@@ -439,7 +445,7 @@ class TestCloseThreadSafety:
         close_done = threading.Event()
 
         def do_store():
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
+            _store_data(handler, key="1", data=b"data")
 
         def do_close():
             store_started.wait(timeout=5)

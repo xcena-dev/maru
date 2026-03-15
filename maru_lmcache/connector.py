@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """
+.. deprecated::
+    MaruConnector is deprecated. Use MaruBackend (storage backend) instead.
+    See ``LMCache/lmcache/v1/storage_backend/maru_backend.py``.
+
 MaruConnector — bridges upstream LMCache's RemoteConnector interface to
 Maru's MaruHandler for CXL shared-memory KV cache storage.
 
 Key design points:
 - Key conversion: CacheEngineKey → string key (via to_string())
-- Zero-copy bridging: MemoryInfo (memoryview) ↔ MemoryObj (torch tensor)
+- Write path: alloc → handle.buf → copy data → store(key, handle)
 - Async wrapping: asyncio.to_thread() around MaruHandler's sync API
 - Batch operations: batch_retrieve / batch_store / batch_exists
 """
@@ -251,13 +255,6 @@ class MaruConnector(RemoteConnector):
             parent_allocator=None,
         )
 
-    @staticmethod
-    def _encode_memory_obj(memory_obj: MemoryObj):
-        """MemoryObj → MemoryInfo (zero-copy via byte_array)."""
-        from maru_handler.memory import MemoryInfo
-
-        return MemoryInfo(view=memory_obj.byte_array)
-
     # ------------------------------------------------------------------
     # Core operations (abstract method implementations)
     # ------------------------------------------------------------------
@@ -337,14 +334,21 @@ class MaruConnector(RemoteConnector):
         key_hash = cache_key_to_str(key)
 
         t0 = time.perf_counter()
-        info = self._encode_memory_obj(memory_obj)
-        data_size = len(info.view)
+        data_bytes = bytes(memory_obj.byte_array)
+        data_size = len(data_bytes)
+
+        def _store() -> bool:
+            handle = self._handle.alloc(data_size)
+            buf = handle.buf
+            buf[:data_size] = data_bytes
+            return self._handle.store(key_hash, handle)
+
         _perf_log((time.perf_counter() - t0) * 1000, f"put encode bytes={data_size}")
 
         try:
             t1 = time.perf_counter()
             success = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.store, key_hash, info),
+                asyncio.to_thread(_store),
                 timeout=self.maru_config.operation_timeout,
             )
             _perf_log(
@@ -523,17 +527,27 @@ class MaruConnector(RemoteConnector):
         key_hashes = [cache_key_to_str(k) for k in keys]
 
         t0 = time.perf_counter()
-        infos = [self._encode_memory_obj(obj) for obj in memory_objs]
-        total_bytes = sum(len(info.view) for info in infos)
+        payloads = [bytes(obj.byte_array) for obj in memory_objs]
+        total_bytes = sum(len(p) for p in payloads)
         _perf_log(
             (time.perf_counter() - t0) * 1000,
             f"batch_put encode n={len(keys)} bytes={total_bytes}",
         )
 
+        def _batch_store() -> list:
+            handles = []
+            for data_bytes, _key_hash in zip(payloads, key_hashes, strict=False):
+                size = len(data_bytes)
+                handle = self._handle.alloc(size)
+                buf = handle.buf
+                buf[:size] = data_bytes
+                handles.append(handle)
+            return self._handle.batch_store(key_hashes, handles)
+
         try:
             t1 = time.perf_counter()
             results = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.batch_store, key_hashes, infos),
+                asyncio.to_thread(_batch_store),
                 timeout=self.maru_config.operation_timeout,
             )
             stored = sum(results) if results else 0

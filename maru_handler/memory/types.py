@@ -106,8 +106,15 @@ class OwnedRegion:
 class AllocHandle:
     """Handle returned by MaruHandler.alloc() for zero-copy writes.
 
-    Caller writes directly to ``buf`` (an mmap memoryview), then passes
-    this handle to ``store(key, handle=handle)`` to register without copy.
+    Contains a writable memoryview into CXL mmap memory and allocation
+    metadata. The caller writes directly to ``buf``, then passes the
+    handle to ``store(key, handle)`` to register without copying.
+
+    Typical zero-copy flow::
+
+        handle = handler.alloc(size=len(data))
+        handle.buf[:len(data)] = data
+        handler.store(key=key, handle=handle)
     """
 
     buf: memoryview
@@ -148,3 +155,5 @@ class MemoryInfo:
     """
 
     view: memoryview
+    region_id: int = 0
+    page_index: int = 0

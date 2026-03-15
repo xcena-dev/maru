@@ -18,7 +18,7 @@ class TestMaruConnectorAdapter:
         adapter = MaruConnectorAdapter()
         assert adapter.schema == "maru://"
 
-    def test_can_parse_maru_url(self):
+    def test_can_parse_maru_path(self):
         adapter = MaruConnectorAdapter()
         assert adapter.can_parse("maru://localhost:5555")
         assert adapter.can_parse("maru://10.0.0.1:5555?pool_size=2G")
@@ -60,7 +60,7 @@ class TestPluginDiscovery:
         adapter_names = [a.__class__.__name__ for a in manager.adapters]
         assert "MaruConnectorAdapter" in adapter_names
 
-    def test_connector_manager_can_parse_maru_url(self, async_loop, lmcache_config):
+    def test_connector_manager_can_parse_maru_path(self, async_loop, lmcache_config):
         from lmcache.v1.storage_backend.connector import ConnectorManager
 
         manager = ConnectorManager(
