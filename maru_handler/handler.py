@@ -1024,6 +1024,15 @@ class MaruHandler:
                 )
                 continue
 
+            # Verify mount_path consistency with existing mapper
+            expected_mp = getattr(self._mapper, "_mount_path_config", None)
+            actual_mp = getattr(response, "mount_path", None)
+            if expected_mp != actual_mp:
+                logger.warning(
+                    "mount_path mismatch in expand: mapper=%s, response=%s",
+                    expected_mp, actual_mp,
+                )
+
             handle = response.handle
             try:
                 self._owned.add_region(handle)

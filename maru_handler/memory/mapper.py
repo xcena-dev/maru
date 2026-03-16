@@ -45,6 +45,7 @@ class DaxMapper:
             self._client = MarufsClient(mount_path)
         else:
             self._client = MaruShmClient()
+        self._mount_path_config = mount_path
         self._lock = threading.Lock()
         self._regions: dict[int, MappedRegion] = {}
 

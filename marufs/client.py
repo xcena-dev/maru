@@ -92,6 +92,12 @@ class MarufsClient:
 
         logger.debug("MarufsClient initialised with mount_path=%s", mount_path)
 
+    def __enter__(self) -> "MarufsClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     @staticmethod
     def _validate_mount_path(real_path: str) -> None:
         """Validate that the mount path is an actual marufs mount point.
@@ -669,6 +675,9 @@ class MarufsClient:
         """
         from maru_shm.types import MaruHandle
 
+        if pool_id != 0:
+            logger.debug("alloc: pool_id=%d ignored (no effect in marufs mode)", pool_id)
+
         with self._lock:
             region_id = self._next_region_id
             self._next_region_id += 1
@@ -727,6 +736,9 @@ class MarufsClient:
         Returns:
             mmap object for the region.
         """
+        if handle.region_id < 0:
+            raise ValueError(f"Invalid region_id: {handle.region_id}")
+
         with self._lock:
             # Return cached mmap if available
             cached = self._mmap_cache.get(handle.region_id)

@@ -28,10 +28,11 @@ def mount_dir(tmp_path):
 
 @pytest.fixture
 def client(mount_dir):
-    """Create a MarufsClient pointed at a tmpdir."""
+    """Create a MarufsClient pointed at a tmpdir (mount validation skipped)."""
     from marufs.client import MarufsClient
 
-    c = MarufsClient(mount_dir)
+    with patch.object(MarufsClient, "_validate_mount_path"):
+        c = MarufsClient(mount_dir)
     yield c
     c.close()
 
@@ -206,7 +207,8 @@ class TestAllocFree:
     @patch("marufs.client.MarufsClient.perm_set_default")
     def test_alloc_creates_file(self, mock_perm, client, mount_dir):
         handle = client.alloc(4096)
-        region_name = f"region_{handle.region_id}"
+        # Region name includes UUID suffix: region_{id}_{uuid8}
+        region_name = client._region_names[handle.region_id]
         path = os.path.join(mount_dir, region_name)
         assert os.path.exists(path)
         assert os.path.getsize(path) == 4096
@@ -225,7 +227,7 @@ class TestAllocFree:
     @patch("marufs.client.MarufsClient.perm_set_default")
     def test_free_does_not_delete_file(self, mock_perm, client, mount_dir):
         handle = client.alloc(4096)
-        region_name = f"region_{handle.region_id}"
+        region_name = client._region_names[handle.region_id]
         path = os.path.join(mount_dir, region_name)
         assert os.path.exists(path)
 
@@ -260,8 +262,8 @@ class TestMmapMunmap:
     @patch("marufs.client.MarufsClient.perm_set_default")
     def test_mmap_shared_region(self, mock_perm, client, mount_dir):
         """Simulate mapping a region created by another instance."""
-        # Create a file as if another instance made it
-        region_name = "region_42"
+        # Create a file as if another instance made it (with UUID suffix)
+        region_name = "region_42_deadbeef"
         path = os.path.join(mount_dir, region_name)
         with open(path, "wb") as f:
             f.write(b"shared_data" + b"\x00" * (4096 - 11))
@@ -347,7 +349,7 @@ class TestIoctlChown:
         self, mock_chown, mock_perm, client, mount_dir
     ):
         """Simulate mapping a region not yet opened (e.g. shared region)."""
-        region_name = "region_99"
+        region_name = "region_99_abcd1234"
         path = os.path.join(mount_dir, region_name)
         with open(path, "wb") as f:
             f.write(b"\x00" * 4096)
@@ -360,7 +362,7 @@ class TestIoctlChown:
     @patch("marufs.client.MarufsClient.perm_set_default")
     @patch("marufs.client.MarufsClient.chown")
     def test_mmap_skips_chown_on_cached(self, mock_chown, mock_perm, client, mount_dir):
-        region_name = "region_88"
+        region_name = "region_88_abcd1234"
         path = os.path.join(mount_dir, region_name)
         with open(path, "wb") as f:
             f.write(b"\x00" * 4096)
@@ -376,7 +378,7 @@ class TestIoctlChown:
 
     def test_mmap_chown_failure_does_not_block(self, client, mount_dir):
         """chown failure (e.g. not on marufs) should not prevent mmap."""
-        region_name = "region_77"
+        region_name = "region_77_abcd1234"
         path = os.path.join(mount_dir, region_name)
         with open(path, "wb") as f:
             f.write(b"\x00" * 4096)
