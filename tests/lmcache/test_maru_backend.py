@@ -287,6 +287,102 @@ class TestMaruBackendContains:
         assert backend.contains(key) is False
 
 
+def _run_async(loop, coro):
+    """Submit a coroutine to a running event loop and wait for result."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=5)
+
+
+class TestMaruBackendAsyncLookup:
+    """Tests for batched_async_contains and batched_get_non_blocking.
+
+    These mirror the connector-era tests in test_connector.py::TestBatchOperations
+    that were lost during the MaruBackend transition.
+    """
+
+    def test_batched_async_contains_all_hit(self, backend, async_loop):
+        keys = [_make_cache_key(i) for i in range(3)]
+        backend._handler.exists.return_value = True
+
+        result = _run_async(
+            async_loop, backend.batched_async_contains("lookup-1", keys)
+        )
+        assert result == 3
+
+    def test_batched_async_contains_partial_prefix(self, backend, async_loop):
+        keys = [_make_cache_key(i) for i in range(3)]
+        backend._handler.exists.side_effect = [True, True, False]
+
+        result = _run_async(
+            async_loop, backend.batched_async_contains("lookup-2", keys)
+        )
+        assert result == 2
+
+    def test_batched_async_contains_first_miss(self, backend, async_loop):
+        keys = [_make_cache_key(i) for i in range(3)]
+        backend._handler.exists.return_value = False
+
+        result = _run_async(
+            async_loop, backend.batched_async_contains("lookup-3", keys)
+        )
+        assert result == 0
+
+    def test_batched_async_contains_empty_keys(self, backend, async_loop):
+        result = _run_async(async_loop, backend.batched_async_contains("lookup-4", []))
+        assert result == 0
+
+    def test_batched_get_non_blocking_all_hit(self, backend, adapter, async_loop):
+        keys = [_make_cache_key(i) for i in range(2)]
+
+        # Pre-store: allocate objects and mock retrieve to return MemoryInfo
+        objs = [_make_memory_obj(adapter) for _ in range(2)]
+        infos = []
+        for obj in objs:
+            rid, pid = CxlMemoryAdapter.decode_address(obj.metadata.address)
+            infos.append(
+                MemoryInfo(
+                    view=memoryview(bytearray(TEST_CHUNK_SIZE)),
+                    region_id=rid,
+                    page_index=pid,
+                )
+            )
+        backend._handler.retrieve.side_effect = infos
+
+        results = _run_async(
+            async_loop, backend.batched_get_non_blocking("lookup-5", keys)
+        )
+        assert len(results) == 2
+        for obj in results:
+            assert obj is not None
+
+    def test_batched_get_non_blocking_prefix_stop_on_miss(
+        self, backend, adapter, async_loop
+    ):
+        """Second key is a miss → only first returned (prefix semantics)."""
+        keys = [_make_cache_key(i) for i in range(3)]
+
+        obj = _make_memory_obj(adapter)
+        rid, pid = CxlMemoryAdapter.decode_address(obj.metadata.address)
+        info = MemoryInfo(
+            view=memoryview(bytearray(TEST_CHUNK_SIZE)),
+            region_id=rid,
+            page_index=pid,
+        )
+        # hit, miss, hit → should return only [hit]
+        backend._handler.retrieve.side_effect = [info, None, info]
+
+        results = _run_async(
+            async_loop, backend.batched_get_non_blocking("lookup-6", keys)
+        )
+        assert len(results) == 1
+
+    def test_batched_get_non_blocking_empty_keys(self, backend, async_loop):
+        results = _run_async(
+            async_loop, backend.batched_get_non_blocking("lookup-7", [])
+        )
+        assert results == []
+
+
 class TestMaruBackendRemove:
     def test_remove_existing_key(self, backend):
         key = _make_cache_key()
