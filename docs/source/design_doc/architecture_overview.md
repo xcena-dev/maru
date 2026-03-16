@@ -86,7 +86,7 @@ The system has three layers:
 | **Memory** | Physical region alloc/free, mmap | MaruShmClient → MaruResourceManager (DAX mode) |
 | | | MarufsClient → marufs kernel (marufs mode) |
 
-Both the server (AllocationManager) and clients (DaxMapper) use the same memory backend. The backend is selected by the server's `mount_path` configuration: when set, `MarufsClient` is used; otherwise, `MaruShmClient` communicates with `MaruResourceManager`. In marufs mode, MaruResourceManager is not used — the marufs kernel manages CXL memory directly. The choice is transparent to MaruHandler and all upper layers.
+Both the server (AllocationManager) and clients (DaxMapper) use the same memory backend. The backend is selected by the server's `mount_path` configuration: when set, `MarufsClient` is used; otherwise, `MaruShmClient` communicates with `MaruResourceManager`. In marufs mode, MaruResourceManager is not used — the marufs kernel manages CXL memory directly. The choice is transparent to MaruHandler and all upper layers. Both backends satisfy the `MemoryBackend` structural protocol (`maru_common.backend_protocol`), enabling static type checking of interface compatibility.
 
 ---
 

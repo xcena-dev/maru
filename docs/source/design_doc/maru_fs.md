@@ -45,12 +45,16 @@ graph LR
 
 | Concern | DAX Mode | marufs Mode |
 |---------|----------|-------------|
-| Region allocation | MaruShmClient → Resource Manager → `/dev/dax` | MarufsClient → `open(O_CREAT)` + `ftruncate(size)` |
+| Region allocation | MaruShmClient → Resource Manager → `/dev/dax` | MarufsClient → `open(O_CREAT \| O_EXCL)` + `ftruncate(size)` |
 | Region mapping | MaruShmClient.mmap() → Resource Manager | MarufsClient → `open(region_file)` + `mmap(fd)` |
 | Region deletion | MaruShmClient → Resource Manager | `close(fd)` + `unlink(path)` |
 | Access control | **None** (`/dev/dax` wide open) | **Kernel VFS** — per-region permission checks on `open`/`mmap` |
 | Server process | MaruServer + Resource Manager | MaruServer only (Resource Manager not needed) |
 | KV metadata | MaruServer KVManager | MaruServer KVManager — unchanged |
+
+### Mount Path Validation
+
+When `MarufsClient` is constructed with a `mount_path`, it validates the path by parsing `/proc/mounts` and checking that the filesystem type is `marufs`. This prevents misconfiguration (e.g., pointing to a tmpfs or ext4 directory) from silently succeeding and producing incorrect behavior at runtime.
 
 ### Mode Auto-Detection
 
@@ -120,7 +124,7 @@ sequenceDiagram
     RPC->>S: ZMQ request
     S->>AM: request_alloc(instance_id, size)
     AM->>XC: alloc(size)
-    XC->>K: open(O_CREAT | O_RDWR) + ftruncate(size)
+    XC->>K: open(O_CREAT | O_EXCL | O_RDWR) + ftruncate(size)
     Note over K,CXL: Allocate contiguous CXL memory
     XC->>K: perm_set_default(fd, PERM_ALL)
     AM-->>S: MaruHandle
@@ -277,7 +281,7 @@ graph TB
 
 | Operation | Usage |
 |-----------|-------|
-| `open(O_CREAT \| O_RDWR)` | Create region file (server-side allocation) |
+| `open(O_CREAT \| O_EXCL \| O_RDWR)` | Create region file (server-side allocation, atomic) |
 | `ftruncate(fd, size)` | Set region size |
 | `open(O_RDWR)` | Open existing region (client-side mapping) |
 | `mmap(fd, size, prot)` | Map region into process address space |
@@ -327,14 +331,16 @@ struct marufs_perm_req {                  // 16 bytes
 marufs presents CXL shared memory as a flat directory of region files:
 
 ```
-/mnt/marufs/                          ← mount point
-├── region_0                          ← owned region (instance A)
-├── region_1                          ← owned region (instance A, 2nd)
-├── region_2                          ← owned region (instance B)
+/mnt/marufs/                                    ← mount point
+├── region_0_a1b2c3d4                           ← owned region (instance A)
+├── region_1_e5f6a7b8                           ← owned region (instance A, 2nd)
+├── region_2_c9d0e1f2                           ← owned region (instance B)
 └── ...
 ```
 
-Each region file is a physically contiguous CXL memory allocation. A single region holds multiple KV cache entries, each identified by a byte offset within the region. Region files are created with `open(O_CREAT) + ftruncate(size)` and memory-mapped directly for zero-copy access.
+Region filenames use the format `region_{id}_{uuid8}`, where `{uuid8}` is an 8-character random suffix. This prevents collision when a server restarts and reuses region IDs while stale files from the previous session still exist on the mount. The `O_EXCL` flag on creation provides an additional safety net — if a name collision occurs despite the UUID, the `open` call fails atomically rather than silently overwriting.
+
+Each region file is a physically contiguous CXL memory allocation. A single region holds multiple KV cache entries, each identified by a byte offset within the region. Region files are created with `open(O_CREAT | O_EXCL) + ftruncate(size)` and memory-mapped directly for zero-copy access.
 
 ---
 
@@ -406,7 +412,7 @@ sequenceDiagram
     Note over C: RPC response receipt guarantees server flush is complete (ordering barrier)
 
     Note over C,CXL: Step 3 — Client opens region (Node B)
-    C->>K_B: open("/mnt/marufs/region_42")
+    C->>K_B: open("/mnt/marufs/region_42_a1b2c3d4")
     K_B->>K_B: d_revalidate() → 0 (cache invalidated)
     K_B->>CXL: marufs_lookup() — direct search from CXL
     K_B-->>C: fd
