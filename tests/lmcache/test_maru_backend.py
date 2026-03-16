@@ -15,10 +15,12 @@ pytest.importorskip(
 
 import torch
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
     TensorMemoryObj,
 )
+from lmcache.v1.pin_monitor import PinMonitor
 
 from maru_handler.memory import AllocHandle
 from maru_handler.memory.types import MappedRegion, MemoryInfo
@@ -108,6 +110,15 @@ def _make_memory_obj(adapter: CxlMemoryAdapter) -> TensorMemoryObj:
     obj = adapter.allocate(TEST_SHAPE, TEST_DTYPE)
     assert obj is not None
     return obj
+
+
+@pytest.fixture(autouse=True)
+def _init_pin_monitor():
+    """Initialize PinMonitor singleton required by TensorMemoryObj.pin()."""
+    PinMonitor._instance = None
+    PinMonitor.GetOrCreate(LMCacheEngineConfig.from_defaults())
+    yield
+    PinMonitor._instance = None
 
 
 @pytest.fixture
