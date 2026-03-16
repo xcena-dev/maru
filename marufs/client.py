@@ -109,9 +109,7 @@ class MarufsClient:
             ValueError: If the path is not a directory or not a marufs mount.
         """
         if not os.path.isdir(real_path):
-            raise ValueError(
-                f"mount_path {real_path!r} is not a directory"
-            )
+            raise ValueError(f"mount_path {real_path!r} is not a directory")
         try:
             with open("/proc/mounts") as f:
                 for line in f:
@@ -121,12 +119,12 @@ class MarufsClient:
                         if mount_point == real_path and parts[2] == "marufs":
                             return
         except OSError:
-            logger.warning("_validate_mount_path: cannot read /proc/mounts, "
-                           "skipping marufs mount verification")
+            logger.warning(
+                "_validate_mount_path: cannot read /proc/mounts, "
+                "skipping marufs mount verification"
+            )
             return
-        raise ValueError(
-            f"mount_path {real_path!r} is not a marufs mount point"
-        )
+        raise ValueError(f"mount_path {real_path!r} is not a marufs mount point")
 
     def _find_region_file(self, region_id: int) -> str:
         """Find the region filename by region_id prefix in the mount directory.
@@ -166,9 +164,7 @@ class MarufsClient:
             ValueError: If name contains invalid characters or path traversal.
         """
         if not _REGION_NAME_RE.match(name):
-            raise ValueError(
-                f"Invalid region name {name!r}: must match [A-Za-z0-9_-]+"
-            )
+            raise ValueError(f"Invalid region name {name!r}: must match [A-Za-z0-9_-]+")
 
     # ------------------------------------------------------------------
     # Region management
@@ -676,7 +672,9 @@ class MarufsClient:
         from maru_shm.types import MaruHandle
 
         if pool_id != 0:
-            logger.debug("alloc: pool_id=%d ignored (no effect in marufs mode)", pool_id)
+            logger.debug(
+                "alloc: pool_id=%d ignored (no effect in marufs mode)", pool_id
+            )
 
         with self._lock:
             region_id = self._next_region_id
@@ -777,7 +775,9 @@ class MarufsClient:
                         # ENOTTY = non-marufs FS (e.g., tmpfs in tests)
                         logger.debug(
                             "chown skipped for region %s (errno=%d: %s)",
-                            region_name, e.errno, e.strerror,
+                            region_name,
+                            e.errno,
+                            e.strerror,
                         )
 
             mm = self._mmap_region(fd, handle.length, prot)
@@ -822,8 +822,9 @@ class MarufsClient:
                 try:
                     mm.close()
                 except Exception:
-                    logger.warning("close: failed to close mmap for region %d",
-                                   region_id)
+                    logger.warning(
+                        "close: failed to close mmap for region %d", region_id
+                    )
             self._mmap_cache.clear()
 
             logger.debug("close: closing %d fds", len(self._fds))

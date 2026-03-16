@@ -292,9 +292,7 @@ class TestValidateMountPath:
         """_validate_mount_path is invoked during MarufsClient construction."""
         from marufs.client import MarufsClient
 
-        with patch.object(
-            MarufsClient, "_validate_mount_path"
-        ) as mock_validate:
+        with patch.object(MarufsClient, "_validate_mount_path") as mock_validate:
             MarufsClient(str(tmp_path))
 
         mock_validate.assert_called_once()

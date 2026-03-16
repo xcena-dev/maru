@@ -1030,7 +1030,8 @@ class MaruHandler:
             if expected_mp != actual_mp:
                 logger.warning(
                     "mount_path mismatch in expand: mapper=%s, response=%s",
-                    expected_mp, actual_mp,
+                    expected_mp,
+                    actual_mp,
                 )
 
             handle = response.handle
