@@ -37,7 +37,8 @@ KV cache contains user prompts and model response state. Sharing without authent
 | **Identity spoofing** — impersonating another instance | X.509 chain verification + kernel `(node_id, pid, birth_time)` dual verification |
 | **Privilege escalation** — read-only instance overwrites cache | Kernel enforces only `perm_grant`-ed permissions |
 | **Certificate compromise** — cert/key leaked externally | Expiration limits + revocation (CRL/OCSP) + kernel process verification |
-| **Man-in-the-middle** — eavesdropping/tampering auth traffic (Option A) | mTLS encrypted channel + mutual certificate verification |
+| **Man-in-the-middle** — eavesdropping/tampering auth traffic (Option A/C) | mTLS encrypted channel + mutual certificate verification |
+| **Server compromise** — attacker controls MaruServer (Option C) | Server can grant permissions but cannot bypass kernel enforcement on existing grants; blast radius limited to new grant decisions. mTLS prevents impersonation of server itself |
 | **Process impersonation** — privilege hijacking on the same node | Kernel `pid + birth_time` identification + automatic GC on termination |
 
 ### Out of Scope
@@ -53,9 +54,10 @@ KV cache contains user prompts and model response state. Sharing without authent
 ### Goals
 
 - Authentication and authorization for CXL region access between vLLM instances
-- Support two authentication models:
+- Support three authentication models:
   - **Option A (P2P)**: Direct mTLS between instances — owner decides permissions based on its own policy
   - **Option B (marufs-mediated)**: marufs acts as proxy authenticator + automatically grants permissions according to pre-defined policy
+  - **Option C (Server-mediated)**: MaruServer acts as central auth authority — authenticates instances, manages roles, and grants permissions on their behalf
 
 ### Integration with Current Architecture
 
@@ -97,25 +99,37 @@ graph TB
     B["Instance B<br/>cert + key"] -->|submit cert| M
 ```
 
+#### Option C: Server-mediated
+
+```mermaid
+graph TB
+    A["Instance A<br/>cert + key"] -->|mTLS handshake| S["MaruServer<br/>cert verification + role DB<br/>→ perm_grant on behalf"]
+    B["Instance B<br/>cert + key"] -->|mTLS handshake| S
+    S -->|perm_grant| K["marufs (kernel)"]
+```
+
 ### Trust Model
 
 | Layer | Role |
 |-------|------|
 | **Instance cert** | Identity included in SAN. Proves identity during authentication. Chain verification prevents forgery |
+| **MaruServer** | (Option C) Central auth authority — verifies certs, manages role-to-permission mapping, calls `perm_grant` on behalf of instances |
 | **marufs kernel** | Process identification via `(node_id, pid, birth_time)` + permission enforcement |
 
-Certificates prove the process's identity, and the kernel enforces access permissions.
+Certificates prove the process's identity. In Options A/B the owner or kernel grants permissions directly; in Option C the server acts as a trusted intermediary. In all cases, the kernel enforces access permissions.
 
 ### Authentication Model Comparison
 
-| | Option A: P2P | Option B: marufs-mediated |
-|---|---|---|
-| **Auth entity** | Each instance (owner) | marufs (filesystem) |
-| **Policy location** | Inside owner code | marufs config file (pre-defined) |
-| **Auth Server** | 1 per owner | Not required (marufs acts as proxy) |
-| **perm_grant caller** | Owner process | marufs (kernel) |
-| **Pros** | Owner has fine-grained control | Operationally simple, centralized policy management |
-| **Cons** | Each instance needs Auth Server implementation | Policy changes require marufs config update |
+| | Option A: P2P | Option B: marufs-mediated | Option C: Server-mediated |
+|---|---|---|---|
+| **Auth entity** | Each instance (owner) | marufs (filesystem) | MaruServer |
+| **Policy location** | Inside owner code | marufs config file (pre-defined) | Server role DB (runtime-mutable) |
+| **Auth Server** | 1 per owner | Not required (marufs acts as proxy) | MaruServer (already exists) |
+| **perm_grant caller** | Owner process | marufs (kernel) | MaruServer process |
+| **Cert verification** | Owner verifies peer cert | Kernel verifies cert | Server verifies cert on mTLS handshake |
+| **Role management** | N/A (owner decides) | Static policy file | Dynamic — RBAC via server API |
+| **Pros** | Owner has fine-grained control | Operationally simple, centralized policy management | Reuses existing RPC infra, dynamic role updates without restart, natural fit for Hybrid mode |
+| **Cons** | Each instance needs Auth Server implementation | Policy changes require marufs config update, kernel complexity | Server is SPOF for auth (not for data), requires mTLS on ZMQ |
 
 ---
 
@@ -225,3 +239,100 @@ sequenceDiagram
 - No Auth Server implementation required — automatic permission grant upon registration
 - Centralized policy management — cluster-wide consistency guaranteed
 - Even if the owner is offline, permissions can be granted to existing regions based on policy
+
+### Option C: Server-mediated
+
+MaruServer acts as the central authentication and authorization authority. Instances authenticate to the server via mTLS during the RPC handshake, and the server manages a role database that maps identities to permission sets. When a client requests access to a region, the server verifies the client's role and calls `perm_grant` on its behalf.
+
+This option reuses the existing MaruServer RPC infrastructure — no additional Auth Server or kernel-level cert handling is needed. Role assignments can be updated at runtime via a server management API, without restarting instances or redeploying config files.
+
+**Role Database:**
+
+```yaml
+# Server-side role configuration (loaded at startup, updatable via API)
+roles:
+  prefill:
+    description: "Prefill instance — owns regions, full access"
+    perms: [READ, WRITE, DELETE, ADMIN, IOCTL]
+  decode:
+    description: "Decode instance — read-only consumer"
+    perms: [READ]
+  admin:
+    description: "Cluster admin — full access + management"
+    perms: [READ, WRITE, DELETE, ADMIN, IOCTL]
+
+# Identity-to-role binding (cert SAN → role)
+bindings:
+  "CN=prefill-*.vllm.local": prefill
+  "CN=decode-*.vllm.local": decode
+  "CN=admin.vllm.local": admin
+```
+
+```mermaid
+sequenceDiagram
+    participant Deploy as Deployment
+    participant S as MaruServer
+    participant A as Instance A (prefill)
+    participant B as Instance B (decode)
+    participant K as marufs (kernel)
+
+    rect rgb(240, 240, 255)
+    Note over Deploy: At deployment time
+    Deploy->>A: Issue certificate (CN=prefill-0.vllm.local)
+    Deploy->>B: Issue certificate (CN=decode-0.vllm.local)
+    Deploy->>S: Issue server certificate + deploy role config
+    end
+
+    rect rgb(240, 255, 240)
+    Note over S: Server startup
+    S->>S: Load role DB + server cert
+    S->>S: Start mTLS-enabled RPC listener
+    end
+
+    rect rgb(255, 250, 230)
+    Note over A: Instance A connects
+    A->>S: mTLS handshake (mutual cert verification)
+    S->>S: Extract identity from cert SAN
+    S->>S: Resolve role: "prefill-0" → prefill
+    A->>S: request_alloc(instance_id, size)
+    S->>S: Create region + perm_set_default(least privilege)
+    S->>K: perm_grant(fd, A.node_id, A.pid, prefill_perms)
+    S-->>A: {handle, mount_path}
+    A->>K: open(region_file) + mmap()
+    end
+
+    rect rgb(255, 245, 230)
+    Note over B: Instance B connects
+    B->>S: mTLS handshake (mutual cert verification)
+    S->>S: Extract identity from cert SAN
+    S->>S: Resolve role: "decode-0" → decode
+    B->>S: lookup_kv(key)
+    S-->>B: {handle, region_id, offset}
+    S->>K: perm_grant(fd, B.node_id, B.pid, decode_perms)
+    S-->>B: ACCESS_GRANTED
+    B->>K: open(region_file) + mmap()
+    Note over K: Kernel enforces: B has READ only
+    end
+```
+
+**Advantages:**
+- Reuses existing MaruServer + ZMQ RPC infrastructure — minimal new components
+- Dynamic role management — update bindings without restart via management API
+- Natural fit for Hybrid mode — server already brokers metadata, extending to auth is incremental
+- Centralized audit trail — all auth decisions logged in one place
+- No kernel-level cert handling complexity (unlike Option B)
+
+**Ownership Model:**
+
+In Options A/B, `alloc()` calls `chown` to transfer POSIX ownership of the region file to the client process. In Option C, the server must **not** `chown` — it retains ownership of all regions so that it keeps `PERM_ADMIN` and can call `perm_grant` / `perm_revoke` at any time. Clients access regions exclusively through explicit grants. This is a key design difference: the server is the sole owner, clients are grantees.
+
+This also means the server must keep region file descriptors open for the lifetime of the region (needed for `perm_grant` ioctl). The fd is already held in `MarufsClient._fd_cache` during the region's lifetime, so no additional mechanism is required.
+
+**Disadvantages:**
+- MaruServer becomes SPOF for authentication (data path remains independent — existing mmaps continue to work even if server goes down)
+- Requires mTLS support on the ZMQ transport layer (CurveZMQ or ZMQ over TLS)
+- Server must not `chown` regions — changes the ownership model from "transfer to client" to "server retains, client is grantee"
+
+**Comparison with Options A/B:**
+
+Option C is best suited for deployments that already use MaruServer in Hybrid mode and want centralized auth without kernel-level complexity (Option B) or per-instance Auth Server overhead (Option A). The tradeoff is that auth availability depends on the server process — but since the server is already required for metadata operations in Hybrid mode, this does not introduce a new dependency.
