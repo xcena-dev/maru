@@ -536,13 +536,18 @@ class MaruConnector(RemoteConnector):
 
         def _batch_store() -> list:
             handles = []
-            for data_bytes, _key_hash in zip(payloads, key_hashes, strict=False):
-                size = len(data_bytes)
-                handle = self._handle.alloc(size)
-                buf = handle.buf
-                buf[:size] = data_bytes
-                handles.append(handle)
-            return self._handle.batch_store(key_hashes, handles)
+            try:
+                for data_bytes, _key_hash in zip(payloads, key_hashes, strict=True):
+                    size = len(data_bytes)
+                    handle = self._handle.alloc(size)
+                    buf = handle.buf
+                    buf[:size] = data_bytes
+                    handles.append(handle)
+                return self._handle.batch_store(key_hashes, handles)
+            except Exception:
+                for h in handles:
+                    self._handle.free(h)
+                raise
 
         try:
             t1 = time.perf_counter()

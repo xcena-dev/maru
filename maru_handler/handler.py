@@ -15,7 +15,7 @@ Example:
         handle.buf[:len(data)] = data
         handler.store(key="12345", handle=handle)
 
-        result = handler.retrieve(key=12345)  # returns MemoryInfo
+        result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
 import logging

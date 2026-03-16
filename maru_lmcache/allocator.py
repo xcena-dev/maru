@@ -250,12 +250,27 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         memory_obj: MemoryObj,
         allocator_type: str | None = None,
     ) -> None:
-        """No-op. CXL pages are managed by MaruBackend.remove(), not here.
+        """Free the underlying handler page allocation.
 
-        Pool objects persist across store/retrieve cycles. Actual page
-        deallocation happens when MaruBackend.remove() is called.
+        Returns the page to the handler's allocator so it can be reused.
+        The pool MemoryObj itself is not destroyed — it persists and will
+        be returned by the next allocate() call for the same page.
+
+        Called during batched_allocate() rollback and explicit free paths.
+        For the normal store lifecycle, pages are freed via
+        MaruBackend.remove() -> handler.delete().
         """
-        pass
+        rid, pid = self.decode_address(memory_obj.metadata.address)
+        handle = AllocHandle(
+            buf=memoryview(b""),
+            _region_id=rid,
+            _page_index=pid,
+            _size=0,
+        )
+        try:
+            self._handler.free(handle)
+        except Exception as e:
+            logger.debug("[Maru] free failed rid=%d pid=%d: %s", rid, pid, e)
 
     def batched_free(
         self,
@@ -263,8 +278,9 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         allocator_type: str | None = None,
         update_stats: bool = True,
     ) -> None:
-        """No-op. See free()."""
-        pass
+        """Free multiple handler page allocations. See free()."""
+        for obj in memory_objs:
+            self.free(obj, allocator_type)
 
     def close(self) -> None:
         """Clean up adapter state and unregister callback."""
@@ -379,7 +395,7 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         sliced_tensor = source.raw_data[: actual_size // dtype_size]
 
         shape_list = list(source.metadata.shape)
-        shape_list[2] = actual_size // single_token_size
+        shape_list[self._fmt.token_dim()] = actual_size // single_token_size
 
         metadata = MemoryObjMetadata(
             shape=torch.Size(shape_list),
