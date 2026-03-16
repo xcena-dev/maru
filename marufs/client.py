@@ -17,6 +17,7 @@ import mmap as mmap_module
 import os
 import re
 import threading
+import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -75,12 +76,13 @@ class MarufsClient:
         Args:
             mount_path: Path where marufs is mounted (e.g., ``"/mnt/marufs"``).
         """
-        self._mount_path = mount_path
+        self._mount_path = os.path.realpath(mount_path)
+        self._validate_mount_path(self._mount_path)
         self._fds: dict[str, int] = {}  # name → fd cache
         self._fd_modes: dict[str, bool] = {}  # name → readonly flag
         self._dir_fd: int | None = None  # directory fd for find_name
         self._node_id: int | None = None  # cached node_id from /proc/mounts
-        self._real_mount_path = os.path.realpath(self._mount_path)
+        self._real_mount_path = self._mount_path
         self._lock = threading.Lock()
 
         # MaruShmClient-compatible state (alloc/free/mmap/munmap)
@@ -89,6 +91,64 @@ class MarufsClient:
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id → mmap
 
         logger.debug("MarufsClient initialised with mount_path=%s", mount_path)
+
+    @staticmethod
+    def _validate_mount_path(real_path: str) -> None:
+        """Validate that the mount path is an actual marufs mount point.
+
+        Parses ``/proc/mounts`` to verify the filesystem type. This prevents
+        a rogue server from directing clients to arbitrary directories.
+
+        Raises:
+            ValueError: If the path is not a directory or not a marufs mount.
+        """
+        if not os.path.isdir(real_path):
+            raise ValueError(
+                f"mount_path {real_path!r} is not a directory"
+            )
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mount_point = os.path.realpath(parts[1])
+                        if mount_point == real_path and parts[2] == "marufs":
+                            return
+        except OSError:
+            logger.warning("_validate_mount_path: cannot read /proc/mounts, "
+                           "skipping marufs mount verification")
+            return
+        raise ValueError(
+            f"mount_path {real_path!r} is not a marufs mount point"
+        )
+
+    def _find_region_file(self, region_id: int) -> str:
+        """Find the region filename by region_id prefix in the mount directory.
+
+        Region files are named ``region_{id}_{uuid8}``. For shared regions
+        from other instances, the UUID suffix is unknown, so we search by
+        the ``region_{id}_`` prefix.
+
+        Args:
+            region_id: The region ID to search for.
+
+        Returns:
+            The matching region filename.
+
+        Raises:
+            FileNotFoundError: If no matching region file is found.
+        """
+        prefix = f"region_{region_id}_"
+        try:
+            for entry in os.listdir(self._mount_path):
+                if entry.startswith(prefix):
+                    return entry
+        except OSError:
+            pass
+        raise FileNotFoundError(
+            f"No region file found for region_id={region_id} "
+            f"(prefix={prefix!r}) in {self._mount_path}"
+        )
 
     def _validate_region_name(self, name: str) -> None:
         """Validate region name to prevent path traversal attacks.
@@ -100,11 +160,9 @@ class MarufsClient:
             ValueError: If name contains invalid characters or path traversal.
         """
         if not _REGION_NAME_RE.match(name):
-            raise ValueError(f"Invalid region name {name!r}: must match [A-Za-z0-9_-]+")
-        real_mount = self._real_mount_path
-        real_path = os.path.realpath(os.path.join(self._mount_path, name))
-        if not (real_path == real_mount or real_path.startswith(real_mount + os.sep)):
-            raise ValueError(f"path traversal detected for region name {name!r}")
+            raise ValueError(
+                f"Invalid region name {name!r}: must match [A-Za-z0-9_-]+"
+            )
 
     # ------------------------------------------------------------------
     # Region management
@@ -126,8 +184,12 @@ class MarufsClient:
         self._validate_region_name(name)
         path = os.path.join(self._mount_path, name)
         logger.debug("create_region: path=%s size=%d", path, size)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        os.ftruncate(fd, size)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, size)
+        except OSError:
+            os.close(fd)
+            raise
         self._fds[name] = fd
         self._fd_modes[name] = False  # created as RDWR
         return fd
@@ -610,8 +672,9 @@ class MarufsClient:
         with self._lock:
             region_id = self._next_region_id
             self._next_region_id += 1
+            region_name = f"region_{region_id}_{uuid.uuid4().hex[:8]}"
+            self._region_names[region_id] = region_name
 
-        region_name = f"region_{region_id}"
         fd = self._create_region(region_name, size)
         self.perm_set_default(fd, PERM_ALL)
 
@@ -621,9 +684,6 @@ class MarufsClient:
             length=size,
             auth_token=0,
         )
-
-        with self._lock:
-            self._region_names[region_id] = region_name
 
         logger.info(
             "alloc: created region %s (id=%d, size=%d)",
@@ -674,39 +734,44 @@ class MarufsClient:
                 return cached
 
             region_name = self._region_names.get(handle.region_id)
-
-        if region_name is None:
-            # Derive name from region_id (for shared regions from other instances)
-            region_name = f"region_{handle.region_id}"
-            with self._lock:
+            if region_name is None:
+                # Discover region file by prefix (for shared regions
+                # created by other instances with UUID suffixes)
+                region_name = self._find_region_file(handle.region_id)
                 self._region_names[handle.region_id] = region_name
 
-        # Open if not already open
-        first_open = self._get_fd(region_name) is None
-        if first_open:
-            readonly = not (prot & mmap_module.PROT_WRITE)
-            self._open_region(region_name, readonly=readonly)
+            # Open if not already open
+            first_open = self._get_fd(region_name) is None
+            if first_open:
+                readonly = not (prot & mmap_module.PROT_WRITE)
+                self._open_region(region_name, readonly=readonly)
 
-        fd = self._get_fd(region_name)
+            fd = self._get_fd(region_name)
 
-        # Transfer ownership on first open (requires ADMIN permission),
-        # then restrict default permissions to READ | WRITE only.
-        if first_open:
-            try:
-                self.chown(fd)
-                self.perm_set_default(fd, PERM_READ | PERM_WRITE)
-            except OSError:
-                logger.debug(
-                    "chown skipped for region %s (not on marufs or no ADMIN)",
-                    region_name,
-                )
+            # Transfer ownership on first open (requires ADMIN permission),
+            # then restrict default permissions to READ | WRITE only.
+            if first_open:
+                try:
+                    self.chown(fd)
+                    self.perm_set_default(fd, PERM_READ | PERM_WRITE)
+                except OSError as e:
+                    if e.errno == errno.EPERM:
+                        logger.warning(
+                            "chown failed for region %s: permission denied "
+                            "(EPERM). Region may retain overly broad permissions.",
+                            region_name,
+                        )
+                    else:
+                        # ENOTTY = non-marufs FS (e.g., tmpfs in tests)
+                        logger.debug(
+                            "chown skipped for region %s (errno=%d: %s)",
+                            region_name, e.errno, e.strerror,
+                        )
 
-        mm = self._mmap_region(fd, handle.length, prot)
-
-        with self._lock:
+            mm = self._mmap_region(fd, handle.length, prot)
             self._mmap_cache[handle.region_id] = mm
 
-        return mm
+            return mm
 
     def munmap(self, handle: "MaruHandle") -> None:
         """Unmap a previously mapped region (MaruShmClient compat).
@@ -737,19 +802,30 @@ class MarufsClient:
             os.close(fd)
 
     def close(self) -> None:
-        """Close all cached file descriptors."""
-        logger.debug("close: closing %d fds", len(self._fds))
-        for name in list(self._fds):
-            try:
-                os.close(self._fds[name])
-            except OSError:
-                logger.warning("close: failed to close fd for %s", name)
-        self._fds.clear()
-        self._fd_modes.clear()
+        """Close all cached mmap objects and file descriptors."""
+        with self._lock:
+            # Close mmap objects first (before closing their backing fds)
+            logger.debug("close: closing %d mmaps", len(self._mmap_cache))
+            for region_id, mm in self._mmap_cache.items():
+                try:
+                    mm.close()
+                except Exception:
+                    logger.warning("close: failed to close mmap for region %d",
+                                   region_id)
+            self._mmap_cache.clear()
 
-        if self._dir_fd is not None:
-            try:
-                os.close(self._dir_fd)
-            except OSError:
-                logger.warning("close: failed to close dir fd")
-            self._dir_fd = None
+            logger.debug("close: closing %d fds", len(self._fds))
+            for name in list(self._fds):
+                try:
+                    os.close(self._fds[name])
+                except OSError:
+                    logger.warning("close: failed to close fd for %s", name)
+            self._fds.clear()
+            self._fd_modes.clear()
+
+            if self._dir_fd is not None:
+                try:
+                    os.close(self._dir_fd)
+                except OSError:
+                    logger.warning("close: failed to close dir fd")
+                self._dir_fd = None
