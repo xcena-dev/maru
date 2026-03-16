@@ -40,6 +40,8 @@ KV cache contains user prompts and model response state. Sharing without authent
 | **Man-in-the-middle** — eavesdropping/tampering auth traffic (Option A/C) | mTLS encrypted channel + mutual certificate verification |
 | **Server compromise** — attacker controls MaruServer (Option C) | Server can grant permissions but cannot bypass kernel enforcement on existing grants; blast radius limited to new grant decisions. mTLS prevents impersonation of server itself |
 | **Process impersonation** — privilege hijacking on the same node | Kernel `pid + birth_time` identification + automatic GC on termination |
+| **Replay attack** — replaying captured auth handshake to obtain grant | mTLS nonce/session prevents replay (Option A/C). Option B ioctl path needs kernel-level nonce or timestamp validation |
+| **Denial of Service** — flooding auth requests to exhaust server/kernel resources | Option C: server-side rate limiting + connection throttle. Option B: kernel resource limits on ioctl calls per process |
 
 ### Out of Scope
 
