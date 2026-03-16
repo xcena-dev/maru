@@ -7,18 +7,17 @@ These tests verify that when mount_path is provided, the marufs backend
 """
 
 import mmap
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from conftest import _make_handle
 
-from maru_common import ANY_POOL_ID, MessageType
+from maru_common import ANY_POOL_ID
 from maru_handler.memory import DaxMapper
 from maru_server.allocation_manager import AllocationManager
 from maru_server.rpc_handler_mixin import RpcHandlerMixin
 from maru_server.server import MaruServer
 from maru_shm import MaruHandle
-
 
 # ============================================================================
 # MockMarufsClient — replaces real MarufsClient in marufs mode tests
@@ -316,6 +315,6 @@ class TestValidateMountPath:
 
     def test_server_allocation_passes_mount_path(self):
         """AllocationManager(mount_path=...) passes it to MarufsClient."""
-        with patch("marufs.MarufsClient", MockMarufsClient) as mock_cls:
+        with patch("marufs.MarufsClient", MockMarufsClient):
             mgr = AllocationManager(mount_path="/mnt/marufs")
         assert mgr._client.mount_path == "/mnt/marufs"
