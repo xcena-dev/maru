@@ -9,7 +9,7 @@ from lmcache.v1.memory_management import MemoryFormat
 
 from maru_handler.memory import AllocHandle
 from maru_handler.memory.types import MappedRegion
-from maru_lmcache.allocator import CxlMemoryAdapter
+from maru_lmcache.adapter import CxlMemoryAdapter
 
 # =========================================================================
 # Fixtures
