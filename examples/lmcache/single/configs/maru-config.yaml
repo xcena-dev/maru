@@ -7,5 +7,4 @@ maru_path: "tcp://localhost:${MARU_SERVER_PORT}"
 maru_pool_size: 4G
 
 extra_config:
-  save_chunk_meta: False
   lookup_backoff_time: 0.001
