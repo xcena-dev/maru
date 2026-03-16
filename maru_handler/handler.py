@@ -20,6 +20,7 @@ Example:
 
 import logging
 import threading
+from collections.abc import Callable
 
 from maru_common import MaruConfig
 from maru_shm import MaruHandle
@@ -98,6 +99,9 @@ class MaruHandler:
         self._key_to_location: dict[str, tuple[int, int]] = {}
         self._connected = False
 
+        # Region-added callback (set by CxlMemoryAdapter)
+        self._on_region_added: Callable[[int, int], None] | None = None
+
         logger.debug("Created MaruHandler with config: %s", self._config)
 
     # =========================================================================
@@ -106,8 +110,80 @@ class MaruHandler:
 
     @property
     def mapper(self) -> DaxMapper:
-        """Public accessor for DaxMapper (used by CxlMemoryAllocator)."""
+        """Deprecated: Use get_buffer_view() instead."""
         return self._mapper
+
+    def get_buffer_view(
+        self, region_id: int, offset: int, size: int
+    ) -> memoryview | None:
+        """Get a memoryview slice from a mapped region.
+
+        Args:
+            region_id: The region ID (owned or shared).
+            offset: Byte offset within the region.
+            size: Number of bytes to view.
+
+        Returns:
+            Writable memoryview, or None if region not mapped.
+        """
+        return self._mapper.get_buffer_view(region_id, offset, size)
+
+    def get_region_page_count(self, region_id: int) -> int | None:
+        """Get page count for a region (owned or shared).
+
+        Args:
+            region_id: The region ID.
+
+        Returns:
+            Number of pages, or None if region not found.
+        """
+        if self._owned is not None:
+            region = self._owned.get_owned_region(region_id)
+            if region is not None:
+                return region.allocator.page_count
+        mapped = self._mapper.get_region(region_id)
+        if mapped is None:
+            return None
+        return mapped.size // self._config.chunk_size_bytes
+
+    def get_owned_region_ids(self) -> list[int]:
+        """Get list of currently owned region IDs.
+
+        Returns:
+            List of region IDs. Empty if not connected.
+        """
+        if self._owned is None:
+            return []
+        return self._owned.get_region_ids()
+
+    def get_chunk_size(self) -> int:
+        """Get the configured chunk size in bytes.
+
+        Returns:
+            Chunk size in bytes.
+        """
+        return self._config.chunk_size_bytes
+
+    def set_on_region_added(self, callback: Callable[[int, int], None] | None) -> None:
+        """Register callback invoked with (region_id, page_count) after region added.
+
+        On registration, replays callback for all existing owned regions
+        so the caller doesn't need separate init-time logic.
+
+        Args:
+            callback: Called with (region_id, page_count), or None to unregister.
+        """
+        self._on_region_added = callback
+        if callback is not None and self._owned is not None:
+            for rid in self._owned.get_region_ids():
+                region = self._owned.get_owned_region(rid)
+                if region is not None:
+                    logger.debug(
+                        "on_region_added replay: region=%d pages=%d",
+                        rid,
+                        region.allocator.page_count,
+                    )
+                    callback(rid, region.allocator.page_count)
 
     # =========================================================================
     # Connection Management
@@ -770,7 +846,7 @@ class MaruHandler:
 
     @property
     def owned_region_manager(self) -> OwnedRegionManager | None:
-        """Get the owned region manager."""
+        """Deprecated: Use get_owned_region_ids(), get_region_page_count() instead."""
         return self._owned
 
     @property
@@ -811,8 +887,17 @@ class MaruHandler:
 
         handle = response.handle
         try:
-            self._owned.add_region(handle)
+            region = self._owned.add_region(handle)
             logger.info("Expanded: new store region %d", handle.region_id)
+            # Callback fires under _write_lock — guarantees pool exists
+            # before alloc() returns. Acceptable since expansion is rare.
+            if self._on_region_added is not None:
+                logger.debug(
+                    "on_region_added fire: region=%d pages=%d",
+                    handle.region_id,
+                    region.allocator.page_count,
+                )
+                self._on_region_added(handle.region_id, region.allocator.page_count)
             return True
         except Exception:
             logger.error("Failed to init expanded region", exc_info=True)

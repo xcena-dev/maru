@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""CxlMemoryAllocator — Pool-based LMCache MemoryAllocatorInterface over MaruHandler.
+"""CxlMemoryAdapter — LMCache MemoryAllocatorInterface adapter over MaruHandler.
 
-Pre-creates MemoryObj per page at region mapping time. Allocate/get return
-pooled objects by (region_id, page_index) lookup. Address encoding uses
-bit-packing: (region_id << 32) | page_index.
+Adapts Maru's page-based CXL memory to LMCache's MemoryObj interface.
+Pre-creates TensorMemoryObj per page via region-added callback from MaruHandler.
+Address encoding uses bit-packing: (region_id << 32) | page_index.
 """
 
 import threading
@@ -25,11 +25,16 @@ from maru_handler.memory import AllocHandle
 logger = init_logger(__name__)
 
 
-class CxlMemoryAllocator(MemoryAllocatorInterface):
-    """LMCache MemoryAllocatorInterface backed by Maru CXL shared memory.
+class CxlMemoryAdapter(MemoryAllocatorInterface):
+    """LMCache MemoryAllocatorInterface adapter backed by Maru CXL shared memory.
 
-    Pool-based design: MemoryObjs are pre-created per page when a region
-    is mapped. allocate/get return pooled objects by (region_id, page_index).
+    Adapter design: MaruHandler owns memory management (regions, pages).
+    This class translates between Maru's page allocation and LMCache's
+    MemoryObj interface by pre-creating TensorMemoryObj per page.
+
+    Pool building is driven entirely by MaruHandler's region-added callback:
+    - On registration: replays for existing regions (initial pool build)
+    - On expansion: fires for newly added regions
 
     Address encoding: (region_id << 32) | page_index — stateless O(1)
     bidirectional conversion, no cumulative offset table needed.
@@ -55,8 +60,8 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
         # Pre-created MemoryObj pool: region_id -> [MemoryObj per page]
         self._pool: dict[int, list[TensorMemoryObj]] = {}
 
-        # Build pool for initially owned regions
-        self._build_owned_pools()
+        # Register callback — replays for existing regions, fires on expansion
+        self._handler.set_on_region_added(self._on_region_added)
 
     # =========================================================================
     # Address Encoding
@@ -76,39 +81,39 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
     # Pool Management
     # =========================================================================
 
-    def _build_owned_pools(self) -> None:
-        """Build pool for all currently owned regions."""
-        orm = self._handler.owned_region_manager
-        if orm is None:
-            return
-        for rid in list(orm.get_region_ids()):
-            region = orm.get_owned_region(rid)
-            if region is not None:
-                self._build_region_pool(rid, region.allocator.page_count)
+    def _on_region_added(self, region_id: int, page_count: int) -> None:
+        """Callback from MaruHandler when a region is added.
+
+        Builds the MemoryObj pool for the region. Called both during
+        initial registration (replay) and on region expansion.
+
+        Args:
+            region_id: The region ID.
+            page_count: Number of pages in the region.
+        """
+        logger.debug("[Maru] on_region_added region=%d pages=%d", region_id, page_count)
+        self._build_region_pool(region_id, page_count)
 
     def _build_region_pool(self, region_id: int, page_count: int) -> None:
         """Pre-create MemoryObjs for all pages in a region.
-
-        Called when a region is mapped (owned or shared).
 
         Args:
             region_id: The region ID.
             page_count: Number of pages in the region.
         """
         chunk_size = self._chunk_size
-        mapper = self._handler.mapper
         objs: list[TensorMemoryObj] = []
 
         for pid in range(page_count):
             offset = pid * chunk_size
-            buf = mapper.get_buffer_view(region_id, offset, chunk_size)
+            buf = self._handler.get_buffer_view(region_id, offset, chunk_size)
             if buf is None:
                 logger.error(
-                    "[Maru] buffer view failed region=%d page=%d",
+                    "[Maru] buffer view failed region=%d page=%d, aborting pool",
                     region_id,
                     pid,
                 )
-                continue
+                return
 
             flat_dtype = self._dtypes[0]
             tensor = torch.frombuffer(buf, dtype=flat_dtype)
@@ -143,12 +148,15 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
             if region_id in self._pool:
                 return True
 
-        # Shared region: compute page_count from mapped region size
-        mapped = self._handler.mapper.get_region(region_id)
-        if mapped is None:
+        page_count = self._handler.get_region_page_count(region_id)
+        if page_count is None:
             return False
 
-        page_count = mapped.size // self._chunk_size
+        # Double-check: another thread may have built it concurrently
+        with self._lock:
+            if region_id in self._pool:
+                return True
+
         self._build_region_pool(region_id, page_count)
         return region_id in self._pool
 
@@ -195,17 +203,8 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
 
         rid, pid = handle.region_id, handle.page_index
 
-        # Ensure pool exists (may need rebuild after region expansion)
         with self._lock:
             region_pool = self._pool.get(rid)
-
-        if region_pool is None:
-            orm = self._handler.owned_region_manager
-            region = orm.get_owned_region(rid) if orm else None
-            if region is not None:
-                self._build_region_pool(rid, region.allocator.page_count)
-            with self._lock:
-                region_pool = self._pool.get(rid)
 
         if region_pool is None or pid >= len(region_pool):
             logger.error("[Maru] pool miss region=%d page=%d", rid, pid)
@@ -268,7 +267,8 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
         pass
 
     def close(self) -> None:
-        """Clean up allocator state."""
+        """Clean up adapter state and unregister callback."""
+        self._handler.set_on_region_added(None)
         with self._lock:
             self._pool.clear()
 
@@ -284,7 +284,7 @@ class CxlMemoryAllocator(MemoryAllocatorInterface):
         already in CXL memory.
 
         Args:
-            memory_obj: MemoryObj with address set by this allocator.
+            memory_obj: MemoryObj with address set by this adapter.
 
         Returns:
             AllocHandle for MaruHandler.store().
