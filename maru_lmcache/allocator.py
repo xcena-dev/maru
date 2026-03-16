@@ -213,6 +213,14 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
 
         obj = region_pool[pid]
         logger.debug("[Maru] allocate rid=%d pid=%d size=%d", rid, pid, size)
+
+        # Partial chunk: return a view with adjusted shape to match actual
+        # token count, preventing CUDA kernel OOB on slot_mapping.
+        token_dim = self._fmt.token_dim()
+        if size < self._chunk_size and token_dim < len(self._shapes[0]):
+            single_token_size = self._chunk_size // self._shapes[0][token_dim]
+            return self._create_partial_view(obj, size, single_token_size)
+
         return obj
 
     def batched_allocate(
