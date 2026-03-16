@@ -4,10 +4,6 @@ Maru LMCache integration — memory adapter and storage backend support.
 
 Usage:
     from maru_lmcache import CxlMemoryAdapter
-
-Deprecated modules (use MaruBackend storage backend instead):
-    - maru_lmcache.connector (MaruConnector)
-    - maru_lmcache.adapter (MaruConnectorAdapter)
 """
 
 __all__ = ["CxlMemoryAdapter"]
