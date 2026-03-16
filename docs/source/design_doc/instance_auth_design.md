@@ -49,7 +49,69 @@ KV cache contains user prompts and model response state. Sharing without authent
 
 ---
 
-## 2. Overview
+## 2. Decision Points
+
+The following decisions must be resolved before selecting an authentication model. Each decision constrains which options are feasible.
+
+### DP-1. Permission Authority — who grants access?
+
+| | Owner-controlled | Centrally-controlled |
+|---|---|---|
+| **Who calls `perm_grant`** | Region owner process | MaruServer (Option C) or marufs kernel (Option B) |
+| **Policy location** | Inside each owner instance | Central config or role DB |
+| **Region ownership** | Transferred to client via `chown` | Retained by server (no `chown`) |
+| **Implication** | Each owner must implement auth logic | Single point of policy enforcement |
+| **Options** | A | B, C |
+
+This is the primary fork — all other decisions follow from it.
+
+### DP-2. Cert Verification Plane — where is X.509 verified?
+
+| | User-space | Kernel-space |
+|---|---|---|
+| **Implementation** | Standard TLS libraries (OpenSSL, rustls) | Kernel X.509 subsystem or custom verification in `marufs.ko` |
+| **Complexity** | Low — well-understood, mature libraries | High — kernel crypto API, limited debugging, CRL/OCSP harder |
+| **Cert rotation** | Process restart or hot-reload | Kernel module reload or ioctl-based update |
+| **Options** | A, C | B |
+
+Kernel-space cert verification (Option B) has significantly higher implementation complexity. If the team does not want to maintain kernel-level crypto, Option B is ruled out.
+
+### DP-3. Permission Lifecycle — grant-only or grant + revoke?
+
+| | Grant-only | Grant + Revoke |
+|---|---|---|
+| **Behavior** | Once granted, permission persists until region is freed | Authority can revoke access at any time |
+| **Stale permissions** | Possible — scaled-down instances retain access | Cleaned up on revoke |
+| **Complexity** | Simple — no state tracking of active grants | Requires tracking grantees and open fds for `perm_revoke` |
+| **Use case** | Single-tenant, static clusters | Multi-tenant, dynamic scaling (pod autoscale) |
+| **Options** | A, B, C (all support grant) | C (server retains fds, natural revoke point) |
+
+If revocation is required, Option C is the most natural fit — the server already retains region fds and can issue `perm_revoke` when instances disconnect or roles change.
+
+### DP-4. Auth Failure Mode — fail-closed or fail-open?
+
+| | Fail-closed | Fail-open |
+|---|---|---|
+| **When auth authority is down** | New grants blocked, new clients cannot access regions | Cached policy allows grants to continue |
+| **Existing mmaps** | Unaffected (kernel enforces, no runtime auth check) | Unaffected |
+| **Security posture** | Stronger — no unauthorized access possible | Weaker — stale cache could grant outdated permissions |
+| **Availability impact** | New instances cannot start sharing until auth recovers | New instances can start with cached roles |
+| **Options** | B (kernel always available), C (server-dependent) | C (with policy cache) |
+
+Option A is immune to this — each owner handles its own auth independently (no central SPOF). Option B runs in-kernel, so auth authority is always available as long as the node is up. Option C must choose between fail-closed (default) and fail-open (requires policy cache design).
+
+### Decision Matrix
+
+| Decision | Option A (P2P) | Option B (marufs) | Option C (Server) |
+|---|---|---|---|
+| DP-1 Authority | Owner | Kernel | Server |
+| DP-2 Cert plane | User-space | Kernel-space | User-space |
+| DP-3 Revoke | Not needed (owner controls) | Possible (kernel) | Natural fit (server holds fds) |
+| DP-4 Failure mode | No SPOF | Always available | Must decide (fail-closed recommended) |
+
+---
+
+## 3. Overview
 
 ### Goals
 
@@ -133,7 +195,7 @@ Certificates prove the process's identity. In Options A/B the owner or kernel gr
 
 ---
 
-## 3. Authentication Flows
+## 4. Authentication Flows
 
 ### Option A: P2P mTLS
 
