@@ -4,12 +4,15 @@
 import mmap
 from unittest.mock import MagicMock
 
-import torch
-from lmcache.v1.memory_management import MemoryFormat
+import pytest
 
-from maru_handler.memory import AllocHandle
-from maru_handler.memory.types import MappedRegion
-from maru_lmcache.adapter import CxlMemoryAdapter
+torch = pytest.importorskip("torch")
+lmcache_mm = pytest.importorskip("lmcache.v1.memory_management")
+MemoryFormat = lmcache_mm.MemoryFormat
+
+from maru_handler.memory import AllocHandle  # noqa: E402
+from maru_handler.memory.types import MappedRegion  # noqa: E402
+from maru_lmcache.adapter import CxlMemoryAdapter  # noqa: E402
 
 # =========================================================================
 # Fixtures
