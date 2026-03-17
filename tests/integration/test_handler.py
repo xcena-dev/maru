@@ -5,7 +5,6 @@
 import pytest
 
 from maru import MaruConfig, MaruHandler
-from maru_handler.memory import MemoryInfo
 
 pytestmark = pytest.mark.integration
 
@@ -80,8 +79,10 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             data = b"hello world"
-            info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key="12345", info=info) is True
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler.store(key="12345", handle=handle) is True
             assert handler.exists(key="12345") is True
 
             result = handler.retrieve(key="12345")
@@ -97,7 +98,11 @@ class TestMaruHandler:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            data = b"data1"
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            handler.store(key="1", handle=handle)
             assert handler.allocator.num_allocated == 1
 
             handler.delete(key="1")
@@ -116,22 +121,18 @@ class TestMaruHandler:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                assert (
-                    handler.store(
-                        key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100))
-                    )
-                    is True
-                )
+                data = b"x" * 100
+                handle = handler.alloc(size=len(data))
+                buf = handle.buf
+                buf[: len(data)] = data
+                assert handler.store(key=str(i), handle=handle) is True
 
             # Next store triggers auto-expansion to new region
             overflow_data = b"overflow"
-            assert (
-                handler.store(
-                    key=str(page_count + 1),
-                    info=MemoryInfo(view=memoryview(overflow_data)),
-                )
-                is True
-            )
+            handle = handler.alloc(size=len(overflow_data))
+            buf = handle.buf
+            buf[: len(overflow_data)] = overflow_data
+            assert handler.store(key=str(page_count + 1), handle=handle) is True
 
             # Verify 2 regions exist
             assert handler.owned_region_manager is not None
@@ -155,7 +156,11 @@ class TestMaruHandler:
             # Fill all pages
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"data")))
+                data = b"data"
+                handle = handler.alloc(size=len(data))
+                buf = handle.buf
+                buf[: len(data)] = data
+                handler.store(key=str(i), handle=handle)
 
             assert handler.allocator.num_free_pages == 0
 
@@ -165,12 +170,11 @@ class TestMaruHandler:
 
             # Store new key — should succeed using freed page
             new_key = str(page_count + 100)  # key not in range(page_count)
-            assert (
-                handler.store(
-                    key=new_key, info=MemoryInfo(view=memoryview(b"new data"))
-                )
-                is True
-            )
+            new_data = b"new data"
+            handle = handler.alloc(size=len(new_data))
+            buf = handle.buf
+            buf[: len(new_data)] = new_data
+            assert handler.store(key=new_key, handle=handle) is True
             assert handler.allocator.num_free_pages == 0
 
     def test_store_duplicate_key_is_skipped(self, server_thread, server_port):
@@ -183,11 +187,18 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             v1 = b"version1"
-            handler.store(key="1", info=MemoryInfo(view=memoryview(v1)))
+            handle = handler.alloc(size=len(v1))
+            buf = handle.buf
+            buf[: len(v1)] = v1
+            handler.store(key="1", handle=handle)
             assert handler.allocator.num_allocated == 1
 
-            # Second store with same key is skipped
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"version2")))
+            # Second store with same key is skipped (alloc freed internally)
+            v2 = b"version2"
+            handle2 = handler.alloc(size=len(v2))
+            buf2 = handle2.buf
+            buf2[: len(v2)] = v2
+            handler.store(key="1", handle=handle2)
             assert handler.allocator.num_allocated == 1  # still 1 page
 
             # Original value is preserved
@@ -196,7 +207,7 @@ class TestMaruHandler:
             assert bytes(result.view[: len(v1)]) == v1
 
     def test_store_exceeds_chunk_size(self, server_thread, server_port):
-        """Test that store fails when data exceeds chunk_size."""
+        """Test that alloc fails when data exceeds chunk_size."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -205,9 +216,8 @@ class TestMaruHandler:
 
         with MaruHandler(config) as handler:
             data = b"x" * 1025  # exceeds 1024
-            assert (
-                handler.store(key="1", info=MemoryInfo(view=memoryview(data))) is False
-            )
+            with pytest.raises(ValueError):
+                handler.alloc(size=len(data))
 
 
 class TestMaruHandlerMultiRegion:
@@ -225,14 +235,30 @@ class TestMaruHandlerMultiRegion:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             d1, d2, d3 = b"region1_data1", b"region1_data2", b"region2_data1"
-            handler.store(key="1", info=MemoryInfo(view=memoryview(d1)))
-            handler.store(key="2", info=MemoryInfo(view=memoryview(d2)))
+
+            handle1 = handler.alloc(size=len(d1))
+            buf = handle1.buf
+            buf[: len(d1)] = d1
+            handler.store(key="1", handle=handle1)
+
+            handle2 = handler.alloc(size=len(d2))
+            buf = handle2.buf
+            buf[: len(d2)] = d2
+            handler.store(key="2", handle=handle2)
+
             for i in range(3, page_count + 1):
-                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
+                filler = b"filler"
+                handle = handler.alloc(size=len(filler))
+                buf = handle.buf
+                buf[: len(filler)] = filler
+                handler.store(key=str(i), handle=handle)
 
             # Next store triggers auto-expand to region 2
             overflow_key = str(page_count + 1)
-            handler.store(key=overflow_key, info=MemoryInfo(view=memoryview(d3)))
+            handle3 = handler.alloc(size=len(d3))
+            buf = handle3.buf
+            buf[: len(d3)] = d3
+            handler.store(key=overflow_key, handle=handle3)
 
             assert handler.owned_region_manager.get_stats()["num_regions"] == 2
 
@@ -252,16 +278,27 @@ class TestMaruHandlerMultiRegion:
         with MaruHandler(config) as handler:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+
+            data1 = b"data1"
+            handle = handler.alloc(size=len(data1))
+            buf = handle.buf
+            buf[: len(data1)] = data1
+            handler.store(key="1", handle=handle)
+
             for i in range(2, page_count + 1):
-                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
+                filler = b"filler"
+                handle = handler.alloc(size=len(filler))
+                buf = handle.buf
+                buf[: len(filler)] = filler
+                handler.store(key=str(i), handle=handle)
 
             # Next store triggers expansion
             overflow_key = str(page_count + 1)
-            handler.store(
-                key=overflow_key,
-                info=MemoryInfo(view=memoryview(b"data2")),
-            )
+            data2 = b"data2"
+            handle = handler.alloc(size=len(data2))
+            buf = handle.buf
+            buf[: len(data2)] = data2
+            handler.store(key=overflow_key, handle=handle)
 
             stats = handler.owned_region_manager.get_stats()
             assert stats["num_regions"] == 2
@@ -282,9 +319,17 @@ class TestMaruHandlerMultiRegion:
 
         with MaruHandler(config) as handler:
             v1 = b"version1"
-            handler.store(key="1", info=MemoryInfo(view=memoryview(v1)))
+            handle = handler.alloc(size=len(v1))
+            buf = handle.buf
+            buf[: len(v1)] = v1
+            handler.store(key="1", handle=handle)
+
             # Second store with same key is skipped
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"version2")))
+            v2 = b"version2"
+            handle2 = handler.alloc(size=len(v2))
+            buf2 = handle2.buf
+            buf2[: len(v2)] = v2
+            handler.store(key="1", handle=handle2)
 
             # Original value is preserved
             result = handler.retrieve(key="1")
@@ -306,12 +351,18 @@ class TestMaruHandlerMultiRegion:
         # Fill first region and trigger expansion
         page_count = handler.allocator.page_count
         for i in range(page_count):
-            handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
+            filler = b"filler"
+            handle = handler.alloc(size=len(filler))
+            buf = handle.buf
+            buf[: len(filler)] = filler
+            handler.store(key=str(i), handle=handle)
+
         # Next store triggers expansion
-        handler.store(
-            key=str(page_count + 1),
-            info=MemoryInfo(view=memoryview(b"overflow")),
-        )
+        overflow = b"overflow"
+        handle = handler.alloc(size=len(overflow))
+        buf = handle.buf
+        buf[: len(overflow)] = overflow
+        handler.store(key=str(page_count + 1), handle=handle)
 
         assert handler.owned_region_manager.get_stats()["num_regions"] == 2
 
@@ -336,7 +387,11 @@ class TestMaruHandlerMultiRegion:
             assert handler.allocator is not None
             assert handler.allocator.page_count == handler.pool_handle.length // 1024
 
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"test")))
+            data = b"test"
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            handler.store(key="1", handle=handle)
             assert handler.allocator.num_allocated == 1
 
     def test_stats_with_multiple_regions(self, server_thread, server_port):
@@ -351,12 +406,18 @@ class TestMaruHandlerMultiRegion:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                handler.store(key=str(i), info=MemoryInfo(view=memoryview(b"filler")))
+                filler = b"filler"
+                handle = handler.alloc(size=len(filler))
+                buf = handle.buf
+                buf[: len(filler)] = filler
+                handler.store(key=str(i), handle=handle)
+
             # Next store triggers expansion
-            handler.store(
-                key=str(page_count + 1),
-                info=MemoryInfo(view=memoryview(b"overflow")),
-            )
+            overflow = b"overflow"
+            handle = handler.alloc(size=len(overflow))
+            buf = handle.buf
+            buf[: len(overflow)] = overflow
+            handler.store(key=str(page_count + 1), handle=handle)
 
             stats = handler.get_stats()
 
@@ -370,10 +431,10 @@ class TestMaruHandlerMultiRegion:
 
 
 class TestMaruHandlerStorePrefix:
-    """Test store with prefix parameter."""
+    """Test store with prefix written into buffer before calling store."""
 
     def test_store_with_prefix(self, server_thread, server_port):
-        """Store with prefix parameter, verify prefix+data concatenated."""
+        """Store with prefix+data written to buffer, verify prefix+data concatenated."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -383,9 +444,12 @@ class TestMaruHandlerStorePrefix:
         with MaruHandler(config) as handler:
             prefix = b"\x01\x02"
             data = b"hello"
-            info = MemoryInfo(view=memoryview(data))
-
-            assert handler.store(key="1", info=info, prefix=prefix) is True
+            total_size = len(prefix) + len(data)
+            handle = handler.alloc(size=total_size)
+            buf = handle.buf
+            buf[: len(prefix)] = prefix
+            buf[len(prefix) : total_size] = data
+            assert handler.store(key="1", handle=handle) is True
 
             # Retrieve and verify prefix+data layout
             result = handler.retrieve(key="1")
@@ -394,7 +458,7 @@ class TestMaruHandlerStorePrefix:
             assert bytes(result.view[: len(expected)]) == expected
 
     def test_store_with_empty_prefix(self, server_thread, server_port):
-        """Store with empty prefix, verify it works the same as prefix=None."""
+        """Store with data only (no prefix), verify it works correctly."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -403,10 +467,10 @@ class TestMaruHandlerStorePrefix:
 
         with MaruHandler(config) as handler:
             data = b"test data"
-            info = MemoryInfo(view=memoryview(data))
-
-            # Store with empty prefix
-            assert handler.store(key="1", info=info, prefix=b"") is True
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler.store(key="1", handle=handle) is True
 
             # Retrieve and verify data only
             result = handler.retrieve(key="1")
@@ -428,10 +492,15 @@ class TestMaruHandlerBatch:
         with MaruHandler(config) as handler:
             keys = ["1", "2", "3"]
             data = [b"data1", b"data2", b"data3"]
-            infos = [MemoryInfo(view=memoryview(d)) for d in data]
+            handles = []
+            for d in data:
+                handle = handler.alloc(size=len(d))
+                buf = handle.buf
+                buf[: len(d)] = d
+                handles.append(handle)
 
             # Batch store
-            results = handler.batch_store(keys=keys, infos=infos)
+            results = handler.batch_store(keys=keys, handles=handles)
             assert results == [True, True, True]
 
             # Batch retrieve
@@ -442,7 +511,7 @@ class TestMaruHandlerBatch:
                 assert bytes(result.view[: len(data[i])]) == data[i]
 
     def test_batch_store_with_prefixes(self, server_thread, server_port):
-        """Call batch_store with prefixes parameter, verify prefix+data layout."""
+        """Call batch_store with prefix+data written to buffers, verify layout."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -453,10 +522,17 @@ class TestMaruHandlerBatch:
             keys = ["1", "2"]
             data = [b"data1", b"data2"]
             prefixes = [b"\x01", b"\x02\x03"]
-            infos = [MemoryInfo(view=memoryview(d)) for d in data]
+            handles = []
+            for d, prefix in zip(data, prefixes, strict=False):
+                total_size = len(prefix) + len(d)
+                handle = handler.alloc(size=total_size)
+                buf = handle.buf
+                buf[: len(prefix)] = prefix
+                buf[len(prefix) : total_size] = d
+                handles.append(handle)
 
-            # Batch store with prefixes
-            results = handler.batch_store(keys=keys, infos=infos, prefixes=prefixes)
+            # Batch store
+            results = handler.batch_store(keys=keys, handles=handles)
             assert results == [True, True]
 
             # Verify prefix+data layout
@@ -467,7 +543,7 @@ class TestMaruHandlerBatch:
                 assert bytes(result.view[: len(expected)]) == expected
 
     def test_batch_store_mismatched_lengths(self, server_thread, server_port):
-        """Call batch_store with mismatched keys/infos lengths, should raise ValueError."""
+        """Call batch_store with mismatched keys/handles lengths, should raise ValueError."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -476,12 +552,16 @@ class TestMaruHandlerBatch:
 
         with MaruHandler(config) as handler:
             keys = ["1", "2"]
-            infos = [MemoryInfo(view=memoryview(b"data1"))]
+            d = b"data1"
+            handle = handler.alloc(size=len(d))
+            buf = handle.buf
+            buf[: len(d)] = d
+            handles = [handle]
 
             with pytest.raises(
-                ValueError, match="keys and infos must have the same length"
+                ValueError, match="keys and handles must have the same length"
             ):
-                handler.batch_store(keys=keys, infos=infos)
+                handler.batch_store(keys=keys, handles=handles)
 
     def test_batch_exists(self, server_thread, server_port):
         """Store some keys, call batch_exists, verify correct True/False results."""
@@ -493,8 +573,17 @@ class TestMaruHandlerBatch:
 
         with MaruHandler(config) as handler:
             # Store keys 1 and 3
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
-            handler.store(key="3", info=MemoryInfo(view=memoryview(b"data3")))
+            d1 = b"data1"
+            handle = handler.alloc(size=len(d1))
+            buf = handle.buf
+            buf[: len(d1)] = d1
+            handler.store(key="1", handle=handle)
+
+            d3 = b"data3"
+            handle = handler.alloc(size=len(d3))
+            buf = handle.buf
+            buf[: len(d3)] = d3
+            handler.store(key="3", handle=handle)
 
             # Check existence of keys 1, 2, 3
             results = handler.batch_exists(keys=["1", "2", "3"])
@@ -558,8 +647,10 @@ class TestMaruHandlerWithAsyncServer:
 
         with MaruHandler(config) as handler:
             data = b"hello async world"
-            info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key="42", info=info) is True
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler.store(key="42", handle=handle) is True
             assert handler.exists(key="42") is True
 
             result = handler.retrieve(key="42")
@@ -576,7 +667,11 @@ class TestMaruHandlerWithAsyncServer:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            data = b"data1"
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            handler.store(key="1", handle=handle)
             assert handler.exists(key="1") is True
 
             handler.delete(key="1")
@@ -597,23 +692,19 @@ class TestMaruHandlerWithAsyncServer:
             # Fill all pages in first region
             page_count = handler.allocator.page_count
             for i in range(page_count):
-                assert (
-                    handler.store(
-                        key=str(i), info=MemoryInfo(view=memoryview(b"x" * 100))
-                    )
-                    is True
-                )
+                d = b"x" * 100
+                handle = handler.alloc(size=len(d))
+                buf = handle.buf
+                buf[: len(d)] = d
+                assert handler.store(key=str(i), handle=handle) is True
 
             # Trigger expansion
             overflow_data = b"overflow"
             overflow_key = str(page_count + 1)
-            assert (
-                handler.store(
-                    key=overflow_key,
-                    info=MemoryInfo(view=memoryview(overflow_data)),
-                )
-                is True
-            )
+            handle = handler.alloc(size=len(overflow_data))
+            buf = handle.buf
+            buf[: len(overflow_data)] = overflow_data
+            assert handler.store(key=overflow_key, handle=handle) is True
 
             # Verify expansion happened
             stats = handler.owned_region_manager.get_stats()
@@ -638,9 +729,14 @@ class TestMaruHandlerWithAsyncServer:
         with MaruHandler(config) as handler:
             keys = ["10", "20", "30"]
             data = [b"batch1", b"batch2", b"batch3"]
-            infos = [MemoryInfo(view=memoryview(d)) for d in data]
+            handles = []
+            for d in data:
+                handle = handler.alloc(size=len(d))
+                buf = handle.buf
+                buf[: len(d)] = d
+                handles.append(handle)
 
-            results = handler.batch_store(keys=keys, infos=infos)
+            results = handler.batch_store(keys=keys, handles=handles)
             assert results == [True, True, True]
 
             retrieved = handler.batch_retrieve(keys=keys)
@@ -693,8 +789,10 @@ class TestMaruHandlerSyncRpc:
 
         with MaruHandler(config) as handler:
             data = b"sync rpc data"
-            info = MemoryInfo(view=memoryview(data))
-            assert handler.store(key="100", info=info) is True
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler.store(key="100", handle=handle) is True
             assert handler.exists(key="100") is True
 
             result = handler.retrieve(key="100")
@@ -711,7 +809,11 @@ class TestMaruHandlerSyncRpc:
         )
 
         with MaruHandler(config) as handler:
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data1")))
+            data = b"data1"
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            handler.store(key="1", handle=handle)
             assert handler.exists(key="1") is True
 
             handler.delete(key="1")
@@ -729,9 +831,14 @@ class TestMaruHandlerSyncRpc:
         with MaruHandler(config) as handler:
             keys = ["50", "60", "70"]
             data = [b"sync1", b"sync2", b"sync3"]
-            infos = [MemoryInfo(view=memoryview(d)) for d in data]
+            handles = []
+            for d in data:
+                handle = handler.alloc(size=len(d))
+                buf = handle.buf
+                buf[: len(d)] = d
+                handles.append(handle)
 
-            results = handler.batch_store(keys=keys, infos=infos)
+            results = handler.batch_store(keys=keys, handles=handles)
             assert results == [True, True, True]
 
             retrieved = handler.batch_retrieve(keys=keys)
@@ -776,8 +883,10 @@ class TestCrossHandlerSharing:
         with MaruHandler(config) as handler_a, MaruHandler(config) as handler_b:
             # Handler A stores data
             data = b"shared metadata"
-            info = MemoryInfo(view=memoryview(data))
-            assert handler_a.store(key="999", info=info) is True
+            handle = handler_a.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler_a.store(key="999", handle=handle) is True
 
             # Handler B can see the key exists in KV registry
             assert handler_b.exists(key="999") is True
@@ -799,8 +908,17 @@ class TestCrossHandlerSharing:
         # Both handlers alive concurrently
         with MaruHandler(config) as handler_a, MaruHandler(config) as handler_b:
             # Handler A stores keys 2000 and 2002
-            handler_a.store(key="2000", info=MemoryInfo(view=memoryview(b"data2000")))
-            handler_a.store(key="2002", info=MemoryInfo(view=memoryview(b"data2002")))
+            d1 = b"data2000"
+            handle = handler_a.alloc(size=len(d1))
+            buf = handle.buf
+            buf[: len(d1)] = d1
+            handler_a.store(key="2000", handle=handle)
+
+            d2 = b"data2002"
+            handle = handler_a.alloc(size=len(d2))
+            buf = handle.buf
+            buf[: len(d2)] = d2
+            handler_a.store(key="2002", handle=handle)
 
             # Handler B checks existence via shared KV registry
             results = handler_b.batch_exists(keys=["2000", "2001", "2002"])
@@ -819,14 +937,15 @@ class TestCrossHandlerSharing:
             data_a = b"from handler A"
             data_b = b"from handler B"
 
-            assert (
-                handler_a.store(key="100", info=MemoryInfo(view=memoryview(data_a)))
-                is True
-            )
-            assert (
-                handler_b.store(key="200", info=MemoryInfo(view=memoryview(data_b)))
-                is True
-            )
+            handle_a = handler_a.alloc(size=len(data_a))
+            buf = handle_a.buf
+            buf[: len(data_a)] = data_a
+            assert handler_a.store(key="100", handle=handle_a) is True
+
+            handle_b = handler_b.alloc(size=len(data_b))
+            buf = handle_b.buf
+            buf[: len(data_b)] = data_b
+            assert handler_b.store(key="200", handle=handle_b) is True
 
             # Both keys visible to both handlers
             assert handler_a.exists(key="100") is True
@@ -850,8 +969,10 @@ class TestCrossHandlerSharing:
         with MaruHandler(config) as handler_a, MaruHandler(config) as handler_b:
             # Handler A stores data
             data = b"test read-only mapping"
-            info = MemoryInfo(view=memoryview(data))
-            assert handler_a.store(key="3000", info=info) is True
+            handle = handler_a.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            assert handler_a.store(key="3000", handle=handle) is True
 
             # Handler B retrieves via read-only mapping of handler A's region
             result = handler_b.retrieve(key="3000")
@@ -909,7 +1030,11 @@ class TestMaruHandlerFailureScenarios:
 
         with MaruHandler(config) as handler:
             # Store a key
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
+            data = b"data"
+            handle = handler.alloc(size=len(data))
+            buf = handle.buf
+            buf[: len(data)] = data
+            handler.store(key="1", handle=handle)
 
             # First delete succeeds
             assert handler.delete(key="1") is True
@@ -928,9 +1053,16 @@ class TestMaruHandlerFailureScenarios:
         with MaruHandler(config) as handler:
             # Store only keys 1 and 3
             data1 = b"data1"
+            handle = handler.alloc(size=len(data1))
+            buf = handle.buf
+            buf[: len(data1)] = data1
+            handler.store(key="1", handle=handle)
+
             data3 = b"data3"
-            handler.store(key="1", info=MemoryInfo(view=memoryview(data1)))
-            handler.store(key="3", info=MemoryInfo(view=memoryview(data3)))
+            handle = handler.alloc(size=len(data3))
+            buf = handle.buf
+            buf[: len(data3)] = data3
+            handler.store(key="3", handle=handle)
 
             # Batch retrieve keys 1, 2, 3
             results = handler.batch_retrieve(keys=["1", "2", "3"])
@@ -948,7 +1080,7 @@ class TestMaruHandlerFailureScenarios:
             assert bytes(results[2].view[: len(data3)]) == data3
 
     def test_store_after_close(self, server_thread, server_port):
-        """Connect handler, close it, then try to store raises RuntimeError."""
+        """Connect handler, close it, then try to alloc raises RuntimeError."""
         config = MaruConfig(
             server_url=f"tcp://127.0.0.1:{server_port}",
             pool_size=4096,
@@ -961,4 +1093,4 @@ class TestMaruHandlerFailureScenarios:
         handler.close()
 
         with pytest.raises(RuntimeError):
-            handler.store(key="1", info=MemoryInfo(view=memoryview(b"data")))
+            handler.alloc(size=len(b"data"))
