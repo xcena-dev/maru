@@ -128,7 +128,7 @@ static bool marufs_deleg_matches(struct marufs_deleg_entry *de,
  *
  * Returns delegation table pointer, or NULL if unavailable.
  */
-static struct marufs_deleg_table*
+struct marufs_deleg_table*
 marufs_deleg_table_get(struct marufs_sb_info* sbi,
                       u32 rat_entry_id,
                       u32* out_num_entries)
@@ -152,6 +152,24 @@ marufs_deleg_table_get(struct marufs_sb_info* sbi,
 
     *out_num_entries = num_entries;
     return dt;
+}
+
+/*
+ * marufs_deleg_entry_clear - zero all data fields of a delegation entry
+ * @de: delegation entry pointer
+ *
+ * Clears node_id, pid, perms, birth_time, granted_at and issues a WMB.
+ * Does NOT touch de->state — caller is responsible for the state transition
+ * (CAS or direct write depending on ownership context).
+ */
+void marufs_deleg_entry_clear(struct marufs_deleg_entry* de)
+{
+    WRITE_LE32(de->node_id, 0);
+    WRITE_LE32(de->pid, 0);
+    WRITE_LE32(de->perms, 0);
+    WRITE_LE64(de->birth_time, 0);
+    WRITE_LE64(de->granted_at, 0);
+    MARUFS_CXL_WMB(de, sizeof(*de));
 }
 
 /*

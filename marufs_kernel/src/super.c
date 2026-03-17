@@ -161,6 +161,51 @@ static int marufs_parse_options(char* options, struct marufs_mount_opts* opts)
 static struct kmem_cache* marufs_inode_cachep;
 
 /* ============================================================================
+ * active_nodes bitmask helpers (shared superblock CAS)
+ * ============================================================================ */
+
+/*
+ * marufs_active_nodes_set - atomically set this node's bit in active_nodes
+ * Returns -EEXIST if the bit is already set (duplicate node_id).
+ */
+static int marufs_active_nodes_set(struct marufs_sb_info* sbi)
+{
+    u64 bit = 1ULL << (sbi->node_id - 1);
+    u64 old, ret_cas;
+
+    do {
+        old = READ_LE64(sbi->gsb->active_nodes);
+        if (old & bit)
+        {
+            pr_err("node_id=%u already mounted by another node\n",
+                   sbi->node_id);
+            return -EEXIST;
+        }
+        ret_cas = CAS_LE64(&sbi->gsb->active_nodes, old, old | bit);
+    } while (ret_cas != old);
+
+    return 0;
+}
+
+/*
+ * marufs_active_nodes_clear - atomically clear this node's bit in active_nodes
+ * Safe to call if gsb is NULL or node_id is out of range (no-op).
+ */
+static void marufs_active_nodes_clear(struct marufs_sb_info* sbi)
+{
+    u64 bit, old, ret_cas;
+
+    if (!sbi->gsb || sbi->node_id < 1 || sbi->node_id > MARUFS_MAX_NODE_ID)
+        return;
+
+    bit = 1ULL << (sbi->node_id - 1);
+    do {
+        old = READ_LE64(sbi->gsb->active_nodes);
+        ret_cas = CAS_LE64(&sbi->gsb->active_nodes, old, old & ~bit);
+    } while (ret_cas != old);
+}
+
+/* ============================================================================
  * inode cache management
  * ============================================================================ */
 
@@ -174,17 +219,7 @@ static struct inode* marufs_alloc_inode(struct super_block* sb)
         return NULL;
     }
 
-    xi->region_id = 0;
-    xi->entry_idx = 0;
-    xi->shard_id = 0;
-
-    /* Initialize fields */
-    xi->rat_entry_id = 0;
-    xi->region_offset = 0;
-    xi->owner_node_id = 0;
-    xi->owner_pid = 0;
-    xi->owner_birth_time = 0;
-    xi->data_phys_offset = 0;
+    marufs_inode_info_init(xi);
 
     return &xi->vfs_inode;
 }
@@ -1091,21 +1126,9 @@ static int marufs_fill_super_common(struct super_block* sb,
     }
 
     /* Cross-node duplicate node_id detection via CAS on shared superblock */
-    {
-        u64 bit = 1ULL << (sbi->node_id - 1);
-        u64 old, ret_cas;
-
-        do {
-            old = READ_LE64(sbi->gsb->active_nodes);
-            if (old & bit)
-            {
-                pr_err("node_id=%u already mounted by another node\n",
-                       sbi->node_id);
-                return -EEXIST;
-            }
-            ret_cas = CAS_LE64(&sbi->gsb->active_nodes, old, old | bit);
-        } while (ret_cas != old);
-    }
+    ret = marufs_active_nodes_set(sbi);
+    if (ret)
+        return ret;
 
     /* Step 2: Initialize shard table */
     ret = marufs_init_shard_table(sbi);
@@ -1179,16 +1202,7 @@ err_free_gsb:
     sbi->shard_free_hint = NULL;
 
     /* Clear active_nodes bit on mount failure */
-    if (sbi->gsb && sbi->node_id > 0 && sbi->node_id <= MARUFS_MAX_NODE_ID)
-    {
-        u64 bit = 1ULL << (sbi->node_id - 1);
-        u64 old, ret_cas;
-
-        do {
-            old = READ_LE64(sbi->gsb->active_nodes);
-            ret_cas = CAS_LE64(&sbi->gsb->active_nodes, old, old & ~bit);
-        } while (ret_cas != old);
-    }
+    marufs_active_nodes_clear(sbi);
     return ret;
 }
 
@@ -1339,16 +1353,7 @@ static void marufs_kill_sb(struct super_block* sb)
         marufs_gc_stop(sbi);
 
         /* Clear node_id bit in shared superblock via CAS */
-        if (sbi->gsb && sbi->node_id >= 1 && sbi->node_id <= MARUFS_MAX_NODE_ID)
-        {
-            u64 bit = 1ULL << (sbi->node_id - 1);
-            u64 old, ret_cas;
-
-            do {
-                old = READ_LE64(sbi->gsb->active_nodes);
-                ret_cas = CAS_LE64(&sbi->gsb->active_nodes, old, old & ~bit);
-            } while (ret_cas != old);
-        }
+        marufs_active_nodes_clear(sbi);
 
         /* RAT mode: regions persist across mounts, GC handles cleanup */
 

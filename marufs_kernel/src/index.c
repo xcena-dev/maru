@@ -28,10 +28,6 @@
 /* Maximum CAS retries for bucket chain insertion */
 #define MARUFS_INDEX_CAS_RETRIES 2048
 
-/* Stale INSERTING timeout (shared with gc.c) */
-#ifndef MARUFS_GC_INSERTING_TIMEOUT_NS
-#define MARUFS_GC_INSERTING_TIMEOUT_NS (30ULL * NSEC_PER_SEC)
-#endif
 
 /*
  * marufs_index_check_duplicate - check for duplicate name in bucket chain
@@ -84,15 +80,18 @@ static int marufs_index_check_duplicate(struct marufs_index_entry_hot* entries,
                     u64 now = ktime_get_real_ns();
 
                     if ((created_at != 0 && now > created_at) &&
-                        ((now - created_at) > MARUFS_GC_INSERTING_TIMEOUT_NS))
+                        ((now - created_at) > MARUFS_STALE_TIMEOUT_NS))
                     {
+                        /* Clear fields BEFORE CAS to prevent concurrent
+                         * reader seeing EMPTY state with stale data */
+                        memset(c->name, 0, sizeof(c->name));
+                        WRITE_LE64(e->name_hash, 0);
+                        MARUFS_CXL_WMB(e, sizeof(*e));
+
                         if (cmpxchg(&e->state, MARUFS_ENTRY_INSERTING_LE,
                                     MARUFS_ENTRY_EMPTY_LE) ==
                             MARUFS_ENTRY_INSERTING_LE)
                         {
-                            memset(c->name, 0, sizeof(c->name));
-                            WRITE_ONCE(e->name_hash, 0);
-                            MARUFS_CXL_WMB(e, sizeof(*e));
                             pr_debug("reclaimed stale INSERTING '%.*s' inline\n",
                                      (int)namelen, name);
                             continue; /* Cleared — no longer a duplicate */
@@ -364,28 +363,27 @@ static int __marufs_index_insert(struct marufs_sb_info* sbi, const char* name,
     {
         u32 cur = READ_LE32(buckets[bucket_idx]);
 
-        while (cur != 0 && cur <= num_entries)
+        while (cur != MARUFS_BUCKET_END && cur < num_entries)
         {
-            struct marufs_index_entry_hot* e = &hot_entries[cur - 1];
-            u32 idx = cur - 1;
+            struct marufs_index_entry_hot* e = &hot_entries[cur];
 
-            if (idx != entry_idx &&
+            if (cur != entry_idx &&
                 READ_ONCE(e->state) == MARUFS_ENTRY_VALID_LE &&
                 READ_LE64(e->name_hash) == hash)
             {
                 /* Hash match — verify name in cold entry */
-                struct marufs_index_entry_cold* c = &cold_entries[idx];
+                struct marufs_index_entry_cold* c = &cold_entries[cur];
 
                 if (strncmp(c->name, name, namelen) == 0 &&
                     (namelen >= sizeof(c->name) || c->name[namelen] == '\0'))
                 {
                     /* Duplicate found — higher entry_idx loses */
-                    if (entry_idx > idx)
+                    if (entry_idx > cur)
                     {
                         pr_info(
                             "index_insert: post-insert dup '%.*s' "
                             "(entry %u loses to %u)\n",
-                            (int)namelen, name, entry_idx, idx);
+                            (int)namelen, name, entry_idx, cur);
                         WRITE_ONCE(hot->state, MARUFS_ENTRY_TOMBSTONE_LE);
                         MARUFS_CXL_WMB(hot, sizeof(*hot));
                         marufs_le32_cas_inc(
@@ -686,19 +684,7 @@ int marufs_index_delete_by_region(struct marufs_sb_info* sbi, u32 rat_entry_id)
     {
         struct marufs_rat_entry* rat_e = marufs_rat_get(sbi, rat_entry_id);
         if (rat_e)
-        {
-            u32 old_count;
-            do
-            {
-                old_count = READ_LE32(rat_e->name_ref_count);
-                if (old_count < (u32)deleted)
-                {
-                    CAS_LE32(&rat_e->name_ref_count, old_count, 0);
-                    break;
-                }
-            } while (CAS_LE32(&rat_e->name_ref_count, old_count,
-                              old_count - deleted) != old_count);
-        }
+            marufs_rat_name_ref_adjust(rat_e, -deleted);
 
         pr_debug("deleted %d name-ref entries for region %u\n",
                  deleted, rat_entry_id);

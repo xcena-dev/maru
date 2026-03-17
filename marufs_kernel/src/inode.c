@@ -240,17 +240,7 @@ struct inode* marufs_new_inode(struct super_block* sb, umode_t mode)
         return ERR_PTR(-ENOMEM);
 
     xi = MARUFS_I(inode);
-    xi->region_id = 0;
-    xi->entry_idx = 0;
-    xi->shard_id = 0;
-
-    /* Initialize fields */
-    xi->rat_entry_id = 0;
-    xi->region_offset = 0;
-    xi->owner_node_id = 0;
-    xi->owner_pid = 0;
-    xi->owner_birth_time = 0;
-    xi->data_phys_offset = 0;
+    marufs_inode_info_init(xi);
 
     inode->i_ino = 0;
     inode->i_mode = mode;
@@ -297,12 +287,34 @@ struct inode* marufs_new_inode(struct super_block* sb, umode_t mode)
  *
  * Return: 0 on success, negative error code on failure
  */
+/*
+ * marufs_index_entry_sync_size - sync file size and timestamp to CXL index
+ * @sbi: superblock info
+ * @xi: marufs inode info
+ * @hot: hot entry pointer (must not be NULL)
+ * @size: file size to write
+ *
+ * Writes file_size to hot entry, modified_at to cold entry, then issues WMB.
+ */
+static void marufs_index_entry_sync_size(struct marufs_sb_info* sbi,
+                                         struct marufs_inode_info* xi,
+                                         struct marufs_index_entry_hot* hot,
+                                         loff_t size)
+{
+    struct marufs_index_entry_cold* cold_e;
+
+    WRITE_LE64(hot->file_size, size);
+    cold_e = marufs_shard_cold_entry(sbi, xi->shard_id, xi->entry_idx);
+    if (cold_e)
+        WRITE_LE64(cold_e->modified_at, ktime_get_real_ns());
+    MARUFS_CXL_WMB(hot, sizeof(*hot));
+}
+
 int marufs_write_inode(struct inode* inode, struct writeback_control* wbc)
 {
     struct marufs_inode_info* xi = MARUFS_I(inode);
     struct marufs_sb_info* sbi = MARUFS_SB(inode->i_sb);
     struct marufs_index_entry_hot* hot;
-    struct marufs_index_entry_cold* cold_e;
 
     if (inode->i_ino == MARUFS_ROOT_INO)
         return 0;
@@ -313,11 +325,7 @@ int marufs_write_inode(struct inode* inode, struct writeback_control* wbc)
         return -EIO;
 
     /* Update file size (hot) and timestamp (cold) */
-    WRITE_LE64(hot->file_size, inode->i_size);
-    cold_e = marufs_shard_cold_entry(sbi, xi->shard_id, xi->entry_idx);
-    if (cold_e)
-        WRITE_LE64(cold_e->modified_at, ktime_get_real_ns());
-    MARUFS_CXL_WMB(hot, sizeof(*hot));
+    marufs_index_entry_sync_size(sbi, xi, hot, inode->i_size);
 
     return 0;
 }
@@ -399,7 +407,6 @@ static int marufs_setattr(MARUFS_IDMAP_PARAM_COMMA struct dentry* dentry,
         struct marufs_inode_info* xi = MARUFS_I(inode);
         struct marufs_sb_info* sbi = MARUFS_SB(inode->i_sb);
         struct marufs_index_entry_hot* hot;
-        struct marufs_index_entry_cold* cold_e;
 
         /* MARUFS permission check before region allocation */
         ret = marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_WRITE);
@@ -456,13 +463,7 @@ static int marufs_setattr(MARUFS_IDMAP_PARAM_COMMA struct dentry* dentry,
         /* Update index entries (bounds-checked) */
         hot = marufs_shard_hot_entry(sbi, xi->shard_id, xi->entry_idx);
         if (hot)
-        {
-            WRITE_LE64(hot->file_size, inode->i_size);
-            cold_e = marufs_shard_cold_entry(sbi, xi->shard_id, xi->entry_idx);
-            if (cold_e)
-                WRITE_LE64(cold_e->modified_at, ktime_get_real_ns());
-            MARUFS_CXL_WMB(hot, sizeof(*hot));
-        }
+            marufs_index_entry_sync_size(sbi, xi, hot, inode->i_size);
 
         mark_inode_dirty(inode);
 

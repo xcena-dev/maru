@@ -72,6 +72,10 @@ struct dma_buf;
 
 #define MARUFS_ROOT_INO 1 /* Root directory ino */
 
+/* Stale entry timeout: INSERTING, GRANTING, ALLOCATING states older than
+ * this are considered abandoned and eligible for GC reclaim. */
+#define MARUFS_STALE_TIMEOUT_NS (30ULL * NSEC_PER_SEC)
+
 /* VFS blocksize (for sb->s_blocksize) */
 #define MARUFS_VFS_BLOCK_SIZE 4096
 #define MARUFS_VFS_BLOCK_SIZE_BITS 12
@@ -215,6 +219,21 @@ static inline struct marufs_inode_info* MARUFS_I(struct inode* inode)
     return container_of(inode, struct marufs_inode_info, vfs_inode);
 }
 
+/* Zero-initialize all marufs-specific fields of inode_info.
+ * Called from alloc_inode (super.c) and new_inode (inode.c). */
+static inline void marufs_inode_info_init(struct marufs_inode_info* xi)
+{
+    xi->region_id = 0;
+    xi->entry_idx = 0;
+    xi->shard_id = 0;
+    xi->rat_entry_id = 0;
+    xi->region_offset = 0;
+    xi->owner_node_id = 0;
+    xi->owner_pid = 0;
+    xi->owner_birth_time = 0;
+    xi->data_phys_offset = 0;
+}
+
 static inline struct marufs_sb_info* MARUFS_SB(struct super_block* sb)
 {
     return sb->s_fs_info;
@@ -264,6 +283,35 @@ static inline struct marufs_rat_entry* marufs_rat_get(struct marufs_sb_info* sbi
     if (unlikely(!sbi->rat || id >= MARUFS_MAX_RAT_ENTRIES))
         return NULL;
     return &sbi->rat->entries[id];
+}
+
+/*
+ * marufs_rat_name_ref_adjust - atomically adjust name_ref_count on a RAT entry
+ * @rat_e: RAT entry pointer (must not be NULL)
+ * @delta: signed adjustment (positive = increment, negative = decrement)
+ *
+ * Uses CAS loop. On decrement, clamps to zero to prevent underflow.
+ */
+static inline void marufs_rat_name_ref_adjust(struct marufs_rat_entry* rat_e,
+                                              s32 delta)
+{
+    u32 old_count, new_count;
+
+    do {
+        old_count = READ_LE32(rat_e->name_ref_count);
+        if (delta < 0 && old_count < (u32)(-delta))
+        {
+            /* Underflow: clamp to zero */
+            new_count = 0;
+        }
+        else
+        {
+            new_count = (u32)((s32)old_count + delta);
+        }
+        if (old_count == new_count)
+            break;
+    } while (CAS_LE32(&rat_e->name_ref_count, old_count,
+                       new_count) != old_count);
 }
 
 /* Safe region header accessor - returns header from consolidated pool by region_id */
@@ -451,6 +499,11 @@ extern const struct file_operations marufs_dir_ops;
  * Function declarations - acl.c (Region-level access control)
  * ============================================================================ */
 
+struct marufs_deleg_table*
+marufs_deleg_table_get(struct marufs_sb_info* sbi,
+                      u32 rat_entry_id,
+                      u32* out_num_entries);
+void marufs_deleg_entry_clear(struct marufs_deleg_entry* de);
 int marufs_check_permission(struct marufs_sb_info* sbi, u32 rat_entry_id,
                           u32 required_perms);
 int marufs_deleg_grant(struct marufs_sb_info* sbi, u32 rat_entry_id,

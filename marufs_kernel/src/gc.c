@@ -13,7 +13,57 @@
 
 #define MARUFS_GC_TOMBSTONE_THRESHOLD_PCT 25                  /* Trigger GC at 25% tombstones */
 #define MARUFS_GC_INTERVAL_MS 10000                           /* Run GC every 10 seconds */
-#define MARUFS_GC_INSERTING_TIMEOUT_NS (30ULL * NSEC_PER_SEC) /* 30s stale INSERTING */
+
+/*
+ * marufs_shard_lower_free_hint - lower free-slot hint if candidate is smaller
+ * @sbi: superblock info
+ * @shard_id: shard to update
+ * @candidate: slot index to compare against current hint
+ *
+ * Helps insert find reclaimed slots faster by lowering the hint.
+ */
+static inline void marufs_shard_lower_free_hint(struct marufs_sb_info* sbi,
+                                                u32 shard_id, u32 candidate)
+{
+    if (sbi->shard_free_hint)
+    {
+        u32 cur = (u32)atomic_read(&sbi->shard_free_hint[shard_id]);
+        if (candidate < cur)
+            atomic_set(&sbi->shard_free_hint[shard_id], candidate);
+    }
+}
+
+/*
+ * marufs_entry_reclaim_slot - clear fields and CAS entry state to EMPTY
+ * @e: hot entry pointer
+ * @cold: cold entry pointer
+ * @expected_state: current state to CAS from (TOMBSTONE_LE or INSERTING_LE)
+ * @sbi: superblock info
+ * @shard_id: shard containing this entry
+ * @slot_idx: slot index within the shard
+ *
+ * Clears name/hash fields BEFORE CAS to prevent concurrent readers from
+ * seeing EMPTY state with stale data. Returns true if slot was reclaimed.
+ */
+static bool marufs_entry_reclaim_slot(struct marufs_index_entry_hot* e,
+                                      struct marufs_index_entry_cold* cold,
+                                      __le32 expected_state,
+                                      struct marufs_sb_info* sbi,
+                                      u32 shard_id, u32 slot_idx)
+{
+    /* Clear fields BEFORE CAS (prevent stale data in reused slot) */
+    memset(cold->name, 0, sizeof(cold->name));
+    WRITE_LE64(e->name_hash, 0);
+    MARUFS_CXL_WMB(e, sizeof(*e));
+
+    if (cmpxchg(&e->state, expected_state,
+                MARUFS_ENTRY_EMPTY_LE) == expected_state)
+    {
+        marufs_shard_lower_free_hint(sbi, shard_id, slot_idx);
+        return true;
+    }
+    return false;
+}
 
 /*
  * marufs_gc_needs_sweep - check if shard needs GC sweep
@@ -87,26 +137,10 @@ int marufs_gc_tombstone_sweep(struct marufs_sb_info* sbi, u32 shard_id)
 
         if (state == MARUFS_ENTRY_TOMBSTONE_LE)
         {
-            /* Clear fields BEFORE CAS (prevent stale data in reused slot) */
-            memset(cold_entries[i].name, 0, sizeof(cold_entries[i].name));
-            WRITE_LE64(e->name_hash, 0);
-            MARUFS_CXL_WMB(e, sizeof(*e)); /* Ensure clears visible before state transition */
-
-            /* CAS: TOMBSTONE -> EMPTY */
-            if (cmpxchg(&e->state, MARUFS_ENTRY_TOMBSTONE_LE,
-                        MARUFS_ENTRY_EMPTY_LE) ==
-                MARUFS_ENTRY_TOMBSTONE_LE)
-            {
+            if (marufs_entry_reclaim_slot(e, &cold_entries[i],
+                                          MARUFS_ENTRY_TOMBSTONE_LE,
+                                          sbi, shard_id, i))
                 tombstone_reclaimed++;
-
-                /* Lower free-slot hint so insert finds reclaimed slot faster */
-                if (sbi->shard_free_hint)
-                {
-                    u32 cur = (u32)atomic_read(&sbi->shard_free_hint[shard_id]);
-                    if (i < cur)
-                        atomic_set(&sbi->shard_free_hint[shard_id], i);
-                }
-            }
         }
         else if (state == MARUFS_ENTRY_INSERTING_LE)
         {
@@ -129,26 +163,13 @@ int marufs_gc_tombstone_sweep(struct marufs_sb_info* sbi, u32 shard_id)
             }
 
             if ((now > created_at) &&
-                ((now - created_at) > MARUFS_GC_INSERTING_TIMEOUT_NS))
+                ((now - created_at) > MARUFS_STALE_TIMEOUT_NS))
             {
-                /* Clear fields before CAS (same pattern as tombstone sweep) */
-                memset(cold_entries[i].name, 0, sizeof(cold_entries[i].name));
-                WRITE_LE64(e->name_hash, 0);
-                MARUFS_CXL_WMB(e, sizeof(*e));
-
-                if (cmpxchg(&e->state, MARUFS_ENTRY_INSERTING_LE,
-                            MARUFS_ENTRY_EMPTY_LE) ==
-                    MARUFS_ENTRY_INSERTING_LE)
+                if (marufs_entry_reclaim_slot(e, &cold_entries[i],
+                                              MARUFS_ENTRY_INSERTING_LE,
+                                              sbi, shard_id, i))
                 {
                     inserting_reclaimed++;
-
-                    if (sbi->shard_free_hint)
-                    {
-                        u32 cur = (u32)atomic_read(&sbi->shard_free_hint[shard_id]);
-                        if (i < cur)
-                            atomic_set(&sbi->shard_free_hint[shard_id], i);
-                    }
-
                     pr_debug("gc reclaimed stale INSERTING entry shard %u slot %u (age %lluns)\n",
                              shard_id, i, now - created_at);
                 }
@@ -187,7 +208,6 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info* sbi,
                                             struct marufs_rat_entry* rat_entry,
                                             u32 rat_entry_id)
 {
-    struct marufs_region_header* rhdr;
     struct marufs_deleg_table* dt;
     u32 num_entries;
     u32 i;
@@ -196,19 +216,9 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info* sbi,
     if (READ_LE64(rat_entry->phys_offset) == 0)
         return 0;
 
-    rhdr = marufs_region_hdr(sbi, rat_entry_id);
-    if (!rhdr)
+    dt = marufs_deleg_table_get(sbi, rat_entry_id, &num_entries);
+    if (!dt)
         return 0;
-
-    dt = &rhdr->deleg_table;
-    MARUFS_CXL_RMB(dt, sizeof(*dt));
-
-    if (READ_LE32(dt->magic) != MARUFS_DELEG_MAGIC)
-        return 0;
-
-    num_entries = READ_LE32(dt->max_entries);
-    if (num_entries > MARUFS_DELEG_MAX_ENTRIES)
-        num_entries = MARUFS_DELEG_MAX_ENTRIES;
 
     for (i = 0; i < num_entries; i++)
     {
@@ -223,16 +233,9 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info* sbi,
             u64 now = ktime_get_real_ns();
 
             if (granted_at == 0 ||
-                (now - granted_at) > MARUFS_GC_INSERTING_TIMEOUT_NS)
+                (now - granted_at) > MARUFS_STALE_TIMEOUT_NS)
             {
-                /* Clear fields before CAS to EMPTY to prevent
-                 * race with new EMPTY->GRANTING claimer */
-                WRITE_LE32(de->node_id, 0);
-                WRITE_LE32(de->pid, 0);
-                WRITE_LE32(de->perms, 0);
-                WRITE_LE64(de->birth_time, 0);
-                WRITE_LE64(de->granted_at, 0);
-                MARUFS_CXL_WMB(de, sizeof(*de));
+                marufs_deleg_entry_clear(de);
                 if (CAS_LE32(&de->state, MARUFS_DELEG_GRANTING,
                              MARUFS_DELEG_EMPTY) == MARUFS_DELEG_GRANTING)
                 {
@@ -259,14 +262,7 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info* sbi,
         if (!marufs_owner_is_dead(de_pid, de_birth))
             continue;
 
-        /* Clear fields before CAS to EMPTY to prevent
-         * race with new EMPTY->GRANTING claimer */
-        WRITE_LE32(de->node_id, 0);
-        WRITE_LE32(de->pid, 0);
-        WRITE_LE32(de->perms, 0);
-        WRITE_LE64(de->birth_time, 0);
-        WRITE_LE64(de->granted_at, 0);
-        MARUFS_CXL_WMB(de, sizeof(*de));
+        marufs_deleg_entry_clear(de);
 
         if (CAS_LE32(&de->state, MARUFS_DELEG_ACTIVE,
                      MARUFS_DELEG_EMPTY) != MARUFS_DELEG_ACTIVE)
@@ -305,7 +301,6 @@ bool marufs_gc_has_active_delegations(struct marufs_sb_info* sbi,
                                       struct marufs_rat_entry* rat_entry,
                                       u32 rat_entry_id)
 {
-    struct marufs_region_header* rhdr;
     struct marufs_deleg_table* dt;
     u32 num_entries;
     u32 i;
@@ -313,19 +308,9 @@ bool marufs_gc_has_active_delegations(struct marufs_sb_info* sbi,
     if (READ_LE64(rat_entry->phys_offset) == 0)
         return false;
 
-    rhdr = marufs_region_hdr(sbi, rat_entry_id);
-    if (!rhdr)
+    dt = marufs_deleg_table_get(sbi, rat_entry_id, &num_entries);
+    if (!dt)
         return false;
-
-    dt = &rhdr->deleg_table;
-    MARUFS_CXL_RMB(dt, sizeof(*dt));
-
-    if (READ_LE32(dt->magic) != MARUFS_DELEG_MAGIC)
-        return false;
-
-    num_entries = READ_LE32(dt->max_entries);
-    if (num_entries > MARUFS_DELEG_MAX_ENTRIES)
-        num_entries = MARUFS_DELEG_MAX_ENTRIES;
 
     for (i = 0; i < num_entries; i++)
     {
@@ -383,7 +368,7 @@ bool marufs_is_orphaned(struct marufs_sb_info* sbi, u32 rat_entry_id)
         u64 now = ktime_get_real_ns();
 
         if (alloc_time == 0 ||
-            (now - alloc_time) <= MARUFS_GC_INSERTING_TIMEOUT_NS)
+            (now - alloc_time) <= MARUFS_STALE_TIMEOUT_NS)
             return false;
     }
     else if (!marufs_owner_is_dead(owner_pid, birth_time))

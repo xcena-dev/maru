@@ -737,14 +737,7 @@ static long marufs_ioctl_name_offset(struct marufs_sb_info* sbi,
         /* New insert succeeded — increment name_ref_count on RAT entry */
         struct marufs_rat_entry* rat_e = marufs_rat_get(sbi, xi->rat_entry_id);
         if (rat_e)
-        {
-            u32 old_count;
-            do
-            {
-                old_count = READ_LE32(rat_e->name_ref_count);
-            } while (CAS_LE32(&rat_e->name_ref_count, old_count,
-                              old_count + 1) != old_count);
-        }
+            marufs_rat_name_ref_adjust(rat_e, 1);
     }
 
     pr_debug("name_ref '%s' -> rat=%u offset=%llu\n",
@@ -894,14 +887,7 @@ static long marufs_ioctl_batch_name_offset(struct marufs_sb_info* sbi,
     {
         struct marufs_rat_entry* rat_e = marufs_rat_get(sbi, xi->rat_entry_id);
         if (rat_e)
-        {
-            u32 old_count;
-            do
-            {
-                old_count = READ_LE32(rat_e->name_ref_count);
-            } while (CAS_LE32(&rat_e->name_ref_count, old_count,
-                              old_count + new_inserts) != old_count);
-        }
+            marufs_rat_name_ref_adjust(rat_e, (s32)new_inserts);
     }
 
     if (copy_to_user(
@@ -968,16 +954,7 @@ static long marufs_ioctl_clear_name(struct marufs_sb_info* sbi,
     {
         struct marufs_rat_entry* rat_e = marufs_rat_get(sbi, caller_rat_entry_id);
         if (rat_e)
-        {
-            u32 old_count;
-            do
-            {
-                old_count = READ_LE32(rat_e->name_ref_count);
-                if (old_count == 0)
-                    break;
-            } while (CAS_LE32(&rat_e->name_ref_count, old_count,
-                              old_count - 1) != old_count);
-        }
+            marufs_rat_name_ref_adjust(rat_e, -1);
     }
 
     return 0;
@@ -1089,11 +1066,7 @@ static long marufs_ioctl_chown(struct marufs_sb_info* sbi,
 
                 if (READ_LE32(de->state) == MARUFS_DELEG_ACTIVE)
                 {
-                    WRITE_LE32(de->node_id, 0);
-                    WRITE_LE32(de->pid, 0);
-                    WRITE_LE32(de->perms, 0);
-                    WRITE_LE64(de->birth_time, 0);
-                    MARUFS_CXL_WMB(de, sizeof(*de));
+                    marufs_deleg_entry_clear(de);
                     WRITE_LE32(de->state, MARUFS_DELEG_EMPTY);
                 }
             }
