@@ -34,13 +34,11 @@ def _make_mock_handler(pool_size=4096, chunk_size=1024):
     )
 
     # Facade methods
-    handler.get_buffer_view.side_effect = (
-        lambda rid, offset, size: mapped_region.get_buffer_view(offset, size)
-        if rid == region_id
-        else None
+    handler.get_buffer_view.side_effect = lambda rid, offset, size: (
+        mapped_region.get_buffer_view(offset, size) if rid == region_id else None
     )
-    handler.get_region_page_count.side_effect = (
-        lambda rid: page_count if rid == region_id else None
+    handler.get_region_page_count.side_effect = lambda rid: (
+        page_count if rid == region_id else None
     )
     handler.get_owned_region_ids.return_value = [region_id]
     handler.get_chunk_size.return_value = chunk_size
