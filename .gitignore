@@ -85,3 +85,26 @@ CLAUDE.md
 # Sphinx
 docs/_build/
 internal_docs/
+
+# marufs kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+Module.symvers
+modules.order
+.modules.order.cmd
+.Module.symvers.cmd
+.tmp_versions/
+
+# marufs test binaries
+marufs_kernel/tests/test_ioctl
+marufs_kernel/tests/test_mmap
+marufs_kernel/tests/test_mmap_cuda
+marufs_kernel/tests/test_cross_process
+marufs_kernel/tests/test_overlap
+marufs_kernel/tests/test_chown_race
+marufs_kernel/tests/test_dupname
+marufs_kernel/tests/test_marufs_ops
