@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from threading import RLock
 
+from maru_common.protocol import ANY_POOL_ID
 from maru_shm import MaruHandle, MaruShmClient
 
 logger = logging.getLogger(__name__)
@@ -29,9 +30,21 @@ class AllocationManager:
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
 
-    def allocate(self, instance_id: str, size: int) -> MaruHandle | None:
+    def allocate(
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+    ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership."""
-        handle = self._client.alloc(size)
+        try:
+            handle = self._client.alloc(size, pool_id=pool_id)
+        except RuntimeError as e:
+            logger.warning(
+                "alloc failed for instance=%s size=%d pool_id=%s: %s",
+                instance_id,
+                size,
+                pool_id,
+                e,
+            )
+            return None
         if handle is None:
             return None
 

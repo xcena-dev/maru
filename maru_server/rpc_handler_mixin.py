@@ -59,18 +59,21 @@ class RpcHandlerMixin:
         handle = self._server.request_alloc(
             instance_id=req.instance_id,
             size=req.size,
+            pool_id=req.pool_id,
         )
         if handle is None:
             logger.debug(
-                "[REQUEST_ALLOC] instance=%s, size=%d -> FAILED",
+                "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> FAILED",
                 req.instance_id,
                 req.size,
+                req.pool_id,
             )
             return {"success": False, "error": "Allocation failed"}
         logger.debug(
-            "[REQUEST_ALLOC] instance=%s, size=%d -> region_id=%d",
+            "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> region_id=%d",
             req.instance_id,
             req.size,
+            req.pool_id,
             handle.region_id,
         )
         return {"success": True, "handle": handle.to_dict()}
@@ -151,6 +154,14 @@ class RpcHandlerMixin:
         """Handle batch register KV request."""
         entries = [(e.key, e.region_id, e.kv_offset, e.kv_length) for e in req.entries]
         logger.debug("[BATCH_PUT] %d entries", len(entries))
+        for e in req.entries:
+            logger.debug(
+                "[BATCH_PUT] key=%s, region_id=%d, kv_offset=%d, kv_length=%d",
+                e.key,
+                e.region_id,
+                e.kv_offset,
+                e.kv_length,
+            )
         results = self._server.batch_register_kv(entries)
         return {"success": True, "results": results}
 
@@ -165,6 +176,12 @@ class RpcHandlerMixin:
             if result is None:
                 entries.append({"found": False})
             else:
+                logger.debug(
+                    "[BATCH_GET] region_id=%d, kv_offset=%d, kv_length=%d",
+                    result["handle"].region_id,
+                    result["kv_offset"],
+                    result["kv_length"],
+                )
                 entries.append(
                     {
                         "found": True,

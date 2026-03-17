@@ -4,12 +4,13 @@
 
 import logging
 import threading
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import zmq
 
-from maru_common import MessageHeader, MessageType, Serializer
+from maru_common import MessageHeader, Serializer
+
+from .rpc_handler_mixin import RpcHandlerMixin
 
 if TYPE_CHECKING:
     from .server import MaruServer
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RpcServer:
+class RpcServer(RpcHandlerMixin):
     """
     ZeroMQ-based RPC server for MaruServer.
 
@@ -104,170 +105,3 @@ class RpcServer:
             self._context.term()
             self._context = None
         logger.info("RPC Server stopped")
-
-    def _handle_message(self, msg_type: int, request: Any) -> dict:
-        """Dispatch message to appropriate handler."""
-        handlers: dict[int, Callable[[Any], dict]] = {
-            MessageType.REQUEST_ALLOC.value: self._handle_request_alloc,
-            MessageType.RETURN_ALLOC.value: self._handle_return_alloc,
-            MessageType.LIST_ALLOCATIONS.value: self._handle_list_allocations,
-            MessageType.REGISTER_KV.value: self._handle_register_kv,
-            MessageType.LOOKUP_KV.value: self._handle_lookup_kv,
-            MessageType.EXISTS_KV.value: self._handle_exists_kv,
-            MessageType.DELETE_KV.value: self._handle_delete_kv,
-            # Batch operations
-            MessageType.BATCH_REGISTER_KV.value: self._handle_batch_register_kv,
-            MessageType.BATCH_LOOKUP_KV.value: self._handle_batch_lookup_kv,
-            MessageType.BATCH_EXISTS_KV.value: self._handle_batch_exists_kv,
-            # Admin
-            MessageType.GET_STATS.value: self._handle_get_stats,
-            MessageType.HEARTBEAT.value: self._handle_heartbeat,
-        }
-
-        handler = handlers.get(msg_type)
-        if handler is None:
-            return {"error": f"Unknown message type: {msg_type}"}
-
-        return handler(request)
-
-    # =========================================================================
-    # Allocation Handlers
-    # =========================================================================
-
-    def _handle_request_alloc(self, req: Any) -> dict:
-        handle = self._server.request_alloc(
-            instance_id=req.instance_id,
-            size=req.size,
-        )
-        if handle is None:
-            logger.debug(
-                "[REQUEST_ALLOC] instance=%s, size=%d -> FAILED",
-                req.instance_id,
-                req.size,
-            )
-            return {"success": False, "error": "Allocation failed"}
-        logger.debug(
-            "[REQUEST_ALLOC] instance=%s, size=%d -> region_id=%d",
-            req.instance_id,
-            req.size,
-            handle.region_id,
-        )
-        return {"success": True, "handle": handle.to_dict()}
-
-    def _handle_return_alloc(self, req: Any) -> dict:
-        success = self._server.return_alloc(
-            instance_id=req.instance_id,
-            region_id=req.region_id,
-        )
-        return {"success": success}
-
-    def _handle_list_allocations(self, req: Any) -> dict:
-        handles = self._server.list_allocations(
-            exclude_instance_id=req.exclude_instance_id,
-        )
-        logger.debug(
-            "[LIST_ALLOCATIONS] exclude=%s -> %d regions",
-            req.exclude_instance_id,
-            len(handles),
-        )
-        return {
-            "success": True,
-            "allocations": [h.to_dict() for h in handles],
-        }
-
-    # =========================================================================
-    # KV Handlers
-    # =========================================================================
-
-    def _handle_register_kv(self, req: Any) -> dict:
-        logger.debug(
-            "[PUT] key=%s, region_id=%d, kv_offset=%d, kv_length=%d",
-            req.key,
-            req.region_id,
-            req.kv_offset,
-            req.kv_length,
-        )
-        is_new = self._server.register_kv(
-            key=req.key,
-            region_id=req.region_id,
-            kv_offset=req.kv_offset,
-            kv_length=req.kv_length,
-        )
-        return {"success": True, "is_new": is_new}
-
-    def _handle_lookup_kv(self, req: Any) -> dict:
-        result = self._server.lookup_kv(key=req.key)
-        if result is None:
-            logger.debug("[GET] key=%s -> NOT FOUND", req.key)
-            return {"found": False}
-        logger.debug(
-            "[GET] key=%s -> region_id=%d, kv_offset=%d, kv_length=%d",
-            req.key,
-            result["handle"].region_id,
-            result["kv_offset"],
-            result["kv_length"],
-        )
-        return {
-            "found": True,
-            "handle": result["handle"].to_dict(),
-            "kv_offset": result["kv_offset"],
-            "kv_length": result["kv_length"],
-        }
-
-    def _handle_exists_kv(self, req: Any) -> dict:
-        exists = self._server.exists_kv(key=req.key)
-        return {"exists": exists}
-
-    def _handle_delete_kv(self, req: Any) -> dict:
-        success = self._server.delete_kv(key=req.key)
-        return {"success": success}
-
-    # =========================================================================
-    # Batch KV Handlers
-    # =========================================================================
-
-    def _handle_batch_register_kv(self, req: Any) -> dict:
-        """Handle batch register KV request."""
-        entries = [(e.key, e.region_id, e.kv_offset, e.kv_length) for e in req.entries]
-        logger.debug("[BATCH_PUT] %d entries", len(entries))
-        results = self._server.batch_register_kv(entries)
-        return {"success": True, "results": results}
-
-    def _handle_batch_lookup_kv(self, req: Any) -> dict:
-        """Handle batch lookup KV request."""
-        keys = req.keys
-        logger.debug("[BATCH_GET] %d keys", len(keys))
-        results = self._server.batch_lookup_kv(keys)
-
-        entries = []
-        for result in results:
-            if result is None:
-                entries.append({"found": False})
-            else:
-                entries.append(
-                    {
-                        "found": True,
-                        "handle": result["handle"].to_dict(),
-                        "kv_offset": result["kv_offset"],
-                        "kv_length": result["kv_length"],
-                    }
-                )
-        return {"entries": entries}
-
-    def _handle_batch_exists_kv(self, req: Any) -> dict:
-        """Handle batch exists KV request."""
-        keys = req.keys
-        logger.debug("[BATCH_EXISTS] %d keys", len(keys))
-        results = self._server.batch_exists_kv(keys)
-        return {"results": results}
-
-    # =========================================================================
-    # Admin Handlers
-    # =========================================================================
-
-    def _handle_get_stats(self, _req: Any) -> dict:
-        stats = self._server.get_stats()
-        return stats
-
-    def _handle_heartbeat(self, _req: Any) -> dict:
-        return {}

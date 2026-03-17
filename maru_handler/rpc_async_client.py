@@ -33,6 +33,7 @@ import zmq
 import zmq.asyncio
 
 from maru_common import (
+    ANY_POOL_ID,
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -359,11 +360,13 @@ class RpcAsyncClient:
     # Allocation Management (blocking)
     # =========================================================================
 
-    def request_alloc(self, instance_id: str, size: int) -> RequestAllocResponse:
+    def request_alloc(
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+    ) -> RequestAllocResponse:
         """Request a new memory allocation."""
         response = self._send_request(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": instance_id, "size": size},
+            {"instance_id": instance_id, "size": size, "pool_id": pool_id},
         )
         return self._parse_request_alloc(response)
 
@@ -484,13 +487,15 @@ class RpcAsyncClient:
     # Non-blocking Async API (*_async methods)
     # =========================================================================
 
-    def request_alloc_async(self, instance_id: str, size: int) -> Future:
+    def request_alloc_async(
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+    ) -> Future:
         """Non-blocking request_alloc. Returns Future[RequestAllocResponse]."""
 
         async def _coro():
             response = await self._send_async(
                 MessageType.REQUEST_ALLOC,
-                {"instance_id": instance_id, "size": size},
+                {"instance_id": instance_id, "size": size, "pool_id": pool_id},
             )
             return self._parse_request_alloc(response)
 

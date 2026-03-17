@@ -22,7 +22,7 @@ import logging
 import threading
 from collections.abc import Callable
 
-from maru_common import MaruConfig
+from maru_common import ANY_POOL_ID, MaruConfig
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -73,6 +73,9 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
+        self._pool_ids: list[int] = (
+            self._config.pool_id if self._config.pool_id is not None else [ANY_POOL_ID]
+        )
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
@@ -208,16 +211,32 @@ class MaruHandler:
                 chunk_size=self._config.chunk_size_bytes,
             )
 
-            # 3. Request initial owned region via RPC
-            response = self._rpc.request_alloc(
-                instance_id=self._config.instance_id,
-                size=self._config.pool_size,
-            )
-            if not response.success or response.handle is None:
-                logger.error(
-                    "Failed to request initial allocation: %s",
+            # 3. Request initial owned region via RPC — try each pool in order
+            response = None
+            for pool_id in self._pool_ids:
+                try:
+                    response = self._rpc.request_alloc(
+                        instance_id=self._config.instance_id,
+                        size=self._config.pool_size,
+                        pool_id=pool_id,
+                    )
+                except Exception:
+                    logger.error(
+                        "RPC request_alloc failed during connect (pool_id=%s)",
+                        pool_id,
+                        exc_info=True,
+                    )
+                    continue
+                if response.success and response.handle is not None:
+                    break
+                logger.warning(
+                    "Pool %s refused initial allocation: %s",
+                    pool_id,
                     getattr(response, "error", "unknown"),
                 )
+
+            if response is None or not response.success or response.handle is None:
+                logger.error("Failed to allocate from any pool")
                 self._owned = None
                 self._rpc.close()
                 return False
@@ -866,49 +885,65 @@ class MaruHandler:
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.
 
+        Tries each pool_id in order, falling back to the next on failure.
+
         Returns:
             True if expansion succeeded.
         """
-        try:
-            response = self._rpc.request_alloc(
-                instance_id=self._config.instance_id,
-                size=self._config.pool_size,
-            )
-        except Exception:
-            logger.error("RPC request_alloc failed during expand", exc_info=True)
-            return False
-
-        if not response.success or response.handle is None:
-            logger.error(
-                "Server refused region expansion: %s",
-                getattr(response, "error", "unknown"),
-            )
-            return False
-
-        handle = response.handle
-        try:
-            region = self._owned.add_region(handle)
-            logger.info("Expanded: new store region %d", handle.region_id)
-            # Callback fires under _write_lock — guarantees pool exists
-            # before alloc() returns. Acceptable since expansion is rare.
-            if self._on_region_added is not None:
-                logger.debug(
-                    "on_region_added fire: region=%d pages=%d",
-                    handle.region_id,
-                    region.allocator.page_count,
-                )
-                self._on_region_added(handle.region_id, region.allocator.page_count)
-            return True
-        except Exception:
-            logger.error("Failed to init expanded region", exc_info=True)
+        for pool_id in self._pool_ids:
             try:
-                self._rpc.return_alloc(self._config.instance_id, handle.region_id)
+                response = self._rpc.request_alloc(
+                    instance_id=self._config.instance_id,
+                    size=self._config.pool_size,
+                    pool_id=pool_id,
+                )
             except Exception:
-                logger.debug(
-                    "Failed to return allocation during expansion cleanup",
+                logger.error(
+                    "RPC request_alloc failed during expand (pool_id=%s)",
+                    pool_id,
                     exc_info=True,
                 )
-            return False
+                continue
+
+            if not response.success or response.handle is None:
+                logger.warning(
+                    "Pool %s refused region expansion: %s",
+                    pool_id,
+                    getattr(response, "error", "unknown"),
+                )
+                continue
+
+            handle = response.handle
+            try:
+                region = self._owned.add_region(handle)
+                logger.info(
+                    "Expanded: new store region %d (pool_id=%s)",
+                    handle.region_id,
+                    pool_id,
+                )
+                # Callback fires under _write_lock — guarantees pool exists
+                # before alloc() returns. Acceptable since expansion is rare.
+                if self._on_region_added is not None:
+                    logger.debug(
+                        "on_region_added fire: region=%d pages=%d",
+                        handle.region_id,
+                        region.allocator.page_count,
+                    )
+                    self._on_region_added(handle.region_id, region.allocator.page_count)
+                return True
+            except Exception:
+                logger.error("Failed to init expanded region", exc_info=True)
+                try:
+                    self._rpc.return_alloc(self._config.instance_id, handle.region_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to return allocation during expansion cleanup",
+                        exc_info=True,
+                    )
+                continue
+
+        logger.error("All pool_ids exhausted during region expansion")
+        return False
 
     def _premap_shared_regions(self) -> None:
         """Pre-map all existing shared regions from other instances.

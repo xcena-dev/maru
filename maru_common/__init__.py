@@ -8,6 +8,7 @@ setup_package_logging("maru_common")
 
 from .config import MaruConfig  # noqa: E402
 from .protocol import (  # noqa: E402
+    ANY_POOL_ID,
     HEADER_SIZE,
     MESSAGE_CLASSES,
     PROTOCOL_MAGIC,
@@ -51,6 +52,8 @@ __all__ = [
     "setup_package_logging",
     # Config
     "MaruConfig",
+    # Pool ID constant
+    "ANY_POOL_ID",
     # Protocol constants
     "PROTOCOL_MAGIC",
     "PROTOCOL_VERSION",
