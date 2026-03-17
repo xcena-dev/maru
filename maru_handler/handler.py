@@ -105,6 +105,10 @@ class MaruHandler:
         # Region-added callback (set by CxlMemoryAdapter)
         self._on_region_added: Callable[[int, int], None] | None = None
 
+        # Expansion policy
+        self._auto_expand = self._config.auto_expand
+        self._expand_size = self._config.expand_size or self._config.pool_size
+
         logger.debug("Created MaruHandler with config: %s", self._config)
 
     # =========================================================================
@@ -211,13 +215,15 @@ class MaruHandler:
                 chunk_size=self._config.chunk_size_bytes,
             )
 
-            # 3. Request initial owned region via RPC — try each pool in order
-            response = None
+            # 3. Request initial owned region(s) via RPC — aggregate across pools
+            remaining = self._config.pool_size
+            allocated_handles: list[MaruHandle] = []
+
             for pool_id in self._pool_ids:
                 try:
                     response = self._rpc.request_alloc(
                         instance_id=self._config.instance_id,
-                        size=self._config.pool_size,
+                        size=remaining,
                         pool_id=pool_id,
                     )
                 except Exception:
@@ -227,34 +233,58 @@ class MaruHandler:
                         exc_info=True,
                     )
                     continue
-                if response.success and response.handle is not None:
-                    break
-                logger.warning(
-                    "Pool %s refused initial allocation: %s",
-                    pool_id,
-                    getattr(response, "error", "unknown"),
-                )
 
-            if response is None or not response.success or response.handle is None:
-                logger.error("Failed to allocate from any pool")
-                self._owned = None
-                self._rpc.close()
-                return False
+                if not response.success or response.handle is None:
+                    logger.warning(
+                        "Pool %s refused initial allocation: %s",
+                        pool_id,
+                        getattr(response, "error", "unknown"),
+                    )
+                    continue
 
-            # 4. Add region to OwnedRegionManager (mmap + allocator)
-            try:
-                self._owned.add_region(response.handle)
-            except Exception:
-                logger.error("Failed to init initial region", exc_info=True)
+                # 4. Add region to OwnedRegionManager (mmap + allocator)
+                handle = response.handle
                 try:
-                    self._rpc.return_alloc(
-                        self._config.instance_id,
-                        response.handle.region_id,
-                    )
+                    self._owned.add_region(handle)
                 except Exception:
-                    logger.debug(
-                        "Failed to return allocation during cleanup", exc_info=True
+                    logger.error(
+                        "Failed to init region from pool %s", pool_id, exc_info=True
                     )
+                    try:
+                        self._rpc.return_alloc(
+                            self._config.instance_id, handle.region_id
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to return allocation during cleanup",
+                            exc_info=True,
+                        )
+                    continue
+
+                allocated_handles.append(handle)
+                remaining -= handle.length
+                if remaining <= 0:
+                    break
+
+            if remaining > 0:
+                logger.error(
+                    "Failed to allocate pool_size=%d: only got %d bytes from %d pool(s)",
+                    self._config.pool_size,
+                    self._config.pool_size - remaining,
+                    len(allocated_handles),
+                )
+                # Cleanup partially allocated regions
+                for h in allocated_handles:
+                    try:
+                        self._rpc.return_alloc(self._config.instance_id, h.region_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to return region %d during cleanup",
+                            h.region_id,
+                            exc_info=True,
+                        )
+                if self._owned is not None:
+                    self._owned.close()
                 self._owned = None
                 self._rpc.close()
                 return False
@@ -349,7 +379,14 @@ class MaruHandler:
             result = self._owned.allocate()
             if result is None:
                 if not self._expand_region():
-                    raise ValueError("Cannot allocate page: pool exhausted")
+                    if not self._auto_expand:
+                        raise ValueError(
+                            "Cannot allocate page: pool exhausted "
+                            "and auto_expand is disabled"
+                        )
+                    raise ValueError(
+                        "Cannot allocate page: pool exhausted after expansion attempt"
+                    )
                 result = self._owned.allocate()
                 if result is None:
                     raise ValueError("Cannot allocate page after expansion")
@@ -885,16 +922,24 @@ class MaruHandler:
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.
 
-        Tries each pool_id in order, falling back to the next on failure.
+        Gated by ``auto_expand`` config. When enabled, tries each pool_id
+        in order, falling back to the next on failure.
 
         Returns:
             True if expansion succeeded.
         """
+        if not self._auto_expand:
+            logger.warning(
+                "Pool exhausted but auto_expand is disabled. "
+                "Set auto_expand=True in MaruConfig to enable."
+            )
+            return False
+
         for pool_id in self._pool_ids:
             try:
                 response = self._rpc.request_alloc(
                     instance_id=self._config.instance_id,
-                    size=self._config.pool_size,
+                    size=self._expand_size,
                     pool_id=pool_id,
                 )
             except Exception:

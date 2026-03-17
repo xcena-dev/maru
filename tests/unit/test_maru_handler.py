@@ -87,6 +87,38 @@ class TestMaruHandlerConfig:
         with pytest.raises(ValueError, match="MARU_EAGER_MAP must be one of"):
             MaruConfig()
 
+    def test_config_auto_expand_defaults_false(self):
+        """auto_expand defaults to False."""
+        config = MaruConfig()
+        assert config.auto_expand is False
+
+    def test_config_auto_expand_true(self):
+        """auto_expand=True is valid."""
+        config = MaruConfig(auto_expand=True)
+        assert config.auto_expand is True
+
+    def test_config_expand_size_requires_auto_expand(self):
+        """expand_size without auto_expand=True raises ValueError."""
+        with pytest.raises(ValueError, match="expand_size requires auto_expand=True"):
+            MaruConfig(expand_size=4096)
+
+    def test_config_expand_size_with_auto_expand(self):
+        """expand_size with auto_expand=True is valid."""
+        config = MaruConfig(auto_expand=True, expand_size=4096, chunk_size_bytes=1024)
+        assert config.expand_size == 4096
+
+    def test_config_expand_size_smaller_than_chunk_raises(self):
+        """expand_size < chunk_size_bytes raises ValueError."""
+        with pytest.raises(
+            ValueError, match="expand_size.*must be >= .*chunk_size_bytes"
+        ):
+            MaruConfig(auto_expand=True, expand_size=512, chunk_size_bytes=1024)
+
+    def test_config_expand_size_none_default(self):
+        """expand_size defaults to None."""
+        config = MaruConfig(auto_expand=True)
+        assert config.expand_size is None
+
 
 class TestMaruHandlerEnsureConnected:
     """Test that operations require connection."""
@@ -109,7 +141,9 @@ class TestMaruHandlerEnsureConnected:
 # =============================================================================
 
 
-def _make_mock_handler(pool_size=8192, chunk_size=1024):
+def _make_mock_handler(
+    pool_size=8192, chunk_size=1024, auto_expand=False, expand_size=None
+):
     """Create a MaruHandler with mocked RPC for unit testing.
 
     Follows the pattern from test_thread_safety.py.
@@ -122,6 +156,8 @@ def _make_mock_handler(pool_size=8192, chunk_size=1024):
         chunk_size_bytes=chunk_size,
         auto_connect=False,
         use_async_rpc=False,
+        auto_expand=auto_expand,
+        expand_size=expand_size,
     )
     handler = MaruHandler(config)
 
@@ -574,7 +610,7 @@ class TestMaruHandlerCoverage:
 
     def test_batch_store_alloc_fails_expand_fails(self):
         """L577-584: allocation fails, expand fails."""
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
 
         # Fill the single page
         h = handler.alloc(size=4)
@@ -701,7 +737,7 @@ class TestMaruHandlerCoverage:
 
     def test_expand_region_rpc_raises(self):
         """request_alloc RPC raises exception during expand."""
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
 
         # Fill the single page
         h1 = handler.alloc(size=4)
@@ -721,7 +757,7 @@ class TestMaruHandlerCoverage:
         """add_region raises during expand — catches, calls return_alloc."""
         from maru_handler.memory import OwnedRegionManager
 
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
 
         # Fill the single page
         h1 = handler.alloc(size=4)
@@ -1008,7 +1044,7 @@ class TestMaruHandlerCoverage:
 
     def test_expand_region_happy_path(self):
         """expand succeeds — add_region works, new alloc succeeds."""
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
 
         # Fill the single page
         h1 = handler.alloc(size=4)
@@ -1034,7 +1070,7 @@ class TestMaruHandlerCoverage:
         """return_alloc also raises during expand cleanup."""
         from maru_handler.memory import OwnedRegionManager
 
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
 
         # Fill the single page
         h1 = handler.alloc(size=4)
@@ -1801,4 +1837,180 @@ class TestAllocThreadSafety:
 
         for i in range(4):
             assert i in handler._key_to_location
+        handler.close()
+
+
+# =============================================================================
+# Fixed Pool / Auto-Expand Tests
+# =============================================================================
+
+
+class TestFixedPoolAllocation:
+    """Tests for fixed pool allocation with optional auto-expand."""
+
+    def test_alloc_raises_when_pool_exhausted_no_expand(self):
+        """auto_expand=False: alloc raises ValueError when pool is full."""
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        assert handler._auto_expand is False
+
+        # Fill the single page
+        h = handler.alloc(size=4)
+        h.buf[:4] = b"fill"
+        handler.store(key="1", handle=h)
+
+        # Next alloc should raise — no expansion attempted
+        with pytest.raises(ValueError, match="auto_expand is disabled"):
+            handler.alloc(size=4)
+
+        handler.close()
+
+    def test_expand_uses_expand_size(self):
+        """auto_expand=True with custom expand_size uses that size for RPC."""
+        handler = _make_mock_handler(
+            pool_size=1024, chunk_size=1024, auto_expand=True, expand_size=2048
+        )
+
+        # Fill the single page
+        h = handler.alloc(size=4)
+        h.buf[:4] = b"fill"
+        handler.store(key="1", handle=h)
+
+        # Setup expand response
+        expand_response = MagicMock()
+        expand_response.success = True
+        expand_response.handle = _make_handle(200, 2048)
+        handler._rpc.request_alloc = MagicMock(return_value=expand_response)
+
+        # Trigger expansion
+        h2 = handler.alloc(size=4)
+        assert h2 is not None
+
+        # Verify request_alloc was called with expand_size=2048, not pool_size=1024
+        call_args = handler._rpc.request_alloc.call_args
+        assert call_args.kwargs.get("size") or call_args[1].get("size") == 2048
+
+        handler.close()
+
+    def test_expand_size_defaults_to_pool_size(self):
+        """auto_expand=True without expand_size uses pool_size for expansion."""
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
+        assert handler._expand_size == 1024  # defaults to pool_size
+
+        handler.close()
+
+    def test_connect_multi_pool_aggregation(self):
+        """connect() aggregates regions from multiple pools."""
+        from maru_common import MaruConfig
+        from maru_handler.handler import MaruHandler
+
+        config = MaruConfig(
+            pool_size=2048,
+            chunk_size_bytes=1024,
+            auto_connect=False,
+            use_async_rpc=False,
+            pool_id=[0, 1],
+        )
+        handler = MaruHandler(config)
+
+        mock_rpc = MagicMock()
+        mock_rpc.connect = MagicMock()
+        mock_rpc.return_alloc = MagicMock()
+        mock_rpc.close = MagicMock()
+
+        # Pool 0 gives 1024 bytes, pool 1 gives 1024 bytes → total 2048
+        resp0 = MagicMock()
+        resp0.success = True
+        resp0.handle = _make_handle(100, 1024)
+
+        resp1 = MagicMock()
+        resp1.success = True
+        resp1.handle = _make_handle(200, 1024)
+
+        mock_rpc.request_alloc = MagicMock(side_effect=[resp0, resp1])
+
+        # list_allocations for premap
+        list_resp = MagicMock()
+        list_resp.success = True
+        list_resp.allocations = []
+        mock_rpc.list_allocations = MagicMock(return_value=list_resp)
+
+        handler._rpc = mock_rpc
+        result = handler.connect()
+
+        assert result is True
+        assert handler.connected is True
+        # Should have 2 regions
+        assert len(handler.get_owned_region_ids()) == 2
+
+        handler.close()
+
+    def test_connect_multi_pool_partial_cleanup(self):
+        """connect() cleans up partial allocations if remaining > 0."""
+        from maru_common import MaruConfig
+        from maru_handler.handler import MaruHandler
+
+        config = MaruConfig(
+            pool_size=3072,
+            chunk_size_bytes=1024,
+            auto_connect=False,
+            use_async_rpc=False,
+            pool_id=[0, 1],
+        )
+        handler = MaruHandler(config)
+
+        mock_rpc = MagicMock()
+        mock_rpc.connect = MagicMock()
+        mock_rpc.return_alloc = MagicMock()
+        mock_rpc.close = MagicMock()
+
+        # Pool 0 gives 1024 bytes, pool 1 fails → only 1024 of 3072
+        resp0 = MagicMock()
+        resp0.success = True
+        resp0.handle = _make_handle(100, 1024)
+
+        resp1 = MagicMock()
+        resp1.success = False
+        resp1.handle = None
+        resp1.error = "pool full"
+
+        mock_rpc.request_alloc = MagicMock(side_effect=[resp0, resp1])
+
+        handler._rpc = mock_rpc
+        result = handler.connect()
+
+        assert result is False
+        assert handler.connected is False
+        # return_alloc should have been called to clean up pool 0's region
+        mock_rpc.return_alloc.assert_called()
+
+    def test_alloc_expand_disabled_error_message(self):
+        """Error message distinguishes disabled vs failed expansion."""
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+
+        h = handler.alloc(size=4)
+        h.buf[:4] = b"fill"
+        handler.store(key="1", handle=h)
+
+        with pytest.raises(ValueError, match="auto_expand is disabled"):
+            handler.alloc(size=4)
+
+        handler.close()
+
+    def test_alloc_expand_failed_error_message(self):
+        """Error message when expansion is enabled but fails."""
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=True)
+
+        h = handler.alloc(size=4)
+        h.buf[:4] = b"fill"
+        handler.store(key="1", handle=h)
+
+        # Make expand fail
+        fail_resp = MagicMock()
+        fail_resp.success = False
+        fail_resp.handle = None
+        handler._rpc.request_alloc = MagicMock(return_value=fail_resp)
+
+        with pytest.raises(ValueError, match="after expansion attempt"):
+            handler.alloc(size=4)
+
         handler.close()
