@@ -30,8 +30,8 @@
  */
 bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time)
 {
-    struct pid *pid_s;
-    struct task_struct *task;
+    struct pid* pid_s;
+    struct task_struct* task;
     bool dead = true;
 
     if (owner_pid == 0)
@@ -62,7 +62,7 @@ bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time)
  * Returns true if current process is the owner.
  */
 static bool marufs_is_owner(struct marufs_sb_info* sbi,
-                           struct marufs_rat_entry* rat_entry)
+                            struct marufs_rat_entry* rat_entry)
 {
     u32 owner_node, owner_pid;
     u64 owner_birth_time, current_birth_time;
@@ -74,12 +74,12 @@ static bool marufs_is_owner(struct marufs_sb_info* sbi,
 
     /* Stage 2: pid check */
     owner_pid = READ_LE32(rat_entry->owner_pid);
-    if (owner_pid != current->pid)
+    if (owner_pid != current->tgid)
         return false;
 
     /* Stage 3: birth_time check (PID reuse protection) */
     owner_birth_time = READ_LE64(rat_entry->owner_birth_time);
-    current_birth_time = ktime_to_ns(current->start_boottime);
+    current_birth_time = ktime_to_ns(current->group_leader->start_boottime);
 
     return owner_birth_time == current_birth_time;
 }
@@ -90,8 +90,8 @@ static bool marufs_is_owner(struct marufs_sb_info* sbi,
  * Exact match only: (node_id, pid) with birth_time verification.
  * pid=0 wildcard matching is no longer supported (rejected at grant time).
  */
-static bool marufs_deleg_matches(struct marufs_deleg_entry *de,
-                                u32 node_id, u32 required_perms)
+static bool marufs_deleg_matches(struct marufs_deleg_entry* de, u32 node_id,
+                                 u32 required_perms)
 {
     u32 de_node = READ_LE32(de->node_id);
     u32 de_pid = READ_LE32(de->pid);
@@ -102,13 +102,14 @@ static bool marufs_deleg_matches(struct marufs_deleg_entry *de,
         return false;
 
     /* Exact match: (node_id, pid) with birth_time verification */
-    if (de_node != node_id || de_pid != current->pid)
+    if (de_node != node_id || de_pid != current->tgid)
         return false;
 
-    /* PID reuse protection via birth_time */
+    /* PID reuse protection via birth_time (use group leader's birth_time
+     * so all threads in the process share the same identity) */
     {
         u64 de_birth = READ_LE64(de->birth_time);
-        u64 cur_birth = ktime_to_ns(current->start_boottime);
+        u64 cur_birth = ktime_to_ns(current->group_leader->start_boottime);
 
         if (de_birth != 0 && de_birth != cur_birth)
             return false;
@@ -130,8 +131,8 @@ static bool marufs_deleg_matches(struct marufs_deleg_entry *de,
  */
 struct marufs_deleg_table*
 marufs_deleg_table_get(struct marufs_sb_info* sbi,
-                      u32 rat_entry_id,
-                      u32* out_num_entries)
+                       u32 rat_entry_id,
+                       u32* out_num_entries)
 {
     struct marufs_region_header* rhdr;
     struct marufs_deleg_table* dt;
@@ -187,7 +188,7 @@ void marufs_deleg_entry_clear(struct marufs_deleg_entry* de)
  * Returns 0 if allowed, -EACCES if denied, -EINVAL on bad input.
  */
 int marufs_check_permission(struct marufs_sb_info* sbi, u32 rat_entry_id,
-                           u32 required_perms)
+                            u32 required_perms)
 {
     struct marufs_rat_entry* rat_entry;
     struct marufs_deleg_table* dt;
@@ -233,7 +234,7 @@ int marufs_check_permission(struct marufs_sb_info* sbi, u32 rat_entry_id,
             if (READ_LE64(de->birth_time) == 0)
             {
                 CAS_LE64(&de->birth_time, 0,
-                         ktime_to_ns(current->start_boottime));
+                         ktime_to_ns(current->group_leader->start_boottime));
                 MARUFS_CXL_WMB(de, sizeof(*de));
             }
             return 0;
@@ -241,6 +242,25 @@ int marufs_check_permission(struct marufs_sb_info* sbi, u32 rat_entry_id,
     }
 
 deny:
+    pr_warn(
+        "check_permission denied: rat_entry_id=%u required=0x%x "
+        "node_id=%u caller_tgid=%d owner_node=%u owner_pid=%u "
+        "default_perms=0x%x num_deleg=%u\n",
+        rat_entry_id, required_perms, sbi->node_id, current->tgid,
+        READ_LE32(rat_entry->owner_node_id), READ_LE32(rat_entry->owner_pid),
+        READ_LE32(rat_entry->default_perms), dt ? READ_LE32(dt->num_entries) : 0);
+    if (dt)
+    {
+        for (i = 0; i < num_entries && i < 4; i++)
+        {
+            struct marufs_deleg_entry* de = &dt->entries[i];
+            u32 st = READ_LE32(de->state);
+            if (st != MARUFS_DELEG_EMPTY)
+                pr_warn("  deleg[%u]: state=%u node=%u pid=%u perms=0x%x birth=%llu\n",
+                        i, st, READ_LE32(de->node_id), READ_LE32(de->pid),
+                        READ_LE32(de->perms), READ_LE64(de->birth_time));
+        }
+    }
     return -EACCES;
 }
 
@@ -268,8 +288,7 @@ deny:
  * Return: 0 if upserted existing entry, 1 if free slot found, -ENOSPC if full
  */
 static int marufs_deleg_try_upsert(struct marufs_deleg_table* dt,
-                                   u32 num_entries,
-                                   struct marufs_perm_req* req,
+                                   u32 num_entries, struct marufs_perm_req* req,
                                    u32* out_free_idx)
 {
     u32 i;
@@ -316,7 +335,7 @@ static int marufs_deleg_try_upsert(struct marufs_deleg_table* dt,
 #define MARUFS_DELEG_GRANT_MAX_RETRIES 3
 
 int marufs_deleg_grant(struct marufs_sb_info* sbi, u32 rat_entry_id,
-                      struct marufs_perm_req* req)
+                       struct marufs_perm_req* req)
 {
     struct marufs_rat_entry* rat_entry;
     struct marufs_deleg_table* dt;
@@ -370,9 +389,12 @@ int marufs_deleg_grant(struct marufs_sb_info* sbi, u32 rat_entry_id,
         WRITE_LE32(de->node_id, req->node_id);
         WRITE_LE32(de->pid, req->pid);
         WRITE_LE32(de->perms, req->perms);
-        WRITE_LE64(de->birth_time, 0); /* Filled on first access by delegated process */
+        WRITE_LE64(de->birth_time,
+                   0); /* Filled on first access by delegated process */
         WRITE_LE64(de->granted_at, ktime_get_real_ns());
-        MARUFS_CXL_WMB(de, sizeof(*de)); /* Ensure all fields visible before state transition */
+        MARUFS_CXL_WMB(
+            de,
+            sizeof(*de)); /* Ensure all fields visible before state transition */
 
         /* Publish: GRANTING → ACTIVE (now safe for readers) */
         WRITE_LE32(de->state, MARUFS_DELEG_ACTIVE);
@@ -384,8 +406,8 @@ int marufs_deleg_grant(struct marufs_sb_info* sbi, u32 rat_entry_id,
             do
             {
                 old_count = READ_LE32(dt->num_entries);
-            } while (CAS_LE32(&dt->num_entries, old_count,
-                              old_count + 1) != old_count);
+            } while (CAS_LE32(&dt->num_entries, old_count, old_count + 1) !=
+                     old_count);
         }
 
         return 0;
@@ -393,4 +415,3 @@ int marufs_deleg_grant(struct marufs_sb_info* sbi, u32 rat_entry_id,
 
     return -EAGAIN;
 }
-

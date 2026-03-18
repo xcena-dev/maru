@@ -305,7 +305,7 @@ static vm_fault_t marufs_page_mkwrite(struct vm_fault* vmf)
     if (ret)
     {
         pr_warn("page_mkwrite denied - rat_entry %u (pid=%d)\n",
-                xi->rat_entry_id, current->pid);
+                xi->rat_entry_id, current->tgid);
         return VM_FAULT_SIGBUS;
     }
 
@@ -376,7 +376,7 @@ static int marufs_mmap(struct file* file, struct vm_area_struct* vma)
     if (ret)
     {
         pr_debug("mmap read denied - rat_entry %u (pid=%d)\n",
-                 xi->rat_entry_id, current->pid);
+                 xi->rat_entry_id, current->tgid);
         return ret;
     }
 
@@ -387,7 +387,7 @@ static int marufs_mmap(struct file* file, struct vm_area_struct* vma)
         if (ret)
         {
             pr_debug("mmap write denied - rat_entry %u (pid=%d)\n",
-                     xi->rat_entry_id, current->pid);
+                     xi->rat_entry_id, current->tgid);
             return ret;
         }
     }
@@ -1039,9 +1039,9 @@ static long marufs_ioctl_chown(struct marufs_sb_info* sbi,
 
     /* Update ownership fields (safe from GC while in ALLOCATING state) */
     WRITE_LE32(rat_entry->owner_node_id, sbi->node_id);
-    WRITE_LE32(rat_entry->owner_pid, current->pid);
+    WRITE_LE32(rat_entry->owner_pid, current->tgid);
     WRITE_LE64(rat_entry->owner_birth_time,
-               ktime_to_ns(current->start_boottime));
+               ktime_to_ns(current->group_leader->start_boottime));
 
     /* Reset default_perms: clear previous owner's settings */
     WRITE_LE32(rat_entry->default_perms, 0);
@@ -1080,7 +1080,7 @@ static long marufs_ioctl_chown(struct marufs_sb_info* sbi,
     MARUFS_CXL_WMB(rat_entry, sizeof(*rat_entry));
 
     pr_info_ratelimited("chown rat_entry %u -> node=%u pid=%d\n",
-                        xi->rat_entry_id, sbi->node_id, current->pid);
+                        xi->rat_entry_id, sbi->node_id, current->tgid);
     return 0;
 }
 
@@ -1100,7 +1100,7 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info* sbi,
     if (ret)
     {
         pr_debug("PERM_SET_DEFAULT denied - rat_entry %u (pid=%d)\n",
-                 xi->rat_entry_id, current->pid);
+                 xi->rat_entry_id, current->tgid);
         return ret;
     }
 
@@ -1153,7 +1153,7 @@ static long marufs_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
     int ret;
 
     pr_debug("ioctl %s (0x%x) pid=%d rat=%u\n",
-             marufs_ioctl_name(cmd), cmd, current->pid, xi->rat_entry_id);
+             marufs_ioctl_name(cmd), cmd, current->tgid, xi->rat_entry_id);
 
     switch (cmd)
     {

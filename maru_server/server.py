@@ -252,6 +252,30 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
     )
+
+    # Auth gRPC options (all required to enable auth)
+    auth_group = parser.add_argument_group("auth", "gRPC mTLS authentication (cold path)")
+    auth_group.add_argument(
+        "--grpc-port", type=int, default=None,
+        help="gRPC auth server port (enables auth when set)",
+    )
+    auth_group.add_argument(
+        "--server-cert", type=str, default=None,
+        help="Server TLS certificate path",
+    )
+    auth_group.add_argument(
+        "--server-key", type=str, default=None,
+        help="Server TLS private key path",
+    )
+    auth_group.add_argument(
+        "--ca-cert", type=str, default=None,
+        help="CA certificate path (trust bundle for client verification)",
+    )
+    auth_group.add_argument(
+        "--policy", type=str, default=None,
+        help="Policy YAML file (role → permissions mapping)",
+    )
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -260,15 +284,52 @@ def main() -> None:
     server = MaruServer(mount_path=args.mount_path)
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
+    # Auth gRPC server (optional — only started if all auth args are provided)
+    auth_server = None
+    if args.grpc_port:
+        missing = [
+            name for name, val in [
+                ("--server-cert", args.server_cert),
+                ("--server-key", args.server_key),
+                ("--ca-cert", args.ca_cert),
+                ("--policy", args.policy),
+            ]
+            if val is None
+        ]
+        if missing:
+            parser.error(f"--grpc-port requires: {', '.join(missing)}")
+
+        from .auth.grpc_server import AuthGrpcServer
+
+        auth_server = AuthGrpcServer(
+            allocation_manager=server._allocation_manager,
+            policy_path=args.policy,
+            server_cert_path=args.server_cert,
+            server_key_path=args.server_key,
+            ca_cert_path=args.ca_cert,
+            host=args.host,
+            port=args.grpc_port,
+        )
+
     # Setup signal handlers
     def signal_handler(signum, frame):
+        if auth_server:
+            auth_server.stop()
         rpc_server.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start server
-    logger.info("Starting MaruServer on %s:%d", args.host, args.port)
+    # Start servers
+    if auth_server:
+        auth_server.start()
+        logger.info(
+            "Starting MaruServer on %s:%d (ZMQ) + %s:%d (gRPC mTLS)",
+            args.host, args.port, args.host, args.grpc_port,
+        )
+    else:
+        logger.info("Starting MaruServer on %s:%d", args.host, args.port)
+
     rpc_server.start()
 
 

@@ -22,6 +22,9 @@ dependencies = [
     "pyzmq>=25.0.0",
     "msgpack>=1.0.0",
     "dacite>=1.8.0",
+    "grpcio>=1.60.0",
+    "cryptography>=42.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

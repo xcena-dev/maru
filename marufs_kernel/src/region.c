@@ -206,8 +206,8 @@ int marufs_rat_alloc_entry(struct marufs_sb_info* sbi, const char* name,
         WRITE_LE64(entry->phys_offset, offset);
         WRITE_LE64(entry->size, size);
         WRITE_LE32(entry->owner_node_id, sbi->node_id);
-        WRITE_LE32(entry->owner_pid, current->pid);
-        WRITE_LE64(entry->owner_birth_time, ktime_to_ns(current->start_boottime));
+        WRITE_LE32(entry->owner_pid, current->tgid);
+        WRITE_LE64(entry->owner_birth_time, ktime_to_ns(current->group_leader->start_boottime));
 
         alloc_time = ktime_get_real_ns();
         WRITE_LE64(entry->alloc_time, alloc_time);

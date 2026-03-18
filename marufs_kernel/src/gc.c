@@ -259,6 +259,26 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info* sbi,
 
         de_birth = READ_LE64(de->birth_time);
 
+        /* Lazy bind: if birth_time=0, try to resolve from live process
+         * and write back to CXL memory so future checks can match. */
+        if (de_birth == 0)
+        {
+            struct pid *pid_s = find_get_pid(de_pid);
+            if (pid_s)
+            {
+                struct task_struct *task = get_pid_task(pid_s, PIDTYPE_PID);
+                if (task)
+                {
+                    u64 bt = ktime_to_ns(task->group_leader->start_boottime);
+                    CAS_LE64(&de->birth_time, 0, bt);
+                    MARUFS_CXL_WMB(de, sizeof(*de));
+                    de_birth = bt;
+                    put_task_struct(task);
+                }
+                put_pid(pid_s);
+            }
+        }
+
         if (!marufs_owner_is_dead(de_pid, de_birth))
             continue;
 

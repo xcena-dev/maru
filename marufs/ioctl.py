@@ -171,7 +171,8 @@ PERM_WRITE = 0x0002
 PERM_DELETE = 0x0004
 PERM_ADMIN = 0x0008
 PERM_IOCTL = 0x0010
-PERM_ALL = 0x001F
+PERM_GRANT = 0x0020
+PERM_ALL = 0x003F
 
 # ---------------------------------------------------------------------------
 # ioctl command numbers

@@ -1,0 +1,9 @@
+roles:
+  prefill:
+    perms: [READ, WRITE, DELETE, ADMIN, IOCTL]
+  decode:
+    perms: [READ, WRITE]
+  server:
+    perms: [GRANT]
+  admin:
+    perms: [READ, WRITE, DELETE, ADMIN, IOCTL, GRANT]

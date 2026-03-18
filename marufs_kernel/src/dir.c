@@ -172,8 +172,8 @@ static int marufs_create(MARUFS_IDMAP_PARAM_COMMA struct inode* dir,
     xi->rat_entry_id = rat_entry_id;
     xi->region_offset = 0; /* No physical region yet */
     xi->owner_node_id = sbi->node_id;
-    xi->owner_pid = current->pid;
-    xi->owner_birth_time = ktime_to_ns(current->start_boottime);
+    xi->owner_pid = current->tgid;
+    xi->owner_birth_time = ktime_to_ns(current->group_leader->start_boottime);
     xi->data_phys_offset = 0; /* Will be set by ftruncate */
 
     inode->i_ino = marufs_ino(rat_entry_id, 0);

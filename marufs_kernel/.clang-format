@@ -1,0 +1,31 @@
+# .clang-format
+# Clang-Format 19.x 버전 기준, Google C++ 스타일 + 프로젝트 규칙 반영
+
+# [공통 기본 설정]
+Language: Cpp
+BasedOnStyle: Google # Google 스타일을 기본으로 사용
+
+AccessModifierOffset: -4 # 접근 제어자(예: public, private) 들여쓰기: -4칸
+IndentWidth: 4 # 들여쓰기 폭: 4칸
+TabWidth: 4 # 탭 폭: 4칸
+UseTab: Never # 탭 대신 공백 사용
+
+BreakBeforeBraces: Allman # Allman 스타일 중괄호(중괄호를 새 줄에)
+
+ColumnLimit: 0 # 코드 한 줄 최대 길이: 140자
+
+# [코드 스타일 및 포맷팅]
+AllowShortIfStatementsOnASingleLine: false # 한 줄 if 금지
+AllowShortLoopsOnASingleLine: false # 한 줄 for/while 금지
+AllowShortFunctionsOnASingleLine: None # 한 줄 함수 금지
+AllowShortBlocksOnASingleLine: Never # 한 줄 블록 금지
+AllowShortCaseLabelsOnASingleLine: false # 한 줄 case 레이블 금지
+AllowShortEnumsOnASingleLine: false # 한 줄 enum 금지
+AllowShortLambdasOnASingleLine: None # Inline
+PackConstructorInitializers: Never # 생성자 초기화 리스트 압축 금지
+
+SpacesInParentheses: false # 괄호 안에 공백 금지
+SpaceAfterCStyleCast: false # C 스타일 캐스트 후 공백 금지
+SpaceBeforeParens: ControlStatements # 제어문(조건문)에서만 괄호 앞 공백
+DerivePointerAlignment: false # PointerAlignment 설정을 절대적으로 적용 (프로젝트 일관성 보장)
+PointerAlignment: Left # 포인터는 타입과 붙여 표기

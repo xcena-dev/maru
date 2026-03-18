@@ -112,6 +112,7 @@ class MaruHandler:
                 timeout_ms=self._config.timeout_ms,
             )
         self._mapper: DaxMapper | None = None
+        self._auth_client = None
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -140,80 +141,165 @@ class MaruHandler:
             return True
 
         try:
-            # 1. Connect RPC client
+            # 1. Connect RPC client (ZMQ — always needed for KV metadata)
             self._rpc.connect()
 
-            # 2. Request initial owned region via RPC — try each pool in order
-            response = None
-            for pool_id in self._pool_ids:
-                try:
-                    response = self._rpc.request_alloc(
-                        instance_id=self._config.instance_id,
-                        size=self._config.pool_size,
-                        pool_id=pool_id,
-                    )
-                except Exception:
-                    logger.error(
-                        "RPC request_alloc failed during connect (pool_id=%s)",
-                        pool_id,
-                        exc_info=True,
-                    )
-                    continue
-                if response.success and response.handle is not None:
-                    break
-                logger.warning(
-                    "Pool %s refused initial allocation: %s",
-                    pool_id,
-                    getattr(response, "error", "unknown"),
-                )
-
-            if response is None or not response.success or response.handle is None:
-                logger.error("Failed to allocate from any pool")
-                self._owned = None
-                self._rpc.close()
-                return False
-
-            # 3. Initialize mapper and OwnedRegionManager
-            if self._mapper is None:
-                self._mapper = DaxMapper(mount_path=response.mount_path)
-            self._owned = OwnedRegionManager(
-                mapper=self._mapper,
-                chunk_size=self._config.chunk_size_bytes,
-            )
-
-            # 4. Add region to OwnedRegionManager (mmap + allocator)
-            try:
-                self._owned.add_region(response.handle)
-            except Exception:
-                logger.error("Failed to init initial region", exc_info=True)
-                try:
-                    self._rpc.return_alloc(
-                        self._config.instance_id,
-                        response.handle.region_id,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to return allocation during cleanup", exc_info=True
-                    )
-                self._owned = None
-                self._rpc.close()
-                return False
-
-            self._connected = True
-
-            # 5. Pre-map shared regions (eager mapping)
-            if self._config.eager_map:
-                self._premap_shared_regions()
-
-            logger.info(
-                "Connected: chunk_size=%d",
-                self._config.chunk_size_bytes,
-            )
-            return True
+            if self._config.auth_server_addr:
+                return self._connect_with_auth()
+            else:
+                return self._connect_legacy()
 
         except Exception:
             logger.error("Failed to connect", exc_info=True)
             return False
+
+    def _connect_with_auth(self) -> bool:
+        """Auth mode: gRPC AllocRequest → CHOWN → GrantReady → mmap."""
+        import os
+
+        from .auth_client import AuthClient
+        from marufs.ioctl import PERM_GRANT
+
+        # 1. Connect auth client
+        self._auth_client = AuthClient(
+            server_addr=self._config.auth_server_addr,
+            client_cert_path=self._config.client_cert,
+            client_key_path=self._config.client_key,
+            ca_cert_path=self._config.ca_cert,
+        )
+
+        # 2. gRPC AllocRequest — get node_id from /proc/mounts via mapper's client
+        #    mount_path comes from ZMQ RPC (request_alloc response) in legacy mode,
+        #    but in auth mode we need it before AllocRequest. Read from env or config.
+        mount_path = os.environ.get("MARU_MOUNT_PATH", "/mnt/marufs")
+        if self._mapper is None:
+            self._mapper = DaxMapper(mount_path=mount_path)
+        node_id = self._mapper._client.get_node_id()
+        pid = os.getpid()
+
+        auth_resp = self._auth_client.request_alloc(
+            size=self._config.pool_size,
+            node_id=node_id,
+            pid=pid,
+        )
+        if not auth_resp.success:
+            logger.error("Auth AllocRequest failed: %s", auth_resp.error)
+            self._rpc.close()
+            return False
+
+        region_id = auth_resp.region_id
+
+        # 4. Local CHOWN + perm_grant(server, GRANT) using mapper's client
+        marufs_client = self._mapper._client
+        region_filename = marufs_client._find_region_file(region_id)
+        fd = marufs_client._open_region(region_filename, readonly=False)
+        marufs_client.chown(fd)
+        logger.info(
+            "CHOWN done, granting GRANT to server: fd=%d server_node=%d server_pid=%d",
+            fd, auth_resp.server_node_id, auth_resp.server_pid,
+        )
+        marufs_client.perm_grant(
+            fd, auth_resp.server_node_id, auth_resp.server_pid, PERM_GRANT,
+        )
+        logger.info("perm_grant(server, GRANT) done for region_id=%d", region_id)
+
+        # 5. gRPC GrantReady
+        grant_resp = self._auth_client.notify_grant_ready(region_id)
+        if not grant_resp.success:
+            logger.error("Auth GrantReady failed: %s", grant_resp.error)
+            self._rpc.close()
+            return False
+
+        handle = MaruHandle(
+            region_id=region_id,
+            offset=0,
+            length=self._config.pool_size,
+            auth_token=0,
+        )
+
+        self._owned = OwnedRegionManager(
+            mapper=self._mapper,
+            chunk_size=self._config.chunk_size_bytes,
+        )
+        self._owned.add_region(handle)
+        self._connected = True
+
+        logger.info(
+            "Connected (auth): region_id=%d chunk_size=%d",
+            region_id,
+            self._config.chunk_size_bytes,
+        )
+        return True
+
+    def _connect_legacy(self) -> bool:
+        """Legacy mode: ZMQ request_alloc (no auth)."""
+        # 2. Request initial owned region via RPC — try each pool in order
+        response = None
+        for pool_id in self._pool_ids:
+            try:
+                response = self._rpc.request_alloc(
+                    instance_id=self._config.instance_id,
+                    size=self._config.pool_size,
+                    pool_id=pool_id,
+                )
+            except Exception:
+                logger.error(
+                    "RPC request_alloc failed during connect (pool_id=%s)",
+                    pool_id,
+                    exc_info=True,
+                )
+                continue
+            if response.success and response.handle is not None:
+                break
+            logger.warning(
+                "Pool %s refused initial allocation: %s",
+                pool_id,
+                getattr(response, "error", "unknown"),
+            )
+
+        if response is None or not response.success or response.handle is None:
+            logger.error("Failed to allocate from any pool")
+            self._owned = None
+            self._rpc.close()
+            return False
+
+        # 3. Initialize mapper and OwnedRegionManager
+        if self._mapper is None:
+            self._mapper = DaxMapper(mount_path=response.mount_path)
+        self._owned = OwnedRegionManager(
+            mapper=self._mapper,
+            chunk_size=self._config.chunk_size_bytes,
+        )
+
+        # 4. Add region to OwnedRegionManager (mmap + allocator)
+        try:
+            self._owned.add_region(response.handle)
+        except Exception:
+            logger.error("Failed to init initial region", exc_info=True)
+            try:
+                self._rpc.return_alloc(
+                    self._config.instance_id,
+                    response.handle.region_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to return allocation during cleanup", exc_info=True
+                )
+            self._owned = None
+            self._rpc.close()
+            return False
+
+        self._connected = True
+
+        # 5. Pre-map shared regions (eager mapping)
+        if self._config.eager_map:
+            self._premap_shared_regions()
+
+        logger.info(
+            "Connected: chunk_size=%d",
+            self._config.chunk_size_bytes,
+        )
+        return True
 
     def close(self) -> None:
         """Close the connection and return all allocations.
@@ -244,7 +330,12 @@ class MaruHandler:
                 if self._mapper is not None:
                     self._mapper.close()
 
-                # 4. Close RPC connection
+                # 4. Close auth client
+                if self._auth_client is not None:
+                    self._auth_client.close()
+                    self._auth_client = None
+
+                # 5. Close RPC connection
                 self._rpc.close()
 
         except Exception:
@@ -571,6 +662,7 @@ class MaruHandler:
         if not self._owned.is_owned(region_id):
             if self._mapper.get_region(region_id) is None:
                 try:
+                    self._request_shared_access(region_id)
                     self._mapper.map_region(handle)
                 except Exception:
                     logger.error(
@@ -726,6 +818,7 @@ class MaruHandler:
             if not self._owned.is_owned(region_id):
                 if self._mapper.get_region(region_id) is None:
                     try:
+                        self._request_shared_access(region_id)
                         self._mapper.map_region(handle)
                     except Exception:
                         logger.error(
@@ -1088,6 +1181,7 @@ class MaruHandler:
             if self._mapper.get_region(handle.region_id) is not None:
                 continue  # already mapped (own region)
             try:
+                self._request_shared_access(handle.region_id)
                 self._mapper.map_region(handle, prefault=False)
                 mapped_count += 1
             except Exception as e:
@@ -1102,6 +1196,25 @@ class MaruHandler:
             mapped_count,
             len(response.allocations),
         )
+
+    def _request_shared_access(self, region_id: int) -> None:
+        """Request access to a shared region via gRPC AccessRequest.
+
+        No-op if auth is not configured. Called before mmap of shared regions.
+        """
+        if self._auth_client is None:
+            return
+        import os
+
+        resp = self._auth_client.request_access(
+            region_id=region_id,
+            node_id=self._mapper._client.get_node_id(),
+            pid=os.getpid(),
+        )
+        if not resp.success:
+            raise PermissionError(
+                f"AccessRequest denied for region {region_id}: {resp.error}"
+            )
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""

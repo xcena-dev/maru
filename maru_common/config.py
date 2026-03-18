@@ -52,6 +52,12 @@ class MaruConfig:
     eager_map: bool = True  # Pre-map all shared regions on connect
     pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
 
+    # Auth (optional — all must be set to enable mTLS auth)
+    auth_server_addr: str | None = None  # gRPC auth server address (e.g., "localhost:50051")
+    client_cert: str | None = None       # Client cert path (with SPIFFE ID in SAN)
+    client_key: str | None = None        # Client private key path
+    ca_cert: str | None = None           # CA cert path (trust bundle)
+
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
         if self.instance_id is None:
@@ -63,6 +69,16 @@ class MaruConfig:
         env_eager_map = _parse_env_bool("MARU_EAGER_MAP")
         if env_eager_map is not None:
             self.eager_map = env_eager_map
+
+        # Auth config from environment (set by naru/launcher per instance)
+        if self.auth_server_addr is None:
+            self.auth_server_addr = os.environ.get("MARU_AUTH_SERVER_ADDR")
+        if self.client_cert is None:
+            self.client_cert = os.environ.get("MARU_CLIENT_CERT")
+        if self.client_key is None:
+            self.client_key = os.environ.get("MARU_CLIENT_KEY")
+        if self.ca_cert is None:
+            self.ca_cert = os.environ.get("MARU_CA_CERT")
 
         # Normalize pool_id to list[int] | None
         if self.pool_id is None:

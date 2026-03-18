@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package maru.auth;
+
+// Cold-path authentication service.
+// Runs on a separate gRPC port with mTLS.
+// Client identity is extracted from the mTLS peer cert SAN (SPIFFE ID),
+// NOT from request fields — prevents role spoofing.
+service AuthService {
+  // Owner requests region allocation.
+  // Server creates region, perm_set_default(0), perm_grant(ADMIN) to owner.
+  // Region enters CHOWN_PENDING state.
+  rpc AllocRequest(AllocRequestMsg) returns (AllocResponseMsg);
+
+  // Reader requests access to an existing region.
+  // Server checks policy (role → perms), calls perm_grant.
+  // If region is CHOWN_PENDING, request is queued until GRANT_READY.
+  rpc AccessRequest(AccessRequestMsg) returns (AccessResponseMsg);
+
+  // Owner confirms CHOWN complete + GRANT re-granted to server.
+  // Region transitions CHOWN_PENDING → ACTIVE. Queued requests processed.
+  rpc GrantReady(GrantReadyMsg) returns (GrantReadyResponseMsg);
+}
+
+message AllocRequestMsg {
+  uint64 size = 1;      // Region size in bytes
+  uint32 node_id = 2;   // Client's CXL node ID (for perm_grant)
+  uint32 pid = 3;       // Client's PID (for perm_grant)
+}
+
+message AllocResponseMsg {
+  bool success = 1;
+  uint32 region_id = 2;       // Allocated region ID
+  string error = 3;
+  uint32 server_node_id = 4;  // Server's CXL node ID (for perm_grant after CHOWN)
+  uint32 server_pid = 5;      // Server's PID (for perm_grant after CHOWN)
+  string mount_path = 6;      // marufs mount path
+}
+
+message AccessRequestMsg {
+  uint32 region_id = 1;
+  uint32 node_id = 2;
+  uint32 pid = 3;
+}
+
+message AccessResponseMsg {
+  bool success = 1;
+  uint32 granted_perms = 2;
+  string error = 3;
+}
+
+message GrantReadyMsg {
+  uint32 region_id = 1;
+}
+
+message GrantReadyResponseMsg {
+  bool success = 1;
+  string error = 2;
+}

@@ -92,6 +92,13 @@ class MarufsClient:
 
         logger.debug("MarufsClient initialised with mount_path=%s", mount_path)
 
+    def get_fd(self, region_id: int) -> int | None:
+        """Return the cached fd for a region_id, or None."""
+        name = self._region_names.get(region_id)
+        if name is None:
+            return None
+        return self._fds.get(name)
+
     def __enter__(self) -> "MarufsClient":
         return self
 
@@ -200,6 +207,10 @@ class MarufsClient:
             os.ftruncate(fd, size)
         except OSError:
             os.close(fd)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
             raise
         self._fds[name] = fd
         self._fd_modes[name] = False  # created as RDWR
@@ -711,7 +722,7 @@ class MarufsClient:
             self._region_names[region_id] = region_name
 
         fd = self._create_region(region_name, size)
-        self.perm_set_default(fd, PERM_ALL)
+        self.perm_set_default(fd, 0)
 
         handle = MaruHandle(
             region_id=region_id,
