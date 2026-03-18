@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_common.protocol import ANY_POOL_ID
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -34,9 +35,11 @@ class MaruServer:
     # Allocation Management
     # =========================================================================
 
-    def request_alloc(self, instance_id: str, size: int) -> MaruHandle | None:
+    def request_alloc(
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+    ) -> MaruHandle | None:
         """Handle allocation request from client."""
-        handle = self._allocation_manager.allocate(instance_id, size)
+        handle = self._allocation_manager.allocate(instance_id, size, pool_id=pool_id)
         if handle:
             logger.info(
                 "Allocated %d bytes for %s: region_id=%d",
@@ -201,7 +204,10 @@ class MaruServer:
 def setup_logging(level: str) -> None:
     """Setup logging level for the MaruServer package."""
     log_level = getattr(logging, level.upper(), logging.INFO)
-    logging.getLogger("maru_server").setLevel(log_level)
+    pkg_logger = logging.getLogger("maru_server")
+    pkg_logger.setLevel(log_level)
+    for handler in pkg_logger.handlers:
+        handler.setLevel(log_level)
 
 
 def main() -> None:

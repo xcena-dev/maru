@@ -2,6 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for MaruServer orchestration logic."""
 
+from maru_common import ANY_POOL_ID
 from maru_server.server import MaruServer
 
 
@@ -290,7 +291,9 @@ class TestMaruServerEdgeCases:
 
         # Mock the allocation manager to return None
         original_alloc = server._allocation_manager.allocate
-        server._allocation_manager.allocate = lambda instance_id, size: None  # type: ignore
+        server._allocation_manager.allocate = (
+            lambda instance_id, size, pool_id=ANY_POOL_ID: None
+        )  # type: ignore
 
         result = server.request_alloc("instance1", 4096)
         assert result is None

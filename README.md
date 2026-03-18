@@ -149,8 +149,12 @@ extra_config:
   maru_pool_size: "4G"
 ```
 
-For full configuration details, see the [documentation](https://xcena-dev.github.io/maru-dev/source/getting_started/examples/lmcache/).
+For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
 
+
+## Tools
+
+- **[pool_monitor](tools/)** — Real-time pool usage monitor (`top`-style TUI, CSV export)
 
 ## License
 
