@@ -87,20 +87,20 @@ class TestMaruHandlerConfig:
         with pytest.raises(ValueError, match="MARU_EAGER_MAP must be one of"):
             MaruConfig()
 
-    def test_config_auto_expand_defaults_false(self):
-        """auto_expand defaults to False."""
+    def test_config_auto_expand_defaults_true(self):
+        """auto_expand defaults to True."""
         config = MaruConfig()
-        assert config.auto_expand is False
-
-    def test_config_auto_expand_true(self):
-        """auto_expand=True is valid."""
-        config = MaruConfig(auto_expand=True)
         assert config.auto_expand is True
+
+    def test_config_auto_expand_false(self):
+        """auto_expand=False is valid."""
+        config = MaruConfig(auto_expand=False)
+        assert config.auto_expand is False
 
     def test_config_expand_size_requires_auto_expand(self):
         """expand_size without auto_expand=True raises ValueError."""
         with pytest.raises(ValueError, match="expand_size requires auto_expand=True"):
-            MaruConfig(expand_size=4096)
+            MaruConfig(auto_expand=False, expand_size=4096)
 
     def test_config_expand_size_with_auto_expand(self):
         """expand_size with auto_expand=True is valid."""
@@ -142,7 +142,7 @@ class TestMaruHandlerEnsureConnected:
 
 
 def _make_mock_handler(
-    pool_size=8192, chunk_size=1024, auto_expand=False, expand_size=None
+    pool_size=8192, chunk_size=1024, auto_expand=True, expand_size=None
 ):
     """Create a MaruHandler with mocked RPC for unit testing.
 
@@ -1850,7 +1850,7 @@ class TestFixedPoolAllocation:
 
     def test_alloc_raises_when_pool_exhausted_no_expand(self):
         """auto_expand=False: alloc raises ValueError when pool is full."""
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=False)
         assert handler._auto_expand is False
 
         # Fill the single page
@@ -1887,7 +1887,7 @@ class TestFixedPoolAllocation:
 
         # Verify request_alloc was called with expand_size=2048, not pool_size=1024
         call_args = handler._rpc.request_alloc.call_args
-        assert call_args.kwargs.get("size") or call_args[1].get("size") == 2048
+        assert call_args.kwargs["size"] == 2048
 
         handler.close()
 
@@ -1985,7 +1985,7 @@ class TestFixedPoolAllocation:
 
     def test_alloc_expand_disabled_error_message(self):
         """Error message distinguishes disabled vs failed expansion."""
-        handler = _make_mock_handler(pool_size=1024, chunk_size=1024)
+        handler = _make_mock_handler(pool_size=1024, chunk_size=1024, auto_expand=False)
 
         h = handler.alloc(size=4)
         h.buf[:4] = b"fill"

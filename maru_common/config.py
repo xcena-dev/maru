@@ -51,9 +51,7 @@ class MaruConfig:
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
     pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
-    auto_expand: bool = (
-        False  # Auto-expand when pool is exhausted (disabled by default)
-    )
+    auto_expand: bool = True  # Auto-expand when pool is exhausted
     expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
 
     def __post_init__(self):
