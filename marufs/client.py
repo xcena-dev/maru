@@ -722,7 +722,9 @@ class MarufsClient:
             self._region_names[region_id] = region_name
 
         fd = self._create_region(region_name, size)
-        self.perm_set_default(fd, 0)
+        # Default: allow all access (legacy mode).
+        # In auth mode, grpc_server overwrites this to 0 after alloc.
+        self.perm_set_default(fd, PERM_ALL)
 
         handle = MaruHandle(
             region_id=region_id,
