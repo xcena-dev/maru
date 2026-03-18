@@ -98,6 +98,37 @@ maru-server --host 127.0.0.1 --port 5556 --log-level DEBUG
 
 ---
 
+## vLLM KV Connector Configuration
+
+When using MaruKVConnector with vLLM, configuration is passed via `kv_connector_extra_config` in the `--kv-transfer-config` JSON:
+
+```bash
+vllm serve <model> --kv-transfer-config '{
+    "kv_connector": "MaruKVConnector",
+    "kv_connector_module_path": "maru_vllm",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "maru_server_url": "tcp://localhost:5555",
+        "maru_pool_size": "4G"
+    }
+}'
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address |
+| `maru_pool_size` | `str \| int` | `1G` | CXL memory pool size (`4G`, `500M`, or integer bytes) |
+| `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
+| `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
+| `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
+| `maru_kv_chunk_tokens` | `int` | `256` | KV cache chunk granularity (in tokens). Auto-aligned to vLLM `block_size` |
+
+For full architecture and data path details, see [vLLM Integration](../integration/vllm.md#configuration).
+
+---
+
 ## LMCache Configuration
 
 For LMCache YAML configuration (plugin settings, `extra_config` parameters), see [LMCache Integration](../integration/lmcache.md#configuration).
