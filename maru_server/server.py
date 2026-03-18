@@ -5,7 +5,6 @@
 import argparse
 import logging
 import signal
-import threading
 from threading import RLock
 
 from maru_common.protocol import ANY_POOL_ID
@@ -26,28 +25,13 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    PIN_TIMEOUT_SEC = 60.0
-    PIN_CHECK_INTERVAL_SEC = 30.0
-
-    def __init__(
-        self,
-        pin_timeout_sec: float = PIN_TIMEOUT_SEC,
-        pin_check_interval_sec: float = PIN_CHECK_INTERVAL_SEC,
-    ):
+    def __init__(self):
         self._allocation_manager = AllocationManager()
-        self._kv_manager = KVManager(pin_timeout_sec=pin_timeout_sec)
+        self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
-
-        # Pin timeout monitor
-        self._pin_check_interval = pin_check_interval_sec
-        self._pin_monitor_stop = threading.Event()
-        self._pin_monitor_thread = threading.Thread(
-            target=self._pin_monitor_loop,
-            name="PinMonitor",
-            daemon=True,
-        )
-        self._pin_monitor_thread.start()
-
+        # TODO: Add PinMonitor daemon thread when eviction is implemented.
+        # Periodically force-unpin entries that exceed a TTL to prevent
+        # pin leaks from crashed clients.
         logger.info("MaruServer initialized")
 
     # =========================================================================
@@ -127,6 +111,10 @@ class MaruServer:
     def exists_kv(self, key: str) -> bool:
         """Check if a KV entry exists."""
         return self._kv_manager.exists(key)
+
+    def exists_and_pin_kv(self, key: str) -> bool:
+        """Check if a KV entry exists and pin it atomically."""
+        return self._kv_manager.exists_and_pin(key)
 
     def unpin_kv(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
@@ -225,23 +213,6 @@ class MaruServer:
             "kv_manager": self._kv_manager.get_stats(),
             "allocation_manager": self._allocation_manager.get_stats(),
         }
-
-    # =========================================================================
-    # Pin Timeout Monitor
-    # =========================================================================
-
-    def _pin_monitor_loop(self) -> None:
-        """Background thread: periodically force-unpin timed-out entries."""
-        while not self._pin_monitor_stop.wait(self._pin_check_interval):
-            try:
-                self._kv_manager.check_pin_timeouts()
-            except Exception:
-                logger.error("PinMonitor error", exc_info=True)
-
-    def shutdown(self) -> None:
-        """Stop background threads."""
-        self._pin_monitor_stop.set()
-        self._pin_monitor_thread.join(timeout=5.0)
 
 
 # =============================================================================

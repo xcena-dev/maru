@@ -417,6 +417,11 @@ class RpcAsyncClient:
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
+    def exists_and_pin_kv(self, key: str) -> bool:
+        """Check if a KV entry exists and pin it atomically."""
+        response = self._send_request(MessageType.EXISTS_AND_PIN_KV, {"key": key})
+        return response.get("exists", False)
+
     def unpin_kv(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
         response = self._send_request(MessageType.UNPIN_KV, {"key": key})
