@@ -219,7 +219,12 @@ class RpcHandlerMixin:
         keys = req.keys
         results = self._server.batch_exists_and_pin_kv(keys)
         hits = sum(results)
-        logger.debug("[BATCH_EXISTS_AND_PIN] %d keys, %d hits", len(keys), hits)
+        logger.debug(
+            "[BATCH_EXISTS_AND_PIN] %d keys, %d hits, %d pinned (prefix-stop)",
+            len(keys),
+            hits,
+            hits,
+        )
         return {"results": results}
 
     def _handle_batch_unpin_kv(self, req: Any) -> dict:
