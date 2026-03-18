@@ -141,14 +141,23 @@ class MarufsClient:
 
         Raises:
             FileNotFoundError: If no matching region file is found.
+            RuntimeError: If multiple files match the same region_id prefix.
         """
         prefix = f"region_{region_id}_"
+        matches = []
         try:
             for entry in os.listdir(self._mount_path):
                 if entry.startswith(prefix):
-                    return entry
+                    matches.append(entry)
         except OSError:
             pass
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Multiple region files found for region_id={region_id}: "
+                f"{matches} in {self._mount_path}"
+            )
         raise FileNotFoundError(
             f"No region file found for region_id={region_id} "
             f"(prefix={prefix!r}) in {self._mount_path}"
@@ -677,8 +686,27 @@ class MarufsClient:
             )
 
         with self._lock:
+            # Scan existing files once to find used region_ids
+            existing_ids: set[int] = set()
+            try:
+                for entry in os.listdir(self._mount_path):
+                    if entry.startswith("region_"):
+                        parts = entry.split("_", 2)
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            existing_ids.add(int(parts[1]))
+            except OSError:
+                pass
+
+            # Skip region_ids that already have files on disk
             region_id = self._next_region_id
-            self._next_region_id += 1
+            while region_id in existing_ids:
+                logger.warning(
+                    "alloc: region_id=%d already exists on disk, skipping",
+                    region_id,
+                )
+                region_id += 1
+            self._next_region_id = region_id + 1
+
             region_name = f"region_{region_id}_{uuid.uuid4().hex[:8]}"
             self._region_names[region_id] = region_name
 
