@@ -354,9 +354,13 @@ class MaruSchedulerConnector:
             return
         # Scheduler only needs metadata lookups (batch_exists), not
         # data storage. Use a minimal pool to avoid wasting CXL memory.
-        _SCHEDULER_POOL_BYTES = 1 * 1024 * 1024  # 1 MB
+        # Ideally pool_size=0 with no owned region, but MaruHandler
+        # requires an owned region on connect. 1MB is the minimum
+        # safe value. A metadata-only connect mode in MaruHandler
+        # would eliminate this waste entirely.
+        scheduler_pool_bytes = 1 * 1024 * 1024  # 1 MB
         self._handler = _create_maru_handler(
-            self._extra_config, pool_size_override=_SCHEDULER_POOL_BYTES
+            self._extra_config, pool_size_override=scheduler_pool_bytes
         )
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
@@ -772,10 +776,7 @@ class MaruWorkerConnector:
                             base_key, set()
                         )
                         progress.add(layer_idx)
-                        if (
-                            self._num_layers > 0
-                            and len(progress) >= self._num_layers
-                        ):
+                        if self._num_layers > 0 and len(progress) >= self._num_layers:
                             done_key = f"{base_key}_DONE"
                             try:
                                 done_h = self._handler.alloc(1)
