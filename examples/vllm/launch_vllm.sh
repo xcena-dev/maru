@@ -61,8 +61,7 @@ KV_CONFIG=$(cat <<EOJSON
 EOJSON
 )
 
-PYTHONHASHSEED=123 \
-    CUDA_VISIBLE_DEVICES=$DEVICE \
+CUDA_VISIBLE_DEVICES=$DEVICE \
     vllm serve "$MODEL" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --port "$PORT" \
