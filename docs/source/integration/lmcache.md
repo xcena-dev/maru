@@ -114,7 +114,7 @@ max_local_cpu_size: 0
 save_unfull_chunk: True
 
 # Maru backend
-maru_path: "tcp://localhost:5555"
+maru_path: "maru://localhost:5555"
 maru_pool_size: 4
 
 extra_config:
@@ -130,7 +130,7 @@ extra_config:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `maru_path` | (required) | MaruServer address. Format: `tcp://<host>:<port>` |
+| `maru_path` | (required) | MaruServer address. Format: `maru://<host>:<port>` |
 | `maru_pool_size` | `4` | CXL memory pool size in GB |
 
 ### Maru extra_config parameters

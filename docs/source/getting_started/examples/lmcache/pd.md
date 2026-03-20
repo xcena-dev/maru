@@ -25,7 +25,7 @@ chunk_size: 256
 local_cpu: False
 save_unfull_chunk: True
 # Maru backend
-maru_path: "tcp://localhost:${MARU_SERVER_PORT}"
+maru_path: "maru://localhost:${MARU_SERVER_PORT}"
 maru_pool_size: 4
 
 extra_config:
