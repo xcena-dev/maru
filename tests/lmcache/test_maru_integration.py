@@ -20,9 +20,9 @@ class TestConfigFields:
         config = LMCacheEngineConfig(chunk_size=256)
         assert config.maru_path is None
 
-    def test_maru_pool_size_default_none(self):
+    def test_maru_pool_size_default(self):
         config = LMCacheEngineConfig(chunk_size=256)
-        assert config.maru_pool_size is None
+        assert config.maru_pool_size == 4.0
 
     def test_maru_path_set(self):
         config = LMCacheEngineConfig(
@@ -34,9 +34,9 @@ class TestConfigFields:
     def test_maru_pool_size_set(self):
         config = LMCacheEngineConfig(
             chunk_size=256,
-            maru_pool_size=4 * 1024**3,
+            maru_pool_size=8.0,
         )
-        assert config.maru_pool_size == 4 * 1024**3
+        assert config.maru_pool_size == 8.0
 
 
 class TestCreateStorageBackends:
@@ -74,7 +74,7 @@ class TestCreateStorageBackends:
             chunk_size=256,
             max_local_cpu_size=0,
             maru_path="tcp://localhost:5555",
-            maru_pool_size=1024 * 1024,
+            maru_pool_size=1.0,
         )
         metadata = MagicMock(spec=LMCacheMetadata)
         metadata.role = "scheduler"

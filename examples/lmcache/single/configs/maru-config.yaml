@@ -4,7 +4,7 @@ local_cpu: False
 enable_async_loading: False
 
 maru_path: "tcp://localhost:${MARU_SERVER_PORT}"
-maru_pool_size: 4G
+maru_pool_size: 4
 
 extra_config:
   lookup_backoff_time: 0.001
