@@ -27,7 +27,7 @@ enable_p2p: False
 enable_controller: False
 
 # Maru backend
-maru_path: "tcp://localhost:${MARU_SERVER_PORT}"
+maru_path: "maru://localhost:${MARU_SERVER_PORT}"
 maru_pool_size: 4
 
 extra_config:
