@@ -43,8 +43,8 @@ with MaruHandler(config) as handler:
 
 ```{eval-rst}
 .. autoclass:: maru_handler.MaruHandler
-   :members: connect, close, alloc, store, retrieve, exists, delete,
-             batch_store, batch_retrieve, batch_exists,
+   :members: connect, close, alloc, free, store, retrieve, exists, pin, unpin, delete,
+             batch_store, batch_retrieve, batch_exists, batch_pin, batch_unpin,
              healthcheck, get_stats
    :noindex:
    :no-undoc-members:
