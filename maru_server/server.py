@@ -11,7 +11,7 @@ from maru_common.protocol import ANY_POOL_ID
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
-from .kv_manager import KVManager
+from .kv_manager import DeleteResult, KVManager
 
 logger = logging.getLogger(__name__)
 
@@ -112,23 +112,23 @@ class MaruServer:
         """Check if a KV entry exists."""
         return self._kv_manager.exists(key)
 
-    def exists_and_pin_kv(self, key: str) -> bool:
+    def pin_kv(self, key: str) -> bool:
         """Check if a KV entry exists and pin it atomically."""
-        return self._kv_manager.exists_and_pin(key)
+        return self._kv_manager.pin(key)
 
-    def unpin_kv(self, key: str) -> bool:
+    def unpin(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
         return self._kv_manager.unpin(key)
 
     def delete_kv(self, key: str) -> bool:
         """Delete a KV entry."""
         with self._lock:
-            existed, region_to_deref = self._kv_manager.delete(key)
+            result, region_to_deref = self._kv_manager.delete(key)
 
             if region_to_deref is not None:
                 self._allocation_manager.decrement_kv_ref(region_to_deref)
 
-        return existed
+        return result == DeleteResult.DELETED
 
     # =========================================================================
     # Batch KV Operations
@@ -187,11 +187,11 @@ class MaruServer:
 
             return results
 
-    def batch_exists_and_pin_kv(self, keys: list[str]) -> list[bool]:
+    def batch_pin_kv(self, keys: list[str]) -> list[bool]:
         """Check existence and pin multiple KV entries atomically."""
-        return self._kv_manager.batch_exists_and_pin(keys)
+        return self._kv_manager.batch_pin(keys)
 
-    def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
         """Unpin multiple KV entries."""
         return self._kv_manager.batch_unpin(keys)
 

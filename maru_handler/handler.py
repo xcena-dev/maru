@@ -589,7 +589,7 @@ class MaruHandler:
         self._ensure_connected()
         return self._rpc.exists_kv(key)
 
-    def exists_and_pin(self, key: str) -> bool:
+    def pin(self, key: str) -> bool:
         """Check if a key exists and pin it atomically.
 
         If the key exists, increments pin_count to protect from eviction.
@@ -601,9 +601,9 @@ class MaruHandler:
             True if exists (and was pinned)
         """
         self._ensure_connected()
-        return self._rpc.exists_and_pin_kv(key)
+        return self._rpc.pin_kv(key)
 
-    def unpin_kv(self, key: str) -> bool:
+    def unpin(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction.
 
         Args:
@@ -613,7 +613,7 @@ class MaruHandler:
             True if unpinned successfully
         """
         self._ensure_connected()
-        return self._rpc.unpin_kv(key)
+        return self._rpc.unpin(key)
 
     def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
@@ -904,7 +904,7 @@ class MaruHandler:
             return [False] * len(keys)
         return batch_resp.results
 
-    def batch_exists_and_pin(self, keys: list[str]) -> list[bool]:
+    def batch_pin(self, keys: list[str]) -> list[bool]:
         """Check existence and pin multiple keys in a single RPC call.
 
         Args:
@@ -914,9 +914,9 @@ class MaruHandler:
             List of booleans — True if key exists (and was pinned).
         """
         self._ensure_connected()
-        return self._rpc.batch_exists_and_pin_kv(keys)
+        return self._rpc.batch_pin_kv(keys).results
 
-    def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
         """Unpin multiple keys in a single RPC call.
 
         Args:
@@ -926,7 +926,7 @@ class MaruHandler:
             List of booleans — True if successfully unpinned.
         """
         self._ensure_connected()
-        return self._rpc.batch_unpin_kv(keys)
+        return self._rpc.batch_unpin(keys).results
 
     # =========================================================================
     # Properties

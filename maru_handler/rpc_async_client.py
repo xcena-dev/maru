@@ -37,7 +37,9 @@ from maru_common import (
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
+    BatchPinKVResponse,
     BatchRegisterKVResponse,
+    BatchUnpinKVResponse,
     GetStatsResponse,
     KVManagerStats,
     ListAllocationsResponse,
@@ -417,12 +419,12 @@ class RpcAsyncClient:
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
-    def exists_and_pin_kv(self, key: str) -> bool:
+    def pin_kv(self, key: str) -> bool:
         """Check if a KV entry exists and pin it atomically."""
-        response = self._send_request(MessageType.EXISTS_AND_PIN_KV, {"key": key})
+        response = self._send_request(MessageType.PIN_KV, {"key": key})
         return response.get("exists", False)
 
-    def unpin_kv(self, key: str) -> bool:
+    def unpin(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction."""
         response = self._send_request(MessageType.UNPIN_KV, {"key": key})
         return response.get("success", False)
@@ -467,17 +469,17 @@ class RpcAsyncClient:
         response = self._send_request(MessageType.BATCH_EXISTS_KV, {"keys": keys})
         return BatchExistsKVResponse(results=response.get("results", []))
 
-    def batch_exists_and_pin_kv(self, keys: list[str]) -> list[bool]:
+    def batch_pin_kv(self, keys: list[str]) -> BatchPinKVResponse:
         """Check existence and pin multiple KV entries in a single RPC call."""
         response = self._send_request(
-            MessageType.BATCH_EXISTS_AND_PIN_KV, {"keys": keys}
+            MessageType.BATCH_PIN_KV, {"keys": keys}
         )
-        return response.get("results", [])
+        return BatchPinKVResponse(results=response.get("results", []))
 
-    def batch_unpin_kv(self, keys: list[str]) -> list[bool]:
+    def batch_unpin(self, keys: list[str]) -> BatchUnpinKVResponse:
         """Unpin multiple KV entries in a single RPC call."""
         response = self._send_request(MessageType.BATCH_UNPIN_KV, {"keys": keys})
-        return response.get("results", [])
+        return BatchUnpinKVResponse(results=response.get("results", []))
 
     # =========================================================================
     # Admin Operations (blocking)

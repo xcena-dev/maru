@@ -2,6 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """KV Manager implementation for managing KV metadata."""
 
+import enum
 import logging
 from dataclasses import dataclass
 from threading import RLock
@@ -17,6 +18,14 @@ class KVEntry:
     kv_offset: int  # Offset within allocation (relative to handle.offset)
     kv_length: int  # Size of KV data
     pin_count: int = 0  # Pin count for eviction protection
+
+
+class DeleteResult(enum.Enum):
+    """Result of a KV delete operation."""
+
+    NOT_FOUND = "not_found"
+    PINNED = "pinned"
+    DELETED = "deleted"
 
 
 class KVManager:
@@ -79,7 +88,7 @@ class KVManager:
         with self._lock:
             return key in self._store
 
-    def exists_and_pin(self, key: str) -> bool:
+    def pin(self, key: str) -> bool:
         """Check if a KV entry exists and pin it atomically.
 
         Returns:
@@ -111,19 +120,20 @@ class KVManager:
             logger.debug("Unpinned KV: key=%s, pin_count=%d", key, entry.pin_count)
             return True
 
-    def delete(self, key: str) -> tuple[bool, int | None]:
+    def delete(self, key: str) -> tuple[DeleteResult, int | None]:
         """
         Delete a KV entry.
 
         Returns:
-            (key_existed, region_id_to_decrement)
-            - (False, None): key didn't exist
-            - (True, region_id): entry deleted, allocation ref needs decrement
+            (result, region_id_to_decrement)
+            - (NOT_FOUND, None): key didn't exist
+            - (PINNED, None): key exists but pinned, deletion refused
+            - (DELETED, region_id): entry deleted, allocation ref needs decrement
         """
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
-                return (False, None)
+                return (DeleteResult.NOT_FOUND, None)
 
             if entry.pin_count > 0:
                 logger.warning(
@@ -131,11 +141,11 @@ class KVManager:
                     key,
                     entry.pin_count,
                 )
-                return (False, None)
+                return (DeleteResult.PINNED, None)
 
             region_id = self._store.pop(key).region_id
             logger.debug("Deleted KV: key=%s, region_id=%d", key, region_id)
-            return (True, region_id)
+            return (DeleteResult.DELETED, region_id)
 
     def get_stats(self) -> dict:
         """Get KV statistics."""
@@ -191,6 +201,9 @@ class KVManager:
         """
         Check existence of multiple KV entries in a single operation.
 
+        Checks ALL keys unconditionally (no prefix-stop).
+        For prefix-stop with pinning, use batch_pin().
+
         Args:
             keys: List of chunk key strings
 
@@ -200,12 +213,16 @@ class KVManager:
         with self._lock:
             return [key in self._store for key in keys]
 
-    def batch_exists_and_pin(self, keys: list[str]) -> list[bool]:
+    def batch_pin(self, keys: list[str]) -> list[bool]:
         """Check existence and pin prefix-contiguous KV entries atomically.
 
-        Stops at the first miss — only the contiguous prefix of existing
-        keys is pinned. This matches LMCache's prefix-contiguous lookup
-        pattern and avoids pin leaks for non-prefix keys.
+        Uses prefix-stop: stops at the first miss, only pinning the
+        contiguous prefix of existing keys. This avoids pin leaks —
+        if all existing keys were pinned, the caller would need to
+        unpin non-prefix keys it doesn't use.
+
+        Unlike batch_exists() which checks ALL keys, this method
+        intentionally stops early because pinning has side effects.
 
         Returns:
             List of booleans — True if key exists (and was pinned).
