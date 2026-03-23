@@ -6,9 +6,12 @@ Tests pure functions and layout helpers without requiring CXL hardware,
 a running MaruServer, or GPU. All tensors are CPU-only.
 """
 
-from unittest.mock import MagicMock, patch
-
 import pytest
+
+pytest.importorskip("torch", reason="torch not installed")
+
+from unittest.mock import MagicMock
+
 import torch
 
 from maru_vllm.connector import (
@@ -16,7 +19,6 @@ from maru_vllm.connector import (
     _chunk_keys,
     _parse_size,
 )
-
 
 # =============================================================================
 # _parse_size
