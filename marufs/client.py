@@ -344,8 +344,8 @@ class MarufsClient:
     ) -> list[bool]:
         """Register multiple name-refs in the global index with a single ioctl.
 
-        Issues ``ioctl(MARUFS_IOC_BATCH_NAME_OFFSET)``. Up to 512 entries
-        per call; automatically splits if len(names) > 512.
+        Issues ``ioctl(MARUFS_IOC_BATCH_NAME_OFFSET)``. Up to 32 entries
+        per call; automatically splits if len(names) > 32.
 
         Args:
             fd:      Open file descriptor for the **data region**.

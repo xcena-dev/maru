@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from threading import RLock
 
+from maru_common.backend_protocol import MemoryBackend
 from maru_common.protocol import ANY_POOL_ID
 from maru_shm import MaruHandle, MaruShmClient
 
@@ -38,6 +39,7 @@ class AllocationManager:
     def __init__(self, mount_path: str | None = None):
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
+        self._client: MemoryBackend
 
         if mount_path is not None:
             from marufs import MarufsClient

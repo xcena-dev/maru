@@ -13,6 +13,7 @@ import os
 import threading
 import time
 
+from maru_common.backend_protocol import MemoryBackend
 from maru_shm import PROT_READ, PROT_WRITE, MaruHandle, MaruShmClient
 
 from .types import MappedRegion
@@ -39,6 +40,7 @@ class DaxMapper:
     """
 
     def __init__(self, mount_path: str | None = None):
+        self._client: MemoryBackend
         if mount_path is not None:
             from marufs import MarufsClient
 
