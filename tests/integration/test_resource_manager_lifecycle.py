@@ -161,7 +161,9 @@ class TestManualRestart:
             # Start a new instance on the same port
             proc2 = _start_rm(rm_binary, state_dir, port)
             try:
-                assert _wait_for_server("127.0.0.1", port), "Restarted server failed to start"
+                assert _wait_for_server("127.0.0.1", port), (
+                    "Restarted server failed to start"
+                )
 
                 pools = client.stats()
                 assert isinstance(pools, list)
