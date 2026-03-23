@@ -98,14 +98,14 @@ class MaruShmClient:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.connect((host, port))
-            except OSError:
+            except OSError as e:
                 sock.close()
                 raise ConnectionError(
                     f"Resource manager is not running "
                     f"(address: {self._address}).\n"
                     f"Start it first: maru-resource-manager "
                     f"--host {host} --port {port}"
-                )
+                ) from e
 
             # Disable Nagle for low-latency RPC
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

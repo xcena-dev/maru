@@ -5,12 +5,10 @@
 Tests cover:
 - Handle / PoolInfo pack/unpack roundtrip
 - MsgHeader and IPC message roundtrip
-- UDS helpers (SCM_RIGHTS via socketpair)
+- TCP helpers (read_full / write_full)
 """
 
-import os
 import socket
-import tempfile
 
 import pytest
 
@@ -32,8 +30,8 @@ from maru_shm.ipc import (
     ErrorResp,
     FreeReq,
     FreeResp,
-    GetFdReq,
-    GetFdResp,
+    GetAccessReq,
+    GetAccessResp,
     MsgHeader,
     MsgType,
     StatsReq,
@@ -42,8 +40,6 @@ from maru_shm.ipc import (
 from maru_shm.types import DaxType, MaruHandle, MaruPoolInfo
 from maru_shm.uds_helpers import (
     read_full,
-    recv_with_fd,
-    send_with_fd,
     write_full,
 )
 
@@ -254,20 +250,23 @@ class TestFreeReqResp:
         assert resp2.status == 0
 
 
-class TestGetFdReqResp:
-    def test_get_fd_req_roundtrip(self):
+class TestGetAccessReqResp:
+    def test_get_access_req_roundtrip(self):
         h = MaruHandle(region_id=7, offset=100, length=500, auth_token=42)
-        req = GetFdReq(handle=h)
+        req = GetAccessReq(handle=h)
         data = req.pack()
-        req2 = GetFdReq.unpack(data)
+        req2 = GetAccessReq.unpack(data)
         assert req2.handle.region_id == 7
         assert req2.handle.offset == 100
 
-    def test_get_fd_resp_roundtrip(self):
-        resp = GetFdResp(status=0)
+    def test_get_access_resp_roundtrip(self):
+        resp = GetAccessResp(status=0, device_path="/dev/dax0.0", offset=0, length=4096)
         data = resp.pack()
-        resp2 = GetFdResp.unpack(data)
+        resp2 = GetAccessResp.unpack(data)
         assert resp2.status == 0
+        assert resp2.device_path == "/dev/dax0.0"
+        assert resp2.offset == 0
+        assert resp2.length == 4096
 
 
 class TestStatsReqResp:
@@ -328,11 +327,11 @@ class TestErrorResp:
 
 
 # =============================================================================
-# UDS helpers tests
+# TCP helpers tests (read_full / write_full)
 # =============================================================================
 
 
-class TestUdsHelpers:
+class TestTcpHelpers:
     def test_read_write_full(self):
         s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -350,46 +349,6 @@ class TestUdsHelpers:
         with pytest.raises(ConnectionError):
             read_full(s2, 10)
         s2.close()
-
-    def test_send_recv_with_fd(self):
-        """Test SCM_RIGHTS FD passing via socketpair."""
-        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            # Create a temp file to get a real FD
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(b"test data")
-                tmp_path = tmp.name
-                fd_to_send = os.open(tmp_path, os.O_RDONLY)
-
-            try:
-                payload = b"fd_payload"
-                send_with_fd(s1, payload, fd_to_send)
-                data, received_fd = recv_with_fd(s2, 64)
-                assert data == payload
-                assert received_fd is not None
-
-                # Verify the received FD works
-                received_data = os.read(received_fd, 100)
-                assert received_data == b"test data"
-                os.close(received_fd)
-            finally:
-                os.close(fd_to_send)
-                os.unlink(tmp_path)
-        finally:
-            s1.close()
-            s2.close()
-
-    def test_recv_with_fd_no_fd(self):
-        """recv_with_fd returns None when no FD is passed."""
-        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s1.sendall(b"no fd here")
-            data, fd = recv_with_fd(s2, 64)
-            assert data == b"no fd here"
-            assert fd is None
-        finally:
-            s1.close()
-            s2.close()
 
 
 # =============================================================================
@@ -421,32 +380,32 @@ class TestIPCUnpackValidation:
     """Test unpack() validation error paths for 100% coverage."""
 
     def test_alloc_req_unpack_too_short(self):
-        """Test AllocReq.unpack with data too short (line 113)."""
+        """Test AllocReq.unpack with data too short."""
         with pytest.raises(ValueError, match="AllocReq too short"):
             AllocReq.unpack(b"\x00" * 10)
 
     def test_alloc_resp_unpack_too_short(self):
-        """Test AllocResp.unpack with data too short (line 149)."""
+        """Test AllocResp.unpack with data too short."""
         with pytest.raises(ValueError, match="AllocResp too short"):
             AllocResp.unpack(b"\x00" * 20)
 
     def test_free_resp_unpack_too_short(self):
-        """Test FreeResp.unpack with data too short (line 198)."""
+        """Test FreeResp.unpack with data too short."""
         with pytest.raises(ValueError, match="FreeResp too short"):
             FreeResp.unpack(b"\x00" * 2)
 
-    def test_get_fd_resp_unpack_too_short(self):
-        """Test GetFdResp.unpack with data too short (line 237)."""
-        with pytest.raises(ValueError, match="GetFdResp too short"):
-            GetFdResp.unpack(b"\x00" * 2)
+    def test_get_access_resp_unpack_too_short(self):
+        """Test GetAccessResp.unpack with data too short."""
+        with pytest.raises(ValueError, match="GetAccessResp too short for header"):
+            GetAccessResp.unpack(b"\x00" * 2)
 
     def test_stats_resp_unpack_too_short_header(self):
-        """Test StatsResp.unpack with truncated header (line 289)."""
+        """Test StatsResp.unpack with truncated header."""
         with pytest.raises(ValueError, match="StatsResp too short for header"):
             StatsResp.unpack(b"\x00" * 2)
 
     def test_stats_resp_unpack_truncated_pools(self):
-        """Test StatsResp.unpack with truncated pool data (line 297)."""
+        """Test StatsResp.unpack with truncated pool data."""
         import struct
 
         # Pack a header saying we have 2 pools
@@ -459,7 +418,7 @@ class TestIPCUnpackValidation:
             StatsResp.unpack(incomplete_data)
 
     def test_error_resp_unpack_too_short(self):
-        """Test ErrorResp.unpack with data too short (line 336)."""
+        """Test ErrorResp.unpack with data too short."""
         with pytest.raises(ValueError, match="ErrorResp too short for header"):
             ErrorResp.unpack(b"\x00" * 4)
 
@@ -480,11 +439,11 @@ class TestIPCNoneDefaults:
         assert req2.handle.region_id == 0
         assert req2.handle.length == 0
 
-    def test_get_fd_req_none_handle(self):
-        """GetFdReq with handle=None uses default MaruHandle."""
-        req = GetFdReq(handle=None)
+    def test_get_access_req_none_handle(self):
+        """GetAccessReq with handle=None uses default MaruHandle."""
+        req = GetAccessReq(handle=None)
         data = req.pack()
-        req2 = GetFdReq.unpack(data)
+        req2 = GetAccessReq.unpack(data)
         assert req2.handle.region_id == 0
 
     def test_alloc_resp_none_handle(self):
@@ -534,13 +493,13 @@ class TestMsgTypeValues:
         assert MsgType.FREE_RESP == 4
         assert MsgType.STATS_REQ == 5
         assert MsgType.STATS_RESP == 6
-        assert MsgType.GET_FD_REQ == 9
-        assert MsgType.GET_FD_RESP == 10
+        assert MsgType.GET_ACCESS_REQ == 9
+        assert MsgType.GET_ACCESS_RESP == 10
         assert MsgType.ERROR_RESP == 255
 
 
 class TestMaruPoolInfoRepr:
-    """Test MaruPoolInfo.__repr__ for 100% coverage (line 166)."""
+    """Test MaruPoolInfo.__repr__ for 100% coverage."""
 
     def test_pool_info_repr(self):
         """Test MaruPoolInfo.__repr__ returns expected format."""
