@@ -57,7 +57,13 @@ def _parse_size(size_str: str | int) -> int:
         return size_str
     match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", str(size_str).upper())
     if not match:
-        return int(size_str)
+        try:
+            return int(size_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid size string: {size_str!r}. "
+                f"Expected format: integer or human-readable like '4G', '500M'"
+            ) from None
     value, unit = float(match.group(1)), match.group(2)
     multipliers = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
     return int(value * multipliers.get(unit, 1))
@@ -94,6 +100,9 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     Returns:
         List of maru key strings, one per chunk
     """
+    # TODO: O(n²) memory from repeated prefix slicing. For long prompts
+    # (e.g. 10K tokens, ~39 chunks), consider incremental hashing
+    # (e.g. blake2b update) to reduce to O(n). Profile before optimizing.
     keys = []
     t = torch.tensor(token_ids)
     num_full_chunks = len(token_ids) // chunk_tokens
@@ -637,19 +646,23 @@ class MaruWorkerConnector:
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
 
             num_layers_loaded = 0
-            for layer_idx, layer_name in enumerate(forward_context.no_compile_layers):
+            for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
                 kv_cache_attr = getattr(layer, "kv_cache", None)
                 if kv_cache_attr is None:
                     continue
 
                 kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
+                # Use the same layer index derivation as save path
+                # to ensure key consistency (enumerate index may diverge
+                # when no_compile_layers contains non-attention layers).
+                actual_layer_idx = self._get_layer_index(layer_name)
 
                 # Load and inject each chunk independently to preserve
                 # K/V layout (concatenating 1D bytes breaks interleaving)
                 success = True
                 for ci in range(num_chunks):
-                    maru_key = f"{chunk_keys[ci]}_L{layer_idx}"
+                    maru_key = f"{chunk_keys[ci]}_L{actual_layer_idx}"
                     try:
                         info = self._handler.retrieve(maru_key)
                         if info is None:
@@ -751,10 +764,12 @@ class MaruWorkerConnector:
 
                 handle = None
                 try:
+                    chunk_slots_gpu = chunk_slots.to(kv_layer.device)
                     kv_data = self._extract_kv_from_layer(
                         kv_layer,
-                        chunk_slots,
+                        chunk_slots_gpu,
                         attn_metadata,
+                        layer_name,
                     )
                     kv_contig = kv_data.detach().contiguous()
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
@@ -778,11 +793,23 @@ class MaruWorkerConnector:
                         progress.add(layer_idx)
                         if self._num_layers > 0 and len(progress) >= self._num_layers:
                             done_key = f"{base_key}_DONE"
+                            done_h = None
                             try:
                                 done_h = self._handler.alloc(1)
                                 self._handler.store(done_key, handle=done_h)
-                            except Exception:
-                                pass  # best-effort marker
+                                done_h = None  # ownership transferred
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to store _DONE marker for %s: %s",
+                                    base_key,
+                                    e,
+                                )
+                            finally:
+                                if done_h is not None:
+                                    try:
+                                        self._handler.free(done_h)
+                                    except Exception:
+                                        pass
                             del self._chunk_layer_progress[base_key]
                     else:
                         logger.warning("Maru store failed: %s", maru_key)
@@ -874,6 +901,7 @@ class MaruWorkerConnector:
         kv_layer: torch.Tensor,
         slot_mapping: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        layer_name: str = "",
     ) -> torch.Tensor:
         """Extract KV cache data from GPU paged buffer for given slots."""
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -883,11 +911,18 @@ class MaruWorkerConnector:
             TritonAttentionMetadata,
         )
 
-        if isinstance(attn_metadata, MLACommonMetadata):
+        # Handle per-layer dict metadata (same as _inject_kv_into_layer)
+        layer_meta = (
+            attn_metadata[layer_name]
+            if isinstance(attn_metadata, dict)
+            else attn_metadata
+        )
+
+        if isinstance(layer_meta, MLACommonMetadata):
             num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
             flat = kv_layer.reshape(num_pages * page_size, -1)
             return flat[slot_mapping]
-        elif isinstance(attn_metadata, TritonAttentionMetadata):
+        elif isinstance(layer_meta, TritonAttentionMetadata):
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             return kv_layer[block_idxs, :, offsets]
