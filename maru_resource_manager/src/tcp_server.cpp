@@ -193,27 +193,19 @@ static void sendSimpleResp(int fd, MsgType type, const void *resp,
     writeFull(fd, resp, respSize);
 }
 
-static pid_t parseClientPid(const std::vector<uint8_t> &payload,
-                             size_t fixedSize) {
+/// Parse client_id string from payload after fixed-size request struct.
+static std::string parseClientId(const std::vector<uint8_t> &payload,
+                                  size_t fixedSize) {
     if (payload.size() <= fixedSize + 2) {
-        return ::getpid();
+        return "";
     }
     uint16_t idLen = 0;
     std::memcpy(&idLen, payload.data() + fixedSize, sizeof(idLen));
     if (idLen == 0 || fixedSize + 2 + idLen > payload.size()) {
-        return ::getpid();
+        return "";
     }
-    std::string clientId(
+    return std::string(
         reinterpret_cast<const char *>(payload.data() + fixedSize + 2), idLen);
-    auto pos = clientId.rfind(':');
-    if (pos != std::string::npos && pos + 1 < clientId.size()) {
-        try {
-            return static_cast<pid_t>(std::stoi(clientId.substr(pos + 1)));
-        } catch (...) {
-            return ::getpid();
-        }
-    }
-    return ::getpid();
 }
 
 // =============================================================================
@@ -337,8 +329,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         AllocReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        pid_t pid = parseClientPid(payload, sizeof(AllocReq));
-        RequestContext ctx{pid, 0};
+        std::string cid = parseClientId(payload, sizeof(AllocReq));
+        RequestContext ctx{cid};
 
         auto result = handler_.handleAlloc(req, ctx);
 
@@ -358,8 +350,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         FreeReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        pid_t pid = parseClientPid(payload, sizeof(FreeReq));
-        RequestContext ctx{pid, 0};
+        std::string cid = parseClientId(payload, sizeof(FreeReq));
+        RequestContext ctx{cid};
 
         auto result = handler_.handleFree(req, ctx);
         if (result.resp.status == -EACCES) {
@@ -387,7 +379,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
         GetAccessReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
-        RequestContext ctx{0, 0};
+        RequestContext ctx{""};
         auto result = handler_.handleGetAccess(req, ctx);
         if (result.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid auth token");
@@ -404,14 +396,14 @@ bool TcpServer::handleOneRequest(int clientFd) {
         writeFull(clientFd, &rh, sizeof(rh));
         writeFull(clientFd, respPayload.data(), respPayload.size());
     } else if (type == MsgType::REGISTER_SERVER_REQ) {
-        pid_t pid = parseClientPid(payload, 0);
-        RequestContext ctx{pid, 0};
+        std::string cid = parseClientId(payload, 0);
+        RequestContext ctx{cid};
         auto result = handler_.handleRegisterServer(ctx);
         sendSimpleResp(clientFd, MsgType::REGISTER_SERVER_RESP,
                         &result.resp, sizeof(result.resp));
     } else if (type == MsgType::UNREGISTER_SERVER_REQ) {
-        pid_t pid = parseClientPid(payload, 0);
-        RequestContext ctx{pid, 0};
+        std::string cid = parseClientId(payload, 0);
+        RequestContext ctx{cid};
         auto result = handler_.handleUnregisterServer(ctx);
         sendSimpleResp(clientFd, MsgType::UNREGISTER_SERVER_RESP,
                         &result.resp, sizeof(result.resp));

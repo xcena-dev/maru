@@ -206,15 +206,27 @@ class FreeReq:
     """Free request payload."""
 
     handle: MaruHandle | None = None
+    client_id: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return h.pack()
+        fixed = h.pack()
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            return fixed + struct.pack("=H", len(id_bytes)) + id_bytes
+        return fixed
 
     @classmethod
     def unpack(cls, data: bytes) -> "FreeReq":
         handle = MaruHandle.unpack(data)
-        return cls(handle=handle)
+        client_id = ""
+        off = 32  # Handle size
+        if off + 2 <= len(data):
+            (id_len,) = struct.unpack("=H", data[off : off + 2])
+            off += 2
+            if id_len > 0 and off + id_len <= len(data):
+                client_id = data[off : off + id_len].decode("utf-8")
+        return cls(handle=handle, client_id=client_id)
 
 
 # FreeResp: status(i32) = 4 bytes

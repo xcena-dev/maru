@@ -10,10 +10,9 @@
 
 namespace maru {
 
-/// Credentials extracted from the UDS transport layer.
+/// Client identity extracted from the transport layer.
 struct RequestContext {
-    pid_t pid;
-    uid_t uid;
+    std::string client_id;  // "hostname:pid"
 };
 
 /// Result of handleAlloc — includes device path for client to open directly.

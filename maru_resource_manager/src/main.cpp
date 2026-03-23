@@ -26,6 +26,7 @@ struct ServerConfig {
     std::string stateDir = "/var/lib/maru-resourced";
     maru::LogLevel logLevel = maru::LogLevel::Info;
     int idleTimeout = 60;  // seconds, 0=disable
+    int numWorkers = 32;
 };
 
 static void writeConfigFile(const ServerConfig &cfg) {
@@ -71,6 +72,7 @@ static void printUsage(const char *prog) {
         "  -d, --state-dir PATH      State directory for WAL/metadata (default: /var/lib/maru-resourced)\n"
         "  -l, --log-level LEVEL     Log level: debug, info, warn, error (default: info)\n"
         "  -t, --idle-timeout SECS   Auto-shutdown after N seconds idle (default: 60, 0=disable)\n"
+        "  -w, --num-workers N       Worker thread pool size (default: 32)\n"
         "  -h, --help                Show this help\n",
         prog);
 }
@@ -83,18 +85,20 @@ static ServerConfig parseArgs(int argc, char **argv) {
         {"state-dir",    required_argument, nullptr, 'd'},
         {"log-level",    required_argument, nullptr, 'l'},
         {"idle-timeout", required_argument, nullptr, 't'},
+        {"num-workers",  required_argument, nullptr, 'w'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:t:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:t:w:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': cfg.port = static_cast<uint16_t>(std::atoi(optarg)); break;
         case 'd': cfg.stateDir = optarg; break;
         case 'l': cfg.logLevel = maru::parseLogLevel(optarg); break;
         case 't': cfg.idleTimeout = std::atoi(optarg); break;
+        case 'w': cfg.numWorkers = std::atoi(optarg); break;
         case 'h': printUsage(argv[0]); std::exit(0);
         default:  printUsage(argv[0]); std::exit(1);
         }
@@ -119,6 +123,7 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "  log level  : %s", maru::logLevelStr(cfg.logLevel));
     maru::logf(maru::LogLevel::Info, "  idle timeout: %ds%s", cfg.idleTimeout,
                cfg.idleTimeout == 0 ? " (disabled)" : "");
+    maru::logf(maru::LogLevel::Info, "  workers    : %d", cfg.numWorkers);
 
     // Signal handlers
     std::signal(SIGINT, onSignal);
@@ -133,7 +138,7 @@ int main(int argc, char **argv) {
                     "no CXL/DAX devices found — starting with empty pool");
     }
 
-    maru::TcpServer server(pm, cfg.host, cfg.port);
+    maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers);
     rc = server.start();
     if (rc != 0) {
         maru::logf(maru::LogLevel::Error,

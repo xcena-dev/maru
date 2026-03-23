@@ -16,7 +16,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     std::string devPath;
     uint64_t requestedSize = 0;
     int32_t status =
-        pm_.alloc(req.size, ctx.pid, handle, devPath, req.poolId, requestedSize);
+        pm_.alloc(req.size, ctx.client_id, handle, devPath, req.poolId, requestedSize);
 
     result.resp.status = status;
     result.resp.handle = handle;
@@ -36,8 +36,7 @@ FreeResult RequestHandler::handleFree(const FreeReq &req,
         return result;
     }
 
-    uint64_t ownerId = (ctx.uid == 0) ? 0 : static_cast<uint64_t>(ctx.pid);
-    result.resp.status = pm_.free(req.handle, ownerId);
+    result.resp.status = pm_.free(req.handle, ctx.client_id);
     return result;
 }
 
@@ -96,7 +95,7 @@ StatsResult RequestHandler::handleStats() {
 RegisterServerResult RequestHandler::handleRegisterServer(
     const RequestContext &ctx) {
     RegisterServerResult result;
-    pm_.registerServer(ctx.pid);
+    pm_.registerServer(ctx.client_id);
     result.resp.status = 0;
     return result;
 }
@@ -104,7 +103,7 @@ RegisterServerResult RequestHandler::handleRegisterServer(
 UnregisterServerResult RequestHandler::handleUnregisterServer(
     const RequestContext &ctx) {
     UnregisterServerResult result;
-    pm_.unregisterServer(ctx.pid);
+    pm_.unregisterServer(ctx.client_id);
     result.resp.status = 0;
     return result;
 }

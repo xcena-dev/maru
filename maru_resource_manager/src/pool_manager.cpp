@@ -29,6 +29,56 @@
 namespace maru
 {
 
+// ---------------------------------------------------------------------------
+// client_id helpers: parse "hostname:pid" and check locality
+// ---------------------------------------------------------------------------
+
+static std::string getLocalHostname() {
+    char buf[256];
+    if (::gethostname(buf, sizeof(buf)) == 0) {
+        buf[sizeof(buf) - 1] = '\0';
+        return std::string(buf);
+    }
+    return "";
+}
+
+static const std::string &localHostname() {
+    static const std::string h = getLocalHostname();
+    return h;
+}
+
+/// Extract PID from "hostname:pid". Returns 0 on parse failure.
+static pid_t pidFromClientId(const std::string &clientId) {
+    auto pos = clientId.rfind(':');
+    if (pos == std::string::npos || pos + 1 >= clientId.size()) return 0;
+    try {
+        return static_cast<pid_t>(std::stoi(clientId.substr(pos + 1)));
+    } catch (...) {
+        return 0;
+    }
+}
+
+/// Check if client_id is from this node.
+static bool isLocalClient(const std::string &clientId) {
+    auto pos = clientId.rfind(':');
+    if (pos == std::string::npos) return false;
+    return clientId.substr(0, pos) == localHostname();
+}
+
+/// Overload for char[] fields.
+static bool isLocalClient(const char *clientId) {
+    return isLocalClient(std::string(clientId));
+}
+
+static pid_t pidFromClientId(const char *clientId) {
+    return pidFromClientId(std::string(clientId));
+}
+
+static void setClientId(char *dest, size_t maxLen, const std::string &src) {
+    std::strncpy(dest, src.c_str(), maxLen - 1);
+    dest[maxLen - 1] = '\0';
+}
+
 // Sysfs and device path constants
 
 // DEV_DAX mode specific paths
@@ -274,19 +324,23 @@ uint32_t PoolManager::registeredServerCount() const {
     return static_cast<uint32_t>(registeredServers_.size());
 }
 
-void PoolManager::registerServer(pid_t pid) {
+void PoolManager::registerServer(const std::string &clientId) {
     std::lock_guard<std::mutex> lock(mu_);
-    uint64_t st = getPidStartTime(pid);
-    registeredServers_[pid] = st;
-    logf(LogLevel::Info, "server registered: pid=%d (total=%zu)",
-         pid, registeredServers_.size());
+    uint64_t st = 0;
+    if (isLocalClient(clientId)) {
+        pid_t pid = pidFromClientId(clientId);
+        if (pid > 0) st = getPidStartTime(pid);
+    }
+    registeredServers_[clientId] = st;
+    logf(LogLevel::Info, "server registered: %s (total=%zu)",
+         clientId.c_str(), registeredServers_.size());
 }
 
-void PoolManager::unregisterServer(pid_t pid) {
+void PoolManager::unregisterServer(const std::string &clientId) {
     std::lock_guard<std::mutex> lock(mu_);
-    registeredServers_.erase(pid);
-    logf(LogLevel::Info, "server unregistered: pid=%d (total=%zu)",
-         pid, registeredServers_.size());
+    registeredServers_.erase(clientId);
+    logf(LogLevel::Info, "server unregistered: %s (total=%zu)",
+         clientId.c_str(), registeredServers_.size());
 }
 
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
@@ -743,7 +797,7 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
     return false;
 }
 
-int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
+int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
                        std::string &devPath, uint32_t poolId,
                        uint64_t &requestedSizeOut)
 {
@@ -768,7 +822,7 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
             {
                 return -ENOMEM;
             }
-            alloc.ownerId = ownerId;
+            setClientId(alloc.clientId, kMaxClientIdLen, clientId);
             pool.freeSize -= alloc.allocLength;
             selectedPool = &pool;
             break;
@@ -784,7 +838,7 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
         {
             if (allocateFromPool(pool, size, alloc))
             {
-                alloc.ownerId = ownerId;
+                setClientId(alloc.clientId, kMaxClientIdLen, clientId);
                 pool.freeSize -= alloc.allocLength;
                 selectedPool = &pool;
                 break;
@@ -798,17 +852,20 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
 
     alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce);
 
-    // Cache owner PID start time for reaper PID-reuse detection
-    if (ownerId != 0)
+    // Cache owner PID start time for reaper PID-reuse detection (local only)
+    if (!clientId.empty())
     {
-        pid_t pid = static_cast<pid_t>(ownerId);
-        ++pidAllocCounts_[pid];
-        if (pidStartTimes_.find(pid) == pidStartTimes_.end())
+        ++clientAllocCounts_[clientId];
+        if (isLocalClient(clientId))
         {
-            uint64_t st = getPidStartTime(pid);
-            if (st != 0)
+            pid_t pid = pidFromClientId(clientId);
+            if (pid > 0 && pidStartTimes_.find(pid) == pidStartTimes_.end())
             {
-                pidStartTimes_[pid] = st;
+                uint64_t st = getPidStartTime(pid);
+                if (st != 0)
+                {
+                    pidStartTimes_[pid] = st;
+                }
             }
         }
     }
@@ -834,7 +891,7 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
     return 0;
 }
 
-int PoolManager::free(const Handle &handle, uint64_t ownerId)
+int PoolManager::free(const Handle &handle, const std::string &clientId)
 {
     std::lock_guard<std::mutex> lock(mu_);
 
@@ -845,7 +902,7 @@ int PoolManager::free(const Handle &handle, uint64_t ownerId)
     }
 
     const Allocation &alloc = globalIt->second;
-    if (ownerId != 0 && alloc.ownerId != ownerId)
+    if (!clientId.empty() && std::strcmp(alloc.clientId, clientId.c_str()) != 0)
     {
         return -EPERM;
     }
@@ -864,17 +921,20 @@ int PoolManager::free(const Handle &handle, uint64_t ownerId)
     insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
     targetPool->freeSize += alloc.allocLength;
 
-    // Update PID refcount
-    if (alloc.ownerId != 0)
+    // Update client refcount
+    if (alloc.clientId[0] != '\0')
     {
-        pid_t pid = static_cast<pid_t>(alloc.ownerId);
-        auto countIt = pidAllocCounts_.find(pid);
-        if (countIt != pidAllocCounts_.end())
+        auto countIt = clientAllocCounts_.find(alloc.clientId);
+        if (countIt != clientAllocCounts_.end())
         {
             if (--countIt->second == 0)
             {
-                pidAllocCounts_.erase(countIt);
-                pidStartTimes_.erase(pid);
+                clientAllocCounts_.erase(countIt);
+                if (isLocalClient(alloc.clientId))
+                {
+                    pid_t pid = pidFromClientId(alloc.clientId);
+                    if (pid > 0) pidStartTimes_.erase(pid);
+                }
             }
         }
     }
@@ -935,14 +995,28 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
 
-    // Reap dead registered servers (with PID-reuse detection)
+    // Reap dead registered servers (local only, with PID-reuse detection)
     for (auto it = registeredServers_.begin(); it != registeredServers_.end(); )
     {
-        pid_t pid = it->first;
+        const std::string &cid = it->first;
         uint64_t savedSt = it->second;
+
+        if (!isLocalClient(cid))
+        {
+            ++it;  // Skip remote clients — no local PID to check
+            continue;
+        }
+
+        pid_t pid = pidFromClientId(cid);
+        if (pid <= 0)
+        {
+            ++it;
+            continue;
+        }
+
         if (::kill(pid, 0) != 0 && errno == ESRCH)
         {
-            logf(LogLevel::Info, "reaper: removing dead server pid=%d", pid);
+            logf(LogLevel::Info, "reaper: removing dead server %s", cid.c_str());
             it = registeredServers_.erase(it);
         }
         else if (savedSt != 0)
@@ -951,7 +1025,7 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
             if (currentSt != 0 && currentSt != savedSt)
             {
                 logf(LogLevel::Info,
-                     "reaper: removing server pid=%d (PID reused)", pid);
+                     "reaper: removing server %s (PID reused)", cid.c_str());
                 it = registeredServers_.erase(it);
             }
             else
@@ -968,12 +1042,16 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     std::vector<uint64_t> toFree;
     for (const auto &kv : allocations_)
     {
-        uint64_t ownerId = kv.second.ownerId;
-        if (ownerId == 0)
+        const char *cid = kv.second.clientId;
+        if (cid[0] == '\0' || !isLocalClient(cid))
+        {
+            continue;  // Skip empty or remote clients
+        }
+        pid_t pid = pidFromClientId(cid);
+        if (pid <= 0)
         {
             continue;
         }
-        pid_t pid = static_cast<pid_t>(ownerId);
         if (::kill(pid, 0) == 0)
         {
             // Process exists — verify it's the same process via start time
@@ -1019,17 +1097,20 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
         insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
         targetPool->freeSize += alloc.allocLength;
 
-        // Update PID refcount — O(1) instead of scanning all allocations
-        if (alloc.ownerId != 0)
+        // Update client refcount
+        if (alloc.clientId[0] != '\0')
         {
-            pid_t pid = static_cast<pid_t>(alloc.ownerId);
-            auto countIt = pidAllocCounts_.find(pid);
-            if (countIt != pidAllocCounts_.end())
+            auto countIt = clientAllocCounts_.find(alloc.clientId);
+            if (countIt != clientAllocCounts_.end())
             {
                 if (--countIt->second == 0)
                 {
-                    pidAllocCounts_.erase(countIt);
-                    pidStartTimes_.erase(pid);
+                    clientAllocCounts_.erase(countIt);
+                    if (isLocalClient(alloc.clientId))
+                    {
+                        pid_t pid = pidFromClientId(alloc.clientId);
+                        if (pid > 0) pidStartTimes_.erase(pid);
+                    }
                 }
             }
         }

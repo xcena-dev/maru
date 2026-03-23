@@ -17,7 +17,7 @@ namespace maru {
 class TcpServer {
 public:
     TcpServer(PoolManager &pm, const std::string &host, uint16_t port,
-              int numWorkers = 4);
+              int numWorkers = 32);
     ~TcpServer();
 
     int start();

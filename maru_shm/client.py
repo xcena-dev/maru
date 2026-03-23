@@ -87,77 +87,75 @@ class MaruShmClient:
     def _ensure_conn(self) -> socket.socket:
         """Return the persistent connection, creating it if needed.
 
-        Thread-safe: protected by _conn_lock.
-        Raises ConnectionError if the resource manager is not reachable.
+        Must be called with _conn_lock held.
         """
-        with self._conn_lock:
-            if self._sock is not None:
-                return self._sock
-
-            host, port = self._parse_address(self._address)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.connect((host, port))
-            except OSError as e:
-                sock.close()
-                raise ConnectionError(
-                    f"Resource manager is not running "
-                    f"(address: {self._address}).\n"
-                    f"Start it first: maru-resource-manager "
-                    f"--host {host} --port {port}"
-                ) from e
-
-            # Disable Nagle for low-latency RPC
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self._sock = sock
+        if self._sock is not None:
             return self._sock
+
+        host, port = self._parse_address(self._address)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((host, port))
+        except OSError as e:
+            sock.close()
+            raise ConnectionError(
+                f"Resource manager is not running "
+                f"(address: {self._address}).\n"
+                f"Start it first: maru-resource-manager "
+                f"--host {host} --port {port}"
+            ) from e
+
+        # Disable Nagle for low-latency RPC
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._sock = sock
+        return self._sock
 
     def _close_conn(self) -> None:
         """Close the persistent connection."""
-        with self._conn_lock:
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except OSError:
-                    pass
-                self._sock = None
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
 
     def _rpc(self, msg_type: MsgType, payload: bytes) -> tuple[MsgHeader, bytes]:
         """Execute a single RPC: send request, receive response.
 
-        Uses the persistent connection. On connection error, closes and
-        retries once with a fresh connection.
+        Thread-safe: the entire send+recv cycle is serialized by _conn_lock.
+        On connection error, closes and retries once with a fresh connection.
 
         Returns:
             (response_header, response_payload)
         """
         for attempt in range(2):
-            sock = self._ensure_conn()
-            try:
-                # Send
-                hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
-                write_full(sock, hdr.pack())
-                if payload:
-                    write_full(sock, payload)
+            with self._conn_lock:
+                sock = self._ensure_conn()
+                try:
+                    # Send
+                    hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
+                    write_full(sock, hdr.pack())
+                    if payload:
+                        write_full(sock, payload)
 
-                # Receive
-                resp_data = read_full(sock, HEADER_SIZE)
-                resp_hdr = MsgHeader.unpack(resp_data)
-                if not resp_hdr.validate():
-                    raise ConnectionError(
-                        f"Invalid response header: magic=0x{resp_hdr.magic:08X}"
-                    )
+                    # Receive
+                    resp_data = read_full(sock, HEADER_SIZE)
+                    resp_hdr = MsgHeader.unpack(resp_data)
+                    if not resp_hdr.validate():
+                        raise ConnectionError(
+                            f"Invalid response header: magic=0x{resp_hdr.magic:08X}"
+                        )
 
-                resp_payload = b""
-                if resp_hdr.payload_len > 0:
-                    resp_payload = read_full(sock, resp_hdr.payload_len)
+                    resp_payload = b""
+                    if resp_hdr.payload_len > 0:
+                        resp_payload = read_full(sock, resp_hdr.payload_len)
 
-                return resp_hdr, resp_payload
+                    return resp_hdr, resp_payload
 
-            except (ConnectionError, OSError):
-                self._close_conn()
-                if attempt == 1:
-                    raise
+                except (ConnectionError, OSError):
+                    self._close_conn()
+                    if attempt == 1:
+                        raise
 
     def _check_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
         """Raise RuntimeError if response is an ERROR_RESP."""
@@ -247,7 +245,7 @@ class MaruShmClient:
         Args:
             handle: Handle from a previous alloc() call.
         """
-        req = FreeReq(handle=handle)
+        req = FreeReq(handle=handle, client_id=self._client_id)
         hdr, payload = self._rpc(MsgType.FREE_REQ, req.pack())
         self._check_error(hdr, payload, "Free failed")
 
@@ -283,15 +281,24 @@ class MaruShmClient:
         Returns:
             Python mmap object with buffer protocol support.
         """
+        # Fast path: check cache
         with self._lock:
             if handle.region_id in self._mmap_cache:
                 return self._mmap_cache[handle.region_id]
-
             path = self._path_cache.get(handle.region_id)
-            if path is None:
-                access_resp = self._request_access(handle)
-                path = access_resp.device_path
-                self._path_cache[handle.region_id] = path
+
+        # Slow path: network RPC outside lock
+        if path is None:
+            access_resp = self._request_access(handle)
+            path = access_resp.device_path
+
+        # Create mmap and update cache
+        with self._lock:
+            # Double-check: another thread may have created it
+            if handle.region_id in self._mmap_cache:
+                return self._mmap_cache[handle.region_id]
+
+            self._path_cache[handle.region_id] = path
 
             if flags == 0:
                 flags = MAP_SHARED
@@ -339,7 +346,8 @@ class MaruShmClient:
 
     def close(self) -> None:
         """Close persistent connection and all cached mmaps."""
-        self._close_conn()
+        with self._conn_lock:
+            self._close_conn()
         with self._lock:
             num_mmaps = len(self._mmap_cache)
             for region_id in list(self._mmap_cache.keys()):

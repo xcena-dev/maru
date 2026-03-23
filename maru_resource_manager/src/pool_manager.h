@@ -19,10 +19,13 @@ struct Extent
     uint64_t length;
 };
 
+/// Max client_id length for fixed-size serialization (hostname:pid).
+static constexpr size_t kMaxClientIdLen = 128;
+
 struct Allocation
 {
     Handle handle;
-    uint64_t ownerId;
+    char clientId[kMaxClientIdLen];  // "hostname:pid" — null-terminated
     uint64_t requestedSize;
     uint64_t allocLength;
     uint64_t nonce;       // Server-side nonce for auth token computation
@@ -53,14 +56,14 @@ public:
     const std::string &stateDir() const { return stateDir_; }
     uint32_t allocationCount() const;
     uint32_t registeredServerCount() const;
-    void registerServer(pid_t pid);
-    void unregisterServer(pid_t pid);
+    void registerServer(const std::string &clientId);
+    void unregisterServer(const std::string &clientId);
 
     int loadPools();
     int rescanDevices();
-    int alloc(uint64_t size, uint64_t ownerId, Handle &out, std::string &devPath,
-              uint32_t poolId, uint64_t &requestedSizeOut);
-    int free(const Handle &handle, uint64_t ownerId);
+    int alloc(uint64_t size, const std::string &clientId, Handle &out,
+              std::string &devPath, uint32_t poolId, uint64_t &requestedSizeOut);
+    int free(const Handle &handle, const std::string &clientId);
 
     void getStats(std::vector<PoolState> &out);
     int getPathForHandle(const Handle &handle, std::string &outPath);
@@ -105,13 +108,14 @@ private:
     std::map<uint64_t, Allocation> allocations_;
     uint64_t nextRegionId_{1};
 
-    // PID start times for reaper PID-reuse detection (in-memory only)
+    // client_id → {pid, start_time} for reaper PID-reuse detection (in-memory only)
+    // Only tracked for local clients (same hostname)
     std::map<pid_t, uint64_t> pidStartTimes_;
-    // PID allocation refcount for O(1) reaper cleanup
-    std::map<pid_t, uint32_t> pidAllocCounts_;
+    // client_id allocation refcount for O(1) reaper cleanup
+    std::map<std::string, uint32_t> clientAllocCounts_;
 
-    // Registered server PIDs → start time (in-memory only, not persisted)
-    std::map<pid_t, uint64_t> registeredServers_;
+    // Registered servers: client_id → pid start time (in-memory only, not persisted)
+    std::map<std::string, uint64_t> registeredServers_;
 };
 
 }  // namespace maru

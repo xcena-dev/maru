@@ -120,7 +120,8 @@ class TestEnsureConn:
         addr = server.start()
         try:
             client = MaruShmClient(address=addr)
-            sock = client._ensure_conn()
+            with client._conn_lock:
+                sock = client._ensure_conn()
             assert sock is not None
             assert client._sock is sock
             client.close()
@@ -137,8 +138,9 @@ class TestEnsureConn:
         addr = server.start()
         try:
             client = MaruShmClient(address=addr)
-            sock1 = client._ensure_conn()
-            sock2 = client._ensure_conn()
+            with client._conn_lock:
+                sock1 = client._ensure_conn()
+                sock2 = client._ensure_conn()
             assert sock1 is sock2
             client.close()
         finally:
@@ -147,8 +149,11 @@ class TestEnsureConn:
     def test_raises_connection_error_when_not_running(self):
         """_ensure_conn raises ConnectionError when server is not running."""
         client = MaruShmClient(address="127.0.0.1:19999")
-        with pytest.raises(ConnectionError, match="Resource manager is not running"):
-            client._ensure_conn()
+        with client._conn_lock:
+            with pytest.raises(
+                ConnectionError, match="Resource manager is not running"
+            ):
+                client._ensure_conn()
 
 
 # =============================================================================
