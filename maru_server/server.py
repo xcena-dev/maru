@@ -25,8 +25,8 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    def __init__(self):
-        self._allocation_manager = AllocationManager()
+    def __init__(self, rm_address: str | None = None):
+        self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
@@ -261,12 +261,18 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--rm-address",
+        type=str,
+        default="127.0.0.1:9850",
+        help="Resource manager address (host:port, default: 127.0.0.1:9850)",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer()
+    server = MaruServer(rm_address=args.rm_address)
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

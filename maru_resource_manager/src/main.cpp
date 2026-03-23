@@ -11,7 +11,7 @@
 #include "log.h"
 #include "pool_manager.h"
 #include "reaper.h"
-#include "uds_server.h"
+#include "tcp_server.h"
 #include "util.h"
 
 static volatile std::sig_atomic_t gStop = 0;
@@ -21,15 +21,15 @@ static void onSignal(int) { gStop = 1; }
 static void onRescan(int) { gRescan = 1; }
 
 struct ServerConfig {
-    std::string socketPath = "/tmp/maru-resourced/maru-resourced.sock";
+    std::string host = "0.0.0.0";
+    uint16_t port = 9850;
     std::string stateDir = "/var/lib/maru-resourced";
     maru::LogLevel logLevel = maru::LogLevel::Info;
     int idleTimeout = 60;  // seconds, 0=disable
 };
 
 static void writeConfigFile(const ServerConfig &cfg) {
-    std::string confDir = maru::parentDir(cfg.socketPath);
-    std::string confPath = confDir + "/rm.conf";
+    std::string confPath = cfg.stateDir + "/rm.conf";
     std::string tmpPath = confPath + ".tmp";
 
     FILE *fp = std::fopen(tmpPath.c_str(), "w");
@@ -39,7 +39,8 @@ static void writeConfigFile(const ServerConfig &cfg) {
                     confPath.c_str(), std::strerror(errno));
         return;
     }
-    std::fprintf(fp, "state_dir=%s\n", cfg.stateDir.c_str());
+    std::fprintf(fp, "host=%s\n", cfg.host.c_str());
+    std::fprintf(fp, "port=%u\n", cfg.port);
     std::fprintf(fp, "log_level=%s\n", maru::logLevelStr(cfg.logLevel));
     std::fprintf(fp, "idle_timeout=%d\n", cfg.idleTimeout);
     bool writeOk = (std::ferror(fp) == 0);
@@ -65,7 +66,8 @@ static void printUsage(const char *prog) {
         "Usage: %s [OPTIONS]\n\n"
         "Maru Resource Manager — CXL/DAX shared memory pool server.\n\n"
         "Options:\n"
-        "  -s, --socket-path PATH    UDS socket path (default: /tmp/maru-resourced/maru-resourced.sock)\n"
+        "  -H, --host ADDR           TCP bind address (default: 0.0.0.0)\n"
+        "  -p, --port PORT           TCP port (default: 9850)\n"
         "  -d, --state-dir PATH      State directory for WAL/metadata (default: /var/lib/maru-resourced)\n"
         "  -l, --log-level LEVEL     Log level: debug, info, warn, error (default: info)\n"
         "  -t, --idle-timeout SECS   Auto-shutdown after N seconds idle (default: 60, 0=disable)\n"
@@ -76,7 +78,8 @@ static void printUsage(const char *prog) {
 static ServerConfig parseArgs(int argc, char **argv) {
     ServerConfig cfg;
     static struct option longOpts[] = {
-        {"socket-path",  required_argument, nullptr, 's'},
+        {"host",         required_argument, nullptr, 'H'},
+        {"port",         required_argument, nullptr, 'p'},
         {"state-dir",    required_argument, nullptr, 'd'},
         {"log-level",    required_argument, nullptr, 'l'},
         {"idle-timeout", required_argument, nullptr, 't'},
@@ -85,9 +88,10 @@ static ServerConfig parseArgs(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:d:l:t:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:t:h", longOpts, nullptr)) != -1) {
         switch (opt) {
-        case 's': cfg.socketPath = optarg; break;
+        case 'H': cfg.host = optarg; break;
+        case 'p': cfg.port = static_cast<uint16_t>(std::atoi(optarg)); break;
         case 'd': cfg.stateDir = optarg; break;
         case 'l': cfg.logLevel = maru::parseLogLevel(optarg); break;
         case 't': cfg.idleTimeout = std::atoi(optarg); break;
@@ -102,16 +106,15 @@ int main(int argc, char **argv) {
     ServerConfig cfg = parseArgs(argc, argv);
     maru::setLogLevel(cfg.logLevel);
 
-    // Ensure directories exist
-    maru::ensureDirExists(maru::parentDir(cfg.socketPath));
+    // Ensure state directory exists
     maru::ensureDirExists(cfg.stateDir);
 
-    // Persist config so auto-start can recover the same settings
+    // Persist config for reference
     writeConfigFile(cfg);
 
     // Startup banner
     maru::logf(maru::LogLevel::Info, "maru-resource-manager starting");
-    maru::logf(maru::LogLevel::Info, "  socket     : %s", cfg.socketPath.c_str());
+    maru::logf(maru::LogLevel::Info, "  listen     : %s:%u", cfg.host.c_str(), cfg.port);
     maru::logf(maru::LogLevel::Info, "  state dir  : %s", cfg.stateDir.c_str());
     maru::logf(maru::LogLevel::Info, "  log level  : %s", maru::logLevelStr(cfg.logLevel));
     maru::logf(maru::LogLevel::Info, "  idle timeout: %ds%s", cfg.idleTimeout,
@@ -130,7 +133,7 @@ int main(int argc, char **argv) {
                     "no CXL/DAX devices found — starting with empty pool");
     }
 
-    maru::UdsServer server(pm, cfg.socketPath);
+    maru::TcpServer server(pm, cfg.host, cfg.port);
     rc = server.start();
     if (rc != 0) {
         maru::logf(maru::LogLevel::Error,
@@ -141,7 +144,8 @@ int main(int argc, char **argv) {
     maru::Reaper reaper(pm);
     reaper.start();
 
-    maru::logf(maru::LogLevel::Info, "ready — listening on %s", cfg.socketPath.c_str());
+    maru::logf(maru::LogLevel::Info, "ready — listening on %s:%u",
+               cfg.host.c_str(), cfg.port);
 
     // Main loop with idle timeout
     int idleSeconds = 0;

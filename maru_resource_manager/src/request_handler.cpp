@@ -1,8 +1,5 @@
 #include "request_handler.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <cstring>
 
 #include "log.h"
@@ -25,15 +22,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     result.resp.handle = handle;
     result.resp.accessType = static_cast<uint32_t>(AccessType::LOCAL);
     result.resp.requestedSize = requestedSize;
-
-    if (status == 0) {
-        result.daxFd = ::open(devPath.c_str(), O_RDWR | O_CLOEXEC);
-        if (result.daxFd < 0) {
-            pm_.free(handle, 0);
-            result.resp.status = -errno;
-            result.resp.handle = Handle{};
-        }
-    }
+    result.devicePath = devPath;
 
     return result;
 }
@@ -52,13 +41,13 @@ FreeResult RequestHandler::handleFree(const FreeReq &req,
     return result;
 }
 
-GetFdResult RequestHandler::handleGetFd(const GetFdReq &req,
-                                        const RequestContext &ctx) {
-    (void)ctx;  // Currently unused, may be needed for access control later
-    GetFdResult result;
+GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
+                                                const RequestContext &ctx) {
+    (void)ctx;
+    GetAccessResult result;
 
     if (!pm_.verifyAuthToken(req.handle)) {
-        result.resp.status = -EACCES;
+        result.status = -EACCES;
         return result;
     }
 
@@ -66,12 +55,11 @@ GetFdResult RequestHandler::handleGetFd(const GetFdReq &req,
     int status = pm_.getPathForHandle(req.handle, pathToOpen);
 
     if (status == 0) {
-        result.daxFd = ::open(pathToOpen.c_str(), O_RDWR | O_CLOEXEC);
-        if (result.daxFd < 0) {
-            result.resp.status = -errno;
-        }
+        result.devicePath = pathToOpen;
+        result.offset = req.handle.offset;
+        result.length = req.handle.length;
     } else {
-        result.resp.status = status;
+        result.status = status;
     }
 
     return result;

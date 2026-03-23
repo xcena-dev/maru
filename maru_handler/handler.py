@@ -89,7 +89,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper()
+        self._mapper = DaxMapper(rm_address=self._config.rm_address)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None

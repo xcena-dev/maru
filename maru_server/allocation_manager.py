@@ -25,8 +25,8 @@ class AllocationInfo:
 class AllocationManager:
     """Manages memory allocation lifecycle."""
 
-    def __init__(self):
-        self._client = MaruShmClient()
+    def __init__(self, rm_address: str | None = None):
+        self._client = MaruShmClient(address=rm_address)
         self._client.register_server()  # Register as active server (prevents idle shutdown)
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()

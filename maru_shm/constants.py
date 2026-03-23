@@ -15,9 +15,8 @@ PROT_EXEC = 0x4
 MAP_SHARED = 0x01
 MAP_PRIVATE = 0x02
 
-# Default socket and state paths
-# no env var override, use MaruShmClient(socket_path=...) for custom paths
-DEFAULT_SOCKET_PATH = "/tmp/maru-resourced/maru-resourced.sock"
+# Default address and state paths
+DEFAULT_ADDRESS = "127.0.0.1:9850"
 DEFAULT_STATE_DIR = "/var/lib/maru-resourced"
 
 # Alignment

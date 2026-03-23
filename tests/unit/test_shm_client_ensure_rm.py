@@ -1,34 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Tests for MaruShmClient: _try_connect, _connect, is_running,
-read-only mmap, __del__, and other coverage gaps.
+"""Tests for MaruShmClient: is_running, _ensure_conn, persistent connection,
+free edge cases, __del__, and other coverage gaps.
 
 These tests exercise the real MaruShmClient class (not the MockShmClient from
-conftest), using mock UDS servers and targeted patching.
+conftest), using mock TCP servers and targeted patching.
 """
 
 import os
 import socket
-import tempfile
 import threading
 from unittest.mock import patch
 
 import pytest
 
 from maru_shm.client import MaruShmClient
-from maru_shm.constants import MAP_SHARED, PROT_READ, PROT_WRITE
 from maru_shm.ipc import (
     HEADER_SIZE,
-    AllocResp,
     FreeResp,
     MsgHeader,
     MsgType,
 )
 from maru_shm.types import MaruHandle
-from maru_shm.uds_helpers import read_full, send_with_fd, write_full
+from maru_shm.uds_helpers import read_full, write_full
 
 # =============================================================================
-# Helpers (same pattern as test_shm_client.py)
+# Helpers
 # =============================================================================
 
 
@@ -40,47 +37,29 @@ def _recv_request(sock):
 
 
 def _send_response(sock, msg_type, resp):
-    """Pack resp and send as a simple (no-FD) response."""
+    """Pack resp and send as a simple response."""
     payload = resp.pack()
     hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
     write_full(sock, hdr.pack() + payload)
 
 
-def _make_temp_fd(size=4096, fill=b"\x00"):
-    """Create a temp file and return (fd, path). Caller must close/unlink."""
-    tmp_fd, tmp_path = tempfile.mkstemp()
-    os.write(tmp_fd, fill * size)
-    os.close(tmp_fd)
-    fd = os.open(tmp_path, os.O_RDWR)
-    return fd, tmp_path
-
-
-def _send_response_with_fd(sock, msg_type, resp, *, size=4096, fill=b"\x00"):
-    """Pack resp, create a temp FD, and send header + payload-with-FD."""
-    fd, tmp_path = _make_temp_fd(size, fill)
-    payload = resp.pack()
-    hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
-    write_full(sock, hdr.pack())
-    send_with_fd(sock, payload, fd)
-    os.close(fd)
-    os.unlink(tmp_path)
-
-
-class MockResourceManagerServer:
-    """Mini mock resource manager that serves requests on a UDS socket."""
+class MockTcpServer:
+    """Mini mock resource manager that serves requests on a TCP socket."""
 
     def __init__(self, handler):
         self._handler = handler
         self._sock = None
+        self._port = 0
 
-    def start(self, tmpdir):
-        path = os.path.join(tmpdir, "test.sock")
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(path)
+    def start(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._port = self._sock.getsockname()[1]
         self._sock.listen(4)
         self._thread = threading.Thread(target=self._accept, daemon=True)
         self._thread.start()
-        return path
+        return f"127.0.0.1:{self._port}"
 
     def _accept(self):
         while True:
@@ -101,34 +80,7 @@ class MockResourceManagerServer:
 
 
 # =============================================================================
-# _try_connect tests
-# =============================================================================
-
-
-class TestTryConnect:
-    def test_success_when_server_listening(self):
-        """_try_connect returns True when server is listening."""
-
-        def handler(sock):
-            pass  # Accept and close
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                assert client._try_connect() is True
-            finally:
-                server.stop()
-
-    def test_failure_when_no_server(self):
-        """_try_connect returns False when no server is listening."""
-        client = MaruShmClient(socket_path="/tmp/_maru_nonexistent_test_sock.sock")
-        assert client._try_connect() is False
-
-
-# =============================================================================
-# _connect tests
+# is_running tests
 # =============================================================================
 
 
@@ -139,108 +91,105 @@ class TestIsRunning:
         def handler(sock):
             pass
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                assert client.is_running() is True
-            finally:
-                server.stop()
+        server = MockTcpServer(handler)
+        addr = server.start()
+        try:
+            client = MaruShmClient(address=addr)
+            assert client.is_running() is True
+        finally:
+            server.stop()
 
     def test_false_when_no_server(self):
         """is_running() returns False when no server is listening."""
-        client = MaruShmClient(socket_path="/tmp/_maru_nonexistent_test_sock.sock")
+        client = MaruShmClient(address="127.0.0.1:19999")
         assert client.is_running() is False
 
 
-class TestConnect:
-    def test_direct_connection(self):
-        """_connect succeeds when server is running."""
+# =============================================================================
+# _ensure_conn tests
+# =============================================================================
+
+
+class TestEnsureConn:
+    def test_creates_connection(self):
+        """_ensure_conn creates a TCP connection on first call."""
 
         def handler(sock):
             pass
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                sock = client._connect()
-                assert sock is not None
-                sock.close()
-            finally:
-                server.stop()
+        server = MockTcpServer(handler)
+        addr = server.start()
+        try:
+            client = MaruShmClient(address=addr)
+            sock = client._ensure_conn()
+            assert sock is not None
+            assert client._sock is sock
+            client.close()
+        finally:
+            server.stop()
+
+    def test_reuses_connection(self):
+        """_ensure_conn returns same socket on subsequent calls."""
+
+        def handler(sock):
+            pass
+
+        server = MockTcpServer(handler)
+        addr = server.start()
+        try:
+            client = MaruShmClient(address=addr)
+            sock1 = client._ensure_conn()
+            sock2 = client._ensure_conn()
+            assert sock1 is sock2
+            client.close()
+        finally:
+            server.stop()
 
     def test_raises_connection_error_when_not_running(self):
-        """_connect raises ConnectionError with instructions when server is not running."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sock_path = os.path.join(tmpdir, "test.sock")
-            client = MaruShmClient(socket_path=sock_path)
-
-            with pytest.raises(ConnectionError, match="Resource manager is not running"):
-                client._connect()
+        """_ensure_conn raises ConnectionError when server is not running."""
+        client = MaruShmClient(address="127.0.0.1:19999")
+        with pytest.raises(ConnectionError, match="Resource manager is not running"):
+            client._ensure_conn()
 
 
 # =============================================================================
-# mmap edge cases
+# Persistent connection — reconnect on error
 # =============================================================================
 
 
-class TestMmapEdgeCases:
-    def test_mmap_read_only(self):
-        """mmap with PROT_READ uses ACCESS_READ."""
+class TestReconnect:
+    def test_rpc_reconnects_after_server_drop(self):
+        """_rpc retries with a fresh connection if the first attempt fails."""
+        call_count = 0
 
         def handler(sock):
+            nonlocal call_count
+            call_count += 1
+            # Handle the request: read header + payload, send FREE_RESP
             hdr, _ = _recv_request(sock)
-            if hdr.msg_type == MsgType.ALLOC_REQ:
-                handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=999)
-                resp = AllocResp(status=0, handle=handle, requested_size=4096)
-                _send_response_with_fd(sock, MsgType.ALLOC_RESP, resp)
+            if hdr.msg_type == MsgType.FREE_REQ:
+                _send_response(sock, MsgType.FREE_RESP, FreeResp(status=0))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                handle = client.alloc(4096)
+        server = MockTcpServer(handler)
+        addr = server.start()
+        try:
+            client = MaruShmClient(address=addr)
+            handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=123)
 
-                # Read-only mmap — hits ACCESS_READ branch
-                mm = client.mmap(handle, PROT_READ)
-                assert mm is not None
-                assert len(mm) == 4096
-                # Read should work
-                _ = mm[0]
+            # First call — establishes connection and succeeds
+            client.free(handle)
+            assert call_count == 1
 
-                client.close()
-            finally:
-                server.stop()
+            # Simulate server dropping the connection
+            client._close_conn()
 
-    def test_mmap_with_explicit_flags(self):
-        """mmap with non-zero flags skips MAP_SHARED default."""
+            # Second call — should reconnect and succeed
+            client.free(handle)
+            assert call_count == 2
 
-        def handler(sock):
-            hdr, _ = _recv_request(sock)
-            if hdr.msg_type == MsgType.ALLOC_REQ:
-                handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=999)
-                resp = AllocResp(status=0, handle=handle, requested_size=4096)
-                _send_response_with_fd(sock, MsgType.ALLOC_RESP, resp)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                handle = client.alloc(4096)
-
-                # Explicit flags — skips `if flags == 0: flags = MAP_SHARED`
-                mm = client.mmap(handle, PROT_READ | PROT_WRITE, flags=MAP_SHARED)
-                assert mm is not None
-                assert len(mm) == 4096
-
-                client.close()
-            finally:
-                server.stop()
+            client.close()
+        finally:
+            server.stop()
 
 
 # =============================================================================
@@ -250,27 +199,26 @@ class TestMmapEdgeCases:
 
 class TestFreeEdgeCases:
     def test_free_without_cached_resources(self):
-        """free() works for a handle with no cached FD/mmap."""
+        """free() works for a handle with no cached path/mmap."""
 
         def handler(sock):
             hdr, _ = _recv_request(sock)
             if hdr.msg_type == MsgType.FREE_REQ:
                 _send_response(sock, MsgType.FREE_RESP, FreeResp(status=0))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = MockResourceManagerServer(handler)
-            sock_path = server.start(tmpdir)
-            try:
-                client = MaruShmClient(socket_path=sock_path)
-                # Free without prior alloc — no cached FD/mmap
-                handle = MaruHandle(
-                    region_id=999, offset=0, length=4096, auth_token=123
-                )
-                client.free(handle)
-                assert 999 not in client._fd_cache
-                assert 999 not in client._mmap_cache
-            finally:
-                server.stop()
+        server = MockTcpServer(handler)
+        addr = server.start()
+        try:
+            client = MaruShmClient(address=addr)
+            handle = MaruHandle(
+                region_id=999, offset=0, length=4096, auth_token=123
+            )
+            client.free(handle)
+            assert 999 not in client._path_cache
+            assert 999 not in client._mmap_cache
+            client.close()
+        finally:
+            server.stop()
 
 
 # =============================================================================
@@ -281,8 +229,7 @@ class TestFreeEdgeCases:
 class TestDel:
     def test_del_calls_close(self):
         """__del__ delegates to close()."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            client = MaruShmClient(socket_path=os.path.join(tmpdir, "fake.sock"))
-            with patch.object(client, "close") as mock_close:
-                client.__del__()
-                mock_close.assert_called_once()
+        client = MaruShmClient(address="127.0.0.1:19999")
+        with patch.object(client, "close") as mock_close:
+            client.__del__()
+            mock_close.assert_called_once()

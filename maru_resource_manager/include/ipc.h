@@ -7,7 +7,7 @@
 namespace maru {
 
 static constexpr uint32_t kMagic = 0x4D415255; // 'MARU'
-static constexpr uint16_t kVersion = 1;
+static constexpr uint16_t kVersion = 2;
 
 /// Memory access type — LOCAL for fd-based mmap, REMOTE for future multi-node.
 enum class AccessType : uint32_t {
@@ -24,8 +24,8 @@ enum class MsgType : uint16_t {
   STATS_RESP = 6,
   REGISTER_SERVER_REQ = 7,
   REGISTER_SERVER_RESP = 8,
-  GET_FD_REQ = 9,
-  GET_FD_RESP = 10,
+  GET_ACCESS_REQ = 9,
+  GET_ACCESS_RESP = 10,
   UNREGISTER_SERVER_REQ = 11,
   UNREGISTER_SERVER_RESP = 12,
   ERROR_RESP = 255
@@ -59,12 +59,14 @@ struct FreeResp {
   int32_t status;
 };
 
-struct GetFdReq {
+struct GetAccessReq {
   Handle handle;
 };
 
-struct GetFdResp {
+struct GetAccessResp {
   int32_t status;
+  uint32_t pathLen;
+  // Followed by: path bytes (pathLen), offset(u64), length(u64)
 };
 
 struct StatsRespHeader {
@@ -90,8 +92,8 @@ static_assert(sizeof(AllocReq) == 16, "AllocReq must be 16 bytes");
 static_assert(sizeof(AllocResp) == 48, "AllocResp must be 48 bytes");
 static_assert(sizeof(FreeReq) == 32, "FreeReq must be 32 bytes (Handle)");
 static_assert(sizeof(FreeResp) == 4, "FreeResp must be 4 bytes");
-static_assert(sizeof(GetFdReq) == 32, "GetFdReq must be 32 bytes (Handle)");
-static_assert(sizeof(GetFdResp) == 4, "GetFdResp must be 4 bytes");
+static_assert(sizeof(GetAccessReq) == 32, "GetAccessReq must be 32 bytes (Handle)");
+static_assert(sizeof(GetAccessResp) == 8, "GetAccessResp must be 8 bytes (fixed part)");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
 static_assert(sizeof(RegisterServerResp) == 4, "RegisterServerResp must be 4 bytes");
 static_assert(sizeof(UnregisterServerResp) == 4, "UnregisterServerResp must be 4 bytes");

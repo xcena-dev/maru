@@ -17,7 +17,7 @@ add_executable(maru_resource_manager
     src/wal.cpp
     src/reaper.cpp
     src/request_handler.cpp
-    src/uds_server.cpp
+    src/tcp_server.cpp
 )
 
 target_include_directories(maru_resource_manager PRIVATE include src)

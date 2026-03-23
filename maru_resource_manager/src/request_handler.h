@@ -16,16 +16,18 @@ struct RequestContext {
     uid_t uid;
 };
 
-/// Result of handleAlloc — includes daxFd for SCM_RIGHTS passing.
+/// Result of handleAlloc — includes device path for client to open directly.
 struct AllocResult {
     AllocResp resp{};
-    int daxFd = -1;  // >= 0 means transport should send via SCM_RIGHTS
+    std::string devicePath;
 };
 
-/// Result of handleGetFd — includes daxFd for SCM_RIGHTS passing.
-struct GetFdResult {
-    GetFdResp resp{};
-    int daxFd = -1;
+/// Result of handleGetAccess — includes device path, offset, length.
+struct GetAccessResult {
+    int32_t status = 0;
+    std::string devicePath;
+    uint64_t offset = 0;
+    uint64_t length = 0;
 };
 
 /// Result of handleStats — serialized payload bytes.
@@ -64,7 +66,7 @@ public:
 
     AllocResult handleAlloc(const AllocReq &req, const RequestContext &ctx);
     FreeResult handleFree(const FreeReq &req, const RequestContext &ctx);
-    GetFdResult handleGetFd(const GetFdReq &req, const RequestContext &ctx);
+    GetAccessResult handleGetAccess(const GetAccessReq &req, const RequestContext &ctx);
     StatsResult handleStats();
     RegisterServerResult handleRegisterServer(const RequestContext &ctx);
     UnregisterServerResult handleUnregisterServer(const RequestContext &ctx);

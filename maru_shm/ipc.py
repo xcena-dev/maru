@@ -20,10 +20,10 @@ from .types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants
 PROTOCOL_MAGIC = 0x4D415255  # 'MARU' in ASCII
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Maximum payload size (DoS prevention)
-MAX_PAYLOAD_SIZE = 1024
+MAX_PAYLOAD_SIZE = 8192
 
 
 class MsgType(IntEnum):
@@ -37,8 +37,8 @@ class MsgType(IntEnum):
     STATS_RESP = 6
     REGISTER_SERVER_REQ = 7
     REGISTER_SERVER_RESP = 8
-    GET_FD_REQ = 9
-    GET_FD_RESP = 10
+    GET_ACCESS_REQ = 9
+    GET_ACCESS_RESP = 10
     UNREGISTER_SERVER_REQ = 11
     UNREGISTER_SERVER_RESP = 12
     ERROR_RESP = 255
@@ -112,9 +112,16 @@ class AllocReq:
     size: int = 0
     pool_id: int = ANY_POOL_ID
     reserved: int = 0
+    client_id: str = ""
 
     def pack(self) -> bytes:
-        return struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
+        fixed = struct.pack(
+            _ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved
+        )
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            return fixed + struct.pack("=H", len(id_bytes)) + id_bytes
+        return fixed
 
     @classmethod
     def unpack(cls, data: bytes) -> "AllocReq":
@@ -123,7 +130,14 @@ class AllocReq:
         size, pool_id, reserved = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
-        return cls(size=size, pool_id=pool_id, reserved=reserved)
+        client_id = ""
+        off = _ALLOC_REQ_SIZE
+        if off + 2 <= len(data):
+            (id_len,) = struct.unpack("=H", data[off : off + 2])
+            off += 2
+            if id_len > 0 and off + id_len <= len(data):
+                client_id = data[off : off + id_len].decode("utf-8")
+        return cls(size=size, pool_id=pool_id, reserved=reserved, client_id=client_id)
 
 
 # AllocResp: status(i32) + accessType(u32) + Handle(32) + requested_size(u64) = 48 bytes
@@ -139,10 +153,11 @@ class AllocResp:
     status: int = 0
     handle: MaruHandle | None = None
     requested_size: int = 0
+    device_path: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return struct.pack(
+        fixed = struct.pack(
             _ALLOC_RESP_FORMAT,
             self.status,
             0,  # accessType (LOCAL)
@@ -152,6 +167,9 @@ class AllocResp:
             h.auth_token,
             self.requested_size,
         )
+        path_bytes = self.device_path.encode("utf-8")
+        path_header = struct.pack("=I", len(path_bytes))
+        return fixed + path_header + path_bytes
 
     @classmethod
     def unpack(cls, data: bytes) -> "AllocResp":
@@ -164,7 +182,20 @@ class AllocResp:
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
         requested_size = vals[6]
-        return cls(status=status, handle=handle, requested_size=requested_size)
+        # Parse optional device_path extension
+        device_path = ""
+        offset = _ALLOC_RESP_SIZE
+        if offset + 4 <= len(data):
+            (path_len,) = struct.unpack("=I", data[offset : offset + 4])
+            offset += 4
+            if path_len > 0 and offset + path_len <= len(data):
+                device_path = data[offset : offset + path_len].decode("utf-8")
+        return cls(
+            status=status,
+            handle=handle,
+            requested_size=requested_size,
+            device_path=device_path,
+        )
 
 
 # FreeReq: Handle(32) = 32 bytes
@@ -210,10 +241,10 @@ class FreeResp:
         return cls(status=status)
 
 
-# GetFdReq: Handle(32) = 32 bytes
+# GetAccessReq: Handle(32) = 32 bytes
 @dataclass
-class GetFdReq:
-    """Get FD request payload (for SCM_RIGHTS)."""
+class GetAccessReq:
+    """Get access info request payload."""
 
     handle: MaruHandle | None = None
 
@@ -222,31 +253,52 @@ class GetFdReq:
         return h.pack()
 
     @classmethod
-    def unpack(cls, data: bytes) -> "GetFdReq":
+    def unpack(cls, data: bytes) -> "GetAccessReq":
         handle = MaruHandle.unpack(data)
         return cls(handle=handle)
 
 
-# GetFdResp: status(i32) = 4 bytes
-_GET_FD_RESP_FORMAT = "=i"
-_GET_FD_RESP_SIZE = struct.calcsize(_GET_FD_RESP_FORMAT)
+# GetAccessResp: status(i32) + pathLen(u32) + path + offset(u64) + length(u64)
+_GET_ACCESS_RESP_HEADER_FORMAT = "=iI"
+_GET_ACCESS_RESP_HEADER_SIZE = struct.calcsize(_GET_ACCESS_RESP_HEADER_FORMAT)
 
 
 @dataclass
-class GetFdResp:
-    """Get FD response payload. The actual FD is sent via SCM_RIGHTS ancillary."""
+class GetAccessResp:
+    """Get access info response — device path, offset, length."""
 
     status: int = 0
+    device_path: str = ""
+    offset: int = 0
+    length: int = 0
 
     def pack(self) -> bytes:
-        return struct.pack(_GET_FD_RESP_FORMAT, self.status)
+        path_bytes = self.device_path.encode("utf-8")
+        header = struct.pack(
+            _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
+        )
+        tail = struct.pack("=QQ", self.offset, self.length)
+        return header + path_bytes + tail
 
     @classmethod
-    def unpack(cls, data: bytes) -> "GetFdResp":
-        if len(data) < _GET_FD_RESP_SIZE:
-            raise ValueError(f"GetFdResp too short: {len(data)} < {_GET_FD_RESP_SIZE}")
-        (status,) = struct.unpack(_GET_FD_RESP_FORMAT, data[:_GET_FD_RESP_SIZE])
-        return cls(status=status)
+    def unpack(cls, data: bytes) -> "GetAccessResp":
+        if len(data) < _GET_ACCESS_RESP_HEADER_SIZE:
+            raise ValueError("GetAccessResp too short for header")
+        status, path_len = struct.unpack(
+            _GET_ACCESS_RESP_HEADER_FORMAT, data[:_GET_ACCESS_RESP_HEADER_SIZE]
+        )
+        off = _GET_ACCESS_RESP_HEADER_SIZE
+        device_path = ""
+        if path_len > 0 and off + path_len <= len(data):
+            device_path = data[off : off + path_len].decode("utf-8")
+            off += path_len
+        offset = 0
+        length = 0
+        if off + 16 <= len(data):
+            offset, length = struct.unpack("=QQ", data[off : off + 16])
+        return cls(
+            status=status, device_path=device_path, offset=offset, length=length
+        )
 
 
 # StatsReq: empty payload (0 bytes)
@@ -321,17 +373,27 @@ class StatsResp:
         return cls(pools=pools)
 
 
-# RegisterServerReq: empty payload (0 bytes) — PID comes from SO_PEERCRED
+# RegisterServerReq: optional client_id for TCP (PID no longer from SO_PEERCRED)
 @dataclass
 class RegisterServerReq:
-    """Register server request payload (empty)."""
+    """Register server request payload."""
+
+    client_id: str = ""
 
     def pack(self) -> bytes:
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            return struct.pack("=H", len(id_bytes)) + id_bytes
         return b""
 
     @classmethod
     def unpack(cls, data: bytes) -> "RegisterServerReq":
-        return cls()
+        client_id = ""
+        if len(data) >= 2:
+            (id_len,) = struct.unpack("=H", data[:2])
+            if id_len > 0 and 2 + id_len <= len(data):
+                client_id = data[2 : 2 + id_len].decode("utf-8")
+        return cls(client_id=client_id)
 
 
 # RegisterServerResp: status(i32) = 4 bytes
@@ -360,17 +422,27 @@ class RegisterServerResp:
         return cls(status=status)
 
 
-# UnregisterServerReq: empty payload (0 bytes) — PID comes from SO_PEERCRED
+# UnregisterServerReq: optional client_id for TCP
 @dataclass
 class UnregisterServerReq:
-    """Unregister server request payload (empty)."""
+    """Unregister server request payload."""
+
+    client_id: str = ""
 
     def pack(self) -> bytes:
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            return struct.pack("=H", len(id_bytes)) + id_bytes
         return b""
 
     @classmethod
     def unpack(cls, data: bytes) -> "UnregisterServerReq":
-        return cls()
+        client_id = ""
+        if len(data) >= 2:
+            (id_len,) = struct.unpack("=H", data[:2])
+            if id_len > 0 and 2 + id_len <= len(data):
+                client_id = data[2 : 2 + id_len].decode("utf-8")
+        return cls(client_id=client_id)
 
 
 # UnregisterServerResp: status(i32) = 4 bytes

@@ -1,6 +1,6 @@
 # MaruResourceManager Architecture
 
-The `MaruResourceManager` is a server that manages physical CXL DAX device pools for the Maru system. It provides memory allocation, deallocation, and region handle issuance to clients via RPC. It handles two device types — DEV_DAX (character devices) and FS_DAX (filesystem-backed DAX mounts) — and ensures durability through write-ahead logging and periodic checkpoints. A background reaper automatically reclaims leaked allocations from terminated client processes.
+The `MaruResourceManager` is a server that manages physical CXL DAX device pools for the Maru system. It provides memory allocation, deallocation, and region handle issuance to clients via TCP RPC. It handles two device types — DEV_DAX (character devices) and FS_DAX (filesystem-backed DAX mounts) — and ensures durability through write-ahead logging and periodic checkpoints. A background reaper automatically reclaims leaked allocations from terminated client processes.
 
 ## 1. Component Architecture
 
@@ -8,7 +8,7 @@ The `MaruResourceManager` is a server that manages physical CXL DAX device pools
 flowchart TB
     subgraph RM["Maru Resource Manager"]
         Main["Main<br/>CLI parsing<br/>Signal handling<br/>Idle timeout"]
-        RPC["RpcServer<br/>IPC protocol<br/>Handle issuance"]
+        TCP["TcpServer<br/>TCP :9850<br/>Binary IPC protocol"]
         RH["RequestHandler<br/>Business logic<br/>Alloc / Free / Stats"]
         PM["PoolManager<br/>Pool management<br/>Free list tracking"]
         Reaper["Reaper<br/>Dead process detection<br/>Auto-cleanup"]
@@ -16,10 +16,10 @@ flowchart TB
         WAL["WalStore<br/>Write-ahead log<br/>Crash recovery"]
     end
 
-    Main --> RPC
+    Main --> TCP
     Main --> PM
     Main --> Reaper
-    RPC --> RH
+    TCP --> RH
     RH --> PM
     PM --> Meta
     PM --> WAL
@@ -29,8 +29,8 @@ flowchart TB
         C2["MaruShmClient #2"]
     end
 
-    C1 <-->|"RPC"| RPC
-    C2 <-->|"RPC"| RPC
+    C1 <-->|"TCP"| TCP
+    C2 <-->|"TCP"| TCP
 
     subgraph Storage["CXL Memory"]
         D1["/dev/dax0.0<br/>(DEV_DAX)"]
@@ -42,9 +42,9 @@ flowchart TB
 
 `PoolManager` is the central component that owns all shared state — pool metadata, allocation maps, and free lists. It performs device discovery by scanning sysfs for DEV_DAX and FS_DAX devices, and supports hot-plug via signal-triggered rescans.
 
-`RpcServer` accepts client connections and dispatches requests to `RequestHandler`. It handles transport concerns including client identity verification and file descriptor passing.
+`TcpServer` accepts TCP client connections and dispatches requests to `RequestHandler`. It handles transport concerns including client identity parsing from the `client_id` field in requests.
 
-`RequestHandler` contains all business logic — allocation, deallocation, fd lookup, and stats queries. It depends only on `PoolManager` and has no transport code, enabling reuse with future transport layers.
+`RequestHandler` contains all business logic — allocation, deallocation, access info lookup, and stats queries. It depends only on `PoolManager` and has no transport code.
 
 `Reaper` runs a background thread that periodically detects terminated client processes and reclaims their leaked allocations through `PoolManager`.
 
@@ -56,17 +56,17 @@ flowchart TB
 
 The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager must be started explicitly by the user before launching any Maru services.
 
-**Manual start:** The user starts the resource manager on the node before running `MaruServer` or any client. Currently all components (Resource Manager, MaruServer, clients) run on the same node:
+**Manual start:** The user starts the resource manager on the node before running `MaruServer` or any client:
 
 ```bash
-maru-resource-manager --socket-path /tmp/maru-resourced/maru-resourced.sock
+maru-resource-manager --host 0.0.0.0 --port 9850
 ```
 
 If a client attempts to connect when the resource manager is not running, `MaruShmClient` raises a `ConnectionError` with actionable instructions. The `MaruShmClient.is_running()` method can be used to check availability before attempting operations.
 
 **Crash recovery:** If the resource manager crashes, the user must restart it manually. On startup, the resource manager recovers its previous state from the WAL.
 
-**Server registration:** After startup, the `MaruServer` registers itself via `REGISTER_SERVER_REQ`. This adds its PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
+**Server registration:** After startup, the `MaruServer` registers itself via `REGISTER_SERVER_REQ` with a `client_id` (`hostname:pid`). This adds the PID to a tracked set, preventing idle shutdown while the server is running. On graceful shutdown, `UNREGISTER_SERVER_REQ` removes it. If a server crashes without unregistering, the Reaper detects the dead PID and removes it automatically.
 
 **Idle shutdown:** The main loop checks both registered server count and active allocation count. When both are zero for `--idle-timeout` seconds (default: 60), the server flushes its state to disk and shuts down gracefully. The user must restart it manually when needed again.
 
@@ -74,21 +74,32 @@ If a client attempts to connect when the resource manager is not running, `MaruS
 
 ## 3. IPC Protocol
 
-All messages use a fixed-size binary header containing protocol version, message type, and payload length, followed by a type-specific payload.
+All messages use a fixed-size binary header (12 bytes) containing protocol magic, version (v2), message type, and payload length, followed by a type-specific payload. Communication is over TCP.
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes a region handle |
+| `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes handle + device path |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
-| `REGISTER_SERVER_REQ` / `RESP` | client ↔ server | Register caller's PID as an active server (prevents idle shutdown) |
-| `GET_FD_REQ` / `GET_FD_RESP` | client ↔ server | Request access to an existing allocation (requires valid auth token) |
-| `UNREGISTER_SERVER_REQ` / `RESP` | client ↔ server | Unregister caller's PID (allows idle shutdown) |
+| `REGISTER_SERVER_REQ` / `RESP` | client ↔ server | Register caller as an active server (prevents idle shutdown) |
+| `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
+| `UNREGISTER_SERVER_REQ` / `RESP` | client ↔ server | Unregister caller (allows idle shutdown) |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
 
 Every allocation returns a **Handle** containing the region ID (globally unique), mmap offset, allocation length, and a cryptographic auth token. The Handle serves as both the allocation identifier and the authorization credential — clients must present it for free and access operations.
 
-The `ALLOC_RESP` includes an `accessType` field (`LOCAL=0`, `REMOTE=1`) to distinguish local fd-based access from future remote memory access mechanisms.
+### Memory access via device path
+
+Instead of passing file descriptors via `SCM_RIGHTS` (which only works over UDS), the server returns a **device path string** in `ALLOC_RESP` and `GET_ACCESS_RESP`. The client opens the path directly with `open()` and creates an `mmap()`.
+
+| DAX type | Device path example | Offset | Length |
+|----------|-------------------|--------|--------|
+| DEV_DAX | `/dev/dax0.0` | Real byte offset within device | Aligned allocation size |
+| FS_DAX | `/mnt/pmem0/maru_42.dat` | 0 (file per allocation) | File size |
+
+### Client identity
+
+Requests that require owner tracking (`ALLOC_REQ`, `REGISTER_SERVER_REQ`, `UNREGISTER_SERVER_REQ`) include a `client_id` field in the payload (`hostname:pid` format). The server extracts the PID for allocation ownership and Reaper tracking.
 
 The `STATS_RESP` returns per-pool statistics. Each pool entry contains:
 
@@ -140,23 +151,40 @@ The secret is generated on first start and persisted to the state directory. On 
 
 **Owner verification** ensures that non-root clients can only free their own allocations — the owner PID is recorded at allocation time and must match the freeing client's PID.
 
+**Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
+
 ---
 
 ## 8. Server Configuration
 
-The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the socket directory (atomic tmp+rename) for reference.
+The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the state directory (atomic tmp+rename) for reference.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--socket-path` | `/tmp/maru-resourced/maru-resourced.sock` | RPC socket path |
+| `--host` | `0.0.0.0` | TCP bind address |
+| `--port` | `9850` | TCP port |
 | `--state-dir` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--idle-timeout` | `60` | Auto-shutdown after N seconds idle (0 to disable) |
 
 ```bash
 # Manual start with custom configuration
-maru-resource-manager --socket-path /var/run/maru/maru.sock \
+maru-resource-manager --host 0.0.0.0 --port 9850 \
                       --state-dir /var/lib/maru \
                       --log-level debug \
                       --idle-timeout 120
 ```
+
+### RM address propagation
+
+MaruServer and MaruHandler need to know the resource manager's address:
+
+```bash
+# MaruServer — pass RM address
+maru-server --port 5555 --rm-address 192.168.1.100:9850
+
+# MaruHandler — configure via MaruConfig
+# maru_rm_address: "192.168.1.100:9850"
+```
+
+Default `127.0.0.1:9850` works for single-node setups without explicit configuration.
