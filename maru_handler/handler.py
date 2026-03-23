@@ -1028,11 +1028,13 @@ class MaruHandler:
             expected_mp = getattr(self._mapper, "_mount_path_config", None)
             actual_mp = getattr(response, "mount_path", None)
             if expected_mp != actual_mp:
-                logger.warning(
-                    "mount_path mismatch in expand: mapper=%s, response=%s",
+                logger.error(
+                    "mount_path mismatch in expand: mapper=%s, response=%s. "
+                    "Skipping this pool to prevent cross-mount region mixing.",
                     expected_mp,
                     actual_mp,
                 )
+                continue
 
             handle = response.handle
             try:

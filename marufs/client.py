@@ -88,7 +88,7 @@ class MarufsClient:
         # MaruShmClient-compatible state (alloc/free/mmap/munmap)
         self._next_region_id = 1
         self._region_names: dict[int, str] = {}  # region_id → filename
-        self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id → mmap
+        self._mmap_cache: dict[int, tuple[mmap_module.mmap, int]] = {}  # region_id → (mmap, prot)
 
         logger.debug("MarufsClient initialised with mount_path=%s", mount_path)
 
@@ -739,10 +739,10 @@ class MarufsClient:
         """
         with self._lock:
             region_name = self._region_names.pop(handle.region_id, None)
-            mm = self._mmap_cache.pop(handle.region_id, None)
+            entry = self._mmap_cache.pop(handle.region_id, None)
 
-        if mm is not None:
-            mm.close()
+        if entry is not None:
+            entry[0].close()
 
         if region_name is not None:
             self._close_fd(region_name)
@@ -766,10 +766,17 @@ class MarufsClient:
             raise ValueError(f"Invalid region_id: {handle.region_id}")
 
         with self._lock:
-            # Return cached mmap if available
-            cached = self._mmap_cache.get(handle.region_id)
-            if cached is not None:
-                return cached
+            # Return cached mmap if compatible with requested prot
+            entry = self._mmap_cache.get(handle.region_id)
+            if entry is not None:
+                cached_mm, cached_prot = entry
+                if prot != cached_prot:
+                    raise ValueError(
+                        f"Region {handle.region_id} already mapped with prot=0x{cached_prot:x}, "
+                        f"cannot remap with prot=0x{prot:x} (existing users would crash)"
+                    )
+                else:
+                    return cached_mm
 
             region_name = self._region_names.get(handle.region_id)
             if region_name is None:
@@ -809,7 +816,7 @@ class MarufsClient:
                         )
 
             mm = self._mmap_region(fd, handle.length, prot)
-            self._mmap_cache[handle.region_id] = mm
+            self._mmap_cache[handle.region_id] = (mm, prot)
 
             return mm
 
@@ -820,9 +827,9 @@ class MarufsClient:
             handle: MaruHandle to unmap.
         """
         with self._lock:
-            mm = self._mmap_cache.pop(handle.region_id, None)
-        if mm is not None:
-            mm.close()
+            entry = self._mmap_cache.pop(handle.region_id, None)
+        if entry is not None:
+            entry[0].close()
         logger.debug("munmap: region_id=%d", handle.region_id)
 
     # ------------------------------------------------------------------
@@ -846,7 +853,7 @@ class MarufsClient:
         with self._lock:
             # Close mmap objects first (before closing their backing fds)
             logger.debug("close: closing %d mmaps", len(self._mmap_cache))
-            for region_id, mm in self._mmap_cache.items():
+            for region_id, (mm, _writable) in self._mmap_cache.items():
                 try:
                     mm.close()
                 except Exception:
