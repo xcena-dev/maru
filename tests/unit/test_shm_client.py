@@ -521,9 +521,7 @@ class TestShmClientErrors:
                     handle = MaruHandle(
                         region_id=1, offset=0, length=4096, auth_token=999
                     )
-                    resp = AllocResp(
-                        status=-5, handle=handle, requested_size=4096
-                    )
+                    resp = AllocResp(status=-5, handle=handle, requested_size=4096)
                     _send_response(sock, MsgType.ALLOC_RESP, resp)
 
         server = MockResourceManagerServer(handler)

@@ -209,9 +209,7 @@ class TestFreeEdgeCases:
         addr = server.start()
         try:
             client = MaruShmClient(address=addr)
-            handle = MaruHandle(
-                region_id=999, offset=0, length=4096, auth_token=123
-            )
+            handle = MaruHandle(region_id=999, offset=0, length=4096, auth_token=123)
             client.free(handle)
             assert 999 not in client._path_cache
             assert 999 not in client._mmap_cache
