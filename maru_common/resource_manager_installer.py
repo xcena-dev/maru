@@ -85,8 +85,7 @@ def _do_uninstall(prefix: str) -> int:
         except PermissionError:
             fprintf(
                 sys.stderr,
-                "  Warning: cannot remove %s (permission denied). "
-                "Run with sudo.\n",
+                "  Warning: cannot remove %s (permission denied). Run with sudo.\n",
                 service,
             )
 
