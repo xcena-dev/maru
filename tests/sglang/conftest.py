@@ -4,14 +4,10 @@
 Provides mock objects so tests can run without SGLang or a live Maru server.
 """
 
-import os
-
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Mock SGLang types (avoid importing sglang at test time)
@@ -28,8 +24,8 @@ class MockHiCacheStorageConfig:
     pp_size: int = 1
     is_mla_model: bool = False
     is_page_first_layout: bool = True
-    model_name: Optional[str] = "test-model"
-    extra_config: Optional[dict] = None
+    model_name: str | None = "test-model"
+    extra_config: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +78,12 @@ class MockMaruHandler:
 
     def batch_store(self, keys: list[str], infos: list) -> list[bool]:
         results = []
-        for key, info in zip(keys, infos):
-            results.append(self.store(key, data=info if isinstance(info, memoryview) else None, info=info))
+        for key, info in zip(keys, infos, strict=False):
+            results.append(
+                self.store(
+                    key, data=info if isinstance(info, memoryview) else None, info=info
+                )
+            )
         return results
 
     def alloc(self, size: int):

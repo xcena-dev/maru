@@ -23,6 +23,7 @@ jobs:
             --cov=maru_server \
             --cov=maru_common \
             --cov=maru_shm \
+            --cov=maru_sglang \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --junitxml=pytest.xml \

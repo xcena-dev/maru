@@ -248,7 +248,10 @@ async def main():
 
     # Flush: send a dummy request to inst1 to trigger writing_check() and
     # flush the async GPU→Host→L3 write pipeline before querying inst2.
-    print("\n[Flush] Sending dummy request to inst1 to flush L3 write pipeline...", file=sys.stderr)
+    print(
+        "\n[Flush] Sending dummy request to inst1 to flush L3 write pipeline...",
+        file=sys.stderr,
+    )
     await stream_completion(f"http://localhost:{args.port1}", args.model, "hi", 1)
 
     # Wait for KV cache propagation

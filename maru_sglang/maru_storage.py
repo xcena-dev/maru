@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MaruHiCacheStorage — SGLang HiCache L3 storage backend backed by Maru.
+"""MaruStorage — SGLang HiCache L3 storage backend backed by Maru.
 
 Implements the HiCacheStorage ABC from SGLang, delegating all storage
 operations to MaruHandler for CXL shared-memory KV cache access.
@@ -10,8 +10,8 @@ Usage (SGLang dynamic backend):
         --hicache-storage-backend dynamic \\
         --hicache-storage-backend-extra-config '{
             "backend_name": "maru",
-            "module_path": "maru_sglang.backend",
-            "class_name": "MaruHiCacheStorage",
+            "module_path": "maru_sglang.maru_storage",
+            "class_name": "MaruStorage",
             "maru_server_url": "tcp://localhost:5555",
             "maru_pool_size": "4G"
         }'
@@ -98,7 +98,7 @@ def _get_base_class():
     return _HiCacheStorageStub
 
 
-class MaruHiCacheStorage(_get_base_class()):
+class MaruStorage(_get_base_class()):
     """SGLang HiCache L3 storage backend using Maru shared memory.
 
     Supports both legacy API (get/set with tensor copying) and V1 API
@@ -111,6 +111,8 @@ class MaruHiCacheStorage(_get_base_class()):
             storage_config.extra_config
         )
         self._handler: MaruHandler | None = None
+        self._connected: bool = False
+        self._is_page_first: bool = False
         self._suffix = self._build_key_suffix()
         self._connect()
 
@@ -136,14 +138,27 @@ class MaruHiCacheStorage(_get_base_class()):
         )
         if handler.connect():
             self._handler = handler
+            self._connected = True
             logger.info(
-                "MaruHiCacheStorage connected: server=%s, pool=%d, chunk=%d",
+                "MaruStorage connected: server=%s, pool=%d, chunk=%d",
                 cfg.server_url,
                 cfg.pool_size,
                 cfg.chunk_size_bytes,
             )
         else:
+            self._connected = False
             raise RuntimeError(f"Failed to connect MaruHandler to {cfg.server_url}")
+
+    def _ensure_connected(self) -> bool:
+        """Check connection and attempt reconnect if needed."""
+        if self._connected and self._handler is not None:
+            return True
+        try:
+            self._connect()
+            return self._connected
+        except RuntimeError:
+            logger.warning("Reconnection attempt failed")
+            return False
 
     # ------------------------------------------------------------------
     # Key management
@@ -167,32 +182,35 @@ class MaruHiCacheStorage(_get_base_class()):
     # ------------------------------------------------------------------
 
     def exists(self, key: str) -> bool:
-        if self._handler is None:
+        if not self._ensure_connected():
             return False
-        return self._handler.exists(self._make_key(key))
+        try:
+            return self._handler.exists(self._make_key(key))
+        except Exception as e:
+            logger.error("exists failed: %s", e)
+            return False
 
     def batch_exists(self, keys: list[str], extra_info=None) -> int:
         """Return number of consecutive existing keys from the start."""
-        if self._handler is None or not keys:
-            logger.debug(
-                "batch_exists: skip (handler=%s, keys=%d)",
-                self._handler is not None,
-                len(keys) if keys else 0,
-            )
+        if not self._ensure_connected() or not keys:
             return 0
         full_keys = [self._make_key(k) for k in keys]
-        logger.info(
-            "batch_exists called: %d keys, first_5=%s",
+        logger.debug(
+            "batch_exists: %d keys",
             len(full_keys),
-            full_keys[:5],
+            # first_5=%s, full_keys[:5],
         )
-        results = self._handler.batch_exists(full_keys)
+        try:
+            results = self._handler.batch_exists(full_keys)
+        except Exception as e:
+            logger.error("batch_exists failed: %s", e)
+            return 0
         count = 0
         for r in results:
             if not r:
                 break
             count += 1
-        logger.info("batch_exists result: %d/%d consecutive hits", count, len(keys))
+        logger.debug("batch_exists result: %d/%d consecutive hits", count, len(keys))
         return count
 
     def get(
@@ -201,10 +219,14 @@ class MaruHiCacheStorage(_get_base_class()):
         target_location: Any | None = None,
         target_sizes: Any | None = None,
     ) -> torch.Tensor | None:
-        if self._handler is None:
+        if not self._ensure_connected():
             return None
         full_key = self._make_key(key)
-        info = self._handler.retrieve(full_key)
+        try:
+            info = self._handler.retrieve(full_key)
+        except Exception as e:
+            logger.error("get failed: %s", e)
+            return None
         if info is None:
             logger.debug("get MISS key=%s", key)
             return None
@@ -227,12 +249,16 @@ class MaruHiCacheStorage(_get_base_class()):
         target_location: Any | None = None,
         target_sizes: Any | None = None,
     ) -> bool:
-        if self._handler is None or value is None:
+        if not self._ensure_connected() or value is None:
             return False
         full_key = self._make_key(key)
-        src = value.contiguous().view(torch.uint8).numpy()
-        mv = memoryview(src)
-        ok = self._handler.store(full_key, data=mv)
+        try:
+            src = value.contiguous().view(torch.uint8).numpy()
+            mv = memoryview(src)
+            ok = self._handler.store(full_key, data=mv)
+        except Exception as e:
+            logger.error("set failed: %s", e)
+            return False
         logger.debug("set %s key=%s, %d bytes", "OK" if ok else "FAIL", key, len(mv))
         return ok
 
@@ -242,15 +268,19 @@ class MaruHiCacheStorage(_get_base_class()):
         target_locations: Any | None = None,
         target_sizes: Any | None = None,
     ) -> list[torch.Tensor | None]:
-        if self._handler is None or not keys:
+        if not self._ensure_connected() or not keys:
             return [None] * len(keys)
         full_keys = [self._make_key(k) for k in keys]
-        logger.info(
-            "batch_get called: %d keys, first_5=%s",
+        logger.debug(
+            "batch_get: %d keys",
             len(full_keys),
-            full_keys[:5],
+            # first_5=%s, full_keys[:5],
         )
-        results = self._handler.batch_retrieve(full_keys)
+        try:
+            results = self._handler.batch_retrieve(full_keys)
+        except Exception as e:
+            logger.error("batch_get failed: %s", e)
+            return [None] * len(keys)
 
         outputs: list[torch.Tensor | None] = []
         for i, info in enumerate(results):
@@ -268,7 +298,7 @@ class MaruHiCacheStorage(_get_base_class()):
                     continue
             outputs.append(data)
         hits = sum(output is not None for output in outputs)
-        logger.info("batch_get result: %d/%d hits", hits, len(keys))
+        logger.debug("batch_get result: %d/%d hits", hits, len(keys))
         return outputs
 
     def batch_set(
@@ -278,25 +308,29 @@ class MaruHiCacheStorage(_get_base_class()):
         target_locations: Any | None = None,
         target_sizes: Any | None = None,
     ) -> bool:
-        if self._handler is None or values is None or not keys:
+        if not self._ensure_connected() or values is None or not keys:
             return False
         full_keys = [self._make_key(k) for k in keys]
-        logger.info(
-            "batch_set called: %d keys, first_5=%s",
+        logger.debug(
+            "batch_set: %d keys",
             len(full_keys),
-            full_keys[:5],
+            # first_5=%s, full_keys[:5],
         )
-        infos = []
-        for v in values:
-            src = v.contiguous().view(torch.uint8).numpy()
-            infos.append(memoryview(src))
-        results = self._handler.batch_store(full_keys, infos)
+        try:
+            infos = []
+            for v in values:
+                src = v.contiguous().view(torch.uint8).numpy()
+                infos.append(memoryview(src))
+            results = self._handler.batch_store(full_keys, infos)
+        except Exception as e:
+            logger.error("batch_set failed: %s", e)
+            return False
         succeeded = sum(results)
-        logger.info(
-            "batch_set result: %d/%d succeeded, first_5_results=%s",
+        logger.debug(
+            "batch_set result: %d/%d succeeded",
             succeeded,
             len(keys),
-            results[:5],
+            # first_5_results=%s, results[:5],
         )
         return all(results)
 
@@ -323,22 +357,23 @@ class MaruHiCacheStorage(_get_base_class()):
         For page_first layouts, uses direct memory copy via ctypes.memmove.
         Falls back to tensor-based copy otherwise.
         """
-        if self._handler is None or not keys:
+        if not self._ensure_connected() or not keys:
             return [False] * len(keys)
 
         full_keys = [self._make_key(k) for k in keys]
-        logger.info(
-            "batch_get_v1 called: %d keys, first_5=%s",
+        logger.debug(
+            "batch_get_v1: %d keys",
             len(full_keys),
-            full_keys[:5],
+            # first_5=%s, full_keys[:5],
         )
-        infos = self._handler.batch_retrieve(full_keys)
+        try:
+            infos = self._handler.batch_retrieve(full_keys)
+        except Exception as e:
+            logger.error("batch_get_v1 failed: %s", e)
+            return [False] * len(keys)
 
-        if not getattr(self, "_is_page_first", False):
-            results = self._fallback_batch_get_v1(keys, host_indices, infos)
-            hits = sum(results)
-            logger.info("batch_get_v1 (fallback) result: %d/%d hits", hits, len(keys))
-            return results
+        if not self._is_page_first:
+            return self._fallback_batch_get_v1(keys, host_indices, infos)
 
         import ctypes
 
@@ -357,7 +392,7 @@ class MaruHiCacheStorage(_get_base_class()):
             )
             results.append(True)
         hits = sum(results)
-        logger.info("batch_get_v1 result: %d/%d hits", hits, len(keys))
+        logger.debug("batch_get_v1 result: %d/%d hits", hits, len(keys))
         return results
 
     def batch_set_v1(
@@ -371,16 +406,20 @@ class MaruHiCacheStorage(_get_base_class()):
         For page_first layouts, uses direct memory copy via ctypes.memmove.
         Falls back to tensor-based copy otherwise.
         """
-        if self._handler is None or not keys:
+        if not self._ensure_connected() or not keys:
             return [False] * len(keys)
 
-        if not getattr(self, "_is_page_first", False):
+        if not self._is_page_first:
             return self._fallback_batch_set_v1(keys, host_indices)
 
         import ctypes
 
         full_keys = [self._make_key(k) for k in keys]
-        page_metas = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        try:
+            page_metas = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        except Exception as e:
+            logger.error("batch_set_v1 get_page_buffer_meta failed: %s", e)
+            return [False] * len(keys)
 
         # Batch alloc + memcpy, then batch store
         handles = []
@@ -405,8 +444,11 @@ class MaruHiCacheStorage(_get_base_class()):
         for i in valid_indices:
             handle = handles[i]
             if handle is not None:
-                success = self._handler.store(full_keys[i], handle=handle)
-                results[i] = success
+                try:
+                    success = self._handler.store(full_keys[i], handle=handle)
+                    results[i] = success
+                except Exception as e:
+                    logger.error("batch_set_v1 store failed for key %s: %s", keys[i], e)
         stored = sum(results)
         logger.debug("batch_set_v1 %d/%d stored", stored, len(keys))
         return results
@@ -415,14 +457,25 @@ class MaruHiCacheStorage(_get_base_class()):
     # Fallback paths for non-page_first layouts
     # ------------------------------------------------------------------
 
-    def _fallback_batch_get_v1(self, keys, host_indices, infos) -> list[bool]:
-        """Fallback: use tensor copy for non-page_first layouts."""
-        results: list[bool] = []
-        for info in infos:
-            results.append(info is not None)
-        return results
+    def _fallback_batch_get_v1(
+        self,
+        keys: list[str],
+        host_indices: torch.Tensor,
+        infos: list,
+    ) -> list[bool]:
+        """Fallback: return all False to signal caller should use legacy API.
 
-    def _fallback_batch_set_v1(self, keys, host_indices) -> list[bool]:
+        Without page_first layout, we cannot directly copy into the host memory
+        pool.  Returning False for all keys tells SGLang to skip L3 for this
+        batch rather than using uninitialised memory (silent data corruption).
+        """
+        return [False] * len(keys)
+
+    def _fallback_batch_set_v1(
+        self,
+        keys: list[str],
+        host_indices: torch.Tensor,
+    ) -> list[bool]:
         """Fallback: return all False to signal caller should use legacy API."""
         return [False] * len(keys)
 
@@ -439,7 +492,9 @@ class MaruHiCacheStorage(_get_base_class()):
         if self._handler is not None:
             try:
                 self._handler.close()
+                logger.info("MaruStorage closed")
             except Exception as e:
                 logger.error("Error closing MaruHandler: %s", e)
             finally:
                 self._handler = None
+                self._connected = False

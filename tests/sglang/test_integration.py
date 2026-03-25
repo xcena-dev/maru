@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for MaruHiCacheStorage V1 API and register_mem_pool_host.
+"""Tests for MaruStorage V1 API and register_mem_pool_host.
 
 Covers batch_get_v1 / batch_set_v1 (page_first and fallback paths) which are
 not exercised in test_backend.py.  Uses MockMaruHandler — no live server needed.
 """
 
 import ctypes
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 import torch
 
-from maru_sglang.backend import MaruHiCacheStorage
+from maru_sglang.maru_storage import MaruStorage
 
 from .conftest import MockHiCacheStorageConfig, MockMaruHandler
 
@@ -19,11 +18,12 @@ from .conftest import MockHiCacheStorageConfig, MockMaruHandler
 def _make_backend(
     is_page_first: bool = True,
     handler: MockMaruHandler | None = None,
-) -> MaruHiCacheStorage:
+) -> MaruStorage:
     cfg = MockHiCacheStorageConfig(is_page_first_layout=is_page_first)
-    with patch.object(MaruHiCacheStorage, "_connect"):
-        backend = MaruHiCacheStorage(cfg, {})
+    with patch.object(MaruStorage, "_connect"):
+        backend = MaruStorage(cfg, {})
     backend._handler = handler or MockMaruHandler()
+    backend._connected = True
     return backend
 
 
@@ -145,7 +145,9 @@ class TestBatchSetV1PageFirst:
     def test_disconnected_returns_false(self):
         backend = _make_backend(is_page_first=True)
         backend._handler = None
-        assert backend.batch_set_v1(["k"], torch.tensor([0])) == [False]
+        backend._connected = False
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.batch_set_v1(["k"], torch.tensor([0])) == [False]
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +204,9 @@ class TestBatchGetV1PageFirst:
     def test_disconnected_returns_false(self):
         backend = _make_backend(is_page_first=True)
         backend._handler = None
-        assert backend.batch_get_v1(["k"], torch.tensor([0])) == [False]
+        backend._connected = False
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.batch_get_v1(["k"], torch.tensor([0])) == [False]
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +222,12 @@ class TestV1Fallback:
         results = backend.batch_set_v1(["a", "b"], torch.tensor([0, 1]))
         assert results == [False, False]
 
-    def test_batch_get_v1_fallback_hit(self):
-        """Fallback returns True for stored keys, False for misses."""
+    def test_batch_get_v1_fallback_always_false(self):
+        """Fallback always returns False — no data copy to host pool.
+
+        Even for stored keys, fallback returns False to prevent silent data
+        corruption (host pool would contain uninitialised memory).
+        """
         backend = _make_backend(is_page_first=False)
         backend.register_mem_pool_host(MockMemPoolHost(64, 3))
 
@@ -230,7 +238,7 @@ class TestV1Fallback:
         results = backend.batch_get_v1(
             ["hit0", "hit1", "miss"], torch.tensor([0, 1, 2])
         )
-        assert results == [True, True, False]
+        assert results == [False, False, False]
 
     def test_batch_get_v1_fallback_all_miss(self):
         backend = _make_backend(is_page_first=False)

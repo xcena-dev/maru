@@ -174,22 +174,21 @@ main() {
     PIDS+=($proxy_pid)
 
 
-    # Launch the prefiller first — must be ready before decoder
-    # so decoder sees prefiller's shared memory regions on connect
-    bash disagg_vllm_launcher.sh prefiller ${_MODEL:+"$_MODEL"} \
-        > >(tee "$LOG_PREFILLER") 2>&1 &
-    prefiller_pid=$!
-    PIDS+=($prefiller_pid)
-
-    wait_for_server $LMCACHE_PREFILLER_PORT
-
-    # Launch the decoder after prefiller is ready
+    # Launch the decoder
     bash disagg_vllm_launcher.sh decoder ${_MODEL:+"$_MODEL"} \
         > >(tee "$LOG_DECODER") 2>&1 &
     decoder_pid=$!
     PIDS+=($decoder_pid)
 
+
+    # Launch the prefiller next
+    bash disagg_vllm_launcher.sh prefiller ${_MODEL:+"$_MODEL"} \
+        > >(tee "$LOG_PREFILLER") 2>&1 &
+    prefiller_pid=$!
+    PIDS+=($prefiller_pid)
+
     wait_for_server $LMCACHE_DECODER_PORT
+    wait_for_server $LMCACHE_PREFILLER_PORT
     wait_for_server $LMCACHE_PROXY_EXTERNAL_PORT
 
     echo "==================================================="

@@ -175,13 +175,14 @@ MaruHandler is **framework-independent**. Its interface operates on string keys 
 ```mermaid
 graph LR
     A[LMCache] -->|MaruConnector| D[MaruHandler]
-    B[SGLang] -->|Future Adapter| D
+    B[SGLang] -->|MaruStorage| D
     C[Other Framework] -->|Custom Adapter| D
     D --> E[MaruServer]
     D --> F[CXL Shared Memory]
 ```
 
 > **See also:** [LMCache Integration](../integration/lmcache.md),
+> [SGLang Integration](../integration/sglang.md),
 > [MaruHandler Design](maru_handler.md)
 
 ```{toctree}

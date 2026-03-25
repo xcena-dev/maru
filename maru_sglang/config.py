@@ -5,23 +5,21 @@ import re
 from dataclasses import dataclass
 
 
-def parse_size(size_str: str | int) -> int:
-    """Parse human-readable size string (e.g., '1G', '500M') to bytes."""
-    if isinstance(size_str, int):
-        return size_str
-    match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", str(size_str).upper())
-    if not match:
-        try:
-            return int(size_str)
-        except ValueError:
-            raise ValueError(
-                f"Invalid size string: {size_str!r}. "
-                "Expected a number or human-readable size "
-                "(e.g., '1G', '500M', '1024')."
-            ) from None
-    value, unit = float(match.group(1)), match.group(2)
-    multipliers = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    return int(value * multipliers.get(unit, 1))
+def parse_size(size_str: str | int | float) -> int:
+    """Parse a human-readable size string into bytes.
+
+    Examples: "4G" -> 4294967296, "512M" -> 536870912, "1.5G" -> 1610612736
+    """
+    if isinstance(size_str, int | float):
+        return int(size_str)
+    s = str(size_str).strip().upper()
+    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?)B?", s)
+    if not m:
+        raise ValueError(f"Invalid size string: {size_str!r}")
+    value = float(m.group(1))
+    unit = m.group(2)
+    multiplier = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    return int(value * multiplier[unit])
 
 
 @dataclass

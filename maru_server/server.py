@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_common.protocol import ANY_POOL_ID
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -34,9 +35,11 @@ class MaruServer:
     # Allocation Management
     # =========================================================================
 
-    def request_alloc(self, instance_id: str, size: int) -> MaruHandle | None:
+    def request_alloc(
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+    ) -> MaruHandle | None:
         """Handle allocation request from client."""
-        handle = self._allocation_manager.allocate(instance_id, size)
+        handle = self._allocation_manager.allocate(instance_id, size, pool_id=pool_id)
         if handle:
             logger.info(
                 "Allocated %d bytes for %s: region_id=%d",
@@ -139,18 +142,6 @@ class MaruServer:
                 if alloc_to_ref is not None:
                     self._allocation_manager.increment_kv_ref(alloc_to_ref)
                 results.append(is_new)
-            logger.info(
-                "batch_register_kv: new=%d/%d, first_5=%s",
-                sum(results),
-                len(entries),
-                list(
-                    zip(
-                        [entry[0] for entry in entries[:5]],
-                        results[:5],
-                        strict=False,
-                    )
-                ),
-            )
             return results
 
     def batch_lookup_kv(self, keys: list[str]) -> list[dict | None]:
@@ -195,14 +186,7 @@ class MaruServer:
         Returns:
             List of booleans indicating if each key exists
         """
-        results = self._kv_manager.batch_exists(keys)
-        logger.info(
-            "batch_exists_kv: hits=%d/%d, first_5=%s",
-            sum(results),
-            len(keys),
-            list(zip(keys[:5], results[:5], strict=False)),
-        )
-        return results
+        return self._kv_manager.batch_exists(keys)
 
     def get_stats(self) -> dict:
         """Get server statistics."""
@@ -220,7 +204,10 @@ class MaruServer:
 def setup_logging(level: str) -> None:
     """Setup logging level for the MaruServer package."""
     log_level = getattr(logging, level.upper(), logging.INFO)
-    logging.getLogger("maru_server").setLevel(log_level)
+    pkg_logger = logging.getLogger("maru_server")
+    pkg_logger.setLevel(log_level)
+    for handler in pkg_logger.handlers:
+        handler.setLevel(log_level)
 
 
 def main() -> None:

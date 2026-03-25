@@ -46,9 +46,10 @@ class MaruConnectorAdapter(ConnectorAdapter):
             )
 
         logger.info(
-            "Maru config: server_url=%s, pool_size=%s, instance_id=%s",
+            "Maru config: server_url=%s, pool_size=%s, pool_id=%s, instance_id=%s",
             maru_config.server_url,
             maru_config.pool_size,
+            maru_config.pool_id,
             maru_config.instance_id,
         )
 

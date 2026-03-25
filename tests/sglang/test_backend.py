@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for MaruHiCacheStorage backend.
+"""Tests for MaruStorage backend.
 
 Uses MockMaruHandler to test without a live Maru server or SGLang.
 """
@@ -7,10 +7,8 @@ Uses MockMaruHandler to test without a live Maru server or SGLang.
 from unittest.mock import patch
 
 import torch
-import pytest
 
-from maru_sglang.backend import MaruHiCacheStorage
-from maru_sglang.config import MaruSGLangConfig
+from maru_sglang.maru_storage import MaruStorage
 
 from .conftest import MockHiCacheStorageConfig, MockMaruHandler
 
@@ -18,16 +16,17 @@ from .conftest import MockHiCacheStorageConfig, MockMaruHandler
 def _make_backend(
     storage_config=None,
     handler=None,
-) -> MaruHiCacheStorage:
-    """Create a MaruHiCacheStorage with a mocked handler."""
+) -> MaruStorage:
+    """Create a MaruStorage with a mocked handler."""
     if storage_config is None:
         storage_config = MockHiCacheStorageConfig()
 
     # Patch _connect to inject mock handler
-    with patch.object(MaruHiCacheStorage, "_connect"):
-        backend = MaruHiCacheStorage(storage_config, {})
+    with patch.object(MaruStorage, "_connect"):
+        backend = MaruStorage(storage_config, {})
 
     backend._handler = handler or MockMaruHandler()
+    backend._connected = True
     return backend
 
 
@@ -142,25 +141,35 @@ class TestBatchOperations:
 
 
 class TestDisconnected:
+    @staticmethod
+    def _disconnect(backend):
+        """Simulate a disconnected backend that cannot reconnect."""
+        backend._handler = None
+        backend._connected = False
+
     def test_exists_disconnected(self):
         backend = _make_backend()
-        backend._handler = None
-        assert backend.exists("key1") is False
+        self._disconnect(backend)
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.exists("key1") is False
 
     def test_get_disconnected(self):
         backend = _make_backend()
-        backend._handler = None
-        assert backend.get("key1") is None
+        self._disconnect(backend)
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.get("key1") is None
 
     def test_set_disconnected(self):
         backend = _make_backend()
-        backend._handler = None
-        assert backend.set("key1", value=torch.ones(4)) is False
+        self._disconnect(backend)
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.set("key1", value=torch.ones(4)) is False
 
     def test_batch_exists_disconnected(self):
         backend = _make_backend()
-        backend._handler = None
-        assert backend.batch_exists(["k"]) == 0
+        self._disconnect(backend)
+        with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
+            assert backend.batch_exists(["k"]) == 0
 
 
 class TestClose:

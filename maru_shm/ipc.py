@@ -15,6 +15,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
+from .constants import ANY_POOL_ID
 from .types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants
@@ -105,7 +106,7 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    pool_id: int = 0xFFFFFFFF  # ANY_POOL_ID
+    pool_id: int = ANY_POOL_ID
     reserved: int = 0
 
     def pack(self) -> bytes:

@@ -14,12 +14,6 @@ fi
 # NOTE: For correct KV cache transfer, ensure all processes use the same PYTHONHASHSEED to keep the hash of the KV cache consistent across processes.
 export PYTHONHASHSEED=0
 
-# Detect optional vLLM flags
-VLLM_EXTRA_ARGS=()
-if vllm serve --help 2>&1 | grep -q -- '--disable-log-requests'; then
-    VLLM_EXTRA_ARGS+=(--disable-log-requests)
-fi
-
 # Function to resolve environment variables in config file
 resolve_config() {
     local config_file=$1
@@ -58,7 +52,7 @@ if [[ $1 == "prefiller" ]]; then
         vllm serve $MODEL \
         --gpu-memory-utilization ${GPU_MEM_UTIL:-0.9} \
         --port $LMCACHE_PREFILLER_PORT \
-        "${VLLM_EXTRA_ARGS[@]}" \
+        --disable-log-requests \
         --enforce-eager \
         --no-enable-prefix-caching \
         --kv-transfer-config \
@@ -83,7 +77,7 @@ elif [[ $1 == "decoder" ]]; then
         vllm serve $MODEL \
         --gpu-memory-utilization ${GPU_MEM_UTIL:-0.9} \
         --port $LMCACHE_DECODER_PORT \
-        "${VLLM_EXTRA_ARGS[@]}" \
+        --disable-log-requests \
         --enforce-eager \
         --no-enable-prefix-caching \
         --kv-transfer-config \

@@ -9,9 +9,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 [ -f "env.sh" ] && source env.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMMON_DIR="$(cd "$SCRIPT_DIR/../common" && pwd)"
 
-exec python "$COMMON_DIR/run_benchmark.py" \
+exec python "$SCRIPT_DIR/run_benchmark.py" \
     --port1 "${SGLANG_INST1_PORT}" \
     --port2 "${SGLANG_INST2_PORT}" \
     --mode p2p \

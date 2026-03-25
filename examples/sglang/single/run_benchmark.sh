@@ -5,8 +5,7 @@ if [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMMON_DIR="$(cd "$SCRIPT_DIR/../common" && pwd)"
-exec python "$COMMON_DIR/run_benchmark.py" \
+exec python "$SCRIPT_DIR/run_benchmark.py" \
     --single-port "${SGLANG_PORT}" \
     --mode single \
     "$@"
