@@ -67,18 +67,30 @@ def _do_uninstall(prefix: str) -> int:
         capture_output=True,
     )
 
+    removed = False
+
     binary = Path(prefix) / "bin" / "maru-resource-manager"
     if binary.exists():
         binary.unlink()
         fprintf(sys.stderr, "  Removed: %s\n", binary)
+        removed = True
 
     service = Path("/etc/systemd/system/maru-resource-manager.service")
     if service.exists():
-        service.unlink()
-        fprintf(sys.stderr, "  Removed: %s\n", service)
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+        try:
+            service.unlink()
+            fprintf(sys.stderr, "  Removed: %s\n", service)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+            removed = True
+        except PermissionError:
+            fprintf(
+                sys.stderr,
+                "  Warning: cannot remove %s (permission denied). "
+                "Run with sudo.\n",
+                service,
+            )
 
-    if not binary.exists() and not service.exists():
+    if not removed:
         fprintf(sys.stderr, "Nothing to remove.\n")
 
     fprintf(sys.stderr, "Uninstall complete.\n")
