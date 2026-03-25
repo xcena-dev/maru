@@ -27,6 +27,12 @@ class AllocationManager:
 
     def __init__(self, rm_address: str | None = None):
         self._client = MaruShmClient(address=rm_address)
+        if not self._client.is_running():
+            addr = rm_address or "127.0.0.1:9850"
+            raise ConnectionError(
+                f"Resource manager is not running (address: {addr}).\n"
+                f"Start it first: sudo maru-resource-manager"
+            )
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
 
