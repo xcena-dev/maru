@@ -165,10 +165,25 @@ def _do_install(args: argparse.Namespace) -> int:
 
     fprintf(sys.stderr, "Installation complete!\n")
     fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
-    fprintf(
-        sys.stderr,
-        "  Start:  sudo systemctl start maru-resource-manager\n",
+
+    # Check if service is currently running and advise restart
+    probe = subprocess.run(
+        ["systemctl", "is-active", "maru-resource-manager"],
+        capture_output=True,
+        text=True,
     )
+    if probe.stdout and probe.stdout.strip() == "active":
+        fprintf(
+            sys.stderr,
+            "\n  NOTE: maru-resource-manager is currently running.\n"
+            "  Restart to apply the new version:\n"
+            "    sudo systemctl restart maru-resource-manager\n",
+        )
+    else:
+        fprintf(
+            sys.stderr,
+            "  Start:  sudo systemctl start maru-resource-manager\n",
+        )
     return 0
 
 
