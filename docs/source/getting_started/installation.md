@@ -53,10 +53,18 @@ Verify that the Maru Resource Manager binary is installed:
 which maru-resource-manager
 ```
 
-The resource manager starts automatically when `MaruServer` launches — no manual startup is needed. To check pool status while it is running:
+The resource manager must be started manually before launching `MaruServer`. Start it with root privileges (required for CXL/DAX device access):
+
+```bash
+sudo maru-resource-manager
+```
+
+To verify it is running, check pool status from another terminal:
 
 ```bash
 maru_test_client stats
 ```
+
+> **Note:** The resource manager runs in the foreground. Use `&` or a separate terminal to keep it running while starting other services. See {doc}`quick_start` for the full startup sequence.
 
 Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.

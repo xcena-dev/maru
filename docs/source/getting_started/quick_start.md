@@ -1,9 +1,19 @@
 # Quickstart
 
-## 1. Start the Server
+## 1. Start the Resource Manager
+
+The resource manager must be running before any other Maru service. It manages CXL/DAX device allocation and requires root privileges:
 
 ```bash
-# Default (localhost:5555)
+sudo maru-resource-manager
+```
+
+> The resource manager runs in the foreground. Use a separate terminal or append `&` to run it in the background.
+
+## 2. Start the Metadata Server
+
+```bash
+# Default (localhost:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
@@ -13,9 +23,9 @@ maru-server --host 0.0.0.0 --port 5556
 maru-server --log-level DEBUG
 ```
 
-## 2. Run a Client Example
+## 3. Run a Client Example
 
-> `maru-server` must be running before proceeding. See step 1 above.
+> Both `maru-resource-manager` and `maru-server` must be running before proceeding.
 
 ### Zero-Copy Store & Retrieve
 
