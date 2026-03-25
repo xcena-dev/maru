@@ -20,6 +20,7 @@ The connector has two roles (instantiated separately by vLLM):
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -169,6 +170,7 @@ class MaruReqMeta:
     is_store: bool  # True = save to maru, False = load from maru
     num_matched_chunks: int = 0  # For load: how many chunks to load
     num_scheduled_tokens: int = 0  # For store: tokens covered this step
+    num_computed_tokens: int = 0  # For store: tokens already computed before this step
 
 
 @dataclass
@@ -358,19 +360,29 @@ class MaruSchedulerConnector:
         # accumulate enough keys to matter.
         self._known_keys: set[str] = set()
 
+        # Backoff timer to avoid reconnect storms when server is down.
+        self._handler_retry_after: float = 0.0
+
     def _ensure_handler(self):
         if self._handler is not None:
             return
+        if time.monotonic() < self._handler_retry_after:
+            return
         # Scheduler only needs metadata lookups (batch_exists), not
-        # data storage. Use a minimal pool to avoid wasting CXL memory.
-        # Ideally pool_size=0 with no owned region, but MaruHandler
-        # requires an owned region on connect. 1MB is the minimum
-        # safe value. A metadata-only connect mode in MaruHandler
-        # would eliminate this waste entirely.
-        scheduler_pool_bytes = 1 * 1024 * 1024  # 1 MB
-        self._handler = _create_maru_handler(
-            self._extra_config, pool_size_override=scheduler_pool_bytes
+        # data storage. Use the minimum pool that satisfies MaruConfig's
+        # pool_size >= chunk_size_bytes constraint.
+        # A metadata-only connect mode in MaruHandler would eliminate
+        # this waste entirely.
+        chunk_size = _parse_size(
+            self._extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
         )
+        try:
+            self._handler = _create_maru_handler(
+                self._extra_config, pool_size_override=chunk_size
+            )
+        except Exception:
+            self._handler_retry_after = time.monotonic() + 5.0
+            logger.warning("Scheduler MaruHandler creation failed, backing off 5s")
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
         """Count how many consecutive prefix chunks are cached in Maru.
@@ -548,6 +560,7 @@ class MaruSchedulerConnector:
             elif req_id in self._requests_need_store:
                 # Chunked prefill continuation — store newly computed chunks
                 token_ids = self._requests_need_store[req_id]
+                num_computed = cached_reqs.num_computed_tokens[i]
                 meta.requests.append(
                     MaruReqMeta(
                         req_id=req_id,
@@ -555,6 +568,7 @@ class MaruSchedulerConnector:
                         block_ids=new_block_ids[0],
                         is_store=True,
                         num_scheduled_tokens=num_new,
+                        num_computed_tokens=num_computed,
                     )
                 )
                 # Check if all chunks are now covered
@@ -563,6 +577,15 @@ class MaruSchedulerConnector:
                 num_full_chunks = len(token_ids) // self._kv_chunk_tokens
                 if total_scheduled // self._kv_chunk_tokens >= num_full_chunks:
                     del self._requests_need_store[req_id]
+
+        # Clean up state for finished/preempted requests to prevent
+        # unbounded memory growth during long-running deployments.
+        stale_ids = scheduler_output.finished_req_ids
+        if scheduler_output.preempted_req_ids:
+            stale_ids = stale_ids | scheduler_output.preempted_req_ids
+        for rid in stale_ids:
+            self._requests_need_store.pop(rid, None)
+            self._requests_need_load.pop(rid, None)
 
         self._requests_need_load.clear()
         return meta
@@ -587,18 +610,29 @@ class MaruWorkerConnector:
         self._extra_config = extra_config
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
-        # TODO: add max size / eviction when long-running deployments
-        # accumulate enough keys to matter.
+        # TODO: _stored_keys grows unbounded and may become stale if CXL
+        # eviction removes the actual data. Consider TTL-based expiry or
+        # periodic batch_exists validation. Also risks memory growth in
+        # long-running deployments (num_chunks × num_layers keys).
         self._stored_keys: set[str] = set()
         # Track per-chunk layer completion for writing _DONE markers.
         # chunk_base_key -> set of stored layer indices
         self._chunk_layer_progress: dict[str, set[int]] = {}
         self._num_layers: int = 0
 
+        # Backoff timer to avoid reconnect storms when server is down.
+        self._handler_retry_after: float = 0.0
+
     def _ensure_handler(self):
         if self._handler is not None:
             return
-        self._handler = _create_maru_handler(self._extra_config)
+        if time.monotonic() < self._handler_retry_after:
+            return
+        try:
+            self._handler = _create_maru_handler(self._extra_config)
+        except Exception:
+            self._handler_retry_after = time.monotonic() + 5.0
+            logger.warning("Worker MaruHandler creation failed, backing off 5s")
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
@@ -742,10 +776,13 @@ class MaruWorkerConnector:
                 continue
 
             # In chunked prefill, only store chunks fully covered by
-            # this step's scheduled tokens / block_ids.
+            # this step's scheduled tokens / block_ids. Use
+            # num_computed_tokens as offset so step 2+ doesn't
+            # re-store chunks from earlier steps.
             if req_meta.num_scheduled_tokens > 0:
+                offset = req_meta.num_computed_tokens // self._kv_chunk_tokens
                 max_chunks = req_meta.num_scheduled_tokens // self._kv_chunk_tokens
-                chunk_keys = chunk_keys[:max_chunks]
+                chunk_keys = chunk_keys[offset : offset + max_chunks]
             if not chunk_keys:
                 continue
 
@@ -792,6 +829,9 @@ class MaruWorkerConnector:
                         )
                         progress.add(layer_idx)
                         if self._num_layers > 0 and len(progress) >= self._num_layers:
+                            # TODO: alloc(1) still allocates a full CXL page
+                            # (chunk_size_bytes, default 4MB). A metadata-only
+                            # store in MaruHandler would eliminate this waste.
                             done_key = f"{base_key}_DONE"
                             done_h = None
                             try:

@@ -86,13 +86,13 @@ sequenceDiagram
     MKV->>MH: retrieve(key) per chunk per layer
     MH-->>MKV: MemoryInfo (CXL mmap memoryview)
     MKV->>MKV: torch.frombuffer(info.view, dtype)
-    MKV->>GPU: .cuda() — CXL→GPU DMA (mmap is cudaHostRegistered)
+    MKV->>GPU: .to(device) — CXL→GPU DMA (pinned via cudaHostRegister)
     MKV->>MKV: Inject into KV cache layer via slot mapping
 ```
 
-The CXL mmap region is already registered with `cudaHostRegister` by MaruHandler's
-DaxMapper, so `.cuda()` triggers a direct DMA transfer from CXL to GPU memory
-without any intermediate CPU copy.
+The CXL mmap region is pinned via `cudaHostRegister` by MaruHandler's DaxMapper,
+so `.to(device)` triggers a direct DMA transfer from CXL to GPU memory without
+any intermediate CPU copy.
 
 ### Chunk-Based Storage
 
@@ -247,8 +247,16 @@ Normal behavior. Automatically adjusted to a multiple of vLLM's block_size.
 
 ### BFloat16 Store Errors
 
-The connector uses `torch.untyped_storage()` to bypass numpy's lack of bfloat16 support.
-Ensure you have the latest `maru_vllm/connector.py`.
+```
+TypeError: Got unsupported ScalarType BFloat16
+# or
+RuntimeError: can't convert bfloat16 to numpy
+```
+
+BFloat16 models (e.g., Llama 3) fail with numpy-based serialization because numpy
+has no bfloat16 dtype. The connector handles this by using `torch.Tensor.contiguous()`
+and raw byte views instead of `.numpy()`. If you see this error, ensure you are using
+the connector from this PR or later — older versions may use numpy conversion paths.
 
 ### Garbage Output on Second Instance
 
