@@ -1,0 +1,12 @@
+[Unit]
+Description=Maru Resource Manager — CXL/DAX shared memory pool server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/maru-resource-manager
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

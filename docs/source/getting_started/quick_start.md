@@ -2,13 +2,13 @@
 
 ## 1. Start the Resource Manager
 
-The resource manager must be running before any other Maru service. It manages CXL/DAX device allocation and requires root privileges:
+The resource manager must be running before any other Maru service. Start it as a systemd service:
 
 ```bash
-sudo maru-resource-manager
+sudo systemctl start maru-resource-manager
 ```
 
-> The resource manager runs in the foreground. Use a separate terminal or append `&` to run it in the background.
+> For development/debugging, you can also run directly: `sudo maru-resource-manager --log-level debug`
 
 ## 2. Start the Metadata Server
 

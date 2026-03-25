@@ -56,13 +56,31 @@ def _check_root() -> int | None:
 
 
 def _do_uninstall(prefix: str) -> int:
-    """Remove the installed resource manager binary."""
+    """Remove the installed resource manager binary and systemd service."""
+    # Stop service if running
+    subprocess.run(
+        ["systemctl", "stop", "maru-resource-manager"],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["systemctl", "disable", "maru-resource-manager"],
+        capture_output=True,
+    )
+
     binary = Path(prefix) / "bin" / "maru-resource-manager"
     if binary.exists():
         binary.unlink()
         fprintf(sys.stderr, "  Removed: %s\n", binary)
-    else:
+
+    service = Path("/etc/systemd/system/maru-resource-manager.service")
+    if service.exists():
+        service.unlink()
+        fprintf(sys.stderr, "  Removed: %s\n", service)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+
+    if not binary.exists() and not service.exists():
         fprintf(sys.stderr, "Nothing to remove.\n")
+
     fprintf(sys.stderr, "Uninstall complete.\n")
     return 0
 
@@ -131,8 +149,26 @@ def _do_install(args: argparse.Namespace) -> int:
     # -- cmake install --------------------------------------------------------
     _run(["cmake", "--install", str(build_dir), "--prefix", args.prefix])
 
+    # -- install systemd service -----------------------------------------------
+    service_src = rm_src / "maru-resource-manager.service"
+    systemd_dir = Path("/etc/systemd/system")
+    if service_src.is_file() and systemd_dir.is_dir():
+        import shutil as _shutil
+
+        service_dst = systemd_dir / "maru-resource-manager.service"
+        _shutil.copy2(str(service_src), str(service_dst))
+        fprintf(sys.stderr, "  Installed systemd service: %s\n", service_dst)
+        subprocess.run(
+            ["systemctl", "daemon-reload"],
+            capture_output=True,
+        )
+
     fprintf(sys.stderr, "Installation complete!\n")
     fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
+    fprintf(
+        sys.stderr,
+        "  Start:  sudo systemctl start maru-resource-manager\n",
+    )
     return 0
 
 

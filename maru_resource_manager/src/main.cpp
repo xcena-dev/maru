@@ -134,8 +134,17 @@ int main(int argc, char **argv) {
     maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers);
     rc = server.start();
     if (rc != 0) {
-        maru::logf(maru::LogLevel::Error,
-                    "failed to start server: %d", rc);
+        if (rc == -EADDRINUSE) {
+            maru::logf(maru::LogLevel::Error,
+                        "port %u is already in use — "
+                        "another maru-resource-manager may be running. "
+                        "Use --port to specify a different port.",
+                        cfg.port);
+        } else {
+            maru::logf(maru::LogLevel::Error,
+                        "failed to start server on %s:%u: %s",
+                        cfg.host.c_str(), cfg.port, std::strerror(-rc));
+        }
         return 1;
     }
 

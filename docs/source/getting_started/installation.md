@@ -53,18 +53,25 @@ Verify that the Maru Resource Manager binary is installed:
 which maru-resource-manager
 ```
 
-The resource manager must be started manually before launching `MaruServer`. Start it with root privileges (required for CXL/DAX device access):
+The resource manager must be running before launching `MaruServer`. Start it as a systemd service:
 
 ```bash
-sudo maru-resource-manager
+sudo systemctl start maru-resource-manager
 ```
 
-To verify it is running, check pool status from another terminal:
+To verify it is running:
 
 ```bash
+sudo systemctl status maru-resource-manager
 maru_test_client stats
 ```
 
-> **Note:** The resource manager runs in the foreground. Use `&` or a separate terminal to keep it running while starting other services. See {doc}`quick_start` for the full startup sequence.
+To start automatically on boot:
+
+```bash
+sudo systemctl enable maru-resource-manager
+```
+
+> **Note:** You can also run the binary directly for development/debugging: `sudo maru-resource-manager --log-level debug`. If the systemd service is already running, the direct command will report a port conflict.
 
 Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.
