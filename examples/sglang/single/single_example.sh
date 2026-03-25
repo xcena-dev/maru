@@ -134,8 +134,12 @@ main() {
     echo "[$(date +%T)] Launching SGLang instance (MODEL=$MODEL, GPU_MEM_UTIL=$GPU_MEM_UTIL)..."
     echo "Please check $LOG_SGLANG for logs."
 
-    # Build Maru extra config
-    MARU_EXTRA_CONFIG="{\"backend_name\":\"maru\",\"module_path\":\"maru_sglang.maru_storage\",\"class_name\":\"MaruStorage\",\"maru_server_url\":\"tcp://localhost:${MARU_SERVER_PORT}\",\"maru_pool_size\":\"${MARU_POOL_SIZE:-4G}\"}"
+    # Build extra config via envsubst
+    MARU_EXTRA_CONFIG=$(
+      MARU_SERVER_PORT=$MARU_SERVER_PORT \
+      MARU_POOL_SIZE=$MARU_POOL_SIZE \
+      envsubst < "$SCRIPT_DIR/configs/maru-sglang-single.json"
+    )
 
     # Launch SGLang with Maru L3 backend
     sglang serve \
@@ -198,7 +202,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$_LOG_LEVEL" ]]; then
-    export SGLANG_LOG_LEVEL="$_LOG_LEVEL"
+    # export SGLANG_LOG_LEVEL="$_LOG_LEVEL"
     export MARU_LOG_LEVEL="$_LOG_LEVEL"
 fi
 if [[ -n "$_MODEL" ]]; then

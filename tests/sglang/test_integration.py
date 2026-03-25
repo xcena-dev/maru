@@ -35,10 +35,12 @@ class MockMemPoolHost:
         self._buf = (ctypes.c_char * (page_size * num_pages))()
 
     def get_page_buffer_meta(self, host_indices: torch.Tensor):
-        return [
-            (ctypes.addressof(self._buf) + int(i) * self._page_size, self._page_size)
-            for i in host_indices.tolist()
-        ]
+        ptr_list = []
+        size_list = []
+        for i in host_indices.tolist():
+            ptr_list.append(ctypes.addressof(self._buf) + int(i) * self._page_size)
+            size_list.append(self._page_size)
+        return ptr_list, size_list
 
     def read_page(self, idx: int) -> bytes:
         off = idx * self._page_size

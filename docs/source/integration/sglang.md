@@ -40,8 +40,8 @@ settings are passed through `--hicache-storage-backend-extra-config` as a JSON
 string with `maru_`-prefixed keys.
 
 ```bash
-python -m sglang.launch_server \
-    --model Qwen/Qwen2.5-7B \
+sglang serve \
+    --model-path Qwen/Qwen2.5-7B \
     --enable-hierarchical-cache \
     --hicache-ratio 2.0 \
     --hicache-write-policy write_through \
@@ -51,10 +51,15 @@ python -m sglang.launch_server \
         "backend_name": "maru",
         "module_path": "maru_sglang.maru_storage",
         "class_name": "MaruStorage",
+        "interface_v1": 1,
         "maru_server_url": "tcp://localhost:5555",
         "maru_pool_size": "4G"
     }'
 ```
+
+> **Important:** `interface_v1` must be set to `1` for the zero-copy V1 path
+> (`batch_get_v1`/`batch_set_v1`) to be used. Without it, SGLang falls back to
+> the legacy API which does not support `page_first_direct` layout.
 
 ### HiCache parameters
 
@@ -63,13 +68,14 @@ python -m sglang.launch_server \
 | `--enable-hierarchical-cache` | Enable the HiCache system |
 | `--hicache-ratio 2.0` | Host cache = 2× GPU cache size |
 | `--hicache-write-policy write_through` | Persist to L3 on cache hit |
-| `--hicache-mem-layout page_first_direct` | Memory layout for zero-copy |
+| `--hicache-mem-layout page_first_direct` | Memory layout for zero-copy (auto-switches `io_backend` to `direct`) |
 | `--hicache-storage-backend dynamic` | Load backend class dynamically |
 
 ### Maru extra-config parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `interface_v1` | `0` | Set to `1` to enable V1 zero-copy API (required for `page_first_direct`) |
 | `maru_server_url` | `tcp://localhost:5555` | MaruServer address |
 | `maru_pool_size` | `4G` | CXL shared memory pool size (`"4G"`, `"500M"`, etc.) |
 | `maru_chunk_size_bytes` | `1M` | Chunk size for memory allocation |
@@ -135,20 +141,17 @@ for details.
 ```bash
 cd examples/sglang/p2p_sharing/
 
-# Start MaruServer + 2 SGLang instances
-bash p2p_example.sh start
+# Start MaruServer + 2 SGLang instances (Ctrl-C to stop)
+bash p2p_example.sh
 
 # In another terminal:
-bash run_p2p_test.sh      # 4-step verification
+bash run_simple_query.sh  # Send query to inst1, then inst2 (cache hit check)
 bash run_benchmark.sh     # TTFT measurement
-
-# Stop
-bash p2p_example.sh stop
 ```
 
 **Success criteria:**
-- Benchmark reports `cache_hit: true` with TTFT speedup > 1.5×
-- Instance 2 logs show Maru retrieval activity
+- Instance 2 logs show `batch_get_v1 result: N/N hits` (100% cache hit)
+- Benchmark reports TTFT speedup > 1.5×
 
 See [examples/sglang/p2p_sharing/README.md](../../../examples/sglang/p2p_sharing/README.md)
 for details on the write-through flush mechanism.
