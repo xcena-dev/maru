@@ -429,7 +429,7 @@ class TestShmClientErrors:
             sock_path = server.start(tmpdir)
             try:
                 client = MaruShmClient(socket_path=sock_path)
-                with pytest.raises(RuntimeError, match="Alloc failed with status -5"):
+                with pytest.raises(RuntimeError, match="alloc failed with status -5"):
                     client.alloc(4096)
             finally:
                 server.stop()
@@ -490,7 +490,7 @@ class TestShmClientErrors:
             try:
                 client = MaruShmClient(socket_path=sock_path)
                 handle = MaruHandle(region_id=1, offset=0, length=100, auth_token=1)
-                with pytest.raises(RuntimeError, match="Free failed with status -7"):
+                with pytest.raises(RuntimeError, match="free failed with status -7"):
                     client.free(handle)
             finally:
                 server.stop()
@@ -530,7 +530,7 @@ class TestShmClientErrors:
             try:
                 client = MaruShmClient(socket_path=sock_path)
                 handle = MaruHandle(region_id=20, offset=0, length=4096, auth_token=111)
-                with pytest.raises(RuntimeError, match="GetFd failed with status -8"):
+                with pytest.raises(RuntimeError, match="get_fd failed with status -8"):
                     client._request_fd(handle)
             finally:
                 server.stop()
@@ -553,7 +553,7 @@ class TestShmClientErrors:
                 client = MaruShmClient(socket_path=sock_path)
                 handle = MaruHandle(region_id=30, offset=0, length=4096, auth_token=222)
                 with pytest.raises(
-                    RuntimeError, match="GetFd succeeded but no FD received"
+                    RuntimeError, match="get_fd succeeded but no FD received"
                 ):
                     client._request_fd(handle)
             finally:

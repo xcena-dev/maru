@@ -280,7 +280,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 4096, "pool_id": ANY_POOL_ID},
+            {"instance_id": "test_instance", "size": 4096, "pool_id": ANY_POOL_ID, "pool_type": "devdax"},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is True
@@ -298,7 +298,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 999999, "pool_id": ANY_POOL_ID},
+            {"instance_id": "test_instance", "size": 999999, "pool_id": ANY_POOL_ID, "pool_type": "devdax"},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is False
@@ -317,7 +317,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "inst-1", "size": 4096, "pool_id": 0},
+            {"instance_id": "inst-1", "size": 4096, "pool_id": 0, "pool_type": "devdax"},
         )
         assert result.success is True
 
@@ -333,7 +333,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "inst-2", "size": 8192, "pool_id": 1},
+            {"instance_id": "inst-2", "size": 8192, "pool_id": 1, "pool_type": "devdax"},
         )
         assert result.success is True
 

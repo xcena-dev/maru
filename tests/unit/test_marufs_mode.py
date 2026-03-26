@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Tests for marufs mode in AllocationManager, DaxMapper, MaruServer, and RpcHandlerMixin.
 
-These tests verify that when mount_path is provided, the marufs backend
+These tests verify that when pool_type="marufs" is provided, the marufs backend
 (MarufsClient) is selected instead of the default MaruShmClient.
 """
 
@@ -30,8 +30,8 @@ _marufs_mmap_objects: list[mmap.mmap] = []
 class MockMarufsClient:
     """Mock MarufsClient for unit tests without a real marufs mount."""
 
-    def __init__(self, mount_path: str):
-        self.mount_path = mount_path
+    def __init__(self):
+        pass
 
     def alloc(self, size, pool_id=0):
         global _marufs_alloc_counter
@@ -72,8 +72,12 @@ def _reset_marufs_mock():
 
 @pytest.fixture
 def mock_marufs():
-    """Patch MarufsClient at the source module (lazy import target)."""
-    with patch("marufs.MarufsClient", MockMarufsClient):
+    """Patch MarufsClient at all import sites."""
+    with (
+        patch("marufs.MarufsClient", MockMarufsClient),
+        patch("maru_server.allocation_manager.MarufsClient", MockMarufsClient),
+        patch("maru_handler.memory.mapper.MarufsClient", MockMarufsClient),
+    ):
         yield MockMarufsClient
 
 
@@ -83,51 +87,46 @@ def mock_marufs():
 
 
 class TestAllocationManagerMarufs:
-    """Test AllocationManager selects MarufsClient when mount_path is set."""
+    """Test AllocationManager selects MarufsClient when pool_type=marufs."""
 
-    def test_selects_marufs_client(self, mock_marufs):
-        """Constructor with mount_path uses MarufsClient."""
-        mgr = AllocationManager(mount_path="/mnt/marufs")
-        assert isinstance(mgr._client, MockMarufsClient)
-        assert mgr._client.mount_path == "/mnt/marufs"
-
-    def test_selects_shm_client_without_mount_path(self):
-        """Constructor without mount_path uses MaruShmClient (default)."""
+    def test_has_both_clients(self, mock_marufs):
+        """Constructor creates both _dax_client and _marufs_client."""
         mgr = AllocationManager()
-        # MockShmClient from conftest.py (autouse fixture)
-        assert not isinstance(mgr._client, MockMarufsClient)
+        assert hasattr(mgr, "_dax_client")
+        assert hasattr(mgr, "_marufs_client")
+        assert isinstance(mgr._marufs_client, MockMarufsClient)
 
     def test_allocate_with_marufs(self, mock_marufs):
-        """allocate() works with MarufsClient backend."""
-        mgr = AllocationManager(mount_path="/mnt/marufs")
-        handle = mgr.allocate("instance1", 4096)
+        """allocate(pool_type='marufs') uses MarufsClient backend."""
+        mgr = AllocationManager()
+        handle = mgr.allocate("instance1", 4096, pool_type="marufs")
 
         assert handle is not None
         assert handle.length == 4096
         assert handle.region_id == 1
 
     def test_allocate_multiple_with_marufs(self, mock_marufs):
-        """Multiple allocations return distinct region_ids."""
-        mgr = AllocationManager(mount_path="/mnt/marufs")
-        h1 = mgr.allocate("inst1", 1024)
-        h2 = mgr.allocate("inst2", 2048)
+        """Multiple allocations with marufs return distinct region_ids."""
+        mgr = AllocationManager()
+        h1 = mgr.allocate("inst1", 1024, pool_type="marufs")
+        h2 = mgr.allocate("inst2", 2048, pool_type="marufs")
 
         assert h1.region_id != h2.region_id
 
     def test_release_with_marufs(self, mock_marufs):
-        """release() calls MarufsClient.free()."""
-        mgr = AllocationManager(mount_path="/mnt/marufs")
-        handle = mgr.allocate("inst1", 4096)
+        """release() works after marufs allocation."""
+        mgr = AllocationManager()
+        handle = mgr.allocate("inst1", 4096, pool_type="marufs")
 
         success = mgr.release("inst1", handle.region_id)
         assert success is True
         assert mgr.get_handle(handle.region_id) is None
 
     def test_disconnect_with_marufs(self, mock_marufs):
-        """disconnect_client() frees allocations via MarufsClient."""
-        mgr = AllocationManager(mount_path="/mnt/marufs")
-        h1 = mgr.allocate("inst1", 1024)
-        h2 = mgr.allocate("inst1", 2048)
+        """disconnect_client() frees marufs allocations."""
+        mgr = AllocationManager()
+        h1 = mgr.allocate("inst1", 1024, pool_type="marufs")
+        h2 = mgr.allocate("inst1", 2048, pool_type="marufs")
 
         mgr.disconnect_client("inst1")
         assert mgr.get_handle(h1.region_id) is None
@@ -140,22 +139,21 @@ class TestAllocationManagerMarufs:
 
 
 class TestDaxMapperMarufs:
-    """Test DaxMapper selects MarufsClient when mount_path is set."""
+    """Test DaxMapper selects MarufsClient when pool_type=marufs."""
 
     def test_selects_marufs_client(self, mock_marufs):
-        """Constructor with mount_path uses MarufsClient."""
-        mapper = DaxMapper(mount_path="/mnt/marufs")
+        """Constructor with pool_type='marufs' uses MarufsClient."""
+        mapper = DaxMapper(pool_type="marufs")
         assert isinstance(mapper._client, MockMarufsClient)
-        assert mapper._client.mount_path == "/mnt/marufs"
 
-    def test_selects_shm_client_without_mount_path(self):
-        """Constructor without mount_path uses MaruShmClient (default)."""
+    def test_selects_shm_client_by_default(self):
+        """Constructor without pool_type uses MaruShmClient (default)."""
         mapper = DaxMapper()
         assert not isinstance(mapper._client, MockMarufsClient)
 
     def test_map_region_with_marufs(self, mock_marufs):
         """map_region() works with MarufsClient backend."""
-        mapper = DaxMapper(mount_path="/mnt/marufs")
+        mapper = DaxMapper(pool_type="marufs")
         handle = _make_handle(1, 4096)
         region = mapper.map_region(handle)
 
@@ -165,7 +163,7 @@ class TestDaxMapperMarufs:
 
     def test_map_region_idempotent_marufs(self, mock_marufs):
         """Mapping same region twice returns cached result."""
-        mapper = DaxMapper(mount_path="/mnt/marufs")
+        mapper = DaxMapper(pool_type="marufs")
         handle = _make_handle(1, 4096)
         r1 = mapper.map_region(handle)
         r2 = mapper.map_region(handle)
@@ -173,7 +171,7 @@ class TestDaxMapperMarufs:
 
     def test_unmap_region_with_marufs(self, mock_marufs):
         """unmap_region() works with MarufsClient backend."""
-        mapper = DaxMapper(mount_path="/mnt/marufs")
+        mapper = DaxMapper(pool_type="marufs")
         handle = _make_handle(1, 4096)
         mapper.map_region(handle)
 
@@ -182,7 +180,7 @@ class TestDaxMapperMarufs:
 
     def test_close_with_marufs(self, mock_marufs):
         """close() unmaps all regions with MarufsClient backend."""
-        mapper = DaxMapper(mount_path="/mnt/marufs")
+        mapper = DaxMapper(pool_type="marufs")
         mapper.map_region(_make_handle(1, 4096))
         mapper.map_region(_make_handle(2, 2048))
 
@@ -197,28 +195,24 @@ class TestDaxMapperMarufs:
 
 
 class TestMaruServerMarufs:
-    """Test MaruServer mount_path property and pass-through."""
-
-    def test_mount_path_property_set(self, mock_marufs):
-        """mount_path property returns the configured path."""
-        server = MaruServer(mount_path="/mnt/marufs")
-        assert server.mount_path == "/mnt/marufs"
-
-    def test_mount_path_property_none(self):
-        """mount_path property returns None in DAX mode."""
-        server = MaruServer()
-        assert server.mount_path is None
+    """Test MaruServer pool_type pass-through."""
 
     def test_request_alloc_with_marufs(self, mock_marufs):
-        """request_alloc() works with marufs backend."""
-        server = MaruServer(mount_path="/mnt/marufs")
-        handle = server.request_alloc("inst1", 4096)
+        """request_alloc(pool_type='marufs') works."""
+        server = MaruServer()
+        handle = server.request_alloc("inst1", 4096, pool_type="marufs")
         assert handle is not None
         assert handle.length == 4096
 
+    def test_request_alloc_default_devdax(self):
+        """request_alloc() defaults to devdax pool_type."""
+        server = MaruServer()
+        handle = server.request_alloc("inst1", 4096)
+        assert handle is not None
+
 
 # ============================================================================
-# RpcHandlerMixin — mount_path in alloc response
+# RpcHandlerMixin — pool_type in alloc request
 # ============================================================================
 
 
@@ -238,81 +232,47 @@ class MockRequest:
 
 
 class TestRpcHandlerMixinMarufs:
-    """Test that alloc response includes mount_path in marufs mode."""
+    """Test that alloc request pool_type is forwarded correctly."""
 
-    def test_alloc_response_includes_mount_path(self, mock_marufs):
-        """Response contains mount_path when server is in marufs mode."""
-        server = MaruServer(mount_path="/mnt/marufs")
-        handler = ConcreteHandler(server)
-
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
-        resp = handler._handle_request_alloc(req)
-
-        assert resp["success"] is True
-        assert resp["mount_path"] == "/mnt/marufs"
-
-    def test_alloc_response_excludes_mount_path_in_dax_mode(self):
-        """Response does NOT contain mount_path key in DAX mode."""
+    def test_alloc_with_marufs_pool_type(self, mock_marufs):
+        """pool_type='marufs' in request is forwarded to server."""
         server = MaruServer()
         handler = ConcreteHandler(server)
 
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+        )
         resp = handler._handle_request_alloc(req)
 
         assert resp["success"] is True
-        assert "mount_path" not in resp
+        assert "handle" in resp
 
-    def test_alloc_failure_no_mount_path(self, mock_marufs, monkeypatch):
-        """Failed alloc response does not include mount_path."""
-        server = MaruServer(mount_path="/mnt/marufs")
+    def test_alloc_default_devdax(self):
+        """Request without pool_type defaults to 'devdax'."""
+        server = MaruServer()
+        handler = ConcreteHandler(server)
+
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
+        resp = handler._handle_request_alloc(req)
+
+        assert resp["success"] is True
+
+    def test_alloc_failure_response(self, mock_marufs, monkeypatch):
+        """Failed alloc response has success=False."""
+        server = MaruServer()
         handler = ConcreteHandler(server)
 
         monkeypatch.setattr(
             server._allocation_manager,
             "allocate",
-            lambda instance_id, size, pool_id=ANY_POOL_ID: None,
+            lambda instance_id, size, pool_id=ANY_POOL_ID, pool_type="devdax": None,
         )
 
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+        )
         resp = handler._handle_request_alloc(req)
 
         assert resp["success"] is False
-        assert "mount_path" not in resp
-
-
-# ============================================================================
-# MarufsClient._validate_mount_path — called from server path
-# ============================================================================
-
-
-class TestValidateMountPath:
-    """Verify that _validate_mount_path is called when MarufsClient is created."""
-
-    def test_validate_called_on_init(self, tmp_path):
-        """_validate_mount_path is invoked during MarufsClient construction."""
-        from marufs.client import MarufsClient
-
-        with patch.object(MarufsClient, "_validate_mount_path") as mock_validate:
-            MarufsClient(str(tmp_path))
-
-        mock_validate.assert_called_once()
-
-    def test_validate_rejects_non_directory(self):
-        """Non-existent path raises ValueError."""
-        from marufs.client import MarufsClient
-
-        with pytest.raises(ValueError, match="is not a directory"):
-            MarufsClient("/nonexistent/path/to/marufs")
-
-    def test_validate_rejects_non_marufs_mount(self, tmp_path):
-        """Existing directory that is not a marufs mount raises ValueError."""
-        from marufs.client import MarufsClient
-
-        with pytest.raises(ValueError, match="is not a marufs mount point"):
-            MarufsClient(str(tmp_path))
-
-    def test_server_allocation_passes_mount_path(self):
-        """AllocationManager(mount_path=...) passes it to MarufsClient."""
-        with patch("marufs.MarufsClient", MockMarufsClient):
-            mgr = AllocationManager(mount_path="/mnt/marufs")
-        assert mgr._client.mount_path == "/mnt/marufs"

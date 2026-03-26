@@ -341,7 +341,7 @@ class TestRpcAsyncClientApiMethods:
 
         client._send_request.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "instance-1", "size": 4096, "pool_id": ANY_POOL_ID},
+            {"instance_id": "instance-1", "size": 4096, "pool_id": ANY_POOL_ID, "pool_type": "devdax"},
         )
         assert result.success is True
         assert result.handle is not None

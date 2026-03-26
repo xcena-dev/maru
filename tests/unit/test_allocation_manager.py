@@ -166,15 +166,15 @@ class TestAllocationManagerEdgeCases:
         """Test allocate when _client.alloc() returns None."""
         manager = AllocationManager()
 
-        # Mock the client to return None
-        original_alloc = manager._client.alloc
-        manager._client.alloc = lambda size, pool_id=None: None  # type: ignore
+        # Mock the dax client to return None
+        original_alloc = manager._dax_client.alloc
+        manager._dax_client.alloc = lambda size, pool_id=None: None  # type: ignore
 
         result = manager.allocate("instance1", 4096)
         assert result is None
 
         # Restore original
-        manager._client.alloc = original_alloc  # type: ignore
+        manager._dax_client.alloc = original_alloc  # type: ignore
 
     def test_decrement_kv_ref_nonexistent(self):
         """Test decrement_kv_ref when region_id not in allocations."""
