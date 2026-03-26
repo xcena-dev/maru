@@ -1,5 +1,16 @@
 # vLLM Integration
 
+## Prerequisites
+
+**vLLM v0.14+** — required for `KVConnectorBase_V1` support:
+
+```bash
+pip install vllm
+```
+
+See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
+for GPU-specific options.
+
 ## Integration Architecture
 
 MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing
@@ -125,19 +136,6 @@ Instance B:
 ```
 
 ## Setup
-
-### Prerequisites
-
-**vLLM v0.14+** — required for `KVConnectorBase_V1` support:
-
-```bash
-pip install vllm
-```
-
-See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-for GPU-specific options.
-
-### Launch
 
 **Start Maru server:**
 
