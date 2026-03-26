@@ -287,29 +287,29 @@ class TestMaruServerPoolType:
 
     def test_request_alloc_forwards_pool_type(self):
         """request_alloc forwards pool_type to AllocationManager."""
-        from unittest.mock import patch as _patch
+        from unittest.mock import MagicMock
 
         server = MaruServer()
-        with _patch.object(
-            server._allocation_manager, "allocate", wraps=server._allocation_manager.allocate
-        ) as mock_alloc:
-            server.request_alloc("inst1", 4096, pool_type="marufs")
-            mock_alloc.assert_called_once_with(
-                "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="marufs"
-            )
+        mock_alloc = MagicMock(return_value=None)
+        server._allocation_manager.allocate = mock_alloc
+
+        server.request_alloc("inst1", 4096, pool_type="marufs")
+        mock_alloc.assert_called_once_with(
+            "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+        )
 
     def test_request_alloc_defaults_to_devdax(self):
         """request_alloc defaults pool_type to 'devdax'."""
-        from unittest.mock import patch as _patch
+        from unittest.mock import MagicMock
 
         server = MaruServer()
-        with _patch.object(
-            server._allocation_manager, "allocate", wraps=server._allocation_manager.allocate
-        ) as mock_alloc:
-            server.request_alloc("inst1", 4096)
-            mock_alloc.assert_called_once_with(
-                "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="devdax"
-            )
+        mock_alloc = MagicMock(return_value=None)
+        server._allocation_manager.allocate = mock_alloc
+
+        server.request_alloc("inst1", 4096)
+        mock_alloc.assert_called_once_with(
+            "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
 
     def test_request_alloc_with_explicit_pool_id(self):
         """request_alloc forwards explicit pool_id."""

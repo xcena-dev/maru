@@ -192,17 +192,19 @@ class TestRpcHandlerMixin:
 
     def test_handle_request_alloc_marufs_pool_type(self):
         """pool_type='marufs' is forwarded to server.request_alloc."""
-        from unittest.mock import patch as _patch
+        from unittest.mock import MagicMock
 
         handler, server = self._make_handler()
+        mock_alloc = MagicMock(return_value=None)
+        server.request_alloc = mock_alloc
+
         req = MockRequest(
             instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
         )
-        with _patch.object(server, "request_alloc", wraps=server.request_alloc) as mock_alloc:
-            handler._handle_request_alloc(req)
-            mock_alloc.assert_called_once_with(
-                instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
-            )
+        handler._handle_request_alloc(req)
+        mock_alloc.assert_called_once_with(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+        )
 
     def test_handle_exists_kv_false(self):
         """_handle_exists_kv returns False for nonexistent key."""

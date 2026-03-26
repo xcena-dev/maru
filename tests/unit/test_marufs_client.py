@@ -108,9 +108,7 @@ class TestAllocFree:
         mock_rm.alloc.return_value = (handle, 10)
 
         client.alloc(4096, pool_id=7)
-        mock_rm.alloc.assert_called_once_with(
-            4096, pool_id=7, pool_type=DaxType.MARUFS
-        )
+        mock_rm.alloc.assert_called_once_with(4096, pool_id=7, pool_type=DaxType.MARUFS)
 
     def test_free_closes_mmap_and_fd(self, client, mock_rm, temp_region_file):
         """free() closes cached mmap before closing fd."""
