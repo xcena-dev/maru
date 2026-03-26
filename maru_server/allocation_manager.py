@@ -20,6 +20,7 @@ class AllocationInfo:
 
     handle: MaruHandle
     owner_instance_id: str
+    pool_type: str = "devdax"
     kv_ref_count: int = 0
     owner_connected: bool = True
 
@@ -38,6 +39,10 @@ class AllocationManager:
         self._marufs_client = MarufsClient()
         logger.info("AllocationManager initialized")
 
+    def _get_client(self, pool_type: str = "devdax"):
+        """Return the client matching pool_type."""
+        return self._marufs_client if pool_type == "marufs" else self._dax_client
+
     def allocate(
         self,
         instance_id: str,
@@ -46,7 +51,7 @@ class AllocationManager:
         pool_type: str = "devdax",
     ) -> MaruHandle | None:
         """Allocate memory via backend and track ownership."""
-        client = self._marufs_client if pool_type == "marufs" else self._dax_client
+        client = self._get_client(pool_type)
         try:
             handle = client.alloc(size, pool_id=pool_id)
         except RuntimeError as e:
@@ -65,6 +70,7 @@ class AllocationManager:
             self._allocations[handle.region_id] = AllocationInfo(
                 handle=handle,
                 owner_instance_id=instance_id,
+                pool_type=pool_type,
                 kv_ref_count=0,
                 owner_connected=True,
             )
@@ -107,7 +113,7 @@ class AllocationManager:
                     region_id,
                     info.owner_instance_id,
                 )
-                self._dax_client.free(info.handle)
+                self._get_client(info.pool_type).free(info.handle)
                 del self._allocations[region_id]
 
             return True
@@ -132,7 +138,7 @@ class AllocationManager:
                     instance_id,
                     info.kv_ref_count,
                 )
-                self._dax_client.free(info.handle)
+                self._get_client(info.pool_type).free(info.handle)
                 del self._allocations[region_id]
             else:
                 logger.info(
@@ -164,7 +170,7 @@ class AllocationManager:
                     instance_id,
                     info.kv_ref_count,
                 )
-                self._dax_client.free(info.handle)
+                self._get_client(info.pool_type).free(info.handle)
                 del self._allocations[region_id]
 
     def list_allocations(
