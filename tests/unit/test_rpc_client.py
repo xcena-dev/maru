@@ -357,6 +357,30 @@ class TestRpcClientApiMethods:
         )
         assert result.success is True
 
+    def test_request_alloc_with_marufs_pool_type(self):
+        """request_alloc forwards pool_type='marufs' correctly."""
+        client, mock_send = self._make_client_with_mock()
+        mock_send.return_value = {
+            "success": True,
+            "handle": {"region_id": 3, "offset": 0, "length": 4096, "auth_token": 0},
+        }
+
+        result = client.request_alloc(
+            instance_id="inst-1", size=4096, pool_type="marufs"
+        )
+
+        mock_send.assert_called_once_with(
+            MessageType.REQUEST_ALLOC,
+            {
+                "instance_id": "inst-1",
+                "size": 4096,
+                "pool_id": ANY_POOL_ID,
+                "pool_type": "marufs",
+            },
+        )
+        assert result.success is True
+        assert result.handle.region_id == 3
+
     def test_request_alloc_no_handle(self):
         """request_alloc handles success without handle data."""
         client, mock_send = self._make_client_with_mock()

@@ -102,6 +102,32 @@ class TestAllocFree:
         mock_rm.free.assert_called_once_with(handle)
         assert 3 not in client._fd_cache
 
+    def test_alloc_with_explicit_pool_id(self, client, mock_rm):
+        """alloc() forwards explicit pool_id to RM."""
+        handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        mock_rm.alloc.return_value = (handle, 10)
+
+        client.alloc(4096, pool_id=7)
+        mock_rm.alloc.assert_called_once_with(
+            4096, pool_id=7, pool_type=DaxType.MARUFS
+        )
+
+    def test_free_closes_mmap_and_fd(self, client, mock_rm, temp_region_file):
+        """free() closes cached mmap before closing fd."""
+        handle = MaruHandle(region_id=3, offset=0, length=4096, auth_token=0)
+        fd = os.open(temp_region_file, os.O_RDWR)
+        mock_rm.alloc.return_value = (handle, fd)
+
+        client.alloc(4096)
+        mm = client.mmap(handle, prot=mmap_module.PROT_READ | mmap_module.PROT_WRITE)
+        assert not mm.closed
+
+        client.free(handle)
+        assert mm.closed
+        assert 3 not in client._fd_cache
+        assert 3 not in client._mmap_cache
+        mock_rm.free.assert_called_once_with(handle)
+
     def test_free_unknown_region(self, client, mock_rm):
         """free() on unknown region should not raise."""
         fake_handle = MaruHandle(region_id=9999, offset=0, length=4096, auth_token=0)
@@ -169,6 +195,17 @@ class TestMmapMunmap:
         with pytest.raises(ValueError, match="Invalid region_id"):
             client.mmap(handle, prot=mmap_module.PROT_READ)
 
+    def test_mmap_read_only(self, client, mock_rm, temp_region_file):
+        """mmap() with PROT_READ uses ACCESS_READ."""
+        handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        fd = os.open(temp_region_file, os.O_RDONLY)
+        mock_rm.alloc.return_value = (handle, fd)
+
+        client.alloc(4096)
+        mm = client.mmap(handle, prot=mmap_module.PROT_READ)
+        assert mm[:4] == b"\x00" * 4
+        client.munmap(handle)
+
     def test_munmap_clears_cache(self, client, mock_rm, temp_region_file):
         """munmap() removes entry from mmap cache."""
         handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
@@ -179,6 +216,11 @@ class TestMmapMunmap:
         client.mmap(handle, prot=mmap_module.PROT_READ | mmap_module.PROT_WRITE)
         client.munmap(handle)
         assert handle.region_id not in client._mmap_cache
+
+    def test_munmap_unmapped_region_is_noop(self, client):
+        """munmap() on region not in cache does not raise."""
+        handle = MaruHandle(region_id=999, offset=0, length=4096, auth_token=0)
+        client.munmap(handle)  # should not raise
 
 
 # ============================================================================
@@ -199,6 +241,52 @@ class TestClose:
         client.close()
         assert len(client._fd_cache) == 0
         assert len(client._mmap_cache) == 0
+
+    def test_close_suppresses_mmap_exception(self, client, mock_rm):
+        """close() suppresses mmap.close() exception and clears cache."""
+        handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        mock_rm.alloc.return_value = (handle, 99)
+
+        client.alloc(4096)
+        # Inject a broken mmap entry
+        broken_mm = MagicMock()
+        broken_mm.close.side_effect = Exception("mmap close failed")
+        client._mmap_cache[1] = (broken_mm, mmap_module.PROT_READ)
+
+        with patch("marufs.client.os.close"):
+            client.close()
+
+        assert len(client._mmap_cache) == 0
+        assert len(client._fd_cache) == 0
+
+    def test_close_suppresses_fd_exception(self, client, mock_rm):
+        """close() suppresses os.close() OSError and clears cache."""
+        handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        mock_rm.alloc.return_value = (handle, 99)
+
+        client.alloc(4096)
+
+        with patch("marufs.client.os.close", side_effect=OSError("bad fd")):
+            client.close()
+
+        assert len(client._fd_cache) == 0
+
+    def test_context_manager(self, mock_rm):
+        """MarufsClient supports with-statement and calls close() on exit."""
+        with patch("marufs.client.ResourceManagerClient", return_value=mock_rm):
+            from marufs.client import MarufsClient
+
+            with MarufsClient() as c:
+                assert c is not None
+                handle = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+                mock_rm.alloc.return_value = (handle, 10)
+                c.alloc(4096)
+                assert len(c._fd_cache) == 1
+
+            # After exiting context, caches should be cleared
+            with patch("marufs.client.os.close"):
+                pass  # close already called by __exit__
+            assert len(c._fd_cache) == 0
 
     def test_double_close(self, client):
         """Calling close() twice should not raise."""

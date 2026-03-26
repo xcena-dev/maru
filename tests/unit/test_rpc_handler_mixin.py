@@ -181,6 +181,43 @@ class TestRpcHandlerMixin:
         resp = handler._handle_batch_exists_kv(req)
         assert resp["results"] == [True, False]
 
+    def test_handle_request_alloc_missing_pool_type_defaults_devdax(self):
+        """Request without pool_type attribute defaults to 'devdax' via getattr."""
+        handler, server = self._make_handler()
+        # MockRequest without pool_type — simulates old client
+        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
+        assert not hasattr(req, "pool_type")
+        resp = handler._handle_request_alloc(req)
+        assert resp["success"] is True
+
+    def test_handle_request_alloc_marufs_pool_type(self):
+        """pool_type='marufs' is forwarded to server.request_alloc."""
+        from unittest.mock import patch as _patch
+
+        handler, server = self._make_handler()
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+        )
+        with _patch.object(server, "request_alloc", wraps=server.request_alloc) as mock_alloc:
+            handler._handle_request_alloc(req)
+            mock_alloc.assert_called_once_with(
+                instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+            )
+
+    def test_handle_exists_kv_false(self):
+        """_handle_exists_kv returns False for nonexistent key."""
+        handler, _ = self._make_handler()
+        req = MockRequest(key="nonexistent")
+        resp = handler._handle_exists_kv(req)
+        assert resp["exists"] is False
+
+    def test_handle_delete_kv_nonexistent(self):
+        """_handle_delete_kv returns False for nonexistent key."""
+        handler, _ = self._make_handler()
+        req = MockRequest(key="nonexistent")
+        resp = handler._handle_delete_kv(req)
+        assert resp["success"] is False
+
     def test_handle_get_stats(self):
         handler, _ = self._make_handler()
         resp = handler._handle_get_stats({})

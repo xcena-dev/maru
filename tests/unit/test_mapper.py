@@ -11,6 +11,38 @@ from conftest import _make_handle
 from maru_handler.memory import DaxMapper
 
 
+class TestDaxMapperConstructor:
+    """Test pool_type-based constructor."""
+
+    def test_default_creates_shm_client(self):
+        """DaxMapper() with no args creates MaruShmClient."""
+        from maru_shm import MaruShmClient
+
+        mapper = DaxMapper()
+        assert isinstance(mapper._client, MaruShmClient)
+
+    def test_devdax_creates_shm_client(self):
+        """DaxMapper(pool_type='devdax') creates MaruShmClient."""
+        from maru_shm import MaruShmClient
+
+        mapper = DaxMapper(pool_type="devdax")
+        assert isinstance(mapper._client, MaruShmClient)
+
+    def test_marufs_creates_marufs_client(self):
+        """DaxMapper(pool_type='marufs') creates MarufsClient."""
+        from marufs import MarufsClient
+
+        mapper = DaxMapper(pool_type="marufs")
+        assert isinstance(mapper._client, MarufsClient)
+
+    def test_unknown_pool_type_falls_back_to_shm(self):
+        """Unknown pool_type falls back to MaruShmClient."""
+        from maru_shm import MaruShmClient
+
+        mapper = DaxMapper(pool_type="unknown")
+        assert isinstance(mapper._client, MaruShmClient)
+
+
 class TestDaxMapperMap:
     """Test map/unmap operations."""
 
@@ -401,3 +433,50 @@ class TestDaxMapperPrefault:
             mock_prefault.assert_not_called()
 
         assert region.is_mapped
+
+
+class TestDaxMapperMarufsIntegration:
+    """Test DaxMapper with marufs pool_type."""
+
+    def test_map_region_with_marufs(self):
+        """map_region works with marufs client."""
+        import mmap as mmap_module
+
+        mock_client = MagicMock()
+        # Use a real anonymous mmap so memoryview() works
+        real_mmap = mmap_module.mmap(-1, 4096)
+        mock_client.mmap.return_value = real_mmap
+
+        with patch("maru_handler.memory.mapper.MarufsClient", return_value=mock_client):
+            mapper = DaxMapper(pool_type="marufs")
+
+        handle = _make_handle(1, 4096)
+        region = mapper.map_region(handle, prefault=False)
+
+        assert region.region_id == 1
+        mock_client.mmap.assert_called_once()
+        mapper.close()
+
+    def test_unmap_buffer_error_deferred_gc(self):
+        """BufferError on munmap is caught and deferred to GC."""
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+        mapper.map_region(handle)
+
+        with patch.object(mapper._client, "munmap", side_effect=BufferError("held")):
+            result = mapper.unmap_region(1)
+
+        assert result is True
+        assert mapper.get_region(1) is None
+
+    def test_close_buffer_error_deferred_gc(self):
+        """BufferError on munmap during close() is caught and deferred to GC."""
+        mapper = DaxMapper()
+        mapper.map_region(_make_handle(1, 4096))
+        mapper.map_region(_make_handle(2, 2048))
+
+        with patch.object(mapper._client, "munmap", side_effect=BufferError("held")):
+            mapper.close()
+
+        assert mapper.get_region(1) is None
+        assert mapper.get_region(2) is None

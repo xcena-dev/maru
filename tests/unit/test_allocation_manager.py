@@ -2,6 +2,9 @@
 # Copyright 2026 XCENA Inc.
 """Tests for AllocationManager."""
 
+from unittest.mock import MagicMock
+
+from maru_common.types import MaruHandle
 from maru_server.allocation_manager import AllocationManager
 
 
@@ -272,3 +275,53 @@ class TestListAllocations:
 
         handles = manager.list_allocations(exclude_instance_id="no-such-inst")
         assert len(handles) == 1
+
+
+class TestAllocationManagerPoolType:
+    """Test pool_type routing in AllocationManager."""
+
+    def test_allocate_devdax_uses_dax_client(self):
+        """allocate(pool_type='devdax') routes to _dax_client."""
+        manager = AllocationManager()
+        manager._dax_client = MagicMock()
+        manager._marufs_client = MagicMock()
+
+        h = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        manager._dax_client.alloc.return_value = h
+
+        manager.allocate("inst1", 4096, pool_type="devdax")
+
+        manager._dax_client.alloc.assert_called_once()
+        manager._marufs_client.alloc.assert_not_called()
+
+    def test_allocate_marufs_uses_marufs_client(self):
+        """allocate(pool_type='marufs') routes to _marufs_client."""
+        manager = AllocationManager()
+        manager._dax_client = MagicMock()
+        manager._marufs_client = MagicMock()
+
+        h = MaruHandle(region_id=1, offset=0, length=4096, auth_token=0)
+        manager._marufs_client.alloc.return_value = h
+
+        manager.allocate("inst1", 4096, pool_type="marufs")
+
+        manager._marufs_client.alloc.assert_called_once()
+        manager._dax_client.alloc.assert_not_called()
+
+    def test_allocate_marufs_returns_none(self):
+        """allocate() returns None when _marufs_client.alloc() returns None."""
+        manager = AllocationManager()
+        manager._marufs_client = MagicMock()
+        manager._marufs_client.alloc.return_value = None
+
+        result = manager.allocate("inst1", 4096, pool_type="marufs")
+        assert result is None
+
+    def test_allocate_marufs_runtime_error(self):
+        """allocate() returns None when _marufs_client.alloc() raises RuntimeError."""
+        manager = AllocationManager()
+        manager._marufs_client = MagicMock()
+        manager._marufs_client.alloc.side_effect = RuntimeError("no space")
+
+        result = manager.allocate("inst1", 4096, pool_type="marufs")
+        assert result is None

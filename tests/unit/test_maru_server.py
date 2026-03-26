@@ -282,6 +282,66 @@ class TestMaruBatch:
         assert results == []
 
 
+class TestMaruServerPoolType:
+    """Test pool_type parameter handling in MaruServer."""
+
+    def test_request_alloc_forwards_pool_type(self):
+        """request_alloc forwards pool_type to AllocationManager."""
+        from unittest.mock import patch as _patch
+
+        server = MaruServer()
+        with _patch.object(
+            server._allocation_manager, "allocate", wraps=server._allocation_manager.allocate
+        ) as mock_alloc:
+            server.request_alloc("inst1", 4096, pool_type="marufs")
+            mock_alloc.assert_called_once_with(
+                "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="marufs"
+            )
+
+    def test_request_alloc_defaults_to_devdax(self):
+        """request_alloc defaults pool_type to 'devdax'."""
+        from unittest.mock import patch as _patch
+
+        server = MaruServer()
+        with _patch.object(
+            server._allocation_manager, "allocate", wraps=server._allocation_manager.allocate
+        ) as mock_alloc:
+            server.request_alloc("inst1", 4096)
+            mock_alloc.assert_called_once_with(
+                "inst1", 4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+            )
+
+    def test_request_alloc_with_explicit_pool_id(self):
+        """request_alloc forwards explicit pool_id."""
+        server = MaruServer()
+        handle = server.request_alloc("inst1", 4096, pool_id=0)
+        assert handle is not None
+
+
+class TestMaruServerKvEdgeCases:
+    """Test KV edge cases."""
+
+    def test_register_kv_duplicate_returns_false(self):
+        """Second register_kv for same key returns is_new=False."""
+        server = MaruServer()
+        handle = server.request_alloc("inst1", 4096)
+
+        is_new1 = server.register_kv("key1", handle.region_id, 0, 100)
+        is_new2 = server.register_kv("key1", handle.region_id, 0, 100)
+        assert is_new1 is True
+        assert is_new2 is False
+
+    def test_delete_kv_nonexistent_returns_false(self):
+        """delete_kv for nonexistent key returns False."""
+        server = MaruServer()
+        assert server.delete_kv("nonexistent") is False
+
+    def test_batch_lookup_kv_empty(self):
+        """batch_lookup_kv with empty list returns empty list."""
+        server = MaruServer()
+        assert server.batch_lookup_kv([]) == []
+
+
 class TestMaruServerEdgeCases:
     """Test edge cases and error paths for MaruServer."""
 

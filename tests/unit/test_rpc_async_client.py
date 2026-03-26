@@ -352,6 +352,26 @@ class TestRpcAsyncClientApiMethods:
         assert result.handle is not None
         assert result.handle.region_id == 1
 
+    def test_request_alloc_with_marufs_pool_type(self):
+        """Test request_alloc forwards pool_type='marufs'."""
+        client = self._make_client()
+        handle_dict = {"region_id": 2, "offset": 0, "length": 4096, "auth_token": 0}
+        client._send_request.return_value = {"success": True, "handle": handle_dict}
+
+        result = client.request_alloc("instance-1", 4096, pool_type="marufs")
+
+        client._send_request.assert_called_once_with(
+            MessageType.REQUEST_ALLOC,
+            {
+                "instance_id": "instance-1",
+                "size": 4096,
+                "pool_id": ANY_POOL_ID,
+                "pool_type": "marufs",
+            },
+        )
+        assert result.success is True
+        assert result.handle.region_id == 2
+
     def test_return_alloc(self):
         """Test return_alloc calls _send_request and returns success."""
         client = self._make_client()
