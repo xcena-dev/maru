@@ -31,7 +31,9 @@ class MarufsClient:
         """Initialize MarufsClient."""
         self._rm = ResourceManagerClient()
         self._fd_cache: dict[int, int] = {}  # region_id → fd
-        self._mmap_cache: dict[int, tuple[mmap_module.mmap, int]] = {}  # region_id → (mmap, prot)
+        self._mmap_cache: dict[
+            int, tuple[mmap_module.mmap, int]
+        ] = {}  # region_id → (mmap, prot)
         self._lock = threading.Lock()
 
         logger.debug("MarufsClient initialised")
@@ -158,7 +160,9 @@ class MarufsClient:
                 try:
                     mm.close()
                 except Exception:
-                    logger.warning("close: failed to close mmap for region %d", region_id)
+                    logger.warning(
+                        "close: failed to close mmap for region %d", region_id
+                    )
             self._mmap_cache.clear()
 
             # Close fds

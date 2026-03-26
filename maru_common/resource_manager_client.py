@@ -71,17 +71,13 @@ class ResourceManagerClient:
         data = read_full(sock, HEADER_SIZE)
         hdr = MsgHeader.unpack(data)
         if not hdr.validate():
-            raise ConnectionError(
-                f"Invalid response header: magic=0x{hdr.magic:08X}"
-            )
+            raise ConnectionError(f"Invalid response header: magic=0x{hdr.magic:08X}")
         return hdr
 
     def _check_error(self, sock: socket.socket, hdr: MsgHeader, op: str) -> None:
         """Check if response is an error and raise if so."""
         if hdr.msg_type == MsgType.ERROR_RESP:
-            payload = (
-                read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
-            )
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
             err = ErrorResp.unpack(payload)
             raise RuntimeError(f"{op} failed ({err.status}): {err.message}")
 
@@ -92,9 +88,7 @@ class ResourceManagerClient:
             self._send_request(sock, msg_type, payload)
             hdr = self._recv_header(sock)
             self._check_error(sock, hdr, op)
-            resp_data = (
-                read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
-            )
+            resp_data = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
             resp = PermResp.unpack(resp_data)
             if resp.status != 0:
                 raise RuntimeError(f"{op} failed with status {resp.status}")
@@ -111,9 +105,7 @@ class ResourceManagerClient:
             self._send_request(sock, MsgType.STATS_REQ, StatsReq().pack())
             hdr = self._recv_header(sock)
             self._check_error(sock, hdr, "stats")
-            payload = (
-                read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
-            )
+            payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
             resp = StatsResp.unpack(payload)
             return resp.pools or []
         finally:
@@ -121,7 +113,9 @@ class ResourceManagerClient:
 
     # ── allocation ─────────────────────────────────────────────────────
 
-    def alloc(self, size: int, pool_id: int = ANY_POOL_ID, pool_type: int = DaxType.ANY) -> tuple[MaruHandle, int]:
+    def alloc(
+        self, size: int, pool_id: int = ANY_POOL_ID, pool_type: int = DaxType.ANY
+    ) -> tuple[MaruHandle, int]:
         """Allocate a region via the resource manager.
 
         Returns:
@@ -186,13 +180,9 @@ class ResourceManagerClient:
 
     # ── marufs permission delegation ──────────────────────────────────
 
-    def perm_grant(
-        self, region_id: int, node_id: int, pid: int, perms: int
-    ) -> None:
+    def perm_grant(self, region_id: int, node_id: int, pid: int, perms: int) -> None:
         """Grant permissions on a marufs region via the resource manager."""
-        req = PermGrantReq(
-            region_id=region_id, node_id=node_id, pid=pid, perms=perms
-        )
+        req = PermGrantReq(region_id=region_id, node_id=node_id, pid=pid, perms=perms)
         self._perm_request(MsgType.PERM_GRANT_REQ, req.pack(), "perm_grant")
 
     def perm_revoke(self, region_id: int, node_id: int, pid: int) -> None:
@@ -203,9 +193,7 @@ class ResourceManagerClient:
     def perm_set_default(self, region_id: int, perms: int) -> None:
         """Set default permissions on a marufs region via the resource manager."""
         req = PermSetDefaultReq(region_id=region_id, perms=perms)
-        self._perm_request(
-            MsgType.PERM_SET_DEFAULT_REQ, req.pack(), "perm_set_default"
-        )
+        self._perm_request(MsgType.PERM_SET_DEFAULT_REQ, req.pack(), "perm_set_default")
 
     def chown(self, region_id: int) -> None:
         """Transfer ownership of a marufs region via the resource manager."""

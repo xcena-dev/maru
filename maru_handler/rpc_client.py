@@ -127,8 +127,11 @@ class RpcClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
-        pool_type: str = "devdax"
+        self,
+        instance_id: str,
+        size: int,
+        pool_id: int = ANY_POOL_ID,
+        pool_type: str = "devdax",
     ) -> RequestAllocResponse:
         """
         Request a new memory allocation.

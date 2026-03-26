@@ -39,7 +39,10 @@ class AllocationManager:
         logger.info("AllocationManager initialized")
 
     def allocate(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
+        self,
+        instance_id: str,
+        size: int,
+        pool_id: int = ANY_POOL_ID,
         pool_type: str = "devdax",
     ) -> MaruHandle | None:
         """Allocate memory via backend and track ownership."""

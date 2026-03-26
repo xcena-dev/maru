@@ -364,14 +364,21 @@ class RpcAsyncClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
-        pool_type: str = "devdax"
+        self,
+        instance_id: str,
+        size: int,
+        pool_id: int = ANY_POOL_ID,
+        pool_type: str = "devdax",
     ) -> RequestAllocResponse:
         """Request a new memory allocation."""
         response = self._send_request(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": instance_id, "size": size, "pool_id": pool_id,
-             "pool_type": pool_type},
+            {
+                "instance_id": instance_id,
+                "size": size,
+                "pool_id": pool_id,
+                "pool_type": pool_type,
+            },
         )
         return self._parse_request_alloc(response)
 

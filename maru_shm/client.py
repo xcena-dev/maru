@@ -45,7 +45,9 @@ class MaruShmClient:
             self._fd_cache[handle.region_id] = fd
         logger.debug(
             "alloc(size=%d, pool_id=%d) -> region_id=%d",
-            size, pool_id, handle.region_id,
+            size,
+            pool_id,
+            handle.region_id,
         )
         return handle
 

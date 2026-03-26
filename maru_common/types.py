@@ -14,10 +14,12 @@ from typing import Any
 
 class DaxType(IntEnum):
     """Pool type."""
+
     DEV_DAX = 0  # Character device (/dev/daxX.Y)
     FS_DAX = 1  # File-based DAX (mounted filesystem)
     MARUFS = 2  # marufs kernel filesystem (CXL shared memory)
     ANY = 0xFFFFFFFF
+
 
 # Handle binary layout: 4 x uint64 = 32 bytes, native byte order
 _HANDLE_FORMAT = "=QQQQ"

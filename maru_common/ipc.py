@@ -385,8 +385,12 @@ class PermGrantReq:
 
     def pack(self) -> bytes:
         return struct.pack(
-            _PERM_GRANT_REQ_FORMAT, self.region_id, self.node_id,
-            self.pid, self.perms, 0,
+            _PERM_GRANT_REQ_FORMAT,
+            self.region_id,
+            self.node_id,
+            self.pid,
+            self.perms,
+            0,
         )
 
     @classmethod
@@ -412,7 +416,10 @@ class PermRevokeReq:
 
     def pack(self) -> bytes:
         return struct.pack(
-            _PERM_REVOKE_REQ_FORMAT, self.region_id, self.node_id, self.pid,
+            _PERM_REVOKE_REQ_FORMAT,
+            self.region_id,
+            self.node_id,
+            self.pid,
         )
 
     @classmethod
@@ -437,7 +444,10 @@ class PermSetDefaultReq:
 
     def pack(self) -> bytes:
         return struct.pack(
-            _PERM_SET_DEFAULT_REQ_FORMAT, self.region_id, self.perms, 0,
+            _PERM_SET_DEFAULT_REQ_FORMAT,
+            self.region_id,
+            self.perms,
+            0,
         )
 
     @classmethod
