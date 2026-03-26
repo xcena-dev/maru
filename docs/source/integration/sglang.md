@@ -18,9 +18,14 @@ P2P sharing without network transfer.
 
 ## Prerequisites
 
-1. **SGLang with dynamic storage backend support** — requires
-   [sgl-project/sglang#20560](https://github.com/sgl-project/sglang/pull/20560).
-   Install from the PR branch or any release that includes it.
+1. **SGLang ≥ v0.5.6** — required for dynamic storage backend and v1 API.
+
+   An additional fix is **required** for L3 store to work:
+   - **Write-through idle fix** — without this, write-through events are not
+     processed when the scheduler is idle, so KV pages never reach L3 storage.
+     Merged to main as [`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd)
+     ([#20560](https://github.com/sgl-project/sglang/pull/20560)).
+     Install from main or any release that includes it.
 
 2. **Maru** — install with SGLang extras:
    ```bash

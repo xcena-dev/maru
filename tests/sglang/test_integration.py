@@ -8,6 +8,7 @@ not exercised in test_backend.py.  Uses MockMaruHandler — no live server neede
 import ctypes
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from maru_sglang.maru_storage import MaruStorage
@@ -16,10 +17,9 @@ from .conftest import MockHiCacheStorageConfig, MockMaruHandler
 
 
 def _make_backend(
-    is_page_first: bool = True,
     handler: MockMaruHandler | None = None,
 ) -> MaruStorage:
-    cfg = MockHiCacheStorageConfig(is_page_first_layout=is_page_first)
+    cfg = MockHiCacheStorageConfig()
     with patch.object(MaruStorage, "_connect"):
         backend = MaruStorage(cfg, {})
     backend._handler = handler or MockMaruHandler()
@@ -30,9 +30,12 @@ def _make_backend(
 class MockMemPoolHost:
     """Minimal mem_pool_host stub for V1 API tests."""
 
-    def __init__(self, page_size: int, num_pages: int) -> None:
+    def __init__(
+        self, page_size: int, num_pages: int, layout: str = "page_first_direct"
+    ) -> None:
         self._page_size = page_size
         self._buf = (ctypes.c_char * (page_size * num_pages))()
+        self.layout = layout
 
     def get_page_buffer_meta(self, host_indices: torch.Tensor):
         ptr_list = []
@@ -64,15 +67,11 @@ class TestRegisterMemPoolHost:
         backend.register_mem_pool_host(pool)
         assert backend.mem_pool_host is pool
 
-    def test_page_first_flag_set(self):
-        backend = _make_backend(is_page_first=True)
-        backend.register_mem_pool_host(MockMemPoolHost(64, 1))
-        assert backend._is_page_first is True
-
-    def test_page_first_flag_unset(self):
-        backend = _make_backend(is_page_first=False)
-        backend.register_mem_pool_host(MockMemPoolHost(64, 1))
-        assert backend._is_page_first is False
+    def test_non_page_first_rejected(self):
+        """MaruStorage rejects non-page_first at register_mem_pool_host."""
+        backend = _make_backend()
+        with pytest.raises(ValueError, match="page_first"):
+            backend.register_mem_pool_host(MockMemPoolHost(64, 1, layout="layer_first"))
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +87,7 @@ class TestBatchSetV1PageFirst:
         pool.write_page(0, 0xAA)
         pool.write_page(1, 0xBB)
 
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(pool)
 
         host_indices = torch.tensor([0, 1])
@@ -105,7 +104,7 @@ class TestBatchSetV1PageFirst:
         pool = MockMemPoolHost(page_size, 1)
         pool.write_page(0, 0xCC)
 
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(pool)
 
         backend.batch_set_v1(["data_key"], torch.tensor([0]))
@@ -114,38 +113,38 @@ class TestBatchSetV1PageFirst:
         assert result.numel() == page_size
         assert result[0].item() == 0xCC
 
-    def test_alloc_failure_returns_false(self):
-        """If alloc raises, that key gets False in results."""
+    def test_partial_store_failure(self):
+        """If batch_store returns False for some keys, results reflect it."""
         page_size = 64
-        pool = MockMemPoolHost(page_size, 1)
+        pool = MockMemPoolHost(page_size, 2)
+        pool.write_page(0, 0xAA)
+        pool.write_page(1, 0xBB)
 
         handler = MockMaruHandler()
-        orig_alloc = handler.alloc
+        orig_batch_store = handler.batch_store
 
-        call_count = [0]
+        def partial_batch_store(keys, infos):
+            results = orig_batch_store(keys, infos)
+            if len(results) > 1:
+                results[1] = False
+            return results
 
-        def failing_alloc(size):
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                raise ValueError("pool full")
-            return orig_alloc(size)
+        handler.batch_store = partial_batch_store
 
-        handler.alloc = failing_alloc
-
-        backend = _make_backend(is_page_first=True, handler=handler)
+        backend = _make_backend(handler=handler)
         backend.register_mem_pool_host(pool)
 
-        results = backend.batch_set_v1(["ok", "fail"], torch.tensor([0, 0]))
+        results = backend.batch_set_v1(["ok", "fail"], torch.tensor([0, 1]))
         assert results[0] is True
         assert results[1] is False
 
     def test_empty_keys(self):
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(MockMemPoolHost(64, 0))
         assert backend.batch_set_v1([], torch.tensor([])) == []
 
     def test_disconnected_returns_false(self):
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend._handler = None
         backend._connected = False
         with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
@@ -163,7 +162,7 @@ class TestBatchGetV1PageFirst:
         page_size = 16
         pool = MockMemPoolHost(page_size, 1)
 
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(pool)
 
         # Store via set_v1 first
@@ -177,7 +176,7 @@ class TestBatchGetV1PageFirst:
         assert pool.read_page(0)[0] == 0xDD
 
     def test_miss_returns_false(self):
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(MockMemPoolHost(64, 1))
         results = backend.batch_get_v1(["miss"], torch.tensor([0]))
         assert results == [False]
@@ -188,7 +187,7 @@ class TestBatchGetV1PageFirst:
         pool.write_page(0, 0x11)
         pool.write_page(1, 0x22)
 
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(pool)
 
         backend.batch_set_v1(["a", "b"], torch.tensor([0, 1]))
@@ -199,51 +198,13 @@ class TestBatchGetV1PageFirst:
         assert results[2] is True
 
     def test_empty_keys(self):
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend.register_mem_pool_host(MockMemPoolHost(64, 0))
         assert backend.batch_get_v1([], torch.tensor([])) == []
 
     def test_disconnected_returns_false(self):
-        backend = _make_backend(is_page_first=True)
+        backend = _make_backend()
         backend._handler = None
         backend._connected = False
         with patch.object(MaruStorage, "_connect", side_effect=RuntimeError):
             assert backend.batch_get_v1(["k"], torch.tensor([0])) == [False]
-
-
-# ---------------------------------------------------------------------------
-# batch_set_v1 / batch_get_v1 — fallback (non-page_first)
-# ---------------------------------------------------------------------------
-
-
-class TestV1Fallback:
-    def test_batch_set_v1_fallback_all_false(self):
-        """Fallback always returns False — caller should use legacy set."""
-        backend = _make_backend(is_page_first=False)
-        backend.register_mem_pool_host(MockMemPoolHost(64, 2))
-        results = backend.batch_set_v1(["a", "b"], torch.tensor([0, 1]))
-        assert results == [False, False]
-
-    def test_batch_get_v1_fallback_always_false(self):
-        """Fallback always returns False — no data copy to host pool.
-
-        Even for stored keys, fallback returns False to prevent silent data
-        corruption (host pool would contain uninitialised memory).
-        """
-        backend = _make_backend(is_page_first=False)
-        backend.register_mem_pool_host(MockMemPoolHost(64, 3))
-
-        v = torch.ones(4, dtype=torch.float32)
-        backend.set("hit0", value=v)
-        backend.set("hit1", value=v)
-
-        results = backend.batch_get_v1(
-            ["hit0", "hit1", "miss"], torch.tensor([0, 1, 2])
-        )
-        assert results == [False, False, False]
-
-    def test_batch_get_v1_fallback_all_miss(self):
-        backend = _make_backend(is_page_first=False)
-        backend.register_mem_pool_host(MockMemPoolHost(64, 2))
-        results = backend.batch_get_v1(["x", "y"], torch.tensor([0, 1]))
-        assert results == [False, False]

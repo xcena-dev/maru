@@ -7,6 +7,13 @@ operations to MaruHandler for CXL shared-memory KV cache access.
 TODO(CXL-as-L2): Place kv_buffer directly in CXL for L2=L3 zero-copy.
 Blocker: HiCache slot lifecycle (protect freed slots from remote reads).
 
+TODO(KV-split-pool): Non-MLA models keep K and V in separate host buffer
+pools (non-contiguous).  Maru stores one contiguous block per key, so
+batch_set_v1 must concat-copy K+V into a temp buffer before passing to
+batch_store.  Adding separate K/V CXL pools would let each key map to
+two regions, eliminating this intermediate copy.
+See: _design/sglang-hicache-maru/260326_kv-memory-layout-mla-vs-non-mla.md
+
 Usage (SGLang dynamic backend):
     python -m sglang.launch_server \\
         --enable-hierarchical-cache \\
@@ -47,7 +54,6 @@ class MaruStorage(HiCacheStorage):
         )
         self._handler: MaruHandler | None = None
         self._connected: bool = False
-        self._is_page_first: bool = False
         self._suffix = self._build_key_suffix()
         self._connect()
 
@@ -272,14 +278,14 @@ class MaruStorage(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host) -> None:
         """Register L2 host memory pool for zero-copy V1 operations."""
+        layout = getattr(mem_pool_host, "layout", "")
+        if not layout.startswith("page_first"):
+            raise ValueError(
+                f"MaruStorage requires page_first memory layout, got {layout!r}. "
+                "Set --hicache-mem-layout page_first_direct"
+            )
         super().register_mem_pool_host(mem_pool_host)
-        self._is_page_first = self.storage_config.is_page_first_layout or getattr(
-            mem_pool_host, "layout", ""
-        ).startswith("page_first")
-        logger.info(
-            "Registered mem_pool_host, page_first_layout=%s",
-            self._is_page_first,
-        )
+        logger.info("Registered mem_pool_host (layout=%s)", layout)
 
     def batch_get_v1(
         self,
@@ -287,11 +293,7 @@ class MaruStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info=None,
     ) -> list[bool]:
-        """Retrieve KV pages from Maru into host memory pool.
-
-        Uses direct memory copy via ctypes.memmove for page_first layouts;
-        falls back otherwise.
-        """
+        """Retrieve KV pages from Maru into host memory pool via batch RPC."""
         if not self._ensure_connected() or not keys:
             return [False] * len(keys)
 
@@ -306,15 +308,12 @@ class MaruStorage(HiCacheStorage):
             logger.error("batch_get_v1 failed: %s", e)
             return [False] * len(keys)
 
-        if not self._is_page_first:
-            return self._fallback_batch_get_v1(keys, host_indices, infos)
-
         import ctypes
 
-        ptr_list, size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        host_ptrs, host_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
 
         # Determine chunks-per-key ratio (non-MLA: 2 for K+V, MLA: 1).
-        n_ptrs = len(ptr_list)
+        n_ptrs = len(host_ptrs)
         n_keys = len(keys)
         chunks_per_key = n_ptrs // n_keys if n_keys else 1
 
@@ -324,17 +323,17 @@ class MaruStorage(HiCacheStorage):
                 results.append(False)
                 continue
             src_mv = info.view
-            src_base = ctypes.addressof(ctypes.c_char.from_buffer(src_mv))
+            src_addr = ctypes.addressof(ctypes.c_char.from_buffer(src_mv))
             base = key_idx * chunks_per_key
-            offset = 0
+            src_offset = 0
             for c in range(chunks_per_key):
-                chunk_size = size_list[base + c]
-                dst_ptr = ptr_list[base + c]
-                nbytes = min(chunk_size, len(src_mv) - offset)
+                dst_ptr = host_ptrs[base + c]
+                dst_size = host_sizes[base + c]
+                nbytes = min(dst_size, len(src_mv) - src_offset)
                 if nbytes <= 0:
                     break
-                ctypes.memmove(dst_ptr, src_base + offset, nbytes)
-                offset += chunk_size
+                ctypes.memmove(dst_ptr, src_addr + src_offset, nbytes)
+                src_offset += dst_size
             results.append(True)
         hits = sum(results)
         logger.debug("batch_get_v1 result: %d/%d hits", hits, n_keys)
@@ -348,20 +347,19 @@ class MaruStorage(HiCacheStorage):
     ) -> list[bool]:
         """Store KV pages from host memory pool into Maru.
 
-        Uses alloc + memmove + store for page_first layouts;
-        falls back otherwise.
+        Collects host page data as zero-copy memoryviews and delegates
+        to batch_store for a single batch RPC.
         """
         if not self._ensure_connected() or not keys:
             return [False] * len(keys)
-
-        if not self._is_page_first:
-            return self._fallback_batch_set_v1(keys, host_indices)
 
         import ctypes
 
         full_keys = [self._make_key(k) for k in keys]
         try:
-            ptr_list, size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            host_ptrs, host_sizes = self.mem_pool_host.get_page_buffer_meta(
+                host_indices
+            )
         except Exception as e:
             logger.error("batch_set_v1 get_page_buffer_meta failed: %s", e)
             return [False] * len(keys)
@@ -369,74 +367,42 @@ class MaruStorage(HiCacheStorage):
         # Determine chunks-per-key ratio.
         # Non-MLA models return separate K and V entries (2 per key);
         # MLA models return a single combined entry (1 per key).
-        n_ptrs = len(ptr_list)
+        n_ptrs = len(host_ptrs)
         n_keys = len(keys)
         chunks_per_key = n_ptrs // n_keys if n_keys else 1
 
-        # Batch alloc + memcpy, then batch store
-        handles: list = [None] * n_keys
-        valid_indices: list[int] = []
+        # Collect host page data as memoryviews for batch_store.
+        # MLA (1 chunk/key): zero-copy view from host page.
+        # Non-MLA (K+V in separate buffer pools): concatenate into owned buffer.
+        infos: list[memoryview] = []
         for key_idx in range(n_keys):
-            # Gather all chunks (K, V, …) belonging to this key
             base = key_idx * chunks_per_key
-            total_size = sum(size_list[base + c] for c in range(chunks_per_key))
-            try:
-                handle = self._handler.alloc(total_size)
-            except (ValueError, RuntimeError):
-                logger.warning("alloc failed for key %s", keys[key_idx])
-                continue
+            if chunks_per_key == 1:
+                src_size = host_sizes[base]
+                src_view = (ctypes.c_char * src_size).from_address(host_ptrs[base])
+                infos.append(memoryview(src_view))
+            else:
+                total_size = sum(host_sizes[base + c] for c in range(chunks_per_key))
+                dst_buf = (ctypes.c_char * total_size)()
+                dst_offset = 0
+                for c in range(chunks_per_key):
+                    src_ptr = host_ptrs[base + c]
+                    src_size = host_sizes[base + c]
+                    ctypes.memmove(
+                        ctypes.addressof(dst_buf) + dst_offset, src_ptr, src_size
+                    )
+                    dst_offset += src_size
+                infos.append(memoryview(dst_buf))
 
-            # Copy each chunk sequentially into the allocated buffer
-            dst_base = ctypes.addressof(ctypes.c_char.from_buffer(handle.buf))
-            offset = 0
-            for c in range(chunks_per_key):
-                chunk_ptr = ptr_list[base + c]
-                chunk_size = size_list[base + c]
-                ctypes.memmove(dst_base + offset, chunk_ptr, chunk_size)
-                offset += chunk_size
+        try:
+            results = self._handler.batch_store(full_keys, infos)
+        except Exception as e:
+            logger.error("batch_set_v1 batch_store failed: %s", e)
+            return [False] * len(keys)
 
-            handles[key_idx] = handle
-            valid_indices.append(key_idx)
-
-        # Batch register via store with handle (zero-copy path)
-        results: list[bool] = [False] * n_keys
-        for i in valid_indices:
-            handle = handles[i]
-            if handle is not None:
-                try:
-                    success = self._handler.store(full_keys[i], handle=handle)
-                    results[i] = success
-                except Exception as e:
-                    logger.error("batch_set_v1 store failed for key %s: %s", keys[i], e)
         stored = sum(results)
-        logger.debug("batch_set_v1 %d/%d stored", stored, len(keys))
+        logger.debug("batch_set_v1 %d/%d stored", stored, n_keys)
         return results
-
-    # ------------------------------------------------------------------
-    # Fallback paths for non-page_first layouts
-    # ------------------------------------------------------------------
-
-    def _fallback_batch_get_v1(
-        self,
-        keys: list[str],
-        host_indices: torch.Tensor,
-        infos: list,
-    ) -> list[bool]:
-        """Fallback: return all False to signal caller should use legacy API.
-
-        Without page_first layout, we cannot directly copy into the host memory
-        pool.  Returning False for all keys tells SGLang to skip L3 for this
-        batch rather than using uninitialised memory (silent data corruption).
-        """
-        return [False] * len(keys)
-
-    def _fallback_batch_set_v1(
-        self,
-        keys: list[str],
-        host_indices: torch.Tensor,
-    ) -> list[bool]:
-        """Fallback: return all False to signal caller should use legacy API."""
-        return [False] * len(keys)
 
     # ------------------------------------------------------------------
     # Lifecycle

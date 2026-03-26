@@ -45,6 +45,13 @@ class TestKeySuffix:
         backend = _make_backend(cfg)
         assert backend._suffix == "_deepseek-ai-DeepSeek-V3"
 
+    def test_model_name_none(self):
+        """model_name=None is safely handled — no '_None' in suffix."""
+        cfg = MockHiCacheStorageConfig(model_name=None, tp_rank=0, tp_size=1)
+        backend = _make_backend(cfg)
+        assert "None" not in backend._suffix
+        assert backend._suffix == "__0_1"
+
     def test_make_key(self):
         backend = _make_backend()
         key = backend._make_key("abc123")
