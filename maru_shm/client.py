@@ -11,10 +11,10 @@ import mmap as mmap_module
 import os
 import threading
 
+from maru_common.resource_manager_client import ResourceManagerClient
+
 from .constants import ANY_POOL_ID, MAP_SHARED
 from .types import MaruHandle, MaruPoolInfo
-
-from maru_common.resource_manager_client import ResourceManagerClient
 
 logger = logging.getLogger(__name__)
 

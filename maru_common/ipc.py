@@ -15,7 +15,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from maru_common.constants import DEFAULT_SOCKET_PATH, ANY_POOL_ID
+from maru_common.constants import ANY_POOL_ID
 from maru_common.types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants

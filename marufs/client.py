@@ -9,9 +9,9 @@ import mmap as mmap_module
 import os
 import threading
 
-from maru_common.resource_manager_client import ResourceManagerClient
-from maru_common.types import MaruHandle, DaxType
 from maru_common.constants import ANY_POOL_ID
+from maru_common.resource_manager_client import ResourceManagerClient
+from maru_common.types import DaxType, MaruHandle
 
 logger = logging.getLogger(__name__)
 

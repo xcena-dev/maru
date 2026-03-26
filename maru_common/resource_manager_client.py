@@ -7,11 +7,12 @@ Used by both MaruShmClient and MarufsClient.
 """
 
 import logging
+import os
 import socket
 
-import os
-
 from maru_common.ipc import (
+    ANY_POOL_ID,
+    DEFAULT_SOCKET_PATH,
     HEADER_SIZE,
     AllocReq,
     AllocResp,
@@ -30,7 +31,6 @@ from maru_common.ipc import (
     StatsReq,
     StatsResp,
 )
-from maru_common.ipc import DEFAULT_SOCKET_PATH, ANY_POOL_ID
 from maru_common.types import DaxType, MaruHandle, MaruPoolInfo
 from maru_common.uds_helpers import read_full, recv_with_fd, write_full
 
