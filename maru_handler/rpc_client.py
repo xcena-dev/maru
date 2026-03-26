@@ -127,7 +127,8 @@ class RpcClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
+        pool_type: str = "devdax"
     ) -> RequestAllocResponse:
         """
         Request a new memory allocation.
@@ -136,6 +137,7 @@ class RpcClient:
             instance_id: Client instance identifier
             size: Requested size in bytes
             pool_id: Pool to allocate from (ANY_POOL_ID means any pool)
+            pool_type: Pool type ("devdax" or "marufs")
 
         Returns:
             RequestAllocResponse with handle on success
@@ -146,6 +148,7 @@ class RpcClient:
                 "instance_id": instance_id,
                 "size": size,
                 "pool_id": pool_id,
+                "pool_type": pool_type,
             },
         )
 
@@ -158,7 +161,10 @@ class RpcClient:
         handle_data = response.get("handle", {})
         handle = MaruHandle.from_dict(handle_data) if handle_data else None
 
-        return RequestAllocResponse(success=True, handle=handle)
+        return RequestAllocResponse(
+            success=True,
+            handle=handle,
+        )
 
     def list_allocations(
         self, exclude_instance_id: str | None = None

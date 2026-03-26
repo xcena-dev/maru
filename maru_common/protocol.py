@@ -16,8 +16,8 @@ import struct
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
-from maru_shm.constants import ANY_POOL_ID
-from maru_shm.types import MaruHandle
+from maru_common.constants import ANY_POOL_ID
+from maru_common.types import MaruHandle
 
 # =============================================================================
 # Protocol Constants
@@ -160,6 +160,7 @@ class RequestAllocRequest:
     instance_id: str
     size: int
     pool_id: int = ANY_POOL_ID
+    pool_type: str = "devdax"
 
 
 @dataclass

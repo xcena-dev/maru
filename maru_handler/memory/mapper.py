@@ -13,7 +13,10 @@ import os
 import threading
 import time
 
-from maru_shm import PROT_READ, PROT_WRITE, MaruHandle, MaruShmClient
+from maru_common.constants import PROT_READ, PROT_WRITE
+from maru_common.types import MaruHandle
+from maru_shm import MaruShmClient
+from marufs import MarufsClient
 
 from .types import MappedRegion
 
@@ -38,8 +41,11 @@ class DaxMapper:
         mapper.unmap_region(handle.region_id)
     """
 
-    def __init__(self):
-        self._client = MaruShmClient()
+    def __init__(self, pool_type: str = "devdax"):
+        if pool_type == "marufs":
+            self._client = MarufsClient()
+        else:
+            self._client = MaruShmClient()
         self._lock = threading.Lock()
         self._regions: dict[int, MappedRegion] = {}
 

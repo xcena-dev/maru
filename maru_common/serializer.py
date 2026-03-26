@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 import msgpack
 from dacite import Config, from_dict
 
-from maru_shm.types import MaruHandle, MaruPoolInfo
+from maru_common.types import MaruHandle, MaruPoolInfo
 
 from .protocol import (
     HEADER_SIZE,

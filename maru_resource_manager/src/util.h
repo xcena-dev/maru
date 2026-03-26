@@ -27,5 +27,6 @@ uint32_t crc32(const void *data, size_t len);
 uint64_t getPidStartTime(pid_t pid);
 
 static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
+static constexpr uint32_t kAnyPoolType = 0xFFFFFFFFu;
 
 } // namespace maru

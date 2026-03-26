@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from threading import RLock
 
 from maru_common.protocol import ANY_POOL_ID
-from maru_shm import MaruHandle, MaruShmClient
+from maru_common.types import MaruHandle
+from maru_shm import MaruShmClient
+from marufs import MarufsClient
 
 logger = logging.getLogger(__name__)
 
@@ -23,19 +25,27 @@ class AllocationInfo:
 
 
 class AllocationManager:
-    """Manages memory allocation lifecycle."""
+    """Manages memory allocation lifecycle.
+
+    Uses MaruShmClient to communicate with the Resource Manager.
+    Pool type (DEV_DAX/MARUFS) is selected per-request via pool_type parameter.
+    """
 
     def __init__(self):
-        self._client = MaruShmClient()
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
+        self._dax_client = MaruShmClient()
+        self._marufs_client = MarufsClient()
+        logger.info("AllocationManager initialized")
 
     def allocate(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
+        pool_type: str = "devdax",
     ) -> MaruHandle | None:
-        """Allocate memory via ShmClient and track ownership."""
+        """Allocate memory via backend and track ownership."""
+        client = self._marufs_client if pool_type == "marufs" else self._dax_client
         try:
-            handle = self._client.alloc(size, pool_id=pool_id)
+            handle = client.alloc(size, pool_id=pool_id)
         except RuntimeError as e:
             logger.warning(
                 "alloc failed for instance=%s size=%d pool_id=%s: %s",
@@ -94,7 +104,7 @@ class AllocationManager:
                     region_id,
                     info.owner_instance_id,
                 )
-                self._client.free(info.handle)
+                self._dax_client.free(info.handle)
                 del self._allocations[region_id]
 
             return True
@@ -119,7 +129,7 @@ class AllocationManager:
                     instance_id,
                     info.kv_ref_count,
                 )
-                self._client.free(info.handle)
+                self._dax_client.free(info.handle)
                 del self._allocations[region_id]
             else:
                 logger.info(
@@ -151,7 +161,7 @@ class AllocationManager:
                     instance_id,
                     info.kv_ref_count,
                 )
-                self._client.free(info.handle)
+                self._dax_client.free(info.handle)
                 del self._allocations[region_id]
 
     def list_allocations(

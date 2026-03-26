@@ -33,7 +33,7 @@ graph TB
     style P6 fill:#e0e0e0,stroke:#999
 ```
 
-**Pool** — The total CXL device capacity managed by the Resource Manager. Discovered at startup via hardware enumeration. Multiple physical devices can form multiple independent pools.
+**Pool** — The total CXL device capacity managed by the Resource Manager. In DAX mode, pools are discovered at startup via hardware enumeration of `/dev/dax` devices. In marufs mode, pools are discovered by scanning `/proc/mounts` for `marufs` filesystem mounts. Multiple physical devices or mounts can form multiple independent pools.
 
 **Region** — A contiguous allocation carved from a pool. Size is determined by the client's `pool_size` configuration. Regions are the unit of allocation, ownership, and shared access.
 
@@ -142,7 +142,9 @@ The Resource Manager also verifies process identity at connection time, ensuring
 
 The **data path is untrusted** — clients read and write shared memory directly without server mediation. The **metadata path is trusted** — only the server can update the key-to-location index. This separation means a compromised client can corrupt data in its own regions but cannot redirect other clients' keys to arbitrary locations.
 
-> See also: [MaruResourceManager — Security](maru_resource_manager.md#6-security)
+When marufs is used as the memory backend, the kernel enforces additional permission control via `perm_set_default` and `perm_grant`. The server sets default permissions on allocated regions so that only authorized clients can map them, providing stronger isolation than user-space capability tokens alone.
+
+> See also: [MaruResourceManager — Security](maru_resource_manager.md#6-security), [Maru FS — Kernel-Level Access Control](maru_fs.md)
 
 ---
 

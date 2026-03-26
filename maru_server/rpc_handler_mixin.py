@@ -60,21 +60,24 @@ class RpcHandlerMixin:
             instance_id=req.instance_id,
             size=req.size,
             pool_id=req.pool_id,
+            pool_type=getattr(req, "pool_type", "devdax"),
         )
         if handle is None:
             logger.debug(
-                "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> FAILED",
+                "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s pool_type=%s -> FAILED",
                 req.instance_id,
                 req.size,
                 req.pool_id,
+                req.pool_type,
             )
             return {"success": False, "error": "Allocation failed"}
         logger.debug(
-            "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s -> region_id=%d",
+            "[REQUEST_ALLOC] instance=%s, size=%d, pool_id=%s pool_type=%s -> region_id=%d",
             req.instance_id,
             req.size,
             req.pool_id,
             handle.region_id,
+            req.pool_type,
         )
         return {"success": True, "handle": handle.to_dict()}
 

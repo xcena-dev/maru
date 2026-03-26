@@ -264,7 +264,7 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
     AllocReq req{};
     req.size = size;
     req.poolId = poolId;
-    req.reserved = 0;
+    req.poolType = 0;
 
     if (sendRequest(fd, MsgType::ALLOC_REQ, &req, sizeof(req)) != 0)
     {
@@ -445,7 +445,9 @@ static int cmdStats()
         off += sizeof(pi);
 
         const char *typeStr =
-            (pi.type == DaxType::DEV_DAX) ? "DEV_DAX" : "FS_DAX";
+            (pi.type == DaxType::DEV_DAX)  ? "DEV_DAX"
+            : (pi.type == DaxType::MARUFS) ? "MARUFS"
+                                           : "FS_DAX";
         double usedPct =
             (pi.totalSize > 0)
                 ? 100.0 *

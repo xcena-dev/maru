@@ -10,6 +10,7 @@ namespace maru {
 enum class DaxType : uint32_t {
   DEV_DAX = 0, ///< Character device (/dev/daxX.Y)
   FS_DAX = 1,  ///< File-based DAX (mounted filesystem)
+  MARUFS = 2,  ///< marufs kernel filesystem (CXL shared memory)
 };
 
 /** @brief Handle for an allocation within a pool-backed DAX device. */
@@ -28,7 +29,7 @@ struct Handle {
 struct PoolInfo {
   /** @brief Pool identifier. */
   uint32_t poolId;
-  /** @brief DAX device type (DEV_DAX or FS_DAX). */
+  /** @brief DAX device type (DEV_DAX, FS_DAX, or MARUFS). */
   DaxType type;
   /** @brief Total pool size in bytes. */
   uint64_t totalSize;

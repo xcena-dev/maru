@@ -19,7 +19,8 @@ add_executable(maru_resourced
     src/uds_server.cpp
 )
 
-target_include_directories(maru_resourced PRIVATE include src)
+target_include_directories(maru_resourced PRIVATE include src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../marufs_kernel/include)
 
 target_compile_options(maru_resourced PRIVATE -Wall -Wextra -Wpedantic)
 

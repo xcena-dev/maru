@@ -16,19 +16,19 @@ flowchart TB
         MaruServer["MaruServer<br/>Atomic coordination<br/>Business logic"]
         KVManager["KVManager<br/>Key → location<br/>Ref counting"]
         AllocMgr["AllocationManager<br/>Region lifecycle<br/>Deferred freeing"]
-        ShmClient["MaruShmClient<br/>(alloc/free only)"]
+        MemClient["Memory Backend<br/>(MaruShmClient | MarufsClient)"]
 
         RpcServer -->|"dispatch"| MaruServer
         MaruServer -->|"KV metadata"| KVManager
         MaruServer -->|"memory allocation"| AllocMgr
-        AllocMgr -->|"RPC"| ShmClient
+        AllocMgr -->|"alloc/free"| MemClient
     end
 
     Clients["MaruHandler #1..N"]
     Clients <-->|"ZMQ RPC"| RpcServer
 
     RM["Maru Resource Manager"]
-    ShmClient <-->|"alloc / free"| RM
+    MemClient <-->|"alloc / free"| RM
 
     style RpcServer fill:#e3f2fd,stroke:#1565c0
     style MaruServer fill:#e8f5e9,stroke:#4a9
@@ -42,7 +42,7 @@ flowchart TB
 
 `KVManager` maintains a key-to-location mapping, where each entry records the region ID, offset, and length of a stored KV pair. Duplicate key registrations are handled idempotently.
 
-`AllocationManager` tracks all CXL memory allocations with records that include the owner instance, a KV reference count, and a connection flag. It communicates with the Resource Manager to perform physical allocation and deallocation.
+`AllocationManager` tracks all CXL memory allocations with records that include the owner instance, a KV reference count, and a connection flag. It communicates with the C++ Resource Manager via a memory backend (`MaruShmClient` or `MarufsClient`, selected by the server's `mount_path` configuration). Both backends delegate to the Resource Manager through `ResourceManagerClient` for physical allocation, deallocation, and permission management. When marufs is configured, allocation responses include the `mount_path` so clients can select the matching backend.
 
 ---
 

@@ -51,6 +51,7 @@ class MaruConfig:
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
     pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
+    pool_type: str = "devdax"  # "devdax" or "marufs"
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""

@@ -26,6 +26,8 @@
 #include <linux/fs.h>
 #endif
 
+#include "marufs_uapi.h"
+
 namespace maru
 {
 
@@ -214,6 +216,53 @@ static void deleteFsDaxFile(const std::string &mountPoint, uint64_t regionId)
     ::unlink(filename.c_str());
 }
 
+// MARUFS file helpers (region files on marufs kernel filesystem)
+
+static std::string makeMarufsFilePath(const std::string &mountPoint,
+                                      uint64_t regionId)
+{
+    char filename[512];
+    std::snprintf(filename, sizeof(filename), "%s/region_%llu",
+                  mountPoint.c_str(), (unsigned long long)regionId);
+    return std::string(filename);
+}
+
+static int createMarufsFile(const std::string &mountPoint, uint64_t regionId,
+                            uint64_t size)
+{
+    std::string filename = makeMarufsFilePath(mountPoint, regionId);
+    int fd = ::open(filename.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd < 0)
+    {
+        return -errno;
+    }
+    if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
+    {
+        int err = errno;
+        ::close(fd);
+        ::unlink(filename.c_str());
+        return -err;
+    }
+
+    // Set default permissions so instances can access the region
+    struct marufs_perm_req preq = {};
+    preq.perms = MARUFS_PERM_ALL;
+    ::ioctl(fd, MARUFS_IOC_PERM_SET_DEFAULT, &preq);
+    ::close(fd);
+
+    logf(LogLevel::Debug,
+         "createMarufsFile: made file %s",
+         filename.c_str());
+
+    return 0;
+}
+
+static void deleteMarufsFile(const std::string &mountPoint, uint64_t regionId)
+{
+    std::string filename = makeMarufsFilePath(mountPoint, regionId);
+    ::unlink(filename.c_str());
+}
+
 static bool getRegionIndexForDax(const std::string &devName,
                                  uint32_t &outIndex)
 {
@@ -350,6 +399,27 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
         outDevices.push_back(DeviceInfo{kv.first, kv.second, DaxType::FS_DAX});
     }
 
+    // Scan for MARUFS mounts
+    FILE *fp = setmntent(kProcMounts, "r");
+    if (fp)
+    {
+        uint32_t marufsPoolId = 1000;
+        struct mntent *entry;
+        while ((entry = getmntent(fp)) != nullptr)
+        {
+            if (std::strcmp(entry->mnt_type, "marufs") == 0)
+            {
+                logf(LogLevel::Debug,
+                     "scanDevices: found MARUFS mount at %s",
+                     entry->mnt_dir);
+                outDevices.push_back(
+                    DeviceInfo{marufsPoolId++, entry->mnt_dir,
+                                DaxType::MARUFS});
+            }
+        }
+        endmntent(fp);
+    }
+
     return 0;
 }
 
@@ -430,16 +500,34 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
             }
         }
     }
-    pool.freeList.push_back(Extent{0, size});
-
-    PoolState loaded = pool;
-    rc = metadata_->load(poolId, loaded);
-    if (rc == 0)
+    else if (type == DaxType::MARUFS)
     {
-        loaded.devPath = path;
-        loaded.totalSize = size;
-        loaded.alignBytes = pool.alignBytes;
-        pool = loaded;
+        // MARUFS: kernel RAT manages allocation, no alignment override needed.
+        // freeSize from statfs (available space on marufs mount).
+        struct statfs fs;
+        if (::statfs(path.c_str(), &fs) == 0)
+        {
+            pool.freeSize =
+                static_cast<uint64_t>(fs.f_bsize) *
+                static_cast<uint64_t>(fs.f_bavail);
+        }
+    }
+
+    // MARUFS: no free-list (kernel RAT handles allocation)
+    // MARUFS: no daemon-side metadata (kernel RAT is persistent)
+    if (type != DaxType::MARUFS)
+    {
+        pool.freeList.push_back(Extent{0, size});
+
+        PoolState loaded = pool;
+        rc = metadata_->load(poolId, loaded);
+        if (rc == 0)
+        {
+            loaded.devPath = path;
+            loaded.totalSize = size;
+            loaded.alignBytes = pool.alignBytes;
+            pool = loaded;
+        }
     }
 
     pools_.push_back(pool);
@@ -654,6 +742,34 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
                                    Allocation &outAlloc)
 {
     uint64_t alignedSize = alignUp(size, pool.alignBytes);
+
+    logf(LogLevel::Debug, "allocateFromPool: id %d, type %d",
+         pool.poolId,
+         static_cast<int>(pool.type));
+         
+    // MARUFS: kernel RAT manages allocation, skip free-list
+    if (pool.type == DaxType::MARUFS)
+    {
+        uint64_t regionId = nextRegionId_++;
+        int rc = createMarufsFile(pool.devPath, regionId, alignedSize);
+        if (rc != 0)
+        {
+            return false;
+        }
+
+        Handle h{};
+        h.regionId = regionId;
+        h.offset = 0;
+        h.length = alignedSize;
+        outAlloc.handle = h;
+        outAlloc.nonce = generateNonce();
+        outAlloc.requestedSize = size;
+        outAlloc.allocLength = alignedSize;
+        outAlloc.poolId = pool.poolId;
+        outAlloc.realOffset = 0;
+        return true;
+    }
+
     for (size_t i = 0; i < pool.freeList.size(); ++i)
     {
         Extent ex = pool.freeList[i];
@@ -717,8 +833,26 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
     return false;
 }
 
+bool PoolManager::checkPoolCondition(const PoolState& pool,
+                                     uint32_t poolId,
+                                     uint32_t poolType)
+{
+    if ((poolId != kAnyPoolId) && (pool.poolId != poolId))
+    {
+        return false;
+    }
+
+    if ((poolType != kAnyPoolType) && (static_cast<uint32_t>(pool.type) != poolType))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+
 int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
-                       std::string &devPath, uint32_t poolId,
+                       std::string &devPath, uint32_t poolId, uint32_t poolType,
                        uint64_t &requestedSizeOut)
 {
     std::lock_guard<std::mutex> lock(mu_);
@@ -730,44 +864,26 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
     Allocation alloc{};
     PoolState *selectedPool = nullptr;
 
-    if (poolId != kAnyPoolId)
+    for (auto &pool : pools_)
     {
-        for (auto &pool : pools_)
+        if (checkPoolCondition(pool, poolId, poolType) == false)
         {
-            if (pool.poolId != poolId)
-            {
-                continue;
-            }
-            if (!allocateFromPool(pool, size, alloc))
-            {
-                return -ENOMEM;
-            }
-            alloc.ownerId = ownerId;
-            pool.freeSize -= alloc.allocLength;
-            selectedPool = &pool;
-            break;
+            continue;
         }
-        if (!selectedPool)
+
+        if (allocateFromPool(pool, size, alloc) == false)
         {
-            return -ENOENT;
+            continue;
         }
+
+        alloc.ownerId = ownerId;
+        pool.freeSize -= alloc.allocLength;
+        selectedPool = &pool;
+        break;
     }
-    else
+    if (!selectedPool)
     {
-        for (auto &pool : pools_)
-        {
-            if (allocateFromPool(pool, size, alloc))
-            {
-                alloc.ownerId = ownerId;
-                pool.freeSize -= alloc.allocLength;
-                selectedPool = &pool;
-                break;
-            }
-        }
-        if (!selectedPool)
-        {
-            return -ENOMEM;
-        }
+        return -ENOMEM;
     }
 
     alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce);
@@ -792,6 +908,10 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
     if (selectedPool->type == DaxType::FS_DAX)
     {
         devPath = makeFsDaxFilePath(selectedPool->devPath, alloc.handle.regionId);
+    }
+    else if (selectedPool->type == DaxType::MARUFS)
+    {
+        devPath = makeMarufsFilePath(selectedPool->devPath, alloc.handle.regionId);
     }
     else
     {
@@ -834,8 +954,15 @@ int PoolManager::free(const Handle &handle, uint64_t ownerId)
     {
         deleteFsDaxFile(targetPool->devPath, handle.regionId);
     }
+    else if (targetPool->type == DaxType::MARUFS)
+    {
+        deleteMarufsFile(targetPool->devPath, handle.regionId);
+    }
 
-    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+    if (targetPool->type != DaxType::MARUFS)
+    {
+        insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+    }
     targetPool->freeSize += alloc.allocLength;
 
     // Update PID refcount
@@ -896,6 +1023,10 @@ int PoolManager::getPathForHandle(const Handle &handle, std::string &outPath)
     if (pool->type == DaxType::FS_DAX)
     {
         outPath = makeFsDaxFilePath(pool->devPath, handle.regionId);
+    }
+    else if (pool->type == DaxType::MARUFS)
+    {
+        outPath = makeMarufsFilePath(pool->devPath, handle.regionId);
     }
     else
     {
@@ -959,8 +1090,15 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
         {
             deleteFsDaxFile(targetPool->devPath, regionId);
         }
+        else if (targetPool->type == DaxType::MARUFS)
+        {
+            deleteMarufsFile(targetPool->devPath, regionId);
+        }
 
-        insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+        if (targetPool->type != DaxType::MARUFS)
+        {
+            insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+        }
         targetPool->freeSize += alloc.allocLength;
 
         // Update PID refcount — O(1) instead of scanning all allocations
@@ -1001,6 +1139,74 @@ bool PoolManager::verifyAuthToken(const Handle &handle)
 
     uint64_t expectedToken = computeAuthToken(handle, it->second.nonce);
     return handle.authToken == expectedToken;
+}
+
+// ── marufs ioctl delegation ──────────────────────────────────────────
+
+static int openRegionFd(PoolManager &pm, uint64_t regionId)
+{
+    std::string path;
+    int rc = pm.getPathForHandle(Handle{regionId, 0, 0, 0}, path);
+    if (rc != 0)
+        return -1;
+    return ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+}
+
+int PoolManager::permGrant(uint64_t regionId, uint32_t nodeId, uint32_t pid,
+                           uint32_t perms)
+{
+    int fd = openRegionFd(*this, regionId);
+    if (fd < 0)
+        return -errno;
+    struct marufs_perm_req req = {};
+    req.node_id = nodeId;
+    req.pid = pid;
+    req.perms = perms;
+    int rc = ::ioctl(fd, MARUFS_IOC_PERM_GRANT, &req);
+    int err = errno;
+    ::close(fd);
+    return rc == 0 ? 0 : -err;
+}
+
+int PoolManager::permRevoke(uint64_t regionId, uint32_t nodeId, uint32_t pid)
+{
+    int fd = openRegionFd(*this, regionId);
+    if (fd < 0)
+        return -errno;
+    struct marufs_perm_req req = {};
+    req.node_id = nodeId;
+    req.pid = pid;
+    req.perms = 0;
+    int rc = ::ioctl(fd, MARUFS_IOC_PERM_GRANT, &req);
+    int err = errno;
+    ::close(fd);
+    return rc == 0 ? 0 : -err;
+}
+
+int PoolManager::permSetDefault(uint64_t regionId, uint32_t perms)
+{
+    int fd = openRegionFd(*this, regionId);
+    if (fd < 0)
+        return -errno;
+    struct marufs_perm_req req = {};
+    req.perms = perms;
+    int rc = ::ioctl(fd, MARUFS_IOC_PERM_SET_DEFAULT, &req);
+    int err = errno;
+    ::close(fd);
+    return rc == 0 ? 0 : -err;
+}
+
+int PoolManager::chownRegion(uint64_t regionId)
+{
+    int fd = openRegionFd(*this, regionId);
+    if (fd < 0)
+        return -errno;
+    struct marufs_chown_req req = {};
+    req.reserved = 0;
+    int rc = ::ioctl(fd, MARUFS_IOC_CHOWN, &req);
+    int err = errno;
+    ::close(fd);
+    return rc == 0 ? 0 : -err;
 }
 
 }  // namespace maru

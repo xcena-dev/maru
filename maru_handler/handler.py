@@ -111,7 +111,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper()
+        self._mapper = DaxMapper(pool_type=self._config.pool_type)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -157,6 +157,7 @@ class MaruHandler:
                         instance_id=self._config.instance_id,
                         size=self._config.pool_size,
                         pool_id=pool_id,
+                        pool_type=self._config.pool_type,
                     )
                 except Exception:
                     logger.error(
@@ -1004,6 +1005,7 @@ class MaruHandler:
                     instance_id=self._config.instance_id,
                     size=self._config.pool_size,
                     pool_id=pool_id,
+                    pool_type=self._config.pool_type,
                 )
             except Exception:
                 logger.error(

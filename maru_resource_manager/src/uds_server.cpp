@@ -434,7 +434,7 @@ void UdsServer::handleClient(int clientFd)
         Handle handle{};
         std::string devPath;
         uint64_t requestedSize = 0;
-        int32_t status = pm_.alloc(req.size, cred.pid, handle, devPath, req.poolId, requestedSize);
+        int32_t status = pm_.alloc(req.size, cred.pid, handle, devPath, req.poolId, req.poolType, requestedSize);
 
         AllocResp resp{};
         resp.status = status;
@@ -572,6 +572,90 @@ void UdsServer::handleClient(int clientFd)
         {
             ::close(daxFd);
         }
+    }
+    else if (type == MsgType::PERM_GRANT_REQ)
+    {
+        if (payload.size() != sizeof(PermGrantReq))
+        {
+            sendError(clientFd, -EPROTO, "bad perm_grant req");
+            ::close(clientFd);
+            return;
+        }
+        PermGrantReq req{};
+        std::memcpy(&req, payload.data(), sizeof(req));
+        int32_t status = pm_.permGrant(req.regionId, req.nodeId, req.pid, req.perms);
+        PermResp resp{};
+        resp.status = status;
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::PERM_GRANT_RESP);
+        rh.payloadLen = sizeof(resp);
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &resp, sizeof(resp));
+    }
+    else if (type == MsgType::PERM_REVOKE_REQ)
+    {
+        if (payload.size() != sizeof(PermRevokeReq))
+        {
+            sendError(clientFd, -EPROTO, "bad perm_revoke req");
+            ::close(clientFd);
+            return;
+        }
+        PermRevokeReq req{};
+        std::memcpy(&req, payload.data(), sizeof(req));
+        int32_t status = pm_.permRevoke(req.regionId, req.nodeId, req.pid);
+        PermResp resp{};
+        resp.status = status;
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::PERM_REVOKE_RESP);
+        rh.payloadLen = sizeof(resp);
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &resp, sizeof(resp));
+    }
+    else if (type == MsgType::PERM_SET_DEFAULT_REQ)
+    {
+        if (payload.size() != sizeof(PermSetDefaultReq))
+        {
+            sendError(clientFd, -EPROTO, "bad perm_set_default req");
+            ::close(clientFd);
+            return;
+        }
+        PermSetDefaultReq req{};
+        std::memcpy(&req, payload.data(), sizeof(req));
+        int32_t status = pm_.permSetDefault(req.regionId, req.perms);
+        PermResp resp{};
+        resp.status = status;
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::PERM_SET_DEFAULT_RESP);
+        rh.payloadLen = sizeof(resp);
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &resp, sizeof(resp));
+    }
+    else if (type == MsgType::CHOWN_REQ)
+    {
+        if (payload.size() != sizeof(ChownReq))
+        {
+            sendError(clientFd, -EPROTO, "bad chown req");
+            ::close(clientFd);
+            return;
+        }
+        ChownReq req{};
+        std::memcpy(&req, payload.data(), sizeof(req));
+        int32_t status = pm_.chownRegion(req.regionId);
+        PermResp resp{};
+        resp.status = status;
+        MsgHeader rh{};
+        rh.magic = kMagic;
+        rh.version = kVersion;
+        rh.type = static_cast<uint16_t>(MsgType::CHOWN_RESP);
+        rh.payloadLen = sizeof(resp);
+        writeFull(clientFd, &rh, sizeof(rh));
+        writeFull(clientFd, &resp, sizeof(resp));
     }
     else
     {

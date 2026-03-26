@@ -18,6 +18,15 @@ enum class MsgType : uint16_t {
   STATS_RESP = 6,
   GET_FD_REQ = 9,
   GET_FD_RESP = 10,
+  // marufs permission ioctls (region_id identifies the target)
+  PERM_GRANT_REQ = 11,
+  PERM_GRANT_RESP = 12,
+  PERM_REVOKE_REQ = 13,
+  PERM_REVOKE_RESP = 14,
+  PERM_SET_DEFAULT_REQ = 15,
+  PERM_SET_DEFAULT_RESP = 16,
+  CHOWN_REQ = 17,
+  CHOWN_RESP = 18,
   ERROR_RESP = 255
 };
 
@@ -31,7 +40,7 @@ struct MsgHeader {
 struct AllocReq {
   uint64_t size;
   uint32_t poolId;
-  uint32_t reserved;
+  uint32_t poolType;
 };
 
 struct AllocResp {
@@ -59,6 +68,35 @@ struct GetFdResp {
 
 struct StatsRespHeader {
   uint32_t numPools;
+};
+
+// marufs permission request (matches kernel marufs_perm_req layout)
+struct PermGrantReq {
+  uint64_t regionId;   // target region
+  uint32_t nodeId;     // grantee node
+  uint32_t pid;        // grantee PID
+  uint32_t perms;      // permission flags (PERM_READ|PERM_WRITE|...)
+  uint32_t reserved;
+};
+
+struct PermRevokeReq {
+  uint64_t regionId;   // target region
+  uint32_t nodeId;     // revokee node
+  uint32_t pid;        // revokee PID
+};
+
+struct PermSetDefaultReq {
+  uint64_t regionId;   // target region
+  uint32_t perms;      // default permission flags
+  uint32_t reserved;
+};
+
+struct ChownReq {
+  uint64_t regionId;   // target region
+};
+
+struct PermResp {
+  int32_t status;
 };
 
 struct ErrorResp {

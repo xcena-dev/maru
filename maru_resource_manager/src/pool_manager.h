@@ -53,7 +53,7 @@ public:
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, uint64_t ownerId, Handle &out, std::string &devPath,
-              uint32_t poolId, uint64_t &requestedSizeOut);
+              uint32_t poolId, uint32_t poolType, uint64_t &requestedSizeOut);
     int free(const Handle &handle, uint64_t ownerId);
 
     void getStats(std::vector<PoolState> &out);
@@ -62,6 +62,13 @@ public:
     bool verifyAuthToken(const Handle &handle);
 
     void reapExpired(uint64_t &reapedCount);
+
+    // marufs ioctl delegation (returns 0 on success, -errno on failure)
+    int permGrant(uint64_t regionId, uint32_t nodeId, uint32_t pid,
+                  uint32_t perms);
+    int permRevoke(uint64_t regionId, uint32_t nodeId, uint32_t pid);
+    int permSetDefault(uint64_t regionId, uint32_t perms);
+    int chownRegion(uint64_t regionId);
 
 private:
     struct DeviceInfo
@@ -83,6 +90,7 @@ private:
     void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
+    bool checkPoolCondition(const PoolState& pool, uint32_t poolId, uint32_t poolType);
 
     std::mutex mu_;
     std::vector<PoolState> pools_;

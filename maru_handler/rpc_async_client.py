@@ -309,7 +309,10 @@ class RpcAsyncClient:
             )
         handle_data = response.get("handle", {})
         handle = MaruHandle.from_dict(handle_data) if handle_data else None
-        return RequestAllocResponse(success=True, handle=handle)
+        return RequestAllocResponse(
+            success=True,
+            handle=handle,
+        )
 
     @staticmethod
     def _parse_lookup_kv(response: dict) -> LookupKVResponse:
@@ -361,12 +364,14 @@ class RpcAsyncClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID,
+        pool_type: str = "devdax"
     ) -> RequestAllocResponse:
         """Request a new memory allocation."""
         response = self._send_request(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": instance_id, "size": size, "pool_id": pool_id},
+            {"instance_id": instance_id, "size": size, "pool_id": pool_id,
+             "pool_type": pool_type},
         )
         return self._parse_request_alloc(response)
 
