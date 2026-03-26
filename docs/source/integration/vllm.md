@@ -6,16 +6,21 @@ MaruKVConnector is a native vLLM KV connector that enables direct KV cache shari
 between vLLM instances through CXL shared memory — **without any middleware**.
 
 ```mermaid
-flowchart TB
-    subgraph "Previous (via LMCache)"
-        direction LR
-        V1["vLLM"] --> LC["LMCacheConnector"] --> LE["LMCache Engine"] --> SM["StorageManager"] --> MC["MaruConnector"] --> MH1["MaruHandler"] --> CXL1["CXL"]
+flowchart LR
+    subgraph prev["Previous (via LMCache)"]
+        direction TB
+        V1["vLLM"] --> LC["LMCacheConnector"] --> LE["LMCache Engine"]
+        LE --> SM["StorageManager"] --> MC["MaruConnector"]
+        MC --> MH1["MaruHandler"] --> CXL1["CXL"]
     end
 
-    subgraph "Direct (this connector)"
-        direction LR
-        V2["vLLM"] --> MKV["MaruKVConnector"] --> MH2["MaruHandler"] --> CXL2["CXL"]
+    subgraph direct["Direct (this connector)"]
+        direction TB
+        V2["vLLM"] --> MKV["MaruKVConnector"]
+        MKV --> MH2["MaruHandler"] --> CXL2["CXL"]
     end
+
+    prev --> direct
 ```
 
 By removing the LMCache middleware layer, the direct connector achieves:
@@ -123,11 +128,14 @@ Instance B:
 
 ### Prerequisites
 
-1. **Maru installed** (includes maru-server, maru-resourced)
-2. **vLLM v0.14+** (KVConnectorBase_V1 support)
-3. **CXL DAX device** with `maru-resourced` running
+**vLLM v0.14+** — required for `KVConnectorBase_V1` support:
 
-See {doc}`Installation <../getting_started/installation>` for full setup instructions.
+```bash
+pip install vllm
+```
+
+See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
+for GPU-specific options.
 
 ### Launch
 
