@@ -16,7 +16,6 @@ import pytest
 from maru_common.constants import ANY_POOL_ID
 from maru_common.types import DaxType, MaruHandle
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -31,9 +30,7 @@ def mock_rm():
 @pytest.fixture
 def client(mock_rm):
     """Create a MarufsClient with mocked ResourceManagerClient."""
-    with patch(
-        "marufs.client.ResourceManagerClient", return_value=mock_rm
-    ):
+    with patch("marufs.client.ResourceManagerClient", return_value=mock_rm):
         from marufs.client import MarufsClient
 
         c = MarufsClient()

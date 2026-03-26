@@ -56,7 +56,9 @@ class TestRpcServerHandlerDispatch:
             lambda instance_id, size, pool_id=ANY_POOL_ID, pool_type="devdax": None,
         )
 
-        request = MockRequest(instance_id="instance1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax")
+        request = MockRequest(
+            instance_id="instance1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
         response = rpc._handle_request_alloc(request)
 
         assert response["success"] is False
@@ -464,7 +466,9 @@ class TestRpcHandlerCoverage:
         server.register_kv(key="100", region_id=region_id, kv_offset=0, kv_length=256)
 
         # Test REQUEST_ALLOC
-        req = MockRequest(instance_id="instance2", size=2048, pool_id=ANY_POOL_ID, pool_type="devdax")
+        req = MockRequest(
+            instance_id="instance2", size=2048, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
         resp = rpc._handle_message(MessageType.REQUEST_ALLOC.value, req)
         assert resp["success"] is True
 

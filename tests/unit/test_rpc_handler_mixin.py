@@ -52,7 +52,9 @@ class TestRpcHandlerMixin:
 
     def test_handle_request_alloc_success(self):
         handler, server = self._make_handler()
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax")
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is True
         assert "handle" in resp
@@ -64,7 +66,9 @@ class TestRpcHandlerMixin:
             "allocate",
             lambda instance_id, size, pool_id=ANY_POOL_ID, pool_type="devdax": None,
         )
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax")
+        req = MockRequest(
+            instance_id="inst1", size=4096, pool_id=ANY_POOL_ID, pool_type="devdax"
+        )
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is False
         assert resp["error"] == "Allocation failed"
