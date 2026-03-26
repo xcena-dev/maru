@@ -315,7 +315,15 @@ class MaruStorage(HiCacheStorage):
         # Determine chunks-per-key ratio (non-MLA: 2 for K+V, MLA: 1).
         n_ptrs = len(host_ptrs)
         n_keys = len(keys)
-        chunks_per_key = n_ptrs // n_keys if n_keys else 1
+        chunks_per_key = n_ptrs // n_keys
+        expected = 1 if self.storage_config.is_mla_model else 2
+        if chunks_per_key != expected:
+            logger.warning(
+                "chunks_per_key=%d but is_mla_model=%s (expected %d)",
+                chunks_per_key,
+                self.storage_config.is_mla_model,
+                expected,
+            )
 
         results: list[bool] = []
         for key_idx, info in enumerate(infos):
@@ -369,7 +377,15 @@ class MaruStorage(HiCacheStorage):
         # MLA models return a single combined entry (1 per key).
         n_ptrs = len(host_ptrs)
         n_keys = len(keys)
-        chunks_per_key = n_ptrs // n_keys if n_keys else 1
+        chunks_per_key = n_ptrs // n_keys
+        expected = 1 if self.storage_config.is_mla_model else 2
+        if chunks_per_key != expected:
+            logger.warning(
+                "chunks_per_key=%d but is_mla_model=%s (expected %d)",
+                chunks_per_key,
+                self.storage_config.is_mla_model,
+                expected,
+            )
 
         # Collect host page data as memoryviews for batch_store.
         # MLA (1 chunk/key): zero-copy view from host page.
