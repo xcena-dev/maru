@@ -18,25 +18,21 @@ P2P sharing without network transfer.
 
 ## Prerequisites
 
-1. **SGLang ≥ v0.5.6** — required for dynamic storage backend and v1 API.
+**SGLang** — install from main (required until the write-through idle fix
+[`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd)
+is included in a release):
 
-   An additional fix is **required** for L3 store to work:
-   - **Write-through idle fix** — without this, write-through events are not
-     processed when the scheduler is idle, so KV pages never reach L3 storage.
-     Merged to main as [`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd)
-     ([#20560](https://github.com/sgl-project/sglang/pull/20560)).
-     Install from main or any release that includes it.
+```bash
+pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirectory=python"
+```
 
-2. **Maru** — install with SGLang extras:
-   ```bash
-   cd maru/
-   pip install -e ".[sglang]"
-   ```
+See [SGLang installation docs](https://docs.sglang.ai/start/install.html)
+for GPU-specific options.
 
-3. **MaruServer** running (for Maru CXL mode):
-   ```bash
-   maru-server --port 5555
-   ```
+> **Why main?** The write-through idle fix
+> ([#20560](https://github.com/sgl-project/sglang/pull/20560)) is required
+> for L3 store to work — without it, write-through events are not processed
+> when the scheduler is idle, so KV pages never reach L3 storage.
 
 ## Configuration
 
@@ -62,7 +58,7 @@ sglang serve \
     }'
 ```
 
-> **Important:** `interface_v1` must be set to `1` for the zero-copy V1 path
+> **Important:** `interface_v1` must be set to `1` for the V1 API path
 > (`batch_get_v1`/`batch_set_v1`) to be used. Without it, SGLang falls back to
 > the legacy API which does not support `page_first_direct` layout.
 
@@ -73,14 +69,14 @@ sglang serve \
 | `--enable-hierarchical-cache` | Enable the HiCache system |
 | `--hicache-ratio 2.0` | Host cache = 2× GPU cache size |
 | `--hicache-write-policy write_through` | Persist to L3 on cache hit |
-| `--hicache-mem-layout page_first_direct` | Memory layout for zero-copy (auto-switches `io_backend` to `direct`) |
+| `--hicache-mem-layout page_first_direct` | Page-first memory layout (required by MaruStorage) |
 | `--hicache-storage-backend dynamic` | Load backend class dynamically |
 
 ### Maru extra-config parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `interface_v1` | `0` | Set to `1` to enable V1 zero-copy API (required for `page_first_direct`) |
+| `interface_v1` | `0` | Set to `1` to enable V1 API (required for `page_first_direct`) |
 | `maru_server_url` | `tcp://localhost:5555` | MaruServer address |
 | `maru_pool_size` | `4G` | CXL shared memory pool size (`"4G"`, `"500M"`, etc.) |
 | `maru_chunk_size_bytes` | `1M` | Chunk size for memory allocation |
@@ -121,9 +117,10 @@ sequenceDiagram
 ```
 
 The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch
-operations.  For MLA models (1 chunk/key), host pages are passed as
-zero-copy memoryviews.  For non-MLA models (K+V in separate buffer pools),
-pages are concatenated into an owned buffer before passing to `batch_store`.
+operations.  For MLA models (1 chunk/key), host pages are passed directly
+as memoryviews.  For non-MLA models (K+V in separate buffer pools),
+K and V are concatenated into a contiguous buffer before passing to
+`batch_store` (see `TODO(KV-split-pool)` in `maru_storage.py`).
 
 ## Quick Start: Single Instance
 
