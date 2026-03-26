@@ -102,12 +102,11 @@ sequenceDiagram
 
     Note over SG,CXL: Store Path (L2 → L3)
     SG->>MHS: batch_set_v1(keys, host_indices)
-    MHS->>MH: alloc(page_size)
-    MH-->>MHS: handle (page in CXL region)
-    MHS->>CXL: ctypes.memmove(host_page → handle.buf)
-    MHS->>MH: store(key, handle)
-    MH->>MS: register_kv(key, region, offset, length)
-    MH-->>MHS: True
+    MHS->>MHS: collect host pages as memoryviews
+    MHS->>MH: batch_store(keys, memoryviews)
+    MH->>CXL: alloc + memcpy (per key)
+    MH->>MS: batch_register_kv(keys, regions, offsets)
+    MH-->>MHS: [True, ...]
     MHS-->>SG: [True, ...]
 
     Note over SG,CXL: Retrieve Path (L3 → L2)
@@ -121,9 +120,10 @@ sequenceDiagram
     MHS-->>SG: [True, ...]
 ```
 
-The V1 API (`batch_get_v1`/`batch_set_v1`) uses `ctypes.memmove` for direct
-memory copy between SGLang's host memory pool and Maru's CXL regions — no
-tensor allocation or Python-level copying.
+The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch
+operations.  For MLA models (1 chunk/key), host pages are passed as
+zero-copy memoryviews.  For non-MLA models (K+V in separate buffer pools),
+pages are concatenated into an owned buffer before passing to `batch_store`.
 
 ## Quick Start: Single Instance
 
