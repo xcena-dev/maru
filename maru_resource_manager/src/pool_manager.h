@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -74,6 +75,14 @@ public:
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
 
+    /// Notify that a client has disconnected. Starts the grace period timer.
+    void clientDisconnected(const std::string &clientId);
+    /// Notify that a client has reconnected. Cancels the grace period timer.
+    void clientReconnected(const std::string &clientId);
+
+    /// Grace period before reaping a disconnected remote client's allocations.
+    static constexpr int kDisconnectGraceSec = 30;
+
 private:
     struct DeviceInfo
     {
@@ -94,6 +103,9 @@ private:
     void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
+    /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
+    /// Caller MUST hold mu_.
+    int doFreeAllocation(uint64_t regionId);
 
     mutable std::mutex mu_;
     std::string stateDir_;
@@ -114,6 +126,11 @@ private:
     std::map<pid_t, uint64_t> pidStartTimes_;
     // client_id allocation refcount for O(1) reaper cleanup
     std::map<std::string, uint32_t> clientAllocCounts_;
+
+    // Disconnected remote clients pending reap after grace period.
+    // Maps client_id -> time of disconnection.
+    using SteadyClock = std::chrono::steady_clock;
+    std::map<std::string, SteadyClock::time_point> disconnectedClients_;
 
 };
 

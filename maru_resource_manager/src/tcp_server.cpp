@@ -145,6 +145,10 @@ void TcpServer::stop() {
         }
         connectedFds_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lk(fdClientMutex_);
+        fdClientMap_.clear();
+    }
 
     if (epollFd_ >= 0) {
         ::close(epollFd_);
@@ -376,6 +380,16 @@ void TcpServer::workerLoop() {
 }
 
 void TcpServer::removeClient(int fd) {
+    // Notify PoolManager of client disconnect before closing
+    {
+        std::lock_guard<std::mutex> lk(fdClientMutex_);
+        auto it = fdClientMap_.find(fd);
+        if (it != fdClientMap_.end()) {
+            pm_.clientDisconnected(it->second);
+            fdClientMap_.erase(it);
+        }
+    }
+
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
     int remaining = activeClients_.fetch_sub(1) - 1;
@@ -383,6 +397,17 @@ void TcpServer::removeClient(int fd) {
          fd, remaining);
     std::lock_guard<std::mutex> lk(fdSetMutex_);
     connectedFds_.erase(fd);
+}
+
+void TcpServer::trackClientId(int fd, const std::string &clientId) {
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lk(fdClientMutex_);
+    auto it = fdClientMap_.find(fd);
+    if (it == fdClientMap_.end()) {
+        // First request on this connection — record and cancel any pending grace period
+        fdClientMap_[fd] = clientId;
+        pm_.clientReconnected(clientId);
+    }
 }
 
 // =============================================================================
@@ -402,10 +427,35 @@ bool TcpServer::cacheLookup(const std::string &clientId,
     std::lock_guard<std::mutex> lk(cacheMutex_);
     auto it = idempotencyCache_.find(key);
     if (it == idempotencyCache_.end()) return false;
+    // Check TTL — expired entries are treated as cache misses
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        SteadyClock::now() - it->second.insertedAt).count();
+    if (age >= kCacheTtlSec) {
+        idempotencyCache_.erase(it);
+        return false;
+    }
     // Send cached response
     sendResp(clientFd, static_cast<MsgType>(it->second.type),
              it->second.payload.data(), it->second.payload.size());
     return true;
+}
+
+void TcpServer::cacheEvictExpired() {
+    // Evict expired entries from the front (oldest first).
+    // Caller must hold cacheMutex_.
+    auto now = SteadyClock::now();
+    while (!cacheOrder_.empty()) {
+        auto it = idempotencyCache_.find(cacheOrder_.front());
+        if (it == idempotencyCache_.end()) {
+            cacheOrder_.pop_front();
+            continue;
+        }
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second.insertedAt).count();
+        if (age < kCacheTtlSec) break;  // rest are newer
+        idempotencyCache_.erase(it);
+        cacheOrder_.pop_front();
+    }
 }
 
 void TcpServer::cacheInsert(const std::string &clientId,
@@ -414,7 +464,8 @@ void TcpServer::cacheInsert(const std::string &clientId,
     if (requestId == 0) return;
     std::string key = cacheKey(clientId, requestId);
     std::lock_guard<std::mutex> lk(cacheMutex_);
-    // Evict oldest entries if cache is full
+    // Evict expired entries first, then enforce size limit
+    cacheEvictExpired();
     while (cacheOrder_.size() >= kMaxCacheEntries) {
         idempotencyCache_.erase(cacheOrder_.front());
         cacheOrder_.pop_front();
@@ -423,6 +474,7 @@ void TcpServer::cacheInsert(const std::string &clientId,
     entry.type = type;
     entry.payload.assign(static_cast<const uint8_t *>(payload),
                           static_cast<const uint8_t *>(payload) + payloadSize);
+    entry.insertedAt = SteadyClock::now();
     cacheOrder_.push_back(key);
 }
 
@@ -472,6 +524,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
         }
+        trackClientId(clientFd, cid);
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache
@@ -503,6 +556,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
         }
+        trackClientId(clientFd, cid);
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache

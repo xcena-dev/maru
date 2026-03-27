@@ -13,6 +13,7 @@ Validates:
 - Graceful shutdown via SIGTERM
 """
 
+import mmap as mmap_module
 import os
 import shutil
 import signal
@@ -23,6 +24,7 @@ import time
 import pytest
 
 from maru_shm.client import MaruShmClient
+from maru_shm.types import MaruHandle
 
 pytestmark = pytest.mark.integration
 
@@ -231,6 +233,193 @@ class TestMultipleClientsIntegration:
                 client_b.close()
 
                 # Server still alive
+                assert proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+
+class TestAllocFree:
+    """Test alloc/free operations against a real resource manager."""
+
+    def test_alloc_no_pools_returns_error(self, rm_binary):
+        """Alloc on a server with no DAX devices returns a proper error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                pools = client.stats()
+                if pools and any(p.free_size > 0 for p in pools):
+                    pytest.skip("DAX pools available — cannot test no-pool error")
+
+                with pytest.raises(RuntimeError):
+                    client.alloc(4096)
+
+                # Server should still be alive after failed alloc
+                assert proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_free_invalid_handle_returns_error(self, rm_binary):
+        """Free with a fabricated handle returns a proper error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                fake_handle = MaruHandle(
+                    region_id=9999, offset=0, length=4096, auth_token=0
+                )
+                with pytest.raises(RuntimeError):
+                    client.free(fake_handle)
+
+                # Server should still be alive after failed free
+                assert proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_multiple_alloc_free_do_not_crash_server(self, rm_binary):
+        """Repeated alloc (or alloc+free) cycles don't crash the server."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                pools = client.stats()
+                has_pools = pools and any(p.free_size > 0 for p in pools)
+
+                for _ in range(5):
+                    if has_pools:
+                        handle = client.alloc(4096)
+                        client.free(handle)
+                    else:
+                        with pytest.raises(RuntimeError):
+                            client.alloc(4096)
+
+                # Server should still be alive
+                assert proc.poll() is None
+
+                # Stats should still work
+                pools = client.stats()
+                assert isinstance(pools, list)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_alloc_and_free(self, rm_binary):
+        """Alloc and free succeed when DAX pools are available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                pools = client.stats()
+                if not pools or all(p.free_size == 0 for p in pools):
+                    pytest.skip("No DAX pools with free space available")
+
+                handle = client.alloc(4096)
+                assert handle.length >= 4096
+                assert handle.region_id != 0
+
+                client.free(handle)
+
+                # Server should still be alive
+                assert proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_alloc_mmap_write_read_free(self, rm_binary):
+        """Full cycle: alloc -> mmap -> write -> read verify -> munmap -> free."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                pools = client.stats()
+                if not pools or all(p.free_size == 0 for p in pools):
+                    pytest.skip("No DAX pools with free space available")
+
+                alloc_size = 4096
+                handle = client.alloc(alloc_size)
+                assert handle.length >= alloc_size
+
+                # mmap and write a test pattern
+                mm = client.mmap(handle, mmap_module.PROT_WRITE | mmap_module.PROT_READ)
+                test_pattern = bytes((i * 7 + 0xA5) & 0xFF for i in range(alloc_size))
+                mm[:alloc_size] = test_pattern
+
+                # Read back and verify
+                assert mm[:alloc_size] == test_pattern
+
+                client.munmap(handle)
+                client.free(handle)
+
+                assert proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+
+    def test_multiple_alloc_free_cycles(self, rm_binary):
+        """Multiple alloc/free cycles don't leak resources."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = os.path.join(tmpdir, "state")
+            os.makedirs(state_dir)
+            port = _find_free_port()
+
+            proc = _start_rm(rm_binary, state_dir, port)
+            try:
+                assert _wait_for_server("127.0.0.1", port), "Server failed to start"
+
+                client = MaruShmClient(address=f"127.0.0.1:{port}")
+                pools = client.stats()
+                if not pools or all(p.free_size == 0 for p in pools):
+                    pytest.skip("No DAX pools with free space available")
+
+                initial_free = pools[0].free_size
+
+                for _ in range(5):
+                    handle = client.alloc(4096)
+                    client.free(handle)
+
+                # Free size should be restored after all frees
+                pools_after = client.stats()
+                assert pools_after[0].free_size == initial_free
+
                 assert proc.poll() is None
             finally:
                 if proc.poll() is None:

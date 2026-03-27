@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,37 @@ using namespace maru;
 static const char *g_host = "127.0.0.1";
 static uint16_t g_port = 9850;
 static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
+
+// Client identity and request sequencing for the v2 protocol.
+static std::string g_clientId;
+static std::atomic<uint64_t> g_requestSeq{1};
+
+static std::string makeClientId()
+{
+    char hostname[256];
+    if (::gethostname(hostname, sizeof(hostname)) != 0)
+        std::snprintf(hostname, sizeof(hostname), "unknown");
+    return std::string(hostname) + ":" + std::to_string(::getpid());
+}
+
+/// Build a v2 request payload: [fixed struct][uint16 idLen][client_id][uint64 requestId]
+static std::vector<uint8_t> buildPayload(const void *fixedStruct, size_t fixedSize,
+                                          const std::string &clientId, uint64_t requestId)
+{
+    uint16_t idLen = static_cast<uint16_t>(clientId.size());
+    size_t totalSize = fixedSize + sizeof(idLen) + idLen + sizeof(requestId);
+    std::vector<uint8_t> buf(totalSize);
+
+    size_t off = 0;
+    std::memcpy(buf.data() + off, fixedStruct, fixedSize);
+    off += fixedSize;
+    std::memcpy(buf.data() + off, &idLen, sizeof(idLen));
+    off += sizeof(idLen);
+    std::memcpy(buf.data() + off, clientId.data(), idLen);
+    off += idLen;
+    std::memcpy(buf.data() + off, &requestId, sizeof(requestId));
+    return buf;
+}
 
 // ----------------------------------------------------------------------------
 // I/O helpers
@@ -226,7 +258,9 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
     req.poolId = poolId;
     req.reserved = 0;
 
-    if (sendRequest(fd, MsgType::ALLOC_REQ, &req, sizeof(req)) != 0)
+    auto payload = buildPayload(&req, sizeof(req), g_clientId, g_requestSeq++);
+    if (sendRequest(fd, MsgType::ALLOC_REQ, payload.data(),
+                    static_cast<uint32_t>(payload.size())) != 0)
     {
         ::close(fd);
         return -1;
@@ -250,8 +284,8 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
         return -1;
     }
 
-    std::vector<uint8_t> payload(hdr.payloadLen);
-    int rc = readFull(fd, payload.data(), hdr.payloadLen);
+    std::vector<uint8_t> respBuf(hdr.payloadLen);
+    int rc = readFull(fd, respBuf.data(), hdr.payloadLen);
     ::close(fd);
 
     if (rc != 0)
@@ -259,14 +293,14 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
         fprintf(stderr, "error: read(AllocResp) failed: %s\n", strerror(-rc));
         return -1;
     }
-    if (payload.size() < sizeof(AllocResp))
+    if (respBuf.size() < sizeof(AllocResp))
     {
         fprintf(stderr, "error: AllocResp too short\n");
         return -1;
     }
 
-    std::memcpy(resp, payload.data(), sizeof(*resp));
-    *devicePath = parseDevicePath(payload.data(), payload.size());
+    std::memcpy(resp, respBuf.data(), sizeof(*resp));
+    *devicePath = parseDevicePath(respBuf.data(), respBuf.size());
 
     if (resp->status != 0)
     {
@@ -292,7 +326,9 @@ static int doFree(const Handle &h)
     FreeReq req{};
     req.handle = h;
 
-    if (sendRequest(fd, MsgType::FREE_REQ, &req, sizeof(req)) != 0)
+    auto payload = buildPayload(&req, sizeof(req), g_clientId, g_requestSeq++);
+    if (sendRequest(fd, MsgType::FREE_REQ, payload.data(),
+                    static_cast<uint32_t>(payload.size())) != 0)
     {
         ::close(fd);
         return -1;
@@ -595,6 +631,8 @@ static void printUsage(const char *prog)
 
 int main(int argc, char *argv[])
 {
+    g_clientId = makeClientId();
+
     int opt;
     while ((opt = getopt(argc, argv, "H:p:h")) != -1)
     {
