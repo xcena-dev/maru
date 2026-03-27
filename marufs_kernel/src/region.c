@@ -336,16 +336,16 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		return -ENOSPC;
 
 	/*
-     * Global allocation lock: CAS spinlock on RAT header.
-     *
-     * Lock-free overlap detection is fundamentally racy — a scan can miss
-     * a concurrent CAS on an entry it already passed. Since ftruncate is
-     * not a hot path, a simple CAS spinlock is correct and sufficient.
-     *
-     * Stale lock recovery: if holder crashed, lock stays set in CXL memory.
-     * Detect via local timing — if we've been waiting longer than timeout,
-     * force unlock and retry. Uses only local clock (no cross-node skew).
-     */
+	 * Global allocation lock: CAS spinlock on RAT header.
+	 *
+	 * Lock-free overlap detection is fundamentally racy — a scan can miss
+	 * a concurrent CAS on an entry it already passed. Since ftruncate is
+	 * not a hot path, a simple CAS spinlock is correct and sufficient.
+	 *
+	 * Stale lock recovery: if holder crashed, lock stays set in CXL memory.
+	 * Detect via local timing — if we've been waiting longer than timeout,
+	 * force unlock and retry. Uses only local clock (no cross-node skew).
+	 */
 	{
 		struct marufs_rat *rat = sbi->rat;
 		u64 wait_start = 0;
@@ -396,9 +396,9 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 	}
 
 	/*
-     * Atomically claim physical offset via CAS(0 → region_offset).
-     * Under the lock, no other node can concurrently allocate overlapping space.
-     */
+	 * Atomically claim physical offset via CAS(0 → region_offset).
+	 * Under the lock, no other node can concurrently allocate overlapping space.
+	 */
 	if (CAS_LE64(&rat_entry->phys_offset, 0, region_offset) != 0) {
 		WRITE_LE32(sbi->rat->alloc_lock, 0); /* unlock */
 		MARUFS_CXL_WMB(&sbi->rat->alloc_lock,

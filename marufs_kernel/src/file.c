@@ -126,11 +126,11 @@ static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	}
 
 	/*
-     * Cross-node file_size sync: another node may have set the size via
-     * ftruncate, so re-read the latest file_size from the CXL hot entry.
-     * The locally cached i_size in DRAM would never reflect a remote
-     * ftruncate (d_revalidate=0 only affects new lookups, not open fds).
-     */
+	 * Cross-node file_size sync: another node may have set the size via
+	 * ftruncate, so re-read the latest file_size from the CXL hot entry.
+	 * The locally cached i_size in DRAM would never reflect a remote
+	 * ftruncate (d_revalidate=0 only affects new lookups, not open fds).
+	 */
 	{
 		struct marufs_index_entry_hot *hot;
 
@@ -185,8 +185,8 @@ static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	data_ptr = (char *)sbi->dax_base + xi->data_phys_offset + pos;
 
 	/* Invalidate CPU cache for data region to ensure cross-node freshness.
-     * Writer may use WC mmap (no CPU cache), but reader's WB memremap
-     * may hold stale cache lines from region init or prior reads. */
+	 * Writer may use WC mmap (no CPU cache), but reader's WB memremap
+	 * may hold stale cache lines from region init or prior reads. */
 	MARUFS_CXL_RMB(data_ptr, count);
 
 	/* Copy data to user buffer */
@@ -354,13 +354,13 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret;
 
 	/*
-     * WORM permission check:
-     * If file opened read-only (no FMODE_WRITE),
-     * reject write mapping (VM_WRITE).
-     *
-     * Acts as additional protection layer when daemon
-     * passes O_RDONLY FD to delegatee.
-     */
+	 * WORM permission check:
+	 * If file opened read-only (no FMODE_WRITE),
+	 * reject write mapping (VM_WRITE).
+	 *
+	 * Acts as additional protection layer when daemon
+	 * passes O_RDONLY FD to delegatee.
+	 */
 	if ((vma->vm_flags & VM_WRITE) && !(file->f_mode & FMODE_WRITE)) {
 		pr_debug("mmap denied - file opened read-only\n");
 		return -EACCES;
@@ -386,17 +386,17 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	/*
-     * DAXHEAP mode: delegate mmap to dma_buf (WC mapping).
-     *
-     * daxheap's dma_buf .mmap op applies pgprot_writecombine() internally,
-     * providing ~57.8 GB/s GPU bandwidth vs ~17 GB/s with UC mapping.
-     *
-     * Kernel metadata access (sbi->dax_base via dma_buf_vmap) stays WB —
-     * CAS and memory barriers work normally.
-     *
-     * dma_buf_mmap() takes a page offset within the buffer. We calculate
-     * this from the region file's data_phys_offset + user-requested offset.
-     */
+	 * DAXHEAP mode: delegate mmap to dma_buf (WC mapping).
+	 *
+	 * daxheap's dma_buf .mmap op applies pgprot_writecombine() internally,
+	 * providing ~57.8 GB/s GPU bandwidth vs ~17 GB/s with UC mapping.
+	 *
+	 * Kernel metadata access (sbi->dax_base via dma_buf_vmap) stays WB —
+	 * CAS and memory barriers work normally.
+	 *
+	 * dma_buf_mmap() takes a page offset within the buffer. We calculate
+	 * this from the region file's data_phys_offset + user-requested offset.
+	 */
 	if (sbi->dax_mode == MARUFS_DAX_HEAP && xi->data_phys_offset != 0) {
 #ifdef CONFIG_DAXHEAP
 		u64 user_offset;
@@ -437,16 +437,16 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	/*
-     * DEV_DAX mode: delegate mmap to device_dax driver.
-     *
-     * NVIDIA driver recognizes device_dax VMAs and handles
-     * cudaHostRegister correctly. By delegating the mmap to the
-     * underlying /dev/daxX.Y file, the VMA gets device_dax's vm_ops
-     * and NVIDIA's pin_user_pages path works on ZONE_DEVICE pages.
-     *
-     * Fallback: if dax_filp is unavailable (open failed at mount),
-     * use remap_pfn_range direct path (no GPU DMA but mmap still works).
-     */
+	 * DEV_DAX mode: delegate mmap to device_dax driver.
+	 *
+	 * NVIDIA driver recognizes device_dax VMAs and handles
+	 * cudaHostRegister correctly. By delegating the mmap to the
+	 * underlying /dev/daxX.Y file, the VMA gets device_dax's vm_ops
+	 * and NVIDIA's pin_user_pages path works on ZONE_DEVICE pages.
+	 *
+	 * Fallback: if dax_filp is unavailable (open failed at mount),
+	 * use remap_pfn_range direct path (no GPU DMA but mmap still works).
+	 */
 	if (sbi->dax_mode == MARUFS_DAX_DEV && xi->data_phys_offset != 0) {
 		u64 user_offset;
 		unsigned long map_size;
@@ -491,8 +491,9 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 			}
 
 			/* Prefault is handled by userspace via madvise(MADV_POPULATE_READ/WRITE)
-             * after mmap returns. Kernel-side handle_mm_fault() in mmap context
-             * risks deadlock (mmap_write_lock already held by VFS). */
+                         * after mmap returns. Kernel-side handle_mm_fault() in mmap context
+                         * risks deadlock (mmap_write_lock already held by VFS).
+                         */
 
 			return 0;
 		}
@@ -632,9 +633,9 @@ static long marufs_ioctl_dmabuf_export(struct marufs_sb_info *sbi,
 			return -EFAULT;
 
 		/*
-         * Allocate fd and copy to user BEFORE installing,
-         * so we can clean up on copy_to_user failure without leaking.
-         */
+                 * Allocate fd and copy to user BEFORE installing,
+                 * so we can clean up on copy_to_user failure without leaking.
+                 */
 		fd = get_unused_fd_flags(O_CLOEXEC);
 		if (fd < 0)
 			return fd;
@@ -1006,10 +1007,10 @@ static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
 		return -EIO;
 
 	/*
-     * Atomic ownership transfer: CAS ALLOCATED → ALLOCATING to prevent
-     * GC from observing a partially written ownership state.
-     * GC skips ALLOCATING entries until alloc_time timeout (30s).
-     */
+	 * Atomic ownership transfer: CAS ALLOCATED → ALLOCATING to prevent
+	 * GC from observing a partially written ownership state.
+	 * GC skips ALLOCATING entries until alloc_time timeout (30s).
+	 */
 	old_state = CAS_LE32(&rat_entry->state, MARUFS_RAT_ENTRY_ALLOCATED,
 			     MARUFS_RAT_ENTRY_ALLOCATING);
 	if (old_state != MARUFS_RAT_ENTRY_ALLOCATED)

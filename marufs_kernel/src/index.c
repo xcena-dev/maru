@@ -80,7 +80,7 @@ marufs_index_check_duplicate(struct marufs_index_entry_hot *entries,
 					    ((now - created_at) >
 					     MARUFS_STALE_TIMEOUT_NS)) {
 						/* Clear fields BEFORE CAS to prevent concurrent
-                         * reader seeing EMPTY state with stale data */
+                                                 * reader seeing EMPTY state with stale data */
 						memset(c->name, 0,
 						       sizeof(c->name));
 						WRITE_LE64(e->name_hash, 0);
@@ -131,9 +131,9 @@ static int marufs_index_link_and_publish(struct marufs_index_entry_hot *entry,
 	int retries;
 
 	/*
-     * Link to bucket chain via CAS on bucket head.
-     * Prepend: new entry becomes head, old head becomes our next.
-     */
+	 * Link to bucket chain via CAS on bucket head.
+	 * Prepend: new entry becomes head, old head becomes our next.
+	 */
 	retries = 0;
 	for (;;) {
 		old_head = READ_ONCE(buckets[bucket_idx]);
@@ -147,8 +147,8 @@ static int marufs_index_link_and_publish(struct marufs_index_entry_hot *entry,
 
 		if (++retries >= MARUFS_INDEX_CAS_RETRIES) {
 			/*
-             * Extremely rare: revert entry to EMPTY for slot reuse.
-             */
+                         * Extremely rare: revert entry to EMPTY for slot reuse.
+                         */
 			pr_err("index_insert: bucket CAS failed after %d retries, reverting\n",
 			       retries);
 			WRITE_ONCE(entry->state, MARUFS_ENTRY_EMPTY_LE);
@@ -159,9 +159,9 @@ static int marufs_index_link_and_publish(struct marufs_index_entry_hot *entry,
 	}
 
 	/*
-     * Finalize - transition INSERTING -> VALID.
-     * Entry is now visible to readers.
-     */
+	 * Finalize - transition INSERTING -> VALID.
+	 * Entry is now visible to readers.
+	 */
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 	WRITE_ONCE(entry->state, MARUFS_ENTRY_VALID_LE);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
@@ -230,14 +230,14 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	}
 
 	/*
-     * Step 2: check for duplicate name before reserving slot.
-     * Walk bucket chain to find existing VALID entry with same name.
-     *
-     * NOTE: This pre-insert check has a TOCTOU window — two nodes can both
-     * pass it and insert the same name. Post-insert dedup after step 6
-     * detects and resolves this: the loser (higher entry_idx) rolls back
-     * to TOMBSTONE and returns -EEXIST.
-     */
+	 * Step 2: check for duplicate name before reserving slot.
+	 * Walk bucket chain to find existing VALID entry with same name.
+	 *
+	 * NOTE: This pre-insert check has a TOCTOU window — two nodes can both
+	 * pass it and insert the same name. Post-insert dedup after step 6
+	 * detects and resolves this: the loser (higher entry_idx) rolls back
+	 * to TOMBSTONE and returns -EEXIST.
+	 */
 	ret = marufs_index_check_duplicate(hot_entries, cold_entries, buckets,
 					   bucket_idx, num_entries, hash, name,
 					   namelen);
@@ -245,10 +245,10 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 		return ret;
 
 	/*
-     * Step 3: scan hot entry array to find EMPTY slot and reserve it via
-     * CAS EMPTY -> INSERTING.  Start from shard_free_hint to skip
-     * known-occupied prefix (H-P1: O(1) amortized vs O(n) linear).
-     */
+	 * Step 3: scan hot entry array to find EMPTY slot and reserve it via
+	 * CAS EMPTY -> INSERTING.  Start from shard_free_hint to skip
+	 * known-occupied prefix (H-P1: O(1) amortized vs O(n) linear).
+	 */
 	hot = NULL;
 	cold = NULL;
 	{
@@ -306,9 +306,9 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	}
 
 	/*
-     * Step 4: fill hot + cold entry fields. In INSERTING state we own it
-     * exclusively - no other node will touch it.
-     */
+	 * Step 4: fill hot + cold entry fields. In INSERTING state we own it
+	 * exclusively - no other node will touch it.
+	 */
 	{
 		u64 now_ns = ktime_get_real_ns();
 		size_t copy_len;
@@ -340,8 +340,8 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	MARUFS_CXL_WMB(cold, sizeof(*cold));
 
 	/*
-     * Steps 5-6: link to bucket chain and publish entry.
-     */
+	 * Steps 5-6: link to bucket chain and publish entry.
+	 */
 	ret = marufs_index_link_and_publish(hot, entry_idx, buckets,
 					    bucket_idx);
 	if (ret)
@@ -351,15 +351,15 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	marufs_le32_cas_dec(&sbi->shard_table[shard_id].tombstone_entries, 1);
 
 	/*
-     * Post-insert duplicate detection (H5):
-     * Two nodes can pass the pre-insert check and both insert the same name.
-     * Now that we're VALID and linked, re-walk the bucket chain. If another
-     * VALID entry with the same name exists, the entry with the higher
-     * entry_idx loses and rolls back to TOMBSTONE.
-     *
-     * This is safe because bucket chain is a linked list — once both entries
-     * are VALID and linked, any walk sees both.
-     */
+	 * Post-insert duplicate detection (H5):
+	 * Two nodes can pass the pre-insert check and both insert the same name.
+	 * Now that we're VALID and linked, re-walk the bucket chain. If another
+	 * VALID entry with the same name exists, the entry with the higher
+	 * entry_idx loses and rolls back to TOMBSTONE.
+	 *
+	 * This is safe because bucket chain is a linked list — once both entries
+	 * are VALID and linked, any walk sees both.
+	 */
 	{
 		u32 cur = READ_LE32(buckets[bucket_idx]);
 
@@ -591,9 +591,9 @@ int marufs_index_delete(struct marufs_sb_info *sbi, const char *name,
 	if (cmpxchg(&entry->state, MARUFS_ENTRY_VALID_LE,
 		    MARUFS_ENTRY_TOMBSTONE_LE) != MARUFS_ENTRY_VALID_LE) {
 		/*
-         * State changed between lookup and CAS - another node deleted
-         * or was already transitioning.
-         */
+                 * State changed between lookup and CAS - another node deleted
+                 * or was already transitioning.
+                 */
 		pr_debug("index_delete: CAS failed for '%.*s', state changed\n",
 			 (int)namelen, name);
 		return -ENOENT;

@@ -140,13 +140,13 @@ int marufs_gc_tombstone_sweep(struct marufs_sb_info *sbi, u32 shard_id)
 				tombstone_reclaimed++;
 		} else if (state == MARUFS_ENTRY_INSERTING_LE) {
 			/*
-             * Stale INSERTING: process crashed mid-insert.
-             * If created_at==0, the inserter hasn't stamped it yet (or crashed
-             * before writing). Stamp it now so timeout starts; the normal
-             * inserter will overwrite with its own value immediately after.
-             * Reclaim only after timeout expires (30s), avoiding false reclaim
-             * of entries still being inserted.
-             */
+                         * Stale INSERTING: process crashed mid-insert.
+                         * If created_at==0, the inserter hasn't stamped it yet (or crashed
+                         * before writing). Stamp it now so timeout starts; the normal
+                         * inserter will overwrite with its own value immediately after.
+                         * Reclaim only after timeout expires (30s), avoiding false reclaim
+                         * of entries still being inserted.
+                         */
 			u64 created_at = READ_LE64(cold_entries[i].created_at);
 			u64 now = ktime_get_real_ns();
 
@@ -454,10 +454,10 @@ int marufs_gc_dead_process_regions(struct marufs_sb_info *sbi)
 		state = READ_LE32(entry->state);
 
 		/*
-         * Recover stuck transient states from crashed processes.
-         * ALLOCATING: pre-index, safe to free directly.
-         * DELETING: may have dangling index entries, needs full cleanup.
-         */
+                 * Recover stuck transient states from crashed processes.
+                 * ALLOCATING: pre-index, safe to free directly.
+                 * DELETING: may have dangling index entries, needs full cleanup.
+                 */
 		if (state == MARUFS_RAT_ENTRY_ALLOCATING) {
 			if (!marufs_is_orphaned(sbi, i))
 				continue;
@@ -529,8 +529,9 @@ static int marufs_gc_thread_fn(void *data)
 			marufs_gc_dead_process_regions(sbi);
 
 			/* Phase 2: Sweep tombstones + stale INSERTING from shards
-             * exceeding threshold. INSERTING entries are counted in
-             * sh->tombstone_entries so threshold naturally triggers. */
+                         * exceeding threshold. INSERTING entries are counted in
+                         * sh->tombstone_entries so threshold naturally triggers.
+                         */
 			for (s = 0; s < sbi->num_shards; s++) {
 				if (marufs_gc_needs_sweep(sbi, s))
 					marufs_gc_tombstone_sweep(sbi, s);

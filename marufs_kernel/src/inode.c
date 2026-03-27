@@ -134,12 +134,12 @@ struct inode *marufs_iget(struct super_block *sb,
 
 	if (!(inode->i_state & I_NEW)) {
 		/*
-         * Already cached — refresh from CXL memory for cross-node
-         * visibility.  When a RAT entry is reused (file deleted then
-         * new file allocated to the same entry), the cached inode
-         * carries stale data_phys_offset / owner fields.  Re-read
-         * everything that can change between uses of the same ino.
-         */
+                 * Already cached — refresh from CXL memory for cross-node
+                 * visibility.  When a RAT entry is reused (file deleted then
+                 * new file allocated to the same entry), the cached inode
+                 * carries stale data_phys_offset / owner fields.  Re-read
+                 * everything that can change between uses of the same ino.
+                 */
 		struct marufs_sb_info *sbi = MARUFS_SB(sb);
 
 		xi = MARUFS_I(inode);
@@ -419,10 +419,10 @@ static int marufs_setattr(MARUFS_IDMAP_PARAM_COMMA struct dentry *dentry,
 			return 0;
 
 		/*
-         * First-time size set: allocate physical region.
-         * marufs_region_init finds contiguous space, initializes region header,
-         * and updates RAT entry with phys_offset and size.
-         */
+                 * First-time size set: allocate physical region.
+                 * marufs_region_init finds contiguous space, initializes region header,
+                 * and updates RAT entry with phys_offset and size.
+                 */
 		ret = marufs_region_init(sbi, xi->rat_entry_id, attr->ia_size);
 		if (ret) {
 			pr_err("region_init failed for rat_entry %u: %d\n",

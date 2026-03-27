@@ -296,15 +296,15 @@ static int marufs_iterate(struct file *file, struct dir_context *ctx)
 	}
 
 	/*
-     * RAT-based readdir: scan 256 RAT entries instead of 64*16384 index entries.
-     *
-     * ctx->pos encoding:
-     *   0 = "."
-     *   1 = ".."
-     *   2 + i = RAT entry[i]  (i = 0..255)
-     *
-     * On VFS re-entry after buffer full, pos resumes from the next RAT slot.
-     */
+	 * RAT-based readdir: scan 256 RAT entries instead of 64*16384 index entries.
+	 *
+	 * ctx->pos encoding:
+	 *   0 = "."
+	 *   1 = ".."
+	 *   2 + i = RAT entry[i]  (i = 0..255)
+	 *
+	 * On VFS re-entry after buffer full, pos resumes from the next RAT slot.
+	 */
 	for (i = ctx->pos - 2; i < MARUFS_MAX_RAT_ENTRIES; i++) {
 		unsigned long ino;
 		size_t name_len;
@@ -411,13 +411,13 @@ static long marufs_ioctl_batch_find_name(struct marufs_sb_info *sbi,
 	}
 
 	/*
-     * Optimized 4-phase batch lookup with CXL latency hiding:
-     *   Phase 1:  Prefetch bucket heads + save computed hash
-     *   Phase 1b: Prefetch first chain entries (bucket heads now in cache)
-     *   Phase 2:  Lookup all entries (defer RAT reads)
-     *   Phase 3:  Prefetch RAT entries for successful lookups
-     *   Phase 4:  Copy region_name from prefetched RAT entries
-     */
+	 * Optimized 4-phase batch lookup with CXL latency hiding:
+	 *   Phase 1:  Prefetch bucket heads + save computed hash
+	 *   Phase 1b: Prefetch first chain entries (bucket heads now in cache)
+	 *   Phase 2:  Lookup all entries (defer RAT reads)
+	 *   Phase 3:  Prefetch RAT entries for successful lookups
+	 *   Phase 4:  Copy region_name from prefetched RAT entries
+	 */
 
 	/* Temporary region_id storage for deferred RAT reads */
 	{

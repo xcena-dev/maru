@@ -401,13 +401,13 @@ static int marufs_dax_acquire_devdax(struct marufs_sb_info *sbi,
 	strscpy(sbi->daxdev_path, devpath, sizeof(sbi->daxdev_path));
 
 	/*
-     * Detect ZONE_DEVICE struct pages
-     *
-     * If the device_dax driver has already created ZONE_DEVICE struct pages
-     * via devm_memremap_pages(), use VM_MIXEDMAP + vmf_insert_mixed() path
-     * so get_user_pages() works. This enables GPU DMA (cudaMemcpy etc.)
-     * to transfer directly from CXL memory without a bounce buffer.
-     */
+	 * Detect ZONE_DEVICE struct pages
+	 *
+	 * If the device_dax driver has already created ZONE_DEVICE struct pages
+	 * via devm_memremap_pages(), use VM_MIXEDMAP + vmf_insert_mixed() path
+	 * so get_user_pages() works. This enables GPU DMA (cudaMemcpy etc.)
+	 * to transfer directly from CXL memory without a bounce buffer.
+	 */
 	sbi->has_struct_pages = pfn_valid(phys_addr >> PAGE_SHIFT);
 	if (sbi->has_struct_pages)
 		pr_debug(
@@ -419,8 +419,8 @@ static int marufs_dax_acquire_devdax(struct marufs_sb_info *sbi,
 			devname);
 
 	/* Open DAX device file for mmap delegation to device_dax driver.
-     * This allows NVIDIA driver to recognize the VMA as device_dax-backed,
-     * enabling cudaHostRegister on CXL memory. */
+	 * This allows NVIDIA driver to recognize the VMA as device_dax-backed,
+	 * enabling cudaHostRegister on CXL memory. */
 	sbi->dax_filp = filp_open(devpath, O_RDWR, 0);
 	if (IS_ERR(sbi->dax_filp)) {
 		pr_warn("failed to open DAX device %s for mmap: %ld\n", devpath,
@@ -526,15 +526,15 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 	}
 
 	/*
-     * Skip daxheap shared metadata area.
-     *
-     * daxheap stores its own metadata (primary 64KB + mirror 64KB = 128KB)
-     * at offset 0 of the CXL region.  The chunk allocator does not reserve
-     * these chunks, so our buffer starts at region->vaddr.  If we write
-     * MARUFS metadata at offset 0 we collide with daxheap's heartbeat and
-     * allocation table updates, causing deterministic shard corruption.
-     *
-     */
+	 * Skip daxheap shared metadata area.
+	 *
+	 * daxheap stores its own metadata (primary 64KB + mirror 64KB = 128KB)
+	 * at offset 0 of the CXL region.  The chunk allocator does not reserve
+	 * these chunks, so our buffer starts at region->vaddr.  If we write
+	 * MARUFS metadata at offset 0 we collide with daxheap's heartbeat and
+	 * allocation table updates, causing deterministic shard corruption.
+	 *
+	 */
 	sbi->dax_base = sbi->heap_map.vaddr;
 	sbi->total_size = dmabuf->size;
 	sbi->dax_nr_pages = sbi->total_size >> PAGE_SHIFT;
@@ -909,10 +909,10 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 		return -ENOMEM;
 
 	/*
-     * Build local DRAM shard cache: pre-compute CXL pointers and geometry
-     * so that every index operation avoids a CXL round-trip for shard header
-     * fields that are immutable after format.
-     */
+	 * Build local DRAM shard cache: pre-compute CXL pointers and geometry
+	 * so that every index operation avoids a CXL round-trip for shard header
+	 * fields that are immutable after format.
+	 */
 	sbi->shard_cache = kvmalloc_array(
 		sbi->num_shards, sizeof(struct marufs_shard_cache), GFP_KERNEL);
 	if (!sbi->shard_cache) {
@@ -1335,9 +1335,9 @@ static void marufs_kill_sb(struct super_block *sb)
 		marufs_cache_destroy(sbi);
 
 		/*
-         * Release non-DAX buffers. In DAX mode, shard_table, gsb, and
-         * index_pool_base all point into CXL memory -- nothing to free.
-         */
+                 * Release non-DAX buffers. In DAX mode, shard_table, gsb, and
+                 * index_pool_base all point into CXL memory -- nothing to free.
+                 */
 
 		/* Free per-shard RAM hint and shard cache */
 		kvfree(sbi->shard_cache);
