@@ -45,7 +45,9 @@ def client(mock_rm):
     with (
         patch("marufs.client.ResourceManagerClient", return_value=mock_rm),
         patch("marufs.client.os.close"),
-        patch("marufs.client.mmap_module.mmap", side_effect=lambda *a, **kw: _anon_mmap()),
+        patch(
+            "marufs.client.mmap_module.mmap", side_effect=lambda *a, **kw: _anon_mmap()
+        ),
     ):
         from marufs.client import MarufsClient
 
