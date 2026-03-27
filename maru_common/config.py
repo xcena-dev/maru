@@ -29,6 +29,9 @@ def _parse_env_bool(name: str) -> bool | None:
     )
 
 
+_VALID_POOL_TYPES = {"devdax", "marufs"}
+
+
 @dataclass
 class MaruConfig:
     """
@@ -95,4 +98,9 @@ class MaruConfig:
             raise ValueError(
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"
+            )
+
+        if self.pool_type not in _VALID_POOL_TYPES:
+            raise ValueError(
+                f"pool_type must be one of {_VALID_POOL_TYPES}, got '{self.pool_type}'"
             )

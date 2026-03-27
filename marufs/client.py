@@ -131,7 +131,8 @@ class MarufsClient:
             else:
                 access = mmap_module.ACCESS_READ
 
-            mm = mmap_module.mmap(fd, handle.length, access=access)
+            # marufs: per-region file, so offset is always 0 (unlike devdax)
+            mm = mmap_module.mmap(fd, handle.length, access=access, offset=0)
             self._mmap_cache[handle.region_id] = (mm, prot)
 
             return mm

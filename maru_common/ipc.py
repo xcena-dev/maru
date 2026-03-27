@@ -114,7 +114,7 @@ class MsgHeader:
 # Request / Response payloads
 # =============================================================================
 
-# AllocReq: size(u64) + pool_id(u32) + reserved(u32) = 16 bytes
+# AllocReq: size(u64) + pool_id(u32) + pool_type(u32) = 16 bytes
 _ALLOC_REQ_FORMAT = "=QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 

@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from threading import RLock
 
+from maru_common.backend_protocol import MemoryBackend
 from maru_common.protocol import ANY_POOL_ID
 from maru_common.types import MaruHandle
 from maru_shm import MaruShmClient
@@ -35,13 +36,17 @@ class AllocationManager:
     def __init__(self):
         self._allocations: dict[int, AllocationInfo] = {}  # region_id -> info
         self._lock = RLock()
-        self._dax_client = MaruShmClient()
-        self._marufs_client = MarufsClient()
+        self._dax_client: MemoryBackend = MaruShmClient()
+        self._marufs_client: MemoryBackend = MarufsClient()
         logger.info("AllocationManager initialized")
 
-    def _get_client(self, pool_type: str = "devdax"):
+    def _get_client(self, pool_type: str = "devdax") -> MemoryBackend:
         """Return the client matching pool_type."""
-        return self._marufs_client if pool_type == "marufs" else self._dax_client
+        if pool_type == "marufs":
+            return self._marufs_client
+        if pool_type != "devdax":
+            logger.warning("Unknown pool_type '%s', falling back to devdax", pool_type)
+        return self._dax_client
 
     def allocate(
         self,

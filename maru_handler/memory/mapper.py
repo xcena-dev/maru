@@ -13,6 +13,7 @@ import os
 import threading
 import time
 
+from maru_common.backend_protocol import MemoryBackend
 from maru_common.constants import PROT_READ, PROT_WRITE
 from maru_common.types import MaruHandle
 from maru_shm import MaruShmClient
@@ -42,6 +43,7 @@ class DaxMapper:
     """
 
     def __init__(self, pool_type: str = "devdax"):
+        self._client: MemoryBackend
         if pool_type == "marufs":
             self._client = MarufsClient()
         else:
