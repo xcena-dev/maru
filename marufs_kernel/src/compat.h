@@ -21,7 +21,7 @@
 #define MARUFS_IDMAP_ARG_COMMA mnt_userns,
 #else
 #define MARUFS_IDMAP_PARAM_COMMA /* empty */
-#define MARUFS_IDMAP_ARG_COMMA   /* empty */
+#define MARUFS_IDMAP_ARG_COMMA /* empty */
 #endif
 
 /*
@@ -29,50 +29,49 @@
  * argument counting issues with MARUFS_IDMAP_ARG_COMMA trailing comma macro.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-static inline void
-marufs_generic_fillattr(struct mnt_idmap* idmap, u32 req_mask,
-                      struct inode* inode, struct kstat* stat)
+static inline void marufs_generic_fillattr(struct mnt_idmap *idmap,
+					   u32 req_mask, struct inode *inode,
+					   struct kstat *stat)
 {
-    generic_fillattr(idmap, req_mask, inode, stat);
+	generic_fillattr(idmap, req_mask, inode, stat);
 }
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-static inline void
-marufs_generic_fillattr(struct user_namespace* mnt_userns, u32 req_mask,
-                      struct inode* inode, struct kstat* stat)
+static inline void marufs_generic_fillattr(struct user_namespace *mnt_userns,
+					   u32 req_mask, struct inode *inode,
+					   struct kstat *stat)
 {
-    generic_fillattr(mnt_userns, inode, stat);
+	generic_fillattr(mnt_userns, inode, stat);
 }
 #else
-static inline void
-marufs_generic_fillattr(u32 req_mask, struct inode* inode, struct kstat* stat)
+static inline void marufs_generic_fillattr(u32 req_mask, struct inode *inode,
+					   struct kstat *stat)
 {
-    generic_fillattr(inode, stat);
+	generic_fillattr(inode, stat);
 }
 #endif
 
 /* setattr_prepare() wrapper */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-static inline int
-marufs_setattr_prepare(struct mnt_idmap* idmap, struct dentry* dentry,
-                     struct iattr* attr)
+static inline int marufs_setattr_prepare(struct mnt_idmap *idmap,
+					 struct dentry *dentry,
+					 struct iattr *attr)
 {
-    return setattr_prepare(idmap, dentry, attr);
+	return setattr_prepare(idmap, dentry, attr);
 }
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-static inline int
-marufs_setattr_prepare(struct user_namespace* mnt_userns, struct dentry* dentry,
-                     struct iattr* attr)
+static inline int marufs_setattr_prepare(struct user_namespace *mnt_userns,
+					 struct dentry *dentry,
+					 struct iattr *attr)
 {
-    return setattr_prepare(mnt_userns, dentry, attr);
+	return setattr_prepare(mnt_userns, dentry, attr);
 }
 #else
-static inline int
-marufs_setattr_prepare(struct dentry* dentry, struct iattr* attr)
+static inline int marufs_setattr_prepare(struct dentry *dentry,
+					 struct iattr *attr)
 {
-    return setattr_prepare(dentry, attr);
+	return setattr_prepare(dentry, attr);
 }
 #endif
-
 
 /* SLAB_MEM_SPREAD removed in 6.8 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
@@ -86,12 +85,11 @@ marufs_setattr_prepare(struct dentry* dentry, struct iattr* attr)
  *   new: int (*)(struct inode *, const struct qstr *, struct dentry *, unsigned int)
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-#define MARUFS_D_REVALIDATE_ARGS                  \
-    struct inode *dir, const struct qstr *name, \
-        struct dentry *dentry, unsigned int flags
+#define MARUFS_D_REVALIDATE_ARGS                                           \
+	struct inode *dir, const struct qstr *name, struct dentry *dentry, \
+		unsigned int flags
 #else
-#define MARUFS_D_REVALIDATE_ARGS \
-    struct dentry *dentry, unsigned int flags
+#define MARUFS_D_REVALIDATE_ARGS struct dentry *dentry, unsigned int flags
 #endif
 
 /* s_d_op: use set_default_d_op() on 6.17+ (direct __s_d_op write
@@ -134,22 +132,31 @@ marufs_setattr_prepare(struct dentry* dentry, struct iattr* attr)
 #include <daxheap_kapi.h>
 #else
 /* Stubs when daxheap is not available */
-static inline struct dma_buf*
-daxheap_kern_alloc(size_t size, unsigned int flags)
+static inline struct dma_buf *daxheap_kern_alloc(size_t size,
+						 unsigned int flags)
 {
-    return ERR_PTR(-ENOSYS);
+	return ERR_PTR(-ENOSYS);
 }
 
-static inline void daxheap_kern_free(struct dma_buf* dmabuf) {}
+static inline void daxheap_kern_free(struct dma_buf *dmabuf)
+{
+}
 
-static inline int
-daxheap_kern_get_id(struct dma_buf* dmabuf, u64* out_id) { return -ENOSYS; }
+static inline int daxheap_kern_get_id(struct dma_buf *dmabuf, u64 *out_id)
+{
+	return -ENOSYS;
+}
 
-static inline int
-daxheap_kern_grant(struct dma_buf* dmabuf, u16 target_host, u32 perms) { return -ENOSYS; }
+static inline int daxheap_kern_grant(struct dma_buf *dmabuf, u16 target_host,
+				     u32 perms)
+{
+	return -ENOSYS;
+}
 
-static inline struct dma_buf*
-daxheap_kern_import(u64 id) { return ERR_PTR(-ENOSYS); }
+static inline struct dma_buf *daxheap_kern_import(u64 id)
+{
+	return ERR_PTR(-ENOSYS);
+}
 #endif /* CONFIG_DAXHEAP */
 
 #endif /* _MARUFS_COMPAT_H */

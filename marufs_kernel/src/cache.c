@@ -6,15 +6,15 @@
 
 #include "marufs.h"
 
-int marufs_cache_init(struct marufs_sb_info* sbi)
+int marufs_cache_init(struct marufs_sb_info *sbi)
 {
-    sbi->entry_cache = NULL;
-    pr_debug("cache initialized (stub)\n");
-    return 0;
+	sbi->entry_cache = NULL;
+	pr_debug("cache initialized (stub)\n");
+	return 0;
 }
 
-void marufs_cache_destroy(struct marufs_sb_info* sbi)
+void marufs_cache_destroy(struct marufs_sb_info *sbi)
 {
-    sbi->entry_cache = NULL;
-    pr_debug("cache destroyed (stub)\n");
+	sbi->entry_cache = NULL;
+	pr_debug("cache destroyed (stub)\n");
 }
