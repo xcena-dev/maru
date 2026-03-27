@@ -10,9 +10,9 @@ import logging
 import os
 import socket
 
+from maru_common.constants import DEFAULT_SOCKET_PATH
 from maru_common.ipc import (
     ANY_POOL_ID,
-    DEFAULT_SOCKET_PATH,
     HEADER_SIZE,
     AllocReq,
     AllocResp,
