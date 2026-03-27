@@ -52,22 +52,6 @@ flowchart TB
 
 ---
 
-## 2. Lifecycle
-
-The binary is installed via `./install.sh`, which builds it with cmake and places it at `/usr/local/bin/maru-resource-manager`. The resource manager must be started explicitly by the user before launching any Maru services.
-
-**Manual start:** The user starts the resource manager on the node before running `MaruServer` or any client:
-
-```bash
-maru-resource-manager --host 0.0.0.0 --port 9850
-```
-
-If a client attempts to connect when the resource manager is not running, `MaruShmClient` raises a `ConnectionError` with actionable instructions. The `MaruShmClient.is_running()` method can be used to check availability before attempting operations.
-
-**Crash recovery:** If the resource manager crashes, the user must restart it manually. On startup, the resource manager recovers its previous state from the WAL.
-
-**Shutdown:** The resource manager runs until explicitly stopped via `SIGTERM` or `SIGINT`. On shutdown, it flushes all state to disk via a final checkpoint.
-
 ---
 
 ## 3. IPC Protocol
@@ -137,6 +121,8 @@ The Reaper periodically checks the liveness of each allocation's owner process. 
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
+For **remote clients** (different hostname), the server monitors TCP connection state. When a remote client disconnects, a grace period begins. If the client does not reconnect within the grace period, its allocations are reclaimed. This prevents memory leaks from crashed remote clients while tolerating transient network interruptions.
+
 ---
 
 ## 7. Security
@@ -145,7 +131,7 @@ Every allocation receives a **cryptographic auth token** derived from the Handle
 
 The secret is generated on first start and persisted to the state directory. On restart, if allocations exist from a previous run, the secret is loaded; if it is missing, startup is aborted to prevent token verification failures.
 
-**Owner verification** ensures that non-root clients can only free their own allocations — the owner PID is recorded at allocation time and must match the freeing client's PID.
+**Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 
@@ -157,14 +143,25 @@ The server is configured via CLI arguments. On startup, the resource manager wri
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--host` | `0.0.0.0` | TCP bind address |
-| `--port` | `9850` | TCP port |
-| `--state-dir` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
-| `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `--num-workers` | `32` | Worker thread pool size |
+| `--host`, `-H` | `0.0.0.0` | TCP bind address |
+| `--port`, `-p` | `9850` | TCP port |
+| `--state-dir`, `-d` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
+| `--log-level`, `-l` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `--num-workers`, `-w` | `32` | Worker thread pool size |
+
+### Daemon mode (production)
+
+The recommended way to run the resource manager is as a systemd service:
 
 ```bash
-# Manual start with custom configuration
+sudo systemctl start maru-resource-manager
+```
+
+To customize options, use `sudo systemctl edit maru-resource-manager` and override `ExecStart`.
+
+### Direct mode (development/debugging)
+
+```bash
 maru-resource-manager --host 0.0.0.0 --port 9850 \
                       --state-dir /var/lib/maru \
                       --log-level debug

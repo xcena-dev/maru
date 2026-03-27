@@ -2,13 +2,27 @@
 
 ## 1. Start the Resource Manager
 
-The resource manager must be running before any other Maru service. Start it as a systemd service:
+The resource manager must be running before any other Maru service.
+
+**Production** — start as a systemd daemon:
 
 ```bash
 sudo systemctl start maru-resource-manager
 ```
 
-> For development/debugging, you can also run directly: `sudo maru-resource-manager --log-level debug`
+**Development/debugging** — run directly with custom options:
+
+```bash
+# Default (0.0.0.0:9850)
+sudo maru-resource-manager --log-level debug
+
+# Custom port
+sudo maru-resource-manager --port 9851 --log-level debug
+```
+
+> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+>
+> See {doc}`installation` for the full list of CLI options and systemd configuration.
 
 ## 2. Start the Metadata Server
 
