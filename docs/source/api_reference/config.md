@@ -147,10 +147,10 @@ vllm serve <model> --kv-transfer-config '{
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
 | `maru_kv_chunk_tokens` | `int` | `256` | KV cache chunk granularity (in tokens). Auto-aligned to vLLM `block_size` |
 
-For full architecture and data path details, see [vLLM Integration](../integration/vllm.md#configuration).
+For full architecture and data path details, see [vLLM](../integration/vllm.md#configuration).
 
 ---
 
 ## LMCache Configuration
 
-For LMCache YAML configuration (plugin settings, `extra_config` parameters), see [LMCache Integration](../integration/lmcache.md#configuration).
+For LMCache YAML configuration (plugin settings, `extra_config` parameters), see [LMCache](../integration/lmcache.md#configuration).

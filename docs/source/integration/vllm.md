@@ -1,4 +1,4 @@
-# vLLM Integration
+# vLLM
 
 ## Prerequisites
 
@@ -275,4 +275,4 @@ For runnable examples, see
 
 > **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
 > [MaruHandler Design](../design_doc/maru_handler.md),
-> [LMCache Integration](./lmcache.md)
+> [LMCache](./lmcache.md)

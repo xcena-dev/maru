@@ -181,8 +181,8 @@ graph LR
     D --> F[CXL Shared Memory]
 ```
 
-> **See also:** [LMCache Integration](../integration/lmcache.md),
-> [SGLang Integration](../integration/sglang.md),
+> **See also:** [LMCache](../integration/lmcache.md),
+> [SGLang HiCache](../integration/sglang.md),
 > [MaruHandler Design](maru_handler.md)
 
 ```{toctree}

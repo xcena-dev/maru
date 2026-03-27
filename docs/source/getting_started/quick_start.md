@@ -116,7 +116,7 @@ with MaruHandler(config) as handler:
 
 ## Next Steps
 
-- [LMCache Integration](examples/lmcache/index.md) — Use Maru as a shared KV cache backend for LMCache/vLLM
+- [LMCache Examples](examples/lmcache/index.md) — Use Maru as a shared KV cache backend for LMCache/vLLM
 - [Architecture Overview](../design_doc/architecture_overview.md) — System architecture and component interactions
 - [API Reference](../api_reference/api.md) — Python API documentation
 - [Configuration](../api_reference/config.md) — Configuration options

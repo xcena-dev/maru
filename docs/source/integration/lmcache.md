@@ -1,4 +1,4 @@
-# LMCache Integration
+# LMCache
 
 ## Integration Architecture
 

@@ -122,4 +122,4 @@ Options:
   --wait-time SEC        Wait between sessions for CXL propagation (default: 3.0)
 ```
 
-For integration details, see [vLLM Integration](../../../integration/vllm.md).
+For integration details, see [vLLM](../../../integration/vllm.md).

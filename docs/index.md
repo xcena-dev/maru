@@ -124,9 +124,9 @@ Consistency and Safety <source/design_doc/consistency_and_safety>
 :caption: Integration
 :hidden:
 
-vLLM Integration <source/integration/vllm>
-LMCache Integration <source/integration/lmcache>
-SGLang Integration <source/integration/sglang>
+LMCache <source/integration/lmcache>
+vLLM <source/integration/vllm>
+SGLang HiCache <source/integration/sglang>
 ```
 
 ```{toctree}

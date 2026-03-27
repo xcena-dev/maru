@@ -1,4 +1,4 @@
-# SGLang Integration
+# SGLang HiCache
 
 ## Overview
 
@@ -168,5 +168,5 @@ for details on the write-through flush mechanism.
 | Low TTFT speedup (< 1.5×) | Prompt too short for meaningful prefill savings | Use longer prompts (> 500 tokens) |
 
 > **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
-> [LMCache Integration](lmcache.md),
+> [LMCache](lmcache.md),
 > [Python API Reference](../api_reference/api.md)
