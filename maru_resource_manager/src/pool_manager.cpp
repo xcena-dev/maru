@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include "metadata.h"
 #include "util.h"
@@ -893,46 +894,7 @@ int PoolManager::free(const Handle &handle, const std::string &clientId)
         return -EPERM;
     }
 
-    PoolState *targetPool = findPoolById(alloc.poolId);
-    if (!targetPool)
-    {
-        return -ENOENT;
-    }
-
-    if (targetPool->type == DaxType::FS_DAX)
-    {
-        deleteFsDaxFile(targetPool->devPath, handle.regionId);
-    }
-
-    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
-    targetPool->freeSize += alloc.allocLength;
-
-    // Update client refcount
-    if (alloc.clientId[0] != '\0')
-    {
-        auto countIt = clientAllocCounts_.find(alloc.clientId);
-        if (countIt != clientAllocCounts_.end())
-        {
-            if (--countIt->second == 0)
-            {
-                clientAllocCounts_.erase(countIt);
-                if (isLocalClient(alloc.clientId))
-                {
-                    pid_t pid = pidFromClientId(alloc.clientId);
-                    if (pid > 0) pidStartTimes_.erase(pid);
-                }
-            }
-        }
-    }
-
-    allocations_.erase(globalIt);
-
-    wal_->appendFree(handle.regionId);
-    if (++opCount_ % checkpointInterval_ == 0)
-    {
-        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
-    }
-    return 0;
+    return doFreeAllocation(handle.regionId);
 }
 
 void PoolManager::getStats(std::vector<PoolState> &out)
@@ -981,13 +943,46 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
 
+    // Collect client_ids whose grace period has expired
+    auto now = SteadyClock::now();
+    std::unordered_set<std::string> expiredClients;
+    for (auto it = disconnectedClients_.begin(); it != disconnectedClients_.end(); )
+    {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second).count();
+        if (elapsed >= kDisconnectGraceSec)
+        {
+            logf(LogLevel::Info, "reaping disconnected client: %s (disconnected %lds ago)",
+                 it->first.c_str(), static_cast<long>(elapsed));
+            expiredClients.insert(it->first);
+            it = disconnectedClients_.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     std::vector<uint64_t> toFree;
     for (const auto &kv : allocations_)
     {
         const char *cid = kv.second.clientId;
-        if (cid[0] == '\0' || !isLocalClient(cid))
+        if (cid[0] == '\0')
         {
-            continue;  // Skip empty or remote clients
+            continue;
+        }
+
+        // Check if this client's grace period has expired (works for both local and remote)
+        if (expiredClients.count(cid))
+        {
+            toFree.push_back(kv.first);
+            continue;
+        }
+
+        // For local clients, also check PID liveness
+        if (!isLocalClient(cid))
+        {
+            continue;
         }
         pid_t pid = pidFromClientId(cid);
         if (pid <= 0)
@@ -1017,54 +1012,10 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 
     for (uint64_t regionId : toFree)
     {
-        auto globalIt = allocations_.find(regionId);
-        if (globalIt == allocations_.end())
+        if (doFreeAllocation(regionId) == 0)
         {
-            continue;
+            ++reapedCount;
         }
-
-        const Allocation &alloc = globalIt->second;
-
-        PoolState *targetPool = findPoolById(alloc.poolId);
-        if (!targetPool)
-        {
-            continue;
-        }
-
-        if (targetPool->type == DaxType::FS_DAX)
-        {
-            deleteFsDaxFile(targetPool->devPath, regionId);
-        }
-
-        insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
-        targetPool->freeSize += alloc.allocLength;
-
-        // Update client refcount
-        if (alloc.clientId[0] != '\0')
-        {
-            auto countIt = clientAllocCounts_.find(alloc.clientId);
-            if (countIt != clientAllocCounts_.end())
-            {
-                if (--countIt->second == 0)
-                {
-                    clientAllocCounts_.erase(countIt);
-                    if (isLocalClient(alloc.clientId))
-                    {
-                        pid_t pid = pidFromClientId(alloc.clientId);
-                        if (pid > 0) pidStartTimes_.erase(pid);
-                    }
-                }
-            }
-        }
-
-        allocations_.erase(globalIt);
-
-        wal_->appendFree(regionId);
-        if (++opCount_ % checkpointInterval_ == 0)
-        {
-            wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
-        }
-        ++reapedCount;
     }
 }
 
@@ -1072,6 +1023,32 @@ void PoolManager::checkpoint()
 {
     std::lock_guard<std::mutex> lock(mu_);
     wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+}
+
+void PoolManager::clientDisconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Only track if this client actually has allocations
+    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
+    {
+        disconnectedClients_[clientId] = SteadyClock::now();
+        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
+             clientId.c_str(), kDisconnectGraceSec);
+    }
+}
+
+void PoolManager::clientReconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = disconnectedClients_.find(clientId);
+    if (it != disconnectedClients_.end())
+    {
+        disconnectedClients_.erase(it);
+        logf(LogLevel::Debug, "client reconnected: %s (grace period cancelled)",
+             clientId.c_str());
+    }
 }
 
 int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId)
@@ -1103,7 +1080,19 @@ int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId
         return -EPERM;
     }
 
-    // Free the allocation
+    return doFreeAllocation(handle.regionId);
+}
+
+int PoolManager::doFreeAllocation(uint64_t regionId)
+{
+    auto globalIt = allocations_.find(regionId);
+    if (globalIt == allocations_.end())
+    {
+        return -ENOENT;
+    }
+
+    const Allocation &alloc = globalIt->second;
+
     PoolState *targetPool = findPoolById(alloc.poolId);
     if (!targetPool)
     {
@@ -1112,7 +1101,7 @@ int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId
 
     if (targetPool->type == DaxType::FS_DAX)
     {
-        deleteFsDaxFile(targetPool->devPath, handle.regionId);
+        deleteFsDaxFile(targetPool->devPath, regionId);
     }
 
     insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
@@ -1138,7 +1127,7 @@ int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId
 
     allocations_.erase(globalIt);
 
-    wal_->appendFree(handle.regionId);
+    wal_->appendFree(regionId);
     if (++opCount_ % checkpointInterval_ == 0)
     {
         wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -59,21 +60,30 @@ private:
     std::mutex fdSetMutex_;
     std::unordered_set<int> connectedFds_;
 
+    // Map fd -> client_id for disconnect notification
+    std::mutex fdClientMutex_;
+    std::unordered_map<int, std::string> fdClientMap_;
+    void trackClientId(int fd, const std::string &clientId);
+
     static constexpr int kMaxClients = 256;
     std::atomic<int> activeClients_{0};
 
     // Idempotency cache for alloc/free requests.
     // Maps request_id -> (response MsgType, serialized payload).
     // Prevents duplicate side effects when client retries after response loss.
+    using SteadyClock = std::chrono::steady_clock;
     struct CachedResponse {
         uint16_t type;
         std::vector<uint8_t> payload;
+        SteadyClock::time_point insertedAt;
     };
     // Cache key: "client_id:request_id" to prevent cross-client collisions
     std::mutex cacheMutex_;
     std::unordered_map<std::string, CachedResponse> idempotencyCache_;
     std::deque<std::string> cacheOrder_;  // insertion order for eviction
     static constexpr size_t kMaxCacheEntries = 1024;
+    static constexpr int kCacheTtlSec = 60;
+    void cacheEvictExpired();
 
     static std::string cacheKey(const std::string &clientId, uint64_t requestId);
     bool cacheLookup(const std::string &clientId, uint64_t requestId, int clientFd);
