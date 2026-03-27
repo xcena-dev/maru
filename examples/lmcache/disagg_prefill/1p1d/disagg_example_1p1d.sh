@@ -135,7 +135,7 @@ main() {
         echo "MaruServer already running on port $MARU_SERVER_PORT, skipping launch..."
     else
         echo "Launching MaruServer..."
-        setsid env PYTHONUNBUFFERED=1 python -m maru_server --port $MARU_SERVER_PORT --rm-address "${MARU_RM_ADDRESS:-127.0.0.1:9850}" --log-level "${_LOG_LEVEL:-ERROR}" \
+        PYTHONUNBUFFERED=1 python -m maru_server --port $MARU_SERVER_PORT --rm-address "${MARU_RM_ADDRESS:-127.0.0.1:9850}" --log-level "${_LOG_LEVEL:-ERROR}" \
             > >(tee "${LOG_MARU_SERVER:-maru_server.log}") 2>&1 &
         maru_server_pid=$!
         PIDS+=($maru_server_pid)
