@@ -31,42 +31,13 @@ The left shows how KV cache is shared without Maru; the right shows how it works
 
 - **Lower System Energy** — Eliminating bulk data transfer cuts NIC and CPU power draw. Shorter data paths also reduce GPU idle time per request.
 
-## Overview
-```mermaid
-flowchart TB
-    subgraph S1["Server 1"]
-        direction TB
-        I1(["LLM Instance"])
-        H1{{"MaruHandler"}}
-        I1 --- H1
-    end
-    subgraph S2["Server 2"]
-        direction TB
-        I2(["LLM Instance"])
-        H2{{"MaruHandler"}}
-        I2 --- H2
-    end
-    subgraph S3["Server 3"]
-        direction TB
-        I3(["LLM Instance"])
-        H3{{"MaruHandler"}}
-        I3 --- H3
-    end
+## Maru Overview
 
-    M["Maru Control Plane"]
+<p align="center">
+  <img src="docs/_static/maru_overview.svg" alt="Maru Architecture Overview" width="260">
+</p>
 
-    subgraph CXL["CXL Shared Memory"]
-        KV["KV Cache"]
-    end
-
-    H1 & H2 & H3 <-.->|"store/retrieve"| M
-    H1 & H2 & H3 <==>|"direct read/write"| CXL
-    M -.->|"manage"| CXL
-```
-
-> **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
->
-> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+Each inference engine embeds a **Maru Handler** that intercepts KV cache operations. The **MaruMetaServer** coordinates memory orchestration — tracking which regions are allocated and where. All bulk data flows directly between handlers and the **CXL Memory Pool** (data plane), while only lightweight metadata travels through the control plane. For more details, see the [Architecture Overview](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html).
 
 ## Quick Start
 
