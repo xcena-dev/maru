@@ -239,6 +239,8 @@ class RpcClient:
                 "kv_length": kv_length,
             },
         )
+        if "error" in response:
+            raise ConnectionError(f"register_kv RPC failed: {response['error']}")
         return response.get("is_new", False)
 
     def lookup_kv(self, key: str) -> LookupKVResponse:

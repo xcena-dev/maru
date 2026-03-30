@@ -490,12 +490,22 @@ class MaruHandler:
             offset = page_index * self._owned.get_chunk_size()
             total_size = handle._size
 
-            is_new = self._rpc.register_kv(
-                key=key,
-                region_id=region_id,
-                kv_offset=offset,
-                kv_length=total_size,
-            )
+            try:
+                is_new = self._rpc.register_kv(
+                    key=key,
+                    region_id=region_id,
+                    kv_offset=offset,
+                    kv_length=total_size,
+                )
+            except Exception:
+                self._owned.free(region_id, page_index)
+                logger.error(
+                    "store: register_kv RPC failed for key=%s, freed page (region=%d, page=%d)",
+                    key,
+                    region_id,
+                    page_index,
+                )
+                return False
 
             if not is_new:
                 self._owned.free(region_id, page_index)
