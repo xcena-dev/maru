@@ -303,7 +303,7 @@ void TcpServer::eventLoop() {
 
                     // Safety timeout for partial reads in workers
                     struct timeval tv{};
-                    tv.tv_sec = 5;
+                    tv.tv_sec = 30;
                     tv.tv_usec = 0;
                     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -391,12 +391,14 @@ void TcpServer::removeClient(int fd) {
     }
 
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
+    {
+        std::lock_guard<std::mutex> lk(fdSetMutex_);
+        connectedFds_.erase(fd);
+    }
     ::close(fd);
     int remaining = activeClients_.fetch_sub(1) - 1;
     logf(LogLevel::Debug, "[CONN] client disconnected fd=%d (active=%d)",
          fd, remaining);
-    std::lock_guard<std::mutex> lk(fdSetMutex_);
-    connectedFds_.erase(fd);
 }
 
 void TcpServer::trackClientId(int fd, const std::string &clientId) {

@@ -113,9 +113,8 @@ class AllocReq:
 
     def pack(self) -> bytes:
         fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
-        if self.client_id:
-            id_bytes = self.client_id.encode("utf-8")
-            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        id_bytes = self.client_id.encode("utf-8")
+        fixed += struct.pack("<H", len(id_bytes)) + id_bytes
         fixed += struct.pack("<Q", self.request_id)
         return fixed
 
@@ -220,9 +219,8 @@ class FreeReq:
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
         fixed = h.pack()
-        if self.client_id:
-            id_bytes = self.client_id.encode("utf-8")
-            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        id_bytes = self.client_id.encode("utf-8")
+        fixed += struct.pack("<H", len(id_bytes)) + id_bytes
         fixed += struct.pack("<Q", self.request_id)
         return fixed
 

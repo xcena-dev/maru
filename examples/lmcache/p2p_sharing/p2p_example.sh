@@ -153,7 +153,7 @@ main() {
     else
         echo "[$(date +%T)] Launching MaruServer on port $MARU_SERVER_PORT..."
         echo "[$(date +%T)] maru package: $(python3 -c 'import maru; print(maru.__file__)' 2>&1)"
-        PYTHONUNBUFFERED=1 python3 -m maru_server --port $MARU_SERVER_PORT --rm-address "${MARU_RM_ADDRESS:-127.0.0.1:9850}" --log-level "${_LOG_LEVEL:-DEBUG}" \
+        PYTHONUNBUFFERED=1 python3 -m maru_server --port $MARU_SERVER_PORT --rm-address "${MARU_RM_ADDRESS:-127.0.0.1:9850}" --log-level "${_LOG_LEVEL:-INFO}" \
             > >(tee "${LOG_DIR:-.}/maru_server.log") 2>&1 &
         maru_server_pid=$!
         PIDS+=($maru_server_pid)

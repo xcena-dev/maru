@@ -286,7 +286,9 @@ bool ensureDirExists(const std::string &path) {
   struct stat st;
   if (::stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
   // Recursively create parent
-  ensureDirExists(parentDir(path));
+  if (!ensureDirExists(parentDir(path))) {
+    return false;
+  }
   if (::mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
     return false;
   }

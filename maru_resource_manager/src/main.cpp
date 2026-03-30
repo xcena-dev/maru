@@ -90,10 +90,26 @@ static ServerConfig parseArgs(int argc, char **argv) {
     while ((opt = getopt_long(argc, argv, "H:p:d:l:w:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
-        case 'p': cfg.port = static_cast<uint16_t>(std::atoi(optarg)); break;
+        case 'p': {
+            int p = std::atoi(optarg);
+            if (p <= 0 || p > 65535) {
+                std::fprintf(stderr, "invalid port: %s (must be 1-65535)\n", optarg);
+                std::exit(1);
+            }
+            cfg.port = static_cast<uint16_t>(p);
+            break;
+        }
         case 'd': cfg.stateDir = optarg; break;
         case 'l': cfg.logLevel = maru::parseLogLevel(optarg); break;
-        case 'w': cfg.numWorkers = std::atoi(optarg); break;
+        case 'w': {
+            int w = std::atoi(optarg);
+            if (w <= 0) {
+                std::fprintf(stderr, "invalid num-workers: %s (must be >= 1)\n", optarg);
+                std::exit(1);
+            }
+            cfg.numWorkers = w;
+            break;
+        }
         case 'h': printUsage(argv[0]); std::exit(0);
         default:  printUsage(argv[0]); std::exit(1);
         }
@@ -122,6 +138,7 @@ int main(int argc, char **argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGHUP, onRescan);
+    std::signal(SIGPIPE, SIG_IGN);
 
     // Initialize components with explicit config injection
     maru::PoolManager pm(cfg.stateDir);
