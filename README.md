@@ -34,10 +34,10 @@ The left shows how KV cache is shared without Maru; the right shows how it works
 ## Maru Overview
 
 <p align="center">
-  <img src="docs/_static/maru_overview.svg" alt="Maru Architecture Overview" width="275">
+  <img src="docs/_static/maru_overview.svg" alt="Maru Architecture Overview">
 </p>
 
-Each inference engine embeds a **Maru Handler** that intercepts KV cache operations. The **MaruMetaServer** coordinates memory orchestration — tracking which regions are allocated and where. All bulk data flows directly between handlers and the **CXL Memory Pool** (data plane), while only lightweight metadata travels through the control plane. For more details, see the [Architecture Overview](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html).
+Each inference instance includes a **Maru Handler** that handles KV cache put/get operations from the LMCache Connector. The **MaruMetaServer** coordinates memory orchestration — tracking which regions are allocated and where. All bulk data flows directly between handlers and the **CXL Memory Pool** (data plane), while only lightweight metadata travels through the control plane. For more details, see the [Architecture Overview](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html).
 
 ## Quick Start
 
