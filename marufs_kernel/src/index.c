@@ -133,10 +133,30 @@ static int marufs_index_link_and_publish(struct marufs_index_entry_hot *entry,
 	/*
 	 * Link to bucket chain via CAS on bucket head.
 	 * Prepend: new entry becomes head, old head becomes our next.
+	 *
+	 * Self-loop guard: a reused tombstone slot may still be linked in
+	 * this bucket from its previous life.  If old_head == entry_idx,
+	 * prepending would set next_in_bucket = self → infinite loop on
+	 * any subsequent chain walk.  Detect and keep the existing chain
+	 * successor so the rest of the bucket stays reachable.
 	 */
 	retries = 0;
 	for (;;) {
 		old_head = READ_ONCE(buckets[bucket_idx]);
+
+		if (unlikely((__force u32)old_head == entry_idx)) {
+			/*
+			 * We are already the bucket head (stale link from
+			 * previous life).  Preserve our chain successor and
+			 * confirm ownership — effectively a no-op re-publish.
+			 */
+			old_head = READ_ONCE(entry->next_in_bucket);
+			if (unlikely((__force u32)old_head == entry_idx))
+				old_head = (__force __le32)MARUFS_BUCKET_END;
+			WRITE_ONCE(entry->next_in_bucket, old_head);
+			MARUFS_CXL_WMB(entry, sizeof(*entry));
+			break;
+		}
 
 		WRITE_ONCE(entry->next_in_bucket, old_head);
 		MARUFS_CXL_WMB(entry, sizeof(*entry));
@@ -280,6 +300,10 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 				struct marufs_shard_header *sh;
 				hot = e;
 				cold = &cold_entries[entry_idx];
+				/* Clear stale chain pointer from previous life
+				 * to prevent self-loops during link_and_publish */
+				WRITE_ONCE(e->next_in_bucket,
+					   (__force __le32)MARUFS_BUCKET_END);
 				/* Stamp created_at immediately so GC can detect stale INSERTING */
 				WRITE_LE64(cold->created_at,
 					   ktime_get_real_ns());
@@ -362,9 +386,16 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	 */
 	{
 		u32 cur = READ_LE32(buckets[bucket_idx]);
+		u32 steps = 0;
 
 		while (cur != MARUFS_BUCKET_END && cur < num_entries) {
 			struct marufs_index_entry_hot *e = &hot_entries[cur];
+
+			if (++steps > num_entries) {
+				pr_err("bucket chain cycle detected (post-insert dedup, bucket %u)\n",
+				       bucket_idx);
+				break;
+			}
 
 			if (cur != entry_idx &&
 			    READ_ONCE(e->state) == MARUFS_ENTRY_VALID_LE &&
