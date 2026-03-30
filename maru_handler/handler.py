@@ -504,6 +504,7 @@ class MaruHandler:
                     key,
                     region_id,
                     page_index,
+                    exc_info=True,
                 )
                 return False
 
