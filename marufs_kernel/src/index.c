@@ -40,14 +40,22 @@
  *
  * Return: 0 if no duplicate, -EEXIST if name already exists
  */
+/*
+ * @tombstone_idx: output — index of first TOMBSTONE found in chain,
+ *                 or MARUFS_BUCKET_END if none.  Caller can reuse this
+ *                 slot instead of scanning the entry array.
+ */
 static int
 marufs_index_check_duplicate(struct marufs_index_entry_hot *entries,
 			     struct marufs_index_entry_cold *cold_entries,
 			     u32 *buckets, u32 bucket_idx, u32 num_entries,
-			     u64 hash, const char *name, size_t namelen)
+			     u64 hash, const char *name, size_t namelen,
+			     u32 *tombstone_idx)
 {
 	u32 cur = READ_LE32(buckets[bucket_idx]);
 	u32 steps = 0;
+
+	*tombstone_idx = MARUFS_BUCKET_END;
 
 	while (cur != MARUFS_BUCKET_END && cur < num_entries) {
 		struct marufs_index_entry_hot *e = &entries[cur];
@@ -60,6 +68,12 @@ marufs_index_check_duplicate(struct marufs_index_entry_hot *entries,
 		}
 
 		MARUFS_CXL_RMB(e, sizeof(*e));
+
+		/* Remember first tombstone in chain for potential reuse */
+		if (st == MARUFS_ENTRY_TOMBSTONE_LE &&
+		    *tombstone_idx == MARUFS_BUCKET_END)
+			*tombstone_idx = cur;
+
 		if ((st == MARUFS_ENTRY_VALID_LE ||
 		     st == MARUFS_ENTRY_INSERTING_LE) &&
 		    READ_LE64(e->name_hash) == hash) {
@@ -224,6 +238,8 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	struct marufs_index_entry_hot *hot;
 	struct marufs_index_entry_cold *cold;
 	__le32 old_state;
+	bool reused_tombstone = false;
+	u32 chain_tombstone = MARUFS_BUCKET_END;
 	int ret;
 
 	/* Step 1: select shard + bucket from hash (shard_cache = local DRAM) */
@@ -252,6 +268,7 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	/*
 	 * Step 2: check for duplicate name before reserving slot.
 	 * Walk bucket chain to find existing VALID entry with same name.
+	 * Also records the first TOMBSTONE in the chain for potential reuse.
 	 *
 	 * NOTE: This pre-insert check has a TOCTOU window — two nodes can both
 	 * pass it and insert the same name. Post-insert dedup after step 6
@@ -260,18 +277,48 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	 */
 	ret = marufs_index_check_duplicate(hot_entries, cold_entries, buckets,
 					   bucket_idx, num_entries, hash, name,
-					   namelen);
+					   namelen, &chain_tombstone);
 	if (ret)
 		return ret;
 
 	/*
-	 * Step 3: scan hot entry array to find EMPTY slot and reserve it via
-	 * CAS EMPTY -> INSERTING.  Start from shard_free_hint to skip
-	 * known-occupied prefix (H-P1: O(1) amortized vs O(n) linear).
-	 */
+		* Step 3a: try to reuse a TOMBSTONE found in the bucket chain.
+		* The entry is already linked, so we skip link_and_publish later.
+		* CAS TOMBSTONE -> INSERTING to claim it exclusively.
+		*/
 	hot = NULL;
 	cold = NULL;
-	{
+	if (chain_tombstone != MARUFS_BUCKET_END) {
+		struct marufs_index_entry_hot *e =
+			&hot_entries[chain_tombstone];
+
+		if (cmpxchg(&e->state, MARUFS_ENTRY_TOMBSTONE_LE,
+			    MARUFS_ENTRY_INSERTING_LE) ==
+		    MARUFS_ENTRY_TOMBSTONE_LE) {
+			entry_idx = chain_tombstone;
+			hot = e;
+			cold = &cold_entries[entry_idx];
+			/* Stamp created_at for GC stale detection */
+			WRITE_LE64(cold->created_at, ktime_get_real_ns());
+			MARUFS_CXL_WMB(cold, sizeof(*cold));
+			/*
+				* tombstone_entries stays unchanged:
+				* was counted as tombstone, now INSERTING
+				* (still a GC candidate until VALID).
+				*/
+			reused_tombstone = true;
+			pr_debug(
+				"index_insert: reusing tombstone entry %u in shard %u\n",
+				entry_idx, shard_id);
+		}
+	}
+
+	/*
+	 * Step 3b: fallback — scan hot entry array for EMPTY slot if no
+	 * tombstone was reused.  Start from shard_free_hint to skip
+	 * known-occupied prefix (H-P1: O(1) amortized vs O(n) linear).
+	 */
+	if (!hot) {
 		u32 hint = 0;
 		u32 scan;
 
@@ -365,11 +412,19 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 
 	/*
 	 * Steps 5-6: link to bucket chain and publish entry.
+	 * Skip linking if we reused a tombstone — it's already in the chain.
 	 */
-	ret = marufs_index_link_and_publish(hot, entry_idx, buckets,
-					    bucket_idx);
-	if (ret)
-		return ret;
+	if (reused_tombstone) {
+		/* Already linked — just publish INSERTING -> VALID */
+		MARUFS_CXL_WMB(hot, sizeof(*hot));
+		WRITE_ONCE(hot->state, MARUFS_ENTRY_VALID_LE);
+		MARUFS_CXL_WMB(hot, sizeof(*hot));
+	} else {
+		ret = marufs_index_link_and_publish(hot, entry_idx, buckets,
+						    bucket_idx);
+		if (ret)
+			return ret;
+	}
 
 	/* INSERTING→VALID succeeded: no longer a GC candidate */
 	marufs_le32_cas_dec(&sbi->shard_table[shard_id].tombstone_entries, 1);
