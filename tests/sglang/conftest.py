@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Skip entire sglang test directory if sglang.srt is not installed
+pytest.importorskip("sglang.srt", reason="sglang.srt not installed")
+
 # ---------------------------------------------------------------------------
 # Mock SGLang types (avoid importing sglang at test time)
 # ---------------------------------------------------------------------------
