@@ -2,6 +2,17 @@
 
 This document describes how to build and install Maru.
 
+## System Components
+
+Maru consists of two server components:
+
+| Component | Role | Binary |
+|-----------|------|--------|
+| **Resource Manager** | Manages the CXL memory pool (allocation, free, crash recovery) | `maru-resource-manager` (C++) |
+| **Metadata Server** | Manages KV metadata (key → region mapping) per serving instance | `maru-server` (Python) |
+
+Both must be running for Maru to operate. In a single-node setup, both run on the same machine. In a multi-node setup, all nodes must have access to the same CXL memory pool. The Resource Manager runs on one node to manage the memory pool, and other nodes connect to it over TCP.
+
 ## Prerequisites
 
 - OS: Ubuntu 24.04 LTS+
@@ -20,7 +31,8 @@ sudo apt-get install -y python3 python3-venv python3-pip git \
 <br/>
 
 ## 1. Installation from Source Code
-### 1.1. Getting the Source
+
+### 1.1 Getting the Source
 The Maru source code for released versions can be obtained from our GitHub repository: [https://github.com/xcena-dev/maru](https://github.com/xcena-dev/maru)
 ```bash
 git clone https://github.com/xcena-dev/maru
@@ -28,7 +40,7 @@ git clone https://github.com/xcena-dev/maru
 
 <br/>
 
-### 1.2. Installation
+### 1.2 Install
 
 (Optional) Create a virtual environment and activate it:
 
@@ -37,94 +49,32 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install the Maru Python package and resource manager:
+Install all components (Python package + Resource Manager):
 
 ```bash
 ./install.sh
+```
+
+To install **without the Resource Manager** (e.g., on nodes that only run MaruServer):
+
+```bash
+./install.sh --no-rm
 ```
 
 <br/>
 
 ## 2. Verify Installation
 
-Verify that the Maru Resource Manager binary is installed:
+Verify that the Maru Python package is installed:
+
+```bash
+python3 -c "import maru_shm; print('ok')"
+```
+
+If you installed with the Resource Manager, verify the binary:
 
 ```bash
 which maru-resource-manager
 ```
-
-The resource manager must be running before launching `MaruServer`.
-
-### Daemon Mode (recommended for production)
-
-Start as a systemd service:
-
-```bash
-sudo systemctl start maru-resource-manager
-```
-
-To verify it is running:
-
-```bash
-sudo systemctl status maru-resource-manager
-maru_test_client stats
-```
-
-To start automatically on boot:
-
-```bash
-sudo systemctl enable maru-resource-manager
-```
-
-To customize host/port or log level, edit the systemd service override:
-
-```bash
-sudo systemctl edit maru-resource-manager
-```
-
-Add the following in the editor:
-
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/local/bin/maru-resource-manager --host 0.0.0.0 --port 9850 --log-level debug
-```
-
-Then restart the service:
-
-```bash
-sudo systemctl restart maru-resource-manager
-```
-
-### Direct Mode (for development/debugging)
-
-Run the binary directly with custom options:
-
-```bash
-sudo maru-resource-manager --log-level debug
-```
-
-Available CLI options:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--host`, `-H` | `127.0.0.1` | TCP bind address (use `0.0.0.0` for remote access — see security note below) |
-| `--port`, `-p` | `9850` | TCP port |
-| `--state-dir`, `-d` | `/var/lib/maru-resourced` | State directory for WAL and metadata |
-| `--log-level`, `-l` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `--num-workers`, `-w` | `32` | Worker thread pool size |
-
-Example with custom port:
-
-```bash
-sudo maru-resource-manager --port 9851 --log-level debug
-```
-
-> **Note:** If the systemd service is already running, the direct command will report a port conflict. Stop the service first: `sudo systemctl stop maru-resource-manager`
-
-> **Important:** If you change the resource manager port from the default (`9850`), you must also pass the same address to `maru-server`:
-> ```bash
-> maru-server --rm-address 127.0.0.1:9851
-> ```
 
 Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.

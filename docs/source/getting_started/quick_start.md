@@ -1,6 +1,8 @@
 # Quickstart
 
-## 1. Start the Resource Manager
+## Single-Node Setup
+
+### 1. Start the Resource Manager
 
 The resource manager must be running before any other Maru service.
 
@@ -16,18 +18,18 @@ sudo systemctl start maru-resource-manager
 # Default (127.0.0.1:9850)
 sudo maru-resource-manager --log-level debug
 
-# Custom port
-sudo maru-resource-manager --port 9851 --log-level debug
+# With custom host/port
+sudo maru-resource-manager --host 0.0.0.0 --port 9851 --log-level debug
 ```
 
 > If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
 >
 > See {doc}`installation` for the full list of CLI options and systemd configuration.
 
-## 2. Start the Metadata Server
+### 2. Start the Metadata Server
 
 ```bash
-# Default (localhost:5555, connects to resource manager at 127.0.0.1:9850)
+# Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
@@ -37,7 +39,7 @@ maru-server --host 0.0.0.0 --port 5556
 maru-server --log-level DEBUG
 ```
 
-## 3. Run a Client Example
+### 3. Run a Client Example
 
 > Both `maru-resource-manager` and `maru-server` must be running before proceeding.
 
@@ -137,6 +139,52 @@ with MaruHandler(config) as handler:
 > Single-script version: `examples/basic/cross_instance.py`
 
 
+
+## Multi-Node Setup
+
+In a CXL switch topology, one Resource Manager manages the entire CXL memory pool. Other nodes connect to it over TCP.
+
+```
+  RM Node                         Serving Nodes
+  ┌───────────────────────┐      ┌─────────────────┐
+  │ maru-resource-manager │◄─TCP─│ maru-server     │
+  │ --host 0.0.0.0        │      │ --rm-address    │
+  │                       │◄─TCP─│   <rm-ip>:9850  │
+  └───────────┬───────────┘      └────────┬────────┘
+              │                           │
+              └──── CXL Memory Pool ──────┘
+                    (direct access)
+```
+
+### 1. Start the Servers
+
+**RM Node** — install all components and start the Resource Manager:
+
+```bash
+./install.sh
+sudo systemctl edit maru-resource-manager
+```
+
+Override the host to accept remote connections:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/maru-resource-manager --host 0.0.0.0
+```
+
+```bash
+sudo systemctl start maru-resource-manager
+```
+
+**Serving Nodes** — install without the Resource Manager and start MaruServer:
+
+```bash
+./install.sh --no-rm
+maru-server --host 0.0.0.0 --rm-address <rm-node-ip>:9850
+```
+
+> **Security:** When binding to `0.0.0.0`, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
 
 ## Next Steps
 
