@@ -111,7 +111,7 @@ maru-server [OPTIONS]
 # Default
 maru-server
 
-# Production (remote access)
+# Production
 maru-server --host 0.0.0.0 --port 5555 --log-level WARNING
 
 # Debug
