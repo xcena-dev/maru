@@ -1,0 +1,3 @@
+*.log
+commands.log
+.p2p_pids

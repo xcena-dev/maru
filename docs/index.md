@@ -124,7 +124,9 @@ Consistency and Safety <source/design_doc/consistency_and_safety>
 :caption: Integration
 :hidden:
 
-LMCache Integration <source/integration/lmcache>
+LMCache <source/integration/lmcache>
+vLLM <source/integration/vllm>
+SGLang HiCache <source/integration/sglang>
 ```
 
 ```{toctree}
@@ -140,7 +142,7 @@ Configuration <source/api_reference/config>
 
 - **NUMA node support for CXL memory** — Currently Maru requires CXL memory to be exposed as devdax devices (`/dev/dax*`). We plan to support CXL memory mapped as NUMA nodes, enabling broader hardware compatibility and simplified deployment.
 
-- **Direct integration with inference frameworks** — Native KV cache connectors for vLLM and SGLang, enabling zero-copy shared memory without intermediate middleware dependencies.
+- **Direct integration with more inference frameworks** — Native KV cache connector for SGLang, enabling zero-copy shared memory without intermediate middleware dependencies.
 
 - **CXL-based Near Data Processing (NDP)** — Offloading KV cache operations — such as compression/decompression, prefix matching, and eviction scoring — to compute-capable CXL devices, reducing host CPU overhead and data movement.
 
