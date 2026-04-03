@@ -1,24 +1,15 @@
 # Quickstart
 
-## 1. Start the Resource Manager
+## Single-Node Setup
+
+### 1. Start the Resource Manager
 
 The resource manager must be running before any other Maru service.
 
 **Production** — start as a systemd daemon:
 
 ```bash
-# Default (127.0.0.1:9850)
 sudo systemctl start maru-resource-manager
-
-# With custom host/port
-sudo systemctl edit maru-resource-manager
-
-[Service]
-ExecStart=
-ExecStart=/usr/local/bin/maru-resource-manager --host <ip> --port <port>
-
-sudo systemctl restart maru-resource-manager
-
 ```
 
 **Development/debugging** — run directly with custom options:
@@ -28,30 +19,27 @@ sudo systemctl restart maru-resource-manager
 sudo maru-resource-manager --log-level debug
 
 # With custom host/port
-sudo maru-resource-manager --host <ip> --port <port> --log-level debug
+sudo maru-resource-manager --host 0.0.0.0 --port 9851 --log-level debug
 ```
 
 > If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
 >
-> See {doc}`../design_doc/maru_resource_manager` for the full list of CLI options.
+> See {doc}`installation` for the full list of CLI options and systemd configuration.
 
-## 2. Start the Metadata Server
+### 2. Start the Metadata Server
 
 ```bash
 # Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
-maru-server --host <ip> --port <port>
-
-# With custom resource manager address (default: 127.0.0.1:9850)
-maru-server --rm-address <rm-ip>:<rm-port>
+maru-server --host 0.0.0.0 --port 5556
 
 # With debug logging
 maru-server --log-level DEBUG
 ```
 
-## 3. Run a Client Example
+### 3. Run a Client Example
 
 > Both `maru-resource-manager` and `maru-server` must be running before proceeding.
 
@@ -151,9 +139,49 @@ with MaruHandler(config) as handler:
 > Single-script version: `examples/basic/cross_instance.py`
 
 
+
+## Multi-Node Setup
+
+In a multi-node deployment, the Resource Manager, Metadata Server, and MaruHandler communicate over the network. All nodes must have direct access to the shared CXL memory pool for zero-copy mmap.
+
+```
+  ┌───────────────────┐       ┌────────────────────────┐
+  │ Resource Manager  │◄──────│ Metadata Server        │
+  │                   │       │  --rm-address <rm-ip>  │
+  └─────────┬─────────┘       └────────────┬───────────┘
+            ▲                              ▲
+            │                              │
+            └──────── MaruHandler ─────────┘
+              (embedded in LLM instance)
+```
+
+### 1. Start the Resource Manager
+
+Bind to `0.0.0.0` to accept remote connections (default is `127.0.0.1`, local-only):
+
+```bash
+sudo maru-resource-manager --host 0.0.0.0
+```
+
+### 2. Start the Metadata Server
+
+Point to the Resource Manager's externally reachable address:
+
+```bash
+maru-server --host 0.0.0.0 --rm-address <rm-ip>:9850
+```
+
+MaruHandler receives the Resource Manager address from the Metadata Server automatically via handshake — no separate RM address configuration is needed on the client side.
+
+> **Note:** The `--rm-address` passed to the Metadata Server is forwarded to all MaruHandlers via handshake. Use an externally reachable IP — if set to `127.0.0.1`, remote MaruHandlers will attempt to connect to their own loopback and fail.
+
+> **Security:** When binding to `0.0.0.0`, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
+
+### 3. Run a Client Example
+Multi-node end-to-end examples are coming soon.
+
 ## Next Steps
 
-- {doc}`installation` — Multi-node configuration
 - [LMCache Examples](examples/lmcache/index.md) — Use Maru as a shared KV cache backend for LMCache/vLLM
 - [Architecture Overview](../design_doc/architecture_overview.md) — System architecture and component interactions
 - [API Reference](../api_reference/api.md) — Python API documentation

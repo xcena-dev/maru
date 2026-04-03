@@ -40,7 +40,7 @@ flowchart TB
     PM -.->|"sysfs scan"| Storage
 ```
 
-`PoolManager` is the central component that owns all shared state — pool metadata, allocation maps, and free lists. It performs device discovery by scanning sysfs for DEV_DAX and FS_DAX devices, and supports hot-plug via signal-triggered rescans.
+`PoolManager` is the central component that owns all shared state — pool metadata, allocation maps, and free lists. It performs device discovery by scanning sysfs for DEV_DAX and FS_DAX devices, and supports hot-plug via `SIGHUP`-triggered rescans (`kill -HUP $(pidof maru-resource-manager)`).
 
 `TcpServer` accepts TCP client connections and dispatches requests to `RequestHandler`. It handles transport concerns including client identity parsing from the `client_id` field in requests.
 
@@ -52,9 +52,9 @@ flowchart TB
 
 ---
 
----
+## 2. IPC Protocol
 
-## 3. IPC Protocol
+> **Note:** This section describes the Resource Manager's binary IPC protocol (TCP, port 9850). The Metadata Server (`maru-server`) uses a separate RPC protocol over ZMQ (port 5555) — see the MaruServer documentation for details.
 
 All messages use a fixed-size binary header (12 bytes) containing protocol magic, version (v2), message type, and payload length, followed by a type-specific payload. Communication is over TCP.
 
@@ -95,7 +95,7 @@ Stats can be queried via `MaruShmClient.stats()` in Python or the `maru_test_cli
 
 ---
 
-## 4. Memory Management
+## 3. Memory Management
 
 Each discovered CXL device becomes a **pool** with a sorted free list of extents (offset + length pairs). The allocation algorithm uses **first-fit with alignment**: it scans the free list for the first extent that can accommodate the aligned request size, splits the extent into residual fragments if needed, and returns a Handle pointing to the allocated region.
 
@@ -105,7 +105,7 @@ All allocation sizes are rounded up to the pool's alignment boundary. For DEV_DA
 
 ---
 
-## 5. Persistence & Recovery
+## 4. Persistence & Recovery
 
 The Resource Manager ensures durability through a combination of write-ahead logging and periodic checkpoints.
 
@@ -115,33 +115,35 @@ On startup, the **recovery sequence** proceeds as: (1) scan for current hardware
 
 ---
 
-## 6. Reaper
+## 5. Reaper
 
 The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
-For **remote clients** (different hostname), the server monitors TCP connection state. When a remote client disconnects, a grace period begins. If the client does not reconnect within the grace period, its allocations are reclaimed. This prevents memory leaks from crashed remote clients while tolerating transient network interruptions.
+For **remote clients** (different hostname), the server monitors TCP connection state. When a remote client disconnects, a grace period begins (configurable via `--grace-period`, default 30 seconds). If the client reconnects within the grace period, the timer is cancelled and allocations are preserved. If not, its allocations are reclaimed.
+
+Local vs. remote is determined by comparing the client's hostname (from `client_id`) against the server's hostname. TCP keepalive (idle 10s, interval 5s, count 3) detects dead connections in ~25 seconds, after which the grace period starts — so a crashed remote client's allocations are reclaimed after ~55 seconds total.
 
 ---
 
-## 7. Security
+## 6. Security
 
 Every allocation receives a **cryptographic auth token** derived from the Handle fields and a server-side secret. Free and access requests must present a valid token; invalid tokens are rejected.
 
 The secret is generated on first start and persisted to the state directory. On restart, if allocations exist from a previous run, the secret is loaded; if it is missing, startup is aborted to prevent token verification failures.
 
-**Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. The auth token is cryptographically bound to the `client_id`, preventing token forgery even if Handle fields are known.
+**Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. Note that `client_id` is self-reported by the client; it provides ownership tracking rather than authentication. The auth token is cryptographically bound to the `client_id`, so forging a valid token requires knowing both the Handle fields and the server-side secret.
 
-**PID reuse safety:** A new process may receive the same PID as a terminated one, but it cannot access the old allocations — the Handle (including auth token) existed only in the old process's memory. The Reaper detects PID reuse by comparing cached process start times (local clients) or via TCP disconnect grace period (remote clients). See §6 for details.
+**PID reuse safety:** A new process may receive the same PID as a terminated one, but it cannot access the old allocations — the Handle (including auth token) existed only in the old process's memory. The Reaper detects PID reuse by comparing cached process start times (local clients) or via TCP disconnect grace period (remote clients). See §5 for details.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 
 ---
 
-## 8. Server Configuration
+## 7. Server Configuration
 
-The server is configured via CLI arguments. On startup, the resource manager writes its resolved configuration to `rm.conf` in the state directory (atomic tmp+rename) for reference.
+The server is configured via CLI arguments. On startup, the resource manager writes host, port, and log level to `rm.conf` in the state directory (atomic tmp+rename) for reference.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -150,6 +152,8 @@ The server is configured via CLI arguments. On startup, the resource manager wri
 | `--state-dir`, `-d` | `/var/lib/maru-resourced` | State directory for WAL and checkpoints |
 | `--log-level`, `-l` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--num-workers`, `-w` | `32` | Worker thread pool size |
+| `--grace-period`, `-g` | `30` | Seconds to wait before reaping a disconnected remote client's allocations |
+| `--max-clients`, `-m` | `256` | Maximum concurrent client connections |
 
 ### Daemon mode (production)
 
