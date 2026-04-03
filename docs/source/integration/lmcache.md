@@ -18,30 +18,32 @@ The full stack from inference engine to shared memory:
 
 | Layer | Responsibility | Scope |
 |-------|---------------|-------|
-| **LMCache stack** | Inference engine → CacheEngine → StorageManager → RemoteBackend | LMCache (external) |
-| **MaruConnector** | Adapts LMCache's RemoteConnector to MaruHandler's API | Integration boundary |
+| **LMCache stack** | Inference engine → CacheEngine → StorageManager → MaruBackend | LMCache (external) |
+| **MaruBackend** | LMCache `AllocatorBackendInterface` — allocates directly on CXL, async store, sync get | Integration boundary |
+| **CxlMemoryAdapter** | LMCache `MemoryAllocatorInterface` — translates Maru pages to `TensorMemoryObj` pool | Integration boundary |
 | **MaruHandler** | Client-side KV operations, memory mapping, connection management | Maru client |
 | **MaruServer** | Central metadata store, memory allocation coordinator | Maru server |
 
-The **integration boundary** sits at MaruConnector. Everything above is LMCache;
-everything below is Maru. MaruConnector is the only component that imports from
-both projects.
+The **integration boundary** sits at MaruBackend + CxlMemoryAdapter. Everything above is LMCache;
+everything below is Maru. These two classes are the only components that import from both projects.
 
-## Connector Design
+## Backend Design
 
-LMCache defines a `RemoteConnector` interface that all remote storage backends
-must implement (`exists`, `get`, `put`, `close`, and batch variants). MaruConnector
-implements this interface by delegating to MaruHandler.
+### Two-layer integration
 
-**Why the connector pattern:** LMCache's RemoteBackend is designed for pluggable
-storage. The same StorageManager can use Redis, S3, Mooncake, or Maru without
-any change to the cache engine logic. MaruConnector slots in as one such plugin.
+```
+MaruBackend (AllocatorBackendInterface)
+  ├── CxlMemoryAdapter (MemoryAllocatorInterface)
+  │     ├── _pool: {region_id: [TensorMemoryObj per page]}
+  │     └── address encoding: (rid << 32) | pid
+  └── MaruHandler (Maru client)
+        ├── RpcClient → MaruServer
+        ├── DaxMapper (mmap management)
+        └── OwnedRegionManager (page allocation)
+```
 
-The key translation between the two APIs involves:
-
-- **Key conversion** — LMCache uses structured `CacheEngineKey` objects; MaruHandler uses string keys (`CacheEngineKey.to_string()`).
-- **Zero-copy bridging** — MaruHandler returns `MemoryInfo` (a memoryview wrapper) which the connector wraps as LMCache's `MemoryObj` without copying data.
-- **Batch optimization** — The connector maps LMCache's batch operations to MaruHandler's batch RPC calls, reducing round-trip overhead.
+**MaruHandler** manages CXL memory (regions, pages, mmap). **CxlMemoryAdapter** translates
+pages into LMCache's `TensorMemoryObj` format.
 
 ## Data Path
 
@@ -53,21 +55,23 @@ When the inference engine produces new KV cache data:
 sequenceDiagram
     participant IE as Inference Engine
     participant CE as CacheEngine
-    participant MC as MaruConnector
+    participant MB as MaruBackend
     participant MH as MaruHandler
     participant MS as MaruServer
     participant CXL as CXL Memory
 
     IE->>CE: KV tensors (GPU)
-    CE->>MC: put(key, MemoryObj)
-    MC->>MH: alloc(size)
-    MH-->>MC: handle (page in CXL region)
-    MC->>CXL: write data via handle buffer (zero-copy)
-    MC->>MH: store(key, handle)
+    CE->>MB: allocate(size)
+    MB->>MH: alloc(size)
+    MH-->>MB: handle (page in CXL region)
+    MB-->>CE: MemoryObj (CXL-backed)
+    CE->>CXL: GPU → CXL direct copy (only data copy)
+    CE->>MB: put(key, MemoryObj)
+    MB->>MH: store(key, handle)
     MH->>MS: register_kv(key, region_id, offset, length)
     MS-->>MH: success
-    MH-->>MC: True
-    MC-->>CE: done
+    MH-->>MB: True
+    MB-->>CE: done
 ```
 
 ### Retrieve Path (read)
@@ -78,20 +82,19 @@ When the inference engine needs cached KV data:
 sequenceDiagram
     participant IE as Inference Engine
     participant CE as CacheEngine
-    participant MC as MaruConnector
+    participant MB as MaruBackend
     participant MH as MaruHandler
     participant MS as MaruServer
     participant CXL as CXL Memory
 
     IE->>CE: Request KV for prompt prefix
-    CE->>MC: get(key)
-    MC->>MH: retrieve(key)
+    CE->>MB: get(key)
+    MB->>MH: retrieve(key)
     MH->>MS: lookup_kv(key)
     MS-->>MH: region_id, offset, length
     MH->>CXL: Map shared region (if not already mapped)
-    MH-->>MC: MemoryInfo (zero-copy memoryview)
-    MC->>MC: Wrap as MemoryObj (zero-copy)
-    MC-->>CE: MemoryObj
+    MH-->>MB: MemoryInfo (zero-copy memoryview)
+    MB-->>CE: MemoryObj (points to CXL mmap, zero-copy)
     CE-->>IE: KV tensors
 ```
 
@@ -101,59 +104,43 @@ accessed directly from CXL shared memory through memory-mapped regions.
 
 ## Configuration
 
-Maru is loaded as an LMCache [remote storage plugin](https://docs.lmcache.ai/developer_guide/extending_lmcache/remote_storage_plugins.html) (requires LMCache >= v0.3.14). Configuration is done via the LMCache YAML config file.
+Maru is configured as a native LMCache storage backend via the `maru_path` and `maru_pool_size`
+config fields. No plugin registration is needed.
 
 ```yaml
 chunk_size: 256
-local_cpu: True
-max_local_cpu_size: 5
-enable_async_loading: True
+local_cpu: False
+max_local_cpu_size: 0
+save_unfull_chunk: True
 
-# Disable P2P for Maru shared storage mode
-enable_p2p: False
-enable_controller: False
-
-# Maru backend — format: maru://<host>:<port>[?pool_size=&pool_id=&...]
-remote_url: "maru://localhost:5555"
-remote_serde: "naive"
-remote_storage_plugins: ["maru"]
+# Maru backend
+maru_path: "maru://localhost:5555"
+maru_pool_size: 4
 
 extra_config:
-  remote_storage_plugin.maru.module_path: maru_lmcache.adapter
-  remote_storage_plugin.maru.class_name: MaruConnectorAdapter
-  maru_pool_size: "4G"              # CXL memory pool size ("1G", "500M", etc.)
-  # maru_pool_id: 1                 # Pin to specific DAX pool (default: any)
-  # maru_pool_id: "0,1"             # Multi-pool fallback (try pool 0, then 1)
-  save_chunk_meta: False
   lookup_backoff_time: 0.001
   # maru_instance_id: "my-id"       # Unique client ID (default: auto UUID)
-  # maru_operation_timeout: 10.0    # Per-operation timeout in seconds
-  # maru_timeout_ms: 2000           # ZMQ socket timeout (ms)
+  # maru_timeout_ms: 5000           # ZMQ socket timeout (ms)
   # maru_use_async_rpc: true        # Async DEALER-ROUTER RPC
   # maru_max_inflight: 64           # Max in-flight async requests
+  # maru_eager_map: true            # Pre-map shared regions on connect
 ```
 
-### Plugin settings
+### MaruBackend settings
 
-| Field | Description |
-| --- | --- |
-| `remote_storage_plugins: ["maru"]` | Registers Maru as a plugin backend |
-| `remote_storage_plugin.maru.module_path` | Python module containing the adapter class |
-| `remote_storage_plugin.maru.class_name` | Adapter class name (`MaruConnectorAdapter`) |
+| Field | Default | Description |
+| --- | --- | --- |
+| `maru_path` | (required) | MaruServer address. Format: `maru://<host>:<port>` |
+| `maru_pool_size` | `4` | CXL memory pool size in GB |
 
 ### Maru extra_config parameters
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `maru_pool_size` | `"1G"` | CXL memory pool size. Supports human-readable strings (`"4G"`, `"500M"`) or integer bytes |
-| `maru_pool_id` | `None` (any pool) | Pin allocations to specific DAX device pool(s). Single int (`1`) or comma-separated (`"0,1"`) for ordered fallback. Can also be set via URL query: `maru://host:port?pool_id=1` |
 | `maru_instance_id` | auto-generated UUID | Unique client instance identifier |
-| `maru_operation_timeout` | `10.0` | Timeout in seconds for individual KV operations |
-| `maru_timeout_ms` | `2000` | ZMQ socket timeout in milliseconds for RPC communication |
+| `maru_timeout_ms` | `5000` | ZMQ socket timeout in milliseconds for RPC communication |
 | `maru_use_async_rpc` | `true` | Use async DEALER-ROUTER pattern for higher throughput |
 | `maru_max_inflight` | `64` | Max concurrent in-flight async RPC requests |
-| `maru_server_url` | (from `remote_url`) | Override server URL. Normally not needed |
-| `maru_auto_connect` | `true` | Auto-connect to MaruServer on initialization |
 | `maru_eager_map` | `true` | Pre-map all shared regions on connect |
 
 For runnable examples, see

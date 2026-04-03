@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Tests for KV Manager."""
 
-from maru_server.kv_manager import KVManager
+from maru_server.kv_manager import DeleteResult, KVManager
 
 
 class TestKVManager:
@@ -58,8 +58,8 @@ class TestKVManager:
         manager = KVManager()
         manager.register(key="123", region_id=1, kv_offset=0, kv_length=1024)
 
-        existed, region_id = manager.delete("123")
-        assert existed is True
+        result, region_id = manager.delete("123")
+        assert result == DeleteResult.DELETED
         assert region_id == 1  # Need to decrement alloc ref
         assert manager.exists("123") is False
 
@@ -75,21 +75,21 @@ class TestKVManager:
         assert rid is None
 
         # Delete removes entry entirely on first call
-        existed, region_id = manager.delete("123")
-        assert existed is True
+        result, region_id = manager.delete("123")
+        assert result == DeleteResult.DELETED
         assert region_id == 1
         assert manager.exists("123") is False
 
-        # Second delete on now-missing key returns (False, None)
-        existed, region_id = manager.delete("123")
-        assert existed is False
+        # Second delete on now-missing key returns NOT_FOUND
+        result, region_id = manager.delete("123")
+        assert result == DeleteResult.NOT_FOUND
         assert region_id is None
 
     def test_delete_nonexistent(self):
         """Test deleting a nonexistent key."""
         manager = KVManager()
-        existed, region_id = manager.delete("999")
-        assert existed is False
+        result, region_id = manager.delete("999")
+        assert result == DeleteResult.NOT_FOUND
         assert region_id is None
 
     def test_get_stats(self):
@@ -210,8 +210,8 @@ class TestKVManagerEdgeCases:
         """Test deleting a key that was never registered."""
         manager = KVManager()
 
-        existed, region_id = manager.delete("999")
-        assert existed is False
+        result, region_id = manager.delete("999")
+        assert result == DeleteResult.NOT_FOUND
         assert region_id is None
 
     def test_register_then_delete_then_re_register(self):
@@ -219,8 +219,8 @@ class TestKVManagerEdgeCases:
         manager = KVManager()
         manager.register(key="123", region_id=1, kv_offset=0, kv_length=1024)
 
-        existed, region_id = manager.delete("123")
-        assert existed is True
+        result, region_id = manager.delete("123")
+        assert result == DeleteResult.DELETED
         assert region_id == 1
         assert manager.exists("123") is False
 
@@ -231,3 +231,174 @@ class TestKVManagerEdgeCases:
         assert is_new is True
         assert new_region_id == 2
         assert manager.exists("123") is True
+
+
+class TestKVManagerPin:
+    """Test cases for pin/unpin operations."""
+
+    # ---- pin() ----
+
+    def test_pin_existing_key(self):
+        """pin() on existing key returns True and increments pin_count."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+
+        assert manager.pin("1") is True
+        assert manager.lookup("1").pin_count == 1
+
+    def test_pin_increments_multiple_times(self):
+        """Multiple pin() calls increment pin_count each time."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+
+        manager.pin("1")
+        manager.pin("1")
+        manager.pin("1")
+        assert manager.lookup("1").pin_count == 3
+
+    def test_pin_nonexistent_key(self):
+        """pin() on nonexistent key returns False."""
+        manager = KVManager()
+        assert manager.pin("999") is False
+
+    # ---- unpin() ----
+
+    def test_unpin_pinned_key(self):
+        """unpin() on pinned key returns True and decrements pin_count."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.pin("1")
+        manager.pin("1")
+
+        assert manager.unpin("1") is True
+        assert manager.lookup("1").pin_count == 1
+
+    def test_unpin_nonexistent_key(self):
+        """unpin() on nonexistent key returns False."""
+        manager = KVManager()
+        assert manager.unpin("999") is False
+
+    def test_unpin_underflow_protection(self):
+        """unpin() on key with pin_count=0 returns False (no underflow)."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+
+        # Never pinned — pin_count is 0
+        assert manager.unpin("1") is False
+        assert manager.lookup("1").pin_count == 0
+
+    def test_unpin_after_full_decrement(self):
+        """unpin() returns False after pin_count reaches 0."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.pin("1")
+
+        assert manager.unpin("1") is True
+        assert manager.lookup("1").pin_count == 0
+        # Second unpin should fail
+        assert manager.unpin("1") is False
+
+    # ---- delete() with pin ----
+
+    def test_delete_pinned_key_refused(self):
+        """delete() on pinned key returns PINNED and does not remove entry."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.pin("1")
+
+        result, region_id = manager.delete("1")
+        assert result == DeleteResult.PINNED
+        assert region_id is None
+        # Entry still exists
+        assert manager.exists("1") is True
+        assert manager.lookup("1").pin_count == 1
+
+    def test_delete_after_unpin(self):
+        """delete() succeeds after pin_count reaches 0 via unpin()."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.pin("1")
+        manager.unpin("1")
+
+        result, region_id = manager.delete("1")
+        assert result == DeleteResult.DELETED
+        assert region_id == 1
+        assert manager.exists("1") is False
+
+
+class TestKVManagerBatchPin:
+    """Test cases for batch pin/unpin operations."""
+
+    # ---- batch_pin() ----
+
+    def test_batch_pin_all_exist(self):
+        """batch_pin() pins all keys when all exist."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.register(key="2", region_id=1, kv_offset=100, kv_length=100)
+        manager.register(key="3", region_id=1, kv_offset=200, kv_length=100)
+
+        results = manager.batch_pin(["1", "2", "3"])
+        assert results == [True, True, True]
+        assert manager.lookup("1").pin_count == 1
+        assert manager.lookup("2").pin_count == 1
+        assert manager.lookup("3").pin_count == 1
+
+    def test_batch_pin_prefix_stop(self):
+        """batch_pin() stops at first miss — only prefix keys are pinned."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        # key "2" missing
+        manager.register(key="3", region_id=1, kv_offset=200, kv_length=100)
+
+        results = manager.batch_pin(["1", "2", "3"])
+        assert results == [True, False, False]
+        # Only "1" should be pinned
+        assert manager.lookup("1").pin_count == 1
+        # "3" exists but should NOT be pinned
+        assert manager.lookup("3").pin_count == 0
+
+    def test_batch_pin_first_key_missing(self):
+        """batch_pin() with first key missing returns all False."""
+        manager = KVManager()
+        manager.register(key="2", region_id=1, kv_offset=0, kv_length=100)
+
+        results = manager.batch_pin(["1", "2"])
+        assert results == [False, False]
+        assert manager.lookup("2").pin_count == 0
+
+    def test_batch_pin_empty_list(self):
+        """batch_pin([]) returns empty list."""
+        manager = KVManager()
+        assert manager.batch_pin([]) == []
+
+    # ---- batch_unpin() ----
+
+    def test_batch_unpin_all_pinned(self):
+        """batch_unpin() unpins all previously pinned keys."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.register(key="2", region_id=1, kv_offset=100, kv_length=100)
+        manager.pin("1")
+        manager.pin("2")
+
+        results = manager.batch_unpin(["1", "2"])
+        assert results == [True, True]
+        assert manager.lookup("1").pin_count == 0
+        assert manager.lookup("2").pin_count == 0
+
+    def test_batch_unpin_mixed(self):
+        """batch_unpin() with mix of pinned, unpinned, and missing keys."""
+        manager = KVManager()
+        manager.register(key="1", region_id=1, kv_offset=0, kv_length=100)
+        manager.register(key="2", region_id=1, kv_offset=100, kv_length=100)
+        manager.pin("1")
+        # "2" registered but not pinned, "3" doesn't exist
+
+        results = manager.batch_unpin(["1", "2", "3"])
+        assert results == [True, False, False]
+
+    def test_batch_unpin_empty_list(self):
+        """batch_unpin([]) returns empty list."""
+        manager = KVManager()
+        assert manager.batch_unpin([]) == []

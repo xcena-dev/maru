@@ -12,17 +12,15 @@ Example:
     with MaruHandler(config) as handler:
         # Zero-copy store: alloc → write to buf → store
         handle = handler.alloc(size=len(data))
-        handle.buf[:] = data
-        handler.store(key=12345, handle=handle)
+        handle.buf[:len(data)] = data
+        handler.store(key="12345", handle=handle)
 
-        result = handler.retrieve(key=12345)  # returns MemoryInfo
+        result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
-import ctypes
 import logging
 import threading
-
-import numpy as np
+from collections.abc import Callable
 
 from maru_common import ANY_POOL_ID, MaruConfig
 from maru_shm import MaruHandle
@@ -37,26 +35,6 @@ from .memory import (
 from .rpc_client import RpcClient
 
 logger = logging.getLogger(__name__)
-
-
-def _gil_free_memcpy(dst: memoryview, src: memoryview | bytes, nbytes: int) -> None:
-    """Copy *nbytes* from *src* into *dst*, releasing the GIL during copy.
-
-    Uses ``ctypes.memmove`` which releases the GIL (all ctypes foreign-function
-    calls do) for the actual memcpy, allowing other Python threads to run
-    concurrently.
-    """
-    dst_c = (ctypes.c_char * nbytes).from_buffer(dst)
-    if isinstance(src, memoryview) and not src.readonly:
-        src_c = (ctypes.c_char * nbytes).from_buffer(src)
-    elif isinstance(src, memoryview):
-        # read-only memoryview — zero-copy view via numpy to get raw pointer
-        arr = np.frombuffer(src[:nbytes], dtype=np.uint8)
-        src_c = arr.ctypes.data
-    else:
-        # bytes — ctypes.memmove accepts bytes directly
-        src_c = src
-    ctypes.memmove(dst_c, src_c, nbytes)
 
 
 class MaruHandler:
@@ -124,7 +102,95 @@ class MaruHandler:
         self._key_to_location: dict[str, tuple[int, int]] = {}
         self._connected = False
 
+        # Region-added callback (set by CxlMemoryAdapter)
+        self._on_region_added: Callable[[int, int], None] | None = None
+
+        # Expansion policy
+        self._auto_expand = self._config.auto_expand
+        self._expand_size = self._config.expand_size or self._config.pool_size
+
         logger.debug("Created MaruHandler with config: %s", self._config)
+
+    # =========================================================================
+    # Public Accessors
+    # =========================================================================
+
+    @property
+    def mapper(self) -> DaxMapper:
+        """Deprecated: Use get_buffer_view() instead."""
+        return self._mapper
+
+    def get_buffer_view(
+        self, region_id: int, offset: int, size: int
+    ) -> memoryview | None:
+        """Get a memoryview slice from a mapped region.
+
+        Args:
+            region_id: The region ID (owned or shared).
+            offset: Byte offset within the region.
+            size: Number of bytes to view.
+
+        Returns:
+            Writable memoryview, or None if region not mapped.
+        """
+        return self._mapper.get_buffer_view(region_id, offset, size)
+
+    def get_region_page_count(self, region_id: int) -> int | None:
+        """Get page count for a region (owned or shared).
+
+        Args:
+            region_id: The region ID.
+
+        Returns:
+            Number of pages, or None if region not found.
+        """
+        if self._owned is not None:
+            region = self._owned.get_owned_region(region_id)
+            if region is not None:
+                return region.allocator.page_count
+        mapped = self._mapper.get_region(region_id)
+        if mapped is None:
+            return None
+        return mapped.size // self._config.chunk_size_bytes
+
+    def get_owned_region_ids(self) -> list[int]:
+        """Get list of currently owned region IDs.
+
+        Returns:
+            List of region IDs. Empty if not connected.
+        """
+        if self._owned is None:
+            return []
+        return self._owned.get_region_ids()
+
+    def get_chunk_size(self) -> int:
+        """Get the configured chunk size in bytes.
+
+        Returns:
+            Chunk size in bytes.
+        """
+        return self._config.chunk_size_bytes
+
+    def set_on_region_added(self, callback: Callable[[int, int], None] | None) -> None:
+        """Register callback invoked with (region_id, page_count) after region added.
+
+        On registration, replays callback for all existing owned regions
+        so the caller doesn't need separate init-time logic.
+
+        Args:
+            callback: Called with (region_id, page_count), or None to unregister.
+        """
+        self._on_region_added = callback
+        if callback is not None and self._owned is not None:
+            for rid in self._owned.get_region_ids():
+                region = self._owned.get_owned_region(rid)
+                if region is not None:
+                    logger.debug(
+                        "on_region_added replay: region=%d pages=%d",
+                        rid,
+                        region.allocator.page_count,
+                    )
+                    callback(rid, region.allocator.page_count)
 
     # =========================================================================
     # Connection Management
@@ -149,13 +215,15 @@ class MaruHandler:
                 chunk_size=self._config.chunk_size_bytes,
             )
 
-            # 3. Request initial owned region via RPC — try each pool in order
-            response = None
+            # 3. Request initial owned region(s) via RPC — aggregate across pools
+            remaining = self._config.pool_size
+            allocated_handles: list[MaruHandle] = []
+
             for pool_id in self._pool_ids:
                 try:
                     response = self._rpc.request_alloc(
                         instance_id=self._config.instance_id,
-                        size=self._config.pool_size,
+                        size=remaining,
                         pool_id=pool_id,
                     )
                 except Exception:
@@ -165,34 +233,58 @@ class MaruHandler:
                         exc_info=True,
                     )
                     continue
-                if response.success and response.handle is not None:
-                    break
-                logger.warning(
-                    "Pool %s refused initial allocation: %s",
-                    pool_id,
-                    getattr(response, "error", "unknown"),
-                )
 
-            if response is None or not response.success or response.handle is None:
-                logger.error("Failed to allocate from any pool")
-                self._owned = None
-                self._rpc.close()
-                return False
+                if not response.success or response.handle is None:
+                    logger.warning(
+                        "Pool %s refused initial allocation: %s",
+                        pool_id,
+                        getattr(response, "error", "unknown"),
+                    )
+                    continue
 
-            # 4. Add region to OwnedRegionManager (mmap + allocator)
-            try:
-                self._owned.add_region(response.handle)
-            except Exception:
-                logger.error("Failed to init initial region", exc_info=True)
+                # 4. Add region to OwnedRegionManager (mmap + allocator)
+                handle = response.handle
                 try:
-                    self._rpc.return_alloc(
-                        self._config.instance_id,
-                        response.handle.region_id,
-                    )
+                    self._owned.add_region(handle)
                 except Exception:
-                    logger.debug(
-                        "Failed to return allocation during cleanup", exc_info=True
+                    logger.error(
+                        "Failed to init region from pool %s", pool_id, exc_info=True
                     )
+                    try:
+                        self._rpc.return_alloc(
+                            self._config.instance_id, handle.region_id
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to return allocation during cleanup",
+                            exc_info=True,
+                        )
+                    continue
+
+                allocated_handles.append(handle)
+                remaining -= handle.length
+                if remaining <= 0:
+                    break
+
+            if remaining > 0:
+                logger.error(
+                    "Failed to allocate pool_size=%d: only got %d bytes from %d pool(s)",
+                    self._config.pool_size,
+                    self._config.pool_size - remaining,
+                    len(allocated_handles),
+                )
+                # Cleanup partially allocated regions
+                for h in allocated_handles:
+                    try:
+                        self._rpc.return_alloc(self._config.instance_id, h.region_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to return region %d during cleanup",
+                            h.region_id,
+                            exc_info=True,
+                        )
+                if self._owned is not None:
+                    self._owned.close()
                 self._owned = None
                 self._rpc.close()
                 return False
@@ -257,16 +349,16 @@ class MaruHandler:
     # =========================================================================
 
     def alloc(self, size: int) -> AllocHandle:
-        """Allocate a page and return a handle with a writable mmap memoryview.
+        """Allocate a page and return a handle with a writable memoryview.
 
         The caller writes directly to ``handle.buf``, then passes the handle
-        to ``store(key, handle=handle)`` to register without copying.
+        to ``store(key, handle)`` to register without copying.
 
         Args:
             size: Required bytes (must be <= chunk_size)
 
         Returns:
-            AllocHandle with writable memoryview
+            AllocHandle with writable memoryview and allocation metadata
 
         Raises:
             RuntimeError: If not connected or closing
@@ -287,7 +379,14 @@ class MaruHandler:
             result = self._owned.allocate()
             if result is None:
                 if not self._expand_region():
-                    raise ValueError("Cannot allocate page: pool exhausted")
+                    if not self._auto_expand:
+                        raise ValueError(
+                            "Cannot allocate page: pool exhausted "
+                            "and auto_expand is disabled"
+                        )
+                    raise ValueError(
+                        "Cannot allocate page: pool exhausted after expansion attempt"
+                    )
                 result = self._owned.allocate()
                 if result is None:
                     raise ValueError("Cannot allocate page after expansion")
@@ -356,24 +455,16 @@ class MaruHandler:
     def store(
         self,
         key: str,
-        info: MemoryInfo | memoryview | None = None,
-        prefix: bytes | None = None,
-        *,
-        data: memoryview | None = None,
-        handle: AllocHandle | None = None,
+        handle: AllocHandle,
     ) -> bool:
-        """Store data to the KV cache.
+        """Register a pre-written page in the KV cache (zero-copy).
 
-        If ``handle`` is provided (zero-copy path), data is already written
-        to the mmap region via alloc() and only register_kv is performed.
-        Otherwise, allocate + memcpy + register are performed in one call.
+        Data must already be written to the page via ``handle.buf``.
+        This method only performs duplicate check + metadata registration.
 
         Args:
             key: The chunk key string
-            info: MemoryInfo or memoryview with data
-            prefix: Optional bytes to prepend (e.g., serialized metadata header)
-            data: memoryview with data (preferred, keyword-only)
-            handle: AllocHandle from alloc() for zero-copy store
+            handle: AllocHandle from alloc()
 
         Returns:
             True if successful
@@ -384,128 +475,21 @@ class MaruHandler:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
 
-            # Duplicate skip: check if key already exists (common to both paths)
+            # Duplicate skip
             if key in self._key_to_location:
-                if handle is not None:
-                    self._owned.free(handle._region_id, handle._page_index)
+                self._owned.free(handle._region_id, handle._page_index)
                 logger.debug("store: key=%s already in local map, skipping", key)
                 return True
             elif self._rpc.exists_kv(key):
-                if handle is not None:
-                    self._owned.free(handle._region_id, handle._page_index)
+                self._owned.free(handle._region_id, handle._page_index)
                 logger.debug("store: key=%s already exists on server, skipping", key)
                 return True
 
-            if handle is not None:
-                # ── Zero-copy path ──
-                if data is not None or info is not None:
-                    raise ValueError("Cannot specify both handle and data/info")
-
-                region_id = handle._region_id
-                page_index = handle._page_index
-                offset = page_index * self._owned.get_chunk_size()
-                total_size = handle._size
-
-                is_new = self._rpc.register_kv(
-                    key=key,
-                    region_id=region_id,
-                    kv_offset=offset,
-                    kv_length=total_size,
-                )
-
-                if not is_new:
-                    self._owned.free(region_id, page_index)
-                    logger.debug(
-                        "store: key=%s lost register race, freed page "
-                        "(region=%d, page=%d)",
-                        key,
-                        region_id,
-                        page_index,
-                    )
-                    return True
-
-                self._key_to_location[key] = (region_id, page_index)
-
-                logger.debug(
-                    "Stored (zero-copy) key=%s: region=%d, page=%d, offset=%d, size=%d",
-                    key,
-                    region_id,
-                    page_index,
-                    offset,
-                    total_size,
-                )
-                return True
-
-            # ── Allocate + memcpy + register ──
-            # Resolve source memoryview from either parameter
-            if data is not None:
-                src = data
-            elif isinstance(info, memoryview):
-                src = info
-            elif isinstance(info, MemoryInfo):
-                src = info.view
-            else:
-                raise TypeError(
-                    "Must provide data (memoryview) or info (MemoryInfo | memoryview)"
-                )
-
-            # Normalize to 1D unsigned-byte view for mmap slice assignment
-            if src.format != "B":
-                src = src.cast("B")
-
-            data_size = len(src)
-            prefix_len = len(prefix) if prefix else 0
-            total_size = prefix_len + data_size
-
-            logger.debug(
-                "store: key=%s, data=%d bytes, prefix=%d bytes, "
-                "total=%d bytes, readonly=%s",
-                key,
-                data_size,
-                prefix_len,
-                total_size,
-                src.readonly,
-            )
-
-            if total_size > self._owned.get_chunk_size():
-                logger.error(
-                    "Total size %d exceeds chunk_size %d",
-                    total_size,
-                    self._owned.get_chunk_size(),
-                )
-                return False
-
-            # Allocate page + CXL write + register (new or overwrite only)
-            result = self._owned.allocate()
-            if result is None:
-                if not self._expand_region():
-                    logger.error("Cannot allocate page for key %s", key)
-                    return False
-                result = self._owned.allocate()
-                if result is None:
-                    return False
-
-            region_id, page_index = result
-
-            # 2. Get writable memoryview slice for the page
-            buf = self._mapper.get_buffer_view(
-                region_id,
-                page_index * self._owned.get_chunk_size(),
-                total_size,
-            )
-            if buf is None:
-                self._owned.free(region_id, page_index)
-                return False
-
-            # 3. Write prefix + data via GIL-free memcpy
-            offset = 0
-            if prefix:
-                _gil_free_memcpy(buf[offset:], prefix, prefix_len)
-                offset += prefix_len
-            _gil_free_memcpy(buf[offset:], src, data_size)
-
-            # 4. Register KV with server
+            region_id = handle._region_id
+            page_index = handle._page_index
             offset = page_index * self._owned.get_chunk_size()
+            total_size = handle._size
+
             try:
                 is_new = self._rpc.register_kv(
                     key=key,
@@ -525,9 +509,6 @@ class MaruHandler:
                 return False
 
             if not is_new:
-                # Race condition: another instance registered the same key
-                # between our exists_kv check and register_kv call.
-                # Free the page we just wrote — the data is identical anyway.
                 self._owned.free(region_id, page_index)
                 logger.debug(
                     "store: key=%s lost register race, freed page (region=%d, page=%d)",
@@ -537,11 +518,10 @@ class MaruHandler:
                 )
                 return True
 
-            # 5. Track
             self._key_to_location[key] = (region_id, page_index)
 
             logger.debug(
-                "Stored key=%s: region=%d, page=%d, offset=%d, size=%d",
+                "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
                 key,
                 region_id,
                 page_index,
@@ -604,7 +584,9 @@ class MaruHandler:
             buf.readonly,
             self._owned.is_owned(region_id),
         )
-        return MemoryInfo(view=buf)
+        chunk_size = self._owned.get_chunk_size()
+        page_index = result.kv_offset // chunk_size
+        return MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
 
     def exists(self, key: str) -> bool:
         """Check if a key exists.
@@ -617,6 +599,32 @@ class MaruHandler:
         """
         self._ensure_connected()
         return self._rpc.exists_kv(key)
+
+    def pin(self, key: str) -> bool:
+        """Check if a key exists and pin it atomically.
+
+        If the key exists, increments pin_count to protect from eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if exists (and was pinned)
+        """
+        self._ensure_connected()
+        return self._rpc.pin_kv(key)
+
+    def unpin(self, key: str) -> bool:
+        """Unpin a KV entry, making it eligible for eviction.
+
+        Args:
+            key: The chunk key string
+
+        Returns:
+            True if unpinned successfully
+        """
+        self._ensure_connected()
+        return self._rpc.unpin(key)
 
     def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
@@ -762,7 +770,11 @@ class MaruHandler:
                 entry.kv_length,
                 buf.readonly,
             )
-            results.append(MemoryInfo(view=buf))
+            chunk_size = self._owned.get_chunk_size()
+            page_index = entry.kv_offset // chunk_size
+            results.append(
+                MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
+            )
 
         hits = sum(1 for r in results if r is not None)
         ro_count = sum(1 for r in results if r is not None and r.view.readonly)
@@ -778,27 +790,24 @@ class MaruHandler:
     def batch_store(
         self,
         keys: list[str],
-        infos: list[MemoryInfo | memoryview],
-        prefixes: list[bytes | None] | None = None,
+        handles: list[AllocHandle],
     ) -> list[bool]:
-        """Store multiple key-value pairs in batch.
+        """Register multiple pre-written pages in batch (zero-copy).
 
-        Uses a single batch RPC call for registration.
+        Data must already be written to each page via ``handle.buf``.
+        Uses a single batch RPC call for metadata registration.
 
         Args:
             keys: List of chunk key strings
-            infos: List of MemoryInfo or memoryview with data
-            prefixes: Optional list of prefix bytes per entry
+            handles: List of AllocHandle from alloc()
 
         Returns:
             List of booleans indicating success for each key
         """
         self._ensure_connected()
 
-        if len(keys) != len(infos):
-            raise ValueError("keys and infos must have the same length")
-        if prefixes is not None and len(prefixes) != len(keys):
-            raise ValueError("prefixes must have the same length as keys")
+        if len(keys) != len(handles):
+            raise ValueError("keys and handles must have the same length")
 
         with self._write_lock:
             if self._closing.is_set():
@@ -809,7 +818,7 @@ class MaruHandler:
             register_entries = []
             allocations: dict[int, tuple[int, int]] = {}
 
-            # Phase 1: Batch check which keys already exist (avoid CXL write waste)
+            # Phase 1: Batch check which keys already exist
             try:
                 exists_resp = self._rpc.batch_exists_kv(keys)
                 exists_results = exists_resp.results
@@ -822,80 +831,34 @@ class MaruHandler:
             skipped = sum(exists_results)
             if skipped > 0:
                 logger.debug(
-                    "batch_store: %d/%d keys already exist, skipping CXL write",
+                    "batch_store: %d/%d keys already exist, skipping",
                     skipped,
                     len(keys),
                 )
 
-            # Phase 2: Only process new keys (skip duplicates)
-            for i, (key, info) in enumerate(zip(keys, infos, strict=True)):
-                is_local = key in self._key_to_location
-                if is_local:
-                    # Same instance already stored — same key = same content, skip
+            # Phase 2: Build register entries, free duplicates
+            for i, (key, handle) in enumerate(zip(keys, handles, strict=True)):
+                if key in self._key_to_location:
+                    self._owned.free(handle._region_id, handle._page_index)
                     logger.debug(
                         "batch_store: key=%s already in local map, skipping", key
                     )
-                    continue  # results[i] stays True (idempotent)
+                    continue
                 if exists_results[i]:
-                    # Another instance already registered — skip CXL write
+                    self._owned.free(handle._region_id, handle._page_index)
                     logger.debug(
-                        "batch_store: key=%s already exists on server, skipping", key
-                    )
-                    continue  # results[i] stays True (idempotent)
-
-                prefix = prefixes[i] if prefixes else None
-                prefix_len = len(prefix) if prefix else 0
-                # Normalize to 1D unsigned-byte view for mmap slice assignment
-                src = info if isinstance(info, memoryview) else info.view
-                if src.format != "B":
-                    src = src.cast("B")
-                data_size = len(src)
-                total_size = prefix_len + data_size
-
-                if total_size > chunk_size:
-                    logger.error(
-                        "Total size %d exceeds chunk_size %d for key %s",
-                        total_size,
-                        chunk_size,
+                        "batch_store: key=%s already exists on server, skipping",
                         key,
                     )
-                    results[i] = False
                     continue
 
-                # Allocate page (expand if needed)
-                alloc_result = self._owned.allocate()
-                if alloc_result is None:
-                    if not self._expand_region():
-                        logger.error("Cannot allocate page for key %s", key)
-                        results[i] = False
-                        continue
-                    alloc_result = self._owned.allocate()
-                    if alloc_result is None:
-                        results[i] = False
-                        continue
-
-                region_id, page_index = alloc_result
+                region_id = handle._region_id
+                page_index = handle._page_index
                 allocations[i] = (region_id, page_index)
-
-                # Write to page via GIL-free memcpy
-                buf = self._mapper.get_buffer_view(
-                    region_id, page_index * chunk_size, total_size
-                )
-                if buf is None:
-                    self._owned.free(region_id, page_index)
-                    results[i] = False
-                    continue
-
-                mv_offset = 0
-                if prefix:
-                    _gil_free_memcpy(buf[mv_offset:], prefix, prefix_len)
-                    mv_offset += prefix_len
-                _gil_free_memcpy(buf[mv_offset:], src, data_size)
-
                 offset = page_index * chunk_size
-                register_entries.append((key, region_id, offset, total_size))
+                register_entries.append((key, region_id, offset, handle._size))
 
-            # Batch register
+            # Phase 3: Batch register
             if register_entries:
                 try:
                     batch_resp = self._rpc.batch_register_kv(register_entries)
@@ -923,15 +886,7 @@ class MaruHandler:
                 if results[i] and i in allocations:
                     self._key_to_location[key] = allocations[i]
 
-            total_bytes = sum(
-                (
-                    infos[i].nbytes
-                    if isinstance(infos[i], memoryview)
-                    else infos[i].view.nbytes
-                )
-                for i in range(len(keys))
-                if results[i]
-            )
+            total_bytes = sum(handles[i]._size for i in range(len(keys)) if results[i])
             logger.debug(
                 "batch_store: %d/%d succeeded, total_data=%d bytes",
                 sum(results),
@@ -960,6 +915,30 @@ class MaruHandler:
             return [False] * len(keys)
         return batch_resp.results
 
+    def batch_pin(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if key exists (and was pinned).
+        """
+        self._ensure_connected()
+        return self._rpc.batch_pin_kv(keys).results
+
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple keys in a single RPC call.
+
+        Args:
+            keys: List of chunk key strings
+
+        Returns:
+            List of booleans — True if successfully unpinned.
+        """
+        self._ensure_connected()
+        return self._rpc.batch_unpin(keys).results
+
     # =========================================================================
     # Properties
     # =========================================================================
@@ -984,7 +963,7 @@ class MaruHandler:
 
     @property
     def owned_region_manager(self) -> OwnedRegionManager | None:
-        """Get the owned region manager."""
+        """Deprecated: Use get_owned_region_ids(), get_region_page_count() instead."""
         return self._owned
 
     @property
@@ -1004,16 +983,24 @@ class MaruHandler:
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.
 
-        Tries each pool_id in order, falling back to the next on failure.
+        Gated by ``auto_expand`` config. When enabled, tries each pool_id
+        in order, falling back to the next on failure.
 
         Returns:
             True if expansion succeeded.
         """
+        if not self._auto_expand:
+            logger.warning(
+                "Pool exhausted but auto_expand is disabled. "
+                "Set auto_expand=True in MaruConfig to enable."
+            )
+            return False
+
         for pool_id in self._pool_ids:
             try:
                 response = self._rpc.request_alloc(
                     instance_id=self._config.instance_id,
-                    size=self._config.pool_size,
+                    size=self._expand_size,
                     pool_id=pool_id,
                 )
             except Exception:
@@ -1034,12 +1021,21 @@ class MaruHandler:
 
             handle = response.handle
             try:
-                self._owned.add_region(handle)
+                region = self._owned.add_region(handle)
                 logger.info(
                     "Expanded: new store region %d (pool_id=%s)",
                     handle.region_id,
                     pool_id,
                 )
+                # Callback fires under _write_lock — guarantees pool exists
+                # before alloc() returns. Acceptable since expansion is rare.
+                if self._on_region_added is not None:
+                    logger.debug(
+                        "on_region_added fire: region=%d pages=%d",
+                        handle.region_id,
+                        region.allocator.page_count,
+                    )
+                    self._on_region_added(handle.region_id, region.allocator.page_count)
                 return True
             except Exception:
                 logger.error("Failed to init expanded region", exc_info=True)

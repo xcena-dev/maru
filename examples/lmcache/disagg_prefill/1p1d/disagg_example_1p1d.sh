@@ -14,6 +14,8 @@ PIDS=()
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+PIDFILE="$(pwd)/.test_pids"
+
 check_hf_token() {
     if [ -z "$HF_TOKEN" ]; then
         echo "HF_TOKEN is not set. Please set it to your Hugging Face token."
@@ -48,24 +50,49 @@ ensure_python_library_installed() {
 }
 
 
-kill_tree() {
-    # Recursively kill a process and all its descendants
+save_pids() {
+    printf '%s\n' "${PIDS[@]}" > "$PIDFILE"
+}
+
+kill_pgid() {
+    # Kill an entire process group by its leader PID
     local pid=$1 sig=${2:-TERM}
-    for child in $(pgrep -P "$pid" 2>/dev/null); do
-        kill_tree "$child" "$sig"
-    done
-    kill -"$sig" "$pid" 2>/dev/null
+    kill -"$sig" -- -"$pid" 2>/dev/null
+}
+
+kill_stale_pids() {
+    # Kill leftover processes from a previous abnormal exit
+    if [ ! -f "$PIDFILE" ]; then
+        return
+    fi
+    echo "Found stale PID file. Cleaning up leftover processes..."
+    while read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  Killing leftover process group $pid"
+            kill_pgid "$pid" TERM
+        fi
+    done < "$PIDFILE"
+    sleep 1
+    while read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  Force killing leftover process group $pid"
+            kill_pgid "$pid" 9
+        fi
+    done < "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "Stale processes cleaned up."
 }
 
 cleanup() {
     echo "Stopping everything…"
-    trap - INT TERM USR1 EXIT   # prevent re-entrancy
+    trap '' INT TERM USR1   # ignore signals during cleanup
+    trap - EXIT
 
-    # Graceful: recursively kill all tracked process trees
+    # Graceful: kill entire process groups
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Killing process tree of $pid"
-            kill_tree "$pid" TERM
+            echo "Killing process group of $pid"
+            kill_pgid "$pid" TERM
         fi
     done
 
@@ -75,11 +102,12 @@ cleanup() {
     # Force kill any survivors
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Force killing process tree of $pid"
-            kill_tree "$pid" 9
+            echo "Force killing process group of $pid"
+            kill_pgid "$pid" 9
         fi
     done
 
+    rm -f "$PIDFILE"
     echo "All processes stopped."
     exit 0
 }
@@ -128,6 +156,7 @@ main() {
     ensure_python_library_installed datasets
     ensure_python_library_installed vllm
 
+    kill_stale_pids
     trap cleanup INT TERM USR1 EXIT
 
     # Launch MaruServer
@@ -135,10 +164,11 @@ main() {
         echo "MaruServer already running on port $MARU_SERVER_PORT, skipping launch..."
     else
         echo "Launching MaruServer..."
-        PYTHONUNBUFFERED=1 python -m maru_server --port $MARU_SERVER_PORT --log-level "${_LOG_LEVEL:-ERROR}" \
+        setsid env PYTHONUNBUFFERED=1 python -m maru_server --port $MARU_SERVER_PORT --log-level "${_LOG_LEVEL:-ERROR}" \
             > >(tee "${LOG_MARU_SERVER:-maru_server.log}") 2>&1 &
         maru_server_pid=$!
         PIDS+=($maru_server_pid)
+        save_pids
 
         wait_for_server $MARU_SERVER_PORT
     fi
@@ -155,7 +185,7 @@ main() {
     echo "Proxy will skip wait_decode_kv_ready (shared storage mode)"
 
     # Launch the proxy first
-    python3 ../disagg_proxy_server.py \
+    setsid python3 ../disagg_proxy_server.py \
         --host localhost \
         --port $LMCACHE_PROXY_EXTERNAL_PORT \
         --prefiller-host localhost \
@@ -172,23 +202,25 @@ main() {
         > >(tee "$LOG_PROXY") 2>&1 &
     proxy_pid=$!
     PIDS+=($proxy_pid)
+    save_pids
 
 
-    # Launch the decoder
-    bash disagg_vllm_launcher.sh decoder ${_MODEL:+"$_MODEL"} \
-        > >(tee "$LOG_DECODER") 2>&1 &
-    decoder_pid=$!
-    PIDS+=($decoder_pid)
-
-
-    # Launch the prefiller next
-    bash disagg_vllm_launcher.sh prefiller ${_MODEL:+"$_MODEL"} \
+    # Launch the prefiller first and wait for it to be ready
+    setsid bash disagg_vllm_launcher.sh prefiller ${_MODEL:+"$_MODEL"} \
         > >(tee "$LOG_PREFILLER") 2>&1 &
     prefiller_pid=$!
     PIDS+=($prefiller_pid)
-
-    wait_for_server $LMCACHE_DECODER_PORT
+    save_pids
     wait_for_server $LMCACHE_PREFILLER_PORT
+
+    # Launch the decoder after prefiller is ready
+    setsid bash disagg_vllm_launcher.sh decoder ${_MODEL:+"$_MODEL"} \
+        > >(tee "$LOG_DECODER") 2>&1 &
+    decoder_pid=$!
+    PIDS+=($decoder_pid)
+    save_pids
+    wait_for_server $LMCACHE_DECODER_PORT
+
     wait_for_server $LMCACHE_PROXY_EXTERNAL_PORT
 
     echo "==================================================="

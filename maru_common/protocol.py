@@ -48,11 +48,15 @@ class MessageType(IntEnum):
     LOOKUP_KV = 0x11
     EXISTS_KV = 0x12
     DELETE_KV = 0x13
+    PIN_KV = 0x14
+    UNPIN_KV = 0x15
 
     # Batch Operations (0x20 - 0x2F)
     BATCH_REGISTER_KV = 0x20
     BATCH_LOOKUP_KV = 0x21
     BATCH_EXISTS_KV = 0x22
+    BATCH_PIN_KV = 0x23
+    BATCH_UNPIN_KV = 0x24
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -271,6 +275,43 @@ class DeleteKVResponse:
     success: bool
 
 
+@dataclass
+class PinKVRequest:
+    """PIN_KV (0x14) - Check if KV entry exists and pin it atomically.
+
+    If the key exists, increments the entry's pin_count to protect it from
+    eviction. This is an atomic operation to avoid race conditions between
+    existence check and pinning.
+    """
+
+    key: str
+
+
+@dataclass
+class PinKVResponse:
+    """Response for PIN_KV."""
+
+    exists: bool
+
+
+@dataclass
+class UnpinKVRequest:
+    """UNPIN_KV (0x15) - Unpin a KV entry.
+
+    Decrements the entry's pin_count. When pin_count reaches 0, the entry
+    becomes eligible for eviction again.
+    """
+
+    key: str
+
+
+@dataclass
+class UnpinKVResponse:
+    """Response for UNPIN_KV."""
+
+    success: bool
+
+
 # =============================================================================
 # Batch Operations Messages (0x20 - 0x2F)
 # =============================================================================
@@ -327,7 +368,7 @@ class BatchLookupKVResponse:
 
 @dataclass
 class BatchExistsKVRequest:
-    """BATCH_EXISTS_KV (0x22) - Batch check KV existence."""
+    """BATCH_EXISTS_KV (0x22) - Batch check KV existence (checks all keys)."""
 
     keys: list[str] = field(default_factory=list)
 
@@ -335,6 +376,34 @@ class BatchExistsKVRequest:
 @dataclass
 class BatchExistsKVResponse:
     """Response for BATCH_EXISTS_KV."""
+
+    results: list[bool] = field(default_factory=list)
+
+
+@dataclass
+class BatchPinKVRequest:
+    """BATCH_PIN_KV (0x23) - Batch check existence and pin (prefix-stop)."""
+
+    keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchPinKVResponse:
+    """Response for BATCH_PIN_KV."""
+
+    results: list[bool] = field(default_factory=list)
+
+
+@dataclass
+class BatchUnpinKVRequest:
+    """BATCH_UNPIN_KV (0x24) - Batch unpin KV entries."""
+
+    keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchUnpinKVResponse:
+    """Response for BATCH_UNPIN_KV."""
 
     results: list[bool] = field(default_factory=list)
 
@@ -438,10 +507,17 @@ MESSAGE_CLASSES = {
     MessageType.LOOKUP_KV: (LookupKVRequest, LookupKVResponse),
     MessageType.EXISTS_KV: (ExistsKVRequest, ExistsKVResponse),
     MessageType.DELETE_KV: (DeleteKVRequest, DeleteKVResponse),
+    MessageType.PIN_KV: (PinKVRequest, PinKVResponse),
+    MessageType.UNPIN_KV: (UnpinKVRequest, UnpinKVResponse),
     # Batch Operations
     MessageType.BATCH_REGISTER_KV: (BatchRegisterKVRequest, BatchRegisterKVResponse),
     MessageType.BATCH_LOOKUP_KV: (BatchLookupKVRequest, BatchLookupKVResponse),
     MessageType.BATCH_EXISTS_KV: (BatchExistsKVRequest, BatchExistsKVResponse),
+    MessageType.BATCH_PIN_KV: (
+        BatchPinKVRequest,
+        BatchPinKVResponse,
+    ),
+    MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
     MessageType.HEARTBEAT: (HeartbeatRequest, HeartbeatResponse),

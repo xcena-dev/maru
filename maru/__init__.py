@@ -16,10 +16,12 @@ setup_package_logging("maru")
 
 from maru_common import MaruConfig  # noqa: E402
 from maru_handler import MaruHandler  # noqa: E402
+from maru_handler.memory import AllocHandle  # noqa: E402
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "AllocHandle",
     "MaruConfig",
     "MaruHandler",
 ]

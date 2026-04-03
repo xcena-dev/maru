@@ -146,7 +146,7 @@ Maru works as a drop-in remote storage backend for [LMCache](https://github.com/
 # LMCache config
 remote_url: "maru://localhost:5555"
 extra_config:
-  maru_pool_size: "4G"
+  maru_pool_size: 4
 ```
 
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
