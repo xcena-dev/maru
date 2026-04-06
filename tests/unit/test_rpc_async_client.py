@@ -8,8 +8,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
-
 from maru_common import (
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -342,7 +340,7 @@ class TestRpcAsyncClientApiMethods:
 
         client._send_request.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "instance-1", "size": 4096, "pool_id": _ANY_POOL_ID},
+            {"instance_id": "instance-1", "size": 4096, "pool_path": ""},
         )
         assert result.success is True
         assert result.handle is not None

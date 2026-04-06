@@ -24,7 +24,6 @@ from collections.abc import Callable
 
 from maru_common import MaruConfig
 
-_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -75,9 +74,7 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        # TODO(Task3): replace _pool_ids with _pool_paths after full migration
-        self._pool_paths: list[str] = self._config.pool_path or []
-        self._pool_ids: list[int] = [_ANY_POOL_ID]  # kept for compat; Task3 will remove
+        self._pool_paths: list[str] | None = self._config.pool_path  # None = any pool
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
@@ -230,32 +227,20 @@ class MaruHandler:
             remaining = self._config.pool_size
             allocated_handles: list[MaruHandle] = []
 
-            # Use pool_paths when configured (new path), otherwise fall back to
-            # legacy pool_ids (TODO Task3: remove legacy branch after full migration)
-            if self._pool_paths:
-                pool_iter: list = [(None, pp) for pp in self._pool_paths]
-            else:
-                pool_iter = [(pid, None) for pid in self._pool_ids]
+            # If pool_paths is None or empty, use [""] to request any pool
+            pool_paths_iter = self._pool_paths if self._pool_paths else [""]
 
-            for pool_id, pool_path in pool_iter:
-                pool_label = pool_path if pool_path is not None else pool_id
+            for pool_path in pool_paths_iter:
                 try:
-                    if pool_path is not None:
-                        response = self._rpc.request_alloc(
-                            instance_id=self._config.instance_id,
-                            size=remaining,
-                            pool_path=pool_path,
-                        )
-                    else:
-                        response = self._rpc.request_alloc(
-                            instance_id=self._config.instance_id,
-                            size=remaining,
-                            pool_id=pool_id,
-                        )
+                    response = self._rpc.request_alloc(
+                        instance_id=self._config.instance_id,
+                        size=remaining,
+                        pool_path=pool_path,
+                    )
                 except Exception:
                     logger.error(
-                        "RPC request_alloc failed during connect (pool_id=%s)",
-                        pool_label,
+                        "RPC request_alloc failed during connect (pool_path=%s)",
+                        pool_path,
                         exc_info=True,
                     )
                     continue
@@ -263,7 +248,7 @@ class MaruHandler:
                 if not response.success or response.handle is None:
                     logger.warning(
                         "Pool %s refused initial allocation: %s",
-                        pool_label,
+                        pool_path,
                         getattr(response, "error", "unknown"),
                     )
                     continue
@@ -274,7 +259,7 @@ class MaruHandler:
                     self._owned.add_region(handle)
                 except Exception:
                     logger.error(
-                        "Failed to init region from pool %s", pool_label, exc_info=True
+                        "Failed to init region from pool %s", pool_path, exc_info=True
                     )
                     try:
                         self._rpc.return_alloc(
@@ -1010,7 +995,7 @@ class MaruHandler:
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.
 
-        Gated by ``auto_expand`` config. When enabled, tries each pool_id
+        Gated by ``auto_expand`` config. When enabled, tries each pool_path
         in order, falling back to the next on failure.
 
         Returns:
@@ -1023,17 +1008,19 @@ class MaruHandler:
             )
             return False
 
-        for pool_id in self._pool_ids:
+        pool_paths_iter = self._pool_paths if self._pool_paths else [""]
+
+        for pool_path in pool_paths_iter:
             try:
                 response = self._rpc.request_alloc(
                     instance_id=self._config.instance_id,
                     size=self._expand_size,
-                    pool_id=pool_id,
+                    pool_path=pool_path,
                 )
             except Exception:
                 logger.error(
-                    "RPC request_alloc failed during expand (pool_id=%s)",
-                    pool_id,
+                    "RPC request_alloc failed during expand (pool_path=%s)",
+                    pool_path,
                     exc_info=True,
                 )
                 continue
@@ -1041,7 +1028,7 @@ class MaruHandler:
             if not response.success or response.handle is None:
                 logger.warning(
                     "Pool %s refused region expansion: %s",
-                    pool_id,
+                    pool_path,
                     getattr(response, "error", "unknown"),
                 )
                 continue
@@ -1050,9 +1037,9 @@ class MaruHandler:
             try:
                 region = self._owned.add_region(handle)
                 logger.info(
-                    "Expanded: new store region %d (pool_id=%s)",
+                    "Expanded: new store region %d (pool_path=%s)",
                     handle.region_id,
-                    pool_id,
+                    pool_path,
                 )
                 # Callback fires under _write_lock — guarantees pool exists
                 # before alloc() returns. Acceptable since expansion is rare.
@@ -1075,7 +1062,7 @@ class MaruHandler:
                     )
                 continue
 
-        logger.error("All pool_ids exhausted during region expansion")
+        logger.error("All pool_paths exhausted during region expansion")
         return False
 
     def _premap_shared_regions(self) -> None:

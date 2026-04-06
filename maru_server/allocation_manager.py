@@ -6,7 +6,6 @@ import logging
 from dataclasses import dataclass
 from threading import RLock
 
-_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
 from maru_shm import MaruHandle, MaruShmClient
 
 logger = logging.getLogger(__name__)
@@ -37,17 +36,17 @@ class AllocationManager:
         self._lock = RLock()
 
     def allocate(
-        self, instance_id: str, size: int, pool_id: int = _ANY_POOL_ID
+        self, instance_id: str, size: int, pool_path: str = ""
     ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership."""
         try:
-            handle = self._client.alloc(size, pool_id=pool_id)
+            handle = self._client.alloc(size, pool_path=pool_path)
         except RuntimeError as e:
             logger.warning(
-                "alloc failed for instance=%s size=%d pool_id=%s: %s",
+                "alloc failed for instance=%s size=%d pool_path=%s: %s",
                 instance_id,
                 size,
-                pool_id,
+                pool_path,
                 e,
             )
             return None

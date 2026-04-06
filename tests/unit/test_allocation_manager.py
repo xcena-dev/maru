@@ -168,7 +168,7 @@ class TestAllocationManagerEdgeCases:
 
         # Mock the client to return None
         original_alloc = manager._client.alloc
-        manager._client.alloc = lambda size, pool_id=None: None  # type: ignore
+        manager._client.alloc = lambda size, pool_path="": None  # type: ignore
 
         result = manager.allocate("instance1", 4096)
         assert result is None

@@ -7,8 +7,6 @@ from typing import Any
 
 import zmq
 
-_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
-
 from maru_common import (
     AllocationManagerStats,
     BatchExistsKVResponse,
@@ -130,7 +128,7 @@ class RpcClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = _ANY_POOL_ID
+        self, instance_id: str, size: int, pool_path: str = ""
     ) -> RequestAllocResponse:
         """
         Request a new memory allocation.
@@ -138,7 +136,7 @@ class RpcClient:
         Args:
             instance_id: Client instance identifier
             size: Requested size in bytes
-            pool_id: Pool to allocate from (ANY_POOL_ID means any pool)
+            pool_path: Pool path to allocate from ("" means any pool)
 
         Returns:
             RequestAllocResponse with handle on success
@@ -148,7 +146,7 @@ class RpcClient:
             {
                 "instance_id": instance_id,
                 "size": size,
-                "pool_id": pool_id,
+                "pool_path": pool_path,
             },
         )
 
