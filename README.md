@@ -80,7 +80,7 @@ Maru consists of two server components and a client library:
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
 
-In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler, which connects to both the Resource Manager and Metadata Server over the network.
+All components run on the same machine in a single-node setup. For multi-node deployment, see the [installation guide](https://xcena-dev.github.io/maru/source/getting_started/installation.html#multi-node-configuration).
 
 
 ### Prerequisites
@@ -89,7 +89,6 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - Python: 3.12+
 - gcc: 13.3.0+, cmake: 3.28.3+
 - CXL DAX device (`/dev/dax*`) or emulation environment
-  - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
 
 ```bash
 sudo apt-get update
@@ -183,7 +182,7 @@ with MaruHandler(config) as handler:
 
 ## LMCache Integration
 
-Maru works as a drop-in remote storage backend for [LMCache](https://github.com/LMCache/LMCache) via the `maru://` URL scheme. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
+Maru is configured as a native [LMCache](https://github.com/LMCache/LMCache) storage backend via the `maru_path` and `maru_pool_size` config fields. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
 
 ```yaml
 # LMCache config
