@@ -1,9 +1,8 @@
-enable_pd: False
 chunk_size: 256
 local_cpu: False
-save_unfull_chunk: True
 
-# Maru backend
+enable_async_loading: False
+
 maru_path: "maru://localhost:${MARU_SERVER_PORT}"
 maru_pool_size: 4
 

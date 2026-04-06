@@ -12,7 +12,9 @@ from maru_common import (
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
+    BatchPinKVResponse,
     BatchRegisterKVResponse,
+    BatchUnpinKVResponse,
     GetStatsResponse,
     KVManagerStats,
     ListAllocationsResponse,
@@ -281,6 +283,32 @@ class RpcClient:
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
         return response.get("exists", False)
 
+    def pin_kv(self, key: str) -> bool:
+        """
+        Check if a KV entry exists and pin it atomically.
+
+        Args:
+            key: Chunk key string
+
+        Returns:
+            True if exists (and was pinned)
+        """
+        response = self._send_request(MessageType.PIN_KV, {"key": key})
+        return response.get("exists", False)
+
+    def unpin(self, key: str) -> bool:
+        """
+        Unpin a KV entry, making it eligible for eviction.
+
+        Args:
+            key: Chunk key string
+
+        Returns:
+            True if unpinned successfully
+        """
+        response = self._send_request(MessageType.UNPIN_KV, {"key": key})
+        return response.get("success", False)
+
     def delete_kv(self, key: str) -> bool:
         """
         Delete a KV entry.
@@ -369,6 +397,16 @@ class RpcClient:
         response = self._send_request(MessageType.BATCH_EXISTS_KV, {"keys": keys})
 
         return BatchExistsKVResponse(results=response.get("results", []))
+
+    def batch_pin_kv(self, keys: list[str]) -> BatchPinKVResponse:
+        """Check existence and pin multiple KV entries in a single RPC call."""
+        response = self._send_request(MessageType.BATCH_PIN_KV, {"keys": keys})
+        return BatchPinKVResponse(results=response.get("results", []))
+
+    def batch_unpin(self, keys: list[str]) -> BatchUnpinKVResponse:
+        """Unpin multiple KV entries in a single RPC call."""
+        response = self._send_request(MessageType.BATCH_UNPIN_KV, {"keys": keys})
+        return BatchUnpinKVResponse(results=response.get("results", []))
 
     # =========================================================================
     # Admin Operations

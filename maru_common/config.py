@@ -51,6 +51,8 @@ class MaruConfig:
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
     pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
+    auto_expand: bool = True  # Auto-expand when pool is exhausted
+    expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
     rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
 
     def __post_init__(self):
@@ -96,3 +98,12 @@ class MaruConfig:
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"
             )
+
+        if self.expand_size is not None:
+            if not self.auto_expand:
+                raise ValueError("expand_size requires auto_expand=True")
+            if self.expand_size < self.chunk_size_bytes:
+                raise ValueError(
+                    f"expand_size ({self.expand_size}) must be >= "
+                    f"chunk_size_bytes ({self.chunk_size_bytes})"
+                )

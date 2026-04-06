@@ -281,8 +281,7 @@ class TestAllocHandle:
         """AllocHandle.region_id, page_index, size return correct values."""
         from maru_handler.memory.types import AllocHandle
 
-        data = bytearray(256)
-        buf = memoryview(data)
+        buf = memoryview(bytearray(256))
         handle = AllocHandle(buf=buf, _region_id=42, _page_index=7, _size=256)
 
         assert handle.region_id == 42

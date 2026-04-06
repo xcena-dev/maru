@@ -207,6 +207,10 @@ class OwnedRegionManager:
         """Return the chunk size."""
         return self._chunk_size
 
+    def get_region_ids(self) -> list[int]:
+        """Get list of owned region IDs in insertion order."""
+        return list(self._region_order)
+
     def get_owned_region(self, region_id: int) -> OwnedRegion | None:
         """Get an owned region by ID."""
         return self._regions.get(region_id)

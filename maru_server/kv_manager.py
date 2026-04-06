@@ -2,6 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """KV Manager implementation for managing KV metadata."""
 
+import enum
 import logging
 from dataclasses import dataclass
 from threading import RLock
@@ -16,6 +17,15 @@ class KVEntry:
     region_id: int  # Region ID (allocation identifier)
     kv_offset: int  # Offset within allocation (relative to handle.offset)
     kv_length: int  # Size of KV data
+    pin_count: int = 0  # Pin count for eviction protection
+
+
+class DeleteResult(enum.Enum):
+    """Result of a KV delete operation."""
+
+    NOT_FOUND = "not_found"
+    PINNED = "pinned"
+    DELETED = "deleted"
 
 
 class KVManager:
@@ -78,22 +88,64 @@ class KVManager:
         with self._lock:
             return key in self._store
 
-    def delete(self, key: str) -> tuple[bool, int | None]:
+    def pin(self, key: str) -> bool:
+        """Check if a KV entry exists and pin it atomically.
+
+        Returns:
+            True if key exists (and was pinned), False otherwise.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return False
+            entry.pin_count += 1
+            logger.debug("Pinned KV: key=%s, pin_count=%d", key, entry.pin_count)
+            return True
+
+    def unpin(self, key: str) -> bool:
+        """Decrement pin_count for a KV entry.
+
+        Returns:
+            True if successfully unpinned, False if key not found or not pinned.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                logger.warning("Unpin failed: key=%s not found", key)
+                return False
+            if entry.pin_count <= 0:
+                logger.warning("Unpin failed: key=%s pin_count already 0", key)
+                return False
+            entry.pin_count -= 1
+            logger.debug("Unpinned KV: key=%s, pin_count=%d", key, entry.pin_count)
+            return True
+
+    def delete(self, key: str) -> tuple[DeleteResult, int | None]:
         """
         Delete a KV entry.
 
         Returns:
-            (key_existed, region_id_to_decrement)
-            - (False, None): key didn't exist
-            - (True, region_id): entry deleted, allocation ref needs decrement
+            (result, region_id_to_decrement)
+            - (NOT_FOUND, None): key didn't exist
+            - (PINNED, None): key exists but pinned, deletion refused
+            - (DELETED, region_id): entry deleted, allocation ref needs decrement
         """
         with self._lock:
-            if key not in self._store:
-                return (False, None)
+            entry = self._store.get(key)
+            if entry is None:
+                return (DeleteResult.NOT_FOUND, None)
+
+            if entry.pin_count > 0:
+                logger.warning(
+                    "Delete refused: key=%s is pinned (pin_count=%d)",
+                    key,
+                    entry.pin_count,
+                )
+                return (DeleteResult.PINNED, None)
 
             region_id = self._store.pop(key).region_id
             logger.debug("Deleted KV: key=%s, region_id=%d", key, region_id)
-            return (True, region_id)
+            return (DeleteResult.DELETED, region_id)
 
     def get_stats(self) -> dict:
         """Get KV statistics."""
@@ -149,6 +201,9 @@ class KVManager:
         """
         Check existence of multiple KV entries in a single operation.
 
+        Checks ALL keys unconditionally (no prefix-stop).
+        For prefix-stop with pinning, use batch_pin().
+
         Args:
             keys: List of chunk key strings
 
@@ -157,3 +212,52 @@ class KVManager:
         """
         with self._lock:
             return [key in self._store for key in keys]
+
+    def batch_pin(self, keys: list[str]) -> list[bool]:
+        """Check existence and pin prefix-contiguous KV entries atomically.
+
+        Uses prefix-stop: stops at the first miss, only pinning the
+        contiguous prefix of existing keys. This avoids pin leaks —
+        if all existing keys were pinned, the caller would need to
+        unpin non-prefix keys it doesn't use.
+
+        Unlike batch_exists() which checks ALL keys, this method
+        intentionally stops early because pinning has side effects.
+
+        Returns:
+            List of booleans — True if key exists (and was pinned).
+            After first False, remaining entries are all False.
+        """
+        with self._lock:
+            results = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None:
+                    # First miss: fill rest with False and stop
+                    results.extend([False] * (len(keys) - len(results)))
+                    break
+                entry.pin_count += 1
+                results.append(True)
+            return results
+
+    def batch_unpin(self, keys: list[str]) -> list[bool]:
+        """Unpin multiple KV entries.
+
+        Returns:
+            List of booleans — True if successfully unpinned.
+        """
+        with self._lock:
+            results = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None or entry.pin_count <= 0:
+                    results.append(False)
+                else:
+                    entry.pin_count -= 1
+                    results.append(True)
+            return results
+
+    # TODO: Add pin timeout monitor (PinMonitor) when eviction is implemented.
+    # Track _pin_timestamps per key, run a periodic check_pin_timeouts() in a
+    # daemon thread to force-unpin entries that exceed a TTL. This prevents
+    # pin leaks when clients crash without sending unpin RPCs.

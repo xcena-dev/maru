@@ -7,7 +7,7 @@ from maru_common.logging_setup import setup_package_logging  # noqa: E402
 setup_package_logging("maru_server")
 
 from .allocation_manager import AllocationInfo, AllocationManager  # noqa: E402
-from .kv_manager import KVEntry, KVManager  # noqa: E402
+from .kv_manager import DeleteResult, KVEntry, KVManager  # noqa: E402
 from .rpc_server import RpcServer  # noqa: E402
 from .server import MaruServer  # noqa: E402
 
@@ -18,6 +18,7 @@ __all__ = [
     "RpcServer",
     "KVManager",
     "KVEntry",
+    "DeleteResult",
     "AllocationManager",
     "AllocationInfo",
 ]

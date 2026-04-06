@@ -119,10 +119,14 @@ The server exposes the following message types:
 | `REGISTER_KV` | Register a KV entry at a given location |
 | `LOOKUP_KV` | Look up a KV entry's location and handle |
 | `EXISTS_KV` | Check whether a key exists |
+| `PIN_KV` | Atomically check existence and pin a KV entry |
+| `UNPIN_KV` | Unpin a KV entry |
 | `DELETE_KV` | Delete a KV entry |
 | `BATCH_REGISTER_KV` | Batch register multiple KV entries |
 | `BATCH_LOOKUP_KV` | Batch look up multiple keys |
 | `BATCH_EXISTS_KV` | Batch check existence of multiple keys |
+| `BATCH_PIN_KV` | Batch check existence and pin multiple entries |
+| `BATCH_UNPIN_KV` | Batch unpin multiple entries |
 | `GET_STATS` | Retrieve server statistics |
 | `HEARTBEAT` | Connection health check |
 | `HANDSHAKE` | Reserved — initial client-server handshake |
