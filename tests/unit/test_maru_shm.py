@@ -394,6 +394,17 @@ class TestIPCUnpackValidation:
         with pytest.raises(ValueError, match="AllocReq too short"):
             AllocReq.unpack(b"\x00" * 10)
 
+    def test_alloc_req_unpack_pool_path_truncated(self):
+        """Test AllocReq.unpack raises ValueError when pool_path bytes are truncated."""
+        import struct
+
+        # Header: size=4096, pool_path_len=10, reserved=0
+        # But only provide 5 bytes of path data instead of 10
+        header = struct.pack("<QII", 4096, 10, 0)
+        truncated_data = header + b"/dev/d"  # 6 bytes, less than pool_path_len=10
+        with pytest.raises(ValueError, match="AllocReq pool_path truncated"):
+            AllocReq.unpack(truncated_data)
+
     def test_alloc_resp_unpack_too_short(self):
         """Test AllocResp.unpack with data too short."""
         with pytest.raises(ValueError, match="AllocResp too short"):

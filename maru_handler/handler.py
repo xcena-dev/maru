@@ -230,17 +230,32 @@ class MaruHandler:
             remaining = self._config.pool_size
             allocated_handles: list[MaruHandle] = []
 
-            for pool_id in self._pool_ids:
+            # Use pool_paths when configured (new path), otherwise fall back to
+            # legacy pool_ids (TODO Task3: remove legacy branch after full migration)
+            if self._pool_paths:
+                pool_iter: list = [(None, pp) for pp in self._pool_paths]
+            else:
+                pool_iter = [(pid, None) for pid in self._pool_ids]
+
+            for pool_id, pool_path in pool_iter:
+                pool_label = pool_path if pool_path is not None else pool_id
                 try:
-                    response = self._rpc.request_alloc(
-                        instance_id=self._config.instance_id,
-                        size=remaining,
-                        pool_id=pool_id,
-                    )
+                    if pool_path is not None:
+                        response = self._rpc.request_alloc(
+                            instance_id=self._config.instance_id,
+                            size=remaining,
+                            pool_path=pool_path,
+                        )
+                    else:
+                        response = self._rpc.request_alloc(
+                            instance_id=self._config.instance_id,
+                            size=remaining,
+                            pool_id=pool_id,
+                        )
                 except Exception:
                     logger.error(
                         "RPC request_alloc failed during connect (pool_id=%s)",
-                        pool_id,
+                        pool_label,
                         exc_info=True,
                     )
                     continue
@@ -248,7 +263,7 @@ class MaruHandler:
                 if not response.success or response.handle is None:
                     logger.warning(
                         "Pool %s refused initial allocation: %s",
-                        pool_id,
+                        pool_label,
                         getattr(response, "error", "unknown"),
                     )
                     continue
@@ -259,7 +274,7 @@ class MaruHandler:
                     self._owned.add_region(handle)
                 except Exception:
                     logger.error(
-                        "Failed to init region from pool %s", pool_id, exc_info=True
+                        "Failed to init region from pool %s", pool_label, exc_info=True
                     )
                     try:
                         self._rpc.return_alloc(

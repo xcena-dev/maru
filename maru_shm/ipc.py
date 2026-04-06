@@ -128,7 +128,12 @@ class AllocReq:
         )
         off = _ALLOC_REQ_SIZE
         pool_path = ""
-        if pool_path_len > 0 and off + pool_path_len <= len(data):
+        if pool_path_len > 0:
+            if off + pool_path_len > len(data):
+                raise ValueError(
+                    f"AllocReq pool_path truncated: need {pool_path_len} bytes at "
+                    f"offset {off}, only {len(data) - off} available"
+                )
             pool_path = data[off:off + pool_path_len].decode("utf-8")
             off += pool_path_len
         client_id = ""

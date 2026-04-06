@@ -1911,7 +1911,7 @@ class TestFixedPoolAllocation:
             chunk_size_bytes=1024,
             auto_connect=False,
             use_async_rpc=False,
-            pool_id=[0, 1],
+            pool_path=["/dev/dax0.0", "/dev/dax1.0"],
         )
         handler = MaruHandler(config)
 
@@ -1957,7 +1957,7 @@ class TestFixedPoolAllocation:
             chunk_size_bytes=1024,
             auto_connect=False,
             use_async_rpc=False,
-            pool_id=[0, 1],
+            pool_path=["/dev/dax0.0", "/dev/dax1.0"],
         )
         handler = MaruHandler(config)
 
