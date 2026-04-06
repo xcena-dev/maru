@@ -36,7 +36,7 @@ using namespace maru;
 
 static const char *g_host = "127.0.0.1";
 static uint16_t g_port = 9850;
-static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
+// Empty pool path means "any pool" — replaces the old kAnyPoolId sentinel.
 
 // Client identity and request sequencing for the v2 protocol.
 static std::string g_clientId;
@@ -245,8 +245,34 @@ static std::string parseDevicePath(const uint8_t *data, size_t dataLen)
     return std::string(reinterpret_cast<const char *>(data + pathOff), pathLen);
 }
 
+/// Build AllocReq payload: fixed struct + pool path bytes + client_id + request_id
+static std::vector<uint8_t> buildAllocPayload(const AllocReq &req,
+                                               const std::string &poolPath,
+                                               const std::string &clientId,
+                                               uint64_t requestId)
+{
+    uint16_t idLen = static_cast<uint16_t>(clientId.size());
+    size_t totalSize = sizeof(req) + poolPath.size() + sizeof(idLen) + idLen + sizeof(requestId);
+    std::vector<uint8_t> buf(totalSize);
+
+    size_t off = 0;
+    std::memcpy(buf.data() + off, &req, sizeof(req));
+    off += sizeof(req);
+    if (!poolPath.empty())
+    {
+        std::memcpy(buf.data() + off, poolPath.data(), poolPath.size());
+        off += poolPath.size();
+    }
+    std::memcpy(buf.data() + off, &idLen, sizeof(idLen));
+    off += sizeof(idLen);
+    std::memcpy(buf.data() + off, clientId.data(), idLen);
+    off += idLen;
+    std::memcpy(buf.data() + off, &requestId, sizeof(requestId));
+    return buf;
+}
+
 // Helper: send alloc request and receive response with device path
-static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
+static int doAlloc(uint64_t size, const std::string &poolPath, AllocResp *resp,
                    std::string *devicePath)
 {
     int fd = connectResourceManager();
@@ -255,10 +281,10 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
 
     AllocReq req{};
     req.size = size;
-    req.poolId = poolId;
+    req.poolPathLen = static_cast<uint32_t>(poolPath.size());
     req.reserved = 0;
 
-    auto payload = buildPayload(&req, sizeof(req), g_clientId, g_requestSeq++);
+    auto payload = buildAllocPayload(req, poolPath, g_clientId, g_requestSeq++);
     if (sendRequest(fd, MsgType::ALLOC_REQ, payload.data(),
                     static_cast<uint32_t>(payload.size())) != 0)
     {
@@ -466,20 +492,21 @@ static int cmdAlloc(int argc, char *argv[])
 {
     if (argc < 1)
     {
-        fprintf(stderr, "Usage: alloc <size_bytes> [pool_id]\n");
+        fprintf(stderr, "Usage: alloc <size_bytes> [pool_path]\n");
         return 1;
     }
 
     uint64_t size = std::strtoull(argv[0], nullptr, 0);
-    uint32_t poolId = kAnyPoolId;
+    std::string poolPath;  // empty = any pool
     if (argc >= 2)
-        poolId = static_cast<uint32_t>(std::strtoul(argv[1], nullptr, 0));
+        poolPath = argv[1];
 
-    fprintf(stdout, "Allocating %" PRIu64 " bytes (pool=%u) ...\n", size, poolId);
+    fprintf(stdout, "Allocating %" PRIu64 " bytes (pool=%s) ...\n",
+            size, poolPath.empty() ? "(any)" : poolPath.c_str());
 
     AllocResp resp{};
     std::string devicePath;
-    if (doAlloc(size, poolId, &resp, &devicePath) != 0)
+    if (doAlloc(size, poolPath, &resp, &devicePath) != 0)
         return 1;
 
     fprintf(stdout, "\nAllocation successful:\n");
@@ -501,27 +528,28 @@ static int cmdMmap(int argc, char *argv[])
 {
     if (argc < 1)
     {
-        fprintf(stderr, "Usage: mmap <size_bytes> [pool_id]\n");
+        fprintf(stderr, "Usage: mmap <size_bytes> [pool_path]\n");
         return 1;
     }
 
     uint64_t size = std::strtoull(argv[0], nullptr, 0);
-    uint32_t poolId = kAnyPoolId;
+    std::string poolPath;  // empty = any pool
     if (argc >= 2)
-        poolId = static_cast<uint32_t>(std::strtoul(argv[1], nullptr, 0));
+        poolPath = argv[1];
 
     fprintf(stdout,
             "=== mmap round-trip test ===\n"
             "  requested size : %s\n"
-            "  pool_id        : %u\n\n",
-            formatSize(size).c_str(), poolId);
+            "  pool_path      : %s\n\n",
+            formatSize(size).c_str(),
+            poolPath.empty() ? "(any)" : poolPath.c_str());
 
     // Step 1: Allocate
     fprintf(stdout, "[1/5] Allocating ...\n");
 
     AllocResp aresp{};
     std::string devicePath;
-    if (doAlloc(size, poolId, &aresp, &devicePath) != 0)
+    if (doAlloc(size, poolPath, &aresp, &devicePath) != 0)
         return 1;
 
     Handle h = aresp.handle;

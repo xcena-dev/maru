@@ -13,6 +13,7 @@ namespace maru {
 /// Client identity extracted from the transport layer.
 struct RequestContext {
     std::string client_id;  // "hostname:pid"
+    std::string pool_path;  // empty = any pool
 };
 
 /// Result of handleAlloc — includes device path for client to open directly.

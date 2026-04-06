@@ -16,7 +16,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     std::string devPath;
     uint64_t requestedSize = 0;
     int32_t status =
-        pm_.alloc(req.size, ctx.client_id, handle, devPath, req.poolId, requestedSize);
+        pm_.alloc(req.size, ctx.client_id, handle, devPath, ctx.pool_path, requestedSize);
 
     result.resp.status = status;
     result.resp.handle = handle;
@@ -26,18 +26,18 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
 
     if (status == 0) {
         logf(LogLevel::Debug,
-             "[ALLOC] client=%s, size=%llu, pool_id=%u -> region_id=%llu, path=%s",
+             "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s",
              ctx.client_id.c_str(),
              (unsigned long long)req.size,
-             req.poolId,
+             ctx.pool_path.c_str(),
              (unsigned long long)handle.regionId,
              devPath.c_str());
     } else {
         logf(LogLevel::Warn,
-             "[ALLOC] client=%s, size=%llu, pool_id=%u -> FAILED (status=%d)",
+             "[ALLOC] client=%s, size=%llu, pool=%s -> FAILED (status=%d)",
              ctx.client_id.c_str(),
              (unsigned long long)req.size,
-             req.poolId,
+             ctx.pool_path.c_str(),
              status);
     }
 

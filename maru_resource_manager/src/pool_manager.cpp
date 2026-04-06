@@ -788,8 +788,20 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
     return false;
 }
 
+PoolState *PoolManager::findPoolByPath(const std::string &devPath)
+{
+    for (auto &pool : pools_)
+    {
+        if (pool.devPath == devPath)
+        {
+            return &pool;
+        }
+    }
+    return nullptr;
+}
+
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
-                       std::string &devPath, uint32_t poolId,
+                       std::string &devPath, const std::string &poolPath,
                        uint64_t &requestedSizeOut)
 {
     if (clientId.empty())
@@ -812,27 +824,19 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     Allocation alloc{};
     PoolState *selectedPool = nullptr;
 
-    if (poolId != kAnyPoolId)
+    if (!poolPath.empty())
     {
-        for (auto &pool : pools_)
-        {
-            if (pool.poolId != poolId)
-            {
-                continue;
-            }
-            if (!allocateFromPool(pool, size, alloc))
-            {
-                return -ENOMEM;
-            }
-            setClientId(alloc.clientId, kMaxClientIdLen, clientId);
-            pool.freeSize -= alloc.allocLength;
-            selectedPool = &pool;
-            break;
-        }
+        selectedPool = findPoolByPath(poolPath);
         if (!selectedPool)
         {
             return -ENOENT;
         }
+        if (!allocateFromPool(*selectedPool, size, alloc))
+        {
+            return -ENOMEM;
+        }
+        setClientId(alloc.clientId, kMaxClientIdLen, clientId);
+        selectedPool->freeSize -= alloc.allocLength;
     }
     else
     {

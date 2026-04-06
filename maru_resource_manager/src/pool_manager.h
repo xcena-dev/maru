@@ -61,7 +61,8 @@ public:
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
-              std::string &devPath, uint32_t poolId, uint64_t &requestedSizeOut);
+              std::string &devPath, const std::string &poolPath,
+              uint64_t &requestedSizeOut);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.
     int verifyAndFree(const Handle &handle, const std::string &clientId);
@@ -100,6 +101,7 @@ private:
     void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
+    PoolState *findPoolByPath(const std::string &devPath);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.

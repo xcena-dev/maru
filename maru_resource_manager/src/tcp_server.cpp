@@ -485,8 +485,23 @@ bool TcpServer::handleOneRequest(int clientFd) {
         AllocReq req{};
         std::memcpy(&req, payload.data(), sizeof(req));
 
+        // Extract pool path (variable-length, before client_id)
+        std::string poolPath;
+        size_t poolPathEnd = sizeof(AllocReq);
+        if (req.poolPathLen > 0) {
+            if (poolPathEnd + req.poolPathLen > payload.size()) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path truncated");
+                return false;
+            }
+            poolPath.assign(
+                reinterpret_cast<const char*>(payload.data()) + poolPathEnd,
+                req.poolPathLen);
+        }
+        poolPathEnd += req.poolPathLen;
+
+        // client_id parsing now starts at poolPathEnd (was sizeof(AllocReq))
         size_t cidEnd = 0;
-        std::string cid = parseClientId(payload, sizeof(AllocReq), cidEnd);
+        std::string cid = parseClientId(payload, poolPathEnd, cidEnd);
         if (cid.empty()) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
@@ -502,7 +517,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             return true;
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, poolPath};
         auto result = handler_.handleAlloc(req, ctx);
 
         auto respPayload = serializeAllocResp(result.resp, result.devicePath);
@@ -537,7 +552,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             return true;
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, {}};
         auto result = handler_.handleFree(req, ctx);
         if (result.resp.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid authToken");
@@ -572,7 +587,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             }
         }
 
-        RequestContext ctx{cid};
+        RequestContext ctx{cid, {}};
         auto result = handler_.handleGetAccess(req, ctx);
         if (result.status == -EACCES) {
             sendError(clientFd, -EACCES, "invalid auth token");

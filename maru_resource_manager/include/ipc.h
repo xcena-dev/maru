@@ -36,7 +36,7 @@ struct MsgHeader {
 
 struct AllocReq {
   uint64_t size;
-  uint32_t poolId;
+  uint32_t poolPathLen;
   uint32_t reserved;
 };
 
