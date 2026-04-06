@@ -4,7 +4,7 @@
 
 The full stack from inference engine to shared memory:
 
-![System-level architecture](../design_doc/resource/lmcache_arch.png)
+![System-level architecture](../image/lmcache_arch.png)
 
 > **Control Plane** (dashed arrows) — metadata RPC: KV registration, region claim/release.
 >
@@ -12,7 +12,7 @@ The full stack from inference engine to shared memory:
 
 ### Component Architecture
 
-![Component-level architecture](../design_doc/resource/lmcache_component_arch.png)
+![Component-level architecture](../image/lmcache_component_arch.png)
 
 **Layer responsibilities:**
 

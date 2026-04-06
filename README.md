@@ -70,6 +70,19 @@ flowchart TB
 
 ## Quick Start
 
+### System Components
+
+Maru consists of two server components and a client library:
+
+| Component | Role | Package |
+|-----------|------|---------|
+| **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
+| **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
+| **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
+
+All components run on the same machine in a single-node setup. For multi-node deployment, see the [installation guide](https://xcena-dev.github.io/maru/source/getting_started/installation.html#multi-node-configuration).
+
+
 ### Prerequisites
 
 - OS: Ubuntu 24.04 LTS+
@@ -94,20 +107,49 @@ source .venv/bin/activate
 ./install.sh
 ```
 
-Verify the Maru Resource Manager daemon is running:
+### 1. Start the Resource Manager
+
+The resource manager must be running before any other Maru service.
+
+**Production** — start as a systemd daemon:
 
 ```bash
-systemctl status maru-resourced
+# Default (127.0.0.1:9850)
+sudo systemctl start maru-resource-manager
+
+# With custom host/port
+sudo systemctl edit maru-resource-manager
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/maru-resource-manager --host <ip> --port <port>
+
+sudo systemctl restart maru-resource-manager
 ```
 
-### Start Services
+**Development/debugging** — run directly with custom options:
 
 ```bash
-# Start MaruServer (metadata server)
+# Default (127.0.0.1:9850)
+sudo maru-resource-manager --log-level debug
+
+# With custom host/port
+sudo maru-resource-manager --host <ip> --port <port> --log-level debug
+```
+
+> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+
+### 2. Start the Metadata Server
+
+```bash
+# Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
-maru-server --host 0.0.0.0 --port 5555
+maru-server --host <ip> --port <port>
+
+# With custom resource manager address (default: 127.0.0.1:9850)
+maru-server --rm-address <rm-ip>:<rm-port>
 ```
 
 ### Basic Usage
@@ -140,13 +182,12 @@ with MaruHandler(config) as handler:
 
 ## LMCache Integration
 
-Maru works as a drop-in remote storage backend for [LMCache](https://github.com/LMCache/LMCache) via the `maru://` URL scheme. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
+Maru works as a native [LMCache](https://github.com/LMCache/LMCache) storage backend via the `maru_path` and `maru_pool_size` config fields. Requires LMCache [`5502419`](https://github.com/LMCache/LMCache/commit/550241961be6edae295cd0a374db1e46f96fe388) (2026-04-03) or later. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
 
 ```yaml
 # LMCache config
-remote_url: "maru://localhost:5555"
-extra_config:
-  maru_pool_size: 4
+maru_path: "maru://localhost:${MARU_SERVER_PORT}"
+maru_pool_size: 4
 ```
 
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
