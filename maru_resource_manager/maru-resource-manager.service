@@ -1,0 +1,23 @@
+[Unit]
+Description=Maru Resource Manager — CXL/DAX shared memory pool server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/maru-resource-manager
+Restart=on-failure
+RestartSec=3
+
+# Security hardening
+# Note: ProtectSystem=full (not strict) because the RM needs read access to
+# /sys/bus/dax/devices for device scanning. strict would block this.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/maru-resourced
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

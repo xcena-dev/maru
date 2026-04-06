@@ -13,8 +13,8 @@ setup_package_logging("maru_shm")
 from .client import MaruShmClient  # noqa: E402
 from .constants import (  # noqa: E402
     ANY_POOL_ID,
+    DEFAULT_ADDRESS,
     DEFAULT_ALIGN_BYTES,
-    DEFAULT_SOCKET_PATH,
     DEFAULT_STATE_DIR,
     MAP_PRIVATE,
     MAP_SHARED,
@@ -41,7 +41,7 @@ __all__ = [
     # Client
     "MaruShmClient",
     # Paths / defaults
-    "DEFAULT_SOCKET_PATH",
+    "DEFAULT_ADDRESS",
     "DEFAULT_STATE_DIR",
     "DEFAULT_ALIGN_BYTES",
     "ANY_POOL_ID",

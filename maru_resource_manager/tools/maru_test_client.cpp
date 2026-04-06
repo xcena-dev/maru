@@ -1,27 +1,23 @@
 // maru_test_client - Interactive test client for Maru Resource Manager
 //
-// Communicates with the resource manager over UDS using the binary IPC protocol.
+// Communicates with the resource manager over TCP using the binary IPC protocol.
 // Supports stats, alloc, and a full mmap round-trip test.
 //
-// Note: The resource manager's reaper reclaims allocations when the owning process
-// exits, so standalone free/get_fd commands are not useful.
-//
 // Usage:
-//   maru_test_client [-s socket_path] <command> [args...]
+//   maru_test_client [-H host] [-p port] <command> [args...]
 //
 // Commands:
 //   stats                    Query pool statistics
 //   alloc <size> [pool_id]   Allocate shared memory
 //   mmap <size> [pool_id]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
-//
-// Environment:
-//   MARU_SOCKET_PATH   Override default resource manager socket path
 
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -30,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -37,9 +34,40 @@
 
 using namespace maru;
 
-static const char *kDefaultSocketPath = "/run/maru-resourced/maru-resourced.sock";
-static const char *g_socketPath = nullptr;
+static const char *g_host = "127.0.0.1";
+static uint16_t g_port = 9850;
 static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
+
+// Client identity and request sequencing for the v2 protocol.
+static std::string g_clientId;
+static std::atomic<uint64_t> g_requestSeq{1};
+
+static std::string makeClientId()
+{
+    char hostname[256];
+    if (::gethostname(hostname, sizeof(hostname)) != 0)
+        std::snprintf(hostname, sizeof(hostname), "unknown");
+    return std::string(hostname) + ":" + std::to_string(::getpid());
+}
+
+/// Build a v2 request payload: [fixed struct][uint16 idLen][client_id][uint64 requestId]
+static std::vector<uint8_t> buildPayload(const void *fixedStruct, size_t fixedSize,
+                                          const std::string &clientId, uint64_t requestId)
+{
+    uint16_t idLen = static_cast<uint16_t>(clientId.size());
+    size_t totalSize = fixedSize + sizeof(idLen) + idLen + sizeof(requestId);
+    std::vector<uint8_t> buf(totalSize);
+
+    size_t off = 0;
+    std::memcpy(buf.data() + off, fixedStruct, fixedSize);
+    off += fixedSize;
+    std::memcpy(buf.data() + off, &idLen, sizeof(idLen));
+    off += sizeof(idLen);
+    std::memcpy(buf.data() + off, clientId.data(), idLen);
+    off += idLen;
+    std::memcpy(buf.data() + off, &requestId, sizeof(requestId));
+    return buf;
+}
 
 // ----------------------------------------------------------------------------
 // I/O helpers
@@ -83,87 +111,35 @@ static int readFull(int fd, void *buf, size_t len)
     return 0;
 }
 
-// Receive data + optional FD via SCM_RIGHTS.
-// Uses a large control buffer to accommodate potential SCM_CREDENTIALS
-// ancillary data that the kernel may auto-attach.
-static int recvWithFd(int sockFd, void *buf, size_t len, int *fdOut)
-{
-    struct iovec iov
-    {
-    };
-    iov.iov_base = buf;
-    iov.iov_len = len;
-
-    // Large enough for SCM_RIGHTS(int) + SCM_CREDENTIALS(ucred)
-    char controlBuf[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
-    std::memset(controlBuf, 0, sizeof(controlBuf));
-
-    struct msghdr msg
-    {
-    };
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = controlBuf;
-    msg.msg_controllen = sizeof(controlBuf);
-
-    ssize_t n = ::recvmsg(sockFd, &msg, 0);
-    if (n < 0)
-        return -errno;
-    if (static_cast<size_t>(n) != len)
-        return -EIO;
-
-    *fdOut = -1;
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
-         cmsg = CMSG_NXTHDR(&msg, cmsg))
-    {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
-        {
-            std::memcpy(fdOut, CMSG_DATA(cmsg), sizeof(int));
-            break;
-        }
-    }
-    return 0;
-}
-
 // ----------------------------------------------------------------------------
 // Protocol helpers
 // ----------------------------------------------------------------------------
 
-static const char *resolveSocketPath()
-{
-    if (g_socketPath)
-        return g_socketPath;
-    const char *env = std::getenv("MARU_SOCKET_PATH");
-    if (env && env[0] != '\0')
-        return env;
-    return kDefaultSocketPath;
-}
-
 static int connectResourceManager()
 {
-    const char *path = resolveSocketPath();
-
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
     {
         fprintf(stderr, "error: socket() failed: %s\n", strerror(errno));
         return -1;
     }
 
-    // Note: Do NOT set SO_PASSCRED on the client socket.
-    // The daemon's accepted socket already has SO_PASSCRED (inherited from
-    // its listening socket), so the kernel auto-attaches our credentials
-    // on the daemon side. Setting it here would cause the kernel to inject
-    // SCM_CREDENTIALS into our recvmsg calls, competing for control buffer
-    // space with the SCM_RIGHTS FD we actually need.
+    int flag = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(g_port);
+    if (::inet_pton(AF_INET, g_host, &addr.sin_addr) != 1)
+    {
+        fprintf(stderr, "error: invalid host address: %s\n", g_host);
+        ::close(fd);
+        return -1;
+    }
 
     if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
     {
-        fprintf(stderr, "error: connect(%s) failed: %s\n", path, strerror(errno));
+        fprintf(stderr, "error: connect(%s:%u) failed: %s\n", g_host, g_port, strerror(errno));
         ::close(fd);
         return -1;
     }
@@ -218,7 +194,6 @@ static int recvHeader(int fd, MsgHeader *hdr)
     return 0;
 }
 
-// Returns true if the response is an error (prints message and returns true).
 static bool handleErrorResp(int fd, const MsgHeader &hdr)
 {
     if (static_cast<MsgType>(hdr.type) != MsgType::ERROR_RESP)
@@ -235,7 +210,8 @@ static bool handleErrorResp(int fd, const MsgHeader &hdr)
         readFull(fd, &msg[0], err.msgLen);
     }
 
-    fprintf(stderr, "error: resource manager returned status=%d: %s\n", err.status, msg.empty() ? "(no message)" : msg.c_str());
+    fprintf(stderr, "error: resource manager returned status=%d: %s\n",
+            err.status, msg.empty() ? "(no message)" : msg.c_str());
     return true;
 }
 
@@ -243,19 +219,35 @@ static std::string formatSize(uint64_t bytes)
 {
     char buf[64];
     if (bytes >= (1ULL << 30))
-        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f GiB)", bytes, static_cast<double>(bytes) / (1ULL << 30));
+        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f GiB)", bytes,
+                      static_cast<double>(bytes) / (1ULL << 30));
     else if (bytes >= (1ULL << 20))
-        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f MiB)", bytes, static_cast<double>(bytes) / (1ULL << 20));
+        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f MiB)", bytes,
+                      static_cast<double>(bytes) / (1ULL << 20));
     else if (bytes >= (1ULL << 10))
-        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f KiB)", bytes, static_cast<double>(bytes) / (1ULL << 10));
+        std::snprintf(buf, sizeof(buf), "%" PRIu64 " (%.2f KiB)", bytes,
+                      static_cast<double>(bytes) / (1ULL << 10));
     else
         std::snprintf(buf, sizeof(buf), "%" PRIu64 " B", bytes);
     return buf;
 }
 
-// Helper: send alloc request and receive response with FD
+/// Parse device_path from AllocResp payload (after fixed 48-byte struct).
+static std::string parseDevicePath(const uint8_t *data, size_t dataLen)
+{
+    if (dataLen <= sizeof(AllocResp) + sizeof(uint32_t))
+        return "";
+    uint32_t pathLen = 0;
+    std::memcpy(&pathLen, data + sizeof(AllocResp), sizeof(pathLen));
+    size_t pathOff = sizeof(AllocResp) + sizeof(pathLen);
+    if (pathLen == 0 || pathOff + pathLen > dataLen)
+        return "";
+    return std::string(reinterpret_cast<const char *>(data + pathOff), pathLen);
+}
+
+// Helper: send alloc request and receive response with device path
 static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
-                   int *daxFd)
+                   std::string *devicePath)
 {
     int fd = connectResourceManager();
     if (fd < 0)
@@ -266,7 +258,9 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
     req.poolId = poolId;
     req.reserved = 0;
 
-    if (sendRequest(fd, MsgType::ALLOC_REQ, &req, sizeof(req)) != 0)
+    auto payload = buildPayload(&req, sizeof(req), g_clientId, g_requestSeq++);
+    if (sendRequest(fd, MsgType::ALLOC_REQ, payload.data(),
+                    static_cast<uint32_t>(payload.size())) != 0)
     {
         ::close(fd);
         return -1;
@@ -290,28 +284,33 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
         return -1;
     }
 
-    *daxFd = -1;
-    int rc = recvWithFd(fd, resp, sizeof(*resp), daxFd);
+    std::vector<uint8_t> respBuf(hdr.payloadLen);
+    int rc = readFull(fd, respBuf.data(), hdr.payloadLen);
     ::close(fd);
 
     if (rc != 0)
     {
-        fprintf(stderr, "error: recvWithFd failed: %s\n", strerror(-rc));
+        fprintf(stderr, "error: read(AllocResp) failed: %s\n", strerror(-rc));
         return -1;
     }
+    if (respBuf.size() < sizeof(AllocResp))
+    {
+        fprintf(stderr, "error: AllocResp too short\n");
+        return -1;
+    }
+
+    std::memcpy(resp, respBuf.data(), sizeof(*resp));
+    *devicePath = parseDevicePath(respBuf.data(), respBuf.size());
+
     if (resp->status != 0)
     {
-        fprintf(stderr, "error: alloc failed with status %d (%s)\n", resp->status, strerror(-resp->status));
-        if (*daxFd >= 0)
-        {
-            ::close(*daxFd);
-            *daxFd = -1;
-        }
+        fprintf(stderr, "error: alloc failed with status %d (%s)\n",
+                resp->status, strerror(-resp->status));
         return -1;
     }
-    if (*daxFd < 0)
+    if (devicePath->empty())
     {
-        fprintf(stderr, "error: alloc succeeded but no FD received\n");
+        fprintf(stderr, "error: alloc succeeded but no device path received\n");
         return -1;
     }
     return 0;
@@ -320,7 +319,6 @@ static int doAlloc(uint64_t size, uint32_t poolId, AllocResp *resp,
 // Helper: send free request for a handle
 static int doFree(const Handle &h)
 {
-
     int fd = connectResourceManager();
     if (fd < 0)
         return -1;
@@ -328,7 +326,9 @@ static int doFree(const Handle &h)
     FreeReq req{};
     req.handle = h;
 
-    if (sendRequest(fd, MsgType::FREE_REQ, &req, sizeof(req)) != 0)
+    auto payload = buildPayload(&req, sizeof(req), g_clientId, g_requestSeq++);
+    if (sendRequest(fd, MsgType::FREE_REQ, payload.data(),
+                    static_cast<uint32_t>(payload.size())) != 0)
     {
         ::close(fd);
         return -1;
@@ -357,7 +357,8 @@ static int doFree(const Handle &h)
     }
     if (resp.status != 0)
     {
-        fprintf(stderr, "error: free failed with status %d (%s)\n", resp.status, strerror(-resp.status));
+        fprintf(stderr, "error: free failed with status %d (%s)\n",
+                resp.status, strerror(-resp.status));
         return -1;
     }
     return 0;
@@ -427,7 +428,8 @@ static int cmdStats()
         return 0;
     }
 
-    fprintf(stdout, "  %-6s  %-8s  %18s  %18s  %12s  %5s\n", "Pool", "Type", "Total", "Free", "Align", "Used%");
+    fprintf(stdout, "  %-6s  %-8s  %18s  %18s  %12s  %5s\n",
+            "Pool", "Type", "Total", "Free", "Align", "Used%");
     fprintf(stdout,
             "  ------  --------  ------------------  ------------------  "
             "------------  -----\n");
@@ -448,11 +450,14 @@ static int cmdStats()
             (pi.type == DaxType::DEV_DAX) ? "DEV_DAX" : "FS_DAX";
         double usedPct =
             (pi.totalSize > 0)
-                ? 100.0 *
-                      (1.0 - static_cast<double>(pi.freeSize) / pi.totalSize)
+                ? 100.0 * (1.0 - static_cast<double>(pi.freeSize) / pi.totalSize)
                 : 0.0;
 
-        fprintf(stdout, "  %-6u  %-8s  %18s  %18s  %12" PRIu64 "  %5.1f\n", pi.poolId, typeStr, formatSize(pi.totalSize).c_str(), formatSize(pi.freeSize).c_str(), pi.alignBytes, usedPct);
+        fprintf(stdout, "  %-6u  %-8s  %18s  %18s  %12" PRIu64 "  %5.1f\n",
+                pi.poolId, typeStr,
+                formatSize(pi.totalSize).c_str(),
+                formatSize(pi.freeSize).c_str(),
+                pi.alignBytes, usedPct);
     }
     return 0;
 }
@@ -473,26 +478,25 @@ static int cmdAlloc(int argc, char *argv[])
     fprintf(stdout, "Allocating %" PRIu64 " bytes (pool=%u) ...\n", size, poolId);
 
     AllocResp resp{};
-    int daxFd = -1;
-    if (doAlloc(size, poolId, &resp, &daxFd) != 0)
+    std::string devicePath;
+    if (doAlloc(size, poolId, &resp, &devicePath) != 0)
         return 1;
 
     fprintf(stdout, "\nAllocation successful:\n");
-    fprintf(stdout, "  region_id  = %" PRIu64 "\n", resp.handle.regionId);
-    fprintf(stdout, "  offset     = %" PRIu64 "\n", resp.handle.offset);
-    fprintf(stdout, "  length     = %" PRIu64 " (%s)\n", resp.handle.length, formatSize(resp.handle.length).c_str());
-    fprintf(stdout, "  auth_token = %" PRIu64 "\n", resp.handle.authToken);
-    fprintf(stdout, "  requested  = %" PRIu64 "\n", resp.requestedSize);
-    fprintf(stdout, "  dax_fd     = %d\n", daxFd);
+    fprintf(stdout, "  region_id   = %" PRIu64 "\n", resp.handle.regionId);
+    fprintf(stdout, "  offset      = %" PRIu64 "\n", resp.handle.offset);
+    fprintf(stdout, "  length      = %" PRIu64 " (%s)\n", resp.handle.length,
+            formatSize(resp.handle.length).c_str());
+    fprintf(stdout, "  auth_token  = %" PRIu64 "\n", resp.handle.authToken);
+    fprintf(stdout, "  requested   = %" PRIu64 "\n", resp.requestedSize);
+    fprintf(stdout, "  device_path = %s\n", devicePath.c_str());
     fprintf(stdout,
             "\n(allocation will be reclaimed by reaper on process exit)\n");
 
-    if (daxFd >= 0)
-        ::close(daxFd);
     return 0;
 }
 
-// Full cycle: alloc -> mmap -> write pattern -> read verify -> munmap -> free
+// Full cycle: alloc -> open(path) -> mmap -> write -> read verify -> munmap -> free
 static int cmdMmap(int argc, char *argv[])
 {
     if (argc < 1)
@@ -510,46 +514,49 @@ static int cmdMmap(int argc, char *argv[])
             "=== mmap round-trip test ===\n"
             "  requested size : %s\n"
             "  pool_id        : %u\n\n",
-            formatSize(size).c_str(),
-            poolId);
+            formatSize(size).c_str(), poolId);
 
     // Step 1: Allocate
     fprintf(stdout, "[1/5] Allocating ...\n");
 
     AllocResp aresp{};
-    int daxFd = -1;
-    if (doAlloc(size, poolId, &aresp, &daxFd) != 0)
+    std::string devicePath;
+    if (doAlloc(size, poolId, &aresp, &devicePath) != 0)
         return 1;
 
     Handle h = aresp.handle;
     fprintf(stdout,
             "  region_id=%" PRIu64 ", offset=%" PRIu64
             ", length=%s\n"
-            "  auth_token=%" PRIu64 ", dax_fd=%d\n\n",
-            h.regionId,
-            h.offset,
-            formatSize(h.length).c_str(),
-            h.authToken,
-            daxFd);
+            "  auth_token=%" PRIu64 ", path=%s\n\n",
+            h.regionId, h.offset, formatSize(h.length).c_str(),
+            h.authToken, devicePath.c_str());
 
-    // Step 2: mmap
+    // Step 2: open device path + mmap
     fprintf(stdout,
-            "[2/5] Mapping memory (fd=%d, offset=%" PRIu64
+            "[2/5] Opening %s and mapping memory (offset=%" PRIu64
             ", length=%" PRIu64 ") ...\n",
-            daxFd,
-            h.offset,
-            h.length);
+            devicePath.c_str(), h.offset, h.length);
 
-    void *ptr = ::mmap(nullptr, h.length, PROT_READ | PROT_WRITE, MAP_SHARED, daxFd, static_cast<off_t>(h.offset));
+    int daxFd = ::open(devicePath.c_str(), O_RDWR);
+    if (daxFd < 0)
+    {
+        fprintf(stderr, "  open(%s) failed: %s\n", devicePath.c_str(), strerror(errno));
+        return 1;
+    }
+
+    void *ptr = ::mmap(nullptr, h.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       daxFd, static_cast<off_t>(h.offset));
+    ::close(daxFd);  // mmap keeps its own reference
+
     if (ptr == MAP_FAILED)
     {
         fprintf(stderr, "  mmap failed: %s\n", strerror(errno));
-        ::close(daxFd);
         return 1;
     }
     fprintf(stdout, "  mapped at %p\n\n", ptr);
 
-    // Step 3: Write test pattern (use requested size, not aligned length)
+    // Step 3: Write test pattern
     uint64_t testSize = aresp.requestedSize;
     fprintf(stdout, "[3/5] Writing test pattern (%s) ...\n", formatSize(testSize).c_str());
 
@@ -568,31 +575,24 @@ static int cmdMmap(int argc, char *argv[])
         if (mem[i] != expected)
         {
             if (errors < 10)
-            {
                 fprintf(stderr,
                         "  MISMATCH at offset %" PRIu64
                         ": expected 0x%02X, got 0x%02X\n",
-                        i,
-                        expected,
-                        mem[i]);
-            }
+                        i, expected, mem[i]);
             ++errors;
         }
     }
 
     if (errors == 0)
-        fprintf(stdout, "  verified %s OK\n\n", formatSize(h.length).c_str());
+        fprintf(stdout, "  verified %s OK\n\n", formatSize(testSize).c_str());
     else
         fprintf(stderr, "  %" PRIu64 " byte(s) mismatched!\n\n", errors);
 
-    // Step 5: Cleanup (munmap + close FD + free)
+    // Step 5: Cleanup
     fprintf(stdout, "[5/5] Cleaning up ...\n");
 
     ::munmap(ptr, h.length);
     fprintf(stdout, "  munmap OK\n");
-
-    ::close(daxFd);
-    fprintf(stdout, "  close(dax_fd) OK\n");
 
     if (doFree(h) != 0)
         return 1;
@@ -613,7 +613,7 @@ static int cmdMmap(int argc, char *argv[])
 static void printUsage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-s socket_path] <command> [args...]\n"
+            "Usage: %s [-H host] [-p port] <command> [args...]\n"
             "\n"
             "Commands:\n"
             "  stats                    Query pool statistics\n"
@@ -621,9 +621,8 @@ static void printUsage(const char *prog)
             "  mmap   <size> [pool_id]  Full mmap round-trip test\n"
             "\n"
             "Options:\n"
-            "  -s <path>  Resource manager socket path\n"
-            "             (default: $MARU_SOCKET_PATH or\n"
-            "              /run/maru-resourced/maru-resourced.sock)\n"
+            "  -H <host>  Resource manager host (default: 127.0.0.1)\n"
+            "  -p <port>  Resource manager port (default: 9850)\n"
             "\n"
             "Size accepts decimal or hex (0x prefix).\n"
             "pool_id 0xFFFFFFFF = any pool (default).\n",
@@ -632,13 +631,18 @@ static void printUsage(const char *prog)
 
 int main(int argc, char *argv[])
 {
+    g_clientId = makeClientId();
+
     int opt;
-    while ((opt = getopt(argc, argv, "s:h")) != -1)
+    while ((opt = getopt(argc, argv, "H:p:h")) != -1)
     {
         switch (opt)
         {
-            case 's':
-                g_socketPath = optarg;
+            case 'H':
+                g_host = optarg;
+                break;
+            case 'p':
+                g_port = static_cast<uint16_t>(std::atoi(optarg));
                 break;
             case 'h':
                 printUsage(argv[0]);

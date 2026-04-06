@@ -7,10 +7,14 @@
 #include <cerrno>
 #include <cstring>
 
+#include "log.h"
 #include "metadata.h"
 #include "util.h"
 
 namespace maru {
+
+static constexpr const char *kLegacyWalName = "maru_resourced.wal";
+static constexpr const char *kCurrentWalName = "maru-resource-manager.wal";
 
 static constexpr uint32_t kWalMagic = 0x57414C21; // 'WAL!'
 static constexpr uint32_t kWalVersion = 6;
@@ -28,7 +32,29 @@ struct WalFreeV3 {
   uint64_t regionId;
 };
 
-WalStore::WalStore(const std::string &stateDir) : stateDir_(stateDir) {}
+WalStore::WalStore(const std::string &stateDir) : stateDir_(stateDir) {
+  // Migrate legacy WAL filename if present
+  std::string legacyPath = stateDir_ + "/" + kLegacyWalName;
+  std::string currentPath = stateDir_ + "/" + kCurrentWalName;
+  struct stat st{};
+  bool legacyExists = (::stat(legacyPath.c_str(), &st) == 0);
+  bool currentExists = (::stat(currentPath.c_str(), &st) == 0);
+
+  if (legacyExists && !currentExists) {
+    if (::rename(legacyPath.c_str(), currentPath.c_str()) == 0) {
+      logf(LogLevel::Info, "Migrated legacy WAL: %s -> %s",
+           legacyPath.c_str(), currentPath.c_str());
+    } else {
+      logf(LogLevel::Warn, "Failed to migrate legacy WAL %s: %s",
+           legacyPath.c_str(), std::strerror(errno));
+    }
+  } else if (legacyExists && currentExists) {
+    logf(LogLevel::Warn,
+         "Both legacy WAL (%s) and current WAL (%s) exist. "
+         "Legacy WAL will be ignored — review and remove manually.",
+         legacyPath.c_str(), currentPath.c_str());
+  }
+}
 
 WalStore::~WalStore() {
   if (walFd_ >= 0) {
@@ -38,7 +64,7 @@ WalStore::~WalStore() {
 }
 
 std::string WalStore::walPath() const {
-  return stateDir_ + "/maru_resourced.wal";
+  return stateDir_ + "/" + kCurrentWalName;
 }
 
 int WalStore::ensureOpen() {

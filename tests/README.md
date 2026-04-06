@@ -19,7 +19,7 @@ pytest -v tests/ -m integration
 pytest -v tests/
 
 # With coverage
-pytest tests/ --cov=maru --cov=maru_common --cov=maru_handler --cov=maru_server --cov-report=html
+pytest tests/ --cov=maru --cov=maru_common --cov=maru_handler --cov=maru_server --cov=maru_shm --cov-report=html
 ```
 
 ## Test Coverage by Module

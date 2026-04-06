@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include "metadata.h"
 #include "util.h"
@@ -28,6 +29,56 @@
 
 namespace maru
 {
+
+// ---------------------------------------------------------------------------
+// client_id helpers: parse "hostname:pid" and check locality
+// ---------------------------------------------------------------------------
+
+static std::string getLocalHostname() {
+    char buf[256];
+    if (::gethostname(buf, sizeof(buf)) == 0) {
+        buf[sizeof(buf) - 1] = '\0';
+        return std::string(buf);
+    }
+    return "";
+}
+
+static const std::string &localHostname() {
+    static const std::string h = getLocalHostname();
+    return h;
+}
+
+/// Extract PID from "hostname:pid". Returns 0 on parse failure.
+static pid_t pidFromClientId(const std::string &clientId) {
+    auto pos = clientId.rfind(':');
+    if (pos == std::string::npos || pos + 1 >= clientId.size()) return 0;
+    try {
+        return static_cast<pid_t>(std::stoi(clientId.substr(pos + 1)));
+    } catch (...) {
+        return 0;
+    }
+}
+
+/// Check if client_id is from this node.
+static bool isLocalClient(const std::string &clientId) {
+    auto pos = clientId.rfind(':');
+    if (pos == std::string::npos) return false;
+    return clientId.substr(0, pos) == localHostname();
+}
+
+/// Overload for char[] fields.
+static bool isLocalClient(const char *clientId) {
+    return isLocalClient(std::string(clientId));
+}
+
+static pid_t pidFromClientId(const char *clientId) {
+    return pidFromClientId(std::string(clientId));
+}
+
+static void setClientId(char *dest, size_t maxLen, const std::string &src) {
+    std::strncpy(dest, src.c_str(), maxLen - 1);
+    dest[maxLen - 1] = '\0';
+}
 
 // Sysfs and device path constants
 
@@ -59,7 +110,12 @@ static uint64_t alignUp(uint64_t v, uint64_t align)
     {
         return v;
     }
-    return v + (align - rem);
+    uint64_t result = v + (align - rem);
+    if (result < v)
+    {
+        return UINT64_MAX; // overflow guard
+    }
+    return result;
 }
 
 static bool findMountPoint(const std::string &deviceName,
@@ -255,13 +311,19 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
-PoolManager::PoolManager()
+PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
+    : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec)
 {
-    metadata_ = std::make_unique<MetadataStore>(defaultStateDir());
-    wal_ = std::make_unique<WalStore>(defaultStateDir());
+    metadata_ = std::make_unique<MetadataStore>(stateDir);
+    wal_ = std::make_unique<WalStore>(stateDir);
 }
 
 PoolManager::~PoolManager() = default;
+
+uint32_t PoolManager::allocationCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return static_cast<uint32_t>(allocations_.size());
+}
 
 int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
 {
@@ -400,7 +462,7 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
     int rc = getDeviceSize(path, size);
     if (rc != 0 || size == 0)
     {
-        logf(LogLevel::Error, "maru_resourced: failed to get size for %s (%d)", path.c_str(), rc);
+        logf(LogLevel::Error, "maru-resource-manager: failed to get size for %s (%d)", path.c_str(), rc);
         return rc != 0 ? rc : -EINVAL;
     }
 
@@ -476,7 +538,7 @@ int PoolManager::loadPoolsLocked()
         rc = loadPoolFromDevice(dev.poolId, dev.devPath, dev.type);
         if (rc != 0)
         {
-            logf(LogLevel::Warn, "maru_resourced: failed to load pool %u from %s: %d", dev.poolId, dev.devPath.c_str(), rc);
+            logf(LogLevel::Warn, "maru-resource-manager: failed to load pool %u from %s: %d", dev.poolId, dev.devPath.c_str(), rc);
         }
     }
 
@@ -486,6 +548,15 @@ int PoolManager::loadPoolsLocked()
     if (walRc != 0 && walRc != -ENOENT)
     {
         return walRc;
+    }
+
+    // Recompute auth tokens for all restored allocations.
+    // Tokens now include client_id in the HMAC input; legacy tokens
+    // (computed without client_id) would fail verification after this change.
+    for (auto &[regionId, alloc] : allocations_)
+    {
+        alloc.handle.authToken = computeAuthToken(
+            alloc.handle, alloc.nonce, std::string(alloc.clientId));
     }
 
     for (auto &pool : pools_)
@@ -717,10 +788,21 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
     return false;
 }
 
-int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
+int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
                        std::string &devPath, uint32_t poolId,
                        uint64_t &requestedSizeOut)
 {
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+    // Reject zero or unreasonably large sizes to prevent alignUp() overflow
+    // and nonsensical allocations. 256 TiB is well beyond any CXL device.
+    if (size == 0 || size > (1ULL << 48))
+    {
+        return -EINVAL;
+    }
+
     std::lock_guard<std::mutex> lock(mu_);
     if (pools_.empty())
     {
@@ -742,7 +824,7 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
             {
                 return -ENOMEM;
             }
-            alloc.ownerId = ownerId;
+            setClientId(alloc.clientId, kMaxClientIdLen, clientId);
             pool.freeSize -= alloc.allocLength;
             selectedPool = &pool;
             break;
@@ -758,7 +840,7 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
         {
             if (allocateFromPool(pool, size, alloc))
             {
-                alloc.ownerId = ownerId;
+                setClientId(alloc.clientId, kMaxClientIdLen, clientId);
                 pool.freeSize -= alloc.allocLength;
                 selectedPool = &pool;
                 break;
@@ -770,19 +852,22 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
         }
     }
 
-    alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce);
+    alloc.handle.authToken = computeAuthToken(alloc.handle, alloc.nonce, clientId);
 
-    // Cache owner PID start time for reaper PID-reuse detection
-    if (ownerId != 0)
+    // Cache owner PID start time for reaper PID-reuse detection (local only)
+    if (!clientId.empty())
     {
-        pid_t pid = static_cast<pid_t>(ownerId);
-        ++pidAllocCounts_[pid];
-        if (pidStartTimes_.find(pid) == pidStartTimes_.end())
+        ++clientAllocCounts_[clientId];
+        if (isLocalClient(clientId))
         {
-            uint64_t st = getPidStartTime(pid);
-            if (st != 0)
+            pid_t pid = pidFromClientId(clientId);
+            if (pid > 0 && pidStartTimes_.find(pid) == pidStartTimes_.end())
             {
-                pidStartTimes_[pid] = st;
+                uint64_t st = getPidStartTime(pid);
+                if (st != 0)
+                {
+                    pidStartTimes_[pid] = st;
+                }
             }
         }
     }
@@ -808,8 +893,13 @@ int PoolManager::alloc(uint64_t size, uint64_t ownerId, Handle &out,
     return 0;
 }
 
-int PoolManager::free(const Handle &handle, uint64_t ownerId)
+int PoolManager::free(const Handle &handle, const std::string &clientId)
 {
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+
     std::lock_guard<std::mutex> lock(mu_);
 
     auto globalIt = allocations_.find(handle.regionId);
@@ -819,48 +909,12 @@ int PoolManager::free(const Handle &handle, uint64_t ownerId)
     }
 
     const Allocation &alloc = globalIt->second;
-    if (ownerId != 0 && alloc.ownerId != ownerId)
+    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
     {
         return -EPERM;
     }
 
-    PoolState *targetPool = findPoolById(alloc.poolId);
-    if (!targetPool)
-    {
-        return -ENOENT;
-    }
-
-    if (targetPool->type == DaxType::FS_DAX)
-    {
-        deleteFsDaxFile(targetPool->devPath, handle.regionId);
-    }
-
-    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
-    targetPool->freeSize += alloc.allocLength;
-
-    // Update PID refcount
-    if (alloc.ownerId != 0)
-    {
-        pid_t pid = static_cast<pid_t>(alloc.ownerId);
-        auto countIt = pidAllocCounts_.find(pid);
-        if (countIt != pidAllocCounts_.end())
-        {
-            if (--countIt->second == 0)
-            {
-                pidAllocCounts_.erase(countIt);
-                pidStartTimes_.erase(pid);
-            }
-        }
-    }
-
-    allocations_.erase(globalIt);
-
-    wal_->appendFree(handle.regionId);
-    if (++opCount_ % checkpointInterval_ == 0)
-    {
-        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
-    }
-    return 0;
+    return doFreeAllocation(handle.regionId);
 }
 
 void PoolManager::getStats(std::vector<PoolState> &out)
@@ -909,15 +963,52 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     std::lock_guard<std::mutex> lock(mu_);
     reapedCount = 0;
 
+    // Collect client_ids whose grace period has expired
+    auto now = SteadyClock::now();
+    std::unordered_set<std::string> expiredClients;
+    for (auto it = disconnectedClients_.begin(); it != disconnectedClients_.end(); )
+    {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second).count();
+        if (elapsed >= gracePeriodSec_)
+        {
+            logf(LogLevel::Info, "reaping disconnected client: %s (disconnected %lds ago)",
+                 it->first.c_str(), static_cast<long>(elapsed));
+            expiredClients.insert(it->first);
+            it = disconnectedClients_.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     std::vector<uint64_t> toFree;
     for (const auto &kv : allocations_)
     {
-        uint64_t ownerId = kv.second.ownerId;
-        if (ownerId == 0)
+        const char *cid = kv.second.clientId;
+        if (cid[0] == '\0')
         {
             continue;
         }
-        pid_t pid = static_cast<pid_t>(ownerId);
+
+        // Check if this client's grace period has expired (works for both local and remote)
+        if (expiredClients.count(cid))
+        {
+            toFree.push_back(kv.first);
+            continue;
+        }
+
+        // For local clients, also check PID liveness
+        if (!isLocalClient(cid))
+        {
+            continue;
+        }
+        pid_t pid = pidFromClientId(cid);
+        if (pid <= 0)
+        {
+            continue;
+        }
         if (::kill(pid, 0) == 0)
         {
             // Process exists — verify it's the same process via start time
@@ -941,66 +1032,164 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
 
     for (uint64_t regionId : toFree)
     {
-        auto globalIt = allocations_.find(regionId);
-        if (globalIt == allocations_.end())
+        if (doFreeAllocation(regionId) == 0)
         {
-            continue;
+            ++reapedCount;
         }
-
-        const Allocation &alloc = globalIt->second;
-
-        PoolState *targetPool = findPoolById(alloc.poolId);
-        if (!targetPool)
-        {
-            continue;
-        }
-
-        if (targetPool->type == DaxType::FS_DAX)
-        {
-            deleteFsDaxFile(targetPool->devPath, regionId);
-        }
-
-        insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
-        targetPool->freeSize += alloc.allocLength;
-
-        // Update PID refcount — O(1) instead of scanning all allocations
-        if (alloc.ownerId != 0)
-        {
-            pid_t pid = static_cast<pid_t>(alloc.ownerId);
-            auto countIt = pidAllocCounts_.find(pid);
-            if (countIt != pidAllocCounts_.end())
-            {
-                if (--countIt->second == 0)
-                {
-                    pidAllocCounts_.erase(countIt);
-                    pidStartTimes_.erase(pid);
-                }
-            }
-        }
-
-        allocations_.erase(globalIt);
-
-        wal_->appendFree(regionId);
-        if (++opCount_ % checkpointInterval_ == 0)
-        {
-            wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
-        }
-        ++reapedCount;
     }
 }
 
-bool PoolManager::verifyAuthToken(const Handle &handle)
+void PoolManager::checkpoint()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+}
+
+void PoolManager::clientDisconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Only track if this client actually has allocations
+    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
+    {
+        disconnectedClients_[clientId] = SteadyClock::now();
+        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
+             clientId.c_str(), gracePeriodSec_);
+    }
+}
+
+void PoolManager::clientReconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = disconnectedClients_.find(clientId);
+    if (it != disconnectedClients_.end())
+    {
+        disconnectedClients_.erase(it);
+        logf(LogLevel::Debug, "client reconnected: %s (grace period cancelled)",
+             clientId.c_str());
+    }
+}
+
+int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId)
+{
+    if (clientId.empty())
+    {
+        return -EINVAL;
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
+
+    auto globalIt = allocations_.find(handle.regionId);
+    if (globalIt == allocations_.end())
+    {
+        return -ENOENT;
+    }
+
+    // Verify auth token (bound to the allocating client_id)
+    const Allocation &alloc = globalIt->second;
+    uint64_t expectedToken = computeAuthToken(handle, alloc.nonce,
+                                               std::string(alloc.clientId));
+    if (handle.authToken != expectedToken)
+    {
+        return -EACCES;
+    }
+
+    // Verify ownership
+    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
+    {
+        return -EPERM;
+    }
+
+    return doFreeAllocation(handle.regionId);
+}
+
+int PoolManager::doFreeAllocation(uint64_t regionId)
+{
+    auto globalIt = allocations_.find(regionId);
+    if (globalIt == allocations_.end())
+    {
+        return -ENOENT;
+    }
+
+    const Allocation &alloc = globalIt->second;
+
+    PoolState *targetPool = findPoolById(alloc.poolId);
+    if (!targetPool)
+    {
+        return -ENOENT;
+    }
+
+    if (targetPool->type == DaxType::FS_DAX)
+    {
+        deleteFsDaxFile(targetPool->devPath, regionId);
+    }
+
+    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+    targetPool->freeSize += alloc.allocLength;
+
+    // Update client refcount
+    if (alloc.clientId[0] != '\0')
+    {
+        auto countIt = clientAllocCounts_.find(alloc.clientId);
+        if (countIt != clientAllocCounts_.end())
+        {
+            if (--countIt->second == 0)
+            {
+                clientAllocCounts_.erase(countIt);
+                if (isLocalClient(alloc.clientId))
+                {
+                    pid_t pid = pidFromClientId(alloc.clientId);
+                    if (pid > 0) pidStartTimes_.erase(pid);
+                }
+            }
+        }
+    }
+
+    allocations_.erase(globalIt);
+
+    wal_->appendFree(regionId);
+    if (++opCount_ % checkpointInterval_ == 0)
+    {
+        wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
+    }
+    return 0;
+}
+
+int PoolManager::verifyAndGetPath(const Handle &handle, std::string &outPath)
 {
     std::lock_guard<std::mutex> lock(mu_);
 
-    auto it = allocations_.find(handle.regionId);
-    if (it == allocations_.end())
+    auto globalIt = allocations_.find(handle.regionId);
+    if (globalIt == allocations_.end())
     {
-        return false;
+        return -ENOENT;
     }
 
-    uint64_t expectedToken = computeAuthToken(handle, it->second.nonce);
-    return handle.authToken == expectedToken;
+    // Verify auth token (bound to the allocating client_id)
+    const Allocation &alloc = globalIt->second;
+    uint64_t expectedToken = computeAuthToken(handle, alloc.nonce,
+                                               std::string(alloc.clientId));
+    if (handle.authToken != expectedToken)
+    {
+        return -EACCES;
+    }
+
+    PoolState *pool = findPoolById(alloc.poolId);
+    if (!pool)
+    {
+        return -ENOENT;
+    }
+
+    if (pool->type == DaxType::FS_DAX)
+    {
+        outPath = makeFsDaxFilePath(pool->devPath, handle.regionId);
+    }
+    else
+    {
+        outPath = pool->devPath;
+    }
+    return 0;
 }
 
 }  // namespace maru

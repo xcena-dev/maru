@@ -89,7 +89,7 @@ class MaruHandler:
                 self._config.server_url,
                 timeout_ms=self._config.timeout_ms,
             )
-        self._mapper = DaxMapper()
+        self._mapper: DaxMapper | None = None
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -208,6 +208,15 @@ class MaruHandler:
         try:
             # 1. Connect RPC client
             self._rpc.connect()
+
+            # 1b. Handshake to get server config (rm_address)
+            try:
+                handshake_resp = self._rpc.handshake()
+                rm_address = handshake_resp.get("rm_address") or self._config.rm_address
+            except Exception:
+                logger.debug("Handshake failed, using config rm_address", exc_info=True)
+                rm_address = self._config.rm_address
+            self._mapper = DaxMapper(rm_address=rm_address)
 
             # 2. Initialize managers
             self._owned = OwnedRegionManager(
@@ -331,7 +340,8 @@ class MaruHandler:
                         logger.error("Failed to return region %d", rid, exc_info=True)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
-                self._mapper.close()
+                if self._mapper is not None:
+                    self._mapper.close()
 
                 # 4. Close RPC connection
                 self._rpc.close()

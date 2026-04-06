@@ -7,7 +7,7 @@ Demonstrates the three-step zero-copy flow:
   3. store(handle=) — register metadata only (key → region, offset)
 
 Prerequisites:
-    1. maru-resourced running (systemctl status maru-resourced)
+    1. maru-resource-manager running
     2. maru-server running (maru-server)
 
 Usage:

@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Binary IPC protocol for resource manager <-> client communication.
 
-This protocol is used over UDS (Unix Domain Sockets) between the Maru Resource Manager
+This protocol is used over TCP between the Maru Resource Manager
 and MaruShmClient. It is separate from the maru RPC protocol in
 maru_common/protocol.py which uses MessagePack over ZMQ.
 
@@ -20,10 +20,10 @@ from .types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants
 PROTOCOL_MAGIC = 0x4D415255  # 'MARU' in ASCII
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Maximum payload size (DoS prevention)
-MAX_PAYLOAD_SIZE = 1024
+MAX_PAYLOAD_SIZE = 8192
 
 
 class MsgType(IntEnum):
@@ -35,13 +35,13 @@ class MsgType(IntEnum):
     FREE_RESP = 4
     STATS_REQ = 5
     STATS_RESP = 6
-    GET_FD_REQ = 9
-    GET_FD_RESP = 10
+    GET_ACCESS_REQ = 9
+    GET_ACCESS_RESP = 10
     ERROR_RESP = 255
 
 
 # MsgHeader: magic(u32) + version(u16) + type(u16) + payload_len(u32) = 12 bytes
-_HEADER_FORMAT = "=IHHI"
+_HEADER_FORMAT = "<IHHI"
 HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
 
 
@@ -49,7 +49,7 @@ HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)  # 12
 class MsgHeader:
     """IPC message header (12 bytes).
 
-    Wire layout (native byte order)::
+    Wire layout (little-endian byte order)::
 
         magic:       4 bytes (0x4D415255)
         version:     2 bytes
@@ -97,7 +97,7 @@ class MsgHeader:
 # =============================================================================
 
 # AllocReq: size(u64) + pool_id(u32) + reserved(u32) = 16 bytes
-_ALLOC_REQ_FORMAT = "=QII"
+_ALLOC_REQ_FORMAT = "<QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
 
@@ -108,9 +108,15 @@ class AllocReq:
     size: int = 0
     pool_id: int = ANY_POOL_ID
     reserved: int = 0
+    client_id: str = ""
+    request_id: int = 0
 
     def pack(self) -> bytes:
-        return struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
+        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
+        id_bytes = self.client_id.encode("utf-8")
+        fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        fixed += struct.pack("<Q", self.request_id)
+        return fixed
 
     @classmethod
     def unpack(cls, data: bytes) -> "AllocReq":
@@ -119,11 +125,29 @@ class AllocReq:
         size, pool_id, reserved = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
-        return cls(size=size, pool_id=pool_id, reserved=reserved)
+        client_id = ""
+        off = _ALLOC_REQ_SIZE
+        if off + 2 <= len(data):
+            (id_len,) = struct.unpack("<H", data[off : off + 2])
+            off += 2
+            if id_len > 0 and off + id_len <= len(data):
+                client_id = data[off : off + id_len].decode("utf-8")
+                off += id_len
+        request_id = 0
+        if off + 8 <= len(data):
+            (request_id,) = struct.unpack("<Q", data[off : off + 8])
+        return cls(
+            size=size,
+            pool_id=pool_id,
+            reserved=reserved,
+            client_id=client_id,
+            request_id=request_id,
+        )
 
 
-# AllocResp: status(i32) + pad(4) + Handle(32) + requested_size(u64) = 48 bytes
-_ALLOC_RESP_FORMAT = "=iIQQQQQ"
+# AllocResp: status(i32) + accessType(u32) + Handle(32) + requested_size(u64) = 48 bytes
+# accessType: 0=LOCAL (fd via SCM_RIGHTS), 1=REMOTE (future multi-node)
+_ALLOC_RESP_FORMAT = "<iIQQQQQ"
 _ALLOC_RESP_SIZE = struct.calcsize(_ALLOC_RESP_FORMAT)
 
 
@@ -134,19 +158,23 @@ class AllocResp:
     status: int = 0
     handle: MaruHandle | None = None
     requested_size: int = 0
+    device_path: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return struct.pack(
+        fixed = struct.pack(
             _ALLOC_RESP_FORMAT,
             self.status,
-            0,  # pad
+            0,  # accessType (LOCAL)
             h.region_id,
             h.offset,
             h.length,
             h.auth_token,
             self.requested_size,
         )
+        path_bytes = self.device_path.encode("utf-8")
+        path_header = struct.pack("<I", len(path_bytes))
+        return fixed + path_header + path_bytes
 
     @classmethod
     def unpack(cls, data: bytes) -> "AllocResp":
@@ -154,16 +182,29 @@ class AllocResp:
             raise ValueError(f"AllocResp too short: {len(data)} < {_ALLOC_RESP_SIZE}")
         vals = struct.unpack(_ALLOC_RESP_FORMAT, data[:_ALLOC_RESP_SIZE])
         status = vals[0]
-        # vals[1] is pad
+        # vals[1] is accessType (0=LOCAL, 1=REMOTE)
         handle = MaruHandle(
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
         requested_size = vals[6]
-        return cls(status=status, handle=handle, requested_size=requested_size)
+        # Parse optional device_path extension
+        device_path = ""
+        offset = _ALLOC_RESP_SIZE
+        if offset + 4 <= len(data):
+            (path_len,) = struct.unpack("<I", data[offset : offset + 4])
+            offset += 4
+            if path_len > 0 and offset + path_len <= len(data):
+                device_path = data[offset : offset + path_len].decode("utf-8")
+        return cls(
+            status=status,
+            handle=handle,
+            requested_size=requested_size,
+            device_path=device_path,
+        )
 
 
 # FreeReq: Handle(32) = 32 bytes
-_FREE_REQ_FORMAT = "=QQQQ"
+_FREE_REQ_FORMAT = "<QQQQ"
 _FREE_REQ_SIZE = struct.calcsize(_FREE_REQ_FORMAT)
 
 
@@ -172,19 +213,36 @@ class FreeReq:
     """Free request payload."""
 
     handle: MaruHandle | None = None
+    client_id: str = ""
+    request_id: int = 0
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return h.pack()
+        fixed = h.pack()
+        id_bytes = self.client_id.encode("utf-8")
+        fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        fixed += struct.pack("<Q", self.request_id)
+        return fixed
 
     @classmethod
     def unpack(cls, data: bytes) -> "FreeReq":
         handle = MaruHandle.unpack(data)
-        return cls(handle=handle)
+        client_id = ""
+        off = 32  # Handle size
+        if off + 2 <= len(data):
+            (id_len,) = struct.unpack("<H", data[off : off + 2])
+            off += 2
+            if id_len > 0 and off + id_len <= len(data):
+                client_id = data[off : off + id_len].decode("utf-8")
+                off += id_len
+        request_id = 0
+        if off + 8 <= len(data):
+            (request_id,) = struct.unpack("<Q", data[off : off + 8])
+        return cls(handle=handle, client_id=client_id, request_id=request_id)
 
 
 # FreeResp: status(i32) = 4 bytes
-_FREE_RESP_FORMAT = "=i"
+_FREE_RESP_FORMAT = "<i"
 _FREE_RESP_SIZE = struct.calcsize(_FREE_RESP_FORMAT)
 
 
@@ -205,43 +263,73 @@ class FreeResp:
         return cls(status=status)
 
 
-# GetFdReq: Handle(32) = 32 bytes
+# GetAccessReq: Handle(32) + optional client_id (u16 len + bytes)
 @dataclass
-class GetFdReq:
-    """Get FD request payload (for SCM_RIGHTS)."""
+class GetAccessReq:
+    """Get access info request payload."""
 
     handle: MaruHandle | None = None
+    client_id: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
-        return h.pack()
+        fixed = h.pack()
+        if self.client_id:
+            id_bytes = self.client_id.encode("utf-8")
+            fixed += struct.pack("<H", len(id_bytes)) + id_bytes
+        return fixed
 
     @classmethod
-    def unpack(cls, data: bytes) -> "GetFdReq":
+    def unpack(cls, data: bytes) -> "GetAccessReq":
         handle = MaruHandle.unpack(data)
-        return cls(handle=handle)
+        client_id = ""
+        offset = 32  # Handle size
+        if len(data) > offset + 2:
+            (id_len,) = struct.unpack_from("<H", data, offset)
+            if id_len > 0 and offset + 2 + id_len <= len(data):
+                client_id = data[offset + 2 : offset + 2 + id_len].decode("utf-8")
+        return cls(handle=handle, client_id=client_id)
 
 
-# GetFdResp: status(i32) = 4 bytes
-_GET_FD_RESP_FORMAT = "=i"
-_GET_FD_RESP_SIZE = struct.calcsize(_GET_FD_RESP_FORMAT)
+# GetAccessResp: status(i32) + pathLen(u32) + path + offset(u64) + length(u64)
+_GET_ACCESS_RESP_HEADER_FORMAT = "<iI"
+_GET_ACCESS_RESP_HEADER_SIZE = struct.calcsize(_GET_ACCESS_RESP_HEADER_FORMAT)
 
 
 @dataclass
-class GetFdResp:
-    """Get FD response payload. The actual FD is sent via SCM_RIGHTS ancillary."""
+class GetAccessResp:
+    """Get access info response — device path, offset, length."""
 
     status: int = 0
+    device_path: str = ""
+    offset: int = 0
+    length: int = 0
 
     def pack(self) -> bytes:
-        return struct.pack(_GET_FD_RESP_FORMAT, self.status)
+        path_bytes = self.device_path.encode("utf-8")
+        header = struct.pack(
+            _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
+        )
+        tail = struct.pack("<QQ", self.offset, self.length)
+        return header + path_bytes + tail
 
     @classmethod
-    def unpack(cls, data: bytes) -> "GetFdResp":
-        if len(data) < _GET_FD_RESP_SIZE:
-            raise ValueError(f"GetFdResp too short: {len(data)} < {_GET_FD_RESP_SIZE}")
-        (status,) = struct.unpack(_GET_FD_RESP_FORMAT, data[:_GET_FD_RESP_SIZE])
-        return cls(status=status)
+    def unpack(cls, data: bytes) -> "GetAccessResp":
+        if len(data) < _GET_ACCESS_RESP_HEADER_SIZE:
+            raise ValueError("GetAccessResp too short for header")
+        status, path_len = struct.unpack(
+            _GET_ACCESS_RESP_HEADER_FORMAT, data[:_GET_ACCESS_RESP_HEADER_SIZE]
+        )
+        off = _GET_ACCESS_RESP_HEADER_SIZE
+        device_path = ""
+        if path_len > 0 and off + path_len <= len(data):
+            device_path = data[off : off + path_len].decode("utf-8")
+            off += path_len
+        offset = 0
+        length = 0
+        if off + 16 <= len(data):
+            offset, length = struct.unpack("<QQ", data[off : off + 16])
+        return cls(status=status, device_path=device_path, offset=offset, length=length)
 
 
 # StatsReq: empty payload (0 bytes)
@@ -258,11 +346,11 @@ class StatsReq:
 
 
 # StatsResp: num_pools(u32) + PoolInfo[num_pools]
-_STATS_RESP_HEADER_FORMAT = "=I"
+_STATS_RESP_HEADER_FORMAT = "<I"
 _STATS_RESP_HEADER_SIZE = struct.calcsize(_STATS_RESP_HEADER_FORMAT)
 
 # PoolInfo wire format for stats: pool_id(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
-_STATS_POOL_FORMAT = "=IIQQQ"
+_STATS_POOL_FORMAT = "<IIQQQ"
 _STATS_POOL_SIZE = struct.calcsize(_STATS_POOL_FORMAT)
 
 
@@ -317,7 +405,7 @@ class StatsResp:
 
 
 # ErrorResp: status(i32) + msg_len(u32) + message(variable)
-_ERROR_RESP_HEADER_FORMAT = "=iI"
+_ERROR_RESP_HEADER_FORMAT = "<iI"
 _ERROR_RESP_HEADER_SIZE = struct.calcsize(_ERROR_RESP_HEADER_FORMAT)
 
 

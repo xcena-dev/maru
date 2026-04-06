@@ -446,6 +446,10 @@ class RpcClient:
         response = self._send_request(MessageType.HEARTBEAT, {})
         return "error" not in response
 
+    def handshake(self) -> dict:
+        """Perform handshake with server. Returns server config (rm_address, etc.)."""
+        return self._send_request(MessageType.HANDSHAKE, {})
+
     # =========================================================================
     # Context Manager
     # =========================================================================

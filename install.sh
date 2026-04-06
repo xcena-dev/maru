@@ -8,17 +8,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Parse arguments -------------------------------------------------------
 
+INSTALL_RM=1
+
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""
-    echo "Build and install Maru (Python package + maru_resourced daemon)."
+    echo "Build and install Maru (Python package + maru-resource-manager)."
     echo ""
     echo "Options:"
-    echo "  -h, --help    Show this help message"
+    echo "  --no-rm      Skip building/installing maru-resource-manager"
+    echo "  -h, --help   Show this help message"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --no-rm)
+            INSTALL_RM=0
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -58,12 +65,14 @@ fi
 echo "Installing Maru Python package ..."
 pip install -e "${SCRIPT_DIR}"
 
-# --- Build and install daemon ----------------------------------------------
+# --- Build and install resource manager ------------------------------------
 
-echo ""
-echo "Building and installing maru_resourced daemon ..."
-echo "This step requires root privileges."
-sudo "$(which install-maru-resource-manager)"
+if [ "$INSTALL_RM" -eq 1 ]; then
+    echo ""
+    echo "Building and installing maru-resource-manager ..."
+    echo "This step requires root privileges."
+    sudo "$(which install-maru-resource-manager)"
+fi
 
 echo ""
 echo "Build complete."

@@ -19,8 +19,8 @@ class DaxType(IntEnum):
     FS_DAX = 1  # File-based DAX (mounted filesystem)
 
 
-# Handle binary layout: 4 x uint64 = 32 bytes, native byte order
-_HANDLE_FORMAT = "=QQQQ"
+# Handle binary layout: 4 x uint64 = 32 bytes, little-endian byte order
+_HANDLE_FORMAT = "<QQQQ"
 _HANDLE_SIZE = struct.calcsize(_HANDLE_FORMAT)  # 32
 
 
@@ -92,7 +92,7 @@ class MaruHandle:
 
 
 # PoolInfo binary layout: u32 + u32 + u64 + u64 + u64 = 32 bytes
-_POOL_INFO_FORMAT = "=IIQQQ"
+_POOL_INFO_FORMAT = "<IIQQQ"
 _POOL_INFO_SIZE = struct.calcsize(_POOL_INFO_FORMAT)  # 32
 
 

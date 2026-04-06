@@ -4,7 +4,7 @@
 
 Wraps the cmake build + install workflow so that after `pip install -e .`,
 a single `sudo $(which install-maru-resource-manager)` builds and installs
-the Maru Resource Manager with systemd integration.
+the Maru Resource Manager.
 """
 
 from __future__ import annotations
@@ -15,10 +15,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-_SERVICE_NAME = "maru-resourced"
-_SERVICE_FILE = Path("/etc/systemd/system/maru-resourced.service")
-_UDEV_RULES_FILE = Path("/etc/udev/rules.d/99-maru-resourced.rules")
 
 
 def _find_resource_manager_source() -> Path:
@@ -60,28 +56,40 @@ def _check_root() -> int | None:
 
 
 def _do_uninstall(prefix: str) -> int:
-    """Stop, disable, and remove the resource manager and its systemd/udev files."""
-    binary = Path(prefix) / "bin" / "maru_resourced"
+    """Remove the installed resource manager binary and systemd service."""
+    # Stop service if running
+    subprocess.run(
+        ["systemctl", "stop", "maru-resource-manager"],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["systemctl", "disable", "maru-resource-manager"],
+        capture_output=True,
+    )
 
-    # Stop and disable systemd service
-    _run(["systemctl", "stop", _SERVICE_NAME], check=False)
-    _run(["systemctl", "disable", _SERVICE_NAME], check=False)
+    removed = False
 
-    # Remove files
-    removed = []
-    for path in (_SERVICE_FILE, _UDEV_RULES_FILE, binary):
-        if path.exists():
-            path.unlink()
-            removed.append(str(path))
+    binary = Path(prefix) / "bin" / "maru-resource-manager"
+    if binary.exists():
+        binary.unlink()
+        fprintf(sys.stderr, "  Removed: %s\n", binary)
+        removed = True
 
-    if removed:
-        _run(["systemctl", "daemon-reload"], check=False)
-        if str(_UDEV_RULES_FILE) in removed:
-            _run(["udevadm", "control", "--reload-rules"], check=False)
-            _run(["udevadm", "trigger"], check=False)
-        for p in removed:
-            fprintf(sys.stderr, "  Removed: %s\n", p)
-    else:
+    service = Path("/etc/systemd/system/maru-resource-manager.service")
+    if service.exists():
+        try:
+            service.unlink()
+            fprintf(sys.stderr, "  Removed: %s\n", service)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+            removed = True
+        except PermissionError:
+            fprintf(
+                sys.stderr,
+                "  Warning: cannot remove %s (permission denied). Run with sudo.\n",
+                service,
+            )
+
+    if not removed:
         fprintf(sys.stderr, "Nothing to remove.\n")
 
     fprintf(sys.stderr, "Uninstall complete.\n")
@@ -136,15 +144,13 @@ def _do_install(args: argparse.Namespace) -> int:
         str(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",
     ]
-    if args.no_systemd:
-        configure_cmd.append("-DMARU_INSTALL_SYSTEMD=OFF")
     _run(configure_cmd)
 
     # -- cmake build ----------------------------------------------------------
     _run(["cmake", "--build", str(build_dir)])
 
     # -- verify build output --------------------------------------------------
-    binary = build_dir / "maru_resourced"
+    binary = build_dir / "maru-resource-manager"
     if not binary.is_file() or binary.stat().st_size == 0:
         fprintf(sys.stderr, "Error: build output not found or empty: %s\n", binary)
         return 1
@@ -154,8 +160,41 @@ def _do_install(args: argparse.Namespace) -> int:
     # -- cmake install --------------------------------------------------------
     _run(["cmake", "--install", str(build_dir), "--prefix", args.prefix])
 
+    # -- install systemd service -----------------------------------------------
+    service_src = rm_src / "maru-resource-manager.service"
+    systemd_dir = Path("/etc/systemd/system")
+    if service_src.is_file() and systemd_dir.is_dir():
+        import shutil as _shutil
+
+        service_dst = systemd_dir / "maru-resource-manager.service"
+        _shutil.copy2(str(service_src), str(service_dst))
+        fprintf(sys.stderr, "  Installed systemd service: %s\n", service_dst)
+        subprocess.run(
+            ["systemctl", "daemon-reload"],
+            capture_output=True,
+        )
+
     fprintf(sys.stderr, "Installation complete!\n")
-    fprintf(sys.stderr, "  Binary: %s/bin/maru_resourced\n", args.prefix)
+    fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
+
+    # Check if service is currently running and advise restart
+    probe = subprocess.run(
+        ["systemctl", "is-active", "maru-resource-manager"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.stdout and probe.stdout.strip() == "active":
+        fprintf(
+            sys.stderr,
+            "\n  NOTE: maru-resource-manager is currently running.\n"
+            "  Restart to apply the new version:\n"
+            "    sudo systemctl restart maru-resource-manager\n",
+        )
+    else:
+        fprintf(
+            sys.stderr,
+            "  Start:  sudo systemctl start maru-resource-manager\n",
+        )
     return 0
 
 
@@ -179,14 +218,9 @@ def main(argv: list[str] | None = None) -> int:
         help="remove build directory before building",
     )
     parser.add_argument(
-        "--no-systemd",
-        action="store_true",
-        help="skip systemd service and udev rules installation",
-    )
-    parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="stop, disable, and remove the installed resource manager",
+        help="remove the installed resource manager",
     )
     args = parser.parse_args(argv)
 

@@ -53,6 +53,7 @@ class MaruConfig:
     pool_id: list[int] | int | None = None  # None means any pool (ANY_POOL_ID)
     auto_expand: bool = True  # Auto-expand when pool is exhausted
     expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
+    rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""

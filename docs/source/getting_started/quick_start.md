@@ -1,21 +1,59 @@
 # Quickstart
 
-## 1. Start the Server
+## 1. Start the Resource Manager
+
+The resource manager must be running before any other Maru service.
+
+**Production** — start as a systemd daemon:
 
 ```bash
-# Default (localhost:5555)
+# Default (127.0.0.1:9850)
+sudo systemctl start maru-resource-manager
+
+# With custom host/port
+sudo systemctl edit maru-resource-manager
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/maru-resource-manager --host <ip> --port <port>
+
+sudo systemctl restart maru-resource-manager
+
+```
+
+**Development/debugging** — run directly with custom options:
+
+```bash
+# Default (127.0.0.1:9850)
+sudo maru-resource-manager --log-level debug
+
+# With custom host/port
+sudo maru-resource-manager --host <ip> --port <port> --log-level debug
+```
+
+> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+>
+> See {doc}`../design_doc/maru_resource_manager` for the full list of CLI options.
+
+## 2. Start the Metadata Server
+
+```bash
+# Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
-maru-server --host 0.0.0.0 --port 5556
+maru-server --host <ip> --port <port>
+
+# With custom resource manager address (default: 127.0.0.1:9850)
+maru-server --rm-address <rm-ip>:<rm-port>
 
 # With debug logging
 maru-server --log-level DEBUG
 ```
 
-## 2. Run a Client Example
+## 3. Run a Client Example
 
-> `maru-server` must be running before proceeding. See step 1 above.
+> Both `maru-resource-manager` and `maru-server` must be running before proceeding.
 
 ### Zero-Copy Store & Retrieve
 
@@ -24,7 +62,7 @@ from maru import MaruConfig, MaruHandler
 
 config = MaruConfig(
     server_url="tcp://localhost:5555",
-    pool_size=1024 * 1024 * 100,  # 100MB
+    pool_size=1024 * 1024 * 100,  # Request 100MB from the CXL memory pool
 )
 
 with MaruHandler(config) as handler:
@@ -113,9 +151,9 @@ with MaruHandler(config) as handler:
 > Single-script version: `examples/basic/cross_instance.py`
 
 
-
 ## Next Steps
 
+- {doc}`installation` — Multi-node configuration
 - [LMCache Examples](examples/lmcache/index.md) — Use Maru as a shared KV cache backend for LMCache/vLLM
 - [Architecture Overview](../design_doc/architecture_overview.md) — System architecture and component interactions
 - [API Reference](../api_reference/api.md) — Python API documentation

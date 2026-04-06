@@ -1496,7 +1496,10 @@ class TestPremapSharedRegions:
 
     def test_premap_individual_map_failure_continues(self):
         """Failing to map one shared region doesn't block others."""
+        from unittest.mock import patch
+
         from maru_common import ListAllocationsResponse
+        from maru_handler.memory import DaxMapper
 
         config = MaruConfig(
             pool_size=4096,
@@ -1522,20 +1525,20 @@ class TestPremapSharedRegions:
         )
         mock_rpc.list_allocations = MagicMock(return_value=list_resp)
         mock_rpc.close = MagicMock()
+        mock_rpc.handshake = MagicMock(return_value={"rm_address": "127.0.0.1:9850"})
 
         handler._rpc = mock_rpc
 
-        # Make map_region fail for region 200 only
-        original_map = handler._mapper.map_region
+        # Patch map_region to fail for region 200 only (mapper created during connect)
+        original_map_region = DaxMapper.map_region
 
-        def selective_fail(handle, prefault=True):
+        def selective_fail(self_mapper, handle, prefault=True):
             if handle.region_id == 200:
                 raise RuntimeError("mmap failed")
-            return original_map(handle, prefault=prefault)
+            return original_map_region(self_mapper, handle, prefault=prefault)
 
-        handler._mapper.map_region = selective_fail
-
-        result = handler.connect()
+        with patch.object(DaxMapper, "map_region", selective_fail):
+            result = handler.connect()
         assert result is True
 
         # Region 200 failed but 300 should be mapped

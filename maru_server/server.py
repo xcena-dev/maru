@@ -25,14 +25,20 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    def __init__(self):
-        self._allocation_manager = AllocationManager()
+    def __init__(self, rm_address: str | None = None):
+        self._rm_address = rm_address or "127.0.0.1:9850"
+        self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
-        logger.info("MaruServer initialized")
+        logger.info("MaruServer initialized (rm_address=%s)", self._rm_address)
+
+    @property
+    def rm_address(self) -> str:
+        """Resource manager address used by this server."""
+        return self._rm_address
 
     # =========================================================================
     # Allocation Management
@@ -214,6 +220,11 @@ class MaruServer:
             "allocation_manager": self._allocation_manager.get_stats(),
         }
 
+    def close(self) -> None:
+        """Shutdown the server and release resources."""
+        self._allocation_manager.close()
+        logger.info("MaruServer closed")
+
 
 # =============================================================================
 # CLI Utilities
@@ -256,12 +267,18 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--rm-address",
+        type=str,
+        default="127.0.0.1:9850",
+        help="Resource manager address (host:port, default: 127.0.0.1:9850)",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer()
+    server = MaruServer(rm_address=args.rm_address)
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers
@@ -273,7 +290,10 @@ def main() -> None:
 
     # Start server
     logger.info("Starting MaruServer on %s:%d", args.host, args.port)
-    rpc_server.start()
+    try:
+        rpc_server.start()
+    finally:
+        server.close()
 
 
 if __name__ == "__main__":

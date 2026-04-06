@@ -44,6 +44,7 @@ class RpcHandlerMixin:
                 # Admin
                 MessageType.GET_STATS.value: self._handle_get_stats,
                 MessageType.HEARTBEAT.value: self._handle_heartbeat,
+                MessageType.HANDSHAKE.value: self._handle_handshake,
             }
         return self._handlers
 
@@ -244,3 +245,9 @@ class RpcHandlerMixin:
 
     def _handle_heartbeat(self, _req: Any) -> dict:
         return {}
+
+    def _handle_handshake(self, req: Any) -> dict:
+        return {
+            "success": True,
+            "rm_address": self._server.rm_address,
+        }

@@ -2,6 +2,8 @@
 
 #include <chrono>
 
+#include "log.h"
+
 namespace maru {
 
 Reaper::Reaper(PoolManager &pm) : pm_(pm) {}
@@ -24,6 +26,10 @@ void Reaper::run() {
   while (!stop_) {
     uint64_t reaped = 0;
     pm_.reapExpired(reaped);
+    if (reaped > 0) {
+      logf(LogLevel::Debug, "[REAPER] reaped %llu dead allocations",
+           (unsigned long long)reaped);
+    }
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 }

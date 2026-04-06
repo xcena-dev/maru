@@ -23,6 +23,12 @@ class MockShmClient:
     def __init__(self, *args, **kwargs):
         pass
 
+    def _ensure_resource_manager(self):
+        pass
+
+    def is_running(self):
+        return True
+
     def stats(self):
         return []
 
@@ -36,7 +42,7 @@ class MockShmClient:
     def free(self, handle):
         pass
 
-    def mmap(self, handle, prot, flags=0):
+    def mmap(self, handle, prot):
         obj = mmap.mmap(-1, handle.length)
         _mmap_objects.append(obj)
         return obj

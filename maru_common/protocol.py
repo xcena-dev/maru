@@ -475,6 +475,7 @@ class HandshakeResponse:
 
     success: bool
     server_version: int = PROTOCOL_VERSION
+    rm_address: str | None = None
     error: str | None = None
 
 
