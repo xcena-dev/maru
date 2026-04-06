@@ -2,7 +2,9 @@
 # Copyright 2026 XCENA
 """Unit tests for RpcHandlerMixin to achieve 100% coverage."""
 
-from maru_common import ANY_POOL_ID, MessageType
+from maru_common import MessageType
+
+_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
 from maru_server.rpc_handler_mixin import RpcHandlerMixin
 from maru_server.server import MaruServer
 
@@ -52,7 +54,7 @@ class TestRpcHandlerMixin:
 
     def test_handle_request_alloc_success(self):
         handler, server = self._make_handler()
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
+        req = MockRequest(instance_id="inst1", size=4096, pool_id=_ANY_POOL_ID)
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is True
         assert "handle" in resp
@@ -62,9 +64,9 @@ class TestRpcHandlerMixin:
         monkeypatch.setattr(
             server._allocation_manager,
             "allocate",
-            lambda instance_id, size, pool_id=ANY_POOL_ID: None,
+            lambda instance_id, size, pool_id=_ANY_POOL_ID: None,
         )
-        req = MockRequest(instance_id="inst1", size=4096, pool_id=ANY_POOL_ID)
+        req = MockRequest(instance_id="inst1", size=4096, pool_id=_ANY_POOL_ID)
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is False
         assert resp["error"] == "Allocation failed"

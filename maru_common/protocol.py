@@ -16,7 +16,6 @@ import struct
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
-from maru_shm.constants import ANY_POOL_ID
 from maru_shm.types import MaruHandle
 
 # =============================================================================
@@ -163,7 +162,7 @@ class RequestAllocRequest:
 
     instance_id: str
     size: int
-    pool_id: int = ANY_POOL_ID
+    pool_path: str = ""   # "" = any pool
 
 
 @dataclass

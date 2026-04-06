@@ -13,7 +13,6 @@ import socket
 import pytest
 
 from maru_shm.constants import (
-    ANY_POOL_ID,
     MAP_PRIVATE,
     MAP_SHARED,
     PROT_EXEC,
@@ -204,15 +203,15 @@ class TestMsgHeader:
 
 class TestAllocReq:
     def test_roundtrip(self):
-        req = AllocReq(size=4096, pool_id=1)
+        req = AllocReq(size=4096, pool_path="/dev/dax0.0")
         data = req.pack()
         req2 = AllocReq.unpack(data)
         assert req2.size == 4096
-        assert req2.pool_id == 1
+        assert req2.pool_path == "/dev/dax0.0"
 
-    def test_default_pool_id(self):
+    def test_default_pool_path(self):
         req = AllocReq(size=1024)
-        assert req.pool_id == ANY_POOL_ID
+        assert req.pool_path == ""  # "" means any pool
 
 
 class TestAllocResp:
@@ -377,8 +376,9 @@ class TestConstants:
         assert MAP_SHARED == 0x01
         assert MAP_PRIVATE == 0x02
 
-    def test_any_pool_id(self):
-        assert ANY_POOL_ID == 0xFFFFFFFF
+    def test_any_pool_path_default(self):
+        req = AllocReq(size=1024)
+        assert req.pool_path == ""  # "" means any pool
 
 
 # =============================================================================

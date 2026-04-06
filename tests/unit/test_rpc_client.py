@@ -7,8 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import zmq
 
+_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
+
 from maru_common import (
-    ANY_POOL_ID,
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -280,7 +281,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 4096, "pool_id": ANY_POOL_ID},
+            {"instance_id": "test_instance", "size": 4096, "pool_id": _ANY_POOL_ID},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is True
@@ -298,7 +299,7 @@ class TestRpcClientApiMethods:
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "test_instance", "size": 999999, "pool_id": ANY_POOL_ID},
+            {"instance_id": "test_instance", "size": 999999, "pool_id": _ANY_POOL_ID},
         )
         assert isinstance(result, RequestAllocResponse)
         assert result.success is False

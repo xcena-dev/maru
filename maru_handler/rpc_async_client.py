@@ -32,8 +32,9 @@ from typing import Any
 import zmq
 import zmq.asyncio
 
+_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
+
 from maru_common import (
-    ANY_POOL_ID,
     AllocationManagerStats,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
@@ -363,7 +364,7 @@ class RpcAsyncClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+        self, instance_id: str, size: int, pool_id: int = _ANY_POOL_ID
     ) -> RequestAllocResponse:
         """Request a new memory allocation."""
         response = self._send_request(
@@ -516,7 +517,7 @@ class RpcAsyncClient:
     # =========================================================================
 
     def request_alloc_async(
-        self, instance_id: str, size: int, pool_id: int = ANY_POOL_ID
+        self, instance_id: str, size: int, pool_id: int = _ANY_POOL_ID
     ) -> Future:
         """Non-blocking request_alloc. Returns Future[RequestAllocResponse]."""
 

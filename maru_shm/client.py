@@ -12,7 +12,7 @@ import os
 import socket
 import threading
 
-from .constants import ANY_POOL_ID, DEFAULT_ADDRESS
+from .constants import DEFAULT_ADDRESS
 from .ipc import (
     HEADER_SIZE,
     AllocReq,
@@ -200,12 +200,12 @@ class MaruShmClient:
         resp = StatsResp.unpack(payload)
         return resp.pools or []
 
-    def alloc(self, size: int, pool_id: int = ANY_POOL_ID) -> MaruHandle:
+    def alloc(self, size: int, pool_path: str = "") -> MaruHandle:
         """Allocate shared memory from the resource manager.
 
         Args:
             size: Requested allocation size in bytes.
-            pool_id: Specific pool ID, or ANY_POOL_ID for any.
+            pool_path: DAX device path (e.g. "/dev/dax0.0"), or "" for any pool.
 
         Returns:
             Handle for the allocation.
@@ -215,7 +215,7 @@ class MaruShmClient:
         """
         req = AllocReq(
             size=size,
-            pool_id=pool_id,
+            pool_path=pool_path,
             client_id=self._client_id,
             request_id=_next_request_id(),
         )
@@ -232,9 +232,9 @@ class MaruShmClient:
                 self._path_cache[handle.region_id] = resp.device_path
 
         logger.debug(
-            "alloc(size=%d, pool_id=%d) -> region_id=%d path=%s",
+            "alloc(size=%d, pool_path=%s) -> region_id=%d path=%s",
             size,
-            pool_id,
+            pool_path,
             handle.region_id,
             resp.device_path,
         )

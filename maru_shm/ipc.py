@@ -15,7 +15,6 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from .constants import ANY_POOL_ID
 from .types import DaxType, MaruHandle, MaruPoolInfo
 
 # Protocol constants
@@ -96,7 +95,7 @@ class MsgHeader:
 # Request / Response payloads
 # =============================================================================
 
-# AllocReq: size(u64) + pool_id(u32) + reserved(u32) = 16 bytes
+# AllocReq: size(u64) + poolPathLen(u32) + reserved(u32) = 16 bytes
 _ALLOC_REQ_FORMAT = "<QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
@@ -106,13 +105,15 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    pool_id: int = ANY_POOL_ID
+    pool_path: str = ""   # "" = any pool
     reserved: int = 0
     client_id: str = ""
     request_id: int = 0
 
     def pack(self) -> bytes:
-        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, self.pool_id, self.reserved)
+        path_bytes = self.pool_path.encode("utf-8")
+        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved)
+        fixed += path_bytes  # pool path BEFORE client_id
         id_bytes = self.client_id.encode("utf-8")
         fixed += struct.pack("<H", len(id_bytes)) + id_bytes
         fixed += struct.pack("<Q", self.request_id)
@@ -122,11 +123,15 @@ class AllocReq:
     def unpack(cls, data: bytes) -> "AllocReq":
         if len(data) < _ALLOC_REQ_SIZE:
             raise ValueError(f"AllocReq too short: {len(data)} < {_ALLOC_REQ_SIZE}")
-        size, pool_id, reserved = struct.unpack(
+        size, pool_path_len, reserved = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
-        client_id = ""
         off = _ALLOC_REQ_SIZE
+        pool_path = ""
+        if pool_path_len > 0 and off + pool_path_len <= len(data):
+            pool_path = data[off:off + pool_path_len].decode("utf-8")
+            off += pool_path_len
+        client_id = ""
         if off + 2 <= len(data):
             (id_len,) = struct.unpack("<H", data[off : off + 2])
             off += 2
@@ -138,7 +143,7 @@ class AllocReq:
             (request_id,) = struct.unpack("<Q", data[off : off + 8])
         return cls(
             size=size,
-            pool_id=pool_id,
+            pool_path=pool_path,
             reserved=reserved,
             client_id=client_id,
             request_id=request_id,

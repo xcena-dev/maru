@@ -22,7 +22,9 @@ import logging
 import threading
 from collections.abc import Callable
 
-from maru_common import ANY_POOL_ID, MaruConfig
+from maru_common import MaruConfig
+
+_ANY_POOL_ID = 0xFFFFFFFF  # TODO(Task3): remove after pool_id → pool_path migration
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -73,9 +75,9 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        self._pool_ids: list[int] = (
-            self._config.pool_id if self._config.pool_id is not None else [ANY_POOL_ID]
-        )
+        # TODO(Task3): replace _pool_ids with _pool_paths after full migration
+        self._pool_paths: list[str] = self._config.pool_path or []
+        self._pool_ids: list[int] = [_ANY_POOL_ID]  # kept for compat; Task3 will remove
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
