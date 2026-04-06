@@ -70,12 +70,26 @@ flowchart TB
 
 ## Quick Start
 
+### System Components
+
+Maru consists of two server components and a client library:
+
+| Component | Role | Package |
+|-----------|------|---------|
+| **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
+| **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
+| **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
+
+In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler, which connects to both the Resource Manager and Metadata Server over the network.
+
+
 ### Prerequisites
 
 - OS: Ubuntu 24.04 LTS+
 - Python: 3.12+
 - gcc: 13.3.0+, cmake: 3.28.3+
 - CXL DAX device (`/dev/dax*`) or emulation environment
+  - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
 
 ```bash
 sudo apt-get update
@@ -94,20 +108,49 @@ source .venv/bin/activate
 ./install.sh
 ```
 
-Verify the Maru Resource Manager daemon is running:
+### 1. Start the Resource Manager
+
+The resource manager must be running before any other Maru service.
+
+**Production** — start as a systemd daemon:
 
 ```bash
-systemctl status maru-resourced
+# Default (127.0.0.1:9850)
+sudo systemctl start maru-resource-manager
+
+# With custom host/port
+sudo systemctl edit maru-resource-manager
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/maru-resource-manager --host <ip> --port <port>
+
+sudo systemctl restart maru-resource-manager
 ```
 
-### Start Services
+**Development/debugging** — run directly with custom options:
 
 ```bash
-# Start MaruServer (metadata server)
+# Default (127.0.0.1:9850)
+sudo maru-resource-manager --log-level debug
+
+# With custom host/port
+sudo maru-resource-manager --host <ip> --port <port> --log-level debug
+```
+
+> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+
+### 2. Start the Metadata Server
+
+```bash
+# Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
 maru-server
 
 # With custom host/port
-maru-server --host 0.0.0.0 --port 5555
+maru-server --host <ip> --port <port>
+
+# With custom resource manager address (default: 127.0.0.1:9850)
+maru-server --rm-address <rm-ip>:<rm-port>
 ```
 
 ### Basic Usage
@@ -144,9 +187,8 @@ Maru works as a drop-in remote storage backend for [LMCache](https://github.com/
 
 ```yaml
 # LMCache config
-remote_url: "maru://localhost:5555"
-extra_config:
-  maru_pool_size: 4
+maru_path: "maru://localhost:${MARU_SERVER_PORT}"
+maru_pool_size: 4
 ```
 
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
