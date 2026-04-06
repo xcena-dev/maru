@@ -85,3 +85,4 @@ CLAUDE.md
 # Sphinx
 docs/_build/
 internal_docs/
+.worktrees/
