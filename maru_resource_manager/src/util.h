@@ -28,6 +28,4 @@ uint64_t getPidStartTime(pid_t pid);
 bool ensureDirExists(const std::string &path);
 std::string parentDir(const std::string &path);
 
-static constexpr uint32_t kAnyPoolId = 0xFFFFFFFFu;
-
 } // namespace maru

@@ -10,6 +10,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -489,6 +490,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
         std::string poolPath;
         size_t poolPathEnd = sizeof(AllocReq);
         if (req.poolPathLen > 0) {
+            if (req.poolPathLen > PATH_MAX) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path too long");
+                return false;
+            }
             if (poolPathEnd + req.poolPathLen > payload.size()) {
                 sendError(clientFd, -EPROTO, "bad alloc req: pool path truncated");
                 return false;
@@ -496,6 +501,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
             poolPath.assign(
                 reinterpret_cast<const char*>(payload.data()) + poolPathEnd,
                 req.poolPathLen);
+            if (std::memchr(payload.data() + poolPathEnd, '\0', req.poolPathLen) != nullptr) {
+                sendError(clientFd, -EPROTO, "bad alloc req: pool path contains null byte");
+                return false;
+            }
         }
         poolPathEnd += req.poolPathLen;
 

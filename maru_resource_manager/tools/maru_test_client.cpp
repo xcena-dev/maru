@@ -7,9 +7,9 @@
 //   maru_test_client [-H host] [-p port] <command> [args...]
 //
 // Commands:
-//   stats                    Query pool statistics
-//   alloc <size> [pool_id]   Allocate shared memory
-//   mmap <size> [pool_id]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
+//   stats                      Query pool statistics
+//   alloc <size> [pool_path]   Allocate shared memory
+//   mmap <size> [pool_path]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -645,15 +645,15 @@ static void printUsage(const char *prog)
             "\n"
             "Commands:\n"
             "  stats                    Query pool statistics\n"
-            "  alloc  <size> [pool_id]  Allocate shared memory\n"
-            "  mmap   <size> [pool_id]  Full mmap round-trip test\n"
+            "  alloc  <size> [pool_path]  Allocate shared memory\n"
+            "  mmap   <size> [pool_path]  Full mmap round-trip test\n"
             "\n"
             "Options:\n"
             "  -H <host>  Resource manager host (default: 127.0.0.1)\n"
             "  -p <port>  Resource manager port (default: 9850)\n"
             "\n"
             "Size accepts decimal or hex (0x prefix).\n"
-            "pool_id 0xFFFFFFFF = any pool (default).\n",
+            "pool_path empty = any pool (default).\n",
             prog);
 }
 
