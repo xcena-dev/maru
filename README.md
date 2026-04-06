@@ -182,7 +182,7 @@ with MaruHandler(config) as handler:
 
 ## LMCache Integration
 
-Maru works as a native [LMCache](https://github.com/LMCache/LMCache) storage backend via the `maru_path` and `maru_pool_size` config fields. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
+Maru works as a native [LMCache](https://github.com/LMCache/LMCache) storage backend via the `maru_path` and `maru_pool_size` config fields. Requires LMCache [`5502419`](https://github.com/LMCache/LMCache/commit/550241961be6edae295cd0a374db1e46f96fe388) (2026-04-03) or later. It supports both **P2P KV cache sharing** and **disaggregated prefill** scenarios.
 
 ```yaml
 # LMCache config
