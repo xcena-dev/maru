@@ -106,7 +106,7 @@ StatsResult RequestHandler::handleStats() {
 
     for (const auto &p : pools) {
         PoolInfo pi{};
-        pi.poolId = p.poolId;
+        pi.devPathLen = static_cast<uint32_t>(p.devPath.size());
         pi.type = p.type;
         pi.totalSize = p.totalSize;
         pi.freeSize = p.freeSize;
@@ -115,6 +115,8 @@ StatsResult RequestHandler::handleStats() {
         size_t old = result.payload.size();
         result.payload.resize(old + sizeof(pi));
         std::memcpy(result.payload.data() + old, &pi, sizeof(pi));
+        // Append device path bytes immediately after the fixed struct
+        result.payload.insert(result.payload.end(), p.devPath.begin(), p.devPath.end());
     }
 
     return result;

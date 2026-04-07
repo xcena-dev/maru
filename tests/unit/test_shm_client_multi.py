@@ -301,7 +301,7 @@ class TestClientIsolation:
                     _send_alloc_resp_with_path(sock, handle, 4096, tmp_path)
                 elif hdr.msg_type == MsgType.STATS_REQ:
                     pool = MaruPoolInfo(
-                        pool_id=0,
+                        device_path="/dev/dax0.0",
                         dax_type=DaxType.DEV_DAX,
                         total_size=1 << 30,
                         free_size=1 << 29,

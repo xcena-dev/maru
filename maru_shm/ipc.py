@@ -359,7 +359,8 @@ class StatsReq:
 _STATS_RESP_HEADER_FORMAT = "<I"
 _STATS_RESP_HEADER_SIZE = struct.calcsize(_STATS_RESP_HEADER_FORMAT)
 
-# PoolInfo wire format for stats: pool_id(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
+# PoolInfo wire format: devPathLen(u32) + dax_type(u32) + total(u64) + free(u64) + align(u64)
+# followed by devPathLen bytes of UTF-8 device path (e.g. "/dev/dax0.0")
 _STATS_POOL_FORMAT = "<IIQQQ"
 _STATS_POOL_SIZE = struct.calcsize(_STATS_POOL_FORMAT)
 
@@ -374,16 +375,18 @@ class StatsResp:
         pools = self.pools or []
         parts = [struct.pack(_STATS_RESP_HEADER_FORMAT, len(pools))]
         for p in pools:
+            path_bytes = p.device_path.encode("utf-8")
             parts.append(
                 struct.pack(
                     _STATS_POOL_FORMAT,
-                    p.pool_id,
+                    len(path_bytes),
                     int(p.dax_type),
                     p.total_size,
                     p.free_size,
                     p.align_bytes,
                 )
             )
+            parts.append(path_bytes)
         return b"".join(parts)
 
     @classmethod
@@ -398,19 +401,25 @@ class StatsResp:
         for _ in range(num_pools):
             if offset + _STATS_POOL_SIZE > len(data):
                 raise ValueError("StatsResp truncated")
-            pool_id, dax_type, total_size, free_size, align_bytes = struct.unpack(
+            dev_path_len, dax_type, total_size, free_size, align_bytes = struct.unpack(
                 _STATS_POOL_FORMAT, data[offset : offset + _STATS_POOL_SIZE]
             )
+            offset += _STATS_POOL_SIZE
+            device_path = ""
+            if dev_path_len > 0:
+                if offset + dev_path_len > len(data):
+                    raise ValueError("StatsResp device_path truncated")
+                device_path = data[offset : offset + dev_path_len].decode("utf-8")
+                offset += dev_path_len
             pools.append(
                 MaruPoolInfo(
-                    pool_id=pool_id,
+                    device_path=device_path,
                     dax_type=DaxType(dax_type),
                     total_size=total_size,
                     free_size=free_size,
                     align_bytes=align_bytes,
                 )
             )
-            offset += _STATS_POOL_SIZE
         return cls(pools=pools)
 
 

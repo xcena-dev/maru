@@ -26,8 +26,8 @@ struct Handle {
 
 /** @brief Pool statistics and attributes. */
 struct PoolInfo {
-  /** @brief Pool identifier. */
-  uint32_t poolId;
+  /** @brief Length of the device path string that immediately follows this struct. */
+  uint32_t devPathLen;
   /** @brief DAX device type (DEV_DAX or FS_DAX). */
   DaxType type;
   /** @brief Total pool size in bytes. */

@@ -101,42 +101,52 @@ class MaruPoolInfo:
     """Pool statistics and attributes.
 
     Attributes:
-        pool_id: Pool identifier.
+        device_path: DAX device path (e.g. '/dev/dax0.0').
         dax_type: DAX device type (DEV_DAX or FS_DAX).
         total_size: Total pool size in bytes.
         free_size: Free size in bytes.
         align_bytes: Alignment size in bytes used by the pool.
     """
 
-    pool_id: int = 0
+    device_path: str = ""
     dax_type: DaxType = DaxType.DEV_DAX
     total_size: int = 0
     free_size: int = 0
     align_bytes: int = 0
 
     def pack(self) -> bytes:
-        """Pack to 32 bytes (native byte order)."""
+        """Pack to fixed header (32 bytes) + variable device path bytes."""
+        path_bytes = self.device_path.encode("utf-8")
         return struct.pack(
             _POOL_INFO_FORMAT,
-            self.pool_id,
+            len(path_bytes),
             int(self.dax_type),
             self.total_size,
             self.free_size,
             self.align_bytes,
-        )
+        ) + path_bytes
 
     @classmethod
     def unpack(cls, data: bytes) -> "MaruPoolInfo":
-        """Unpack from 32 bytes."""
+        """Unpack from fixed header (32 bytes) + variable device path bytes."""
         if len(data) < _POOL_INFO_SIZE:
             raise ValueError(
                 f"PoolInfo data too short: {len(data)} < {_POOL_INFO_SIZE}"
             )
-        pool_id, dax_type, total_size, free_size, align_bytes = struct.unpack(
+        dev_path_len, dax_type, total_size, free_size, align_bytes = struct.unpack(
             _POOL_INFO_FORMAT, data[:_POOL_INFO_SIZE]
         )
+        device_path = ""
+        if dev_path_len > 0:
+            if len(data) < _POOL_INFO_SIZE + dev_path_len:
+                raise ValueError(
+                    f"PoolInfo device_path truncated: need {dev_path_len} bytes"
+                )
+            device_path = data[_POOL_INFO_SIZE : _POOL_INFO_SIZE + dev_path_len].decode(
+                "utf-8"
+            )
         return cls(
-            pool_id=pool_id,
+            device_path=device_path,
             dax_type=DaxType(dax_type),
             total_size=total_size,
             free_size=free_size,
@@ -146,7 +156,7 @@ class MaruPoolInfo:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for RPC serialization."""
         return {
-            "pool_id": self.pool_id,
+            "device_path": self.device_path,
             "dax_type": int(self.dax_type),
             "total_size": self.total_size,
             "free_size": self.free_size,
@@ -157,7 +167,7 @@ class MaruPoolInfo:
     def from_dict(cls, d: dict[str, Any]) -> "MaruPoolInfo":
         """Create from dict."""
         return cls(
-            pool_id=d["pool_id"],
+            device_path=d.get("device_path", ""),
             dax_type=DaxType(d.get("dax_type", 0)),
             total_size=d["total_size"],
             free_size=d["free_size"],
@@ -166,6 +176,6 @@ class MaruPoolInfo:
 
     def __repr__(self) -> str:
         return (
-            f"<MaruPoolInfo pool_id={self.pool_id} dax_type={self.dax_type.name} "
+            f"<MaruPoolInfo device_path={self.device_path!r} dax_type={self.dax_type.name} "
             f"total_size={self.total_size} free_size={self.free_size}>"
         )

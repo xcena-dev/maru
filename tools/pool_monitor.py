@@ -47,9 +47,9 @@ def _clear_screen() -> None:
 
 
 def render_table(
-    pools: list[MaruPoolInfo], ts: str, prev: dict[int, int] | None = None
+    pools: list[MaruPoolInfo], ts: str, prev: dict[str, int] | None = None
 ) -> str:
-    """Render table to string. prev maps pool_id -> previous used bytes for delta."""
+    """Render table to string. prev maps device_path -> previous used bytes for delta."""
     lines = []
     lines.append(f"  Maru Pool Monitor  —  {ts}  (Ctrl+C to quit)")
     lines.append("")
@@ -57,25 +57,26 @@ def render_table(
         lines.append("  (no pools found)")
         return "\n".join(lines)
     lines.append(
-        f"  {'Pool':>4}  {'Type':<8}  {'Used':>8}  {'Free':>8}  "
+        f"  {'Device':<16}  {'Type':<8}  {'Used':>8}  {'Free':>8}  "
         f"{'Total':>8}  {'Delta':>8}  {'Usage'}"
     )
     lines.append(
-        f"  {'----':>4}  {'--------':<8}  {'--------':>8}  {'--------':>8}  "
+        f"  {'----------------':<16}  {'--------':<8}  {'--------':>8}  {'--------':>8}  "
         f"{'--------':>8}  {'--------':>8}  {'-----'}"
     )
-    for p in sorted(pools, key=lambda x: x.pool_id):
+    for p in sorted(pools, key=lambda x: x.device_path):
         used = p.total_size - p.free_size
         bar = _usage_bar(used, p.total_size)
         delta = ""
-        if prev and p.pool_id in prev:
-            diff = used - prev[p.pool_id]
+        if prev and p.device_path in prev:
+            diff = used - prev[p.device_path]
             if diff > 0:
                 delta = f"+{_fmt_size(diff)}"
             elif diff < 0:
                 delta = f"-{_fmt_size(-diff)}"
+        device_label = p.device_path or "(unknown)"
         lines.append(
-            f"  {p.pool_id:>4}  {p.dax_type.name:<8}  "
+            f"  {device_label:<16}  {p.dax_type.name:<8}  "
             f"{_fmt_size(used):>8}  {_fmt_size(p.free_size):>8}  "
             f"{_fmt_size(p.total_size):>8}  {delta:>8}  {bar}"
         )
@@ -83,15 +84,15 @@ def render_table(
 
 
 def print_csv_header() -> None:
-    print("timestamp,pool_id,dax_type,total_bytes,free_bytes,used_bytes,usage_pct")
+    print("timestamp,device_path,dax_type,total_bytes,free_bytes,used_bytes,usage_pct")
 
 
 def print_csv_row(pools: list[MaruPoolInfo], ts: str) -> None:
-    for p in sorted(pools, key=lambda x: x.pool_id):
+    for p in sorted(pools, key=lambda x: x.device_path):
         used = p.total_size - p.free_size
         pct = (used / p.total_size * 100) if p.total_size > 0 else 0
         print(
-            f"{ts},{p.pool_id},{p.dax_type.name},{p.total_size},{p.free_size},{used},{pct:.2f}"
+            f"{ts},{p.device_path},{p.dax_type.name},{p.total_size},{p.free_size},{used},{pct:.2f}"
         )
 
 
@@ -171,7 +172,7 @@ def main() -> None:
                 sys.stdout.flush()
 
             # Track previous for delta
-            prev_used = {p.pool_id: p.total_size - p.free_size for p in pools}
+            prev_used = {p.device_path: p.total_size - p.free_size for p in pools}
 
             iteration += 1
             if args.count > 0 and iteration >= args.count:

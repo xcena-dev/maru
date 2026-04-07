@@ -454,10 +454,10 @@ static int cmdStats()
         return 0;
     }
 
-    fprintf(stdout, "  %-6s  %-8s  %18s  %18s  %12s  %5s\n",
-            "Pool", "Type", "Total", "Free", "Align", "Used%");
+    fprintf(stdout, "  %-16s  %-8s  %18s  %18s  %12s  %5s\n",
+            "Device", "Type", "Total", "Free", "Align", "Used%");
     fprintf(stdout,
-            "  ------  --------  ------------------  ------------------  "
+            "  ----------------  --------  ------------------  ------------------  "
             "------------  -----\n");
 
     size_t off = sizeof(sh);
@@ -472,6 +472,14 @@ static int cmdStats()
         std::memcpy(&pi, buf.data() + off, sizeof(pi));
         off += sizeof(pi);
 
+        // Extract variable-length device path
+        std::string devPath;
+        if (pi.devPathLen > 0 && off + pi.devPathLen <= buf.size())
+        {
+            devPath.assign(reinterpret_cast<const char *>(buf.data() + off), pi.devPathLen);
+            off += pi.devPathLen;
+        }
+
         const char *typeStr =
             (pi.type == DaxType::DEV_DAX) ? "DEV_DAX" : "FS_DAX";
         double usedPct =
@@ -479,8 +487,8 @@ static int cmdStats()
                 ? 100.0 * (1.0 - static_cast<double>(pi.freeSize) / pi.totalSize)
                 : 0.0;
 
-        fprintf(stdout, "  %-6u  %-8s  %18s  %18s  %12" PRIu64 "  %5.1f\n",
-                pi.poolId, typeStr,
+        fprintf(stdout, "  %-16s  %-8s  %18s  %18s  %12" PRIu64 "  %5.1f\n",
+                devPath.empty() ? "(unknown)" : devPath.c_str(), typeStr,
                 formatSize(pi.totalSize).c_str(),
                 formatSize(pi.freeSize).c_str(),
                 pi.alignBytes, usedPct);

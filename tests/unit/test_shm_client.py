@@ -153,7 +153,7 @@ class TestShmClientStats:
                 if hdr.msg_type == MsgType.STATS_REQ:
                     pools = [
                         MaruPoolInfo(
-                            pool_id=0,
+                            device_path="/dev/dax0.0",
                             dax_type=DaxType.DEV_DAX,
                             total_size=1 << 30,
                             free_size=1 << 29,
@@ -168,7 +168,7 @@ class TestShmClientStats:
             client = MaruShmClient(address=address)
             result = client.stats()
             assert len(result) == 1
-            assert result[0].pool_id == 0
+            assert result[0].device_path == "/dev/dax0.0"
             assert result[0].total_size == 1 << 30
             client.close()
         finally:

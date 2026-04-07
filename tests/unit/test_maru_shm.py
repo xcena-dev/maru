@@ -109,16 +109,16 @@ class TestHandle:
 class TestPoolInfo:
     def test_pack_unpack_roundtrip(self):
         p = MaruPoolInfo(
-            pool_id=1,
+            device_path="/dev/dax1.0",
             dax_type=DaxType.FS_DAX,
             total_size=1 << 30,
             free_size=1 << 29,
             align_bytes=2 * 1024 * 1024,
         )
         data = p.pack()
-        assert len(data) == 32
+        assert len(data) == 32 + len("/dev/dax1.0")
         p2 = MaruPoolInfo.unpack(data)
-        assert p2.pool_id == 1
+        assert p2.device_path == "/dev/dax1.0"
         assert p2.dax_type == DaxType.FS_DAX
         assert p2.total_size == 1 << 30
         assert p2.free_size == 1 << 29
@@ -126,7 +126,7 @@ class TestPoolInfo:
 
     def test_to_dict_from_dict_roundtrip(self):
         p = MaruPoolInfo(
-            pool_id=5,
+            device_path="/dev/dax0.0",
             dax_type=DaxType.DEV_DAX,
             total_size=100,
             free_size=50,
@@ -134,7 +134,7 @@ class TestPoolInfo:
         )
         d = p.to_dict()
         p2 = MaruPoolInfo.from_dict(d)
-        assert p2.pool_id == p.pool_id
+        assert p2.device_path == p.device_path
         assert p2.dax_type == p.dax_type
         assert p2.total_size == p.total_size
 
@@ -295,14 +295,14 @@ class TestStatsReqResp:
     def test_stats_resp_with_pools(self):
         pools = [
             MaruPoolInfo(
-                pool_id=0,
+                device_path="/dev/dax0.0",
                 dax_type=DaxType.DEV_DAX,
                 total_size=1 << 30,
                 free_size=1 << 29,
                 align_bytes=2 << 20,
             ),
             MaruPoolInfo(
-                pool_id=1,
+                device_path="/dev/dax1.0",
                 dax_type=DaxType.FS_DAX,
                 total_size=1 << 31,
                 free_size=1 << 30,
@@ -313,9 +313,9 @@ class TestStatsReqResp:
         data = resp.pack()
         resp2 = StatsResp.unpack(data)
         assert len(resp2.pools) == 2
-        assert resp2.pools[0].pool_id == 0
+        assert resp2.pools[0].device_path == "/dev/dax0.0"
         assert resp2.pools[0].dax_type == DaxType.DEV_DAX
-        assert resp2.pools[1].pool_id == 1
+        assert resp2.pools[1].device_path == "/dev/dax1.0"
         assert resp2.pools[1].dax_type == DaxType.FS_DAX
 
 
@@ -488,19 +488,19 @@ class TestPoolInfoFromDictDefaults:
     """Test MaruPoolInfo.from_dict with missing optional fields."""
 
     def test_missing_dax_type_defaults_to_dev_dax(self):
-        d = {"pool_id": 1, "total_size": 1000, "free_size": 500}
+        d = {"device_path": "/dev/dax0.0", "total_size": 1000, "free_size": 500}
         p = MaruPoolInfo.from_dict(d)
         assert p.dax_type == DaxType.DEV_DAX
 
     def test_missing_align_bytes_defaults_to_zero(self):
-        d = {"pool_id": 2, "total_size": 2000, "free_size": 1000}
+        d = {"device_path": "/dev/dax1.0", "total_size": 2000, "free_size": 1000}
         p = MaruPoolInfo.from_dict(d)
         assert p.align_bytes == 0
 
     def test_all_optional_fields_missing(self):
-        d = {"pool_id": 3, "total_size": 3000, "free_size": 1500}
+        d = {"total_size": 3000, "free_size": 1500}
         p = MaruPoolInfo.from_dict(d)
-        assert p.pool_id == 3
+        assert p.device_path == ""
         assert p.dax_type == DaxType.DEV_DAX
         assert p.align_bytes == 0
 
@@ -526,7 +526,7 @@ class TestMaruPoolInfoRepr:
     def test_pool_info_repr(self):
         """Test MaruPoolInfo.__repr__ returns expected format."""
         pool = MaruPoolInfo(
-            pool_id=5,
+            device_path="/dev/dax0.0",
             dax_type=DaxType.FS_DAX,
             total_size=1000000,
             free_size=500000,
@@ -534,7 +534,7 @@ class TestMaruPoolInfoRepr:
         )
         repr_str = repr(pool)
         assert "<MaruPoolInfo" in repr_str
-        assert "pool_id=5" in repr_str
+        assert "device_path=" in repr_str
         assert "dax_type=FS_DAX" in repr_str
         assert "total_size=1000000" in repr_str
         assert "free_size=500000" in repr_str
