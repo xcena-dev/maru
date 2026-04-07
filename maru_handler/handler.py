@@ -23,7 +23,6 @@ import threading
 from collections.abc import Callable
 
 from maru_common import MaruConfig
-
 from maru_shm import MaruHandle
 
 from .memory import (

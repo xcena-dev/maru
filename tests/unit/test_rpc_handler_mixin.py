@@ -3,7 +3,6 @@
 """Unit tests for RpcHandlerMixin to achieve 100% coverage."""
 
 from maru_common import MessageType
-
 from maru_server.rpc_handler_mixin import RpcHandlerMixin
 from maru_server.server import MaruServer
 

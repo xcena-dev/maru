@@ -5,7 +5,6 @@
 from maru_server.server import MaruServer
 
 
-
 class TestMaruBasic:
     """Test basic MaruServer operations (CRUD)."""
 

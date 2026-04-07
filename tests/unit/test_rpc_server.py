@@ -9,7 +9,6 @@ import pytest
 import zmq
 
 from maru_common import MessageHeader, MessageType, Serializer
-
 from maru_server.rpc_async_server import RpcAsyncServer
 from maru_server.rpc_server import RpcServer
 from maru_server.server import MaruServer
