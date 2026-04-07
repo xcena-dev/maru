@@ -54,9 +54,9 @@ def _make_temp_file(size=4096, fill=b"\x00"):
 
 
 def _send_alloc_resp_with_path(sock, handle, requested_size, tmp_path):
-    """Send an AllocResp with device_path pointing to a real temp file."""
+    """Send an AllocResp with dax_path pointing to a real temp file."""
     resp = AllocResp(
-        status=0, handle=handle, requested_size=requested_size, device_path=tmp_path
+        status=0, handle=handle, requested_size=requested_size, dax_path=tmp_path
     )
     payload = resp.pack()
     hdr = MsgHeader(msg_type=MsgType.ALLOC_RESP, payload_len=len(payload))
@@ -301,7 +301,7 @@ class TestClientIsolation:
                     _send_alloc_resp_with_path(sock, handle, 4096, tmp_path)
                 elif hdr.msg_type == MsgType.STATS_REQ:
                     pool = MaruPoolInfo(
-                        device_path="/dev/dax0.0",
+                        dax_path="/dev/dax0.0",
                         dax_type=DaxType.DEV_DAX,
                         total_size=1 << 30,
                         free_size=1 << 29,

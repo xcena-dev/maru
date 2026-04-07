@@ -227,16 +227,16 @@ class MaruShmClient:
             raise RuntimeError(f"Alloc failed with status {resp.status}")
 
         handle = resp.handle
-        if resp.device_path:
+        if resp.dax_path:
             with self._lock:
-                self._path_cache[handle.region_id] = resp.device_path
+                self._path_cache[handle.region_id] = resp.dax_path
 
         logger.debug(
             "alloc(size=%d, dax_path=%s) -> region_id=%d path=%s",
             size,
             dax_path,
             handle.region_id,
-            resp.device_path,
+            resp.dax_path,
         )
         return handle
 
@@ -294,7 +294,7 @@ class MaruShmClient:
         # Slow path: network RPC outside lock
         if path is None:
             access_resp = self._request_access(handle)
-            path = access_resp.device_path
+            path = access_resp.dax_path
 
         # Create mmap and update cache
         with self._lock:

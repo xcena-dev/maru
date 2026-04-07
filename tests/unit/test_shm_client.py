@@ -98,19 +98,19 @@ def _make_temp_file(size=4096, fill=b"\x00"):
 
 
 def _send_alloc_resp_with_path(sock, handle, requested_size, tmp_path):
-    """Send an AllocResp with device_path pointing to a real temp file."""
+    """Send an AllocResp with dax_path pointing to a real temp file."""
     resp = AllocResp(
-        status=0, handle=handle, requested_size=requested_size, device_path=tmp_path
+        status=0, handle=handle, requested_size=requested_size, dax_path=tmp_path
     )
     payload = resp.pack()
     hdr = MsgHeader(msg_type=MsgType.ALLOC_RESP, payload_len=len(payload))
     write_full(sock, hdr.pack() + payload)
 
 
-def _send_get_access_resp(sock, device_path, offset, length):
-    """Send a GetAccessResp with device_path, offset, length."""
+def _send_get_access_resp(sock, dax_path, offset, length):
+    """Send a GetAccessResp with dax_path, offset, length."""
     resp = GetAccessResp(
-        status=0, device_path=device_path, offset=offset, length=length
+        status=0, dax_path=dax_path, offset=offset, length=length
     )
     payload = resp.pack()
     hdr = MsgHeader(msg_type=MsgType.GET_ACCESS_RESP, payload_len=len(payload))
@@ -153,7 +153,7 @@ class TestShmClientStats:
                 if hdr.msg_type == MsgType.STATS_REQ:
                     pools = [
                         MaruPoolInfo(
-                            device_path="/dev/dax0.0",
+                            dax_path="/dev/dax0.0",
                             dax_type=DaxType.DEV_DAX,
                             total_size=1 << 30,
                             free_size=1 << 29,
@@ -168,7 +168,7 @@ class TestShmClientStats:
             client = MaruShmClient(address=address)
             result = client.stats()
             assert len(result) == 1
-            assert result[0].device_path == "/dev/dax0.0"
+            assert result[0].dax_path == "/dev/dax0.0"
             assert result[0].total_size == 1 << 30
             client.close()
         finally:
@@ -182,7 +182,7 @@ class TestShmClientStats:
 
 class TestShmClientAlloc:
     def test_alloc_success(self):
-        """Test alloc receives handle with device_path."""
+        """Test alloc receives handle with dax_path."""
         tmp_paths = []
 
         def handler(sock):
@@ -272,7 +272,7 @@ class TestShmClientFree:
 
 class TestShmClientMmap:
     def test_mmap_success(self):
-        """Test mmap opens device_path and mmaps successfully."""
+        """Test mmap opens dax_path and mmaps successfully."""
         call_count = {"alloc": 0, "get_access": 0}
         tmp_paths = []
 
@@ -618,7 +618,7 @@ class TestShmClientErrors:
                 except (ConnectionError, OSError):
                     break
                 if hdr.msg_type == MsgType.GET_ACCESS_REQ:
-                    resp = GetAccessResp(status=-8, device_path="", offset=0, length=0)
+                    resp = GetAccessResp(status=-8, dax_path="", offset=0, length=0)
                     _send_response(sock, MsgType.GET_ACCESS_RESP, resp)
 
         server = MockResourceManagerServer(handler)

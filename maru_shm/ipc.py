@@ -168,7 +168,7 @@ class AllocResp:
     status: int = 0
     handle: MaruHandle | None = None
     requested_size: int = 0
-    device_path: str = ""
+    dax_path: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
@@ -182,7 +182,7 @@ class AllocResp:
             h.auth_token,
             self.requested_size,
         )
-        path_bytes = self.device_path.encode("utf-8")
+        path_bytes = self.dax_path.encode("utf-8")
         path_header = struct.pack("<I", len(path_bytes))
         return fixed + path_header + path_bytes
 
@@ -197,19 +197,19 @@ class AllocResp:
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
         requested_size = vals[6]
-        # Parse optional device_path extension
-        device_path = ""
+        # Parse optional dax_path extension
+        dax_path = ""
         offset = _ALLOC_RESP_SIZE
         if offset + 4 <= len(data):
             (path_len,) = struct.unpack("<I", data[offset : offset + 4])
             offset += 4
             if path_len > 0 and offset + path_len <= len(data):
-                device_path = data[offset : offset + path_len].decode("utf-8")
+                dax_path = data[offset : offset + path_len].decode("utf-8")
         return cls(
             status=status,
             handle=handle,
             requested_size=requested_size,
-            device_path=device_path,
+            dax_path=dax_path,
         )
 
 
@@ -311,12 +311,12 @@ class GetAccessResp:
     """Get access info response — device path, offset, length."""
 
     status: int = 0
-    device_path: str = ""
+    dax_path: str = ""
     offset: int = 0
     length: int = 0
 
     def pack(self) -> bytes:
-        path_bytes = self.device_path.encode("utf-8")
+        path_bytes = self.dax_path.encode("utf-8")
         header = struct.pack(
             _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
         )
@@ -331,15 +331,15 @@ class GetAccessResp:
             _GET_ACCESS_RESP_HEADER_FORMAT, data[:_GET_ACCESS_RESP_HEADER_SIZE]
         )
         off = _GET_ACCESS_RESP_HEADER_SIZE
-        device_path = ""
+        dax_path = ""
         if path_len > 0 and off + path_len <= len(data):
-            device_path = data[off : off + path_len].decode("utf-8")
+            dax_path = data[off : off + path_len].decode("utf-8")
             off += path_len
         offset = 0
         length = 0
         if off + 16 <= len(data):
             offset, length = struct.unpack("<QQ", data[off : off + 16])
-        return cls(status=status, device_path=device_path, offset=offset, length=length)
+        return cls(status=status, dax_path=dax_path, offset=offset, length=length)
 
 
 # StatsReq: empty payload (0 bytes)
@@ -375,7 +375,7 @@ class StatsResp:
         pools = self.pools or []
         parts = [struct.pack(_STATS_RESP_HEADER_FORMAT, len(pools))]
         for p in pools:
-            path_bytes = p.device_path.encode("utf-8")
+            path_bytes = p.dax_path.encode("utf-8")
             parts.append(
                 struct.pack(
                     _STATS_POOL_FORMAT,
@@ -401,19 +401,19 @@ class StatsResp:
         for _ in range(num_pools):
             if offset + _STATS_POOL_SIZE > len(data):
                 raise ValueError("StatsResp truncated")
-            dev_path_len, dax_type, total_size, free_size, align_bytes = struct.unpack(
+            dax_path_len, dax_type, total_size, free_size, align_bytes = struct.unpack(
                 _STATS_POOL_FORMAT, data[offset : offset + _STATS_POOL_SIZE]
             )
             offset += _STATS_POOL_SIZE
-            device_path = ""
-            if dev_path_len > 0:
-                if offset + dev_path_len > len(data):
-                    raise ValueError("StatsResp device_path truncated")
-                device_path = data[offset : offset + dev_path_len].decode("utf-8")
-                offset += dev_path_len
+            dax_path = ""
+            if dax_path_len > 0:
+                if offset + dax_path_len > len(data):
+                    raise ValueError("StatsResp dax_path truncated")
+                dax_path = data[offset : offset + dax_path_len].decode("utf-8")
+                offset += dax_path_len
             pools.append(
                 MaruPoolInfo(
-                    device_path=device_path,
+                    dax_path=dax_path,
                     dax_type=DaxType(dax_type),
                     total_size=total_size,
                     free_size=free_size,
