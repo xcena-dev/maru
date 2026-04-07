@@ -74,7 +74,7 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        self._pool_paths: list[str] | None = self._config.pool_path  # None = any pool
+        self._dax_paths: list[str] | None = self._config.dax_path  # None = any pool
         if self._config.use_async_rpc:
             from .rpc_async_client import RpcAsyncClient
 
@@ -227,20 +227,20 @@ class MaruHandler:
             remaining = self._config.pool_size
             allocated_handles: list[MaruHandle] = []
 
-            # If pool_paths is None or empty, use [""] to request any pool
-            pool_paths_iter = self._pool_paths if self._pool_paths else [""]
+            # If dax_paths is None or empty, use [""] to request any pool
+            dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
-            for pool_path in pool_paths_iter:
+            for dax_path in dax_paths_iter:
                 try:
                     response = self._rpc.request_alloc(
                         instance_id=self._config.instance_id,
                         size=remaining,
-                        pool_path=pool_path,
+                        dax_path=dax_path,
                     )
                 except Exception:
                     logger.error(
-                        "RPC request_alloc failed during connect (pool_path=%s)",
-                        pool_path,
+                        "RPC request_alloc failed during connect (dax_path=%s)",
+                        dax_path,
                         exc_info=True,
                     )
                     continue
@@ -248,7 +248,7 @@ class MaruHandler:
                 if not response.success or response.handle is None:
                     logger.warning(
                         "Pool %s refused initial allocation: %s",
-                        pool_path,
+                        dax_path,
                         getattr(response, "error", "unknown"),
                     )
                     continue
@@ -259,7 +259,7 @@ class MaruHandler:
                     self._owned.add_region(handle)
                 except Exception:
                     logger.error(
-                        "Failed to init region from pool %s", pool_path, exc_info=True
+                        "Failed to init region from pool %s", dax_path, exc_info=True
                     )
                     try:
                         self._rpc.return_alloc(
@@ -995,7 +995,7 @@ class MaruHandler:
     def _expand_region(self) -> bool:
         """Request a new store region from the server and add it.
 
-        Gated by ``auto_expand`` config. When enabled, tries each pool_path
+        Gated by ``auto_expand`` config. When enabled, tries each dax_path
         in order, falling back to the next on failure.
 
         Returns:
@@ -1008,19 +1008,19 @@ class MaruHandler:
             )
             return False
 
-        pool_paths_iter = self._pool_paths if self._pool_paths else [""]
+        dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
-        for pool_path in pool_paths_iter:
+        for dax_path in dax_paths_iter:
             try:
                 response = self._rpc.request_alloc(
                     instance_id=self._config.instance_id,
                     size=self._expand_size,
-                    pool_path=pool_path,
+                    dax_path=dax_path,
                 )
             except Exception:
                 logger.error(
-                    "RPC request_alloc failed during expand (pool_path=%s)",
-                    pool_path,
+                    "RPC request_alloc failed during expand (dax_path=%s)",
+                    dax_path,
                     exc_info=True,
                 )
                 continue
@@ -1028,7 +1028,7 @@ class MaruHandler:
             if not response.success or response.handle is None:
                 logger.warning(
                     "Pool %s refused region expansion: %s",
-                    pool_path,
+                    dax_path,
                     getattr(response, "error", "unknown"),
                 )
                 continue
@@ -1037,9 +1037,9 @@ class MaruHandler:
             try:
                 region = self._owned.add_region(handle)
                 logger.info(
-                    "Expanded: new store region %d (pool_path=%s)",
+                    "Expanded: new store region %d (dax_path=%s)",
                     handle.region_id,
-                    pool_path,
+                    dax_path,
                 )
                 # Callback fires under _write_lock — guarantees pool exists
                 # before alloc() returns. Acceptable since expansion is rare.
@@ -1062,7 +1062,7 @@ class MaruHandler:
                     )
                 continue
 
-        logger.error("All pool_paths exhausted during region expansion")
+        logger.error("All dax_paths exhausted during region expansion")
         return False
 
     def _premap_shared_regions(self) -> None:

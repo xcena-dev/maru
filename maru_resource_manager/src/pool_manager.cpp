@@ -801,7 +801,7 @@ PoolState *PoolManager::findPoolByPath(const std::string &devPath)
 }
 
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
-                       std::string &devPath, const std::string &poolPath,
+                       std::string &devPath, const std::string &daxPath,
                        uint64_t &requestedSizeOut)
 {
     if (clientId.empty())
@@ -824,9 +824,9 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     Allocation alloc{};
     PoolState *selectedPool = nullptr;
 
-    if (!poolPath.empty())
+    if (!daxPath.empty())
     {
-        selectedPool = findPoolByPath(poolPath);
+        selectedPool = findPoolByPath(daxPath);
         if (!selectedPool)
         {
             return -ENOENT;

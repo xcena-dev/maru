@@ -53,7 +53,7 @@ class TestRpcHandlerMixin:
 
     def test_handle_request_alloc_success(self):
         handler, server = self._make_handler()
-        req = MockRequest(instance_id="inst1", size=4096, pool_path="")
+        req = MockRequest(instance_id="inst1", size=4096, dax_path="")
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is True
         assert "handle" in resp
@@ -63,9 +63,9 @@ class TestRpcHandlerMixin:
         monkeypatch.setattr(
             server._allocation_manager,
             "allocate",
-            lambda instance_id, size, pool_path="": None,
+            lambda instance_id, size, dax_path="": None,
         )
-        req = MockRequest(instance_id="inst1", size=4096, pool_path="")
+        req = MockRequest(instance_id="inst1", size=4096, dax_path="")
         resp = handler._handle_request_alloc(req)
         assert resp["success"] is False
         assert resp["error"] == "Allocation failed"

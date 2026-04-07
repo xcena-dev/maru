@@ -36,17 +36,17 @@ class AllocationManager:
         self._lock = RLock()
 
     def allocate(
-        self, instance_id: str, size: int, pool_path: str = ""
+        self, instance_id: str, size: int, dax_path: str = ""
     ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership."""
         try:
-            handle = self._client.alloc(size, pool_path=pool_path)
+            handle = self._client.alloc(size, dax_path=dax_path)
         except RuntimeError as e:
             logger.warning(
-                "alloc failed for instance=%s size=%d pool_path=%s: %s",
+                "alloc failed for instance=%s size=%d dax_path=%s: %s",
                 instance_id,
                 size,
-                pool_path,
+                dax_path,
                 e,
             )
             return None

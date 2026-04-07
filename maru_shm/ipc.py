@@ -95,7 +95,7 @@ class MsgHeader:
 # Request / Response payloads
 # =============================================================================
 
-# AllocReq: size(u64) + poolPathLen(u32) + reserved(u32) = 16 bytes
+# AllocReq: size(u64) + daxPathLen(u32) + reserved(u32) = 16 bytes
 _ALLOC_REQ_FORMAT = "<QII"
 _ALLOC_REQ_SIZE = struct.calcsize(_ALLOC_REQ_FORMAT)
 
@@ -105,13 +105,13 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    pool_path: str = ""   # "" = any pool
+    dax_path: str = ""   # "" = any pool
     reserved: int = 0
     client_id: str = ""
     request_id: int = 0
 
     def pack(self) -> bytes:
-        path_bytes = self.pool_path.encode("utf-8")
+        path_bytes = self.dax_path.encode("utf-8")
         fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved)
         fixed += path_bytes  # pool path BEFORE client_id
         id_bytes = self.client_id.encode("utf-8")
@@ -123,19 +123,19 @@ class AllocReq:
     def unpack(cls, data: bytes) -> "AllocReq":
         if len(data) < _ALLOC_REQ_SIZE:
             raise ValueError(f"AllocReq too short: {len(data)} < {_ALLOC_REQ_SIZE}")
-        size, pool_path_len, reserved = struct.unpack(
+        size, dax_path_len, reserved = struct.unpack(
             _ALLOC_REQ_FORMAT, data[:_ALLOC_REQ_SIZE]
         )
         off = _ALLOC_REQ_SIZE
-        pool_path = ""
-        if pool_path_len > 0:
-            if off + pool_path_len > len(data):
+        dax_path = ""
+        if dax_path_len > 0:
+            if off + dax_path_len > len(data):
                 raise ValueError(
-                    f"AllocReq pool_path truncated: need {pool_path_len} bytes at "
+                    f"AllocReq dax_path truncated: need {dax_path_len} bytes at "
                     f"offset {off}, only {len(data) - off} available"
                 )
-            pool_path = data[off:off + pool_path_len].decode("utf-8")
-            off += pool_path_len
+            dax_path = data[off:off + dax_path_len].decode("utf-8")
+            off += dax_path_len
         client_id = ""
         if off + 2 <= len(data):
             (id_len,) = struct.unpack("<H", data[off : off + 2])
@@ -148,7 +148,7 @@ class AllocReq:
             (request_id,) = struct.unpack("<Q", data[off : off + 8])
         return cls(
             size=size,
-            pool_path=pool_path,
+            dax_path=dax_path,
             reserved=reserved,
             client_id=client_id,
             request_id=request_id,

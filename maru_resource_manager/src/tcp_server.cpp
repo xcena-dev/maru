@@ -487,30 +487,30 @@ bool TcpServer::handleOneRequest(int clientFd) {
         std::memcpy(&req, payload.data(), sizeof(req));
 
         // Extract pool path (variable-length, before client_id)
-        std::string poolPath;
-        size_t poolPathEnd = sizeof(AllocReq);
-        if (req.poolPathLen > 0) {
-            if (req.poolPathLen > PATH_MAX) {
+        std::string daxPath;
+        size_t daxPathEnd = sizeof(AllocReq);
+        if (req.daxPathLen > 0) {
+            if (req.daxPathLen > PATH_MAX) {
                 sendError(clientFd, -EPROTO, "bad alloc req: pool path too long");
                 return false;
             }
-            if (poolPathEnd + req.poolPathLen > payload.size()) {
+            if (daxPathEnd + req.daxPathLen > payload.size()) {
                 sendError(clientFd, -EPROTO, "bad alloc req: pool path truncated");
                 return false;
             }
-            poolPath.assign(
-                reinterpret_cast<const char*>(payload.data()) + poolPathEnd,
-                req.poolPathLen);
-            if (std::memchr(payload.data() + poolPathEnd, '\0', req.poolPathLen) != nullptr) {
+            daxPath.assign(
+                reinterpret_cast<const char*>(payload.data()) + daxPathEnd,
+                req.daxPathLen);
+            if (std::memchr(payload.data() + daxPathEnd, '\0', req.daxPathLen) != nullptr) {
                 sendError(clientFd, -EPROTO, "bad alloc req: pool path contains null byte");
                 return false;
             }
         }
-        poolPathEnd += req.poolPathLen;
+        daxPathEnd += req.daxPathLen;
 
-        // client_id parsing now starts at poolPathEnd (was sizeof(AllocReq))
+        // client_id parsing now starts at daxPathEnd (was sizeof(AllocReq))
         size_t cidEnd = 0;
-        std::string cid = parseClientId(payload, poolPathEnd, cidEnd);
+        std::string cid = parseClientId(payload, daxPathEnd, cidEnd);
         if (cid.empty()) {
             sendError(clientFd, -EINVAL, "missing client_id");
             return true;
@@ -526,7 +526,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             return true;
         }
 
-        RequestContext ctx{cid, poolPath};
+        RequestContext ctx{cid, daxPath};
         auto result = handler_.handleAlloc(req, ctx);
 
         auto respPayload = serializeAllocResp(result.resp, result.devicePath);

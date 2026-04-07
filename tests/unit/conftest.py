@@ -32,7 +32,7 @@ class MockShmClient:
     def stats(self):
         return []
 
-    def alloc(self, size, pool_path=""):
+    def alloc(self, size, dax_path=""):
         global _alloc_counter
         _alloc_counter += 1
         return MaruHandle(

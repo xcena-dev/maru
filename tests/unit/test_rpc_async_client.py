@@ -340,7 +340,7 @@ class TestRpcAsyncClientApiMethods:
 
         client._send_request.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
-            {"instance_id": "instance-1", "size": 4096, "pool_path": ""},
+            {"instance_id": "instance-1", "size": 4096, "dax_path": ""},
         )
         assert result.success is True
         assert result.handle is not None

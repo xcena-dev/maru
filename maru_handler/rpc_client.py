@@ -128,7 +128,7 @@ class RpcClient:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_path: str = ""
+        self, instance_id: str, size: int, dax_path: str = ""
     ) -> RequestAllocResponse:
         """
         Request a new memory allocation.
@@ -136,7 +136,7 @@ class RpcClient:
         Args:
             instance_id: Client instance identifier
             size: Requested size in bytes
-            pool_path: Pool path to allocate from ("" means any pool)
+            dax_path: Pool path to allocate from ("" means any pool)
 
         Returns:
             RequestAllocResponse with handle on success
@@ -146,7 +146,7 @@ class RpcClient:
             {
                 "instance_id": instance_id,
                 "size": size,
-                "pool_path": pool_path,
+                "dax_path": dax_path,
             },
         )
 

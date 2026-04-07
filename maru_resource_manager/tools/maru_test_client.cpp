@@ -8,8 +8,8 @@
 //
 // Commands:
 //   stats                      Query pool statistics
-//   alloc <size> [pool_path]   Allocate shared memory
-//   mmap <size> [pool_path]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
+//   alloc <size> [dax_path]   Allocate shared memory
+//   mmap <size> [dax_path]    Full cycle: alloc -> mmap -> write -> read -> verify -> free
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -247,21 +247,21 @@ static std::string parseDevicePath(const uint8_t *data, size_t dataLen)
 
 /// Build AllocReq payload: fixed struct + pool path bytes + client_id + request_id
 static std::vector<uint8_t> buildAllocPayload(const AllocReq &req,
-                                               const std::string &poolPath,
+                                               const std::string &daxPath,
                                                const std::string &clientId,
                                                uint64_t requestId)
 {
     uint16_t idLen = static_cast<uint16_t>(clientId.size());
-    size_t totalSize = sizeof(req) + poolPath.size() + sizeof(idLen) + idLen + sizeof(requestId);
+    size_t totalSize = sizeof(req) + daxPath.size() + sizeof(idLen) + idLen + sizeof(requestId);
     std::vector<uint8_t> buf(totalSize);
 
     size_t off = 0;
     std::memcpy(buf.data() + off, &req, sizeof(req));
     off += sizeof(req);
-    if (!poolPath.empty())
+    if (!daxPath.empty())
     {
-        std::memcpy(buf.data() + off, poolPath.data(), poolPath.size());
-        off += poolPath.size();
+        std::memcpy(buf.data() + off, daxPath.data(), daxPath.size());
+        off += daxPath.size();
     }
     std::memcpy(buf.data() + off, &idLen, sizeof(idLen));
     off += sizeof(idLen);
@@ -272,7 +272,7 @@ static std::vector<uint8_t> buildAllocPayload(const AllocReq &req,
 }
 
 // Helper: send alloc request and receive response with device path
-static int doAlloc(uint64_t size, const std::string &poolPath, AllocResp *resp,
+static int doAlloc(uint64_t size, const std::string &daxPath, AllocResp *resp,
                    std::string *devicePath)
 {
     int fd = connectResourceManager();
@@ -281,10 +281,10 @@ static int doAlloc(uint64_t size, const std::string &poolPath, AllocResp *resp,
 
     AllocReq req{};
     req.size = size;
-    req.poolPathLen = static_cast<uint32_t>(poolPath.size());
+    req.daxPathLen = static_cast<uint32_t>(daxPath.size());
     req.reserved = 0;
 
-    auto payload = buildAllocPayload(req, poolPath, g_clientId, g_requestSeq++);
+    auto payload = buildAllocPayload(req, daxPath, g_clientId, g_requestSeq++);
     if (sendRequest(fd, MsgType::ALLOC_REQ, payload.data(),
                     static_cast<uint32_t>(payload.size())) != 0)
     {
@@ -492,21 +492,21 @@ static int cmdAlloc(int argc, char *argv[])
 {
     if (argc < 1)
     {
-        fprintf(stderr, "Usage: alloc <size_bytes> [pool_path]\n");
+        fprintf(stderr, "Usage: alloc <size_bytes> [dax_path]\n");
         return 1;
     }
 
     uint64_t size = std::strtoull(argv[0], nullptr, 0);
-    std::string poolPath;  // empty = any pool
+    std::string daxPath;  // empty = any pool
     if (argc >= 2)
-        poolPath = argv[1];
+        daxPath = argv[1];
 
     fprintf(stdout, "Allocating %" PRIu64 " bytes (pool=%s) ...\n",
-            size, poolPath.empty() ? "(any)" : poolPath.c_str());
+            size, daxPath.empty() ? "(any)" : daxPath.c_str());
 
     AllocResp resp{};
     std::string devicePath;
-    if (doAlloc(size, poolPath, &resp, &devicePath) != 0)
+    if (doAlloc(size, daxPath, &resp, &devicePath) != 0)
         return 1;
 
     fprintf(stdout, "\nAllocation successful:\n");
@@ -528,28 +528,28 @@ static int cmdMmap(int argc, char *argv[])
 {
     if (argc < 1)
     {
-        fprintf(stderr, "Usage: mmap <size_bytes> [pool_path]\n");
+        fprintf(stderr, "Usage: mmap <size_bytes> [dax_path]\n");
         return 1;
     }
 
     uint64_t size = std::strtoull(argv[0], nullptr, 0);
-    std::string poolPath;  // empty = any pool
+    std::string daxPath;  // empty = any pool
     if (argc >= 2)
-        poolPath = argv[1];
+        daxPath = argv[1];
 
     fprintf(stdout,
             "=== mmap round-trip test ===\n"
             "  requested size : %s\n"
-            "  pool_path      : %s\n\n",
+            "  dax_path      : %s\n\n",
             formatSize(size).c_str(),
-            poolPath.empty() ? "(any)" : poolPath.c_str());
+            daxPath.empty() ? "(any)" : daxPath.c_str());
 
     // Step 1: Allocate
     fprintf(stdout, "[1/5] Allocating ...\n");
 
     AllocResp aresp{};
     std::string devicePath;
-    if (doAlloc(size, poolPath, &aresp, &devicePath) != 0)
+    if (doAlloc(size, daxPath, &aresp, &devicePath) != 0)
         return 1;
 
     Handle h = aresp.handle;
@@ -645,15 +645,15 @@ static void printUsage(const char *prog)
             "\n"
             "Commands:\n"
             "  stats                    Query pool statistics\n"
-            "  alloc  <size> [pool_path]  Allocate shared memory\n"
-            "  mmap   <size> [pool_path]  Full mmap round-trip test\n"
+            "  alloc  <size> [dax_path]  Allocate shared memory\n"
+            "  mmap   <size> [dax_path]  Full mmap round-trip test\n"
             "\n"
             "Options:\n"
             "  -H <host>  Resource manager host (default: 127.0.0.1)\n"
             "  -p <port>  Resource manager port (default: 9850)\n"
             "\n"
             "Size accepts decimal or hex (0x prefix).\n"
-            "pool_path empty = any pool (default).\n",
+            "dax_path empty = any pool (default).\n",
             prog);
 }
 

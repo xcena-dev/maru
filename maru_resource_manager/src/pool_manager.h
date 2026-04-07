@@ -61,7 +61,7 @@ public:
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
-              std::string &devPath, const std::string &poolPath,
+              std::string &devPath, const std::string &daxPath,
               uint64_t &requestedSizeOut);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.

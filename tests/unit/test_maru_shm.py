@@ -203,15 +203,15 @@ class TestMsgHeader:
 
 class TestAllocReq:
     def test_roundtrip(self):
-        req = AllocReq(size=4096, pool_path="/dev/dax0.0")
+        req = AllocReq(size=4096, dax_path="/dev/dax0.0")
         data = req.pack()
         req2 = AllocReq.unpack(data)
         assert req2.size == 4096
-        assert req2.pool_path == "/dev/dax0.0"
+        assert req2.dax_path == "/dev/dax0.0"
 
-    def test_default_pool_path(self):
+    def test_default_dax_path(self):
         req = AllocReq(size=1024)
-        assert req.pool_path == ""  # "" means any pool
+        assert req.dax_path == ""  # "" means any pool
 
 
 class TestAllocResp:
@@ -376,9 +376,9 @@ class TestConstants:
         assert MAP_SHARED == 0x01
         assert MAP_PRIVATE == 0x02
 
-    def test_any_pool_path_default(self):
+    def test_any_dax_path_default(self):
         req = AllocReq(size=1024)
-        assert req.pool_path == ""  # "" means any pool
+        assert req.dax_path == ""  # "" means any pool
 
 
 # =============================================================================
@@ -394,15 +394,15 @@ class TestIPCUnpackValidation:
         with pytest.raises(ValueError, match="AllocReq too short"):
             AllocReq.unpack(b"\x00" * 10)
 
-    def test_alloc_req_unpack_pool_path_truncated(self):
-        """Test AllocReq.unpack raises ValueError when pool_path bytes are truncated."""
+    def test_alloc_req_unpack_dax_path_truncated(self):
+        """Test AllocReq.unpack raises ValueError when dax_path bytes are truncated."""
         import struct
 
-        # Header: size=4096, pool_path_len=10, reserved=0
+        # Header: size=4096, dax_path_len=10, reserved=0
         # But only provide 5 bytes of path data instead of 10
         header = struct.pack("<QII", 4096, 10, 0)
-        truncated_data = header + b"/dev/d"  # 6 bytes, less than pool_path_len=10
-        with pytest.raises(ValueError, match="AllocReq pool_path truncated"):
+        truncated_data = header + b"/dev/d"  # 6 bytes, less than dax_path_len=10
+        with pytest.raises(ValueError, match="AllocReq dax_path truncated"):
             AllocReq.unpack(truncated_data)
 
     def test_alloc_resp_unpack_too_short(self):

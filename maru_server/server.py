@@ -44,10 +44,10 @@ class MaruServer:
     # =========================================================================
 
     def request_alloc(
-        self, instance_id: str, size: int, pool_path: str = ""
+        self, instance_id: str, size: int, dax_path: str = ""
     ) -> MaruHandle | None:
         """Handle allocation request from client."""
-        handle = self._allocation_manager.allocate(instance_id, size, pool_path=pool_path)
+        handle = self._allocation_manager.allocate(instance_id, size, dax_path=dax_path)
         if handle:
             logger.info(
                 "Allocated %d bytes for %s: region_id=%d",
