@@ -4,7 +4,7 @@ enable_async_loading: True
 
 # Maru backend
 maru_path: "maru://localhost:${MARU_SERVER_PORT}"
-maru_pool_size: 100
+maru_pool_size: 4
 
 extra_config:
   lookup_backoff_time: 0.001
