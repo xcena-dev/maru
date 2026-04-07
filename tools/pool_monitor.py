@@ -117,10 +117,16 @@ def main() -> None:
         action="store_true",
         help="Scrolling log instead of top-style refresh",
     )
+    parser.add_argument(
+        "--address",
+        type=str,
+        default=None,
+        help="Resource manager address (host:port, default: 127.0.0.1:9850)",
+    )
     args = parser.parse_args()
 
     try:
-        client = MaruShmClient()
+        client = MaruShmClient(address=args.address)
     except Exception as e:
         print(f"Error: cannot connect to maru_resourced: {e}", file=sys.stderr)
         sys.exit(1)

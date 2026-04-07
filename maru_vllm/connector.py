@@ -138,6 +138,7 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
+    dax_path = extra_config.get("maru_dax_path")  # None = any pool
 
     cfg = MaruConfig(
         server_url=server_url,
@@ -146,6 +147,7 @@ def _create_maru_handler(
         instance_id=instance_id,
         auto_connect=False,
         eager_map=eager_map,
+        dax_path=dax_path,
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
