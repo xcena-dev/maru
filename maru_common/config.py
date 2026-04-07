@@ -83,6 +83,13 @@ class MaruConfig:
             if not self.dax_path:
                 self.dax_path = None
 
+        if self.dax_path:
+            for p in self.dax_path:
+                if not p.startswith("/"):
+                    raise ValueError(
+                        f"dax_path must be an absolute path, got {p!r}"
+                    )
+
         if self.chunk_size_bytes <= 0:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"

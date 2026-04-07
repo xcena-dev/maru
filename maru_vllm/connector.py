@@ -204,6 +204,7 @@ class MaruKVConnector(KVConnectorBase_V1):
         maru_instance_id: str   - Unique instance ID (default: auto-generated)
         maru_chunk_size: str|int - Maru page size for CXL pages (default: 4M)
         maru_eager_map: bool    - Pre-map shared regions on connect (default: true)
+        maru_dax_path: str|list - DAX device path for pool selection, e.g. '/dev/dax0.0' (default: any pool)
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
     """
 
