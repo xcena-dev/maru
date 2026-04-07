@@ -85,6 +85,7 @@ sglang serve \
 | `maru_use_async_rpc` | `true` | Async DEALER-ROUTER RPC |
 | `maru_max_inflight` | `64` | Max concurrent in-flight async requests |
 | `maru_eager_map` | `true` | Pre-map all shared regions on connect |
+| `maru_dax_path` | `null` | DAX device path for pool selection, e.g. `"/dev/dax0.0"`. Accepts a single path or a list for multi-device fallback. Omit for any pool. |
 
 ## Integration Architecture
 

@@ -189,6 +189,7 @@ Settings in `kv_connector_extra_config`:
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | str | auto | Unique instance ID (default: auto-generated UUID) |
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
+| `maru_dax_path` | str/list | `null` | DAX device path for pool selection, e.g. `"/dev/dax0.0"`. Accepts a single path or a list for multi-device fallback. Omit for any pool. |
 | `maru_kv_chunk_tokens` | int | `256` | KV cache chunk granularity (in tokens) |
 
 ### maru_kv_chunk_tokens
