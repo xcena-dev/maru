@@ -37,7 +37,9 @@ class MaruSGLangConfig:
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
-    dax_path: list[str] | str | None = None  # passed through to MaruConfig; accepts str, list[str], or None (any pool)
+    dax_path: list[str] | str | None = (
+        None  # passed through to MaruConfig; accepts str, list[str], or None (any pool)
+    )
 
     @staticmethod
     def from_extra_config(extra: dict | None) -> "MaruSGLangConfig":

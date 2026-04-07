@@ -162,7 +162,7 @@ class RequestAllocRequest:
 
     instance_id: str
     size: int
-    dax_path: str = ""   # "" = any pool
+    dax_path: str = ""  # "" = any pool
 
 
 @dataclass

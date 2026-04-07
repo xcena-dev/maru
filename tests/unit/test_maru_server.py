@@ -290,8 +290,8 @@ class TestMaruServerEdgeCases:
 
         # Mock the allocation manager to return None
         original_alloc = server._allocation_manager.allocate
-        server._allocation_manager.allocate = (
-            lambda instance_id, size, dax_path="": None
+        server._allocation_manager.allocate = lambda instance_id, size, dax_path="": (
+            None
         )  # type: ignore
 
         result = server.request_alloc("instance1", 4096)

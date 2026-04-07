@@ -109,9 +109,7 @@ def _send_alloc_resp_with_path(sock, handle, requested_size, tmp_path):
 
 def _send_get_access_resp(sock, dax_path, offset, length):
     """Send a GetAccessResp with dax_path, offset, length."""
-    resp = GetAccessResp(
-        status=0, dax_path=dax_path, offset=offset, length=length
-    )
+    resp = GetAccessResp(status=0, dax_path=dax_path, offset=offset, length=length)
     payload = resp.pack()
     hdr = MsgHeader(msg_type=MsgType.GET_ACCESS_RESP, payload_len=len(payload))
     write_full(sock, hdr.pack() + payload)

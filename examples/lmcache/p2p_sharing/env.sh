@@ -15,4 +15,4 @@ export LMCACHE_INST2_PORT=${LMCACHE_INST2_PORT:-$((LMCACHE_PORT_BASE + 11))}
 # Maru Server port (required for maru remote connector)
 export MARU_SERVER_PORT=${MARU_SERVER_PORT:-$((10000 + $(id -u)))}
 
-export MARU_RM_ADDRESS=${MARU_RM_ADDRESS:-127.0.0.1:10010}
+# export MARU_RM_ADDRESS=${MARU_RM_ADDRESS:-127.0.0.1:10010}

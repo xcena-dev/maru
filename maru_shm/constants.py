@@ -21,4 +21,3 @@ DEFAULT_STATE_DIR = "/var/lib/maru-resourced"
 
 # Alignment
 DEFAULT_ALIGN_BYTES = 2 * 1024 * 1024  # 2 MiB (DAX hugepage alignment)
-

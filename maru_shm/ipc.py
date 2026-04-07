@@ -105,14 +105,16 @@ class AllocReq:
     """Allocation request payload."""
 
     size: int = 0
-    dax_path: str = ""   # "" = any pool
+    dax_path: str = ""  # "" = any pool
     reserved: int = 0
     client_id: str = ""
     request_id: int = 0
 
     def pack(self) -> bytes:
         path_bytes = self.dax_path.encode("utf-8")
-        fixed = struct.pack(_ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved)
+        fixed = struct.pack(
+            _ALLOC_REQ_FORMAT, self.size, len(path_bytes), self.reserved
+        )
         fixed += path_bytes  # pool path BEFORE client_id
         id_bytes = self.client_id.encode("utf-8")
         fixed += struct.pack("<H", len(id_bytes)) + id_bytes
@@ -134,7 +136,7 @@ class AllocReq:
                     f"AllocReq dax_path truncated: need {dax_path_len} bytes at "
                     f"offset {off}, only {len(data) - off} available"
                 )
-            dax_path = data[off:off + dax_path_len].decode("utf-8")
+            dax_path = data[off : off + dax_path_len].decode("utf-8")
             off += dax_path_len
         client_id = ""
         if off + 2 <= len(data):

@@ -117,14 +117,17 @@ class MaruPoolInfo:
     def pack(self) -> bytes:
         """Pack to fixed header (32 bytes) + variable device path bytes."""
         path_bytes = self.dax_path.encode("utf-8")
-        return struct.pack(
-            _POOL_INFO_FORMAT,
-            len(path_bytes),
-            int(self.dax_type),
-            self.total_size,
-            self.free_size,
-            self.align_bytes,
-        ) + path_bytes
+        return (
+            struct.pack(
+                _POOL_INFO_FORMAT,
+                len(path_bytes),
+                int(self.dax_type),
+                self.total_size,
+                self.free_size,
+                self.align_bytes,
+            )
+            + path_bytes
+        )
 
     @classmethod
     def unpack(cls, data: bytes) -> "MaruPoolInfo":

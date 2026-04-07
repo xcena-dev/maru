@@ -312,7 +312,9 @@ class TestRpcClientApiMethods:
             "handle": {"region_id": 1, "offset": 0, "length": 4096, "auth_token": 0},
         }
 
-        result = client.request_alloc(instance_id="inst-1", size=4096, dax_path="/dev/dax0")
+        result = client.request_alloc(
+            instance_id="inst-1", size=4096, dax_path="/dev/dax0"
+        )
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
@@ -328,7 +330,9 @@ class TestRpcClientApiMethods:
             "handle": {"region_id": 2, "offset": 0, "length": 8192, "auth_token": 0},
         }
 
-        result = client.request_alloc(instance_id="inst-2", size=8192, dax_path="/dev/dax1")
+        result = client.request_alloc(
+            instance_id="inst-2", size=8192, dax_path="/dev/dax1"
+        )
 
         mock_send.assert_called_once_with(
             MessageType.REQUEST_ALLOC,
