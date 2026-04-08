@@ -40,6 +40,11 @@ struct FreeResult {
     FreeResp resp{};
 };
 
+/// Result of handleNodeRegister.
+struct NodeRegisterResult {
+    NodeRegisterResp resp{};
+};
+
 /// Result of makeError.
 struct ErrorResult {
     int32_t status;
@@ -58,6 +63,8 @@ public:
     FreeResult handleFree(const FreeReq &req, const RequestContext &ctx);
     GetAccessResult handleGetAccess(const GetAccessReq &req, const RequestContext &ctx);
     StatsResult handleStats();
+    NodeRegisterResult handleNodeRegister(const std::string &nodeId,
+                                          const std::vector<PoolManager::DeviceMapping> &mappings);
 
 private:
     PoolManager &pm_;

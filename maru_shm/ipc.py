@@ -36,6 +36,8 @@ class MsgType(IntEnum):
     STATS_RESP = 6
     GET_ACCESS_REQ = 9
     GET_ACCESS_RESP = 10
+    NODE_REGISTER_REQ = 11
+    NODE_REGISTER_RESP = 12
     ERROR_RESP = 255
 
 
@@ -456,3 +458,67 @@ class ErrorResp:
             "utf-8", errors="replace"
         )
         return cls(status=status, message=message)
+
+
+# =============================================================================
+# NodeRegisterReq / NodeRegisterResp
+# =============================================================================
+
+# NodeRegisterResp: status(i32) + matched(u32) + total(u32) = 12 bytes
+_NODE_REGISTER_RESP_FORMAT = "<iII"
+_NODE_REGISTER_RESP_SIZE = struct.calcsize(_NODE_REGISTER_RESP_FORMAT)
+
+
+@dataclass
+class NodeRegisterReq:
+    """Node registration request.
+
+    Wire format:
+        num_nodes(u32) + for each node:
+            node_id_len(u16) + node_id(bytes) +
+            num_devices(u32) + for each device:
+                uuid_len(u16) + uuid(bytes) +
+                path_len(u16) + path(bytes)
+    """
+
+    nodes: list[tuple[str, list[tuple[str, str]]]] = None  # [(node_id, [(uuid, path)])]
+
+    def __post_init__(self):
+        if self.nodes is None:
+            self.nodes = []
+
+    def pack(self) -> bytes:
+        parts = [struct.pack("<I", len(self.nodes))]
+        for node_id, devices in self.nodes:
+            nid = node_id.encode("utf-8")
+            parts.append(struct.pack("<H", len(nid)))
+            parts.append(nid)
+            parts.append(struct.pack("<I", len(devices)))
+            for uuid, path in devices:
+                ub = uuid.encode("utf-8")
+                pb = path.encode("utf-8")
+                parts.append(struct.pack("<H", len(ub)))
+                parts.append(ub)
+                parts.append(struct.pack("<H", len(pb)))
+                parts.append(pb)
+        return b"".join(parts)
+
+
+@dataclass
+class NodeRegisterResp:
+    """Node registration response."""
+
+    status: int = 0
+    matched: int = 0
+    total: int = 0
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "NodeRegisterResp":
+        if len(data) < _NODE_REGISTER_RESP_SIZE:
+            raise ValueError(
+                f"NodeRegisterResp too short: {len(data)} < {_NODE_REGISTER_RESP_SIZE}"
+            )
+        status, matched, total = struct.unpack(
+            _NODE_REGISTER_RESP_FORMAT, data[:_NODE_REGISTER_RESP_SIZE]
+        )
+        return cls(status=status, matched=matched, total=total)

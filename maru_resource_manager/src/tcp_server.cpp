@@ -609,6 +609,84 @@ bool TcpServer::handleOneRequest(int clientFd) {
                      respPayload.data(), respPayload.size()) != 0) {
             return false;
         }
+    } else if (type == MsgType::NODE_REGISTER_REQ) {
+        // Wire format: num_nodes(u32) + for each node:
+        //   node_id_len(u16) + node_id + num_devices(u32) + for each device:
+        //     uuid_len(u16) + uuid + path_len(u16) + path
+        if (payload.size() < 4) {
+            sendError(clientFd, -EPROTO, "bad node_register req");
+            return false;
+        }
+        size_t off = 0;
+        uint32_t numNodes = 0;
+        std::memcpy(&numNodes, payload.data() + off, 4);
+        off += 4;
+
+        for (uint32_t n = 0; n < numNodes; ++n) {
+            if (off + 2 > payload.size()) {
+                sendError(clientFd, -EPROTO, "node_register: truncated node_id");
+                return false;
+            }
+            uint16_t nodeIdLen = 0;
+            std::memcpy(&nodeIdLen, payload.data() + off, 2);
+            off += 2;
+            if (off + nodeIdLen > payload.size()) {
+                sendError(clientFd, -EPROTO, "node_register: truncated node_id data");
+                return false;
+            }
+            std::string nodeId(reinterpret_cast<const char *>(payload.data() + off), nodeIdLen);
+            off += nodeIdLen;
+
+            if (off + 4 > payload.size()) {
+                sendError(clientFd, -EPROTO, "node_register: truncated num_devices");
+                return false;
+            }
+            uint32_t numDevices = 0;
+            std::memcpy(&numDevices, payload.data() + off, 4);
+            off += 4;
+
+            std::vector<PoolManager::DeviceMapping> mappings;
+            for (uint32_t d = 0; d < numDevices; ++d) {
+                if (off + 2 > payload.size()) {
+                    sendError(clientFd, -EPROTO, "node_register: truncated uuid_len");
+                    return false;
+                }
+                uint16_t uuidLen = 0;
+                std::memcpy(&uuidLen, payload.data() + off, 2);
+                off += 2;
+                if (off + uuidLen > payload.size()) {
+                    sendError(clientFd, -EPROTO, "node_register: truncated uuid");
+                    return false;
+                }
+                std::string uuid(reinterpret_cast<const char *>(payload.data() + off), uuidLen);
+                off += uuidLen;
+
+                if (off + 2 > payload.size()) {
+                    sendError(clientFd, -EPROTO, "node_register: truncated path_len");
+                    return false;
+                }
+                uint16_t pathLen = 0;
+                std::memcpy(&pathLen, payload.data() + off, 2);
+                off += 2;
+                if (off + pathLen > payload.size()) {
+                    sendError(clientFd, -EPROTO, "node_register: truncated path");
+                    return false;
+                }
+                std::string path(reinterpret_cast<const char *>(payload.data() + off), pathLen);
+                off += pathLen;
+
+                mappings.push_back({uuid, path});
+            }
+
+            auto result = handler_.handleNodeRegister(nodeId, mappings);
+            // Send response for the last node (simplified: one response per request)
+            if (n == numNodes - 1) {
+                if (sendResp(clientFd, MsgType::NODE_REGISTER_RESP,
+                             &result.resp, sizeof(result.resp)) != 0) {
+                    return false;
+                }
+            }
+        }
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");
         return false;

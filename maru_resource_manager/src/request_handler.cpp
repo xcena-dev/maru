@@ -111,6 +111,17 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
     return result;
 }
 
+NodeRegisterResult RequestHandler::handleNodeRegister(
+    const std::string &nodeId,
+    const std::vector<PoolManager::DeviceMapping> &mappings) {
+    NodeRegisterResult result;
+    int matched = pm_.registerNode(nodeId, mappings);
+    result.resp.status = 0;
+    result.resp.matched = static_cast<uint32_t>(matched);
+    result.resp.total = static_cast<uint32_t>(mappings.size());
+    return result;
+}
+
 StatsResult RequestHandler::handleStats() {
     StatsResult result;
 

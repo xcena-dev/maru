@@ -24,6 +24,8 @@ from .ipc import (
     GetAccessResp,
     MsgHeader,
     MsgType,
+    NodeRegisterReq,
+    NodeRegisterResp,
     StatsReq,
     StatsResp,
 )
@@ -199,6 +201,26 @@ class MaruShmClient:
         self._check_error(hdr, payload, "Stats failed")
         resp = StatsResp.unpack(payload)
         return resp.pools or []
+
+    def register_node(
+        self, nodes: list[tuple[str, list[tuple[str, str]]]]
+    ) -> NodeRegisterResp:
+        """Register node device mappings with the resource manager.
+
+        Args:
+            nodes: List of (node_id, [(device_uuid, local_dax_path), ...])
+
+        Returns:
+            NodeRegisterResp with status, matched count, total count.
+        """
+        req = NodeRegisterReq(nodes=nodes)
+        hdr, payload = self._rpc(MsgType.NODE_REGISTER_REQ, req.pack())
+        self._check_error(hdr, payload, "Node register failed")
+        resp = NodeRegisterResp.unpack(payload)
+        logger.info(
+            "register_node: matched=%d, total=%d", resp.matched, resp.total
+        )
+        return resp
 
     def alloc(self, size: int, dax_path: str = "") -> MaruHandle:
         """Allocate shared memory from the resource manager.
