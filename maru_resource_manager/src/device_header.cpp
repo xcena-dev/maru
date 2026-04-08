@@ -6,22 +6,25 @@
 #include <cstring>
 #include <fcntl.h>
 #include <openssl/rand.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace maru {
 
-int readDeviceHeader(const std::string &devPath, DeviceHeader &out) {
+int readDeviceHeader(const std::string &devPath, DeviceHeader &out,
+                     uint64_t mapSize) {
     int fd = ::open(devPath.c_str(), O_RDONLY);
     if (fd < 0)
         return -errno;
 
-    ssize_t n = ::pread(fd, &out, sizeof(out), 0);
+    void *ptr = ::mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
+    int err = errno;
     ::close(fd);
+    if (ptr == MAP_FAILED)
+        return -err;
 
-    if (n < 0)
-        return -errno;
-    if (static_cast<size_t>(n) < sizeof(out))
-        return -EIO;
+    std::memcpy(&out, ptr, sizeof(out));
+    ::munmap(ptr, mapSize);
 
     if (std::memcmp(out.magic, kDeviceHeaderMagic, sizeof(out.magic)) != 0)
         return -ENODATA;
@@ -29,21 +32,22 @@ int readDeviceHeader(const std::string &devPath, DeviceHeader &out) {
     return 0;
 }
 
-int writeDeviceHeader(const std::string &devPath, const DeviceHeader &hdr) {
+int writeDeviceHeader(const std::string &devPath, const DeviceHeader &hdr,
+                      uint64_t mapSize) {
     int fd = ::open(devPath.c_str(), O_RDWR);
     if (fd < 0)
         return -errno;
 
-    ssize_t n = ::pwrite(fd, &hdr, sizeof(hdr), 0);
+    void *ptr =
+        ::mmap(nullptr, mapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     int err = errno;
-    ::fsync(fd);
     ::close(fd);
-
-    if (n < 0)
+    if (ptr == MAP_FAILED)
         return -err;
-    if (static_cast<size_t>(n) < sizeof(hdr))
-        return -EIO;
 
+    std::memcpy(ptr, &hdr, sizeof(hdr));
+    ::msync(ptr, sizeof(hdr), MS_SYNC);
+    ::munmap(ptr, mapSize);
     return 0;
 }
 

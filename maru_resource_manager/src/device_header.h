@@ -22,14 +22,18 @@ struct DeviceHeader {
 static_assert(sizeof(DeviceHeader) == kDeviceHeaderSize,
               "DeviceHeader must be 32 bytes");
 
-/// Read header from a DEV_DAX device via pread.
+/// Read header from a DEV_DAX device via mmap.
+/// mapSize must be >= device alignment (typically 2MB for DEV_DAX).
 /// Returns 0 on success, -ENODATA if magic doesn't match (not initialized),
 /// or -errno on I/O error.
-int readDeviceHeader(const std::string &devPath, DeviceHeader &out);
+int readDeviceHeader(const std::string &devPath, DeviceHeader &out,
+                     uint64_t mapSize);
 
-/// Write header to a DEV_DAX device via pwrite.
+/// Write header to a DEV_DAX device via mmap.
+/// mapSize must be >= device alignment (typically 2MB for DEV_DAX).
 /// Returns 0 on success, -errno on error.
-int writeDeviceHeader(const std::string &devPath, const DeviceHeader &hdr);
+int writeDeviceHeader(const std::string &devPath, const DeviceHeader &hdr,
+                      uint64_t mapSize);
 
 /// Generate a new UUID v4 and populate all header fields.
 void initDeviceHeader(DeviceHeader &hdr);

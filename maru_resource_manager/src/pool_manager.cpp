@@ -467,18 +467,29 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         return rc != 0 ? rc : -EINVAL;
     }
 
-    // DEV_DAX: read or auto-initialize device UUID header
+    // Read device alignment first (needed for mmap-based header access)
+    uint64_t devAlign = alignBytes_;
+    if (type == DaxType::DEV_DAX)
+    {
+        uint64_t da = 0;
+        if (readDaxAlignBytes(baseName(path), da))
+        {
+            devAlign = da;
+        }
+    }
+
+    // DEV_DAX: read or auto-initialize device UUID header via mmap
     uint64_t dataOffset = 0;
     std::string deviceUuid;
     if (type == DaxType::DEV_DAX)
     {
         DeviceHeader hdr{};
-        int hrc = readDeviceHeader(path, hdr);
+        int hrc = readDeviceHeader(path, hdr, devAlign);
         if (hrc == -ENODATA)
         {
             // No valid header — auto-initialize
             initDeviceHeader(hdr);
-            hrc = writeDeviceHeader(path, hdr);
+            hrc = writeDeviceHeader(path, hdr, devAlign);
             if (hrc != 0)
             {
                 logf(LogLevel::Error,
@@ -513,27 +524,19 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
     pool.deviceUuid = deviceUuid;
     pool.totalSize = size - dataOffset;
     pool.freeSize = size - dataOffset;
-    pool.alignBytes = alignBytes_;
     pool.type = type;
-    if (type == DaxType::DEV_DAX)
-    {
-        uint64_t devAlign = 0;
-        if (readDaxAlignBytes(baseName(path), devAlign))
-        {
-            pool.alignBytes = devAlign;
-        }
-    }
-    else if (type == DaxType::FS_DAX)
+    if (type == DaxType::FS_DAX)
     {
         uint64_t blksz = 0;
         if (getBlockLogicalBlockSize(path, blksz) && blksz > 0)
         {
-            if (blksz > pool.alignBytes)
+            if (blksz > devAlign)
             {
-                pool.alignBytes = blksz;
+                devAlign = blksz;
             }
         }
     }
+    pool.alignBytes = devAlign;
     pool.freeList.push_back(Extent{dataOffset, size - dataOffset});
 
     PoolState loaded = pool;
