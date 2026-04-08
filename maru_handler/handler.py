@@ -206,9 +206,21 @@ class MaruHandler:
             # 1. Connect RPC client
             self._rpc.connect()
 
-            # 1b. Handshake to get server config (rm_address)
+            # 1b. Scan local devices and handshake with server
             try:
-                handshake_resp = self._rpc.handshake()
+                from maru_shm.device_scanner import scan_dax_devices
+
+                local_devices = scan_dax_devices()
+                import platform
+
+                handshake_data = {
+                    "hostname": platform.node(),
+                    "devices": [
+                        {"uuid": uuid, "dax_path": path}
+                        for uuid, path in local_devices
+                    ],
+                }
+                handshake_resp = self._rpc.handshake(extra=handshake_data)
                 rm_address = handshake_resp.get("rm_address") or self._config.rm_address
             except Exception:
                 logger.debug("Handshake failed, using config rm_address", exc_info=True)
