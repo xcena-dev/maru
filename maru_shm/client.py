@@ -217,9 +217,7 @@ class MaruShmClient:
         hdr, payload = self._rpc(MsgType.NODE_REGISTER_REQ, req.pack())
         self._check_error(hdr, payload, "Node register failed")
         resp = NodeRegisterResp.unpack(payload)
-        logger.info(
-            "register_node: matched=%d, total=%d", resp.matched, resp.total
-        )
+        logger.info("register_node: matched=%d, total=%d", resp.matched, resp.total)
         return resp
 
     def alloc(self, size: int, dax_path: str = "") -> MaruHandle:

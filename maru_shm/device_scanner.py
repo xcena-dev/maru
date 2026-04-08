@@ -3,7 +3,6 @@
 """Scan local DEV_DAX devices and read UUID headers."""
 
 import logging
-import mmap
 import os
 import struct
 

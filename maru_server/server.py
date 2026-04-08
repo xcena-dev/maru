@@ -81,15 +81,11 @@ class MaruServer:
                 exc_info=True,
             )
 
-    def register_handler_devices(
-        self, hostname: str, devices: list[dict]
-    ) -> None:
+    def register_handler_devices(self, hostname: str, devices: list[dict]) -> None:
         """Store handler's device mappings and send NODE_REGISTER to RM."""
         device_list = [(d["uuid"], d["dax_path"]) for d in devices]
         self._node_devices[hostname] = device_list
-        logger.info(
-            "Handler %s registered %d devices", hostname, len(device_list)
-        )
+        logger.info("Handler %s registered %d devices", hostname, len(device_list))
         self._send_node_register()
 
     def _send_node_register(self) -> None:
@@ -97,8 +93,7 @@ class MaruServer:
         if not self._node_devices:
             return
         nodes = [
-            (hostname, devices)
-            for hostname, devices in self._node_devices.items()
+            (hostname, devices) for hostname, devices in self._node_devices.items()
         ]
         try:
             resp = self._allocation_manager._client.register_node(nodes)

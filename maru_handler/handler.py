@@ -216,8 +216,7 @@ class MaruHandler:
                 handshake_data = {
                     "hostname": platform.node(),
                     "devices": [
-                        {"uuid": uuid, "dax_path": path}
-                        for uuid, path in local_devices
+                        {"uuid": uuid, "dax_path": path} for uuid, path in local_devices
                     ],
                 }
                 handshake_resp = self._rpc.handshake(extra=handshake_data)
