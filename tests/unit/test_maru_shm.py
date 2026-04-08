@@ -498,9 +498,9 @@ class TestPoolInfoFromDictDefaults:
         assert p.align_bytes == 0
 
     def test_all_optional_fields_missing(self):
-        d = {"total_size": 3000, "free_size": 1500}
+        d = {"dax_path": "/dev/dax0.0", "total_size": 3000, "free_size": 1500}
         p = MaruPoolInfo.from_dict(d)
-        assert p.dax_path == ""
+        assert p.dax_path == "/dev/dax0.0"
         assert p.dax_type == DaxType.DEV_DAX
         assert p.align_bytes == 0
 

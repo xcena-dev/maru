@@ -170,7 +170,7 @@ class MaruPoolInfo:
     def from_dict(cls, d: dict[str, Any]) -> "MaruPoolInfo":
         """Create from dict."""
         return cls(
-            dax_path=d.get("dax_path", ""),
+            dax_path=d["dax_path"],
             dax_type=DaxType(d.get("dax_type", 0)),
             total_size=d["total_size"],
             free_size=d["free_size"],

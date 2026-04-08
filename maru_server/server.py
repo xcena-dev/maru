@@ -37,11 +37,33 @@ class MaruServer:
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
+
+        if self._dax_paths:
+            self._validate_dax_paths()
+
         logger.info(
             "MaruServer initialized (rm_address=%s, dax_paths=%s)",
             self._rm_address,
             self._dax_paths,
         )
+
+    def _validate_dax_paths(self) -> None:
+        """Warn if any --dax-path values don't match resource manager pools."""
+        try:
+            pools = self._allocation_manager._client.stats()
+            available = {p.dax_path for p in pools}
+            for path in self._dax_paths:
+                if path not in available:
+                    logger.warning(
+                        "--dax-path %s not found in resource manager pools: %s",
+                        path,
+                        available,
+                    )
+        except Exception:
+            logger.warning(
+                "Could not validate --dax-path against resource manager",
+                exc_info=True,
+            )
 
     @property
     def rm_address(self) -> str:
