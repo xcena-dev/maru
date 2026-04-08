@@ -788,6 +788,7 @@ bool PoolManager::allocateFromPool(PoolState &pool, uint64_t size,
     return false;
 }
 
+// TODO(kihwan): normalize devPath with realpath() to handle symlinks/trailing slashes
 PoolState *PoolManager::findPoolByPath(const std::string &devPath)
 {
     for (auto &pool : pools_)
