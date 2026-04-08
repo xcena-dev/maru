@@ -20,7 +20,6 @@ class MaruConfig:
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
-    dax_path: list[str] | str | None = None
 ```
 
 ### Parameters
@@ -36,7 +35,6 @@ class MaruConfig:
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
 | `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
-| `dax_path` | `list[str] \| str \| None` | `None` (any pool) | Pin allocations to a specific DAX device path, e.g. `"/dev/dax0.0"`. A list enables ordered fallback across multiple devices. `None` lets the resource manager choose. Must be an absolute path. |
 
 ### Examples
 
@@ -57,26 +55,6 @@ config = MaruConfig(
     pool_size=1024 * 1024 * 1024,    # 1GB
     chunk_size_bytes=2 * 1024 * 1024, # 2MB pages
     timeout_ms=5000,
-)
-```
-
-**Pin to a specific DAX device:**
-
-```python
-config = MaruConfig(
-    server_url="tcp://10.0.0.1:5555",
-    pool_size=1024 * 1024 * 1024,    # 1GB
-    dax_path="/dev/dax1.0",
-)
-```
-
-**Multi-device fallback (try dax0 first, then dax1):**
-
-```python
-config = MaruConfig(
-    server_url="tcp://10.0.0.1:5555",
-    pool_size=1024 * 1024 * 1024,    # 1GB
-    dax_path=["/dev/dax0.0", "/dev/dax1.0"],
 )
 ```
 
@@ -104,12 +82,19 @@ maru-server [OPTIONS]
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `5555` | Bind port |
 | `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+| `--dax-path` | any pool | DAX device path for allocation. Repeat for multiple pools (fill-first fallback). |
 
 ### Examples
 
 ```bash
-# Default
+# Default (any available pool)
 maru-server
+
+# Pin to a specific DAX device
+maru-server --dax-path /dev/dax0.0
+
+# Multiple pools (fill-first fallback)
+maru-server --dax-path /dev/dax0.0 --dax-path /dev/dax1.0
 
 # Production
 maru-server --host 0.0.0.0 --port 5555 --log-level WARNING
@@ -145,7 +130,6 @@ vllm serve <model> --kv-transfer-config '{
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
-| `maru_dax_path` | `str \| list` | `null` (any pool) | DAX device path for pool selection, e.g. `"/dev/dax0.0"`. Accepts a single path or a list for multi-device fallback. |
 | `maru_kv_chunk_tokens` | `int` | `256` | KV cache chunk granularity (in tokens). Auto-aligned to vLLM `block_size` |
 
 For full architecture and data path details, see [vLLM](../integration/vllm.md#configuration).
