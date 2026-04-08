@@ -24,15 +24,24 @@ class MaruServer:
     - Memory allocation and ownership
     """
 
-    def __init__(self, rm_address: str | None = None):
+    def __init__(
+        self,
+        rm_address: str | None = None,
+        dax_paths: list[str] | None = None,
+    ):
         self._rm_address = rm_address or "127.0.0.1:9850"
+        self._dax_paths = dax_paths
         self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
         self._lock = RLock()  # Coordinates cross-manager operations
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
-        logger.info("MaruServer initialized (rm_address=%s)", self._rm_address)
+        logger.info(
+            "MaruServer initialized (rm_address=%s, dax_paths=%s)",
+            self._rm_address,
+            self._dax_paths,
+        )
 
     @property
     def rm_address(self) -> str:
@@ -43,21 +52,34 @@ class MaruServer:
     # Allocation Management
     # =========================================================================
 
-    def request_alloc(
-        self, instance_id: str, size: int, dax_path: str = ""
-    ) -> MaruHandle | None:
-        """Handle allocation request from client."""
-        handle = self._allocation_manager.allocate(instance_id, size, dax_path=dax_path)
-        if handle:
-            logger.info(
-                "Allocated %d bytes for %s: region_id=%d",
-                size,
+    def request_alloc(self, instance_id: str, size: int) -> MaruHandle | None:
+        """Handle allocation request from client.
+
+        When ``--dax-path`` is configured, iterates over the server's
+        dax_path list (fill-first fallback). Otherwise uses any available pool.
+        """
+        dax_paths_iter = self._dax_paths if self._dax_paths else [""]
+
+        for path in dax_paths_iter:
+            handle = self._allocation_manager.allocate(instance_id, size, dax_path=path)
+            if handle:
+                logger.info(
+                    "Allocated %d bytes for %s from %s: region_id=%d",
+                    size,
+                    instance_id,
+                    path or "(any)",
+                    handle.region_id,
+                )
+                return handle
+            logger.debug(
+                "Pool %s refused allocation for %s (%d bytes)",
+                path or "(any)",
                 instance_id,
-                handle.region_id,
+                size,
             )
-        else:
-            logger.error("Failed to allocate %d bytes for %s", size, instance_id)
-        return handle
+
+        logger.error("Failed to allocate %d bytes for %s", size, instance_id)
+        return None
 
     def return_alloc(self, instance_id: str, region_id: int) -> bool:
         """Handle allocation return request from client."""
@@ -272,12 +294,23 @@ def main() -> None:
         default="127.0.0.1:9850",
         help="Resource manager address (host:port, default: 127.0.0.1:9850)",
     )
+    parser.add_argument(
+        "--dax-path",
+        action="append",
+        default=None,
+        dest="dax_paths",
+        help=(
+            "DAX device path for allocation (e.g. /dev/dax0.0). "
+            "Repeat for multiple pools (fill-first fallback). "
+            "If omitted, any available pool is used."
+        ),
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer(rm_address=args.rm_address)
+    server = MaruServer(rm_address=args.rm_address, dax_paths=args.dax_paths)
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

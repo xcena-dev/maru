@@ -50,7 +50,6 @@ class MaruConfig:
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
-    dax_path: list[str] | str | None = None  # None = any pool
     auto_expand: bool = True  # Auto-expand when pool is exhausted
     expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
     rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
@@ -66,27 +65,6 @@ class MaruConfig:
         env_eager_map = _parse_env_bool("MARU_EAGER_MAP")
         if env_eager_map is not None:
             self.eager_map = env_eager_map
-
-        # Normalize dax_path to list[str] | None
-        if self.dax_path is None:
-            pass  # None stays None (means any pool)
-        elif isinstance(self.dax_path, list | tuple) and len(self.dax_path) == 0:
-            self.dax_path = None  # empty list/tuple → any pool
-        elif isinstance(self.dax_path, str):
-            if self.dax_path == "":
-                self.dax_path = None  # empty string → any pool
-            else:
-                self.dax_path = [self.dax_path]
-        else:
-            # list[str]
-            self.dax_path = [p for p in self.dax_path if p]  # filter empty strings
-            if not self.dax_path:
-                self.dax_path = None
-
-        if self.dax_path:
-            for p in self.dax_path:
-                if not p.startswith("/"):
-                    raise ValueError(f"dax_path must be an absolute path, got {p!r}")
 
         if self.chunk_size_bytes <= 0:
             raise ValueError(

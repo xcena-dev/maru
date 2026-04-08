@@ -75,7 +75,6 @@ class MaruStorage(HiCacheStorage):
                 use_async_rpc=cfg.use_async_rpc,
                 max_inflight=cfg.max_inflight,
                 eager_map=cfg.eager_map,
-                dax_path=cfg.dax_path,
             )
         )
         if handler.connect():

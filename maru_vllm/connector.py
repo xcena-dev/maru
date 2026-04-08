@@ -138,8 +138,6 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
-    dax_path = extra_config.get("maru_dax_path")  # None = any pool
-
     cfg = MaruConfig(
         server_url=server_url,
         pool_size=pool_size,
@@ -147,7 +145,6 @@ def _create_maru_handler(
         instance_id=instance_id,
         auto_connect=False,
         eager_map=eager_map,
-        dax_path=dax_path,
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
@@ -204,7 +201,6 @@ class MaruKVConnector(KVConnectorBase_V1):
         maru_instance_id: str   - Unique instance ID (default: auto-generated)
         maru_chunk_size: str|int - Maru page size for CXL pages (default: 4M)
         maru_eager_map: bool    - Pre-map shared regions on connect (default: true)
-        maru_dax_path: str|list - DAX device path for pool selection, e.g. '/dev/dax0.0' (default: any pool)
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
     """
 

@@ -37,9 +37,6 @@ class MaruSGLangConfig:
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
-    dax_path: list[str] | str | None = (
-        None  # passed through to MaruConfig; accepts str, list[str], or None (any pool)
-    )
 
     @staticmethod
     def from_extra_config(extra: dict | None) -> "MaruSGLangConfig":
@@ -48,7 +45,7 @@ class MaruSGLangConfig:
         Recognized keys (all prefixed with ``maru_``):
             maru_server_url, maru_pool_size, maru_chunk_size_bytes,
             maru_instance_id, maru_timeout_ms, maru_use_async_rpc,
-            maru_max_inflight, maru_eager_map, maru_dax_path
+            maru_max_inflight, maru_eager_map
         """
         if not extra:
             return MaruSGLangConfig()
@@ -72,5 +69,4 @@ class MaruSGLangConfig:
             use_async_rpc=extra.get("maru_use_async_rpc", defaults.use_async_rpc),
             max_inflight=int(extra.get("maru_max_inflight", defaults.max_inflight)),
             eager_map=extra.get("maru_eager_map", defaults.eager_map),
-            dax_path=extra.get("maru_dax_path", defaults.dax_path),
         )

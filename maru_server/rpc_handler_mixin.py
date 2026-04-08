@@ -64,21 +64,18 @@ class RpcHandlerMixin:
         handle = self._server.request_alloc(
             instance_id=req.instance_id,
             size=req.size,
-            dax_path=req.dax_path,
         )
         if handle is None:
             logger.debug(
-                "[REQUEST_ALLOC] instance=%s, size=%d, dax_path=%s -> FAILED",
+                "[REQUEST_ALLOC] instance=%s, size=%d -> FAILED",
                 req.instance_id,
                 req.size,
-                req.dax_path,
             )
             return {"success": False, "error": "Allocation failed"}
         logger.debug(
-            "[REQUEST_ALLOC] instance=%s, size=%d, dax_path=%s -> region_id=%d",
+            "[REQUEST_ALLOC] instance=%s, size=%d -> region_id=%d",
             req.instance_id,
             req.size,
-            req.dax_path,
             handle.region_id,
         )
         return {"success": True, "handle": handle.to_dict()}
