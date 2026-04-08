@@ -9,6 +9,7 @@ include(GNUInstallDirs)
 find_package(OpenSSL REQUIRED)
 
 add_executable(maru_resource_manager
+    src/device_header.cpp
     src/util.cpp
     src/main.cpp
     src/server_config.cpp

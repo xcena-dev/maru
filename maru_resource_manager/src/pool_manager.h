@@ -38,6 +38,7 @@ struct PoolState
 {
     uint32_t poolId;
     std::string devPath;
+    std::string deviceUuid;  // UUID from device header (DEV_DAX only, empty for FS_DAX)
     uint64_t totalSize;
     uint64_t freeSize;
     uint64_t alignBytes;
@@ -102,6 +103,7 @@ private:
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
+    PoolState *findPoolByUuid(const std::string &uuid);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.

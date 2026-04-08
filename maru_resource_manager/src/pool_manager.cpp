@@ -19,6 +19,7 @@
 #include <cstring>
 #include <unordered_set>
 
+#include "device_header.h"
 #include "metadata.h"
 #include "util.h"
 #include "wal.h"
@@ -466,11 +467,52 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         return rc != 0 ? rc : -EINVAL;
     }
 
+    // DEV_DAX: read or auto-initialize device UUID header
+    uint64_t dataOffset = 0;
+    std::string deviceUuid;
+    if (type == DaxType::DEV_DAX)
+    {
+        DeviceHeader hdr{};
+        int hrc = readDeviceHeader(path, hdr);
+        if (hrc == -ENODATA)
+        {
+            // No valid header — auto-initialize
+            initDeviceHeader(hdr);
+            hrc = writeDeviceHeader(path, hdr);
+            if (hrc != 0)
+            {
+                logf(LogLevel::Error,
+                     "Failed to write device header to %s (%d)",
+                     path.c_str(), hrc);
+                return hrc;
+            }
+            logf(LogLevel::Info,
+                 "Auto-initialized device header on %s: UUID=%s",
+                 path.c_str(), uuidToString(hdr.uuid).c_str());
+        }
+        else if (hrc != 0)
+        {
+            logf(LogLevel::Error,
+                 "Failed to read device header from %s (%d)",
+                 path.c_str(), hrc);
+            return hrc;
+        }
+        else
+        {
+            logf(LogLevel::Info,
+                 "Device %s: UUID=%s",
+                 path.c_str(), uuidToString(hdr.uuid).c_str());
+        }
+        deviceUuid = uuidToString(hdr.uuid);
+        dataOffset = kDeviceHeaderSize;
+    }
+
     PoolState pool{};
     pool.poolId = poolId;
     pool.devPath = path;
-    pool.totalSize = size;
-    pool.freeSize = size;
+    pool.deviceUuid = deviceUuid;
+    pool.totalSize = size - dataOffset;
+    pool.freeSize = size - dataOffset;
     pool.alignBytes = alignBytes_;
     pool.type = type;
     if (type == DaxType::DEV_DAX)
@@ -492,7 +534,7 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
             }
         }
     }
-    pool.freeList.push_back(Extent{0, size});
+    pool.freeList.push_back(Extent{dataOffset, size - dataOffset});
 
     PoolState loaded = pool;
     rc = metadata_->load(poolId, loaded);
@@ -794,6 +836,18 @@ PoolState *PoolManager::findPoolByPath(const std::string &devPath)
     for (auto &pool : pools_)
     {
         if (pool.devPath == devPath)
+        {
+            return &pool;
+        }
+    }
+    return nullptr;
+}
+
+PoolState *PoolManager::findPoolByUuid(const std::string &uuid)
+{
+    for (auto &pool : pools_)
+    {
+        if (pool.deviceUuid == uuid)
         {
             return &pool;
         }
