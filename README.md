@@ -152,6 +152,32 @@ extra_config:
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
 
 
+## maru-cpp (Experimental)
+
+**maru-cpp** is a C++ reimplementation of Maru's core modules (handler, server, shared memory IPC), designed as a drop-in replacement for the Python backend with significantly lower latency.
+
+| Metric (PD mode) | Python | C++ | Speedup |
+|-------------------|--------|-----|---------|
+| TTFT mean | 728.61 ms | 528.49 ms | **1.38x** |
+| TTFT p99 | 1080.89 ms | 618.56 ms | **1.75x** |
+
+Key features:
+- GIL-free data plane — zero-copy CXL memory access without Python overhead
+- Drop-in Python bindings (`CppMaruConnector`) — no application code changes needed
+- **NIXL transport backend plugin** (`libplugin_MARU.so`) for framework-native KV cache sharing via CXL
+
+```bash
+# Build maru-cpp
+cd maru-cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DMARU_BUILD_PYTHON=ON
+cmake --build build -j$(nproc)
+
+# Run the C++ server (drop-in replacement)
+./build/maru_server_bin --host 0.0.0.0 --port 5555
+```
+
+For NIXL plugin integration with LMCache, vLLM, and SGLang, see [NIXL Integration](docs/source/integration/nixl.md).
+
 ## Tools
 
 - **[pool_monitor](tools/)** — Real-time pool usage monitor (`top`-style TUI, CSV export)

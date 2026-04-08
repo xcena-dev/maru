@@ -127,6 +127,7 @@ Consistency and Safety <source/design_doc/consistency_and_safety>
 LMCache <source/integration/lmcache>
 vLLM <source/integration/vllm>
 SGLang HiCache <source/integration/sglang>
+NIXL Plugin <source/integration/nixl>
 ```
 
 ```{toctree}
