@@ -25,6 +25,17 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     result.devicePath = devPath;
 
     if (status == 0) {
+        // Resolve device path for the client's node (multi-node support)
+        auto *pool = pm_.findPoolForRegion(handle.regionId);
+        if (pool && !pool->deviceUuid.empty()) {
+            std::string resolved = pm_.resolvePathForClient(
+                pool->deviceUuid, ctx.client_id);
+            if (!resolved.empty()) {
+                devPath = resolved;
+            }
+        }
+        result.devicePath = devPath;
+
         logf(LogLevel::Debug,
              "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s",
              ctx.client_id.c_str(),
@@ -67,13 +78,21 @@ FreeResult RequestHandler::handleFree(const FreeReq &req,
 
 GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
                                                 const RequestContext &ctx) {
-    (void)ctx;
     GetAccessResult result;
 
     std::string pathToOpen;
     int status = pm_.verifyAndGetPath(req.handle, pathToOpen);
 
     if (status == 0) {
+        // Resolve device path for the client's node (multi-node support)
+        auto *pool = pm_.findPoolForRegion(req.handle.regionId);
+        if (pool && !pool->deviceUuid.empty()) {
+            std::string resolved = pm_.resolvePathForClient(
+                pool->deviceUuid, ctx.client_id);
+            if (!resolved.empty()) {
+                pathToOpen = resolved;
+            }
+        }
         result.devicePath = pathToOpen;
         result.offset = req.handle.offset;
         result.length = req.handle.length;

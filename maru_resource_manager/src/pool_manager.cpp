@@ -546,6 +546,12 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         pool = loaded;
     }
 
+    // Auto-register own node mapping for DEV_DAX
+    if (!pool.deviceUuid.empty())
+    {
+        nodeMappings_[pool.deviceUuid][localHostname()] = pool.devPath;
+    }
+
     pools_.push_back(pool);
     return 0;
 }
@@ -853,6 +859,85 @@ PoolState *PoolManager::findPoolByUuid(const std::string &uuid)
         }
     }
     return nullptr;
+}
+
+int PoolManager::registerNode(const std::string &nodeId,
+                              const std::vector<DeviceMapping> &mappings)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+
+    if (registeredNodes_.count(nodeId))
+    {
+        logf(LogLevel::Debug,
+             "[NODE_REGISTER] node=%s already registered, skipping",
+             nodeId.c_str());
+        return 0;
+    }
+
+    int matched = 0;
+    for (const auto &m : mappings)
+    {
+        nodeMappings_[m.uuid][nodeId] = m.localDaxPath;
+        if (findPoolByUuid(m.uuid) != nullptr)
+        {
+            ++matched;
+        }
+    }
+    registeredNodes_.insert(nodeId);
+    logf(LogLevel::Info,
+         "[NODE_REGISTER] node=%s, devices=%zu, matched=%d",
+         nodeId.c_str(), mappings.size(), matched);
+    return matched;
+}
+
+std::string PoolManager::resolvePathForClient(const std::string &deviceUuid,
+                                              const std::string &clientId)
+{
+    // FS_DAX or no UUID: no resolution needed
+    if (deviceUuid.empty())
+    {
+        return "";
+    }
+
+    std::string hostname;
+    auto pos = clientId.rfind(':');
+    if (pos != std::string::npos)
+    {
+        hostname = clientId.substr(0, pos);
+    }
+    else
+    {
+        hostname = clientId;
+    }
+
+    // Local client: return RM's own devPath
+    if (hostname == localHostname())
+    {
+        auto *pool = findPoolByUuid(deviceUuid);
+        return pool ? pool->devPath : "";
+    }
+
+    // Remote client: lookup node mapping table
+    auto it = nodeMappings_.find(deviceUuid);
+    if (it != nodeMappings_.end())
+    {
+        auto nodeIt = it->second.find(hostname);
+        if (nodeIt != it->second.end())
+        {
+            return nodeIt->second;
+        }
+    }
+    return "";
+}
+
+PoolState *PoolManager::findPoolForRegion(uint64_t regionId)
+{
+    auto it = allocations_.find(regionId);
+    if (it == allocations_.end())
+    {
+        return nullptr;
+    }
+    return findPoolById(it->second.poolId);
 }
 
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,

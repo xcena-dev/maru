@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,25 @@ public:
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
 
+    /// Register device mappings for a remote node.
+    /// Each entry maps a device UUID to the node's local dax_path.
+    struct DeviceMapping
+    {
+        std::string uuid;
+        std::string localDaxPath;
+    };
+    int registerNode(const std::string &nodeId,
+                     const std::vector<DeviceMapping> &mappings);
+
+    /// Resolve the correct local dax_path for a client based on its hostname.
+    /// For DEV_DAX: looks up node mapping table. For FS_DAX: returns path as-is.
+    /// Returns empty string if no mapping found (unregistered node).
+    std::string resolvePathForClient(const std::string &deviceUuid,
+                                     const std::string &clientId);
+
+    /// Find the pool that owns a given regionId. Returns nullptr if not found.
+    PoolState *findPoolForRegion(uint64_t regionId);
+
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
 
@@ -120,6 +140,10 @@ private:
     std::unique_ptr<MetadataStore> metadata_;
     std::unique_ptr<WalStore> wal_;
     uint64_t alignBytes_{2ULL << 20};  // 2 MiB
+
+    // Node mapping table: device_uuid → { hostname → local_dax_path }
+    std::map<std::string, std::map<std::string, std::string>> nodeMappings_;
+    std::set<std::string> registeredNodes_;
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;
