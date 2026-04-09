@@ -44,3 +44,42 @@ if(MARU_BUILD_TOOLS)
     target_include_directories(maru_test_client PRIVATE include)
     target_link_libraries(maru_test_client PRIVATE pthread)
 endif()
+
+# Unit tests (Google Test)
+option(MARU_BUILD_TESTS "Build unit tests" ON)
+
+if(MARU_BUILD_TESTS)
+    find_package(GTest REQUIRED)
+    enable_testing()
+
+    # Sources needed by tests (everything except main.cpp)
+    set(RM_LIB_SOURCES
+        src/device_header.cpp
+        src/util.cpp
+        src/server_config.cpp
+        src/log.cpp
+        src/pool_manager.cpp
+        src/metadata.cpp
+        src/wal.cpp
+        src/reaper.cpp
+        src/request_handler.cpp
+        src/tcp_server.cpp
+    )
+
+    add_executable(maru_rm_tests
+        tests/test_device_header.cpp
+        tests/test_pool_manager_uuid.cpp
+        ${RM_LIB_SOURCES}
+    )
+
+    target_include_directories(maru_rm_tests PRIVATE include src)
+    target_compile_options(maru_rm_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(maru_rm_tests PRIVATE
+        GTest::gtest_main
+        pthread
+        OpenSSL::Crypto
+    )
+
+    include(GoogleTest)
+    gtest_discover_tests(maru_rm_tests)
+endif()

@@ -465,6 +465,8 @@ class HandshakeRequest:
 
     client_version: int = PROTOCOL_VERSION
     instance_id: str | None = None
+    hostname: str | None = None
+    devices: list[dict] | None = None
 
 
 @dataclass
