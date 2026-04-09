@@ -64,36 +64,21 @@ TEST_F(PoolManagerUuidTest, RegisterNodeMultipleDevices) {
     EXPECT_EQ(matched, 0);
 }
 
-TEST_F(PoolManagerUuidTest, RegisterNodesDuplicateReplaces) {
-    PoolManager::NodeList first = {
-        {"node-0", {{"uuid-A", "/dev/dax0.0"}}},
-    };
-    pm_->registerNodes(first);
+TEST_F(PoolManagerUuidTest, RegisterNodesDuplicateUpdates) {
+    pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
 
-    // Second call replaces entire table
-    PoolManager::NodeList second = {
-        {"node-0", {{"uuid-A", "/dev/dax0.0"}}},
-    };
-    int matched = pm_->registerNodes(second);
-    EXPECT_EQ(matched, 0);
-
-    // Mapping still works after replacement
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax0.0");
+    // Re-register same node with updated path
+    pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax1.0"}}}});
+    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax1.0");
 }
 
-TEST_F(PoolManagerUuidTest, RegisterNodesFullReplacement) {
-    // First registration: node-0 has uuid-A
-    PoolManager::NodeList first = {
-        {"node-0", {{"uuid-A", "/dev/dax0.0"}}},
-    };
-    pm_->registerNodes(first);
+TEST_F(PoolManagerUuidTest, RegisterNodesDeviceRemoved) {
+    // node-0 has uuid-A
+    pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
     EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax0.0");
 
-    // Second registration: uuid-A removed, uuid-B added
-    PoolManager::NodeList second = {
-        {"node-0", {{"uuid-B", "/dev/dax1.0"}}},
-    };
-    pm_->registerNodes(second);
+    // node-0 re-registers without uuid-A (device removed), uuid-B added
+    pm_->registerNodes({{"node-0", {{"uuid-B", "/dev/dax1.0"}}}});
     EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "");  // stale cleared
     EXPECT_EQ(pm_->resolvePathForClient("uuid-B", "node-0:1234"), "/dev/dax1.0");
 }
@@ -106,6 +91,23 @@ TEST_F(PoolManagerUuidTest, RegisterMultipleNodes) {
     pm_->registerNodes(nodes);
 
     // Both registrations succeed — verified by resolvePathForClient below
+}
+
+TEST_F(PoolManagerUuidTest, MultipleMetaServersPreserveOtherNodes) {
+    // MetaServer 1 registers node-0 and node-1
+    pm_->registerNodes({
+        {"node-0", {{"uuid-A", "/dev/dax0.0"}}},
+        {"node-1", {{"uuid-A", "/dev/dax1.0"}}},
+    });
+
+    // MetaServer 2 registers node-2 — node-0 and node-1 must survive
+    pm_->registerNodes({
+        {"node-2", {{"uuid-A", "/dev/dax2.0"}}},
+    });
+
+    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:100"), "/dev/dax0.0");
+    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-1:200"), "/dev/dax1.0");
+    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-2:300"), "/dev/dax2.0");
 }
 
 // ── resolvePathForClient ────────────────────────────────────────────────────

@@ -868,14 +868,16 @@ int PoolManager::registerNodes(const NodeList &nodes)
 {
     std::lock_guard<std::mutex> lock(mu_);
 
-    // MetaServer sends the complete node list each time.
-    // Replace the entire mapping table so removed devices don't linger.
-    nodeMappings_.clear();
-    registeredNodes_.clear();
-
     int matched = 0;
     for (const auto &[nodeId, mappings] : nodes)
     {
+        // Clear this node's old mappings (handles device hot-unplug)
+        for (auto &[uuid, nodeMap] : nodeMappings_)
+        {
+            nodeMap.erase(nodeId);
+        }
+
+        // Add new mappings for this node
         for (const auto &m : mappings)
         {
             nodeMappings_[m.uuid][nodeId] = m.localDaxPath;
@@ -887,7 +889,7 @@ int PoolManager::registerNodes(const NodeList &nodes)
         registeredNodes_.insert(nodeId);
     }
     logf(LogLevel::Info,
-         "[NODE_REGISTER] %zu nodes registered, matched=%d",
+         "[NODE_REGISTER] %zu nodes updated, matched=%d",
          nodes.size(), matched);
     return matched;
 }
