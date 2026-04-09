@@ -864,32 +864,31 @@ PoolState *PoolManager::findPoolByUuid(const std::string &uuid)
     return nullptr;
 }
 
-int PoolManager::registerNode(const std::string &nodeId,
-                              const std::vector<DeviceMapping> &mappings)
+int PoolManager::registerNodes(const NodeList &nodes)
 {
     std::lock_guard<std::mutex> lock(mu_);
 
-    if (registeredNodes_.count(nodeId))
-    {
-        logf(LogLevel::Debug,
-             "[NODE_REGISTER] node=%s already registered, skipping",
-             nodeId.c_str());
-        return 0;
-    }
+    // MetaServer sends the complete node list each time.
+    // Replace the entire mapping table so removed devices don't linger.
+    nodeMappings_.clear();
+    registeredNodes_.clear();
 
     int matched = 0;
-    for (const auto &m : mappings)
+    for (const auto &[nodeId, mappings] : nodes)
     {
-        nodeMappings_[m.uuid][nodeId] = m.localDaxPath;
-        if (findPoolByUuid(m.uuid) != nullptr)
+        for (const auto &m : mappings)
         {
-            ++matched;
+            nodeMappings_[m.uuid][nodeId] = m.localDaxPath;
+            if (findPoolByUuid(m.uuid) != nullptr)
+            {
+                ++matched;
+            }
         }
+        registeredNodes_.insert(nodeId);
     }
-    registeredNodes_.insert(nodeId);
     logf(LogLevel::Info,
-         "[NODE_REGISTER] node=%s, devices=%zu, matched=%d",
-         nodeId.c_str(), mappings.size(), matched);
+         "[NODE_REGISTER] %zu nodes registered, matched=%d",
+         nodes.size(), matched);
     return matched;
 }
 
@@ -941,6 +940,22 @@ PoolState *PoolManager::findPoolForRegion(uint64_t regionId)
         return nullptr;
     }
     return findPoolById(it->second.poolId);
+}
+
+std::string PoolManager::resolveDevicePath(uint64_t regionId,
+                                           const std::string &clientId)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    auto *pool = findPoolForRegion(regionId);
+    if (pool && !pool->deviceUuid.empty())
+    {
+        std::string resolved = resolvePathForClient(pool->deviceUuid, clientId);
+        if (!resolved.empty())
+        {
+            return resolved;
+        }
+    }
+    return "";
 }
 
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,

@@ -63,8 +63,7 @@ public:
     FreeResult handleFree(const FreeReq &req, const RequestContext &ctx);
     GetAccessResult handleGetAccess(const GetAccessReq &req, const RequestContext &ctx);
     StatsResult handleStats();
-    NodeRegisterResult handleNodeRegister(const std::string &nodeId,
-                                          const std::vector<PoolManager::DeviceMapping> &mappings);
+    NodeRegisterResult handleNodeRegister(const PoolManager::NodeList &nodes);
 
 private:
     PoolManager &pm_;

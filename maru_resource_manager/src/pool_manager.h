@@ -75,24 +75,30 @@ public:
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
 
-    /// Register device mappings for a remote node.
-    /// Each entry maps a device UUID to the node's local dax_path.
+    /// Device UUID → local dax_path mapping entry.
     struct DeviceMapping
     {
         std::string uuid;
         std::string localDaxPath;
     };
-    int registerNode(const std::string &nodeId,
-                     const std::vector<DeviceMapping> &mappings);
+
+    /// Register device mappings for all nodes at once (full replacement).
+    /// MetaServer sends the complete node list each time, so we treat it
+    /// as the source of truth and replace the entire mapping table.
+    using NodeList = std::vector<std::pair<std::string, std::vector<DeviceMapping>>>;
+    int registerNodes(const NodeList &nodes);
+
+    /// Resolve the device path a client should use for a given allocation.
+    /// Combines findPoolForRegion + UUID-based node mapping lookup under a
+    /// single lock. Returns empty string if no resolution needed or no mapping.
+    std::string resolveDevicePath(uint64_t regionId, const std::string &clientId);
 
     /// Resolve the correct local dax_path for a client based on its hostname.
     /// For DEV_DAX: looks up node mapping table. For FS_DAX: returns path as-is.
     /// Returns empty string if no mapping found (unregistered node).
+    /// NOTE: caller must NOT hold mu_ (this method does not lock).
     std::string resolvePathForClient(const std::string &deviceUuid,
                                      const std::string &clientId);
-
-    /// Find the pool that owns a given regionId. Returns nullptr if not found.
-    PoolState *findPoolForRegion(uint64_t regionId);
 
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
@@ -124,6 +130,7 @@ private:
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
     PoolState *findPoolByUuid(const std::string &uuid);
+    PoolState *findPoolForRegion(uint64_t regionId);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.

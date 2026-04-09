@@ -3,6 +3,7 @@
 """Scan local DEV_DAX devices and read UUID headers."""
 
 import logging
+import mmap
 import os
 import struct
 
@@ -12,6 +13,18 @@ logger = logging.getLogger(__name__)
 _HEADER_MAGIC = b"MARUDEV\x00"
 _HEADER_SIZE = 32
 _HEADER_FORMAT = "<8sI16sI"  # magic(8) + version(u32) + uuid(16) + reserved(u32)
+_DEFAULT_MAP_SIZE = 2 * 1024 * 1024  # 2 MiB fallback
+
+
+def _get_dax_align(dax_path: str) -> int:
+    """Read device alignment from sysfs. DEV_DAX requires mmap size >= alignment."""
+    dev_name = os.path.basename(dax_path)
+    align_path = f"/sys/bus/dax/devices/{dev_name}/align"
+    try:
+        with open(align_path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return _DEFAULT_MAP_SIZE
 
 
 def read_device_uuid(dax_path: str) -> str | None:
@@ -19,13 +32,22 @@ def read_device_uuid(dax_path: str) -> str | None:
 
     Returns UUID string (e.g. "550e8400-e29b-...") or None if no valid header.
     """
+    map_size = _get_dax_align(dax_path)
     try:
         fd = os.open(dax_path, os.O_RDONLY)
         try:
-            data = os.pread(fd, _HEADER_SIZE, 0)
+            # For regular files (e.g. tests), clamp to file size
+            file_size = os.fstat(fd).st_size
+            if file_size > 0 and file_size < map_size:
+                map_size = file_size
+            mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_READ)
+            try:
+                data = mm[:_HEADER_SIZE]
+            finally:
+                mm.close()
         finally:
             os.close(fd)
-    except OSError:
+    except (OSError, ValueError):
         logger.debug("Cannot read device header from %s", dax_path, exc_info=True)
         return None
 

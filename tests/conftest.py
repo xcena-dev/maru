@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator
+from unittest.mock import patch
 
 import pytest
 
@@ -59,7 +60,8 @@ def server_thread(server_port):
     """Start RPC server in a background thread."""
     from maru_server import MaruServer, RpcServer
 
-    maru_server = MaruServer()
+    with patch("maru_server.server.scan_dax_devices", return_value=[]):
+        maru_server = MaruServer()
     rpc_server = RpcServer(maru_server, host="127.0.0.1", port=server_port)
 
     thread = threading.Thread(target=rpc_server.start, daemon=True)

@@ -622,6 +622,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         std::memcpy(&numNodes, payload.data() + off, 4);
         off += 4;
 
+        PoolManager::NodeList allNodes;
+
         for (uint32_t n = 0; n < numNodes; ++n) {
             if (off + 2 > payload.size()) {
                 sendError(clientFd, -EPROTO, "node_register: truncated node_id");
@@ -678,14 +680,13 @@ bool TcpServer::handleOneRequest(int clientFd) {
                 mappings.push_back({uuid, path});
             }
 
-            auto result = handler_.handleNodeRegister(nodeId, mappings);
-            // Send response for the last node (simplified: one response per request)
-            if (n == numNodes - 1) {
-                if (sendResp(clientFd, MsgType::NODE_REGISTER_RESP,
-                             &result.resp, sizeof(result.resp)) != 0) {
-                    return false;
-                }
-            }
+            allNodes.emplace_back(std::move(nodeId), std::move(mappings));
+        }
+
+        auto result = handler_.handleNodeRegister(allNodes);
+        if (sendResp(clientFd, MsgType::NODE_REGISTER_RESP,
+                     &result.resp, sizeof(result.resp)) != 0) {
+            return false;
         }
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");

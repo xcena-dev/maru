@@ -22,19 +22,11 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     result.resp.handle = handle;
     result.resp.accessType = static_cast<uint32_t>(AccessType::LOCAL);
     result.resp.requestedSize = requestedSize;
-    result.devicePath = devPath;
 
     if (status == 0) {
         // Resolve device path for the client's node (multi-node support)
-        auto *pool = pm_.findPoolForRegion(handle.regionId);
-        if (pool && !pool->deviceUuid.empty()) {
-            std::string resolved = pm_.resolvePathForClient(
-                pool->deviceUuid, ctx.client_id);
-            if (!resolved.empty()) {
-                devPath = resolved;
-            }
-        }
-        result.devicePath = devPath;
+        std::string resolved = pm_.resolveDevicePath(handle.regionId, ctx.client_id);
+        result.devicePath = resolved.empty() ? devPath : resolved;
 
         logf(LogLevel::Debug,
              "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s",
@@ -42,7 +34,7 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
              (unsigned long long)req.size,
              ctx.dax_path.c_str(),
              (unsigned long long)handle.regionId,
-             devPath.c_str());
+             result.devicePath.c_str());
     } else {
         logf(LogLevel::Warn,
              "[ALLOC] client=%s, size=%llu, pool=%s -> FAILED (status=%d)",
@@ -85,21 +77,14 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
 
     if (status == 0) {
         // Resolve device path for the client's node (multi-node support)
-        auto *pool = pm_.findPoolForRegion(req.handle.regionId);
-        if (pool && !pool->deviceUuid.empty()) {
-            std::string resolved = pm_.resolvePathForClient(
-                pool->deviceUuid, ctx.client_id);
-            if (!resolved.empty()) {
-                pathToOpen = resolved;
-            }
-        }
-        result.devicePath = pathToOpen;
+        std::string resolved = pm_.resolveDevicePath(req.handle.regionId, ctx.client_id);
+        result.devicePath = resolved.empty() ? pathToOpen : resolved;
         result.offset = req.handle.offset;
         result.length = req.handle.length;
         logf(LogLevel::Debug,
              "[GET_ACCESS] region_id=%llu -> path=%s",
              (unsigned long long)req.handle.regionId,
-             pathToOpen.c_str());
+             result.devicePath.c_str());
     } else {
         result.status = status;
         logf(LogLevel::Warn,
@@ -112,13 +97,16 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
 }
 
 NodeRegisterResult RequestHandler::handleNodeRegister(
-    const std::string &nodeId,
-    const std::vector<PoolManager::DeviceMapping> &mappings) {
+    const PoolManager::NodeList &nodes) {
     NodeRegisterResult result;
-    int matched = pm_.registerNode(nodeId, mappings);
+    int matched = pm_.registerNodes(nodes);
+    uint32_t totalDevices = 0;
+    for (const auto &[nodeId, mappings] : nodes) {
+        totalDevices += static_cast<uint32_t>(mappings.size());
+    }
     result.resp.status = 0;
     result.resp.matched = static_cast<uint32_t>(matched);
-    result.resp.total = static_cast<uint32_t>(mappings.size());
+    result.resp.total = totalDevices;
     return result;
 }
 

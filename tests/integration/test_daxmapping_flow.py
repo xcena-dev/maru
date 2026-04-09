@@ -42,7 +42,7 @@ class MockRM:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
         self._sock.listen(5)
-        self._sock.settimeout(5.0)
+        self._sock.settimeout(0.1)
         self.port = self._sock.getsockname()[1]
         self.address = f"127.0.0.1:{self.port}"
         self._running = True
@@ -192,12 +192,18 @@ def meta_server(mock_rm, zmq_port):
     rpc = RpcServer(server, host="127.0.0.1", port=zmq_port)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
-    time.sleep(0.1)
+    # Wait for RPC server to be ready
+    for _ in range(50):
+        try:
+            with socket.create_connection(("127.0.0.1", zmq_port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.01)
 
     yield server
 
     rpc.stop()
-    thread.join(timeout=5.0)
+    thread.join(timeout=0.5)
 
 
 @pytest.fixture
@@ -233,8 +239,11 @@ class TestDaxMappingFlow:
         assert resp["success"] is True
         assert "rm_address" in resp
 
-        # Wait briefly for async NODE_REGISTER to be sent
-        time.sleep(0.3)
+        # Poll for async NODE_REGISTER
+        for _ in range(50):
+            if len(mock_rm.node_register_calls) >= 1:
+                break
+            time.sleep(0.01)
 
         # Verify NODE_REGISTER was received by mock RM
         assert len(mock_rm.node_register_calls) >= 1
@@ -260,22 +269,30 @@ class TestDaxMappingFlow:
     def test_multiple_handlers_aggregate(self, handler_client, meta_server, mock_rm):
         """Two handlers register → both appear in NODE_REGISTER."""
         # First handler
+        initial_count = len(mock_rm.node_register_calls)
         handler_client.handshake(
             extra={
                 "hostname": "node-0",
                 "devices": [{"uuid": "uuid-A", "dax_path": "/dev/dax2.0"}],
             }
         )
-        time.sleep(0.2)
+        for _ in range(50):
+            if len(mock_rm.node_register_calls) > initial_count:
+                break
+            time.sleep(0.01)
 
         # Second handler (reuse same client for simplicity)
+        second_count = len(mock_rm.node_register_calls)
         handler_client.handshake(
             extra={
                 "hostname": "node-1",
                 "devices": [{"uuid": "uuid-A", "dax_path": "/dev/dax3.0"}],
             }
         )
-        time.sleep(0.2)
+        for _ in range(50):
+            if len(mock_rm.node_register_calls) > second_count:
+                break
+            time.sleep(0.01)
 
         # Last NODE_REGISTER should contain all nodes
         last_call = mock_rm.node_register_calls[-1]
@@ -294,7 +311,8 @@ class TestDaxMappingFlow:
         resp = handler_client.handshake(extra={})
 
         assert resp["success"] is True
-        time.sleep(0.2)
+        # Brief wait — we expect NO new call, so we can't poll for a positive condition
+        time.sleep(0.05)
 
         # No new NODE_REGISTER should be sent (no new node was added)
         assert len(mock_rm.node_register_calls) == initial_count

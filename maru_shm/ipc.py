@@ -12,7 +12,7 @@ Wire format::
 """
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 from .types import DaxType, MaruHandle, MaruPoolInfo
@@ -481,11 +481,7 @@ class NodeRegisterReq:
                 path_len(u16) + path(bytes)
     """
 
-    nodes: list[tuple[str, list[tuple[str, str]]]] = None  # [(node_id, [(uuid, path)])]
-
-    def __post_init__(self):
-        if self.nodes is None:
-            self.nodes = []
+    nodes: list[tuple[str, list[tuple[str, str]]]] = field(default_factory=list)
 
     def pack(self) -> bytes:
         parts = [struct.pack("<I", len(self.nodes))]

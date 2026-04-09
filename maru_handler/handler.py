@@ -208,10 +208,11 @@ class MaruHandler:
 
             # 1b. Scan local devices and handshake with server
             try:
+                import platform
+
                 from maru_shm.device_scanner import scan_dax_devices
 
                 local_devices = scan_dax_devices()
-                import platform
 
                 handshake_data = {
                     "hostname": platform.node(),
