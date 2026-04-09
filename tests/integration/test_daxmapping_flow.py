@@ -23,7 +23,6 @@ from maru_shm.ipc import (
     HEADER_SIZE,
     MsgHeader,
     MsgType,
-    NodeRegisterReq,
     NodeRegisterResp,
 )
 
@@ -66,7 +65,7 @@ class MockRM:
         while self._running:
             try:
                 conn, _ = self._sock.accept()
-            except (OSError, socket.timeout):
+            except (TimeoutError, OSError):
                 continue
             threading.Thread(
                 target=self._handle_conn, args=(conn,), daemon=True
@@ -91,9 +90,7 @@ class MockRM:
 
                 if hdr.msg_type == MsgType.STATS_REQ:
                     # is_running() probe sends STATS_REQ — respond with empty stats
-                    self._send_response(
-                        conn, MsgType.STATS_RESP, struct.pack("<I", 0)
-                    )
+                    self._send_response(conn, MsgType.STATS_RESP, struct.pack("<I", 0))
                 elif hdr.msg_type == MsgType.NODE_REGISTER_REQ:
                     self._handle_node_register(conn, payload)
                 else:
@@ -103,7 +100,7 @@ class MockRM:
                         MsgType.ERROR_RESP,
                         struct.pack("<i", -1) + b"unknown",
                     )
-        except (OSError, socket.timeout):
+        except (TimeoutError, OSError):
             pass
         finally:
             conn.close()
@@ -185,9 +182,10 @@ def meta_server(mock_rm, zmq_port):
         ("uuid-A", "/dev/dax0.0"),
         ("uuid-B", "/dev/dax1.0"),
     ]
-    with patch(
-        "maru_server.server.scan_dax_devices", return_value=meta_devices
-    ), patch("maru_server.server.platform") as mock_platform:
+    with (
+        patch("maru_server.server.scan_dax_devices", return_value=meta_devices),
+        patch("maru_server.server.platform") as mock_platform,
+    ):
         mock_platform.node.return_value = "meta-node"
         server = MaruServer(rm_address=mock_rm.address)
 
@@ -255,15 +253,11 @@ class TestDaxMappingFlow:
         assert handler_devices["uuid-B"] == "/dev/dax0.0"
 
         # Verify meta-node device mappings (different paths for same UUIDs)
-        meta_devices = dict(
-            next(devs for nid, devs in last_call if nid == "meta-node")
-        )
+        meta_devices = dict(next(devs for nid, devs in last_call if nid == "meta-node"))
         assert meta_devices["uuid-A"] == "/dev/dax0.0"
         assert meta_devices["uuid-B"] == "/dev/dax1.0"
 
-    def test_multiple_handlers_aggregate(
-        self, handler_client, meta_server, mock_rm
-    ):
+    def test_multiple_handlers_aggregate(self, handler_client, meta_server, mock_rm):
         """Two handlers register → both appear in NODE_REGISTER."""
         # First handler
         handler_client.handshake(
@@ -305,9 +299,7 @@ class TestDaxMappingFlow:
         # No new NODE_REGISTER should be sent (no new node was added)
         assert len(mock_rm.node_register_calls) == initial_count
 
-    def test_handshake_returns_rm_address(
-        self, handler_client, meta_server, mock_rm
-    ):
+    def test_handshake_returns_rm_address(self, handler_client, meta_server, mock_rm):
         """HANDSHAKE response includes RM address for direct handler→RM access."""
         resp = handler_client.handshake(
             extra={

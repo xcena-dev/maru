@@ -24,9 +24,7 @@ def _make_header(
     return struct.pack(_HEADER_FORMAT, magic, version, uuid_bytes, reserved)
 
 
-SAMPLE_UUID_BYTES = (
-    b"\x55\x0e\x84\x00\xe2\x9b\x41\xd4\xa7\x16\x44\x66\x55\x44\x00\x00"
-)
+SAMPLE_UUID_BYTES = b"\x55\x0e\x84\x00\xe2\x9b\x41\xd4\xa7\x16\x44\x66\x55\x44\x00\x00"
 SAMPLE_UUID_STR = "550e8400-e29b-41d4-a716-446655440000"
 
 
@@ -73,9 +71,7 @@ class TestReadDeviceUuid:
         assert read_device_uuid(str(dev)) == SAMPLE_UUID_STR
 
     def test_os_error_returns_none(self):
-        with mock.patch(
-            "maru_shm.device_scanner.os.open", side_effect=OSError("perm")
-        ):
+        with mock.patch("maru_shm.device_scanner.os.open", side_effect=OSError("perm")):
             assert read_device_uuid("/dev/dax0.0") is None
 
 
@@ -88,10 +84,9 @@ class TestScanDaxDevices:
             assert scan_dax_devices() == []
 
     def test_listdir_oserror(self):
-        with mock.patch(
-            "maru_shm.device_scanner.os.path.isdir", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.os.listdir", side_effect=OSError
+        with (
+            mock.patch("maru_shm.device_scanner.os.path.isdir", return_value=True),
+            mock.patch("maru_shm.device_scanner.os.listdir", side_effect=OSError),
         ):
             assert scan_dax_devices() == []
 
@@ -99,16 +94,15 @@ class TestScanDaxDevices:
         uuid_a = b"\x01" * 16
         uuid_b = b"\x02" * 16
 
-        with mock.patch(
-            "maru_shm.device_scanner.os.path.isdir", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.os.listdir",
-            return_value=["dax0.0", "dax1.0"],
-        ), mock.patch(
-            "maru_shm.device_scanner.os.path.exists", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.read_device_uuid"
-        ) as mock_read:
+        with (
+            mock.patch("maru_shm.device_scanner.os.path.isdir", return_value=True),
+            mock.patch(
+                "maru_shm.device_scanner.os.listdir",
+                return_value=["dax0.0", "dax1.0"],
+            ),
+            mock.patch("maru_shm.device_scanner.os.path.exists", return_value=True),
+            mock.patch("maru_shm.device_scanner.read_device_uuid") as mock_read,
+        ):
             mock_read.side_effect = [
                 _uuid_to_string(uuid_a),
                 _uuid_to_string(uuid_b),
@@ -120,23 +114,18 @@ class TestScanDaxDevices:
         assert results[1] == (_uuid_to_string(uuid_b), "/dev/dax1.0")
 
     def test_skips_device_without_valid_header(self):
-        with mock.patch(
-            "maru_shm.device_scanner.os.path.isdir", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.os.listdir", return_value=["dax0.0"]
-        ), mock.patch(
-            "maru_shm.device_scanner.os.path.exists", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.read_device_uuid", return_value=None
+        with (
+            mock.patch("maru_shm.device_scanner.os.path.isdir", return_value=True),
+            mock.patch("maru_shm.device_scanner.os.listdir", return_value=["dax0.0"]),
+            mock.patch("maru_shm.device_scanner.os.path.exists", return_value=True),
+            mock.patch("maru_shm.device_scanner.read_device_uuid", return_value=None),
         ):
             assert scan_dax_devices() == []
 
     def test_skips_nonexistent_dev_path(self):
-        with mock.patch(
-            "maru_shm.device_scanner.os.path.isdir", return_value=True
-        ), mock.patch(
-            "maru_shm.device_scanner.os.listdir", return_value=["dax0.0"]
-        ), mock.patch(
-            "maru_shm.device_scanner.os.path.exists", return_value=False
+        with (
+            mock.patch("maru_shm.device_scanner.os.path.isdir", return_value=True),
+            mock.patch("maru_shm.device_scanner.os.listdir", return_value=["dax0.0"]),
+            mock.patch("maru_shm.device_scanner.os.path.exists", return_value=False),
         ):
             assert scan_dax_devices() == []

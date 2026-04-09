@@ -4,12 +4,9 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from maru_common.protocol import HandshakeRequest
 from maru_server.rpc_handler_mixin import RpcHandlerMixin
 from maru_shm.ipc import NodeRegisterResp
-
 
 # ── _handle_handshake (RpcHandlerMixin) ──────────────────────────────────────
 
@@ -48,9 +45,7 @@ class TestHandleHandshake:
 
     def test_no_hostname_skips_registration(self):
         mixin = self._make_mixin()
-        req = HandshakeRequest(
-            devices=[{"uuid": "uuid-A", "dax_path": "/dev/dax0.0"}]
-        )
+        req = HandshakeRequest(devices=[{"uuid": "uuid-A", "dax_path": "/dev/dax0.0"}])
         resp = mixin._handle_handshake(req)
 
         assert resp["success"] is True
@@ -121,9 +116,7 @@ class TestServerDeviceAggregation:
         ]
 
     def test_register_sends_node_register_to_rm(self):
-        server = self._make_server(
-            local_devices=[("uuid-A", "/dev/dax1.0")]
-        )
+        server = self._make_server(local_devices=[("uuid-A", "/dev/dax1.0")])
         mock_resp = NodeRegisterResp(status=0, matched=1, total=2)
         server._allocation_manager._client.register_node.return_value = mock_resp
 
@@ -158,9 +151,7 @@ class TestServerDeviceAggregation:
         server._allocation_manager._client.register_node.assert_not_called()
 
     def test_send_node_register_exception_logged(self):
-        server = self._make_server(
-            local_devices=[("uuid-A", "/dev/dax0.0")]
-        )
+        server = self._make_server(local_devices=[("uuid-A", "/dev/dax0.0")])
         server._allocation_manager._client.register_node.side_effect = (
             ConnectionRefusedError("RM down")
         )
@@ -180,9 +171,12 @@ class TestHandlerDeviceScan:
             ("uuid-A", "/dev/dax0.0"),
             ("uuid-B", "/dev/dax1.0"),
         ]
-        with patch(
-            "maru_shm.device_scanner.scan_dax_devices", return_value=mock_devices
-        ), patch("platform.node", return_value="test-node"):
+        with (
+            patch(
+                "maru_shm.device_scanner.scan_dax_devices", return_value=mock_devices
+            ),
+            patch("platform.node", return_value="test-node"),
+        ):
             from maru_handler.handler import MaruHandler
 
             handler = object.__new__(MaruHandler)

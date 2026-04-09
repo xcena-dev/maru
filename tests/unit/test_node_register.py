@@ -8,7 +8,6 @@ import pytest
 
 from maru_shm.ipc import NodeRegisterReq, NodeRegisterResp
 
-
 # ── NodeRegisterReq.pack ─────────────────────────────────────────────────────
 
 
@@ -19,9 +18,7 @@ class TestNodeRegisterReqPack:
         assert data == struct.pack("<I", 0)
 
     def test_single_node_single_device(self):
-        req = NodeRegisterReq(
-            nodes=[("node-0", [("uuid-aaa", "/dev/dax0.0")])]
-        )
+        req = NodeRegisterReq(nodes=[("node-0", [("uuid-aaa", "/dev/dax0.0")])])
         data = req.pack()
 
         offset = 0
