@@ -111,42 +111,6 @@ class TestStatsManagerCounters:
         sm.close()
 
 
-class TestStatsManagerCSV:
-    """Test CSV trace writing."""
-
-    def test_csv_written_when_enabled(self, monkeypatch, tmp_path):
-        out = str(tmp_path / "trace.csv")
-        monkeypatch.setenv("MARU_TRACE", out)
-        sm = StatsManager()
-        sm.record("alloc", 1, 4096, 1024, 50.0)
-        sm.record("retrieve", 2, 8192, 2048, 80.0, result="hit")
-        sm.close()
-
-        with open(out) as f:
-            lines = f.readlines()
-        assert len(lines) == 3  # header + 2 events
-        assert "timestamp_s" in lines[0]
-        assert "result" in lines[0]
-        assert "alloc" in lines[1]
-        assert ",hit," in lines[2]
-
-    def test_no_csv_when_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("MARU_TRACE", raising=False)
-        sm = StatsManager()
-        sm.record("alloc", 1, 0, 100, 10.0)
-        sm.close()
-        # No CSV file should be created
-        assert list(tmp_path.iterdir()) == []
-
-    def test_csv_bad_path_no_crash(self, monkeypatch):
-        monkeypatch.setenv("MARU_TRACE", "/nonexistent/dir/trace.csv")
-        sm = StatsManager()  # should not raise
-        sm.record("alloc", 1, 0, 100, 10.0)
-        stats = sm.get_stats()
-        assert stats["clients"]["_all"]["operations"]["alloc"]["count"] == 1  # counters still work
-        sm.close()
-
-
 class TestStatsManagerLifecycle:
     """Test close and idempotency."""
 

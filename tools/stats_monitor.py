@@ -7,7 +7,7 @@ with per-operation sparkline latency graphs and interactive detail panel.
 Usage:
     python -m tools.stats_monitor -p 11008                     # one-shot snapshot
     python -m tools.stats_monitor -p 11008 -w 1                # interactive TUI
-    python -m tools.stats_monitor -p 11008 --csv               # CSV output
+    python -m tools.stats_monitor -p 11008                     # one-shot snapshot
 """
 
 import argparse
@@ -673,7 +673,7 @@ def _tui_loop(
 
 
 # =============================================================================
-# Non-interactive modes (one-shot, CSV)
+# Non-interactive mode (one-shot)
 # =============================================================================
 
 def render_table(stats: dict, ts: str) -> str:
@@ -718,19 +718,6 @@ def render_table(stats: dict, ts: str) -> str:
     return "\n".join(lines)
 
 
-def print_csv_header() -> None:
-    print("timestamp,operation,count,total_bytes,avg_latency_us,min_latency_us,max_latency_us")
-
-
-def print_csv_row(stats: dict, ts: str) -> None:
-    ops = _get_ops(stats)
-    for name in sorted(ops):
-        o = ops[name]
-        print(
-            f"{ts},{name},{o['count']},{o['total_bytes']},"
-            f"{o['avg_latency_us']:.1f},{o['min_latency_us']:.1f},{o['max_latency_us']:.1f}"
-        )
-
 
 # =============================================================================
 # Main
@@ -742,33 +729,22 @@ def main() -> None:
     parser.add_argument("-p", "--port", type=int, default=5555, help="MaruServer port (default: 5555)")
     parser.add_argument("-w", "--watch", type=float, default=0, help="Refresh interval in seconds (0 = one-shot)")
     parser.add_argument("-c", "--count", type=int, default=0, help="Number of iterations (0 = unlimited)")
-    parser.add_argument("--csv", action="store_true", help="Output in CSV format")
     args = parser.parse_args()
 
     server_url = f"tcp://{args.host}:{args.port}"
 
     # Interactive TUI (watch mode)
-    if args.watch > 0 and not args.csv:
+    if args.watch > 0:
         _run_tui(server_url, args.watch, args.count)
         return
 
-    # One-shot / CSV need immediate connection
+    # One-shot
     try:
         client = RpcClient(server_url=server_url)
         client.connect()
     except Exception as e:
         print(f"Error: cannot connect to MaruServer at {server_url}: {e}", file=sys.stderr)
         sys.exit(1)
-
-    if args.csv:
-        print_csv_header()
-        try:
-            stats = fetch_stats(client)
-            print_csv_row(stats, datetime.now().isoformat(timespec="seconds"))
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        return
 
     # One-shot
     try:

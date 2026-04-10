@@ -1,34 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Server-side operation metrics and access pattern tracing.
+"""Server-side operation metrics collection.
 
-Tracks per-operation counters, latency statistics, and optionally writes
-a CSV trace file for scatter-plot visualization.
-
-CSV tracing is activated via environment variable:
-    MARU_TRACE=1              → writes to maru_trace.csv
-    MARU_TRACE=/path/out.csv  → writes to specified path
-    (unset or 0)              → disabled, zero overhead on record path
+Tracks per-operation counters and latency statistics per client.
 """
 
-import csv
 import logging
-import os
 import threading
-import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-
-_CSV_COLUMNS = [
-    "timestamp_s",
-    "op_type",
-    "result",
-    "region_id",
-    "device_offset",
-    "size",
-    "latency_us",
-]
 
 
 @dataclass
@@ -53,41 +34,12 @@ class StatsManager:
     """Server-side metrics collector.
 
     Thread-safe. Collects per-operation counters and latency stats.
-    Optionally writes CSV trace when ``MARU_TRACE`` is set.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._t0 = time.monotonic()
         self._stats: dict[tuple[str, str, str], _OpStats] = {}  # (client_id, op_type, result)
         self._closed = False
-        self._csv_record_count = 0
-
-        # CSV tracing (optional)
-        self._csv_file = None
-        self._csv_writer = None
-        self._init_csv_trace()
-
-    def _init_csv_trace(self) -> None:
-        env = os.environ.get("MARU_TRACE", "")
-        if not env or env.strip().lower() in ("0", "false", "no", "off"):
-            return
-        if env.strip().lower() in ("1", "true", "yes", "on"):
-            output_path = "maru_trace.csv"
-        else:
-            output_path = env.strip()
-        try:
-            self._csv_file = open(output_path, "w", newline="")
-            self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow(_CSV_COLUMNS)
-            self._csv_file.flush()
-            logger.info("Trace CSV enabled → %s", output_path)
-        except OSError:
-            logger.warning(
-                "Failed to open trace file %s, CSV tracing disabled", output_path
-            )
-            self._csv_file = None
-            self._csv_writer = None
 
     def record(
         self,
@@ -100,8 +52,6 @@ class StatsManager:
         client_id: str = "_unknown",
     ) -> None:
         """Record an operation event.
-
-        Updates in-memory counters and optionally writes to CSV.
 
         Args:
             op_type: Operation name (alloc, store, retrieve, etc.)
@@ -136,23 +86,6 @@ class StatsManager:
                 stats.iv_min_us = latency_us
             if latency_us > stats.iv_max_us:
                 stats.iv_max_us = latency_us
-
-            if self._csv_writer is not None:
-                ts = time.monotonic() - self._t0
-                self._csv_writer.writerow(
-                    [
-                        f"{ts:.6f}",
-                        op_type,
-                        result,
-                        region_id,
-                        device_offset,
-                        size,
-                        f"{latency_us:.1f}",
-                    ]
-                )
-                self._csv_record_count += 1
-                if self._csv_record_count % 100 == 0:
-                    self._csv_file.flush()
 
     @staticmethod
     def _new_merged() -> dict:
@@ -209,12 +142,10 @@ class StatsManager:
     def get_stats(self) -> dict:
         """Return per-client and aggregated operation statistics."""
         with self._lock:
-            # Accumulate per (client, op_type)
             per_client: dict[str, dict[str, dict]] = {}
             all_merged: dict[str, dict] = {}
 
             for (client_id, op_type, result), s in sorted(self._stats.items()):
-                # Per-client
                 if client_id not in per_client:
                     per_client[client_id] = {}
                 client_ops = per_client[client_id]
@@ -222,7 +153,6 @@ class StatsManager:
                     client_ops[op_type] = self._new_merged()
                 self._accumulate(client_ops[op_type], s, result)
 
-                # All aggregate
                 if op_type not in all_merged:
                     all_merged[op_type] = self._new_merged()
                 self._accumulate(all_merged[op_type], s, result)
@@ -233,7 +163,6 @@ class StatsManager:
                 s.iv_min_us = float("inf")
                 s.iv_max_us = 0.0
 
-            # Build result
             clients = {"_all": self._finalize(all_merged)}
             for cid, ops in sorted(per_client.items()):
                 clients[cid] = self._finalize(ops)
@@ -241,15 +170,6 @@ class StatsManager:
             return {"clients": clients}
 
     def close(self) -> None:
-        """Flush and close the CSV file if open."""
+        """Mark as closed to reject future records."""
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
-        if self._csv_file is not None:
-            try:
-                self._csv_file.flush()
-                self._csv_file.close()
-            except (OSError, ValueError):
-                pass
-            logger.info("StatsManager trace closed")
