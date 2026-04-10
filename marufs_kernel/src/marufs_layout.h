@@ -144,14 +144,13 @@ struct marufs_superblock {
 	__le64 total_size; /* Total CXL memory size */
 	__le64 shard_table_offset; /* Shard header array offset */
 	__le64 rat_offset; /* RAT (Region Allocation Table) offset */
-	__le64 active_nodes; /* Bitmask of mounted node_ids (bit N = node_id N+1), CAS-managed */
 	__le32 num_shards; /* Number of shards (pow2) */
 	__le32 buckets_per_shard; /* buckets per shard */
 	__le32 entries_per_shard; /* Index entries per shard */
 	__le32 checksum; /* CRC32 */
 
-	/* ── CL1–CL3: reserved (bytes 64–255) ────────────────────────── */
-	__u8 reserved[200]; /* Padding to 256 */
+	/* ── CL1–CL3: reserved (bytes 56–255) ────────────────────────── */
+	__u8 reserved[208]; /* Padding to 256 */
 } __attribute__((packed));
 
 /*

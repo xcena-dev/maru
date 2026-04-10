@@ -13,6 +13,7 @@
  */
 
 #include <linux/blkdev.h>
+#include <linux/crc32.h>
 #include <linux/dax.h>
 #include <linux/dma-buf.h>
 #include <linux/fs.h>
@@ -156,52 +157,6 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 
 /* inode cache */
 static struct kmem_cache *marufs_inode_cachep;
-
-/* ============================================================================
- * active_nodes bitmask helpers (shared superblock CAS)
- * ============================================================================ */
-
-/*
- * marufs_active_nodes_set - atomically set this node's bit in active_nodes
- * Returns -EEXIST if the bit is already set (duplicate node_id).
- */
-static int marufs_active_nodes_set(struct marufs_sb_info *sbi)
-{
-	u64 bit = 1ULL << (sbi->node_id - 1);
-	u64 old, ret_cas;
-
-	do {
-		old = READ_LE64(sbi->gsb->active_nodes);
-		if (old & bit) {
-			pr_err("node_id=%u already mounted by another node\n",
-			       sbi->node_id);
-			return -EEXIST;
-		}
-		ret_cas = marufs_le64_cas(&sbi->gsb->active_nodes, old,
-					  old | bit);
-	} while (ret_cas != old);
-
-	return 0;
-}
-
-/*
- * marufs_active_nodes_clear - atomically clear this node's bit in active_nodes
- * Safe to call if gsb is NULL or node_id is out of range (no-op).
- */
-static void marufs_active_nodes_clear(struct marufs_sb_info *sbi)
-{
-	u64 bit, old, ret_cas;
-
-	if (!sbi->gsb || sbi->node_id < 1 || sbi->node_id > MARUFS_MAX_NODE_ID)
-		return;
-
-	bit = 1ULL << (sbi->node_id - 1);
-	do {
-		old = READ_LE64(sbi->gsb->active_nodes);
-		ret_cas = marufs_le64_cas(&sbi->gsb->active_nodes, old,
-					  old & ~bit);
-	} while (ret_cas != old);
-}
 
 /* ============================================================================
  * inode cache management
@@ -547,6 +502,19 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 }
 
 /*
+ * marufs_gsb_checksum - CRC32 over immutable superblock fields.
+ *
+ * Covers: magic, version, total_size, shard_table_offset, rat_offset,
+ *         num_shards, buckets_per_shard, entries_per_shard.
+ * Skips: checksum (self), reserved.
+ */
+static u32 marufs_gsb_checksum(const struct marufs_superblock *gsb)
+{
+	return crc32(~0, (const u8 *)gsb,
+		     offsetof(struct marufs_superblock, checksum));
+}
+
+/*
  * marufs_format_device - in-kernel format for DEV_DAX and DAXHEAP modes.
  *
  * Initialises filesystem metadata directly on the mapped memory.
@@ -617,7 +585,7 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	WRITE_LE32(gsb->entries_per_shard, entries_per_shard);
 	WRITE_LE64(gsb->shard_table_offset, MARUFS_SHARD_TABLE_OFFSET);
 	WRITE_LE64(gsb->rat_offset, rat_offset);
-	WRITE_LE32(gsb->checksum, 0); /* TODO: CRC32 */
+	WRITE_LE32(gsb->checksum, marufs_gsb_checksum(gsb));
 
 	/* --- Step 2: Shard table --- */
 	for (i = 0; i < num_shards; i++) {
@@ -806,6 +774,16 @@ static int marufs_read_superblock(struct marufs_sb_info *sbi,
 		return -EINVAL;
 	}
 
+	/* Validate CRC32 (immutable fields only, excludes checksum/reserved) */
+	u32 stored = READ_CXL_LE32(gsb->checksum);
+	u32 computed = marufs_gsb_checksum(gsb);
+	if (stored != computed) {
+		if (!silent)
+			pr_err("superblock checksum mismatch (stored=0x%x, computed=0x%x)\n",
+			       stored, computed);
+		return -EINVAL;
+	}
+
 	sbi->gsb = gsb;
 
 	/* Copy geometry fields to sbi */
@@ -860,9 +838,9 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 	 * pointers, and free_hint are all consolidated here.
 	 * GFP_ZERO ensures free_hint starts at 0.
 	 */
-	sbi->shard_cache = kvmalloc_array(
-		sbi->num_shards, sizeof(struct marufs_shard_cache),
-		GFP_KERNEL | __GFP_ZERO);
+	sbi->shard_cache = kvmalloc_array(sbi->num_shards,
+					  sizeof(struct marufs_shard_cache),
+					  GFP_KERNEL | __GFP_ZERO);
 	if (!sbi->shard_cache)
 		return -ENOMEM;
 
@@ -899,8 +877,7 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 		u64 entry_off = READ_CXL_LE64(sh->entry_array_offset);
 
 		/* Validate offsets + array sizes within device bounds */
-		if (!marufs_dax_range_valid(sbi, boff,
-					    (u64)nb * sizeof(u32)) ||
+		if (!marufs_dax_range_valid(sbi, boff, (u64)nb * sizeof(u32)) ||
 		    !marufs_dax_range_valid(sbi, entry_off,
 					    (u64)ne *
 						    MARUFS_INDEX_ENTRY_SIZE)) {
@@ -1045,11 +1022,6 @@ static int marufs_fill_super_common(struct super_block *sb,
 		return ret;
 	}
 
-	/* Cross-node duplicate node_id detection via CAS on shared superblock */
-	ret = marufs_active_nodes_set(sbi);
-	if (ret)
-		return ret;
-
 	/* Step 2: Initialize shard table */
 	ret = marufs_init_shard_table(sbi);
 	if (ret) {
@@ -1114,8 +1086,6 @@ err_free_gsb:
 	/* Free shard_cache and per-shard DRAM arrays allocated before RAT loading */
 	marufs_free_shard_resources(sbi);
 
-	/* Clear active_nodes bit on mount failure */
-	marufs_active_nodes_clear(sbi);
 	return ret;
 }
 
@@ -1143,7 +1113,7 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->node_id = opts.node_id;
 	spin_lock_init(&sbi->lock);
 
-	/* Validate node_id range for active_nodes bitmask */
+	/* Validate node_id range */
 	if (opts.node_id > MARUFS_MAX_NODE_ID) {
 		pr_err("node_id=%d exceeds maximum %d\n", opts.node_id,
 		       MARUFS_MAX_NODE_ID);
@@ -1252,9 +1222,6 @@ static void marufs_kill_sb(struct super_block *sb)
 	if (sbi) {
 		/* Stop background GC thread */
 		marufs_gc_stop(sbi);
-
-		/* Clear node_id bit in shared superblock via CAS */
-		marufs_active_nodes_clear(sbi);
 
 		/* RAT mode: regions persist across mounts, GC handles cleanup */
 
