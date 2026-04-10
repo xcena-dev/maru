@@ -35,6 +35,11 @@ protected:
         removePath(tmpDir_);
     }
 
+    std::string callResolvePathForClient(const std::string &uuid,
+                                           const std::string &clientId) {
+        return pm_->resolvePathForClient(uuid, clientId);
+    }
+
     std::string getHostname() {
         char buf[256];
         if (::gethostname(buf, sizeof(buf)) == 0) {
@@ -69,18 +74,18 @@ TEST_F(PoolManagerUuidTest, RegisterNodesDuplicateUpdates) {
 
     // Re-register same node with updated path
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax1.0"}}}});
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax1.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax1.0");
 }
 
 TEST_F(PoolManagerUuidTest, RegisterNodesDeviceRemoved) {
     // node-0 has uuid-A
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax0.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-0:1234"), "/dev/dax0.0");
 
     // node-0 re-registers without uuid-A (device removed), uuid-B added
     pm_->registerNodes({{"node-0", {{"uuid-B", "/dev/dax1.0"}}}});
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:1234"), "");  // stale cleared
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-B", "node-0:1234"), "/dev/dax1.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-0:1234"), "");  // stale cleared
+    EXPECT_EQ(callResolvePathForClient("uuid-B", "node-0:1234"), "/dev/dax1.0");
 }
 
 TEST_F(PoolManagerUuidTest, RegisterMultipleNodes) {
@@ -105,22 +110,22 @@ TEST_F(PoolManagerUuidTest, MultipleMetaServersPreserveOtherNodes) {
         {"node-2", {{"uuid-A", "/dev/dax2.0"}}},
     });
 
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:100"), "/dev/dax0.0");
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-1:200"), "/dev/dax1.0");
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-2:300"), "/dev/dax2.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-0:100"), "/dev/dax0.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-1:200"), "/dev/dax1.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-2:300"), "/dev/dax2.0");
 }
 
 // ── resolvePathForClient ────────────────────────────────────────────────────
 
 TEST_F(PoolManagerUuidTest, ResolveEmptyUuidReturnsEmpty) {
-    std::string path = pm_->resolvePathForClient("", "node-0:1234");
+    std::string path = callResolvePathForClient("", "node-0:1234");
     EXPECT_EQ(path, "");
 }
 
 TEST_F(PoolManagerUuidTest, ResolveRemoteClientFromMapping) {
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
 
-    std::string path = pm_->resolvePathForClient("uuid-A", "node-0:1234");
+    std::string path = callResolvePathForClient("uuid-A", "node-0:1234");
     EXPECT_EQ(path, "/dev/dax0.0");
 }
 
@@ -130,21 +135,21 @@ TEST_F(PoolManagerUuidTest, ResolveRemoteClientDifferentPaths) {
         {"node-1", {{"uuid-A", "/dev/dax0.0"}}},
     });
 
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-0:100"), "/dev/dax1.0");
-    EXPECT_EQ(pm_->resolvePathForClient("uuid-A", "node-1:200"), "/dev/dax0.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-0:100"), "/dev/dax1.0");
+    EXPECT_EQ(callResolvePathForClient("uuid-A", "node-1:200"), "/dev/dax0.0");
 }
 
 TEST_F(PoolManagerUuidTest, ResolveUnregisteredNodeReturnsEmpty) {
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
 
-    std::string path = pm_->resolvePathForClient("uuid-A", "node-99:1234");
+    std::string path = callResolvePathForClient("uuid-A", "node-99:1234");
     EXPECT_EQ(path, "");
 }
 
 TEST_F(PoolManagerUuidTest, ResolveUnknownUuidReturnsEmpty) {
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
 
-    std::string path = pm_->resolvePathForClient("uuid-UNKNOWN", "node-0:1234");
+    std::string path = callResolvePathForClient("uuid-UNKNOWN", "node-0:1234");
     EXPECT_EQ(path, "");
 }
 
@@ -152,7 +157,7 @@ TEST_F(PoolManagerUuidTest, ResolveClientIdWithoutPort) {
     pm_->registerNodes({{"node-0", {{"uuid-A", "/dev/dax0.0"}}}});
 
     // clientId without ":pid" should use whole string as hostname
-    std::string path = pm_->resolvePathForClient("uuid-A", "node-0");
+    std::string path = callResolvePathForClient("uuid-A", "node-0");
     EXPECT_EQ(path, "/dev/dax0.0");
 }
 
@@ -161,7 +166,7 @@ TEST_F(PoolManagerUuidTest, ResolveLocalClientNoPool) {
     std::string hostname = getHostname();
     if (hostname.empty()) GTEST_SKIP() << "Cannot determine hostname";
 
-    std::string path = pm_->resolvePathForClient("uuid-A", hostname + ":1234");
+    std::string path = callResolvePathForClient("uuid-A", hostname + ":1234");
     EXPECT_EQ(path, "");
 }
 

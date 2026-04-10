@@ -66,7 +66,7 @@ class MaruServer:
     def _validate_dax_paths(self) -> None:
         """Warn if any --dax-path values don't match resource manager pools."""
         try:
-            pools = self._allocation_manager._client.stats()
+            pools = self._allocation_manager.pool_stats()
             available = {p.dax_path for p in pools}
             for path in self._dax_paths:
                 if path not in available:
@@ -83,20 +83,26 @@ class MaruServer:
 
     def register_handler_devices(self, hostname: str, devices: list[dict]) -> None:
         """Store handler's device mappings and send NODE_REGISTER to RM."""
-        device_list = [(d["uuid"], d["dax_path"]) for d in devices]
-        self._node_devices[hostname] = device_list
-        logger.info("Handler %s registered %d devices", hostname, len(device_list))
-        self._send_node_register()
+        device_list = []
+        for d in devices:
+            if isinstance(d, dict) and "uuid" in d and "dax_path" in d:
+                device_list.append((d["uuid"], d["dax_path"]))
+            else:
+                logger.warning("Skipping malformed device entry from %s: %s", hostname, d)
+        with self._lock:
+            self._node_devices[hostname] = device_list
+            logger.info("Handler %s registered %d devices", hostname, len(device_list))
+            self._send_node_register()
 
     def _send_node_register(self) -> None:
-        """Send all collected node device mappings to RM."""
+        """Send all collected node device mappings to RM. Caller must hold _lock."""
         if not self._node_devices:
             return
         nodes = [
             (hostname, devices) for hostname, devices in self._node_devices.items()
         ]
         try:
-            resp = self._allocation_manager._client.register_node(nodes)
+            resp = self._allocation_manager.register_node(nodes)
             logger.info(
                 "NODE_REGISTER sent: matched=%d, total=%d",
                 resp.matched,

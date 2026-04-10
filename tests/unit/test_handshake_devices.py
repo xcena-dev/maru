@@ -2,6 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for HANDSHAKE device list and MetaServer aggregation."""
 
+from threading import RLock
 from unittest.mock import MagicMock, patch
 
 from maru_common.protocol import HandshakeRequest
@@ -92,6 +93,7 @@ class TestServerDeviceAggregation:
         server._hostname = "meta-node"
         server._allocation_manager = MagicMock()
         server._rm_address = "10.0.0.1:9850"
+        server._lock = RLock()
 
         if local_devices:
             server._node_devices[server._hostname] = local_devices
@@ -105,7 +107,7 @@ class TestServerDeviceAggregation:
             {"uuid": "uuid-B", "dax_path": "/dev/dax1.0"},
         ]
         mock_resp = NodeRegisterResp(status=0, matched=2, total=2)
-        server._allocation_manager._client.register_node.return_value = mock_resp
+        server._allocation_manager.register_node.return_value = mock_resp
 
         server.register_handler_devices("node-0", devices)
 
@@ -118,19 +120,19 @@ class TestServerDeviceAggregation:
     def test_register_sends_node_register_to_rm(self):
         server = self._make_server(local_devices=[("uuid-A", "/dev/dax1.0")])
         mock_resp = NodeRegisterResp(status=0, matched=1, total=2)
-        server._allocation_manager._client.register_node.return_value = mock_resp
+        server._allocation_manager.register_node.return_value = mock_resp
 
         devices = [{"uuid": "uuid-A", "dax_path": "/dev/dax0.0"}]
         server.register_handler_devices("handler-node", devices)
 
-        call_args = server._allocation_manager._client.register_node.call_args[0][0]
+        call_args = server._allocation_manager.register_node.call_args[0][0]
         hostnames = {node_id for node_id, _ in call_args}
         assert hostnames == {"meta-node", "handler-node"}
 
     def test_multiple_handlers_aggregate(self):
         server = self._make_server()
         mock_resp = NodeRegisterResp(status=0, matched=0, total=0)
-        server._allocation_manager._client.register_node.return_value = mock_resp
+        server._allocation_manager.register_node.return_value = mock_resp
 
         server.register_handler_devices(
             "node-0", [{"uuid": "uuid-A", "dax_path": "/dev/dax0.0"}]
@@ -141,18 +143,18 @@ class TestServerDeviceAggregation:
 
         assert len(server._node_devices) == 2
         # Last NODE_REGISTER call should include both nodes
-        call_args = server._allocation_manager._client.register_node.call_args[0][0]
+        call_args = server._allocation_manager.register_node.call_args[0][0]
         hostnames = {node_id for node_id, _ in call_args}
         assert hostnames == {"node-0", "node-1"}
 
     def test_send_node_register_empty_devices_noop(self):
         server = self._make_server()
         server._send_node_register()
-        server._allocation_manager._client.register_node.assert_not_called()
+        server._allocation_manager.register_node.assert_not_called()
 
     def test_send_node_register_exception_logged(self):
         server = self._make_server(local_devices=[("uuid-A", "/dev/dax0.0")])
-        server._allocation_manager._client.register_node.side_effect = (
+        server._allocation_manager.register_node.side_effect = (
             ConnectionRefusedError("RM down")
         )
         # Should not raise

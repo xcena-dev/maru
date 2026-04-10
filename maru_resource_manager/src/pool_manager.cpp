@@ -515,7 +515,7 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
                  path.c_str(), uuidToString(hdr.uuid).c_str());
         }
         deviceUuid = uuidToString(hdr.uuid);
-        dataOffset = kDeviceHeaderSize;
+        dataOffset = devAlign;
     }
 
     PoolState pool{};
@@ -886,7 +886,6 @@ int PoolManager::registerNodes(const NodeList &nodes)
                 ++matched;
             }
         }
-        registeredNodes_.insert(nodeId);
     }
     logf(LogLevel::Info,
          "[NODE_REGISTER] %zu nodes updated, matched=%d",

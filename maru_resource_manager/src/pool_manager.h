@@ -5,12 +5,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
 #include "log.h"
 #include "types.h"
+
+class PoolManagerUuidTest;
 
 namespace maru
 {
@@ -52,6 +53,8 @@ class WalStore;
 
 class PoolManager
 {
+    friend class ::PoolManagerUuidTest;
+
 public:
     explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30);
     ~PoolManager();
@@ -93,13 +96,6 @@ public:
     /// single lock. Returns empty string if no resolution needed or no mapping.
     std::string resolveDevicePath(uint64_t regionId, const std::string &clientId);
 
-    /// Resolve the correct local dax_path for a client based on its hostname.
-    /// For DEV_DAX: looks up node mapping table. For FS_DAX: returns path as-is.
-    /// Returns empty string if no mapping found (unregistered node).
-    /// NOTE: caller must NOT hold mu_ (this method does not lock).
-    std::string resolvePathForClient(const std::string &deviceUuid,
-                                     const std::string &clientId);
-
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
 
@@ -131,6 +127,10 @@ private:
     PoolState *findPoolByPath(const std::string &devPath);
     PoolState *findPoolByUuid(const std::string &uuid);
     PoolState *findPoolForRegion(uint64_t regionId);
+    /// Resolve the correct local dax_path for a client based on its hostname.
+    /// Caller MUST hold mu_.
+    std::string resolvePathForClient(const std::string &deviceUuid,
+                                     const std::string &clientId);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
@@ -150,7 +150,6 @@ private:
 
     // Node mapping table: device_uuid → { hostname → local_dax_path }
     std::map<std::string, std::map<std::string, std::string>> nodeMappings_;
-    std::set<std::string> registeredNodes_;
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;
