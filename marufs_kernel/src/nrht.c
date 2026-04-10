@@ -97,7 +97,9 @@ static int nrht_is_stale(struct marufs_sb_info *sbi,
 {
 	u32 ins_node = READ_CXL_LE32(e->inserter_node);
 	if (ins_node == 0)
-		return (sbi->node_id == 1) ? 0 : -1; /* Only admin node tracks orphans */
+		return (sbi->node_id == 1) ?
+			       0 :
+			       -1; /* Only admin node tracks orphans */
 
 	if (ins_node != sbi->node_id)
 		return -1;
@@ -345,6 +347,18 @@ static struct marufs_nrht_entry *nrht_find_chain(struct nrht_shard_ctx *ctx,
  * Slot acquisition + link + publish
  * ============================================================================ */
 
+static inline void nrht_shard_lock(struct marufs_nrht_shard_header *hdr)
+{
+	while (marufs_le32_cas(&hdr->lock, 0, 1) != 0)
+		cpu_relax();
+}
+
+static inline void nrht_shard_unlock(struct marufs_nrht_shard_header *hdr)
+{
+	WRITE_LE32(hdr->lock, 0);
+	MARUFS_CXL_WMB(&hdr->lock, sizeof(hdr->lock));
+}
+
 static int nrht_link_to_bucket(struct marufs_nrht_entry *entry, u32 entry_idx,
 			       u32 *bucket_head)
 {
@@ -382,23 +396,46 @@ static int nrht_link_to_bucket(struct marufs_nrht_entry *entry, u32 entry_idx,
 }
 
 /*
- * nrht_post_insert_dedup - detect concurrent duplicate after publish.
- * If another VALID entry with the same name exists, higher entry_idx loses
- * and rolls back to TOMBSTONE.
- * Return: 0 if unique, -EEXIST if this entry lost dedup.
+ * nrht_post_insert_dedup - detect duplicate under shard lock.
+ * Called after link_to_bucket while holding the shard lock.  Walks the
+ * bucket chain looking for another VALID entry with the same name.
+ * If found, returns -EEXIST so the caller can tombstone and release.
  */
 static int nrht_post_insert_dedup(struct nrht_shard_ctx *ctx,
 				  struct marufs_nrht_entry *entry,
 				  u32 entry_idx, u64 hash, const char *name,
 				  size_t namelen)
 {
-	u32 winner_idx;
-	struct marufs_nrht_entry *winner =
-		nrht_find_chain(ctx, hash, name, namelen, &winner_idx, NULL);
-	if (winner && winner != entry && entry_idx > winner_idx) {
-		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
-		MARUFS_CXL_WMB(entry, 64);
-		return -EEXIST;
+	u32 *head = ctx->bucket_head;
+	MARUFS_CXL_RMB(head, sizeof(*head));
+	u32 cur = READ_CXL_LE32(*head);
+	u32 steps = 0;
+
+	while (cur != MARUFS_BUCKET_END && cur < ctx->num_entries) {
+		if (++steps > ctx->num_entries) {
+			pr_err("nrht: chain cycle detected\n");
+			return -EIO;
+		}
+
+		struct marufs_nrht_entry *e = &ctx->entries[cur];
+		MARUFS_CXL_RMB(e, 64);
+		u32 next = READ_CXL_LE32(e->next_in_bucket);
+
+		if (entry_idx == cur) {
+			cur = next;
+			continue;
+		}
+
+		if (next != MARUFS_BUCKET_END && next < ctx->num_entries)
+			prefetch(&ctx->entries[next]);
+
+		u32 state = READ_CXL_LE32(e->state);
+		if (state == MARUFS_ENTRY_VALID &&
+		    nrht_name_matches(e, hash, name, namelen)) {
+			return -EEXIST;
+		}
+
+		cur = next;
 	}
 
 	return 0;
@@ -491,10 +528,6 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		return -ENOSPC;
 	}
 
-	/* Tag region as NRHT for GC discovery via RAT scan */
-	WRITE_LE32(rat_e->region_type, MARUFS_REGION_NRHT);
-	MARUFS_CXL_WMB(rat_e, 64);
-
 	/* Register in DRAM bitmap for fast GC enumeration */
 	set_bit(nrht_region_id, sbi->gc_nrht_bitmap);
 
@@ -506,16 +539,18 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	if (!base)
 		return -EINVAL;
 
-	/* Double-init protection: only for pre-existing regions (ftruncate path).
-	 * Freshly allocated memory may contain stale magic from recycled regions. */
-	if (!freshly_allocated) {
-		struct marufs_nrht_header *existing = base;
-		MARUFS_CXL_RMB(existing, sizeof(*existing));
-		if (READ_CXL_LE32(existing->magic) == MARUFS_NRHT_MAGIC) {
-			pr_err("nrht_init: region %u already formatted\n",
-			       nrht_region_id);
-			return -EEXIST;
-		}
+	/* Double-init protection: check the RAT entry's region_type rather than
+	 * probing physical data for magic.  rat_entry_reset() zeroes region_type
+	 * to MARUFS_REGION_DATA on every alloc/free, so REGION_NRHT here means
+	 * nrht_init already ran on THIS lifecycle — genuine double-init.
+	 * Stale NRHT magic in recycled CXL physical space is safely ignored.
+	 * NOTE: region_type is set to NRHT *after* format (below), so this
+	 * check only triggers on a second call, not the first. */
+	if (!freshly_allocated &&
+	    READ_CXL_LE32(rat_e->region_type) == MARUFS_REGION_NRHT) {
+		pr_err("nrht_init: region %u already formatted\n",
+		       nrht_region_id);
+		return -EEXIST;
 	}
 
 	/* Zero + format */
@@ -555,6 +590,12 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 
 		offset += per_shard_size;
 	}
+
+	/* Tag region as NRHT for GC discovery and double-init protection.
+	 * Must be AFTER format so the double-init check above doesn't
+	 * see our own write on the first call. */
+	WRITE_LE32(rat_e->region_type, MARUFS_REGION_NRHT);
+	MARUFS_CXL_WMB(rat_e, 64);
 
 	pr_info("nrht_init: region %u, %u shards, %u entries/shard, %u buckets/shard, %llu bytes\n",
 		nrht_region_id, num_shards, entries_per_shard,
@@ -648,40 +689,51 @@ int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		return -ENOSPC;
 
 	/* Step 3: fill fields (both CL0 and CL1) */
-	size_t copy_len = min(namelen, sizeof(entry->name) - 1);
-
 	WRITE_LE64(entry->name_hash, name_hash);
 	WRITE_LE64(entry->offset, offset);
 	WRITE_LE32(entry->target_region_id, target_region_id);
 	WRITE_LE32(entry->inserter_node, sbi->node_id);
 	WRITE_LE64(entry->created_at, ktime_get_real_ns());
 
+	size_t copy_len = min(namelen, sizeof(entry->name) - 1);
 	memset(entry->name, 0, sizeof(entry->name));
 	memcpy(entry->name, name, copy_len);
 
 	MARUFS_CXL_WMB(entry, sizeof(*entry)); /* flush both CL0 + CL1 */
 
-	/* Step 4: link to bucket (skip if reused — already in chain) */
+	/* Step 4: INSERTING → TENTATIVE (visible in chain but not yet VALID) */
+	WRITE_LE32(entry->state, MARUFS_ENTRY_TENTATIVE);
+	MARUFS_CXL_WMB(entry, 64);
+
+	/* Step 5: acquire shard lock — serializes link + dedup within shard */
+	nrht_shard_lock(ctx.header);
+
+	/* Step 6: link to bucket (skip if reused — already in chain) */
 	if (!reused_chain_entry) {
 		ret = nrht_link_to_bucket(entry, entry_idx, ctx.bucket_head);
-		if (ret)
-			return ret;
+		if (ret) {
+			WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+			MARUFS_CXL_WMB(entry, 64);
+			goto unlock;
+		}
 	}
 
-	/* Step 5: publish INSERTING → VALID */
+	/* Step 7: post-insert dedup — concurrent inserts resolved here */
+	ret = nrht_post_insert_dedup(&ctx, entry, entry_idx, name_hash, name,
+				     namelen);
+	if (ret) {
+		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+		MARUFS_CXL_WMB(entry, 64);
+		goto unlock;
+	}
+
+	/* Step 8: TENTATIVE → VALID (entry is now queryable) */
 	WRITE_LE32(entry->state, MARUFS_ENTRY_VALID);
 	MARUFS_CXL_WMB(entry, 64);
 
-	/* Step 6: post-insert dedup — concurrent inserts resolved here */
-	ret = nrht_post_insert_dedup(&ctx, entry, entry_idx, name_hash, name,
-				     namelen);
-	if (ret)
-		return ret;
-
-	pr_debug("nrht: insert '%.*s' -> entry %u (region %u offset %llu)\n",
-		 (int)namelen, name, entry_idx, target_region_id, offset);
-
-	return 0;
+unlock:
+	nrht_shard_unlock(ctx.header);
+	return ret;
 }
 
 int marufs_nrht_lookup(struct marufs_sb_info *sbi, u32 nrht_region_id,

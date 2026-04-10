@@ -91,9 +91,10 @@ Hash routing (shard/bucket selection) and bucket chain structure are identical t
 | 8B | `bucket_array_offset` | **Absolute** device offset of bucket array |
 | 8B | `entry_array_offset` | Absolute offset of entry array |
 | 4B | `free_hint` | Flat scan start hint (best-effort, no CAS needed) |
-| 36B | `reserved` | Padding |
+| 4B | `lock` | Shard-level CAS spinlock (0=unlocked, 1=locked) |
+| 32B | `reserved` | Padding |
 
-**Usage**: `nrht_get_shard_ctx()` — read shard header → convert offsets to DAX pointers → cache in `nrht_shard_ctx` struct. `free_hint` is read and updated by insert's flat scan (only advances on insert, delete does not touch it).
+**Usage**: `nrht_get_shard_ctx()` — read shard header → convert offsets to DAX pointers → cache in `nrht_shard_ctx` struct. `free_hint` is read and updated by insert's flat scan (only advances on insert, delete does not touch it). `lock` is acquired via `CAS(0,1)` spinloop in `marufs_nrht_insert()` to serialize bucket linking and post-insert dedup within a shard.
 
 ### 3.3 NRHT Entry (128B, 2 CL)
 
@@ -101,7 +102,7 @@ Hash routing (shard/bucket selection) and bucket chain structure are identical t
 
 | CL | Size | Field | Description |
 |----|------|-------|-------------|
-| CL0 | 4B | `state` | CAS target: EMPTY(0) / INSERTING(1) / VALID(2) / TOMBSTONE(3) |
+| CL0 | 4B | `state` | CAS target: EMPTY(0) / INSERTING(1) / TENTATIVE(2) / VALID(3) / TOMBSTONE(4) |
 | CL0 | 4B | `next_in_bucket` | Chain link (`BUCKET_END` = end) |
 | CL0 | 8B | `name_hash` | 64-bit SHA-256 truncated hash |
 | CL0 | 8B | `offset` | Offset within target region's data area |
@@ -117,21 +118,23 @@ The CPU fetches only the CLs actually accessed, so on hash mismatch during chain
 
 ## 4. NRHT Entry Lifecycle
 
-Same 4-state pattern as Global Index. Delete only transitions to TOMBSTONE; TOMBSTONE entries are reused in-place by the insert path.
+5-state pattern with shard lock serialization. Delete only transitions to TOMBSTONE; TOMBSTONE entries are reused in-place by the insert path.
 
 ### 4.1 State Transition Diagram
 
 ```mermaid
 flowchart LR
   EMPTY -->|"insert (claim)"| INSERTING
-  INSERTING -->|"publish"| VALID
+  INSERTING -->|"fields written"| TENTATIVE
+  TENTATIVE -->|"dedup pass"| VALID
+  TENTATIVE -->|"dedup fail"| TOMBSTONE
   VALID -->|"delete"| TOMBSTONE
   TOMBSTONE -->|"insert (in-place reuse)"| INSERTING
   TOMBSTONE -->|"inline unlink"| EMPTY
   INSERTING -->|"stale (GC Phase 4)"| TOMBSTONE
 ```
 
-**Invariant**: Only INSERTING, VALID, TOMBSTONE exist in chains. EMPTY is always outside chains (flat scan only).
+**Invariant**: Only INSERTING, TENTATIVE, VALID, TOMBSTONE exist in chains. EMPTY is always outside chains (flat scan only).
 
 ### 4.2 State Transition Details
 
@@ -139,21 +142,25 @@ flowchart LR
 |------------|-------|---------------|----------|
 | EMPTY → INSERTING | Insert: flat scan | `CAS(state, EMPTY, INSERTING)` | `nrht_claim_entry()` |
 | TOMBSTONE → INSERTING | Insert: chain reuse (in-place) | `CAS(state, TOMBSTONE, INSERTING)` | `nrht_claim_entry()` |
-| INSERTING → VALID | Insert: publish after bucket link | `WRITE_ONCE(state, VALID)` | `marufs_nrht_insert()` |
+| INSERTING → TENTATIVE | Insert: fields written, pre-lock publish | `WRITE_LE32(state, TENTATIVE)` | `marufs_nrht_insert()` step 4 |
+| TENTATIVE → VALID | Insert: dedup passed under shard lock | `WRITE_LE32(state, VALID)` | `marufs_nrht_insert()` step 8 |
+| TENTATIVE → TOMBSTONE | Insert: dedup lost or link failed under shard lock | `WRITE_LE32(state, TOMBSTONE)` | `marufs_nrht_insert()` step 6-7 |
 | VALID → TOMBSTONE | Delete: logical delete | `CAS(state, VALID, TOMBSTONE)` | `marufs_nrht_delete()` |
 | TOMBSTONE → EMPTY | Dup check: inline unlink (after removing from chain) | `CAS(state, TOMBSTONE, EMPTY)` | `nrht_check_duplicate()` |
 | INSERTING → TOMBSTONE | GC Phase 4: stale reclaim | `CAS(state, INSERTING, TOMBSTONE)` | `marufs_nrht_gc_sweep_all()` |
 
-### 4.3 Lifecycle Consistency with Global Index
+### 4.3 Lifecycle Differences from Global Index
 
 | Item | Global Index | NRHT |
 |------|-------------|------|
+| States | 4 (EMPTY/INSERTING/VALID/TOMBSTONE) | 5 (+TENTATIVE) |
+| Insert serialization | Lock-free (CAS only) | Shard lock (CAS spinlock on `shard_header->lock`) |
+| Post-insert dedup | Lock-free, lower entry_idx wins | Under shard lock, first to lock wins |
 | Delete | CAS VALID→TOMBSTONE (stays in chain) | Same |
 | Chain reuse targets | TOMBSTONE/EMPTY (first dead entry in-place reuse) | Same |
 | TOMBSTONE → EMPTY | `check_duplicate` inline unlink (after removing from chain) | Same |
 | Stale INSERTING | GC Phase 2: INSERTING→TOMBSTONE | GC Phase 4: INSERTING→TOMBSTONE |
 | Orphan tracking | Phase 3 DRAM tracker | Same (MARUFS_ORPHAN_NRHT) |
-| Post-insert dedup | `marufs_index_post_insert_dedup()` | `nrht_post_insert_dedup()` |
 | Flat scan optimization | DRAM `atomic free_hint` | CXL shard header `free_hint` |
 
 ---
@@ -193,14 +200,21 @@ flowchart LR
   Dup -->|pass| Slot["Claim entry<br/>dead chain reuse (TOMBSTONE/EMPTY)<br/>or flat scan (free_hint)"]
   Slot -->|fail| Full(["-ENOSPC"])
   Slot -->|success| Fill["write fields + WMB"]
-  Fill --> Publish["Link to bucket → VALID"]
-  Publish --> Dedup["Post-insert dedup"]
-  Dedup --> Done(["success"])
+  Fill --> Tent["TENTATIVE"]
+  Tent --> Lock["acquire shard lock"]
+  Lock --> Link["Link to bucket<br/>(skip if chain reuse)"]
+  Link --> Dedup["Post-insert dedup"]
+  Dedup -->|"dup found"| TS["TOMBSTONE + unlock"]
+  Dedup -->|"unique"| Valid["VALID + unlock"]
+  Valid --> Done(["success"])
+  TS --> Fail2(["-EEXIST"])
 ```
 
 **Slot claim priority**: Chain reuse (first dead entry — TOMBSTONE or EMPTY — in-place reuse, remaining dead entries are inline unlinked + transitioned to EMPTY) → Flat scan (starting from `free_hint`, O(1) amortized). Same pattern as Global Index `check_duplicate`.
 
-**Post-insert dedup**: Concurrent insert race can publish two entries with the same name. Chain walk determines winner — **lower entry_idx wins**, higher one transitions itself to TOMBSTONE.
+**Shard lock**: After writing fields and transitioning to TENTATIVE, the inserter acquires a CAS spinlock on `shard_header->lock`. Under the lock, bucket linking and post-insert dedup execute atomically, eliminating the TOCTOU race where two inserters both pass dedup before seeing each other's entry. The lock scope is per-shard, so inserts to different shards proceed in parallel.
+
+**Post-insert dedup**: Under shard lock, walks the bucket chain looking for another VALID entry with the same name. If found, the current insert loses (transitions to TOMBSTONE). Since the lock serializes inserts within a shard, the first inserter to acquire the lock wins.
 
 ### 5.3 Lookup
 
@@ -428,9 +442,9 @@ If the region referenced by `target_region_id` in NRHT is deleted, a dangling re
 | `nrht_check_duplicate()` | Chain walk: dup detection + record first dead entry (TOMBSTONE/EMPTY) for in-place reuse + inline unlink remaining dead entries |
 | `nrht_find_chain()` | Chain walk: search VALID entry + return prev_next (prefetch optimized) |
 | `nrht_link_to_bucket()` | CAS bucket prepend (publish is caller's responsibility) |
-| `nrht_post_insert_dedup()` | Concurrent dup detection: higher entry_idx loses → TOMBSTONE |
+| `nrht_post_insert_dedup()` | Under shard lock: chain walk dup detection, returns -EEXIST if duplicate VALID found |
 | `marufs_nrht_init()` | NRHT format: parameter validation → size calculation → zero + header/shard/bucket init |
-| `marufs_nrht_insert()` | Dup check → claim entry (dead chain reuse / flat scan with free_hint) → write fields → link → publish → dedup |
+| `marufs_nrht_insert()` | Dup check → claim entry → write fields → TENTATIVE → shard lock → link → dedup → VALID/TOMBSTONE → unlock |
 | `marufs_nrht_lookup()` | Resolve bucket → find chain → return offset/region_id |
 | `marufs_nrht_delete()` | Resolve bucket → find chain → CAS VALID→TOMBSTONE (stays in chain) |
 | `marufs_nrht_gc_sweep_all()` | Enumerate NRHT via RAT bitmap → shard round-robin sweep → stale INSERTING→TOMBSTONE + orphan tracking |

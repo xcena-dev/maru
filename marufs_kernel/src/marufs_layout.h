@@ -32,8 +32,9 @@ enum marufs_magic {
 enum marufs_entry_state {
 	MARUFS_ENTRY_EMPTY = 0,
 	MARUFS_ENTRY_INSERTING = 1,
-	MARUFS_ENTRY_VALID = 2,
-	MARUFS_ENTRY_TOMBSTONE = 3,
+	MARUFS_ENTRY_TENTATIVE = 2,
+	MARUFS_ENTRY_VALID = 3,
+	MARUFS_ENTRY_TOMBSTONE = 4,
 };
 
 /* ── Region type (stored in RAT entry CL0) ───────────────────────── */
@@ -226,7 +227,8 @@ struct marufs_nrht_shard_header {
 	__le64 bucket_array_offset; /*  8: absolute offset in device */
 	__le64 entry_array_offset; /* 16: absolute offset in device */
 	__le32 free_hint; /* 24: flat scan start hint (best-effort, no CAS) */
-	__u8 reserved[36]; /* 28: padding to 64B */
+	__le32 lock;
+	__u8 reserved[32]; /* 28: padding to 64B */
 } __attribute__((packed)); /* Total: 64 bytes */
 
 /*
@@ -395,16 +397,16 @@ static inline void __marufs_verify_structs(void)
 
 #include <linux/libnvdimm.h>
 
-#define MARUFS_CXL_WMB(addr, len)                              \
-	do {                                                   \
-		wmb();                                         \
-		arch_wb_cache_pmem((void *)(addr), (len));     \
+#define MARUFS_CXL_WMB(addr, len)                          \
+	do {                                               \
+		wmb();                                     \
+		arch_wb_cache_pmem((void *)(addr), (len)); \
 	} while (0)
 
-#define MARUFS_CXL_RMB(addr, len)                              \
-	do {                                                   \
-		arch_invalidate_pmem((void *)(addr), (len));   \
-		rmb();                                         \
+#define MARUFS_CXL_RMB(addr, len)                            \
+	do {                                                 \
+		arch_invalidate_pmem((void *)(addr), (len)); \
+		rmb();                                       \
 	} while (0)
 
 #else /* CXL 3.0: hardware coherence guaranteed across hosts */
