@@ -9,7 +9,5 @@ jobs:
   review:
     uses: xcena-dev/.github/.github/workflows/claude-review.yml@main
     with:
-      language: "ko"
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      METISX_GIT_ACTION_ACCESS_TOKEN: ${{ secrets.METISX_GIT_ACTION_ACCESS_TOKEN }}
+      model: "claude-opus-4-6"
+    secrets: inherit
