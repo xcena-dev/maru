@@ -19,12 +19,6 @@
 #include "compat.h"
 #include "marufs.h"
 
-struct marufs_file_ctx {
-	struct inode *inode;
-	struct marufs_inode_info *xi;
-	struct marufs_sb_info *sbi;
-};
-
 /* Pre-allocated batch buffer to avoid kvmalloc per ioctl */
 #define MARUFS_BATCH_BUF_SIZE                                            \
 	max(MARUFS_BATCH_FIND_MAX * sizeof(struct marufs_find_name_req), \
@@ -32,6 +26,12 @@ struct marufs_file_ctx {
 
 struct marufs_file_priv {
 	void *batch_buf;
+};
+
+struct marufs_file_ctx {
+	struct inode *inode;
+	struct marufs_inode_info *xi;
+	struct marufs_sb_info *sbi;
 };
 
 static inline void marufs_file_ctx_init(struct marufs_file_ctx *ctx,
@@ -84,8 +84,11 @@ static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		marufs_rat_entry_get(fc.sbi, fc.xi->rat_entry_id);
 	if (rat_e) {
 		u64 fresh_size = READ_LE64(rat_e->size);
-		if (fresh_size != (u64)fc.inode->i_size)
+		if (fresh_size != (u64)fc.inode->i_size) {
+			inode_lock(fc.inode);
 			i_size_write(fc.inode, fresh_size);
+			inode_unlock(fc.inode);
+		}
 
 		if (fc.xi->data_phys_offset == 0) {
 			u64 phys = READ_CXL_LE64(rat_e->phys_offset);

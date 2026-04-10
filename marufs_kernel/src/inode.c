@@ -282,7 +282,8 @@ struct inode *marufs_new_inode(struct super_block *sb, umode_t mode)
 static void marufs_rat_sync_size(struct marufs_sb_info *sbi,
 				 struct marufs_inode_info *xi, loff_t size)
 {
-	struct marufs_rat_entry *rat_e = marufs_rat_entry_get(sbi, xi->rat_entry_id);
+	struct marufs_rat_entry *rat_e =
+		marufs_rat_entry_get(sbi, xi->rat_entry_id);
 
 	if (rat_e) {
 		WRITE_LE64(rat_e->size, size);
@@ -340,20 +341,23 @@ static int marufs_getattr(MARUFS_IDMAP_PARAM_COMMA const struct path *path,
 	struct marufs_inode_info *xi = marufs_inode_get(inode);
 	struct super_block *sb = inode->i_sb;
 	struct marufs_sb_info *sbi = marufs_sb_get(sb);
-	if (inode->i_ino != MARUFS_ROOT_INO) {
-		/* Read latest file_size from RAT entry */
-		struct marufs_rat_entry *rat_e =
-			marufs_rat_entry_get(sbi, xi->rat_entry_id);
-		if (rat_e) {
-			inode->i_size = READ_LE64(rat_e->size);
-			inode->i_blocks =
-				(inode->i_size + MARUFS_SECTOR_SIZE - 1) >>
-				MARUFS_SECTOR_SHIFT;
-		}
-	}
 
 	marufs_generic_fillattr(MARUFS_IDMAP_ARG_COMMA request_mask, inode,
 				stat);
+
+	if (inode->i_ino != MARUFS_ROOT_INO) {
+		/* Read latest file_size from RAT — write to stat directly
+		 * to avoid i_size_write() without i_rwsem */
+		struct marufs_rat_entry *rat_e =
+			marufs_rat_entry_get(sbi, xi->rat_entry_id);
+		if (rat_e) {
+			u64 fresh_size = READ_CXL_LE64(rat_e->size);
+			stat->size = fresh_size;
+			stat->blocks = (fresh_size + MARUFS_SECTOR_SIZE - 1) >>
+				       MARUFS_SECTOR_SHIFT;
+		}
+	}
+
 	return 0;
 }
 
