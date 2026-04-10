@@ -42,3 +42,16 @@ Individual test binaries (built automatically by the test suite):
 | `test_cross_process` | Cross-process create/truncate/mmap/unlink visibility |
 | `test_chown_race` | CHOWN concurrency and race condition tests |
 | `test_overlap` | Concurrent ftruncate physical overlap check |
+
+## Documentation
+
+Architecture docs are in `docs/`:
+
+| Document | Description |
+|----------|-------------|
+| [1_arch_metadata_layout](docs/1_arch_metadata_layout.md) | CXL memory layout, superblock/shard/RAT/NRHT structs |
+| [2_arch_entry_lifecycle](docs/2_arch_entry_lifecycle.md) | State machines for index, RAT, delegation entries |
+| [3_arch_gc](docs/3_arch_gc.md) | GC thread: tombstone sweep, dead process reclaim, orphan tracking |
+| [4_arch_nrht](docs/4_arch_nrht.md) | NRHT (Name-Ref Hash Table) structure and operations |
+| [5_arch_acl](docs/5_arch_acl.md) | Permission model: owner/default_perms/delegation |
+| [6_arch_mount_io](docs/6_arch_mount_io.md) | Mount/unmount flow, read/write/mmap I/O paths |
