@@ -759,4 +759,5 @@ const struct file_operations marufs_file_ops = {
 	.release = marufs_release,
 	.fsync = noop_fsync,
 	.unlocked_ioctl = marufs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
