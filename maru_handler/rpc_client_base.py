@@ -31,7 +31,7 @@ from maru_common import (
 from maru_shm import MaruHandle
 
 
-class RpcClientMixin(abc.ABC):
+class RpcClientBase(abc.ABC):
     """Mixin providing all RPC API methods on top of ``_send_request``."""
 
     @abc.abstractmethod

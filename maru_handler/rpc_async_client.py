@@ -40,12 +40,12 @@ from maru_common import (
 )
 from maru_common.protocol import HEADER_SIZE, MessageHeader
 
-from .rpc_client_mixin import RpcClientMixin
+from .rpc_client_base import RpcClientBase
 
 logger = logging.getLogger(__name__)
 
 
-class RpcAsyncClient(RpcClientMixin):
+class RpcAsyncClient(RpcClientBase):
     """
     ZeroMQ-based async RPC client using asyncio event loop.
 

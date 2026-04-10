@@ -9,12 +9,12 @@ import zmq
 
 from maru_common import MessageType, Serializer
 
-from .rpc_client_mixin import RpcClientMixin
+from .rpc_client_base import RpcClientBase
 
 logger = logging.getLogger(__name__)
 
 
-class RpcClient(RpcClientMixin):
+class RpcClient(RpcClientBase):
     """
     ZeroMQ-based RPC client for communicating with MaruServer.
 
