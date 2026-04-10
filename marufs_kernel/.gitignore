@@ -1,0 +1,21 @@
+# Kernel build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.tmp_versions/
+.*.cmd
+Module.symvers
+modules.order
+
+# Test binaries
+tests/bench_name_ref
+tests/test_chown_race
+tests/test_cross_process
+tests/test_dupname
+tests/test_ioctl
+tests/test_mmap
+tests/test_mmap_cuda
+tests/test_overlap
