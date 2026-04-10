@@ -21,16 +21,36 @@ _SPARK_CHARS = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587"
 _HISTORY_WIDTH = 50
 _SPARK_TABLE_WIDTH = _HISTORY_WIDTH // 2  # sparkline shows last 25 ticks
 _KNOWN_OPS = [
-    "alloc", "free", "store", "retrieve", "exists", "pin", "unpin", "delete",
-    "batch_store", "batch_retrieve", "batch_exists", "batch_pin", "batch_unpin",
+    "alloc",
+    "free",
+    "store",
+    "retrieve",
+    "exists",
+    "pin",
+    "unpin",
+    "delete",
+    "batch_store",
+    "batch_retrieve",
+    "batch_exists",
+    "batch_pin",
+    "batch_unpin",
 ]
 _ZERO_LAT = (0.0, 0.0, 0.0)
 _HIT_MISS_OPS = {"retrieve", "batch_retrieve", "exists", "batch_exists"}
 _DATA_OPS = {"store", "retrieve", "batch_store", "batch_retrieve"}
 _EMPTY_OP = {
-    "count": 0, "hit_count": 0, "miss_count": 0, "total_bytes": 0,
-    "latency_sum_us": 0, "avg_latency_us": 0, "min_latency_us": 0, "max_latency_us": 0,
-    "interval_count": 0, "interval_avg_us": 0, "interval_min_us": 0, "interval_max_us": 0,
+    "count": 0,
+    "hit_count": 0,
+    "miss_count": 0,
+    "total_bytes": 0,
+    "latency_sum_us": 0,
+    "avg_latency_us": 0,
+    "min_latency_us": 0,
+    "max_latency_us": 0,
+    "interval_count": 0,
+    "interval_avg_us": 0,
+    "interval_min_us": 0,
+    "interval_max_us": 0,
 }
 
 
@@ -65,8 +85,12 @@ _GRAPH_HEIGHT = 8
 
 
 def _draw_line_graph(
-    win, y: int, x: int, values: list[int],
-    width: int = _HISTORY_WIDTH, height: int = _GRAPH_HEIGHT,
+    win,
+    y: int,
+    x: int,
+    values: list[int],
+    width: int = _HISTORY_WIDTH,
+    height: int = _GRAPH_HEIGHT,
 ) -> int:
     """Draw a single-line count graph. Returns rows consumed."""
     if len(values) < 2:
@@ -120,8 +144,12 @@ def _draw_line_graph(
 
 
 def _draw_latency_graph(
-    win, y: int, x: int, values: list[tuple[float, float, float]],
-    width: int = _HISTORY_WIDTH, height: int = _GRAPH_HEIGHT,
+    win,
+    y: int,
+    x: int,
+    values: list[tuple[float, float, float]],
+    width: int = _HISTORY_WIDTH,
+    height: int = _GRAPH_HEIGHT,
 ) -> int:
     """Draw 3-line (min/avg/max) latency graph. Returns rows consumed.
 
@@ -246,6 +274,7 @@ def _extract_interval(
 # Curses TUI
 # =============================================================================
 
+
 def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     """addstr that silently ignores writes outside window bounds."""
     max_y, max_x = win.getmaxyx()
@@ -259,8 +288,12 @@ def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
 
 
 def _handle_key(
-    key: int, selected: int, client_idx: int,
-    num_ops: int, num_clients: int, need_redraw: bool,
+    key: int,
+    selected: int,
+    client_idx: int,
+    num_ops: int,
+    num_clients: int,
+    need_redraw: bool,
 ) -> tuple[int, int, bool]:
     """Process a key press and return updated (selected, client_idx, need_redraw)."""
     if key == curses.KEY_UP:
@@ -283,7 +316,9 @@ def _run_tui(server_url: str, interval: float, max_count: int) -> None:
     logging.getLogger("maru_handler").setLevel(logging.WARNING)
     logging.getLogger("maru_common").setLevel(logging.WARNING)
     try:
-        curses.wrapper(lambda stdscr: _tui_loop(stdscr, server_url, interval, max_count))
+        curses.wrapper(
+            lambda stdscr: _tui_loop(stdscr, server_url, interval, max_count)
+        )
     except KeyboardInterrupt:
         pass
     finally:
@@ -304,10 +339,9 @@ def _try_connect(server_url: str) -> RpcClient | None:
         return None
 
 
-def _tui_loop(
-    stdscr, server_url: str, interval: float, max_count: int
-) -> None:
+def _tui_loop(stdscr, server_url: str, interval: float, max_count: int) -> None:
     import time as _time
+
     curses.curs_set(0)
     stdscr.timeout(100)  # 100ms for responsive key handling
     curses.use_default_colors()
@@ -318,14 +352,14 @@ def _tui_loop(
         curses.start_color()
         # Try 256-color for closer XCENA yellow (color 220 ≈ #FFD700)
         if curses.COLORS >= 256:
-            curses.init_pair(1, 255, -1)                # header: bright white (website title)
-            curses.init_pair(2, 156, -1)                # avg graph: light green
-            curses.init_pair(3, 220, -1)                # box title/accent: XCENA gold (Contact btn)
-            curses.init_pair(4, 252, -1)                # dim text: light gray (nav menu)
-            curses.init_pair(5, 203, -1)                # max: soft red
-            curses.init_pair(6, 75, -1)                 # min: soft blue
-            curses.init_pair(7, 60, -1)                 # border: slate navy (website bg tone)
-            curses.init_pair(8, 232, 220)               # selected: navy on gold (Contact btn style)
+            curses.init_pair(1, 255, -1)  # header: bright white (website title)
+            curses.init_pair(2, 156, -1)  # avg graph: light green
+            curses.init_pair(3, 220, -1)  # box title/accent: XCENA gold (Contact btn)
+            curses.init_pair(4, 252, -1)  # dim text: light gray (nav menu)
+            curses.init_pair(5, 203, -1)  # max: soft red
+            curses.init_pair(6, 75, -1)  # min: soft blue
+            curses.init_pair(7, 60, -1)  # border: slate navy (website bg tone)
+            curses.init_pair(8, 232, 220)  # selected: navy on gold (Contact btn style)
         else:
             curses.init_pair(1, curses.COLOR_YELLOW, -1)
             curses.init_pair(2, curses.COLOR_GREEN, -1)
@@ -350,11 +384,19 @@ def _tui_loop(
         """Get or create per-client history dicts."""
         if client_key not in all_count_hist:
             all_count_hist[client_key] = {n: [0] * _HISTORY_WIDTH for n in _KNOWN_OPS}
-            all_lat_hist[client_key] = {n: [_ZERO_LAT] * _HISTORY_WIDTH for n in _KNOWN_OPS}
-            all_spark_hist[client_key] = {n: [0.0] * _SPARK_TABLE_WIDTH for n in _KNOWN_OPS}
+            all_lat_hist[client_key] = {
+                n: [_ZERO_LAT] * _HISTORY_WIDTH for n in _KNOWN_OPS
+            }
+            all_spark_hist[client_key] = {
+                n: [0.0] * _SPARK_TABLE_WIDTH for n in _KNOWN_OPS
+            }
             all_spark_accum[client_key] = dict.fromkeys(_KNOWN_OPS, 0)
-        return (all_count_hist[client_key], all_lat_hist[client_key],
-                all_spark_hist[client_key], all_spark_accum[client_key])
+        return (
+            all_count_hist[client_key],
+            all_lat_hist[client_key],
+            all_spark_hist[client_key],
+            all_spark_accum[client_key],
+        )
 
     iteration = 0
     op_names: list[str] = list(_KNOWN_OPS)
@@ -371,8 +413,14 @@ def _tui_loop(
         # Connect / reconnect
         if client is None:
             stdscr.erase()
-            header_attr = curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
-            _safe_addstr(stdscr, 0, 0, f"  Maru Stats Monitor  --  {ts}  (q=quit)", header_attr)
+            header_attr = (
+                curses.color_pair(1) | curses.A_BOLD
+                if curses.has_colors()
+                else curses.A_BOLD
+            )
+            _safe_addstr(
+                stdscr, 0, 0, f"  Maru Stats Monitor  --  {ts}  (q=quit)", header_attr
+            )
             _safe_addstr(stdscr, 2, 0, f"  Connecting to {server_url} ...")
             stdscr.refresh()
             client = _try_connect(server_url)
@@ -457,12 +505,19 @@ def _tui_loop(
             if key in (ord("q"), 27, 3):
                 return
             selected, client_idx, need_redraw = _handle_key(
-                key, selected, client_idx, len(op_names), len(client_keys), need_redraw,
+                key,
+                selected,
+                client_idx,
+                len(op_names),
+                len(client_keys),
+                need_redraw,
             )
             continue
 
         need_redraw = False
-        cur_client = client_keys[client_idx] if client_idx < len(client_keys) else "_all"
+        cur_client = (
+            client_keys[client_idx] if client_idx < len(client_keys) else "_all"
+        )
         ops = _get_ops(stats, cur_client)
         count_history, latency_history, spark_history, _ = _get_hist(cur_client)
 
@@ -473,8 +528,15 @@ def _tui_loop(
         # Header — compact single line with global info
         kv = stats["kv_manager"]
         alloc = stats["allocation_manager"]
-        header_attr = curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
-        _safe_addstr(stdscr, row, 0,
+        header_attr = (
+            curses.color_pair(1) | curses.A_BOLD
+            if curses.has_colors()
+            else curses.A_BOLD
+        )
+        _safe_addstr(
+            stdscr,
+            row,
+            0,
             f"  Maru Stats Monitor  {ts}    "
             f"KV:{kv['total_entries']} ({_fmt_size(kv['total_size'])})  "
             f"Alloc:{alloc['num_allocations']} ({_fmt_size(alloc['total_allocated'])})  "
@@ -488,12 +550,31 @@ def _tui_loop(
         for ci, ck in enumerate(client_keys):
             label = "ALL" if ck == "_all" else f"Instance {ci}"
             if ci == client_idx:
-                _safe_addstr(stdscr, row, col, "▐", curses.color_pair(3) if curses.has_colors() else 0)
+                _safe_addstr(
+                    stdscr,
+                    row,
+                    col,
+                    "▐",
+                    curses.color_pair(3) if curses.has_colors() else 0,
+                )
                 col += 1
-                _safe_addstr(stdscr, row, col, f" {label} ",
-                    curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE)
+                _safe_addstr(
+                    stdscr,
+                    row,
+                    col,
+                    f" {label} ",
+                    curses.color_pair(3) | curses.A_BOLD
+                    if curses.has_colors()
+                    else curses.A_REVERSE,
+                )
                 col += len(label) + 2
-                _safe_addstr(stdscr, row, col, "▌", curses.color_pair(3) if curses.has_colors() else 0)
+                _safe_addstr(
+                    stdscr,
+                    row,
+                    col,
+                    "▌",
+                    curses.color_pair(3) if curses.has_colors() else 0,
+                )
                 col += 2
             else:
                 _safe_addstr(stdscr, row, col, f" {label} ")
@@ -509,7 +590,10 @@ def _tui_loop(
         border_attr = curses.color_pair(7) if curses.has_colors() else 0
         _safe_addstr(stdscr, row, 0, table_hdr, curses.A_BOLD)
         row += 1
-        _safe_addstr(stdscr, row, 0,
+        _safe_addstr(
+            stdscr,
+            row,
+            0,
             f"  {'─' * 22}┼{'─' * 8}┼{'─' * 7}┼"
             f"{'─' * 9}┼{'─' * 9}┼{'─' * 9}"
             f"┼─{'─' * _SPARK_TABLE_WIDTH}",
@@ -554,7 +638,11 @@ def _tui_loop(
             )
 
             if i == selected:
-                attr = curses.color_pair(8) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
+                attr = (
+                    curses.color_pair(8) | curses.A_BOLD
+                    if curses.has_colors()
+                    else curses.A_REVERSE
+                )
             else:
                 attr = 0
             _safe_addstr(stdscr, row, 0, line, attr)
@@ -566,8 +654,11 @@ def _tui_loop(
             sel_name = op_names[selected]
             sel_op = ops[sel_name]
 
-
-            accent = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+            accent = (
+                curses.color_pair(3) | curses.A_BOLD
+                if curses.has_colors()
+                else curses.A_BOLD
+            )
             # Total line width = 98 (matches table). Layout: "  ╭─...─╮" / "  │ ... │"
             total_w = 98  # must match table header len
             # ╭ and ╮ at positions 2 and total_w-1, so fill = total_w - 4
@@ -577,7 +668,9 @@ def _tui_loop(
             # === Info box (rounded + bold) ===
             bb = border_attr | curses.A_BOLD
 
-            def _box_top(title: str, _fw: int = fill_w, _bb: int = bb, _ac: int = accent) -> None:
+            def _box_top(
+                title: str, _fw: int = fill_w, _bb: int = bb, _ac: int = accent
+            ) -> None:
                 nonlocal row
                 pad = _fw - 1 - len(title)
                 _safe_addstr(stdscr, row, 2, "╭─", _bb)
@@ -622,7 +715,9 @@ def _tui_loop(
                 _box_line("")
 
             # Line 3: latency
-            _box_line(f"latency (us):  avg={avg:.1f}  min={sel_op['min_latency_us']:.1f}  max={sel_op['max_latency_us']:.1f}")
+            _box_line(
+                f"latency (us):  avg={avg:.1f}  min={sel_op['min_latency_us']:.1f}  max={sel_op['max_latency_us']:.1f}"
+            )
 
             # Line 4: throughput (only for data ops)
             if sel_name in _DATA_OPS and count > 0 and avg > 0:
@@ -645,7 +740,9 @@ def _tui_loop(
             # graph at x=4 (indent+border+space), y-label=8
             # right border at total_w-1, so plot_w = total_w - 4(left) - 8(label) - 2(right pad+border)
             graph_plot_w = total_w - 14
-            graph_rows = _draw_latency_graph(stdscr, row, 4, sel_lat_hist, graph_plot_w, _GRAPH_HEIGHT)
+            graph_rows = _draw_latency_graph(
+                stdscr, row, 4, sel_lat_hist, graph_plot_w, _GRAPH_HEIGHT
+            )
             # Draw side borders for each graph row
             for gr in range(graph_rows):
                 _safe_addstr(stdscr, row + gr, 2, "│", bb)
@@ -666,21 +763,38 @@ def _tui_loop(
         if key in (ord("q"), 27, 3):
             return
         selected, client_idx, need_redraw = _handle_key(
-            key, selected, client_idx, len(op_names), len(client_keys), need_redraw,
+            key,
+            selected,
+            client_idx,
+            len(op_names),
+            len(client_keys),
+            need_redraw,
         )
-
-
 
 
 # =============================================================================
 # Main
 # =============================================================================
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Maru server operation stats monitor")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="MaruServer host (default: 127.0.0.1)")
-    parser.add_argument("-p", "--port", type=int, default=5555, help="MaruServer port (default: 5555)")
-    parser.add_argument("-i", "--interval", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0)")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="MaruServer host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "-p", "--port", type=int, default=5555, help="MaruServer port (default: 5555)"
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=1.0,
+        help="Refresh interval in seconds (default: 1.0)",
+    )
     args = parser.parse_args()
 
     server_url = f"tcp://{args.host}:{args.port}"

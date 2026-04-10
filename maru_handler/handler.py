@@ -544,7 +544,9 @@ class MaruHandler:
                         page_index,
                         exc_info=True,
                     )
-                    self._record_stats("store", total_size, (time.monotonic() - t0) * 1e6)
+                    self._record_stats(
+                        "store", total_size, (time.monotonic() - t0) * 1e6
+                    )
                     return False
 
                 if not is_new:
@@ -591,7 +593,9 @@ class MaruHandler:
         result = self._rpc.lookup_kv(key)
         if not result.found or result.handle is None:
             logger.debug("Key %s not found", key)
-            self._record_stats("retrieve", 0, (time.monotonic() - t0) * 1e6, result="miss")
+            self._record_stats(
+                "retrieve", 0, (time.monotonic() - t0) * 1e6, result="miss"
+            )
             return None
 
         handle = result.handle
@@ -628,7 +632,9 @@ class MaruHandler:
         )
         chunk_size = self._owned.get_chunk_size()
         page_index = result.kv_offset // chunk_size
-        self._record_stats("retrieve", result.kv_length, (time.monotonic() - t0) * 1e6, result="hit")
+        self._record_stats(
+            "retrieve", result.kv_length, (time.monotonic() - t0) * 1e6, result="hit"
+        )
         return MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
 
     def exists(self, key: str) -> bool:
@@ -643,7 +649,12 @@ class MaruHandler:
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.exists_kv(key)
-        self._record_stats("exists", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss")
+        self._record_stats(
+            "exists",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
         return result
 
     def pin(self, key: str) -> bool:
@@ -660,7 +671,9 @@ class MaruHandler:
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.pin_kv(key)
-        self._record_stats("pin", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss")
+        self._record_stats(
+            "pin", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss"
+        )
         return result
 
     def unpin(self, key: str) -> bool:
@@ -675,7 +688,12 @@ class MaruHandler:
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.unpin(key)
-        self._record_stats("unpin", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss")
+        self._record_stats(
+            "unpin",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
         return result
 
     def delete(self, key: str) -> bool:
@@ -705,7 +723,12 @@ class MaruHandler:
             else:
                 logger.debug("Delete key=%s: not found on server", key)
 
-        self._record_stats("delete", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss")
+        self._record_stats(
+            "delete",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
         return result
 
     def healthcheck(self) -> bool:
@@ -842,11 +865,14 @@ class MaruHandler:
             hits - ro_count,
         )
         total_bytes = sum(
-            entry.kv_length for i, entry in enumerate(batch_resp.entries)
+            entry.kv_length
+            for i, entry in enumerate(batch_resp.entries)
             if results[i] is not None and entry.handle is not None
         )
         self._record_stats(
-            "batch_retrieve", total_bytes, (time.monotonic() - t0) * 1e6,
+            "batch_retrieve",
+            total_bytes,
+            (time.monotonic() - t0) * 1e6,
             result="hit" if hits == len(keys) else "miss",
         )
         return results
@@ -983,7 +1009,9 @@ class MaruHandler:
             return [False] * len(keys)
         hits = sum(batch_resp.results)
         self._record_stats(
-            "batch_exists", 0, (time.monotonic() - t0) * 1e6,
+            "batch_exists",
+            0,
+            (time.monotonic() - t0) * 1e6,
             result="hit" if hits == len(keys) else "miss",
         )
         return batch_resp.results
@@ -1002,7 +1030,9 @@ class MaruHandler:
         results = self._rpc.batch_pin_kv(keys).results
         hits = sum(results)
         self._record_stats(
-            "batch_pin", 0, (time.monotonic() - t0) * 1e6,
+            "batch_pin",
+            0,
+            (time.monotonic() - t0) * 1e6,
             result="hit" if hits == len(keys) else "miss",
         )
         return results
@@ -1021,7 +1051,9 @@ class MaruHandler:
         results = self._rpc.batch_unpin(keys).results
         hits = sum(results)
         self._record_stats(
-            "batch_unpin", 0, (time.monotonic() - t0) * 1e6,
+            "batch_unpin",
+            0,
+            (time.monotonic() - t0) * 1e6,
             result="hit" if hits == len(keys) else "miss",
         )
         return results

@@ -38,7 +38,9 @@ class StatsManager:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._stats: dict[tuple[str, str, str], _OpStats] = {}  # (client_id, op_type, result)
+        self._stats: dict[
+            tuple[str, str, str], _OpStats
+        ] = {}  # (client_id, op_type, result)
         self._closed = False
 
     def record(
@@ -90,13 +92,17 @@ class StatsManager:
     @staticmethod
     def _new_merged() -> dict:
         return {
-            "count": 0, "hit_count": 0, "miss_count": 0,
+            "count": 0,
+            "hit_count": 0,
+            "miss_count": 0,
             "total_bytes": 0,
             "latency_sum_us": 0.0,
             "latency_min_us": float("inf"),
             "latency_max_us": 0.0,
-            "iv_count": 0, "iv_sum_us": 0.0,
-            "iv_min_us": float("inf"), "iv_max_us": 0.0,
+            "iv_count": 0,
+            "iv_sum_us": 0.0,
+            "iv_min_us": float("inf"),
+            "iv_max_us": 0.0,
         }
 
     @staticmethod

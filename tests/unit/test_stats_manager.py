@@ -148,5 +148,8 @@ class TestStatsManagerThreadSafety:
             t.join()
 
         stats = sm.get_stats()
-        assert stats["clients"]["_all"]["operations"]["alloc"]["count"] == n_threads * n_per_thread
+        assert (
+            stats["clients"]["_all"]["operations"]["alloc"]["count"]
+            == n_threads * n_per_thread
+        )
         sm.close()
