@@ -5,15 +5,13 @@ Connects to MaruServer via RPC and displays real-time operation metrics
 with per-operation sparkline latency graphs and interactive detail panel.
 
 Usage:
-    python -m tools.stats_monitor -p 11008                     # one-shot snapshot
-    python -m tools.stats_monitor -p 11008 -w 1                # interactive TUI
-    python -m tools.stats_monitor -p 11008                     # one-shot snapshot
+    python -m tools.stats_monitor -p 11008
+    python -m tools.stats_monitor --host 10.0.0.1 -p 5556
 """
 
 import argparse
 import curses
 import logging
-import sys
 from datetime import datetime
 
 from maru_handler.rpc_client import RpcClient
@@ -672,51 +670,6 @@ def _tui_loop(
         )
 
 
-# =============================================================================
-# Non-interactive mode (one-shot)
-# =============================================================================
-
-def render_table(stats: dict, ts: str) -> str:
-    """Render a plain-text table for one-shot mode."""
-    lines = []
-    lines.append(f"  Maru Stats Monitor  --  {ts}")
-    lines.append("")
-
-    kv = stats["kv_manager"]
-    alloc = stats["allocation_manager"]
-    lines.append(
-        f"  KV entries: {kv['total_entries']}  ({_fmt_size(kv['total_size'])})    "
-        f"Allocations: {alloc['num_allocations']}  ({_fmt_size(alloc['total_allocated'])})    "
-        f"Clients: {alloc['active_clients']}"
-    )
-    lines.append("")
-
-    ops = _get_ops(stats)
-    lines.append(
-        f"  {'operation':<22} {'count':>8} "
-        f"{'avg_us':>9} {'min_us':>9} {'max_us':>9}"
-    )
-    lines.append(
-        f"  {'-' * 22} {'-' * 8} {'-' * 9} {'-' * 9} {'-' * 9}"
-    )
-    for name in sorted(ops):
-        o = ops[name]
-        lines.append(
-            f"  {name:<22} {o['count']:>8} "
-            f"{o['avg_latency_us']:>9.1f} "
-            f"{o['min_latency_us']:>9.1f} "
-            f"{o['max_latency_us']:>9.1f}"
-        )
-
-    retrieve_ops = {k: v for k, v in ops.items() if "retrieve" in k}
-    if retrieve_ops:
-        hits = sum(v.get("hit_count", 0) for v in retrieve_ops.values())
-        total = sum(v["count"] for v in retrieve_ops.values())
-        if total > 0:
-            lines.append(f"\n  Retrieve hit rate: {hits}/{total} ({hits / total * 100:.1f}%)")
-
-    return "\n".join(lines)
-
 
 
 # =============================================================================
@@ -727,32 +680,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Maru server operation stats monitor")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="MaruServer host (default: 127.0.0.1)")
     parser.add_argument("-p", "--port", type=int, default=5555, help="MaruServer port (default: 5555)")
-    parser.add_argument("-w", "--watch", type=float, default=0, help="Refresh interval in seconds (0 = one-shot)")
-    parser.add_argument("-c", "--count", type=int, default=0, help="Number of iterations (0 = unlimited)")
+    parser.add_argument("-i", "--interval", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0)")
     args = parser.parse_args()
 
     server_url = f"tcp://{args.host}:{args.port}"
-
-    # Interactive TUI (watch mode)
-    if args.watch > 0:
-        _run_tui(server_url, args.watch, args.count)
-        return
-
-    # One-shot
-    try:
-        client = RpcClient(server_url=server_url)
-        client.connect()
-    except Exception as e:
-        print(f"Error: cannot connect to MaruServer at {server_url}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # One-shot
-    try:
-        stats = fetch_stats(client)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    print(render_table(stats, datetime.now().isoformat(timespec="seconds")))
+    _run_tui(server_url, args.interval, 0)
 
 
 if __name__ == "__main__":
