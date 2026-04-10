@@ -342,9 +342,7 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			if (waited > MARUFS_ALLOC_LOCK_TIMEOUT_NS) {
 				pr_warn("region_init: force-unlocking stale alloc_lock (waited %lluns)\n",
 					waited);
-				WRITE_LE32(rat->alloc_lock, 0);
-				MARUFS_CXL_WMB(&rat->alloc_lock,
-					       sizeof(rat->alloc_lock));
+				marufs_le32_cas(&rat->alloc_lock, 1, 0);
 				wait_start = 0;
 				continue;
 			}

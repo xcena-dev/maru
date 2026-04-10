@@ -272,6 +272,7 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 					"mmap DEV_DAX delegated inode=%lu pgoff=%lu ret=%d\n",
 					inode->i_ino, vma->vm_pgoff, ret);
 				if (ret) {
+					vma_set_file(vma, file);
 					vma->vm_pgoff = orig_pgoff;
 					return ret;
 				}
@@ -284,29 +285,23 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 		}
 
 		/* Fallback: remap_pfn_range (WC pgprot) */
-		{
-			phys_addr_t phys_addr = sbi->phys_base +
-						xi->data_phys_offset +
-						user_offset;
+		phys_addr_t phys_addr =
+			sbi->phys_base + xi->data_phys_offset + user_offset;
 
-			vm_flags_set(vma,
-				     VM_PFNMAP | VM_DONTEXPAND | VM_DONTCOPY);
-			vma->vm_page_prot =
-				pgprot_writecombine(vma->vm_page_prot);
+		vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTCOPY);
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
-			ret = remap_pfn_range(vma, vma->vm_start,
-					      phys_addr >> PAGE_SHIFT, map_size,
-					      vma->vm_page_prot);
-			if (ret) {
-				pr_err("remap_pfn_range failed: %d\n", ret);
-				return ret;
-			}
-
-			pr_debug(
-				"mmap DEV_DAX fallback PFN inode=%lu phys=0x%llx\n",
-				inode->i_ino, (unsigned long long)phys_addr);
-			return 0;
+		ret = remap_pfn_range(vma, vma->vm_start,
+				      phys_addr >> PAGE_SHIFT, map_size,
+				      vma->vm_page_prot);
+		if (ret) {
+			pr_err("remap_pfn_range failed: %d\n", ret);
+			return ret;
 		}
+
+		pr_debug("mmap DEV_DAX fallback PFN inode=%lu phys=0x%llx\n",
+			 inode->i_ino, (unsigned long long)phys_addr);
+		return 0;
 	}
 
 	return -EINVAL;

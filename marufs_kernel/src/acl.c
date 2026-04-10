@@ -338,9 +338,11 @@ int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			de,
 			sizeof(*de)); /* Ensure all fields visible before state transition */
 
-		/* Publish: GRANTING → ACTIVE (now safe for readers) */
-		WRITE_LE32(de->state, MARUFS_DELEG_ACTIVE);
-		MARUFS_CXL_WMB(de, sizeof(*de));
+		/* Publish: GRANTING → ACTIVE (CAS to guard against GC reclaim) */
+		if (marufs_le32_cas(&de->state, MARUFS_DELEG_GRANTING,
+				    MARUFS_DELEG_ACTIVE) !=
+		    MARUFS_DELEG_GRANTING)
+			return -EAGAIN; /* GC reclaimed slot, caller retries */
 
 		marufs_le16_cas_inc(&rat_entry->deleg_num_entries);
 

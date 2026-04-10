@@ -65,6 +65,9 @@ static bool marufs_entry_reclaim_slot(struct marufs_index_entry *entry)
  *
  * Tracks entry locally with discovery timestamp. Does NOT write to CXL
  * to avoid cacheline clobbering with live writers on other nodes/CPUs.
+ *
+ * Thread safety: gc_orphans[] and gc_orphan_count are only accessed by the
+ * single GC kthread — no locking required.
  */
 void marufs_gc_track_orphan(struct marufs_sb_info *sbi, void *entry,
 			   enum marufs_orphan_type type)

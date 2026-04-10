@@ -403,7 +403,8 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 	int ret;
 
 	if (bufid == 0) {
-		/* Primary mount: allocate new buffer (sbi->total_size > 0) */
+		/* Primary mount: allocate new buffer (sbi->total_size > 0)
+		 * Hold lock through alloc to prevent TOCTOU double allocation */
 		mutex_lock(&marufs_daxheap_lock);
 		if (marufs_daxheap_bufid != 0) {
 			mutex_unlock(&marufs_daxheap_lock);
@@ -411,10 +412,10 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 			       marufs_daxheap_bufid);
 			return -EEXIST;
 		}
-		mutex_unlock(&marufs_daxheap_lock);
 
 		dmabuf = daxheap_kern_alloc(sbi->total_size, 0);
 		if (IS_ERR(dmabuf)) {
+			mutex_unlock(&marufs_daxheap_lock);
 			pr_err("daxheap_kern_alloc failed: %ld\n",
 			       PTR_ERR(dmabuf));
 			return PTR_ERR(dmabuf);
@@ -422,6 +423,7 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 
 		ret = daxheap_kern_get_id(dmabuf, &allocated_id);
 		if (ret) {
+			mutex_unlock(&marufs_daxheap_lock);
 			pr_err("daxheap_kern_get_id failed: %d\n", ret);
 			daxheap_kern_free(dmabuf);
 			return ret;
@@ -432,12 +434,12 @@ static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
 					 DAXHEAP_KERN_GRANT_READ |
 						 DAXHEAP_KERN_GRANT_WRITE);
 		if (ret) {
+			mutex_unlock(&marufs_daxheap_lock);
 			pr_err("daxheap_kern_grant failed: %d\n", ret);
 			daxheap_kern_free(dmabuf);
 			return ret;
 		}
 
-		mutex_lock(&marufs_daxheap_lock);
 		marufs_daxheap_bufid = allocated_id;
 		atomic_inc(&marufs_daxheap_mounts);
 		mutex_unlock(&marufs_daxheap_lock);
