@@ -497,7 +497,12 @@ class RpcAsyncClient:
                 total_allocated=alloc_data.get("total_allocated", 0),
                 active_clients=alloc_data.get("active_clients", 0),
             ),
+            stats_manager=response.get("stats_manager", {}),
         )
+
+    def report_timings(self, entries: list[dict]) -> None:
+        """Report client-side handler timings to server."""
+        self._send_request(MessageType.REPORT_TIMINGS, {"entries": entries})
 
     def heartbeat(self) -> bool:
         """Send heartbeat to server."""
