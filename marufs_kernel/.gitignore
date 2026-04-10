@@ -19,3 +19,8 @@ tests/test_ioctl
 tests/test_mmap
 tests/test_mmap_cuda
 tests/test_overlap
+tests/test_mmap_notrunc
+tests/test_negative
+tests/test_nrht_race
+tests/test_gc_deleg
+tests/test_pid_reuse

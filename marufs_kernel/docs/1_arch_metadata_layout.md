@@ -199,14 +199,14 @@ Core unit of the Global Index. Maps filename → region_id.
 **Purpose**: Hash-chain based file lookup. `state` field is the CAS target.
 
 **Usage**:
-- **insert**: `marufs_index_insert()` — `CAS(state, EMPTY, INSERTING)` → fill fields → bucket prepend → `WRITE_ONCE(state, VALID)`
+- **insert**: `marufs_index_insert()` — `CAS(state, EMPTY, INSERTING)` → fill fields → TENTATIVE → shard lock → bucket prepend → post-insert dedup → VALID → unlock
 - **lookup**: `marufs_index_lookup()` — chain walk + `name_hash` matching
 - **delete**: `marufs_index_delete()` — `CAS(VALID, TOMBSTONE)` (stays in chain, reused by insert path)
 - **GC**: Reclaims stale INSERTING/TOMBSTONE entries (`gc.c`)
 
 ```c
 struct marufs_index_entry {             /* 64B = 1 CL */
-    uint32  state;                      /* EMPTY(0)/INSERTING(1)/VALID(2)/TOMBSTONE(3) */
+    uint32  state;                      /* EMPTY(0)/INSERTING(1)/TENTATIVE(2)/VALID(3)/TOMBSTONE(4) */
     uint32  next_in_bucket;             /* Hash chain link (0xFFFFFFFF = end) */
     uint64  name_hash;                  /* SHA-256 → 64-bit truncate */
     uint32  region_id;                  /* RAT entry ID */

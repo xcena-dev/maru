@@ -106,7 +106,7 @@ run_test() {
         FAIL=$((FAIL + 1))
         echo -e "${RED}FAIL${NC}"
         if [ -n "$output" ]; then
-            echo "$output" | head -5 | sed 's/^/       /'
+            echo "$output" | sed 's/^/       /'
         fi
     fi
 }
@@ -309,7 +309,7 @@ fi
 # Build test binaries
 echo -e "${YELLOW}--- Building test binaries ---${NC}"
 build_ok=true
-for src in "$SCRIPT_DIR"/test_ioctl.c "$SCRIPT_DIR"/test_mmap.c "$SCRIPT_DIR"/test_mmap_cuda.c "$SCRIPT_DIR"/test_cross_process.c "$SCRIPT_DIR"/test_overlap.c "$SCRIPT_DIR"/test_chown_race.c; do
+for src in "$SCRIPT_DIR"/test_ioctl.c "$SCRIPT_DIR"/test_mmap.c "$SCRIPT_DIR"/test_mmap_cuda.c "$SCRIPT_DIR"/test_cross_process.c "$SCRIPT_DIR"/test_overlap.c "$SCRIPT_DIR"/test_chown_race.c "$SCRIPT_DIR"/test_mmap_notrunc.c "$SCRIPT_DIR"/test_negative.c "$SCRIPT_DIR"/test_nrht_race.c "$SCRIPT_DIR"/test_gc_deleg.c "$SCRIPT_DIR"/test_pid_reuse.c; do
     [ -f "$src" ] || continue
     bin="${src%.c}"
     name="$(basename "$src")"
@@ -1166,6 +1166,90 @@ if [ -f "$BENCH_SRC" ]; then
     fi
 else
     echo -e "  ${YELLOW}SKIP${NC} (bench_name_ref.c not found)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 25: mmap on Untruncated Region (ENODATA)
+# ============================================================================
+echo -e "${YELLOW}=== Section 25: mmap on Untruncated Region ===${NC}"
+
+NOTRUNC_BIN="$SCRIPT_DIR/test_mmap_notrunc"
+if [ -x "$NOTRUNC_BIN" ]; then
+    run_test "mmap on untruncated region returns ENODATA" '
+        "$NOTRUNC_BIN" "$MOUNT_POINT_0" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_mmap_notrunc not compiled)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 26: Negative / Error Path (C test)
+# ============================================================================
+echo -e "${YELLOW}=== Section 26: Negative Error Path (C test) ===${NC}"
+
+NEGATIVE_BIN="$SCRIPT_DIR/test_negative"
+if [ -x "$NEGATIVE_BIN" ]; then
+    run_test "Negative tests: single-node" '
+        "$NEGATIVE_BIN" "$MOUNT_POINT_0" 2>&1
+    '
+
+    run_test "Negative tests: multi-node (GRANT escalation)" '
+        "$NEGATIVE_BIN" "$MOUNT_POINT_0" "$MOUNT_POINT_1" "$NODE_ID_1" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_negative not compiled)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 27: NRHT CAS Race Test
+# ============================================================================
+echo -e "${YELLOW}=== Section 27: NRHT CAS Race ===${NC}"
+
+NRHT_RACE_BIN="$SCRIPT_DIR/test_nrht_race"
+if [ -x "$NRHT_RACE_BIN" ]; then
+    run_test "NRHT concurrent insert/delete race" '
+        "$NRHT_RACE_BIN" "$MOUNT_POINT_0" "$MOUNT_POINT_1" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_nrht_race not compiled)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 28: GC Dead Delegation Sweep
+# ============================================================================
+echo -e "${YELLOW}=== Section 28: GC Dead Delegation Sweep ===${NC}"
+
+GC_DELEG_BIN="$SCRIPT_DIR/test_gc_deleg"
+if [ -x "$GC_DELEG_BIN" ] && [ -d "$SYSFS_BASE" ]; then
+    run_test "GC dead delegation sweep" '
+        "$GC_DELEG_BIN" "$MOUNT_POINT_0" "$MOUNT_POINT_1" "$NODE_ID_1" "$SYSFS_BASE" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_gc_deleg not compiled or sysfs unavailable)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 29: PID Reuse birth_time Security
+# ============================================================================
+echo -e "${YELLOW}=== Section 29: PID Reuse birth_time ===${NC}"
+
+PID_REUSE_BIN="$SCRIPT_DIR/test_pid_reuse"
+if [ -x "$PID_REUSE_BIN" ] && [ "$(id -u)" -eq 0 ]; then
+    run_test "PID reuse: birth_time prevents stale delegation" '
+        "$PID_REUSE_BIN" "$MOUNT_POINT_0" "$MOUNT_POINT_1" "$NODE_ID_1" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_pid_reuse not compiled or not root)"
 fi
 
 echo ""

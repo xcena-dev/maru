@@ -225,26 +225,23 @@ static ssize_t deleg_info_store(struct kobject *kobj,
 static struct kobj_attribute deleg_info_attr =
 	__ATTR(deleg_info, 0644, deleg_info_show, deleg_info_store);
 
-/* GC trigger - write to trigger manual GC */
+/*
+ * GC trigger - write any value to trigger manual GC on all local mounts.
+ * Each mount's GC sweeps its own node's dead entries.
+ */
 static ssize_t gc_trigger_store(struct kobject *kobj,
 				struct kobj_attribute *attr, const char *buf,
 				size_t count)
 {
-	struct marufs_sb_info *sbi;
-	int reclaimed;
+	int i;
 
 	mutex_lock(&marufs_sysfs_lock);
-	sbi = marufs_sysfs_get_sbi();
-	if (!sbi) {
-		mutex_unlock(&marufs_sysfs_lock);
-		pr_err("no filesystem mounted\n");
-		return -ENODEV;
+	for (i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		if (marufs_sysfs_sbi_list[i])
+			marufs_gc_reclaim_dead_regions(
+				marufs_sysfs_sbi_list[i]);
 	}
-
-	pr_debug("manual GC triggered via sysfs\n");
-	reclaimed = marufs_gc_reclaim_dead_regions(sbi);
 	mutex_unlock(&marufs_sysfs_lock);
-	pr_debug("manual GC reclaimed %d regions\n", reclaimed);
 
 	return count;
 }

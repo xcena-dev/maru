@@ -10,7 +10,7 @@ All state transitions are performed via CAS (compare-and-swap), providing lock-f
 
 | Entry Type | Location | States | Definition |
 |------------|----------|--------|------------|
-| Global Index Entry | Shard Entry Array | 4 | `enum marufs_entry_state` |
+| Global Index Entry | Shard Entry Array | 5 | `enum marufs_entry_state` |
 | RAT Entry | Region Allocation Table | 4 | `enum marufs_rat_entry_state` |
 | Delegation Entry | Inside RAT Entry (CL3-31) | 3 | `enum marufs_deleg_state` |
 
@@ -25,7 +25,9 @@ Core unit of the filename → region_id mapping. `marufs_index_entry` (64B = 1CL
 ```mermaid
 flowchart LR
     EMPTY -->|"open(O_CREAT)"| INSERTING
-    INSERTING -->|"chain prepend done"| VALID
+    INSERTING -->|"fields written"| TENTATIVE
+    TENTATIVE -->|"shard lock + dedup pass"| VALID
+    TENTATIVE -->|"dedup loss / link fail"| TOMBSTONE
     VALID -->|"unlink()"| TOMBSTONE
     INSERTING -->|"GC stale (5s)"| TOMBSTONE
     TOMBSTONE -->|"insert chain reuse"| INSERTING
@@ -33,6 +35,7 @@ flowchart LR
 ```
 
 - **INSERTING**: Slot claimed, fields being written. Other nodes ignore it. Stale detection via `node_id` + `created_at`.
+- **TENTATIVE**: Fields written, entry linked to chain. Visible to dedup but not to lookup. Transitions to VALID under shard lock after dedup passes.
 - **TOMBSTONE**: `unlink()` performs `CAS(VALID, TOMBSTONE)` for logical deletion. Stays in chain; cleaned up during next insert's dup check.
 
 ### Transition Details
@@ -41,26 +44,33 @@ flowchart LR
 |------------|-------|---------------|----------|
 | EMPTY → INSERTING | `open(O_CREAT)` → index insert | `CAS(state, EMPTY, INSERTING)` | `__marufs_index_insert()` step 3b (flat scan) |
 | TOMBSTONE → INSERTING | `open(O_CREAT)` → chain reuse | `CAS(state, TOMBSTONE, INSERTING)` | `__marufs_index_insert()` step 3a |
-| INSERTING → VALID | Insert: bucket chain prepend complete | `WRITE_LE32(entry->state, MARUFS_ENTRY_VALID)` | After `marufs_index_link_to_bucket()`, inline |
+| INSERTING → TENTATIVE | Insert: fields written | `WRITE_LE32(entry->state, MARUFS_ENTRY_TENTATIVE)` | `__marufs_index_insert()` step 5 |
+| TENTATIVE → VALID | Insert: shard lock + dedup pass | `WRITE_LE32(entry->state, MARUFS_ENTRY_VALID)` | `__marufs_index_insert()` step 9 (under lock) |
+| TENTATIVE → TOMBSTONE | Insert: dedup loss or link failure | `WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE)` | `__marufs_index_insert()` (under lock) |
 | VALID → TOMBSTONE | `unlink()` → logical delete (stays in chain) | `CAS(VALID, TOMBSTONE)` | `marufs_index_delete()` |
 | TOMBSTONE → EMPTY | Inline unlink during insert dup check chain walk | `CAS(state, TOMBSTONE, EMPTY)` + `CAS(prev_next, cur, next)` | `marufs_index_check_duplicate()` |
 | INSERTING → TOMBSTONE | GC Phase 2: stale timeout exceeds 5s | `CAS(state, INSERTING, TOMBSTONE)` | `marufs_gc_sweep_stale_entries()` → `marufs_entry_reclaim_slot()` |
 
-### INSERTING 2-Phase Protocol
+### Insert Protocol (Shard-Lock Serialized)
 
-1. **Slot claim**: Flat scan finds EMPTY slot → `CAS(EMPTY, INSERTING)`. On success, stamp `node_id` and `created_at` (for GC stale detection)
-2. **Field write**: Write `name_hash`, `region_id`. While INSERTING, other nodes ignore this entry, so exclusive ownership
-3. **Bucket prepend**: `marufs_index_link_to_bucket()` — `CAS(bucket_head, old_head, entry_idx)` retries on failure (max 32 attempts)
-4. **Publish**: `WRITE_LE32(entry->state, MARUFS_ENTRY_VALID)` + WMB — visible to other nodes from this point
+1. **Pre-insert dup check** (lock-free, best-effort): Walk bucket chain for existing VALID entry
+2. **Slot claim**: CAS EMPTY/TOMBSTONE → INSERTING. Stamp `node_id` and `created_at` (for GC stale detection)
+3. **Field write**: Write `name_hash`, `region_id`. While INSERTING, exclusive ownership
+4. **TENTATIVE**: `WRITE_LE32(state, TENTATIVE)` — visible to dedup walkers but not to lookup
+5. **Acquire shard lock** (`spin_lock` in DRAM `marufs_shard_cache.insert_lock`)
+6. **Bucket prepend**: `marufs_index_link_to_bucket()` — `CAS(bucket_head, old_head, entry_idx)` (skip if chain-reuse)
+7. **Post-insert dedup**: Re-walk chain for VALID duplicates. Loser (higher `entry_idx`) → TOMBSTONE
+8. **Publish**: Winner `WRITE_LE32(state, VALID)` — visible to lookup
+9. **Release shard lock**
 
-Chain reuse path (step 3a): TOMBSTONE slot is already linked in the chain, so it transitions directly to VALID without bucket prepend.
+Chain reuse path (step 3a): TOMBSTONE slot is already linked in the chain, so bucket prepend is skipped.
 
-### TOCTOU Defense: Post-insert Dedup
+### TOCTOU Defense: Post-insert Dedup (Under Lock)
 
-Two nodes can simultaneously pass the pre-insert dup check with the same name. To resolve this, after VALID transition, the bucket chain is re-walked to check for another VALID entry with the same name:
+The shard lock serializes link + dedup + publish within a node, eliminating the window where two VALID entries with the same name are visible to lookup. Cross-node serialization is handled by the token ring protocol.
 
 - **Winner determination**: Lower `entry_idx` wins
-- **Loser rollback**: Higher `entry_idx` transitions itself to TOMBSTONE, returns `-EEXIST`
+- **Loser rollback**: Higher `entry_idx` transitions to TOMBSTONE (under lock), returns `-EEXIST`
 
 ### Stale INSERTING Detection (`marufs_is_stale_inserting()`)
 
