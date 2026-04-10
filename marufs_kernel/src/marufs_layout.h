@@ -176,7 +176,7 @@ struct marufs_shard_header {
  * (single source of truth).
  */
 struct marufs_index_entry {
-	__le32 state; /*  0: CAS target (EMPTY/VALID/TOMBSTONE/INSERTING) */
+	__le32 state; /*  0: CAS target (EMPTY/INSERTING/TENTATIVE/VALID/TOMBSTONE) */
 	__le32 next_in_bucket; /*  4: hash chain link (MARUFS_BUCKET_END = end) */
 	__le64 name_hash; /*  8: 64-bit SHA-256 truncated hash */
 	__le32 region_id; /* 16: RAT entry ID */
@@ -240,7 +240,7 @@ struct marufs_nrht_shard_header {
  */
 struct marufs_nrht_entry {
 	/* ── CL0: hot path (bytes 0–63) ────────────────────────────── */
-	__le32 state; /*  0: EMPTY(0) / INSERTING(1) / VALID(2) / TOMBSTONE(3) */
+	__le32 state; /*  0: EMPTY(0) / INSERTING(1) / TENTATIVE(2) / VALID(3) / TOMBSTONE(4) */
 	__le32 next_in_bucket; /*  4: chain link (BUCKET_END = 0xFFFFFFFF) */
 	__le64 name_hash; /*  8: 64-bit SHA-256 truncated hash */
 	__le64 offset; /* 16: offset within target region's data area */

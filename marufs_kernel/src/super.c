@@ -895,6 +895,7 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 		sbi->shard_cache[i].entries =
 			(struct marufs_index_entry *)((char *)sbi->dax_base +
 						      entry_off);
+		spin_lock_init(&sbi->shard_cache[i].insert_lock);
 	}
 
 	pr_debug(

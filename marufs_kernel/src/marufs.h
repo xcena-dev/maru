@@ -130,6 +130,7 @@ struct marufs_shard_cache {
 	struct marufs_index_entry *entries; /* CXL entry array (32B each) */
 	struct marufs_shard_header *header; /* CXL shard header (READ-ONLY after format) */
 	atomic_t free_hint; /* Next-free scan start (not for correctness) */
+	spinlock_t insert_lock; /* Local lock: serializes insert within this node */
 };
 
 /* ============================================================================

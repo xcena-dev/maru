@@ -8,7 +8,7 @@
  * pointers for multi-node safety.
  *
  * Entry state machine:
- *   EMPTY  --CAS-->  INSERTING  --WRITE_ONCE-->  VALID  --CAS-->  TOMBSTONE
+ *   EMPTY --CAS--> INSERTING --> TENTATIVE --> VALID --CAS--> TOMBSTONE
  *
  * Bucket chains are singly-linked via next_in_bucket, terminating with
  * MARUFS_BUCKET_END (0xFFFFFFFF).
@@ -25,6 +25,16 @@
 #include "marufs.h"
 
 /* Maximum CAS retries for bucket chain insertion */
+
+static inline void index_shard_lock(struct marufs_shard_cache *sc)
+{
+	spin_lock(&sc->insert_lock);
+}
+
+static inline void index_shard_unlock(struct marufs_shard_cache *sc)
+{
+	spin_unlock(&sc->insert_lock);
+}
 
 /* CAS current state → INSERTING and stamp inserter identity for GC. */
 static inline bool marufs_index_claim_entry(struct marufs_sb_info *sbi,
@@ -117,9 +127,10 @@ static int marufs_index_check_duplicate(struct marufs_sb_info *sbi,
 		}
 
 		/*
-		 * Only VALID or INSERTING remain (dead entries handled above).
-		 * Skip INSERTING — not yet committed; concurrent duplicates
-		 * are caught by post-insert dedup (step 6), stale cleanup by GC.
+		 * Only VALID, TENTATIVE, or INSERTING remain (dead handled
+		 * above).  Skip INSERTING/TENTATIVE — not yet committed;
+		 * concurrent duplicates caught by post-insert dedup (step 7),
+		 * stale entries cleaned up by GC.
 		 */
 		if (st == MARUFS_ENTRY_VALID &&
 		    READ_CXL_LE64(e->name_hash) == hash &&
@@ -139,10 +150,10 @@ static int marufs_index_check_duplicate(struct marufs_sb_info *sbi,
 }
 
 /*
- * marufs_index_post_insert_dedup - detect concurrent duplicate after publish.
- * If another VALID entry with the same name exists, higher entry_idx loses
- * and rolls back to TOMBSTONE.
- * Return: 0 if unique, -EEXIST if this entry lost dedup.
+ * marufs_index_post_insert_dedup - detect concurrent duplicate under shard lock.
+ * Called after link_to_bucket while holding the shard lock.  Walks the
+ * bucket chain looking for another VALID entry with the same name.
+ * If found, returns -EEXIST so the caller can tombstone and release.
  */
 static int marufs_index_post_insert_dedup(struct marufs_sb_info *sbi,
 					  struct marufs_index_entry *entries,
@@ -174,9 +185,6 @@ static int marufs_index_post_insert_dedup(struct marufs_sb_info *sbi,
 				pr_info("index_insert: post-insert dup '%.*s' "
 					"(entry %u loses to %u)\n",
 					(int)namelen, name, entry_idx, cur);
-				WRITE_LE32(entry->state,
-					   MARUFS_ENTRY_TOMBSTONE);
-				MARUFS_CXL_WMB(entry, sizeof(*entry));
 				return -EEXIST;
 			}
 		}
@@ -238,10 +246,15 @@ static int marufs_index_link_to_bucket(struct marufs_index_entry *entry,
  * @region_id: region where data is allocated (= RAT entry ID)
  * @out_entry_idx: output - global entry index within shard
  *
- * 3-phase CAS protocol:
- *   1. CAS entry state EMPTY -> INSERTING (reserve slot)
- *   2. CAS bucket head to link entry into hash chain
- *   3. WRITE_ONCE state to VALID (publish)
+ * Insert protocol (shard-lock serialized):
+ *   1. Pre-insert dup check (lock-free, best-effort)
+ *   2. CAS entry state EMPTY/TOMBSTONE -> INSERTING (reserve slot)
+ *   3. Fill entry fields
+ *   4. WRITE state to TENTATIVE (visible to dedup, not to lookup)
+ *   5. Acquire shard lock
+ *   6. CAS bucket head to link entry into hash chain
+ *   7. Post-insert dedup → loser TOMBSTONE, winner VALID (publish)
+ *   8. Release shard lock
  *
  * Return: 0 on success, -ENOSPC if shard full, -EEXIST if name exists
  */
@@ -346,32 +359,42 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	WRITE_LE32(entry->region_id, region_id);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 
-	/*
-	 * Steps 5-6: link to bucket chain and publish entry.
-	 * Skip linking if we reused a tombstone — it's already in the chain.
-	 */
+	/* Step 5: INSERTING → TENTATIVE (visible to dedup, not to lookup) */
+	WRITE_LE32(entry->state, MARUFS_ENTRY_TENTATIVE);
+	MARUFS_CXL_WMB(entry, sizeof(*entry));
+
+	/* Step 6: acquire shard lock — serializes link + dedup within node */
+	index_shard_lock(sc);
+
+	/* Step 7: link to bucket (skip if reused — already in chain) */
 	if (!reused_chain_entry) {
 		ret = marufs_index_link_to_bucket(entry, entry_idx,
 						  bucket_head);
-		if (ret)
-			return ret;
+		if (ret) {
+			WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+			MARUFS_CXL_WMB(entry, sizeof(*entry));
+			goto unlock;
+		}
 	}
 
-	/* Publish: INSERTING → VALID (now visible to readers) */
+	/* Step 8: post-insert dedup — concurrent inserts resolved here */
+	ret = marufs_index_post_insert_dedup(sbi, entries, bucket_head, entry,
+					     entry_idx, hash, name, namelen);
+	if (ret) {
+		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+		MARUFS_CXL_WMB(entry, sizeof(*entry));
+		goto unlock;
+	}
+
+	/* Step 9: TENTATIVE → VALID (now visible to lookup) */
 	WRITE_LE32(entry->state, MARUFS_ENTRY_VALID);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 
-	/* Post-insert dedup: concurrent inserts of same name resolved here */
-	ret = marufs_index_post_insert_dedup(sbi, entries, bucket_head, entry,
-					     entry_idx, hash, name, namelen);
-	if (ret)
-		return ret;
-
 	*out_entry_idx = entry_idx;
-	pr_debug("index_insert: '%.*s' -> shard %u entry %u (region %u)\n",
-		 (int)namelen, name, shard_id, entry_idx, region_id);
 
-	return 0;
+unlock:
+	index_shard_unlock(sc);
+	return ret;
 }
 
 int marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
