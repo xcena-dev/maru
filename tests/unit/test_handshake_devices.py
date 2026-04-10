@@ -154,8 +154,8 @@ class TestServerDeviceAggregation:
 
     def test_send_node_register_exception_logged(self):
         server = self._make_server(local_devices=[("uuid-A", "/dev/dax0.0")])
-        server._allocation_manager.register_node.side_effect = (
-            ConnectionRefusedError("RM down")
+        server._allocation_manager.register_node.side_effect = ConnectionRefusedError(
+            "RM down"
         )
         # Should not raise
         server._send_node_register()

@@ -88,7 +88,9 @@ class MaruServer:
             if isinstance(d, dict) and "uuid" in d and "dax_path" in d:
                 device_list.append((d["uuid"], d["dax_path"]))
             else:
-                logger.warning("Skipping malformed device entry from %s: %s", hostname, d)
+                logger.warning(
+                    "Skipping malformed device entry from %s: %s", hostname, d
+                )
         with self._lock:
             self._node_devices[hostname] = device_list
             logger.info("Handler %s registered %d devices", hostname, len(device_list))
