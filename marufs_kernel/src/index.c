@@ -31,6 +31,8 @@ static inline bool marufs_index_claim_entry(struct marufs_sb_info *sbi,
 					    struct marufs_index_entry *e)
 {
 	u32 st = READ_LE32(e->state);
+	if (st != MARUFS_ENTRY_EMPTY && st != MARUFS_ENTRY_TOMBSTONE)
+		return false;
 	if (marufs_le32_cas(&e->state, st, MARUFS_ENTRY_INSERTING) != st)
 		return false;
 

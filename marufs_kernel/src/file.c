@@ -26,8 +26,9 @@ struct marufs_file_ctx {
 };
 
 /* Pre-allocated batch buffer to avoid kvmalloc per ioctl */
-#define MARUFS_BATCH_BUF_SIZE \
-	(MARUFS_BATCH_FIND_MAX * sizeof(struct marufs_find_name_req))
+#define MARUFS_BATCH_BUF_SIZE                                            \
+	max(MARUFS_BATCH_FIND_MAX * sizeof(struct marufs_find_name_req), \
+	    MARUFS_BATCH_STORE_MAX * sizeof(struct marufs_name_offset_req))
 
 struct marufs_file_priv {
 	void *batch_buf;
@@ -639,7 +640,7 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -EFAULT;
 
 	struct marufs_file_priv *priv = file->private_data;
-	long ret;
+	long ret = 0;
 
 	switch (cmd) {
 	case MARUFS_IOC_NAME_OFFSET:
@@ -660,12 +661,21 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 
 	case MARUFS_IOC_FIND_NAME:
-		ret = nrht_find_one(fc.sbi, fc.xi->rat_entry_id, &payload.find);
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = nrht_find_one(fc.sbi, fc.xi->rat_entry_id,
+					    &payload.find);
+
 		break;
 
 	case MARUFS_IOC_BATCH_FIND_NAME:
-		ret = marufs_ioctl_batch_find_name(
-			fc.sbi, fc.xi, &payload.batch_find, priv->batch_buf);
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_ioctl_batch_find_name(fc.sbi, fc.xi,
+							   &payload.batch_find,
+							   priv->batch_buf);
 		break;
 
 	case MARUFS_IOC_CLEAR_NAME:
