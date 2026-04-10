@@ -40,7 +40,7 @@ NUM_REGIONS="${MARUFS_NUM_REGIONS:-4}"
 
 # DAXHEAP configuration
 USE_DAXHEAP="${MARUFS_DAXHEAP:-false}"
-DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-/home/mcpark/daxheap}"
+DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-}"
 DAXHEAP_MODULE="${DAXHEAP_DIR}/kernel/core/daxheap.ko"
 DAXHEAP_SIZE="${MARUFS_DAXHEAP_SIZE:-192G}"  # Allocation size from daxheap buffer
 
@@ -68,7 +68,7 @@ for arg in "$@"; do
             echo "  MARUFS_NODE_1       Node 1 ID (default: 1)"
             echo "  MARUFS_MODULE       Module path (default: \$PROJECT/marufs.ko)"
             echo "  MARUFS_DAXHEAP      true/false (default: false)"
-            echo "  MARUFS_DAXHEAP_DIR  daxheap source dir (default: /home/mcpark/daxheap)"
+            echo "  MARUFS_DAXHEAP_DIR  daxheap source dir (required when MARUFS_DAXHEAP=true)"
             exit 0
             ;;
     esac

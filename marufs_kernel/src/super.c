@@ -197,7 +197,7 @@ static int marufs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	for (i = 0; i < MARUFS_MAX_RAT_ENTRIES; i++) {
 		struct marufs_rat_entry *entry = marufs_rat_entry_get(sbi, i);
 		if (!entry)
-			return -1;
+			return -EIO;
 
 		u32 state = READ_LE32(entry->state);
 		if (state == MARUFS_RAT_ENTRY_ALLOCATED ||

@@ -13,6 +13,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -348,7 +349,7 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			}
 		}
 
-		cpu_relax();
+		usleep_range(500000, 600000); /* 500ms between retries */
 		retries++;
 	}
 	if (retries >= MARUFS_REGION_INIT_MAX_RETRIES) {

@@ -393,36 +393,18 @@ static inline void __marufs_verify_structs(void)
  */
 #ifdef CONFIG_MARUFS_CXL2_COMPAT
 
-static inline void __marufs_cxl_flush_range(const void *addr, size_t len)
-{
-	volatile char *p = (volatile char *)((unsigned long)addr & ~63UL);
-	const char *end = (const char *)addr + len;
+#include <linux/libnvdimm.h>
 
-	for (; p < (volatile char *)end; p += 64)
-		clwb(p);
-	wmb();
-}
-
-static inline void __marufs_cxl_invalidate_range(const void *addr, size_t len)
-{
-	volatile char *p = (volatile char *)((unsigned long)addr & ~63UL);
-	const char *end = (const char *)addr + len;
-
-	for (; p < (volatile char *)end; p += 64)
-		clflushopt(p);
-	mb();
-}
-
-#define MARUFS_CXL_WMB(addr, len)                    \
-	do {                                         \
-		wmb();                               \
-		__marufs_cxl_flush_range(addr, len); \
+#define MARUFS_CXL_WMB(addr, len)                              \
+	do {                                                   \
+		wmb();                                         \
+		arch_wb_cache_pmem((void *)(addr), (len));     \
 	} while (0)
 
-#define MARUFS_CXL_RMB(addr, len)                         \
-	do {                                              \
-		__marufs_cxl_invalidate_range(addr, len); \
-		rmb();                                    \
+#define MARUFS_CXL_RMB(addr, len)                              \
+	do {                                                   \
+		arch_invalidate_pmem((void *)(addr), (len));   \
+		rmb();                                         \
 	} while (0)
 
 #else /* CXL 3.0: hardware coherence guaranteed across hosts */

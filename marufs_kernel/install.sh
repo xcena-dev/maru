@@ -33,7 +33,7 @@ DEVICE=""
 MOUNT_POINT=""
 SKIP_BUILD=false
 USE_DAXHEAP=false
-DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-/home/mcpark/daxheap}"
+DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-}"
 
 # Helper functions with module name prefix
 log_info()    { echo -e "${BLUE}[INFO]${NC} [$MODULE_NAME] $1"; }
@@ -111,6 +111,10 @@ if [ "$SKIP_BUILD" = false ]; then
     log_info "Step 1/4: Building..."
 
     if [ "$USE_DAXHEAP" = true ]; then
+        if [ -z "$DAXHEAP_DIR" ]; then
+            log_error "DAXHEAP_DIR not set. Use --daxheap-dir or export MARUFS_DAXHEAP_DIR"
+            exit 1
+        fi
         log_info "Building with DAXHEAP_DIR=$DAXHEAP_DIR..."
         make clean > /dev/null 2>&1 || true
         make MODULE_NAME="$MODULE_NAME" DAXHEAP_DIR="$DAXHEAP_DIR" -j128

@@ -37,7 +37,7 @@ CHMOD_MODE="${MARUFS_CHMOD:-1777}"         # permissions for mount points
 
 # DAXHEAP configuration
 USE_DAXHEAP="${MARUFS_DAXHEAP:-false}"
-DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-/home/mcpark/daxheap}"
+DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-}"
 DAXHEAP_MODULE="${DAXHEAP_DIR}/kernel/core/daxheap.ko"
 DAXHEAP_SIZE="${MARUFS_DAXHEAP_SIZE:-192G}"  # Allocation size from daxheap buffer
 
@@ -99,7 +99,7 @@ Actions:
 Options:
   --device DEV      DAX device (default: /dev/dax6.0)
   --daxheap         Use DAXHEAP mode (WC mmap for GPU high-bandwidth)
-  --daxheap-dir DIR daxheap source directory (default: /home/mcpark/daxheap)
+  --daxheap-dir DIR daxheap source directory (required when --daxheap)
   --daxheap-size SZ daxheap allocation size (default: 100G)
   --mount-0 PATH    Node 0 mount point (default: /mnt/marufs)
   --mount-1 PATH    Node 1 mount point (default: /mnt/marufs2)

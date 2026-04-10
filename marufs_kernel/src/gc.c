@@ -54,7 +54,8 @@ static bool marufs_entry_reclaim_slot(struct marufs_index_entry *entry)
 	WRITE_LE64(entry->name_hash, 0);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 	return marufs_le32_cas(&entry->state, MARUFS_ENTRY_INSERTING,
-			       MARUFS_ENTRY_TOMBSTONE) == MARUFS_ENTRY_INSERTING;
+			       MARUFS_ENTRY_TOMBSTONE) ==
+	       MARUFS_ENTRY_INSERTING;
 }
 
 /*
@@ -70,7 +71,7 @@ static bool marufs_entry_reclaim_slot(struct marufs_index_entry *entry)
  * single GC kthread — no locking required.
  */
 void marufs_gc_track_orphan(struct marufs_sb_info *sbi, void *entry,
-			   enum marufs_orphan_type type)
+			    enum marufs_orphan_type type)
 {
 	/* Already tracked? Skip duplicate registration */
 	u32 i;
@@ -94,8 +95,7 @@ void marufs_gc_track_orphan(struct marufs_sb_info *sbi, void *entry,
  * Returns true if entry is still stuck (eligible for reclaim on timeout).
  * Returns false if state changed (should be removed from tracker).
  */
-static bool marufs_gc_is_orphan_stuck(void *entry,
-					 enum marufs_orphan_type type)
+static bool marufs_gc_is_orphan_stuck(void *entry, enum marufs_orphan_type type)
 {
 	MARUFS_CXL_RMB(entry, 64); /* Invalidate CL0 (state & node_id field) */
 
@@ -277,7 +277,9 @@ static int marufs_is_stale_inserting(struct marufs_sb_info *sbi,
 	u64 created_at, now;
 
 	if (inserter_node == 0)
-		return (sbi->node_id == 1) ? 0 : -1; /* Only admin node tracks orphans */
+		return (sbi->node_id == 1) ?
+			       0 :
+			       -1; /* Only admin node tracks orphans */
 
 	if (inserter_node != sbi->node_id)
 		return -1;
@@ -311,7 +313,8 @@ static int marufs_is_stale_inserting(struct marufs_sb_info *sbi,
  *
  * Returns number of reclaimed entries, or negative on error.
  */
-static int marufs_gc_sweep_stale_entries(struct marufs_sb_info *sbi, u32 shard_id)
+static int marufs_gc_sweep_stale_entries(struct marufs_sb_info *sbi,
+					 u32 shard_id)
 {
 	struct marufs_shard_header *sh = marufs_shard_header_get(sbi, shard_id);
 	if (!sh)
@@ -385,8 +388,8 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info *sbi,
 				u32 de_node = READ_CXL_LE32(de->node_id);
 
 				if (de_node != 0 || sbi->node_id == 1)
-					marufs_gc_track_orphan(sbi, de,
-							       MARUFS_ORPHAN_DELEG);
+					marufs_gc_track_orphan(
+						sbi, de, MARUFS_ORPHAN_DELEG);
 			} else if (ktime_get_real_ns() - granted_at >
 				   MARUFS_STALE_TIMEOUT_NS) {
 				if (marufs_le32_cas(&de->state,
@@ -412,8 +415,8 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info *sbi,
 			 * Use granted_at timeout instead (same pattern as GRANTING).
 			 */
 			if (de_birth == 0) {
-				marufs_gc_track_orphan(sbi, de,
-						       MARUFS_ORPHAN_DELEG_UNBOUND);
+				marufs_gc_track_orphan(
+					sbi, de, MARUFS_ORPHAN_DELEG_UNBOUND);
 				break;
 			}
 
@@ -594,7 +597,8 @@ int marufs_gc_reclaim_dead_regions(struct marufs_sb_info *sbi)
 		u16 owner_node = READ_LE16(entry->owner_node_id);
 		if (owner_node == 0 && state == MARUFS_RAT_ENTRY_ALLOCATING) {
 			if (sbi->node_id == 1)
-				marufs_gc_track_orphan(sbi, entry, MARUFS_ORPHAN_RAT);
+				marufs_gc_track_orphan(sbi, entry,
+						       MARUFS_ORPHAN_RAT);
 			continue;
 		}
 
@@ -643,7 +647,7 @@ static int marufs_gc_thread_fn(void *data)
 	struct marufs_sb_info *sbi = data;
 	pr_info("gc thread started for node %u\n", sbi->node_id);
 
-	while (!kthread_should_stop()) {
+	while (1) {
 		msleep_interruptible(MARUFS_GC_INTERVAL_MS);
 
 		if (atomic_read(&sbi->gc_paused))
@@ -654,6 +658,8 @@ static int marufs_gc_thread_fn(void *data)
 
 		/* Phase 1: Reclaim regions from dead processes */
 		marufs_gc_reclaim_dead_regions(sbi);
+		if (kthread_should_stop())
+			break;
 
 		/* Phase 2: Round-robin sweep of stale INSERTING entries */
 		for (u32 s = 0; s < shards_per_cycle; s++) {
@@ -661,12 +667,18 @@ static int marufs_gc_thread_fn(void *data)
 			sbi->gc_next_shard =
 				(sbi->gc_next_shard + 1) % sbi->num_shards;
 		}
+		if (kthread_should_stop())
+			break;
 
 		/* Phase 3: Reclaim timed-out orphaned entries from DRAM tracker */
 		marufs_gc_sweep_orphans(sbi);
+		if (kthread_should_stop())
+			break;
 
 		/* Phase 4: Sweep stale INSERTING entries in NRHT regions */
 		marufs_nrht_gc_sweep_all(sbi);
+		if (kthread_should_stop())
+			break;
 
 		atomic_inc(&sbi->gc_epoch);
 	}

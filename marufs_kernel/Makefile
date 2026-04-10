@@ -29,7 +29,7 @@ ccflags-y += -I$(src)/include
 ccflags-y += -DCONFIG_MARUFS_CXL2_COMPAT
 
 # Optional daxheap integration (WC mmap + DMA-BUF export for GPU)
-# Set DAXHEAP_DIR to enable: make DAXHEAP_DIR=/home/mcpark/daxheap
+# Set DAXHEAP_DIR to enable: make DAXHEAP_DIR=/path/to/daxheap
 ifdef DAXHEAP_DIR
 ccflags-y += -DCONFIG_DAXHEAP -I$(DAXHEAP_DIR)/kernel/core/include
 DAXHEAP_SYMVERS := KBUILD_EXTRA_SYMBOLS=$(DAXHEAP_DIR)/kernel/core/Module.symvers
