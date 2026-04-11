@@ -99,7 +99,7 @@ class MaruHandler:
         # Client-side timing for StatsManager reporting
         self._stats_buffer: list[dict] = []
         self._stats_lock = threading.Lock()
-        self._stats_last_flush = 0.0
+        self._stats_flusher: threading.Thread | None = None
 
         # Connection state
         self._key_to_location: dict[str, tuple[int, int]] = {}
@@ -276,6 +276,15 @@ class MaruHandler:
             if self._config.eager_map:
                 self._premap_shared_regions()
 
+            # 6. Start stats flush thread if enabled
+            if self._config.enable_stats:
+                self._stats_flusher = threading.Thread(
+                    target=self._stats_flush_loop,
+                    name="stats-flusher",
+                    daemon=True,
+                )
+                self._stats_flusher.start()
+
             logger.info(
                 "Connected: chunk_size=%d",
                 self._config.chunk_size_bytes,
@@ -293,7 +302,7 @@ class MaruHandler:
     def _record_stats(
         self, op_type: str, size: int, latency_us: float, result: str = "none"
     ) -> None:
-        """Buffer a timing entry and flush if >=1s since last flush."""
+        """Buffer a timing entry. Flushed by background thread every 1s."""
         if not self._config.enable_stats or not self._connected:
             return
         entry = {
@@ -303,23 +312,11 @@ class MaruHandler:
             "size": size,
             "latency_us": latency_us,
         }
-        flush_buf = None
         with self._stats_lock:
             self._stats_buffer.append(entry)
-            now = time.monotonic()
-            if now - self._stats_last_flush >= 1.0:
-                flush_buf = self._stats_buffer.copy()
-                self._stats_buffer.clear()
-                self._stats_last_flush = now
-        # Send RPC outside lock to avoid blocking other threads
-        if flush_buf:
-            try:
-                self._rpc.report_stats(flush_buf)
-            except Exception:
-                logger.debug("Failed to flush timings", exc_info=True)
 
     def _flush_stats(self) -> None:
-        """Flush remaining timings. Called from close()."""
+        """Send buffered stats to server. Called by flush thread and close()."""
         with self._stats_lock:
             buf = self._stats_buffer.copy()
             self._stats_buffer.clear()
@@ -327,7 +324,13 @@ class MaruHandler:
             try:
                 self._rpc.report_stats(buf)
             except Exception:
-                logger.debug("Failed to flush timings", exc_info=True)
+                logger.debug("Failed to flush stats", exc_info=True)
+
+    def _stats_flush_loop(self) -> None:
+        """Background loop: flush stats buffer every 1s."""
+        while self._connected and not self._closing.is_set():
+            self._closing.wait(timeout=1.0)
+            self._flush_stats()
 
     def close(self) -> None:
         """Close the connection and return all allocations.
@@ -340,7 +343,10 @@ class MaruHandler:
 
         self._closing.set()  # reject new operations immediately
 
-        # Flush remaining timings
+        # Stop stats flush thread and flush remaining
+        if self._stats_flusher is not None:
+            self._stats_flusher.join(timeout=2.0)
+            self._stats_flusher = None
         self._flush_stats()
 
         try:
