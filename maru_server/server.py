@@ -258,7 +258,7 @@ class MaruServer:
         """
         return self._kv_manager.batch_exists(keys)
 
-    def report_timings(self, entries: list[dict]) -> None:
+    def report_stats(self, entries: list[dict]) -> None:
         """Record client-reported handler-side timings."""
         for e in entries:
             self._stats_manager.record(

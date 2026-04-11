@@ -60,7 +60,7 @@ class MessageType(IntEnum):
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
     HEARTBEAT = 0xF1
-    REPORT_TIMINGS = 0xF2
+    REPORT_STATS = 0xF2
     HANDSHAKE = 0xFE
     SHUTDOWN = 0xFF
 
@@ -462,16 +462,16 @@ class HeartbeatResponse:
 
 
 @dataclass
-class ReportTimingsRequest:
-    """REPORT_TIMINGS (0xF2) - Client reports handler-side latency."""
+class ReportStatsRequest:
+    """REPORT_STATS (0xF2) - Client reports handler-side latency."""
 
     entries: list[dict] = field(default_factory=list)
     # Each entry: {"op_type": str, "result": str, "size": int, "latency_us": float}
 
 
 @dataclass
-class ReportTimingsResponse:
-    """Response for REPORT_TIMINGS."""
+class ReportStatsResponse:
+    """Response for REPORT_STATS."""
 
     success: bool = True
 
@@ -537,7 +537,7 @@ MESSAGE_CLASSES = {
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
     MessageType.HEARTBEAT: (HeartbeatRequest, HeartbeatResponse),
-    MessageType.REPORT_TIMINGS: (ReportTimingsRequest, ReportTimingsResponse),
+    MessageType.REPORT_STATS: (ReportStatsRequest, ReportStatsResponse),
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }

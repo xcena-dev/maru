@@ -314,7 +314,7 @@ class MaruHandler:
         # Send RPC outside lock to avoid blocking other threads
         if flush_buf:
             try:
-                self._rpc.report_timings(flush_buf)
+                self._rpc.report_stats(flush_buf)
             except Exception:
                 logger.debug("Failed to flush timings", exc_info=True)
 
@@ -325,7 +325,7 @@ class MaruHandler:
             self._stats_buffer.clear()
         if buf and self._connected:
             try:
-                self._rpc.report_timings(buf)
+                self._rpc.report_stats(buf)
             except Exception:
                 logger.debug("Failed to flush timings", exc_info=True)
 
