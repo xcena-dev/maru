@@ -725,10 +725,10 @@ class TestShmClientDeviceTable:
         tmp_paths = []
 
         # The "local" file that the handler should actually mmap
-        local_path = _make_temp_file(size=4096, fill=b"\xAA")
+        local_path = _make_temp_file(size=4096, fill=b"\xaa")
         tmp_paths.append(local_path)
         # The "RM" file — should NOT be opened when UUID resolves
-        rm_path = _make_temp_file(size=4096, fill=b"\xBB")
+        rm_path = _make_temp_file(size=4096, fill=b"\xbb")
         tmp_paths.append(rm_path)
 
         test_uuid = "550e8400-e29b-41d4-a716-446655440000"
@@ -769,7 +769,7 @@ class TestShmClientDeviceTable:
             mm = client.mmap(handle, PROT_READ | PROT_WRITE)
             assert mm is not None
             # Should have mmap'd the LOCAL file (0xAA), not the RM file (0xBB)
-            assert mm[0:1] == b"\xAA"
+            assert mm[0:1] == b"\xaa"
 
             client.close()
         finally:
@@ -783,7 +783,7 @@ class TestShmClientDeviceTable:
     def test_mmap_falls_back_without_device_table(self):
         """Without device_table, mmap uses RM's dax_path directly."""
         tmp_paths = []
-        rm_path = _make_temp_file(size=4096, fill=b"\xCC")
+        rm_path = _make_temp_file(size=4096, fill=b"\xcc")
         tmp_paths.append(rm_path)
 
         def handler(sock):
@@ -822,7 +822,7 @@ class TestShmClientDeviceTable:
 
             mm = client.mmap(handle, PROT_READ | PROT_WRITE)
             assert mm is not None
-            assert mm[0:1] == b"\xCC"
+            assert mm[0:1] == b"\xcc"
 
             client.close()
         finally:

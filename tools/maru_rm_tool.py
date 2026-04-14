@@ -53,9 +53,7 @@ def cmd_device_clear(args: argparse.Namespace) -> None:
         return
 
     if not args.yes:
-        answer = input(
-            f"Clear UUID header on {path}? (UUID: {existing}) [y/N] "
-        )
+        answer = input(f"Clear UUID header on {path}? (UUID: {existing}) [y/N] ")
         if answer.lower() not in ("y", "yes"):
             print("Aborted.")
             return

@@ -484,4 +484,3 @@ class ErrorResp:
             "utf-8", errors="replace"
         )
         return cls(status=status, message=message)
-
