@@ -544,15 +544,9 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
     if (rc == 0)
     {
         loaded.devPath = path;
-        loaded.totalSize = size;
+        loaded.totalSize = size - dataOffset;
         loaded.alignBytes = pool.alignBytes;
         pool = loaded;
-    }
-
-    // Auto-register own node mapping for DEV_DAX
-    if (!pool.deviceUuid.empty())
-    {
-        nodeMappings_[pool.deviceUuid][localHostname()] = pool.devPath;
     }
 
     pools_.push_back(pool);
@@ -852,87 +846,6 @@ PoolState *PoolManager::findPoolByPath(const std::string &devPath)
     return nullptr;
 }
 
-PoolState *PoolManager::findPoolByUuid(const std::string &uuid)
-{
-    for (auto &pool : pools_)
-    {
-        if (pool.deviceUuid == uuid)
-        {
-            return &pool;
-        }
-    }
-    return nullptr;
-}
-
-int PoolManager::registerNodes(const NodeList &nodes)
-{
-    std::lock_guard<std::mutex> lock(mu_);
-
-    int matched = 0;
-    for (const auto &[nodeId, mappings] : nodes)
-    {
-        // Clear this node's old mappings (handles device hot-unplug)
-        for (auto &[uuid, nodeMap] : nodeMappings_)
-        {
-            nodeMap.erase(nodeId);
-        }
-
-        // Add new mappings for this node
-        for (const auto &m : mappings)
-        {
-            nodeMappings_[m.uuid][nodeId] = m.localDaxPath;
-            if (findPoolByUuid(m.uuid) != nullptr)
-            {
-                ++matched;
-            }
-        }
-    }
-    logf(LogLevel::Info,
-         "[NODE_REGISTER] %zu nodes updated, matched=%d",
-         nodes.size(), matched);
-    return matched;
-}
-
-std::string PoolManager::resolvePathForClient(const std::string &deviceUuid,
-                                              const std::string &clientId)
-{
-    // FS_DAX or no UUID: no resolution needed
-    if (deviceUuid.empty())
-    {
-        return "";
-    }
-
-    std::string hostname;
-    auto pos = clientId.rfind(':');
-    if (pos != std::string::npos)
-    {
-        hostname = clientId.substr(0, pos);
-    }
-    else
-    {
-        hostname = clientId;
-    }
-
-    // Local client: return RM's own devPath
-    if (hostname == localHostname())
-    {
-        auto *pool = findPoolByUuid(deviceUuid);
-        return pool ? pool->devPath : "";
-    }
-
-    // Remote client: lookup node mapping table
-    auto it = nodeMappings_.find(deviceUuid);
-    if (it != nodeMappings_.end())
-    {
-        auto nodeIt = it->second.find(hostname);
-        if (nodeIt != it->second.end())
-        {
-            return nodeIt->second;
-        }
-    }
-    return "";
-}
-
 PoolState *PoolManager::findPoolForRegion(uint64_t regionId)
 {
     auto it = allocations_.find(regionId);
@@ -943,25 +856,20 @@ PoolState *PoolManager::findPoolForRegion(uint64_t regionId)
     return findPoolById(it->second.poolId);
 }
 
-std::string PoolManager::resolveDevicePath(uint64_t regionId,
-                                           const std::string &clientId)
+std::string PoolManager::getDeviceUuidForRegion(uint64_t regionId)
 {
     std::lock_guard<std::mutex> lock(mu_);
     auto *pool = findPoolForRegion(regionId);
-    if (pool && !pool->deviceUuid.empty())
+    if (pool)
     {
-        std::string resolved = resolvePathForClient(pool->deviceUuid, clientId);
-        if (!resolved.empty())
-        {
-            return resolved;
-        }
+        return pool->deviceUuid;
     }
     return "";
 }
 
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
-                       std::string &devPath, const std::string &daxPath,
-                       uint64_t &requestedSizeOut)
+                       std::string &devPath, std::string &deviceUuid,
+                       const std::string &daxPath, uint64_t &requestedSizeOut)
 {
     if (clientId.empty())
     {
@@ -1046,6 +954,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         devPath = selectedPool->devPath;
     }
 
+    deviceUuid = selectedPool->deviceUuid;
     requestedSizeOut = alloc.requestedSize;
     out = alloc.handle;
     wal_->appendAlloc(alloc);

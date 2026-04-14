@@ -4,11 +4,9 @@
 
 import argparse
 import logging
-import platform
 import signal
 from threading import RLock
 
-from maru_shm.device_scanner import scan_dax_devices
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -40,20 +38,6 @@ class MaruServer:
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
 
-        # Node device mappings: {hostname: [(uuid, dax_path), ...]}
-        self._node_devices: dict[str, list[tuple[str, str]]] = {}
-
-        # Scan own node's devices at startup
-        self._hostname = platform.node()
-        local_devices = scan_dax_devices()
-        if local_devices:
-            self._node_devices[self._hostname] = local_devices
-            logger.info(
-                "Scanned %d local DAX devices on %s",
-                len(local_devices),
-                self._hostname,
-            )
-
         if self._dax_paths:
             self._validate_dax_paths()
 
@@ -80,38 +64,6 @@ class MaruServer:
                 "Could not validate --dax-path against resource manager",
                 exc_info=True,
             )
-
-    def register_handler_devices(self, hostname: str, devices: list[dict]) -> None:
-        """Store handler's device mappings and send NODE_REGISTER to RM."""
-        device_list = []
-        for d in devices:
-            if isinstance(d, dict) and "uuid" in d and "dax_path" in d:
-                device_list.append((d["uuid"], d["dax_path"]))
-            else:
-                logger.warning(
-                    "Skipping malformed device entry from %s: %s", hostname, d
-                )
-        with self._lock:
-            self._node_devices[hostname] = device_list
-            logger.info("Handler %s registered %d devices", hostname, len(device_list))
-            self._send_node_register()
-
-    def _send_node_register(self) -> None:
-        """Send all collected node device mappings to RM. Caller must hold _lock."""
-        if not self._node_devices:
-            return
-        nodes = [
-            (hostname, devices) for hostname, devices in self._node_devices.items()
-        ]
-        try:
-            resp = self._allocation_manager.register_node(nodes)
-            logger.info(
-                "NODE_REGISTER sent: matched=%d, total=%d",
-                resp.matched,
-                resp.total,
-            )
-        except Exception:
-            logger.warning("NODE_REGISTER failed", exc_info=True)
 
     @property
     def rm_address(self) -> str:

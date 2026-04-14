@@ -715,3 +715,120 @@ class TestShmClientErrors:
                     os.unlink(p)
                 except OSError:
                     pass
+
+
+class TestShmClientDeviceTable:
+    """Test v2 device_table UUID → local path resolution in mmap."""
+
+    def test_mmap_resolves_uuid_to_local_path(self):
+        """When GET_ACCESS returns device_uuid, mmap uses device_table to resolve."""
+        tmp_paths = []
+
+        # The "local" file that the handler should actually mmap
+        local_path = _make_temp_file(size=4096, fill=b"\xAA")
+        tmp_paths.append(local_path)
+        # The "RM" file — should NOT be opened when UUID resolves
+        rm_path = _make_temp_file(size=4096, fill=b"\xBB")
+        tmp_paths.append(rm_path)
+
+        test_uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+        def handler(sock):
+            while True:
+                try:
+                    hdr, payload = _recv_request(sock)
+                except (ConnectionError, OSError):
+                    break
+
+                if hdr.msg_type == MsgType.ALLOC_REQ:
+                    handle = MaruHandle(
+                        region_id=1, offset=0, length=4096, auth_token=999
+                    )
+                    # ALLOC response includes UUID
+                    resp = AllocResp(
+                        status=0,
+                        handle=handle,
+                        requested_size=4096,
+                        dax_path=rm_path,
+                        device_uuid=test_uuid,
+                    )
+                    resp_payload = resp.pack()
+                    resp_hdr = MsgHeader(
+                        msg_type=MsgType.ALLOC_RESP,
+                        payload_len=len(resp_payload),
+                    )
+                    write_full(sock, resp_hdr.pack() + resp_payload)
+
+        server = MockResourceManagerServer(handler)
+        address = server.start()
+        try:
+            device_table = {test_uuid: local_path}
+            client = MaruShmClient(address=address, device_table=device_table)
+            handle = client.alloc(4096)
+
+            mm = client.mmap(handle, PROT_READ | PROT_WRITE)
+            assert mm is not None
+            # Should have mmap'd the LOCAL file (0xAA), not the RM file (0xBB)
+            assert mm[0:1] == b"\xAA"
+
+            client.close()
+        finally:
+            server.stop()
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def test_mmap_falls_back_without_device_table(self):
+        """Without device_table, mmap uses RM's dax_path directly."""
+        tmp_paths = []
+        rm_path = _make_temp_file(size=4096, fill=b"\xCC")
+        tmp_paths.append(rm_path)
+
+        def handler(sock):
+            while True:
+                try:
+                    hdr, payload = _recv_request(sock)
+                except (ConnectionError, OSError):
+                    break
+
+                if hdr.msg_type == MsgType.ALLOC_REQ:
+                    handle = MaruHandle(
+                        region_id=1, offset=0, length=4096, auth_token=999
+                    )
+                    _send_alloc_resp_with_path(sock, handle, 4096, rm_path)
+                elif hdr.msg_type == MsgType.GET_ACCESS_REQ:
+                    resp = GetAccessResp(
+                        status=0,
+                        dax_path=rm_path,
+                        device_uuid="some-uuid",
+                        offset=0,
+                        length=4096,
+                    )
+                    resp_payload = resp.pack()
+                    resp_hdr = MsgHeader(
+                        msg_type=MsgType.GET_ACCESS_RESP,
+                        payload_len=len(resp_payload),
+                    )
+                    write_full(sock, resp_hdr.pack() + resp_payload)
+
+        server = MockResourceManagerServer(handler)
+        address = server.start()
+        try:
+            # No device_table → fallback to RM path
+            client = MaruShmClient(address=address)
+            handle = client.alloc(4096)
+
+            mm = client.mmap(handle, PROT_READ | PROT_WRITE)
+            assert mm is not None
+            assert mm[0:1] == b"\xCC"
+
+            client.close()
+        finally:
+            server.stop()
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass

@@ -12,7 +12,7 @@ Wire format::
 """
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 
 from .types import DaxType, MaruHandle, MaruPoolInfo
@@ -36,8 +36,6 @@ class MsgType(IntEnum):
     STATS_RESP = 6
     GET_ACCESS_REQ = 9
     GET_ACCESS_RESP = 10
-    NODE_REGISTER_REQ = 11
-    NODE_REGISTER_RESP = 12
     ERROR_RESP = 255
 
 
@@ -173,6 +171,7 @@ class AllocResp:
     handle: MaruHandle | None = None
     requested_size: int = 0
     dax_path: str = ""
+    device_uuid: str = ""
 
     def pack(self) -> bytes:
         h = self.handle or MaruHandle()
@@ -188,7 +187,9 @@ class AllocResp:
         )
         path_bytes = self.dax_path.encode("utf-8")
         path_header = struct.pack("<I", len(path_bytes))
-        return fixed + path_header + path_bytes
+        uuid_bytes = self.device_uuid.encode("utf-8")
+        uuid_header = struct.pack("<H", len(uuid_bytes))
+        return fixed + path_header + path_bytes + uuid_header + uuid_bytes
 
     @classmethod
     def unpack(cls, data: bytes) -> "AllocResp":
@@ -201,7 +202,7 @@ class AllocResp:
             region_id=vals[2], offset=vals[3], length=vals[4], auth_token=vals[5]
         )
         requested_size = vals[6]
-        # Parse optional dax_path extension
+        # Parse dax_path
         dax_path = ""
         offset = _ALLOC_RESP_SIZE
         if offset + 4 <= len(data):
@@ -209,11 +210,20 @@ class AllocResp:
             offset += 4
             if path_len > 0 and offset + path_len <= len(data):
                 dax_path = data[offset : offset + path_len].decode("utf-8")
+                offset += path_len
+        # Parse device_uuid
+        device_uuid = ""
+        if offset + 2 <= len(data):
+            (uuid_len,) = struct.unpack("<H", data[offset : offset + 2])
+            offset += 2
+            if uuid_len > 0 and offset + uuid_len <= len(data):
+                device_uuid = data[offset : offset + uuid_len].decode("utf-8")
         return cls(
             status=status,
             handle=handle,
             requested_size=requested_size,
             dax_path=dax_path,
+            device_uuid=device_uuid,
         )
 
 
@@ -316,6 +326,7 @@ class GetAccessResp:
 
     status: int = 0
     dax_path: str = ""
+    device_uuid: str = ""
     offset: int = 0
     length: int = 0
 
@@ -325,7 +336,9 @@ class GetAccessResp:
             _GET_ACCESS_RESP_HEADER_FORMAT, self.status, len(path_bytes)
         )
         tail = struct.pack("<QQ", self.offset, self.length)
-        return header + path_bytes + tail
+        uuid_bytes = self.device_uuid.encode("utf-8")
+        uuid_header = struct.pack("<H", len(uuid_bytes))
+        return header + path_bytes + tail + uuid_header + uuid_bytes
 
     @classmethod
     def unpack(cls, data: bytes) -> "GetAccessResp":
@@ -343,7 +356,20 @@ class GetAccessResp:
         length = 0
         if off + 16 <= len(data):
             offset, length = struct.unpack("<QQ", data[off : off + 16])
-        return cls(status=status, dax_path=dax_path, offset=offset, length=length)
+            off += 16
+        device_uuid = ""
+        if off + 2 <= len(data):
+            (uuid_len,) = struct.unpack("<H", data[off : off + 2])
+            off += 2
+            if uuid_len > 0 and off + uuid_len <= len(data):
+                device_uuid = data[off : off + uuid_len].decode("utf-8")
+        return cls(
+            status=status,
+            dax_path=dax_path,
+            device_uuid=device_uuid,
+            offset=offset,
+            length=length,
+        )
 
 
 # StatsReq: empty payload (0 bytes)
@@ -459,62 +485,3 @@ class ErrorResp:
         )
         return cls(status=status, message=message)
 
-
-# =============================================================================
-# NodeRegisterReq / NodeRegisterResp
-# =============================================================================
-
-# NodeRegisterResp: status(i32) + matched(u32) + total(u32) = 12 bytes
-_NODE_REGISTER_RESP_FORMAT = "<iII"
-_NODE_REGISTER_RESP_SIZE = struct.calcsize(_NODE_REGISTER_RESP_FORMAT)
-
-
-@dataclass
-class NodeRegisterReq:
-    """Node registration request.
-
-    Wire format:
-        num_nodes(u32) + for each node:
-            node_id_len(u16) + node_id(bytes) +
-            num_devices(u32) + for each device:
-                uuid_len(u16) + uuid(bytes) +
-                path_len(u16) + path(bytes)
-    """
-
-    nodes: list[tuple[str, list[tuple[str, str]]]] = field(default_factory=list)
-
-    def pack(self) -> bytes:
-        parts = [struct.pack("<I", len(self.nodes))]
-        for node_id, devices in self.nodes:
-            nid = node_id.encode("utf-8")
-            parts.append(struct.pack("<H", len(nid)))
-            parts.append(nid)
-            parts.append(struct.pack("<I", len(devices)))
-            for uuid, path in devices:
-                ub = uuid.encode("utf-8")
-                pb = path.encode("utf-8")
-                parts.append(struct.pack("<H", len(ub)))
-                parts.append(ub)
-                parts.append(struct.pack("<H", len(pb)))
-                parts.append(pb)
-        return b"".join(parts)
-
-
-@dataclass
-class NodeRegisterResp:
-    """Node registration response."""
-
-    status: int = 0
-    matched: int = 0
-    total: int = 0
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "NodeRegisterResp":
-        if len(data) < _NODE_REGISTER_RESP_SIZE:
-            raise ValueError(
-                f"NodeRegisterResp too short: {len(data)} < {_NODE_REGISTER_RESP_SIZE}"
-            )
-        status, matched, total = struct.unpack(
-            _NODE_REGISTER_RESP_FORMAT, data[:_NODE_REGISTER_RESP_SIZE]
-        )
-        return cls(status=status, matched=matched, total=total)

@@ -8,7 +8,7 @@ from unittest import mock
 from maru_shm.device_scanner import (
     _HEADER_FORMAT,
     _HEADER_MAGIC,
-    _uuid_to_string,
+    uuid_to_string,
     read_device_uuid,
     scan_dax_devices,
 )
@@ -28,18 +28,18 @@ SAMPLE_UUID_BYTES = b"\x55\x0e\x84\x00\xe2\x9b\x41\xd4\xa7\x16\x44\x66\x55\x44\x
 SAMPLE_UUID_STR = "550e8400-e29b-41d4-a716-446655440000"
 
 
-# ── _uuid_to_string ──────────────────────────────────────────────────────────
+# ── uuid_to_string ──────────────────────────────────────────────────────────
 
 
 class TestUuidToString:
     def test_known_uuid(self):
-        assert _uuid_to_string(SAMPLE_UUID_BYTES) == SAMPLE_UUID_STR
+        assert uuid_to_string(SAMPLE_UUID_BYTES) == SAMPLE_UUID_STR
 
     def test_all_zeros(self):
-        assert _uuid_to_string(b"\x00" * 16) == "00000000-0000-0000-0000-000000000000"
+        assert uuid_to_string(b"\x00" * 16) == "00000000-0000-0000-0000-000000000000"
 
     def test_all_ff(self):
-        assert _uuid_to_string(b"\xff" * 16) == "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        assert uuid_to_string(b"\xff" * 16) == "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
 
 # ── read_device_uuid ─────────────────────────────────────────────────────────
@@ -104,14 +104,14 @@ class TestScanDaxDevices:
             mock.patch("maru_shm.device_scanner.read_device_uuid") as mock_read,
         ):
             mock_read.side_effect = [
-                _uuid_to_string(uuid_a),
-                _uuid_to_string(uuid_b),
+                uuid_to_string(uuid_a),
+                uuid_to_string(uuid_b),
             ]
             results = scan_dax_devices()
 
         assert len(results) == 2
-        assert results[0] == (_uuid_to_string(uuid_a), "/dev/dax0.0")
-        assert results[1] == (_uuid_to_string(uuid_b), "/dev/dax1.0")
+        assert results[0] == (uuid_to_string(uuid_a), "/dev/dax0.0")
+        assert results[1] == (uuid_to_string(uuid_b), "/dev/dax1.0")
 
     def test_skips_device_without_valid_header(self):
         with (

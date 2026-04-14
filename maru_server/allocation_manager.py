@@ -206,10 +206,6 @@ class AllocationManager:
         """Get pool stats from resource manager."""
         return self._client.stats()
 
-    def register_node(self, nodes: list) -> object:
-        """Forward NODE_REGISTER to resource manager."""
-        return self._client.register_node(nodes)
-
     def close(self) -> None:
         """Close the resource manager client."""
         try:

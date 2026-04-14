@@ -401,3 +401,23 @@ class TestDaxMapperPrefault:
             mock_prefault.assert_not_called()
 
         assert region.is_mapped
+
+
+class TestDaxMapperDeviceTable:
+    """Test v2 device_table (UUID → local path resolution)."""
+
+    def test_init_with_device_table(self):
+        """DaxMapper accepts device_table and passes it to MaruShmClient."""
+        table = {"uuid-A": "/dev/dax0.0", "uuid-B": "/dev/dax1.0"}
+        mapper = DaxMapper(device_table=table)
+        assert mapper._client._device_table == table
+
+    def test_init_without_device_table(self):
+        """DaxMapper without device_table defaults to empty dict."""
+        mapper = DaxMapper()
+        assert mapper._client._device_table == {}
+
+    def test_init_with_none_device_table(self):
+        """DaxMapper with None device_table defaults to empty dict."""
+        mapper = DaxMapper(device_table=None)
+        assert mapper._client._device_table == {}

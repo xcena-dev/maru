@@ -24,8 +24,6 @@ enum class MsgType : uint16_t {
   STATS_RESP = 6,
   GET_ACCESS_REQ = 9,
   GET_ACCESS_RESP = 10,
-  NODE_REGISTER_REQ = 11,
-  NODE_REGISTER_RESP = 12,
   ERROR_RESP = 255
 };
 
@@ -71,12 +69,6 @@ struct StatsRespHeader {
   uint32_t numPools;
 };
 
-struct NodeRegisterResp {
-  int32_t status;
-  uint32_t matched;
-  uint32_t total;
-};
-
 struct ErrorResp {
   int32_t status;
   uint32_t msgLen;
@@ -95,7 +87,6 @@ static_assert(sizeof(FreeResp) == 4, "FreeResp must be 4 bytes");
 static_assert(sizeof(GetAccessReq) == 32, "GetAccessReq must be 32 bytes (Handle)");
 static_assert(sizeof(GetAccessResp) == 8, "GetAccessResp must be 8 bytes (fixed part)");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
-static_assert(sizeof(NodeRegisterResp) == 12, "NodeRegisterResp must be 12 bytes");
 static_assert(sizeof(ErrorResp) == 8, "ErrorResp must be 8 bytes");
 
 } // namespace maru

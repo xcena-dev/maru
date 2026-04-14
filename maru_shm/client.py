@@ -24,8 +24,6 @@ from .ipc import (
     GetAccessResp,
     MsgHeader,
     MsgType,
-    NodeRegisterReq,
-    NodeRegisterResp,
     StatsReq,
     StatsResp,
 )
@@ -68,8 +66,13 @@ class MaruShmClient:
     mmap() opens the device path directly to create Python mmap objects.
     """
 
-    def __init__(self, address: str | None = None):
+    def __init__(
+        self,
+        address: str | None = None,
+        device_table: dict[str, str] | None = None,
+    ):
         self._address = address or DEFAULT_ADDRESS
+        self._device_table = device_table or {}  # uuid -> local_dax_path
         self._path_cache: dict[int, str] = {}  # region_id -> device path
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
@@ -202,24 +205,6 @@ class MaruShmClient:
         resp = StatsResp.unpack(payload)
         return resp.pools or []
 
-    def register_node(
-        self, nodes: list[tuple[str, list[tuple[str, str]]]]
-    ) -> NodeRegisterResp:
-        """Register node device mappings with the resource manager.
-
-        Args:
-            nodes: List of (node_id, [(device_uuid, local_dax_path), ...])
-
-        Returns:
-            NodeRegisterResp with status, matched count, total count.
-        """
-        req = NodeRegisterReq(nodes=nodes)
-        hdr, payload = self._rpc(MsgType.NODE_REGISTER_REQ, req.pack())
-        self._check_error(hdr, payload, "Node register failed")
-        resp = NodeRegisterResp.unpack(payload)
-        logger.info("register_node: matched=%d, total=%d", resp.matched, resp.total)
-        return resp
-
     def alloc(self, size: int, dax_path: str = "") -> MaruHandle:
         """Allocate shared memory from the resource manager.
 
@@ -248,8 +233,14 @@ class MaruShmClient:
 
         handle = resp.handle
         if resp.dax_path:
+            path = resp.dax_path
+            # Client-side UUID resolution: use local device table
+            if resp.device_uuid and self._device_table:
+                local = self._device_table.get(resp.device_uuid)
+                if local:
+                    path = local
             with self._lock:
-                self._path_cache[handle.region_id] = resp.dax_path
+                self._path_cache[handle.region_id] = path
 
         logger.debug(
             "alloc(size=%d, dax_path=%s) -> region_id=%d path=%s",
@@ -315,6 +306,11 @@ class MaruShmClient:
         if path is None:
             access_resp = self._request_access(handle)
             path = access_resp.dax_path
+            # Client-side UUID resolution: use local device table
+            if access_resp.device_uuid and self._device_table:
+                local = self._device_table.get(access_resp.device_uuid)
+                if local:
+                    path = local
 
         # Create mmap and update cache
         with self._lock:

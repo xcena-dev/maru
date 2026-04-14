@@ -58,7 +58,10 @@ def read_device_uuid(dax_path: str) -> str | None:
     if magic != _HEADER_MAGIC:
         return None
 
-    return _uuid_to_string(uuid_bytes)
+    if version != 1:
+        logger.warning("Unknown device header version %d on %s", version, dax_path)
+
+    return uuid_to_string(uuid_bytes)
 
 
 def scan_dax_devices() -> list[tuple[str, str]]:
@@ -88,7 +91,63 @@ def scan_dax_devices() -> list[tuple[str, str]]:
     return results
 
 
-def _uuid_to_string(uuid_bytes: bytes) -> str:
+def write_device_header(dax_path: str, uuid_bytes: bytes | None = None) -> str:
+    """Write a UUID header to a DEV_DAX device.
+
+    If uuid_bytes is None, generates a new UUID v4.
+    Returns the UUID string written.
+    """
+    import uuid as uuid_mod
+
+    if uuid_bytes is None:
+        new_uuid = uuid_mod.uuid4()
+        uuid_bytes = new_uuid.bytes
+
+    header = struct.pack(
+        _HEADER_FORMAT,
+        _HEADER_MAGIC,
+        1,  # version
+        uuid_bytes,
+        0,  # reserved
+    )
+
+    map_size = _get_dax_align(dax_path)
+    fd = os.open(dax_path, os.O_RDWR)
+    try:
+        file_size = os.fstat(fd).st_size
+        if file_size > 0 and file_size < map_size:
+            map_size = file_size
+        mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
+        try:
+            mm[:_HEADER_SIZE] = header
+            mm.flush()
+        finally:
+            mm.close()
+    finally:
+        os.close(fd)
+
+    return uuid_to_string(uuid_bytes)
+
+
+def clear_device_header(dax_path: str) -> None:
+    """Clear the UUID header from a DEV_DAX device (zero-fill first 32 bytes)."""
+    map_size = _get_dax_align(dax_path)
+    fd = os.open(dax_path, os.O_RDWR)
+    try:
+        file_size = os.fstat(fd).st_size
+        if file_size > 0 and file_size < map_size:
+            map_size = file_size
+        mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
+        try:
+            mm[:_HEADER_SIZE] = b"\x00" * _HEADER_SIZE
+            mm.flush()
+        finally:
+            mm.close()
+    finally:
+        os.close(fd)
+
+
+def uuid_to_string(uuid_bytes: bytes) -> str:
     """Format 16 UUID bytes as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."""
     b = uuid_bytes
     return (

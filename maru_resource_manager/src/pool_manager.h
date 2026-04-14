@@ -11,8 +11,6 @@
 #include "log.h"
 #include "types.h"
 
-class PoolManagerUuidTest;
-
 namespace maru
 {
 
@@ -53,8 +51,6 @@ class WalStore;
 
 class PoolManager
 {
-    friend class ::PoolManagerUuidTest;
-
 public:
     explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30);
     ~PoolManager();
@@ -66,8 +62,8 @@ public:
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
-              std::string &devPath, const std::string &daxPath,
-              uint64_t &requestedSizeOut);
+              std::string &devPath, std::string &deviceUuid,
+              const std::string &daxPath, uint64_t &requestedSizeOut);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.
     int verifyAndFree(const Handle &handle, const std::string &clientId);
@@ -78,23 +74,8 @@ public:
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
 
-    /// Device UUID → local dax_path mapping entry.
-    struct DeviceMapping
-    {
-        std::string uuid;
-        std::string localDaxPath;
-    };
-
-    /// Register device mappings for all nodes at once (full replacement).
-    /// MetaServer sends the complete node list each time, so we treat it
-    /// as the source of truth and replace the entire mapping table.
-    using NodeList = std::vector<std::pair<std::string, std::vector<DeviceMapping>>>;
-    int registerNodes(const NodeList &nodes);
-
-    /// Resolve the device path a client should use for a given allocation.
-    /// Combines findPoolForRegion + UUID-based node mapping lookup under a
-    /// single lock. Returns empty string if no resolution needed or no mapping.
-    std::string resolveDevicePath(uint64_t regionId, const std::string &clientId);
+    /// Get device UUID for a given region. Returns empty string if not found.
+    std::string getDeviceUuidForRegion(uint64_t regionId);
 
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
@@ -125,12 +106,7 @@ private:
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
-    PoolState *findPoolByUuid(const std::string &uuid);
     PoolState *findPoolForRegion(uint64_t regionId);
-    /// Resolve the correct local dax_path for a client based on its hostname.
-    /// Caller MUST hold mu_.
-    std::string resolvePathForClient(const std::string &deviceUuid,
-                                     const std::string &clientId);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
@@ -147,9 +123,6 @@ private:
     std::unique_ptr<MetadataStore> metadata_;
     std::unique_ptr<WalStore> wal_;
     uint64_t alignBytes_{2ULL << 20};  // 2 MiB
-
-    // Node mapping table: device_uuid → { hostname → local_dax_path }
-    std::map<std::string, std::map<std::string, std::string>> nodeMappings_;
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;

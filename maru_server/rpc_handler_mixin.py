@@ -244,13 +244,6 @@ class RpcHandlerMixin:
         return {}
 
     def _handle_handshake(self, req: Any) -> dict:
-        # Extract device mappings from handler if present
-        hostname = getattr(req, "hostname", None)
-        devices = getattr(req, "devices", None)
-
-        if hostname and devices is not None:
-            self._server.register_handler_devices(hostname, devices)
-
         return {
             "success": True,
             "rm_address": self._server.rm_address,

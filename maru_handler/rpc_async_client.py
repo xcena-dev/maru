@@ -504,9 +504,9 @@ class RpcAsyncClient:
         response = self._send_request(MessageType.HEARTBEAT, {})
         return "error" not in response
 
-    def handshake(self, extra: dict | None = None) -> dict:
+    def handshake(self) -> dict:
         """Perform handshake with server. Returns server config (rm_address, etc.)."""
-        return self._send_request(MessageType.HANDSHAKE, extra or {})
+        return self._send_request(MessageType.HANDSHAKE, {})
 
     # =========================================================================
     # Non-blocking Async API (*_async methods)

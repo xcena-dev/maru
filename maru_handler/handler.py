@@ -207,25 +207,25 @@ class MaruHandler:
             self._rpc.connect()
 
             # 1b. Scan local devices and handshake with server
+            from maru_shm.device_scanner import scan_dax_devices
+
+            local_devices = scan_dax_devices()
+            device_table = {uuid: path for uuid, path in local_devices}
+            if device_table:
+                logger.info("Scanned %d local DAX devices", len(device_table))
+            else:
+                logger.warning(
+                    "No local DAX devices with UUID headers found. "
+                    "Multi-node UUID resolution will not work."
+                )
+
             try:
-                import platform
-
-                from maru_shm.device_scanner import scan_dax_devices
-
-                local_devices = scan_dax_devices()
-
-                handshake_data = {
-                    "hostname": platform.node(),
-                    "devices": [
-                        {"uuid": uuid, "dax_path": path} for uuid, path in local_devices
-                    ],
-                }
-                handshake_resp = self._rpc.handshake(extra=handshake_data)
+                handshake_resp = self._rpc.handshake()
                 rm_address = handshake_resp.get("rm_address") or self._config.rm_address
             except Exception:
                 logger.debug("Handshake failed, using config rm_address", exc_info=True)
                 rm_address = self._config.rm_address
-            self._mapper = DaxMapper(rm_address=rm_address)
+            self._mapper = DaxMapper(rm_address=rm_address, device_table=device_table)
 
             # 2. Initialize managers
             self._owned = OwnedRegionManager(

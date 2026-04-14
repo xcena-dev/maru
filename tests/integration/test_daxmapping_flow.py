@@ -1,328 +1,134 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Integration test for multi-node device mapping flow.
+"""Integration test for v2 client-side device UUID mapping.
 
-Tests the end-to-end data flow:
-    Handler → HANDSHAKE(devices) → MetaServer → NODE_REGISTER → RM
-
-Uses a mock TCP server in place of the real Resource Manager to capture
-the NODE_REGISTER message and verify its contents.
+Tests that:
+    - HANDSHAKE does NOT carry device info (no hostname/devices fields)
+    - Handler scans devices locally and builds a device table
+    - DaxMapper resolves UUID → local path using the device table
 """
-
-import socket
-import struct
-import threading
-import time
-from unittest.mock import patch
 
 import pytest
 
-from maru_handler.rpc_client import RpcClient
-from maru_server import MaruServer, RpcServer
-from maru_shm.ipc import (
-    HEADER_SIZE,
-    MsgHeader,
-    MsgType,
-    NodeRegisterResp,
+from maru_shm.device_scanner import (
+    clear_device_header,
+    read_device_uuid,
+    write_device_header,
 )
+from maru_shm.ipc import AllocResp, GetAccessResp
 
 pytestmark = pytest.mark.integration
 
 
 # =============================================================================
-# Mock Resource Manager (TCP server)
+# AllocResp / GetAccessResp UUID round-trip
 # =============================================================================
 
 
-class MockRM:
-    """Minimal TCP server that handles is_running probe and NODE_REGISTER."""
+class TestAllocRespUuid:
+    """AllocResp packs and unpacks device_uuid correctly."""
 
-    def __init__(self):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(5)
-        self._sock.settimeout(0.1)
-        self.port = self._sock.getsockname()[1]
-        self.address = f"127.0.0.1:{self.port}"
-        self._running = True
-        self._thread = None
-        # Captured NODE_REGISTER data
-        self.node_register_calls: list[list[tuple[str, list[tuple[str, str]]]]] = []
-        self._lock = threading.Lock()
+    def test_alloc_resp_with_uuid(self):
+        from maru_shm.types import MaruHandle
 
-    def start(self):
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        self._sock.close()
-        if self._thread:
-            self._thread.join(timeout=5.0)
-
-    def _serve(self):
-        while self._running:
-            try:
-                conn, _ = self._sock.accept()
-            except (TimeoutError, OSError):
-                continue
-            threading.Thread(
-                target=self._handle_conn, args=(conn,), daemon=True
-            ).start()
-
-    def _handle_conn(self, conn: socket.socket):
-        conn.settimeout(5.0)
-        try:
-            while self._running:
-                # Read header (12 bytes)
-                hdr_data = self._recv_exact(conn, HEADER_SIZE)
-                if not hdr_data:
-                    break
-                hdr = MsgHeader.unpack(hdr_data)
-
-                # Read payload
-                payload = b""
-                if hdr.payload_len > 0:
-                    payload = self._recv_exact(conn, hdr.payload_len)
-                    if not payload:
-                        break
-
-                if hdr.msg_type == MsgType.STATS_REQ:
-                    # is_running() probe sends STATS_REQ — respond with empty stats
-                    self._send_response(conn, MsgType.STATS_RESP, struct.pack("<I", 0))
-                elif hdr.msg_type == MsgType.NODE_REGISTER_REQ:
-                    self._handle_node_register(conn, payload)
-                else:
-                    # Unknown message — send error
-                    self._send_response(
-                        conn,
-                        MsgType.ERROR_RESP,
-                        struct.pack("<i", -1) + b"unknown",
-                    )
-        except (TimeoutError, OSError):
-            pass
-        finally:
-            conn.close()
-
-    def _handle_node_register(self, conn: socket.socket, payload: bytes):
-        # Parse the NODE_REGISTER payload manually
-        nodes = []
-        offset = 0
-        (num_nodes,) = struct.unpack_from("<I", payload, offset)
-        offset += 4
-        for _ in range(num_nodes):
-            (nid_len,) = struct.unpack_from("<H", payload, offset)
-            offset += 2
-            node_id = payload[offset : offset + nid_len].decode()
-            offset += nid_len
-            (num_devices,) = struct.unpack_from("<I", payload, offset)
-            offset += 4
-            devices = []
-            for _ in range(num_devices):
-                (uuid_len,) = struct.unpack_from("<H", payload, offset)
-                offset += 2
-                uuid_str = payload[offset : offset + uuid_len].decode()
-                offset += uuid_len
-                (path_len,) = struct.unpack_from("<H", payload, offset)
-                offset += 2
-                path_str = payload[offset : offset + path_len].decode()
-                offset += path_len
-                devices.append((uuid_str, path_str))
-            nodes.append((node_id, devices))
-
-        with self._lock:
-            self.node_register_calls.append(nodes)
-
-        # Respond with success
-        resp = NodeRegisterResp(status=0, matched=0, total=num_nodes)
-        resp_data = struct.pack("<iII", resp.status, resp.matched, resp.total)
-        self._send_response(conn, MsgType.NODE_REGISTER_RESP, resp_data)
-
-    def _send_response(self, conn: socket.socket, msg_type: int, payload: bytes):
-        hdr = MsgHeader(msg_type=msg_type, payload_len=len(payload))
-        conn.sendall(hdr.pack() + payload)
-
-    @staticmethod
-    def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
-        buf = b""
-        while len(buf) < n:
-            chunk = conn.recv(n - len(buf))
-            if not chunk:
-                return None
-            buf += chunk
-        return buf
-
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-
-@pytest.fixture
-def mock_rm():
-    rm = MockRM()
-    rm.start()
-    yield rm
-    rm.stop()
-
-
-@pytest.fixture
-def zmq_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def meta_server(mock_rm, zmq_port):
-    """Start MaruServer + RpcServer backed by mock RM."""
-    # Patch scan_dax_devices so MetaServer sees its own "local" devices
-    meta_devices = [
-        ("uuid-A", "/dev/dax0.0"),
-        ("uuid-B", "/dev/dax1.0"),
-    ]
-    with (
-        patch("maru_server.server.scan_dax_devices", return_value=meta_devices),
-        patch("maru_server.server.platform") as mock_platform,
-    ):
-        mock_platform.node.return_value = "meta-node"
-        server = MaruServer(rm_address=mock_rm.address)
-
-    rpc = RpcServer(server, host="127.0.0.1", port=zmq_port)
-    thread = threading.Thread(target=rpc.start, daemon=True)
-    thread.start()
-    # Wait for RPC server to be ready
-    for _ in range(50):
-        try:
-            with socket.create_connection(("127.0.0.1", zmq_port), timeout=0.1):
-                break
-        except OSError:
-            time.sleep(0.01)
-
-    yield server
-
-    rpc.stop()
-    thread.join(timeout=0.5)
-
-
-@pytest.fixture
-def handler_client(zmq_port, meta_server):
-    """Create a connected RPC client (simulating a handler)."""
-    c = RpcClient(f"tcp://127.0.0.1:{zmq_port}", timeout_ms=5000)
-    c.connect()
-    yield c
-    c.close()
-
-
-# =============================================================================
-# Tests
-# =============================================================================
-
-
-class TestDaxMappingFlow:
-    """End-to-end tests for the device mapping flow."""
-
-    def test_handshake_with_devices_triggers_node_register(
-        self, handler_client, meta_server, mock_rm
-    ):
-        """Handler HANDSHAKE with devices → MetaServer → NODE_REGISTER to RM."""
-        handshake_data = {
-            "hostname": "handler-node",
-            "devices": [
-                {"uuid": "uuid-A", "dax_path": "/dev/dax1.0"},
-                {"uuid": "uuid-B", "dax_path": "/dev/dax0.0"},
-            ],
-        }
-        resp = handler_client.handshake(extra=handshake_data)
-
-        assert resp["success"] is True
-        assert "rm_address" in resp
-
-        # Poll for async NODE_REGISTER
-        for _ in range(50):
-            if len(mock_rm.node_register_calls) >= 1:
-                break
-            time.sleep(0.01)
-
-        # Verify NODE_REGISTER was received by mock RM
-        assert len(mock_rm.node_register_calls) >= 1
-        last_call = mock_rm.node_register_calls[-1]
-
-        # Should contain both meta-node and handler-node
-        node_ids = {nid for nid, _ in last_call}
-        assert "meta-node" in node_ids
-        assert "handler-node" in node_ids
-
-        # Verify handler-node device mappings
-        handler_devices = dict(
-            next(devs for nid, devs in last_call if nid == "handler-node")
+        resp = AllocResp(
+            status=0,
+            handle=MaruHandle(region_id=1, offset=0, length=4096, auth_token=42),
+            requested_size=4096,
+            dax_path="/dev/dax0.0",
+            device_uuid="550e8400-e29b-41d4-a716-446655440000",
         )
-        assert handler_devices["uuid-A"] == "/dev/dax1.0"
-        assert handler_devices["uuid-B"] == "/dev/dax0.0"
+        data = resp.pack()
+        parsed = AllocResp.unpack(data)
 
-        # Verify meta-node device mappings (different paths for same UUIDs)
-        meta_devices = dict(next(devs for nid, devs in last_call if nid == "meta-node"))
-        assert meta_devices["uuid-A"] == "/dev/dax0.0"
-        assert meta_devices["uuid-B"] == "/dev/dax1.0"
+        assert parsed.status == 0
+        assert parsed.dax_path == "/dev/dax0.0"
+        assert parsed.device_uuid == "550e8400-e29b-41d4-a716-446655440000"
+        assert parsed.handle.region_id == 1
 
-    def test_multiple_handlers_aggregate(self, handler_client, meta_server, mock_rm):
-        """Two handlers register → both appear in NODE_REGISTER."""
-        # First handler
-        initial_count = len(mock_rm.node_register_calls)
-        handler_client.handshake(
-            extra={
-                "hostname": "node-0",
-                "devices": [{"uuid": "uuid-A", "dax_path": "/dev/dax2.0"}],
-            }
+    def test_alloc_resp_without_uuid(self):
+        from maru_shm.types import MaruHandle
+
+        resp = AllocResp(
+            status=0,
+            handle=MaruHandle(region_id=2, offset=0, length=8192, auth_token=0),
+            requested_size=8192,
+            dax_path="/dev/dax1.0",
+            device_uuid="",
         )
-        for _ in range(50):
-            if len(mock_rm.node_register_calls) > initial_count:
-                break
-            time.sleep(0.01)
+        data = resp.pack()
+        parsed = AllocResp.unpack(data)
 
-        # Second handler (reuse same client for simplicity)
-        second_count = len(mock_rm.node_register_calls)
-        handler_client.handshake(
-            extra={
-                "hostname": "node-1",
-                "devices": [{"uuid": "uuid-A", "dax_path": "/dev/dax3.0"}],
-            }
+        assert parsed.dax_path == "/dev/dax1.0"
+        assert parsed.device_uuid == ""
+
+
+class TestGetAccessRespUuid:
+    """GetAccessResp packs and unpacks device_uuid correctly."""
+
+    def test_get_access_resp_with_uuid(self):
+        resp = GetAccessResp(
+            status=0,
+            dax_path="/dev/dax0.0",
+            device_uuid="550e8400-e29b-41d4-a716-446655440000",
+            offset=2097152,
+            length=4096,
         )
-        for _ in range(50):
-            if len(mock_rm.node_register_calls) > second_count:
-                break
-            time.sleep(0.01)
+        data = resp.pack()
+        parsed = GetAccessResp.unpack(data)
 
-        # Last NODE_REGISTER should contain all nodes
-        last_call = mock_rm.node_register_calls[-1]
-        node_ids = {nid for nid, _ in last_call}
-        assert "node-0" in node_ids
-        assert "node-1" in node_ids
-        assert "meta-node" in node_ids
+        assert parsed.dax_path == "/dev/dax0.0"
+        assert parsed.device_uuid == "550e8400-e29b-41d4-a716-446655440000"
+        assert parsed.offset == 2097152
+        assert parsed.length == 4096
 
-    def test_handshake_without_devices_no_node_register(
-        self, handler_client, meta_server, mock_rm
-    ):
-        """Legacy HANDSHAKE without devices should not trigger NODE_REGISTER
-        (unless MetaServer already has its own devices)."""
-        initial_count = len(mock_rm.node_register_calls)
-
-        resp = handler_client.handshake(extra={})
-
-        assert resp["success"] is True
-        # Brief wait — we expect NO new call, so we can't poll for a positive condition
-        time.sleep(0.05)
-
-        # No new NODE_REGISTER should be sent (no new node was added)
-        assert len(mock_rm.node_register_calls) == initial_count
-
-    def test_handshake_returns_rm_address(self, handler_client, meta_server, mock_rm):
-        """HANDSHAKE response includes RM address for direct handler→RM access."""
-        resp = handler_client.handshake(
-            extra={
-                "hostname": "test-node",
-                "devices": [],
-            }
+    def test_get_access_resp_without_uuid(self):
+        resp = GetAccessResp(
+            status=0,
+            dax_path="/dev/dax1.0",
+            device_uuid="",
+            offset=0,
+            length=1024,
         )
-        assert resp["rm_address"] == mock_rm.address
+        data = resp.pack()
+        parsed = GetAccessResp.unpack(data)
+
+        assert parsed.dax_path == "/dev/dax1.0"
+        assert parsed.device_uuid == ""
+        assert parsed.offset == 0
+        assert parsed.length == 1024
+
+
+# =============================================================================
+# Device header write / read / clear round-trip (using temp file)
+# =============================================================================
+
+
+class TestDeviceHeaderRoundTrip:
+    """Write, read, and clear device headers on a regular file (mock device)."""
+
+    @pytest.fixture
+    def tmp_device(self, tmp_path):
+        """Create a temp file simulating a 4KB DAX device."""
+        p = tmp_path / "mock_dax"
+        p.write_bytes(b"\x00" * 4096)
+        return str(p)
+
+    def test_write_and_read(self, tmp_device):
+        uuid_str = write_device_header(tmp_device)
+        assert len(uuid_str) == 36  # "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+        read_back = read_device_uuid(tmp_device)
+        assert read_back == uuid_str
+
+    def test_clear(self, tmp_device):
+        write_device_header(tmp_device)
+        assert read_device_uuid(tmp_device) is not None
+
+        clear_device_header(tmp_device)
+        assert read_device_uuid(tmp_device) is None
+
+    def test_force_regenerate(self, tmp_device):
+        uuid1 = write_device_header(tmp_device)
+        uuid2 = write_device_header(tmp_device)
+        assert uuid1 != uuid2  # Each call generates a new UUID
