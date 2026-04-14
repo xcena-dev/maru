@@ -382,9 +382,12 @@ static int marufs_setattr(MARUFS_IDMAP_PARAM_COMMA struct dentry *dentry,
 	if (ret)
 		return ret;
 
-	/* CXL FS: only ATTR_SIZE (ftruncate) is supported */
-	if (attr->ia_valid & ~(ATTR_SIZE | ATTR_FORCE))
-		return -EPERM;
+	/* CXL FS: only ATTR_SIZE (ftruncate) is meaningful — silently
+	 * succeed for other attrs (chmod/chown/utimes) since CXL memory
+	 * does not persist POSIX attributes.
+	 */
+	if (!(attr->ia_valid & ATTR_SIZE))
+		return 0;
 
 	if (attr->ia_valid & ATTR_SIZE) {
 		struct marufs_inode_info *xi = marufs_inode_get(inode);

@@ -650,6 +650,9 @@ static int marufs_gc_thread_fn(void *data)
 	while (1) {
 		msleep_interruptible(MARUFS_GC_INTERVAL_MS);
 
+		if (kthread_should_stop())
+			break;
+
 		if (atomic_read(&sbi->gc_paused))
 			continue;
 
