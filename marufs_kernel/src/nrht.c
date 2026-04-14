@@ -488,7 +488,11 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		if (buckets_per_shard == 0)
 			buckets_per_shard = 1;
 	}
+	if (buckets_per_shard > MARUFS_NRHT_MAX_ENTRIES)
+		return -EINVAL;
 	buckets_per_shard = roundup_pow_of_two(buckets_per_shard);
+	if (buckets_per_shard == 0 || buckets_per_shard > MARUFS_NRHT_MAX_ENTRIES)
+		return -EINVAL;
 
 	u64 bucket_array_size =
 		marufs_align_up((u64)buckets_per_shard * sizeof(u32), 64);

@@ -65,7 +65,18 @@ static int marufs_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* Direct CXL read — bypasses page cache, copies to user buffer */
+/*
+ * Direct CXL read — bypasses page cache, copies to user buffer.
+ *
+ * marufs is a DAX FS: primary data access is via mmap (zero-copy).
+ * read_iter supports read() for debugging/operational tools (cat, hexdump)
+ * while maintaining full permission checks and CXL cache coherence (RMB).
+ *
+ * Page cache path (read_folio) is intentionally blocked (-EIO) because:
+ *  - No permission check interface at folio fill time
+ *  - DRAM page cache copies break cross-node CXL coherence
+ *  - sendfile/splice are not part of the KV cache access model
+ */
 static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct marufs_file_ctx fc;
@@ -164,7 +175,7 @@ static vm_fault_t marufs_page_mkwrite(struct vm_fault *vmf)
 		return VM_FAULT_NOPAGE;
 	}
 
-	set_page_dirty(page);
+	marufs_set_page_dirty(page);
 	return VM_FAULT_LOCKED;
 }
 
@@ -312,16 +323,14 @@ static loff_t marufs_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
-/* Zero-fill new pages — data arrives via mmap writes */
+/*
+ * Page cache path not supported — DAX FS uses mmap for data access
+ * and read_iter for read(). sendfile/splice will get -EIO.
+ */
 static int marufs_read_folio(struct file *file, struct folio *folio)
 {
-	struct page *page = &folio->page;
-
-	zero_user_segments(page, 0, PAGE_SIZE, 0, 0);
-	SetPageUptodate(page);
-	unlock_page(page);
-
-	return 0;
+	folio_unlock(folio);
+	return -EIO;
 }
 
 const struct address_space_operations marufs_aops = {

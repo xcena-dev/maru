@@ -213,7 +213,10 @@ static int marufs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_type = MARUFS_MAGIC;
 	buf->f_bsize = PAGE_SIZE;
 	buf->f_blocks = sbi->total_size / PAGE_SIZE;
-	buf->f_bfree = (sbi->total_size - used_size) / PAGE_SIZE;
+	if (used_size > sbi->total_size)
+		buf->f_bfree = 0;
+	else
+		buf->f_bfree = (sbi->total_size - used_size) / PAGE_SIZE;
 	buf->f_bavail = buf->f_bfree;
 	buf->f_namelen = MARUFS_NAME_MAX;
 

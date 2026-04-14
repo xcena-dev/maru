@@ -80,6 +80,16 @@ static inline int marufs_setattr_prepare(struct dentry *dentry,
 #define MARUFS_SLAB_MEM_SPREAD SLAB_MEM_SPREAD
 #endif
 
+/* set_page_dirty() removed in 6.8, replaced by folio_mark_dirty() */
+static inline void marufs_set_page_dirty(struct page *page)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	folio_mark_dirty(page_folio(page));
+#else
+	set_page_dirty(page);
+#endif
+}
+
 /* d_revalidate() signature changed in 6.12:
  *   old: int (*)(struct dentry *, unsigned int)
  *   new: int (*)(struct inode *, const struct qstr *, struct dentry *, unsigned int)
