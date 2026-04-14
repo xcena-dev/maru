@@ -338,7 +338,7 @@ static long marufs_ioctl_dmabuf_export(struct marufs_sb_info *sbi,
 		return -EOPNOTSUPP;
 
 	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					  MARUFS_PERM_READ | MARUFS_PERM_WRITE);
+					  MARUFS_PERM_ADMIN);
 	if (ret)
 		return ret;
 
@@ -699,7 +699,7 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	case MARUFS_IOC_NRHT_INIT:
 		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
+					      MARUFS_PERM_ADMIN);
 		if (!ret)
 			ret = marufs_ioctl_nrht_init(fc.sbi, fc.xi,
 						     &payload.nrht_init);

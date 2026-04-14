@@ -235,6 +235,9 @@ static ssize_t gc_trigger_store(struct kobject *kobj,
 {
 	int i;
 
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	mutex_lock(&marufs_sysfs_lock);
 	for (i = 0; i < MARUFS_MAX_MOUNTS; i++) {
 		if (marufs_sysfs_sbi_list[i])
@@ -257,6 +260,9 @@ static struct kobj_attribute gc_trigger_attr =
 static ssize_t gc_stop_store(struct kobject *kobj, struct kobj_attribute *attr,
 			     const char *buf, size_t count)
 {
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	mutex_lock(&marufs_sysfs_lock);
 	if (strncmp(buf, "all", 3) == 0) {
 		int i;
@@ -328,6 +334,9 @@ static ssize_t gc_pause_show(struct kobject *kobj, struct kobj_attribute *attr,
 static ssize_t gc_pause_store(struct kobject *kobj, struct kobj_attribute *attr,
 			      const char *buf, size_t count)
 {
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	u32 node_id;
 	int val;
 	const char *colon;
@@ -376,7 +385,7 @@ static ssize_t gc_pause_store(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static struct kobj_attribute gc_pause_attr =
-	__ATTR(gc_pause, 0644, gc_pause_show, gc_pause_store);
+	__ATTR(gc_pause, 0600, gc_pause_show, gc_pause_store);
 
 /*
  * GC status - show per-node GC thread liveness and epoch counter.
@@ -425,6 +434,9 @@ static ssize_t gc_restart_store(struct kobject *kobj,
 				struct kobj_attribute *attr, const char *buf,
 				size_t count)
 {
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	mutex_lock(&marufs_sysfs_lock);
 	if (strncmp(buf, "all", 3) == 0) {
 		int i;
