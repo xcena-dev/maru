@@ -99,6 +99,7 @@ class MaruHandler:
         # Client-side timing for StatsManager reporting
         self._stats_buffer: list[dict] = []
         self._stats_lock = threading.Lock()
+        self._stats_rpc: RpcClient | None = None  # dedicated connection for flush
         self._stats_flusher: threading.Thread | None = None
 
         # Connection state
@@ -276,8 +277,13 @@ class MaruHandler:
             if self._config.eager_map:
                 self._premap_shared_regions()
 
-            # 6. Start stats flush thread if enabled
+            # 6. Start stats flush thread with dedicated RPC connection
             if self._config.enable_stats:
+                self._stats_rpc = RpcClient(
+                    server_url=self._config.server_url,
+                    timeout_ms=self._config.timeout_ms,
+                )
+                self._stats_rpc.connect()
                 self._stats_flusher = threading.Thread(
                     target=self._stats_flush_loop,
                     name="stats-flusher",
@@ -316,19 +322,17 @@ class MaruHandler:
             self._stats_buffer.append(entry)
 
     def _flush_stats(self) -> None:
-        """Send buffered stats to server. Called by flush thread and close()."""
+        """Send buffered stats via dedicated RPC. Drops on failure (best-effort)."""
         with self._stats_lock:
             buf = self._stats_buffer.copy()
             self._stats_buffer.clear()
-        if buf and self._connected:
+        if buf and self._stats_rpc is not None:
             try:
-                self._rpc.report_stats(buf)
+                self._stats_rpc.report_stats(buf)
             except Exception:
-                logger.warning(
-                    "Failed to flush %d stats entries", len(buf), exc_info=True
-                )
-                with self._stats_lock:
-                    self._stats_buffer = buf + self._stats_buffer
+                # Stats are best-effort monitoring data. Dropped entries only
+                # affect interval accuracy, not application correctness.
+                logger.warning("Failed to flush %d stats entries (dropped)", len(buf))
 
     def _stats_flush_loop(self) -> None:
         """Background loop: flush stats buffer every 1s."""
@@ -345,13 +349,16 @@ class MaruHandler:
         if not self._connected:
             return
 
-        self._closing.set()  # reject new operations immediately
+        self._closing.set()  # reject new operations + wake flush thread
 
-        # Stop stats flush thread and flush remaining
+        # Stop stats: close dedicated RPC first (unblocks flush thread),
+        # then join thread. Flush loop does one final flush before exiting.
+        if self._stats_rpc is not None:
+            self._stats_rpc.close()
         if self._stats_flusher is not None:
             self._stats_flusher.join(timeout=2.0)
             self._stats_flusher = None
-        self._flush_stats()
+        self._stats_rpc = None
 
         try:
             with self._write_lock:
