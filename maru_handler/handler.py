@@ -210,7 +210,7 @@ class MaruHandler:
             from maru_shm.device_scanner import scan_dax_devices
 
             local_devices = scan_dax_devices()
-            device_table = {uuid: path for uuid, path in local_devices}
+            device_table = dict(local_devices)
             if device_table:
                 logger.info("Scanned %d local DAX devices", len(device_table))
             else:

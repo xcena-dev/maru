@@ -8,9 +8,9 @@ from unittest import mock
 from maru_shm.device_scanner import (
     _HEADER_FORMAT,
     _HEADER_MAGIC,
-    uuid_to_string,
     read_device_uuid,
     scan_dax_devices,
+    uuid_to_string,
 )
 
 
