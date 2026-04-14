@@ -258,13 +258,13 @@ class MaruServer:
         """
         return self._kv_manager.batch_exists(keys)
 
+    _MAX_STATS_BATCH = 10000
+
     def report_stats(self, entries: list[dict]) -> None:
-        """Record client-reported handler-side timings."""
-        for e in entries:
+        """Record client-reported handler-side stats."""
+        for e in entries[: self._MAX_STATS_BATCH]:
             self._stats_manager.record(
                 op_type=e.get("op_type", "unknown"),
-                region_id=0,
-                device_offset=0,
                 size=e.get("size", 0),
                 latency_us=e.get("latency_us", 0.0),
                 result=e.get("result", "none"),

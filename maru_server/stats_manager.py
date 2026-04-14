@@ -46,8 +46,6 @@ class StatsManager:
     def record(
         self,
         op_type: str,
-        region_id: int,
-        device_offset: int,
         size: int,
         latency_us: float,
         result: str = "none",
@@ -57,11 +55,9 @@ class StatsManager:
 
         Args:
             op_type: Operation name (alloc, store, retrieve, etc.)
-            region_id: Region identifier (0 if N/A)
-            device_offset: Device byte offset (0 if N/A)
             size: Data size in bytes
             latency_us: Processing time in microseconds
-            result: "hit", "miss", or "none"
+            result: "hit", "miss", "partial", or "none"
             client_id: Handler instance ID
         """
         with self._lock:

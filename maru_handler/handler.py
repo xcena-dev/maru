@@ -324,7 +324,11 @@ class MaruHandler:
             try:
                 self._rpc.report_stats(buf)
             except Exception:
-                logger.debug("Failed to flush stats", exc_info=True)
+                logger.warning(
+                    "Failed to flush %d stats entries", len(buf), exc_info=True
+                )
+                with self._stats_lock:
+                    self._stats_buffer = buf + self._stats_buffer
 
     def _stats_flush_loop(self) -> None:
         """Background loop: flush stats buffer every 1s."""
@@ -550,30 +554,28 @@ class MaruHandler:
                         page_index,
                         exc_info=True,
                     )
-                    self._record_stats(
-                        "store", total_size, (time.monotonic() - t0) * 1e6
-                    )
-                    return False
-
-                if not is_new:
-                    self._owned.free(region_id, page_index)
-                    logger.debug(
-                        "store: key=%s lost register race, freed page (region=%d, page=%d)",
-                        key,
-                        region_id,
-                        page_index,
-                    )
+                    store_size = total_size
+                    # store_ok stays False
                 else:
-                    self._key_to_location[key] = (region_id, page_index)
-                    logger.debug(
-                        "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
-                        key,
-                        region_id,
-                        page_index,
-                        offset,
-                        total_size,
-                    )
-                store_ok = True
+                    if not is_new:
+                        self._owned.free(region_id, page_index)
+                        logger.debug(
+                            "store: key=%s lost register race, freed page (region=%d, page=%d)",
+                            key,
+                            region_id,
+                            page_index,
+                        )
+                    else:
+                        self._key_to_location[key] = (region_id, page_index)
+                        logger.debug(
+                            "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
+                            key,
+                            region_id,
+                            page_index,
+                            offset,
+                            total_size,
+                        )
+                    store_ok = True
 
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
@@ -879,7 +881,7 @@ class MaruHandler:
             "batch_retrieve",
             total_bytes,
             (time.monotonic() - t0) * 1e6,
-            result="hit" if hits == len(keys) else "miss",
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return results
 
@@ -1018,7 +1020,7 @@ class MaruHandler:
             "batch_exists",
             0,
             (time.monotonic() - t0) * 1e6,
-            result="hit" if hits == len(keys) else "miss",
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return batch_resp.results
 
@@ -1039,7 +1041,7 @@ class MaruHandler:
             "batch_pin",
             0,
             (time.monotonic() - t0) * 1e6,
-            result="hit" if hits == len(keys) else "miss",
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return results
 
@@ -1060,7 +1062,7 @@ class MaruHandler:
             "batch_unpin",
             0,
             (time.monotonic() - t0) * 1e6,
-            result="hit" if hits == len(keys) else "miss",
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return results
 
