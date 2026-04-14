@@ -284,7 +284,10 @@ def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     available = max_x - x
     if available <= 0:
         return
-    win.addnstr(y, x, text, available, attr)
+    try:
+        win.addnstr(y, x, text, available, attr)
+    except curses.error:
+        pass  # writing to last cell of screen raises on some terminals
 
 
 def _handle_key(
