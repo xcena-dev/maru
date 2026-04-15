@@ -19,6 +19,7 @@
 #include <cstring>
 #include <unordered_set>
 
+#include "device_header.h"
 #include "metadata.h"
 #include "util.h"
 #include "wal.h"
@@ -466,40 +467,84 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         return rc != 0 ? rc : -EINVAL;
     }
 
+    // Read device alignment first (needed for mmap-based header access)
+    uint64_t devAlign = alignBytes_;
+    if (type == DaxType::DEV_DAX)
+    {
+        uint64_t da = 0;
+        if (readDaxAlignBytes(baseName(path), da))
+        {
+            devAlign = da;
+        }
+    }
+
+    // DEV_DAX: read or auto-initialize device UUID header via mmap
+    uint64_t dataOffset = 0;
+    std::string deviceUuid;
+    if (type == DaxType::DEV_DAX)
+    {
+        DeviceHeader hdr{};
+        int hrc = readDeviceHeader(path, hdr, devAlign);
+        if (hrc == -ENODATA)
+        {
+            // No valid header — auto-initialize
+            initDeviceHeader(hdr);
+            hrc = writeDeviceHeader(path, hdr, devAlign);
+            if (hrc != 0)
+            {
+                logf(LogLevel::Error,
+                     "Failed to write device header to %s (%d)",
+                     path.c_str(), hrc);
+                return hrc;
+            }
+            logf(LogLevel::Info,
+                 "Auto-initialized device header on %s: UUID=%s",
+                 path.c_str(), uuidToString(hdr.uuid).c_str());
+        }
+        else if (hrc != 0)
+        {
+            logf(LogLevel::Error,
+                 "Failed to read device header from %s (%d)",
+                 path.c_str(), hrc);
+            return hrc;
+        }
+        else
+        {
+            logf(LogLevel::Info,
+                 "Device %s: UUID=%s",
+                 path.c_str(), uuidToString(hdr.uuid).c_str());
+        }
+        deviceUuid = uuidToString(hdr.uuid);
+        dataOffset = devAlign;
+    }
+
     PoolState pool{};
     pool.poolId = poolId;
     pool.devPath = path;
-    pool.totalSize = size;
-    pool.freeSize = size;
-    pool.alignBytes = alignBytes_;
+    pool.deviceUuid = deviceUuid;
+    pool.totalSize = size - dataOffset;
+    pool.freeSize = size - dataOffset;
     pool.type = type;
-    if (type == DaxType::DEV_DAX)
-    {
-        uint64_t devAlign = 0;
-        if (readDaxAlignBytes(baseName(path), devAlign))
-        {
-            pool.alignBytes = devAlign;
-        }
-    }
-    else if (type == DaxType::FS_DAX)
+    if (type == DaxType::FS_DAX)
     {
         uint64_t blksz = 0;
         if (getBlockLogicalBlockSize(path, blksz) && blksz > 0)
         {
-            if (blksz > pool.alignBytes)
+            if (blksz > devAlign)
             {
-                pool.alignBytes = blksz;
+                devAlign = blksz;
             }
         }
     }
-    pool.freeList.push_back(Extent{0, size});
+    pool.alignBytes = devAlign;
+    pool.freeList.push_back(Extent{dataOffset, size - dataOffset});
 
     PoolState loaded = pool;
     rc = metadata_->load(poolId, loaded);
     if (rc == 0)
     {
         loaded.devPath = path;
-        loaded.totalSize = size;
+        loaded.totalSize = size - dataOffset;
         loaded.alignBytes = pool.alignBytes;
         pool = loaded;
     }
@@ -801,9 +846,30 @@ PoolState *PoolManager::findPoolByPath(const std::string &devPath)
     return nullptr;
 }
 
+PoolState *PoolManager::findPoolForRegion(uint64_t regionId)
+{
+    auto it = allocations_.find(regionId);
+    if (it == allocations_.end())
+    {
+        return nullptr;
+    }
+    return findPoolById(it->second.poolId);
+}
+
+std::string PoolManager::getDeviceUuidForRegion(uint64_t regionId)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    auto *pool = findPoolForRegion(regionId);
+    if (pool)
+    {
+        return pool->deviceUuid;
+    }
+    return "";
+}
+
 int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
-                       std::string &devPath, const std::string &daxPath,
-                       uint64_t &requestedSizeOut)
+                       std::string &devPath, std::string &deviceUuid,
+                       const std::string &daxPath, uint64_t &requestedSizeOut)
 {
     if (clientId.empty())
     {
@@ -888,6 +954,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         devPath = selectedPool->devPath;
     }
 
+    deviceUuid = selectedPool->deviceUuid;
     requestedSizeOut = alloc.requestedSize;
     out = alloc.handle;
     wal_->appendAlloc(alloc);

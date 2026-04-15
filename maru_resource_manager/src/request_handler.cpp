@@ -14,24 +14,28 @@ AllocResult RequestHandler::handleAlloc(const AllocReq &req,
     AllocResult result;
     Handle handle{};
     std::string devPath;
+    std::string deviceUuid;
     uint64_t requestedSize = 0;
     int32_t status =
-        pm_.alloc(req.size, ctx.client_id, handle, devPath, ctx.dax_path, requestedSize);
+        pm_.alloc(req.size, ctx.client_id, handle, devPath, deviceUuid, ctx.dax_path, requestedSize);
 
     result.resp.status = status;
     result.resp.handle = handle;
     result.resp.accessType = static_cast<uint32_t>(AccessType::LOCAL);
     result.resp.requestedSize = requestedSize;
-    result.devicePath = devPath;
 
     if (status == 0) {
+        result.devicePath = devPath;
+        result.deviceUuid = deviceUuid;
+
         logf(LogLevel::Debug,
-             "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s",
+             "[ALLOC] client=%s, size=%llu, pool=%s -> region_id=%llu, path=%s, uuid=%s",
              ctx.client_id.c_str(),
              (unsigned long long)req.size,
              ctx.dax_path.c_str(),
              (unsigned long long)handle.regionId,
-             devPath.c_str());
+             result.devicePath.c_str(),
+             result.deviceUuid.c_str());
     } else {
         logf(LogLevel::Warn,
              "[ALLOC] client=%s, size=%llu, pool=%s -> FAILED (status=%d)",
@@ -66,8 +70,7 @@ FreeResult RequestHandler::handleFree(const FreeReq &req,
 }
 
 GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
-                                                const RequestContext &ctx) {
-    (void)ctx;
+                                                const RequestContext & /*ctx*/) {
     GetAccessResult result;
 
     std::string pathToOpen;
@@ -75,12 +78,16 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
 
     if (status == 0) {
         result.devicePath = pathToOpen;
+        // Note: separate lock acquisition from verifyAndGetPath, but safe because
+        // only the owning client calls GET_ACCESS on its own allocations.
+        result.deviceUuid = pm_.getDeviceUuidForRegion(req.handle.regionId);
         result.offset = req.handle.offset;
         result.length = req.handle.length;
         logf(LogLevel::Debug,
-             "[GET_ACCESS] region_id=%llu -> path=%s",
+             "[GET_ACCESS] region_id=%llu -> path=%s, uuid=%s",
              (unsigned long long)req.handle.regionId,
-             pathToOpen.c_str());
+             result.devicePath.c_str(),
+             result.deviceUuid.c_str());
     } else {
         result.status = status;
         logf(LogLevel::Warn,

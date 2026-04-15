@@ -202,6 +202,10 @@ class AllocationManager:
                 ),
             }
 
+    def pool_stats(self) -> list:
+        """Get pool stats from resource manager."""
+        return self._client.stats()
+
     def close(self) -> None:
         """Close the resource manager client."""
         try:

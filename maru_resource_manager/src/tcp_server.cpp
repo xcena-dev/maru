@@ -529,7 +529,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
         RequestContext ctx{cid, daxPath};
         auto result = handler_.handleAlloc(req, ctx);
 
-        auto respPayload = serializeAllocResp(result.resp, result.devicePath);
+        auto respPayload = serializeAllocResp(result.resp, result.devicePath, result.deviceUuid);
         cacheInsert(cid, requestId, static_cast<uint16_t>(MsgType::ALLOC_RESP),
                     respPayload.data(), respPayload.size());
         if (sendResp(clientFd, MsgType::ALLOC_RESP,
@@ -604,7 +604,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         }
 
         auto respPayload = serializeGetAccessResp(
-            result.status, result.devicePath, result.offset, result.length);
+            result.status, result.devicePath, result.offset, result.length,
+            result.deviceUuid);
         if (sendResp(clientFd, MsgType::GET_ACCESS_RESP,
                      respPayload.data(), respPayload.size()) != 0) {
             return false;

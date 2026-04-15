@@ -38,6 +38,7 @@ struct PoolState
 {
     uint32_t poolId;
     std::string devPath;
+    std::string deviceUuid;  // UUID from device header (DEV_DAX only, empty for FS_DAX)
     uint64_t totalSize;
     uint64_t freeSize;
     uint64_t alignBytes;
@@ -61,8 +62,8 @@ public:
     int loadPools();
     int rescanDevices();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
-              std::string &devPath, const std::string &daxPath,
-              uint64_t &requestedSizeOut);
+              std::string &devPath, std::string &deviceUuid,
+              const std::string &daxPath, uint64_t &requestedSizeOut);
 
     /// Atomically verify auth token and free. Returns -EACCES on bad token.
     int verifyAndFree(const Handle &handle, const std::string &clientId);
@@ -72,6 +73,9 @@ public:
     void getStats(std::vector<PoolState> &out);
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
+
+    /// Get device UUID for a given region. Returns empty string if not found.
+    std::string getDeviceUuidForRegion(uint64_t regionId);
 
     void reapExpired(uint64_t &reapedCount);
     void checkpoint();
@@ -102,6 +106,7 @@ private:
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
+    PoolState *findPoolForRegion(uint64_t regionId);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
