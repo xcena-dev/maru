@@ -16,16 +16,18 @@ struct RequestContext {
     std::string dax_path;  // empty = any pool
 };
 
-/// Result of handleAlloc — includes device path for client to open directly.
+/// Result of handleAlloc — includes device path and UUID for client-side resolution.
 struct AllocResult {
     AllocResp resp{};
     std::string devicePath;
+    std::string deviceUuid;
 };
 
-/// Result of handleGetAccess — includes device path, offset, length.
+/// Result of handleGetAccess — includes device path, UUID, offset, length.
 struct GetAccessResult {
     int32_t status = 0;
     std::string devicePath;
+    std::string deviceUuid;
     uint64_t offset = 0;
     uint64_t length = 0;
 };

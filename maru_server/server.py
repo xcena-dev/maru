@@ -52,7 +52,7 @@ class MaruServer:
     def _validate_dax_paths(self) -> None:
         """Warn if any --dax-path values don't match resource manager pools."""
         try:
-            pools = self._allocation_manager._client.stats()
+            pools = self._allocation_manager.pool_stats()
             available = {p.dax_path for p in pools}
             for path in self._dax_paths:
                 if path not in available:

@@ -10,11 +10,14 @@
 
 namespace maru {
 
-/// Serialize an AllocResp + device path into a single payload buffer.
+/// Serialize an AllocResp + device path + device UUID into a single payload buffer.
 inline std::vector<uint8_t> serializeAllocResp(const AllocResp &resp,
-                                                const std::string &path) {
+                                                const std::string &path,
+                                                const std::string &deviceUuid = "") {
     uint32_t pathLen = path.size();
-    size_t totalSize = sizeof(resp) + sizeof(pathLen) + pathLen;
+    uint16_t uuidLen = deviceUuid.size();
+    size_t totalSize = sizeof(resp) + sizeof(pathLen) + pathLen
+                       + sizeof(uuidLen) + uuidLen;
     std::vector<uint8_t> buf(totalSize);
 
     size_t off = 0;
@@ -24,20 +27,29 @@ inline std::vector<uint8_t> serializeAllocResp(const AllocResp &resp,
     off += sizeof(pathLen);
     if (pathLen > 0) {
         std::memcpy(buf.data() + off, path.data(), pathLen);
+        off += pathLen;
+    }
+    std::memcpy(buf.data() + off, &uuidLen, sizeof(uuidLen));
+    off += sizeof(uuidLen);
+    if (uuidLen > 0) {
+        std::memcpy(buf.data() + off, deviceUuid.data(), uuidLen);
     }
     return buf;
 }
 
-/// Serialize a GetAccessResp + path + offset/length into a single payload buffer.
+/// Serialize a GetAccessResp + path + offset/length + UUID into a single payload buffer.
 inline std::vector<uint8_t> serializeGetAccessResp(
     int32_t status, const std::string &path,
-    uint64_t offset, uint64_t length) {
+    uint64_t offset, uint64_t length,
+    const std::string &deviceUuid = "") {
     uint32_t pathLen = path.size();
+    uint16_t uuidLen = deviceUuid.size();
     GetAccessResp resp{};
     resp.status = status;
     resp.pathLen = pathLen;
 
-    size_t totalSize = sizeof(resp) + pathLen + sizeof(offset) + sizeof(length);
+    size_t totalSize = sizeof(resp) + pathLen + sizeof(offset) + sizeof(length)
+                       + sizeof(uuidLen) + uuidLen;
     std::vector<uint8_t> buf(totalSize);
 
     size_t off = 0;
@@ -50,6 +62,12 @@ inline std::vector<uint8_t> serializeGetAccessResp(
     std::memcpy(buf.data() + off, &offset, sizeof(offset));
     off += sizeof(offset);
     std::memcpy(buf.data() + off, &length, sizeof(length));
+    off += sizeof(length);
+    std::memcpy(buf.data() + off, &uuidLen, sizeof(uuidLen));
+    off += sizeof(uuidLen);
+    if (uuidLen > 0) {
+        std::memcpy(buf.data() + off, deviceUuid.data(), uuidLen);
+    }
     return buf;
 }
 

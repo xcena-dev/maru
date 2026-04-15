@@ -21,7 +21,7 @@ class MockShmClient:
     """Mock MaruShmClient for unit tests that don't need a running resource manager."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self._device_table = kwargs.get("device_table") or {}
 
     def _ensure_resource_manager(self):
         pass
