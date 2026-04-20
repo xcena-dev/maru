@@ -99,6 +99,11 @@ private:
     };
 
     int scanDevices(std::vector<DeviceInfo> &outDevices);
+    // Pure builder: constructs a PoolState from device without touching pools_.
+    // Caller decides when to commit. Disk side effects (UUID header init) may
+    // still happen and are idempotent.
+    int buildPoolFromDevice(uint32_t poolId, const std::string &path,
+                            DaxType type, PoolState &out);
     int loadPoolFromDevice(uint32_t poolId, const std::string &path,
                            DaxType type);
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);
