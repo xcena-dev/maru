@@ -60,6 +60,7 @@ class MessageType(IntEnum):
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
     HEARTBEAT = 0xF1
+    REPORT_STATS = 0xF2
     HANDSHAKE = 0xFE
     SHUTDOWN = 0xFF
 
@@ -443,6 +444,7 @@ class GetStatsResponse:
     allocation_manager: AllocationManagerStats = field(
         default_factory=AllocationManagerStats
     )
+    stats_manager: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -457,6 +459,21 @@ class HeartbeatResponse:
     """Response for HEARTBEAT."""
 
     pass
+
+
+@dataclass
+class ReportStatsRequest:
+    """REPORT_STATS (0xF2) - Client reports handler-side latency."""
+
+    entries: list[dict] = field(default_factory=list)
+    # Each entry: {"op_type": str, "result": str, "size": int, "latency_us": float}
+
+
+@dataclass
+class ReportStatsResponse:
+    """Response for REPORT_STATS."""
+
+    success: bool = True
 
 
 @dataclass
@@ -520,6 +537,7 @@ MESSAGE_CLASSES = {
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
     MessageType.HEARTBEAT: (HeartbeatRequest, HeartbeatResponse),
+    MessageType.REPORT_STATS: (ReportStatsRequest, ReportStatsResponse),
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }

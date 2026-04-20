@@ -53,6 +53,7 @@ class MaruConfig:
     auto_expand: bool = True  # Auto-expand when pool is exhausted
     expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
     rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
+    enable_stats: bool = False  # Enable handler-side stats reporting to server
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -61,10 +62,14 @@ class MaruConfig:
 
             self.instance_id = str(uuid.uuid4())
 
-        # Optional env override for eager shared-region pre-mapping.
+        # Optional env overrides
         env_eager_map = _parse_env_bool("MARU_EAGER_MAP")
         if env_eager_map is not None:
             self.eager_map = env_eager_map
+
+        env_stats = _parse_env_bool("MARU_STAT")
+        if env_stats is not None:
+            self.enable_stats = env_stats
 
         if self.chunk_size_bytes <= 0:
             raise ValueError(
