@@ -11,6 +11,7 @@ from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
 from .kv_manager import DeleteResult, KVManager
+from .stats_manager import StatsManager
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class MaruServer:
         self._dax_paths = dax_paths
         self._allocation_manager = AllocationManager(rm_address=rm_address)
         self._kv_manager = KVManager()
+        self._stats_manager = StatsManager()
         self._lock = RLock()  # Coordinates cross-manager operations
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
@@ -256,15 +258,30 @@ class MaruServer:
         """
         return self._kv_manager.batch_exists(keys)
 
+    _MAX_STATS_BATCH = 10000
+
+    def report_stats(self, entries: list[dict]) -> None:
+        """Record client-reported handler-side stats."""
+        for e in entries[: self._MAX_STATS_BATCH]:
+            self._stats_manager.record(
+                op_type=e.get("op_type", "unknown"),
+                size=e.get("size", 0),
+                latency_us=e.get("latency_us", 0.0),
+                result=e.get("result", "none"),
+                client_id=e.get("client_id", "_unknown"),
+            )
+
     def get_stats(self) -> dict:
         """Get server statistics."""
         return {
             "kv_manager": self._kv_manager.get_stats(),
             "allocation_manager": self._allocation_manager.get_stats(),
+            "stats_manager": self._stats_manager.get_stats(),
         }
 
     def close(self) -> None:
         """Shutdown the server and release resources."""
+        self._stats_manager.close()
         self._allocation_manager.close()
         logger.info("MaruServer closed")
 

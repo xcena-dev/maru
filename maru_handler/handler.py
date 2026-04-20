@@ -20,6 +20,7 @@ Example:
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 
 from maru_common import MaruConfig
@@ -94,6 +95,12 @@ class MaruHandler:
         # Thread-safety
         self._write_lock = threading.Lock()
         self._closing = threading.Event()
+
+        # Client-side timing for StatsManager reporting
+        self._stats_buffer: list[dict] = []
+        self._stats_lock = threading.Lock()
+        self._stats_rpc: RpcClient | None = None  # dedicated connection for flush
+        self._stats_flusher: threading.Thread | None = None
 
         # Connection state
         self._key_to_location: dict[str, tuple[int, int]] = {}
@@ -282,6 +289,20 @@ class MaruHandler:
             if self._config.eager_map:
                 self._premap_shared_regions()
 
+            # 6. Start stats flush thread with dedicated RPC connection
+            if self._config.enable_stats:
+                self._stats_rpc = RpcClient(
+                    server_url=self._config.server_url,
+                    timeout_ms=self._config.timeout_ms,
+                )
+                self._stats_rpc.connect()
+                self._stats_flusher = threading.Thread(
+                    target=self._stats_flush_loop,
+                    name="stats-flusher",
+                    daemon=True,
+                )
+                self._stats_flusher.start()
+
             logger.info(
                 "Connected: chunk_size=%d",
                 self._config.chunk_size_bytes,
@@ -292,6 +313,45 @@ class MaruHandler:
             logger.error("Failed to connect", exc_info=True)
             return False
 
+    # =========================================================================
+    # Timing
+    # =========================================================================
+
+    def _record_stats(
+        self, op_type: str, size: int, latency_us: float, result: str = "none"
+    ) -> None:
+        """Buffer a timing entry. Flushed by background thread every 1s."""
+        if not self._config.enable_stats or not self._connected:
+            return
+        entry = {
+            "client_id": self._config.instance_id,
+            "op_type": op_type,
+            "result": result,
+            "size": size,
+            "latency_us": latency_us,
+        }
+        with self._stats_lock:
+            self._stats_buffer.append(entry)
+
+    def _flush_stats(self) -> None:
+        """Send buffered stats via dedicated RPC. Drops on failure (best-effort)."""
+        with self._stats_lock:
+            buf = self._stats_buffer.copy()
+            self._stats_buffer.clear()
+        if buf and self._stats_rpc is not None:
+            try:
+                self._stats_rpc.report_stats(buf)
+            except Exception:
+                # Stats are best-effort monitoring data. Dropped entries only
+                # affect interval accuracy, not application correctness.
+                logger.warning("Failed to flush %d stats entries (dropped)", len(buf))
+
+    def _stats_flush_loop(self) -> None:
+        """Background loop: flush stats buffer every 1s."""
+        while self._connected and not self._closing.is_set():
+            self._closing.wait(timeout=1.0)
+            self._flush_stats()
+
     def close(self) -> None:
         """Close the connection and return all allocations.
 
@@ -301,7 +361,16 @@ class MaruHandler:
         if not self._connected:
             return
 
-        self._closing.set()  # reject new operations immediately
+        self._closing.set()  # reject new operations + wake flush thread
+
+        # Stop stats: close dedicated RPC first (unblocks flush thread),
+        # then join thread. Flush loop does one final flush before exiting.
+        if self._stats_rpc is not None:
+            self._stats_rpc.close()
+        if self._stats_flusher is not None:
+            self._stats_flusher.join(timeout=2.0)
+            self._stats_flusher = None
+        self._stats_rpc = None
 
         try:
             with self._write_lock:
@@ -353,6 +422,7 @@ class MaruHandler:
             ValueError: If size exceeds chunk_size or allocation fails
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         with self._write_lock:
             if self._closing.is_set():
@@ -402,7 +472,9 @@ class MaruHandler:
                 region_id,
                 page_index,
             )
-            return handle
+
+        self._record_stats("alloc", size, (time.monotonic() - t0) * 1e6)
+        return handle
 
     def free(self, handle: AllocHandle) -> None:
         """Free a page previously obtained via alloc().
@@ -416,6 +488,7 @@ class MaruHandler:
             ValueError: If handle is not tracked (already freed or invalid)
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         with self._write_lock:
             region_id = handle._region_id
@@ -440,6 +513,8 @@ class MaruHandler:
                 key_to_remove,
             )
 
+        self._record_stats("free", 0, (time.monotonic() - t0) * 1e6)
+
     def store(
         self,
         key: str,
@@ -458,6 +533,9 @@ class MaruHandler:
             True if successful
         """
         self._ensure_connected()
+        t0 = time.monotonic()
+        store_size = 0
+        store_ok = False
 
         with self._write_lock:
             if self._closing.is_set():
@@ -467,56 +545,59 @@ class MaruHandler:
             if key in self._key_to_location:
                 self._owned.free(handle._region_id, handle._page_index)
                 logger.debug("store: key=%s already in local map, skipping", key)
-                return True
+                store_ok = True
             elif self._rpc.exists_kv(key):
                 self._owned.free(handle._region_id, handle._page_index)
                 logger.debug("store: key=%s already exists on server, skipping", key)
-                return True
+                store_ok = True
+            else:
+                region_id = handle._region_id
+                page_index = handle._page_index
+                offset = page_index * self._owned.get_chunk_size()
+                total_size = handle._size
+                store_size = total_size
 
-            region_id = handle._region_id
-            page_index = handle._page_index
-            offset = page_index * self._owned.get_chunk_size()
-            total_size = handle._size
+                try:
+                    is_new = self._rpc.register_kv(
+                        key=key,
+                        region_id=region_id,
+                        kv_offset=offset,
+                        kv_length=total_size,
+                    )
+                except Exception:
+                    self._owned.free(region_id, page_index)
+                    logger.error(
+                        "store: register_kv RPC failed for key=%s, freed page (region=%d, page=%d)",
+                        key,
+                        region_id,
+                        page_index,
+                        exc_info=True,
+                    )
+                    store_size = total_size
+                    # store_ok stays False
+                else:
+                    if not is_new:
+                        self._owned.free(region_id, page_index)
+                        logger.debug(
+                            "store: key=%s lost register race, freed page (region=%d, page=%d)",
+                            key,
+                            region_id,
+                            page_index,
+                        )
+                    else:
+                        self._key_to_location[key] = (region_id, page_index)
+                        logger.debug(
+                            "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
+                            key,
+                            region_id,
+                            page_index,
+                            offset,
+                            total_size,
+                        )
+                    store_ok = True
 
-            try:
-                is_new = self._rpc.register_kv(
-                    key=key,
-                    region_id=region_id,
-                    kv_offset=offset,
-                    kv_length=total_size,
-                )
-            except Exception:
-                self._owned.free(region_id, page_index)
-                logger.error(
-                    "store: register_kv RPC failed for key=%s, freed page (region=%d, page=%d)",
-                    key,
-                    region_id,
-                    page_index,
-                    exc_info=True,
-                )
-                return False
-
-            if not is_new:
-                self._owned.free(region_id, page_index)
-                logger.debug(
-                    "store: key=%s lost register race, freed page (region=%d, page=%d)",
-                    key,
-                    region_id,
-                    page_index,
-                )
-                return True
-
-            self._key_to_location[key] = (region_id, page_index)
-
-            logger.debug(
-                "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
-                key,
-                region_id,
-                page_index,
-                offset,
-                total_size,
-            )
-            return True
+        self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
+        return store_ok
 
     def retrieve(self, key: str) -> MemoryInfo | None:
         """Retrieve a zero-copy MemoryInfo from the KV cache.
@@ -534,10 +615,14 @@ class MaruHandler:
             MemoryInfo with memoryview, or None if not found
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         result = self._rpc.lookup_kv(key)
         if not result.found or result.handle is None:
             logger.debug("Key %s not found", key)
+            self._record_stats(
+                "retrieve", 0, (time.monotonic() - t0) * 1e6, result="miss"
+            )
             return None
 
         handle = result.handle
@@ -574,6 +659,9 @@ class MaruHandler:
         )
         chunk_size = self._owned.get_chunk_size()
         page_index = result.kv_offset // chunk_size
+        self._record_stats(
+            "retrieve", result.kv_length, (time.monotonic() - t0) * 1e6, result="hit"
+        )
         return MemoryInfo(view=buf, region_id=region_id, page_index=page_index)
 
     def exists(self, key: str) -> bool:
@@ -586,7 +674,15 @@ class MaruHandler:
             True if exists
         """
         self._ensure_connected()
-        return self._rpc.exists_kv(key)
+        t0 = time.monotonic()
+        result = self._rpc.exists_kv(key)
+        self._record_stats(
+            "exists",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
+        return result
 
     def pin(self, key: str) -> bool:
         """Check if a key exists and pin it atomically.
@@ -600,7 +696,12 @@ class MaruHandler:
             True if exists (and was pinned)
         """
         self._ensure_connected()
-        return self._rpc.pin_kv(key)
+        t0 = time.monotonic()
+        result = self._rpc.pin_kv(key)
+        self._record_stats(
+            "pin", 0, (time.monotonic() - t0) * 1e6, result="hit" if result else "miss"
+        )
+        return result
 
     def unpin(self, key: str) -> bool:
         """Unpin a KV entry, making it eligible for eviction.
@@ -612,7 +713,15 @@ class MaruHandler:
             True if unpinned successfully
         """
         self._ensure_connected()
-        return self._rpc.unpin(key)
+        t0 = time.monotonic()
+        result = self._rpc.unpin(key)
+        self._record_stats(
+            "unpin",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
+        return result
 
     def delete(self, key: str) -> bool:
         """Delete a key and free the corresponding page.
@@ -624,6 +733,7 @@ class MaruHandler:
             True if deleted
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         with self._write_lock:
             if self._closing.is_set():
@@ -640,7 +750,13 @@ class MaruHandler:
             else:
                 logger.debug("Delete key=%s: not found on server", key)
 
-            return result
+        self._record_stats(
+            "delete",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result else "miss",
+        )
+        return result
 
     def healthcheck(self) -> bool:
         """Check if the handler and MaruServer are healthy.
@@ -675,6 +791,7 @@ class MaruHandler:
                 "total_allocated": stats.allocation_manager.total_allocated,
                 "active_clients": stats.allocation_manager.active_clients,
             },
+            "stats_manager": stats.stats_manager,
         }
 
         if self._owned is not None:
@@ -710,6 +827,7 @@ class MaruHandler:
             List of MemoryInfo (None for keys not found)
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         try:
             batch_resp = self._rpc.batch_lookup_kv(keys)
@@ -773,6 +891,17 @@ class MaruHandler:
             ro_count,
             hits - ro_count,
         )
+        total_bytes = sum(
+            entry.kv_length
+            for i, entry in enumerate(batch_resp.entries)
+            if results[i] is not None and entry.handle is not None
+        )
+        self._record_stats(
+            "batch_retrieve",
+            total_bytes,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
+        )
         return results
 
     def batch_store(
@@ -793,6 +922,7 @@ class MaruHandler:
             List of booleans indicating success for each key
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         if len(keys) != len(handles):
             raise ValueError("keys and handles must have the same length")
@@ -881,7 +1011,9 @@ class MaruHandler:
                 len(keys),
                 total_bytes,
             )
-            return results
+
+        self._record_stats("batch_store", total_bytes, (time.monotonic() - t0) * 1e6)
+        return results
 
     def batch_exists(self, keys: list[str]) -> list[bool]:
         """Check if multiple keys exist.
@@ -895,12 +1027,20 @@ class MaruHandler:
             List of booleans indicating existence for each key
         """
         self._ensure_connected()
+        t0 = time.monotonic()
 
         try:
             batch_resp = self._rpc.batch_exists_kv(keys)
         except Exception:
             logger.error("batch_exists RPC failed", exc_info=True)
             return [False] * len(keys)
+        hits = sum(batch_resp.results)
+        self._record_stats(
+            "batch_exists",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
+        )
         return batch_resp.results
 
     def batch_pin(self, keys: list[str]) -> list[bool]:
@@ -913,7 +1053,16 @@ class MaruHandler:
             List of booleans — True if key exists (and was pinned).
         """
         self._ensure_connected()
-        return self._rpc.batch_pin_kv(keys).results
+        t0 = time.monotonic()
+        results = self._rpc.batch_pin_kv(keys).results
+        hits = sum(results)
+        self._record_stats(
+            "batch_pin",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
+        )
+        return results
 
     def batch_unpin(self, keys: list[str]) -> list[bool]:
         """Unpin multiple keys in a single RPC call.
@@ -925,7 +1074,16 @@ class MaruHandler:
             List of booleans — True if successfully unpinned.
         """
         self._ensure_connected()
-        return self._rpc.batch_unpin(keys).results
+        t0 = time.monotonic()
+        results = self._rpc.batch_unpin(keys).results
+        hits = sum(results)
+        self._record_stats(
+            "batch_unpin",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
+        )
+        return results
 
     # =========================================================================
     # Properties
