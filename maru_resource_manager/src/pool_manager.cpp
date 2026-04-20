@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <unordered_set>
 
 #include "device_header.h"
@@ -456,8 +457,8 @@ int PoolManager::getDeviceSize(const std::string &path, uint64_t &sizeOut)
     return -ENOTSUP;
 }
 
-int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
-                                    DaxType type)
+int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
+                                      DaxType type, PoolState &out)
 {
     uint64_t size = 0;
     int rc = getDeviceSize(path, size);
@@ -549,7 +550,20 @@ int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
         pool = loaded;
     }
 
-    pools_.push_back(pool);
+    out = std::move(pool);
+    return 0;
+}
+
+int PoolManager::loadPoolFromDevice(uint32_t poolId, const std::string &path,
+                                    DaxType type)
+{
+    PoolState pool;
+    int rc = buildPoolFromDevice(poolId, path, type, pool);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    pools_.push_back(std::move(pool));
     return 0;
 }
 
@@ -565,50 +579,83 @@ int PoolManager::rescanDevices()
     return rescanDevicesLocked();
 }
 
+bool PoolManager::hasPools() const
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    return !pools_.empty();
+}
+
+int PoolManager::rescanIfEmpty()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pools_.empty())
+    {
+        return 1;
+    }
+    int rc = rescanDevicesLocked();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    return pools_.empty() ? 0 : 1;
+}
+
 int PoolManager::loadPoolsLocked()
 {
     std::vector<DeviceInfo> devices;
     int rc = scanDevices(devices);
     if (rc != 0)
     {
+        logf(LogLevel::Error, "loadPools: device scan failed: %d", rc);
         return rc;
     }
 
-    pools_.clear();
-    allocations_.clear();
-    nextRegionId_ = 1;
-
+    // Stage everything in scratch state. Commit only after WAL replay succeeds
+    // so a partial replay cannot leave pools_/allocations_ in an inconsistent
+    // state visible to clients.
+    std::vector<PoolState> stagedPools;
     for (const auto &dev : devices)
     {
-        rc = loadPoolFromDevice(dev.poolId, dev.devPath, dev.type);
+        PoolState pool;
+        rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
         if (rc != 0)
         {
-            logf(LogLevel::Warn, "maru-resource-manager: failed to load pool %u from %s: %d", dev.poolId, dev.devPath.c_str(), rc);
+            logf(LogLevel::Warn,
+                 "maru-resource-manager: failed to load pool %u from %s: %d",
+                 dev.poolId, dev.devPath.c_str(), rc);
+            continue;
         }
+        stagedPools.push_back(std::move(pool));
     }
 
-    metadata_->loadGlobal(allocations_, nextRegionId_);
+    std::map<uint64_t, Allocation> stagedAllocations;
+    uint64_t stagedNextRegionId = 1;
+    metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
 
-    int walRc = wal_->replay(pools_, allocations_, nextRegionId_);
+    int walRc = wal_->replay(stagedPools, stagedAllocations, stagedNextRegionId);
     if (walRc != 0 && walRc != -ENOENT)
     {
+        logf(LogLevel::Error, "loadPools: WAL replay failed: %d", walRc);
         return walRc;
     }
 
     // Recompute auth tokens for all restored allocations.
     // Tokens now include client_id in the HMAC input; legacy tokens
     // (computed without client_id) would fail verification after this change.
-    for (auto &[regionId, alloc] : allocations_)
+    for (auto &[regionId, alloc] : stagedAllocations)
     {
         alloc.handle.authToken = computeAuthToken(
             alloc.handle, alloc.nonce, std::string(alloc.clientId));
     }
 
-    for (auto &pool : pools_)
+    for (auto &pool : stagedPools)
     {
         recomputeFreeSize(pool);
     }
 
+    pools_ = std::move(stagedPools);
+    allocations_ = std::move(stagedAllocations);
+    nextRegionId_ = stagedNextRegionId;
     return 0;
 }
 
@@ -621,7 +668,8 @@ int PoolManager::rescanDevicesLocked()
         return rc;
     }
 
-    size_t oldSize = pools_.size();
+    // Build new pools in scratch space without touching pools_.
+    std::vector<PoolState> stagedPools;
     for (const auto &dev : devices)
     {
         bool exists = false;
@@ -637,31 +685,43 @@ int PoolManager::rescanDevicesLocked()
         {
             continue;
         }
-        rc = loadPoolFromDevice(dev.poolId, dev.devPath, dev.type);
+        PoolState pool;
+        rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
         if (rc != 0)
         {
-            return rc;
+            logf(LogLevel::Warn,
+                 "rescan: failed to load pool from %s: %d",
+                 dev.devPath.c_str(), rc);
+            continue;
         }
+        stagedPools.push_back(std::move(pool));
     }
 
-    if (pools_.size() == oldSize)
+    if (stagedPools.empty())
     {
         return 0;
     }
 
-    std::vector<PoolState> newPools(
-        pools_.begin() + static_cast<std::ptrdiff_t>(oldSize),
-        pools_.end());
-    int walRc = wal_->replay(newPools, allocations_, nextRegionId_);
+    // Snapshot global mutable state. WAL replay mutates allocations_ and
+    // nextRegionId_ by reference and may fail mid-stream, so we need rollback.
+    auto allocSnapshot = allocations_;
+    uint64_t nextRegionIdSnapshot = nextRegionId_;
+
+    int walRc = wal_->replay(stagedPools, allocations_, nextRegionId_);
     if (walRc != 0 && walRc != -ENOENT)
     {
+        allocations_ = std::move(allocSnapshot);
+        nextRegionId_ = nextRegionIdSnapshot;
+        logf(LogLevel::Error,
+             "rescan: WAL replay failed: %d, rolled back", walRc);
         return walRc;
     }
 
-    for (size_t i = 0; i < newPools.size(); ++i)
+    // Commit only after replay succeeds.
+    for (auto &pool : stagedPools)
     {
-        recomputeFreeSize(newPools[i]);
-        pools_[oldSize + i] = std::move(newPools[i]);
+        recomputeFreeSize(pool);
+        pools_.push_back(std::move(pool));
     }
 
     return 0;

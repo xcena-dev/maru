@@ -48,6 +48,12 @@ int main(int argc, char **argv) {
     maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec);
     int rc = pm.loadPools();
     if (rc != 0) {
+        maru::logf(maru::LogLevel::Error, "loadPools failed (rc=%d)", rc);
+    }
+    // loadPools returns 0 even when no devices found (scanDevices succeeds
+    // with empty list). Check actual pool state for auto-rescan decision.
+    bool needsRescan = !pm.hasPools();
+    if (needsRescan) {
         maru::logf(maru::LogLevel::Warn,
                     "no CXL/DAX devices found — starting with empty pool");
     }
@@ -76,10 +82,30 @@ int main(int argc, char **argv) {
                cfg.host.c_str(), cfg.port);
 
     // Main loop — runs until SIGINT/SIGTERM
+    auto lastRescan = std::chrono::steady_clock::now();
     while (!gStop) {
         if (gRescan) {
             gRescan = 0;
             pm.rescanDevices();
+            lastRescan = std::chrono::steady_clock::now();
+        }
+
+        if (needsRescan) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastRescan > std::chrono::seconds(10)) {
+                maru::logf(maru::LogLevel::Info,
+                           "pools empty, rescanning for CXL/DAX devices...");
+                int ret = pm.rescanIfEmpty();
+                lastRescan = now;
+                if (ret > 0) {
+                    maru::logf(maru::LogLevel::Info,
+                               "CXL/DAX devices found, auto-rescan complete");
+                    needsRescan = false;
+                } else if (ret < 0) {
+                    maru::logf(maru::LogLevel::Warn,
+                               "auto-rescan failed (rc=%d), will retry", ret);
+                }
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));

@@ -49,3 +49,4 @@ TEST_F(PoolManagerUuidTest, GetStatsEmptyPools) {
     pm_->getStats(stats);
     EXPECT_TRUE(stats.empty());
 }
+

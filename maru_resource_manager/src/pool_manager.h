@@ -61,6 +61,9 @@ public:
 
     int loadPools();
     int rescanDevices();
+    /// Rescan devices only if no pools are loaded.
+    /// Returns: 1 = pools available, 0 = still empty, negative = error.
+    int rescanIfEmpty();
     int alloc(uint64_t size, const std::string &clientId, Handle &out,
               std::string &devPath, std::string &deviceUuid,
               const std::string &daxPath, uint64_t &requestedSizeOut);
@@ -71,6 +74,8 @@ public:
     int verifyAndGetPath(const Handle &handle, std::string &outPath);
 
     void getStats(std::vector<PoolState> &out);
+    /// Lightweight check: returns true if at least one pool is loaded.
+    bool hasPools() const;
     int getPathForHandle(const Handle &handle, std::string &outPath);
     bool hasExistingAllocations();
 
@@ -94,6 +99,11 @@ private:
     };
 
     int scanDevices(std::vector<DeviceInfo> &outDevices);
+    // Pure builder: constructs a PoolState from device without touching pools_.
+    // Caller decides when to commit. Disk side effects (UUID header init) may
+    // still happen and are idempotent.
+    int buildPoolFromDevice(uint32_t poolId, const std::string &path,
+                            DaxType type, PoolState &out);
     int loadPoolFromDevice(uint32_t poolId, const std::string &path,
                            DaxType type);
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);
