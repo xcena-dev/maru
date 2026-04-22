@@ -112,6 +112,12 @@ Key `install.sh` options:
 | `--mount-point <path>` | Filesystem mount directory (default: `/mnt/marufs`) |
 | `--format` | Initialize CXL memory. Only on the *first* node, *first* boot |
 
+Additional mount options (pass via `mount -o` or `/etc/fstab`):
+
+| Option | Meaning |
+|--------|---------|
+| `me_strategy=<order\|request>` | Cross-node write coordination strategy for NRHT (default: `request`). Per-NRHT override via `marufs_nrht_init_req.me_strategy`. |
+
 See: [6_arch_mount_io.md](6_arch_mount_io.md) for the on-mount
 discovery and bootstrapping logic.
 
@@ -292,6 +298,7 @@ struct marufs_nrht_init_req init = {
     .max_entries = 0,   /* 0 → default (524288)   */
     .num_shards  = 0,   /* 0 → default (64, pow2) */
     .num_buckets = 0,   /* 0 → default (max_entries / 4) */
+    .me_strategy = 1,   /* 0 = order-driven, 1 = request-driven (default). */
 };
 ioctl(nrht_fd, MARUFS_IOC_NRHT_INIT, &init);  /* requires PERM_ADMIN */
 
@@ -304,6 +311,16 @@ After this, every node just does `open("/mnt/marufs/kv_nrht")` to get
 an `nrht_fd`; no further init is needed (idempotent creation only
 happens the first time). `NRHT_INIT` is ADMIN-gated, so only the
 region's owner (or a delegated admin) can format it.
+
+Peers lazily join the NRHT's cross-node coordination ring on their
+first `NAME_OFFSET` / `FIND_NAME` call, which adds a one-time setup
+latency (~ms). Latency-sensitive consumers can pre-warm that path:
+
+```c
+/* Optional: join the NRHT ring up front. Idempotent — safe to call
+ * repeatedly; the first call bears the full join cost. */
+ioctl(nrht_fd, MARUFS_IOC_NRHT_JOIN);
+```
 
 ### 4.2 Publishing and looking up names
 
