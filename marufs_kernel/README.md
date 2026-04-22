@@ -49,6 +49,7 @@ Architecture docs are in `docs/`:
 
 | Document | Description |
 |----------|-------------|
+| [0_user_guide](docs/0_user_guide.md) | User-facing flow: multi-node mount, region lifecycle, name-ref sharing, security model (vLLM/LMCache scenario) |
 | [1_arch_metadata_layout](docs/1_arch_metadata_layout.md) | CXL memory layout, superblock/shard/RAT/NRHT structs |
 | [2_arch_entry_lifecycle](docs/2_arch_entry_lifecycle.md) | State machines for index, RAT, delegation entries |
 | [3_arch_gc](docs/3_arch_gc.md) | GC thread: tombstone sweep, dead process reclaim, orphan tracking |
