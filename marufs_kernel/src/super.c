@@ -98,7 +98,7 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 	opts->format = false;
 	opts->daxheap_size = 0;
 	opts->daxheap_bufid = 0;
-	opts->me_strategy = MARUFS_ME_ORDER; /* default: token ring */
+	opts->me_strategy = MARUFS_ME_REQUEST; /* default: demand-driven */
 
 	if (!options)
 		return 0;

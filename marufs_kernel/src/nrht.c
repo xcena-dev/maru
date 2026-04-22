@@ -703,9 +703,7 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	u32 mnodes = READ_CXL_LE32(mh->max_nodes);
 
 	for (u32 s = 0; s < num_shards; s++) {
-		struct marufs_me_cb *cb =
-			(struct marufs_me_cb *)(me_base + cb_off +
-						(u64)s * sizeof(*cb));
+		struct marufs_me_cb *cb = marufs_me_cb_at(me_base, cb_off, s);
 		u64 new_gen = READ_CXL_LE64(cb->generation) + 1;
 		WRITE_LE32(cb->holder, sbi->node_id);
 		WRITE_LE64(cb->generation, new_gen);
@@ -714,11 +712,8 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		/* Ring the initiator's doorbell so the first acquire's
 		 * wait_for_token fast path sees a fresh seq + generation.
 		 */
-		struct marufs_me_slot *ms =
-			(struct marufs_me_slot *)(me_base + slot_off +
-						  ((u64)s * mnodes +
-						   (sbi->node_id - 1)) *
-							  sizeof(*ms));
+		struct marufs_me_slot *ms = marufs_me_slot_at(
+			me_base, slot_off, mnodes, s, sbi->node_id - 1);
 		WRITE_LE32(ms->from_node, sbi->node_id);
 		WRITE_LE64(ms->cb_gen_at_write, new_gen);
 		WRITE_LE64(ms->token_seq, READ_CXL_LE64(ms->token_seq) + 1);
@@ -726,9 +721,7 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	}
 	/* slot[i] is for external node_id (i+1); index by (node_id - 1). */
 	struct marufs_me_membership_slot *my_slot =
-		(struct marufs_me_membership_slot *)(me_base + mem_off +
-						     (u64)(sbi->node_id - 1) *
-							     sizeof(*my_slot));
+		marufs_me_membership_at(me_base, mem_off, sbi->node_id - 1);
 	WRITE_LE32(my_slot->status, MARUFS_ME_ACTIVE);
 	WRITE_LE32(my_slot->node_id, sbi->node_id);
 	WRITE_LE64(my_slot->joined_at, ktime_get_ns());

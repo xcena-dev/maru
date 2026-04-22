@@ -46,15 +46,23 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
 
 /*
  * marufs_me_check_heartbeat - non-holder crash detection.
+ *
+ * Reads the holder's membership slot heartbeat (per-node, distributed)
+ * rather than a shared CB heartbeat — this keeps the CB CL cold.
+ *
  * First observation seeds the baseline without triggering timeout —
  * otherwise last_heartbeat_time=0 (kcalloc) makes elapsed == uptime and
  * triggers false crash detection / split-brain takeover.
  */
-void marufs_me_check_heartbeat(struct marufs_me_instance *me,
-			       struct marufs_me_cb *cb, u32 shard_id,
+void marufs_me_check_heartbeat(struct marufs_me_instance *me, u32 shard_id,
 			       u32 holder)
 {
-	u64 hb = READ_CXL_LE64(cb->heartbeat);
+	if (!marufs_me_is_valid_node(me, holder))
+		return;
+
+	struct marufs_me_membership_slot *hslot = &me->membership[holder - 1];
+	MARUFS_CXL_RMB(hslot, sizeof(*hslot));
+	u64 hb = READ_CXL_LE64(hslot->heartbeat);
 
 	if (me->last_heartbeat_time[shard_id] == 0) {
 		me->last_heartbeat[shard_id] = hb;
@@ -70,7 +78,7 @@ void marufs_me_check_heartbeat(struct marufs_me_instance *me,
 			if (succ == me->node_id) {
 				pr_warn("me: crash detected (holder=%u shard=%u), taking over\n",
 					holder, shard_id);
-				me_cb_write_holder(cb, me->node_id);
+				me_pass_token(me, shard_id, me->node_id);
 			}
 		}
 	} else {
@@ -79,16 +87,59 @@ void marufs_me_check_heartbeat(struct marufs_me_instance *me,
 	}
 }
 
+/*
+ * marufs_me_wait_for_token - poll own doorbell slot until token arrives.
+ *
+ * Reader order (acquire-side, mirrors me_pass_token's writer order):
+ *   1. Read my slot->token_seq. If unchanged → continue polling.
+ *   2. RMB. Read cb->holder + cb->generation.
+ *   3. Double-check: holder == me && generation > last_seen → success.
+ *      Otherwise phantom/stale wakeup — reset snapshot and keep polling.
+ */
 int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 {
+	/* Fast path: already holder (prior CS kept token, or poll thread
+	 * hasn't passed yet). Sync baselines and return.
+	 */
+	struct marufs_me_slot *my_slot = me_my_slot(me, shard_id);
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
+	MARUFS_CXL_RMB(cb, sizeof(*cb));
+
+	if (READ_CXL_LE32(cb->holder) == me->node_id) {
+		me->last_cb_gen[shard_id] = READ_CXL_LE64(cb->generation);
+		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
+		me->last_token_seq[shard_id] =
+			READ_CXL_LE64(my_slot->token_seq);
+		return 0;
+	}
+
 	u64 deadline = ktime_get_ns() + MARUFS_ME_ACQUIRE_TIMEOUT_NS;
 	u32 spins = 0;
-
 	while (ktime_get_ns() < deadline) {
-		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		if (READ_CXL_LE32(cb->holder) == me->node_id)
-			return 0;
+		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
+		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
+
+		if (cur_seq != me->last_token_seq[shard_id]) {
+			/* Acquire ordering: subsequent CB read must not be
+			 * reordered before the slot read above.
+			 */
+			MARUFS_CXL_RMB(cb, sizeof(*cb));
+			u32 holder = READ_CXL_LE32(cb->holder);
+			u64 cb_gen = READ_CXL_LE64(cb->generation);
+
+			if (holder == me->node_id &&
+			    cb_gen > me->last_cb_gen[shard_id]) {
+				me->last_token_seq[shard_id] = cur_seq;
+				me->last_cb_gen[shard_id] = cb_gen;
+				return 0;
+			}
+			/* Phantom: seq advanced but CB not for us. Advance
+			 * last_token_seq only; keeping last_cb_gen lets the
+			 * gen-monotonicity filter still reject stale passes
+			 * from prior generations.
+			 */
+			me->last_token_seq[shard_id] = cur_seq;
+		}
 
 		if (++spins < MARUFS_ME_SPIN_COUNT)
 			cpu_relax();
@@ -134,7 +185,24 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 	WRITE_LE32(slot->status, MARUFS_ME_ACTIVE);
 	WRITE_LE32(slot->node_id, me->node_id);
 	WRITE_LE64(slot->joined_at, ktime_get_ns());
+	WRITE_LE64(slot->heartbeat, 0);
+	WRITE_LE64(slot->heartbeat_ts, ktime_get_ns());
 	MARUFS_CXL_WMB(slot, sizeof(*slot));
+
+	/* Seed per-shard baselines BEFORE claiming, so our own NONE-claim
+	 * below isn't mistaken for a phantom wakeup.
+	 */
+	for (u32 s = 0; s < me->num_shards; s++) {
+		struct marufs_me_slot *my_slot = me_my_slot(me, s);
+
+		MARUFS_CXL_RMB(my_slot, sizeof(*my_slot));
+		me->last_token_seq[s] = READ_CXL_LE64(my_slot->token_seq);
+
+		struct marufs_me_cb *cb = &me->cbs[s];
+
+		MARUFS_CXL_RMB(cb, sizeof(*cb));
+		me->last_cb_gen[s] = READ_CXL_LE64(cb->generation);
+	}
 
 	u32 claimed = 0;
 	for (u32 s = 0; s < me->num_shards; s++) {
@@ -142,7 +210,7 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
 		if (READ_CXL_LE32(cb->holder) == MARUFS_ME_HOLDER_NONE) {
-			me_cb_write_holder(cb, me->node_id);
+			me_pass_token(me, s, me->node_id);
 			claimed++;
 		}
 	}
@@ -164,23 +232,17 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 }
 
 /*
- * marufs_me_common_leave - hand off every held shard, clear membership.
- * When no successor exists we write HOLDER_NONE so a later joiner can
- * reclaim the shard via common_join's NONE-claim path.
+ * marufs_me_common_leave - hand off held shards, clear membership.
+ * NONE fallback when alone lets a later joiner NONE-claim in common_join.
  */
 void marufs_me_common_leave(struct marufs_me_instance *me)
 {
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_cb *cb = &me->cbs[s];
+
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
-
-		if (READ_CXL_LE32(cb->holder) == me->node_id) {
-			u32 succ = marufs_me_next_active(me, me->node_id);
-
-			me_cb_write_holder(cb, succ == me->node_id ?
-						       MARUFS_ME_HOLDER_NONE :
-						       succ);
-		}
+		if (READ_CXL_LE32(cb->holder) == me->node_id)
+			me_pass_token(me, s, me_leave_successor(me));
 		ME_RESET_HOLDING(me, s);
 	}
 
@@ -212,8 +274,10 @@ static int marufs_me_registry_poll_fn(void *data)
 
 		mutex_lock(&sbi->me_list_lock);
 		list_for_each_entry(me, &sbi->me_list, list_node) {
-			if (atomic_read(&me->active))
-				me->ops->poll_cycle(me);
+			if (!atomic_read(&me->active))
+				continue;
+
+			me->ops->poll_cycle(me);
 		}
 		mutex_unlock(&sbi->me_list_lock);
 	}
@@ -278,8 +342,24 @@ void marufs_me_teardown(struct marufs_sb_info *sbi,
 {
 	if (!me)
 		return;
-	marufs_me_unregister(sbi, me);
+
+	/* Reformat detection: underlying CXL area was wiped by a fresh
+	 * nrht_init while this instance was cached. Skip leave — CBs /
+	 * membership now belong to a foreign ring.
+	 */
+	struct marufs_me_header *h = me->header;
+	MARUFS_CXL_RMB(h, sizeof(*h));
+	if (READ_CXL_LE64(h->format_generation) != me->cached_generation) {
+		pr_info("me: teardown skip leave (format_gen mismatch)\n");
+		marufs_me_invalidate(sbi, me);
+		return;
+	}
+
+	/* leave() BEFORE unregister: poll thread must keep ticking heartbeat
+	 * and passing tokens during handoff. leave() clears membership last.
+	 */
 	me->ops->leave(me);
+	marufs_me_unregister(sbi, me);
 	marufs_me_destroy(me);
 }
 
@@ -320,17 +400,20 @@ struct marufs_me_instance *marufs_me_create(void *me_area_base, u32 num_shards,
 	me->header = hdr;
 	MARUFS_CXL_RMB(hdr, sizeof(*hdr));
 	me->cached_generation = READ_CXL_LE64(hdr->format_generation);
-	me->cbs = (struct marufs_me_cb *)((u8 *)me_area_base +
-					  READ_CXL_LE64(hdr->cb_array_offset));
-	me->membership = (struct marufs_me_membership_slot
-				  *)((u8 *)me_area_base +
-				     READ_CXL_LE64(hdr->membership_offset));
+	me->cbs = marufs_me_cb_at(me_area_base,
+				  READ_CXL_LE64(hdr->cb_array_offset), 0);
+	me->membership = marufs_me_membership_at(
+		me_area_base, READ_CXL_LE64(hdr->membership_offset), 0);
 
-	if (strategy == MARUFS_ME_REQUEST &&
-	    READ_CXL_LE64(hdr->request_offset) != 0)
-		me->slots = (struct marufs_me_request_slot
-				     *)((u8 *)me_area_base +
-					READ_CXL_LE64(hdr->request_offset));
+	/* Slot region is now always allocated (per-(shard, node) doorbell +
+	 * request hand-raise). Fall back to NULL only for legacy headers
+	 * with request_offset == 0, in which case strategy-specific code
+	 * must tolerate it (should not happen after format).
+	 */
+	if (READ_CXL_LE64(hdr->request_offset) != 0)
+		me->slots = marufs_me_slot_at(
+			me_area_base, READ_CXL_LE64(hdr->request_offset),
+			max_nodes, 0, 0);
 	else
 		me->slots = NULL;
 
@@ -350,10 +433,13 @@ struct marufs_me_instance *marufs_me_create(void *me_area_base, u32 num_shards,
 	me->cached_successor = kcalloc(num_shards, sizeof(u32), GFP_KERNEL);
 	me->last_heartbeat = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
 	me->last_heartbeat_time = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
+	me->last_token_seq = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
+	me->last_cb_gen = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
 
 	if (!me->holding || !me->local_waiters || !me->local_locks ||
 	    !me->cached_successor || !me->last_heartbeat ||
-	    !me->last_heartbeat_time) {
+	    !me->last_heartbeat_time || !me->last_token_seq ||
+	    !me->last_cb_gen) {
 		marufs_me_destroy(me);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -381,6 +467,8 @@ void marufs_me_destroy(struct marufs_me_instance *me)
 	kfree(me->cached_successor);
 	kfree(me->last_heartbeat);
 	kfree(me->last_heartbeat_time);
+	kfree(me->last_token_seq);
+	kfree(me->last_cb_gen);
 	kfree(me);
 }
 
@@ -395,17 +483,14 @@ void marufs_me_destroy(struct marufs_me_instance *me)
 int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 		     u32 poll_interval_us, enum marufs_me_strategy strategy)
 {
-	/* Compute offsets */
+	/* Compute offsets — slot region is now allocated for both strategies */
 	u64 cb_off = sizeof(struct marufs_me_header);
 	u64 mem_off = cb_off + (u64)num_shards * sizeof(struct marufs_me_cb);
-	u64 req_off = mem_off +
-		      (u64)max_nodes * sizeof(struct marufs_me_membership_slot);
-	u64 total;
-	if (strategy == MARUFS_ME_REQUEST)
-		total = req_off + (u64)num_shards * max_nodes *
-					  sizeof(struct marufs_me_request_slot);
-	else
-		total = req_off; /* no request slots for order-driven */
+	u64 slot_off =
+		mem_off +
+		(u64)max_nodes * sizeof(struct marufs_me_membership_slot);
+	u64 total = slot_off +
+		    (u64)num_shards * max_nodes * sizeof(struct marufs_me_slot);
 
 	/* Write header */
 	struct marufs_me_header *hdr = me_area_base;
@@ -417,8 +502,7 @@ int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 	WRITE_LE32(hdr->poll_interval_us, poll_interval_us);
 	WRITE_LE64(hdr->cb_array_offset, cb_off);
 	WRITE_LE64(hdr->membership_offset, mem_off);
-	WRITE_LE64(hdr->request_offset,
-		   strategy == MARUFS_ME_REQUEST ? req_off : 0);
+	WRITE_LE64(hdr->request_offset, slot_off);
 	WRITE_LE64(hdr->total_size, total);
 	/* Bump generation so any prior cached ME instance on another sbi
 	 * detects the reformat and drops its stale state on next me_get.
@@ -429,10 +513,10 @@ int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 	/* Initialize CBs — holder=NONE (no valid node), state=FREE */
 	for (u32 s = 0; s < num_shards; s++) {
 		struct marufs_me_cb *cb =
-			(struct marufs_me_cb *)((u8 *)me_area_base + cb_off +
-						(u64)s * sizeof(*cb));
+			marufs_me_cb_at(me_area_base, cb_off, s);
 
 		memset(cb, 0, sizeof(*cb));
+		WRITE_LE32(cb->magic, MARUFS_ME_CB_MAGIC);
 		WRITE_LE32(cb->holder, MARUFS_ME_HOLDER_NONE);
 		MARUFS_CXL_WMB(cb, sizeof(*cb));
 	}
@@ -442,37 +526,35 @@ int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 	 */
 	for (u32 n = 0; n < max_nodes; n++) {
 		struct marufs_me_membership_slot *slot =
-			(struct marufs_me_membership_slot
-				 *)((u8 *)me_area_base + mem_off +
-				    (u64)n * sizeof(*slot));
+			marufs_me_membership_at(me_area_base, mem_off, n);
 
+		WRITE_LE32(slot->magic, MARUFS_ME_MS_MAGIC);
 		WRITE_LE32(slot->status, MARUFS_ME_NONE);
 		WRITE_LE32(slot->node_id, n + 1);
 		WRITE_LE64(slot->joined_at, 0);
+		WRITE_LE64(slot->heartbeat, 0);
+		WRITE_LE64(slot->heartbeat_ts, 0);
 		memset(slot->reserved, 0, sizeof(slot->reserved));
 		MARUFS_CXL_WMB(slot, sizeof(*slot));
 	}
 
-	/* Initialize request slots (if request-driven) */
-	if (strategy == MARUFS_ME_REQUEST) {
-		for (u32 s = 0; s < num_shards; s++) {
-			for (u32 n = 0; n < max_nodes; n++) {
-				struct marufs_me_request_slot *rs =
-					(struct marufs_me_request_slot
-						 *)((u8 *)me_area_base +
-						    req_off +
-						    ((u64)s * max_nodes + n) *
-							    sizeof(*rs));
-
-				WRITE_LE32(rs->requesting, 0);
-				WRITE_LE32(rs->sequence, 0);
-				WRITE_LE64(rs->requested_at, 0);
-				WRITE_LE64(rs->granted_at, 0);
-				memset(rs->reserved, 0, sizeof(rs->reserved));
-				MARUFS_CXL_WMB(rs, sizeof(*rs));
-			}
+	/* Initialize per-(shard, node) slots — tag each with magic; batch
+	 * the WMB since format is a cold path (one big flush > N*S small).
+	 */
+	for (u32 s = 0; s < num_shards; s++) {
+		for (u32 n = 0; n < max_nodes; n++) {
+			struct marufs_me_slot *sl = marufs_me_slot_at(
+				me_area_base, slot_off, max_nodes, s, n);
+			memset(sl, 0, sizeof(*sl));
+			WRITE_LE32(sl->magic, MARUFS_ME_SLOT_MAGIC);
 		}
 	}
+
+	struct marufs_me_slot *slots_base =
+		marufs_me_slot_at(me_area_base, slot_off, max_nodes, 0, 0);
+	u64 slots_bytes =
+		(u64)num_shards * max_nodes * sizeof(struct marufs_me_slot);
+	MARUFS_CXL_WMB(slots_base, slots_bytes);
 
 	pr_info("me: formatted area (%s, shards=%u, nodes=%u, size=%llu)\n",
 		strategy == MARUFS_ME_ORDER ? "order" : "request", num_shards,

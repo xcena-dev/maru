@@ -110,7 +110,10 @@ struct marufs_nrht_init_req {
 	__u32 max_entries; /* 0 = default (524288), total across all shards */
 	__u32 num_shards; /* 0 = default (64), must be power of 2 */
 	__u32 num_buckets; /* 0 = default (max_entries / 4), total across all shards */
-	__u32 me_strategy; /* 0 = order (default), 1 = request */
+	__u32 me_strategy; /* 0 = order, 1 = request (recommended). Zero-
+			    * init ⇒ 0 ⇒ order; pass 1 explicitly for request.
+			    * Mount-option default is request (see super.c).
+			    */
 };
 
 /* ── ioctl commands ────────────────────────────────────────────────── */

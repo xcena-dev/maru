@@ -588,6 +588,33 @@ static int me_info_emit_one(char *buf, int len, struct marufs_sb_info *sbi,
 			me->last_heartbeat_time ? me->last_heartbeat_time[s] :
 						  0);
 
+		/* Own doorbell slot — surfaces token-pass state for debugging
+		 * (who rang, which seq, what gen). last_* are DRAM baselines
+		 * used by wait_for_token's phantom filter.
+		 */
+		if (me->slots) {
+			struct marufs_me_slot *ms = me_my_slot(me, s);
+			MARUFS_CXL_RMB(ms, sizeof(*ms));
+			u32 from = READ_CXL_LE32(ms->from_node);
+			u64 tseq = READ_CXL_LE64(ms->token_seq);
+			u64 cgaw = READ_CXL_LE64(ms->cb_gen_at_write);
+			u32 req = READ_CXL_LE32(ms->requesting);
+			u32 rseq = READ_CXL_LE32(ms->sequence);
+			u64 rat = READ_CXL_LE64(ms->requested_at);
+			u64 gat = READ_CXL_LE64(ms->granted_at);
+			u64 last_seq = me->last_token_seq ?
+					       me->last_token_seq[s] :
+					       0;
+			u64 last_gen = me->last_cb_gen ? me->last_cb_gen[s] :
+							 0;
+
+			len += sysfs_emit_at(
+				buf, len,
+				"    my_slot: from=%u seq=%llu cb_gen_at_write=%llu last_seq=%llu last_gen=%llu req=%u rseq=%u req_at=%llu grant_at=%llu\n",
+				from, tseq, cgaw, last_seq, last_gen, req,
+				rseq, rat, gat);
+		}
+
 		/* Guard against PAGE_SIZE overflow */
 		if (len > PAGE_SIZE - 512) {
 			len += sysfs_emit_at(buf, len, "  ... (truncated)\n");

@@ -37,7 +37,7 @@ NUM_SHARDS="${MARUFS_NUM_SHARDS:-64}"
 NUM_REGIONS="${MARUFS_NUM_REGIONS:-4}"
 REGION_OWNERS="${MARUFS_REGION_OWNERS:-}"  # auto-set below if empty
 CHMOD_MODE="${MARUFS_CHMOD:-1777}"         # permissions for mount points
-ME_STRATEGY="${MARUFS_ME_STRATEGY:-order}" # ME strategy: order or request
+ME_STRATEGY="${MARUFS_ME_STRATEGY:-request}" # ME strategy: order or request
 
 # DAXHEAP configuration
 USE_DAXHEAP="${MARUFS_DAXHEAP:-false}"

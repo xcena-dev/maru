@@ -71,12 +71,25 @@ struct marufs_me_header {
  * Per-shard mutual exclusion state. Read-mostly; written only on holder
  * transition. Hot path polling happens on per-node slot doorbell, not here.
  */
+/* Per-type magics — prefix each CXL-resident ME struct so writers can
+ * verify they are actually addressing the intended record type. Guards
+ * against stale instance writes after a peer reformat changed the ME
+ * area layout (cached offsets now fall inside a different struct).
+ */
+enum marufs_me_struct_magic {
+	MARUFS_ME_CB_MAGIC = 0x4352454D, /* "MERC" */
+	MARUFS_ME_MS_MAGIC = 0x534D454D, /* "MEMS" */
+	MARUFS_ME_SLOT_MAGIC = 0x4C534D45, /* "EMSL" */
+};
+
 struct marufs_me_cb {
-	__le32 holder; /*  0: current holder node_id (MARUFS_ME_HOLDER_NONE if vacant) */
-	__le32 state; /*  4: ME_FREE(0) / ME_HELD(1) / ME_RELEASING(2) */
-	__le64 generation; /*  8: monotonic, bumped on every holder change */
-	__le64 acquire_count; /* 16: total acquisitions (stats) */
-	__u8 reserved[40]; /* 24: pad to 64B */
+	__le32 magic; /*  0: MARUFS_ME_CB_MAGIC */
+	__le32 holder; /*  4: current holder node_id (MARUFS_ME_HOLDER_NONE if vacant) */
+	__le32 state; /*  8: ME_FREE(0) / ME_HELD(1) / ME_RELEASING(2) */
+	__le32 _pad; /* 12 */
+	__le64 generation; /* 16: monotonic, bumped on every holder change */
+	__le64 acquire_count; /* 24: total acquisitions (stats) */
+	__u8 reserved[32]; /* 32: pad to 64B */
 } __attribute__((packed));
 
 /*
@@ -88,12 +101,14 @@ struct marufs_me_cb {
  * so liveness ticks don't invalidate a shared hot CL.
  */
 struct marufs_me_membership_slot {
-	__le32 status; /*  0: MARUFS_ME_NONE / MARUFS_ME_ACTIVE */
-	__le32 node_id; /*  4: self node_id (validation) */
-	__le64 joined_at; /*  8: ktime_get_ns() at status change */
-	__le64 heartbeat; /* 16: self-tick counter (poll thread advances) */
-	__le64 heartbeat_ts; /* 24: ktime_get_ns() at last tick */
-	__u8 reserved[32]; /* 32: pad to 64B */
+	__le32 magic; /*  0: MARUFS_ME_MS_MAGIC */
+	__le32 status; /*  4: MARUFS_ME_NONE / MARUFS_ME_ACTIVE */
+	__le32 node_id; /*  8: self node_id (validation) */
+	__le32 _pad; /* 12 */
+	__le64 joined_at; /* 16: ktime_get_ns() at status change */
+	__le64 heartbeat; /* 24: self-tick counter (poll thread advances) */
+	__le64 heartbeat_ts; /* 32: ktime_get_ns() at last tick */
+	__u8 reserved[24]; /* 40: pad to 64B */
 } __attribute__((packed));
 
 /*
@@ -116,9 +131,8 @@ struct marufs_me_membership_slot {
  * Layout: slots[shard_id * max_nodes + internal_idx]
  */
 struct marufs_me_slot {
-	/* Observability */
-	__le32 from_node; /*  0: last writer node_id */
-	__le32 flags; /*  4: reserved for future use */
+	__le32 magic; /*  0: MARUFS_ME_SLOT_MAGIC */
+	__le32 from_node; /*  4: last writer node_id (observability) */
 
 	/* Order-driven doorbell (holder-written) */
 	__le64 token_seq; /*  8: monotonic; owner polls this */
@@ -132,6 +146,33 @@ struct marufs_me_slot {
 
 	__u8 reserved[16]; /* 48: pad to 64B */
 } __attribute__((packed));
+
+/* ── CXL Address Helpers ──────────────────────────────────────────────
+ *
+ * Compute CXL addresses of CB / membership / slot entries from
+ * (me_area_base, offset, index). Return void* so callers can cast to the
+ * typed pointer once. Used during format/create (before typed arrays are
+ * cached in the instance) and from nrht bootstrap.
+ */
+static inline void *marufs_me_cb_at(void *me_area_base, u64 cb_off, u32 s)
+{
+	return (u8 *)me_area_base + cb_off +
+	       (u64)s * sizeof(struct marufs_me_cb);
+}
+
+static inline void *marufs_me_membership_at(void *me_area_base, u64 mem_off,
+					    u32 n)
+{
+	return (u8 *)me_area_base + mem_off +
+	       (u64)n * sizeof(struct marufs_me_membership_slot);
+}
+
+static inline void *marufs_me_slot_at(void *me_area_base, u64 slot_off,
+				      u32 max_nodes, u32 s, u32 n)
+{
+	return (u8 *)me_area_base + slot_off +
+	       ((u64)s * max_nodes + n) * sizeof(struct marufs_me_slot);
+}
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 
@@ -289,15 +330,45 @@ static inline void me_cb_bump_acquire_count(struct marufs_me_cb *cb)
 	MARUFS_CXL_WMB(&cb->acquire_count, sizeof(cb->acquire_count));
 }
 
-/*
- * me_membership_tick_heartbeat - holder advances its own heartbeat.
- * Distributed heartbeat: each node writes only its own membership slot,
- * so liveness ticks don't invalidate a shared CL. Non-holders observe
- * the holder's slot for crash detection.
- */
-static inline void
-me_membership_tick_heartbeat(struct marufs_me_membership_slot *ms)
+/* Per-(shard, internal_idx) slot lookup in the instance's cached array. */
+static inline struct marufs_me_slot *me_slot_of(struct marufs_me_instance *me,
+						u32 shard_id, u32 idx)
 {
+	return &me->slots[(u64)shard_id * me->max_nodes + idx];
+}
+
+/* Self-slot shortcut (idx = me->me_idx). */
+static inline struct marufs_me_slot *me_my_slot(struct marufs_me_instance *me,
+						u32 shard_id)
+{
+	return me_slot_of(me, shard_id, me->me_idx);
+}
+
+/*
+ * Leave-path successor: next ACTIVE node or HOLDER_NONE if we're alone.
+ * Lets leave paths vacate CB so a later joiner NONE-claims the shard.
+ */
+/* Forward decl — needed by me_leave_successor inline below. */
+u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from);
+static inline u32 me_leave_successor(struct marufs_me_instance *me)
+{
+	u32 succ = marufs_me_next_active(me, me->node_id);
+	return (succ == me->node_id) ? MARUFS_ME_HOLDER_NONE : succ;
+}
+
+/*
+ * me_membership_tick_heartbeat - advance own heartbeat; deactivate ME if
+ * the cached membership slot pointer no longer addresses a real slot
+ * (peer reformatted the area — magic mismatch).
+ */
+static inline void me_membership_tick_heartbeat(struct marufs_me_instance *me)
+{
+	struct marufs_me_membership_slot *ms = &me->membership[me->me_idx];
+	MARUFS_CXL_RMB(ms, sizeof(*ms));
+	if (READ_CXL_LE32(ms->magic) != MARUFS_ME_MS_MAGIC) {
+		atomic_set(&me->active, 0);
+		return;
+	}
 	WRITE_LE64(ms->heartbeat, READ_CXL_LE64(ms->heartbeat) + 1);
 	WRITE_LE64(ms->heartbeat_ts, ktime_get_ns());
 	MARUFS_CXL_WMB(&ms->heartbeat, 16);
@@ -335,8 +406,16 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 		return;
 	}
 
-	/* Step 1: CB update — must become visible before the doorbell. */
+	/* Step 1: CB update — must become visible before the doorbell.
+	 * Magic check: deactivate self if the cached cb pointer no longer
+	 * addresses a CB record (stale layout after peer reformat).
+	 */
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
+	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	if (READ_CXL_LE32(cb->magic) != MARUFS_ME_CB_MAGIC) {
+		atomic_set(&me->active, 0);
+		return;
+	}
 	u64 new_gen = READ_CXL_LE64(cb->generation) + 1;
 	WRITE_LE32(cb->holder, new_holder);
 	WRITE_LE64(cb->generation, new_gen);
@@ -346,12 +425,15 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 	if (new_holder == MARUFS_ME_HOLDER_NONE)
 		return;
 
-	struct marufs_me_slot *slot =
-		&me->slots[(u64)shard_id * me->max_nodes + (new_holder - 1)];
-	u64 new_seq = READ_CXL_LE64(slot->token_seq) + 1;
+	struct marufs_me_slot *slot = me_slot_of(me, shard_id, new_holder - 1);
+	MARUFS_CXL_RMB(slot, sizeof(*slot));
+	if (READ_CXL_LE32(slot->magic) != MARUFS_ME_SLOT_MAGIC) {
+		atomic_set(&me->active, 0);
+		return;
+	}
 	WRITE_LE32(slot->from_node, me->node_id);
 	WRITE_LE64(slot->cb_gen_at_write, new_gen);
-	WRITE_LE64(slot->token_seq, new_seq);
+	WRITE_LE64(slot->token_seq, READ_CXL_LE64(slot->token_seq) + 1);
 	MARUFS_CXL_WMB(slot, sizeof(*slot));
 }
 

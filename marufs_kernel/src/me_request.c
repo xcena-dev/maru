@@ -21,37 +21,22 @@
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
 /*
- * request_slot - locate the request slot for (shard_id, internal idx).
- * idx must be 0..max_nodes-1 (use me->me_idx for self, candidate idx for scan).
- */
-static inline struct marufs_me_request_slot *
-request_slot(struct marufs_me_instance *me, u32 shard_id, u32 idx)
-{
-	return &me->slots[(u64)shard_id * me->max_nodes + idx];
-}
-
-/*
- * request_scan_and_grant - scan request slots, grant token to first requester.
- * Caller must be the current holder and not actively holding.
- *
- * Scan order: (node_id+1) mod max_nodes, wrapping around, skipping self.
- * A naïve 0..N-1 sweep biases toward low node_ids — under sustained
- * contention, node 0 could starve higher ids. Rotating the start point
- * approximates round-robin fairness similar to the order-driven ring.
- *
- * Returns true if token was granted.
+ * request_scan_and_grant - holder scans request slots, grants to first
+ * requester. Scan starts at (me_idx+1) wrapping — round-robin fairness
+ * prevents low-id starvation under sustained contention.
+ * Caller must be current holder, idle (hold counter 0).
+ * Returns true iff token was granted.
  */
 static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 {
-	struct marufs_me_cb *cb = &me->cbs[shard_id];
-
 	for (u32 i = 1; i < me->max_nodes; i++) {
 		u32 idx = (me->me_idx + i) % me->max_nodes;
-		struct marufs_me_request_slot *rs =
-			request_slot(me, shard_id, idx);
+		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
 		MARUFS_CXL_RMB(rs, sizeof(*rs));
 		if (READ_CXL_LE32(rs->requesting)) {
-			me_cb_write_holder(cb, idx + 1); /* external node_id */
+			WRITE_LE64(rs->granted_at, ktime_get_ns());
+			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
+			me_pass_token(me, shard_id, idx + 1); /* ext node_id */
 			return true;
 		}
 	}
@@ -61,8 +46,7 @@ static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 static inline void request_clear_own(struct marufs_me_instance *me,
 				     u32 shard_id)
 {
-	struct marufs_me_request_slot *rs =
-		request_slot(me, shard_id, me->me_idx);
+	struct marufs_me_slot *rs = me_my_slot(me, shard_id);
 	WRITE_LE32(rs->requesting, 0);
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
 }
@@ -71,26 +55,26 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 
 static void request_poll_cycle(struct marufs_me_instance *me)
 {
+	bool ticked_hb = false;
+
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_cb *cb = &me->cbs[s];
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
-
 		u32 holder = READ_CXL_LE32(cb->holder);
 
-		/* Always refresh successor (for crash recovery path) */
 		me->cached_successor[s] =
 			marufs_me_next_active(me, me->node_id);
 
 		if (holder == me->node_id) {
-			me_cb_tick_heartbeat(cb);
-
-			/* If not holding, scan for requests and grant.
-			 * smp_mb() in ME_IS_IDLE pairs with acquire's smp_mb().
-			 */
+			/* Tick once per cycle — peers only watch holders. */
+			if (!ticked_hb) {
+				me_membership_tick_heartbeat(me);
+				ticked_hb = true;
+			}
 			if (me_shard_passable(me, s))
 				request_scan_and_grant(me, s);
 		} else {
-			marufs_me_check_heartbeat(me, cb, s, holder);
+			marufs_me_check_heartbeat(me, s, holder);
 		}
 	}
 }
@@ -104,11 +88,9 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	mutex_lock(&me->local_locks[shard_id]);
 	atomic_dec(&me->local_waiters[shard_id]);
 
-	/* Fast path: we already hold the token (e.g. previous release kept it).
-	* smp_mb() after holding=1 pairs with poll_cycle's smp_mb() before
-	* reading holding — ensures if poll sees holding==0 it already wrote
-	* cb->holder, and if we see cb->holder==us then poll won't pass it.
-	*/
+	/* Fast path: previous release kept the token. ME_HOLD's smp_mb()
+	 * pairs with poll_cycle's to close the holding/holder read race.
+	 */
 	ME_HOLD(me, shard_id);
 
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
@@ -118,9 +100,8 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 		return 0;
 	}
 
-	/* Post request and wait for grant */
-	struct marufs_me_request_slot *rs =
-		request_slot(me, shard_id, me->me_idx);
+	/* Raise hand, wait for grant. */
+	struct marufs_me_slot *rs = me_my_slot(me, shard_id);
 	WRITE_LE32(rs->sequence, READ_CXL_LE32(rs->sequence) + 1);
 	WRITE_LE32(rs->requesting, 1);
 	WRITE_LE64(rs->requested_at, ktime_get_ns());

@@ -357,7 +357,7 @@ int main(int argc, char **argv)
 	int size_mb = 64;
 	int do_shuffle = 0;
 	int prefill_count = 0;
-	__u32 me_strategy = MARUFS_ME_ORDER;
+	__u32 me_strategy = MARUFS_ME_REQUEST;
 	char filepath[512];
 	char nrht_path[512];
 	int fd, nrht_fd, pid = (int)getpid();
