@@ -140,18 +140,20 @@ enum marufs_layout {
  */
 struct marufs_superblock {
 	/* ── CL0: identity + layout + integrity (bytes 0–63) ────────── */
-	__le32 magic; /* MARUFS_MAGIC */
-	__le32 version; /* 1 */
-	__le64 total_size; /* Total CXL memory size */
-	__le64 shard_table_offset; /* Shard header array offset */
-	__le64 rat_offset; /* RAT (Region Allocation Table) offset */
-	__le32 num_shards; /* Number of shards (pow2) */
-	__le32 buckets_per_shard; /* buckets per shard */
-	__le32 entries_per_shard; /* Index entries per shard */
-	__le32 checksum; /* CRC32 */
+	__le32 magic; /*  0: MARUFS_MAGIC */
+	__le32 uuid; /*  4: Filesystem UUID (per-format random) */
+	__le32 version; /*  8: 1 */
+	__le32 _pad0; /* 12: align total_size to 8B */
+	__le64 total_size; /* 16: Total CXL memory size */
+	__le64 shard_table_offset; /* 24: Shard header array offset */
+	__le64 rat_offset; /* 32: RAT (Region Allocation Table) offset */
+	__le32 num_shards; /* 40: Number of shards (pow2) */
+	__le32 buckets_per_shard; /* 44: buckets per shard */
+	__le32 entries_per_shard; /* 48: Index entries per shard */
+	__le32 checksum; /* 52: CRC32 */
 
-	/* ── CL1–CL3: reserved (bytes 56–255) ────────────────────────── */
-	__u8 reserved[208]; /* Padding to 256 */
+	/* ── CL0 tail + CL1–CL3: reserved (bytes 56–255) ──────────────── */
+	__u8 reserved[200]; /* Padding to 256 */
 } __attribute__((packed));
 
 /*
