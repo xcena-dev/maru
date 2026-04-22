@@ -24,18 +24,6 @@
 
 #include "marufs.h"
 
-/* Maximum CAS retries for bucket chain insertion */
-
-static inline void index_shard_lock(struct marufs_shard_cache *sc)
-{
-	spin_lock(&sc->insert_lock);
-}
-
-static inline void index_shard_unlock(struct marufs_shard_cache *sc)
-{
-	spin_unlock(&sc->insert_lock);
-}
-
 /* CAS current state → INSERTING and stamp inserter identity for GC. */
 static inline bool marufs_index_claim_entry(struct marufs_sb_info *sbi,
 					    struct marufs_index_entry *e)
@@ -200,41 +188,27 @@ static int marufs_index_post_insert_dedup(struct marufs_sb_info *sbi,
  * life), skip linking to avoid infinite chain walk.
  * Return: 0 on success, -EAGAIN if CAS retries exhausted
  */
+/*
+ * Caller holds Global ME (single writer on this node, cross-node also
+ * excluded) → no competitor can race bucket_head, so a plain WRITE suffices.
+ */
 static int marufs_index_link_to_bucket(struct marufs_index_entry *entry,
 				       u32 entry_idx, u32 *bucket_head)
 {
-	const int max_retries = 32;
-	int retries = 0;
-	for (;;) {
-		MARUFS_CXL_RMB(bucket_head, sizeof(*bucket_head));
-		u32 old_head = READ_CXL_LE32(*bucket_head);
+	MARUFS_CXL_RMB(bucket_head, sizeof(*bucket_head));
+	u32 old_head = READ_CXL_LE32(*bucket_head);
 
-		if (unlikely(old_head == entry_idx)) {
-			/* Already the bucket head (stale link from previous life).
-			 * Chain successor is intact — just skip linking. */
-			break;
-		}
-
-		WRITE_LE32(entry->next_in_bucket, old_head);
-		MARUFS_CXL_WMB(entry, sizeof(*entry));
-
-		if (marufs_le32_cas(bucket_head, old_head, entry_idx) ==
-		    old_head)
-			break;
-
-		if (++retries >= max_retries) {
-			/*
-			 * Extremely rare: revert entry to EMPTY for slot reuse.
-			 */
-			pr_err("index_insert: bucket CAS failed after %d retries, reverting\n",
-			       retries);
-			WRITE_LE32(entry->state, MARUFS_ENTRY_EMPTY);
-			MARUFS_CXL_WMB(entry, sizeof(*entry));
-			return -EAGAIN;
-		}
-		cpu_relax();
+	if (unlikely(old_head == entry_idx)) {
+		/* Already the bucket head (stale link from previous life).
+		 * Chain successor is intact — just skip linking. */
+		return 0;
 	}
 
+	WRITE_LE32(entry->next_in_bucket, old_head);
+	MARUFS_CXL_WMB(entry, sizeof(*entry));
+
+	WRITE_LE32(*bucket_head, entry_idx);
+	MARUFS_CXL_WMB(bucket_head, sizeof(*bucket_head));
 	return 0;
 }
 
@@ -363,38 +337,34 @@ static int __marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
 	WRITE_LE32(entry->state, MARUFS_ENTRY_TENTATIVE);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 
-	/* Step 6: acquire shard lock — serializes link + dedup within node */
-	index_shard_lock(sc);
+	/* Steps 6-8 run under Global ME (held by caller) — exclusive
+	 * link + dedup with no intra/cross-node competitor. */
 
-	/* Step 7: link to bucket (skip if reused — already in chain) */
 	if (!reused_chain_entry) {
 		ret = marufs_index_link_to_bucket(entry, entry_idx,
 						  bucket_head);
 		if (ret) {
 			WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
 			MARUFS_CXL_WMB(entry, sizeof(*entry));
-			goto unlock;
+			return ret;
 		}
 	}
 
-	/* Step 8: post-insert dedup — concurrent inserts resolved here */
+	/* Post-insert dedup — concurrent inserts resolved here */
 	ret = marufs_index_post_insert_dedup(sbi, entries, bucket_head, entry,
 					     entry_idx, hash, name, namelen);
 	if (ret) {
 		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
 		MARUFS_CXL_WMB(entry, sizeof(*entry));
-		goto unlock;
+		return ret;
 	}
 
-	/* Step 9: TENTATIVE → VALID (now visible to lookup) */
+	/* TENTATIVE → VALID (now visible to lookup) */
 	WRITE_LE32(entry->state, MARUFS_ENTRY_VALID);
 	MARUFS_CXL_WMB(entry, sizeof(*entry));
 
 	*out_entry_idx = entry_idx;
-
-unlock:
-	index_shard_unlock(sc);
-	return ret;
+	return 0;
 }
 
 int marufs_index_insert(struct marufs_sb_info *sbi, const char *name,

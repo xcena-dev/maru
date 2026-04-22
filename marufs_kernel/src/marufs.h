@@ -53,6 +53,8 @@
 
 #include <linux/atomic.h>
 #include <linux/fs.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
@@ -63,6 +65,7 @@ struct dma_buf;
 
 /* On-disk structure definitions */
 #include "marufs_layout.h"
+#include "me.h"
 
 /* ============================================================================
  * Filesystem constants
@@ -96,6 +99,7 @@ enum marufs_dax_mode {
 
 /* Forward declarations */
 struct marufs_entry_cache;
+struct marufs_me_instance;
 
 /* ============================================================================
  * GC orphan tracker types
@@ -128,9 +132,9 @@ struct marufs_orphan_tracker {
 struct marufs_shard_cache {
 	u32 *buckets; /* CXL bucket array pointer */
 	struct marufs_index_entry *entries; /* CXL entry array (32B each) */
-	struct marufs_shard_header *header; /* CXL shard header (READ-ONLY after format) */
+	struct marufs_shard_header
+		*header; /* CXL shard header (READ-ONLY after format) */
 	atomic_t free_hint; /* Next-free scan start (not for correctness) */
-	spinlock_t insert_lock; /* Local lock: serializes insert within this node */
 };
 
 /* ============================================================================
@@ -196,8 +200,18 @@ struct marufs_sb_info {
 	/* ---- GC: NRHT region tracker (DRAM) ---- */
 	DECLARE_BITMAP(gc_nrht_bitmap, MARUFS_MAX_RAT_ENTRIES);
 
-	/* ---- Synchronization ---- */
-	spinlock_t lock;
+	/* ---- Mutual Exclusion (ME) ---- */
+	struct marufs_me_instance *me; /* Global ME instance */
+	struct marufs_me_instance *nrht_me[MARUFS_MAX_RAT_ENTRIES];
+	struct mutex nrht_me_lock; /* serializes nrht_me[] creation */
+
+	/* ME registry — unified poll thread for all ME instances
+	 * (Global ME + NRHT MEs). Single kthread iterates all registered
+	 * instances and calls their poll_cycle().
+	 */
+	struct list_head me_list;
+	struct mutex me_list_lock;
+	struct task_struct *me_poll_thread;
 };
 
 /* ============================================================================
@@ -366,8 +380,8 @@ static inline bool marufs_dax_range_valid(struct marufs_sb_info *sbi,
  * Returns true if names match.
  */
 static inline bool marufs_rat_name_matches(struct marufs_sb_info *sbi,
-					   u32 region_id,
-					   const char *name, size_t namelen)
+					   u32 region_id, const char *name,
+					   size_t namelen)
 {
 	struct marufs_rat_entry *rat_e = marufs_rat_entry_get(sbi, region_id);
 	if (!rat_e)
@@ -555,7 +569,14 @@ void marufs_sysfs_unregister(struct marufs_sb_info *sbi);
  * ============================================================================ */
 
 int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		     u32 max_entries, u32 num_shards, u32 num_buckets);
+		     u32 max_entries, u32 num_shards, u32 num_buckets,
+		     enum marufs_me_strategy me_strategy);
+/*
+ * marufs_nrht_join - explicit pre-warm: create this sbi's NRHT ME instance
+ * and join the ring for @nrht_region_id. Idempotent (cached on re-call).
+ * Backup path is lazy-init on first insert.
+ */
+int marufs_nrht_join(struct marufs_sb_info *sbi, u32 nrht_region_id);
 int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		       const char *name, size_t namelen, u64 name_hash,
 		       u64 offset, u32 target_region_id);

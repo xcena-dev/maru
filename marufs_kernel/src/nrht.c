@@ -44,6 +44,7 @@ struct nrht_shard_ctx {
 	struct marufs_nrht_entry *entries;
 	u32 *bucket_head;
 	u32 num_entries;
+	u32 shard_id; /* needed for ME acquire/release */
 };
 
 /* ============================================================================
@@ -219,6 +220,7 @@ static int nrht_resolve_bucket(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	int ret = nrht_get_shard_ctx(sbi, nrht, shard_id, ctx);
 	if (ret)
 		return ret;
+	ctx->shard_id = shard_id;
 
 	/* Resolve bucket head pointer */
 	u32 num_buckets = READ_CXL_LE32(ctx->header->num_buckets);
@@ -347,51 +349,133 @@ static struct marufs_nrht_entry *nrht_find_chain(struct nrht_shard_ctx *ctx,
  * Slot acquisition + link + publish
  * ============================================================================ */
 
-static inline void nrht_shard_lock(struct marufs_nrht_shard_header *hdr)
+/*
+ * marufs_nrht_me_get - lazily create/return per-NRHT ME instance for this node.
+ * The first access by this node creates the instance, joins membership,
+ * and registers with the sbi-level poll thread.
+ */
+static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
+						     u32 nrht_region_id)
 {
-	while (marufs_le32_cas(&hdr->lock, 0, 1) != 0)
-		cpu_relax();
+	struct marufs_me_instance *nme;
+	struct marufs_rat_entry *rat_e;
+	void *base;
+	struct marufs_nrht_header *hdr;
+	void *me_base;
+	u32 num_shards;
+	int ret;
+
+	if (nrht_region_id >= MARUFS_MAX_RAT_ENTRIES)
+		return ERR_PTR(-EINVAL);
+
+	/* Fast path: already initialized AND CXL format generation matches.
+	 * If the underlying CXL ME area has been reformatted (e.g. a peer
+	 * mount re-ran nrht_init on a recycled RAT slot), our cached
+	 * instance is stale and must be dropped so we re-join the fresh ring.
+	 */
+	nme = READ_ONCE(sbi->nrht_me[nrht_region_id]);
+	if (nme) {
+		struct marufs_me_header *h = nme->header;
+		MARUFS_CXL_RMB(h, sizeof(*h));
+		if (READ_CXL_LE64(h->format_generation) ==
+		    nme->cached_generation)
+			return nme;
+	}
+
+	mutex_lock(&sbi->nrht_me_lock);
+	nme = sbi->nrht_me[nrht_region_id];
+	if (nme) {
+		struct marufs_me_header *h = nme->header;
+		MARUFS_CXL_RMB(h, sizeof(*h));
+		if (READ_CXL_LE64(h->format_generation) ==
+		    nme->cached_generation) {
+			mutex_unlock(&sbi->nrht_me_lock);
+			return nme;
+		}
+		/* Stale: drop it and fall through to recreate. */
+		pr_info("nrht: ME instance for region %u stale (gen changed), reinit\n",
+			nrht_region_id);
+		sbi->nrht_me[nrht_region_id] = NULL;
+		marufs_me_invalidate(sbi, nme);
+		nme = NULL;
+	}
+
+	/* Resolve NRHT base + ME area */
+	rat_e = marufs_rat_entry_get(sbi, nrht_region_id);
+	if (!rat_e ||
+	    READ_CXL_LE32(rat_e->state) != MARUFS_RAT_ENTRY_ALLOCATED) {
+		mutex_unlock(&sbi->nrht_me_lock);
+		return ERR_PTR(-ENOENT);
+	}
+	base = marufs_dax_ptr(sbi, READ_CXL_LE64(rat_e->phys_offset));
+	if (!base) {
+		mutex_unlock(&sbi->nrht_me_lock);
+		return ERR_PTR(-EIO);
+	}
+	hdr = base;
+	MARUFS_CXL_RMB(hdr, sizeof(*hdr));
+	num_shards = READ_CXL_LE32(hdr->num_shards);
+	me_base = (char *)base + sizeof(struct marufs_nrht_header) +
+		  (u64)num_shards * sizeof(struct marufs_nrht_shard_header);
+
+	/* Read strategy from ME header (formatted during nrht_init) */
+	struct marufs_me_header *me_hdr = me_base;
+	MARUFS_CXL_RMB(me_hdr, sizeof(*me_hdr));
+	enum marufs_me_strategy strat = READ_CXL_LE32(me_hdr->strategy);
+
+	nme = marufs_me_create(me_base, num_shards, MARUFS_ME_MAX_NODES,
+			       sbi->node_id, MARUFS_ME_DEFAULT_POLL_US, strat);
+	if (IS_ERR(nme)) {
+		mutex_unlock(&sbi->nrht_me_lock);
+		return nme;
+	}
+
+	ret = nme->ops->join(nme);
+	if (ret) {
+		marufs_me_destroy(nme);
+		mutex_unlock(&sbi->nrht_me_lock);
+		return ERR_PTR(ret);
+	}
+
+	marufs_me_register(sbi, nme);
+
+	/* Publish via WRITE_ONCE; fast path uses READ_ONCE */
+	WRITE_ONCE(sbi->nrht_me[nrht_region_id], nme);
+	mutex_unlock(&sbi->nrht_me_lock);
+
+	pr_info("nrht: ME instance created for region %u (strategy=%s, shards=%u)\n",
+		nrht_region_id, strat == MARUFS_ME_ORDER ? "order" : "request",
+		num_shards);
+	return nme;
 }
 
-static inline void nrht_shard_unlock(struct marufs_nrht_shard_header *hdr)
-{
-	WRITE_LE32(hdr->lock, 0);
-	MARUFS_CXL_WMB(&hdr->lock, sizeof(hdr->lock));
-}
-
+/*
+ * Caller MUST hold the NRHT ME shard lock — no other mutator can touch
+ * bucket_head concurrently:
+ *   - link_to_bucket / check_duplicate unlink / post_insert_dedup: all under
+ *     the same ME shard lock in the insert path (this thread).
+ *   - lookup: read-only on bucket chain.
+ *   - delete: only CAS-es entry->state, does not touch bucket_head / next_in_bucket.
+ *   - gc: does not touch bucket structure.
+ * So the CAS on bucket_head can be a plain WRITE.
+ */
 static int nrht_link_to_bucket(struct marufs_nrht_entry *entry, u32 entry_idx,
 			       u32 *bucket_head)
 {
-	const int max_retries = 32;
-	int retries = 0;
+	MARUFS_CXL_RMB(bucket_head, sizeof(*bucket_head));
+	u32 old_head = READ_CXL_LE32(*bucket_head);
 
-	for (;;) {
-		MARUFS_CXL_RMB(bucket_head, sizeof(*bucket_head));
-		u32 old_head = READ_CXL_LE32(*bucket_head);
-
-		if (unlikely(old_head == entry_idx)) {
-			/* Already the bucket head (stale link from previous life).
-			 * Chain successor is intact — just skip linking. */
-			break;
-		}
-
-		WRITE_LE32(entry->next_in_bucket, old_head);
-		MARUFS_CXL_WMB(entry, 64);
-
-		if (marufs_le32_cas(bucket_head, old_head, entry_idx) ==
-		    old_head)
-			break;
-
-		if (++retries >= max_retries) {
-			pr_err("nrht: bucket CAS failed after %d retries\n",
-			       retries);
-			WRITE_LE32(entry->state, MARUFS_ENTRY_EMPTY);
-			MARUFS_CXL_WMB(entry, 64);
-			return -EAGAIN;
-		}
-		cpu_relax();
+	if (unlikely(old_head == entry_idx)) {
+		/* Already the bucket head (stale link from previous life).
+		 * Chain successor is intact — just skip linking. */
+		return 0;
 	}
 
+	WRITE_LE32(entry->next_in_bucket, old_head);
+	MARUFS_CXL_WMB(entry, 64);
+
+	WRITE_LE32(*bucket_head, entry_idx);
+	MARUFS_CXL_WMB(bucket_head, sizeof(*bucket_head));
 	return 0;
 }
 
@@ -445,7 +529,8 @@ static int nrht_post_insert_dedup(struct nrht_shard_ctx *ctx,
  * Public API
  * ============================================================================ */
 int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		     u32 max_entries, u32 num_shards, u32 num_buckets)
+		     u32 max_entries, u32 num_shards, u32 num_buckets,
+		     enum marufs_me_strategy me_strategy)
 {
 	struct marufs_rat_entry *rat_e =
 		marufs_rat_entry_get(sbi, nrht_region_id);
@@ -491,7 +576,8 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	if (buckets_per_shard > MARUFS_NRHT_MAX_ENTRIES)
 		return -EINVAL;
 	buckets_per_shard = roundup_pow_of_two(buckets_per_shard);
-	if (buckets_per_shard == 0 || buckets_per_shard > MARUFS_NRHT_MAX_ENTRIES)
+	if (buckets_per_shard == 0 ||
+	    buckets_per_shard > MARUFS_NRHT_MAX_ENTRIES)
 		return -EINVAL;
 
 	u64 bucket_array_size =
@@ -502,7 +588,15 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	u64 shard_headers_end =
 		sizeof(struct marufs_nrht_header) +
 		(u64)num_shards * sizeof(struct marufs_nrht_shard_header);
-	u64 total_needed = shard_headers_end + (u64)num_shards * per_shard_size;
+
+	/* NRHT ME area placed between shard headers and shard data.
+	 * Always sized as REQUEST to support both strategies without re-format.
+	 */
+	u64 me_area_size = marufs_me_area_size(num_shards, MARUFS_ME_MAX_NODES);
+	u64 me_area_offset = shard_headers_end;
+	u64 shard_data_start = me_area_offset + me_area_size;
+
+	u64 total_needed = shard_data_start + (u64)num_shards * per_shard_size;
 
 	/* ── Step 2: allocate physical memory if not yet done ────────── */
 	u64 phys_offset = READ_CXL_LE64(rat_e->phys_offset);
@@ -557,6 +651,20 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		return -EEXIST;
 	}
 
+	/* Invalidate any stale per-node ME instance cached for this rat_id.
+	 * Happens when a RAT entry is freed and later reallocated for a new
+	 * NRHT file — without this, sbi->nrht_me[rat_id] points to a stale
+	 * instance whose DRAM state (holding, heartbeat, cached_successor)
+	 * does not match the freshly-formatted CXL area.
+	 */
+	mutex_lock(&sbi->nrht_me_lock);
+	{
+		struct marufs_me_instance *stale = sbi->nrht_me[nrht_region_id];
+		sbi->nrht_me[nrht_region_id] = NULL;
+		marufs_me_invalidate(sbi, stale);
+	}
+	mutex_unlock(&sbi->nrht_me_lock);
+
 	/* Zero + format */
 	memset(base, 0, (size_t)total_needed);
 	MARUFS_CXL_WMB(base, total_needed);
@@ -571,7 +679,64 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	WRITE_LE64(hdr->table_size, total_needed);
 	MARUFS_CXL_WMB(hdr, sizeof(*hdr));
 
-	u64 offset = shard_headers_end;
+	/* Format NRHT ME area (between shard headers and shard data) */
+	int me_ret = marufs_me_format((char *)base + me_area_offset, num_shards,
+				      MARUFS_ME_MAX_NODES,
+				      MARUFS_ME_DEFAULT_POLL_US, me_strategy);
+	if (me_ret) {
+		pr_err("nrht_init: me_format failed: %d\n", me_ret);
+		return me_ret;
+	}
+
+	/* Make the initiator the first holder and ACTIVE member
+		 * atomically from any peer's perspective — peers that race
+		 * through me_get will see a non-empty ring and will not
+		 * self-elect as first_node. This removes the start-up window
+		 * where holder=NONE would be visible.
+		 */
+	char *me_base = (char *)base + me_area_offset;
+	struct marufs_me_header *mh = (struct marufs_me_header *)me_base;
+	MARUFS_CXL_RMB(mh, sizeof(*mh));
+	u64 cb_off = READ_CXL_LE64(mh->cb_array_offset);
+	u64 mem_off = READ_CXL_LE64(mh->membership_offset);
+	u64 slot_off = READ_CXL_LE64(mh->request_offset);
+	u32 mnodes = READ_CXL_LE32(mh->max_nodes);
+
+	for (u32 s = 0; s < num_shards; s++) {
+		struct marufs_me_cb *cb =
+			(struct marufs_me_cb *)(me_base + cb_off +
+						(u64)s * sizeof(*cb));
+		u64 new_gen = READ_CXL_LE64(cb->generation) + 1;
+		WRITE_LE32(cb->holder, sbi->node_id);
+		WRITE_LE64(cb->generation, new_gen);
+		MARUFS_CXL_WMB(cb, sizeof(*cb));
+
+		/* Ring the initiator's doorbell so the first acquire's
+		 * wait_for_token fast path sees a fresh seq + generation.
+		 */
+		struct marufs_me_slot *ms =
+			(struct marufs_me_slot *)(me_base + slot_off +
+						  ((u64)s * mnodes +
+						   (sbi->node_id - 1)) *
+							  sizeof(*ms));
+		WRITE_LE32(ms->from_node, sbi->node_id);
+		WRITE_LE64(ms->cb_gen_at_write, new_gen);
+		WRITE_LE64(ms->token_seq, READ_CXL_LE64(ms->token_seq) + 1);
+		MARUFS_CXL_WMB(ms, sizeof(*ms));
+	}
+	/* slot[i] is for external node_id (i+1); index by (node_id - 1). */
+	struct marufs_me_membership_slot *my_slot =
+		(struct marufs_me_membership_slot *)(me_base + mem_off +
+						     (u64)(sbi->node_id - 1) *
+							     sizeof(*my_slot));
+	WRITE_LE32(my_slot->status, MARUFS_ME_ACTIVE);
+	WRITE_LE32(my_slot->node_id, sbi->node_id);
+	WRITE_LE64(my_slot->joined_at, ktime_get_ns());
+	WRITE_LE64(my_slot->heartbeat, 0);
+	WRITE_LE64(my_slot->heartbeat_ts, ktime_get_ns());
+	MARUFS_CXL_WMB(my_slot, sizeof(*my_slot));
+
+	u64 offset = shard_data_start;
 	for (u32 s = 0; s < num_shards; s++) {
 		struct marufs_nrht_shard_header *sh =
 			nrht_shard_header(base, s);
@@ -605,7 +770,31 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		nrht_region_id, num_shards, entries_per_shard,
 		buckets_per_shard, total_needed);
 
+	/* Join the initiating node to the freshly-formatted ring so the
+	 * first insert (on any node) has at least one ACTIVE member and
+	 * the initial token holder is a real node_id — not left as NONE.
+	 * Without this, insert from a peer mount would race through
+	 * first_node detection on an empty ring, which on a very short
+	 * retry window can miss a concurrent joiner. Also ensures crash
+	 * recovery (next_active) has a candidate.
+	 */
+	{
+		struct marufs_me_instance *nme =
+			marufs_nrht_me_get(sbi, nrht_region_id);
+		if (IS_ERR(nme))
+			pr_warn("nrht_init: initiator join failed for region %u: %ld\n",
+				nrht_region_id, PTR_ERR(nme));
+	}
+
 	return 0;
+}
+
+int marufs_nrht_join(struct marufs_sb_info *sbi, u32 nrht_region_id)
+{
+	struct marufs_me_instance *nme =
+		marufs_nrht_me_get(sbi, nrht_region_id);
+
+	return IS_ERR(nme) ? PTR_ERR(nme) : 0;
 }
 
 int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
@@ -709,8 +898,20 @@ int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	WRITE_LE32(entry->state, MARUFS_ENTRY_TENTATIVE);
 	MARUFS_CXL_WMB(entry, 64);
 
-	/* Step 5: acquire shard lock — serializes link + dedup within shard */
-	nrht_shard_lock(ctx.header);
+	/* Step 5: acquire NRHT ME token — cross-node shard lock (FT via heartbeat) */
+	struct marufs_me_instance *nme =
+		marufs_nrht_me_get(sbi, nrht_region_id);
+	if (IS_ERR(nme)) {
+		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+		MARUFS_CXL_WMB(entry, 64);
+		return PTR_ERR(nme);
+	}
+	ret = nme->ops->acquire(nme, ctx.shard_id);
+	if (ret) {
+		WRITE_LE32(entry->state, MARUFS_ENTRY_TOMBSTONE);
+		MARUFS_CXL_WMB(entry, 64);
+		return ret;
+	}
 
 	/* Step 6: link to bucket (skip if reused — already in chain) */
 	if (!reused_chain_entry) {
@@ -736,7 +937,7 @@ int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	MARUFS_CXL_WMB(entry, 64);
 
 unlock:
-	nrht_shard_unlock(ctx.header);
+	nme->ops->release(nme, ctx.shard_id);
 	return ret;
 }
 

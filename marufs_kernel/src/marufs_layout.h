@@ -23,9 +23,11 @@ enum marufs_magic {
 	MARUFS_SHARD_MAGIC = 0x4D534844, /* "MSHD" */
 	MARUFS_RAT_MAGIC = 0x4D524154, /* "MRAT" */
 	MARUFS_NRHT_MAGIC = 0x4E524854, /* "NRHT" */
+	MARUFS_ME_MAGIC = 0x4D454C4B, /* "MELK" */
 
 	MARUFS_VERSION = 1,
 	MARUFS_NRHT_VERSION = 1,
+	MARUFS_ME_VERSION = 1,
 };
 
 /* ── Index entry state (CAS target) ──────────────────────────────── */
@@ -87,15 +89,42 @@ enum marufs_nrht_config {
 /* ── Structure sizes ──────────────────────────────────────────────── */
 enum marufs_struct_size {
 	MARUFS_GSB_SIZE = 256, /* Global superblock */
+
 	MARUFS_SHARD_HEADER_SIZE = 64, /* Per-shard header in shard table */
 	MARUFS_INDEX_ENTRY_SIZE = 64, /* Hash chain entry (half CL) */
+
 	MARUFS_DELEG_ENTRY_SIZE = 64, /* Single delegation entry */
 	MARUFS_RAT_ENTRY_SIZE =
 		2048, /* RAT entry (metadata + delegation, 32 CL = 2KB) */
+	MARUFS_RAT_HEADER_SIZE = 128, /* RAT header (fields before entries[]) */
+
 	MARUFS_NRHT_HEADER_SIZE = 64, /* NRHT file header (1 CL) */
 	MARUFS_NRHT_SHARD_HEADER_SIZE = 64, /* NRHT per-shard header (1 CL) */
 	MARUFS_NRHT_ENTRY_SIZE = 128, /* NRHT unified entry (2 CL) */
+
+	MARUFS_ME_HEADER_SIZE = 64, /* ME area header (1 CL) */
+	MARUFS_ME_CB_SIZE = 64, /* ME control block (1 CL) */
+	MARUFS_ME_MEMBERSHIP_SLOT_SIZE = 64, /* ME membership slot (1 CL) */
+	MARUFS_ME_SLOT_SIZE = 64, /* ME per-(shard, node) slot (1 CL) */
 };
+
+/*
+ * marufs_me_area_size - compute total ME area size in bytes.
+ * Layout: [Header 64B] [CB S×64B] [Membership N×64B] [Slot S×N×64B]
+ *
+ * Slot region is allocated for BOTH strategies:
+ *   - order-driven: per-node doorbell (token_seq)
+ *   - request-driven: per-node hand-raise + doorbell
+ */
+static inline u64 marufs_me_area_size(u32 num_shards, u32 max_nodes)
+{
+	u64 size = MARUFS_ME_HEADER_SIZE;
+
+	size += (u64)num_shards * MARUFS_ME_CB_SIZE;
+	size += (u64)max_nodes * MARUFS_ME_MEMBERSHIP_SLOT_SIZE;
+	size += (u64)num_shards * max_nodes * MARUFS_ME_SLOT_SIZE;
+	return size;
+}
 
 /*
  * CXL Memory Layout (packed, only regions are 2MB-aligned):
@@ -110,6 +139,8 @@ enum marufs_struct_size {
  * │ Entry Arrays (4 × 256 × 64B = 64KB)         │  0x01200
  * ├──────────────────────────────────────────────┤
  * │ RAT (hdr + 256 × 2KB ≈ 512KB)               │  0x11200
+ * ├──────────────────────────────────────────────┤
+ * │ ME Area (hdr + CBs + membership ≈ 4KB)      │  dynamic (gsb->me_area_offset)
  * ├──────────── 2MB aligned ─────────────────────┤
  * │ Region 0 data, Region 1 data, ...           │  0x200000
  * └──────────────────────────────────────────────┘
@@ -129,6 +160,8 @@ enum marufs_layout {
 			    MARUFS_REGION_NUM_SHARDS *
 				    MARUFS_REGION_ENTRIES_PER_SHARD *
 				    MARUFS_INDEX_ENTRY_SIZE,
+	MARUFS_ME_AREA_OFFSET = MARUFS_RAT_OFFSET + MARUFS_RAT_HEADER_SIZE +
+				MARUFS_MAX_RAT_ENTRIES * MARUFS_RAT_ENTRY_SIZE,
 	MARUFS_REGION_OFFSET = MARUFS_ALIGN_2MB,
 };
 
@@ -151,9 +184,10 @@ struct marufs_superblock {
 	__le32 buckets_per_shard; /* 44: buckets per shard */
 	__le32 entries_per_shard; /* 48: Index entries per shard */
 	__le32 checksum; /* 52: CRC32 */
+	__le64 me_area_offset; /* 56: ME area offset (0 = ME disabled) */
 
-	/* ── CL0 tail + CL1–CL3: reserved (bytes 56–255) ──────────────── */
-	__u8 reserved[200]; /* Padding to 256 */
+	/* ── CL1–CL3: reserved (bytes 64–255) ────────────────────────── */
+	__u8 reserved[192]; /* Padding to 256 */
 } __attribute__((packed));
 
 /*
@@ -229,8 +263,7 @@ struct marufs_nrht_shard_header {
 	__le64 bucket_array_offset; /*  8: absolute offset in device */
 	__le64 entry_array_offset; /* 16: absolute offset in device */
 	__le32 free_hint; /* 24: flat scan start hint (best-effort, no CAS) */
-	__le32 lock;
-	__u8 reserved[32]; /* 28: padding to 64B */
+	__u8 reserved[36]; /* 28: padding to 64B */
 } __attribute__((packed)); /* Total: 64 bytes */
 
 /*

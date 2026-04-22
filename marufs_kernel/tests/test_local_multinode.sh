@@ -5,8 +5,7 @@
 # Tests multi-node behavior on a single host by mounting the same DEV_DAX
 # device twice with different node_ids.
 #
-#   node 0 -> /mnt/marufs   (MOUNT_POINT_0)
-#   node 1 -> /mnt/marufs2  (MOUNT_POINT_1)
+#   node i -> /mnt/marufs[i+1]  (i=0 -> /mnt/marufs; i>=1 -> /mnt/marufs<i+1>)
 #
 # Requirements:
 #   - MARUFS module built (marufs.ko)
@@ -14,7 +13,8 @@
 #   - sudo privileges
 #
 # Usage:
-#   ./test_local_multinode.sh                        # Run with defaults
+#   ./test_local_multinode.sh                        # Run with defaults (2 mounts)
+#   ./test_local_multinode.sh --num-mounts 8         # 8-node simulation
 #   ./test_local_multinode.sh --daxheap              # Run with DAXHEAP mode
 #   ./test_local_multinode.sh --skip-setup           # Skip format/mount (already mounted)
 #   ./test_local_multinode.sh --no-cleanup           # Keep mounts after tests
@@ -30,6 +30,10 @@ DAX_DEVICE="${MARUFS_DAX_DEVICE:-/dev/dax6.0}"
 # Auto-detect module name from Makefile
 _makefile_module_name=$(grep '^MODULE_NAME' "$PROJECT_DIR/Makefile" 2>/dev/null | head -1 | sed 's/.*:= *//')
 MODULE_NAME="${MARUFS_MODULE_NAME:-${_makefile_module_name:-marufs}}"
+NUM_MOUNTS="${MARUFS_NUM_MOUNTS:-2}"          # Simulated nodes (1..8)
+# Legacy 2-node vars (also populated into MOUNT_POINTS[0..1] below).
+# Test sections that reference MOUNT_POINT_0/_1 literally keep working
+# unchanged; sections that want to sweep all nodes iterate MOUNT_POINTS[].
 MOUNT_POINT_0="${MARUFS_MOUNT_0:-/mnt/${MODULE_NAME}}"
 MOUNT_POINT_1="${MARUFS_MOUNT_1:-/mnt/${MODULE_NAME}2}"
 NODE_ID_0="${MARUFS_NODE_0:-1}"
@@ -47,32 +51,71 @@ DAXHEAP_SIZE="${MARUFS_DAXHEAP_SIZE:-192G}"  # Allocation size from daxheap buff
 # --- Flags ---
 SKIP_SETUP=false
 DO_CLEANUP=true
-for arg in "$@"; do
-    case "$arg" in
-        --skip-setup)  SKIP_SETUP=true ;;
-        --no-cleanup)  DO_CLEANUP=false ;;
-        --daxheap)     USE_DAXHEAP=true ;;
+# Simple loop — supports `--num-mounts 8` (separate arg) form.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-setup)  SKIP_SETUP=true; shift ;;
+        --no-cleanup)  DO_CLEANUP=false; shift ;;
+        --daxheap)     USE_DAXHEAP=true; shift ;;
+        --num-mounts)  NUM_MOUNTS="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: $0 [--skip-setup] [--no-cleanup] [--daxheap]"
+            echo "Usage: $0 [--skip-setup] [--no-cleanup] [--daxheap] [--num-mounts N]"
             echo ""
             echo "Options:"
             echo "  --skip-setup   Skip build/format/mount (assume already mounted)"
             echo "  --no-cleanup   Keep mounts after tests complete"
             echo "  --daxheap      Use DAXHEAP mode (WC mmap via daxheap buffer)"
+            echo "  --num-mounts N Simulated nodes, 1..8 (default: 2)"
             echo ""
             echo "Environment variables:"
             echo "  MARUFS_DAX_DEVICE   DAX device (default: /dev/dax6.0)"
-            echo "  MARUFS_MOUNT_0      Node 0 mount point (default: /mnt/marufs)"
-            echo "  MARUFS_MOUNT_1      Node 1 mount point (default: /mnt/marufs2)"
-            echo "  MARUFS_NODE_0       Node 0 ID (default: 0)"
-            echo "  MARUFS_NODE_1       Node 1 ID (default: 1)"
+            echo "  MARUFS_NUM_MOUNTS   Simulated node count (default: 2, max: 8)"
+            echo "  MARUFS_MOUNT_<i>    Override mount path for node i (i=0..N-1)"
+            echo "  MARUFS_NODE_<i>     Override node_id for node i (default: i+1)"
             echo "  MARUFS_MODULE       Module path (default: \$PROJECT/marufs.ko)"
             echo "  MARUFS_DAXHEAP      true/false (default: false)"
             echo "  MARUFS_DAXHEAP_DIR  daxheap source dir (required when MARUFS_DAXHEAP=true)"
             exit 0
             ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
     esac
 done
+
+# --- Build MOUNT_POINTS[] / NODE_IDS[] arrays from NUM_MOUNTS + per-index envs ---
+if ! [[ "$NUM_MOUNTS" =~ ^[1-8]$ ]]; then
+    echo "--num-mounts must be 1..8 (got: $NUM_MOUNTS)" >&2
+    exit 1
+fi
+
+MOUNT_POINTS=()
+NODE_IDS=()
+for ((_i = 0; _i < NUM_MOUNTS; _i++)); do
+    # Index 0 -> MARUFS_MOUNT_0 or legacy MOUNT_POINT_0
+    # Index 1 -> MARUFS_MOUNT_1 or legacy MOUNT_POINT_1
+    # Index i>=2 -> MARUFS_MOUNT_<i> or /mnt/<module><i+1>
+    _m_var="MARUFS_MOUNT_$_i"
+    _n_var="MARUFS_NODE_$_i"
+    if [ "$_i" -eq 0 ]; then
+        _default_mp="$MOUNT_POINT_0"; _default_nid="$NODE_ID_0"
+    elif [ "$_i" -eq 1 ]; then
+        _default_mp="$MOUNT_POINT_1"; _default_nid="$NODE_ID_1"
+    else
+        _default_mp="/mnt/${MODULE_NAME}$((_i + 1))"
+        _default_nid=$((_i + 1))
+    fi
+    MOUNT_POINTS[_i]="${!_m_var:-$_default_mp}"
+    NODE_IDS[_i]="${!_n_var:-$_default_nid}"
+done
+
+# Keep legacy scalar aliases pointing at array slots (tests that reference
+# MOUNT_POINT_0 / MOUNT_POINT_1 textually still work).
+MOUNT_POINT_0="${MOUNT_POINTS[0]}"
+MOUNT_POINT_1="${MOUNT_POINTS[1]:-${MOUNT_POINTS[0]}}"
+NODE_ID_0="${NODE_IDS[0]}"
+NODE_ID_1="${NODE_IDS[1]:-${NODE_IDS[0]}}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -117,10 +160,12 @@ file_count() {
     ls -1 "$mp" 2>/dev/null | wc -l | tr -d '[:space:]'
 }
 
-# --- Helper: clean both mount points ---
+# --- Helper: clean all mount points ---
 clean_all() {
-    rm -f "$MOUNT_POINT_0"/* 2>/dev/null || true
-    rm -f "$MOUNT_POINT_1"/* 2>/dev/null || true
+    local mp
+    for mp in "${MOUNT_POINTS[@]}"; do
+        rm -f "$mp"/* 2>/dev/null || true
+    done
 }
 
 # --- Helper: build mount options for a given node_id ---
@@ -157,9 +202,12 @@ mount_opts_for() {
 setup() {
     echo -e "${YELLOW}--- Setup ---${NC}"
 
-    # Unmount if mounted
-    mount | grep -q " $MOUNT_POINT_1 " && sudo umount "$MOUNT_POINT_1" 2>/dev/null
-    mount | grep -q " $MOUNT_POINT_0 " && sudo umount "$MOUNT_POINT_0" 2>/dev/null
+    # Unmount all in reverse order (secondaries before primary)
+    local _i _mp
+    for ((_i = ${#MOUNT_POINTS[@]} - 1; _i >= 0; _i--)); do
+        _mp="${MOUNT_POINTS[_i]}"
+        mount | grep -q " $_mp " && sudo umount "$_mp" 2>/dev/null
+    done
 
     # Unload modules if loaded
     if lsmod | grep -q "^${MODULE_NAME} "; then
@@ -197,21 +245,19 @@ setup() {
     sudo insmod "$MODULE_PATH" node_id=$NODE_ID_0
 
     # Create mount points (format happens on first mount via 'format' option)
-    sudo mkdir -p "$MOUNT_POINT_0" "$MOUNT_POINT_1"
+    local _j
+    for _j in "${!MOUNT_POINTS[@]}"; do
+        sudo mkdir -p "${MOUNT_POINTS[_j]}"
+    done
 
-    # Mount node 0
-    local opts0
-    opts0=$(mount_opts_for "$NODE_ID_0")
-    echo "  Mounting node $NODE_ID_0 -> $MOUNT_POINT_0 ($opts0)"
-    sudo mount -t "${MODULE_NAME}" -o "$opts0" none "$MOUNT_POINT_0"
-    sudo chmod 1777 "$MOUNT_POINT_0"
-
-    # Mount node 1
-    local opts1
-    opts1=$(mount_opts_for "$NODE_ID_1")
-    echo "  Mounting node $NODE_ID_1 -> $MOUNT_POINT_1 ($opts1)"
-    sudo mount -t "${MODULE_NAME}" -o "$opts1" none "$MOUNT_POINT_1"
-    sudo chmod 1777 "$MOUNT_POINT_1"
+    # Mount each node (first one formats due to mount_opts_for's format flag).
+    local _opts
+    for _j in "${!MOUNT_POINTS[@]}"; do
+        _opts=$(mount_opts_for "${NODE_IDS[_j]}")
+        echo "  Mounting node ${NODE_IDS[_j]} -> ${MOUNT_POINTS[_j]} ($_opts)"
+        sudo mount -t "${MODULE_NAME}" -o "$_opts" none "${MOUNT_POINTS[_j]}"
+        sudo chmod 1777 "${MOUNT_POINTS[_j]}"
+    done
 
     if [ "$USE_DAXHEAP" = true ]; then
         echo -e "  ${GREEN}Setup complete (DAXHEAP mode)${NC}"
@@ -226,26 +272,27 @@ cleanup() {
     if [ "$DO_CLEANUP" = true ]; then
         echo ""
         echo -e "${YELLOW}--- Cleanup ---${NC}"
-        sudo umount "$MOUNT_POINT_1" 2>/dev/null || true
-        sudo umount "$MOUNT_POINT_0" 2>/dev/null || true
+        local _i
+        for ((_i = ${#MOUNT_POINTS[@]} - 1; _i >= 0; _i--)); do
+            sudo umount "${MOUNT_POINTS[_i]}" 2>/dev/null || true
+        done
         echo "  Mounts removed"
     fi
 }
 trap cleanup EXIT
 
 # --- Remount helper (used within tests) ---
-# Unmount both, re-format via mount option, remount both
+# Unmount all, re-format via mount option, remount all.
 remount_fresh() {
-    sudo umount "$MOUNT_POINT_1" 2>/dev/null || true
-    sudo umount "$MOUNT_POINT_0" 2>/dev/null || true
-
-    local opts0 opts1
-    opts0=$(mount_opts_for "$NODE_ID_0")
-    opts1=$(mount_opts_for "$NODE_ID_1")
-    sudo mount -t "${MODULE_NAME}" -o "$opts0" none "$MOUNT_POINT_0"
-    sudo chmod 1777 "$MOUNT_POINT_0"
-    sudo mount -t "${MODULE_NAME}" -o "$opts1" none "$MOUNT_POINT_1"
-    sudo chmod 1777 "$MOUNT_POINT_1"
+    local _i _opts
+    for ((_i = ${#MOUNT_POINTS[@]} - 1; _i >= 0; _i--)); do
+        sudo umount "${MOUNT_POINTS[_i]}" 2>/dev/null || true
+    done
+    for _i in "${!MOUNT_POINTS[@]}"; do
+        _opts=$(mount_opts_for "${NODE_IDS[_i]}")
+        sudo mount -t "${MODULE_NAME}" -o "$_opts" none "${MOUNT_POINTS[_i]}"
+        sudo chmod 1777 "${MOUNT_POINTS[_i]}"
+    done
 }
 
 # ============================================================================
@@ -261,8 +308,11 @@ echo "  MARUFS Local Multi-Node Test Suite"
 echo "============================================"
 echo "  Mode:    $MODE_LABEL"
 echo "  Device:  $DAX_DEVICE"
-echo "  Node 0:  $MOUNT_POINT_0 (node_id=$NODE_ID_0)"
-echo "  Node 1:  $MOUNT_POINT_1 (node_id=$NODE_ID_1)"
+echo "  Mounts:  $NUM_MOUNTS"
+for _i in "${!MOUNT_POINTS[@]}"; do
+    printf "    Node %d: %s (node_id=%s)\n" \
+        "$_i" "${MOUNT_POINTS[_i]}" "${NODE_IDS[_i]}"
+done
 echo "  Module:  $MODULE_PATH"
 if [ "$USE_DAXHEAP" = true ]; then
     echo "  daxheap: $DAXHEAP_MODULE"
@@ -280,13 +330,14 @@ else
     echo ""
 fi
 
-# Pre-flight check
-if ! mount | grep -q "$MOUNT_POINT_0 type ${MODULE_NAME}" || \
-   ! mount | grep -q "$MOUNT_POINT_1 type ${MODULE_NAME}"; then
-    echo -e "${RED}ERROR: Both mount points must be active${NC}"
-    mount | grep "${MODULE_NAME}" || true
-    exit 1
-fi
+# Pre-flight check: every configured mount must be active
+for _i in "${!MOUNT_POINTS[@]}"; do
+    if ! mount | grep -q "${MOUNT_POINTS[_i]} type ${MODULE_NAME}"; then
+        echo -e "${RED}ERROR: Mount $_i not active: ${MOUNT_POINTS[_i]}${NC}"
+        mount | grep "${MODULE_NAME}" || true
+        exit 1
+    fi
+done
 
 # Pause GC to prevent dead-process reclamation during tests.
 # Files created by short-lived processes (touch) would be reclaimed by GC
@@ -1213,8 +1264,8 @@ echo -e "${YELLOW}=== Section 27: NRHT CAS Race ===${NC}"
 
 NRHT_RACE_BIN="$SCRIPT_DIR/test_nrht_race"
 if [ -x "$NRHT_RACE_BIN" ]; then
-    run_test "NRHT concurrent insert/delete race" '
-        "$NRHT_RACE_BIN" "$MOUNT_POINT_0" "$MOUNT_POINT_1" 2>&1
+    run_test "NRHT concurrent insert/delete race ($NUM_MOUNTS mounts)" '
+        "$NRHT_RACE_BIN" "${MOUNT_POINTS[@]}" 2>&1
     '
 else
     echo -e "  ${YELLOW}SKIP${NC} (test_nrht_race not compiled)"
@@ -1272,15 +1323,15 @@ if [ "$DO_CLEANUP" = true ]; then
     echo ""
     echo -e "${CYAN}[INFO]${NC} Cleaning up..."
 
-    # Unmount node 1
-    if mount | grep -q "$MOUNT_POINT_1 type ${MODULE_NAME}"; then
-        umount "$MOUNT_POINT_1" 2>/dev/null && echo -e "  ${GREEN}✓${NC} Unmounted $MOUNT_POINT_1" || echo -e "  ${YELLOW}!${NC} Failed to unmount $MOUNT_POINT_1"
-    fi
-
-    # Unmount node 0
-    if mount | grep -q "$MOUNT_POINT_0 type ${MODULE_NAME}"; then
-        umount "$MOUNT_POINT_0" 2>/dev/null && echo -e "  ${GREEN}✓${NC} Unmounted $MOUNT_POINT_0" || echo -e "  ${YELLOW}!${NC} Failed to unmount $MOUNT_POINT_0"
-    fi
+    # Unmount all nodes in reverse order
+    for ((_ci = ${#MOUNT_POINTS[@]} - 1; _ci >= 0; _ci--)); do
+        _cmp="${MOUNT_POINTS[_ci]}"
+        if mount | grep -q "$_cmp type ${MODULE_NAME}"; then
+            umount "$_cmp" 2>/dev/null \
+                && echo -e "  ${GREEN}✓${NC} Unmounted $_cmp" \
+                || echo -e "  ${YELLOW}!${NC} Failed to unmount $_cmp"
+        fi
+    done
 
     # Unload MARUFS module
     if lsmod | grep -q "^${MODULE_NAME} "; then

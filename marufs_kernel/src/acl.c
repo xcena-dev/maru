@@ -20,6 +20,7 @@
 #include <linux/sched.h>
 
 #include "marufs.h"
+#include "me.h"
 
 /*
  * marufs_owner_is_dead - check if RAT entry owner process is dead
@@ -273,14 +274,18 @@ static int marufs_deleg_try_upsert(struct marufs_deleg_entry *deleg_entries,
 	return (free_idx < num_entries) ? 1 : -ENOSPC;
 }
 
-#define MARUFS_DELEG_GRANT_MAX_RETRIES 3
-
+/*
+ * Caller MUST hold the Global ME for MARUFS_ME_GLOBAL_SHARD_ID. With the ME
+ * held, this function is the sole state-field mutator for this rat_entry's
+ * delegation array — no retry/CAS-dance is needed.
+ *
+ * Readers (check_permission) only CAS `de->birth_time` and are gated by the
+ * state-machine (GRANTING → WMB → ACTIVE), so plain writes + the intermediate
+ * WMB are sufficient for visibility.
+ */
 int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		       struct marufs_perm_req *req)
 {
-	struct marufs_rat_entry *rat_entry;
-	int attempt;
-
 	if (!sbi || !req)
 		return -EINVAL;
 
@@ -290,64 +295,43 @@ int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 	if (req->node_id == 0 || req->pid == 0)
 		return -EINVAL;
 
-	rat_entry = marufs_rat_entry_get(sbi, rat_entry_id);
-	if (!rat_entry)
-		return -EINVAL;
-
-	if (READ_LE32(rat_entry->state) != MARUFS_RAT_ENTRY_ALLOCATED)
+	struct marufs_rat_entry *rat_entry =
+		marufs_rat_entry_get(sbi, rat_entry_id);
+	if (!rat_entry ||
+	    READ_CXL_LE32(rat_entry->state) != MARUFS_RAT_ENTRY_ALLOCATED)
 		return -EINVAL;
 
 	MARUFS_CXL_RMB(&rat_entry->default_perms, 64);
 
-	for (attempt = 0; attempt < MARUFS_DELEG_GRANT_MAX_RETRIES; attempt++) {
-		struct marufs_deleg_entry *de;
-		u32 free_idx;
-		u32 old_state;
-		int ret;
+	/* Single pass: upsert hit, no space, or free slot to claim. */
+	u32 free_idx;
+	int ret = marufs_deleg_try_upsert(rat_entry->deleg_entries,
+					  MARUFS_DELEG_MAX_ENTRIES, req,
+					  &free_idx);
+	if (ret <= 0)
+		return ret; /* 0 = upserted, -ENOSPC = full */
 
-		/* Scan for existing match (upsert) or free slot */
-		ret = marufs_deleg_try_upsert(rat_entry->deleg_entries,
-					      MARUFS_DELEG_MAX_ENTRIES, req,
-					      &free_idx);
-		if (ret == 0)
-			return 0; /* Upserted existing entry */
-		if (ret == -ENOSPC)
-			return -ENOSPC;
+	struct marufs_deleg_entry *de =
+		marufs_rat_deleg_entry(rat_entry, free_idx);
+	if (!de)
+		return -EINVAL;
 
-		/* ret == 1: free slot found — try to claim it */
-		de = marufs_rat_deleg_entry(rat_entry, free_idx);
-		if (!de)
-			return -EINVAL;
+	/* Reserve slot visibly so readers racing by see GRANTING, not stale ACTIVE. */
+	WRITE_LE32(de->state, MARUFS_DELEG_GRANTING);
+	MARUFS_CXL_WMB(&de->state, sizeof(de->state));
 
-		/* CAS: EMPTY → GRANTING (reserve slot, fields not yet visible) */
-		old_state = marufs_le32_cas(&de->state, MARUFS_DELEG_EMPTY,
-					    MARUFS_DELEG_GRANTING);
-		if (old_state != MARUFS_DELEG_EMPTY) {
-			cpu_relax();
-			continue; /* Lost race — rescan */
-		}
+	WRITE_LE32(de->node_id, req->node_id);
+	WRITE_LE32(de->pid, req->pid);
+	WRITE_LE32(de->perms, req->perms);
+	WRITE_LE64(de->birth_time,
+		   0); /* Filled on first access by delegated process */
+	WRITE_LE64(de->granted_at, ktime_get_real_ns());
+	MARUFS_CXL_WMB(de, sizeof(*de));
 
-		/* Slot claimed in GRANTING state — fill fields before publish */
-		WRITE_LE32(de->node_id, req->node_id);
-		WRITE_LE32(de->pid, req->pid);
-		WRITE_LE32(de->perms, req->perms);
-		WRITE_LE64(de->birth_time,
-			   0); /* Filled on first access by delegated process */
-		WRITE_LE64(de->granted_at, ktime_get_real_ns());
-		MARUFS_CXL_WMB(
-			de,
-			sizeof(*de)); /* Ensure all fields visible before state transition */
+	/* Publish — ensured fields are globally visible before state transition. */
+	WRITE_LE32(de->state, MARUFS_DELEG_ACTIVE);
+	MARUFS_CXL_WMB(&de->state, sizeof(de->state));
 
-		/* Publish: GRANTING → ACTIVE (CAS to guard against GC reclaim) */
-		if (marufs_le32_cas(&de->state, MARUFS_DELEG_GRANTING,
-				    MARUFS_DELEG_ACTIVE) !=
-		    MARUFS_DELEG_GRANTING)
-			return -EAGAIN; /* GC reclaimed slot, caller retries */
-
-		marufs_le16_cas_inc(&rat_entry->deleg_num_entries);
-
-		return 0;
-	}
-
-	return -EAGAIN;
+	marufs_le16_cas_inc(&rat_entry->deleg_num_entries);
+	return 0;
 }

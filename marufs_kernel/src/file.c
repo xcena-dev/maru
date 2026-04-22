@@ -18,6 +18,7 @@
 
 #include "compat.h"
 #include "marufs.h"
+#include "me.h"
 
 /* Pre-allocated batch buffer to avoid kvmalloc per ioctl */
 #define MARUFS_BATCH_BUF_SIZE                                            \
@@ -512,43 +513,54 @@ static long marufs_ioctl_perm_grant(struct marufs_sb_info *sbi,
 				    struct marufs_inode_info *xi,
 				    struct marufs_perm_req *preq)
 {
-	/* ADMIN can grant anything — check first */
-	int ret;
+	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
+		return ret;
+
+	/* Permission check inside ME: a concurrent chown can strip
+	 * ADMIN/GRANT between check and delegation write, so a lock-free
+	 * precheck would let stale rights leak across ownership transfer.
+	 */
 	if (marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN) !=
 	    0) {
 		/* GRANT can grant, but not ADMIN or GRANT itself */
 		ret = marufs_check_permission(sbi, xi->rat_entry_id,
 					      MARUFS_PERM_GRANT);
 		if (ret)
-			return ret;
+			goto out;
 
-		if (preq->perms & (MARUFS_PERM_ADMIN | MARUFS_PERM_GRANT))
-			return -EPERM;
+		if (preq->perms & (MARUFS_PERM_ADMIN | MARUFS_PERM_GRANT)) {
+			ret = -EPERM;
+			goto out;
+		}
 	}
 
 	ret = marufs_deleg_grant(sbi, xi->rat_entry_id, preq);
-	if (ret)
-		return ret;
+	if (ret == 0)
+		pr_debug("granted perms=0x%x to node=%u pid=%u on rat_entry %u\n",
+			 preq->perms, preq->node_id, preq->pid,
+			 xi->rat_entry_id);
 
-	pr_debug("granted perms=0x%x to node=%u pid=%u on rat_entry %u\n",
-		 preq->perms, preq->node_id, preq->pid, xi->rat_entry_id);
-	return 0;
+out:
+	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	return ret;
 }
 
 /* ── ioctl handler: CHOWN (ownership transfer to caller) ───────────── */
-static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
-			       struct marufs_inode_info *xi,
-			       struct marufs_chown_req *req)
+/*
+ * Caller MUST hold the Global ME. The ADMIN check is done here (not in the
+ * ioctl wrapper) so that the check and the ownership-transfer writes happen
+ * in the same critical section: a concurrent chown cannot strip ADMIN after
+ * the check has passed, which would otherwise let multiple chowns win.
+ */
+static long __marufs_ioctl_chown_locked(struct marufs_sb_info *sbi,
+					struct marufs_inode_info *xi,
+					struct marufs_rat_entry *rat_entry)
 {
 	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
 					  MARUFS_PERM_ADMIN);
 	if (ret)
 		return ret;
-
-	struct marufs_rat_entry *rat_entry =
-		marufs_rat_entry_get(sbi, xi->rat_entry_id);
-	if (!rat_entry)
-		return -EIO;
 
 	/* CAS ALLOCATED→ALLOCATING: block GC during ownership transfer */
 	u32 old_state = marufs_le32_cas(&rat_entry->state,
@@ -581,9 +593,30 @@ static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
 	WRITE_LE32(rat_entry->state, MARUFS_RAT_ENTRY_ALLOCATED);
 	MARUFS_CXL_WMB(rat_entry, sizeof(*rat_entry));
 
-	pr_info_ratelimited("chown rat_entry %u -> node=%u pid=%d\n",
-			    xi->rat_entry_id, sbi->node_id, current->pid);
 	return 0;
+}
+
+static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
+			       struct marufs_inode_info *xi,
+			       struct marufs_chown_req *req)
+{
+	struct marufs_rat_entry *rat_entry =
+		marufs_rat_entry_get(sbi, xi->rat_entry_id);
+	if (!rat_entry)
+		return -EIO;
+
+	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
+		return ret;
+
+	ret = __marufs_ioctl_chown_locked(sbi, xi, rat_entry);
+
+	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret == 0)
+		pr_info_ratelimited("chown rat_entry %u -> node=%u pid=%d\n",
+				    xi->rat_entry_id, sbi->node_id,
+				    current->pid);
+	return ret;
 }
 
 /* ── ioctl handler: NRHT_INIT (format NRHT hash table) ──────────────── */
@@ -591,8 +624,11 @@ static long marufs_ioctl_nrht_init(struct marufs_sb_info *sbi,
 				   struct marufs_inode_info *xi,
 				   struct marufs_nrht_init_req *nreq)
 {
+	enum marufs_me_strategy strat =
+		(nreq->me_strategy == MARUFS_ME_REQUEST) ?
+			MARUFS_ME_REQUEST : MARUFS_ME_ORDER;
 	return marufs_nrht_init(sbi, xi->rat_entry_id, nreq->max_entries,
-				nreq->num_shards, nreq->num_buckets);
+				nreq->num_shards, nreq->num_buckets, strat);
 }
 
 /* ── ioctl handler: PERM_SET_DEFAULT ────────────────────────────────── */
@@ -600,14 +636,6 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info *sbi,
 					  struct marufs_inode_info *xi,
 					  struct marufs_perm_req *preq)
 {
-	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					  MARUFS_PERM_ADMIN);
-	if (ret) {
-		pr_debug("PERM_SET_DEFAULT denied - rat_entry %u (pid=%d)\n",
-			 xi->rat_entry_id, current->pid);
-		return ret;
-	}
-
 	if (preq->perms & ~MARUFS_PERM_ALL)
 		return -EINVAL;
 
@@ -616,12 +644,30 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info *sbi,
 	if (!rat_entry)
 		return -EIO;
 
+	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
+		return ret;
+
+	/* Check ADMIN inside ME — a concurrent chown would otherwise be
+	 * able to strip ADMIN between check and write, letting a stale
+	 * caller clobber default_perms on the new owner's file.
+	 */
+	ret = marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN);
+	if (ret) {
+		pr_debug("PERM_SET_DEFAULT denied - rat_entry %u (pid=%d)\n",
+			 xi->rat_entry_id, current->pid);
+		goto out;
+	}
+
 	WRITE_LE16(rat_entry->default_perms, preq->perms);
 	MARUFS_CXL_WMB(rat_entry, sizeof(*rat_entry));
 
 	pr_debug("set default_perms=0x%x on rat_entry %u\n", preq->perms,
 		 xi->rat_entry_id);
-	return 0;
+
+out:
+	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	return ret;
 }
 
 static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -712,6 +758,18 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!ret)
 			ret = marufs_ioctl_nrht_init(fc.sbi, fc.xi,
 						     &payload.nrht_init);
+		break;
+
+	case MARUFS_IOC_NRHT_JOIN:
+		/* Explicit pre-warm of this sbi's NRHT ME instance (same
+		 * cost as lazy-join on first NAME_OFFSET, just surfaced).
+		 * IOCTL perm mirrors the insert/find/delete path that would
+		 * have done the same work implicitly.
+		 */
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_nrht_join(fc.sbi, fc.xi->rat_entry_id);
 		break;
 
 	case MARUFS_IOC_DMABUF_EXPORT:

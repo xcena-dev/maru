@@ -25,6 +25,9 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODULE_NAME="${MARUFS_MODULE_NAME:-marufs}"  # Filesystem type and module name
 DAX_DEVICE="${MARUFS_DAX_DEVICE:-/dev/dax6.0}"
+NUM_MOUNTS="${MARUFS_NUM_MOUNTS:-2}"          # Number of simulated nodes (1..8)
+# Per-index defaults: MARUFS_MOUNT_<i>=... / MARUFS_NODE_<i>=... override below.
+# Mount 0 uses /mnt/<module>, mount i>0 uses /mnt/<module>(i+1). Node IDs default to i+1.
 MOUNT_POINT_0="${MARUFS_MOUNT_0:-/mnt/${MODULE_NAME}}"
 MOUNT_POINT_1="${MARUFS_MOUNT_1:-/mnt/${MODULE_NAME}2}"
 NODE_ID_0="${MARUFS_NODE_0:-1}"
@@ -34,6 +37,7 @@ NUM_SHARDS="${MARUFS_NUM_SHARDS:-64}"
 NUM_REGIONS="${MARUFS_NUM_REGIONS:-4}"
 REGION_OWNERS="${MARUFS_REGION_OWNERS:-}"  # auto-set below if empty
 CHMOD_MODE="${MARUFS_CHMOD:-1777}"         # permissions for mount points
+ME_STRATEGY="${MARUFS_ME_STRATEGY:-order}" # ME strategy: order or request
 
 # DAXHEAP configuration
 USE_DAXHEAP="${MARUFS_DAXHEAP:-false}"
@@ -79,12 +83,14 @@ while [[ $# -gt 0 ]]; do
         --mount-1)      MOUNT_POINT_1="$2"; shift 2 ;;
         --node-0)       NODE_ID_0="$2"; shift 2 ;;
         --node-1)       NODE_ID_1="$2"; shift 2 ;;
+        --num-mounts)   NUM_MOUNTS="$2"; shift 2 ;;
         --num-regions)  NUM_REGIONS="$2"; shift 2 ;;
         --num-shards)   NUM_SHARDS="$2"; shift 2 ;;
         --daxheap)      USE_DAXHEAP=true; shift ;;
         --daxheap-dir)  DAXHEAP_DIR="$2"; DAXHEAP_MODULE="${DAXHEAP_DIR}/kernel/core/daxheap.ko"; shift 2 ;;
         --daxheap-size) DAXHEAP_SIZE="$2"; shift 2 ;;
         --skip-build)   SKIP_BUILD=true; shift ;;
+        --me-strategy)  ME_STRATEGY="$2"; shift 2 ;;
         --teardown)     ACTION="teardown"; shift ;;
         --status)       ACTION="status"; shift ;;
         --help|-h)
@@ -101,13 +107,17 @@ Options:
   --daxheap         Use DAXHEAP mode (WC mmap for GPU high-bandwidth)
   --daxheap-dir DIR daxheap source directory (required when --daxheap)
   --daxheap-size SZ daxheap allocation size (default: 100G)
+  --num-mounts N    Number of mount points / simulated nodes, 1..8 (default: 2)
   --mount-0 PATH    Node 0 mount point (default: /mnt/marufs)
   --mount-1 PATH    Node 1 mount point (default: /mnt/marufs2)
-  --node-0 ID       Node 0 ID (default: 0)
-  --node-1 ID       Node 1 ID (default: 1)
+                    (use MARUFS_MOUNT_<i>=... env var for indices >= 2)
+  --node-0 ID       Node 0 ID (default: 1)
+  --node-1 ID       Node 1 ID (default: 2)
+                    (use MARUFS_NODE_<i>=... env var for indices >= 2)
   --num-regions N   Number of regions (default: 4)
   --num-shards N    Number of shards (default: 64)
   --skip-build      Skip build step (use existing binaries)
+  --me-strategy S   ME strategy: order (default) or request
 
 Environment:
   MARUFS_DAX_DEVICE, MARUFS_MOUNT_0, MARUFS_MOUNT_1, MARUFS_NODE_0, MARUFS_NODE_1,
@@ -129,10 +139,43 @@ EOF
     esac
 done
 
+# --- Validate + expand NUM_MOUNTS into MOUNT_POINTS[] / NODE_IDS[] ---
+if ! [[ "$NUM_MOUNTS" =~ ^[1-8]$ ]]; then
+    log_error "--num-mounts must be 1..8 (got: $NUM_MOUNTS)"
+    exit 1
+fi
+
+# Default mount path for index i: /mnt/<module>  (i=0)  |  /mnt/<module>(i+1) (i>0)
+default_mount_for_idx() {
+    local i=$1
+    if [ "$i" -eq 0 ]; then
+        echo "/mnt/${MODULE_NAME}"
+    else
+        echo "/mnt/${MODULE_NAME}$((i + 1))"
+    fi
+}
+
+MOUNT_POINTS=()
+NODE_IDS=()
+for ((i = 0; i < NUM_MOUNTS; i++)); do
+    # MARUFS_MOUNT_<i> / MARUFS_NODE_<i> env overrides, else defaults.
+    m_var="MARUFS_MOUNT_$i"
+    n_var="MARUFS_NODE_$i"
+    default_mp=$(default_mount_for_idx "$i")
+    default_nid=$((i + 1))
+
+    # Preserve --mount-0/--mount-1/--node-0/--node-1 CLI flags for back-compat.
+    if [ "$i" -eq 0 ]; then default_mp="$MOUNT_POINT_0"; default_nid="$NODE_ID_0"; fi
+    if [ "$i" -eq 1 ]; then default_mp="$MOUNT_POINT_1"; default_nid="$NODE_ID_1"; fi
+
+    MOUNT_POINTS[i]="${!m_var:-$default_mp}"
+    NODE_IDS[i]="${!n_var:-$default_nid}"
+done
+
 # Note: REGION_OWNERS variable is legacy and no longer used
 # Regions are now dynamically allocated from a shared pool
 if [ -z "$REGION_OWNERS" ]; then
-    REGION_OWNERS="$NODE_ID_0,$NODE_ID_1"
+    REGION_OWNERS=$(IFS=,; echo "${NODE_IDS[*]}")
 fi
 
 # ============================================================================
@@ -162,21 +205,16 @@ do_status() {
     fi
 
     # Mounts
-    echo -n "  Mount 0: "
-    if mount | grep -q "$MOUNT_POINT_0 type ${MODULE_NAME}"; then
-        local count0=$(ls -1 "$MOUNT_POINT_0" 2>/dev/null | wc -l)
-        echo -e "${GREEN}$MOUNT_POINT_0${NC} ($count0 files)"
-    else
-        echo -e "${YELLOW}not mounted${NC}"
-    fi
-
-    echo -n "  Mount 1: "
-    if mount | grep -q "$MOUNT_POINT_1 type ${MODULE_NAME}"; then
-        local count1=$(ls -1 "$MOUNT_POINT_1" 2>/dev/null | wc -l)
-        echo -e "${GREEN}$MOUNT_POINT_1${NC} ($count1 files)"
-    else
-        echo -e "${YELLOW}not mounted${NC}"
-    fi
+    for ((i = 0; i < NUM_MOUNTS; i++)); do
+        local mp="${MOUNT_POINTS[i]}"
+        echo -n "  Mount $i: "
+        if mount | grep -q "$mp type ${MODULE_NAME}"; then
+            local count=$(ls -1 "$mp" 2>/dev/null | wc -l)
+            echo -e "${GREEN}$mp${NC} ($count files)"
+        else
+            echo -e "${YELLOW}not mounted${NC} ($mp)"
+        fi
+    done
 
     # Device — detect from mount if available, fallback to DAX_DEVICE
     local actual_dev="$DAX_DEVICE"
@@ -198,11 +236,11 @@ do_status() {
         echo -e "${RED}$actual_dev not found${NC}"
     fi
 
-    # Filesystem stats
-    if mount | grep -q "$MOUNT_POINT_0 type ${MODULE_NAME}"; then
+    # Filesystem stats (based on mount 0)
+    if mount | grep -q "${MOUNT_POINTS[0]} type ${MODULE_NAME}"; then
         echo ""
         echo "  Filesystem:"
-        df -h "$MOUNT_POINT_0" 2>/dev/null | tail -1 | awk '{printf "    Size: %s  Used: %s  Avail: %s  Use%%: %s\n", $2, $3, $4, $5}'
+        df -h "${MOUNT_POINTS[0]}" 2>/dev/null | tail -1 | awk '{printf "    Size: %s  Used: %s  Avail: %s  Use%%: %s\n", $2, $3, $4, $5}'
     fi
 
     echo "============================================"
@@ -239,8 +277,11 @@ do_setup() {
     echo "============================================"
     echo "  Mode:         $mode_label"
     echo "  Device:       $DAX_DEVICE"
-    echo "  Node 0:       $MOUNT_POINT_0 (node_id=$NODE_ID_0)"
-    echo "  Node 1:       $MOUNT_POINT_1 (node_id=$NODE_ID_1)"
+    echo "  Mounts:       $NUM_MOUNTS"
+    for ((i = 0; i < NUM_MOUNTS; i++)); do
+        printf "    Node %d:     %s (node_id=%s)\n" \
+            "$i" "${MOUNT_POINTS[i]}" "${NODE_IDS[i]}"
+    done
     echo "  Regions:      $NUM_REGIONS (shared pool with dynamic allocation)"
     echo "  Shards:       $NUM_SHARDS"
     if [ "$USE_DAXHEAP" = true ]; then
@@ -310,17 +351,21 @@ do_setup() {
 
     log_success "Module ready"
 
-    # --- Step 4: Mount (format on first mount) ---
-    log_info "Step 4/4: Mounting..."
+    # --- Step 4: Mount (first mount formats; rest attach) ---
+    log_info "Step 4/4: Mounting $NUM_MOUNTS nodes..."
 
-    mkdir -p "$MOUNT_POINT_0" "$MOUNT_POINT_1"
+    for ((i = 0; i < NUM_MOUNTS; i++)); do
+        mkdir -p "${MOUNT_POINTS[i]}"
+    done
 
     if [ "$USE_DAXHEAP" = true ]; then
-        # DAXHEAP mount: primary allocates buffer, secondary attaches
+        # DAXHEAP: primary allocates the shared buffer, secondaries attach via bufid.
         log_info "  DAXHEAP primary mount (buffer size: $DAXHEAP_SIZE)"
-        mount -t "${MODULE_NAME}" -o "daxheap=${DAXHEAP_SIZE},node_id=${NODE_ID_0}" none "$MOUNT_POINT_0"
-        chmod "$CHMOD_MODE" "$MOUNT_POINT_0"
-        log_success "Node $NODE_ID_0 -> $MOUNT_POINT_0 (DAXHEAP primary, ${DAXHEAP_SIZE})"
+        mount -t "${MODULE_NAME}" \
+            -o "daxheap=${DAXHEAP_SIZE},node_id=${NODE_IDS[0]}" \
+            none "${MOUNT_POINTS[0]}"
+        chmod "$CHMOD_MODE" "${MOUNT_POINTS[0]}"
+        log_success "Node ${NODE_IDS[0]} -> ${MOUNT_POINTS[0]} (DAXHEAP primary, ${DAXHEAP_SIZE})"
 
         # Read buf_id from sysfs (published by primary mount)
         local bufid_file="/sys/fs/${MODULE_NAME}/daxheap_bufid"
@@ -334,19 +379,30 @@ do_setup() {
             log_error "Primary mount did not publish a valid buf_id"
             exit 1
         fi
-        log_info "  DAXHEAP secondary mount (bufid=${bufid})"
-        mount -t "${MODULE_NAME}" -o "daxheap_bufid=${bufid},node_id=${NODE_ID_1}" none "$MOUNT_POINT_1"
-        chmod "$CHMOD_MODE" "$MOUNT_POINT_1"
-        log_success "Node $NODE_ID_1 -> $MOUNT_POINT_1 (DAXHEAP secondary, bufid=${bufid})"
-    else
-        # DEV_DAX mount (first mount formats the device)
-        mount -t "${MODULE_NAME}" -o daxdev="$DAX_DEVICE",node_id="$NODE_ID_0",format none "$MOUNT_POINT_0"
-        chmod "$CHMOD_MODE" "$MOUNT_POINT_0"
-        log_success "Node $NODE_ID_0 -> $MOUNT_POINT_0"
 
-        mount -t "${MODULE_NAME}" -o daxdev="$DAX_DEVICE",node_id="$NODE_ID_1" none "$MOUNT_POINT_1"
-        chmod "$CHMOD_MODE" "$MOUNT_POINT_1"
-        log_success "Node $NODE_ID_1 -> $MOUNT_POINT_1"
+        for ((i = 1; i < NUM_MOUNTS; i++)); do
+            log_info "  DAXHEAP secondary mount $i (bufid=${bufid})"
+            mount -t "${MODULE_NAME}" \
+                -o "daxheap_bufid=${bufid},node_id=${NODE_IDS[i]}" \
+                none "${MOUNT_POINTS[i]}"
+            chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
+            log_success "Node ${NODE_IDS[i]} -> ${MOUNT_POINTS[i]} (DAXHEAP secondary, bufid=${bufid})"
+        done
+    else
+        # DEV_DAX: first mount formats the device, subsequent mounts attach.
+        mount -t "${MODULE_NAME}" \
+            -o daxdev="$DAX_DEVICE",node_id="${NODE_IDS[0]}",format,me_strategy="$ME_STRATEGY" \
+            none "${MOUNT_POINTS[0]}"
+        chmod "$CHMOD_MODE" "${MOUNT_POINTS[0]}"
+        log_success "Node ${NODE_IDS[0]} -> ${MOUNT_POINTS[0]} (format)"
+
+        for ((i = 1; i < NUM_MOUNTS; i++)); do
+            mount -t "${MODULE_NAME}" \
+                -o daxdev="$DAX_DEVICE",node_id="${NODE_IDS[i]}",me_strategy="$ME_STRATEGY" \
+                none "${MOUNT_POINTS[i]}"
+            chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
+            log_success "Node ${NODE_IDS[i]} -> ${MOUNT_POINTS[i]}"
+        done
     fi
 
     # --- Done ---
@@ -356,10 +412,8 @@ do_setup() {
     echo "============================================"
     echo ""
     echo "  Quick test:"
-    echo "    touch $MOUNT_POINT_0/hello.txt     # Node $NODE_ID_0 creates"
-    echo "    ls $MOUNT_POINT_1/                  # Node $NODE_ID_1 sees it"
-    echo "    touch $MOUNT_POINT_1/world.txt     # Node $NODE_ID_1 creates"
-    echo "    ls $MOUNT_POINT_0/                  # Node $NODE_ID_0 sees it"
+    echo "    touch ${MOUNT_POINTS[0]}/hello.txt     # Node ${NODE_IDS[0]} creates"
+    echo "    ls ${MOUNT_POINTS[1]:-${MOUNT_POINTS[0]}}/             # Cross-node visibility"
     echo ""
     echo "  Run tests:"
     if [ "$USE_DAXHEAP" = true ]; then

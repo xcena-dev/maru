@@ -123,7 +123,7 @@ static int *make_order(int n, int do_shuffle)
 }
 
 /* Helper: create + init NRHT file, returns fd or -1 */
-static int create_nrht(const char *mount_path, int pid)
+static int create_nrht(const char *mount_path, int pid, __u32 me_strategy)
 {
 	char path[512];
 	struct marufs_nrht_init_req ninit;
@@ -136,9 +136,15 @@ static int create_nrht(const char *mount_path, int pid)
 
 	memset(&ninit, 0, sizeof(ninit));
 	ninit.max_entries = 0; /* default 8192 */
+	ninit.me_strategy = me_strategy;
 	ret = ioctl(nfd, MARUFS_IOC_NRHT_INIT, &ninit);
 	if (ret != 0) { close(nfd); return -1; }
 	return nfd;
+}
+
+static const char *strategy_name(__u32 s)
+{
+	return s == MARUFS_ME_REQUEST ? "request" : "order";
 }
 
 /* ── Prefill: populate background entries for cache pressure ─────── */
@@ -351,6 +357,7 @@ int main(int argc, char **argv)
 	int size_mb = 64;
 	int do_shuffle = 0;
 	int prefill_count = 0;
+	__u32 me_strategy = MARUFS_ME_ORDER;
 	char filepath[512];
 	char nrht_path[512];
 	int fd, nrht_fd, pid = (int)getpid();
@@ -368,12 +375,25 @@ int main(int argc, char **argv)
 			iters = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
 			size_mb = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--strategy") == 0 && i + 1 < argc) {
+			const char *v = argv[++i];
+			if (!strcmp(v, "order"))
+				me_strategy = MARUFS_ME_ORDER;
+			else if (!strcmp(v, "request"))
+				me_strategy = MARUFS_ME_REQUEST;
+			else {
+				fprintf(stderr,
+					"invalid --strategy '%s' (order|request)\n",
+					v);
+				return 1;
+			}
 		} else if (argv[i][0] != '-' && !mount_path) {
 			mount_path = argv[i];
 		} else {
 			fprintf(stderr,
 				"Usage: %s <mount> [-n iters] [-s size_mb] "
-				"[--shuffle] [--prefill N]\n", argv[0]);
+				"[--shuffle] [--prefill N] "
+				"[--strategy order|request]\n", argv[0]);
 			return 1;
 		}
 	}
@@ -381,7 +401,8 @@ int main(int argc, char **argv)
 	if (!mount_path) {
 		fprintf(stderr,
 			"Usage: %s <mount> [-n iters] [-s size_mb] "
-			"[--shuffle] [--prefill N]\n", argv[0]);
+			"[--shuffle] [--prefill N] "
+			"[--strategy order|request]\n", argv[0]);
 		return 1;
 	}
 
@@ -403,7 +424,7 @@ int main(int argc, char **argv)
 
 	/* Create NRHT file */
 	snprintf(nrht_path, sizeof(nrht_path), "%s/bench_nrht_%d", mount_path, pid);
-	nrht_fd = create_nrht(mount_path, pid);
+	nrht_fd = create_nrht(mount_path, pid, me_strategy);
 	if (nrht_fd < 0) {
 		perror("NRHT init");
 		close(fd); unlink(filepath); return 1;
@@ -418,9 +439,9 @@ int main(int argc, char **argv)
 	printf("=== MARUFS name-ref ioctl microbenchmark ===\n");
 	printf("mount=%s  region=%dMB  iterations=%d  batch=%d  pid=%d\n",
 	       mount_path, size_mb, iters, BATCH_SIZE, pid);
-	printf("mode=%s  prefill=%d\n\n",
+	printf("mode=%s  prefill=%d  me_strategy=%s\n\n",
 	       do_shuffle ? "SHUFFLE (random)" : "SEQUENTIAL (cache-warm)",
-	       prefill_count);
+	       prefill_count, strategy_name(me_strategy));
 
 	warmup(nrht_fd, fd, pid);
 

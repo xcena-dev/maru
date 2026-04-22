@@ -22,9 +22,7 @@
 #include <linux/types.h>
 
 #include "marufs.h"
-
-#define MARUFS_REGION_INIT_MAX_RETRIES 10
-#define MARUFS_ALLOC_LOCK_TIMEOUT_NS (5ULL * NSEC_PER_SEC) /* 5s stale lock */
+#include "me.h"
 
 /* ============================================================================
  * RAT (Region Allocation Table) management
@@ -298,15 +296,8 @@ void marufs_rat_free_entry(struct marufs_rat_entry *entry)
 int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		       u64 data_size)
 {
-	struct marufs_rat *rat = marufs_rat_get(sbi);
 	struct marufs_rat_entry *entry =
 		marufs_rat_entry_get(sbi, rat_entry_id);
-	u64 region_size;
-	u64 region_offset;
-	u64 wait_start = 0;
-	int ret;
-	int retries = 0;
-
 	if (!entry || data_size == 0)
 		return -EINVAL;
 
@@ -321,46 +312,21 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		return -ENOSPC;
 
 	/* Align region size to 2MB boundary */
-	region_size = marufs_align_up(data_size, MARUFS_ALIGN_2MB);
+	u64 region_size = marufs_align_up(data_size, MARUFS_ALIGN_2MB);
 	if (region_size > sbi->total_size)
 		return -ENOSPC;
 
-	/*
-	 * Global allocation lock: CAS spinlock on RAT header.
-	 * Will be replaced by token-ring in a future PR.
-	 *
-	 * Stale lock recovery: if holder crashed, force-unlock after timeout.
-	 */
-	while (retries < MARUFS_REGION_INIT_MAX_RETRIES) {
-		if (marufs_le32_cas(&rat->alloc_lock, 0, 1) == 0)
-			break;
-
-		if (wait_start == 0) {
-			wait_start = ktime_get_real_ns();
-		} else {
-			u64 waited = ktime_get_real_ns() - wait_start;
-
-			if (waited > MARUFS_ALLOC_LOCK_TIMEOUT_NS) {
-				pr_warn("region_init: force-unlocking stale alloc_lock (waited %lluns)\n",
-					waited);
-				marufs_le32_cas(&rat->alloc_lock, 1, 0);
-				wait_start = 0;
-				continue;
-			}
-		}
-
-		usleep_range(500000, 600000); /* 500ms between retries */
-		retries++;
-	}
-	if (retries >= MARUFS_REGION_INIT_MAX_RETRIES) {
-		pr_err("region_init: alloc_lock contention (rat_entry=%u)\n",
-		       rat_entry_id);
-		return -EAGAIN;
+	/* Global ME gives cross-node + intra-node exclusion (local_locks). */
+	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret) {
+		pr_err("region_init: ME acquire failed: %d\n", ret);
+		return ret;
 	}
 
-	/* ── Critical section (lock held) ──────────────────────────── */
+	/* ── Critical section (ME held) ───────────────────────────── */
 
 	/* Find contiguous free space */
+	u64 region_offset;
 	ret = marufs_find_contiguous_space(sbi, region_size, &region_offset);
 	if (ret) {
 		pr_err("no contiguous space for region (size=%llu)\n",
@@ -382,8 +348,7 @@ int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
 	MARUFS_CXL_WMB(entry, 64);
 
 unlock:
-	WRITE_LE32(rat->alloc_lock, 0);
-	MARUFS_CXL_WMB(&rat->alloc_lock, sizeof(rat->alloc_lock));
+	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
 
 	if (ret) {
 		pr_err("region_init failed for rat_entry=%u (err=%d)\n",

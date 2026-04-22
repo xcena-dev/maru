@@ -20,23 +20,32 @@
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
-#define MARUFS_MAX_NODE_ID 64
-#define MARUFS_NAME_MAX 63
-#define MARUFS_DELEG_MAX 29 /* Max delegation entries per region */
+enum marufs_constants {
+	MARUFS_MAX_NODE_ID = 8,
+	MARUFS_NAME_MAX = 63,
+	MARUFS_DELEG_MAX = 29, /* Max delegation entries per region */
+	MARUFS_BATCH_FIND_MAX = 32,
+	MARUFS_BATCH_STORE_MAX = 32,
+};
+
+/* ME (Mutual Exclusion) strategy */
+enum marufs_me_strategy {
+	MARUFS_ME_ORDER = 0, /* Order-driven: token ring circulation */
+	MARUFS_ME_REQUEST = 1, /* Request-driven: holder grants on demand */
+};
 
 /* Permission bitmask */
-#define MARUFS_PERM_READ 0x0001 /* read() and mmap(PROT_READ) */
-#define MARUFS_PERM_WRITE 0x0002 /* mmap(PROT_WRITE), page_mkwrite */
-#define MARUFS_PERM_DELETE 0x0004 /* unlink */
-#define MARUFS_PERM_ADMIN \
-	0x0008 /* chown, perm_set_default (ownership control) */
-#define MARUFS_PERM_IOCTL 0x0010 /* name_offset, clear_name ioctls */
-#define MARUFS_PERM_GRANT 0x0020 /* perm_grant to third parties (auth proxy) */
-#define MARUFS_PERM_ALL 0x003F
-
-/* Batch operation limits */
-#define MARUFS_BATCH_FIND_MAX 32
-#define MARUFS_BATCH_STORE_MAX 32
+enum marufs_perm {
+	MARUFS_PERM_READ = 0x0001, /* read() and mmap(PROT_READ) */
+	MARUFS_PERM_WRITE = 0x0002, /* mmap(PROT_WRITE), page_mkwrite */
+	MARUFS_PERM_DELETE = 0x0004, /* unlink */
+	MARUFS_PERM_ADMIN =
+		0x0008, /* chown, perm_set_default (ownership control) */
+	MARUFS_PERM_IOCTL = 0x0010, /* name_offset, clear_name ioctls */
+	MARUFS_PERM_GRANT =
+		0x0020, /* perm_grant to third parties (auth proxy) */
+	MARUFS_PERM_ALL = 0x003F,
+};
 
 /* ── ioctl structures ──────────────────────────────────────────────── */
 
@@ -101,7 +110,7 @@ struct marufs_nrht_init_req {
 	__u32 max_entries; /* 0 = default (524288), total across all shards */
 	__u32 num_shards; /* 0 = default (64), must be power of 2 */
 	__u32 num_buckets; /* 0 = default (max_entries / 4), total across all shards */
-	__u32 reserved;
+	__u32 me_strategy; /* 0 = order (default), 1 = request */
 };
 
 /* ── ioctl commands ────────────────────────────────────────────────── */
@@ -123,6 +132,10 @@ struct marufs_nrht_init_req {
 
 /* NRHT (Name-Ref Hash Table) */
 #define MARUFS_IOC_NRHT_INIT _IOW('X', 20, struct marufs_nrht_init_req)
+/* Explicit ME ring join — optional pre-warm alternative to lazy-init on
+ * first NAME_OFFSET. Idempotent (re-joining a cached instance is a no-op).
+ */
+#define MARUFS_IOC_NRHT_JOIN _IO('X', 21)
 
 /* DMA-BUF */
 #define MARUFS_IOC_DMABUF_EXPORT _IOWR('X', 0x50, struct marufs_dmabuf_req)

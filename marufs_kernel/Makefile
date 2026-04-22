@@ -14,7 +14,7 @@ MODULE_NAME := marufs
 obj-m := $(MODULE_NAME).o
 
 # Source files (from src/ directory)
-$(MODULE_NAME)-objs := src/super.o src/inode.o src/file.o src/dir.o src/region.o src/index.o src/nrht.o src/acl.o src/cache.o src/sysfs.o src/gc.o
+$(MODULE_NAME)-objs := src/super.o src/inode.o src/file.o src/dir.o src/region.o src/index.o src/nrht.o src/acl.o src/cache.o src/sysfs.o src/gc.o src/me.o src/me_order.o src/me_request.o
 
 # Kernel build directory (default to running kernel)
 KDIR ?= /lib/modules/$(shell uname -r)/build

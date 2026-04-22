@@ -19,6 +19,7 @@
 
 #include "compat.h"
 #include "marufs.h"
+#include "me.h"
 
 /* ============================================================================
  * marufs_lookup - Global index hash lookup
@@ -77,21 +78,50 @@ static struct dentry *marufs_lookup(struct inode *dir, struct dentry *dentry,
  * Physical allocation happens in marufs_setattr() via ftruncate().
  */
 
+/*
+ * __marufs_create_locked - critical section: RAT alloc + index insert.
+ * Caller holds Global ME. On success, *out_rat_entry_id and *out_entry_idx
+ * are set. On failure, any partial allocation is cleaned up internally.
+ */
+static int __marufs_create_locked(struct marufs_sb_info *sbi,
+				  struct dentry *dentry, umode_t mode,
+				  u32 *out_rat_entry_id, u32 *out_entry_idx)
+{
+	/* Step 1: Reserve RAT entry (size=0, offset=0) */
+	u32 rat_entry_id;
+	int ret = marufs_rat_alloc_entry(sbi, dentry->d_name.name, 0, 0,
+					 &rat_entry_id);
+	if (ret) {
+		pr_err("RAT entry reservation failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Write uid/gid/mode to RAT entry (single source of truth) */
+	struct marufs_rat_entry *rat_e =
+		marufs_rat_entry_get(sbi, rat_entry_id);
+	if (rat_e) {
+		WRITE_LE32(rat_e->uid, current_uid().val);
+		WRITE_LE32(rat_e->gid, current_gid().val);
+		WRITE_LE16(rat_e->mode, mode & 0777);
+		MARUFS_CXL_WMB(rat_e, sizeof(*rat_e));
+	}
+
+	/* Step 2: Insert into global index */
+	ret = marufs_index_insert(sbi, dentry->d_name.name, dentry->d_name.len,
+				  rat_entry_id, out_entry_idx);
+	if (ret) {
+		pr_err("index insert failed: %d\n", ret);
+		marufs_rat_free_entry(marufs_rat_entry_get(sbi, rat_entry_id));
+		return ret;
+	}
+
+	*out_rat_entry_id = rat_entry_id;
+	return 0;
+}
+
 static int marufs_create(MARUFS_IDMAP_PARAM_COMMA struct inode *dir,
 			 struct dentry *dentry, umode_t mode, bool excl)
 {
-	struct super_block *sb = dir->i_sb;
-	struct marufs_sb_info *sbi = marufs_sb_get(sb);
-	struct inode *inode;
-	struct marufs_inode_info *xi;
-	struct marufs_index_entry *entry;
-	struct marufs_rat_entry *rat_e;
-	u32 rat_entry_id;
-	u32 entry_idx;
-	u64 hash;
-	u32 shard_id;
-	int ret;
-
 	if (dir->i_ino != MARUFS_ROOT_INO)
 		return -ENOENT;
 
@@ -101,61 +131,48 @@ static int marufs_create(MARUFS_IDMAP_PARAM_COMMA struct inode *dir,
 	pr_debug("creating file '%.*s' (lightweight, no physical space)\n",
 		 (int)dentry->d_name.len, dentry->d_name.name);
 
-	/* Check if RAT is available */
+	struct super_block *sb = dir->i_sb;
+	struct marufs_sb_info *sbi = marufs_sb_get(sb);
 	if (!sbi->rat) {
 		pr_err("RAT not initialized\n");
 		return -ENOSPC;
 	}
 
-	/* Step 1: Reserve RAT entry (size=0, offset=0) */
-	ret = marufs_rat_alloc_entry(sbi, dentry->d_name.name, 0, 0,
-				     &rat_entry_id);
-	if (ret) {
-		pr_err("RAT entry reservation failed: %d\n", ret);
+	/* Global ME: serialize RAT alloc + index insert across nodes */
+	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
 		return ret;
-	}
-
-	/* Write uid/gid/mode to RAT entry (single source of truth) */
-	rat_e = marufs_rat_entry_get(sbi, rat_entry_id);
-	if (rat_e) {
-		WRITE_LE32(rat_e->uid, current_uid().val);
-		WRITE_LE32(rat_e->gid, current_gid().val);
-		WRITE_LE16(rat_e->mode, mode & 0777);
-		MARUFS_CXL_WMB(rat_e, sizeof(*rat_e));
-	}
-
-	/* Step 2: Insert into global index */
-	hash = marufs_hash_name(dentry->d_name.name, dentry->d_name.len);
-	shard_id = marufs_shard_idx(hash, sbi->shard_mask);
-
-	ret = marufs_index_insert(sbi, dentry->d_name.name, dentry->d_name.len,
-				  rat_entry_id, &entry_idx);
-	if (ret) {
-		pr_err("index insert failed: %d\n", ret);
-		marufs_rat_free_entry(rat_e);
+	u32 rat_entry_id, entry_idx;
+	ret = __marufs_create_locked(sbi, dentry, mode, &rat_entry_id,
+				     &entry_idx);
+	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
 		return ret;
-	}
+
+	u64 hash = marufs_hash_name(dentry->d_name.name, dentry->d_name.len);
+	u32 shard_id = marufs_shard_idx(hash, sbi->shard_mask);
 
 	/* Resolve entry pointer directly — no redundant lookup needed */
-	entry = marufs_shard_entry(sbi, shard_id, entry_idx);
+	struct marufs_index_entry *entry =
+		marufs_shard_entry(sbi, shard_id, entry_idx);
 	if (!entry) {
 		pr_err("post-insert entry resolve failed\n");
 		marufs_index_delete(sbi, dentry->d_name.name,
 				    dentry->d_name.len);
-		marufs_rat_free_entry(rat_e);
+		marufs_rat_free_entry(marufs_rat_entry_get(sbi, rat_entry_id));
 		return -EIO;
 	}
 
-	inode = marufs_new_inode(sb, mode);
+	struct inode *inode = marufs_new_inode(sb, mode);
 	if (IS_ERR(inode)) {
 		pr_err("inode creation failed: %ld\n", PTR_ERR(inode));
 		marufs_index_delete(sbi, dentry->d_name.name,
 				    dentry->d_name.len);
-		marufs_rat_free_entry(rat_e);
+		marufs_rat_free_entry(marufs_rat_entry_get(sbi, rat_entry_id));
 		return PTR_ERR(inode);
 	}
 
-	xi = marufs_inode_get(inode);
+	struct marufs_inode_info *xi = marufs_inode_get(inode);
 	xi->region_id = rat_entry_id;
 	xi->entry_idx = entry_idx;
 	xi->shard_id = shard_id;
@@ -191,16 +208,15 @@ static int marufs_create(MARUFS_IDMAP_PARAM_COMMA struct inode *dir,
 static void marufs_unlink_cleanup_region(struct marufs_sb_info *sbi,
 					 u32 rat_entry_id)
 {
-	struct marufs_rat_entry *rat_e;
-	u32 old_state;
-
-	rat_e = marufs_rat_entry_get(sbi, rat_entry_id);
+	struct marufs_rat_entry *rat_e =
+		marufs_rat_entry_get(sbi, rat_entry_id);
 	if (!rat_e)
 		return;
 
 	/* CAS: ALLOCATED → DELETING (preempt — prevent race with GC) */
-	old_state = marufs_le32_cas(&rat_e->state, MARUFS_RAT_ENTRY_ALLOCATED,
-				    MARUFS_RAT_ENTRY_DELETING);
+	u32 old_state = marufs_le32_cas(&rat_e->state,
+					MARUFS_RAT_ENTRY_ALLOCATED,
+					MARUFS_RAT_ENTRY_DELETING);
 	if (old_state != MARUFS_RAT_ENTRY_ALLOCATED)
 		return; /* GC already preempted or already FREE */
 

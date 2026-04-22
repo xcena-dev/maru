@@ -31,6 +31,7 @@
 
 #include "compat.h"
 #include "marufs.h"
+#include "me.h"
 
 /* Module parameter: node_id (must be > 0) */
 int marufs_node_id = 1;
@@ -59,6 +60,7 @@ enum MARUFS_MOUNT_OPTION {
 	OPTION_DAXHEAP,
 	OPTION_DAXHEAP_IMPORT,
 	OPTION_FORMAT,
+	OPTION_ME_STRATEGY,
 	OPTION_ERROR,
 };
 
@@ -68,6 +70,7 @@ static const match_table_t marufs_tokens = {
 	{ OPTION_DAXHEAP, "daxheap=%s" },
 	{ OPTION_DAXHEAP_IMPORT, "daxheap_import_id=%s" },
 	{ OPTION_FORMAT, "format" },
+	{ OPTION_ME_STRATEGY, "me_strategy=%s" },
 	{ OPTION_ERROR, NULL },
 };
 
@@ -78,6 +81,7 @@ struct marufs_mount_opts {
 	bool use_daxheap;
 	u64 daxheap_size;
 	u64 daxheap_bufid; /* secondary: import existing buffer by ID */
+	enum marufs_me_strategy me_strategy; /* order or request */
 };
 
 static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
@@ -94,6 +98,7 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 	opts->format = false;
 	opts->daxheap_size = 0;
 	opts->daxheap_bufid = 0;
+	opts->me_strategy = MARUFS_ME_ORDER; /* default: token ring */
 
 	if (!options)
 		return 0;
@@ -146,6 +151,21 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 		case OPTION_FORMAT:
 			opts->format = true;
 			break;
+		case OPTION_ME_STRATEGY: {
+			char str[16];
+
+			match_strlcpy(str, &args[0], sizeof(str));
+			if (strcmp(str, "order") == 0)
+				opts->me_strategy = MARUFS_ME_ORDER;
+			else if (strcmp(str, "request") == 0)
+				opts->me_strategy = MARUFS_ME_REQUEST;
+			else {
+				pr_err("invalid me_strategy: %s (use 'order' or 'request')\n",
+				       str);
+				return -EINVAL;
+			}
+			break;
+		}
 		default:
 			pr_err("unrecognized mount option: %s\n", p);
 			return -EINVAL;
@@ -630,51 +650,71 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	WRITE_LE64(rat->total_allocated, 0);
 	WRITE_LE64(rat->total_free, total - regions_start);
 
-	/* Full barrier to ensure all metadata is flushed (WC memory) */
+	/* --- Step 6: ME (Mutual Exclusion) area ---
+	 * Size AND format use REQUEST strategy so request slots fit
+	 * inside the reserved area and either strategy can be selected
+	 * at runtime without re-formatting. ORDER sizing would leave
+	 * format to overflow into the RAT region.
+	 */
+	u64 me_offset = MARUFS_ME_AREA_OFFSET;
+	u64 me_size = marufs_me_area_size(MARUFS_ME_GLOBAL_SHARDS,
+					  MARUFS_ME_MAX_NODES);
+	if (me_offset + me_size > regions_start) {
+		pr_err("no space for ME area (need %llu at 0x%llx, regions@0x%llx)\n",
+		       me_size, me_offset, regions_start);
+		return -ENOSPC;
+	}
+
+	int ret = marufs_me_format((char *)base + me_offset,
+				   MARUFS_ME_GLOBAL_SHARDS, MARUFS_ME_MAX_NODES,
+				   MARUFS_ME_DEFAULT_POLL_US,
+				   MARUFS_ME_REQUEST);
+	if (ret) {
+		pr_err("ME format failed: %d\n", ret);
+		return ret;
+	}
+
+	WRITE_LE64(gsb->me_area_offset, me_offset);
+
+	/* Full barrier to ensure all metadata is flushed (WC memory).
+	 * The verify reads below are on the same CPU that just wrote,
+	 * so store→load ordering after WMB is sufficient — no RMB needed.
+	 */
 	MARUFS_CXL_WMB(base, regions_start);
 
 	/* --- Verify format: read back critical fields --- */
-	{
-		struct marufs_shard_header *vsh;
-		u32 v_magic, v_buckets, v_entries;
-		u32 v_rat_magic;
-		u32 v_rat_state0;
+	/* Check the first shard */
+	struct marufs_shard_header *vsh =
+		(struct marufs_shard_header *)((char *)base +
+					       MARUFS_SHARD_TABLE_OFFSET);
+	u32 v_magic = READ_CXL_LE32(vsh->magic);
+	u32 v_buckets = READ_CXL_LE32(vsh->num_buckets);
+	u32 v_entries = READ_CXL_LE32(vsh->num_entries);
+	pr_debug(
+		"format verify the first shard: magic=0x%x buckets=%u entries=%u\n",
+		v_magic, v_buckets, v_entries);
 
-		MARUFS_CXL_RMB(base, regions_start);
+	/* Check the last shard (previously corrupted) */
+	vsh = (struct marufs_shard_header *)((char *)base +
+					     MARUFS_SHARD_TABLE_OFFSET +
+					     (MARUFS_REGION_NUM_SHARDS - 1) *
+						     MARUFS_SHARD_HEADER_SIZE);
+	v_magic = READ_CXL_LE32(vsh->magic);
+	v_buckets = READ_CXL_LE32(vsh->num_buckets);
+	v_entries = READ_CXL_LE32(vsh->num_entries);
+	pr_debug(
+		"format verify the last shard: magic=0x%x buckets=%u entries=%u\n",
+		v_magic, v_buckets, v_entries);
 
-		/* Check the first shard */
-		vsh = (struct marufs_shard_header *)((char *)base +
-						     MARUFS_SHARD_TABLE_OFFSET);
-		v_magic = READ_CXL_LE32(vsh->magic);
-		v_buckets = READ_CXL_LE32(vsh->num_buckets);
-		v_entries = READ_CXL_LE32(vsh->num_entries);
-		pr_debug(
-			"format verify the first shard: magic=0x%x buckets=%u entries=%u\n",
-			v_magic, v_buckets, v_entries);
+	/* Check RAT magic and first entry state */
+	u32 v_rat_magic = READ_CXL_LE32(rat->magic);
+	u32 v_rat_state0 = READ_CXL_LE32(rat->entries[0].state);
+	pr_debug("format verify RAT: magic=0x%x entry[0].state=%u\n",
+		 v_rat_magic, v_rat_state0);
 
-		/* Check the last shard (previously corrupted) */
-		vsh = (struct marufs_shard_header
-			       *)((char *)base + MARUFS_SHARD_TABLE_OFFSET +
-				  (MARUFS_REGION_NUM_SHARDS - 1) *
-					  MARUFS_SHARD_HEADER_SIZE);
-		v_magic = READ_CXL_LE32(vsh->magic);
-		v_buckets = READ_CXL_LE32(vsh->num_buckets);
-		v_entries = READ_CXL_LE32(vsh->num_entries);
-		pr_debug(
-			"format verify the last shard: magic=0x%x buckets=%u entries=%u\n",
-			v_magic, v_buckets, v_entries);
-
-		/* Check RAT magic and first entry state */
-		v_rat_magic = READ_CXL_LE32(rat->magic);
-		v_rat_state0 = READ_CXL_LE32(rat->entries[0].state);
-		pr_debug("format verify RAT: magic=0x%x entry[0].state=%u\n",
-			 v_rat_magic, v_rat_state0);
-
-		if (v_magic != MARUFS_SHARD_MAGIC ||
-		    v_buckets != buckets_per_shard) {
-			pr_err("FORMAT VERIFICATION FAILED — WC memory not flushed\n");
-			return -EIO;
-		}
+	if (v_magic != MARUFS_SHARD_MAGIC || v_buckets != buckets_per_shard) {
+		pr_err("FORMAT VERIFICATION FAILED — WC memory not flushed\n");
+		return -EIO;
 	}
 
 	pr_info("format complete (shards=%u, entries/shard=%u, rat@0x%llx, regions@0x%llx)\n",
@@ -898,7 +938,6 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 		sbi->shard_cache[i].entries =
 			(struct marufs_index_entry *)((char *)sbi->dax_base +
 						      entry_off);
-		spin_lock_init(&sbi->shard_cache[i].insert_lock);
 	}
 
 	pr_debug(
@@ -1013,7 +1052,8 @@ static struct inode *marufs_make_root_inode(struct super_block *sb)
  * ============================================================================ */
 
 static int marufs_fill_super_common(struct super_block *sb,
-				    struct marufs_sb_info *sbi, int silent)
+				    struct marufs_sb_info *sbi, int silent,
+				    enum marufs_me_strategy me_strategy)
 {
 	struct inode *root_inode;
 	struct dentry *root_dentry;
@@ -1079,6 +1119,49 @@ static int marufs_fill_super_common(struct super_block *sb,
 	if (ret)
 		pr_warn("failed to register sysfs: %d\n", ret);
 
+	/* Step 7.5: Initialize Global ME */
+	u64 me_offset = READ_CXL_LE64(sbi->gsb->me_area_offset);
+	if (me_offset != MARUFS_ME_AREA_OFFSET) {
+		pr_err("ME area offset mismatch (got 0x%llx, expected 0x%x). Re-format required.\n",
+		       me_offset, MARUFS_ME_AREA_OFFSET);
+		ret = -EINVAL;
+		goto err_free_gsb;
+	}
+
+	/* Start the unified ME poll thread (serves Global ME + all NRHT MEs) */
+	marufs_me_registry_init(sbi);
+	ret = marufs_me_registry_start(sbi);
+	if (ret) {
+		pr_err("ME registry start failed: %d\n", ret);
+		goto err_free_gsb;
+	}
+
+	sbi->me = marufs_me_create(
+		(char *)sbi->dax_base + MARUFS_ME_AREA_OFFSET,
+		MARUFS_ME_GLOBAL_SHARDS, MARUFS_ME_MAX_NODES, sbi->node_id,
+		MARUFS_ME_DEFAULT_POLL_US, me_strategy);
+	if (IS_ERR(sbi->me)) {
+		pr_err("ME create failed: %ld\n", PTR_ERR(sbi->me));
+		sbi->me = NULL;
+		ret = -ENOMEM;
+		marufs_me_registry_stop(sbi);
+		goto err_free_gsb;
+	}
+	pr_info("ME strategy: %s\n",
+		sbi->me->strategy == MARUFS_ME_ORDER ? "order" : "request");
+
+	ret = sbi->me->ops->join(sbi->me);
+	if (ret) {
+		pr_err("ME join failed: %d\n", ret);
+		marufs_me_destroy(sbi->me);
+		sbi->me = NULL;
+		marufs_me_registry_stop(sbi);
+		goto err_free_gsb;
+	}
+
+	/* Register with unified poll thread */
+	marufs_me_register(sbi, sbi->me);
+
 	/* Step 8: Start background GC thread */
 	ret = marufs_gc_start(sbi);
 	if (ret)
@@ -1117,12 +1200,13 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sb->s_fs_info = sbi;
 	sbi->node_id = opts.node_id;
-	spin_lock_init(&sbi->lock);
 
-	/* Validate node_id range */
-	if (opts.node_id > MARUFS_MAX_NODE_ID) {
-		pr_err("node_id=%d exceeds maximum %d\n", opts.node_id,
-		       MARUFS_MAX_NODE_ID);
+	/* Validate node_id range. 0 is reserved as ORPHAN/unset sentinel
+	 * (see gc.c, inode.c); valid node_ids are 1..MARUFS_MAX_NODE_ID.
+	 */
+	if (opts.node_id == 0 || opts.node_id > MARUFS_MAX_NODE_ID) {
+		pr_err("node_id=%d invalid (valid range: 1..%d)\n",
+		       opts.node_id, MARUFS_MAX_NODE_ID);
 		kfree(sbi);
 		return -EINVAL;
 	}
@@ -1195,7 +1279,7 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 	}
 
 	/* Common handling */
-	ret = marufs_fill_super_common(sb, sbi, silent);
+	ret = marufs_fill_super_common(sb, sbi, silent, opts.me_strategy);
 	if (ret)
 		goto err_release_dax;
 
@@ -1226,6 +1310,19 @@ static void marufs_kill_sb(struct super_block *sb)
 	struct marufs_sb_info *sbi = marufs_sb_get(sb);
 
 	if (sbi) {
+		/* Teardown all NRHT ME instances (opt-in per rat_entry) */
+		for (u32 i = 0; i < MARUFS_MAX_RAT_ENTRIES; i++) {
+			marufs_me_teardown(sbi, sbi->nrht_me[i]);
+			sbi->nrht_me[i] = NULL;
+		}
+
+		/* Teardown Global ME (must happen before GC stop and dax_release) */
+		marufs_me_teardown(sbi, sbi->me);
+		sbi->me = NULL;
+
+		/* Stop the unified registry poll thread */
+		marufs_me_registry_stop(sbi);
+
 		/* Stop background GC thread */
 		marufs_gc_stop(sbi);
 
