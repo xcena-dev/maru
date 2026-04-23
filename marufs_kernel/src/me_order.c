@@ -25,37 +25,35 @@
 static void order_poll_cycle(struct marufs_me_instance *me)
 {
 	bool ticked_hb = false;
+	u32 successor = marufs_me_next_active(me, me->node_id);
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_cb *cb = &me->cbs[s];
-		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		atomic64_inc(&me->poll_rmb_cb);
-		u32 holder = READ_CXL_LE32(cb->holder);
+		me->cached_successor[s] = successor;
 
-		me->cached_successor[s] =
-			marufs_me_next_active(me, me->node_id);
+		/* Receiver-side doorbell (per-(shard,node) CL, single-reader,
+		 * no CXL CL contention). Bump ⇒ a peer just passed us the
+		 * token via me_pass_token (CB was written before the slot WMB,
+		 * so is_holder=true is consistent with CB without CB RMB).
+		 */
+		struct marufs_me_slot *my_slot = me_my_slot(me, s);
+		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
+		atomic64_inc(&me->poll_rmb_slot);
+		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		if (holder == me->node_id) {
-			/* Heartbeat only needs to tick when we're holder —
-			 * peers observe the holder's slot to judge liveness.
-			 * Once per cycle is enough regardless of shard count.
-			 */
-			if (!ticked_hb) {
-				me_membership_tick_heartbeat(me);
-				ticked_hb = true;
-			}
-			/* Skip self-pass when alone: next_active returns self,
-			 * and bumping CB gen against ourselves is a no-op.
-			 */
-			if (me_shard_passable(me, s) &&
-			    me->cached_successor[s] != me->node_id)
-				me_pass_token(me, s, me->cached_successor[s]);
-		} else if (me->cached_successor[s] == me->node_id) {
-			/* Only the successor polls holder heartbeat — O(1)
-			 * crash-detection cost per shard across the ring.
-			 */
-			marufs_me_check_heartbeat(me, s, holder);
+		if (cur_seq != me->poll_last_slot_seq[s]) {
+			me->is_holder[s] = true;
+			me->poll_last_slot_seq[s] = cur_seq;
 		}
+
+		if (!me->is_holder[s])
+			continue;
+
+		if (!ticked_hb) {
+			me_membership_tick_heartbeat(me);
+			ticked_hb = true;
+		}
+		if (me_shard_passable(me, s) && successor != me->node_id)
+			me_pass_token(me, s, successor);
 	}
 }
 

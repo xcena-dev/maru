@@ -99,18 +99,13 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 static void request_poll_cycle(struct marufs_me_instance *me)
 {
 	bool ticked_hb = false;
-	/* Stack snapshot of per-peer pending_shards_mask plus global OR.
-	 * Array is u64 × MARUFS_ME_MAX_NODES = 64B — cheap.
-	 */
 	u64 node_pending[MARUFS_ME_MAX_NODES] = { 0 };
 	u64 peers_pending = 0;
 	u32 successor = me->node_id;
 	bool successor_found = false;
 
-	/* Single membership pass: gather pending bitmasks AND pick the
-	 * first ACTIVE successor (round-robin from me_idx+1). This fuses
-	 * the former per-shard marufs_me_next_active() call with mask
-	 * collection, saving S×N membership RMBs per poll cycle.
+	/* Single membership pass: gather pending masks + pick round-robin
+	 * successor. S×N → N membership RMBs/cycle vs. per-shard next_active.
 	 */
 	for (u32 i = 1; i <= me->max_nodes; i++) {
 		u32 idx = (me->me_idx + i) % me->max_nodes;
@@ -127,37 +122,40 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 		peers_pending |= node_pending[idx];
 		if (!successor_found) {
-			successor = idx + 1; /* external node_id */
+			successor = idx + 1;
 			successor_found = true;
 		}
 	}
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_cb *cb = &me->cbs[s];
-		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		atomic64_inc(&me->poll_rmb_cb);
-		u32 holder = READ_CXL_LE32(cb->holder);
-
 		me->cached_successor[s] = successor;
 
-		if (holder == me->node_id) {
-			/* Tick once per cycle — peers only watch holders. */
-			if (!ticked_hb) {
-				me_membership_tick_heartbeat(me);
-				ticked_hb = true;
-			}
-			/* Shard-level skip: no peer has a hand up on s → no
-			 * slot RMBs at all. Saves (max_nodes-1) CL reads per
-			 * idle shard per cycle — the dominant steady-state
-			 * cost under light load.
-			 */
-			if (me_shard_passable(me, s) &&
-			    (peers_pending & (1ULL << s)))
-				request_scan_and_grant_masked(me, s,
-							      node_pending);
-		} else {
-			marufs_me_check_heartbeat(me, s, holder);
+		/* Receiver-side doorbell: own per-(shard,node) slot is
+		 * single-reader (no CXL CL contention). A bump means a peer
+		 * just granted the token to us (me_pass_token writes our slot
+		 * AFTER writing CB), so we become holder immediately — no CB
+		 * RMB needed. This is the whole point of the doorbell design.
+		 */
+		struct marufs_me_slot *my_slot = me_my_slot(me, s);
+		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
+		atomic64_inc(&me->poll_rmb_slot);
+		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
+
+		if (cur_seq != me->poll_last_slot_seq[s]) {
+			me->is_holder[s] = true;
+			me->poll_last_slot_seq[s] = cur_seq;
 		}
+
+		if (!me->is_holder[s])
+			continue;
+
+		/* Holder path: tick heartbeat once, grant if passable. */
+		if (!ticked_hb) {
+			me_membership_tick_heartbeat(me);
+			ticked_hb = true;
+		}
+		if (me_shard_passable(me, s) && (peers_pending & (1ULL << s)))
+			request_scan_and_grant_masked(me, s, node_pending);
 	}
 }
 

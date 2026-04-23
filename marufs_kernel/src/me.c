@@ -45,50 +45,6 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
 /* ── Shared strategy primitives ───────────────────────────────────── */
 
 /*
- * marufs_me_check_heartbeat - non-holder crash detection.
- *
- * Reads the holder's membership slot heartbeat (per-node, distributed)
- * rather than a shared CB heartbeat — this keeps the CB CL cold.
- *
- * First observation seeds the baseline without triggering timeout —
- * otherwise last_heartbeat_time=0 (kcalloc) makes elapsed == uptime and
- * triggers false crash detection / split-brain takeover.
- */
-void marufs_me_check_heartbeat(struct marufs_me_instance *me, u32 shard_id,
-			       u32 holder)
-{
-	if (!marufs_me_is_valid_node(me, holder))
-		return;
-
-	struct marufs_me_membership_slot *hslot = &me->membership[holder - 1];
-	MARUFS_CXL_RMB(hslot, sizeof(*hslot));
-	atomic64_inc(&me->poll_rmb_membership);
-	u64 hb = READ_CXL_LE64(hslot->heartbeat);
-
-	if (me->last_heartbeat_time[shard_id] == 0) {
-		me->last_heartbeat[shard_id] = hb;
-		me->last_heartbeat_time[shard_id] = ktime_get_ns();
-		return;
-	}
-
-	if (hb == me->last_heartbeat[shard_id]) {
-		u64 elapsed =
-			ktime_get_ns() - me->last_heartbeat_time[shard_id];
-		if (elapsed > MARUFS_ME_TIMEOUT_NS) {
-			u32 succ = marufs_me_next_active(me, holder);
-			if (succ == me->node_id) {
-				pr_warn("me: crash detected (holder=%u shard=%u), taking over\n",
-					holder, shard_id);
-				me_pass_token(me, shard_id, me->node_id);
-			}
-		}
-	} else {
-		me->last_heartbeat[shard_id] = hb;
-		me->last_heartbeat_time[shard_id] = ktime_get_ns();
-	}
-}
-
-/*
  * marufs_me_wait_for_token - poll own doorbell slot until token arrives.
  *
  * Reader order (acquire-side, mirrors me_pass_token's writer order):
@@ -111,6 +67,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		me->last_token_seq[shard_id] =
 			READ_CXL_LE64(my_slot->token_seq);
+		me->is_holder[shard_id] = true;
 		return 0;
 	}
 
@@ -132,6 +89,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			    cb_gen > me->last_cb_gen[shard_id]) {
 				me->last_token_seq[shard_id] = cur_seq;
 				me->last_cb_gen[shard_id] = cb_gen;
+				me->is_holder[shard_id] = true;
 				return 0;
 			}
 			/* Phantom: seq advanced but CB not for us. Advance
@@ -148,7 +106,37 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			usleep_range(me->poll_interval_us / 2,
 				     me->poll_interval_us);
 	}
-	return -ETIMEDOUT;
+
+	/* Deadline expired. With poll-thread distributed crash watch removed
+	 * (see is_holder boolean design), this is now the SOLE crash-recovery
+	 * trigger: if the holder's heartbeat has stalled past the timeout,
+	 * take over ourselves. Otherwise the holder is genuinely busy —
+	 * report -ETIMEDOUT.
+	 */
+	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	u32 holder = READ_CXL_LE32(cb->holder);
+
+	if (!marufs_me_is_valid_node(me, holder) || holder == me->node_id)
+		return -ETIMEDOUT;
+
+	struct marufs_me_membership_slot *hs = &me->membership[holder - 1];
+
+	MARUFS_CXL_RMB(hs, sizeof(*hs));
+	u64 hb_ts = READ_CXL_LE64(hs->heartbeat_ts);
+	u64 elapsed = ktime_get_ns() - hb_ts;
+
+	if (elapsed < MARUFS_ME_TIMEOUT_NS)
+		return -ETIMEDOUT;
+
+	pr_warn("me: acquire timeout on shard %u, holder=%u heartbeat stalled %llums — taking over\n",
+		shard_id, holder, elapsed / 1000000);
+	me_pass_token(me, shard_id, me->node_id);
+
+	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	me->last_cb_gen[shard_id] = READ_CXL_LE64(cb->generation);
+	MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
+	me->last_token_seq[shard_id] = READ_CXL_LE64(my_slot->token_seq);
+	return 0;
 }
 
 int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
@@ -160,8 +148,10 @@ int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	u32 holder = READ_CXL_LE32(cb->holder);
 
-	if (READ_CXL_LE32(cb->holder) == me->node_id) {
+	me->is_holder[shard_id] = (holder == me->node_id);
+	if (holder == me->node_id) {
 		me_cb_bump_acquire_count(cb);
 		return 0;
 	}
@@ -196,9 +186,11 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 	 */
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
-
 		MARUFS_CXL_RMB(my_slot, sizeof(*my_slot));
-		me->last_token_seq[s] = READ_CXL_LE64(my_slot->token_seq);
+		u64 seq = READ_CXL_LE64(my_slot->token_seq);
+
+		me->last_token_seq[s] = seq;
+		me->poll_last_slot_seq[s] = seq;
 
 		struct marufs_me_cb *cb = &me->cbs[s];
 
@@ -211,9 +203,17 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 		struct marufs_me_cb *cb = &me->cbs[s];
 
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		if (READ_CXL_LE32(cb->holder) == MARUFS_ME_HOLDER_NONE) {
+		u32 cur = READ_CXL_LE32(cb->holder);
+
+		if (cur == MARUFS_ME_HOLDER_NONE) {
 			me_pass_token(me, s, me->node_id);
 			claimed++;
+		} else {
+			/* Seed holder cache so subsequent poll_cycles can
+			 * skip the CB RMB for this shard when we are neither
+			 * holder nor successor.
+			 */
+			me->is_holder[s] = (cur == me->node_id);
 		}
 	}
 
@@ -437,14 +437,14 @@ struct marufs_me_instance *marufs_me_create(void *me_area_base, u32 num_shards,
 	me->local_waiters = kcalloc(num_shards, sizeof(atomic_t), GFP_KERNEL);
 	me->local_locks = kcalloc(num_shards, sizeof(struct mutex), GFP_KERNEL);
 	me->cached_successor = kcalloc(num_shards, sizeof(u32), GFP_KERNEL);
-	me->last_heartbeat = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
-	me->last_heartbeat_time = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
+	me->is_holder = kcalloc(num_shards, sizeof(bool), GFP_KERNEL);
+	me->poll_last_slot_seq = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
 	me->last_token_seq = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
 	me->last_cb_gen = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
 
 	if (!me->holding || !me->local_waiters || !me->local_locks ||
-	    !me->cached_successor || !me->last_heartbeat ||
-	    !me->last_heartbeat_time || !me->last_token_seq ||
+	    !me->cached_successor || !me->is_holder ||
+	    !me->poll_last_slot_seq || !me->last_token_seq ||
 	    !me->last_cb_gen) {
 		marufs_me_destroy(me);
 		return ERR_PTR(-ENOMEM);
@@ -471,8 +471,8 @@ void marufs_me_destroy(struct marufs_me_instance *me)
 	kfree(me->local_waiters);
 	kfree(me->local_locks);
 	kfree(me->cached_successor);
-	kfree(me->last_heartbeat);
-	kfree(me->last_heartbeat_time);
+	kfree(me->is_holder);
+	kfree(me->poll_last_slot_seq);
 	kfree(me->last_token_seq);
 	kfree(me->last_cb_gen);
 	kfree(me);

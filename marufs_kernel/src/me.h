@@ -248,8 +248,14 @@ struct marufs_me_instance {
 	struct mutex
 		*local_locks; /* [S] — intra-node serialization (sleepable) */
 	u32 *cached_successor; /* [S] — pre-computed next ACTIVE node */
-	u64 *last_heartbeat; /* [S] — last observed holder heartbeat per shard */
-	u64 *last_heartbeat_time; /* [S] — when we observed it (ktime_get_ns) */
+	bool *is_holder; /* [S] — DRAM flag, true while I hold the token.
+			  * Replaces CB per-cycle hot-poll. Flipped by:
+			  *   - me_pass_token (I write CB to pass away)
+			  *   - poll_cycle slot doorbell (I receive token)
+			  *   - wait_for_token / try_acquire success */
+	u64 *poll_last_slot_seq; /* [S] — poll-thread shadow of own slot
+				  * token_seq; drives receiver-side is_holder
+				  * flip on bump. */
 	u64 *last_token_seq; /* [S] — last observed own slot->token_seq (doorbell) */
 	u64 *last_cb_gen; /* [S] — last observed cb->generation (stale fence) */
 
@@ -495,6 +501,13 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 	WRITE_LE64(cb->generation, new_gen);
 	MARUFS_CXL_WMB(cb, sizeof(*cb));
 
+	/* Flip own is_holder flag — we just transferred the token away
+	 * (or, for a self-takeover, to ourselves). This is the writer
+	 * half of the hot-path "am I holder?" test that replaces per-cycle
+	 * CB RMBs.
+	 */
+	me->is_holder[shard_id] = (new_holder == me->node_id);
+
 	/* Step 2: doorbell (skip when clearing ownership). */
 	if (new_holder == MARUFS_ME_HOLDER_NONE)
 		return;
@@ -575,14 +588,6 @@ int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 		     u32 poll_interval_us, enum marufs_me_strategy strategy);
 
 /* ── Shared strategy primitives ───────────────────────────────────── */
-
-/*
- * marufs_me_check_heartbeat - non-holder crash detection.
- * If holder's heartbeat has stalled past MARUFS_ME_TIMEOUT_NS and we are
- * its successor, seize the token.
- */
-void marufs_me_check_heartbeat(struct marufs_me_instance *me, u32 shard_id,
-			       u32 holder);
 
 /*
  * marufs_me_wait_for_token - spin-then-sleep until cb->holder == self or
