@@ -602,17 +602,15 @@ static int me_info_emit_one(char *buf, int len, struct marufs_sb_info *sbi,
 			u32 rseq = READ_CXL_LE32(ms->sequence);
 			u64 rat = READ_CXL_LE64(ms->requested_at);
 			u64 gat = READ_CXL_LE64(ms->granted_at);
-			u64 last_seq = me->last_token_seq ?
-					       me->last_token_seq[s] :
-					       0;
-			u64 last_gen = me->last_cb_gen ? me->last_cb_gen[s] :
-							 0;
+			u64 last_seq =
+				me->last_token_seq ? me->last_token_seq[s] : 0;
+			u64 last_gen = me->last_cb_gen ? me->last_cb_gen[s] : 0;
 
 			len += sysfs_emit_at(
 				buf, len,
 				"    my_slot: from=%u seq=%llu cb_gen_at_write=%llu last_seq=%llu last_gen=%llu req=%u rseq=%u req_at=%llu grant_at=%llu\n",
-				from, tseq, cgaw, last_seq, last_gen, req,
-				rseq, rat, gat);
+				from, tseq, cgaw, last_seq, last_gen, req, rseq,
+				rat, gat);
 		}
 
 		/* Guard against PAGE_SIZE overflow */
@@ -698,6 +696,101 @@ static ssize_t me_info_store(struct kobject *kobj, struct kobj_attribute *attr,
 static struct kobj_attribute me_info_attr =
 	__ATTR(me_info, 0644, me_info_show, me_info_store);
 
+/*
+ * /sys/fs/marufs/me_poll_stats - per-ME poll-thread cost counters.
+ *
+ * Shows cumulative RMB counts (CB / slot / membership), poll-cycle
+ * invocations, and wall-clock ns spent inside ops->poll_cycle(). Useful
+ * for quantifying polling overhead and validating optimizations that
+ * reduce CXL traffic (e.g. pending-mask scan skip).
+ *
+ * Write any value → reset all counters across every registered ME.
+ */
+static ssize_t me_poll_stats_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int any_sbi = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi)
+			continue;
+
+		any_sbi = 1;
+		len += sysfs_emit_at(buf, len, "== node %u ==\n", sbi->node_id);
+
+		mutex_lock(&sbi->me_list_lock);
+		struct marufs_me_instance *me;
+
+		list_for_each_entry(me, &sbi->me_list, list_node) {
+			u64 cycles = atomic64_read(&me->poll_cycles);
+			u64 ns = atomic64_read(&me->poll_ns_total);
+			u64 rmb_cb = atomic64_read(&me->poll_rmb_cb);
+			u64 rmb_slot = atomic64_read(&me->poll_rmb_slot);
+			u64 rmb_mem = atomic64_read(&me->poll_rmb_membership);
+			u64 avg_ns = cycles ? ns / cycles : 0;
+			const char *tag = (me == sbi->me) ? "global" : "nrht";
+
+			len += sysfs_emit_at(
+				buf, len,
+				"  %s shards=%u strategy=%s cycles=%llu ns_total=%llu ns_avg=%llu rmb_cb=%llu rmb_slot=%llu rmb_membership=%llu\n",
+				tag, me->num_shards,
+				me->strategy == MARUFS_ME_ORDER ? "order" :
+								  "request",
+				cycles, ns, avg_ns, rmb_cb, rmb_slot, rmb_mem);
+			if (len > PAGE_SIZE - 256)
+				break;
+		}
+		mutex_unlock(&sbi->me_list_lock);
+		if (len > PAGE_SIZE - 256)
+			break;
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+
+	if (!any_sbi)
+		return sysfs_emit(buf, "No filesystem mounted\n");
+	if (len == 0)
+		return sysfs_emit(buf, "no ME instances\n");
+	return len;
+}
+
+/*
+ * me_poll_stats_store - reset handler. Writing ANY value (content ignored)
+ * zeros every poll counter across every registered ME on every mount.
+ * Intended for benchmark harnesses that delta-measure a timed window —
+ * reset immediately before the run, read immediately after.
+ */
+static ssize_t me_poll_stats_store(struct kobject *kobj,
+				   struct kobj_attribute *attr, const char *buf,
+				   size_t count)
+{
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+
+		if (!sbi)
+			continue;
+		mutex_lock(&sbi->me_list_lock);
+		struct marufs_me_instance *me;
+
+		list_for_each_entry(me, &sbi->me_list, list_node) {
+			atomic64_set(&me->poll_cycles, 0);
+			atomic64_set(&me->poll_ns_total, 0);
+			atomic64_set(&me->poll_rmb_cb, 0);
+			atomic64_set(&me->poll_rmb_slot, 0);
+			atomic64_set(&me->poll_rmb_membership, 0);
+		}
+		mutex_unlock(&sbi->me_list_lock);
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+	return count;
+}
+
+static struct kobj_attribute me_poll_stats_attr =
+	__ATTR(me_poll_stats, 0644, me_poll_stats_show, me_poll_stats_store);
+
 /* /sys/fs/marufs/daxheap_bufid - expose buf_id for secondary mounts */
 #ifdef CONFIG_DAXHEAP
 extern u64 marufs_daxheap_bufid;
@@ -721,6 +814,7 @@ static struct attribute *marufs_attrs[] = {
 	&gc_status_attr.attr,
 	&gc_restart_attr.attr,
 	&me_info_attr.attr,
+	&me_poll_stats_attr.attr,
 #ifdef CONFIG_DAXHEAP
 	&daxheap_bufid_attr.attr,
 #endif

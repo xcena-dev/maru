@@ -248,6 +248,15 @@ struct marufs_me_instance {
 	u64 *last_token_seq; /* [S] — last observed own slot->token_seq (doorbell) */
 	u64 *last_cb_gen; /* [S] — last observed cb->generation (stale fence) */
 
+	/* Poll-path cost counters exposed via /sys/fs/marufs/me_poll_stats.
+	 * Incremented only from poll_cycle; app-thread traffic excluded.
+	 */
+	atomic64_t poll_cycles;
+	atomic64_t poll_ns_total;
+	atomic64_t poll_rmb_cb;
+	atomic64_t poll_rmb_slot;
+	atomic64_t poll_rmb_membership;
+
 	/* Active flag — cleared on destroy, checked by registry poll thread */
 	atomic_t active; /* 0 = shutdown, 1 = serving polls */
 
@@ -365,6 +374,7 @@ static inline void me_membership_tick_heartbeat(struct marufs_me_instance *me)
 {
 	struct marufs_me_membership_slot *ms = &me->membership[me->me_idx];
 	MARUFS_CXL_RMB(ms, sizeof(*ms));
+	atomic64_inc(&me->poll_rmb_membership);
 	if (READ_CXL_LE32(ms->magic) != MARUFS_ME_MS_MAGIC) {
 		atomic_set(&me->active, 0);
 		return;
@@ -412,6 +422,7 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 	 */
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	atomic64_inc(&me->poll_rmb_cb);
 	if (READ_CXL_LE32(cb->magic) != MARUFS_ME_CB_MAGIC) {
 		atomic_set(&me->active, 0);
 		return;
@@ -427,6 +438,7 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 
 	struct marufs_me_slot *slot = me_slot_of(me, shard_id, new_holder - 1);
 	MARUFS_CXL_RMB(slot, sizeof(*slot));
+	atomic64_inc(&me->poll_rmb_slot);
 	if (READ_CXL_LE32(slot->magic) != MARUFS_ME_SLOT_MAGIC) {
 		atomic_set(&me->active, 0);
 		return;

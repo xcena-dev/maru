@@ -912,11 +912,66 @@ struct op_stats {
 	double throughput;
 };
 
+/*
+ * poll_stats - snapshot of /sys/fs/marufs/me_poll_stats (aggregated across
+ * all mounts + all ME instances). Used by the benchmark to attribute CXL
+ * RMB traffic + poll-thread CPU time to each test config.
+ */
+struct poll_stats {
+	uint64_t cycles;
+	uint64_t ns_total;
+	uint64_t rmb_cb;
+	uint64_t rmb_slot;
+	uint64_t rmb_membership;
+};
+
+/* Write-any-value resets all ME counters across all mounted marufs sbis. */
+static void reset_poll_stats(void)
+{
+	int fd = open("/sys/fs/marufs/me_poll_stats", O_WRONLY);
+	if (fd < 0)
+		return;
+	ssize_t w = write(fd, "0\n", 2);
+	(void)w;
+	close(fd);
+}
+
+static void read_poll_stats(struct poll_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	FILE *f = fopen("/sys/fs/marufs/me_poll_stats", "r");
+	if (!f)
+		return;
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		const char *p;
+		uint64_t v;
+
+		if ((p = strstr(line, "cycles=")) &&
+		    sscanf(p, "cycles=%lu", &v) == 1)
+			out->cycles += v;
+		if ((p = strstr(line, "ns_total=")) &&
+		    sscanf(p, "ns_total=%lu", &v) == 1)
+			out->ns_total += v;
+		if ((p = strstr(line, "rmb_cb=")) &&
+		    sscanf(p, "rmb_cb=%lu", &v) == 1)
+			out->rmb_cb += v;
+		if ((p = strstr(line, "rmb_slot=")) &&
+		    sscanf(p, "rmb_slot=%lu", &v) == 1)
+			out->rmb_slot += v;
+		if ((p = strstr(line, "rmb_membership=")) &&
+		    sscanf(p, "rmb_membership=%lu", &v) == 1)
+			out->rmb_membership += v;
+	}
+	fclose(f);
+}
+
 struct bench_result {
 	struct bench_config cfg;
 	char strategy[16];
 	uint64_t wall_ns;
 	struct op_stats insert, find, del;
+	struct poll_stats poll;
 	int valid;
 };
 
@@ -1189,6 +1244,11 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	for (int i = 0; i < NUM_WORKERS; i++)
 		sync_wait(ready_pipes[i][0]);
 
+	/* Reset ME poll counters across all sbis, so diff captures only this
+	 * bench's steady-state poll traffic.
+	 */
+	reset_poll_stats();
+
 	wall_start = now_ns();
 	for (int i = 0; i < NUM_WORKERS; i++)
 		sync_signal(go_pipes[i][1]);
@@ -1196,6 +1256,10 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	for (int i = 0; i < NUM_WORKERS; i++)
 		waitpid(pids[i], NULL, 0);
 	wall_elapsed = now_ns() - wall_start;
+
+	struct poll_stats poll_after;
+
+	read_poll_stats(&poll_after);
 
 	for (int i = 0; i < NUM_WORKERS; i++) {
 		close(ready_pipes[i][0]);
@@ -1210,6 +1274,13 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	report_stats("find", find_samples, total, wall_elapsed, &s_find);
 	report_stats("delete", delete_samples, total, wall_elapsed, &s_del);
 
+	uint64_t avg_cycle_ns =
+		poll_after.cycles ? poll_after.ns_total / poll_after.cycles : 0;
+	printf("  poll: cycles=%lu ns_total=%lu ns_avg=%lu rmb_cb=%lu rmb_slot=%lu rmb_membership=%lu\n",
+	       poll_after.cycles, poll_after.ns_total, avg_cycle_ns,
+	       poll_after.rmb_cb, poll_after.rmb_slot,
+	       poll_after.rmb_membership);
+
 	if (out) {
 		out->cfg = *cfg;
 		snprintf(out->strategy, sizeof(out->strategy), "%s",
@@ -1218,6 +1289,7 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 		out->insert = s_ins;
 		out->find = s_find;
 		out->del = s_del;
+		out->poll = poll_after;
 		out->valid = 1;
 	}
 
@@ -1468,6 +1540,41 @@ int main(int argc, char *argv[])
 			       br->find.mean,   br->find.p99,
 			       br->del.mean,    br->del.p99,
 			       br->insert.throughput);
+		}
+
+		/* Poll-thread cost table — CXL RMB counts and ns spent per
+		 * ops->poll_cycle() across every mounted sbi. Numbers are the
+		 * delta accumulated during each timed run (reset at bench
+		 * start). Useful for measuring polling overhead independently
+		 * of application throughput.
+		 *
+		 * Raw totals grow with cycle count; the *_/c columns (per-cycle
+		 * rates) are the apples-to-apples efficiency metric when
+		 * comparing code versions — a faster poll_cycle lets more
+		 * cycles fit into the same wall time, inflating totals even
+		 * when per-cycle cost drops.
+		 */
+		printf("\n--- poll-thread cost (aggregated across all mounts) ---\n");
+		printf("%-8s %-8s %-8s %12s %10s %10s %10s %10s %10s %10s\n",
+		       "strat", "shards", "entries", "cycles", "ns_avg",
+		       "cb/c", "slot/c", "mem/c", "rmb_slot", "rmb_mem");
+		for (size_t r = 0; r < n_results; r++) {
+			struct bench_result *br = &results[r];
+
+			if (!br->valid)
+				continue;
+			uint64_t c = br->poll.cycles;
+			double ns_avg = c ? (double)br->poll.ns_total / c : 0;
+			double cb_pc = c ? (double)br->poll.rmb_cb / c : 0;
+			double slot_pc = c ? (double)br->poll.rmb_slot / c : 0;
+			double mem_pc =
+				c ? (double)br->poll.rmb_membership / c : 0;
+
+			printf("%-8s %-8u %-8u %12lu %10.1f %10.2f %10.2f %10.2f %10lu %10lu\n",
+			       br->strategy, br->cfg.num_shards,
+			       br->cfg.max_entries, c, ns_avg, cb_pc, slot_pc,
+			       mem_pc, br->poll.rmb_slot,
+			       br->poll.rmb_membership);
 		}
 	} else {
 		if (strategy_mask & (1u << MARUFS_ME_ORDER))

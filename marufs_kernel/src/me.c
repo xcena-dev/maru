@@ -34,8 +34,8 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
 	for (u32 i = 1; i < me->max_nodes; i++) {
 		u32 idx = (from_idx + i) % me->max_nodes;
 		struct marufs_me_membership_slot *slot = &me->membership[idx];
-
 		MARUFS_CXL_RMB(slot, sizeof(*slot));
+		atomic64_inc(&me->poll_rmb_membership);
 		if (READ_CXL_LE32(slot->status) == MARUFS_ME_ACTIVE)
 			return idx + 1; /* external node_id */
 	}
@@ -62,6 +62,7 @@ void marufs_me_check_heartbeat(struct marufs_me_instance *me, u32 shard_id,
 
 	struct marufs_me_membership_slot *hslot = &me->membership[holder - 1];
 	MARUFS_CXL_RMB(hslot, sizeof(*hslot));
+	atomic64_inc(&me->poll_rmb_membership);
 	u64 hb = READ_CXL_LE64(hslot->heartbeat);
 
 	if (me->last_heartbeat_time[shard_id] == 0) {
@@ -277,7 +278,10 @@ static int marufs_me_registry_poll_fn(void *data)
 			if (!atomic_read(&me->active))
 				continue;
 
+			u64 t0 = ktime_get_ns();
 			me->ops->poll_cycle(me);
+			atomic64_add(ktime_get_ns() - t0, &me->poll_ns_total);
+			atomic64_inc(&me->poll_cycles);
 		}
 		mutex_unlock(&sbi->me_list_lock);
 	}

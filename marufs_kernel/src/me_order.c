@@ -28,8 +28,8 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_cb *cb = &me->cbs[s];
-
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
+		atomic64_inc(&me->poll_rmb_cb);
 		u32 holder = READ_CXL_LE32(cb->holder);
 
 		me->cached_successor[s] =

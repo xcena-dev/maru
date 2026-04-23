@@ -33,6 +33,7 @@ static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 		u32 idx = (me->me_idx + i) % me->max_nodes;
 		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
 		MARUFS_CXL_RMB(rs, sizeof(*rs));
+		atomic64_inc(&me->poll_rmb_slot);
 		if (READ_CXL_LE32(rs->requesting)) {
 			WRITE_LE64(rs->granted_at, ktime_get_ns());
 			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
@@ -60,6 +61,7 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_cb *cb = &me->cbs[s];
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
+		atomic64_inc(&me->poll_rmb_cb);
 		u32 holder = READ_CXL_LE32(cb->holder);
 
 		me->cached_successor[s] =
