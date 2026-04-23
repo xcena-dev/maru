@@ -108,7 +108,12 @@ struct marufs_me_membership_slot {
 	__le64 joined_at; /* 16: ktime_get_ns() at status change */
 	__le64 heartbeat; /* 24: self-tick counter (poll thread advances) */
 	__le64 heartbeat_ts; /* 32: ktime_get_ns() at last tick */
-	__u8 reserved[24]; /* 40: pad to 64B */
+	/* 40: per-shard pending bitmap — bit s set ⇒ this node has a hand
+	 * up on shard s. Single-writer (owning node). Holder ORs peers' masks
+	 * to skip scans. Width caps at MARUFS_NRHT_MAX_NUM_SHARDS (64).
+	 */
+	__le64 pending_shards_mask; /* 40 */
+	__u8 reserved[16]; /* 48: pad to 64B */
 } __attribute__((packed));
 
 /*
@@ -363,6 +368,64 @@ static inline u32 me_leave_successor(struct marufs_me_instance *me)
 {
 	u32 succ = marufs_me_next_active(me, me->node_id);
 	return (succ == me->node_id) ? MARUFS_ME_HOLDER_NONE : succ;
+}
+
+/*
+ * me_membership_{set,clear}_pending - flip bit @shard_id in own
+ * pending_shards_mask with bounded CAS retry.
+ *
+ * Cross-node: sole writer of own membership slot — no remote contention.
+ * Intra-node: multiple threads may race on different bits of the same word;
+ * CAS serializes them.
+ *
+ * Must be called AFTER the slot.requesting WMB so holders observing the bit
+ * see a fully-written request slot.
+ *
+ * Bounded retry + cpu_relax + WARN_ONCE on exhaustion: release-path full
+ * scan covers a missing set-bit under real traffic; a stale set-bit only
+ * costs one wasted poll-path slot RMB (self-skipped during scan).
+ * Correctness preserved in either case.
+ */
+#define MARUFS_ME_PENDING_CAS_RETRIES 64
+
+static inline void me_membership_set_pending(struct marufs_me_instance *me,
+					     u32 shard_id)
+{
+	struct marufs_me_membership_slot *ms = &me->membership[me->me_idx];
+	u64 bit = 1ULL << shard_id;
+
+	for (int r = 0; r < MARUFS_ME_PENDING_CAS_RETRIES; r++) {
+		u64 old = READ_CXL_LE64(ms->pending_shards_mask);
+
+		if (old & bit)
+			return;
+		if (marufs_le64_cas(&ms->pending_shards_mask, old, old | bit) ==
+		    old)
+			return;
+		cpu_relax();
+	}
+	WARN_ONCE(1, "me: pending_shards_mask set stuck (shard=%u)\n",
+		  shard_id);
+}
+
+static inline void me_membership_clear_pending(struct marufs_me_instance *me,
+					       u32 shard_id)
+{
+	struct marufs_me_membership_slot *ms = &me->membership[me->me_idx];
+	u64 bit = 1ULL << shard_id;
+
+	for (int r = 0; r < MARUFS_ME_PENDING_CAS_RETRIES; r++) {
+		u64 old = READ_CXL_LE64(ms->pending_shards_mask);
+
+		if (!(old & bit))
+			return;
+		if (marufs_le64_cas(&ms->pending_shards_mask, old,
+				    old & ~bit) == old)
+			return;
+		cpu_relax();
+	}
+	WARN_ONCE(1, "me: pending_shards_mask clear stuck (shard=%u)\n",
+		  shard_id);
 }
 
 /*

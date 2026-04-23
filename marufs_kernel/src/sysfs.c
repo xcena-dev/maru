@@ -580,13 +580,12 @@ static int me_info_emit_one(char *buf, int len, struct marufs_sb_info *sbi,
 
 		len += sysfs_emit_at(
 			buf, len,
-			"  shard %u: holder=%s state=%s hb=%llu gen=%llu acq=%llu holding=%d waiters=%d cached_succ=%u last_hb_obs=%llu\n",
+			"  shard %u: holder=%s state=%s hb=%llu gen=%llu acq=%llu holding=%d waiters=%d cached_succ=%u is_holder=%d\n",
 			s, hbuf, me_state_str(state), hb, gen, acq,
 			atomic_read(&me->holding[s]),
 			atomic_read(&me->local_waiters[s]),
 			me->cached_successor ? me->cached_successor[s] : 0,
-			me->last_heartbeat_time ? me->last_heartbeat_time[s] :
-						  0);
+			me->is_holder ? me->is_holder[s] : 0);
 
 		/* Own doorbell slot — surfaces token-pass state for debugging
 		 * (who rang, which seq, what gen). last_* are DRAM baselines

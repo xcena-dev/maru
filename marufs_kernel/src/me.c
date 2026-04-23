@@ -188,6 +188,7 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 	WRITE_LE64(slot->joined_at, ktime_get_ns());
 	WRITE_LE64(slot->heartbeat, 0);
 	WRITE_LE64(slot->heartbeat_ts, ktime_get_ns());
+	WRITE_LE64(slot->pending_shards_mask, 0);
 	MARUFS_CXL_WMB(slot, sizeof(*slot));
 
 	/* Seed per-shard baselines BEFORE claiming, so our own NONE-claim
@@ -250,6 +251,7 @@ void marufs_me_common_leave(struct marufs_me_instance *me)
 	struct marufs_me_membership_slot *slot = &me->membership[me->me_idx];
 	WRITE_LE32(slot->status, MARUFS_ME_NONE);
 	WRITE_LE64(slot->joined_at, 0);
+	WRITE_LE64(slot->pending_shards_mask, 0);
 	MARUFS_CXL_WMB(slot, sizeof(*slot));
 
 	pr_info("me: node %u left ring\n", me->node_id);
@@ -538,6 +540,7 @@ int marufs_me_format(void *me_area_base, u32 num_shards, u32 max_nodes,
 		WRITE_LE64(slot->joined_at, 0);
 		WRITE_LE64(slot->heartbeat, 0);
 		WRITE_LE64(slot->heartbeat_ts, 0);
+		WRITE_LE64(slot->pending_shards_mask, 0);
 		memset(slot->reserved, 0, sizeof(slot->reserved));
 		MARUFS_CXL_WMB(slot, sizeof(*slot));
 	}

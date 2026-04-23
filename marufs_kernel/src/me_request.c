@@ -26,6 +26,9 @@
  * prevents low-id starvation under sustained contention.
  * Caller must be current holder, idle (hold counter 0).
  * Returns true iff token was granted.
+ *
+ * Full scan variant — used by release path where mask pre-collection has
+ * no amortization benefit.
  */
 static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 {
@@ -44,12 +47,51 @@ static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 	return false;
 }
 
+/*
+ * request_scan_and_grant_masked - filtered scan using pre-collected
+ * pending-mask snapshots from peers' membership CLs. Skips nodes whose
+ * bit for @shard_id is clear, avoiding the slot RMB entirely.
+ *
+ * Invariant: a set bit was written AFTER slot.requesting=1 with WMB, so
+ * reading requesting==0 on a node with bit set can only mean the peer
+ * just cleared its hand (post-CS) — benign, continue scan.
+ */
+static bool request_scan_and_grant_masked(struct marufs_me_instance *me,
+					  u32 shard_id, const u64 *node_pending)
+{
+	u64 bit = 1ULL << shard_id;
+
+	for (u32 i = 1; i < me->max_nodes; i++) {
+		u32 idx = (me->me_idx + i) % me->max_nodes;
+		if (!(node_pending[idx] & bit))
+			continue;
+
+		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
+		MARUFS_CXL_RMB(rs, sizeof(*rs));
+		atomic64_inc(&me->poll_rmb_slot);
+
+		if (READ_CXL_LE32(rs->requesting)) {
+			WRITE_LE64(rs->granted_at, ktime_get_ns());
+			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
+			me_pass_token(me, shard_id, idx + 1);
+			return true;
+		}
+	}
+	return false;
+}
+
 static inline void request_clear_own(struct marufs_me_instance *me,
 				     u32 shard_id)
 {
 	struct marufs_me_slot *rs = me_my_slot(me, shard_id);
 	WRITE_LE32(rs->requesting, 0);
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
+
+	/* Clear bit AFTER slot clear. Transient "bit set but requesting=0"
+	 * is observable by a peer holder but results only in a wasted slot
+	 * RMB; no correctness impact.
+	 */
+	me_membership_clear_pending(me, shard_id);
 }
 
 /* ── Poll cycle ───────────────────────────────────────────────────── */
@@ -57,6 +99,38 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 static void request_poll_cycle(struct marufs_me_instance *me)
 {
 	bool ticked_hb = false;
+	/* Stack snapshot of per-peer pending_shards_mask plus global OR.
+	 * Array is u64 × MARUFS_ME_MAX_NODES = 64B — cheap.
+	 */
+	u64 node_pending[MARUFS_ME_MAX_NODES] = { 0 };
+	u64 peers_pending = 0;
+	u32 successor = me->node_id;
+	bool successor_found = false;
+
+	/* Single membership pass: gather pending bitmasks AND pick the
+	 * first ACTIVE successor (round-robin from me_idx+1). This fuses
+	 * the former per-shard marufs_me_next_active() call with mask
+	 * collection, saving S×N membership RMBs per poll cycle.
+	 */
+	for (u32 i = 1; i <= me->max_nodes; i++) {
+		u32 idx = (me->me_idx + i) % me->max_nodes;
+		struct marufs_me_membership_slot *ms = &me->membership[idx];
+		MARUFS_CXL_RMB(ms, sizeof(*ms));
+		atomic64_inc(&me->poll_rmb_membership);
+
+		if (READ_CXL_LE32(ms->status) != MARUFS_ME_ACTIVE)
+			continue;
+
+		node_pending[idx] = READ_CXL_LE64(ms->pending_shards_mask);
+		if (idx == me->me_idx)
+			continue;
+
+		peers_pending |= node_pending[idx];
+		if (!successor_found) {
+			successor = idx + 1; /* external node_id */
+			successor_found = true;
+		}
+	}
 
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_cb *cb = &me->cbs[s];
@@ -64,8 +138,7 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 		atomic64_inc(&me->poll_rmb_cb);
 		u32 holder = READ_CXL_LE32(cb->holder);
 
-		me->cached_successor[s] =
-			marufs_me_next_active(me, me->node_id);
+		me->cached_successor[s] = successor;
 
 		if (holder == me->node_id) {
 			/* Tick once per cycle — peers only watch holders. */
@@ -73,8 +146,15 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 				me_membership_tick_heartbeat(me);
 				ticked_hb = true;
 			}
-			if (me_shard_passable(me, s))
-				request_scan_and_grant(me, s);
+			/* Shard-level skip: no peer has a hand up on s → no
+			 * slot RMBs at all. Saves (max_nodes-1) CL reads per
+			 * idle shard per cycle — the dominant steady-state
+			 * cost under light load.
+			 */
+			if (me_shard_passable(me, s) &&
+			    (peers_pending & (1ULL << s)))
+				request_scan_and_grant_masked(me, s,
+							      node_pending);
 		} else {
 			marufs_me_check_heartbeat(me, s, holder);
 		}
@@ -108,6 +188,11 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	WRITE_LE32(rs->requesting, 1);
 	WRITE_LE64(rs->requested_at, ktime_get_ns());
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
+	/* Publish hand-up to holder via own membership bitmap AFTER the
+	 * slot WMB. Holders that see the bit are guaranteed to see a
+	 * fully-populated request slot on targeted RMB.
+	 */
+	me_membership_set_pending(me, shard_id);
 
 	int ret = marufs_me_wait_for_token(me, shard_id);
 	request_clear_own(me, shard_id);
@@ -130,6 +215,11 @@ static void request_release(struct marufs_me_instance *me, u32 shard_id)
 
 	/* Keep token if local threads are waiting — avoids cross-node
 	 * ping-pong for single-node-dominant workloads.
+	 *
+	 * Release ALWAYS scans — it is the primary grant path (poll thread
+	 * is only a backstop for crash takeover and long-idle cases). Any
+	 * DRAM-snapshot skip here would stall requests raised between the
+	 * last poll and this release for up to one poll interval.
 	 */
 	if (me_shard_passable(me, shard_id))
 		request_scan_and_grant(me, shard_id);
