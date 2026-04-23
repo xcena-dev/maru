@@ -63,11 +63,12 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 
 	if (READ_CXL_LE32(cb->holder) == me->node_id) {
-		me->last_cb_gen[shard_id] = READ_CXL_LE64(cb->generation);
+		me->shards[shard_id].last_cb_gen =
+			READ_CXL_LE64(cb->generation);
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-		me->last_token_seq[shard_id] =
+		me->shards[shard_id].last_token_seq =
 			READ_CXL_LE64(my_slot->token_seq);
-		me->is_holder[shard_id] = true;
+		me->shards[shard_id].is_holder = true;
 		return 0;
 	}
 
@@ -77,7 +78,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		if (cur_seq != me->last_token_seq[shard_id]) {
+		if (cur_seq != me->shards[shard_id].last_token_seq) {
 			/* Acquire ordering: subsequent CB read must not be
 			 * reordered before the slot read above.
 			 */
@@ -86,10 +87,10 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			u64 cb_gen = READ_CXL_LE64(cb->generation);
 
 			if (holder == me->node_id &&
-			    cb_gen > me->last_cb_gen[shard_id]) {
-				me->last_token_seq[shard_id] = cur_seq;
-				me->last_cb_gen[shard_id] = cb_gen;
-				me->is_holder[shard_id] = true;
+			    cb_gen > me->shards[shard_id].last_cb_gen) {
+				me->shards[shard_id].last_token_seq = cur_seq;
+				me->shards[shard_id].last_cb_gen = cb_gen;
+				me->shards[shard_id].is_holder = true;
 				return 0;
 			}
 			/* Phantom: seq advanced but CB not for us. Advance
@@ -97,7 +98,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			 * gen-monotonicity filter still reject stale passes
 			 * from prior generations.
 			 */
-			me->last_token_seq[shard_id] = cur_seq;
+			me->shards[shard_id].last_token_seq = cur_seq;
 		}
 
 		if (++spins < MARUFS_ME_SPIN_COUNT)
@@ -133,15 +134,15 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	me_pass_token(me, shard_id, me->node_id);
 
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
-	me->last_cb_gen[shard_id] = READ_CXL_LE64(cb->generation);
+	me->shards[shard_id].last_cb_gen = READ_CXL_LE64(cb->generation);
 	MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-	me->last_token_seq[shard_id] = READ_CXL_LE64(my_slot->token_seq);
+	me->shards[shard_id].last_token_seq = READ_CXL_LE64(my_slot->token_seq);
 	return 0;
 }
 
 int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	if (!mutex_trylock(&me->local_locks[shard_id]))
+	if (!mutex_trylock(&me->shards[shard_id].local_lock))
 		return -EBUSY;
 
 	ME_HOLD(me, shard_id);
@@ -150,13 +151,13 @@ int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 	u32 holder = READ_CXL_LE32(cb->holder);
 
-	me->is_holder[shard_id] = (holder == me->node_id);
+	me->shards[shard_id].is_holder = (holder == me->node_id);
 	if (holder == me->node_id) {
 		me_cb_bump_acquire_count(cb);
 		return 0;
 	}
 	ME_UNHOLD(me, shard_id);
-	mutex_unlock(&me->local_locks[shard_id]);
+	mutex_unlock(&me->shards[shard_id].local_lock);
 	return -EBUSY;
 }
 
@@ -189,13 +190,13 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 		MARUFS_CXL_RMB(my_slot, sizeof(*my_slot));
 		u64 seq = READ_CXL_LE64(my_slot->token_seq);
 
-		me->last_token_seq[s] = seq;
-		me->poll_last_slot_seq[s] = seq;
+		me->shards[s].last_token_seq = seq;
+		me->shards[s].poll_last_slot_seq = seq;
 
 		struct marufs_me_cb *cb = &me->cbs[s];
 
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		me->last_cb_gen[s] = READ_CXL_LE64(cb->generation);
+		me->shards[s].last_cb_gen = READ_CXL_LE64(cb->generation);
 	}
 
 	u32 claimed = 0;
@@ -213,12 +214,12 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 			 * skip the CB RMB for this shard when we are neither
 			 * holder nor successor.
 			 */
-			me->is_holder[s] = (cur == me->node_id);
+			me->shards[s].is_holder = (cur == me->node_id);
 		}
 	}
 
 	for (u32 s = 0; s < me->num_shards; s++)
-		me->cached_successor[s] =
+		me->shards[s].cached_successor =
 			marufs_me_next_active(me, me->node_id);
 
 	if (claimed == me->num_shards)
@@ -432,26 +433,16 @@ struct marufs_me_instance *marufs_me_create(void *me_area_base, u32 num_shards,
 	me->strategy = strategy;
 	me->ops = marufs_me_get_ops(strategy);
 
-	/* DRAM arrays */
-	me->holding = kcalloc(num_shards, sizeof(atomic_t), GFP_KERNEL);
-	me->local_waiters = kcalloc(num_shards, sizeof(atomic_t), GFP_KERNEL);
-	me->local_locks = kcalloc(num_shards, sizeof(struct mutex), GFP_KERNEL);
-	me->cached_successor = kcalloc(num_shards, sizeof(u32), GFP_KERNEL);
-	me->is_holder = kcalloc(num_shards, sizeof(bool), GFP_KERNEL);
-	me->poll_last_slot_seq = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
-	me->last_token_seq = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
-	me->last_cb_gen = kcalloc(num_shards, sizeof(u64), GFP_KERNEL);
-
-	if (!me->holding || !me->local_waiters || !me->local_locks ||
-	    !me->cached_successor || !me->is_holder ||
-	    !me->poll_last_slot_seq || !me->last_token_seq ||
-	    !me->last_cb_gen) {
+	/* Single per-shard DRAM allocation — kcalloc zeroes all fields, so
+	 * atomic counters, is_holder, sequence shadows start at 0 / false.
+	 */
+	me->shards = kcalloc(num_shards, sizeof(*me->shards), GFP_KERNEL);
+	if (!me->shards) {
 		marufs_me_destroy(me);
 		return ERR_PTR(-ENOMEM);
 	}
-
 	for (u32 s = 0; s < num_shards; s++)
-		mutex_init(&me->local_locks[s]);
+		mutex_init(&me->shards[s].local_lock);
 
 	atomic_set(&me->active, 0);
 	INIT_LIST_HEAD(&me->list_node);
@@ -467,14 +458,7 @@ void marufs_me_destroy(struct marufs_me_instance *me)
 	/* Caller must have unregistered first; this is a safety net. */
 	WARN_ON_ONCE(!list_empty(&me->list_node));
 
-	kfree(me->holding);
-	kfree(me->local_waiters);
-	kfree(me->local_locks);
-	kfree(me->cached_successor);
-	kfree(me->is_holder);
-	kfree(me->poll_last_slot_seq);
-	kfree(me->last_token_seq);
-	kfree(me->last_cb_gen);
+	kfree(me->shards);
 	kfree(me);
 }
 

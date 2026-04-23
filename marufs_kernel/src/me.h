@@ -223,6 +223,36 @@ struct marufs_me_ops {
 	void (*leave)(struct marufs_me_instance *me);
 };
 
+/* ── Per-shard DRAM state ─────────────────────────────────────────── */
+
+/*
+ * struct marufs_me_shard - per-shard local bookkeeping.
+ *
+ * Laid out as a single array in marufs_me_instance::shards[num_shards],
+ * one struct per shard. Fields touched together (hot path: holding,
+ * is_holder, last_token_seq) naturally share a cache line.
+ *
+ * holding / local_waiters : atomic counters for intra-node coordination.
+ * local_lock              : intra-node serialization (sleepable).
+ * cached_successor        : precomputed next ACTIVE node_id (ring).
+ * is_holder               : DRAM "am I the token holder?" flag (replaces
+ *                           per-cycle CB hot-polling).
+ * poll_last_slot_seq      : poll-thread's shadow of own slot token_seq;
+ *                           drives receiver-side is_holder flip on bump.
+ * last_token_seq          : wait_for_token phantom filter baseline.
+ * last_cb_gen             : cb->generation snapshot for stale-pass fence.
+ */
+struct marufs_me_shard {
+	atomic_t holding;
+	atomic_t local_waiters;
+	struct mutex local_lock;
+	u32 cached_successor;
+	bool is_holder;
+	u64 poll_last_slot_seq;
+	u64 last_token_seq;
+	u64 last_cb_gen;
+};
+
 /* ── ME Instance (per-mount, DRAM) ────────────────────────────────── */
 
 struct marufs_me_instance {
@@ -242,22 +272,10 @@ struct marufs_me_instance {
 	enum marufs_me_strategy strategy;
 	const struct marufs_me_ops *ops;
 
-	/* DRAM-local state (poll thread + caller cross-CPU) */
-	atomic_t *holding; /* [S] — hold counter (0 = idle, >0 = held) */
-	atomic_t *local_waiters; /* [S] — pending acquire threads on this node */
-	struct mutex
-		*local_locks; /* [S] — intra-node serialization (sleepable) */
-	u32 *cached_successor; /* [S] — pre-computed next ACTIVE node */
-	bool *is_holder; /* [S] — DRAM flag, true while I hold the token.
-			  * Replaces CB per-cycle hot-poll. Flipped by:
-			  *   - me_pass_token (I write CB to pass away)
-			  *   - poll_cycle slot doorbell (I receive token)
-			  *   - wait_for_token / try_acquire success */
-	u64 *poll_last_slot_seq; /* [S] — poll-thread shadow of own slot
-				  * token_seq; drives receiver-side is_holder
-				  * flip on bump. */
-	u64 *last_token_seq; /* [S] — last observed own slot->token_seq (doorbell) */
-	u64 *last_cb_gen; /* [S] — last observed cb->generation (stale fence) */
+	/* Per-shard DRAM state — one struct per shard, allocated as a single
+	 * contiguous array (avoids 8 separate kcalloc/kfree cycles).
+	 */
+	struct marufs_me_shard *shards;
 
 	/* Poll-path cost counters exposed via /sys/fs/marufs/me_poll_stats.
 	 * Incremented only from poll_cycle; app-thread traffic excluded.
@@ -288,10 +306,10 @@ struct marufs_me_instance {
  * Multiple threads on the same node can hold simultaneously; poll thread
  * only passes the token when the counter reaches 0.
  */
-#define ME_HOLD(me, shard)                           \
-	do {                                         \
-		atomic_inc(&(me)->holding[(shard)]); \
-		smp_mb();                            \
+#define ME_HOLD(me, shard)                                  \
+	do {                                                \
+		atomic_inc(&(me)->shards[(shard)].holding); \
+		smp_mb();                                   \
 	} while (0)
 
 /*
@@ -306,7 +324,8 @@ struct marufs_me_instance {
 #define ME_UNHOLD(me, shard)                                                \
 	do {                                                                \
 		wmb();                                                      \
-		int __v = atomic_dec_if_positive(&(me)->holding[(shard)]);  \
+		int __v = atomic_dec_if_positive(                           \
+			&(me)->shards[(shard)].holding);                    \
 		WARN_ON_ONCE(__v < 0); /* unbalanced UNHOLD — caller bug */ \
 		smp_mb();                                                   \
 	} while (0)
@@ -315,20 +334,20 @@ struct marufs_me_instance {
  * ME_RESET_HOLDING - force counter to 0 (leave/cleanup path only).
  * Used during node leave to prevent underflow from blind dec.
  */
-#define ME_RESET_HOLDING(me, shard)                     \
-	do {                                            \
-		atomic_set(&(me)->holding[(shard)], 0); \
-		smp_mb();                               \
+#define ME_RESET_HOLDING(me, shard)                            \
+	do {                                                   \
+		atomic_set(&(me)->shards[(shard)].holding, 0); \
+		smp_mb();                                      \
 	} while (0)
 
 /*
  * ME_IS_IDLE - check if no one on this node holds the shard.
  * smp_mb() before read pairs with ME_HOLD/ME_UNHOLD's smp_mb().
  */
-#define ME_IS_IDLE(me, shard)                              \
-	({                                                 \
-		smp_mb();                                  \
-		atomic_read(&(me)->holding[(shard)]) == 0; \
+#define ME_IS_IDLE(me, shard)                                     \
+	({                                                        \
+		smp_mb();                                         \
+		atomic_read(&(me)->shards[(shard)].holding) == 0; \
 	})
 
 /*
@@ -506,7 +525,7 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 	 * half of the hot-path "am I holder?" test that replaces per-cycle
 	 * CB RMBs.
 	 */
-	me->is_holder[shard_id] = (new_holder == me->node_id);
+	me->shards[shard_id].is_holder = (new_holder == me->node_id);
 
 	/* Step 2: doorbell (skip when clearing ownership). */
 	if (new_holder == MARUFS_ME_HOLDER_NONE)
@@ -534,7 +553,7 @@ static inline bool me_shard_passable(struct marufs_me_instance *me,
 				     u32 shard_id)
 {
 	return ME_IS_IDLE(me, shard_id) &&
-	       atomic_read(&me->local_waiters[shard_id]) == 0;
+	       atomic_read(&me->shards[shard_id].local_waiters) == 0;
 }
 
 /* ── Common infrastructure (me.c) ─────────────────────────────────── */
