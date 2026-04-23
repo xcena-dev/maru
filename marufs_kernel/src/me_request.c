@@ -132,20 +132,15 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 		sh->cached_successor = successor;
 
-		/* Receiver-side doorbell: own per-(shard,node) slot is
-		 * single-reader (no CXL CL contention). A bump means a peer
-		 * just granted the token to us (me_pass_token writes our slot
-		 * AFTER writing CB), so we become holder immediately — no CB
-		 * RMB needed. This is the whole point of the doorbell design.
-		 */
+		/* Receiver doorbell: bump ⇒ peer granted token. */
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
 		if (cur_seq != sh->poll_last_slot_seq) {
-			sh->is_holder = true;
 			sh->poll_last_slot_seq = cur_seq;
+			ME_BECOME_HOLDER(sh);
 		}
 
 		if (!sh->is_holder)

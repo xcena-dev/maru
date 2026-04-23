@@ -351,6 +351,46 @@ struct marufs_me_instance {
 	})
 
 /*
+ * ME_BECOME_HOLDER - publish "we are now the token holder" to other CPUs.
+ *
+ * Callers MUST write any DRAM baselines (last_cb_gen / last_token_seq /
+ * poll_last_slot_seq) BEFORE invoking this macro. The smp_wmb() pairs with
+ * the smp_rmb() in wait_for_token's fast path: once a reader observes
+ * is_holder=true, all prior baseline stores are guaranteed visible.
+ * Sole publish point for is_holder=true — keeps the barrier rule in one
+ * place instead of scattered across call sites.
+ */
+#define ME_BECOME_HOLDER(sh)            \
+	do {                            \
+		smp_wmb();              \
+		(sh)->is_holder = true; \
+	} while (0)
+
+/*
+ * ME_LOSE_HOLDER - counterpart for "we gave the token away".
+ *
+ * No barrier needed: a reader that observes is_holder=false falls to the
+ * wait_for_token loop path, which performs its own CB RMB to re-verify
+ * ownership. Kept as a symmetric macro so every is_holder mutation goes
+ * through this header.
+ */
+#define ME_LOSE_HOLDER(sh)               \
+	do {                             \
+		(sh)->is_holder = false; \
+	} while (0)
+
+/*
+ * ME_IS_HOLDER - reader pair for ME_BECOME_HOLDER. smp_rmb ensures any
+ * baseline stores published by the writer are visible once is_holder
+ * reads true.
+ */
+#define ME_IS_HOLDER(sh)        \
+	({                      \
+		smp_rmb();      \
+		(sh)->is_holder;\
+	})
+
+/*
  * marufs_me_is_valid_node - true iff @node_id names a real slot.
  *
  * Valid external node_ids are [1, max_nodes]. Excludes 0 (ORPHAN sentinel)
@@ -515,21 +555,19 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 		atomic_set(&me->active, 0);
 		return;
 	}
+
 	u64 new_gen = READ_CXL_LE64(cb->generation) + 1;
 	WRITE_LE32(cb->holder, new_holder);
 	WRITE_LE64(cb->generation, new_gen);
 	MARUFS_CXL_WMB(cb, sizeof(*cb));
 
-	/* Flip own is_holder flag — we just transferred the token away
-	 * (or, for a self-takeover, to ourselves). This is the writer
-	 * half of the hot-path "am I holder?" test that replaces per-cycle
-	 * CB RMBs.
-	 */
-	me->shards[shard_id].is_holder = (new_holder == me->node_id);
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 
-	/* Step 2: doorbell (skip when clearing ownership). */
-	if (new_holder == MARUFS_ME_HOLDER_NONE)
+	/* Step 2: doorbell (skip when clearing ownership — no slot to ring). */
+	if (new_holder == MARUFS_ME_HOLDER_NONE) {
+		ME_LOSE_HOLDER(sh);
 		return;
+	}
 
 	struct marufs_me_slot *slot = me_slot_of(me, shard_id, new_holder - 1);
 	MARUFS_CXL_RMB(slot, sizeof(*slot));
@@ -538,10 +576,21 @@ static inline void me_pass_token(struct marufs_me_instance *me, u32 shard_id,
 		atomic_set(&me->active, 0);
 		return;
 	}
+
+	u64 new_seq = READ_CXL_LE64(slot->token_seq) + 1;
 	WRITE_LE32(slot->from_node, me->node_id);
 	WRITE_LE64(slot->cb_gen_at_write, new_gen);
-	WRITE_LE64(slot->token_seq, READ_CXL_LE64(slot->token_seq) + 1);
+	WRITE_LE64(slot->token_seq, new_seq);
 	MARUFS_CXL_WMB(slot, sizeof(*slot));
+
+	if (new_holder == me->node_id) {
+		sh->last_cb_gen = new_gen;
+		sh->last_token_seq = new_seq;
+		sh->poll_last_slot_seq = new_seq;
+		ME_BECOME_HOLDER(sh);
+	} else {
+		ME_LOSE_HOLDER(sh);
+	}
 }
 
 /*

@@ -32,19 +32,15 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 
 		sh->cached_successor = successor;
 
-		/* Receiver-side doorbell (per-(shard,node) CL, single-reader,
-		 * no CXL CL contention). Bump ⇒ a peer just passed us the
-		 * token via me_pass_token (CB was written before the slot WMB,
-		 * so is_holder=true is consistent with CB without CB RMB).
-		 */
+		/* Receiver doorbell: bump ⇒ peer passed token. */
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
 		if (cur_seq != sh->poll_last_slot_seq) {
-			sh->is_holder = true;
 			sh->poll_last_slot_seq = cur_seq;
+			ME_BECOME_HOLDER(sh);
 		}
 
 		if (!sh->is_holder)

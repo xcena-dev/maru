@@ -55,21 +55,16 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
  */
 int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 {
-	/* Fast path: already holder (prior CS kept token, or poll thread
-	 * hasn't passed yet). Sync baselines and return.
-	 */
 	struct marufs_me_shard *sh = &me->shards[shard_id];
 	struct marufs_me_slot *my_slot = me_my_slot(me, shard_id);
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
-	MARUFS_CXL_RMB(cb, sizeof(*cb));
 
-	if (READ_CXL_LE32(cb->holder) == me->node_id) {
-		sh->last_cb_gen = READ_CXL_LE64(cb->generation);
-		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-		sh->last_token_seq = READ_CXL_LE64(my_slot->token_seq);
-		sh->is_holder = true;
+	/* Fast path: token already ours — no CB RMB needed. Cross-node CB
+	 * can flip only via heartbeat-timeout takeover, blocked while we
+	 * keep ticking heartbeat in poll_cycle.
+	 */
+	if (ME_IS_HOLDER(sh))
 		return 0;
-	}
 
 	u64 deadline = ktime_get_ns() + MARUFS_ME_ACQUIRE_TIMEOUT_NS;
 	u32 spins = 0;
@@ -88,7 +83,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			if (holder == me->node_id && cb_gen > sh->last_cb_gen) {
 				sh->last_token_seq = cur_seq;
 				sh->last_cb_gen = cb_gen;
-				sh->is_holder = true;
+				ME_BECOME_HOLDER(sh);
 				return 0;
 			}
 			/* Phantom: seq advanced but CB not for us. Advance
@@ -106,11 +101,8 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 				     me->poll_interval_us);
 	}
 
-	/* Deadline expired. With poll-thread distributed crash watch removed
-	 * (see is_holder boolean design), this is now the SOLE crash-recovery
-	 * trigger: if the holder's heartbeat has stalled past the timeout,
-	 * take over ourselves. Otherwise the holder is genuinely busy —
-	 * report -ETIMEDOUT.
+	/* Deadline expired — sole crash-recovery trigger. Take over iff
+	 * holder's heartbeat has stalled past the timeout.
 	 */
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 	u32 holder = READ_CXL_LE32(cb->holder);
@@ -130,11 +122,6 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	pr_warn("me: acquire timeout on shard %u, holder=%u heartbeat stalled %llums — taking over\n",
 		shard_id, holder, elapsed / 1000000);
 	me_pass_token(me, shard_id, me->node_id);
-
-	MARUFS_CXL_RMB(cb, sizeof(*cb));
-	sh->last_cb_gen = READ_CXL_LE64(cb->generation);
-	MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-	sh->last_token_seq = READ_CXL_LE64(my_slot->token_seq);
 	return 0;
 }
 
@@ -151,11 +138,17 @@ int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 	u32 holder = READ_CXL_LE32(cb->holder);
 
-	sh->is_holder = (holder == me->node_id);
 	if (holder == me->node_id) {
+		/* Sync DRAM baseline before flipping is_holder via the macro
+		 * so the fast path in wait_for_token sees a consistent
+		 * (is_holder, last_cb_gen) pair.
+		 */
+		sh->last_cb_gen = READ_CXL_LE64(cb->generation);
+		ME_BECOME_HOLDER(sh);
 		me_cb_bump_acquire_count(cb);
 		return 0;
 	}
+	ME_LOSE_HOLDER(sh);
 	ME_UNHOLD(me, shard_id);
 	mutex_unlock(&sh->local_lock);
 	return -EBUSY;
@@ -213,9 +206,15 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 		} else {
 			/* Seed holder cache so subsequent poll_cycles can
 			 * skip the CB RMB for this shard when we are neither
-			 * holder nor successor.
+			 * holder nor successor. Baselines were already seeded
+			 * in the prior loop, so publishing via the macro is safe.
 			 */
-			me->shards[s].is_holder = (cur == me->node_id);
+			struct marufs_me_shard *sh = &me->shards[s];
+
+			if (cur == me->node_id)
+				ME_BECOME_HOLDER(sh);
+			else
+				ME_LOSE_HOLDER(sh);
 		}
 	}
 
