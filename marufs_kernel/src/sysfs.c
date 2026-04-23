@@ -578,15 +578,15 @@ static int me_info_emit_one(char *buf, int len, struct marufs_sb_info *sbi,
 		else
 			snprintf(hbuf, sizeof(hbuf), "%u", holder);
 
+		struct marufs_me_shard *sh = me->shards ? &me->shards[s] : NULL;
+
 		len += sysfs_emit_at(
 			buf, len,
 			"  shard %u: holder=%s state=%s hb=%llu gen=%llu acq=%llu holding=%d waiters=%d cached_succ=%u is_holder=%d\n",
 			s, hbuf, me_state_str(state), hb, gen, acq,
-			me->shards ? atomic_read(&me->shards[s].holding) : 0,
-			me->shards ? atomic_read(&me->shards[s].local_waiters) :
-				     0,
-			me->shards ? me->shards[s].cached_successor : 0,
-			me->shards ? me->shards[s].is_holder : 0);
+			sh ? atomic_read(&sh->holding) : 0,
+			sh ? atomic_read(&sh->local_waiters) : 0,
+			sh ? sh->cached_successor : 0, sh ? sh->is_holder : 0);
 
 		/* Own doorbell slot — surfaces token-pass state for debugging
 		 * (who rang, which seq, what gen). last_* are DRAM baselines
@@ -602,10 +602,8 @@ static int me_info_emit_one(char *buf, int len, struct marufs_sb_info *sbi,
 			u32 rseq = READ_CXL_LE32(ms->sequence);
 			u64 rat = READ_CXL_LE64(ms->requested_at);
 			u64 gat = READ_CXL_LE64(ms->granted_at);
-			u64 last_seq =
-				me->shards ? me->shards[s].last_token_seq : 0;
-			u64 last_gen = me->shards ? me->shards[s].last_cb_gen :
-						    0;
+			u64 last_seq = sh ? sh->last_token_seq : 0;
+			u64 last_gen = sh ? sh->last_cb_gen : 0;
 
 			len += sysfs_emit_at(
 				buf, len,

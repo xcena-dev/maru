@@ -28,7 +28,9 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 	u32 successor = marufs_me_next_active(me, me->node_id);
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		me->shards[s].cached_successor = successor;
+		struct marufs_me_shard *sh = &me->shards[s];
+
+		sh->cached_successor = successor;
 
 		/* Receiver-side doorbell (per-(shard,node) CL, single-reader,
 		 * no CXL CL contention). Bump ⇒ a peer just passed us the
@@ -40,12 +42,12 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		if (cur_seq != me->shards[s].poll_last_slot_seq) {
-			me->shards[s].is_holder = true;
-			me->shards[s].poll_last_slot_seq = cur_seq;
+		if (cur_seq != sh->poll_last_slot_seq) {
+			sh->is_holder = true;
+			sh->poll_last_slot_seq = cur_seq;
 		}
 
-		if (!me->shards[s].is_holder)
+		if (!sh->is_holder)
 			continue;
 
 		if (!ticked_hb) {
@@ -61,12 +63,14 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 
 static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
+	struct marufs_me_shard *sh = &me->shards[shard_id];
+
 	/* Intra-node serialization; cross-node via CXL token (cb->holder).
 	 * local_waiters lets release() decide keep-token vs. pass-to-ring.
 	 */
-	atomic_inc(&me->shards[shard_id].local_waiters);
-	mutex_lock(&me->shards[shard_id].local_lock);
-	atomic_dec(&me->shards[shard_id].local_waiters);
+	atomic_inc(&sh->local_waiters);
+	mutex_lock(&sh->local_lock);
+	atomic_dec(&sh->local_waiters);
 
 	ME_HOLD(me, shard_id);
 
@@ -77,7 +81,7 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 	}
 
 	ME_UNHOLD(me, shard_id);
-	mutex_unlock(&me->shards[shard_id].local_lock);
+	mutex_unlock(&sh->local_lock);
 	return ret;
 }
 
@@ -90,20 +94,22 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
  */
 static void order_release(struct marufs_me_instance *me, u32 shard_id)
 {
+	struct marufs_me_shard *sh = &me->shards[shard_id];
+
 	ME_UNHOLD(me, shard_id);
 
 	if (me_shard_passable(me, shard_id)) {
-		u32 succ = me->shards[shard_id].cached_successor;
+		u32 succ = sh->cached_successor;
 
 		if (succ == me->node_id) {
 			succ = marufs_me_next_active(me, me->node_id);
-			me->shards[shard_id].cached_successor = succ;
+			sh->cached_successor = succ;
 		}
 		if (succ != me->node_id)
 			me_pass_token(me, shard_id, succ);
 	}
 
-	mutex_unlock(&me->shards[shard_id].local_lock);
+	mutex_unlock(&sh->local_lock);
 }
 
 /* ── Leave: token-gated cleanup ───────────────────────────────────── */
@@ -116,6 +122,7 @@ static void order_release(struct marufs_me_instance *me, u32 shard_id)
 static void order_leave_dump(struct marufs_me_instance *me, u32 s, int ret,
 			     u32 holder)
 {
+	struct marufs_me_shard *sh = &me->shards[s];
 	struct marufs_me_cb *cb = &me->cbs[s];
 	u64 cb_gen = READ_CXL_LE64(cb->generation);
 	u32 holder_status = 0;
@@ -134,8 +141,8 @@ static void order_leave_dump(struct marufs_me_instance *me, u32 s, int ret,
 	pr_debug(
 		"me: leave shard %u acquire failed (%d) holder=%u hstatus=%u cb_gen=%llu my_seq=%llu last_seq=%llu last_gen=%llu succ=%u, forcing handoff\n",
 		s, ret, holder, holder_status, cb_gen,
-		READ_CXL_LE64(ms->token_seq), me->shards[s].last_token_seq,
-		me->shards[s].last_cb_gen, me->shards[s].cached_successor);
+		READ_CXL_LE64(ms->token_seq), sh->last_token_seq,
+		sh->last_cb_gen, sh->cached_successor);
 }
 
 /*
@@ -150,6 +157,7 @@ static void order_leave_dump(struct marufs_me_instance *me, u32 s, int ret,
 static void order_leave(struct marufs_me_instance *me)
 {
 	for (u32 s = 0; s < me->num_shards; s++) {
+		struct marufs_me_shard *sh = &me->shards[s];
 		int ret = me->ops->acquire(me, s);
 		bool acquired = (ret == 0);
 		u32 holder;
@@ -169,7 +177,7 @@ static void order_leave(struct marufs_me_instance *me)
 
 		if (acquired) {
 			ME_UNHOLD(me, s);
-			mutex_unlock(&me->shards[s].local_lock);
+			mutex_unlock(&sh->local_lock);
 		}
 		ME_RESET_HOLDING(me, s);
 	}

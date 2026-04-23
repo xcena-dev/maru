@@ -128,7 +128,9 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 	}
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		me->shards[s].cached_successor = successor;
+		struct marufs_me_shard *sh = &me->shards[s];
+
+		sh->cached_successor = successor;
 
 		/* Receiver-side doorbell: own per-(shard,node) slot is
 		 * single-reader (no CXL CL contention). A bump means a peer
@@ -141,12 +143,12 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		if (cur_seq != me->shards[s].poll_last_slot_seq) {
-			me->shards[s].is_holder = true;
-			me->shards[s].poll_last_slot_seq = cur_seq;
+		if (cur_seq != sh->poll_last_slot_seq) {
+			sh->is_holder = true;
+			sh->poll_last_slot_seq = cur_seq;
 		}
 
-		if (!me->shards[s].is_holder)
+		if (!sh->is_holder)
 			continue;
 
 		/* Holder path: tick heartbeat once, grant if passable. */
@@ -163,10 +165,12 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
+	struct marufs_me_shard *sh = &me->shards[shard_id];
+
 	/* Intra-node serialization (see order_acquire comment). */
-	atomic_inc(&me->shards[shard_id].local_waiters);
-	mutex_lock(&me->shards[shard_id].local_lock);
-	atomic_dec(&me->shards[shard_id].local_waiters);
+	atomic_inc(&sh->local_waiters);
+	mutex_lock(&sh->local_lock);
+	atomic_dec(&sh->local_waiters);
 
 	/* Fast path: previous release kept the token. ME_HOLD's smp_mb()
 	 * pairs with poll_cycle's to close the holding/holder read race.
@@ -201,7 +205,7 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	}
 
 	ME_UNHOLD(me, shard_id);
-	mutex_unlock(&me->shards[shard_id].local_lock);
+	mutex_unlock(&sh->local_lock);
 	return ret;
 }
 
@@ -209,6 +213,8 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 
 static void request_release(struct marufs_me_instance *me, u32 shard_id)
 {
+	struct marufs_me_shard *sh = &me->shards[shard_id];
+
 	ME_UNHOLD(me, shard_id);
 
 	/* Keep token if local threads are waiting — avoids cross-node
@@ -222,7 +228,7 @@ static void request_release(struct marufs_me_instance *me, u32 shard_id)
 	if (me_shard_passable(me, shard_id))
 		request_scan_and_grant(me, shard_id);
 
-	mutex_unlock(&me->shards[shard_id].local_lock);
+	mutex_unlock(&sh->local_lock);
 }
 
 const struct marufs_me_ops marufs_me_request_ops = {

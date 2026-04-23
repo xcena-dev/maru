@@ -58,17 +58,16 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	/* Fast path: already holder (prior CS kept token, or poll thread
 	 * hasn't passed yet). Sync baselines and return.
 	 */
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 	struct marufs_me_slot *my_slot = me_my_slot(me, shard_id);
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 
 	if (READ_CXL_LE32(cb->holder) == me->node_id) {
-		me->shards[shard_id].last_cb_gen =
-			READ_CXL_LE64(cb->generation);
+		sh->last_cb_gen = READ_CXL_LE64(cb->generation);
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-		me->shards[shard_id].last_token_seq =
-			READ_CXL_LE64(my_slot->token_seq);
-		me->shards[shard_id].is_holder = true;
+		sh->last_token_seq = READ_CXL_LE64(my_slot->token_seq);
+		sh->is_holder = true;
 		return 0;
 	}
 
@@ -78,7 +77,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		if (cur_seq != me->shards[shard_id].last_token_seq) {
+		if (cur_seq != sh->last_token_seq) {
 			/* Acquire ordering: subsequent CB read must not be
 			 * reordered before the slot read above.
 			 */
@@ -86,11 +85,10 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			u32 holder = READ_CXL_LE32(cb->holder);
 			u64 cb_gen = READ_CXL_LE64(cb->generation);
 
-			if (holder == me->node_id &&
-			    cb_gen > me->shards[shard_id].last_cb_gen) {
-				me->shards[shard_id].last_token_seq = cur_seq;
-				me->shards[shard_id].last_cb_gen = cb_gen;
-				me->shards[shard_id].is_holder = true;
+			if (holder == me->node_id && cb_gen > sh->last_cb_gen) {
+				sh->last_token_seq = cur_seq;
+				sh->last_cb_gen = cb_gen;
+				sh->is_holder = true;
 				return 0;
 			}
 			/* Phantom: seq advanced but CB not for us. Advance
@@ -98,7 +96,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			 * gen-monotonicity filter still reject stale passes
 			 * from prior generations.
 			 */
-			me->shards[shard_id].last_token_seq = cur_seq;
+			sh->last_token_seq = cur_seq;
 		}
 
 		if (++spins < MARUFS_ME_SPIN_COUNT)
@@ -134,15 +132,17 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	me_pass_token(me, shard_id, me->node_id);
 
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
-	me->shards[shard_id].last_cb_gen = READ_CXL_LE64(cb->generation);
+	sh->last_cb_gen = READ_CXL_LE64(cb->generation);
 	MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-	me->shards[shard_id].last_token_seq = READ_CXL_LE64(my_slot->token_seq);
+	sh->last_token_seq = READ_CXL_LE64(my_slot->token_seq);
 	return 0;
 }
 
 int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	if (!mutex_trylock(&me->shards[shard_id].local_lock))
+	struct marufs_me_shard *sh = &me->shards[shard_id];
+
+	if (!mutex_trylock(&sh->local_lock))
 		return -EBUSY;
 
 	ME_HOLD(me, shard_id);
@@ -151,13 +151,13 @@ int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id)
 	MARUFS_CXL_RMB(cb, sizeof(*cb));
 	u32 holder = READ_CXL_LE32(cb->holder);
 
-	me->shards[shard_id].is_holder = (holder == me->node_id);
+	sh->is_holder = (holder == me->node_id);
 	if (holder == me->node_id) {
 		me_cb_bump_acquire_count(cb);
 		return 0;
 	}
 	ME_UNHOLD(me, shard_id);
-	mutex_unlock(&me->shards[shard_id].local_lock);
+	mutex_unlock(&sh->local_lock);
 	return -EBUSY;
 }
 
@@ -186,17 +186,18 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 	 * below isn't mistaken for a phantom wakeup.
 	 */
 	for (u32 s = 0; s < me->num_shards; s++) {
+		struct marufs_me_shard *sh = &me->shards[s];
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
 		MARUFS_CXL_RMB(my_slot, sizeof(*my_slot));
 		u64 seq = READ_CXL_LE64(my_slot->token_seq);
 
-		me->shards[s].last_token_seq = seq;
-		me->shards[s].poll_last_slot_seq = seq;
+		sh->last_token_seq = seq;
+		sh->poll_last_slot_seq = seq;
 
 		struct marufs_me_cb *cb = &me->cbs[s];
 
 		MARUFS_CXL_RMB(cb, sizeof(*cb));
-		me->shards[s].last_cb_gen = READ_CXL_LE64(cb->generation);
+		sh->last_cb_gen = READ_CXL_LE64(cb->generation);
 	}
 
 	u32 claimed = 0;
@@ -218,9 +219,9 @@ int marufs_me_common_join(struct marufs_me_instance *me)
 		}
 	}
 
+	u32 succ = marufs_me_next_active(me, me->node_id);
 	for (u32 s = 0; s < me->num_shards; s++)
-		me->shards[s].cached_successor =
-			marufs_me_next_active(me, me->node_id);
+		me->shards[s].cached_successor = succ;
 
 	if (claimed == me->num_shards)
 		pr_info("me: node %u joined as first node (token holder)\n",
