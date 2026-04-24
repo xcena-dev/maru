@@ -28,16 +28,14 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 	u32 successor = marufs_me_next_active(me, me->node_id);
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_shard *sh = &me->shards[s];
-
-		sh->cached_successor = successor;
-
 		/* Receiver doorbell: bump ⇒ peer passed token. */
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
 		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
+		struct marufs_me_shard *sh = &me->shards[s];
+		sh->cached_successor = successor;
 		if (cur_seq != sh->poll_last_slot_seq) {
 			sh->poll_last_slot_seq = cur_seq;
 			ME_BECOME_HOLDER(sh);
@@ -59,11 +57,10 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 
 static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-
 	/* Intra-node serialization; cross-node via CXL token (cb->holder).
-	 * local_waiters lets release() decide keep-token vs. pass-to-ring.
-	 */
+	* local_waiters lets release() decide keep-token vs. pass-to-ring.
+	*/
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 	atomic_inc(&sh->local_waiters);
 	mutex_lock(&sh->local_lock);
 	atomic_dec(&sh->local_waiters);
@@ -90,10 +87,9 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
  */
 static void order_release(struct marufs_me_instance *me, u32 shard_id)
 {
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-
 	ME_UNHOLD(me, shard_id);
 
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 	if (me_shard_passable(me, shard_id)) {
 		u32 succ = sh->cached_successor;
 
@@ -111,37 +107,6 @@ static void order_release(struct marufs_me_instance *me, u32 shard_id)
 /* ── Leave: token-gated cleanup ───────────────────────────────────── */
 
 /*
- * Diagnostic dump for the acquire-failed leave path.
- * Emitted only when we can't grab our own shard's token within timeout;
- * helps root-cause ring stalls / phantom timeouts.
- */
-static void order_leave_dump(struct marufs_me_instance *me, u32 s, int ret,
-			     u32 holder)
-{
-	struct marufs_me_shard *sh = &me->shards[s];
-	struct marufs_me_cb *cb = &me->cbs[s];
-	u64 cb_gen = READ_CXL_LE64(cb->generation);
-	u32 holder_status = 0;
-
-	if (marufs_me_is_valid_node(me, holder)) {
-		struct marufs_me_membership_slot *hs =
-			&me->membership[holder - 1];
-
-		MARUFS_CXL_RMB(hs, sizeof(*hs));
-		holder_status = READ_CXL_LE32(hs->status);
-	}
-
-	struct marufs_me_slot *ms = me_my_slot(me, s);
-
-	MARUFS_CXL_RMB(ms, sizeof(*ms));
-	pr_debug(
-		"me: leave shard %u acquire failed (%d) holder=%u hstatus=%u cb_gen=%llu my_seq=%llu last_seq=%llu last_gen=%llu succ=%u, forcing handoff\n",
-		s, ret, holder, holder_status, cb_gen,
-		READ_CXL_LE64(ms->token_seq), sh->last_token_seq,
-		sh->last_cb_gen, sh->cached_successor);
-}
-
-/*
  * order_leave - own the token on each shard (if possible), then pass.
  *
  * Success path: acquire forces sole-writer status for this node's slot,
@@ -153,26 +118,21 @@ static void order_leave_dump(struct marufs_me_instance *me, u32 s, int ret,
 static void order_leave(struct marufs_me_instance *me)
 {
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_shard *sh = &me->shards[s];
 		int ret = me->ops->acquire(me, s);
 		bool acquired = (ret == 0);
 		u32 holder;
 
-		if (acquired) {
+		if (acquired)
 			holder = me->node_id;
-		} else {
-			struct marufs_me_cb *cb = &me->cbs[s];
-
-			MARUFS_CXL_RMB(cb, sizeof(*cb));
-			holder = READ_CXL_LE32(cb->holder);
-			order_leave_dump(me, s, ret, holder);
-		}
+		else
+			holder = me_cb_snapshot(&me->cbs[s], NULL);
 
 		if (holder == me->node_id)
 			me_pass_token(me, s, me_leave_successor(me));
 
 		if (acquired) {
 			ME_UNHOLD(me, s);
+			struct marufs_me_shard *sh = &me->shards[s];
 			mutex_unlock(&sh->local_lock);
 		}
 		ME_RESET_HOLDING(me, s);
@@ -190,7 +150,6 @@ static void order_leave(struct marufs_me_instance *me)
 const struct marufs_me_ops marufs_me_order_ops = {
 	.acquire = order_acquire,
 	.release = order_release,
-	.try_acquire = marufs_me_common_try_acquire,
 	.poll_cycle = order_poll_cycle,
 	.join = marufs_me_common_join,
 	.leave = order_leave,

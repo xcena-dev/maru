@@ -37,6 +37,7 @@ static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
 		MARUFS_CXL_RMB(rs, sizeof(*rs));
 		atomic64_inc(&me->poll_rmb_slot);
+
 		if (READ_CXL_LE32(rs->requesting)) {
 			WRITE_LE64(rs->granted_at, ktime_get_ns());
 			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
@@ -87,10 +88,6 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 	WRITE_LE32(rs->requesting, 0);
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
 
-	/* Clear bit AFTER slot clear. Transient "bit set but requesting=0"
-	 * is observable by a peer holder but results only in a wasted slot
-	 * RMB; no correctness impact.
-	 */
 	me_membership_clear_pending(me, shard_id);
 }
 
@@ -129,7 +126,6 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_shard *sh = &me->shards[s];
-
 		sh->cached_successor = successor;
 
 		/* Receiver doorbell: bump ⇒ peer granted token. */
@@ -160,9 +156,8 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-
 	/* Intra-node serialization (see order_acquire comment). */
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 	atomic_inc(&sh->local_waiters);
 	mutex_lock(&sh->local_lock);
 	atomic_dec(&sh->local_waiters);
@@ -185,10 +180,6 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	WRITE_LE32(rs->requesting, 1);
 	WRITE_LE64(rs->requested_at, ktime_get_ns());
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
-	/* Publish hand-up to holder via own membership bitmap AFTER the
-	 * slot WMB. Holders that see the bit are guaranteed to see a
-	 * fully-populated request slot on targeted RMB.
-	 */
 	me_membership_set_pending(me, shard_id);
 
 	int ret = marufs_me_wait_for_token(me, shard_id);
@@ -208,28 +199,18 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 
 static void request_release(struct marufs_me_instance *me, u32 shard_id)
 {
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-
 	ME_UNHOLD(me, shard_id);
 
-	/* Keep token if local threads are waiting — avoids cross-node
-	 * ping-pong for single-node-dominant workloads.
-	 *
-	 * Release ALWAYS scans — it is the primary grant path (poll thread
-	 * is only a backstop for crash takeover and long-idle cases). Any
-	 * DRAM-snapshot skip here would stall requests raised between the
-	 * last poll and this release for up to one poll interval.
-	 */
 	if (me_shard_passable(me, shard_id))
 		request_scan_and_grant(me, shard_id);
 
+	struct marufs_me_shard *sh = &me->shards[shard_id];
 	mutex_unlock(&sh->local_lock);
 }
 
 const struct marufs_me_ops marufs_me_request_ops = {
 	.acquire = request_acquire,
 	.release = request_release,
-	.try_acquire = marufs_me_common_try_acquire,
 	.poll_cycle = request_poll_cycle,
 	.join = marufs_me_common_join,
 	.leave = marufs_me_common_leave,

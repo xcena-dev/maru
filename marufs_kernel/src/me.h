@@ -199,12 +199,6 @@ struct marufs_me_ops {
 	void (*release)(struct marufs_me_instance *me, u32 shard_id);
 
 	/*
-	 * try_acquire - non-blocking acquire attempt.
-	 * Returns 0 if acquired, -EBUSY if held by another node.
-	 */
-	int (*try_acquire)(struct marufs_me_instance *me, u32 shard_id);
-
-	/*
 	 * poll_cycle - called periodically by poll thread.
 	 * Holder: heartbeat update, token pass if not holding.
 	 * Non-holder: heartbeat monitoring, crash detection,
@@ -407,6 +401,20 @@ static inline void me_cb_bump_acquire_count(struct marufs_me_cb *cb)
 {
 	WRITE_LE64(cb->acquire_count, READ_CXL_LE64(cb->acquire_count) + 1);
 	MARUFS_CXL_WMB(&cb->acquire_count, sizeof(cb->acquire_count));
+}
+
+/*
+ * me_cb_snapshot - RMB the CB cacheline and return (holder, generation).
+ * Pass NULL for @out_gen when only the holder is needed. A single RMB
+ * covers both fields (same CL), so callers wanting either one or both
+ * should prefer this helper over separate reads.
+ */
+static inline u32 me_cb_snapshot(struct marufs_me_cb *cb, u64 *out_gen)
+{
+	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	if (out_gen)
+		*out_gen = READ_CXL_LE64(cb->generation);
+	return READ_CXL_LE32(cb->holder);
 }
 
 /* Per-(shard, internal_idx) slot lookup in the instance's cached array. */
@@ -668,7 +676,6 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id);
  * marufs_me_common_* - strategy-independent ops implementations used by
  * both order-driven and request-driven vtables.
  */
-int marufs_me_common_try_acquire(struct marufs_me_instance *me, u32 shard_id);
 int marufs_me_common_join(struct marufs_me_instance *me);
 void marufs_me_common_leave(struct marufs_me_instance *me);
 
