@@ -61,8 +61,10 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	* keep ticking heartbeat in poll_cycle.
 	*/
 	struct marufs_me_shard *sh = &me->shards[shard_id];
-	if (ME_IS_HOLDER(sh))
+	if (ME_IS_HOLDER(sh)) {
+		me_stats_wait_fast_hit(me);
 		return 0;
+	}
 
 	struct marufs_me_slot *my_slot = me_my_slot(me, shard_id);
 	struct marufs_me_cb *cb = &me->cbs[shard_id];

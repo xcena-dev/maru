@@ -26,7 +26,7 @@ enum marufs_me_config {
 	MARUFS_ME_MAX_NODES = MARUFS_MAX_NODE_ID,
 	MARUFS_ME_GLOBAL_SHARDS = 1, /* Global ME: single shard */
 	MARUFS_ME_GLOBAL_SHARD_ID = 0, /* Global ME: shard index */
-	MARUFS_ME_DEFAULT_POLL_US = 50, /* default poll interval (us) */
+	MARUFS_ME_DEFAULT_POLL_US = 10, /* default poll interval (us) */
 	MARUFS_ME_SPIN_COUNT = 100, /* spins before usleep in acquire */
 };
 

@@ -56,6 +56,7 @@ struct marufs_me_stats_pcpu {
 	u64 wait_spin_hit;
 	u64 wait_sleep_hit;
 	u64 wait_deadline_hit;
+	u64 wait_fast_hit; /* ME_IS_HOLDER early-return (no token wait) */
 	u64 wait_lat_buckets[MARUFS_ME_LAT_BUCKETS];
 
 	/* poll_cycle phase breakdown (ns per invocation, summed) */
@@ -116,6 +117,18 @@ static inline u32 me_stats_lat_bucket(u64 ns)
 }
 
 /* ── Accessor helpers ──────────────────────────────────────────────── */
+
+/*
+ * me_stats_wait_fast_hit - wait_for_token early exit via ME_IS_HOLDER.
+ * Called before any token-wait work; paired with me_stats_wait_done
+ * which handles the full-wait exit paths. Tracking the split reveals
+ * how often the intra-node fast path avoids ME traffic entirely.
+ */
+static inline void me_stats_wait_fast_hit(struct marufs_me_instance *me)
+{
+	struct marufs_me_stats_pcpu *st = this_cpu_ptr(me->stats);
+	st->wait_fast_hit++;
+}
 
 /*
  * me_stats_wait_done - common exit accounting for wait_for_token.

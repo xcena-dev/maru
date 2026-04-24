@@ -814,6 +814,7 @@ static void me_stats_aggregate(struct marufs_me_instance *me,
 		out->wait_spin_hit += p->wait_spin_hit;
 		out->wait_sleep_hit += p->wait_sleep_hit;
 		out->wait_deadline_hit += p->wait_deadline_hit;
+		out->wait_fast_hit += p->wait_fast_hit;
 		out->poll_ns_membership += p->poll_ns_membership;
 		out->poll_ns_doorbell += p->poll_ns_doorbell;
 		out->poll_ns_scan += p->poll_ns_scan;
@@ -901,9 +902,9 @@ static ssize_t me_fine_stats_show(struct kobject *kobj,
 				agg.wait_cpu_ns);
 			len += sysfs_emit_at(
 				buf, len,
-				"    wait_hit spin=%llu sleep=%llu deadline=%llu\n",
+				"    wait_hit spin=%llu sleep=%llu deadline=%llu fast=%llu\n",
 				agg.wait_spin_hit, agg.wait_sleep_hit,
-				agg.wait_deadline_hit);
+				agg.wait_deadline_hit, agg.wait_fast_hit);
 			len = me_fine_stats_emit_buckets(buf, len,
 							 "wait_lat_buckets",
 							 agg.wait_lat_buckets,

@@ -953,6 +953,7 @@ struct fine_stats {
 	uint64_t wait_spin_hit;
 	uint64_t wait_sleep_hit;
 	uint64_t wait_deadline_hit;
+	uint64_t wait_fast_hit;
 	uint64_t poll_ns_mem;
 	uint64_t poll_ns_doorbell;
 	uint64_t poll_ns_scan;
@@ -974,7 +975,7 @@ static void read_fine_stats(struct fine_stats *out)
 		return;
 	char line[512];
 	while (fgets(line, sizeof(line), f)) {
-		uint64_t a, b, c;
+		uint64_t a, b, c, d;
 		const char *p;
 
 		/* Each metric line is uniquely identifiable by a leading token,
@@ -990,11 +991,12 @@ static void read_fine_stats(struct fine_stats *out)
 			out->wait_wall_ns += b;
 			out->wait_cpu_ns += c;
 		} else if ((p = strstr(line, "wait_hit spin=")) &&
-			   sscanf(p, "wait_hit spin=%lu sleep=%lu deadline=%lu",
-				  &a, &b, &c) == 3) {
+			   sscanf(p, "wait_hit spin=%lu sleep=%lu deadline=%lu fast=%lu",
+				  &a, &b, &c, &d) == 4) {
 			out->wait_spin_hit += a;
 			out->wait_sleep_hit += b;
 			out->wait_deadline_hit += c;
+			out->wait_fast_hit += d;
 		} else if ((p = strstr(line, "poll_ns mem=")) &&
 			   sscanf(p, "poll_ns mem=%lu doorbell=%lu scan=%lu",
 				  &a, &b, &c) == 3) {
@@ -1470,10 +1472,21 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 				fine_after.lock_hold_ns_total /
 					fine_after.lock_hold_count :
 				0;
-		printf("  wait: count=%lu avg_ns=%lu cpu_util=%u%% spin_hit=%u%% sleep=%lu deadline=%lu\n",
+		/* fast_hit = ME_IS_HOLDER early return (not counted in
+		 * wait_count); report as % of TOTAL acquire attempts.
+		 */
+		uint64_t acquire_total =
+			fine_after.wait_count + fine_after.wait_fast_hit;
+		uint32_t fast_pct =
+			acquire_total ?
+				(uint32_t)((fine_after.wait_fast_hit * 100) /
+					   acquire_total) :
+				0;
+		printf("  wait: count=%lu avg_ns=%lu cpu_util=%u%% spin_hit=%u%% sleep=%lu deadline=%lu fast=%lu (%u%%)\n",
 		       fine_after.wait_count, wait_avg, cpu_util_pct,
 		       spin_pct, fine_after.wait_sleep_hit,
-		       fine_after.wait_deadline_hit);
+		       fine_after.wait_deadline_hit,
+		       fine_after.wait_fast_hit, fast_pct);
 		printf("  lock_hold: count=%lu avg_ns=%lu  grant_age count=%lu  poll_ns mem=%lu door=%lu scan=%lu\n",
 		       fine_after.lock_hold_count, hold_avg,
 		       fine_after.grant_age_count, fine_after.poll_ns_mem,
@@ -1803,10 +1816,10 @@ int main(int argc, char *argv[])
 		 * raw totals so rows are comparable across strategies.
 		 */
 		printf("\n--- fine-grained ME stats ---\n");
-		printf("%-8s %-6s %-8s %12s %9s %5s %5s %9s %6s %7s %8s\n",
+		printf("%-8s %-6s %-8s %12s %9s %5s %5s %5s %9s %6s %7s %8s %5s %5s %5s\n",
 		       "strat", "shards", "entries", "wait_n", "wait_avg",
-		       "cpu%", "spin%", "hold_avg", "grant", "chain",
-		       "poll_cpu%");
+		       "cpu%", "spin%", "fast%", "hold_avg", "grant", "chain",
+		       "poll_cpu%", "mem%", "door%", "scan%");
 		for (size_t r = 0; r < n_results; r++) {
 			struct bench_result *br = &results[r];
 
@@ -1844,12 +1857,46 @@ int main(int argc, char *argv[])
 						   ((uint64_t)br->poll_cpu.wall_ns *
 						    br->poll_cpu.mount_count)) :
 					0;
+			/* Fast-path % = intra-node holder keep avoidance of
+			 * the whole wait_for_token body. High values → most
+			 * acquires resolve without ME traffic.
+			 */
+			uint64_t acq_total = wc + br->fine.wait_fast_hit;
+			uint32_t fast_pct =
+				acq_total ? (uint32_t)((br->fine.wait_fast_hit *
+							100) /
+						       acq_total) :
+					    0;
+			/* Poll phase breakdown: share of each sub-phase in
+			 * the aggregated poll_cycle time. Useful for tuning
+			 * — high mem% signals membership-pass dominance, etc.
+			 */
+			uint64_t poll_total = br->fine.poll_ns_mem +
+					      br->fine.poll_ns_doorbell +
+					      br->fine.poll_ns_scan;
+			uint32_t mem_pct =
+				poll_total ? (uint32_t)((br->fine.poll_ns_mem *
+							 100) /
+							poll_total) :
+					     0;
+			uint32_t door_pct =
+				poll_total ?
+					(uint32_t)((br->fine.poll_ns_doorbell *
+						    100) /
+						   poll_total) :
+					0;
+			uint32_t scan_pct =
+				poll_total ? (uint32_t)((br->fine.poll_ns_scan *
+							 100) /
+							poll_total) :
+					     0;
 
-			printf("%-8s %-6u %-8u %12lu %9lu %5u %5u %9lu %6lu %7lu %8u\n",
+			printf("%-8s %-6u %-8u %12lu %9lu %5u %5u %5u %9lu %6lu %7lu %8u %5u %5u %5u\n",
 			       br->strategy, br->cfg.num_shards,
 			       br->cfg.max_entries, wc, wait_avg, cpu_pct,
-			       spin_pct, hold_avg, br->fine.grant_age_count,
-			       chain_avg, poll_cpu_pct);
+			       spin_pct, fast_pct, hold_avg,
+			       br->fine.grant_age_count, chain_avg,
+			       poll_cpu_pct, mem_pct, door_pct, scan_pct);
 		}
 	} else {
 		if (strategy_mask & (1u << MARUFS_ME_ORDER))
