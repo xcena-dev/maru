@@ -32,8 +32,16 @@ enum marufs_me_config {
 
 /* Typed constants — kept as #define so their width is explicit. */
 #define MARUFS_ME_HOLDER_NONE ((u32)0xFFFFFFFF) /* no holder sentinel */
-#define MARUFS_ME_TIMEOUT_NS (5ULL * NSEC_PER_SEC) /* crash detection */
 #define MARUFS_ME_ACQUIRE_TIMEOUT_NS (5ULL * NSEC_PER_SEC)
+/* Liveness probe window for second-chance crash check (observer-local).
+ * On acquire deadline, sample holder's heartbeat counter, sleep this long
+ * on local clock, resample. Unchanged counter after this window ⇒ crash.
+ * Avoids cross-node ktime_get_ns() subtraction (local monotonic clocks
+ * have per-node boot-time zero points and can't be subtracted meaningfully
+ * across nodes sharing CXL memory). 100ms = 10000× default poll interval:
+ * even pathological scheduler stalls should still produce a tick within it.
+ */
+#define MARUFS_ME_LIVENESS_PROBE_NS (100ULL * NSEC_PER_MSEC)
 
 /* ── CXL Shared Memory Structures ─────────────────────────────────── */
 /* ME membership slot status */

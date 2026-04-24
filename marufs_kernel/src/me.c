@@ -46,6 +46,66 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
 /* ── Shared strategy primitives ───────────────────────────────────── */
 
 /*
+ * me_handle_acquire_deadline - post-deadline liveness probe + optional takeover.
+ *
+ * Returns 0 if we legitimately hold the token after this call (via takeover
+ * or a late grant that landed on us during the probe sleep). Returns
+ * -ETIMEDOUT if the holder is alive (contention) or another node already
+ * reclaimed the shard.
+ *
+ * Observer-local second-chance probe: sample holder's heartbeat counter,
+ * sleep on local clock, resample. Unchanged counter ⇒ holder stopped
+ * ticking ⇒ crash ⇒ self-takeover. Counter-based (not heartbeat_ts
+ * subtraction) because CXL peers don't share a monotonic clock origin.
+ */
+static int me_handle_acquire_deadline(struct marufs_me_instance *me,
+				      u32 shard_id,
+				      struct marufs_me_shard *sh,
+				      struct marufs_me_slot *my_slot,
+				      struct marufs_me_cb *cb)
+{
+	u32 holder = me_cb_snapshot(cb, NULL);
+	if (!marufs_me_is_valid_node(me, holder) || holder == me->node_id)
+		return -ETIMEDOUT;
+
+	struct marufs_me_membership_slot *hs = &me->membership[holder - 1];
+	MARUFS_CXL_RMB(hs, sizeof(*hs));
+	u64 hb_before = READ_CXL_LE64(hs->heartbeat);
+
+	/* Second-chance wait: sleep on local clock so the "elapsed" compared
+	 * below is observer-local, not cross-node subtraction.
+	 */
+	u64 probe_us = MARUFS_ME_LIVENESS_PROBE_NS / NSEC_PER_USEC;
+	usleep_range(probe_us, probe_us + probe_us / 4);
+	MARUFS_CXL_RMB(hs, sizeof(*hs));
+	u64 hb_after = READ_CXL_LE64(hs->heartbeat);
+
+	/* Re-read CB while we're here. Cheap (1 RMB) and catches two races that
+	 * occurred during the probe sleep:
+	 *   - A late grant landed on us ⇒ enter CS directly, skip takeover.
+	 *   - Another node already took over / the live holder passed elsewhere
+	 *     ⇒ back off; overwriting CB would only bump gen for no benefit.
+	 */
+	u64 cb_gen_after;
+	u32 holder_after = me_cb_snapshot(cb, &cb_gen_after);
+
+	if (holder_after == me->node_id && cb_gen_after > sh->last_cb_gen) {
+		sh->last_cb_gen = cb_gen_after;
+		sh->last_token_seq = READ_CXL_LE64(my_slot->token_seq);
+		ME_BECOME_HOLDER(sh);
+		return 0;
+	}
+
+	if (holder_after != holder || hb_after != hb_before)
+		return -ETIMEDOUT; /* holder changed or original still alive */
+
+	pr_warn("me: crash detected on shard %u (holder=%u, heartbeat stuck at %llu) — taking over\n",
+		shard_id, holder, hb_before);
+	me_pass_token(me, shard_id, me->node_id);
+	return 0;
+}
+
+/*
  * marufs_me_wait_for_token - poll own doorbell slot until token arrives.
  *
  * Reader order (acquire-side, mirrors me_pass_token's writer order):
@@ -109,27 +169,8 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 				     me->poll_interval_us);
 	}
 
-	/* Deadline expired — sole crash-recovery trigger. Take over iff
-	 * holder's heartbeat has stalled past the timeout.
-	 */
 	me_stats_wait_done(me, wall_start, cpu_start, MARUFS_ME_WAIT_DEADLINE);
-
-	u32 holder = me_cb_snapshot(cb, NULL);
-	if (!marufs_me_is_valid_node(me, holder) || holder == me->node_id)
-		return -ETIMEDOUT;
-
-	struct marufs_me_membership_slot *hs = &me->membership[holder - 1];
-	MARUFS_CXL_RMB(hs, sizeof(*hs));
-	u64 hb_ts = READ_CXL_LE64(hs->heartbeat_ts);
-	u64 elapsed = ktime_get_ns() - hb_ts;
-
-	if (elapsed < MARUFS_ME_TIMEOUT_NS)
-		return -ETIMEDOUT;
-
-	pr_warn("me: acquire timeout on shard %u, holder=%u heartbeat stalled %llums — taking over\n",
-		shard_id, holder, elapsed / 1000000);
-	me_pass_token(me, shard_id, me->node_id);
-	return 0;
+	return me_handle_acquire_deadline(me, shard_id, sh, my_slot, cb);
 }
 
 /*
