@@ -17,6 +17,7 @@
 
 #include "marufs.h"
 #include "me.h"
+#include "me_stats.h"
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -39,8 +40,11 @@ static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 		atomic64_inc(&me->poll_rmb_slot);
 
 		if (READ_CXL_LE32(rs->requesting)) {
-			WRITE_LE64(rs->granted_at, ktime_get_ns());
+			u64 now = ktime_get_ns();
+			u64 requested_at = READ_CXL_LE64(rs->requested_at);
+			WRITE_LE64(rs->granted_at, now);
 			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
+			me_stats_record_grant_age(me, now, requested_at);
 			me_pass_token(me, shard_id, idx + 1); /* ext node_id */
 			return true;
 		}
@@ -72,8 +76,11 @@ static bool request_scan_and_grant_masked(struct marufs_me_instance *me,
 		atomic64_inc(&me->poll_rmb_slot);
 
 		if (READ_CXL_LE32(rs->requesting)) {
-			WRITE_LE64(rs->granted_at, ktime_get_ns());
+			u64 now = ktime_get_ns();
+			u64 requested_at = READ_CXL_LE64(rs->requested_at);
+			WRITE_LE64(rs->granted_at, now);
 			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
+			me_stats_record_grant_age(me, now, requested_at);
 			me_pass_token(me, shard_id, idx + 1);
 			return true;
 		}
@@ -101,6 +108,8 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 	u32 successor = me->node_id;
 	bool successor_found = false;
 
+	u64 t0 = ktime_get_ns();
+
 	/* Single membership pass: gather pending masks + pick round-robin
 	 * successor. S×N → N membership RMBs/cycle vs. per-shard next_active.
 	 */
@@ -123,6 +132,9 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 			successor_found = true;
 		}
 	}
+
+	u64 t1 = ktime_get_ns();
+	u64 scan_ns_total = 0;
 
 	for (u32 s = 0; s < me->num_shards; s++) {
 		struct marufs_me_shard *sh = &me->shards[s];
@@ -147,9 +159,18 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 			me_membership_tick_heartbeat(me);
 			ticked_hb = true;
 		}
-		if (me_shard_passable(me, s) && (peers_pending & (1ULL << s)))
+		if (me_shard_passable(me, s) && (peers_pending & (1ULL << s))) {
+			u64 ts0 = ktime_get_ns();
 			request_scan_and_grant_masked(me, s, node_pending);
+			scan_ns_total += ktime_get_ns() - ts0;
+		}
 	}
+
+	u64 t2 = ktime_get_ns();
+	struct marufs_me_stats_pcpu *st = this_cpu_ptr(me->stats);
+	st->poll_ns_membership += t1 - t0;
+	st->poll_ns_scan += scan_ns_total;
+	st->poll_ns_doorbell += (t2 - t1) - scan_ns_total;
 }
 
 /* ── Acquire: write request slot, wait for grant ──────────────────── */
@@ -161,6 +182,8 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	atomic_inc(&sh->local_waiters);
 	mutex_lock(&sh->local_lock);
 	atomic_dec(&sh->local_waiters);
+	me_stats_lock_acquired(sh);
+	me_stats_bump_shard_acquire(me, shard_id);
 
 	/* Fast path: previous release kept the token. ME_HOLD's smp_mb()
 	 * pairs with poll_cycle's to close the holding/holder read race.
@@ -191,6 +214,7 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	}
 
 	ME_UNHOLD(me, shard_id);
+	me_stats_lock_released(me, sh);
 	mutex_unlock(&sh->local_lock);
 	return ret;
 }
@@ -205,6 +229,7 @@ static void request_release(struct marufs_me_instance *me, u32 shard_id)
 		request_scan_and_grant(me, shard_id);
 
 	struct marufs_me_shard *sh = &me->shards[shard_id];
+	me_stats_lock_released(me, sh);
 	mutex_unlock(&sh->local_lock);
 }
 

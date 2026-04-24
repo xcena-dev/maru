@@ -9,6 +9,8 @@
 
 #include "marufs.h"
 #include "me.h"
+#include "me_stats.h"
+#include "nrht_stats.h"
 
 static struct kobject *marufs_kobj;
 
@@ -790,6 +792,371 @@ static ssize_t me_poll_stats_store(struct kobject *kobj,
 static struct kobj_attribute me_poll_stats_attr =
 	__ATTR(me_poll_stats, 0644, me_poll_stats_show, me_poll_stats_store);
 
+/*
+ * Aggregate a per-CPU struct marufs_me_stats_pcpu into a zero-initialised
+ * output. Plain field-by-field sum across for_each_possible_cpu; cost
+ * scales with CPU count but runs only on sysfs read.
+ */
+static void me_stats_aggregate(struct marufs_me_instance *me,
+			       struct marufs_me_stats_pcpu *out)
+{
+	int cpu;
+
+	memset(out, 0, sizeof(*out));
+	if (!me->stats)
+		return;
+	for_each_possible_cpu(cpu) {
+		struct marufs_me_stats_pcpu *p = per_cpu_ptr(me->stats, cpu);
+
+		out->wait_count += p->wait_count;
+		out->wait_wall_ns += p->wait_wall_ns;
+		out->wait_cpu_ns += p->wait_cpu_ns;
+		out->wait_spin_hit += p->wait_spin_hit;
+		out->wait_sleep_hit += p->wait_sleep_hit;
+		out->wait_deadline_hit += p->wait_deadline_hit;
+		out->poll_ns_membership += p->poll_ns_membership;
+		out->poll_ns_doorbell += p->poll_ns_doorbell;
+		out->poll_ns_scan += p->poll_ns_scan;
+		out->lock_hold_count += p->lock_hold_count;
+		out->lock_hold_ns_total += p->lock_hold_ns_total;
+		out->grant_age_count += p->grant_age_count;
+		for (int b = 0; b < MARUFS_ME_LAT_BUCKETS; b++) {
+			out->wait_lat_buckets[b] += p->wait_lat_buckets[b];
+			out->lock_hold_buckets[b] += p->lock_hold_buckets[b];
+			out->grant_age_buckets[b] += p->grant_age_buckets[b];
+		}
+		for (int s = 0; s < MARUFS_NRHT_MAX_NUM_SHARDS; s++)
+			out->per_shard_acquire[s] += p->per_shard_acquire[s];
+	}
+}
+
+/*
+ * me_fine_stats_emit_buckets - shared helper for log2(ns) bucket rows.
+ * Prints " <bucket_name>=a/b/c/..." where each slot is one bucket count.
+ */
+static int me_fine_stats_emit_buckets(char *buf, int len, const char *name,
+				      const u64 *buckets, int nbuckets)
+{
+	len += sysfs_emit_at(buf, len, "    %s=[", name);
+	for (int i = 0; i < nbuckets; i++)
+		len += sysfs_emit_at(buf, len, "%s%llu", i ? "," : "",
+				     buckets[i]);
+	len += sysfs_emit_at(buf, len, "]\n");
+	return len;
+}
+
+/*
+ * /sys/fs/marufs/me_fine_stats - per-ME fine-grained counters.
+ *
+ * Aggregates per-CPU counters across all CPUs and emits a human-readable
+ * dump per registered ME instance. Covers:
+ *   - wait_for_token: count, wall+cpu ns, hit phase split, lat histogram
+ *   - poll_cycle phase breakdown (membership/doorbell/scan ns)
+ *   - lock hold time (sum + histogram)
+ *   - grant age histogram (request-mode)
+ *
+ * Per-shard acquire distribution and NRHT chain depth are exposed via
+ * dedicated nodes (me_per_shard_acquire, nrht_chain_depth).
+ *
+ * Write any value → zero all per-CPU counters across every ME.
+ */
+static ssize_t me_fine_stats_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int any_sbi = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi)
+			continue;
+
+		any_sbi = 1;
+		len += sysfs_emit_at(buf, len, "== node %u ==\n", sbi->node_id);
+
+		mutex_lock(&sbi->me_list_lock);
+		struct marufs_me_instance *me;
+
+		list_for_each_entry(me, &sbi->me_list, list_node) {
+			struct marufs_me_stats_pcpu agg;
+			me_stats_aggregate(me, &agg);
+
+			const char *tag = (me == sbi->me) ? "global" : "nrht";
+
+			/* Raw totals — consumers (bench harness) diff between
+			 * reset + read and compute avg/util themselves. One
+			 * key=value per line keeps parsing trivial.
+			 */
+			len += sysfs_emit_at(buf, len,
+					     "  %s shards=%u strategy=%s\n",
+					     tag, me->num_shards,
+					     me->strategy == MARUFS_ME_ORDER ?
+						     "order" :
+						     "request");
+			len += sysfs_emit_at(
+				buf, len,
+				"    wait count=%llu wall_ns=%llu cpu_ns=%llu\n",
+				agg.wait_count, agg.wait_wall_ns,
+				agg.wait_cpu_ns);
+			len += sysfs_emit_at(
+				buf, len,
+				"    wait_hit spin=%llu sleep=%llu deadline=%llu\n",
+				agg.wait_spin_hit, agg.wait_sleep_hit,
+				agg.wait_deadline_hit);
+			len = me_fine_stats_emit_buckets(buf, len,
+							 "wait_lat_buckets",
+							 agg.wait_lat_buckets,
+							 MARUFS_ME_LAT_BUCKETS);
+			len += sysfs_emit_at(
+				buf, len,
+				"    poll_ns mem=%llu doorbell=%llu scan=%llu\n",
+				agg.poll_ns_membership, agg.poll_ns_doorbell,
+				agg.poll_ns_scan);
+			len += sysfs_emit_at(
+				buf, len,
+				"    lock_hold count=%llu ns_total=%llu\n",
+				agg.lock_hold_count, agg.lock_hold_ns_total);
+			len = me_fine_stats_emit_buckets(buf, len,
+							 "lock_hold_buckets",
+							 agg.lock_hold_buckets,
+							 MARUFS_ME_LAT_BUCKETS);
+			len += sysfs_emit_at(buf, len,
+					     "    grant_age count=%llu\n",
+					     agg.grant_age_count);
+			len = me_fine_stats_emit_buckets(buf, len,
+							 "grant_age_buckets",
+							 agg.grant_age_buckets,
+							 MARUFS_ME_LAT_BUCKETS);
+
+			if (len > PAGE_SIZE - 512)
+				break;
+		}
+		mutex_unlock(&sbi->me_list_lock);
+		if (len > PAGE_SIZE - 512)
+			break;
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+
+	if (!any_sbi)
+		return sysfs_emit(buf, "No filesystem mounted\n");
+	if (len == 0)
+		return sysfs_emit(buf, "no ME instances\n");
+	return len;
+}
+
+static ssize_t me_fine_stats_store(struct kobject *kobj,
+				   struct kobj_attribute *attr, const char *buf,
+				   size_t count)
+{
+	int cpu;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+
+		if (!sbi)
+			continue;
+		mutex_lock(&sbi->me_list_lock);
+		struct marufs_me_instance *me;
+
+		list_for_each_entry(me, &sbi->me_list, list_node) {
+			if (!me->stats)
+				continue;
+			for_each_possible_cpu(cpu) {
+				memset(per_cpu_ptr(me->stats, cpu), 0,
+				       sizeof(struct marufs_me_stats_pcpu));
+			}
+		}
+		mutex_unlock(&sbi->me_list_lock);
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+	return count;
+}
+
+static struct kobj_attribute me_fine_stats_attr =
+	__ATTR(me_fine_stats, 0644, me_fine_stats_show, me_fine_stats_store);
+
+/*
+ * /sys/fs/marufs/me_per_shard_acquire - per-shard acquire hotspot.
+ *
+ * Exposed as "shard=count" lines, one per shard. Long output when
+ * num_shards is high; skip emitting zero-count shards to keep it tight.
+ *
+ * Reset handled by writing to me_fine_stats (shared per-CPU struct).
+ */
+static ssize_t me_per_shard_acquire_show(struct kobject *kobj,
+					 struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int any_sbi = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi)
+			continue;
+
+		any_sbi = 1;
+		len += sysfs_emit_at(buf, len, "== node %u ==\n", sbi->node_id);
+
+		mutex_lock(&sbi->me_list_lock);
+		struct marufs_me_instance *me;
+
+		list_for_each_entry(me, &sbi->me_list, list_node) {
+			struct marufs_me_stats_pcpu agg;
+			me_stats_aggregate(me, &agg);
+
+			const char *tag = (me == sbi->me) ? "global" : "nrht";
+			len += sysfs_emit_at(buf, len, "  %s shards=%u\n", tag,
+					     me->num_shards);
+			u32 cap = min_t(u32, me->num_shards,
+					MARUFS_NRHT_MAX_NUM_SHARDS);
+			for (u32 s = 0; s < cap; s++) {
+				if (!agg.per_shard_acquire[s])
+					continue;
+				len += sysfs_emit_at(
+					buf, len, "    shard=%u count=%llu\n",
+					s, agg.per_shard_acquire[s]);
+				if (len > PAGE_SIZE - 128)
+					break;
+			}
+		}
+		mutex_unlock(&sbi->me_list_lock);
+		if (len > PAGE_SIZE - 128)
+			break;
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+
+	if (!any_sbi)
+		return sysfs_emit(buf, "No filesystem mounted\n");
+	return len;
+}
+
+static struct kobj_attribute me_per_shard_acquire_attr =
+	__ATTR(me_per_shard_acquire, 0444, me_per_shard_acquire_show, NULL);
+
+/*
+ * /sys/fs/marufs/nrht_chain_depth - NRHT bucket-chain walk histogram.
+ *
+ * Write any value → reset across every sbi.
+ */
+static ssize_t nrht_chain_depth_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int any_sbi = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi || !sbi->nrht_stats)
+			continue;
+
+		any_sbi = 1;
+		struct marufs_nrht_stats_pcpu agg = { 0 };
+		int cpu;
+
+		for_each_possible_cpu(cpu) {
+			struct marufs_nrht_stats_pcpu *p =
+				per_cpu_ptr(sbi->nrht_stats, cpu);
+
+			agg.find_chain_count += p->find_chain_count;
+			agg.find_chain_steps_total += p->find_chain_steps_total;
+			for (int b = 0; b < MARUFS_NRHT_DEPTH_BUCKETS; b++)
+				agg.chain_depth_buckets[b] +=
+					p->chain_depth_buckets[b];
+		}
+
+		u64 avg_steps = agg.find_chain_count ?
+					agg.find_chain_steps_total /
+						agg.find_chain_count :
+					0;
+		len += sysfs_emit_at(
+			buf, len,
+			"node=%u find_chain count=%llu steps_total=%llu avg=%llu\n",
+			sbi->node_id, agg.find_chain_count,
+			agg.find_chain_steps_total, avg_steps);
+		len += sysfs_emit_at(buf, len, "  depth_log2=[");
+		for (int b = 0; b < MARUFS_NRHT_DEPTH_BUCKETS; b++)
+			len += sysfs_emit_at(buf, len, "%s%llu", b ? "," : "",
+					     agg.chain_depth_buckets[b]);
+		len += sysfs_emit_at(buf, len, "]\n");
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+
+	if (!any_sbi)
+		return sysfs_emit(buf, "No filesystem mounted\n");
+	return len;
+}
+
+static ssize_t nrht_chain_depth_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	int cpu;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+
+		if (!sbi || !sbi->nrht_stats)
+			continue;
+		for_each_possible_cpu(cpu) {
+			memset(per_cpu_ptr(sbi->nrht_stats, cpu), 0,
+			       sizeof(struct marufs_nrht_stats_pcpu));
+		}
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+	return count;
+}
+
+static struct kobj_attribute nrht_chain_depth_attr = __ATTR(
+	nrht_chain_depth, 0644, nrht_chain_depth_show, nrht_chain_depth_store);
+
+/*
+ * /sys/fs/marufs/me_poll_thread_cpu - cumulative on-CPU time of the
+ * per-sbi ME poll kthread.
+ *
+ * Emits one line per sbi:
+ *   node=<id> cpu_ns=<sum_exec_runtime> wall_ns=<ktime_get_ns>
+ *
+ * Consumer (bench harness) reads before and after a timed window;
+ * delta(cpu_ns) / delta(wall_ns) = per-CPU utilization of the poll
+ * thread (not wait-relative like me_fine_stats::cpu_ns). The cumulative
+ * `sum_exec_runtime` counter can't be reset, so diff-based sampling is
+ * mandatory. Read-only.
+ */
+static ssize_t me_poll_thread_cpu_show(struct kobject *kobj,
+				       struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int any_sbi = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi || !sbi->me_poll_thread)
+			continue;
+
+		any_sbi = 1;
+		u64 cpu_ns = sbi->me_poll_thread->se.sum_exec_runtime;
+		u64 wall_ns = ktime_get_ns();
+
+		len += sysfs_emit_at(buf, len,
+				     "node=%u cpu_ns=%llu wall_ns=%llu\n",
+				     sbi->node_id, cpu_ns, wall_ns);
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+
+	if (!any_sbi)
+		return sysfs_emit(buf, "No filesystem mounted\n");
+	return len;
+}
+
+static struct kobj_attribute me_poll_thread_cpu_attr =
+	__ATTR(me_poll_thread_cpu, 0444, me_poll_thread_cpu_show, NULL);
+
 /* /sys/fs/marufs/daxheap_bufid - expose buf_id for secondary mounts */
 #ifdef CONFIG_DAXHEAP
 extern u64 marufs_daxheap_bufid;
@@ -814,6 +1181,10 @@ static struct attribute *marufs_attrs[] = {
 	&gc_restart_attr.attr,
 	&me_info_attr.attr,
 	&me_poll_stats_attr.attr,
+	&me_fine_stats_attr.attr,
+	&me_per_shard_acquire_attr.attr,
+	&me_poll_thread_cpu_attr.attr,
+	&nrht_chain_depth_attr.attr,
 #ifdef CONFIG_DAXHEAP
 	&daxheap_bufid_attr.attr,
 #endif

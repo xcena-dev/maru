@@ -32,6 +32,7 @@
 #include "compat.h"
 #include "marufs.h"
 #include "me.h"
+#include "nrht_stats.h"
 
 /* Module parameter: node_id (must be > 0) */
 int marufs_node_id = 1;
@@ -1211,6 +1212,15 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 		return -EINVAL;
 	}
 
+	/* Fine-grained NRHT per-CPU stats (bucket-chain depth). alloc_percpu
+	 * zeroes every field; recorders check for NULL for safety.
+	 */
+	sbi->nrht_stats = alloc_percpu(struct marufs_nrht_stats_pcpu);
+	if (!sbi->nrht_stats) {
+		kfree(sbi);
+		return -ENOMEM;
+	}
+
 	/* Determine DAX mode from parsed options */
 	if (opts.use_daxheap) {
 		/* DAXHEAP path: WC mmap via daxheap buffer */
@@ -1289,6 +1299,7 @@ err_release_dax:
 	marufs_dax_release(sbi, sb);
 err_free_sbi:
 	marufs_free_shard_resources(sbi);
+	free_percpu(sbi->nrht_stats);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 	return ret;
@@ -1351,6 +1362,7 @@ static void marufs_kill_sb(struct super_block *sb)
 		/* Release DAX mapping */
 		marufs_dax_release(sbi, sb);
 
+		free_percpu(sbi->nrht_stats);
 		kfree(sbi);
 	}
 

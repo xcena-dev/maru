@@ -34,6 +34,7 @@
 #include <linux/types.h>
 
 #include "marufs.h"
+#include "nrht_stats.h"
 
 /* ============================================================================
  * Shard view — transient CXL pointer set for one shard
@@ -45,6 +46,10 @@ struct nrht_shard_ctx {
 	u32 *bucket_head;
 	u32 num_entries;
 	u32 shard_id; /* needed for ME acquire/release */
+	/* Direct handle to sbi-level per-CPU stats — avoids threading
+	 * sbi through just for instrumentation. Set once in ctx init.
+	 */
+	struct marufs_nrht_stats_pcpu __percpu *stats;
 };
 
 /* ============================================================================
@@ -173,6 +178,7 @@ static int nrht_get_shard_ctx(struct marufs_sb_info *sbi,
 	struct marufs_nrht_shard_header *sh = nrht_shard_header(nrht, shard_id);
 
 	out->header = sh;
+	out->stats = sbi->nrht_stats;
 	out->num_entries = READ_CXL_LE32(sh->num_entries);
 
 	u32 num_buckets = READ_CXL_LE32(sh->num_buckets);
@@ -317,6 +323,7 @@ static struct marufs_nrht_entry *nrht_find_chain(struct nrht_shard_ctx *ctx,
 	while (cur != MARUFS_BUCKET_END && cur < ctx->num_entries) {
 		if (++steps > ctx->num_entries) {
 			pr_err("nrht: chain cycle detected\n");
+			nrht_stats_record_chain_depth(ctx->stats, steps);
 			return NULL;
 		}
 
@@ -334,6 +341,8 @@ static struct marufs_nrht_entry *nrht_find_chain(struct nrht_shard_ctx *ctx,
 					*out_idx = cur;
 				if (out_prev_next)
 					*out_prev_next = prev_next;
+				nrht_stats_record_chain_depth(ctx->stats,
+							      steps);
 				return e;
 			}
 		}
@@ -342,6 +351,7 @@ static struct marufs_nrht_entry *nrht_find_chain(struct nrht_shard_ctx *ctx,
 		cur = next;
 	}
 
+	nrht_stats_record_chain_depth(ctx->stats, steps);
 	return NULL;
 }
 

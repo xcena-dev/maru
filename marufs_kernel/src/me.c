@@ -13,6 +13,7 @@
 
 #include "marufs.h"
 #include "me.h"
+#include "me_stats.h"
 
 /* ── next_active: scan membership slots for next ACTIVE node ──────── */
 
@@ -65,7 +66,9 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 
 	struct marufs_me_slot *my_slot = me_my_slot(me, shard_id);
 	struct marufs_me_cb *cb = &me->cbs[shard_id];
-	u64 deadline = ktime_get_ns() + MARUFS_ME_ACQUIRE_TIMEOUT_NS;
+	u64 wall_start = ktime_get_ns();
+	u64 cpu_start = me_stats_cpu_ns();
+	u64 deadline = wall_start + MARUFS_ME_ACQUIRE_TIMEOUT_NS;
 	u32 spins = 0;
 	while (ktime_get_ns() < deadline) {
 		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
@@ -82,6 +85,11 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 				sh->last_token_seq = cur_seq;
 				sh->last_cb_gen = cb_gen;
 				ME_BECOME_HOLDER(sh);
+				me_stats_wait_done(
+					me, wall_start, cpu_start,
+					spins < MARUFS_ME_SPIN_COUNT ?
+						MARUFS_ME_WAIT_SPIN :
+						MARUFS_ME_WAIT_SLEEP);
 				return 0;
 			}
 			/* Phantom: seq advanced but CB not for us. Advance
@@ -102,6 +110,8 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 	/* Deadline expired — sole crash-recovery trigger. Take over iff
 	 * holder's heartbeat has stalled past the timeout.
 	 */
+	me_stats_wait_done(me, wall_start, cpu_start, MARUFS_ME_WAIT_DEADLINE);
+
 	u32 holder = me_cb_snapshot(cb, NULL);
 	if (!marufs_me_is_valid_node(me, holder) || holder == me->node_id)
 		return -ETIMEDOUT;
@@ -400,6 +410,13 @@ struct marufs_me_instance *marufs_me_create(void *me_area_base, u32 num_shards,
 	for (u32 s = 0; s < num_shards; s++)
 		mutex_init(&me->shards[s].local_lock);
 
+	/* Fine-grained per-CPU stats. alloc_percpu zeroes all fields. */
+	me->stats = alloc_percpu(struct marufs_me_stats_pcpu);
+	if (!me->stats) {
+		marufs_me_destroy(me);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	atomic_set(&me->active, 0);
 	INIT_LIST_HEAD(&me->list_node);
 
@@ -414,6 +431,7 @@ void marufs_me_destroy(struct marufs_me_instance *me)
 	/* Caller must have unregistered first; this is a safety net. */
 	WARN_ON_ONCE(!list_empty(&me->list_node));
 
+	free_percpu(me->stats);
 	kfree(me->shards);
 	kfree(me);
 }

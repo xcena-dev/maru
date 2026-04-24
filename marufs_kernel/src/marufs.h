@@ -212,6 +212,12 @@ struct marufs_sb_info {
 	struct list_head me_list;
 	struct mutex me_list_lock;
 	struct task_struct *me_poll_thread;
+
+	/* Fine-grained NRHT per-CPU stats (bucket-chain depth). Full layout
+	 * and helpers in nrht_stats.h. May be NULL before initial alloc;
+	 * recorders guard for that.
+	 */
+	struct marufs_nrht_stats_pcpu __percpu *nrht_stats;
 };
 
 /* ============================================================================

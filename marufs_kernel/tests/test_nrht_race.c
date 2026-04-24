@@ -926,14 +926,165 @@ struct poll_stats {
 };
 
 /* Write-any-value resets all ME counters across all mounted marufs sbis. */
-static void reset_poll_stats(void)
+static void reset_sysfs_counter(const char *path)
 {
-	int fd = open("/sys/fs/marufs/me_poll_stats", O_WRONLY);
+	int fd = open(path, O_WRONLY);
 	if (fd < 0)
 		return;
 	ssize_t w = write(fd, "0\n", 2);
 	(void)w;
 	close(fd);
+}
+
+static void reset_poll_stats(void)
+{
+	reset_sysfs_counter("/sys/fs/marufs/me_poll_stats");
+}
+
+/*
+ * Fine-grained ME stats — aggregated scalar totals (raw, not averaged).
+ * Populated from /sys/fs/marufs/me_fine_stats; bench harness diffs
+ * between reset + read windows.
+ */
+struct fine_stats {
+	uint64_t wait_count;
+	uint64_t wait_wall_ns;
+	uint64_t wait_cpu_ns;
+	uint64_t wait_spin_hit;
+	uint64_t wait_sleep_hit;
+	uint64_t wait_deadline_hit;
+	uint64_t poll_ns_mem;
+	uint64_t poll_ns_doorbell;
+	uint64_t poll_ns_scan;
+	uint64_t lock_hold_count;
+	uint64_t lock_hold_ns_total;
+	uint64_t grant_age_count;
+};
+
+static void reset_fine_stats(void)
+{
+	reset_sysfs_counter("/sys/fs/marufs/me_fine_stats");
+}
+
+static void read_fine_stats(struct fine_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	FILE *f = fopen("/sys/fs/marufs/me_fine_stats", "r");
+	if (!f)
+		return;
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		uint64_t a, b, c;
+		const char *p;
+
+		/* Each metric line is uniquely identifiable by a leading token,
+		 * so scan for that token then sscanf the matching fields. The
+		 * per-ME iteration accumulates across all instances (global +
+		 * NRHT) — acceptable because the bench targets NRHT traffic and
+		 * the Global ME contributes negligibly.
+		 */
+		if ((p = strstr(line, "wait count=")) &&
+		    sscanf(p, "wait count=%lu wall_ns=%lu cpu_ns=%lu",
+			   &a, &b, &c) == 3) {
+			out->wait_count += a;
+			out->wait_wall_ns += b;
+			out->wait_cpu_ns += c;
+		} else if ((p = strstr(line, "wait_hit spin=")) &&
+			   sscanf(p, "wait_hit spin=%lu sleep=%lu deadline=%lu",
+				  &a, &b, &c) == 3) {
+			out->wait_spin_hit += a;
+			out->wait_sleep_hit += b;
+			out->wait_deadline_hit += c;
+		} else if ((p = strstr(line, "poll_ns mem=")) &&
+			   sscanf(p, "poll_ns mem=%lu doorbell=%lu scan=%lu",
+				  &a, &b, &c) == 3) {
+			out->poll_ns_mem += a;
+			out->poll_ns_doorbell += b;
+			out->poll_ns_scan += c;
+		} else if ((p = strstr(line, "lock_hold count=")) &&
+			   sscanf(p, "lock_hold count=%lu ns_total=%lu", &a,
+				  &b) == 2) {
+			out->lock_hold_count += a;
+			out->lock_hold_ns_total += b;
+		} else if ((p = strstr(line, "grant_age count=")) &&
+			   sscanf(p, "grant_age count=%lu", &a) == 1) {
+			out->grant_age_count += a;
+		}
+	}
+	fclose(f);
+}
+
+/*
+ * NRHT bucket-chain walk stats — aggregated find_chain totals.
+ * One line per sbi in /sys/fs/marufs/nrht_chain_depth.
+ */
+struct chain_stats {
+	uint64_t find_chain_count;
+	uint64_t find_chain_steps_total;
+};
+
+static void reset_chain_stats(void)
+{
+	reset_sysfs_counter("/sys/fs/marufs/nrht_chain_depth");
+}
+
+static void read_chain_stats(struct chain_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	FILE *f = fopen("/sys/fs/marufs/nrht_chain_depth", "r");
+	if (!f)
+		return;
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		uint64_t a, b;
+		const char *p;
+
+		if ((p = strstr(line, "find_chain count=")) &&
+		    sscanf(p, "find_chain count=%lu steps_total=%lu", &a,
+			   &b) == 2) {
+			out->find_chain_count += a;
+			out->find_chain_steps_total += b;
+		}
+	}
+	fclose(f);
+}
+
+/*
+ * Poll kthread cumulative on-CPU + wall snapshot. Read before + after a
+ * timed window; diff gives poll_thread_cpu_util (per-CPU). Kthread's
+ * sum_exec_runtime is cumulative and cannot be reset, so snapshot-based
+ * sampling is mandatory.
+ */
+struct poll_thread_cpu {
+	uint64_t cpu_ns; /* summed across all poll kthreads (all sbis) */
+	uint64_t wall_ns; /* monotonic clock at sample time (sbis share it) */
+	uint32_t mount_count; /* number of sbis contributing to cpu_ns */
+};
+
+static void read_poll_thread_cpu(struct poll_thread_cpu *out)
+{
+	memset(out, 0, sizeof(*out));
+	FILE *f = fopen("/sys/fs/marufs/me_poll_thread_cpu", "r");
+	if (!f)
+		return;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		uint64_t cpu, wall;
+		const char *p;
+
+		if ((p = strstr(line, "cpu_ns=")) &&
+		    sscanf(p, "cpu_ns=%lu wall_ns=%lu", &cpu, &wall) == 2) {
+			out->cpu_ns += cpu;
+			/* All sbis share the monotonic clock, so any line's
+			 * wall_ns is valid. Take the max to absorb any stale
+			 * read ordering.
+			 */
+			if (wall > out->wall_ns)
+				out->wall_ns = wall;
+			out->mount_count++;
+		}
+	}
+	fclose(f);
 }
 
 static void read_poll_stats(struct poll_stats *out)
@@ -972,6 +1123,9 @@ struct bench_result {
 	uint64_t wall_ns;
 	struct op_stats insert, find, del;
 	struct poll_stats poll;
+	struct fine_stats fine;
+	struct chain_stats chain;
+	struct poll_thread_cpu poll_cpu; /* delta between bench start/end */
 	int valid;
 };
 
@@ -1248,6 +1402,13 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	 * bench's steady-state poll traffic.
 	 */
 	reset_poll_stats();
+	reset_fine_stats();
+	reset_chain_stats();
+	/* Poll kthread runtime is cumulative and unresettable — snapshot
+	 * before + after and diff.
+	 */
+	struct poll_thread_cpu ptcpu_before;
+	read_poll_thread_cpu(&ptcpu_before);
 
 	wall_start = now_ns();
 	for (int i = 0; i < NUM_WORKERS; i++)
@@ -1258,8 +1419,20 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	wall_elapsed = now_ns() - wall_start;
 
 	struct poll_stats poll_after;
+	struct fine_stats fine_after;
+	struct chain_stats chain_after;
+	struct poll_thread_cpu ptcpu_after;
 
 	read_poll_stats(&poll_after);
+	read_fine_stats(&fine_after);
+	read_chain_stats(&chain_after);
+	read_poll_thread_cpu(&ptcpu_after);
+
+	struct poll_thread_cpu ptcpu_delta = {
+		.cpu_ns = ptcpu_after.cpu_ns - ptcpu_before.cpu_ns,
+		.wall_ns = ptcpu_after.wall_ns - ptcpu_before.wall_ns,
+		.mount_count = ptcpu_after.mount_count,
+	};
 
 	for (int i = 0; i < NUM_WORKERS; i++) {
 		close(ready_pipes[i][0]);
@@ -1281,6 +1454,51 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	       poll_after.rmb_cb, poll_after.rmb_slot,
 	       poll_after.rmb_membership);
 
+	/* Fine-grained stats — acquire latency, CPU util, wait phase split. */
+	if (fine_after.wait_count > 0) {
+		uint64_t wait_avg = fine_after.wait_wall_ns /
+				    fine_after.wait_count;
+		uint32_t cpu_util_pct =
+			fine_after.wait_wall_ns ?
+				(uint32_t)((fine_after.wait_cpu_ns * 100) /
+					   fine_after.wait_wall_ns) :
+				0;
+		uint32_t spin_pct = (uint32_t)((fine_after.wait_spin_hit * 100) /
+					       fine_after.wait_count);
+		uint64_t hold_avg =
+			fine_after.lock_hold_count ?
+				fine_after.lock_hold_ns_total /
+					fine_after.lock_hold_count :
+				0;
+		printf("  wait: count=%lu avg_ns=%lu cpu_util=%u%% spin_hit=%u%% sleep=%lu deadline=%lu\n",
+		       fine_after.wait_count, wait_avg, cpu_util_pct,
+		       spin_pct, fine_after.wait_sleep_hit,
+		       fine_after.wait_deadline_hit);
+		printf("  lock_hold: count=%lu avg_ns=%lu  grant_age count=%lu  poll_ns mem=%lu door=%lu scan=%lu\n",
+		       fine_after.lock_hold_count, hold_avg,
+		       fine_after.grant_age_count, fine_after.poll_ns_mem,
+		       fine_after.poll_ns_doorbell, fine_after.poll_ns_scan);
+	}
+	if (chain_after.find_chain_count > 0) {
+		uint64_t depth_avg = chain_after.find_chain_steps_total /
+				     chain_after.find_chain_count;
+		printf("  nrht_chain: count=%lu avg_depth=%lu\n",
+		       chain_after.find_chain_count, depth_avg);
+	}
+	if (ptcpu_delta.wall_ns > 0 && ptcpu_delta.mount_count > 0) {
+		/* Per-poll-thread utilization: cpu_ns is the sum across all
+		 * sbi poll kthreads, so divide by mount_count to express it
+		 * as % of one CPU per thread. 100% → one core saturated.
+		 */
+		uint64_t denom =
+			(uint64_t)ptcpu_delta.wall_ns * ptcpu_delta.mount_count;
+		uint32_t util_pct =
+			(uint32_t)((ptcpu_delta.cpu_ns * 100) / denom);
+		printf("  poll_thread: cpu_ns=%lu wall_ns=%lu mounts=%u util=%u%% (per-thread avg)\n",
+		       ptcpu_delta.cpu_ns, ptcpu_delta.wall_ns,
+		       ptcpu_delta.mount_count, util_pct);
+	}
+
 	if (out) {
 		out->cfg = *cfg;
 		snprintf(out->strategy, sizeof(out->strategy), "%s",
@@ -1290,6 +1508,9 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 		out->find = s_find;
 		out->del = s_del;
 		out->poll = poll_after;
+		out->fine = fine_after;
+		out->chain = chain_after;
+		out->poll_cpu = ptcpu_delta;
 		out->valid = 1;
 	}
 
@@ -1555,7 +1776,7 @@ int main(int argc, char *argv[])
 		 * when per-cycle cost drops.
 		 */
 		printf("\n--- poll-thread cost (aggregated across all mounts) ---\n");
-		printf("%-8s %-8s %-8s %12s %10s %10s %10s %10s %10s %10s\n",
+		printf("%-8s %-6s %-8s %12s %9s %8s %8s %8s %10s %10s\n",
 		       "strat", "shards", "entries", "cycles", "ns_avg",
 		       "cb/c", "slot/c", "mem/c", "rmb_slot", "rmb_mem");
 		for (size_t r = 0; r < n_results; r++) {
@@ -1570,11 +1791,65 @@ int main(int argc, char *argv[])
 			double mem_pc =
 				c ? (double)br->poll.rmb_membership / c : 0;
 
-			printf("%-8s %-8u %-8u %12lu %10.1f %10.2f %10.2f %10.2f %10lu %10lu\n",
+			printf("%-8s %-6u %-8u %12lu %9.1f %8.2f %8.2f %8.2f %10lu %10lu\n",
 			       br->strategy, br->cfg.num_shards,
 			       br->cfg.max_entries, c, ns_avg, cb_pc, slot_pc,
 			       mem_pc, br->poll.rmb_slot,
 			       br->poll.rmb_membership);
+		}
+
+		/* Fine-grained acquire metrics — wait latency / cpu util /
+		 * spin-hit ratio / lock hold / chain depth. All averaged from
+		 * raw totals so rows are comparable across strategies.
+		 */
+		printf("\n--- fine-grained ME stats ---\n");
+		printf("%-8s %-6s %-8s %12s %9s %5s %5s %9s %6s %7s %8s\n",
+		       "strat", "shards", "entries", "wait_n", "wait_avg",
+		       "cpu%", "spin%", "hold_avg", "grant", "chain",
+		       "poll_cpu%");
+		for (size_t r = 0; r < n_results; r++) {
+			struct bench_result *br = &results[r];
+
+			if (!br->valid)
+				continue;
+			uint64_t wc = br->fine.wait_count;
+			uint64_t wait_avg = wc ? br->fine.wait_wall_ns / wc : 0;
+			uint32_t cpu_pct =
+				br->fine.wait_wall_ns ?
+					(uint32_t)((br->fine.wait_cpu_ns * 100) /
+						   br->fine.wait_wall_ns) :
+					0;
+			uint32_t spin_pct =
+				wc ? (uint32_t)((br->fine.wait_spin_hit * 100) /
+						wc) :
+				     0;
+			uint64_t hold_avg =
+				br->fine.lock_hold_count ?
+					br->fine.lock_hold_ns_total /
+						br->fine.lock_hold_count :
+					0;
+			uint64_t chain_avg =
+				br->chain.find_chain_count ?
+					br->chain.find_chain_steps_total /
+						br->chain.find_chain_count :
+					0;
+			/* Per-poll-thread utilization (avg across all sbi
+			 * poll kthreads). cpu_ns sums across mounts, so
+			 * divide by (wall × mounts) to normalize.
+			 */
+			uint32_t poll_cpu_pct =
+				(br->poll_cpu.wall_ns &&
+				 br->poll_cpu.mount_count) ?
+					(uint32_t)((br->poll_cpu.cpu_ns * 100) /
+						   ((uint64_t)br->poll_cpu.wall_ns *
+						    br->poll_cpu.mount_count)) :
+					0;
+
+			printf("%-8s %-6u %-8u %12lu %9lu %5u %5u %9lu %6lu %7lu %8u\n",
+			       br->strategy, br->cfg.num_shards,
+			       br->cfg.max_entries, wc, wait_avg, cpu_pct,
+			       spin_pct, hold_avg, br->fine.grant_age_count,
+			       chain_avg, poll_cpu_pct);
 		}
 	} else {
 		if (strategy_mask & (1u << MARUFS_ME_ORDER))

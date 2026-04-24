@@ -245,7 +245,20 @@ struct marufs_me_shard {
 	u64 poll_last_slot_seq;
 	u64 last_token_seq;
 	u64 last_cb_gen;
+
+	/* Timestamp captured by acquire() just after mutex_lock; consumed by
+	 * release() to record CS hold time. Valid only while the local_lock
+	 * is held (single owner). Non-volatile; torn reads are impossible
+	 * because only the owner reads/writes it.
+	 */
+	u64 lock_hold_start_ns;
 };
+
+/* Fine-grained per-CPU stats — full layout and helpers in me_stats.h.
+ * Forward-declared here so marufs_me_instance can hold the pointer
+ * without pulling in the stats machinery.
+ */
+struct marufs_me_stats_pcpu;
 
 /* ── ME Instance (per-mount, DRAM) ────────────────────────────────── */
 
@@ -279,6 +292,12 @@ struct marufs_me_instance {
 	atomic64_t poll_rmb_cb;
 	atomic64_t poll_rmb_slot;
 	atomic64_t poll_rmb_membership;
+
+	/* Fine-grained per-CPU stats (latency histos, hit buckets, per-shard).
+	 * Allocated in marufs_me_create, freed in marufs_me_destroy. See
+	 * struct marufs_me_stats_pcpu for field layout.
+	 */
+	struct marufs_me_stats_pcpu __percpu *stats;
 
 	/* Active flag — cleared on destroy, checked by registry poll thread */
 	atomic_t active; /* 0 = shutdown, 1 = serving polls */
@@ -378,10 +397,10 @@ struct marufs_me_instance {
  * baseline stores published by the writer are visible once is_holder
  * reads true.
  */
-#define ME_IS_HOLDER(sh)        \
-	({                      \
-		smp_rmb();      \
-		(sh)->is_holder;\
+#define ME_IS_HOLDER(sh)         \
+	({                       \
+		smp_rmb();       \
+		(sh)->is_holder; \
 	})
 
 /*

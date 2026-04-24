@@ -19,13 +19,17 @@
 
 #include "marufs.h"
 #include "me.h"
+#include "me_stats.h"
 
 /* ── Poll cycle ───────────────────────────────────────────────────── */
 
 static void order_poll_cycle(struct marufs_me_instance *me)
 {
 	bool ticked_hb = false;
+	u64 t0 = ktime_get_ns();
 	u32 successor = marufs_me_next_active(me, me->node_id);
+	u64 t1 = ktime_get_ns();
+	u64 scan_ns_total = 0;
 
 	for (u32 s = 0; s < me->num_shards; s++) {
 		/* Receiver doorbell: bump ⇒ peer passed token. */
@@ -48,9 +52,18 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 			me_membership_tick_heartbeat(me);
 			ticked_hb = true;
 		}
-		if (me_shard_passable(me, s) && successor != me->node_id)
+		if (me_shard_passable(me, s) && successor != me->node_id) {
+			u64 ts0 = ktime_get_ns();
 			me_pass_token(me, s, successor);
+			scan_ns_total += ktime_get_ns() - ts0;
+		}
 	}
+
+	u64 t2 = ktime_get_ns();
+	struct marufs_me_stats_pcpu *st = this_cpu_ptr(me->stats);
+	st->poll_ns_membership += t1 - t0;
+	st->poll_ns_scan += scan_ns_total;
+	st->poll_ns_doorbell += (t2 - t1) - scan_ns_total;
 }
 
 /* ── Acquire: wait for token arrival ──────────────────────────────── */
@@ -64,6 +77,8 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 	atomic_inc(&sh->local_waiters);
 	mutex_lock(&sh->local_lock);
 	atomic_dec(&sh->local_waiters);
+	me_stats_lock_acquired(sh);
+	me_stats_bump_shard_acquire(me, shard_id);
 
 	ME_HOLD(me, shard_id);
 
@@ -74,6 +89,7 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 	}
 
 	ME_UNHOLD(me, shard_id);
+	me_stats_lock_released(me, sh);
 	mutex_unlock(&sh->local_lock);
 	return ret;
 }
@@ -101,6 +117,7 @@ static void order_release(struct marufs_me_instance *me, u32 shard_id)
 			me_pass_token(me, shard_id, succ);
 	}
 
+	me_stats_lock_released(me, sh);
 	mutex_unlock(&sh->local_lock);
 }
 
