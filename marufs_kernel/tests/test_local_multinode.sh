@@ -1306,6 +1306,33 @@ fi
 echo ""
 
 # ============================================================================
+# Section 30: ME Crash Detection (T1-T7)
+# ============================================================================
+# Delegates to standalone test_me_crash.sh. Exercises poll-freeze fault
+# injection: takeover timing, false-positive suppression, late-grant /
+# ETIMEDOUT paths, concurrent takeover race, post-takeover sanity.
+#
+# Runs last because:
+#   - manipulates dmesg ring (uses dmesg -C)
+#   - T1 saturates CPU with stress-ng (soft dep — self-skips if absent)
+#   - T5 needs ≥3 mounts (self-skips if /mnt/marufs3 absent)
+#   - ~50s total runtime
+echo -e "${YELLOW}=== Section 30: ME Crash Detection ===${NC}"
+
+ME_CRASH_SCRIPT="$SCRIPT_DIR/test_me_crash.sh"
+if [ -x "$ME_CRASH_SCRIPT" ] \
+    && [ -w "/sys/fs/marufs/debug/me_freeze_heartbeat" ] \
+    && [ "$(id -u)" -eq 0 ]; then
+    run_test "ME crash detection (T1-T7, ~50s)" '
+        bash "$ME_CRASH_SCRIPT" 2>&1
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_me_crash.sh missing, fault-inject sysfs absent, or not root)"
+fi
+
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "============================================"
