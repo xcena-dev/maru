@@ -25,6 +25,12 @@
 
 static void order_poll_cycle(struct marufs_me_instance *me)
 {
+	/* Fault injection: simulate a crashed node — skip the entire cycle
+	 * (no heartbeat, no grant, no doorbell handling).
+	 */
+	if (atomic_read(&me->debug_freeze_poll))
+		return;
+
 	bool ticked_hb = false;
 	u64 t0 = ktime_get_ns();
 	u32 successor = marufs_me_next_active(me, me->node_id);

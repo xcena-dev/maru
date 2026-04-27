@@ -78,7 +78,7 @@ static int trigger_gc(const char *sysfs_dir)
 {
     char path[512];
     int fd;
-    snprintf(path, sizeof(path), "%s/gc_trigger", sysfs_dir);
+    snprintf(path, sizeof(path), "%s/debug/gc_trigger", sysfs_dir);
     fd = open(path, O_WRONLY);
     if (fd < 0)
         return -1;

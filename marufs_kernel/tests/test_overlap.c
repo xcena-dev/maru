@@ -168,7 +168,7 @@ static void cleanup_files(const char *mount_a, const char *mount_b,
      * nodeB files owned by dead child process — trigger GC to reclaim.
      * Parent can't unlink them (owner_pid mismatch).
      */
-    snprintf(gc_path, sizeof(gc_path), "%.*s/gc_trigger",
+    snprintf(gc_path, sizeof(gc_path), "%.*s/debug/gc_trigger",
              (int)(strrchr(sysfs_path, '/') - sysfs_path), sysfs_path);
     {
         int fd = open(gc_path, O_WRONLY);

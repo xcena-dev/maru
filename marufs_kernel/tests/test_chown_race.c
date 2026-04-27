@@ -206,7 +206,7 @@ static void test_chown_gc_race(const char* mount, unsigned node_id,
                                 __u64 data_size)
 {
     char filepath[512];
-    char gc_trigger[] = "/sys/fs/marufs/gc_trigger";
+    char gc_trigger[] = "/sys/fs/marufs/debug/gc_trigger";
     int fd, ret;
     int gc_fd;
 

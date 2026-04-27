@@ -307,6 +307,15 @@ struct marufs_me_instance {
 	 */
 	struct marufs_me_stats_pcpu __percpu *stats;
 
+	/* Test-only fault injection. When non-zero, the poll thread treats
+	 * this ME as dead: no heartbeat tick, no grant scan, no doorbell
+	 * handling. Peers' acquire deadline path then exercises the
+	 * counter-based liveness probe and self-takeover end-to-end.
+	 * Toggled via /sys/fs/marufs/me_freeze_heartbeat (node_id-scoped).
+	 * Overhead: one atomic_read per poll cycle — negligible.
+	 */
+	atomic_t debug_freeze_poll;
+
 	/* Active flag — cleared on destroy, checked by registry poll thread */
 	atomic_t active; /* 0 = shutdown, 1 = serving polls */
 

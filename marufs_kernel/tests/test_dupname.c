@@ -109,7 +109,7 @@ static void cleanup_file(const char *mount, const char *filename,
     unlink(path);
 
     /* Trigger GC to clean up dead-process files */
-    snprintf(gc_path, sizeof(gc_path), "%.*s/gc_trigger",
+    snprintf(gc_path, sizeof(gc_path), "%.*s/debug/gc_trigger",
              (int)(strrchr(sysfs_path, '/') - sysfs_path), sysfs_path);
     {
         int fd = open(gc_path, O_WRONLY);

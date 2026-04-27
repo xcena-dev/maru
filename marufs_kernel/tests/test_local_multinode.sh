@@ -342,7 +342,7 @@ done
 # Pause GC to prevent dead-process reclamation during tests.
 # Files created by short-lived processes (touch) would be reclaimed by GC
 # before the test can verify them.
-GC_PAUSE_FILE="/sys/fs/${MODULE_NAME}/gc_pause"
+GC_PAUSE_FILE="/sys/fs/${MODULE_NAME}/debug/gc_pause"
 GC_PAUSED=false
 if [ -f "$GC_PAUSE_FILE" ]; then
     if bash -c "echo 1 > '$GC_PAUSE_FILE'" 2>/dev/null; then
@@ -544,7 +544,7 @@ echo ""
 echo -e "${YELLOW}=== Section 5: Concurrent Writes (CAS Contention) ===${NC}"
 # Pause GC to prevent dead-process reclamation of files created by short-lived
 # touch processes (each touch exits immediately, making owner_pid dead).
-bash -c 'echo 1 > /sys/fs/'"${MODULE_NAME}"'/gc_pause' 2>/dev/null || true
+bash -c 'echo 1 > /sys/fs/'"${MODULE_NAME}"'/debug/gc_pause' 2>/dev/null || true
 clean_all
 
 run_test "Both nodes create 10 files each simultaneously" '
@@ -648,7 +648,7 @@ run_test "Concurrent: Node 0 writes + Node 1 reads" '
 # Cleanup stress files
 rm -f $MOUNT_POINT_0/wr_*.txt 2>/dev/null || true
 # Resume GC after concurrent/stress sections
-bash -c 'echo 0 > /sys/fs/'"${MODULE_NAME}"'/gc_pause' 2>/dev/null || true
+bash -c 'echo 0 > /sys/fs/'"${MODULE_NAME}"'/debug/gc_pause' 2>/dev/null || true
 echo ""
 
 # ============================================================================
@@ -810,16 +810,16 @@ if [ "$(id -u)" -eq 0 ] && [ -d "$SYSFS_BASE" ]; then
     '
 
     run_test "sysfs: gc_trigger writable" '
-        echo 1 > $SYSFS_BASE/gc_trigger
+        echo 1 > $SYSFS_BASE/debug/gc_trigger
     '
 
     run_test "sysfs: gc_stop writable" '
-        echo 1 > $SYSFS_BASE/gc_stop
+        echo 1 > $SYSFS_BASE/debug/gc_stop
     '
 
     # gc_stop kills threads — restart them for subsequent tests
     run_test "sysfs: gc_restart after stop" '
-        echo all > $SYSFS_BASE/gc_restart
+        echo all > $SYSFS_BASE/debug/gc_restart
     '
 else
     echo -e "  ${YELLOW}SKIP${NC} (requires root and mounted filesystem)"
@@ -840,7 +840,7 @@ if [ "$(id -u)" -eq 0 ] && [ -d "$SYSFS_BASE" ]; then
         # File should exist before GC
         [ -f $MOUNT_POINT_0/gc_dead.txt ] && \
         # Trigger GC to reclaim dead-process RAT entry
-        echo 1 > $SYSFS_BASE/gc_trigger && \
+        echo 1 > $SYSFS_BASE/debug/gc_trigger && \
         sleep 0.5 && \
         # File should be gone (owner process exited)
         [ ! -f $MOUNT_POINT_0/gc_dead.txt ]
@@ -850,7 +850,7 @@ if [ "$(id -u)" -eq 0 ] && [ -d "$SYSFS_BASE" ]; then
         bash -c "touch $MOUNT_POINT_0/gc_dead2.txt" && \
         sleep 0.2 && \
         [ -f $MOUNT_POINT_1/gc_dead2.txt ] && \
-        echo 1 > $SYSFS_BASE/gc_trigger && \
+        echo 1 > $SYSFS_BASE/debug/gc_trigger && \
         sleep 0.5 && \
         [ ! -f $MOUNT_POINT_0/gc_dead2.txt ] && \
         [ ! -f $MOUNT_POINT_1/gc_dead2.txt ]
@@ -1119,13 +1119,13 @@ echo ""
 # ============================================================================
 echo -e "${YELLOW}=== Section 21: Tombstone GC Sweep ===${NC}"
 
-if [ -w "/sys/fs/${MODULE_NAME}/gc_trigger" ] 2>/dev/null; then
+if [ -w "/sys/fs/${MODULE_NAME}/debug/gc_trigger" ] 2>/dev/null; then
     clean_all
 
     run_test "Create+delete 50 files, GC sweep reclaims slots" '
         for i in $(seq 1 50); do touch "$MOUNT_POINT_0/gc_sweep_${i}.txt"; done && \
         for i in $(seq 1 50); do rm -f "$MOUNT_POINT_0/gc_sweep_${i}.txt"; done && \
-        echo 1 > /sys/fs/${MODULE_NAME}/gc_trigger && \
+        echo 1 > /sys/fs/${MODULE_NAME}/debug/gc_trigger && \
         sleep 1 && \
         # After GC, should be able to create files (slots reclaimed)
         for i in $(seq 1 50); do touch "$MOUNT_POINT_0/gc_verify_${i}.txt"; done && \

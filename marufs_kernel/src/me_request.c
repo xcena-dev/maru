@@ -102,6 +102,12 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 
 static void request_poll_cycle(struct marufs_me_instance *me)
 {
+	/* Fault injection: simulate a crashed node — skip the entire cycle
+	 * (no heartbeat, no grant, no doorbell handling).
+	 */
+	if (atomic_read(&me->debug_freeze_poll))
+		return;
+
 	bool ticked_hb = false;
 	u64 node_pending[MARUFS_ME_MAX_NODES] = { 0 };
 	u64 peers_pending = 0;
