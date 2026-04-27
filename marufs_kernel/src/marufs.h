@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * marufs.h - MARUFS Partitioned Global Index in-memory structures
+ * marufs.h - MARUFS in-memory core (sbi, DAX/RAT/shard helpers).
  *
  * ============================================================================
  * MARUFS Architecture: CAS-based Lock-free Distributed Model
@@ -9,28 +9,11 @@
  * All nodes can concurrently read/write the global index using CAS
  * (Compare-And-Swap) operations. No GCS (Global Chunk Server) needed.
  *
- * CXL Memory Layout:
- * ┌─────────────────────────────────────────────────────────────┐
- * │ Global Superblock (4 KB)                                    │  0x0000
- * ├─────────────────────────────────────────────────────────────┤
- * │ Shard Table (num_shards × 64B headers)                      │  0x1000
- * ├─────────────────────────────────────────────────────────────┤
- * │ Index Pool                                                   │  0x2000
- * │   Per-shard: [bucket array (u32[])] [entry array (128B[])]   │
- * ├──────────────── 2 MB aligned ────────────────────────────────┤
- * │ RAT (4KB header + 256 × 2048B entries)                        │
- * ├──────────────── 2 MB aligned ────────────────────────────────┤
- * │ Region 0 [Data area]                                          │
- * │ Region 1 [Data area]                                          │
- * │ ...                                                          │
- * └─────────────────────────────────────────────────────────────┘
- *
- * Key Concepts:
- *   - Shards partition the global namespace via hash (upper bits)
- *   - Each shard has its own bucket array + entry array
- *   - Regions are per-node data stores using bitmap slot allocation
- *   - Index entries reference (region_id, slot_idx) for data location
- *   - Lock-free insert/delete via CAS on entry.state
+ * On-disk layout lives in marufs_layout.h (umbrella over per-domain
+ * layout headers). Per-module entry points live in their own headers
+ * (gc.h, acl.h, region.h, index.h, nrht.h, cache.h, inode.h, super.h,
+ * file.h, dir.h). This file owns the in-memory `marufs_sb_info` plus
+ * inline DAX/RAT/shard accessors that all subsystems reuse.
  */
 
 #ifndef _MARUFS_H
@@ -63,9 +46,24 @@
 struct dma_buf;
 #endif
 
-/* On-disk structure definitions */
+/* On-disk layout + ME types (sbi fields reference both) */
 #include "marufs_layout.h"
 #include "me.h"
+
+/* GC orphan tracker types — referenced by sbi fields below */
+#include "gc.h"
+
+/* Per-module entry points (kept here so .c files including only marufs.h
+ * still see all subsystem APIs — preserves existing include patterns). */
+#include "acl.h"
+#include "cache.h"
+#include "dir.h"
+#include "file.h"
+#include "index.h"
+#include "inode.h"
+#include "nrht.h"
+#include "region.h"
+#include "super.h"
 
 /* ============================================================================
  * Filesystem constants
@@ -100,25 +98,7 @@ enum marufs_dax_mode {
 /* Forward declarations */
 struct marufs_entry_cache;
 struct marufs_me_instance;
-
-/* ============================================================================
- * GC orphan tracker types
- * ============================================================================ */
-#define MARUFS_GC_ORPHAN_MAX 64
-
-enum marufs_orphan_type {
-	MARUFS_ORPHAN_INDEX, /* stale INSERTING index entry */
-	MARUFS_ORPHAN_DELEG, /* stale GRANTING delegation entry */
-	MARUFS_ORPHAN_DELEG_UNBOUND, /* ACTIVE deleg, birth_time not yet bound */
-	MARUFS_ORPHAN_RAT, /* stuck ALLOCATING RAT entry */
-	MARUFS_ORPHAN_NRHT, /* stale INSERTING NRHT entry */
-};
-
-struct marufs_orphan_tracker {
-	void *entry;
-	u64 discovered_at;
-	enum marufs_orphan_type type;
-};
+struct marufs_nrht_stats_pcpu;
 
 /* ============================================================================
  * Local DRAM cache for shard metadata (read-only after format)
@@ -221,51 +201,8 @@ struct marufs_sb_info {
 };
 
 /* ============================================================================
- * In-memory inode info
- * ============================================================================
- *
- * Tracks mapping from VFS inode to global index entry and region/slot
- * where file data resides.
- *
- * vfs_inode must be last field (container_of requirement).
- */
-
-struct marufs_inode_info {
-	u32 region_id; /* Region where data is stored (= RAT entry ID) */
-	u32 entry_idx; /* Global index entry index (for writeback) */
-	u32 shard_id; /* Shard this entry belongs to */
-	u32 rat_entry_id;
-	u64 region_offset;
-	u32 owner_node_id;
-	u32 owner_pid;
-	u64 owner_birth_time;
-	u64 data_phys_offset; /* Cached: region phys_offset (= data start) */
-	struct inode vfs_inode; /* VFS inode (must be last!) */
-};
-
-/* ============================================================================
- * Helper macros
+ * sbi accessor
  * ============================================================================ */
-
-static inline struct marufs_inode_info *marufs_inode_get(struct inode *inode)
-{
-	return container_of(inode, struct marufs_inode_info, vfs_inode);
-}
-
-/* Zero-initialize all marufs-specific fields of inode_info.
- * Called from alloc_inode (super.c) and new_inode (inode.c). */
-static inline void marufs_inode_info_init(struct marufs_inode_info *xi)
-{
-	xi->region_id = 0;
-	xi->entry_idx = 0;
-	xi->shard_id = 0;
-	xi->rat_entry_id = 0;
-	xi->region_offset = 0;
-	xi->owner_node_id = 0;
-	xi->owner_pid = 0;
-	xi->owner_birth_time = 0;
-	xi->data_phys_offset = 0;
-}
 
 static inline struct marufs_sb_info *marufs_sb_get(struct super_block *sb)
 {
@@ -408,7 +345,7 @@ static inline bool marufs_validate_region_addr(struct marufs_sb_info *sbi,
 }
 
 /* ============================================================================
- * Helper inline functions
+ * Shard helpers
  * ============================================================================ */
 
 /* Safe shard header accessor with bounds check + RMB */
@@ -487,122 +424,12 @@ marufs_shard_entry(struct marufs_sb_info *sbi, u32 shard_id, u32 entry_idx)
 }
 
 /* ============================================================================
- * Function declarations - super.c
- * ============================================================================ */
-
-int marufs_fill_super(struct super_block *sb, void *data, int silent);
-
-/* ============================================================================
- * Function declarations - region.c (RAT allocator)
- * ============================================================================ */
-
-/* RAT (Region Allocation Table) management */
-int marufs_rat_alloc_entry(struct marufs_sb_info *sbi, const char *name,
-			   u64 size, u64 offset, u32 *out_rat_entry_id);
-void marufs_rat_free_entry(struct marufs_rat_entry *entry);
-
-/* Region initialization (called from ftruncate path) */
-int marufs_region_init(struct marufs_sb_info *sbi, u32 rat_entry_id,
-		       u64 data_size);
-
-/* ============================================================================
- * Function declarations - index.c (Global index CAS operations)
- * ============================================================================ */
-
-int marufs_index_insert(struct marufs_sb_info *sbi, const char *name,
-			size_t namelen, u32 region_id, u32 *out_entry_idx);
-int marufs_index_lookup(struct marufs_sb_info *sbi, const char *name,
-			size_t namelen, struct marufs_index_entry **out_entry);
-int marufs_index_delete(struct marufs_sb_info *sbi, const char *name,
-			size_t namelen);
-
-/* ============================================================================
- * Function declarations - inode.c
- * ============================================================================ */
-
-struct inode *marufs_iget(struct super_block *sb,
-			  struct marufs_index_entry *entry, u32 shard_id,
-			  u32 entry_idx);
-struct inode *marufs_new_inode(struct super_block *sb, umode_t mode);
-int marufs_write_inode(struct inode *inode, struct writeback_control *wbc);
-void marufs_evict_inode(struct inode *inode);
-
-extern const struct inode_operations marufs_file_inode_ops;
-extern const struct inode_operations marufs_dir_inode_ops;
-
-/* ============================================================================
- * Function declarations - file.c
- * ============================================================================ */
-
-extern const struct file_operations marufs_file_ops;
-extern const struct address_space_operations marufs_aops;
-
-/* ============================================================================
- * Function declarations - dir.c
- * ============================================================================ */
-
-extern const struct file_operations marufs_dir_ops;
-
-/* ============================================================================
- * Function declarations - acl.c (Region-level access control)
- * ============================================================================ */
-
-void marufs_deleg_entry_clear(struct marufs_deleg_entry *de);
-int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
-			    u32 required_perms);
-int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
-		       struct marufs_perm_req *req);
-bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time);
-
-/* ============================================================================
- * Function declarations - cache.c
- * ============================================================================ */
-
-int marufs_cache_init(struct marufs_sb_info *sbi);
-void marufs_cache_destroy(struct marufs_sb_info *sbi);
-
-/* ============================================================================
- * Function declarations - sysfs.c
+ * sysfs entry points (sysfs.c)
  * ============================================================================ */
 
 int marufs_sysfs_init(void);
 void marufs_sysfs_exit(void);
 int marufs_sysfs_register(struct marufs_sb_info *sbi);
 void marufs_sysfs_unregister(struct marufs_sb_info *sbi);
-
-/* ============================================================================
- * Function declarations - nrht.c (Independent Name-Ref Hash Table)
- * ============================================================================ */
-
-int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		     u32 max_entries, u32 num_shards, u32 num_buckets,
-		     enum marufs_me_strategy me_strategy);
-/*
- * marufs_nrht_join - explicit pre-warm: create this sbi's NRHT ME instance
- * and join the ring for @nrht_region_id. Idempotent (cached on re-call).
- * Backup path is lazy-init on first insert.
- */
-int marufs_nrht_join(struct marufs_sb_info *sbi, u32 nrht_region_id);
-int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		       const char *name, size_t namelen, u64 name_hash,
-		       u64 offset, u32 target_region_id);
-int marufs_nrht_lookup(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		       const char *name, size_t namelen, u64 name_hash,
-		       u64 *out_offset, u32 *out_target_region_id);
-int marufs_nrht_delete(struct marufs_sb_info *sbi, u32 nrht_region_id,
-		       const char *name, size_t namelen, u64 name_hash);
-int marufs_nrht_gc_sweep_all(struct marufs_sb_info *sbi);
-
-/* ============================================================================
- * Function declarations - gc.c (Tombstone GC)
- * ============================================================================ */
-
-void marufs_gc_track_orphan(struct marufs_sb_info *sbi, void *entry,
-			    enum marufs_orphan_type type);
-int marufs_gc_reclaim_dead_regions(struct marufs_sb_info *sbi);
-bool marufs_can_force_unlink(struct marufs_sb_info *sbi, u32 rat_entry_id);
-int marufs_gc_start(struct marufs_sb_info *sbi);
-void marufs_gc_stop(struct marufs_sb_info *sbi);
-int marufs_gc_restart(struct marufs_sb_info *sbi);
 
 #endif /* _MARUFS_H */
