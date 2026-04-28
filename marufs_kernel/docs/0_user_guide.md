@@ -368,6 +368,42 @@ block-level access patterns.
 
 See: [4_arch_nrht.md](4_arch_nrht.md).
 
+### 4.3 Per-entry ref/pin counters
+
+Each NRHT entry carries two user-managed `__u32` counters — `ref_count`
+and `pin_count` — meant for application-defined eviction policies.
+Both reset to 0 on every fresh insert. Caller semantics:
+
+- **inc**: returns `-EOVERFLOW` if current value is `UINT32_MAX`.
+- **dec**: returns `-EINVAL` if current value is already 0.
+
+Each ioctl acquires the entry's NRHT shard ME for the read-modify-write,
+so concurrent `inc`/`dec` from any node serialize correctly.
+
+```c
+struct marufs_refcnt_req cr = {0};
+strncpy(cr.name, "kv_blk_AAAA", sizeof(cr.name) - 1);
+
+/* refcount on cache pin/release. */
+ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_INC, &cr);   /* cr.count = post-op value */
+ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_DEC, &cr);
+
+/* pin to block eviction across a critical region. */
+ioctl(nrht_fd, MARUFS_IOC_NRHT_PIN_INC, &cr);
+/* ... mmap + read/write ... */
+ioctl(nrht_fd, MARUFS_IOC_NRHT_PIN_DEC, &cr);
+```
+
+`MARUFS_IOC_FIND_NAME` returns the current `ref_count` and `pin_count`
+alongside `offset` — no separate read ioctl needed:
+
+```c
+struct marufs_find_name_req fr = {0};
+strncpy(fr.name, "kv_blk_AAAA", sizeof(fr.name) - 1);
+ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &fr);
+/* fr.ref_count, fr.pin_count = snapshot (lock-free read, may be stale). */
+```
+
 ---
 
 ## 5. Security — who can read/write a region
