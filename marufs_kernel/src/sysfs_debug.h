@@ -28,4 +28,7 @@ extern struct kobj_attribute gc_stop_attr;
 extern struct kobj_attribute gc_pause_attr;
 extern struct kobj_attribute gc_restart_attr;
 
+/* Bootstrap dump attr (inject_stuck is now a module param, not sysfs). */
+extern struct kobj_attribute bootstrap_dump_attr;
+
 #endif /* _MARUFS_SYSFS_DEBUG_H */

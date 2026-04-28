@@ -199,6 +199,7 @@ static struct attribute *marufs_debug_attrs[] = {
 	&gc_stop_attr.attr,
 	&gc_pause_attr.attr,
 	&gc_restart_attr.attr,
+	&bootstrap_dump_attr.attr,
 	NULL,
 };
 

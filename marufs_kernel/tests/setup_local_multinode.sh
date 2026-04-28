@@ -38,6 +38,7 @@ NUM_REGIONS="${MARUFS_NUM_REGIONS:-4}"
 REGION_OWNERS="${MARUFS_REGION_OWNERS:-}"  # auto-set below if empty
 CHMOD_MODE="${MARUFS_CHMOD:-1777}"         # permissions for mount points
 ME_STRATEGY="${MARUFS_ME_STRATEGY:-request}" # ME strategy: order or request
+LEGACY_NODE_ID="${MARUFS_LEGACY_NODE_ID:-false}" # true = pass node_id= explicitly (old style)
 
 # DAXHEAP configuration
 USE_DAXHEAP="${MARUFS_DAXHEAP:-false}"
@@ -91,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --daxheap-size) DAXHEAP_SIZE="$2"; shift 2 ;;
         --skip-build)   SKIP_BUILD=true; shift ;;
         --me-strategy)  ME_STRATEGY="$2"; shift 2 ;;
+        --legacy)       LEGACY_NODE_ID=true; shift ;;
         --teardown)     ACTION="teardown"; shift ;;
         --status)       ACTION="status"; shift ;;
         --help|-h)
@@ -360,12 +362,12 @@ do_setup() {
 
     if [ "$USE_DAXHEAP" = true ]; then
         # DAXHEAP: primary allocates the shared buffer, secondaries attach via bufid.
-        log_info "  DAXHEAP primary mount (buffer size: $DAXHEAP_SIZE)"
-        mount -t "${MODULE_NAME}" \
-            -o "daxheap=${DAXHEAP_SIZE},node_id=${NODE_IDS[0]}" \
-            none "${MOUNT_POINTS[0]}"
+        local primary_opts="daxheap=${DAXHEAP_SIZE}"
+        [ "$LEGACY_NODE_ID" = true ] && primary_opts="${primary_opts},node_id=${NODE_IDS[0]}"
+        log_info "  DAXHEAP primary mount (buffer size: $DAXHEAP_SIZE, opts: $primary_opts)"
+        mount -t "${MODULE_NAME}" -o "$primary_opts" none "${MOUNT_POINTS[0]}"
         chmod "$CHMOD_MODE" "${MOUNT_POINTS[0]}"
-        log_success "Node ${NODE_IDS[0]} -> ${MOUNT_POINTS[0]} (DAXHEAP primary, ${DAXHEAP_SIZE})"
+        log_success "-> ${MOUNT_POINTS[0]} (DAXHEAP primary, ${DAXHEAP_SIZE})"
 
         # Read buf_id from sysfs (published by primary mount)
         local bufid_file="/sys/fs/${MODULE_NAME}/daxheap_bufid"
@@ -381,28 +383,42 @@ do_setup() {
         fi
 
         for ((i = 1; i < NUM_MOUNTS; i++)); do
+            local sec_opts="daxheap_bufid=${bufid}"
+            [ "$LEGACY_NODE_ID" = true ] && sec_opts="${sec_opts},node_id=${NODE_IDS[i]}"
             log_info "  DAXHEAP secondary mount $i (bufid=${bufid})"
-            mount -t "${MODULE_NAME}" \
-                -o "daxheap_bufid=${bufid},node_id=${NODE_IDS[i]}" \
-                none "${MOUNT_POINTS[i]}"
+            mount -t "${MODULE_NAME}" -o "$sec_opts" none "${MOUNT_POINTS[i]}"
             chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
-            log_success "Node ${NODE_IDS[i]} -> ${MOUNT_POINTS[i]} (DAXHEAP secondary, bufid=${bufid})"
+            log_success "-> ${MOUNT_POINTS[i]} (DAXHEAP secondary, bufid=${bufid})"
         done
     else
-        # DEV_DAX: first mount formats the device, subsequent mounts attach.
-        mount -t "${MODULE_NAME}" \
-            -o daxdev="$DAX_DEVICE",node_id="${NODE_IDS[0]}",format,me_strategy="$ME_STRATEGY" \
-            none "${MOUNT_POINTS[0]}"
-        chmod "$CHMOD_MODE" "${MOUNT_POINTS[0]}"
-        log_success "Node ${NODE_IDS[0]} -> ${MOUNT_POINTS[0]} (format)"
-
-        for ((i = 1; i < NUM_MOUNTS; i++)); do
+        # DEV_DAX auto-mount: first mounter auto-elects formatter via bootstrap.
+        # Pass me_strategy; omit node_id= for auto-mount (pass it for --legacy).
+        local base_opts="daxdev=${DAX_DEVICE},me_strategy=${ME_STRATEGY}"
+        if [ "$LEGACY_NODE_ID" = true ]; then
+            # Legacy: explicit node_id + format flag on first mount
             mount -t "${MODULE_NAME}" \
-                -o daxdev="$DAX_DEVICE",node_id="${NODE_IDS[i]}",me_strategy="$ME_STRATEGY" \
-                none "${MOUNT_POINTS[i]}"
-            chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
-            log_success "Node ${NODE_IDS[i]} -> ${MOUNT_POINTS[i]}"
-        done
+                -o "${base_opts},node_id=${NODE_IDS[0]},format" \
+                none "${MOUNT_POINTS[0]}"
+            chmod "$CHMOD_MODE" "${MOUNT_POINTS[0]}"
+            log_success "-> ${MOUNT_POINTS[0]} (legacy format, node_id=${NODE_IDS[0]})"
+            for ((i = 1; i < NUM_MOUNTS; i++)); do
+                mount -t "${MODULE_NAME}" \
+                    -o "${base_opts},node_id=${NODE_IDS[i]}" \
+                    none "${MOUNT_POINTS[i]}"
+                chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
+                log_success "-> ${MOUNT_POINTS[i]} (legacy, node_id=${NODE_IDS[i]})"
+            done
+        else
+            # Auto-mount: no node_id= — bootstrap election assigns node_ids.
+            for ((i = 0; i < NUM_MOUNTS; i++)); do
+                log_info "  Auto-mount $i -> ${MOUNT_POINTS[i]}"
+                mount -t "${MODULE_NAME}" \
+                    -o "${base_opts}" \
+                    none "${MOUNT_POINTS[i]}"
+                chmod "$CHMOD_MODE" "${MOUNT_POINTS[i]}"
+                log_success "-> ${MOUNT_POINTS[i]} (auto-mount)"
+            done
+        fi
     fi
 
     # --- Done ---

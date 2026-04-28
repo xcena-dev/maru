@@ -1333,6 +1333,78 @@ fi
 echo ""
 
 # ============================================================================
+# Section 31: Bootstrap Auto-Mount
+# ============================================================================
+# Verifies auto-mount assigns unique node_ids, exactly one formatter,
+# and that bootstrap slot table is consistent after mount.
+# Requires /sys/fs/marufs/debug/bootstrap_dump sysfs entry.
+echo -e "${YELLOW}=== Section 31: Bootstrap Auto-Mount ===${NC}"
+
+BOOTSTRAP_DUMP_SYSFS="/sys/fs/${MODULE_NAME}/debug/bootstrap_dump"
+
+run_test "bootstrap_dump sysfs accessible" '
+    [ -r "'"$BOOTSTRAP_DUMP_SYSFS"'" ] 2>&1
+'
+
+run_test "All mounted nodes have CLAIMED bootstrap slots" '
+    dump=$(cat "'"$BOOTSTRAP_DUMP_SYSFS"'" 2>&1) && \
+    claimed_count=$(echo "$dump" | grep -c "status=CLAIMED") && \
+    [ "$claimed_count" -ge 1 ] && \
+    echo "CLAIMED slots: $claimed_count" 2>&1
+'
+
+run_test "No FORMATTING slots remain after mount" '
+    dump=$(cat "'"$BOOTSTRAP_DUMP_SYSFS"'" 2>&1) && \
+    stuck=$(echo "$dump" | grep -c "status=FORMATTING" || true) && \
+    [ "${stuck:-0}" -eq 0 ] && \
+    echo "No stuck FORMATTING slots" 2>&1
+'
+
+# Each mount marks its own slot with "<mine>". Extract those lines to get
+# per-mount owned slots, then verify node_ids are unique across mounts.
+run_test "Each mount owns a unique bootstrap slot" '
+    dump=$(cat "'"$BOOTSTRAP_DUMP_SYSFS"'" 2>&1) && \
+    mine_lines=$(echo "$dump" | grep "<mine>") && \
+    node_ids=$(echo "$mine_lines" | grep -oE "node_id=[0-9]+" | sort) && \
+    uniq_ids=$(echo "$node_ids" | sort -u) && \
+    [ -n "$node_ids" ] && \
+    [ "$node_ids" = "$uniq_ids" ] && \
+    echo "Owned slots: $(echo "$mine_lines" | wc -l)" 2>&1
+'
+
+echo ""
+
+# ============================================================================
+# Section 32: Bootstrap Chaos (via test_bootstrap_chaos.sh)
+# ============================================================================
+# Delegates to test_bootstrap_chaos.sh:
+#   T1 stuck-formatter recovery, T2 concurrent mount race, T3 slot reuse.
+echo -e "${YELLOW}=== Section 32: Bootstrap Chaos ===${NC}"
+
+BOOTSTRAP_CHAOS_SCRIPT="$SCRIPT_DIR/test_bootstrap_chaos.sh"
+BOOTSTRAP_SETUP_SCRIPT="$SCRIPT_DIR/setup_local_multinode.sh"
+# Chaos needs exclusive module ownership (rmmod/insmod cycles).
+# If marufs mounts are active, auto-teardown before running chaos.
+# Note: chaos leaves the module unloaded — re-run setup_local_multinode.sh
+# manually if subsequent tests need a mounted filesystem.
+if [ -x "$BOOTSTRAP_CHAOS_SCRIPT" ] && [ "$(id -u)" -eq 0 ]; then
+    chaos_active_mounts=$(mount | grep -c "type ${MODULE_NAME} " || true)
+    if [ "${chaos_active_mounts:-0}" -gt 0 ]; then
+        echo -e "  ${YELLOW}NOTE${NC}: ${chaos_active_mounts} marufs mounts active — auto-teardown before chaos"
+        "$BOOTSTRAP_SETUP_SCRIPT" --teardown >/dev/null 2>&1 || \
+            echo -e "  ${YELLOW}WARN${NC}: teardown script failed; chaos may abort"
+    fi
+    run_test "Bootstrap chaos tests (T1-T3, ~30s)" '
+        bash "'"$BOOTSTRAP_CHAOS_SCRIPT"'" 2>&1
+    '
+    echo -e "  ${YELLOW}NOTE${NC}: chaos finished — module unloaded. Re-run setup if needed."
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_bootstrap_chaos.sh missing or not root)"
+fi
+
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "============================================"

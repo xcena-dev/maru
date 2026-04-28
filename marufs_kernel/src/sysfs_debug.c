@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * sysfs_debug.c - MARUFS test-only sysfs attrs (fault injection for ME
- * crash-detection tests). Not for production use.
+ * crash-detection tests and bootstrap chaos tests). Not for production use.
  */
 
 #include <linux/fs.h>
@@ -333,3 +333,39 @@ static ssize_t gc_restart_store(struct kobject *kobj,
 
 struct kobj_attribute gc_restart_attr =
 	__ATTR(gc_restart, 0200, NULL, gc_restart_store);
+
+/*
+ * bootstrap_inject_stuck_formatter is now a module param
+ * (/sys/module/<name>/parameters/bootstrap_inject_stuck_formatter).
+ * It must be set BEFORE mounting the formatter node, so a per-sbi sysfs
+ * attribute (which only exists after sb construction) is too late.
+ * The old per-sbi implementation has been removed.
+ */
+
+/*
+ * bootstrap_dump - read-only: dump bootstrap slot table for all mounts.
+ *
+ * Read: one line per slot per mount.
+ */
+static ssize_t bootstrap_dump_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	ssize_t n = 0;
+
+	mutex_lock(&marufs_sysfs_lock);
+	for (int i = 0; i < MARUFS_MAX_MOUNTS; i++) {
+		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
+		if (!sbi)
+			continue;
+		n += scnprintf(buf + n, PAGE_SIZE - n, "=== mount node=%u ===\n",
+			       sbi->node_id);
+		if (n < PAGE_SIZE - 1)
+			n += marufs_bootstrap_dump_slots(
+				sbi, buf + n);
+	}
+	mutex_unlock(&marufs_sysfs_lock);
+	return n;
+}
+
+struct kobj_attribute bootstrap_dump_attr =
+	__ATTR(bootstrap_dump, 0400, bootstrap_dump_show, NULL);

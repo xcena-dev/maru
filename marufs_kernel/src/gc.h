@@ -38,4 +38,8 @@ int marufs_gc_start(struct marufs_sb_info *sbi);
 void marufs_gc_stop(struct marufs_sb_info *sbi);
 int marufs_gc_restart(struct marufs_sb_info *sbi);
 
+/* Admin role helpers (decoupled from hardcoded node_id==1) */
+u32  marufs_current_admin_node_id(struct marufs_sb_info *sbi);
+bool marufs_is_admin_node(struct marufs_sb_info *sbi);
+
 #endif /* _MARUFS_GC_H */

@@ -132,7 +132,7 @@ static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 	/* RMB: WC writer → WB reader cache coherence */
 	void *data_ptr =
-		(char *)fc.sbi->dax_base + fc.xi->data_phys_offset + pos;
+		marufs_file_data_at(fc.sbi, fc.xi->data_phys_offset, pos);
 	MARUFS_CXL_RMB(data_ptr, count);
 
 	size_t copied = copy_to_iter(data_ptr, count, to);
@@ -537,9 +537,10 @@ static long marufs_ioctl_perm_grant(struct marufs_sb_info *sbi,
 
 	ret = marufs_deleg_grant(sbi, xi->rat_entry_id, preq);
 	if (ret == 0)
-		pr_debug("granted perms=0x%x to node=%u pid=%u on rat_entry %u\n",
-			 preq->perms, preq->node_id, preq->pid,
-			 xi->rat_entry_id);
+		pr_debug(
+			"granted perms=0x%x to node=%u pid=%u on rat_entry %u\n",
+			preq->perms, preq->node_id, preq->pid,
+			xi->rat_entry_id);
 
 out:
 	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
@@ -625,8 +626,8 @@ static long marufs_ioctl_nrht_init(struct marufs_sb_info *sbi,
 				   struct marufs_nrht_init_req *nreq)
 {
 	enum marufs_me_strategy strat =
-		(nreq->me_strategy == MARUFS_ME_REQUEST) ?
-			MARUFS_ME_REQUEST : MARUFS_ME_ORDER;
+		(nreq->me_strategy == MARUFS_ME_REQUEST) ? MARUFS_ME_REQUEST :
+							   MARUFS_ME_ORDER;
 	return marufs_nrht_init(sbi, xi->rat_entry_id, nreq->max_entries,
 				nreq->num_shards, nreq->num_buckets, strat);
 }

@@ -21,11 +21,14 @@
  * stamping its node_id.  No node's "node_id == sbi->node_id" filter
  * matches them, so the normal GC path cannot reach them.
  *
- * node_id==1 is the designated admin node.  Only the admin node
- * tracks node_id==0 orphans in the local DRAM tracker and later
- * CAS-claims them (node_id 0→1, timestamp=now).  Once claimed,
- * the next GC cycle's normal path reclaims them like any other
- * dead-process resource owned by node 1.
+ * The "admin node" is the node with the lowest currently-ACTIVE node_id
+ * in the bootstrap slot table.  Only the admin node tracks node_id==0
+ * orphans in the local DRAM tracker and later CAS-claims them
+ * (node_id 0→admin_id, timestamp=now).  Once claimed, the next GC cycle's
+ * normal path reclaims them like any other dead-process resource.
+ *
+ * Admin role is cached in sbi->cached_admin_node_id; refreshed at mount
+ * and on ME membership changes.  Use marufs_is_admin_node(sbi) for checks.
  *
  * This eliminates CAS contention that would occur if every node
  * raced to claim the same orphan entries.
@@ -36,6 +39,52 @@
  *   - marufs_gc_reclaim_dead_regions()          — ALLOCATING + node_id==0
  *   - marufs_gc_sweep_dead_delegations()        — GRANTING + granted_at==0
  */
+
+/*
+ * marufs_current_admin_node_id - return the lowest ACTIVE node_id.
+ *
+ * Scans the bootstrap slot table for ACTIVE slots and returns the lowest
+ * node_id (= slot index + 1).  Returns 0 if no ACTIVE slot found (all-dead
+ * or bootstrap area not yet initialised).
+ *
+ * Called at GC sweep entry — O(8) scan, negligible overhead.
+ */
+u32 marufs_current_admin_node_id(struct marufs_sb_info *sbi)
+{
+	struct marufs_bootstrap_slot *slots;
+	u32 lowest = U32_MAX;
+	int i;
+
+	if (!sbi->dax_base)
+		return 0;
+
+	slots = marufs_bootstrap_slot_get(sbi, 0);
+	if (!slots)
+		return 0;
+
+	for (i = 0; i < MARUFS_BOOTSTRAP_MAX_SLOTS; i++) {
+		MARUFS_CXL_RMB(&slots[i], sizeof(slots[i]));
+		if (READ_CXL_LE32(slots[i].status) != MARUFS_BS_CLAIMED)
+			continue;
+		u32 candidate = (u32)(i + 1);
+		if (candidate < lowest)
+			lowest = candidate;
+	}
+
+	return (lowest == U32_MAX) ? 0 : lowest;
+}
+
+/*
+ * marufs_is_admin_node - return true if this node is the current admin.
+ *
+ * Uses the cached value sbi->cached_admin_node_id for the hot path.
+ * The cache is refreshed at mount and on ME membership change events.
+ * GC sweep refreshes it directly via marufs_current_admin_node_id().
+ */
+bool marufs_is_admin_node(struct marufs_sb_info *sbi)
+{
+	return READ_LE32(sbi->cached_admin_node_id) == sbi->node_id;
+}
 
 /*
  * marufs_entry_reclaim_slot - reclaim stale INSERTING entry to TOMBSTONE
@@ -277,7 +326,7 @@ static int marufs_is_stale_inserting(struct marufs_sb_info *sbi,
 	u64 created_at, now;
 
 	if (inserter_node == 0)
-		return (sbi->node_id == 1) ?
+		return marufs_is_admin_node(sbi) ?
 			       0 :
 			       -1; /* Only admin node tracks orphans */
 
@@ -387,7 +436,7 @@ static int marufs_gc_sweep_dead_delegations(struct marufs_sb_info *sbi,
 			if (granted_at == 0) {
 				u32 de_node = READ_CXL_LE32(de->node_id);
 
-				if (de_node != 0 || sbi->node_id == 1)
+				if (de_node != 0 || marufs_is_admin_node(sbi))
 					marufs_gc_track_orphan(
 						sbi, de, MARUFS_ORPHAN_DELEG);
 			} else if (ktime_get_real_ns() - granted_at >
@@ -596,7 +645,7 @@ int marufs_gc_reclaim_dead_regions(struct marufs_sb_info *sbi)
 		/* Orphan with no owner node (crash before node_id written) */
 		u16 owner_node = READ_LE16(entry->owner_node_id);
 		if (owner_node == 0 && state == MARUFS_RAT_ENTRY_ALLOCATING) {
-			if (sbi->node_id == 1)
+			if (marufs_is_admin_node(sbi))
 				marufs_gc_track_orphan(sbi, entry,
 						       MARUFS_ORPHAN_RAT);
 			continue;
@@ -658,6 +707,10 @@ static int marufs_gc_thread_fn(void *data)
 
 		u32 shards_per_cycle =
 			max(sbi->num_shards / MARUFS_GC_SHARD_DIVISOR, 1U);
+
+		/* Refresh admin role cache once per sweep cycle. */
+		WRITE_LE32(sbi->cached_admin_node_id,
+			   marufs_current_admin_node_id(sbi));
 
 		/* Phase 1: Reclaim regions from dead processes */
 		marufs_gc_reclaim_dead_regions(sbi);

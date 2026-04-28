@@ -121,11 +121,8 @@ struct marufs_rat {
 	__le64 total_allocated; /* Total allocated bytes */
 	__le64 total_free; /* Remaining free bytes */
 
-	/* Global allocation lock (CAS spinlock for region_init) */
-	__le32 alloc_lock; /* 0=unlocked, 1=locked */
-
 	/* Reserved */
-	__u8 reserved[68]; /* Padding to 4KB (4036 + 60 bytes above = 4096) */
+	__u8 reserved[72]; /* Padding to 4KB */
 
 	/* Entry array follows immediately */
 	struct marufs_rat_entry entries[MARUFS_MAX_RAT_ENTRIES];

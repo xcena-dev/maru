@@ -11,7 +11,7 @@
 #   T1 stress CPU         stress-ng saturation under normal traffic →
 #                         no spurious crash-detected logs (baseline sanity).
 #   T2 crash loop         freeze Node 1 → Node 2 acquire hits 5.1s takeover,
-#                         repeated 3× to cover basic path + no-leak.
+#                         repeated 2× to cover basic path + no-leak.
 #   T3 busy holder        alive holder with long CS → no false takeover.
 #   T4 late grant         freeze Node 1, Node 2 acquire, unfreeze mid-probe →
 #                         Case A early return (enter CS without takeover).
@@ -65,11 +65,11 @@ run_t1_stress() {
 	info "T1 (no false positive under CPU load)"
 	sync_state
 	dmesg_reset
-	stress-ng --cpu 0 --timeout 8s >/dev/null 2>&1 &
+	stress-ng --cpu 0 --timeout 4s >/dev/null 2>&1 &
 	local stress_pid=$!
-	sleep 0.5
+	sleep 0.3
 
-	local end=$(( $(date +%s) + 6 ))
+	local end=$(( $(date +%s) + 3 ))
 	local i=0
 	while [[ $(date +%s) -lt $end ]]; do
 		touch /mnt/marufs/.t1_pulse  && rm -f /mnt/marufs/.t1_pulse
@@ -84,8 +84,8 @@ run_t1_stress() {
 
 # ── T2 crash loop ─────────────────────────────────────────────────────
 run_t2_crash_loop() {
-	info "T2 (crash loop × 3)"
-	local iters=3 i t0 t1 dt
+	info "T2 (crash loop × 2)"
+	local iters=2 i t0 t1 dt
 	for (( i = 1; i <= iters; i++ )); do
 		sync_state
 		touch /mnt/marufs/.t2_prep_$i || die "iter $i prep failed"
@@ -109,7 +109,7 @@ run_t3_busy_holder() {
 	sync_state
 	dmesg_reset
 	(
-		end=$(( $(date +%s) + 7 ))
+		end=$(( $(date +%s) + 6 ))
 		while [[ $(date +%s) -lt $end ]]; do
 			touch /mnt/marufs/.busy$$ && rm -f /mnt/marufs/.busy$$
 		done

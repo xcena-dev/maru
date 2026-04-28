@@ -103,7 +103,7 @@ static int nrht_is_stale(struct marufs_sb_info *sbi,
 {
 	u32 ins_node = READ_CXL_LE32(e->inserter_node);
 	if (ins_node == 0)
-		return (sbi->node_id == 1) ?
+		return marufs_is_admin_node(sbi) ?
 			       0 :
 			       -1; /* Only admin node tracks orphans */
 

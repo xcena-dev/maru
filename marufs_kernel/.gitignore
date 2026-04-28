@@ -5,7 +5,6 @@
 *.mod.c
 *.order
 *.symvers
-.tmp_versions/
 .*.cmd
 Module.symvers
 modules.order
@@ -24,3 +23,4 @@ tests/test_negative
 tests/test_nrht_race
 tests/test_gc_deleg
 tests/test_pid_reuse
+tests/dax_zero

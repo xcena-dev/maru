@@ -76,7 +76,7 @@ static const match_table_t marufs_tokens = {
 };
 
 struct marufs_mount_opts {
-	int node_id;
+	int node_id; /* 0 = auto-mount (no node_id= given); ≥1 = manual */
 	char daxdev[128];
 	bool format; /* in-kernel format on mount */
 	bool use_daxheap;
@@ -92,8 +92,8 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 	int token;
 	int option;
 
-	/* Set defaults from module parameter */
-	opts->node_id = marufs_node_id;
+	/* Default: 0 = auto-mount (no node_id= on command line) */
+	opts->node_id = 0;
 	opts->daxdev[0] = '\0';
 	opts->use_daxheap = false;
 	opts->format = false;
@@ -258,7 +258,7 @@ static int marufs_show_options(struct seq_file *m, struct dentry *root)
 		seq_printf(m, ",daxdev=%s", sbi->daxdev_path);
 	else if (sbi->dax_mode == MARUFS_DAX_HEAP)
 		seq_puts(m, ",daxheap");
-	else if (sbi->use_dax)
+	else if (sbi->dax_base != NULL)
 		seq_puts(m, ",dax");
 
 	return 0;
@@ -555,12 +555,6 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	u32 num_shards = MARUFS_REGION_NUM_SHARDS;
 	u32 entries_per_shard = MARUFS_REGION_ENTRIES_PER_SHARD;
 	u32 buckets_per_shard = MARUFS_REGION_BUCKETS_PER_SHARD;
-	u64 bucket_array_start, total_bucket_bytes;
-	u64 entry_array_start, total_entry_bytes;
-	u64 index_pool_end;
-	u64 rat_offset, rat_size, regions_start;
-	struct marufs_superblock *gsb;
-	struct marufs_rat *rat;
 	u32 i;
 	u32 *bucket_base;
 
@@ -570,15 +564,16 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 		 total, total >> 20);
 
 	/* --- Layout calculation --- */
-	bucket_array_start = MARUFS_INDEX_BUCKET_OFFSET;
-	total_bucket_bytes = (u64)num_shards * buckets_per_shard * sizeof(u32);
-	entry_array_start = bucket_array_start + total_bucket_bytes;
-	total_entry_bytes =
+	u64 bucket_array_start = MARUFS_INDEX_BUCKET_OFFSET;
+	u64 total_bucket_bytes =
+		(u64)num_shards * buckets_per_shard * sizeof(u32);
+	u64 entry_array_start = bucket_array_start + total_bucket_bytes;
+	u64 total_entry_bytes =
 		(u64)num_shards * entries_per_shard * MARUFS_INDEX_ENTRY_SIZE;
-	index_pool_end = entry_array_start + total_entry_bytes;
-	rat_offset = index_pool_end;
-	rat_size = sizeof(struct marufs_rat);
-	regions_start =
+	u64 index_pool_end = entry_array_start + total_entry_bytes;
+	u64 rat_offset = index_pool_end;
+	u64 rat_size = sizeof(struct marufs_rat);
+	u64 regions_start =
 		marufs_align_up(rat_offset + rat_size, MARUFS_ALIGN_2MB);
 
 	if (regions_start >= total) {
@@ -594,16 +589,34 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 		return -EIO;
 	}
 
-	/* --- Zero the metadata area --- */
-	if (sbi->dax_mode == MARUFS_DAX_HEAP)
-		memset_io(base, 0, regions_start); /* WC-mapped memory */
-	else
-		memset(base, 0, regions_start); /* WB memremap */
+	/* --- Zero the metadata area (skip bootstrap area) ---
+	 *
+	 * Bootstrap area [MARUFS_BOOTSTRAP_AREA_OFFSET, MARUFS_BOOTSTRAP_AREA_OFFSET +
+	 * MARUFS_BOOTSTRAP_AREA_SIZE) is preserved so concurrent auto-mount
+	 * claimants keep their slot state across a formatter restart.
+	 * Zero [0 .. GSB_SIZE) and [shard_table_offset .. regions_start).
+	 */
+	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
+		memset_io(base, 0, MARUFS_GSB_SIZE);
+		memset_io((char *)base + MARUFS_SHARD_TABLE_OFFSET, 0,
+			  regions_start - MARUFS_SHARD_TABLE_OFFSET);
+	} else {
+		memset(base, 0, MARUFS_GSB_SIZE);
+		memset((char *)base + MARUFS_SHARD_TABLE_OFFSET, 0,
+		       regions_start - MARUFS_SHARD_TABLE_OFFSET);
+	}
 	MARUFS_CXL_WMB(base, regions_start);
 
-	/* --- Step 1: Superblock --- */
-	gsb = marufs_gsb_get(sbi);
-	WRITE_LE32(gsb->magic, MARUFS_MAGIC);
+	/* --- Step 1: Superblock (magic written LAST as format-complete fence) ---
+	 *
+	 * sbi->gsb is already cached by marufs_sbi_init_layout_ptrs() at mount
+	 * start, so marufs_gsb_get() returns a valid pointer here.
+	 */
+	struct marufs_superblock *gsb = marufs_gsb_get(sbi);
+	if (!gsb)
+		return -EINVAL;
+
+	/* magic intentionally deferred to end of format */
 	WRITE_LE32(gsb->version, MARUFS_VERSION);
 	WRITE_LE64(gsb->total_size, total);
 	WRITE_LE32(gsb->num_shards, num_shards);
@@ -611,14 +624,12 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	WRITE_LE32(gsb->entries_per_shard, entries_per_shard);
 	WRITE_LE64(gsb->shard_table_offset, MARUFS_SHARD_TABLE_OFFSET);
 	WRITE_LE64(gsb->rat_offset, rat_offset);
-	WRITE_LE32(gsb->checksum, marufs_gsb_checksum(gsb));
-
 	/* --- Step 2: Shard table --- */
 	for (i = 0; i < num_shards; i++) {
-		u64 off = MARUFS_SHARD_TABLE_OFFSET +
-			  (u64)i * MARUFS_SHARD_HEADER_SIZE;
 		struct marufs_shard_header *sh =
-			(struct marufs_shard_header *)((char *)base + off);
+			marufs_shard_header_get(sbi, i);
+		if (!sh)
+			return -EINVAL;
 
 		WRITE_LE32(sh->magic, MARUFS_SHARD_MAGIC);
 		WRITE_LE32(sh->shard_id, i);
@@ -640,7 +651,10 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	/* --- Step 4: Entry arrays already zeroed (ENTRY_EMPTY = 0) --- */
 
 	/* --- Step 5: RAT --- */
-	rat = (struct marufs_rat *)((char *)base + rat_offset);
+	struct marufs_rat *rat = marufs_rat_get(sbi);
+	if (!rat)
+		return -EINVAL;
+
 	WRITE_LE32(rat->magic, MARUFS_RAT_MAGIC);
 	WRITE_LE32(rat->version, 1);
 	WRITE_LE32(rat->num_entries, 0);
@@ -677,10 +691,7 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 
 	WRITE_LE64(gsb->me_area_offset, me_offset);
 
-	/* Full barrier to ensure all metadata is flushed (WC memory).
-	 * The verify reads below are on the same CPU that just wrote,
-	 * so store→load ordering after WMB is sufficient — no RMB needed.
-	 */
+	/* Full barrier to ensure all metadata except magic is flushed. */
 	MARUFS_CXL_WMB(base, regions_start);
 
 	/* --- Verify format: read back critical fields --- */
@@ -718,6 +729,15 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 		return -EIO;
 	}
 
+	/*
+	 * Write GSB magic LAST as the format-complete fence.
+	 * Joiners poll for this magic to know format is done.
+	 */
+	WRITE_LE32(gsb->magic, MARUFS_MAGIC);
+	u32 want_csum = marufs_gsb_checksum(gsb);
+	WRITE_LE32(gsb->checksum, want_csum);
+	MARUFS_CXL_WMB(gsb, sizeof(*gsb));
+
 	pr_info("format complete (shards=%u, entries/shard=%u, rat@0x%llx, regions@0x%llx)\n",
 		num_shards, entries_per_shard, rat_offset, regions_start);
 	return 0;
@@ -747,7 +767,6 @@ static int marufs_dax_acquire(struct marufs_sb_info *sbi,
 		return ret;
 	}
 
-	sbi->use_dax = (sbi->dax_base != NULL);
 	return 0;
 }
 
@@ -785,7 +804,6 @@ static void marufs_dax_release(struct marufs_sb_info *sbi,
 	}
 
 	sbi->dax_base = NULL;
-	sbi->use_dax = false;
 }
 
 /* ============================================================================
@@ -795,15 +813,13 @@ static void marufs_dax_release(struct marufs_sb_info *sbi,
 static int marufs_read_superblock(struct marufs_sb_info *sbi,
 				  struct super_block *sb, int silent)
 {
-	struct marufs_superblock *gsb;
-	u32 magic, version;
+	struct marufs_superblock *gsb = marufs_gsb_get(sbi);
 
-	gsb = marufs_gsb_get(sbi);
 	if (!gsb)
 		return -EINVAL;
 
 	/* Validate magic */
-	magic = READ_CXL_LE32(gsb->magic);
+	u32 magic = READ_CXL_LE32(gsb->magic);
 	if (magic != MARUFS_MAGIC) {
 		if (!silent)
 			pr_err("invalid magic 0x%x (expected 0x%x)\n", magic,
@@ -812,7 +828,7 @@ static int marufs_read_superblock(struct marufs_sb_info *sbi,
 	}
 
 	/* Validate version (v2 required: region header pool layout) */
-	version = READ_CXL_LE32(gsb->version);
+	u32 version = READ_CXL_LE32(gsb->version);
 	if (version != MARUFS_VERSION) {
 		if (!silent)
 			pr_err("unsupported version %u (expected %u, reformat required)\n",
@@ -829,8 +845,6 @@ static int marufs_read_superblock(struct marufs_sb_info *sbi,
 			       stored, computed);
 		return -EINVAL;
 	}
-
-	sbi->gsb = gsb;
 
 	/* Copy geometry fields to sbi */
 	sbi->total_size = READ_CXL_LE64(gsb->total_size);
@@ -863,10 +877,8 @@ static int marufs_read_superblock(struct marufs_sb_info *sbi,
 
 static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 {
-	u64 shard_table_offset = READ_CXL_LE64(sbi->gsb->shard_table_offset);
-	u32 i;
-
 	/* Validate shard_table_offset within DAX range */
+	u64 shard_table_offset = READ_CXL_LE64(sbi->gsb->shard_table_offset);
 	if (!marufs_dax_range_valid(sbi, shard_table_offset,
 				    (u64)sbi->num_shards *
 					    MARUFS_SHARD_HEADER_SIZE)) {
@@ -875,27 +887,18 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 		return -EINVAL;
 	}
 
-	struct marufs_shard_header *shard_table =
-		(struct marufs_shard_header *)((char *)sbi->dax_base +
-					       shard_table_offset);
+	WARN_ON_ONCE(shard_table_offset != MARUFS_SHARD_TABLE_OFFSET);
 
-	/*
-	 * Allocate shard cache first — header pointers, bucket/entry array
-	 * pointers, and free_hint are all consolidated here.
-	 * GFP_ZERO ensures free_hint starts at 0.
-	 */
-	sbi->shard_cache = kvmalloc_array(sbi->num_shards,
-					  sizeof(struct marufs_shard_cache),
-					  GFP_KERNEL | __GFP_ZERO);
-	if (!sbi->shard_cache)
-		return -ENOMEM;
-
-	/* Populate header pointers and validate each shard */
-	for (i = 0; i < sbi->num_shards; i++) {
-		struct marufs_shard_header *sh = &shard_table[i];
-
-		MARUFS_CXL_RMB(sh, sizeof(*sh));
-		sbi->shard_cache[i].header = sh;
+	/* shard_cache + header pointers already populated by
+	 * marufs_sbi_init_layout_ptrs at mount start.  Here we validate each
+	 * header and fill the buckets/entries pointers. */
+	for (u32 i = 0; i < sbi->num_shards; i++) {
+		struct marufs_shard_header *sh =
+			marufs_shard_header_get(sbi, i);
+		if (!sh) {
+			pr_err("shard_cache header NULL at %u\n", i);
+			return -EINVAL;
+		}
 
 		if (READ_CXL_LE32(sh->magic) != MARUFS_SHARD_MAGIC) {
 			pr_err("bad shard magic at %u (0x%x)\n", i,
@@ -934,11 +937,8 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 			return -EINVAL;
 		}
 
-		sbi->shard_cache[i].buckets =
-			(u32 *)((char *)sbi->dax_base + boff);
-		sbi->shard_cache[i].entries =
-			(struct marufs_index_entry *)((char *)sbi->dax_base +
-						      entry_off);
+		sbi->shard_cache[i].buckets = marufs_dax_ptr(sbi, boff);
+		sbi->shard_cache[i].entries = marufs_dax_ptr(sbi, entry_off);
 	}
 
 	pr_debug(
@@ -954,14 +954,8 @@ static int marufs_init_shard_table(struct marufs_sb_info *sbi)
 
 static int marufs_load_rat(struct marufs_sb_info *sbi)
 {
-	u64 rat_offset;
-	struct marufs_rat *rat;
-	u32 magic, version;
-
 	/* Get RAT offset from superblock */
-	rat_offset = READ_CXL_LE64(sbi->gsb->rat_offset);
-
-	/* RAT is mandatory - fail if not present */
+	u64 rat_offset = READ_CXL_LE64(sbi->gsb->rat_offset);
 	if (rat_offset == 0) {
 		pr_err("RAT not present! rat_offset=0 (filesystem too old or corrupted)\n");
 		return -EINVAL;
@@ -974,14 +968,15 @@ static int marufs_load_rat(struct marufs_sb_info *sbi)
 		return -EINVAL;
 	}
 
-	/* Map RAT from CXL memory */
-	rat = (struct marufs_rat *)((char *)sbi->dax_base + rat_offset);
-	MARUFS_CXL_RMB(
-		rat,
-		sizeof(*rat)); /* Memory barrier for cross-node visibility */
+	WARN_ON_ONCE(rat_offset != MARUFS_RAT_OFFSET);
+
+	/* sbi->rat already cached by marufs_sbi_init_layout_ptrs at mount start. */
+	struct marufs_rat *rat = marufs_rat_get(sbi);
+	if (!rat)
+		return -EINVAL;
 
 	/* Validate RAT magic */
-	magic = READ_CXL_LE32(rat->magic);
+	u32 magic = READ_CXL_LE32(rat->magic);
 	if (magic != MARUFS_RAT_MAGIC) {
 		pr_err("invalid RAT magic 0x%x (expected 0x%x) at offset 0x%llx\n",
 		       magic, MARUFS_RAT_MAGIC, rat_offset);
@@ -989,21 +984,17 @@ static int marufs_load_rat(struct marufs_sb_info *sbi)
 	}
 
 	/* Validate RAT version */
-	version = READ_CXL_LE32(rat->version);
+	u32 version = READ_CXL_LE32(rat->version);
 	if (version != 1) {
 		pr_err("unsupported RAT version %u (expected 1)\n", version);
 		return -EINVAL;
 	}
 
-	/* Store RAT pointer and offsets */
-	sbi->rat = rat;
-	sbi->rat_offset = rat_offset;
-	sbi->regions_start_offset = READ_CXL_LE64(rat->regions_start);
-
 	pr_debug("RAT loaded at offset 0x%llx, RAT pointer=%p\n", rat_offset,
 		 rat);
 	pr_debug("  device_size=%llu, regions_start=0x%llx\n",
-		 READ_CXL_LE64(rat->device_size), sbi->regions_start_offset);
+		 READ_CXL_LE64(rat->device_size),
+		 READ_CXL_LE64(rat->regions_start));
 	pr_debug("  num_entries=%u/%u\n", READ_CXL_LE32(rat->num_entries),
 		 READ_CXL_LE32(rat->max_entries));
 	pr_debug("  total_allocated=%llu, total_free=%llu\n",
@@ -1137,10 +1128,10 @@ static int marufs_fill_super_common(struct super_block *sb,
 		goto err_free_gsb;
 	}
 
-	sbi->me = marufs_me_create(
-		(char *)sbi->dax_base + MARUFS_ME_AREA_OFFSET,
-		MARUFS_ME_GLOBAL_SHARDS, MARUFS_ME_MAX_NODES, sbi->node_id,
-		MARUFS_ME_DEFAULT_POLL_US, me_strategy);
+	/* sbi->me_area already cached by marufs_sbi_init_layout_ptrs at mount start. */
+	sbi->me = marufs_me_create(sbi->me_area, MARUFS_ME_GLOBAL_SHARDS,
+				   MARUFS_ME_MAX_NODES, sbi->node_id,
+				   MARUFS_ME_DEFAULT_POLL_US, me_strategy);
 	if (IS_ERR(sbi->me)) {
 		pr_err("ME create failed: %ld\n", PTR_ERR(sbi->me));
 		sbi->me = NULL;
@@ -1180,37 +1171,326 @@ err_free_gsb:
 }
 
 /* ============================================================================
+ * Auto-mount helpers (called from marufs_fill_super)
+ * ============================================================================ */
+
+/*
+ * marufs_sbi_init_layout_ptrs - cache all on-disk layout pointers.
+ *
+ * Each cached pointer references a region at a compile-time fixed offset
+ * (GSB at 0, bootstrap area at MARUFS_BOOTSTRAP_AREA_OFFSET, RAT at
+ * MARUFS_RAT_OFFSET, ME area at MARUFS_ME_AREA_OFFSET).  All four pointers
+ * are valid as soon as sbi->dax_base is set — even before format or
+ * read_superblock has populated the underlying memory.  Callers that
+ * dereference the pointers must still ensure the content is initialised
+ * (e.g. format completed, read_superblock validated).
+ *
+ * Call once in marufs_fill_super after marufs_dax_acquire succeeds.
+ */
+static int marufs_sbi_init_layout_ptrs(struct marufs_sb_info *sbi)
+{
+	u32 i;
+
+	sbi->gsb = marufs_dax_ptr(sbi, MARUFS_GSB_OFFSET);
+	sbi->bootstrap_slots =
+		marufs_dax_ptr(sbi, MARUFS_BOOTSTRAP_AREA_OFFSET);
+	sbi->rat = marufs_dax_ptr(sbi, MARUFS_RAT_OFFSET);
+	sbi->me_area = marufs_dax_ptr(sbi, MARUFS_ME_AREA_OFFSET);
+
+	/* Allocate per-shard cache + populate header pointers (offset-derived).
+	 * buckets/entries fields are filled later by marufs_init_shard_table
+	 * after format/read_superblock validates shard content. */
+	sbi->shard_cache = kvmalloc_array(MARUFS_REGION_NUM_SHARDS,
+					  sizeof(struct marufs_shard_cache),
+					  GFP_KERNEL | __GFP_ZERO);
+	if (!sbi->shard_cache)
+		return -ENOMEM;
+
+	for (i = 0; i < MARUFS_REGION_NUM_SHARDS; i++) {
+		u64 off = MARUFS_SHARD_TABLE_OFFSET +
+			  (u64)i * MARUFS_SHARD_HEADER_SIZE;
+		sbi->shard_cache[i].header = marufs_dax_ptr(sbi, off);
+	}
+	return 0;
+}
+
+/*
+ * marufs_check_needs_format - determine whether the device requires formatting.
+ *
+ * For DAXHEAP: primary mount (no bufid) always formats.
+ * For DEV_DAX: check GSB magic and checksum; invalid means format needed.
+ */
+static bool marufs_check_needs_format(struct marufs_sb_info *sbi,
+				      u64 daxheap_bufid)
+{
+	if (sbi->dax_mode == MARUFS_DAX_HEAP)
+		return (daxheap_bufid == 0);
+
+	struct marufs_superblock *gsb = marufs_gsb_get(sbi);
+	if (!gsb || READ_CXL_LE32(gsb->magic) != MARUFS_MAGIC)
+		return true;
+
+	/* Magic OK — validate checksum; stale layout leaves magic valid but
+	 * checksum wrong, so reformat rather than failing the mount.
+	 */
+	u32 stored = READ_CXL_LE32(gsb->checksum);
+	u32 computed = marufs_gsb_checksum(gsb);
+	if (stored != computed) {
+		pr_warn("bootstrap: GSB checksum mismatch (stored=0x%x computed=0x%x) — reformatting\n",
+			stored, computed);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * marufs_run_formatter - formatter path for slot[0] on an unformatted device.
+ *
+ * Sets slot[0]=FORMATTING, optionally injects stuck state (chaos test), then
+ * calls marufs_format_device() and promotes slot[0] to CLAIMED on success.
+ *
+ * Return values:
+ *   0           success; slot[0]=CLAIMED, GSB magic written.
+ *   -EOWNERDEAD inject_stuck path: slot[0] LEFT at FORMATTING for joiners to
+ *               detect via timeout. Caller must NOT release the bootstrap
+ *               slot but MUST run normal sbi teardown (shard_cache, nrht_stats
+ *               etc.) — route to err_release_dax (which skips bs_release).
+ *   other       real format error; slot released, caller may goto err_release_dax.
+ */
+/*
+ * marufs_format_and_promote - format the device then promote slot[0] to CLAIMED.
+ *
+ * Shared between formatter election (marufs_run_formatter) and joiner-side
+ * stuck recovery (marufs_run_joiner). Caller must already own slot[0] at
+ * MARUFS_BS_FORMATTING.  On format failure, releases the bootstrap slot.
+ */
+static int marufs_format_and_promote(struct marufs_sb_info *sbi)
+{
+	int ret = marufs_format_device(sbi);
+	if (ret) {
+		pr_err("bootstrap: format failed: %d\n", ret);
+		marufs_bootstrap_release(sbi);
+		return ret;
+	}
+	/* GSB magic was written inside format_device; promote slot */
+	marufs_bootstrap_promote_claimed(sbi);
+	return 0;
+}
+
+static int marufs_run_formatter(struct marufs_sb_info *sbi,
+				struct super_block *sb)
+{
+	pr_info("bootstrap: formatter elected (slot=0, node_id=%u)\n",
+		sbi->node_id);
+
+	/* Signal formatting in progress to joiners */
+	marufs_bootstrap_set_status(sbi, 0, MARUFS_BS_FORMATTING);
+
+	if (marufs_bootstrap_should_inject_stuck()) {
+		pr_info("bootstrap: DEBUG stuck-formatter injection active — leaving slot[0]=FORMATTING, aborting mount (test-only)\n");
+		return -EOWNERDEAD;
+	}
+
+	return marufs_format_and_promote(sbi);
+}
+
+/*
+ * marufs_run_joiner - joiner path: wait for formatter, handle stuck recovery.
+ *
+ * Returns 0 on success (GSB magic visible or recovery format complete).
+ * Returns -EAGAIN if we lost the steal race — caller must release its joiner
+ * slot and retry from marufs_bootstrap_claim.
+ * Returns other negative on unrecoverable error; slot released by callee.
+ */
+static int marufs_run_joiner(struct marufs_sb_info *sbi)
+{
+	int ret;
+
+	pr_info("bootstrap: joiner waiting for format (slot=%d, node_id=%u)\n",
+		sbi->bootstrap_slot_idx, sbi->node_id);
+
+	ret = marufs_bootstrap_wait_for_format(sbi);
+	if (ret == 0)
+		return 0;
+
+	if (ret != -EAGAIN) {
+		pr_err("bootstrap: wait_for_format error: %d\n", ret);
+		marufs_bootstrap_release(sbi);
+		return ret;
+	}
+
+	/* Formatter stuck — attempt steal + re-format */
+	ret = marufs_bootstrap_steal_stuck_slot0(sbi);
+	if (ret == -EAGAIN) {
+		/* Another node won the steal; caller releases joiner slot and
+		 * retries from scratch. */
+		pr_info("bootstrap: steal lost, retrying mount\n");
+		return -EAGAIN;
+	}
+	if (ret) {
+		pr_err("bootstrap: steal failed: %d\n", ret);
+		return ret;
+	}
+
+	/* We now own slot[0] at FORMATTING; re-format and promote */
+	sbi->node_id = 1;
+	return marufs_format_and_promote(sbi);
+}
+
+/*
+ * marufs_auto_mount - top-level auto-mount: claim → format-or-wait.
+ *
+ * Handles the full claim/format/wait loop.  On success returns 0 with sbi
+ * fully populated.  On failure returns negative errno; bootstrap slot is
+ * released for normal errors but LEFT at FORMATTING for the inject_stuck
+ * test path (-EOWNERDEAD).  In all error cases caller routes to
+ * err_release_dax for normal sbi teardown.
+ */
+static int marufs_auto_mount(struct marufs_sb_info *sbi, struct super_block *sb,
+			     const struct marufs_mount_opts *opts)
+{
+	/* Initialise bootstrap area (no-op on well-formed devices) */
+	marufs_bootstrap_init_area(sbi->dax_base);
+
+	/*
+	* Claim → format/wait loop.
+	*
+	* Two retry triggers:
+	*   (a) bootstrap_claim returns -EAGAIN: lost the per-slot write race;
+	*       another node won this slot, retry the whole scan.
+	*   (b) run_joiner returns -EAGAIN: detected a stuck formatter and
+	*       lost the steal race for slot[0]; release our joiner slot and
+	*       retry the claim from scratch.
+	*
+	* Bounded by EBUSY (table full) or other fatal errors propagating up.
+	*/
+	int slot_idx = -1;
+	for (;;) {
+		int ret = marufs_bootstrap_claim(sbi, &slot_idx);
+		if (ret == -EAGAIN) {
+			pr_info("bootstrap: claim race lost, retrying\n");
+			continue;
+		}
+		if (ret) {
+			pr_err("bootstrap: claim failed: %d\n", ret);
+			return ret;
+		}
+
+		sbi->node_id = slot_idx + 1;
+		pr_info("bootstrap: node_id=%u (slot %d)\n", sbi->node_id,
+			slot_idx);
+
+		if (slot_idx == 0 &&
+		    marufs_check_needs_format(sbi, opts->daxheap_bufid)) {
+			ret = marufs_run_formatter(sbi, sb);
+			/* -EAGAIN means inject_stuck: sbi already freed,
+			 * propagate. */
+			if (ret)
+				return ret;
+		} else if (slot_idx != 0) {
+			ret = marufs_run_joiner(sbi);
+			if (ret == -EAGAIN) {
+				/* Lost steal race: release joiner slot, retry */
+				marufs_bootstrap_release(sbi);
+				continue;
+			}
+			if (ret)
+				return ret;
+		} else {
+			/* slot_idx == 0 && !needs_format: device already
+			 * formatted, claimed a free slot[0] after reclaim.
+			 * Ensure status is CLAIMED (may have been EMPTY). */
+			marufs_bootstrap_promote_claimed(sbi);
+		}
+
+		return 0;
+	}
+}
+
+/*
+ * marufs_manual_mount - manual node_id= path (legacy explicit mount).
+ *
+ * Optionally formats, then claims the explicit slot.
+ * Returns 0 on success, negative on error (DAX not released — caller handles).
+ */
+static int marufs_manual_mount(struct marufs_sb_info *sbi,
+			       struct super_block *sb,
+			       const struct marufs_mount_opts *opts)
+{
+	int ret;
+
+	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
+		if (opts->daxheap_bufid != 0) {
+			struct marufs_superblock *gsb = marufs_gsb_get(sbi);
+			if (!gsb || READ_CXL_LE32(gsb->magic) != MARUFS_MAGIC) {
+				pr_err("DAXHEAP secondary mount but buffer not formatted\n");
+				return -EINVAL;
+			}
+		} else {
+			ret = marufs_format_device(sbi);
+			if (ret) {
+				pr_err("in-kernel format failed\n");
+				return ret;
+			}
+		}
+	} else if (opts->format) {
+		ret = marufs_format_device(sbi);
+		if (ret) {
+			pr_err("in-kernel format failed\n");
+			return ret;
+		}
+	}
+
+	/* Try to claim bootstrap slot for this node_id.
+	 * Best-effort: if bootstrap area not yet initialised on an old
+	 * image, the claim will see magic==0 and succeed silently.
+	 */
+	ret = marufs_bootstrap_claim_explicit(sbi, opts->node_id);
+	if (ret == -EBUSY) {
+		pr_err("bootstrap: slot for node_id=%d already active\n",
+		       opts->node_id);
+		return ret;
+	} else if (ret) {
+		/* Other errors (EAGAIN, EINVAL) — warn but continue */
+		pr_warn("bootstrap: explicit claim for node_id=%d: %d\n",
+			opts->node_id, ret);
+	}
+	return 0;
+}
+
+/* ============================================================================
  * Mount handling - unified marufs_fill_super (DEV_DAX and DAXHEAP)
  * ============================================================================ */
 
 int marufs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	struct marufs_sb_info *sbi;
-	struct marufs_mount_opts opts;
-	int ret;
-
 	/* Parse mount options */
-	ret = marufs_parse_options((char *)data, &opts);
+	struct marufs_mount_opts opts;
+	int ret = marufs_parse_options((char *)data, &opts);
 	if (ret)
 		return ret;
 
 	/* Allocate marufs_sb_info */
-	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	struct marufs_sb_info *sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
 
 	sb->s_fs_info = sbi;
-	sbi->node_id = opts.node_id;
+	sbi->bootstrap_slot_idx = -1; /* not yet claimed */
 
-	/* Validate node_id range. 0 is reserved as ORPHAN/unset sentinel
-	 * (see gc.c, inode.c); valid node_ids are 1..MARUFS_MAX_NODE_ID.
+	/* Validate node_id only for explicit manual mounts (node_id ≥ 1).
+	 * Auto-mount path (opts.node_id == 0) assigns node_id from bootstrap claim.
 	 */
-	if (opts.node_id == 0 || opts.node_id > MARUFS_MAX_NODE_ID) {
-		pr_err("node_id=%d invalid (valid range: 1..%d)\n",
-		       opts.node_id, MARUFS_MAX_NODE_ID);
-		kfree(sbi);
-		return -EINVAL;
+	if (opts.node_id != 0) {
+		if (opts.node_id > MARUFS_MAX_NODE_ID) {
+			pr_err("node_id=%d invalid (valid range: 1..%d)\n",
+			       opts.node_id, MARUFS_MAX_NODE_ID);
+			kfree(sbi);
+			return -EINVAL;
+		}
+		sbi->node_id = opts.node_id;
 	}
+	/* Auto-mount: node_id assigned after bootstrap claim below */
 
 	/* Fine-grained NRHT per-CPU stats (bucket-chain depth). alloc_percpu
 	 * zeroes every field; recorders check for NULL for safety.
@@ -1260,41 +1540,32 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 		goto err_free_sbi;
 	}
 
-	/* In-kernel format: DAXHEAP always formats (primary), DEV_DAX when format option set */
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-		if (opts.daxheap_bufid != 0) {
-			/* Secondary: buffer must already be formatted by primary */
-			struct marufs_superblock *gsb = marufs_gsb_get(sbi);
-
-			if (!gsb || READ_CXL_LE32(gsb->magic) != MARUFS_MAGIC) {
-				pr_err("DAXHEAP secondary mount but buffer not formatted\n");
-				ret = -EINVAL;
-				goto err_release_dax;
-			}
-		} else {
-			/* Primary: always format (daxheap may reuse physical memory) */
-			ret = marufs_format_device(sbi);
-			if (ret) {
-				pr_err("in-kernel format failed\n");
-				goto err_release_dax;
-			}
-		}
-	} else if (opts.format) {
-		/* DEV_DAX: format when mount option 'format' is specified */
-		ret = marufs_format_device(sbi);
-		if (ret) {
-			pr_err("in-kernel format failed\n");
-			goto err_release_dax;
-		}
+	/* Cache all on-disk layout pointers (GSB, bootstrap, RAT, ME area, shard headers). */
+	ret = marufs_sbi_init_layout_ptrs(sbi);
+	if (ret) {
+		pr_err("layout pointer init failed: %d\n", ret);
+		goto err_release_dax;
 	}
+
+	if (opts.node_id == 0)
+		ret = marufs_auto_mount(sbi, sb, &opts);
+	else
+		ret = marufs_manual_mount(sbi, sb, &opts);
+	if (ret)
+		goto err_release_dax;
+
+	/* Seed admin role cache before fill_super_common (GC starts inside). */
+	sbi->cached_admin_node_id = marufs_current_admin_node_id(sbi);
 
 	/* Common handling */
 	ret = marufs_fill_super_common(sb, sbi, silent, opts.me_strategy);
 	if (ret)
-		goto err_release_dax;
+		goto err_bs_release;
 
 	return 0;
 
+err_bs_release:
+	marufs_bootstrap_release(sbi);
 err_release_dax:
 	marufs_dax_release(sbi, sb);
 err_free_sbi:
@@ -1321,6 +1592,9 @@ static void marufs_kill_sb(struct super_block *sb)
 	struct marufs_sb_info *sbi = marufs_sb_get(sb);
 
 	if (sbi) {
+		/* Bootstrap: release slot (CLAIMED → EMPTY) */
+		marufs_bootstrap_release(sbi);
+
 		/* Teardown all NRHT ME instances (opt-in per rat_entry) */
 		for (u32 i = 0; i < MARUFS_MAX_RAT_ENTRIES; i++) {
 			marufs_me_teardown(sbi, sbi->nrht_me[i]);

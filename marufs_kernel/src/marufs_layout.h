@@ -39,6 +39,7 @@
 #include "marufs_hash.h"
 
 #include "marufs_superblock_layout.h"
+#include "marufs_bootstrap_layout.h"
 #include "marufs_index_layout.h"
 #include "marufs_rat_layout.h"
 #include "marufs_nrht_layout.h"
@@ -46,6 +47,7 @@
 /* ── Magic Numbers / Version ───────────────────────────────────────── */
 enum marufs_magic {
 	MARUFS_MAGIC = 0x4D415255, /* "MARU" */
+	MARUFS_BOOTSTRAP_MAGIC = 0x4D425453, /* "MBTS" */
 	MARUFS_SHARD_MAGIC = 0x4D534844, /* "MSHD" */
 	MARUFS_RAT_MAGIC = 0x4D524154, /* "MRAT" */
 	MARUFS_NRHT_MAGIC = 0x4E524854, /* "NRHT" */
@@ -62,6 +64,14 @@ enum {
 	MARUFS_ME_CB_SIZE = 64, /* ME control block (1 CL) */
 	MARUFS_ME_MEMBERSHIP_SLOT_SIZE = 64, /* ME membership slot (1 CL) */
 	MARUFS_ME_SLOT_SIZE = 64, /* ME per-(shard, node) slot (1 CL) */
+};
+
+/* Bootstrap area constants */
+enum {
+	MARUFS_BOOTSTRAP_SLOT_SIZE = 64, /* 1 CL */
+	MARUFS_BOOTSTRAP_MAX_SLOTS = MARUFS_MAX_NODE_ID,
+	MARUFS_BOOTSTRAP_AREA_SIZE = MARUFS_BOOTSTRAP_SLOT_SIZE *
+				     MARUFS_BOOTSTRAP_MAX_SLOTS, /* 512B */
 };
 
 /*
@@ -87,7 +97,11 @@ enum marufs_layout {
 	MARUFS_ALIGN_2MB = 2 * 1024 * 1024,
 
 	MARUFS_GSB_OFFSET = 0,
-	MARUFS_SHARD_TABLE_OFFSET = MARUFS_GSB_OFFSET + MARUFS_GSB_SIZE,
+	/* Bootstrap area immediately follows the GSB (512B = 8 × 64B slots) */
+	MARUFS_BOOTSTRAP_AREA_OFFSET = MARUFS_GSB_SIZE,
+	/* Shard table starts after GSB + bootstrap area */
+	MARUFS_SHARD_TABLE_OFFSET =
+		MARUFS_BOOTSTRAP_AREA_OFFSET + MARUFS_BOOTSTRAP_AREA_SIZE,
 	MARUFS_INDEX_BUCKET_OFFSET =
 		MARUFS_SHARD_TABLE_OFFSET +
 		MARUFS_REGION_NUM_SHARDS * MARUFS_SHARD_HEADER_SIZE,
@@ -111,6 +125,8 @@ static inline void __marufs_verify_structs(void)
 {
 	MARUFS_BUILD_BUG_ON(sizeof(struct marufs_superblock) !=
 			    MARUFS_GSB_SIZE);
+	MARUFS_BUILD_BUG_ON(sizeof(struct marufs_bootstrap_slot) !=
+			    MARUFS_BOOTSTRAP_SLOT_SIZE);
 	MARUFS_BUILD_BUG_ON(sizeof(struct marufs_shard_header) !=
 			    MARUFS_SHARD_HEADER_SIZE);
 	MARUFS_BUILD_BUG_ON(sizeof(struct marufs_index_entry) !=
