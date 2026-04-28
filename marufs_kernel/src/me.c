@@ -59,8 +59,7 @@ u32 marufs_me_next_active(struct marufs_me_instance *me, u32 from)
  * subtraction) because CXL peers don't share a monotonic clock origin.
  */
 static int me_handle_acquire_deadline(struct marufs_me_instance *me,
-				      u32 shard_id,
-				      struct marufs_me_shard *sh,
+				      u32 shard_id, struct marufs_me_shard *sh,
 				      struct marufs_me_slot *my_slot,
 				      struct marufs_me_cb *cb)
 {
@@ -146,6 +145,7 @@ int marufs_me_wait_for_token(struct marufs_me_instance *me, u32 shard_id)
 			if (holder == me->node_id && cb_gen > sh->last_cb_gen) {
 				sh->last_token_seq = cur_seq;
 				sh->last_cb_gen = cb_gen;
+				sh->poll_last_slot_seq = cur_seq;
 				ME_BECOME_HOLDER(sh);
 				me_stats_wait_done(
 					me, wall_start, cpu_start,
