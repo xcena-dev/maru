@@ -447,13 +447,16 @@ static int nrht_find_one(struct marufs_sb_info *sbi, u32 owner_rid,
 
 	u64 offset;
 	u32 target_region_id;
+	u32 ref_count = 0, pin_count = 0;
 	int ret = marufs_nrht_lookup(sbi, owner_rid, req->name, nlen,
-				     req->name_hash, &offset,
-				     &target_region_id);
+				     req->name_hash, &offset, &target_region_id,
+				     &ref_count, &pin_count);
 	if (ret)
 		return ret;
 
 	req->offset = offset;
+	req->ref_count = ref_count;
+	req->pin_count = pin_count;
 
 	memset(req->region_name, 0, sizeof(req->region_name));
 	struct marufs_rat_entry *rat_e =
@@ -620,6 +623,27 @@ static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
 	return ret;
 }
 
+/* ── ioctl handler: NRHT_REF/PIN_INC/DEC (per-entry counter ops) ───── */
+typedef int (*nrht_refcnt_op_t)(struct marufs_sb_info *sbi, u32 nrht_region_id,
+				const char *name, size_t namelen, u64 name_hash,
+				u32 *out_count);
+
+static long marufs_ioctl_nrht_refcnt(struct marufs_sb_info *sbi,
+				     struct marufs_inode_info *xi,
+				     struct marufs_refcnt_req *req,
+				     nrht_refcnt_op_t op)
+{
+	req->name[sizeof(req->name) - 1] = '\0';
+	size_t name_len = strnlen(req->name, sizeof(req->name));
+
+	u32 new_count = 0;
+	int ret = op(sbi, xi->rat_entry_id, req->name, name_len, req->name_hash,
+		     &new_count);
+	if (ret == 0)
+		req->count = new_count;
+	return ret;
+}
+
 /* ── ioctl handler: NRHT_INIT (format NRHT hash table) ──────────────── */
 static long marufs_ioctl_nrht_init(struct marufs_sb_info *sbi,
 				   struct marufs_inode_info *xi,
@@ -684,6 +708,7 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		struct marufs_perm_req perm;
 		struct marufs_chown_req chown;
 		struct marufs_nrht_init_req nrht_init;
+		struct marufs_refcnt_req refcnt;
 		struct marufs_dmabuf_req dmabuf;
 	} payload;
 
@@ -762,15 +787,46 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 
 	case MARUFS_IOC_NRHT_JOIN:
-		/* Explicit pre-warm of this sbi's NRHT ME instance (same
-		 * cost as lazy-join on first NAME_OFFSET, just surfaced).
-		 * IOCTL perm mirrors the insert/find/delete path that would
-		 * have done the same work implicitly.
-		 */
 		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
 					      MARUFS_PERM_IOCTL);
 		if (!ret)
 			ret = marufs_nrht_join(fc.sbi, fc.xi->rat_entry_id);
+		break;
+
+	case MARUFS_IOC_NRHT_REF_INC:
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
+						       &payload.refcnt,
+						       marufs_nrht_ref_inc);
+		break;
+
+	case MARUFS_IOC_NRHT_REF_DEC:
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
+						       &payload.refcnt,
+						       marufs_nrht_ref_dec);
+		break;
+
+	case MARUFS_IOC_NRHT_PIN_INC:
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
+						       &payload.refcnt,
+						       marufs_nrht_pin_inc);
+		break;
+
+	case MARUFS_IOC_NRHT_PIN_DEC:
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      MARUFS_PERM_IOCTL);
+		if (!ret)
+			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
+						       &payload.refcnt,
+						       marufs_nrht_pin_dec);
 		break;
 
 	case MARUFS_IOC_DMABUF_EXPORT:

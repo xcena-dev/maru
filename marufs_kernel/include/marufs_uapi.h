@@ -68,7 +68,8 @@ struct marufs_find_name_req {
 	__u64 offset; /* output: offset within target region's data area */
 	__u64 name_hash; /* input: pre-computed hash (0 = auto) */
 	__s32 status; /* output: 0=found, negative errno (batch) */
-	__u8 _pad[4];
+	__u32 ref_count; /* output: NRHT entry ref_count */
+	__u32 pin_count; /* output: NRHT entry pin_count */
 };
 
 /* Batch find name request */
@@ -105,6 +106,22 @@ struct marufs_dmabuf_req {
 	__u32 flags; /* Reserved, must be 0 */
 };
 
+/* NRHT ref/pin counter manipulation: name → (counter inc/dec).
+ * Used for REF_INC, REF_DEC, PIN_INC, PIN_DEC ioctls. Looks up the entry
+ * by name, performs the requested op under ME shard lock, returns the
+ * post-op counter value.
+ *
+ * Semantics:
+ *   inc: fails with -EOVERFLOW if current value is UINT32_MAX
+ *   dec: fails with -EINVAL if current value is 0
+ */
+struct marufs_refcnt_req {
+	char name[MARUFS_NAME_MAX + 1]; /* input: name */
+	__u64 name_hash; /* input: pre-computed hash (0 = auto) */
+	__u32 count; /* output: counter value after op */
+	__s32 status; /* output: 0=success, negative errno (reserved for batch) */
+};
+
 /* NRHT initialization request */
 struct marufs_nrht_init_req {
 	__u32 max_entries; /* 0 = default (524288), total across all shards */
@@ -139,6 +156,12 @@ struct marufs_nrht_init_req {
  * first NAME_OFFSET. Idempotent (re-joining a cached instance is a no-op).
  */
 #define MARUFS_IOC_NRHT_JOIN _IO('X', 21)
+
+/* Per-entry ref/pin counter manipulation (each acquires NRHT shard ME). */
+#define MARUFS_IOC_NRHT_REF_INC _IOWR('X', 22, struct marufs_refcnt_req)
+#define MARUFS_IOC_NRHT_REF_DEC _IOWR('X', 23, struct marufs_refcnt_req)
+#define MARUFS_IOC_NRHT_PIN_INC _IOWR('X', 24, struct marufs_refcnt_req)
+#define MARUFS_IOC_NRHT_PIN_DEC _IOWR('X', 25, struct marufs_refcnt_req)
 
 /* DMA-BUF */
 #define MARUFS_IOC_DMABUF_EXPORT _IOWR('X', 0x50, struct marufs_dmabuf_req)

@@ -890,6 +890,9 @@ int marufs_nrht_insert(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	WRITE_LE32(entry->target_region_id, target_region_id);
 	WRITE_LE32(entry->inserter_node, sbi->node_id);
 	WRITE_LE64(entry->created_at, ktime_get_real_ns());
+	/* Reset user counters when claiming a fresh/reused slot. */
+	WRITE_LE32(entry->ref_count, 0);
+	WRITE_LE32(entry->pin_count, 0);
 
 	size_t copy_len = min(namelen, sizeof(entry->name) - 1);
 	memset(entry->name, 0, sizeof(entry->name));
@@ -944,9 +947,116 @@ unlock:
 	return ret;
 }
 
+/*
+ * nrht_modify_count - shared ME-protected RMW of an entry counter field.
+ *
+ * @field_offset: byte offset of __le32 counter within marufs_nrht_entry
+ *                (offsetof ref_count / pin_count).
+ * @delta:        +1 (inc) or -1 (dec).
+ *
+ * Acquires the NRHT shard ME for (region, name), locates a VALID entry,
+ * applies the bounded RMW, and releases. The ME shard lock guards against
+ * concurrent dec-from-zero / inc-from-UINT32_MAX races on the same entry.
+ */
+static int nrht_modify_count(struct marufs_sb_info *sbi, u32 nrht_region_id,
+			     const char *name, size_t namelen, u64 name_hash,
+			     size_t field_offset, int delta, u32 *out_count)
+{
+	if (!sbi || !name || !out_count)
+		return -EINVAL;
+	if (namelen == 0 || namelen > MARUFS_NAME_MAX)
+		return -ENOENT;
+
+	struct nrht_shard_ctx ctx;
+	int ret = nrht_resolve_bucket(sbi, nrht_region_id, name, namelen,
+				      &name_hash, &ctx);
+	if (ret)
+		return ret;
+
+	struct marufs_me_instance *nme =
+		marufs_nrht_me_get(sbi, nrht_region_id);
+	if (IS_ERR(nme))
+		return PTR_ERR(nme);
+
+	ret = nme->ops->acquire(nme, ctx.shard_id);
+	if (ret)
+		return ret;
+
+	struct marufs_nrht_entry *e =
+		nrht_find_chain(&ctx, name_hash, name, namelen, NULL, NULL);
+	if (!e) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	__le32 *counter = (__le32 *)((u8 *)e + field_offset);
+	MARUFS_CXL_RMB(counter, sizeof(*counter));
+	u32 cur = READ_CXL_LE32(*counter);
+
+	if (delta > 0) {
+		if (cur == U32_MAX) {
+			ret = -EOVERFLOW;
+			goto unlock;
+		}
+		cur += 1;
+	} else {
+		if (cur == 0) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		cur -= 1;
+	}
+
+	WRITE_LE32(*counter, cur);
+	MARUFS_CXL_WMB(counter, sizeof(*counter));
+	*out_count = cur;
+	ret = 0;
+
+unlock:
+	nme->ops->release(nme, ctx.shard_id);
+	return ret;
+}
+
+int marufs_nrht_ref_inc(struct marufs_sb_info *sbi, u32 nrht_region_id,
+			const char *name, size_t namelen, u64 name_hash,
+			u32 *out_count)
+{
+	return nrht_modify_count(sbi, nrht_region_id, name, namelen, name_hash,
+				 offsetof(struct marufs_nrht_entry, ref_count),
+				 +1, out_count);
+}
+
+int marufs_nrht_ref_dec(struct marufs_sb_info *sbi, u32 nrht_region_id,
+			const char *name, size_t namelen, u64 name_hash,
+			u32 *out_count)
+{
+	return nrht_modify_count(sbi, nrht_region_id, name, namelen, name_hash,
+				 offsetof(struct marufs_nrht_entry, ref_count),
+				 -1, out_count);
+}
+
+int marufs_nrht_pin_inc(struct marufs_sb_info *sbi, u32 nrht_region_id,
+			const char *name, size_t namelen, u64 name_hash,
+			u32 *out_count)
+{
+	return nrht_modify_count(sbi, nrht_region_id, name, namelen, name_hash,
+				 offsetof(struct marufs_nrht_entry, pin_count),
+				 +1, out_count);
+}
+
+int marufs_nrht_pin_dec(struct marufs_sb_info *sbi, u32 nrht_region_id,
+			const char *name, size_t namelen, u64 name_hash,
+			u32 *out_count)
+{
+	return nrht_modify_count(sbi, nrht_region_id, name, namelen, name_hash,
+				 offsetof(struct marufs_nrht_entry, pin_count),
+				 -1, out_count);
+}
+
 int marufs_nrht_lookup(struct marufs_sb_info *sbi, u32 nrht_region_id,
 		       const char *name, size_t namelen, u64 name_hash,
-		       u64 *out_offset, u32 *out_target_region_id)
+		       u64 *out_offset, u32 *out_target_region_id,
+		       u32 *out_ref_count, u32 *out_pin_count)
 {
 	if (!sbi || !name || !out_offset || !out_target_region_id)
 		return -EINVAL;
@@ -966,6 +1076,10 @@ int marufs_nrht_lookup(struct marufs_sb_info *sbi, u32 nrht_region_id,
 
 	*out_offset = READ_CXL_LE64(e->offset);
 	*out_target_region_id = READ_CXL_LE32(e->target_region_id);
+	if (out_ref_count)
+		*out_ref_count = READ_CXL_LE32(e->ref_count);
+	if (out_pin_count)
+		*out_pin_count = READ_CXL_LE32(e->pin_count);
 	return 0;
 }
 

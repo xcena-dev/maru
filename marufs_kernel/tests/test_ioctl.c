@@ -498,6 +498,103 @@ static int run_single_node_tests(const char* mount_point,
     }
 
     /* ----------------------------------------------------------------
+     * Test 3.5: REF/PIN counters (NRHT_REF/PIN_INC/DEC)
+     * ---------------------------------------------------------------- */
+    printf("\n[3.5] REF/PIN counters\n");
+    if (num_names > 0)
+    {
+        struct marufs_refcnt_req cr;
+        struct marufs_find_name_req fr;
+
+        /* Baseline: fresh entry has ref=0, pin=0 */
+        memset(&fr, 0, sizeof(fr));
+        strncpy(fr.name, names[0], sizeof(fr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &fr);
+        TEST("initial ref_count == 0",
+             ret == 0 && fr.ref_count == 0);
+        TEST("initial pin_count == 0",
+             ret == 0 && fr.pin_count == 0);
+
+        /* REF_INC twice -> count == 2 */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_INC, &cr);
+        TEST("REF_INC #1 returns count==1",
+             ret == 0 && cr.count == 1);
+
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_INC, &cr);
+        TEST("REF_INC #2 returns count==2",
+             ret == 0 && cr.count == 2);
+
+        /* FIND reflects ref=2 */
+        memset(&fr, 0, sizeof(fr));
+        strncpy(fr.name, names[0], sizeof(fr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &fr);
+        TEST("FIND ref_count == 2 after two incs",
+             ret == 0 && fr.ref_count == 2 && fr.pin_count == 0);
+
+        /* REF_DEC -> 1 */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_DEC, &cr);
+        TEST("REF_DEC returns count==1",
+             ret == 0 && cr.count == 1);
+
+        /* PIN_INC -> 1, PIN_DEC -> 0 */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_PIN_INC, &cr);
+        TEST("PIN_INC returns count==1",
+             ret == 0 && cr.count == 1);
+
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_PIN_DEC, &cr);
+        TEST("PIN_DEC returns count==0",
+             ret == 0 && cr.count == 0);
+
+        /* PIN_DEC at 0 -> EINVAL (no underflow) */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        errno = 0;
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_PIN_DEC, &cr);
+        TEST("PIN_DEC at 0 returns EINVAL",
+             ret != 0 && errno == EINVAL);
+
+        /* INC/DEC on nonexistent name -> ENOENT */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, "no-such-name-for-refcnt", sizeof(cr.name) - 1);
+        errno = 0;
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_INC, &cr);
+        TEST("REF_INC on missing name returns ENOENT",
+             ret != 0 && errno == ENOENT);
+
+        /* Cross-counter independence: ref still 1, pin still 0 */
+        memset(&fr, 0, sizeof(fr));
+        strncpy(fr.name, names[0], sizeof(fr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &fr);
+        TEST("ref/pin independent: ref==1, pin==0",
+             ret == 0 && fr.ref_count == 1 && fr.pin_count == 0);
+
+        /* Wind down ref to 0 for a clean next-test state */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_DEC, &cr);
+        TEST("REF_DEC final returns count==0",
+             ret == 0 && cr.count == 0);
+
+        /* REF_DEC at 0 -> EINVAL */
+        memset(&cr, 0, sizeof(cr));
+        strncpy(cr.name, names[0], sizeof(cr.name) - 1);
+        errno = 0;
+        ret = ioctl(nrht_fd, MARUFS_IOC_NRHT_REF_DEC, &cr);
+        TEST("REF_DEC at 0 returns EINVAL",
+             ret != 0 && errno == EINVAL);
+    }
+
+    /* ----------------------------------------------------------------
      * Test 4: CLEAR_NAME
      * ---------------------------------------------------------------- */
     printf("\n[4] CLEAR_NAME\n");

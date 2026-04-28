@@ -75,7 +75,9 @@ struct marufs_nrht_entry {
 	__le32 target_region_id; /* 24: which region this offset refers to */
 	__le32 inserter_node; /* 28: node_id that created this entry */
 	__le64 created_at; /* 32: ns since epoch (stale INSERTING detection) */
-	__u8 reserved0[24]; /* 40: padding to 64B CL boundary */
+	__le32 ref_count; /* 40: user-managed reference count (REF_INC/DEC ioctls) */
+	__le32 pin_count; /* 44: user-managed pin count (PIN_INC/DEC ioctls) */
+	__u8 reserved0[16]; /* 48: padding to 64B CL boundary */
 
 	/* ── CL1: cold path (bytes 64–127) ─────────────────────────── */
 	char name[MARUFS_NAME_MAX + 1]; /* 64: null-terminated name (64B) */

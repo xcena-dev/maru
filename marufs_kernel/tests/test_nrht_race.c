@@ -145,6 +145,61 @@ static int do_clear_name(int fd, const char *name)
 	return ioctl(fd, MARUFS_IOC_CLEAR_NAME, &req);
 }
 
+/* Counter ioctl helpers — return 0 on success and write post-op count to
+ * @out_count if non-NULL; on failure returns -1 with errno set. */
+static int do_refcnt_op(int fd, unsigned long cmd, const char *name,
+			__u32 *out_count)
+{
+	struct marufs_refcnt_req req;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	strncpy(req.name, name, MARUFS_NAME_MAX);
+	ret = ioctl(fd, cmd, &req);
+	if (ret == 0 && out_count)
+		*out_count = req.count;
+	return ret;
+}
+
+static int do_ref_inc(int fd, const char *name, __u32 *out_count)
+{
+	return do_refcnt_op(fd, MARUFS_IOC_NRHT_REF_INC, name, out_count);
+}
+
+static int do_ref_dec(int fd, const char *name, __u32 *out_count)
+{
+	return do_refcnt_op(fd, MARUFS_IOC_NRHT_REF_DEC, name, out_count);
+}
+
+static int do_pin_inc(int fd, const char *name, __u32 *out_count)
+{
+	return do_refcnt_op(fd, MARUFS_IOC_NRHT_PIN_INC, name, out_count);
+}
+
+static int do_pin_dec(int fd, const char *name, __u32 *out_count)
+{
+	return do_refcnt_op(fd, MARUFS_IOC_NRHT_PIN_DEC, name, out_count);
+}
+
+/* Snapshot ref/pin counts via FIND_NAME (no ME — best-effort). */
+static int do_find_counts(int fd, const char *name, __u32 *out_ref,
+			  __u32 *out_pin)
+{
+	struct marufs_find_name_req req;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	strncpy(req.name, name, MARUFS_NAME_MAX);
+	ret = ioctl(fd, MARUFS_IOC_FIND_NAME, &req);
+	if (ret == 0) {
+		if (out_ref)
+			*out_ref = req.ref_count;
+		if (out_pin)
+			*out_pin = req.pin_count;
+	}
+	return ret;
+}
+
 /*
  * setup_nrht_region - create region file, ftruncate, init NRHT, grant perms.
  * Returns open fd on success, -1 on failure.
@@ -801,6 +856,241 @@ static void run_test3(char **mounts, int num_mounts, int round,
 }
 
 /* ======================================================================
+ * Test 4: REF/PIN counter race (balanced inc/dec under contention)
+ *
+ * NUM_WORKERS children all hammer REF_INC/REF_DEC and PIN_INC/PIN_DEC on a
+ * single pre-inserted name. Each worker performs a balanced sequence
+ * (every INC followed by exactly one DEC), so the steady-state final
+ * value of both counters MUST be 0.
+ *
+ * Without ME serialization an unbalanced read-modify-write would either
+ * lose updates (final < 0 modulo wrap, or non-zero) or allow underflow
+ * (-EINVAL leaked from kernel into the inc/dec stream). Both are caught
+ * by the parent's post-race FIND_NAME + per-worker ioctl-error tally.
+ *
+ * Result-pipe payload per worker: u32 ioctl_errors. Parent sums and
+ * asserts == 0 across the cohort. Final FIND must report ref==0, pin==0.
+ * ====================================================================== */
+
+#define TEST4_ITERS_PER_WORKER 200
+
+static void run_test4(char **mounts, int num_mounts, int round,
+		      __u32 me_strategy)
+{
+	char region_name[64];
+	char cnt_name[64];
+	char label[160];
+	int region_fd;
+	int ready_pipes[NUM_WORKERS][2];
+	int go_pipes[NUM_WORKERS][2];
+	int result_pipe[2];
+	pid_t pids[NUM_WORKERS];
+	int i;
+	__u32 final_ref = 0xFFFFFFFFu;
+	__u32 final_pin = 0xFFFFFFFFu;
+	int find_ret;
+	__u64 total_errors = 0;
+	int fail_before = fail_count;
+
+	snprintf(region_name, sizeof(region_name), "t4_%s_r%d_region",
+		 strategy_name(me_strategy), round);
+	snprintf(cnt_name, sizeof(cnt_name), "race_cnt_%s_r%d",
+		 strategy_name(me_strategy), round);
+
+	region_fd = setup_nrht_region(mounts[0], region_name, me_strategy);
+	if (region_fd < 0) {
+		fprintf(stderr, "Test4: setup failed\n");
+		fail_count++;
+		return;
+	}
+
+	if (do_name_offset(region_fd, cnt_name, 0, region_fd) != 0) {
+		fprintf(stderr, "Test4: pre-insert failed errno=%d\n", errno);
+		close(region_fd);
+		unlink_region(mounts[0], region_name);
+		fail_count++;
+		return;
+	}
+
+	if (pipe(result_pipe) < 0) {
+		perror("pipe result");
+		close(region_fd);
+		unlink_region(mounts[0], region_name);
+		fail_count++;
+		return;
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		if (pipe(ready_pipes[i]) < 0 || pipe(go_pipes[i]) < 0) {
+			perror("pipe");
+			close(region_fd);
+			unlink_region(mounts[0], region_name);
+			fail_count++;
+			return;
+		}
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			perror("fork");
+			_exit(1);
+		}
+
+		if (pids[i] == 0) {
+			int child_fd;
+			__u32 errors = 0;
+			int j;
+
+			for (j = 0; j < NUM_WORKERS; j++) {
+				close(ready_pipes[j][0]);
+				close(go_pipes[j][1]);
+				if (j != i) {
+					close(ready_pipes[j][1]);
+					close(go_pipes[j][0]);
+				}
+			}
+			close(result_pipe[0]);
+			close(region_fd);
+
+			child_fd = open_region(
+				worker_mount(mounts, num_mounts, i), region_name);
+			if (child_fd < 0)
+				child_fd = open_region(mounts[0], region_name);
+			if (child_fd < 0) {
+				errors = 0xFFFFFFFFu;
+				write(result_pipe[1], &errors, sizeof(errors));
+				_exit(1);
+			}
+
+			sync_signal(ready_pipes[i][1]);
+			sync_wait(go_pipes[i][0]);
+
+			/* Balanced loop: every INC paired with a DEC. Order
+			 * intentionally interleaves ref/pin so both counters
+			 * see contention from every worker.
+			 *
+			 * On first ioctl failure, dump op/iter/errno to stderr
+			 * so the diagnostic is surfaced even though the result
+			 * pipe only carries the aggregate count. */
+			int logged = 0;
+#define T4_LOG_FAIL(op_name)                                                  \
+	do {                                                                  \
+		errors++;                                                     \
+		if (!logged) {                                                \
+			fprintf(stderr,                                       \
+				"[t4 %s w%d j=%d %s FAIL errno=%d (%s)]\n",   \
+				strategy_name(me_strategy), i, j, (op_name),  \
+				errno, strerror(errno));                      \
+			logged = 1;                                           \
+		}                                                             \
+	} while (0)
+
+			for (j = 0; j < TEST4_ITERS_PER_WORKER; j++) {
+				if (do_ref_inc(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL("REF_INC");
+				if (do_pin_inc(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL("PIN_INC");
+				if (do_ref_dec(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL("REF_DEC");
+				if (do_pin_dec(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL("PIN_DEC");
+			}
+#undef T4_LOG_FAIL
+
+			write(result_pipe[1], &errors, sizeof(errors));
+			close(child_fd);
+			close(ready_pipes[i][1]);
+			close(go_pipes[i][0]);
+			close(result_pipe[1]);
+			_exit(0);
+		}
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		close(ready_pipes[i][1]);
+		close(go_pipes[i][0]);
+	}
+	close(result_pipe[1]);
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		sync_wait(ready_pipes[i][0]);
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		sync_signal(go_pipes[i][1]);
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		__u32 errors = 0;
+		ssize_t r = read(result_pipe[0], &errors, sizeof(errors));
+		if (r != (ssize_t)sizeof(errors))
+			errors = 0xFFFFFFFFu;
+		total_errors += errors;
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		waitpid(pids[i], NULL, 0);
+
+	close(result_pipe[0]);
+	for (i = 0; i < NUM_WORKERS; i++) {
+		close(ready_pipes[i][0]);
+		close(go_pipes[i][1]);
+	}
+
+	/* Invariant 1: zero ioctl errors across all workers. */
+	snprintf(label, sizeof(label),
+		 "Test4 [%s] r%d: zero ioctl errors across %d workers (got %llu)",
+		 strategy_name(me_strategy), round, NUM_WORKERS,
+		 (unsigned long long)total_errors);
+	TEST(label, total_errors == 0);
+
+	/* Invariant 2: final counts must be 0/0 (every inc paired with dec). */
+	find_ret = do_find_counts(region_fd, cnt_name, &final_ref, &final_pin);
+	snprintf(label, sizeof(label),
+		 "Test4 [%s] r%d: post-race FIND succeeds",
+		 strategy_name(me_strategy), round);
+	TEST(label, find_ret == 0);
+
+	snprintf(label, sizeof(label),
+		 "Test4 [%s] r%d: final ref_count == 0 (got %u)",
+		 strategy_name(me_strategy), round, final_ref);
+	TEST(label, final_ref == 0);
+
+	snprintf(label, sizeof(label),
+		 "Test4 [%s] r%d: final pin_count == 0 (got %u)",
+		 strategy_name(me_strategy), round, final_pin);
+	TEST(label, final_pin == 0);
+
+	/* Invariant 3: dec at 0 must reject (no underflow). Confirms ME-
+	 * protected RMW preserved the bound throughout the race. */
+	{
+		int ret = do_ref_dec(region_fd, cnt_name, NULL);
+		int e = errno;
+		snprintf(label, sizeof(label),
+			 "Test4 [%s] r%d: REF_DEC at 0 returns EINVAL (ret=%d errno=%d)",
+			 strategy_name(me_strategy), round, ret, e);
+		TEST(label, ret != 0 && e == EINVAL);
+	}
+
+	do_clear_name(region_fd, cnt_name);
+	close(region_fd);
+	unlink_region(mounts[0], region_name);
+
+	/* Stop immediately on first failed round so dmesg captures the
+	 * incident in isolation; subsequent rounds churn ME state and
+	 * obscure the original kernel log. */
+	if (fail_count > fail_before) {
+		fprintf(stderr,
+			"\n[Test4 %s r%d] failure detected — aborting for dmesg capture\n",
+			strategy_name(me_strategy), round);
+		fflush(stdout);
+		fflush(stderr);
+		printf("Results: %d passed, %d failed\n", pass_count,
+		       fail_count);
+		_exit(1);
+	}
+}
+
+/* ======================================================================
  * main
  * ====================================================================== */
 /* ======================================================================
@@ -1124,6 +1414,10 @@ struct bench_result {
 	char strategy[16];
 	uint64_t wall_ns;
 	struct op_stats insert, find, del;
+	/* Per-iter counter ops on a single shared NRHT entry — exposes
+	 * cross-worker ME contention on one shard for the ref/pin RMW path.
+	 */
+	struct op_stats ref_inc, ref_dec, pin_inc, pin_dec;
 	struct poll_stats poll;
 	struct fine_stats fine;
 	struct chain_stats chain;
@@ -1181,6 +1475,8 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	pid_t pids[NUM_WORKERS];
 	size_t samples_bytes, first_bytes;
 	uint64_t *insert_samples, *find_samples, *delete_samples;
+	uint64_t *ref_inc_samples, *ref_dec_samples;
+	uint64_t *pin_inc_samples, *pin_dec_samples;
 	uint64_t *first_join, *first_insert_max, *warmup_total_ns;
 	uint64_t wall_start, wall_elapsed;
 	__u64 slot_size = compute_slot_size(cfg);
@@ -1213,8 +1509,18 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 			    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	delete_samples = mmap(NULL, samples_bytes, PROT_READ | PROT_WRITE,
 			      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	ref_inc_samples = mmap(NULL, samples_bytes, PROT_READ | PROT_WRITE,
+			       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	ref_dec_samples = mmap(NULL, samples_bytes, PROT_READ | PROT_WRITE,
+			       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	pin_inc_samples = mmap(NULL, samples_bytes, PROT_READ | PROT_WRITE,
+			       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	pin_dec_samples = mmap(NULL, samples_bytes, PROT_READ | PROT_WRITE,
+			       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (insert_samples == MAP_FAILED || find_samples == MAP_FAILED ||
-	    delete_samples == MAP_FAILED) {
+	    delete_samples == MAP_FAILED || ref_inc_samples == MAP_FAILED ||
+	    ref_dec_samples == MAP_FAILED || pin_inc_samples == MAP_FAILED ||
+	    pin_dec_samples == MAP_FAILED) {
 		perror("mmap samples");
 		close(region_fd);
 		unlink_region(mounts[0], region_name);
@@ -1382,6 +1688,30 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 				do_find_name(child_fd, name, NULL, NULL);
 				find_samples[idx] = now_ns() - t0;
 
+				/* Counter ops on the iter's own @name — bundled
+				 * with insert/find/delete so all 7 ops share the
+				 * same shard for this iter. As @cfg->num_shards
+				 * grows, names spread across shards uniformly,
+				 * so counter ME contention scales the same way
+				 * insert/find/delete does. Balanced INC/DEC
+				 * leaves the entry at ref=0/pin=0 before delete.
+				 */
+				t0 = now_ns();
+				do_ref_inc(child_fd, name, NULL);
+				ref_inc_samples[idx] = now_ns() - t0;
+
+				t0 = now_ns();
+				do_pin_inc(child_fd, name, NULL);
+				pin_inc_samples[idx] = now_ns() - t0;
+
+				t0 = now_ns();
+				do_ref_dec(child_fd, name, NULL);
+				ref_dec_samples[idx] = now_ns() - t0;
+
+				t0 = now_ns();
+				do_pin_dec(child_fd, name, NULL);
+				pin_dec_samples[idx] = now_ns() - t0;
+
 				t0 = now_ns();
 				do_clear_name(child_fd, name);
 				delete_samples[idx] = now_ns() - t0;
@@ -1443,11 +1773,20 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 
 	int total = NUM_WORKERS * iters;
 	struct op_stats s_ins, s_find, s_del;
+	struct op_stats s_ref_inc, s_ref_dec, s_pin_inc, s_pin_dec;
 
 	printf("  wall=%.3f ms\n", wall_elapsed / 1e6);
 	report_stats("insert", insert_samples, total, wall_elapsed, &s_ins);
 	report_stats("find", find_samples, total, wall_elapsed, &s_find);
 	report_stats("delete", delete_samples, total, wall_elapsed, &s_del);
+	report_stats("ref_inc", ref_inc_samples, total, wall_elapsed,
+		     &s_ref_inc);
+	report_stats("pin_inc", pin_inc_samples, total, wall_elapsed,
+		     &s_pin_inc);
+	report_stats("ref_dec", ref_dec_samples, total, wall_elapsed,
+		     &s_ref_dec);
+	report_stats("pin_dec", pin_dec_samples, total, wall_elapsed,
+		     &s_pin_dec);
 
 	uint64_t avg_cycle_ns =
 		poll_after.cycles ? poll_after.ns_total / poll_after.cycles : 0;
@@ -1520,6 +1859,10 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 		out->insert = s_ins;
 		out->find = s_find;
 		out->del = s_del;
+		out->ref_inc = s_ref_inc;
+		out->ref_dec = s_ref_dec;
+		out->pin_inc = s_pin_inc;
+		out->pin_dec = s_pin_dec;
 		out->poll = poll_after;
 		out->fine = fine_after;
 		out->chain = chain_after;
@@ -1543,6 +1886,10 @@ static void run_bench(char **mounts, int num_mounts, int iters,
 	munmap(insert_samples, samples_bytes);
 	munmap(find_samples, samples_bytes);
 	munmap(delete_samples, samples_bytes);
+	munmap(ref_inc_samples, samples_bytes);
+	munmap(ref_dec_samples, samples_bytes);
+	munmap(pin_inc_samples, samples_bytes);
+	munmap(pin_dec_samples, samples_bytes);
 	munmap(first_join, first_bytes);
 	munmap(first_insert_max, first_bytes);
 	munmap(warmup_total_ns, first_bytes);
@@ -1577,6 +1924,11 @@ static void run_all_tests(char **mounts, int num_mounts, int rounds,
 	       strategy_name(me_strategy));
 	for (r = 0; r < rounds; r++)
 		run_test3(mounts, num_mounts, r, me_strategy);
+
+	printf("\n--- Test 4 [%s]: REF/PIN counter race (balanced inc/dec) ---\n",
+	       strategy_name(me_strategy));
+	for (r = 0; r < rounds; r++)
+		run_test4(mounts, num_mounts, r, me_strategy);
 }
 
 /*
@@ -1774,6 +2126,38 @@ int main(int argc, char *argv[])
 			       br->find.mean,   br->find.p99,
 			       br->del.mean,    br->del.p99,
 			       br->insert.throughput);
+		}
+
+		/* Counter ops summary — REF/PIN INC/DEC latencies on the
+		 * shared cnt entry (single shard, full cross-worker contention).
+		 */
+		printf("\n--- counter ops (REF/PIN INC/DEC on shared entry) ---\n");
+		printf("%-8s %-6s %-8s   "
+		       "%-s\n",
+		       "strat", "shards", "entries",
+		       "ref_inc: mean/p50/p99 (ns)   "
+		       "pin_inc: mean/p99 (ns)   "
+		       "ref_dec: mean/p99 (ns)   "
+		       "pin_dec: mean/p99 (ns)   "
+		       "ref_inc ops/s");
+		for (size_t r = 0; r < n_results; r++) {
+			struct bench_result *br = &results[r];
+
+			if (!br->valid)
+				continue;
+			printf("%-8s %-6u %-8u   "
+			       "%8lu %8lu %8lu   "
+			       "%8lu %8lu   "
+			       "%8lu %8lu   "
+			       "%8lu %8lu   "
+			       "%.0f\n",
+			       br->strategy, br->cfg.num_shards,
+			       br->cfg.max_entries,
+			       br->ref_inc.mean, br->ref_inc.p50, br->ref_inc.p99,
+			       br->pin_inc.mean, br->pin_inc.p99,
+			       br->ref_dec.mean, br->ref_dec.p99,
+			       br->pin_dec.mean, br->pin_dec.p99,
+			       br->ref_inc.throughput);
 		}
 
 		/* Poll-thread cost table — CXL RMB counts and ns spent per
