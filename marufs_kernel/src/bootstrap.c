@@ -422,15 +422,22 @@ static const char *const bs_status_names[] = {
 	[MARUFS_BS_FORMATTING] = "FORMATTING",
 };
 
-ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf)
+ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf,
+				    size_t bufsize)
 {
+	if (bufsize == 0)
+		return 0;
+
 	struct marufs_bootstrap_slot *slots = marufs_bootstrap_slot_get(sbi, 0);
 	if (!slots)
-		return scnprintf(buf, PAGE_SIZE,
+		return scnprintf(buf, bufsize,
 				 "(bootstrap not initialized)\n");
 
 	ssize_t n = 0;
 	for (int i = 0; i < MARUFS_BOOTSTRAP_MAX_SLOTS; i++) {
+		if ((size_t)n >= bufsize)
+			break;
+
 		struct marufs_bootstrap_slot *s = &slots[i];
 		MARUFS_CXL_RMB(s, sizeof(*s));
 
@@ -443,7 +450,7 @@ ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf)
 					     bs_status_names[st] :
 					     "?";
 
-		n += scnprintf(buf + n, PAGE_SIZE - n,
+		n += scnprintf(buf + n, bufsize - n,
 			       "slot[%d] node_id=%d magic=0x%08x status=%s "
 			       "token=0x%016llx%s\n",
 			       i, i + 1, mg, stname, tok,

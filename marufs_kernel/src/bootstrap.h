@@ -81,9 +81,10 @@ void marufs_bootstrap_set_status(struct marufs_sb_info *sbi, int slot_idx,
 /* ── Sysfs debug helpers ────────────────────────────────────────── */
 
 /*
- * marufs_bootstrap_dump_slots - print slot table to @buf (PAGE_SIZE max).
+ * marufs_bootstrap_dump_slots - print slot table to @buf, bounded by @bufsize.
  */
-ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf);
+ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf,
+				    size_t bufsize);
 
 /*
  * marufs_bootstrap_should_inject_stuck - true when the

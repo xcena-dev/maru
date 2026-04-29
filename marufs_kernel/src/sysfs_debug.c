@@ -361,7 +361,7 @@ static ssize_t bootstrap_dump_show(struct kobject *kobj,
 			       sbi->node_id);
 		if (n < PAGE_SIZE - 1)
 			n += marufs_bootstrap_dump_slots(
-				sbi, buf + n);
+				sbi, buf + n, PAGE_SIZE - n);
 	}
 	mutex_unlock(&marufs_sysfs_lock);
 	return n;
