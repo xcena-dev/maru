@@ -86,3 +86,5 @@ CLAUDE.md
 docs/_build/
 internal_docs/
 .worktrees/
+# Added by code-review-graph
+.code-review-graph/
