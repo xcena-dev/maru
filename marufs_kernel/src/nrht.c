@@ -385,8 +385,7 @@ static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
 	 */
 	nme = READ_ONCE(sbi->nrht_me[nrht_region_id]);
 	if (nme) {
-		struct marufs_me_header *h = nme->header;
-		MARUFS_CXL_RMB(h, sizeof(*h));
+		struct marufs_me_header *h = me_header_get(nme);
 		if (READ_CXL_LE64(h->format_generation) ==
 		    nme->cached_generation)
 			return nme;
@@ -395,8 +394,7 @@ static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
 	mutex_lock(&sbi->nrht_me_lock);
 	nme = sbi->nrht_me[nrht_region_id];
 	if (nme) {
-		struct marufs_me_header *h = nme->header;
-		MARUFS_CXL_RMB(h, sizeof(*h));
+		struct marufs_me_header *h = me_header_get(nme);
 		if (READ_CXL_LE64(h->format_generation) ==
 		    nme->cached_generation) {
 			mutex_unlock(&sbi->nrht_me_lock);

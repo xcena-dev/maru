@@ -22,6 +22,27 @@
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
 /*
+ * request_pass_token - if @node_idx is requesting, grant + pass token to it.
+ *
+ * Common tail of full-scan and masked-scan grant loops. Returns true iff
+ * the token was actually transferred.
+ */
+static bool request_pass_token(struct marufs_me_instance *me, u32 shard_id,
+			       u32 node_idx)
+{
+	struct marufs_me_slot *rs = me_slot_of(me, shard_id, node_idx);
+	if (READ_CXL_LE32(rs->requesting)) {
+		u64 now = ktime_get_ns();
+		u64 requested_at = READ_CXL_LE64(rs->requested_at);
+		WRITE_LE64(rs->granted_at, now);
+		MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
+		me_stats_record_grant_age(me, now, requested_at);
+		marufs_me_pass_token(me, shard_id, node_idx + 1);
+		return true;
+	}
+	return false;
+}
+/*
  * request_scan_and_grant - holder scans request slots, grants to first
  * requester. Scan starts at (me_idx+1) wrapping — round-robin fairness
  * prevents low-id starvation under sustained contention.
@@ -34,18 +55,8 @@
 static bool request_scan_and_grant(struct marufs_me_instance *me, u32 shard_id)
 {
 	for (u32 i = 1; i < me->max_nodes; i++) {
-		u32 idx = (me->me_idx + i) % me->max_nodes;
-		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
-		MARUFS_CXL_RMB(rs, sizeof(*rs));
-		atomic64_inc(&me->poll_rmb_slot);
-
-		if (READ_CXL_LE32(rs->requesting)) {
-			u64 now = ktime_get_ns();
-			u64 requested_at = READ_CXL_LE64(rs->requested_at);
-			WRITE_LE64(rs->granted_at, now);
-			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
-			me_stats_record_grant_age(me, now, requested_at);
-			me_pass_token(me, shard_id, idx + 1); /* ext node_id */
+		u32 node_idx = (me->me_idx + i) % me->max_nodes;
+		if (request_pass_token(me, shard_id, node_idx)) {
 			return true;
 		}
 	}
@@ -67,21 +78,11 @@ static bool request_scan_and_grant_masked(struct marufs_me_instance *me,
 	u64 bit = 1ULL << shard_id;
 
 	for (u32 i = 1; i < me->max_nodes; i++) {
-		u32 idx = (me->me_idx + i) % me->max_nodes;
-		if (!(node_pending[idx] & bit))
+		u32 node_idx = (me->me_idx + i) % me->max_nodes;
+		if (!(node_pending[node_idx] & bit))
 			continue;
 
-		struct marufs_me_slot *rs = me_slot_of(me, shard_id, idx);
-		MARUFS_CXL_RMB(rs, sizeof(*rs));
-		atomic64_inc(&me->poll_rmb_slot);
-
-		if (READ_CXL_LE32(rs->requesting)) {
-			u64 now = ktime_get_ns();
-			u64 requested_at = READ_CXL_LE64(rs->requested_at);
-			WRITE_LE64(rs->granted_at, now);
-			MARUFS_CXL_WMB(&rs->granted_at, sizeof(rs->granted_at));
-			me_stats_record_grant_age(me, now, requested_at);
-			me_pass_token(me, shard_id, idx + 1);
+		if (request_pass_token(me, shard_id, node_idx)) {
 			return true;
 		}
 	}
@@ -94,8 +95,7 @@ static inline void request_clear_own(struct marufs_me_instance *me,
 	struct marufs_me_slot *rs = me_my_slot(me, shard_id);
 	WRITE_LE32(rs->requesting, 0);
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
-
-	me_membership_clear_pending(me, shard_id);
+	marufs_me_membership_clear_pending(me, shard_id);
 }
 
 /* ── Poll cycle ───────────────────────────────────────────────────── */
@@ -121,9 +121,8 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 	 */
 	for (u32 i = 1; i <= me->max_nodes; i++) {
 		u32 idx = (me->me_idx + i) % me->max_nodes;
-		struct marufs_me_membership_slot *ms = &me->membership[idx];
-		MARUFS_CXL_RMB(ms, sizeof(*ms));
-		atomic64_inc(&me->poll_rmb_membership);
+		struct marufs_me_membership_slot *ms =
+			me_membership_get(me, idx);
 
 		if (READ_CXL_LE32(ms->status) != MARUFS_ME_ACTIVE)
 			continue;
@@ -143,18 +142,17 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 	u64 scan_ns_total = 0;
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_shard *sh = &me->shards[s];
+		struct marufs_me_shard *sh = me_shard_get(me, s);
 		sh->cached_successor = successor;
 
-		/* Receiver doorbell: bump ⇒ peer granted token. */
+		/* Receiver doorbell: bump ⇒ peer granted token. Use the
+		 * slot's cb_gen_at_write (already RMB'd via me_my_slot) to
+		 * verify freshness — avoids hammering the shared CB cacheline. */
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
-		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
-
 		if (cur_seq != sh->poll_last_slot_seq) {
 			sh->poll_last_slot_seq = cur_seq;
-			ME_BECOME_HOLDER(sh);
+			me_shard_become_holder(sh);
 		}
 
 		if (!sh->is_holder)
@@ -183,21 +181,9 @@ static void request_poll_cycle(struct marufs_me_instance *me)
 
 static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	/* Intra-node serialization (see order_acquire comment). */
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-	atomic_inc(&sh->local_waiters);
-	mutex_lock(&sh->local_lock);
-	atomic_dec(&sh->local_waiters);
-	me_stats_lock_acquired(sh);
-	me_stats_bump_shard_acquire(me, shard_id);
+	marufs_me_hold(me, shard_id);
 
-	/* Fast path: previous release kept the token. ME_HOLD's smp_mb()
-	 * pairs with poll_cycle's to close the holding/holder read race.
-	 */
-	ME_HOLD(me, shard_id);
-
-	struct marufs_me_cb *cb = &me->cbs[shard_id];
-	MARUFS_CXL_RMB(cb, sizeof(*cb));
+	struct marufs_me_cb *cb = me_cb_get(me, shard_id);
 	if (READ_CXL_LE32(cb->holder) == me->node_id) {
 		me_cb_bump_acquire_count(cb);
 		return 0;
@@ -209,7 +195,7 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 	WRITE_LE32(rs->requesting, 1);
 	WRITE_LE64(rs->requested_at, ktime_get_ns());
 	MARUFS_CXL_WMB(rs, sizeof(*rs));
-	me_membership_set_pending(me, shard_id);
+	marufs_me_membership_set_pending(me, shard_id);
 
 	int ret = marufs_me_wait_for_token(me, shard_id);
 	request_clear_own(me, shard_id);
@@ -219,9 +205,7 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 		return 0;
 	}
 
-	ME_UNHOLD(me, shard_id);
-	me_stats_lock_released(me, sh);
-	mutex_unlock(&sh->local_lock);
+	marufs_me_unhold(me, shard_id);
 	return ret;
 }
 
@@ -229,12 +213,15 @@ static int request_acquire(struct marufs_me_instance *me, u32 shard_id)
 
 static void request_release(struct marufs_me_instance *me, u32 shard_id)
 {
-	ME_UNHOLD(me, shard_id);
+	/* Cannot use marufs_me_unhold(): scan_and_grant must execute between
+	 * unhold (so passable check sees holding=0) and mutex_unlock (so a
+	 * concurrent local acquire doesn't interleave). */
+	struct marufs_me_shard *sh = me_shard_get(me, shard_id);
+	me_shard_unhold(sh);
 
 	if (me_shard_passable(me, shard_id))
 		request_scan_and_grant(me, shard_id);
 
-	struct marufs_me_shard *sh = &me->shards[shard_id];
 	me_stats_lock_released(me, sh);
 	mutex_unlock(&sh->local_lock);
 }

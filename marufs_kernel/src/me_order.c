@@ -40,15 +40,13 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 	for (u32 s = 0; s < me->num_shards; s++) {
 		/* Receiver doorbell: bump ⇒ peer passed token. */
 		struct marufs_me_slot *my_slot = me_my_slot(me, s);
-		MARUFS_CXL_RMB(&my_slot->token_seq, sizeof(my_slot->token_seq));
-		atomic64_inc(&me->poll_rmb_slot);
 		u64 cur_seq = READ_CXL_LE64(my_slot->token_seq);
 
-		struct marufs_me_shard *sh = &me->shards[s];
+		struct marufs_me_shard *sh = me_shard_get(me, s);
 		sh->cached_successor = successor;
 		if (cur_seq != sh->poll_last_slot_seq) {
 			sh->poll_last_slot_seq = cur_seq;
-			ME_BECOME_HOLDER(sh);
+			me_shard_become_holder(sh);
 		}
 
 		if (!sh->is_holder)
@@ -60,7 +58,7 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 		}
 		if (me_shard_passable(me, s) && successor != me->node_id) {
 			u64 ts0 = ktime_get_ns();
-			me_pass_token(me, s, successor);
+			marufs_me_pass_token(me, s, successor);
 			scan_ns_total += ktime_get_ns() - ts0;
 		}
 	}
@@ -76,27 +74,15 @@ static void order_poll_cycle(struct marufs_me_instance *me)
 
 static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
 {
-	/* Intra-node serialization; cross-node via CXL token (cb->holder).
-	* local_waiters lets release() decide keep-token vs. pass-to-ring.
-	*/
-	struct marufs_me_shard *sh = &me->shards[shard_id];
-	atomic_inc(&sh->local_waiters);
-	mutex_lock(&sh->local_lock);
-	atomic_dec(&sh->local_waiters);
-	me_stats_lock_acquired(sh);
-	me_stats_bump_shard_acquire(me, shard_id);
-
-	ME_HOLD(me, shard_id);
+	marufs_me_hold(me, shard_id);
 
 	int ret = marufs_me_wait_for_token(me, shard_id);
 	if (ret == 0) {
-		me_cb_bump_acquire_count(&me->cbs[shard_id]);
+		me_cb_bump_acquire_count(me_cb_get(me, shard_id));
 		return 0;
 	}
 
-	ME_UNHOLD(me, shard_id);
-	me_stats_lock_released(me, sh);
-	mutex_unlock(&sh->local_lock);
+	marufs_me_unhold(me, shard_id);
 	return ret;
 }
 
@@ -109,9 +95,9 @@ static int order_acquire(struct marufs_me_instance *me, u32 shard_id)
  */
 static void order_release(struct marufs_me_instance *me, u32 shard_id)
 {
-	ME_UNHOLD(me, shard_id);
+	struct marufs_me_shard *sh = me_shard_get(me, shard_id);
+	me_shard_unhold(sh);
 
-	struct marufs_me_shard *sh = &me->shards[shard_id];
 	if (me_shard_passable(me, shard_id)) {
 		u32 succ = sh->cached_successor;
 
@@ -120,7 +106,7 @@ static void order_release(struct marufs_me_instance *me, u32 shard_id)
 			sh->cached_successor = succ;
 		}
 		if (succ != me->node_id)
-			me_pass_token(me, shard_id, succ);
+			marufs_me_pass_token(me, shard_id, succ);
 	}
 
 	me_stats_lock_released(me, sh);
@@ -151,18 +137,16 @@ static void order_leave(struct marufs_me_instance *me)
 			holder = me_cb_snapshot(&me->cbs[s], NULL);
 
 		if (holder == me->node_id)
-			me_pass_token(me, s, me_leave_successor(me));
+			marufs_me_pass_token(me, s, me_leave_successor(me));
 
-		if (acquired) {
-			ME_UNHOLD(me, s);
-			struct marufs_me_shard *sh = &me->shards[s];
-			mutex_unlock(&sh->local_lock);
-		}
-		ME_RESET_HOLDING(me, s);
+		if (acquired)
+			marufs_me_unhold(me, s);
+
+		me_shard_reset_holding(me_shard_get(me, s));
 	}
 
 	/* Clear membership last — after this, no peer will target our slot. */
-	struct marufs_me_membership_slot *slot = &me->membership[me->me_idx];
+	struct marufs_me_membership_slot *slot = me_my_membership_get(me);
 	WRITE_LE32(slot->status, MARUFS_ME_NONE);
 	WRITE_LE64(slot->joined_at, 0);
 	MARUFS_CXL_WMB(slot, sizeof(*slot));

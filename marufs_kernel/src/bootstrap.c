@@ -146,8 +146,8 @@ static bool me_node_is_dead(struct marufs_sb_info *sbi, u32 node_id)
 		return false;
 
 	/* membership[] is indexed by internal idx = node_id - 1 */
-	struct marufs_me_membership_slot *ms = &me->membership[node_id - 1];
-	MARUFS_CXL_RMB(ms, sizeof(*ms));
+	struct marufs_me_membership_slot *ms =
+		me_membership_get(me, node_id - 1);
 	u64 hb_before = READ_CXL_LE64(ms->heartbeat);
 
 	/* Observer-local probe interval — sleep on our clock, not theirs. */
@@ -430,8 +430,7 @@ ssize_t marufs_bootstrap_dump_slots(struct marufs_sb_info *sbi, char *buf,
 
 	struct marufs_bootstrap_slot *slots = marufs_bootstrap_slot_get(sbi, 0);
 	if (!slots)
-		return scnprintf(buf, bufsize,
-				 "(bootstrap not initialized)\n");
+		return scnprintf(buf, bufsize, "(bootstrap not initialized)\n");
 
 	ssize_t n = 0;
 	for (int i = 0; i < MARUFS_BOOTSTRAP_MAX_SLOTS; i++) {

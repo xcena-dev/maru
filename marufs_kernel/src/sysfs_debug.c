@@ -109,12 +109,13 @@ static ssize_t me_sync_is_holder_store(struct kobject *kobj,
 		struct marufs_me_instance *me;
 		list_for_each_entry(me, &sbi->me_list, list_node) {
 			for (u32 s = 0; s < me->num_shards; s++) {
-				struct marufs_me_shard *sh = &me->shards[s];
+				struct marufs_me_shard *sh =
+					me_shard_get(me, s);
 				u32 h = me_cb_snapshot(&me->cbs[s], NULL);
 				if (h == me->node_id)
-					ME_BECOME_HOLDER(sh);
+					me_shard_become_holder(sh);
 				else
-					ME_LOSE_HOLDER(sh);
+					me_shard_lose_holder(sh);
 			}
 		}
 		mutex_unlock(&sbi->me_list_lock);
@@ -197,8 +198,7 @@ static ssize_t gc_stop_store(struct kobject *kobj, struct kobj_attribute *attr,
 	return count;
 }
 
-struct kobj_attribute gc_stop_attr =
-	__ATTR(gc_stop, 0200, NULL, gc_stop_store);
+struct kobj_attribute gc_stop_attr = __ATTR(gc_stop, 0200, NULL, gc_stop_store);
 
 /*
  * GC pause - temporarily pause GC without killing thread.
@@ -357,11 +357,11 @@ static ssize_t bootstrap_dump_show(struct kobject *kobj,
 		struct marufs_sb_info *sbi = marufs_sysfs_sbi_list[i];
 		if (!sbi)
 			continue;
-		n += scnprintf(buf + n, PAGE_SIZE - n, "=== mount node=%u ===\n",
-			       sbi->node_id);
+		n += scnprintf(buf + n, PAGE_SIZE - n,
+			       "=== mount node=%u ===\n", sbi->node_id);
 		if (n < PAGE_SIZE - 1)
-			n += marufs_bootstrap_dump_slots(
-				sbi, buf + n, PAGE_SIZE - n);
+			n += marufs_bootstrap_dump_slots(sbi, buf + n,
+							 PAGE_SIZE - n);
 	}
 	mutex_unlock(&marufs_sysfs_lock);
 	return n;

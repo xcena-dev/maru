@@ -50,8 +50,8 @@ static const char *me_state_name(u32 s)
 }
 
 static const char *me_format_tag(struct marufs_sb_info *sbi,
-			      struct marufs_me_instance *me, char *buf,
-			      size_t buflen)
+				 struct marufs_me_instance *me, char *buf,
+				 size_t buflen)
 {
 	if (me == sbi->me) {
 		snprintf(buf, buflen, "global");
@@ -86,8 +86,7 @@ static int me_emit_instance(char *buf, int len, struct marufs_sb_info *sbi,
 	int first = 1;
 	/* slot[i] is for external node_id (i + 1) */
 	for (u32 n = 0; n < me->max_nodes; n++) {
-		struct marufs_me_membership_slot *ms = &me->membership[n];
-		MARUFS_CXL_RMB(ms, sizeof(*ms));
+		struct marufs_me_membership_slot *ms = me_membership_get(me, n);
 		u32 status = READ_CXL_LE32(ms->status);
 		if (status == MARUFS_ME_ACTIVE) {
 			len += sysfs_emit_at(buf, len, "%s%u",
@@ -100,8 +99,7 @@ static int me_emit_instance(char *buf, int len, struct marufs_sb_info *sbi,
 	len += sysfs_emit_at(buf, len, "\n");
 
 	for (u32 s = 0; s < me->num_shards; s++) {
-		struct marufs_me_cb *cb = &me->cbs[s];
-		MARUFS_CXL_RMB(cb, sizeof(*cb));
+		struct marufs_me_cb *cb = me_cb_get(me, s);
 
 		u32 holder = READ_CXL_LE32(cb->holder);
 		u32 state = READ_CXL_LE32(cb->state);
@@ -112,8 +110,7 @@ static int me_emit_instance(char *buf, int len, struct marufs_sb_info *sbi,
 		u64 hb = 0;
 		if (marufs_me_is_valid_node(me, holder)) {
 			struct marufs_me_membership_slot *hms =
-				&me->membership[holder - 1];
-			MARUFS_CXL_RMB(&hms->heartbeat, 8);
+				me_membership_get(me, holder - 1);
 			hb = READ_CXL_LE64(hms->heartbeat);
 		}
 
@@ -139,7 +136,6 @@ static int me_emit_instance(char *buf, int len, struct marufs_sb_info *sbi,
 		 */
 		if (me->slots) {
 			struct marufs_me_slot *ms = me_my_slot(me, s);
-			MARUFS_CXL_RMB(ms, sizeof(*ms));
 			u32 from = READ_CXL_LE32(ms->from_node);
 			u64 tseq = READ_CXL_LE64(ms->token_seq);
 			u64 cgaw = READ_CXL_LE64(ms->cb_gen_at_write);
@@ -379,7 +375,7 @@ static void me_aggregate_stats(struct marufs_me_instance *me,
  * Prints " <bucket_name>=a/b/c/..." where each slot is one bucket count.
  */
 static int me_emit_buckets(char *buf, int len, const char *name,
-				      const u64 *buckets, int nbuckets)
+			   const u64 *buckets, int nbuckets)
 {
 	len += sysfs_emit_at(buf, len, "    %s=[", name);
 	for (int i = 0; i < nbuckets; i++)
@@ -448,10 +444,9 @@ static ssize_t me_fine_stats_show(struct kobject *kobj,
 				"    wait_hit spin=%llu sleep=%llu deadline=%llu fast=%llu\n",
 				agg.wait_spin_hit, agg.wait_sleep_hit,
 				agg.wait_deadline_hit, agg.wait_fast_hit);
-			len = me_emit_buckets(buf, len,
-							 "wait_lat_buckets",
-							 agg.wait_lat_buckets,
-							 MARUFS_ME_LAT_BUCKETS);
+			len = me_emit_buckets(buf, len, "wait_lat_buckets",
+					      agg.wait_lat_buckets,
+					      MARUFS_ME_LAT_BUCKETS);
 			len += sysfs_emit_at(
 				buf, len,
 				"    poll_ns mem=%llu doorbell=%llu scan=%llu\n",
@@ -461,17 +456,15 @@ static ssize_t me_fine_stats_show(struct kobject *kobj,
 				buf, len,
 				"    lock_hold count=%llu ns_total=%llu\n",
 				agg.lock_hold_count, agg.lock_hold_ns_total);
-			len = me_emit_buckets(buf, len,
-							 "lock_hold_buckets",
-							 agg.lock_hold_buckets,
-							 MARUFS_ME_LAT_BUCKETS);
+			len = me_emit_buckets(buf, len, "lock_hold_buckets",
+					      agg.lock_hold_buckets,
+					      MARUFS_ME_LAT_BUCKETS);
 			len += sysfs_emit_at(buf, len,
 					     "    grant_age count=%llu\n",
 					     agg.grant_age_count);
-			len = me_emit_buckets(buf, len,
-							 "grant_age_buckets",
-							 agg.grant_age_buckets,
-							 MARUFS_ME_LAT_BUCKETS);
+			len = me_emit_buckets(buf, len, "grant_age_buckets",
+					      agg.grant_age_buckets,
+					      MARUFS_ME_LAT_BUCKETS);
 
 			if (len > PAGE_SIZE - 512)
 				break;
