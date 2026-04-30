@@ -551,13 +551,19 @@ static long marufs_ioctl_perm_grant(struct marufs_sb_info *sbi,
 /*
  * Caller MUST hold the Global ME. The ADMIN check is done here (not in the
  * ioctl wrapper) so that the check and the ownership-transfer writes happen
- * in the same critical section: a concurrent chown cannot strip ADMIN after
- * the check has passed, which would otherwise let multiple chowns win.
+ * in the same critical section: a concurrent chown that completed first will
+ * have stripped ADMIN (default_perms=0, deleg cleared), so an in-lock recheck
+ * is the only thing that prevents multiple chowns from winning.
  */
 static long __marufs_ioctl_chown_locked(struct marufs_sb_info *sbi,
 					struct marufs_inode_info *xi,
 					struct marufs_rat_entry *rat_entry)
 {
+	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
+					  MARUFS_PERM_ADMIN);
+	if (ret)
+		return ret;
+
 	/* CAS ALLOCATED→ALLOCATING: block GC during ownership transfer */
 	u32 old_state = marufs_le32_cas(&rat_entry->state,
 					MARUFS_RAT_ENTRY_ALLOCATED,
@@ -661,12 +667,19 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info *sbi,
 	if (ret)
 		return ret;
 
+	/* Re-check ADMIN inside ME: a concurrent perm_set_default or chown
+	 * may have stripped our ADMIN since the lock-free precheck. */
+	ret = marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN);
+	if (ret)
+		goto out;
+
 	WRITE_LE16(rat_entry->default_perms, preq->perms);
 	MARUFS_CXL_WMB(rat_entry, sizeof(*rat_entry));
 
 	pr_debug("set default_perms=0x%x on rat_entry %u\n", preq->perms,
 		 xi->rat_entry_id);
 
+out:
 	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
 	return ret;
 }
@@ -674,16 +687,16 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info *sbi,
 /*
  * Required perm for ioctl precheck.
  * Returns 0 when handler does its own check inside an ME critical section
- * (PERM_GRANT/PERM_SET_DEFAULT/CHOWN need check+write atomic vs concurrent
- * chown; DMABUF_EXPORT checks after dax_mode gate).
+ * (PERM_GRANT/CHOWN need check+write atomic vs concurrent chown;
+ * DMABUF_EXPORT checks after dax_mode gate).
  */
 static u16 marufs_ioctl_required_perm(unsigned int cmd)
 {
 	switch (cmd) {
 	case MARUFS_IOC_PERM_GRANT:
-		return 0; /* handler self-checks */
-	case MARUFS_IOC_PERM_SET_DEFAULT:
 	case MARUFS_IOC_CHOWN:
+	case MARUFS_IOC_PERM_SET_DEFAULT:
+		return 0; /* handler self-checks */
 	case MARUFS_IOC_DMABUF_EXPORT:
 	case MARUFS_IOC_NRHT_INIT:
 		return MARUFS_PERM_ADMIN;
