@@ -874,6 +874,24 @@ static void run_test3(char **mounts, int num_mounts, int round,
 
 #define TEST4_ITERS_PER_WORKER 200
 
+/*
+ * Per-worker result payload. Per-op counters localize the failure mode
+ * (e.g., DEC-only failures point at counter underflow / ME race; INC
+ * failures point at lookup races). first_errno per op preserves the
+ * earliest signal so the parent can classify EINVAL vs ENOENT etc.
+ */
+struct t4_err_stats {
+	__u32 ref_inc;
+	__u32 pin_inc;
+	__u32 ref_dec;
+	__u32 pin_dec;
+	int ref_inc_first_errno;
+	int pin_inc_first_errno;
+	int ref_dec_first_errno;
+	int pin_dec_first_errno;
+	__u32 fatal; /* nonzero = worker setup failed (treat as opaque error) */
+};
+
 static void run_test4(char **mounts, int num_mounts, int round,
 		      __u32 me_strategy)
 {
@@ -939,7 +957,7 @@ static void run_test4(char **mounts, int num_mounts, int round,
 
 		if (pids[i] == 0) {
 			int child_fd;
-			__u32 errors = 0;
+			struct t4_err_stats stats = { 0 };
 			int j;
 
 			for (j = 0; j < NUM_WORKERS; j++) {
@@ -958,8 +976,8 @@ static void run_test4(char **mounts, int num_mounts, int round,
 			if (child_fd < 0)
 				child_fd = open_region(mounts[0], region_name);
 			if (child_fd < 0) {
-				errors = 0xFFFFFFFFu;
-				write(result_pipe[1], &errors, sizeof(errors));
+				stats.fatal = 1;
+				write(result_pipe[1], &stats, sizeof(stats));
 				_exit(1);
 			}
 
@@ -970,35 +988,51 @@ static void run_test4(char **mounts, int num_mounts, int round,
 			 * intentionally interleaves ref/pin so both counters
 			 * see contention from every worker.
 			 *
-			 * On first ioctl failure, dump op/iter/errno to stderr
-			 * so the diagnostic is surfaced even though the result
-			 * pipe only carries the aggregate count. */
-			int logged = 0;
-#define T4_LOG_FAIL(op_name)                                                  \
+			 * Per-op counters + first-errno-per-op keep diagnostics
+			 * compact while preserving enough signal to distinguish
+			 * EINVAL (counter underflow / kernel race) from ENOENT
+			 * (entry vanished mid-op). The first failure of each op
+			 * is logged to stderr; subsequent ones bump the counter
+			 * silently to avoid spam. */
+#define T4_LOG_FAIL(field, op_name)                                           \
 	do {                                                                  \
-		errors++;                                                     \
-		if (!logged) {                                                \
+		int e = errno;                                                \
+		if (stats.field == 0) {                                       \
+			stats.field##_first_errno = e;                        \
 			fprintf(stderr,                                       \
 				"[t4 %s w%d j=%d %s FAIL errno=%d (%s)]\n",   \
 				strategy_name(me_strategy), i, j, (op_name),  \
-				errno, strerror(errno));                      \
-			logged = 1;                                           \
+				e, strerror(e));                              \
 		}                                                             \
+		stats.field++;                                                \
 	} while (0)
 
+			/* DEC must be skipped when its paired INC failed,
+			 * otherwise DEC sees an unincremented counter and
+			 * raises a cascade EINVAL that double-counts the same
+			 * incident. The skip also preserves the inc/dec balance
+			 * required by invariant 2 (final counts == 0). */
 			for (j = 0; j < TEST4_ITERS_PER_WORKER; j++) {
-				if (do_ref_inc(child_fd, cnt_name, NULL) != 0)
-					T4_LOG_FAIL("REF_INC");
-				if (do_pin_inc(child_fd, cnt_name, NULL) != 0)
-					T4_LOG_FAIL("PIN_INC");
-				if (do_ref_dec(child_fd, cnt_name, NULL) != 0)
-					T4_LOG_FAIL("REF_DEC");
-				if (do_pin_dec(child_fd, cnt_name, NULL) != 0)
-					T4_LOG_FAIL("PIN_DEC");
+				int ref_inc_ok =
+					do_ref_inc(child_fd, cnt_name, NULL) == 0;
+				if (!ref_inc_ok)
+					T4_LOG_FAIL(ref_inc, "REF_INC");
+
+				int pin_inc_ok =
+					do_pin_inc(child_fd, cnt_name, NULL) == 0;
+				if (!pin_inc_ok)
+					T4_LOG_FAIL(pin_inc, "PIN_INC");
+
+				if (ref_inc_ok &&
+				    do_ref_dec(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL(ref_dec, "REF_DEC");
+				if (pin_inc_ok &&
+				    do_pin_dec(child_fd, cnt_name, NULL) != 0)
+					T4_LOG_FAIL(pin_dec, "PIN_DEC");
 			}
 #undef T4_LOG_FAIL
 
-			write(result_pipe[1], &errors, sizeof(errors));
+			write(result_pipe[1], &stats, sizeof(stats));
 			close(child_fd);
 			close(ready_pipes[i][1]);
 			close(go_pipes[i][0]);
@@ -1019,12 +1053,46 @@ static void run_test4(char **mounts, int num_mounts, int round,
 	for (i = 0; i < NUM_WORKERS; i++)
 		sync_signal(go_pipes[i][1]);
 
+	struct t4_err_stats agg = { 0 };
 	for (i = 0; i < NUM_WORKERS; i++) {
-		__u32 errors = 0;
-		ssize_t r = read(result_pipe[0], &errors, sizeof(errors));
-		if (r != (ssize_t)sizeof(errors))
-			errors = 0xFFFFFFFFu;
-		total_errors += errors;
+		struct t4_err_stats stats = { 0 };
+		ssize_t r = read(result_pipe[0], &stats, sizeof(stats));
+		if (r != (ssize_t)sizeof(stats)) {
+			total_errors += 0xFFFFFFFFu;
+			continue;
+		}
+		if (stats.fatal) {
+			total_errors += stats.fatal;
+			continue;
+		}
+		agg.ref_inc += stats.ref_inc;
+		agg.pin_inc += stats.pin_inc;
+		agg.ref_dec += stats.ref_dec;
+		agg.pin_dec += stats.pin_dec;
+		if (stats.ref_inc && !agg.ref_inc_first_errno)
+			agg.ref_inc_first_errno = stats.ref_inc_first_errno;
+		if (stats.pin_inc && !agg.pin_inc_first_errno)
+			agg.pin_inc_first_errno = stats.pin_inc_first_errno;
+		if (stats.ref_dec && !agg.ref_dec_first_errno)
+			agg.ref_dec_first_errno = stats.ref_dec_first_errno;
+		if (stats.pin_dec && !agg.pin_dec_first_errno)
+			agg.pin_dec_first_errno = stats.pin_dec_first_errno;
+		total_errors += (__u64)stats.ref_inc + stats.pin_inc +
+				stats.ref_dec + stats.pin_dec;
+	}
+
+	/* Per-op breakdown surfaces which step is racing. Printed only when
+	 * something failed so clean runs stay quiet. */
+	if (agg.ref_inc || agg.pin_inc || agg.ref_dec || agg.pin_dec) {
+		fprintf(stderr,
+			"[t4 %s r%d errno-breakdown] "
+			"REF_INC=%u(e=%d) PIN_INC=%u(e=%d) "
+			"REF_DEC=%u(e=%d) PIN_DEC=%u(e=%d)\n",
+			strategy_name(me_strategy), round,
+			agg.ref_inc, agg.ref_inc_first_errno,
+			agg.pin_inc, agg.pin_inc_first_errno,
+			agg.ref_dec, agg.ref_dec_first_errno,
+			agg.pin_dec, agg.pin_dec_first_errno);
 	}
 
 	for (i = 0; i < NUM_WORKERS; i++)
@@ -1086,6 +1154,244 @@ static void run_test4(char **mounts, int num_mounts, int round,
 		fflush(stderr);
 		printf("Results: %d passed, %d failed\n", pass_count,
 		       fail_count);
+		_exit(1);
+	}
+}
+
+/* ======================================================================
+ * Test 5: INC-only race (lost-update detection)
+ *
+ * Test 4 catches counter races only when DEC observes cur==0 — INC has no
+ * underflow check, so a lost-update on INC is silent and only surfaces
+ * via end-state imbalance. Test 5 isolates INC by having all workers
+ * race INC ops without any DEC. The expected final count is exact:
+ *
+ *     final == NUM_WORKERS * TEST5_ITERS_PER_WORKER
+ *
+ * Any value below means at least one INC's RMW was clobbered by a
+ * concurrent INC under broken serialization — direct evidence of a
+ * race window the balanced loop in Test 4 hides.
+ *
+ * Cleanup: workers leave the counter at the expected high value; the
+ * outer test drains via DEC down to 0 and clears the entry. The drain
+ * is best-effort (skipped on early imbalance).
+ * ====================================================================== */
+
+#define TEST5_ITERS_PER_WORKER 200
+
+static void run_test5(char **mounts, int num_mounts, int round,
+		      __u32 me_strategy)
+{
+	char region_name[64];
+	char cnt_name[64];
+	char label[160];
+	int region_fd;
+	int ready_pipes[NUM_WORKERS][2];
+	int go_pipes[NUM_WORKERS][2];
+	int result_pipe[2];
+	pid_t pids[NUM_WORKERS];
+	int i;
+	__u32 final_ref = 0xFFFFFFFFu;
+	__u32 final_pin = 0xFFFFFFFFu;
+	int find_ret;
+	__u64 total_errors = 0;
+	int fail_before = fail_count;
+
+	snprintf(region_name, sizeof(region_name), "t5_%s_r%d_region",
+		 strategy_name(me_strategy), round);
+	snprintf(cnt_name, sizeof(cnt_name), "race_inc_%s_r%d",
+		 strategy_name(me_strategy), round);
+
+	region_fd = setup_nrht_region(mounts[0], region_name, me_strategy);
+	if (region_fd < 0) {
+		fprintf(stderr, "Test5: setup failed\n");
+		fail_count++;
+		return;
+	}
+
+	if (do_name_offset(region_fd, cnt_name, 0, region_fd) != 0) {
+		fprintf(stderr, "Test5: pre-insert failed errno=%d\n", errno);
+		close(region_fd);
+		unlink_region(mounts[0], region_name);
+		fail_count++;
+		return;
+	}
+
+	if (pipe(result_pipe) < 0) {
+		perror("pipe result");
+		close(region_fd);
+		unlink_region(mounts[0], region_name);
+		fail_count++;
+		return;
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		if (pipe(ready_pipes[i]) < 0 || pipe(go_pipes[i]) < 0) {
+			perror("pipe");
+			close(region_fd);
+			unlink_region(mounts[0], region_name);
+			fail_count++;
+			return;
+		}
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			perror("fork");
+			_exit(1);
+		}
+
+		if (pids[i] == 0) {
+			int child_fd;
+			struct t4_err_stats stats = { 0 };
+			int j;
+
+			for (j = 0; j < NUM_WORKERS; j++) {
+				close(ready_pipes[j][0]);
+				close(go_pipes[j][1]);
+				if (j != i) {
+					close(ready_pipes[j][1]);
+					close(go_pipes[j][0]);
+				}
+			}
+			close(result_pipe[0]);
+			close(region_fd);
+
+			child_fd = open_region(
+				worker_mount(mounts, num_mounts, i), region_name);
+			if (child_fd < 0)
+				child_fd = open_region(mounts[0], region_name);
+			if (child_fd < 0) {
+				stats.fatal = 1;
+				write(result_pipe[1], &stats, sizeof(stats));
+				_exit(1);
+			}
+
+			sync_signal(ready_pipes[i][1]);
+			sync_wait(go_pipes[i][0]);
+
+#define T5_LOG_FAIL(field, op_name)                                           \
+	do {                                                                  \
+		int e = errno;                                                \
+		if (stats.field == 0) {                                       \
+			stats.field##_first_errno = e;                        \
+			fprintf(stderr,                                       \
+				"[t5 %s w%d j=%d %s FAIL errno=%d (%s)]\n",   \
+				strategy_name(me_strategy), i, j, (op_name),  \
+				e, strerror(e));                              \
+		}                                                             \
+		stats.field++;                                                \
+	} while (0)
+
+			for (j = 0; j < TEST5_ITERS_PER_WORKER; j++) {
+				if (do_ref_inc(child_fd, cnt_name, NULL) != 0)
+					T5_LOG_FAIL(ref_inc, "REF_INC");
+				if (do_pin_inc(child_fd, cnt_name, NULL) != 0)
+					T5_LOG_FAIL(pin_inc, "PIN_INC");
+			}
+#undef T5_LOG_FAIL
+
+			write(result_pipe[1], &stats, sizeof(stats));
+			close(child_fd);
+			close(ready_pipes[i][1]);
+			close(go_pipes[i][0]);
+			close(result_pipe[1]);
+			_exit(0);
+		}
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++) {
+		close(ready_pipes[i][1]);
+		close(go_pipes[i][0]);
+	}
+	close(result_pipe[1]);
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		sync_wait(ready_pipes[i][0]);
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		sync_signal(go_pipes[i][1]);
+
+	struct t4_err_stats agg = { 0 };
+	for (i = 0; i < NUM_WORKERS; i++) {
+		struct t4_err_stats stats = { 0 };
+		ssize_t r = read(result_pipe[0], &stats, sizeof(stats));
+		if (r != (ssize_t)sizeof(stats)) {
+			total_errors += 0xFFFFFFFFu;
+			continue;
+		}
+		if (stats.fatal) {
+			total_errors += stats.fatal;
+			continue;
+		}
+		agg.ref_inc += stats.ref_inc;
+		agg.pin_inc += stats.pin_inc;
+		if (stats.ref_inc && !agg.ref_inc_first_errno)
+			agg.ref_inc_first_errno = stats.ref_inc_first_errno;
+		if (stats.pin_inc && !agg.pin_inc_first_errno)
+			agg.pin_inc_first_errno = stats.pin_inc_first_errno;
+		total_errors += (__u64)stats.ref_inc + stats.pin_inc;
+	}
+
+	if (agg.ref_inc || agg.pin_inc) {
+		fprintf(stderr,
+			"[t5 %s r%d errno-breakdown] "
+			"REF_INC=%u(e=%d) PIN_INC=%u(e=%d)\n",
+			strategy_name(me_strategy), round,
+			agg.ref_inc, agg.ref_inc_first_errno,
+			agg.pin_inc, agg.pin_inc_first_errno);
+	}
+
+	for (i = 0; i < NUM_WORKERS; i++)
+		waitpid(pids[i], NULL, 0);
+
+	close(result_pipe[0]);
+	for (i = 0; i < NUM_WORKERS; i++) {
+		close(ready_pipes[i][0]);
+		close(go_pipes[i][1]);
+	}
+
+	/* Invariant 1: zero ioctl errors. */
+	snprintf(label, sizeof(label),
+		 "Test5 [%s] r%d: zero INC errors across %d workers (got %llu)",
+		 strategy_name(me_strategy), round, NUM_WORKERS,
+		 (unsigned long long)total_errors);
+	TEST(label, total_errors == 0);
+
+	/* Invariant 2: final counts must equal NUM_WORKERS * iters exactly.
+	 * Below-expected = lost INC update under broken ME serialization.
+	 * Above-expected = impossible (no DEC ran), would indicate corruption. */
+	__u32 expected = (__u32)NUM_WORKERS * TEST5_ITERS_PER_WORKER;
+	find_ret = do_find_counts(region_fd, cnt_name, &final_ref, &final_pin);
+	snprintf(label, sizeof(label), "Test5 [%s] r%d: post-race FIND succeeds",
+		 strategy_name(me_strategy), round);
+	TEST(label, find_ret == 0);
+
+	snprintf(label, sizeof(label),
+		 "Test5 [%s] r%d: final ref_count == %u (got %u)",
+		 strategy_name(me_strategy), round, expected, final_ref);
+	TEST(label, final_ref == expected);
+
+	snprintf(label, sizeof(label),
+		 "Test5 [%s] r%d: final pin_count == %u (got %u)",
+		 strategy_name(me_strategy), round, expected, final_pin);
+	TEST(label, final_pin == expected);
+
+	/* Skip drain: clear_name removes the entry outright (with counters),
+	 * so a 3200-ioctl drain via paired DECs would just be wasted ME-pass
+	 * roundtrips on the cross-mount token. */
+	do_clear_name(region_fd, cnt_name);
+	close(region_fd);
+	unlink_region(mounts[0], region_name);
+
+	if (fail_count > fail_before) {
+		fprintf(stderr,
+			"\n[Test5 %s r%d] failure detected — aborting for dmesg capture\n",
+			strategy_name(me_strategy), round);
+		fflush(stdout);
+		fflush(stderr);
+		printf("Results: %d passed, %d failed\n", pass_count, fail_count);
 		_exit(1);
 	}
 }
@@ -1929,6 +2235,11 @@ static void run_all_tests(char **mounts, int num_mounts, int rounds,
 	       strategy_name(me_strategy));
 	for (r = 0; r < rounds; r++)
 		run_test4(mounts, num_mounts, r, me_strategy);
+
+	printf("\n--- Test 5 [%s]: INC-only race (lost-update detection) ---\n",
+	       strategy_name(me_strategy));
+	for (r = 0; r < rounds; r++)
+		run_test5(mounts, num_mounts, r, me_strategy);
 }
 
 /*
@@ -2035,8 +2346,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (num_mounts < 2) {
-		fprintf(stderr, "need at least 2 mounts\n");
+	if (num_mounts < 1) {
+		fprintf(stderr, "need at least 1 mount\n");
 		usage(argv[0]);
 		return 1;
 	}

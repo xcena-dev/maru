@@ -347,11 +347,6 @@ static long marufs_ioctl_dmabuf_export(struct marufs_sb_info *sbi,
 	if (sbi->dax_mode != MARUFS_DAX_HEAP)
 		return -EOPNOTSUPP;
 
-	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					  MARUFS_PERM_ADMIN);
-	if (ret)
-		return ret;
-
 #ifdef CONFIG_DAXHEAP
 	if (!sbi->heap_dmabuf)
 		return -EINVAL;
@@ -516,27 +511,30 @@ static long marufs_ioctl_perm_grant(struct marufs_sb_info *sbi,
 				    struct marufs_inode_info *xi,
 				    struct marufs_perm_req *preq)
 {
-	int ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
-	if (ret)
-		return ret;
-
 	/* Permission check inside ME: a concurrent chown can strip
 	 * ADMIN/GRANT between check and delegation write, so a lock-free
 	 * precheck would let stale rights leak across ownership transfer.
+	 *
+	 * GRANT can grant non-privileged perms; only ADMIN can grant
+	 * ADMIN or GRANT itself.
 	 */
-	if (marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN) !=
-	    0) {
-		/* GRANT can grant, but not ADMIN or GRANT itself */
-		ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					      MARUFS_PERM_GRANT);
-		if (ret)
-			goto out;
-
-		if (preq->perms & (MARUFS_PERM_ADMIN | MARUFS_PERM_GRANT)) {
-			ret = -EPERM;
-			goto out;
-		}
+	u32 have;
+	int ret = marufs_check_permission_any(
+		sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN | MARUFS_PERM_GRANT,
+		&have);
+	if (ret)
+		return ret;
+	if (!have) {
+		return -EACCES;
 	}
+	if (!(have & MARUFS_PERM_ADMIN) &&
+	    (preq->perms & (MARUFS_PERM_ADMIN | MARUFS_PERM_GRANT))) {
+		return -EPERM;
+	}
+
+	ret = sbi->me->ops->acquire(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
+	if (ret)
+		return ret;
 
 	ret = marufs_deleg_grant(sbi, xi->rat_entry_id, preq);
 	if (ret == 0)
@@ -545,7 +543,6 @@ static long marufs_ioctl_perm_grant(struct marufs_sb_info *sbi,
 			preq->perms, preq->node_id, preq->pid,
 			xi->rat_entry_id);
 
-out:
 	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
 	return ret;
 }
@@ -561,11 +558,6 @@ static long __marufs_ioctl_chown_locked(struct marufs_sb_info *sbi,
 					struct marufs_inode_info *xi,
 					struct marufs_rat_entry *rat_entry)
 {
-	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					  MARUFS_PERM_ADMIN);
-	if (ret)
-		return ret;
-
 	/* CAS ALLOCATED→ALLOCATING: block GC during ownership transfer */
 	u32 old_state = marufs_le32_cas(&rat_entry->state,
 					MARUFS_RAT_ENTRY_ALLOCATED,
@@ -624,10 +616,6 @@ static long marufs_ioctl_chown(struct marufs_sb_info *sbi,
 }
 
 /* ── ioctl handler: NRHT_REF/PIN_INC/DEC (per-entry counter ops) ───── */
-typedef int (*nrht_refcnt_op_t)(struct marufs_sb_info *sbi, u32 nrht_region_id,
-				const char *name, size_t namelen, u64 name_hash,
-				u32 *out_count);
-
 static long marufs_ioctl_nrht_refcnt(struct marufs_sb_info *sbi,
 				     struct marufs_inode_info *xi,
 				     struct marufs_refcnt_req *req,
@@ -673,26 +661,35 @@ static long marufs_ioctl_perm_set_default(struct marufs_sb_info *sbi,
 	if (ret)
 		return ret;
 
-	/* Check ADMIN inside ME — a concurrent chown would otherwise be
-	 * able to strip ADMIN between check and write, letting a stale
-	 * caller clobber default_perms on the new owner's file.
-	 */
-	ret = marufs_check_permission(sbi, xi->rat_entry_id, MARUFS_PERM_ADMIN);
-	if (ret) {
-		pr_debug("PERM_SET_DEFAULT denied - rat_entry %u (pid=%d)\n",
-			 xi->rat_entry_id, current->pid);
-		goto out;
-	}
-
 	WRITE_LE16(rat_entry->default_perms, preq->perms);
 	MARUFS_CXL_WMB(rat_entry, sizeof(*rat_entry));
 
 	pr_debug("set default_perms=0x%x on rat_entry %u\n", preq->perms,
 		 xi->rat_entry_id);
 
-out:
 	sbi->me->ops->release(sbi->me, MARUFS_ME_GLOBAL_SHARD_ID);
 	return ret;
+}
+
+/*
+ * Required perm for ioctl precheck.
+ * Returns 0 when handler does its own check inside an ME critical section
+ * (PERM_GRANT/PERM_SET_DEFAULT/CHOWN need check+write atomic vs concurrent
+ * chown; DMABUF_EXPORT checks after dax_mode gate).
+ */
+static u16 marufs_ioctl_required_perm(unsigned int cmd)
+{
+	switch (cmd) {
+	case MARUFS_IOC_PERM_GRANT:
+		return 0; /* handler self-checks */
+	case MARUFS_IOC_PERM_SET_DEFAULT:
+	case MARUFS_IOC_CHOWN:
+	case MARUFS_IOC_DMABUF_EXPORT:
+	case MARUFS_IOC_NRHT_INIT:
+		return MARUFS_PERM_ADMIN;
+	default:
+		return MARUFS_PERM_IOCTL;
+	}
 }
 
 static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -718,51 +715,39 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (copy_from_user(&payload, (void __user *)arg, req_size))
 		return -EFAULT;
 
-	struct marufs_file_priv *priv = file->private_data;
+	u16 req_perm = marufs_ioctl_required_perm(cmd);
 	long ret = 0;
+	if (req_perm) {
+		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
+					      req_perm);
+		if (ret)
+			return ret;
+	}
+
+	struct marufs_file_priv *priv = file->private_data;
 
 	switch (cmd) {
 	case MARUFS_IOC_NAME_OFFSET:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = nrht_store_one(fc.sbi, fc.xi->rat_entry_id,
-					     &payload.name);
+		ret = nrht_store_one(fc.sbi, fc.xi->rat_entry_id,
+				     &payload.name);
 		break;
 
 	case MARUFS_IOC_BATCH_NAME_OFFSET:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_batch_name_offset(
-				fc.sbi, fc.xi, &payload.batch_store,
-				priv->batch_buf);
+		ret = marufs_ioctl_batch_name_offset(
+			fc.sbi, fc.xi, &payload.batch_store, priv->batch_buf);
 		break;
 
 	case MARUFS_IOC_FIND_NAME:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = nrht_find_one(fc.sbi, fc.xi->rat_entry_id,
-					    &payload.find);
-
+		ret = nrht_find_one(fc.sbi, fc.xi->rat_entry_id, &payload.find);
 		break;
 
 	case MARUFS_IOC_BATCH_FIND_NAME:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_batch_find_name(fc.sbi, fc.xi,
-							   &payload.batch_find,
-							   priv->batch_buf);
+		ret = marufs_ioctl_batch_find_name(
+			fc.sbi, fc.xi, &payload.batch_find, priv->batch_buf);
 		break;
 
 	case MARUFS_IOC_CLEAR_NAME:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_clear_name(fc.sbi, fc.xi,
-						      &payload.name);
+		ret = marufs_ioctl_clear_name(fc.sbi, fc.xi, &payload.name);
 		break;
 
 	case MARUFS_IOC_PERM_GRANT:
@@ -779,54 +764,31 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 
 	case MARUFS_IOC_NRHT_INIT:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_ADMIN);
-		if (!ret)
-			ret = marufs_ioctl_nrht_init(fc.sbi, fc.xi,
-						     &payload.nrht_init);
+		ret = marufs_ioctl_nrht_init(fc.sbi, fc.xi, &payload.nrht_init);
 		break;
 
 	case MARUFS_IOC_NRHT_JOIN:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_nrht_join(fc.sbi, fc.xi->rat_entry_id);
+		ret = marufs_nrht_join(fc.sbi, fc.xi->rat_entry_id);
 		break;
 
 	case MARUFS_IOC_NRHT_REF_INC:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
-						       &payload.refcnt,
-						       marufs_nrht_ref_inc);
+		ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi, &payload.refcnt,
+					       marufs_nrht_ref_inc);
 		break;
 
 	case MARUFS_IOC_NRHT_REF_DEC:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
-						       &payload.refcnt,
-						       marufs_nrht_ref_dec);
+		ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi, &payload.refcnt,
+					       marufs_nrht_ref_dec);
 		break;
 
 	case MARUFS_IOC_NRHT_PIN_INC:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
-						       &payload.refcnt,
-						       marufs_nrht_pin_inc);
+		ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi, &payload.refcnt,
+					       marufs_nrht_pin_inc);
 		break;
 
 	case MARUFS_IOC_NRHT_PIN_DEC:
-		ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					      MARUFS_PERM_IOCTL);
-		if (!ret)
-			ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi,
-						       &payload.refcnt,
-						       marufs_nrht_pin_dec);
+		ret = marufs_ioctl_nrht_refcnt(fc.sbi, fc.xi, &payload.refcnt,
+					       marufs_nrht_pin_dec);
 		break;
 
 	case MARUFS_IOC_DMABUF_EXPORT:

@@ -49,6 +49,11 @@ int marufs_nrht_delete(struct marufs_sb_info *sbi, u32 nrht_region_id,
  * Returns 0 on success, -ENOENT if entry missing/non-VALID,
  * -EINVAL on dec-from-zero, -EOVERFLOW on inc-from-UINT32_MAX.
  */
+
+typedef int (*nrht_refcnt_op_t)(struct marufs_sb_info *sbi, u32 nrht_region_id,
+				const char *name, size_t namelen, u64 name_hash,
+				u32 *out_count);
+
 int marufs_nrht_ref_inc(struct marufs_sb_info *sbi, u32 nrht_region_id,
 			const char *name, size_t namelen, u64 name_hash,
 			u32 *out_count);

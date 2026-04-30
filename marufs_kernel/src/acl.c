@@ -88,39 +88,6 @@ static bool marufs_is_owner(struct marufs_sb_info *sbi,
 }
 
 /*
- * marufs_deleg_matches - check if delegation entry grants required perms
- *
- * Exact match only: (node_id, pid) with birth_time verification.
- * pid=0 wildcard matching is no longer supported (rejected at grant time).
- */
-static bool marufs_deleg_matches(struct marufs_deleg_entry *de, u32 node_id,
-				 u32 required_perms)
-{
-	u32 de_node = READ_LE32(de->node_id);
-	u32 de_pid = READ_LE32(de->pid);
-	u32 de_perms = READ_LE32(de->perms);
-
-	/* Permission bits must be sufficient */
-	if ((de_perms & required_perms) != required_perms)
-		return false;
-
-	/* Exact match: (node_id, pid) with birth_time verification */
-	if (de_node != node_id || de_pid != current->pid)
-		return false;
-
-	/* PID reuse protection via birth_time */
-	{
-		u64 de_birth = READ_LE64(de->birth_time);
-		u64 cur_birth = ktime_to_ns(current->start_boottime);
-
-		if (de_birth != 0 && de_birth != cur_birth)
-			return false;
-	}
-
-	return true;
-}
-
-/*
  * marufs_deleg_entry_clear - zero all data fields of a delegation entry
  * @de: delegation entry pointer
  *
@@ -139,51 +106,55 @@ void marufs_deleg_entry_clear(struct marufs_deleg_entry *de)
 }
 
 /*
- * marufs_check_permission - unified permission check
+ * marufs_check_permission_any - compute granted subset of candidate perms
  * @sbi: superblock info
  * @rat_entry_id: RAT entry ID
- * @required_perms: permission bitmask (MARUFS_PERM_*)
+ * @candidate: permission bitmask to test (MARUFS_PERM_*, OR-combined)
+ * @out_granted: granted subset (intersection of candidate with caller's rights)
  *
- * Check order:
- *   1. Owner → allow ALL (fast path, same as existing 3-stage ACL)
- *   2. RAT default_perms → allow if sufficient
- *   3. Delegation table → scan for matching entry
- *   4. Deny
+ * ANY-semantics: returns the actual rights held by the caller within the
+ * requested candidate set. Caller branches on which bits matched (e.g.,
+ * PERM_GRANT: ADMIN can grant anything, GRANT cannot propagate ADMIN/GRANT).
  *
- * Returns 0 if allowed, -EACCES if denied, -EINVAL on bad input.
+ * Aggregation:
+ *   1. Owner → *out_granted = candidate (full match, fast path)
+ *   2. Otherwise: (default_perms ∪ matched deleg entries) & candidate
+ *
+ * Returns 0 on success, -EINVAL on bad input. State != ALLOCATED yields
+ * 0 with *out_granted=0 (caller maps to -EACCES).
+ *
+ * marufs_check_permission() is a thin AND-semantics wrapper over this.
  */
-int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
-			    u32 required_perms)
+int marufs_check_permission_any(struct marufs_sb_info *sbi, u32 rat_entry_id,
+				u32 candidate, u32 *out_granted)
 {
-	struct marufs_rat_entry *rat_entry;
-	u32 default_perms;
-	u32 i;
-
-	if (!sbi)
-		return -EINVAL;
-
-	rat_entry = marufs_rat_entry_get(sbi, rat_entry_id);
-	if (!rat_entry)
+	struct marufs_rat_entry *rat_entry =
+		marufs_rat_entry_get(sbi, rat_entry_id);
+	if (!rat_entry || !out_granted || candidate == 0)
 		return -EINVAL;
 
 	/* Verify RAT entry is still allocated before reading fields */
 	if (READ_LE32(rat_entry->state) != MARUFS_RAT_ENTRY_ALLOCATED)
-		return -EACCES;
+		return 0;
 
 	/* Fast path: owner has ALL permissions */
-	if (marufs_is_owner(sbi, rat_entry))
+	*out_granted = 0;
+	if (marufs_is_owner(sbi, rat_entry)) {
+		*out_granted = candidate;
 		return 0;
+	}
 
-	/* Invalidate CL2 again to cover deleg_num_entries and deleg_entries */
+	/* Invalidate CL2 to cover default_perms, deleg_num_entries, deleg_entries */
 	MARUFS_CXL_RMB(&rat_entry->default_perms, 64);
-
-	/* Check RAT default_perms */
-	default_perms = READ_LE16(rat_entry->default_perms);
-	if ((default_perms & required_perms) == required_perms)
+	u32 default_perms = READ_LE16(rat_entry->default_perms);
+	u32 have = 0;
+	have |= default_perms & candidate;
+	if (have == candidate) {
+		*out_granted = have;
 		return 0;
+	}
 
-	/* Check delegation entries directly in RAT entry */
-	for (i = 0; i < MARUFS_DELEG_MAX_ENTRIES; i++) {
+	for (u32 i = 0; i < rat_entry->deleg_num_entries; i++) {
 		struct marufs_deleg_entry *de =
 			marufs_rat_deleg_entry(rat_entry, i);
 		if (!de)
@@ -191,19 +162,52 @@ int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		if (READ_LE32(de->state) != MARUFS_DELEG_ACTIVE)
 			continue;
 
-		if (marufs_deleg_matches(de, sbi->node_id, required_perms)) {
-			/* Lazy birth_time init on first access by delegated process */
-			if (READ_LE64(de->birth_time) == 0) {
-				marufs_le64_cas(
-					&de->birth_time, 0,
-					ktime_to_ns(current->start_boottime));
-				MARUFS_CXL_WMB(de, sizeof(*de));
-			}
-			return 0;
+		u32 de_node = READ_LE32(de->node_id);
+		u32 de_pid = READ_LE32(de->pid);
+		if (de_node != sbi->node_id || de_pid != current->pid)
+			continue;
+
+		u64 de_birth = READ_LE64(de->birth_time);
+		u64 cur_birth = ktime_to_ns(current->start_boottime);
+		if (de_birth == 0) {
+			/* Lazy init on first access by matching process */
+			marufs_le64_cas(&de->birth_time, 0, cur_birth);
+			MARUFS_CXL_WMB(de, sizeof(*de));
+		} else if (de_birth != cur_birth) {
+			continue; /* PID reuse */
 		}
+
+		u32 de_perms = READ_LE32(de->perms);
+		u32 grant = de_perms & candidate;
+		if (!grant)
+			continue;
+
+		have |= grant;
+		if (have == candidate)
+			break;
 	}
 
-	return -EACCES;
+	*out_granted = have;
+	return 0;
+}
+
+/*
+ * marufs_check_permission - AND-semantics permission check
+ *
+ * Returns 0 if every bit in @required_perms is granted, -EACCES if any
+ * bit missing, -EINVAL on bad input.
+ *
+ * Thin wrapper over marufs_check_permission_any().
+ */
+int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
+			    u32 required_perms)
+{
+	u32 have;
+	int ret = marufs_check_permission_any(sbi, rat_entry_id,
+					      required_perms, &have);
+	if (ret)
+		return ret;
+	return have == required_perms ? 0 : -EACCES;
 }
 
 /*

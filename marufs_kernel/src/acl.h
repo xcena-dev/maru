@@ -15,6 +15,8 @@ struct marufs_perm_req;
 void marufs_deleg_entry_clear(struct marufs_deleg_entry *de);
 int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			    u32 required_perms);
+int marufs_check_permission_any(struct marufs_sb_info *sbi, u32 rat_entry_id,
+				u32 candidate, u32 *out_granted);
 int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		       struct marufs_perm_req *req);
 bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time);
