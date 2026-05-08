@@ -9,7 +9,6 @@
 # Usage:
 #   sudo ./install.sh                              # Build + load module only
 #   sudo ./install.sh --mount /dev/dax0.0          # Build + load + format + mount
-#   sudo ./install.sh --daxheap                    # Build with DAXHEAP support
 #   sudo ./install.sh --skip-build                 # Load pre-built module
 #   sudo ./install.sh --module-name myfs           # Custom module name
 
@@ -32,8 +31,6 @@ DO_FORMAT=0
 DEVICE=""
 MOUNT_POINT=""
 SKIP_BUILD=false
-USE_DAXHEAP=false
-DAXHEAP_DIR="${MARUFS_DAXHEAP_DIR:-}"
 
 # Helper functions with module name prefix
 log_info()    { echo -e "${BLUE}[INFO]${NC} [$MODULE_NAME] $1"; }
@@ -53,8 +50,6 @@ Options:
   --mount-point <path>      Mount point (default: /mnt/<module-name>)
   --build-dir <path>        Build directory (default: build)
   --module-name <name>      Module name (default: $MODULE_NAME)
-  --daxheap                 Build with DAXHEAP support
-  --daxheap-dir <path>      DAXHEAP source directory
   --skip-build              Skip build step (use existing binaries)
   -h, --help                Print help
 
@@ -63,7 +58,6 @@ Examples:
   sudo $0 --mount /dev/dax0.0 --format              # Build + load + format + mount
   sudo $0 --mount /dev/dax0.0                       # Build + load + mount (no format)
   sudo $0 --mount /dev/dax0.0 --node-id 2           # Set node_id=2
-  sudo $0 --daxheap --mount /dev/dax0.0             # DAXHEAP mode
   sudo $0 --module-name myfs --mount /dev/dax0.0    # Custom module name
 EOF
     exit 1
@@ -78,8 +72,6 @@ while [[ $# -gt 0 ]]; do
         --mount-point)  MOUNT_POINT="$2"; shift 2 ;;
         --build-dir)    BUILD_DIR="$2"; shift 2 ;;
         --module-name)  MODULE_NAME="$2"; shift 2 ;;
-        --daxheap)      USE_DAXHEAP=true; shift ;;
-        --daxheap-dir)  DAXHEAP_DIR="$2"; shift 2 ;;
         --skip-build)   SKIP_BUILD=true; shift ;;
         -h|--help)      usage ;;
         *)              log_error "Unknown option: $1"; usage ;;
@@ -110,18 +102,8 @@ cd "$SCRIPT_DIR"
 if [ "$SKIP_BUILD" = false ]; then
     log_info "Step 1/4: Building..."
 
-    if [ "$USE_DAXHEAP" = true ]; then
-        if [ -z "$DAXHEAP_DIR" ]; then
-            log_error "DAXHEAP_DIR not set. Use --daxheap-dir or export MARUFS_DAXHEAP_DIR"
-            exit 1
-        fi
-        log_info "Building with DAXHEAP_DIR=$DAXHEAP_DIR..."
-        make clean > /dev/null 2>&1 || true
-        make MODULE_NAME="$MODULE_NAME" DAXHEAP_DIR="$DAXHEAP_DIR" -j128
-    else
-        make clean > /dev/null 2>&1 || true
-        make MODULE_NAME="$MODULE_NAME" -j128
-    fi
+    make clean > /dev/null 2>&1 || true
+    make MODULE_NAME="$MODULE_NAME" -j128
 
     if [ ! -f "$MODULE_PATH" ]; then
         log_error "Build failed: $MODULE_PATH not found"

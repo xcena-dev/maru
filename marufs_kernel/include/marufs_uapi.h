@@ -99,13 +99,6 @@ struct marufs_chown_req {
 	__u32 reserved; /* must be 0 */
 };
 
-/* DMA-BUF export (DAXHEAP mode only) */
-struct marufs_dmabuf_req {
-	__u64 size; /* IN: export size (0 = entire buffer) */
-	__s32 fd; /* OUT: DMA-BUF file descriptor */
-	__u32 flags; /* Reserved, must be 0 */
-};
-
 /* NRHT ref/pin counter manipulation: name → (counter inc/dec).
  * Used for REF_INC, REF_DEC, PIN_INC, PIN_DEC ioctls. Looks up the entry
  * by name, performs the requested op under ME shard lock, returns the
@@ -162,8 +155,5 @@ struct marufs_nrht_init_req {
 #define MARUFS_IOC_NRHT_REF_DEC _IOWR('X', 23, struct marufs_refcnt_req)
 #define MARUFS_IOC_NRHT_PIN_INC _IOWR('X', 24, struct marufs_refcnt_req)
 #define MARUFS_IOC_NRHT_PIN_DEC _IOWR('X', 25, struct marufs_refcnt_req)
-
-/* DMA-BUF */
-#define MARUFS_IOC_DMABUF_EXPORT _IOWR('X', 0x50, struct marufs_dmabuf_req)
 
 #endif /* _MARUFS_UAPI_H */

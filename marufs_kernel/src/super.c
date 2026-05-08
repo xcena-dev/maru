@@ -40,13 +40,6 @@ module_param_named(node_id, marufs_node_id, int, 0444);
 MODULE_PARM_DESC(node_id,
 		 "Node ID for multi-node access control (must be > 0)");
 
-/* DAXHEAP multi-mount sharing: buf_id based, refcount for lifecycle */
-#ifdef CONFIG_DAXHEAP
-static DEFINE_MUTEX(marufs_daxheap_lock);
-u64 marufs_daxheap_bufid; /* buf_id from primary alloc (0 = none) */
-static atomic_t marufs_daxheap_mounts = ATOMIC_INIT(0);
-#endif
-
 /* Free per-shard DRAM resources */
 static void marufs_free_shard_resources(struct marufs_sb_info *sbi)
 {
@@ -58,8 +51,6 @@ static void marufs_free_shard_resources(struct marufs_sb_info *sbi)
 enum MARUFS_MOUNT_OPTION {
 	OPTION_NODE_ID,
 	OPTION_DAXDEV,
-	OPTION_DAXHEAP,
-	OPTION_DAXHEAP_IMPORT,
 	OPTION_FORMAT,
 	OPTION_ME_STRATEGY,
 	OPTION_ERROR,
@@ -68,8 +59,6 @@ enum MARUFS_MOUNT_OPTION {
 static const match_table_t marufs_tokens = {
 	{ OPTION_NODE_ID, "node_id=%d" },
 	{ OPTION_DAXDEV, "daxdev=%s" },
-	{ OPTION_DAXHEAP, "daxheap=%s" },
-	{ OPTION_DAXHEAP_IMPORT, "daxheap_import_id=%s" },
 	{ OPTION_FORMAT, "format" },
 	{ OPTION_ME_STRATEGY, "me_strategy=%s" },
 	{ OPTION_ERROR, NULL },
@@ -79,9 +68,6 @@ struct marufs_mount_opts {
 	int node_id; /* 0 = auto-mount (no node_id= given); ≥1 = manual */
 	char daxdev[128];
 	bool format; /* in-kernel format on mount */
-	bool use_daxheap;
-	u64 daxheap_size;
-	u64 daxheap_bufid; /* secondary: import existing buffer by ID */
 	enum marufs_me_strategy me_strategy; /* order or request */
 };
 
@@ -95,10 +81,7 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 	/* Default: 0 = auto-mount (no node_id= on command line) */
 	opts->node_id = 0;
 	opts->daxdev[0] = '\0';
-	opts->use_daxheap = false;
 	opts->format = false;
-	opts->daxheap_size = 0;
-	opts->daxheap_bufid = 0;
 	opts->me_strategy = MARUFS_ME_REQUEST; /* default: demand-driven */
 
 	if (!options)
@@ -124,31 +107,6 @@ static int marufs_parse_options(char *options, struct marufs_mount_opts *opts)
 			match_strlcpy(opts->daxdev, &args[0],
 				      sizeof(opts->daxdev));
 			break;
-		case OPTION_DAXHEAP: {
-			char size_str[64];
-
-			match_strlcpy(size_str, &args[0], sizeof(size_str));
-			opts->daxheap_size = memparse(size_str, NULL);
-			if (opts->daxheap_size == 0) {
-				pr_err("daxheap= requires non-zero size (use daxheap_bufid= for secondary)\n");
-				return -EINVAL;
-			}
-			opts->use_daxheap = true;
-			break;
-		}
-		case OPTION_DAXHEAP_IMPORT: {
-			char id_str[32];
-			int ret;
-
-			match_strlcpy(id_str, &args[0], sizeof(id_str));
-			ret = kstrtoull(id_str, 0, &opts->daxheap_bufid);
-			if (ret || opts->daxheap_bufid == 0) {
-				pr_err("daxheap_bufid= requires non-zero buffer ID\n");
-				return -EINVAL;
-			}
-			opts->use_daxheap = true;
-			break;
-		}
 		case OPTION_FORMAT:
 			opts->format = true;
 			break;
@@ -254,10 +212,8 @@ static int marufs_show_options(struct seq_file *m, struct dentry *root)
 
 	seq_printf(m, ",node_id=%u", sbi->node_id);
 
-	if (sbi->dax_mode == MARUFS_DAX_DEV && sbi->daxdev_path[0])
+	if (sbi->daxdev_path[0])
 		seq_printf(m, ",daxdev=%s", sbi->daxdev_path);
-	else if (sbi->dax_mode == MARUFS_DAX_HEAP)
-		seq_puts(m, ",daxheap");
 	else if (sbi->dax_base != NULL)
 		seq_puts(m, ",dax");
 
@@ -298,12 +254,11 @@ static const struct dentry_operations marufs_dentry_ops = {
  *
  * marufs_dax_acquire() / marufs_dax_release()
  *
- * Both DEV_DAX (character device) and DAXHEAP produce:
- *   sbi->dax_base  = mapped memory pointer
- *   sbi->use_dax   = true
+ * DEV_DAX (character device) produces:
+ *   sbi->dax_base   = mapped memory pointer
  *   sbi->total_size = total size
  *
- * After that, all filesystem logic only references sbi->dax_base and use_dax.
+ * After that, all filesystem logic references only sbi->dax_base.
  */
 
 /* Helper: read u64 value from sysfs */
@@ -329,10 +284,16 @@ static int marufs_read_sysfs_u64(const char *path, u64 *out)
 	return kstrtoull(buf, 0, out) < 0 ? -EINVAL : 0;
 }
 
-/* DEV_DAX: read physical address/size from sysfs and perform memremap */
-static int marufs_dax_acquire_devdax(struct marufs_sb_info *sbi,
-				     const char *devpath)
+/*
+ * marufs_dax_acquire - DEV_DAX memory acquisition via memremap.
+ *
+ * Reads phys addr/size from sysfs, memremap()s, opens the device file
+ * for mmap delegation. Reads sbi->daxdev_path (set by caller).
+ * After return, sbi->dax_base / phys_base / total_size / dax_filp populated.
+ */
+static int marufs_dax_acquire(struct marufs_sb_info *sbi)
 {
+	const char *devpath = sbi->daxdev_path;
 	const char *devname;
 	char sysfs_path[256];
 	u64 phys_addr, dev_size;
@@ -373,7 +334,6 @@ static int marufs_dax_acquire_devdax(struct marufs_sb_info *sbi,
 	sbi->phys_base = phys_addr; /* Store physical address for DAX mmap */
 	sbi->dax_nr_pages = dev_size >> PAGE_SHIFT;
 	sbi->total_size = dev_size;
-	strscpy(sbi->daxdev_path, devpath, sizeof(sbi->daxdev_path));
 
 	/*
 	 * Detect ZONE_DEVICE struct pages
@@ -409,125 +369,6 @@ static int marufs_dax_acquire_devdax(struct marufs_sb_info *sbi,
 }
 
 /*
- * DAXHEAP: allocate full-device buffer from daxheap kernel API.
- *
- * daxheap provides WC (Write-Combining) mmap for GPU high-bandwidth access
- * (~57.8 GB/s vs ~17 GB/s with memremap WB→UC).
- *
- * Uses standard dma_buf kernel interface:
- *   daxheap_kern_alloc() → dma_buf* (contiguous CXL buffer)
- *   dma_buf_vmap()       → kernel VA for metadata access (WB)
- *   dma_buf_mmap()       → userspace mapping (WC, handled by daxheap)
- */
-static int marufs_dax_acquire_daxheap(struct marufs_sb_info *sbi, u64 bufid)
-{
-#ifdef CONFIG_DAXHEAP
-	struct dma_buf *dmabuf;
-	u64 allocated_id;
-	int ret;
-
-	if (bufid == 0) {
-		/* Primary mount: allocate new buffer (sbi->total_size > 0)
-		 * Hold lock through alloc to prevent TOCTOU double allocation */
-		mutex_lock(&marufs_daxheap_lock);
-		if (marufs_daxheap_bufid != 0) {
-			mutex_unlock(&marufs_daxheap_lock);
-			pr_err("DAXHEAP buffer already allocated (bufid=0x%llx), use daxheap_bufid= for secondary\n",
-			       marufs_daxheap_bufid);
-			return -EEXIST;
-		}
-
-		dmabuf = daxheap_kern_alloc(sbi->total_size, 0);
-		if (IS_ERR(dmabuf)) {
-			mutex_unlock(&marufs_daxheap_lock);
-			pr_err("daxheap_kern_alloc failed: %ld\n",
-			       PTR_ERR(dmabuf));
-			return PTR_ERR(dmabuf);
-		}
-
-		ret = daxheap_kern_get_id(dmabuf, &allocated_id);
-		if (ret) {
-			mutex_unlock(&marufs_daxheap_lock);
-			pr_err("daxheap_kern_get_id failed: %d\n", ret);
-			daxheap_kern_free(dmabuf);
-			return ret;
-		}
-
-		/* Grant all hosts read+write access so secondary mounts can import */
-		ret = daxheap_kern_grant(dmabuf, DAXHEAP_KERN_GRANT_ANY_HOST,
-					 DAXHEAP_KERN_GRANT_READ |
-						 DAXHEAP_KERN_GRANT_WRITE);
-		if (ret) {
-			mutex_unlock(&marufs_daxheap_lock);
-			pr_err("daxheap_kern_grant failed: %d\n", ret);
-			daxheap_kern_free(dmabuf);
-			return ret;
-		}
-
-		marufs_daxheap_bufid = allocated_id;
-		atomic_inc(&marufs_daxheap_mounts);
-		mutex_unlock(&marufs_daxheap_lock);
-
-		pr_debug(
-			"DAXHEAP primary: allocated %zu bytes (bufid=0x%llx, granted all hosts)\n",
-			dmabuf->size, allocated_id);
-	} else {
-		/* Secondary mount: import existing buffer by ID */
-		dmabuf = daxheap_kern_import(bufid);
-		if (IS_ERR(dmabuf)) {
-			pr_err("daxheap_kern_import(0x%llx) failed: %ld\n",
-			       bufid, PTR_ERR(dmabuf));
-			return PTR_ERR(dmabuf);
-		}
-
-		mutex_lock(&marufs_daxheap_lock);
-		atomic_inc(&marufs_daxheap_mounts);
-		mutex_unlock(&marufs_daxheap_lock);
-
-		pr_debug(
-			"DAXHEAP secondary: imported bufid=0x%llx (%zu bytes)\n",
-			bufid, dmabuf->size);
-	}
-
-	/* Kernel vmap for metadata access (WB — CAS/barriers work normally) */
-	ret = dma_buf_vmap(dmabuf, &sbi->heap_map);
-	if (ret) {
-		pr_err("dma_buf_vmap failed: %d\n", ret);
-		mutex_lock(&marufs_daxheap_lock);
-		if (atomic_dec_and_test(&marufs_daxheap_mounts)) {
-			marufs_daxheap_bufid = 0;
-		}
-		mutex_unlock(&marufs_daxheap_lock);
-		dma_buf_put(dmabuf);
-		return ret;
-	}
-
-	/*
-	 * Skip daxheap shared metadata area.
-	 *
-	 * daxheap stores its own metadata (primary 64KB + mirror 64KB = 128KB)
-	 * at offset 0 of the CXL region.  The chunk allocator does not reserve
-	 * these chunks, so our buffer starts at region->vaddr.  If we write
-	 * MARUFS metadata at offset 0 we collide with daxheap's heartbeat and
-	 * allocation table updates, causing deterministic shard corruption.
-	 *
-	 */
-	sbi->dax_base = sbi->heap_map.vaddr;
-	sbi->total_size = dmabuf->size;
-	sbi->dax_nr_pages = sbi->total_size >> PAGE_SHIFT;
-	sbi->heap_dmabuf = dmabuf;
-
-	pr_debug("DAXHEAP buffer acquired: size=%zu dax_base=%p mounts=%d\n",
-		 dmabuf->size, sbi->dax_base,
-		 atomic_read(&marufs_daxheap_mounts));
-	return 0;
-#else
-	pr_err("daxheap support not compiled (CONFIG_DAXHEAP not set)\n");
-	return -ENOSYS;
-#endif
-}
-
-/*
  * marufs_gsb_checksum - CRC32 over immutable superblock fields.
  *
  * Covers: magic, version, total_size, shard_table_offset, rat_offset,
@@ -541,12 +382,10 @@ static u32 marufs_gsb_checksum(const struct marufs_superblock *gsb)
 }
 
 /*
- * marufs_format_device - in-kernel format for DEV_DAX and DAXHEAP modes.
+ * marufs_format_device - in-kernel format for DEV_DAX mode.
  *
  * Initialises filesystem metadata directly on the mapped memory.
  * Layout: superblock + shard table + bucket/entry arrays + RAT.
- *
- * Uses memset_io for DAXHEAP (WC-mapped), memset for DEV_DAX (WB memremap).
  */
 static int marufs_format_device(struct marufs_sb_info *sbi)
 {
@@ -558,9 +397,7 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	u32 i;
 	u32 *bucket_base;
 
-	pr_debug("formatting %s (%llu bytes, %llu MB)\n",
-		 sbi->dax_mode == MARUFS_DAX_HEAP ? "DAXHEAP buffer" :
-						    "DEV_DAX device",
+	pr_debug("formatting DEV_DAX device (%llu bytes, %llu MB)\n",
 		 total, total >> 20);
 
 	/* --- Layout calculation --- */
@@ -596,15 +433,9 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	 * claimants keep their slot state across a formatter restart.
 	 * Zero [0 .. GSB_SIZE) and [shard_table_offset .. regions_start).
 	 */
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-		memset_io(base, 0, MARUFS_GSB_SIZE);
-		memset_io((char *)base + MARUFS_SHARD_TABLE_OFFSET, 0,
-			  regions_start - MARUFS_SHARD_TABLE_OFFSET);
-	} else {
-		memset(base, 0, MARUFS_GSB_SIZE);
-		memset((char *)base + MARUFS_SHARD_TABLE_OFFSET, 0,
-		       regions_start - MARUFS_SHARD_TABLE_OFFSET);
-	}
+	memset(base, 0, MARUFS_GSB_SIZE);
+	memset((char *)base + MARUFS_SHARD_TABLE_OFFSET, 0,
+	       regions_start - MARUFS_SHARD_TABLE_OFFSET);
 	MARUFS_CXL_WMB(base, regions_start);
 
 	/* --- Step 1: Superblock (magic written LAST as format-complete fence) ---
@@ -743,66 +574,11 @@ static int marufs_format_device(struct marufs_sb_info *sbi)
 	return 0;
 }
 
-/*
- * marufs_dax_acquire - unified DAX memory acquisition
- *
- * After return, sbi->dax_base and sbi->use_dax are set.
- * All subsequent filesystem code references only these two fields.
- */
-static int marufs_dax_acquire(struct marufs_sb_info *sbi,
-			      struct super_block *sb, u64 daxheap_bufid)
+/* marufs_dax_release - unmap DEV_DAX memory. */
+static void marufs_dax_release(struct marufs_sb_info *sbi)
 {
-	int ret;
-
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-		ret = marufs_dax_acquire_daxheap(sbi, daxheap_bufid);
-	} else if (sbi->dax_mode == MARUFS_DAX_DEV) {
-		ret = marufs_dax_acquire_devdax(sbi, sbi->daxdev_path);
-	} else {
-		pr_err("unsupported DAX mode %d\n", sbi->dax_mode);
-		return -EINVAL;
-	}
-
-	if (ret) {
-		return ret;
-	}
-
-	return 0;
-}
-
-/*
- * marufs_dax_release - unified DAX memory release
- *
- * Calls the appropriate release function based on mode.
- */
-static void marufs_dax_release(struct marufs_sb_info *sbi,
-			       struct super_block *sb)
-{
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-#ifdef CONFIG_DAXHEAP
-		if (sbi->heap_dmabuf) {
-			dma_buf_vunmap(sbi->heap_dmabuf, &sbi->heap_map);
-			dma_buf_put(sbi->heap_dmabuf);
-			sbi->heap_dmabuf = NULL;
-
-			mutex_lock(&marufs_daxheap_lock);
-			if (atomic_dec_and_test(&marufs_daxheap_mounts)) {
-				pr_debug(
-					"DAXHEAP last mount released, clearing bufid\n");
-				marufs_daxheap_bufid = 0;
-			} else {
-				pr_debug(
-					"DAXHEAP mount released (remaining=%d)\n",
-					atomic_read(&marufs_daxheap_mounts));
-			}
-			mutex_unlock(&marufs_daxheap_lock);
-		}
-#endif
-	} else if (sbi->dax_mode == MARUFS_DAX_DEV) {
-		if (sbi->dax_base)
-			memunmap(sbi->dax_base);
-	}
-
+	if (sbi->dax_base)
+		memunmap(sbi->dax_base);
 	sbi->dax_base = NULL;
 }
 
@@ -1040,7 +816,7 @@ static struct inode *marufs_make_root_inode(struct super_block *sb)
 }
 
 /* ============================================================================
- * Common mount handling - shared by DEV_DAX and DAXHEAP paths
+ * Common mount handling for DEV_DAX
  * ============================================================================ */
 
 static int marufs_fill_super_common(struct super_block *sb,
@@ -1217,15 +993,10 @@ static int marufs_sbi_init_layout_ptrs(struct marufs_sb_info *sbi)
 /*
  * marufs_check_needs_format - determine whether the device requires formatting.
  *
- * For DAXHEAP: primary mount (no bufid) always formats.
- * For DEV_DAX: check GSB magic and checksum; invalid means format needed.
+ * Check GSB magic and checksum; invalid means format needed.
  */
-static bool marufs_check_needs_format(struct marufs_sb_info *sbi,
-				      u64 daxheap_bufid)
+static bool marufs_check_needs_format(struct marufs_sb_info *sbi)
 {
-	if (sbi->dax_mode == MARUFS_DAX_HEAP)
-		return (daxheap_bufid == 0);
-
 	struct marufs_superblock *gsb = marufs_gsb_get(sbi);
 	if (!gsb || READ_CXL_LE32(gsb->magic) != MARUFS_MAGIC)
 		return true;
@@ -1380,8 +1151,7 @@ static int marufs_auto_mount(struct marufs_sb_info *sbi, struct super_block *sb,
 		pr_info("bootstrap: node_id=%u (slot %d)\n", sbi->node_id,
 			slot_idx);
 
-		if (slot_idx == 0 &&
-		    marufs_check_needs_format(sbi, opts->daxheap_bufid)) {
+		if (slot_idx == 0 && marufs_check_needs_format(sbi)) {
 			ret = marufs_run_formatter(sbi, sb);
 			/* -EAGAIN means inject_stuck: sbi already freed,
 			 * propagate. */
@@ -1419,21 +1189,7 @@ static int marufs_manual_mount(struct marufs_sb_info *sbi,
 {
 	int ret;
 
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-		if (opts->daxheap_bufid != 0) {
-			struct marufs_superblock *gsb = marufs_gsb_get(sbi);
-			if (!gsb || READ_CXL_LE32(gsb->magic) != MARUFS_MAGIC) {
-				pr_err("DAXHEAP secondary mount but buffer not formatted\n");
-				return -EINVAL;
-			}
-		} else {
-			ret = marufs_format_device(sbi);
-			if (ret) {
-				pr_err("in-kernel format failed\n");
-				return ret;
-			}
-		}
-	} else if (opts->format) {
+	if (opts->format) {
 		ret = marufs_format_device(sbi);
 		if (ret) {
 			pr_err("in-kernel format failed\n");
@@ -1459,7 +1215,7 @@ static int marufs_manual_mount(struct marufs_sb_info *sbi,
 }
 
 /* ============================================================================
- * Mount handling - unified marufs_fill_super (DEV_DAX and DAXHEAP)
+ * Mount handling - marufs_fill_super (DEV_DAX)
  * ============================================================================ */
 
 int marufs_fill_super(struct super_block *sb, void *data, int silent)
@@ -1477,6 +1233,9 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sb->s_fs_info = sbi;
 	sbi->bootstrap_slot_idx = -1; /* not yet claimed */
+	mutex_init(&sbi->vm_ops_lock);
+	mutex_init(&sbi->me_list_lock);
+	mutex_init(&sbi->nrht_me_lock);
 
 	/* Validate node_id only for explicit manual mounts (node_id ≥ 1).
 	 * Auto-mount path (opts.node_id == 0) assigns node_id from bootstrap claim.
@@ -1501,42 +1260,19 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENOMEM;
 	}
 
-	/* Determine DAX mode from parsed options */
-	if (opts.use_daxheap) {
-		/* DAXHEAP path: WC mmap via daxheap buffer */
-		sbi->dax_mode = MARUFS_DAX_HEAP;
-		sbi->total_size =
-			opts.daxheap_size; /* 0 for secondary (bufid import) */
-		if (opts.daxheap_bufid)
-			pr_debug(
-				"fill_super DAXHEAP secondary bufid=0x%llx (node_id=%d)\n",
-				opts.daxheap_bufid, opts.node_id);
-		else
-			pr_debug(
-				"fill_super DAXHEAP primary size=%llu (%llu MB, node_id=%d)\n",
-				opts.daxheap_size, opts.daxheap_size >> 20,
-				opts.node_id);
-	} else if (opts.daxdev[0]) {
-		/* DEV_DAX path */
-		sbi->dax_mode = MARUFS_DAX_DEV;
-		strscpy(sbi->daxdev_path, opts.daxdev,
-			sizeof(sbi->daxdev_path));
-		pr_debug("fill_super DEV_DAX %s (node_id=%d)\n", opts.daxdev,
-			 opts.node_id);
-	} else {
-		pr_err("must specify daxdev= or daxheap= mount option\n");
+	/* DEV_DAX path */
+	if (!opts.daxdev[0]) {
+		pr_err("must specify daxdev= mount option\n");
 		ret = -EINVAL;
 		goto err_free_sbi;
 	}
+	strscpy(sbi->daxdev_path, opts.daxdev, sizeof(sbi->daxdev_path));
+	pr_debug("fill_super DEV_DAX %s (node_id=%d)\n", opts.daxdev,
+		 opts.node_id);
 
-	/* Unified DAX acquisition */
-	ret = marufs_dax_acquire(sbi, sb, opts.daxheap_bufid);
+	ret = marufs_dax_acquire(sbi);
 	if (ret) {
-		if (opts.use_daxheap)
-			pr_err("DAXHEAP acquisition failed\n");
-		else if (opts.daxdev[0])
-			pr_err("DEV_DAX acquisition failed for %s\n",
-			       opts.daxdev);
+		pr_err("DEV_DAX acquisition failed for %s\n", opts.daxdev);
 		goto err_free_sbi;
 	}
 
@@ -1567,7 +1303,7 @@ int marufs_fill_super(struct super_block *sb, void *data, int silent)
 err_bs_release:
 	marufs_bootstrap_release(sbi);
 err_release_dax:
-	marufs_dax_release(sbi, sb);
+	marufs_dax_release(sbi);
 err_free_sbi:
 	marufs_free_shard_resources(sbi);
 	free_percpu(sbi->nrht_stats);
@@ -1583,7 +1319,7 @@ err_free_sbi:
 static struct dentry *marufs_mount(struct file_system_type *fs_type, int flags,
 				   const char *dev_name, void *data)
 {
-	/* All modes (DEV_DAX, DAXHEAP) use mount_nodev — no block device */
+	/* DEV_DAX uses mount_nodev — no block device */
 	return mount_nodev(fs_type, flags, data, marufs_fill_super);
 }
 
@@ -1634,7 +1370,7 @@ static void marufs_kill_sb(struct super_block *sb)
 		}
 
 		/* Release DAX mapping */
-		marufs_dax_release(sbi, sb);
+		marufs_dax_release(sbi);
 
 		free_percpu(sbi->nrht_stats);
 		kfree(sbi);
@@ -1715,17 +1451,6 @@ static void __exit marufs_exit(void)
 	rcu_barrier();
 	kmem_cache_destroy(marufs_inode_cachep);
 
-#ifdef CONFIG_DAXHEAP
-	/* Safety: clear leaked bufid on module unload */
-	mutex_lock(&marufs_daxheap_lock);
-	if (marufs_daxheap_bufid != 0) {
-		pr_warn("clearing leaked DAXHEAP bufid=0x%llx on module unload\n",
-			marufs_daxheap_bufid);
-		marufs_daxheap_bufid = 0;
-	}
-	mutex_unlock(&marufs_daxheap_lock);
-#endif
-
 	pr_info("module unloaded\n");
 }
 
@@ -1737,7 +1462,3 @@ MODULE_AUTHOR("XCMP Team");
 MODULE_DESCRIPTION(
 	"MARUFS - Partitioned Global Index filesystem for CXL shared memory");
 MODULE_VERSION("1.0");
-MODULE_SOFTDEP("pre: daxheap");
-#ifdef CONFIG_DAXHEAP
-MODULE_IMPORT_NS("DMA_BUF");
-#endif

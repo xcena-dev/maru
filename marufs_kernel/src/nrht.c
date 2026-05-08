@@ -396,10 +396,9 @@ static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
 	if (nme) {
 		struct marufs_me_header *h = me_header_get(nme);
 		if (READ_CXL_LE64(h->format_generation) ==
-		    nme->cached_generation) {
-			mutex_unlock(&sbi->nrht_me_lock);
-			return nme;
-		}
+		    nme->cached_generation)
+			goto out; /* fresh cached, return as-is */
+
 		/* Stale: drop it and fall through to recreate. */
 		pr_info("nrht: ME instance for region %u stale (gen changed), reinit\n",
 			nrht_region_id);
@@ -412,13 +411,13 @@ static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
 	rat_e = marufs_rat_entry_get(sbi, nrht_region_id);
 	if (!rat_e ||
 	    READ_CXL_LE32(rat_e->state) != MARUFS_RAT_ENTRY_ALLOCATED) {
-		mutex_unlock(&sbi->nrht_me_lock);
-		return ERR_PTR(-ENOENT);
+		nme = ERR_PTR(-ENOENT);
+		goto out;
 	}
 	base = marufs_dax_ptr(sbi, READ_CXL_LE64(rat_e->phys_offset));
 	if (!base) {
-		mutex_unlock(&sbi->nrht_me_lock);
-		return ERR_PTR(-EIO);
+		nme = ERR_PTR(-EIO);
+		goto out;
 	}
 	hdr = base;
 	MARUFS_CXL_RMB(hdr, sizeof(*hdr));
@@ -433,27 +432,27 @@ static struct marufs_me_instance *marufs_nrht_me_get(struct marufs_sb_info *sbi,
 
 	nme = marufs_me_create(me_base, num_shards, MARUFS_ME_MAX_NODES,
 			       sbi->node_id, MARUFS_ME_DEFAULT_POLL_US, strat);
-	if (IS_ERR(nme)) {
-		mutex_unlock(&sbi->nrht_me_lock);
-		return nme;
-	}
+	if (IS_ERR(nme))
+		goto out;
 
 	ret = nme->ops->join(nme);
 	if (ret) {
 		marufs_me_destroy(nme);
-		mutex_unlock(&sbi->nrht_me_lock);
-		return ERR_PTR(ret);
+		nme = ERR_PTR(ret);
+		goto out;
 	}
 
 	marufs_me_register(sbi, nme);
 
 	/* Publish via WRITE_ONCE; fast path uses READ_ONCE */
 	WRITE_ONCE(sbi->nrht_me[nrht_region_id], nme);
-	mutex_unlock(&sbi->nrht_me_lock);
 
 	pr_info("nrht: ME instance created for region %u (strategy=%s, shards=%u)\n",
 		nrht_region_id, strat == MARUFS_ME_ORDER ? "order" : "request",
 		num_shards);
+
+out:
+	mutex_unlock(&sbi->nrht_me_lock);
 	return nme;
 }
 
@@ -666,11 +665,9 @@ int marufs_nrht_init(struct marufs_sb_info *sbi, u32 nrht_region_id,
 	 * does not match the freshly-formatted CXL area.
 	 */
 	mutex_lock(&sbi->nrht_me_lock);
-	{
-		struct marufs_me_instance *stale = sbi->nrht_me[nrht_region_id];
-		sbi->nrht_me[nrht_region_id] = NULL;
-		marufs_me_invalidate(sbi, stale);
-	}
+	struct marufs_me_instance *stale = sbi->nrht_me[nrht_region_id];
+	sbi->nrht_me[nrht_region_id] = NULL;
+	marufs_me_invalidate(sbi, stale);
 	mutex_unlock(&sbi->nrht_me_lock);
 
 	/* Zero + format */

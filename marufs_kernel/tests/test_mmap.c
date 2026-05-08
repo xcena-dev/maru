@@ -15,13 +15,17 @@
  *   test_mmap <mount1> <mount2> <peer_node> <size>  Full options
  */
 
+#define _GNU_SOURCE  /* mremap, MREMAP_MAYMOVE */
+
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../include/marufs_uapi.h"
@@ -468,6 +472,426 @@ static int run_cross_node(const char* mount1, const char* mount2,
 }
 
 /* ================================================================
+ * vm_ops wrapper enforcement: mprotect / VM_DONTCOPY / VM_DONTEXPAND
+ * ================================================================ */
+
+static int run_vm_protect(const char* mount, unsigned long size_mb)
+{
+    char filepath[512];
+    __u64 data_size = (__u64)size_mb * 1024 * 1024;
+    long page = sysconf(_SC_PAGESIZE);
+    int fd;
+    void* map;
+
+    if (data_size < (__u64)page * 8)
+        data_size = (__u64)page * 8; /* need room for split test */
+
+    snprintf(filepath, sizeof(filepath), "%s/vm_protect_%d", mount,
+             (int)getpid());
+    unlink(filepath);
+
+    printf("\n=== MARUFS vm_ops wrapper enforcement (single-node) ===\n");
+    printf("  mount: %s, size: %lluMB\n\n",
+           mount, (unsigned long long)(data_size >> 20));
+
+    /* ---- [1] mprotect basic semantics ---- */
+    printf("[1] mprotect basic semantics\n");
+
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    TEST("open(O_CREAT,RDWR)", fd >= 0);
+    if (fd < 0)
+        return 1;
+    TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+
+    map = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    TEST("mmap(PROT_READ|PROT_WRITE)", map != MAP_FAILED);
+    if (map == MAP_FAILED)
+    {
+        close(fd);
+        unlink(filepath);
+        return 1;
+    }
+
+    TEST("mprotect to same PROT_RW",
+         mprotect(map, data_size, PROT_READ | PROT_WRITE) == 0);
+    TEST("mprotect narrow to PROT_READ",
+         mprotect(map, data_size, PROT_READ) == 0);
+    TEST("mprotect to PROT_NONE", mprotect(map, data_size, PROT_NONE) == 0);
+    TEST("mprotect restore PROT_READ",
+         mprotect(map, data_size, PROT_READ) == 0);
+    TEST("mprotect re-add PROT_WRITE on owner mapping",
+         mprotect(map, data_size, PROT_READ | PROT_WRITE) == 0);
+
+    munmap(map, data_size);
+    close(fd);
+    unlink(filepath);
+
+    /* ---- [2] O_RDONLY fd cannot escalate via mprotect ---- */
+    printf("\n[2] O_RDONLY fd cannot escalate to PROT_WRITE\n");
+
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    TEST("create RDWR for sizing", fd >= 0);
+    if (fd < 0)
+        return 1;
+    TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+    close(fd);
+
+    fd = open(filepath, O_RDONLY);
+    TEST("reopen O_RDONLY", fd >= 0);
+    if (fd < 0)
+    {
+        unlink(filepath);
+        return 1;
+    }
+
+    map = mmap(NULL, data_size, PROT_READ, MAP_SHARED, fd, 0);
+    TEST("mmap(PROT_READ) on RDONLY fd", map != MAP_FAILED);
+    if (map == MAP_FAILED)
+    {
+        close(fd);
+        unlink(filepath);
+        return 1;
+    }
+
+    {
+        int rc = mprotect(map, data_size, PROT_READ | PROT_WRITE);
+        TEST("mprotect(PROT_RW) on RDONLY mapping rejected",
+             rc < 0 && (errno == EACCES || errno == EPERM));
+    }
+
+    munmap(map, data_size);
+    close(fd);
+    unlink(filepath);
+
+    /* ---- [3] VM_DONTCOPY: fork() child does not inherit ---- */
+    printf("\n[3] VM_DONTCOPY: fork child does not inherit mapping\n");
+
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    TEST("create RDWR region", fd >= 0);
+    if (fd < 0)
+        return 1;
+    TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+
+    {
+        volatile unsigned int* m = mmap(NULL, data_size,
+                                        PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, fd, 0);
+        TEST("mmap(PROT_RW)", m != MAP_FAILED);
+        if (m == MAP_FAILED)
+        {
+            close(fd);
+            unlink(filepath);
+            return 1;
+        }
+
+        m[0] = PATTERN_A;
+
+        pid_t pid = fork();
+        TEST("fork()", pid >= 0);
+        if (pid == 0)
+        {
+            /* Touching m[0] in the child must SIGSEGV (vma not inherited
+             * due to VM_DONTCOPY). The volatile read forces an access. */
+            volatile unsigned int v = m[0];
+            (void)v;
+            _exit(0); /* unreachable on correct kernel */
+        }
+
+        int status = 0;
+        waitpid(pid, &status, 0);
+        int signaled = WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV;
+        TEST("child SIGSEGV on inherited mapping (VM_DONTCOPY)", signaled);
+        TEST("parent mapping intact after fork", m[0] == PATTERN_A);
+
+        munmap((void*)m, data_size);
+    }
+
+    close(fd);
+    unlink(filepath);
+
+    /* ---- [4] VM_DONTEXPAND: mremap cannot grow ---- */
+    printf("\n[4] VM_DONTEXPAND: mremap cannot grow\n");
+
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    TEST("create RDWR region (2x size)", fd >= 0);
+    if (fd < 0)
+        return 1;
+    TEST("ftruncate(2x)", ftruncate(fd, (off_t)(data_size * 2)) == 0);
+
+    /* Map only first half so kernel could in principle extend into the file */
+    map = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    TEST("mmap half region", map != MAP_FAILED);
+    if (map != MAP_FAILED)
+    {
+        void* grew = mremap(map, data_size, data_size * 2, 0);
+        TEST("mremap grow rejected (VM_DONTEXPAND)",
+             grew == MAP_FAILED && errno == EFAULT);
+
+        grew = mremap(map, data_size, data_size * 2, MREMAP_MAYMOVE);
+        TEST("mremap grow MAYMOVE rejected (VM_DONTEXPAND)",
+             grew == MAP_FAILED && errno == EFAULT);
+
+        munmap(map, data_size);
+    }
+
+    close(fd);
+    unlink(filepath);
+
+    /* ---- [5] vma split via partial mprotect (.open/.close balance) ----
+     * device_dax requires 2MB-aligned splits (dev_dax_may_split). Use a
+     * 2MB chunk in the middle so splits are accepted by the underlying
+     * .may_split hook copied into our wrapper. */
+    printf("\n[5] partial mprotect: vma split + igrab balance\n");
+
+    {
+        const size_t HUGE = 2UL << 20; /* 2MB — dev_dax align */
+        if (data_size < HUGE * 4)
+        {
+            printf("  SKIP: data_size < 8MB, cannot 2MB-align split\n");
+        }
+        else
+        {
+            fd = open(filepath, O_CREAT | O_RDWR, 0644);
+            TEST("create RDWR region", fd >= 0);
+            if (fd < 0)
+                return 1;
+            TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+
+            char* m = mmap(NULL, data_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+            TEST("mmap full region", m != MAP_FAILED);
+            if (m != MAP_FAILED)
+            {
+                char* mid = m + HUGE;
+                TEST("mprotect 2MB mid slice to PROT_READ",
+                     mprotect(mid, HUGE, PROT_READ) == 0);
+
+                *(volatile char*)m = 'A';
+                *(volatile char*)(m + HUGE * 2) = 'Z';
+                TEST("outer slices remain writable",
+                     m[0] == 'A' && m[HUGE * 2] == 'Z');
+
+                TEST("mprotect full restore PROT_RW",
+                     mprotect(m, data_size, PROT_READ | PROT_WRITE) == 0);
+
+                munmap(m, data_size);
+            }
+
+            close(fd);
+            unlink(filepath);
+        }
+    }
+
+    /* ---- [6] mremap MOVE-only (no grow) succeeds ---- */
+    printf("\n[6] mremap move (no grow) succeeds\n");
+
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    TEST("create RDWR region", fd >= 0);
+    if (fd < 0)
+        return 1;
+    TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+
+    map = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    TEST("mmap full region", map != MAP_FAILED);
+    if (map != MAP_FAILED)
+    {
+        /* Same-size mremap with MAYMOVE: relocation, not growth.
+         * VM_DONTEXPAND only blocks growth, so this should succeed. */
+        void* moved = mremap(map, data_size, data_size, MREMAP_MAYMOVE);
+        TEST("mremap same-size MAYMOVE succeeds", moved != MAP_FAILED);
+        if (moved != MAP_FAILED)
+            map = moved;
+
+        munmap(map, data_size);
+    }
+
+    close(fd);
+    unlink(filepath);
+
+    /* ---- [7] stress: split+merge cycles for .open/.close balance ----
+     * 2MB-aligned splits (dev_dax_may_split requirement). Skip if region
+     * too small to host 4 chunks of 2MB. */
+    printf("\n[7] split+merge stress (.open/.close ref balance)\n");
+
+    {
+        const size_t HUGE = 2UL << 20;
+        if (data_size < HUGE * 4)
+        {
+            printf("  SKIP: data_size < 8MB, cannot 2MB-align split\n");
+        }
+        else
+        {
+            fd = open(filepath, O_CREAT | O_RDWR, 0644);
+            TEST("create RDWR region", fd >= 0);
+            if (fd < 0)
+                return 1;
+            TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
+
+            char* m = mmap(NULL, data_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+            TEST("mmap full region", m != MAP_FAILED);
+            if (m != MAP_FAILED)
+            {
+                const int ITERS = 200;
+                int ok = 1;
+                int i;
+                for (i = 0; i < ITERS && ok; i++)
+                {
+                    if (mprotect(m + HUGE, HUGE, PROT_READ) != 0)
+                    {
+                        ok = 0;
+                        break;
+                    }
+                    if (mprotect(m, data_size, PROT_READ | PROT_WRITE) != 0)
+                    {
+                        ok = 0;
+                        break;
+                    }
+                }
+                TEST("split+merge cycles (no leak/crash)", ok);
+                munmap(m, data_size);
+            }
+
+            close(fd);
+            unlink(filepath);
+        }
+    }
+
+    return 0;
+}
+
+/* ================================================================
+ * Cross-node mprotect escalation block
+ *
+ * Owner grants READ-only delegation to (peer_node, our_pid).
+ * Consumer (same PID, mount2 view) mmaps PROT_READ, then tries to
+ * escalate via mprotect — must be rejected by marufs_vm_mprotect.
+ * After owner additionally grants WRITE, escalation must succeed.
+ * ================================================================ */
+
+static int run_vm_protect_cross(const char* mount1, const char* mount2,
+                                unsigned int peer_node,
+                                unsigned long size_mb)
+{
+    char filepath1[512], filepath2[512];
+    char filename[64];
+    __u64 data_size = (__u64)size_mb * 1024 * 1024;
+    int fd1 = -1, fd2 = -1, ret;
+    void* map = MAP_FAILED;
+
+    snprintf(filename, sizeof(filename), "vmprotect_xn_%d", (int)getpid());
+    snprintf(filepath1, sizeof(filepath1), "%s/%s", mount1, filename);
+    snprintf(filepath2, sizeof(filepath2), "%s/%s", mount2, filename);
+    unlink(filepath1);
+
+    printf("\n=== MARUFS Cross-Node mprotect escalation block ===\n");
+    printf("  mount1 (owner): %s\n", mount1);
+    printf("  mount2 (peer):  %s\n", mount2);
+    printf("  peer_node: %u, size: %lluMB\n\n",
+           peer_node, (unsigned long long)(data_size >> 20));
+
+    /* ---- [Y1] Owner: create + ftruncate + grant READ-only to peer ---- */
+    printf("[Y1] Owner: create + grant READ-only to (peer_node=%u, pid=%d)\n",
+           peer_node, (int)getpid());
+
+    fd1 = open(filepath1, O_CREAT | O_RDWR, 0644);
+    TEST("owner open(O_CREAT)", fd1 >= 0);
+    if (fd1 < 0)
+        return 1;
+    ret = ftruncate(fd1, (off_t)data_size);
+    TEST("owner ftruncate", ret == 0);
+    if (ret)
+    {
+        close(fd1);
+        unlink(filepath1);
+        return 1;
+    }
+
+    ret = do_grant(fd1, peer_node, (unsigned)getpid(), MARUFS_PERM_READ);
+    TEST("grant READ-only to peer", ret == 0);
+
+    /* ---- [Y2] Consumer (mount2): mmap PROT_READ succeeds ---- */
+    printf("\n[Y2] Consumer mmap(PROT_READ) on mount2\n");
+
+    fd2 = open(filepath2, O_RDONLY);
+    TEST("consumer open(filepath2, O_RDONLY)", fd2 >= 0);
+    if (fd2 < 0)
+        goto cleanup;
+
+    map = mmap(NULL, data_size, PROT_READ, MAP_SHARED, fd2, 0);
+    TEST("consumer mmap(PROT_READ)", map != MAP_FAILED);
+    if (map == MAP_FAILED)
+        goto cleanup;
+
+    /* ---- [Y3] Consumer mprotect PROT_RW must be rejected ---- */
+    printf("\n[Y3] Consumer mprotect escalation rejected\n");
+
+    {
+        int rc = mprotect(map, data_size, PROT_READ | PROT_WRITE);
+        TEST("mprotect(PROT_RW) rejected (RDONLY fd guard)",
+             rc < 0 && (errno == EACCES || errno == EPERM));
+    }
+
+    /* PROT_NONE always allowed */
+    TEST("mprotect(PROT_NONE) allowed",
+         mprotect(map, data_size, PROT_NONE) == 0);
+    TEST("mprotect(PROT_READ) allowed (READ delegation present)",
+         mprotect(map, data_size, PROT_READ) == 0);
+
+    munmap(map, data_size);
+    map = MAP_FAILED;
+    close(fd2);
+    fd2 = -1;
+
+    /* ---- [Y4] Consumer reopen O_RDWR; mprotect still must check RAT ---- */
+    printf("\n[Y4] Consumer O_RDWR reopen + mprotect must hit RAT WRITE check\n");
+
+    fd2 = open(filepath2, O_RDWR);
+    TEST("consumer open(filepath2, O_RDWR)", fd2 >= 0);
+    if (fd2 < 0)
+        goto cleanup;
+
+    /* mmap PROT_READ on RDWR fd. fd allows WRITE (no FMODE_WRITE rejection),
+     * so the FMODE guard doesn't fire — escalation goes through RAT check. */
+    map = mmap(NULL, data_size, PROT_READ, MAP_SHARED, fd2, 0);
+    TEST("consumer mmap(PROT_READ) on RDWR fd", map != MAP_FAILED);
+    if (map == MAP_FAILED)
+        goto cleanup;
+
+    {
+        int rc = mprotect(map, data_size, PROT_READ | PROT_WRITE);
+        TEST("mprotect(PROT_RW) rejected by RAT check (no WRITE delegation)",
+             rc < 0 && errno == EACCES);
+    }
+
+    /* ---- [Y5] Owner grants WRITE; mprotect(PROT_RW) now succeeds ---- */
+    printf("\n[Y5] Owner adds WRITE; consumer mprotect(PROT_RW) succeeds\n");
+
+    ret = do_grant(fd1, peer_node, (unsigned)getpid(),
+                   MARUFS_PERM_READ | MARUFS_PERM_WRITE);
+    TEST("grant READ|WRITE to peer", ret == 0);
+
+    {
+        int rc = mprotect(map, data_size, PROT_READ | PROT_WRITE);
+        TEST("mprotect(PROT_RW) succeeds after WRITE delegation", rc == 0);
+    }
+
+    /* Drop back and verify narrow still works */
+    TEST("mprotect narrow to PROT_READ",
+         mprotect(map, data_size, PROT_READ) == 0);
+
+cleanup:
+    if (map != MAP_FAILED)
+        munmap(map, data_size);
+    if (fd2 >= 0)
+        close(fd2);
+    if (fd1 >= 0)
+        close(fd1);
+    unlink(filepath1);
+    return 0;
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 
@@ -509,9 +933,13 @@ int main(int argc, char* argv[])
     }
 
     run_single_node(mount1, size_mb);
+    run_vm_protect(mount1, size_mb);
 
     if (mount2)
+    {
         run_cross_node(mount1, mount2, peer_node, size_mb);
+        run_vm_protect_cross(mount1, mount2, peer_node, size_mb);
+    }
 
     printf("\n============================================\n");
     printf("=== Total: %d passed, %d failed ===\n", pass_count, fail_count);

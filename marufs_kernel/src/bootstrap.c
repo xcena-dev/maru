@@ -376,15 +376,9 @@ static void __bootstrap_zero_format_output(struct marufs_sb_info *sbi)
 	u64 regions_start = MARUFS_REGION_OFFSET;
 
 	void *base = sbi->dax_base;
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-		memset_io(base, 0, MARUFS_GSB_SIZE);
-		memset_io(marufs_dax_ptr(sbi, MARUFS_SHARD_TABLE_OFFSET), 0,
-			  regions_start - MARUFS_SHARD_TABLE_OFFSET);
-	} else {
-		memset(base, 0, MARUFS_GSB_SIZE);
-		memset(marufs_dax_ptr(sbi, MARUFS_SHARD_TABLE_OFFSET), 0,
-		       regions_start - MARUFS_SHARD_TABLE_OFFSET);
-	}
+	memset(base, 0, MARUFS_GSB_SIZE);
+	memset(marufs_dax_ptr(sbi, MARUFS_SHARD_TABLE_OFFSET), 0,
+	       regions_start - MARUFS_SHARD_TABLE_OFFSET);
 	MARUFS_CXL_WMB(base, regions_start);
 }
 

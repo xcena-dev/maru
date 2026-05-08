@@ -158,18 +158,6 @@ static ssize_t perm_info_show(struct kobject *kobj, struct kobj_attribute *attr,
 }
 static struct kobj_attribute perm_info_attr = __ATTR_RO(perm_info);
 
-/* /sys/fs/marufs/daxheap_bufid - expose buf_id for secondary mounts */
-#ifdef CONFIG_DAXHEAP
-extern u64 marufs_daxheap_bufid;
-
-static ssize_t daxheap_bufid_show(struct kobject *kobj,
-				  struct kobj_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "0x%llx\n", marufs_daxheap_bufid);
-}
-static struct kobj_attribute daxheap_bufid_attr = __ATTR_RO(daxheap_bufid);
-#endif
-
 static struct attribute *marufs_attrs[] = {
 	&version_attr.attr,
 	&region_info_attr.attr,
@@ -182,9 +170,6 @@ static struct attribute *marufs_attrs[] = {
 	&me_per_shard_acquire_attr.attr,
 	&me_poll_thread_cpu_attr.attr,
 	&nrht_chain_depth_attr.attr,
-#ifdef CONFIG_DAXHEAP
-	&daxheap_bufid_attr.attr,
-#endif
 	NULL,
 };
 

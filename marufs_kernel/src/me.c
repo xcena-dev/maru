@@ -450,8 +450,6 @@ static int marufs_me_registry_poll_fn(void *data)
 void marufs_me_registry_init(struct marufs_sb_info *sbi)
 {
 	INIT_LIST_HEAD(&sbi->me_list);
-	mutex_init(&sbi->me_list_lock);
-	mutex_init(&sbi->nrht_me_lock);
 	sbi->me_poll_thread = NULL;
 }
 

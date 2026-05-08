@@ -37,14 +37,10 @@
 #include <linux/atomic.h>
 #include <linux/fs.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
-
-#ifdef CONFIG_DAXHEAP
-#include <linux/iosys-map.h>
-struct dma_buf;
-#endif
 
 /* On-disk layout + ME types (sbi fields reference both) */
 #include "marufs_layout.h"
@@ -89,15 +85,6 @@ struct dma_buf;
 /* Root directory mode */
 #define MARUFS_ROOT_DIR_MODE 0755
 
-/* ============================================================================
- * DAX mode enumeration
- * ============================================================================ */
-
-enum marufs_dax_mode {
-	MARUFS_DAX_DEV = 0, /* DEV_DAX: via dax character device */
-	MARUFS_DAX_HEAP = 1, /* DAXHEAP: via daxheap buffer (WC mmap for GPU) */
-};
-
 /* Forward declarations */
 struct marufs_entry_cache;
 struct marufs_me_instance;
@@ -128,18 +115,21 @@ struct marufs_shard_cache {
  */
 
 struct marufs_sb_info {
-	/* ── Storage backend (DEV_DAX / DAXHEAP) ─────────────────────────── */
+	/* ── Storage backend (DEV_DAX) ────────────────────────────────────── */
 	void *dax_base; /* DAX direct access base (virtual) */
 	phys_addr_t phys_base; /* Physical base address for DAX mmap */
 	long dax_nr_pages; /* DAX mapped page count */
 	u64 total_size; /* Total device size (bytes) */
-	enum marufs_dax_mode dax_mode; /* DEV_DAX vs DAXHEAP */
 	char daxdev_path[128]; /* DEV_DAX device path */
 	struct file *dax_filp; /* DEV_DAX device file for mmap delegation */
-#ifdef CONFIG_DAXHEAP
-	struct dma_buf *heap_dmabuf; /* daxheap dma_buf handle */
-	struct iosys_map heap_map; /* kernel vmap (WB) for metadata access */
-#endif
+
+	/* ── vm_ops wrapper (mprotect enforcement) ──────────────────────────
+	 * Lazy-seeded at first mmap: copy underlying ops, override .mprotect.
+	 * All vmas point to &sbi->vm_ops; no per-vma alloc.
+	 */
+	struct vm_operations_struct vm_ops;
+	bool vm_ops_seeded;
+	struct mutex vm_ops_lock;
 
 	/* ── Node identity ────────────────────────────────────────────────── */
 	u32 node_id;
@@ -234,16 +224,8 @@ static inline void marufs_bootstrap_promote_claimed(struct marufs_sb_info *sbi)
  * DAX abstraction API
  * ============================================================================
  *
- * All filesystem code uses these helpers to access device memory.
- * Transparently handles DEV_DAX and DAXHEAP modes.
+ * All filesystem code uses these helpers to access device memory (DEV_DAX).
  */
-
-/* Return current DAX mode */
-static inline enum marufs_dax_mode
-marufs_dax_get_mode(struct marufs_sb_info *sbi)
-{
-	return sbi->dax_mode;
-}
 
 /* Get direct pointer to device memory at @offset (DAX only) */
 static inline void *marufs_dax_ptr(struct marufs_sb_info *sbi, u64 offset)

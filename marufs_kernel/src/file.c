@@ -2,7 +2,6 @@
 /* file.c - MARUFS file operations (open, read, mmap, ioctl) */
 
 #include <linux/dax.h>
-#include <linux/dma-buf.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
@@ -19,6 +18,9 @@
 #include "compat.h"
 #include "marufs.h"
 #include "me.h"
+
+/* vma hardening: block fork inherit, mremap grow, coredump leak */
+#define MARUFS_VMA_HARDEN_FLAGS (VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP)
 
 /* Pre-allocated batch buffer to avoid kvmalloc per ioctl */
 #define MARUFS_BATCH_BUF_SIZE                                            \
@@ -149,41 +151,92 @@ static ssize_t marufs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return -EACCES;
 }
 
-/* Page fault: delegate to filemap_fault (page cache) */
-static vm_fault_t marufs_fault(struct vm_fault *vmf)
+/* RAT delegation gate shared by mmap and mprotect paths. */
+static int marufs_authorize_perms(struct marufs_sb_info *sbi,
+				  struct marufs_inode_info *xi, bool need_write)
 {
-	return filemap_fault(vmf);
+	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
+					  MARUFS_PERM_READ);
+	if (ret)
+		return ret;
+	if (need_write)
+		return marufs_check_permission(sbi, xi->rat_entry_id,
+					       MARUFS_PERM_WRITE);
+	return 0;
 }
 
-/* Write fault: permission check + mark dirty */
-static vm_fault_t marufs_page_mkwrite(struct vm_fault *vmf)
+/*
+ * vm_ops wrapper hooks. Recover sbi via container_of(vma->vm_ops),
+ * xi via vma->vm_private_data (set by attach, kept alive by igrab).
+ * vma->vm_file may point to dax_filp (device_dax delegate).
+ */
+
+static void marufs_vm_open(struct vm_area_struct *vma)
 {
-	struct marufs_file_ctx fc;
-	marufs_file_ctx_init(&fc, vmf->vma->vm_file);
+	struct marufs_inode_info *xi = vma->vm_private_data;
 
-	int ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
-					  MARUFS_PERM_WRITE);
-	if (ret) {
-		pr_warn("page_mkwrite denied - rat_entry %u (pid=%d)\n",
-			fc.xi->rat_entry_id, current->pid);
-		return VM_FAULT_SIGBUS;
-	}
-
-	struct page *page = vmf->page;
-	lock_page(page);
-	if (page->mapping != fc.inode->i_mapping) {
-		unlock_page(page);
-		return VM_FAULT_NOPAGE;
-	}
-
-	marufs_set_page_dirty(page);
-	return VM_FAULT_LOCKED;
+	if (xi)
+		igrab(&xi->vfs_inode);
 }
 
-static const struct vm_operations_struct marufs_vm_ops = {
-	.fault = marufs_fault,
-	.page_mkwrite = marufs_page_mkwrite,
-};
+static void marufs_vm_close(struct vm_area_struct *vma)
+{
+	struct marufs_inode_info *xi = vma->vm_private_data;
+
+	if (xi)
+		iput(&xi->vfs_inode);
+}
+
+/* mprotect: block escalation past RAT delegation. */
+static int marufs_vm_mprotect(struct vm_area_struct *vma, unsigned long start,
+			      unsigned long end, unsigned long newflags)
+{
+	if (!(newflags & (VM_READ | VM_WRITE | VM_EXEC)))
+		return 0; /* PROT_NONE */
+
+	struct marufs_inode_info *xi = vma->vm_private_data;
+	if (!xi || !vma->vm_ops)
+		return 0;
+
+	if ((newflags & VM_WRITE) && vma->vm_file &&
+	    !(vma->vm_file->f_mode & FMODE_WRITE))
+		return -EACCES;
+
+	struct marufs_sb_info *sbi =
+		container_of(vma->vm_ops, struct marufs_sb_info, vm_ops);
+
+	return marufs_authorize_perms(sbi, xi, newflags & VM_WRITE);
+}
+
+/*
+ * Lazy-seed sbi->vm_ops from underlying driver's ops, override hooks,
+ * point vma at it. xi stashed in vm_private_data + igrab keeps inode
+ * alive across vma life. .open/.close maintain igrab balance over
+ * vma split/clone.
+ */
+static int marufs_attach_vm_ops(struct vm_area_struct *vma,
+				struct marufs_sb_info *sbi,
+				struct marufs_inode_info *xi)
+{
+	mutex_lock(&sbi->vm_ops_lock);
+	if (!sbi->vm_ops_seeded) {
+		if (vma->vm_ops)
+			sbi->vm_ops = *vma->vm_ops;
+		else
+			memset(&sbi->vm_ops, 0, sizeof(sbi->vm_ops));
+		sbi->vm_ops.open = marufs_vm_open;
+		sbi->vm_ops.close = marufs_vm_close;
+		sbi->vm_ops.mprotect = marufs_vm_mprotect;
+		sbi->vm_ops_seeded = true;
+	}
+	mutex_unlock(&sbi->vm_ops_lock);
+
+	if (!igrab(&xi->vfs_inode))
+		return -ESTALE; /* inode being evicted */
+	vma->vm_private_data = xi;
+	vma->vm_ops = &sbi->vm_ops;
+	return 0;
+}
 
 static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -198,109 +251,55 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 	struct marufs_sb_info *sbi = fc.sbi;
 	struct marufs_inode_info *xi = fc.xi;
 
-	int ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					  MARUFS_PERM_READ);
+	int ret = marufs_authorize_perms(sbi, xi, vma->vm_flags & VM_WRITE);
 	if (ret)
 		return ret;
 
-	if (vma->vm_flags & VM_WRITE) {
-		ret = marufs_check_permission(sbi, xi->rat_entry_id,
-					      MARUFS_PERM_WRITE);
-		if (ret)
-			return ret;
-	}
-
 	if (xi->data_phys_offset == 0 || inode->i_size == 0)
 		return -ENODATA;
-
-	/* DAXHEAP: delegate to dma_buf (WC mapping, ~57.8 GB/s GPU bandwidth) */
-	if (sbi->dax_mode == MARUFS_DAX_HEAP) {
-#ifdef CONFIG_DAXHEAP
-		u64 user_offset;
-		unsigned long map_size;
-		unsigned long buf_pgoff;
-
-		if (!sbi->heap_dmabuf)
-			return -EINVAL;
-
-		user_offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
-		map_size = vma->vm_end - vma->vm_start;
-		if (user_offset + map_size > inode->i_size)
-			return -EINVAL;
-
-		if (unlikely(!marufs_validate_region_addr(
-			    sbi, fc.xi->data_phys_offset,
-			    user_offset + map_size)))
-			return -EIO;
-
-		buf_pgoff = (fc.xi->data_phys_offset + user_offset) >>
-			    PAGE_SHIFT;
-
-		ret = dma_buf_mmap(sbi->heap_dmabuf, vma, buf_pgoff);
-		if (ret) {
-			pr_err("dma_buf_mmap failed: %d\n", ret);
-			return ret;
-		}
-
-		pr_debug("mmap DAXHEAP WC inode=%lu buf_pgoff=%lu size=%lu\n",
-			 inode->i_ino, buf_pgoff, map_size);
-		return 0;
-#else
-		return -ENOSYS;
-#endif
-	}
 
 	/*
 	 * DEV_DAX: delegate to device_dax driver — NVIDIA cudaHostRegister
 	 * needs device_dax vm_ops on ZONE_DEVICE pages.
 	 * Fallback: remap_pfn_range (no GPU DMA but mmap works).
 	 */
-	if (sbi->dax_mode == MARUFS_DAX_DEV) {
-		u64 user_offset;
-		unsigned long map_size;
 
-		/* Bounds check */
-		user_offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
-		map_size = vma->vm_end - vma->vm_start;
-		if (user_offset + map_size > inode->i_size)
-			return -EINVAL;
+	/* Bounds check */
+	u64 user_offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+	unsigned long map_size = vma->vm_end - vma->vm_start;
+	if (user_offset + map_size > inode->i_size)
+		return -EINVAL;
 
-		if (unlikely(!marufs_validate_region_addr(
-			    sbi, xi->data_phys_offset, user_offset + map_size)))
-			return -EIO;
+	if (unlikely(!marufs_validate_region_addr(sbi, xi->data_phys_offset,
+						  user_offset + map_size)))
+		return -EIO;
 
-		if (sbi->dax_filp && sbi->dax_filp->f_op &&
-		    sbi->dax_filp->f_op->mmap) {
-			{
-				unsigned long orig_pgoff = vma->vm_pgoff;
+	if (sbi->dax_filp && sbi->dax_filp->f_op && sbi->dax_filp->f_op->mmap) {
+		/* Delegate to device_dax mmap (GPU DMA capable). */
+		unsigned long orig_pgoff = vma->vm_pgoff;
 
-				vma->vm_pgoff += fc.xi->data_phys_offset >>
-						 PAGE_SHIFT;
+		vma->vm_pgoff += fc.xi->data_phys_offset >> PAGE_SHIFT;
 
-				vma_set_file(vma, sbi->dax_filp);
-				ret = sbi->dax_filp->f_op->mmap(sbi->dax_filp,
-								vma);
-				pr_debug(
-					"mmap DEV_DAX delegated inode=%lu pgoff=%lu ret=%d\n",
-					inode->i_ino, vma->vm_pgoff, ret);
-				if (ret) {
-					vma_set_file(vma, file);
-					vma->vm_pgoff = orig_pgoff;
-					return ret;
-				}
-
-				vma->vm_page_prot =
-					pgprot_writecombine(vma->vm_page_prot);
-			}
-
-			return 0;
+		vma_set_file(vma, sbi->dax_filp);
+		ret = sbi->dax_filp->f_op->mmap(sbi->dax_filp, vma);
+		pr_debug("mmap DEV_DAX delegated inode=%lu pgoff=%lu ret=%d\n",
+			 inode->i_ino, vma->vm_pgoff, ret);
+		if (ret) {
+			vma_set_file(vma, file);
+			vma->vm_pgoff = orig_pgoff;
+			return ret;
 		}
 
-		/* Fallback: remap_pfn_range (WC pgprot) */
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+		vm_flags_set(vma, MARUFS_VMA_HARDEN_FLAGS);
+		/* Keep vm_file = dax_filp; device_dax fault hooks need it.
+		 * Recover marufs state via container_of + vm_private_data. */
+	} else {
+		/* Fallback: remap_pfn_range (WC pgprot, no GPU DMA). */
 		phys_addr_t phys_addr =
 			sbi->phys_base + xi->data_phys_offset + user_offset;
 
-		vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTCOPY);
+		vm_flags_set(vma, VM_PFNMAP | MARUFS_VMA_HARDEN_FLAGS);
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
 		ret = remap_pfn_range(vma, vma->vm_start,
@@ -313,10 +312,9 @@ static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 
 		pr_debug("mmap DEV_DAX fallback PFN inode=%lu phys=0x%llx\n",
 			 inode->i_ino, (unsigned long long)phys_addr);
-		return 0;
 	}
 
-	return -EINVAL;
+	return marufs_attach_vm_ops(vma, sbi, xi);
 }
 
 static loff_t marufs_llseek(struct file *file, loff_t offset, int whence)
@@ -338,33 +336,6 @@ const struct address_space_operations marufs_aops = {
 	.read_folio = marufs_read_folio,
 	.dirty_folio = filemap_dirty_folio,
 };
-
-/* DAXHEAP: export DMA-BUF fd for GPU import */
-static long marufs_ioctl_dmabuf_export(struct marufs_sb_info *sbi,
-				       struct marufs_inode_info *xi,
-				       struct marufs_dmabuf_req *dreq)
-{
-	if (sbi->dax_mode != MARUFS_DAX_HEAP)
-		return -EOPNOTSUPP;
-
-#ifdef CONFIG_DAXHEAP
-	if (!sbi->heap_dmabuf)
-		return -EINVAL;
-
-	int fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0)
-		return fd;
-
-	dreq->fd = fd;
-	get_file(sbi->heap_dmabuf->file);
-	fd_install(fd, sbi->heap_dmabuf->file);
-
-	pr_debug("DMABUF_EXPORT fd=%d size=%zu\n", fd, sbi->heap_dmabuf->size);
-	return 0;
-#else
-	return -ENOSYS;
-#endif
-}
 
 /* Resolve a userspace region fd to its RAT entry ID */
 static int nrht_resolve_target_fd(int target_fd, u32 *out_region_id)
@@ -687,8 +658,7 @@ out:
 /*
  * Required perm for ioctl precheck.
  * Returns 0 when handler does its own check inside an ME critical section
- * (PERM_GRANT/CHOWN need check+write atomic vs concurrent chown;
- * DMABUF_EXPORT checks after dax_mode gate).
+ * (PERM_GRANT/CHOWN need check+write atomic vs concurrent chown).
  */
 static u16 marufs_ioctl_required_perm(unsigned int cmd)
 {
@@ -697,7 +667,6 @@ static u16 marufs_ioctl_required_perm(unsigned int cmd)
 	case MARUFS_IOC_CHOWN:
 	case MARUFS_IOC_PERM_SET_DEFAULT:
 		return 0; /* handler self-checks */
-	case MARUFS_IOC_DMABUF_EXPORT:
 	case MARUFS_IOC_NRHT_INIT:
 		return MARUFS_PERM_ADMIN;
 	default:
@@ -719,7 +688,6 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		struct marufs_chown_req chown;
 		struct marufs_nrht_init_req nrht_init;
 		struct marufs_refcnt_req refcnt;
-		struct marufs_dmabuf_req dmabuf;
 	} payload;
 
 	size_t req_size = _IOC_SIZE(cmd);
@@ -804,11 +772,6 @@ static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 					       marufs_nrht_pin_dec);
 		break;
 
-	case MARUFS_IOC_DMABUF_EXPORT:
-		ret = marufs_ioctl_dmabuf_export(fc.sbi, fc.xi,
-						 &payload.dmabuf);
-		break;
-
 	default:
 		return -ENOTTY;
 	}
@@ -838,8 +801,8 @@ static unsigned long marufs_get_unmapped_area(struct file *file,
 	marufs_file_ctx_init(&fc, file);
 	struct marufs_sb_info *sbi = fc.sbi;
 
-	if (sbi->dax_mode == MARUFS_DAX_DEV && sbi->dax_filp &&
-	    sbi->dax_filp->f_op && sbi->dax_filp->f_op->get_unmapped_area) {
+	if (sbi->dax_filp && sbi->dax_filp->f_op &&
+	    sbi->dax_filp->f_op->get_unmapped_area) {
 		return sbi->dax_filp->f_op->get_unmapped_area(
 			sbi->dax_filp, addr, len, pgoff, flags);
 	}

@@ -28,13 +28,6 @@ ccflags-y += -I$(src)/include
 # CXL 2.0 compatibility: explicit cache flush for cross-host visibility
 ccflags-y += -DCONFIG_MARUFS_CXL2_COMPAT
 
-# Optional daxheap integration (WC mmap + DMA-BUF export for GPU)
-# Set DAXHEAP_DIR to enable: make DAXHEAP_DIR=/path/to/daxheap
-ifdef DAXHEAP_DIR
-ccflags-y += -DCONFIG_DAXHEAP -I$(DAXHEAP_DIR)/kernel/core/include
-DAXHEAP_SYMVERS := KBUILD_EXTRA_SYMBOLS=$(DAXHEAP_DIR)/kernel/core/Module.symvers
-endif
-
 # Build output directory
 BUILD_DIR := build
 
@@ -50,7 +43,7 @@ prepare:
 
 # Build kernel module in-place (depends on prepare)
 build-module: prepare
-	$(MAKE) -C $(KDIR) M=$(PWD) $(DAXHEAP_SYMVERS) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 # Collect all build artifacts to build/ and clean source dirs (depends on build)
 collect-artifacts: build-module
