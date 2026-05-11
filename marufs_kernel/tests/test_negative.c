@@ -75,6 +75,70 @@ static int do_nrht_init(int fd, __u32 max_entries, __u32 num_shards,
 }
 
 /*
+ * Section 0: mmap requires FD_CLOEXEC
+ *
+ * Defense in depth against post-exec privilege retention: even when
+ * execve preserves PID/start_boottime/exe_inode (same binary re-exec
+ * with hostile argv), an open fd without FD_CLOEXEC would survive exec
+ * and let the new context call mmap. marufs_mmap requires close_on_exec
+ * on the calling fd and returns -EACCES otherwise.
+ */
+static void test_mmap_requires_cloexec(const char *mount)
+{
+    char filepath[512];
+    int fd;
+    void *map;
+
+    printf("\n=== Section 0: mmap requires FD_CLOEXEC ===\n");
+
+    snprintf(filepath, sizeof(filepath), "%s/neg_cloexec_%d", mount,
+             getpid());
+    unlink(filepath);
+
+    /* open WITHOUT O_CLOEXEC, then ftruncate */
+    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        printf("  SKIP: open failed errno=%d (%s)\n", errno,
+               strerror(errno));
+        return;
+    }
+    if (ftruncate(fd, (off_t)SLOT_SIZE) < 0) {
+        printf("  SKIP: ftruncate failed errno=%d (%s)\n", errno,
+               strerror(errno));
+        close(fd);
+        unlink(filepath);
+        return;
+    }
+
+    /* mmap on non-cloexec fd must fail with EACCES */
+    errno = 0;
+    map = mmap(NULL, SLOT_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    TEST("mmap on fd without FD_CLOEXEC returns EACCES",
+         map == MAP_FAILED && errno == EACCES);
+    if (map != MAP_FAILED)
+        munmap(map, SLOT_SIZE);
+
+    close(fd);
+
+    /* Re-open WITH O_CLOEXEC: mmap must succeed */
+    fd = open(filepath, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("  SKIP: reopen failed errno=%d (%s)\n", errno,
+               strerror(errno));
+        unlink(filepath);
+        return;
+    }
+    errno = 0;
+    map = mmap(NULL, SLOT_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    TEST("mmap on fd with FD_CLOEXEC succeeds", map != MAP_FAILED);
+    if (map != MAP_FAILED)
+        munmap(map, SLOT_SIZE);
+
+    close(fd);
+    unlink(filepath);
+}
+
+/*
  * Section 1: Unknown ioctl (M3)
  *
  * An unrecognized ioctl number must return -1 with errno==ENOTTY.
@@ -87,7 +151,7 @@ static void test_unknown_ioctl(const char *mount)
     printf("\n=== Section 1: Unknown ioctl (M3) ===\n");
 
     snprintf(filepath, sizeof(filepath), "%s/neg_unk_%d", mount, getpid());
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) {
         printf("  SKIP: cannot create test file errno=%d (%s)\n",
                errno, strerror(errno));
@@ -125,7 +189,7 @@ static void test_nrht_init(const char *mount)
     printf("\n=== Section 2: NRHT init validation (M2) ===\n");
 
     snprintf(filepath, sizeof(filepath), "%s/neg_nrht_%d", mount, getpid());
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) {
         printf("  SKIP: cannot create test file errno=%d (%s)\n",
                errno, strerror(errno));
@@ -186,7 +250,7 @@ static void test_deleg_full(const char *mount)
     printf("\n=== Section 3: Delegation table full (H6) ===\n");
 
     snprintf(filepath, sizeof(filepath), "%s/neg_deleg_%d", mount, getpid());
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) {
         printf("  SKIP: cannot create test file errno=%d (%s)\n",
                errno, strerror(errno));
@@ -250,7 +314,7 @@ static void test_grant_escalation(const char *mount1, const char *mount2,
     snprintf(filepath2, sizeof(filepath2), "%s/%s", mount2, filename);
 
     /* Owner creates and sizes the file */
-    fd1 = open(filepath1, O_CREAT | O_RDWR, 0644);
+    fd1 = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd1 < 0) {
         printf("  SKIP: cannot create test file on mount1 errno=%d (%s)\n",
                errno, strerror(errno));
@@ -281,7 +345,7 @@ static void test_grant_escalation(const char *mount1, const char *mount2,
     close(fd1);
 
     /* Open same file from mount2 (peer node view) */
-    fd2 = open(filepath2, O_RDWR);
+    fd2 = open(filepath2, O_RDWR | O_CLOEXEC);
     if (fd2 < 0) {
         printf("  SKIP: cannot open file on mount2 errno=%d (%s)\n",
                errno, strerror(errno));
@@ -344,6 +408,7 @@ int main(int argc, char *argv[])
         printf("Mount2: %s  peer_node=%u\n", mount2, peer_node);
     printf("========================================\n");
 
+    test_mmap_requires_cloexec(mount1);
     test_unknown_ioctl(mount1);
     test_nrht_init(mount1);
     test_deleg_full(mount1);

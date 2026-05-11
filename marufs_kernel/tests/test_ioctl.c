@@ -104,7 +104,7 @@ static int create_nrht(const char *mount_point, int pid, __u32 max_entries)
     snprintf(path, sizeof(path), "%s/nrht_test_%d", mount_point, pid);
     unlink(path);  /* clean up stale */
 
-    fd = open(path, O_CREAT | O_RDWR, 0644);
+    fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0)
         return -1;
 
@@ -128,7 +128,7 @@ static int try_read(const char* path)
     int fd;
     ssize_t n;
 
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
 
@@ -144,7 +144,7 @@ static int try_write_mmap(const char* path)
     void* map;
     struct stat st;
 
-    fd = open(path, O_RDWR);
+    fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0)
         return -1;
 
@@ -197,7 +197,7 @@ static int run_multinode_tests(const char* mount1, const char* mount2,
     /* ---- Setup: create file on mount1 (owner) ---- */
     printf("[M0] Setup: create + ftruncate on owner mount\n");
 
-    fd1 = open(filepath1, O_CREAT | O_RDWR, 0644);
+    fd1 = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT) on mount1", fd1 >= 0);
     if (fd1 < 0)
         return 1;
@@ -284,7 +284,7 @@ static int run_multinode_tests(const char* mount1, const char* mount2,
 
         printf("[M5] SET_DEFAULT tests (separate file, no grants)\n");
 
-        fd2 = open(fp1_2, O_CREAT | O_RDWR, 0644);
+        fd2 = open(fp1_2, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         TEST("open new file for default_perms test", fd2 >= 0);
         if (fd2 < 0)
             return 1;
@@ -351,7 +351,7 @@ static int run_single_node_tests(const char* mount_point,
      * ---------------------------------------------------------------- */
     printf("[1] Two-phase create\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT) succeeds", fd >= 0);
     if (fd < 0)
     {
@@ -816,7 +816,7 @@ static int run_single_node_tests(const char* mount_point,
     printf("\n[8] BATCH_FIND_NAME\n");
 
     /* Re-open file (closed by perm tests) */
-    fd = open(filepath, O_RDWR);
+    fd = open(filepath, O_RDWR | O_CLOEXEC);
     if (fd < 0)
     {
         printf("  SKIP: cannot reopen file for batch test\n");
@@ -1282,7 +1282,7 @@ static int run_chown_tests(const char* mount_point, unsigned long data_size_mb,
     /* ---- C0: Create file (owner = current process) ---- */
     printf("[C0] Setup: create file as owner\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT)", fd >= 0);
     if (fd < 0)
         return 1;
@@ -1316,7 +1316,7 @@ static int run_chown_tests(const char* mount_point, unsigned long data_size_mb,
     if (child == 0)
     {
         /* Child: different PID, has READ via default_perms, no ADMIN */
-        fd2 = open(filepath, O_RDONLY);
+        fd2 = open(filepath, O_RDONLY | O_CLOEXEC);
         if (fd2 < 0)
             _exit(1);
         errno = 0;
@@ -1342,7 +1342,7 @@ static int run_chown_tests(const char* mount_point, unsigned long data_size_mb,
         /* Child: wait briefly for parent to grant ADMIN */
         usleep(50000);
 
-        fd2 = open(filepath, O_RDONLY);
+        fd2 = open(filepath, O_RDONLY | O_CLOEXEC);
         if (fd2 < 0)
             _exit(2);
 
@@ -1396,7 +1396,7 @@ static int cmd_perm_setup(const char* mount, const char* filename,
     snprintf(filepath, sizeof(filepath), "%s/%s", mount, filename);
     unlink(filepath);
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0)
     {
         perror("open");
@@ -1470,7 +1470,7 @@ static int cmd_perm_grant(const char* mount, const char* filename,
     char filepath[512];
     int fd, ret;
     snprintf(filepath, sizeof(filepath), "%s/%s", mount, filename);
-    fd = open(filepath, O_RDWR);
+    fd = open(filepath, O_RDWR | O_CLOEXEC);
     if (fd < 0)
     {
         perror("open");
@@ -1493,7 +1493,7 @@ static int cmd_perm_default(const char* mount, const char* filename,
     char filepath[512];
     int fd, ret;
     snprintf(filepath, sizeof(filepath), "%s/%s", mount, filename);
-    fd = open(filepath, O_RDWR);
+    fd = open(filepath, O_RDWR | O_CLOEXEC);
     if (fd < 0)
     {
         perror("open");

@@ -73,7 +73,7 @@ int main(int argc, char* argv[])
     /* ---- [1] mmap on fresh file (no ftruncate) ---- */
     printf("[1] mmap on fresh file (no ftruncate)\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT)", fd >= 0);
     if (fd < 0)
         return 1;
@@ -92,7 +92,7 @@ int main(int argc, char* argv[])
     /* ---- [2] read on fresh file (no ftruncate) ---- */
     printf("\n[2] read on fresh file (no ftruncate)\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT)", fd >= 0);
     if (fd >= 0)
     {
@@ -116,7 +116,7 @@ int main(int argc, char* argv[])
     /* ---- [3] mmap after ftruncate works ---- */
     printf("\n[3] mmap after ftruncate succeeds\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT)", fd >= 0);
     if (fd >= 0)
     {

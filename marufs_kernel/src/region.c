@@ -21,6 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 
+#include "acl.h"
 #include "marufs.h"
 #include "me.h"
 
@@ -173,6 +174,13 @@ static void marufs_rat_entry_reset(struct marufs_rat_entry *entry,
 		WRITE_LE32(entry->owner_pid, current->pid);
 		WRITE_LE64(entry->owner_birth_time,
 			   ktime_to_ns(current->start_boottime));
+
+		u64 exe_ino = 0;
+		u32 exe_dev = 0;
+		(void)marufs_get_exe_id(&exe_ino, &exe_dev);
+		WRITE_LE64(entry->owner_exe_inode_ino, exe_ino);
+		WRITE_LE32(entry->owner_exe_inode_dev, exe_dev);
+
 		WRITE_LE64(entry->alloc_time, now);
 		WRITE_LE64(entry->modified_at, now);
 	}

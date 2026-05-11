@@ -360,7 +360,7 @@ fi
 # Build test binaries
 echo -e "${YELLOW}--- Building test binaries ---${NC}"
 build_ok=true
-for src in "$SCRIPT_DIR"/test_ioctl.c "$SCRIPT_DIR"/test_mmap.c "$SCRIPT_DIR"/test_mmap_cuda.c "$SCRIPT_DIR"/test_cross_process.c "$SCRIPT_DIR"/test_overlap.c "$SCRIPT_DIR"/test_chown_race.c "$SCRIPT_DIR"/test_mmap_notrunc.c "$SCRIPT_DIR"/test_negative.c "$SCRIPT_DIR"/test_nrht_race.c "$SCRIPT_DIR"/test_gc_deleg.c "$SCRIPT_DIR"/test_pid_reuse.c; do
+for src in "$SCRIPT_DIR"/test_ioctl.c "$SCRIPT_DIR"/test_mmap.c "$SCRIPT_DIR"/test_mmap_cuda.c "$SCRIPT_DIR"/test_cross_process.c "$SCRIPT_DIR"/test_overlap.c "$SCRIPT_DIR"/test_chown_race.c "$SCRIPT_DIR"/test_mmap_notrunc.c "$SCRIPT_DIR"/test_negative.c "$SCRIPT_DIR"/test_nrht_race.c "$SCRIPT_DIR"/test_gc_deleg.c "$SCRIPT_DIR"/test_pid_reuse.c "$SCRIPT_DIR"/test_postexec_attack.c; do
     [ -f "$src" ] || continue
     bin="${src%.c}"
     name="$(basename "$src")"
@@ -1375,11 +1375,36 @@ run_test "Each mount owns a unique bootstrap slot" '
 echo ""
 
 # ============================================================================
-# Section 32: Bootstrap Chaos (via test_bootstrap_chaos.sh)
+# Section 32: Post-Exec Attack Defense (FD_CLOEXEC enforcement)
+# ============================================================================
+# Verifies marufs_require_cloexec() defense at mmap entry. Two scenarios:
+#   Mode 1 (no O_CLOEXEC): mmap rejected with EACCES — attack blocked early.
+#   Mode 2 (--cloexec):    parent mmap OK → execve auto-closes fd →
+#                          attacker post-exec fails fd lookup → DEFENDED.
+echo -e "${YELLOW}=== Section 32: Post-Exec Attack Defense ===${NC}"
+
+POSTEXEC_BIN="$SCRIPT_DIR/test_postexec_attack"
+if [ -x "$POSTEXEC_BIN" ]; then
+    run_test "Post-exec attack: no O_CLOEXEC (parent mmap blocked)" '
+        rc=0; "$POSTEXEC_BIN" "$MOUNT_POINT_0" 2>&1; rc=$?; \
+        [ "$rc" = "1" ] || { echo "expected exit=1 (parent mmap EACCES), got rc=$rc"; false; }
+    '
+    run_test "Post-exec attack: --cloexec (fd closed on execve, DEFENDED)" '
+        rc=0; "$POSTEXEC_BIN" "$MOUNT_POINT_0" --cloexec 2>&1; rc=$?; \
+        [ "$rc" = "0" ] || { echo "expected exit=0 (DEFENDED), got rc=$rc"; false; }
+    '
+else
+    echo -e "  ${YELLOW}SKIP${NC} (test_postexec_attack not compiled)"
+fi
+
+echo ""
+
+# ============================================================================
+# Section 33: Bootstrap Chaos (via test_bootstrap_chaos.sh)
 # ============================================================================
 # Delegates to test_bootstrap_chaos.sh:
 #   T1 stuck-formatter recovery, T2 concurrent mount race, T3 slot reuse.
-echo -e "${YELLOW}=== Section 32: Bootstrap Chaos ===${NC}"
+echo -e "${YELLOW}=== Section 33: Bootstrap Chaos ===${NC}"
 
 BOOTSTRAP_CHAOS_SCRIPT="$SCRIPT_DIR/test_bootstrap_chaos.sh"
 BOOTSTRAP_SETUP_SCRIPT="$SCRIPT_DIR/setup_local_multinode.sh"

@@ -293,7 +293,7 @@ int main(int argc, char* argv[])
      * ============================================================ */
     printf("\n[1] Owner: create region + mmap(PROT_WRITE)\n");
 
-    fd0 = open(filepath0, O_CREAT | O_RDWR, 0644);
+    fd0 = open(filepath0, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("owner open(O_CREAT|O_RDWR)", fd0 >= 0);
     if (fd0 < 0)
         goto out;
@@ -336,7 +336,7 @@ int main(int argc, char* argv[])
      * ============================================================ */
     printf("\n[3] Reader (READ perm): mmap(PROT_READ)\n");
 
-    fd1 = open(filepath1, O_RDONLY);
+    fd1 = open(filepath1, O_RDONLY | O_CLOEXEC);
     TEST("reader open(O_RDONLY)", fd1 >= 0);
     if (fd1 < 0)
         goto out_close0;
@@ -392,7 +392,7 @@ int main(int argc, char* argv[])
      * but mmap(PROT_WRITE) denied (permission enforced on data access) */
     printf("\n[4b] Reader (READ perm): open(O_RDWR) ok, mmap(PROT_WRITE) → EACCES\n");
     errno = 0;
-    fd1 = open(filepath1, O_RDWR);
+    fd1 = open(filepath1, O_RDWR | O_CLOEXEC);
     TEST("reader open(O_RDWR) succeeds (open always allowed)", fd1 >= 0);
     if (fd1 >= 0)
     {
@@ -413,7 +413,7 @@ int main(int argc, char* argv[])
     ret = do_grant(fd0, peer_node, my_pid, MARUFS_PERM_READ | MARUFS_PERM_WRITE);
     TEST("grant READ+WRITE to peer", ret == 0);
 
-    fd1 = open(filepath1, O_RDWR);
+    fd1 = open(filepath1, O_RDWR | O_CLOEXEC);
     TEST("reader re-open(O_RDWR)", fd1 >= 0);
     if (fd1 < 0)
         goto out_close0;

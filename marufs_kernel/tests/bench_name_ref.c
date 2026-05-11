@@ -131,7 +131,7 @@ static int create_nrht(const char *mount_path, int pid, __u32 me_strategy)
 
 	snprintf(path, sizeof(path), "%s/bench_nrht_%d", mount_path, pid);
 	unlink(path);
-	nfd = open(path, O_CREAT | O_RDWR, 0644);
+	nfd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (nfd < 0) return -1;
 
 	memset(&ninit, 0, sizeof(ninit));
@@ -415,7 +415,7 @@ int main(int argc, char **argv)
 
 	/* Create region file */
 	snprintf(filepath, sizeof(filepath), "%s/bench_%d", mount_path, pid);
-	fd = open(filepath, O_CREAT | O_RDWR, 0644);
+	fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0) { perror("open"); return 1; }
 	if (ftruncate(fd, (__off_t)size_mb * 1024 * 1024) < 0) {
 		perror("ftruncate");

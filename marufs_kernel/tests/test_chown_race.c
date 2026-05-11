@@ -75,7 +75,7 @@ static int do_set_default(int fd, unsigned perms)
 /* Create a test file with ftruncate */
 static int create_test_file(const char* path, __u64 size)
 {
-    int fd = open(path, O_CREAT | O_RDWR, 0644);
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0)
         return -1;
     if (ftruncate(fd, (__off_t)size) != 0)
@@ -139,7 +139,7 @@ static void test_concurrent_chown_race(const char* mount,
         if (children[i] == 0)
         {
             /* Child: open file, wait for signal, then race to chown */
-            int cfd = open(filepath, O_RDONLY);
+            int cfd = open(filepath, O_RDONLY | O_CLOEXEC);
             if (cfd < 0)
                 _exit(1);
 
@@ -239,7 +239,7 @@ static void test_chown_gc_race(const char* mount, unsigned node_id,
         /* Child: wait for grant, then chown */
         usleep(50000); /* 50ms for parent to grant */
 
-        int cfd = open(filepath, O_RDONLY);
+        int cfd = open(filepath, O_RDONLY | O_CLOEXEC);
         if (cfd < 0)
             _exit(1);
 
@@ -317,7 +317,7 @@ static void test_delegation_revoked_after_chown(const char* mount1,
     TEST("grant READ|WRITE|DELETE to peer", ret == 0);
 
     /* Verify peer can open file (via delegation) */
-    fd2 = open(filepath2, O_RDONLY);
+    fd2 = open(filepath2, O_RDONLY | O_CLOEXEC);
     TEST("peer can open before chown", fd2 >= 0);
     if (fd2 >= 0)
         close(fd2);
@@ -327,7 +327,7 @@ static void test_delegation_revoked_after_chown(const char* mount1,
     if (child == 0)
     {
         usleep(50000);
-        int cfd = open(filepath1, O_RDONLY);
+        int cfd = open(filepath1, O_RDONLY | O_CLOEXEC);
         if (cfd < 0)
             _exit(1);
         ret = do_chown(cfd);
@@ -348,7 +348,7 @@ static void test_delegation_revoked_after_chown(const char* mount1,
      * Peer's old delegation should be revoked.
      * open() always succeeds, but read()/mmap() should fail with -EACCES.
      */
-    fd2 = open(filepath2, O_RDONLY);
+    fd2 = open(filepath2, O_RDONLY | O_CLOEXEC);
     TEST("peer open succeeds (open always allowed)", fd2 >= 0);
     if (fd2 >= 0)
     {
@@ -410,7 +410,7 @@ static void test_chown_pingpong(const char* mount,
         close(to_parent[0]);
 
         char buf;
-        int cfd = open(filepath, O_RDONLY);
+        int cfd = open(filepath, O_RDONLY | O_CLOEXEC);
         if (cfd < 0)
             _exit(1);
 
@@ -558,7 +558,7 @@ static void test_chown_rescue_from_dead_owner(const char* mount,
     TEST("child A granted successfully", buf == 'Y');
 
     /* Parent: owner is dead, but we have ADMIN delegation. Try CHOWN. */
-    int fd = open(filepath, O_RDONLY);
+    int fd = open(filepath, O_RDONLY | O_CLOEXEC);
     TEST("open file after owner death", fd >= 0);
 
     if (fd >= 0)

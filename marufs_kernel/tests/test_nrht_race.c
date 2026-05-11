@@ -222,7 +222,7 @@ static int setup_nrht_region_sized(const char *mount, const char *filename,
 	snprintf(path, sizeof(path), "%s/%s", mount, filename);
 	unlink(path); /* remove stale */
 
-	fd = open(path, O_CREAT | O_RDWR, 0644);
+	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0) {
 		perror("open region");
 		return -1;
@@ -260,7 +260,7 @@ static int setup_nrht_region(const char *mount, const char *filename,
 	snprintf(path, sizeof(path), "%s/%s", mount, filename);
 	unlink(path);
 
-	fd = open(path, O_CREAT | O_RDWR, 0644);
+	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0) {
 		perror("open region");
 		return -1;
@@ -292,7 +292,7 @@ static int open_region(const char *mount, const char *filename)
 	char path[512];
 
 	snprintf(path, sizeof(path), "%s/%s", mount, filename);
-	return open(path, O_RDWR);
+	return open(path, O_RDWR | O_CLOEXEC);
 }
 
 /*

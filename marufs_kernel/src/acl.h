@@ -20,5 +20,9 @@ int marufs_check_permission_any(struct marufs_sb_info *sbi, u32 rat_entry_id,
 int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 		       struct marufs_perm_req *req);
 bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time);
+bool marufs_get_exe_id(u64 *out_ino, u32 *out_dev);
+bool marufs_check_exe_id(u64 ino, u32 dev);
+bool marufs_get_pid_identity(u32 target_pid, u64 *out_birth, u64 *out_ino,
+			     u32 *out_dev);
 
 #endif /* _MARUFS_ACL_H */

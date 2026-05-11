@@ -90,7 +90,7 @@ static int run_single_node(const char* mount, unsigned long size_mb)
     /* ---- [1] Two-phase create ---- */
     printf("[1] Two-phase create\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT)", fd >= 0);
     if (fd < 0)
         return 1;
@@ -285,7 +285,7 @@ static int run_cross_node(const char* mount1, const char* mount2,
     /* ---- [X1] Owner: create + truncate + grant ---- */
     printf("[X1] Owner: create + truncate + grant\n");
 
-    fd1 = open(filepath1, O_CREAT | O_RDWR, 0644);
+    fd1 = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("owner open(O_CREAT)", fd1 >= 0);
     if (fd1 < 0)
         return 1;
@@ -332,7 +332,7 @@ static int run_cross_node(const char* mount1, const char* mount2,
     /* ---- [X3] Peer: mmap read + verify pattern ---- */
     printf("\n[X3] Peer: mmap read + verify pattern\n");
 
-    fd2 = open(filepath2, O_RDWR);
+    fd2 = open(filepath2, O_RDWR | O_CLOEXEC);
     TEST("peer open(O_RDWR)", fd2 >= 0);
     if (fd2 < 0)
     {
@@ -497,7 +497,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
     /* ---- [1] mprotect basic semantics ---- */
     printf("[1] mprotect basic semantics\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("open(O_CREAT,RDWR)", fd >= 0);
     if (fd < 0)
         return 1;
@@ -529,14 +529,14 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
     /* ---- [2] O_RDONLY fd cannot escalate via mprotect ---- */
     printf("\n[2] O_RDONLY fd cannot escalate to PROT_WRITE\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("create RDWR for sizing", fd >= 0);
     if (fd < 0)
         return 1;
     TEST("ftruncate", ftruncate(fd, (off_t)data_size) == 0);
     close(fd);
 
-    fd = open(filepath, O_RDONLY);
+    fd = open(filepath, O_RDONLY | O_CLOEXEC);
     TEST("reopen O_RDONLY", fd >= 0);
     if (fd < 0)
     {
@@ -566,7 +566,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
     /* ---- [3] VM_DONTCOPY: fork() child does not inherit ---- */
     printf("\n[3] VM_DONTCOPY: fork child does not inherit mapping\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("create RDWR region", fd >= 0);
     if (fd < 0)
         return 1;
@@ -612,7 +612,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
     /* ---- [4] VM_DONTEXPAND: mremap cannot grow ---- */
     printf("\n[4] VM_DONTEXPAND: mremap cannot grow\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("create RDWR region (2x size)", fd >= 0);
     if (fd < 0)
         return 1;
@@ -651,7 +651,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
         }
         else
         {
-            fd = open(filepath, O_CREAT | O_RDWR, 0644);
+            fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
             TEST("create RDWR region", fd >= 0);
             if (fd < 0)
                 return 1;
@@ -685,7 +685,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
     /* ---- [6] mremap MOVE-only (no grow) succeeds ---- */
     printf("\n[6] mremap move (no grow) succeeds\n");
 
-    fd = open(filepath, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("create RDWR region", fd >= 0);
     if (fd < 0)
         return 1;
@@ -721,7 +721,7 @@ static int run_vm_protect(const char* mount, unsigned long size_mb)
         }
         else
         {
-            fd = open(filepath, O_CREAT | O_RDWR, 0644);
+            fd = open(filepath, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
             TEST("create RDWR region", fd >= 0);
             if (fd < 0)
                 return 1;
@@ -794,7 +794,7 @@ static int run_vm_protect_cross(const char* mount1, const char* mount2,
     printf("[Y1] Owner: create + grant READ-only to (peer_node=%u, pid=%d)\n",
            peer_node, (int)getpid());
 
-    fd1 = open(filepath1, O_CREAT | O_RDWR, 0644);
+    fd1 = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("owner open(O_CREAT)", fd1 >= 0);
     if (fd1 < 0)
         return 1;
@@ -813,7 +813,7 @@ static int run_vm_protect_cross(const char* mount1, const char* mount2,
     /* ---- [Y2] Consumer (mount2): mmap PROT_READ succeeds ---- */
     printf("\n[Y2] Consumer mmap(PROT_READ) on mount2\n");
 
-    fd2 = open(filepath2, O_RDONLY);
+    fd2 = open(filepath2, O_RDONLY | O_CLOEXEC);
     TEST("consumer open(filepath2, O_RDONLY)", fd2 >= 0);
     if (fd2 < 0)
         goto cleanup;
@@ -846,7 +846,7 @@ static int run_vm_protect_cross(const char* mount1, const char* mount2,
     /* ---- [Y4] Consumer reopen O_RDWR; mprotect still must check RAT ---- */
     printf("\n[Y4] Consumer O_RDWR reopen + mprotect must hit RAT WRITE check\n");
 
-    fd2 = open(filepath2, O_RDWR);
+    fd2 = open(filepath2, O_RDWR | O_CLOEXEC);
     TEST("consumer open(filepath2, O_RDWR)", fd2 >= 0);
     if (fd2 < 0)
         goto cleanup;

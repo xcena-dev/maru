@@ -59,7 +59,7 @@ static int run_node(const char *mount, const char *prefix,
     for (i = 0; i < FILES_PER_ROUND; i++) {
         snprintf(path, sizeof(path), "%s/%s_r%d_%d", mount, prefix, round, i);
         fprintf(stderr, "[DBG] %s: open(%s)\n", prefix, path);
-        fds[i] = open(path, O_CREAT | O_RDWR, 0644);
+        fds[i] = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (fds[i] < 0) {
             fprintf(stderr, "%s: open(%s) failed: %s\n",
                     prefix, path, strerror(errno));

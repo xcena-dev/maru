@@ -51,7 +51,8 @@ enum {
 
 /*
  * Delegation Entry — 64 bytes each, stored in region header delegation table.
- * Each entry grants specific permissions to a (node_id, pid) pair.
+ * Each entry grants specific permissions to a (node_id, pid) pair plus an
+ * exe-binary identity (post-exec privilege retention defense).
  */
 struct marufs_deleg_entry {
 	__le32 state; /* MARUFS_DELEG_EMPTY(0) / MARUFS_DELEG_GRANTING(1) / MARUFS_DELEG_ACTIVE(2) */
@@ -60,7 +61,9 @@ struct marufs_deleg_entry {
 	__le32 perms; /* Permission bitmask (MARUFS_PERM_*) */
 	__le64 birth_time; /* PID reuse protection (0 if pid=0) */
 	__le64 granted_at; /* Grant timestamp (ns since epoch) */
-	__u8 reserved[32]; /* Padding to 64 */
+	__le64 exe_inode_ino; /* exe binary inode # (0 = lazy-init on first match) */
+	__le32 exe_inode_dev; /* exe binary fs dev (huge_encode_dev) */
+	__u8 reserved[20]; /* Padding to 64 */
 } __attribute__((packed)); /* Total: 64 bytes */
 
 /*
@@ -90,11 +93,13 @@ struct marufs_rat_entry {
 	__le16 owner_node_id; /* node ownership (max 64) */
 	__le32 owner_pid; /* process ownership */
 	__le64 owner_birth_time; /* PID reuse protection */
+	__le64 owner_exe_inode_ino; /* owner exe binary inode # (post-exec retention defense) */
+	__le32 owner_exe_inode_dev; /* owner exe binary fs dev */
 	__le32 uid; /* POSIX owner UID */
 	__le32 gid; /* POSIX owner GID */
 	__le16 mode; /* POSIX mode bits */
 	__le16 deleg_num_entries; /* active delegation count (max 29) */
-	__u8 reserved2[36];
+	__u8 reserved2[24];
 
 	/* ── CL3-CL31: Delegation entries (29 × 64B = 1856B) ────────── */
 	struct marufs_deleg_entry deleg_entries[MARUFS_DELEG_MAX_ENTRIES];

@@ -84,7 +84,7 @@ static int run_process_a(const char *filepath_a, int sig_fd, int wait_fd)
 
     printf("\n=== Step 1: Node A creates file ===\n");
     printf("  path: %s\n", filepath_a);
-    fd = open(filepath_a, O_CREAT | O_RDWR, 0644);
+    fd = open(filepath_a, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     CHECK(fd >= 0, "open(O_CREAT) returned fd=%d (errno=%d)", fd, errno);
     if (fd < 0)
         return 1;
@@ -103,7 +103,7 @@ static int run_process_a(const char *filepath_a, int sig_fd, int wait_fd)
     sync_wait(wait_fd);   /* <- B: stat done */
 
     printf("\n=== Step 2: Node A ftruncate(4KB) ===\n");
-    fd = open(filepath_a, O_RDWR);
+    fd = open(filepath_a, O_RDWR | O_CLOEXEC);
     CHECK(fd >= 0, "re-open for ftruncate fd=%d", fd);
     if (fd < 0)
         return 1;
@@ -118,7 +118,7 @@ static int run_process_a(const char *filepath_a, int sig_fd, int wait_fd)
     sync_wait(wait_fd);   /* <- B: read done */
 
     printf("\n=== Step 3: Node A WORM check + mmap attempt ===\n");
-    fd = open(filepath_a, O_RDWR);
+    fd = open(filepath_a, O_RDWR | O_CLOEXEC);
     CHECK(fd >= 0, "re-open for write/mmap fd=%d", fd);
     if (fd < 0)
         return 1;
@@ -204,7 +204,7 @@ static int run_process_b(const char *filepath_b, int sig_fd, int wait_fd)
         int fd;
         void *map;
 
-        fd = open(filepath_b, O_RDONLY);
+        fd = open(filepath_b, O_RDONLY | O_CLOEXEC);
         CHECK(fd >= 0, "open(O_RDONLY) fd=%d errno=%d", fd, errno);
         if (fd >= 0) {
             map = mmap(NULL, TEST_SIZE, PROT_READ, MAP_SHARED, fd, 0);
@@ -227,7 +227,7 @@ static int run_process_b(const char *filepath_b, int sig_fd, int wait_fd)
         volatile unsigned char *map;
         int mismatch = 0;
 
-        fd = open(filepath_b, O_RDONLY);
+        fd = open(filepath_b, O_RDONLY | O_CLOEXEC);
         CHECK(fd >= 0, "open(O_RDONLY) fd=%d errno=%d", fd, errno);
         if (fd >= 0) {
             map = mmap(NULL, TEST_SIZE, PROT_READ, MAP_SHARED, fd, 0);

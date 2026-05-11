@@ -213,7 +213,7 @@ static int run_gc_deleg_test(const char *mount1, const char *mount2,
     printf("\n--- Test: GC dead delegation sweep ---\n");
 
     /* Step 1: Owner creates and initializes region */
-    owner_fd = open(filepath1, O_CREAT | O_RDWR, 0644);
+    owner_fd = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("owner create", owner_fd >= 0);
     if (owner_fd < 0)
         return -1;
@@ -262,7 +262,7 @@ static int run_gc_deleg_test(const char *mount1, const char *mount2,
         sync_wait(p2c[0]);
 
         {
-            int peer_fd = open(filepath2, O_RDWR);
+            int peer_fd = open(filepath2, O_RDWR | O_CLOEXEC);
             if (peer_fd < 0) {
                 char result = 'F';
                 write(c2p[1], &result, 1);

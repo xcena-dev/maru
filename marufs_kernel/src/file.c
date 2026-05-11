@@ -2,6 +2,7 @@
 /* file.c - MARUFS file operations (open, read, mmap, ioctl) */
 
 #include <linux/dax.h>
+#include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
@@ -69,6 +70,41 @@ static int marufs_release(struct inode *inode, struct file *file)
 }
 
 /*
+ * marufs_require_cloexec - require FD_CLOEXEC on the caller's fd for @file.
+ *
+ * Post-exec privilege retention defense (fd-level, defense in depth):
+ * even when execve preserves PID + start_boottime + exe_inode (e.g.,
+ * same binary re-exec with hostile argv), an unmarked fd would survive
+ * exec and let the new context reach our data paths. Requiring
+ * FD_CLOEXEC forces the kernel to drop the fd across execve, closing
+ * that class of attack regardless of exe inode equality.
+ *
+ * Looked up at data-access time (mmap/read/write/ioctl) because at
+ * .open the fd is not yet installed in fdtable; only there can we
+ * inspect close_on_exec.
+ */
+static bool marufs_require_cloexec(struct file *file)
+{
+	struct files_struct *files = current->files;
+	if (!files)
+		return false;
+
+	rcu_read_lock();
+
+	struct fdtable *fdt = files_fdtable(files);
+	bool cloexec = false;
+	for (unsigned int i = 0; i < fdt->max_fds; i++) {
+		if (rcu_dereference_raw(fdt->fd[i]) == file) {
+			cloexec = close_on_exec(i, files);
+			break;
+		}
+	}
+
+	rcu_read_unlock();
+	return cloexec;
+}
+
+/*
  * Direct CXL read — bypasses page cache, copies to user buffer.
  *
  * marufs is a DAX FS: primary data access is via mmap (zero-copy).
@@ -84,6 +120,9 @@ static ssize_t marufs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct marufs_file_ctx fc;
 	marufs_file_ctx_init(&fc, iocb->ki_filp);
+
+	if (!marufs_require_cloexec(iocb->ki_filp))
+		return -EACCES;
 
 	int ret = marufs_check_permission(fc.sbi, fc.xi->rat_entry_id,
 					  MARUFS_PERM_READ);
@@ -240,6 +279,9 @@ static int marufs_attach_vm_ops(struct vm_area_struct *vma,
 
 static int marufs_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	if (!marufs_require_cloexec(file))
+		return -EACCES;
+
 	/* Reject VM_WRITE on O_RDONLY fd */
 	if ((vma->vm_flags & VM_WRITE) && !(file->f_mode & FMODE_WRITE))
 		return -EACCES;
@@ -551,6 +593,14 @@ static long __marufs_ioctl_chown_locked(struct marufs_sb_info *sbi,
 	WRITE_LE64(rat_entry->owner_birth_time,
 		   ktime_to_ns(current->start_boottime));
 	WRITE_LE16(rat_entry->deleg_num_entries, 0);
+
+	/* Bind owner identity to exe binary (post-exec retention defense) */
+	u64 owner_ino = 0;
+	u32 owner_dev = 0;
+	marufs_get_exe_id(&owner_ino, &owner_dev);
+	WRITE_LE64(rat_entry->owner_exe_inode_ino, owner_ino);
+	WRITE_LE32(rat_entry->owner_exe_inode_dev, owner_dev);
+
 	MARUFS_CXL_WMB(&rat_entry->default_perms, 64); // CL2
 
 	for (u32 i = 0; i < MARUFS_DELEG_MAX_ENTRIES; i++) {
@@ -676,6 +726,9 @@ static u16 marufs_ioctl_required_perm(unsigned int cmd)
 
 static long marufs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	if (!marufs_require_cloexec(file))
+		return -EACCES;
+
 	struct marufs_file_ctx fc;
 	marufs_file_ctx_init(&fc, file);
 

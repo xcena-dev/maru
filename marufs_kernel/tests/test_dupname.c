@@ -50,7 +50,7 @@ static int try_create(const char *mount, const char *filename)
     int fd;
 
     snprintf(path, sizeof(path), "%s/%s", mount, filename);
-    fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0644);
+    fd = open(path, O_CREAT | O_RDWR | O_EXCL | O_CLOEXEC, 0644);
     return fd;
 }
 

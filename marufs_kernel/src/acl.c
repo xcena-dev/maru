@@ -15,12 +15,97 @@
  */
 
 #include <linux/fs.h>
+#include <linux/kdev_t.h>
 #include <linux/kernel.h>
+#include <linux/mm_types.h>
 #include <linux/pid.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 
 #include "marufs.h"
 #include "me.h"
+
+/*
+ * marufs_get_exe_id - read current process's exe binary identity.
+ *
+ * Used by post-exec privilege retention defense: bind ownership /
+ * delegation to (inode, dev) of the exe binary so that an execve() into
+ * a different binary fails subsequent permission checks.
+ *
+ * Returns true with @out_ino / @out_dev populated, or false if there is
+ * no exe (kernel thread) — caller should treat as deny.
+ */
+bool marufs_get_exe_id(u64 *out_ino, u32 *out_dev)
+{
+	struct mm_struct *mm = current->mm;
+	struct file *exe = mm ? READ_ONCE(mm->exe_file) : NULL;
+
+	if (!exe || !exe->f_inode)
+		return false;
+
+	*out_ino = exe->f_inode->i_ino;
+	*out_dev = new_encode_dev(exe->f_inode->i_sb->s_dev);
+	return true;
+}
+
+/*
+ * marufs_check_exe_id - check current process's exe identity matches.
+ *
+ * Returns true iff @ino and @dev equal the current task's exe inode/dev.
+ * Returns false if no exe (kernel thread) or mismatch.
+ */
+bool marufs_check_exe_id(u64 ino, u32 dev)
+{
+	u64 cur_ino;
+	u32 cur_dev;
+
+	if (!marufs_get_exe_id(&cur_ino, &cur_dev))
+		return false;
+	return cur_ino == ino && cur_dev == dev;
+}
+
+/*
+ * marufs_get_pid_identity - read identity (birth_time + exe id) of an
+ * arbitrary local PID.
+ *
+ * Same-node only: looks up the target task on the current host and reads
+ * (start_boottime, exe inode, exe dev). Used by delegation grant to
+ * eagerly bind a same-node delegation to the target's identity (closes
+ * the lazy-init timing window where an attacker could hijack the target
+ * between grant and first mmap). Cross-node delegations cannot use this —
+ * caller must fall back to lazy-init.
+ *
+ * Returns true with all out params populated on success. False if the
+ * PID is not found, the task has no mm, or no exe.
+ */
+bool marufs_get_pid_identity(u32 target_pid, u64 *out_birth, u64 *out_ino,
+			     u32 *out_dev)
+{
+	if (target_pid == 0)
+		return false;
+
+	struct pid *pid_s = find_get_pid(target_pid);
+	if (!pid_s)
+		return false;
+
+	bool ok = false;
+	struct task_struct *task = get_pid_task(pid_s, PIDTYPE_PID);
+	if (task) {
+		if (task->mm) {
+			struct file *exe = READ_ONCE(task->mm->exe_file);
+			if (exe && exe->f_inode) {
+				*out_birth = ktime_to_ns(task->start_boottime);
+				*out_ino = exe->f_inode->i_ino;
+				*out_dev = new_encode_dev(
+					exe->f_inode->i_sb->s_dev);
+				ok = true;
+			}
+		}
+		put_task_struct(task);
+	}
+	put_pid(pid_s);
+	return ok;
+}
 
 /*
  * marufs_owner_is_dead - check if RAT entry owner process is dead
@@ -58,7 +143,11 @@ bool marufs_owner_is_dead(u32 owner_pid, u64 owner_birth_time)
  * @sbi: superblock info
  * @rat_entry: RAT entry to check
  *
- * 3-stage ACL: node_id → pid → birth_time
+ * 4-stage ACL: node_id → pid → birth_time → exe_inode
+ * The exe_inode stage defends against post-exec privilege retention:
+ * an attacker that execve()s a different binary keeps PID + birth_time
+ * but ends up with a different exe inode/dev — fails the check.
+ *
  * Returns true if current process is the owner.
  */
 static bool marufs_is_owner(struct marufs_sb_info *sbi,
@@ -83,8 +172,14 @@ static bool marufs_is_owner(struct marufs_sb_info *sbi,
 	/* Stage 3: birth_time check (PID reuse protection) */
 	owner_birth_time = READ_LE64(rat_entry->owner_birth_time);
 	current_birth_time = ktime_to_ns(current->start_boottime);
+	if (owner_birth_time != current_birth_time)
+		return false;
 
-	return owner_birth_time == current_birth_time;
+	/* Stage 4: exe_inode check (post-exec privilege retention defense) */
+	u64 owner_ino = READ_LE64(rat_entry->owner_exe_inode_ino);
+	u32 owner_dev = READ_LE32(rat_entry->owner_exe_inode_dev);
+
+	return marufs_check_exe_id(owner_ino, owner_dev);
 }
 
 /*
@@ -102,6 +197,8 @@ void marufs_deleg_entry_clear(struct marufs_deleg_entry *de)
 	WRITE_LE32(de->perms, 0);
 	WRITE_LE64(de->birth_time, 0);
 	WRITE_LE64(de->granted_at, 0);
+	WRITE_LE64(de->exe_inode_ino, 0);
+	WRITE_LE32(de->exe_inode_dev, 0);
 	MARUFS_CXL_WMB(de, sizeof(*de));
 }
 
@@ -177,6 +274,32 @@ int marufs_check_permission_any(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			continue; /* PID reuse */
 		}
 
+		/*
+		 * Bind delegation to the caller's exe binary identity.
+		 * Defends against post-exec privilege retention: an attacker
+		 * that execve()s a different binary (same PID + birth_time,
+		 * possibly inherited fd) ends up with a different exe
+		 * inode/dev — entry no longer matches.
+		 *
+		 * Lazy-init mirrors birth_time: de->exe_inode_ino == 0 ⇒
+		 * "first match"; capture and CAS-bind. Subsequent calls
+		 * compare; mismatch ⇒ skip this entry.
+		 */
+		u64 cur_ino;
+		u32 cur_dev;
+		if (!marufs_get_exe_id(&cur_ino, &cur_dev))
+			continue; /* kernel thread / no exe — never matches */
+
+		u64 de_ino = READ_LE64(de->exe_inode_ino);
+		u32 de_dev = READ_LE32(de->exe_inode_dev);
+		if (de_ino == 0) {
+			marufs_le64_cas(&de->exe_inode_ino, 0, cur_ino);
+			marufs_le32_cas(&de->exe_inode_dev, 0, cur_dev);
+			MARUFS_CXL_WMB(de, sizeof(*de));
+		} else if (de_ino != cur_ino || de_dev != cur_dev) {
+			continue; /* exe binary changed (post-exec attack) */
+		}
+
 		u32 de_perms = READ_LE32(de->perms);
 		u32 grant = de_perms & candidate;
 		if (!grant)
@@ -203,8 +326,8 @@ int marufs_check_permission(struct marufs_sb_info *sbi, u32 rat_entry_id,
 			    u32 required_perms)
 {
 	u32 have;
-	int ret = marufs_check_permission_any(sbi, rat_entry_id,
-					      required_perms, &have);
+	int ret = marufs_check_permission_any(sbi, rat_entry_id, required_perms,
+					      &have);
 	if (ret)
 		return ret;
 	return have == required_perms ? 0 : -EACCES;
@@ -327,8 +450,23 @@ int marufs_deleg_grant(struct marufs_sb_info *sbi, u32 rat_entry_id,
 	WRITE_LE32(de->node_id, req->node_id);
 	WRITE_LE32(de->pid, req->pid);
 	WRITE_LE32(de->perms, req->perms);
-	WRITE_LE64(de->birth_time,
-		   0); /* Filled on first access by delegated process */
+
+	/*
+	 * Identity binding (birth_time + exe_inode):
+	 *   same-node target → eager (resolve target's identity now, closes
+	 *                      the grant→first-mmap timing window where an
+	 *                      attacker could hijack the target via execve)
+	 *   cross-node target → lazy (kernel can't reach remote task; the
+	 *                      consumer's first mmap captures it)
+	 */
+	u64 t_birth = 0, t_ino = 0;
+	u32 t_dev = 0;
+	if (req->node_id == sbi->node_id)
+		marufs_get_pid_identity(req->pid, &t_birth, &t_ino, &t_dev);
+	WRITE_LE64(de->birth_time, t_birth);
+	WRITE_LE64(de->exe_inode_ino, t_ino);
+	WRITE_LE32(de->exe_inode_dev, t_dev);
+
 	WRITE_LE64(de->granted_at, ktime_get_real_ns());
 	MARUFS_CXL_WMB(de, sizeof(*de));
 

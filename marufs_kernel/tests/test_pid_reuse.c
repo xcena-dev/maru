@@ -118,7 +118,7 @@ static int run_pid_reuse_test(const char *mount1, const char *mount2,
     }
 
     /* Step 1: Owner creates region */
-    owner_fd = open(filepath1, O_CREAT | O_RDWR, 0644);
+    owner_fd = open(filepath1, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     TEST("create region", owner_fd >= 0);
     if (owner_fd < 0) return -1;
     TEST("ftruncate", ftruncate(owner_fd, SLOT_SIZE) == 0);
@@ -135,7 +135,7 @@ static int run_pid_reuse_test(const char *mount1, const char *mount2,
 
         sync_wait(p2c[0]); /* Wait for grant */
 
-        int peer_fd = open(filepath2, O_RDWR);
+        int peer_fd = open(filepath2, O_RDWR | O_CLOEXEC);
         void *map = (peer_fd >= 0) ?
             mmap(NULL, SLOT_SIZE, PROT_READ, MAP_SHARED, peer_fd, 0) :
             MAP_FAILED;
@@ -189,7 +189,7 @@ static int run_pid_reuse_test(const char *mount1, const char *mount2,
         close(c2p2[0]);
 
         /* Try to access region — should fail because birth_time differs */
-        int peer_fd = open(filepath2, O_RDWR);
+        int peer_fd = open(filepath2, O_RDWR | O_CLOEXEC);
         int mmap_errno = 0;
         void *map = MAP_FAILED;
 

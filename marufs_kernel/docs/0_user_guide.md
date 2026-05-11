@@ -28,6 +28,11 @@ Key invariants the user can rely on:
   that created it) and a size that is fixed after first `ftruncate()`.
 - Permissions live on the region, not on the file's POSIX mode. `open()`
   always succeeds; the kernel denies at `mmap`/`read`/`ioctl` time.
+- **`O_CLOEXEC` is required** on every `open()` that will be used for
+  `mmap`/`read`/`ioctl`. The kernel returns `-EACCES` at first
+  data-access if the fd does not have `FD_CLOEXEC` set. This closes the
+  post-exec privilege retention class of attacks (an inherited fd
+  surviving an `execve` into hostile code).
 
 ### Deployment topology
 
@@ -292,7 +297,7 @@ that wants to look up or publish names.
 
 ```c
 /* Producer, one-time setup: create + format the NRHT region. */
-int nrht_fd = open("/mnt/marufs/kv_nrht", O_CREAT | O_RDWR, 0644);
+int nrht_fd = open("/mnt/marufs/kv_nrht", O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 
 struct marufs_nrht_init_req init = {
     .max_entries = 0,   /* 0 → default (524288)   */
@@ -351,7 +356,7 @@ if (ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &req) < 0) {
 /* Step 2: open the region and mmap the byte range you need. */
 char path[PATH_MAX];
 snprintf(path, sizeof(path), "/mnt/marufs/%s", req.region_name);
-int region_fd = open(path, O_RDONLY);
+int region_fd = open(path, O_RDONLY | O_CLOEXEC);
 
 /* mmap offset must be page-aligned; round down and adjust if needed. */
 void *base = mmap(NULL, kv_block_size, PROT_READ, MAP_SHARED,
@@ -411,6 +416,13 @@ ioctl(nrht_fd, MARUFS_IOC_FIND_NAME, &fr);
 marufs uses a **delegation model**, not POSIX file bits. The check
 happens at data-access time (`mmap`, `read`, permission-gated ioctls),
 not at `open()`.
+
+In addition to the delegation check, every data-access entry point
+requires the calling fd to be marked `FD_CLOEXEC` (set via
+`open(..., O_CLOEXEC)` or `fcntl(fd, F_SETFD, FD_CLOEXEC)`). An fd
+without `FD_CLOEXEC` would survive `execve` and let post-exec code
+reach the region; the kernel returns `-EACCES` at `mmap`/`read`/`ioctl`
+to close that path regardless of the new exe identity.
 
 Owner (the node that created the region) always has full access.
 For everyone else, the kernel consults, in order:
