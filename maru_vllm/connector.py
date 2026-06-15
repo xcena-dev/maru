@@ -685,7 +685,11 @@ class MaruWorkerConnector:
                 if kv_cache_attr is None:
                     continue
 
-                kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
+                if isinstance(kv_cache_attr, (list, tuple)):
+                    virtual_engine = getattr(forward_context, "virtual_engine", 0)
+                    kv_cache_layer = kv_cache_attr[virtual_engine]
+                else:
+                    kv_cache_layer = kv_cache_attr
                 # Use the same layer index derivation as save path
                 # to ensure key consistency (enumerate index may diverge
                 # when no_compile_layers contains non-attention layers).
