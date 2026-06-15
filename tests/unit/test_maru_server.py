@@ -185,6 +185,33 @@ class TestGetUsage:
         assert usage["pool_total"] == 0
         assert usage["pool_free"] == 0
 
+    def test_get_usage_includes_deferred_owner(self):
+        """A disconnected owner whose region is kept alive by KV refs (deferred
+        free) still appears in usage with its held bytes."""
+        server = MaruServer()
+        handle = server.request_alloc("gone", 4096)
+        server.register_kv(
+            key="k", region_id=handle.region_id, kv_offset=0, kv_length=128
+        )
+        # Owner disconnects, but the KV ref keeps the region from being freed.
+        server.client_disconnected("gone")
+
+        usage = server.get_usage()
+        by_id = {i["instance_id"]: i for i in usage["instances"]}
+        assert "gone" in by_id
+        assert by_id["gone"]["regions"] == 1
+        assert by_id["gone"]["used"] == 128
+
+    def test_get_usage_orphan_kv_region_ignored(self):
+        """A KV entry referencing a region with no allocation entry (orphan) is
+        dropped from per-instance accounting rather than crashing."""
+        server = MaruServer()
+        # Register against a region that was never allocated on this server.
+        server.register_kv(key="orphan", region_id=99999, kv_offset=0, kv_length=500)
+
+        usage = server.get_usage()
+        assert usage["instances"] == []  # no owning instance -> nothing attributed
+
 
 class TestClientDisconnected:
     """Test cases for MaruServer.client_disconnected()."""

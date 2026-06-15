@@ -343,8 +343,16 @@ class RpcClientBase(abc.ABC):
         Returns:
             GetUsageResponse with one InstanceUsage per owner_instance_id
             plus pool_total / pool_free (shared device capacity).
+
+        Raises:
+            ConnectionError: If the request fails (timeout / transport error)
+                or the server returns an error — including older servers that
+                predate GET_USAGE and cannot decode the message. This makes a
+                failed request distinguishable from a healthy-but-empty server.
         """
         response = self._send_request(MessageType.GET_USAGE, {})
+        if "error" in response:
+            raise ConnectionError(f"get_usage RPC failed: {response['error']}")
         instances = [
             InstanceUsage(
                 instance_id=i.get("instance_id", ""),

@@ -5,6 +5,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 from maru_common import GetUsageResponse, InstanceUsage, MessageType
 from maru_handler.rpc_client_base import RpcClientBase
 
@@ -54,6 +56,13 @@ class TestGetUsageClientParse:
         assert resp.pool_total == 0
         assert resp.pool_free == 0
 
+    def test_raises_on_error_response(self):
+        """An error dict (timeout / transport / old server) must raise, not
+        silently render as an empty/healthy server."""
+        client = _FakeClient({"error": "timeout", "success": False})
+        with pytest.raises(ConnectionError):
+            client.get_usage()
+
 
 # tools/ is not an installed package — load the tool module by file path.
 _TOOL_PATH = Path(__file__).resolve().parents[2] / "tools" / "usage_monitor.py"
@@ -91,6 +100,12 @@ class TestUsageMonitorRendering:
         assert usage_monitor._fmt_size(1024) == "1.0K"
         assert usage_monitor._fmt_size(1024**3) == "1.0G"
         assert usage_monitor._fmt_size(1024**4) == "1.0T"
+
+    def test_fmt_size_negative(self):
+        # Negative slack (broken upstream invariant) renders with a sign and
+        # correct magnitude unit, not a bogus fractional-K value.
+        assert usage_monitor._fmt_size(-(1024**3)) == "-1.0G"
+        assert usage_monitor._fmt_size(-1024) == "-1.0K"
 
     def test_render_table_contains_rows(self):
         out = usage_monitor.render_table(_sample_usage(), "2026-06-15T00:00:00")

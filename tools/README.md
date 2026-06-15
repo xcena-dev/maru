@@ -99,6 +99,9 @@ timestamp,instance_id,regions,allocated_bytes,used_bytes,slack_bytes,pool_total_
 > (TP/DP runs one per worker), and the default is a random UUID per process.
 > Set `maru_instance_id` in the integration's `extra_config` for stable,
 > readable rows.
+>
+> Requires a MaruServer that supports the `GET_USAGE` RPC. Against an older
+> server the tool reports a connection error rather than an empty table.
 
 ## stats_monitor.py
 

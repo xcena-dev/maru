@@ -29,6 +29,8 @@ from maru_handler.rpc_client import RpcClient
 
 
 def _fmt_size(nbytes: int) -> str:
+    if nbytes < 0:
+        return "-" + _fmt_size(-nbytes)
     if nbytes == 0:
         return "0B"
     if nbytes >= 1024**4:
@@ -151,7 +153,8 @@ def main() -> None:
     parser.add_argument(
         "--scroll",
         action="store_true",
-        help="Scrolling log instead of top-style refresh",
+        help="Scrolling log instead of top-style refresh (table mode only; "
+        "ignored with --csv)",
     )
     args = parser.parse_args()
 
@@ -169,7 +172,11 @@ def main() -> None:
 
     try:
         if args.watch <= 0:
-            usage = snapshot(client)
+            try:
+                usage = snapshot(client)
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
             ts = datetime.now().isoformat(timespec="seconds")
             if args.csv:
                 print_csv_header()
