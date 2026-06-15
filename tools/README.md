@@ -139,6 +139,49 @@ Options:
 | `-p`, `--port` | `5555` | MaruServer port |
 | `-i`, `--interval` | `1.0` | Refresh interval in seconds |
 
+### Example Output
+
+Interactive curses dashboard (the selected row, `▶`, drives the detail panel):
+
+```
+  Maru Stats Monitor  14:30:05    KV:1820 (4.2G)  Alloc:6 (24.0G)  Inst:2
+
+  ▐ ALL ▌   Instance 0    Instance 1
+
+  operation             │   count│  delta│   avg_us│   min_us│   max_us│                  activity
+  ──────────────────────┼────────┼───────┼─────────┼─────────┼─────────┼──────────────────────────
+▶ store                 │    8124│    +37│     45.2│     12.1│    230.0│         ▂▃▅▇▆▅▃▂▃▄▅▆▇▅▃▂▃▄▅
+  retrieve              │   15330│    +71│     18.7│      5.0│     92.4│         ▁▂▄▆▇▆▄▂▁▂▃▅▇▆▄▂▁▂▃
+  exists                │   20106│   +112│      6.3│      2.1│     40.0│         ▃▄▅▆▇▇▆▅▄▃▄▅▆▇▆▅▄▃▄▅
+  pin                   │   15330│    +71│      7.1│      2.4│     38.9│         ▁▂▃▄▅▆▇▆▅▄▃▂▁▂▃▄▅▆▇▆
+  alloc                 │     820│     +4│     12.5│      4.0│     88.0│         ▁▁▂▂▃▃▂▂▁▁▂▂▃▃▂▂▁▁▂▂
+  delete                │       0│       │      0.0│      0.0│      0.0│
+  batch_retrieve        │    1240│    +6│     210.4│     85.0│    640.0│         ▂▄▆▇▅▃▂▄▆▇▅▃▂▄▆▇▅▃▂▄
+
+  ╭─ store ──────────────────────────────────────────────────────────────────────────────────╮
+  │ count: 8124    bytes: 3.8G                                                                  │
+  │                                                                                            │
+  │ latency (us):  avg=45.2  min=12.1  max=230.0                                                │
+  │ throughput:    812.4 MB/s                                                                   │
+  ╰────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╭─ latency (us) ───────────────────────────────────────────────────────────────────────────╮
+  │                                                                                            │
+  │  230.0 ┤            ▴         ▴                                                             │
+  │        │      ▴   ▴     ▴   ▴                                                               │
+  │  115.0 ┤   •    •    •     •      •                                                         │
+  │        │ •    •   •    •      •                                                             │
+  │        │▾   ▾    ▾    ▾    ▾                                                                 │
+  │    0.0 ┤  ▾    ▾                                                                            │
+  │        └──────────────────────────────────────                                            │
+  │        ▴=max  •=avg  ▾=min                                                                  │
+  ╰────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  q:quit  ↑↓:select  ←→:instance
+```
+
+(The `delta` column shows the per-interval count; rows with no activity in the
+window stay blank. The `activity` sparkline is the last 25 ticks.)
+
 ### Key bindings
 
 | Key | Action |
