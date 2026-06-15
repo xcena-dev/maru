@@ -30,8 +30,11 @@ from .protocol import (  # noqa: E402
     ExistsKVResponse,
     GetStatsRequest,
     GetStatsResponse,
+    GetUsageRequest,
+    GetUsageResponse,
     HandshakeRequest,
     HandshakeResponse,
+    InstanceUsage,
     KVManagerStats,
     ListAllocationsRequest,
     ListAllocationsResponse,
@@ -102,6 +105,9 @@ __all__ = [
     # Admin messages
     "GetStatsRequest",
     "GetStatsResponse",
+    "GetUsageRequest",
+    "GetUsageResponse",
+    "InstanceUsage",
     "KVManagerStats",
     "AllocationManagerStats",
     # List allocations messages

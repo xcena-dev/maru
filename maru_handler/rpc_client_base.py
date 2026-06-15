@@ -21,6 +21,8 @@ from maru_common import (
     BatchRegisterKVResponse,
     BatchUnpinKVResponse,
     GetStatsResponse,
+    GetUsageResponse,
+    InstanceUsage,
     KVManagerStats,
     ListAllocationsResponse,
     LookupKVResponse,
@@ -333,6 +335,29 @@ class RpcClientBase(abc.ABC):
                 active_clients=alloc_data.get("active_clients", 0),
             ),
             stats_manager=response.get("stats_manager", {}),
+        )
+
+    def get_usage(self) -> GetUsageResponse:
+        """Get per-instance CXL usage and shared pool totals.
+
+        Returns:
+            GetUsageResponse with one InstanceUsage per owner_instance_id
+            plus pool_total / pool_free (shared device capacity).
+        """
+        response = self._send_request(MessageType.GET_USAGE, {})
+        instances = [
+            InstanceUsage(
+                instance_id=i.get("instance_id", ""),
+                regions=i.get("regions", 0),
+                allocated=i.get("allocated", 0),
+                used=i.get("used", 0),
+            )
+            for i in response.get("instances", [])
+        ]
+        return GetUsageResponse(
+            instances=instances,
+            pool_total=response.get("pool_total", 0),
+            pool_free=response.get("pool_free", 0),
         )
 
     def report_stats(self, entries: list[dict]) -> None:

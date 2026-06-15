@@ -39,6 +39,29 @@ class TestKVManager:
         assert entry.kv_offset == 1024
         assert entry.kv_length == 2048
 
+    def test_used_by_region_empty(self):
+        """used_by_region on an empty store returns an empty mapping."""
+        manager = KVManager()
+        assert manager.used_by_region() == {}
+
+    def test_used_by_region_sums_per_region(self):
+        """used_by_region sums kv_length grouped by region_id."""
+        manager = KVManager()
+        manager.register(key="a", region_id=1, kv_offset=0, kv_length=100)
+        manager.register(key="b", region_id=1, kv_offset=100, kv_length=200)
+        manager.register(key="c", region_id=2, kv_offset=0, kv_length=50)
+
+        assert manager.used_by_region() == {1: 300, 2: 50}
+
+    def test_used_by_region_reflects_delete(self):
+        """Deleting an entry removes its bytes from the region total."""
+        manager = KVManager()
+        manager.register(key="a", region_id=1, kv_offset=0, kv_length=100)
+        manager.register(key="b", region_id=1, kv_offset=100, kv_length=200)
+        manager.delete("a")
+
+        assert manager.used_by_region() == {1: 200}
+
     def test_lookup_nonexistent_key(self):
         """Test looking up a nonexistent key."""
         manager = KVManager()

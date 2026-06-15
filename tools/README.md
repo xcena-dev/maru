@@ -1,5 +1,16 @@
 # Tools
 
+Three monitors, each at a different layer — they complement rather than
+overlap (the only shared figure is pool free):
+
+| Tool | Layer | Source | Answers |
+|---|---|---|---|
+| `pool_monitor.py` | physical device/pool | resource manager (`:9850`) | "how full is each DAX device?" |
+| `usage_monitor.py` | logical per-instance | MaruServer (`:5555`) | "who is holding what, and how much is left?" |
+| `stats_monitor.py` | operations/performance | MaruServer (`:5555`) | "who is doing how many ops, how fast?" |
+
+(`maru_rm_tool.py` is a device-header utility, not a monitor.)
+
 ## pool_monitor.py
 
 Real-time maru memory pool usage monitor.
@@ -34,6 +45,60 @@ timestamp,pool_id,dax_type,total_bytes,free_bytes,used_bytes,usage_pct
 2026-03-11T14:30:05,0,DEV_DAX,260717199360,245861867520,14855331840,5.70
 2026-03-11T14:30:05,1,DEV_DAX,3578455826432,14855331840,3563600494592,99.58
 ```
+
+## usage_monitor.py
+
+Per-instance CXL usage monitor. Shows, for each client instance
+(`owner_instance_id`), how much CXL memory it reserved (**allocated**) versus
+how much is live KV data (**used**), the difference (**slack**), and the shared
+pool free space. Queries MaruServer over the `GET_USAGE` RPC — no `MARU_STAT`
+required.
+
+```bash
+python -m tools.usage_monitor                  # one-shot snapshot
+python -m tools.usage_monitor -w 1             # refresh every 1s
+python -m tools.usage_monitor -w 1 -c 30       # 30 iterations then exit
+python -m tools.usage_monitor --csv            # CSV for post-processing
+python -m tools.usage_monitor --host 10.0.0.1 -p 5556
+```
+
+Options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | MaruServer host |
+| `-p`, `--port` | `5555` | MaruServer port |
+| `-w`, `--watch` | `0` | Refresh interval in seconds (0 = one-shot) |
+| `-c`, `--count` | `0` | Number of iterations (0 = unlimited) |
+| `--csv` | off | CSV output for post-processing |
+| `--scroll` | off | Scrolling log instead of top-style refresh |
+
+### Example Output
+
+```
+  Maru Usage Monitor  —  2026-06-15T14:30:05  (Ctrl+C to quit)
+
+  owner_instance_id                       regions  allocated       used      slack
+  --------------------------------------  -------  ---------  ---------  ---------
+  vllm-0                                        3      12.0G       9.4G       2.6G
+  vllm-1                                        2       8.0G       7.9G       0.1G
+  --------------------------------------  -------  ---------  ---------  ---------
+  TOTAL                                         5      20.0G      17.3G       2.7G
+
+  Pool (shared): 229.0G free / 242.8G total  [##----------------------------] 5.7%
+```
+
+**CSV mode** (`--csv`):
+
+```
+timestamp,instance_id,regions,allocated_bytes,used_bytes,slack_bytes,pool_total_bytes,pool_free_bytes
+2026-06-15T14:30:05,vllm-0,3,12884901888,10093173964,2791727924,260717199360,245861867520
+```
+
+> **Note:** `instance_id` identifies one `MaruBackend` = one process/worker
+> (TP/DP runs one per worker), and the default is a random UUID per process.
+> Set `maru_instance_id` in the integration's `extra_config` for stable,
+> readable rows.
 
 ## stats_monitor.py
 
