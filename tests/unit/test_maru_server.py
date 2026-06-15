@@ -108,7 +108,9 @@ class TestGetUsage:
         h3 = server.request_alloc("instance2", 8192)
 
         server.register_kv(key="a", region_id=h1.region_id, kv_offset=0, kv_length=100)
-        server.register_kv(key="b", region_id=h1.region_id, kv_offset=100, kv_length=200)
+        server.register_kv(
+            key="b", region_id=h1.region_id, kv_offset=100, kv_length=200
+        )
         server.register_kv(key="c", region_id=h2.region_id, kv_offset=0, kv_length=50)
         server.register_kv(key="d", region_id=h3.region_id, kv_offset=0, kv_length=1000)
 

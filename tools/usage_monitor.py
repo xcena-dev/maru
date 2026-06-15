@@ -69,9 +69,7 @@ def render_table(usage: GetUsageResponse, ts: str) -> str:
             f"  {'owner_instance_id':<38}  {'regions':>7}  "
             f"{'allocated':>9}  {'used':>9}  {'slack':>9}"
         )
-        lines.append(
-            f"  {'-' * 38}  {'-' * 7}  {'-' * 9}  {'-' * 9}  {'-' * 9}"
-        )
+        lines.append(f"  {'-' * 38}  {'-' * 7}  {'-' * 9}  {'-' * 9}  {'-' * 9}")
         for inst in instances:
             slack = inst.allocated - inst.used
             lines.append(
@@ -81,9 +79,7 @@ def render_table(usage: GetUsageResponse, ts: str) -> str:
             )
         total_alloc = sum(i.allocated for i in instances)
         total_used = sum(i.used for i in instances)
-        lines.append(
-            f"  {'-' * 38}  {'-' * 7}  {'-' * 9}  {'-' * 9}  {'-' * 9}"
-        )
+        lines.append(f"  {'-' * 38}  {'-' * 7}  {'-' * 9}  {'-' * 9}  {'-' * 9}")
         lines.append(
             f"  {'TOTAL':<38}  {len(instances):>7}  "
             f"{_fmt_size(total_alloc):>9}  {_fmt_size(total_used):>9}  "
@@ -167,7 +163,9 @@ def main() -> None:
     try:
         client.connect()
     except Exception as e:
-        print(f"Error: cannot connect to MaruServer at {server_url}: {e}", file=sys.stderr)
+        print(
+            f"Error: cannot connect to MaruServer at {server_url}: {e}", file=sys.stderr
+        )
         sys.exit(1)
 
     try:
