@@ -528,22 +528,22 @@ class MaruSchedulerConnector:
                 if stored_chunks < num_full_chunks:
                     self._requests_need_store[new_req.req_id] = token_ids
 
-        # Handle resumed requests (chunked prefill continuations).
+        # Cached requests: chunked-prefill continuations and resumed loads.
+        # Do NOT gate the store on ``resumed`` — chunked-prefill requests
+        # reappear here every step un-resumed, so gating stored only the first
+        # chunk. See design note 20260624_maru-vllm-direct-chunked-prefill-store-bug.
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
-            resumed = req_id in cached_reqs.resumed_req_ids
-            if not resumed:
-                continue
-
             num_new = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             new_block_ids = cached_reqs.new_block_ids[i]
             if new_block_ids is None:
                 continue
+            num_computed = cached_reqs.num_computed_tokens[i]
+            resumed = req_id in cached_reqs.resumed_req_ids
 
-            if req_id in self._requests_need_load:
-                # Still needs load from maru
+            if resumed and req_id in self._requests_need_load:
+                # Resumed from preemption and still needs its KV loaded.
                 request, num_chunks = self._requests_need_load[req_id]
-                num_computed = cached_reqs.num_computed_tokens[i]
                 total_tokens = num_computed + num_new
                 token_ids = list(request.all_token_ids[:total_tokens])
 
@@ -557,9 +557,9 @@ class MaruSchedulerConnector:
                     )
                 )
             elif req_id in self._requests_need_store:
-                # Chunked prefill continuation — store newly computed chunks
+                # Chunked-prefill continuation (normal progression OR resumed):
+                # store the chunks computed in this step.
                 token_ids = self._requests_need_store[req_id]
-                num_computed = cached_reqs.num_computed_tokens[i]
                 meta.requests.append(
                     MaruReqMeta(
                         req_id=req_id,
@@ -570,8 +570,7 @@ class MaruSchedulerConnector:
                         num_computed_tokens=num_computed,
                     )
                 )
-                # Check if all chunks are now covered
-                num_computed = cached_reqs.num_computed_tokens[i]
+                # Drop tracking once all full chunks have been stored.
                 total_scheduled = num_computed + num_new
                 num_full_chunks = len(token_ids) // self._kv_chunk_tokens
                 if total_scheduled // self._kv_chunk_tokens >= num_full_chunks:
