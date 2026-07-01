@@ -184,6 +184,32 @@ class AllocationManager:
                 handles.append(info.handle)
             return handles
 
+    def region_owners(self) -> dict[int, str]:
+        """Map region_id -> owner_instance_id for all tracked allocations.
+
+        Includes deferred (owner_connected=False) regions, since they still
+        occupy CXL memory until their kv_ref_count drops to zero.
+        """
+        with self._lock:
+            return {
+                rid: info.owner_instance_id for rid, info in self._allocations.items()
+            }
+
+    def allocated_by_instance(self) -> dict[str, tuple[int, int]]:
+        """Per-owner allocation totals.
+
+        Returns:
+            Mapping of owner_instance_id -> (region_count, allocated_bytes).
+            Aggregated over all tracked allocations (connected or deferred).
+        """
+        with self._lock:
+            out: dict[str, list[int]] = {}
+            for info in self._allocations.values():
+                acc = out.setdefault(info.owner_instance_id, [0, 0])
+                acc[0] += 1
+                acc[1] += info.handle.length
+            return {iid: (acc[0], acc[1]) for iid, acc in out.items()}
+
     def get_stats(self) -> dict:
         """Get allocation statistics."""
         with self._lock:

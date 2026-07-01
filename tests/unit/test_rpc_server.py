@@ -63,6 +63,29 @@ class TestRpcServerHandlerDispatch:
         assert "error" in response
         assert response["error"] == "Allocation failed"
 
+    def test_handle_get_usage(self, server_cls):
+        """_handle_get_usage returns per-instance usage and pool totals."""
+        server = MaruServer()
+        if server_cls is RpcServer:
+            rpc = RpcServer(server, host="127.0.0.1", port=5555)
+        else:
+            rpc = RpcAsyncServer(server, host="127.0.0.1", port=5555, num_workers=2)
+
+        handle = server.request_alloc("instance1", 4096)
+        server.register_kv(
+            key="k", region_id=handle.region_id, kv_offset=0, kv_length=128
+        )
+
+        response = rpc._handle_get_usage(MockRequest())
+
+        assert "instances" in response
+        assert "pool_total" in response
+        assert "pool_free" in response
+        inst = {i["instance_id"]: i for i in response["instances"]}
+        assert inst["instance1"]["regions"] == 1
+        assert inst["instance1"]["allocated"] == 4096
+        assert inst["instance1"]["used"] == 128
+
 
 class TestRpcServerStartLoop:
     """Test RpcServer.start() main loop error handling for 100% coverage."""

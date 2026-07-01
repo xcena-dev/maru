@@ -43,6 +43,7 @@ class RpcHandlerMixin:
                 MessageType.BATCH_UNPIN_KV.value: self._handle_batch_unpin_kv,
                 # Admin
                 MessageType.GET_STATS.value: self._handle_get_stats,
+                MessageType.GET_USAGE.value: self._handle_get_usage,
                 MessageType.HEARTBEAT.value: self._handle_heartbeat,
                 MessageType.REPORT_STATS.value: self._handle_report_stats,
                 MessageType.HANDSHAKE.value: self._handle_handshake,
@@ -240,6 +241,16 @@ class RpcHandlerMixin:
     def _handle_get_stats(self, _req: Any) -> dict:
         stats = self._server.get_stats()
         return stats
+
+    def _handle_get_usage(self, _req: Any) -> dict:
+        usage = self._server.get_usage()
+        logger.debug(
+            "[GET_USAGE] %d instances, pool_free=%d/%d",
+            len(usage.get("instances", [])),
+            usage.get("pool_free", 0),
+            usage.get("pool_total", 0),
+        )
+        return usage
 
     def _handle_report_stats(self, req: Any) -> dict:
         self._server.report_stats(req.entries)

@@ -155,6 +155,19 @@ class KVManager:
                 "total_size": sum(e.kv_length for e in self._store.values()),
             }
 
+    def used_by_region(self) -> dict[int, int]:
+        """Sum of live KV bytes per region.
+
+        Returns:
+            Mapping of region_id -> total kv_length of entries stored there.
+            Used for per-instance usage accounting (joined with region owners).
+        """
+        with self._lock:
+            out: dict[int, int] = {}
+            for entry in self._store.values():
+                out[entry.region_id] = out.get(entry.region_id, 0) + entry.kv_length
+            return out
+
     # =========================================================================
     # Batch Operations
     # =========================================================================

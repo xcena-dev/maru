@@ -61,6 +61,7 @@ class MessageType(IntEnum):
     GET_STATS = 0xF0
     HEARTBEAT = 0xF1
     REPORT_STATS = 0xF2
+    GET_USAGE = 0xF3
     HANDSHAKE = 0xFE
     SHUTDOWN = 0xFF
 
@@ -448,6 +449,42 @@ class GetStatsResponse:
 
 
 @dataclass
+class GetUsageRequest:
+    """GET_USAGE (0xF3) - Request per-instance CXL usage."""
+
+    pass
+
+
+@dataclass
+class InstanceUsage:
+    """Per-instance (owner_instance_id) CXL memory usage.
+
+    ``allocated`` is the sum of region sizes the instance reserved;
+    ``used`` is the sum of live KV bytes stored in those regions.
+    Slack (allocated - used) is derived by the consumer.
+    """
+
+    instance_id: str
+    regions: int = 0
+    allocated: int = 0
+    used: int = 0
+
+
+@dataclass
+class GetUsageResponse:
+    """Response for GET_USAGE.
+
+    ``pool_total`` / ``pool_free`` are the shared device capacity reported
+    by the resource manager (summed across pools); any instance can draw
+    from the free space.
+    """
+
+    instances: list[InstanceUsage] = field(default_factory=list)
+    pool_total: int = 0
+    pool_free: int = 0
+
+
+@dataclass
 class HeartbeatRequest:
     """HEARTBEAT (0xF1) - Connection keepalive."""
 
@@ -536,6 +573,7 @@ MESSAGE_CLASSES = {
     MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
+    MessageType.GET_USAGE: (GetUsageRequest, GetUsageResponse),
     MessageType.HEARTBEAT: (HeartbeatRequest, HeartbeatResponse),
     MessageType.REPORT_STATS: (ReportStatsRequest, ReportStatsResponse),
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),

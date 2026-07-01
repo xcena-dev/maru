@@ -43,6 +43,43 @@ class TestAllocationManager:
         result = manager.get_handle(99999)
         assert result is None
 
+    def test_region_owners(self):
+        """region_owners maps each region_id to its owner instance."""
+        manager = AllocationManager()
+        h1 = manager.allocate("instance1", 1024)
+        h2 = manager.allocate("instance1", 2048)
+        h3 = manager.allocate("instance2", 4096)
+
+        owners = manager.region_owners()
+        assert owners == {
+            h1.region_id: "instance1",
+            h2.region_id: "instance1",
+            h3.region_id: "instance2",
+        }
+
+    def test_region_owners_empty(self):
+        """region_owners with no allocations is an empty mapping."""
+        manager = AllocationManager()
+        assert manager.region_owners() == {}
+
+    def test_allocated_by_instance(self):
+        """allocated_by_instance aggregates region count and bytes per owner."""
+        manager = AllocationManager()
+        manager.allocate("instance1", 1024)
+        manager.allocate("instance1", 2048)
+        manager.allocate("instance2", 4096)
+
+        by_instance = manager.allocated_by_instance()
+        assert by_instance == {
+            "instance1": (2, 1024 + 2048),
+            "instance2": (1, 4096),
+        }
+
+    def test_allocated_by_instance_empty(self):
+        """allocated_by_instance with no allocations is an empty mapping."""
+        manager = AllocationManager()
+        assert manager.allocated_by_instance() == {}
+
     def test_increment_kv_ref(self):
         """Test incrementing KV reference count."""
         manager = AllocationManager()

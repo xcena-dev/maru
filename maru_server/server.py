@@ -279,6 +279,56 @@ class MaruServer:
             "stats_manager": self._stats_manager.get_stats(),
         }
 
+    def get_usage(self) -> dict:
+        """Per-instance CXL usage plus shared pool totals.
+
+        For each owner_instance_id, reports the number of regions it owns,
+        the bytes it reserved (``allocated``), and the live KV bytes stored
+        in those regions (``used``). ``pool_total``/``pool_free`` are the
+        shared device capacity from the resource manager.
+        """
+        # Snapshot in-memory manager state atomically; the RM pool query is
+        # done outside the lock since it performs a network round-trip.
+        with self._lock:
+            alloc = self._allocation_manager.allocated_by_instance()
+            owners = self._allocation_manager.region_owners()
+            used_by_region = self._kv_manager.used_by_region()
+
+        used_by_instance: dict[str, int] = {}
+        for region_id, used in used_by_region.items():
+            owner = owners.get(region_id)
+            if owner is not None:
+                used_by_instance[owner] = used_by_instance.get(owner, 0) + used
+
+        instances = [
+            {
+                "instance_id": instance_id,
+                "regions": regions,
+                "allocated": allocated,
+                "used": used_by_instance.get(instance_id, 0),
+            }
+            for instance_id, (regions, allocated) in sorted(alloc.items())
+        ]
+
+        pool_total, pool_free = self._pool_totals()
+        return {
+            "instances": instances,
+            "pool_total": pool_total,
+            "pool_free": pool_free,
+        }
+
+    def _pool_totals(self) -> tuple[int, int]:
+        """Return (total_bytes, free_bytes) summed across resource manager pools."""
+        try:
+            pools = self._allocation_manager.pool_stats()
+        except Exception:
+            logger.warning("pool_stats failed during get_usage", exc_info=True)
+            return (0, 0)
+        return (
+            sum(p.total_size for p in pools),
+            sum(p.free_size for p in pools),
+        )
+
     def close(self) -> None:
         """Shutdown the server and release resources."""
         self._stats_manager.close()

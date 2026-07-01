@@ -87,6 +87,134 @@ class TestMaruBasic:
         assert stats["allocation_manager"]["num_allocations"] == 1
 
 
+class TestGetUsage:
+    """Test cases for MaruServer.get_usage() per-instance accounting."""
+
+    def test_get_usage_empty(self):
+        """No allocations -> empty instance list, zero pool totals (mock RM)."""
+        server = MaruServer()
+        usage = server.get_usage()
+        assert usage["instances"] == []
+        assert usage["pool_total"] == 0
+        assert usage["pool_free"] == 0
+
+    def test_get_usage_allocated_and_used(self):
+        """Per-instance allocated/used/regions aggregate correctly."""
+        server = MaruServer()
+        # instance1: two regions, partially filled
+        h1 = server.request_alloc("instance1", 4096)
+        h2 = server.request_alloc("instance1", 4096)
+        # instance2: one region
+        h3 = server.request_alloc("instance2", 8192)
+
+        server.register_kv(key="a", region_id=h1.region_id, kv_offset=0, kv_length=100)
+        server.register_kv(
+            key="b", region_id=h1.region_id, kv_offset=100, kv_length=200
+        )
+        server.register_kv(key="c", region_id=h2.region_id, kv_offset=0, kv_length=50)
+        server.register_kv(key="d", region_id=h3.region_id, kv_offset=0, kv_length=1000)
+
+        usage = server.get_usage()
+        by_id = {i["instance_id"]: i for i in usage["instances"]}
+
+        assert by_id["instance1"]["regions"] == 2
+        assert by_id["instance1"]["allocated"] == 4096 + 4096
+        assert by_id["instance1"]["used"] == 100 + 200 + 50  # joined across regions
+        assert by_id["instance2"]["regions"] == 1
+        assert by_id["instance2"]["allocated"] == 8192
+        assert by_id["instance2"]["used"] == 1000
+
+    def test_get_usage_instance_with_no_kv(self):
+        """An instance that allocated but stored nothing reports used=0."""
+        server = MaruServer()
+        server.request_alloc("idle", 4096)
+
+        usage = server.get_usage()
+        by_id = {i["instance_id"]: i for i in usage["instances"]}
+        assert by_id["idle"]["regions"] == 1
+        assert by_id["idle"]["used"] == 0
+
+    def test_get_usage_instances_sorted(self):
+        """Instances are returned sorted by instance_id."""
+        server = MaruServer()
+        server.request_alloc("zeta", 4096)
+        server.request_alloc("alpha", 4096)
+
+        usage = server.get_usage()
+        ids = [i["instance_id"] for i in usage["instances"]]
+        assert ids == sorted(ids)
+
+    def test_get_usage_pool_totals(self, monkeypatch):
+        """pool_total / pool_free are summed from resource manager pools."""
+        from maru_shm.types import DaxType, MaruPoolInfo
+
+        server = MaruServer()
+        monkeypatch.setattr(
+            server._allocation_manager,
+            "pool_stats",
+            lambda: [
+                MaruPoolInfo(
+                    dax_path="/dev/dax0.0",
+                    dax_type=DaxType.DEV_DAX,
+                    total_size=100,
+                    free_size=60,
+                    align_bytes=2 << 20,
+                ),
+                MaruPoolInfo(
+                    dax_path="/dev/dax0.1",
+                    dax_type=DaxType.DEV_DAX,
+                    total_size=200,
+                    free_size=150,
+                    align_bytes=2 << 20,
+                ),
+            ],
+        )
+
+        usage = server.get_usage()
+        assert usage["pool_total"] == 300
+        assert usage["pool_free"] == 210
+
+    def test_get_usage_pool_stats_failure_is_tolerated(self, monkeypatch):
+        """If the RM pool query fails, pool totals fall back to 0."""
+        server = MaruServer()
+
+        def _boom():
+            raise RuntimeError("rm down")
+
+        monkeypatch.setattr(server._allocation_manager, "pool_stats", _boom)
+
+        usage = server.get_usage()
+        assert usage["pool_total"] == 0
+        assert usage["pool_free"] == 0
+
+    def test_get_usage_includes_deferred_owner(self):
+        """A disconnected owner whose region is kept alive by KV refs (deferred
+        free) still appears in usage with its held bytes."""
+        server = MaruServer()
+        handle = server.request_alloc("gone", 4096)
+        server.register_kv(
+            key="k", region_id=handle.region_id, kv_offset=0, kv_length=128
+        )
+        # Owner disconnects, but the KV ref keeps the region from being freed.
+        server.client_disconnected("gone")
+
+        usage = server.get_usage()
+        by_id = {i["instance_id"]: i for i in usage["instances"]}
+        assert "gone" in by_id
+        assert by_id["gone"]["regions"] == 1
+        assert by_id["gone"]["used"] == 128
+
+    def test_get_usage_orphan_kv_region_ignored(self):
+        """A KV entry referencing a region with no allocation entry (orphan) is
+        dropped from per-instance accounting rather than crashing."""
+        server = MaruServer()
+        # Register against a region that was never allocated on this server.
+        server.register_kv(key="orphan", region_id=99999, kv_offset=0, kv_length=500)
+
+        usage = server.get_usage()
+        assert usage["instances"] == []  # no owning instance -> nothing attributed
+
+
 class TestClientDisconnected:
     """Test cases for MaruServer.client_disconnected()."""
 
