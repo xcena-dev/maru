@@ -11,10 +11,13 @@ setup_package_logging("maru_handler")
 
 from .handler import MaruHandler  # noqa: E402
 from .memory import OwnedRegionManager  # noqa: E402
+from .plugin import MaruHandlerPlugin, load_handler_plugins  # noqa: E402
 from .rpc_client import RpcClient  # noqa: E402
 
 __all__ = [
     "MaruHandler",
+    "MaruHandlerPlugin",
     "OwnedRegionManager",
     "RpcClient",
+    "load_handler_plugins",
 ]

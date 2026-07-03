@@ -193,6 +193,24 @@ maru_pool_size: 4
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
 
 
+## Plugins
+
+Maru core is vendor-neutral. Hardware- or vendor-specific behaviour lives in
+separate packages that register a `maru.handler_plugins` entry point;
+`MaruHandler` discovers them at construction time and calls their hooks —
+loading is soft-fail, so a missing or broken plugin never breaks KV-cache
+operation. Select plugins at runtime with `MARU_PLUGINS` (unset → load all).
+
+```python
+# In the plugin package's pyproject.toml
+[project.entry-points."maru.handler_plugins"]
+my_plugin = "my_pkg.plugin:MyPlugin"
+```
+
+A plugin implements any subset of `MaruHandlerPlugin` (`on_init`,
+`on_batch_retrieve`, `on_close`, `contribute_stats`). See
+[`maru_handler/plugin.py`](maru_handler/plugin.py) for the interface.
+
 ## Tools
 
 - **[pool_monitor](tools/)** — Real-time pool usage monitor (`top`-style TUI, CSV export)

@@ -33,6 +33,7 @@ from .memory import (
     OwnedRegionManager,
     PagedMemoryAllocator,
 )
+from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,34 @@ class MaruHandler:
         self._auto_expand = self._config.auto_expand
         self._expand_size = self._config.expand_size or self._config.pool_size
 
+        # Out-of-tree extension plugins (see maru_handler/plugin.py). Empty
+        # unless a package registers a `maru.handler_plugins` entry point;
+        # loading is soft-fail so a broken plugin never blocks construction.
+        self._plugins = load_handler_plugins()
+
         logger.debug("Created MaruHandler with config: %s", self._config)
+
+        self._dispatch_plugins("on_init", self)
+
+    def _dispatch_plugins(self, hook: str, *args) -> None:
+        """Invoke ``hook`` on every loaded plugin, isolating failures.
+
+        Plugins implement any subset of the MaruHandlerPlugin protocol, so a
+        missing hook is skipped. One plugin raising never affects the others
+        or the surrounding core operation — the point of soft-fail loading.
+        """
+        for plugin in self._plugins:
+            fn = getattr(plugin, hook, None)
+            if fn is None:
+                continue
+            try:
+                fn(*args)
+            except Exception:
+                logger.exception(
+                    "handler plugin %s hook %s failed",
+                    type(plugin).__name__,
+                    hook,
+                )
 
     # =========================================================================
     # Public Accessors
@@ -166,6 +194,24 @@ class MaruHandler:
         if self._owned is None:
             return []
         return self._owned.get_region_ids()
+
+    # --- Plugin accessor surface -------------------------------------------
+    # The stable, documented API a handler plugin (maru_handler/plugin.py) may
+    # rely on to inspect mapped regions. Kept intentionally small: everything a
+    # plugin needs about a batch arrives via the on_batch_retrieve hook args;
+    # these two cover the region-mapping state that isn't in those args.
+
+    def is_region_mapped(self, region_id: int) -> bool:
+        """Return True if the region is currently mmap'd. Plugin API."""
+        return (
+            self._mapper is not None and self._mapper.get_region(region_id) is not None
+        )
+
+    def get_region_dax_path(self, region_id: int) -> str | None:
+        """Return the DAX device path for a mapped region, or None. Plugin API."""
+        if self._mapper is None:
+            return None
+        return self._mapper.get_dax_path(region_id)
 
     def get_chunk_size(self) -> int:
         """Get the configured chunk size in bytes.
@@ -374,6 +420,12 @@ class MaruHandler:
 
         try:
             with self._write_lock:
+                # 0. Let plugins release resources while regions are still
+                #    mapped and the RPC connection is live (e.g. unpin device
+                #    ranges) — must run before the unmap in step 3.
+                if self._plugins:
+                    self._dispatch_plugins("on_close", self)
+
                 # 1. Close owned regions (allocator cleanup only) → get region_ids
                 owned_region_ids: list[int] = []
                 if self._owned is not None:
@@ -802,6 +854,22 @@ class MaruHandler:
             if regions_list:
                 result["allocator"] = regions_list[0]
 
+        # Merge plugin-contributed stats under result["plugins"][<PluginClass>].
+        for plugin in self._plugins:
+            fn = getattr(plugin, "contribute_stats", None)
+            if fn is None:
+                continue
+            try:
+                contrib = fn()
+            except Exception:
+                logger.exception(
+                    "handler plugin %s contribute_stats failed",
+                    type(plugin).__name__,
+                )
+                continue
+            if contrib:
+                result.setdefault("plugins", {})[type(plugin).__name__] = contrib
+
         return result
 
     # =========================================================================
@@ -891,6 +959,11 @@ class MaruHandler:
             ro_count,
             hits - ro_count,
         )
+        # Plugins observe the mapped batch (e.g. issue prefetch/pin hints).
+        # Guarded so the empty-plugin common case stays free on the hot path.
+        if self._plugins:
+            self._dispatch_plugins("on_batch_retrieve", self, keys, batch_resp)
+
         total_bytes = sum(
             entry.kv_length
             for i, entry in enumerate(batch_resp.entries)

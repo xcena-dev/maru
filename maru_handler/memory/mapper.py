@@ -246,6 +246,10 @@ class DaxMapper:
         """Get a mapped region by ID."""
         return self._regions.get(region_id)
 
+    def get_dax_path(self, region_id: int) -> str | None:
+        """Return the DAX device path for a mapped region, or None."""
+        return self._client.get_dax_path(region_id)
+
     def get_buffer_view(
         self, region_id: int, offset: int, size: int
     ) -> memoryview | None:
