@@ -196,19 +196,24 @@ class MaruHandler:
         return self._owned.get_region_ids()
 
     # --- Plugin accessor surface -------------------------------------------
-    # The stable, documented API a handler plugin (maru_handler/plugin.py) may
-    # rely on to inspect mapped regions. Kept intentionally small: everything a
-    # plugin needs about a batch arrives via the on_batch_retrieve hook args;
-    # these two cover the region-mapping state that isn't in those args.
+    # STABLE PLUGIN API. These two methods, together with the MaruHandlerPlugin
+    # hook signatures (maru_handler/plugin.py), are the public contract that
+    # out-of-tree plugins (on independent release cycles) depend on. Do NOT
+    # rename, remove, or change their behaviour without a deprecation cycle —
+    # doing so silently breaks every installed plugin. A contract test in
+    # tests/unit/test_plugin_loader.py fails CI if this surface drifts.
+    # Kept intentionally small: everything a plugin needs about a batch arrives
+    # via the on_batch_retrieve hook args; these cover only the region-mapping
+    # state that isn't in those args.
 
     def is_region_mapped(self, region_id: int) -> bool:
-        """Return True if the region is currently mmap'd. Plugin API."""
+        """Return True if the region is currently mmap'd. Stable plugin API."""
         return (
             self._mapper is not None and self._mapper.get_region(region_id) is not None
         )
 
     def get_region_dax_path(self, region_id: int) -> str | None:
-        """Return the DAX device path for a mapped region, or None. Plugin API."""
+        """Return the DAX device path for a mapped region, or None. Stable plugin API."""
         if self._mapper is None:
             return None
         return self._mapper.get_dax_path(region_id)

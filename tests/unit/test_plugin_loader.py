@@ -183,3 +183,37 @@ def _make_owned_stub():
     owned = MagicMock()
     owned.get_stats.return_value = {"regions": []}
     return owned
+
+
+# ---------------------------------------------------------------------------
+# Plugin API contract — pins the public surface out-of-tree plugins depend on.
+# If any assertion here fails, a change broke a documented plugin contract:
+# fix the change or run a deprecation cycle. See docs api_reference/plugins.md.
+# ---------------------------------------------------------------------------
+
+
+class TestPluginApiContract:
+    def test_handler_accessor_surface_is_stable(self):
+        """MaruHandler exposes the two stable accessor methods with their signature."""
+        import inspect
+
+        for name in ("is_region_mapped", "get_region_dax_path"):
+            method = getattr(MaruHandler, name, None)
+            assert callable(method), f"MaruHandler.{name} removed — breaks plugins"
+            params = list(inspect.signature(method).parameters)
+            assert params == ["self", "region_id"], (
+                f"MaruHandler.{name} signature drifted to {params}"
+            )
+
+    def test_plugin_hook_names_are_stable(self):
+        """The four documented hook names exist on the MaruHandlerPlugin protocol."""
+        from maru_handler.plugin import MaruHandlerPlugin
+
+        for hook in ("on_init", "on_batch_retrieve", "on_close", "contribute_stats"):
+            assert hasattr(MaruHandlerPlugin, hook), (
+                f"hook {hook} removed from protocol"
+            )
+
+    def test_entry_point_group_name_is_stable(self):
+        """The entry-point group name is itself part of the contract."""
+        assert PLUGIN_GROUP == "maru.handler_plugins"
