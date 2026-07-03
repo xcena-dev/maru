@@ -222,6 +222,7 @@ def _make_stats_rpc():
         allocation_manager=SimpleNamespace(
             num_allocations=0, total_allocated=0, active_clients=0
         ),
+        stats_manager={},
     )
     return rpc
 
