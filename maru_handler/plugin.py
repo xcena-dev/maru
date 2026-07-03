@@ -138,19 +138,44 @@ def load_handler_plugins(
             return []
 
     plugins: list[object] = []
+    seen_names: set[str] = set()
     for ep in entry_points_iter:
         if allowlist is not None and ep.name not in allowlist:
             logger.debug(
                 "skipping handler plugin %r (not in %s)", ep.name, PLUGIN_ALLOWLIST_ENV
             )
             continue
+        if ep.name in seen_names:
+            # Two installed dists can register the same name (e.g. a stale and
+            # a fresh copy). First wins — running both would double every hook.
+            logger.warning(
+                "duplicate handler plugin name %r, ignoring the later entry", ep.name
+            )
+            continue
+        seen_names.add(ep.name)
         try:
             factory = ep.load()
             plugin = factory()
         except Exception:
             logger.exception("handler plugin %r failed to load, skipping", ep.name)
             continue
+        if plugin is None:
+            # A factory that self-disables should return a no-op object, not
+            # None — a None here would sit in the list as a dead "plugin".
+            logger.warning("handler plugin %r factory returned None, skipping", ep.name)
+            continue
         plugins.append(plugin)
         logger.info("loaded handler plugin: %s", ep.name)
+
+    # Surface typos: an allowlist name that matched no installed plugin is
+    # almost always a misspelling, and otherwise loads nothing silently.
+    if allowlist is not None:
+        missing = allowlist - seen_names
+        if missing:
+            logger.warning(
+                "%s names matched no installed plugin: %s",
+                PLUGIN_ALLOWLIST_ENV,
+                ", ".join(sorted(missing)),
+            )
 
     return plugins

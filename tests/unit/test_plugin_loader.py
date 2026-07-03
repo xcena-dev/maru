@@ -9,6 +9,7 @@ stdlib callables so the actual ``.load()`` path is exercised without needing a
 separately installed plugin package.
 """
 
+import logging
 from collections import OrderedDict, defaultdict
 from importlib.metadata import EntryPoint
 
@@ -19,6 +20,18 @@ from maru_handler.plugin import PLUGIN_GROUP, load_handler_plugins
 def _ep(name: str, value: str) -> EntryPoint:
     """Build a real EntryPoint in the handler-plugin group."""
     return EntryPoint(name=name, value=value, group=PLUGIN_GROUP)
+
+
+class _FakeEP:
+    """Duck-typed entry point (name + load()) for edge cases a real EntryPoint
+    can't express with a stdlib target — e.g. a factory that returns None."""
+
+    def __init__(self, name, factory):
+        self.name = name
+        self._factory = factory
+
+    def load(self):
+        return self._factory
 
 
 class TestLoadHandlerPlugins:
@@ -86,6 +99,43 @@ class TestLoadHandlerPlugins:
             entry_points_iter=[_ep("od", "collections:OrderedDict")]
         )
         assert len(plugins) == 1
+
+    def test_factory_returning_none_is_skipped(self, caplog, monkeypatch):
+        """A factory that returns None is dropped, not kept as a dead plugin."""
+        # maru_handler logger has propagate=False (own handler); let records
+        # reach caplog's root handler for the duration of the test.
+        monkeypatch.setattr(logging.getLogger("maru_handler"), "propagate", True)
+        with caplog.at_level("WARNING", logger="maru_handler.plugin"):
+            plugins = load_handler_plugins(
+                entry_points_iter=[_FakeEP("noop", lambda: None)]
+            )
+        assert plugins == []
+        assert "returned None" in caplog.text
+
+    def test_duplicate_names_first_wins(self, caplog, monkeypatch):
+        """Two entries with the same name: keep the first, warn, drop the rest."""
+        monkeypatch.setattr(logging.getLogger("maru_handler"), "propagate", True)
+        with caplog.at_level("WARNING", logger="maru_handler.plugin"):
+            plugins = load_handler_plugins(
+                entry_points_iter=[
+                    _ep("dup", "collections:OrderedDict"),
+                    _ep("dup", "collections:defaultdict"),
+                ]
+            )
+        assert [type(p) for p in plugins] == [OrderedDict]  # first wins
+        assert "duplicate handler plugin name" in caplog.text
+
+    def test_allowlist_typo_warns(self, caplog, monkeypatch):
+        """An allowlist name matching no installed plugin is surfaced, not silent."""
+        monkeypatch.setattr(logging.getLogger("maru_handler"), "propagate", True)
+        with caplog.at_level("WARNING", logger="maru_handler.plugin"):
+            plugins = load_handler_plugins(
+                entry_points_iter=[_ep("od", "collections:OrderedDict")],
+                allowlist={"od", "typo"},
+            )
+        assert [type(p) for p in plugins] == [OrderedDict]
+        assert "matched no installed plugin" in caplog.text
+        assert "typo" in caplog.text
 
 
 # ---------------------------------------------------------------------------
