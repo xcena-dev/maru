@@ -71,17 +71,16 @@ that is not in those arguments:
 | `MaruHandler.get_region_dax_path(region_id: int) -> str \| None` | the DAX device path for a mapped region |
 
 ```{note}
-Gaia-style hints only fire on **mapped shared** regions. A handler never
-prefetches or pins a region it *owns* (its own just-written data is not in the
-mapper), so plugin behaviour is exercised in the cross-instance
+Per-region device hints only apply to **mapped shared** regions. A handler
+never issues them for a region it *owns* (its own just-written data is not in
+the mapper), so plugin behaviour is exercised in the cross-instance
 producer/consumer path, not a single handler storing and retrieving its own key.
 ```
 
-## Example
+## Writing a plugin
 
-[`maru-gaia`](https://github.com/xcena-dev/maru-gaia) is the reference
-out-of-tree plugin: it provides XCENA Gaia (CXL) prefetch and pin hints,
-depends on the internal `pyxif` device binding, and registers as
-`gaia = "maru_gaia.plugin:GaiaPlugin"`. See
+A hardware/vendor plugin typically implements `on_batch_retrieve` to issue
+device hints (prefetch/pin) against the mapped regions of a batch, and
+`on_close` to release any device resources before regions are unmapped. See
 [`maru_handler/plugin.py`](https://github.com/xcena-dev/maru/blob/main/maru_handler/plugin.py)
 for the full interface definition.
