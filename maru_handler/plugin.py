@@ -48,6 +48,25 @@ PLUGIN_GROUP = "maru.handler_plugins"
 #: Comma-separated allowlist of plugin *names* to load. Unset/empty → load all.
 PLUGIN_ALLOWLIST_ENV = "MARU_PLUGINS"
 
+#: Process-level cache of the discovered entry points. The installed
+#: distribution set is immutable within a process, so scan once (the scan is
+#: not free) and reuse across every MaruHandler construction.
+_discovered_entry_points: list | None = None
+
+
+def _discover_entry_points() -> list:
+    """Scan (once) the installed ``maru.handler_plugins`` entry points."""
+    global _discovered_entry_points
+    if _discovered_entry_points is None:
+        try:
+            _discovered_entry_points = list(
+                importlib.metadata.entry_points(group=PLUGIN_GROUP)
+            )
+        except Exception:
+            logger.exception("failed to enumerate %s entry points", PLUGIN_GROUP)
+            _discovered_entry_points = []
+    return _discovered_entry_points
+
 
 @runtime_checkable
 class MaruHandlerPlugin(Protocol):
@@ -131,11 +150,7 @@ def load_handler_plugins(
         allowlist = _get_allowlist()
 
     if entry_points_iter is None:
-        try:
-            entry_points_iter = importlib.metadata.entry_points(group=PLUGIN_GROUP)
-        except Exception:
-            logger.exception("failed to enumerate %s entry points", PLUGIN_GROUP)
-            return []
+        entry_points_iter = _discover_entry_points()
 
     plugins: list[object] = []
     seen_names: set[str] = set()

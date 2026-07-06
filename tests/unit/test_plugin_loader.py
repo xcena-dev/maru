@@ -268,3 +268,23 @@ class TestPluginApiContract:
     def test_entry_point_group_name_is_stable(self):
         """The entry-point group name is itself part of the contract."""
         assert PLUGIN_GROUP == "maru.handler_plugins"
+
+    def test_on_batch_retrieve_payload_fields_are_stable(self):
+        """The batch_resp/handle fields plugins read are the core contract.
+
+        These are what every field plugin actually depends on in
+        on_batch_retrieve; renaming them in maru_common would pass maru CI green
+        while silently breaking every installed plugin. Pin them here too.
+        """
+        from maru_common import BatchLookupKVResponse, LookupResult
+        from maru_shm import MaruHandle
+
+        assert "entries" in BatchLookupKVResponse.__dataclass_fields__
+        for f in ("found", "handle", "kv_offset", "kv_length"):
+            assert f in LookupResult.__dataclass_fields__, (
+                f"LookupResult.{f} removed — breaks plugins"
+            )
+        for f in ("region_id", "offset"):
+            assert f in MaruHandle.__dataclass_fields__, (
+                f"MaruHandle.{f} removed — breaks plugins"
+            )

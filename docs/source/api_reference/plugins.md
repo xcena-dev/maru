@@ -71,10 +71,14 @@ that is not in those arguments:
 | `MaruHandler.get_region_dax_path(region_id: int) -> str \| None` | the DAX device path for a mapped region |
 
 ```{note}
-Per-region device hints only apply to **mapped shared** regions. A handler
-never issues them for a region it *owns* (its own just-written data is not in
-the mapper), so plugin behaviour is exercised in the cross-instance
-producer/consumer path, not a single handler storing and retrieving its own key.
+`on_batch_retrieve` fires for every *found* entry whose region is mapped —
+and **both** owned regions (this handler's own allocations) and shared regions
+(mmap'd from another instance) are registered in the mapper. So a handler that
+stores and then retrieves its own keys will invoke the hook on those owned
+regions too; the region-mapping accessors do not distinguish owned from shared.
+A plugin that should act only on shared regions must filter them itself — the
+public `get_owned_region_ids()` lists the owned ones (note it is outside the
+minimal stable accessor contract above).
 ```
 
 ## Writing a plugin
