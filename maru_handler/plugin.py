@@ -75,7 +75,9 @@ class MaruHandlerPlugin(Protocol):
     Every hook is **optional** — a plugin implements only the ones it needs;
     MaruHandler skips any that are absent. All hooks are best-effort: an
     exception raised inside one is logged and swallowed so it can never break
-    the surrounding core operation.
+    the surrounding core operation. That isolation covers *raised exceptions*
+    only — a hook that blocks or hangs still stalls the calling core path, so
+    every hook must return promptly.
     """
 
     def on_init(self, handler: MaruHandler) -> None:
@@ -84,6 +86,14 @@ class MaruHandlerPlugin(Protocol):
         The handler is constructed but **not yet connected** (``_mapper`` is
         ``None`` until ``connect()``). Use this only for cheap setup; defer any
         work that needs mapped regions to :meth:`on_batch_retrieve`.
+
+        Runs synchronously inside the constructor, so keep it fast and
+        non-blocking. Note this hook is **not paired** with
+        :meth:`on_close`: ``on_close`` fires only if the handler was connected
+        (see its note), so do not acquire in ``on_init`` a resource whose
+        release you rely on ``on_close`` to perform — a construct-then-never-
+        connect sequence would leak it. Acquire lazily in ``on_batch_retrieve``
+        instead.
         """
         ...
 
@@ -95,10 +105,20 @@ class MaruHandlerPlugin(Protocol):
     ) -> None:
         """Called at the end of ``batch_retrieve``, after regions are mapped.
 
-        ``keys[i]`` corresponds to ``batch_resp.entries[i]``. Found entries
-        expose a ``handle`` (region/offset) whose region is already mapped, so
-        a plugin may issue hardware hints (prefetch/pin) against live memory.
+        ``keys[i]`` corresponds to ``batch_resp.entries[i]``. For a found
+        entry, the KV bytes live at ``entry.kv_offset`` (offset within the
+        allocation) for ``entry.kv_length`` bytes; ``entry.handle.offset`` is
+        only the region's mmap base, **not** the payload location, so a
+        hardware hint must target ``handle.offset + kv_offset`` for
+        ``kv_length`` bytes (mirror ``get_buffer_view``). The region is already
+        mapped, so a plugin may issue hints (prefetch/pin) against live memory.
+
         Runs on the retrieval hot path — keep it cheap and non-blocking.
+        **Not serialized against** :meth:`on_close`: ``batch_retrieve`` takes
+        no lock, so this hook can still be in flight while another thread's
+        ``close()`` unmaps the very regions referenced here. A plugin issuing
+        HW hints must be thread-safe and treat pin/unpin as idempotent (or
+        reference-counted) so a hint that lands after the unmap is harmless.
         """
         ...
 
@@ -107,7 +127,13 @@ class MaruHandlerPlugin(Protocol):
 
         Runs before regions are unmapped and the RPC connection is torn down,
         so a plugin can safely release resources tied to mapped memory (e.g.
-        unpin device ranges) here.
+        unpin device ranges) here. Fires **only if the handler was connected** —
+        a handler that is constructed but never connected does not invoke this
+        hook (see :meth:`on_init`).
+
+        Dispatched while holding the handler's write lock, so a slow or
+        blocking implementation stalls ``close()`` and every concurrent writer:
+        keep it cheap and non-blocking, same as the other hooks.
         """
         ...
 
@@ -115,7 +141,10 @@ class MaruHandlerPlugin(Protocol):
         """Return a JSON-serializable stats dict merged into ``get_stats``.
 
         The result is placed under ``stats["plugins"][<plugin-class-name>]``.
-        Return ``None`` (or an empty dict) to contribute nothing.
+        The key is the plugin's class name, so two plugins sharing a class name
+        (from different packages) would overwrite each other here — give the
+        class a distinctive name if that collision is possible. Return ``None``
+        (or an empty dict) to contribute nothing.
         """
         ...
 
