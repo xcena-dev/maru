@@ -42,10 +42,12 @@ red). It has two screens you switch between:
   covered without knowing their ports. Pass `-p`/`--host` to pin a single
   (possibly remote) server instead.
 
-**STATS view** (select an instance + `enter`): a full-screen per-operation table
-for that instance — count / avg / min / max latency / hit% / bytes, busiest op
-first. Populated only when clients run with `MARU_STAT=1` (else a hint). `esc`/`←`
-returns to the overview. The separate sparkline dashboard stays at `marutop stats`.
+**STATS view** (select an instance + `enter`): a full per-instance dashboard —
+an op table (count / delta / avg / min / max latency + an activity sparkline),
+a detail box for the `↑↓`-selected op (hit-rate bar, throughput), and a
+min/avg/max latency graph over time. Populated only when clients run with
+`MARU_STAT=1` (else a hint). `esc`/`←` returns to the overview. `marutop stats`
+remains for a directly port-pinned dashboard.
 
 Backends are polled on a background thread, so the UI stays smooth and keys stay
 responsive even when a server is slow or unreachable (its block just shows
@@ -60,7 +62,8 @@ marutop --host 10.0.0.1 -p 5556 --address 10.0.0.1:9850
 ```
 
 Keys — overview: `↑↓` select instance · `enter` open STATS · `s` sort · `i`
-interval · `q` quit.  STATS view: `↑↓` change instance · `esc`/`←` back · `q` quit.
+interval · `q` quit.  STATS view: `↑↓` select op · `esc`/`←` back · `i`
+interval · `q` quit.
 
 ## `marutop pool`
 

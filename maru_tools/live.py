@@ -5,9 +5,11 @@ Fuses backends into one ``htop``-style curses TUI, the analog of XCENA's
 
 - **DEVICES**   — physical DAX pools from the Resource Manager (:9850)
 - **INSTANCES** — per-instance allocated/used/slack from MaruServer(s) (:5555)
-- **STATS**     — compact per-op summary (count/avg_us/hit%) from the same
-  server(s); populated only when clients run with ``MARU_STAT=1``. The full
-  latency-graph dashboard remains ``marutop stats``.
+- **STATS**     — select an instance + ``enter`` to drill into a full
+  per-instance dashboard: op table (count/delta/avg/min/max + activity
+  sparkline), a detail box for the selected op (hit-rate bar, throughput), and a
+  min/avg/max latency graph over time. Populated only when clients run with
+  ``MARU_STAT=1``. (``marutop stats`` remains for a port-pinned dashboard.)
 
 With no ``-p``/``--host``, the INSTANCES section **auto-discovers** local
 ``maru-server`` processes (scanning ``/proc`` for their ``--port``) and polls
@@ -23,7 +25,7 @@ stay responsive even when a server is slow or unreachable.
     marutop --once             # single plain-text snapshot then exit (scriptable)
 
 Keys (overview):  ↑↓ select instance · enter → per-instance STATS · s sort · i interval · q quit
-Keys (STATS view): ↑↓ instance · esc/← back · i interval · q quit
+Keys (STATS view): ↑↓ select op · esc/← back · i interval · q quit
 """
 
 import argparse
@@ -34,6 +36,12 @@ from datetime import datetime
 from pathlib import Path
 
 from maru_tools._common import clear_screen, fmt_size, usage_bar
+from maru_tools.stats import (
+    _HISTORY_WIDTH,
+    _SPARK_TABLE_WIDTH,
+    _ZERO_LAT,
+    _sparkline,
+)
 
 # ── color pairs (pxltop palette: cyan header, green/yellow/red gauge, blue dim) ─
 _CP_HEADER = 1
@@ -191,6 +199,14 @@ class _Poller:
         self.servers: list[dict] = []
         self.fetch_count = 0
 
+        # Per-(server_label, client_id) op history for the STATS dashboard.
+        # op -> list; bounded to _HISTORY_WIDTH (counts/latency) / _SPARK_TABLE_WIDTH.
+        self._tick = 0
+        self._h_count: dict[tuple, dict[str, list]] = {}
+        self._h_lat: dict[tuple, dict[str, list]] = {}
+        self._h_spark: dict[tuple, dict[str, list]] = {}
+        self._h_accum: dict[tuple, dict[str, int]] = {}
+
     @property
     def interval(self) -> float:
         with self._lock:
@@ -203,6 +219,61 @@ class _Poller:
     def snapshot(self):
         with self._lock:
             return self.pool, list(self.servers), self.fetch_count
+
+    def get_history(self, label: str, client_id: str):
+        """Copy of (count_hist, lat_hist, spark_hist) for one client's ops."""
+        key = (label, client_id)
+        with self._lock:
+            return (
+                {op: list(v) for op, v in self._h_count.get(key, {}).items()},
+                {op: list(v) for op, v in self._h_lat.get(key, {}).items()},
+                {op: list(v) for op, v in self._h_spark.get(key, {}).items()},
+            )
+
+    def _update_history(self, label: str, sm: dict, flush_spark: bool) -> None:
+        """Accumulate per-op interval history from one server's stats dict.
+
+        Server interval counters reset on each get_stats, so each tick's
+        ``interval_*`` values are the delta since the previous poll.
+        """
+        clients = sm.get("clients", {}) if isinstance(sm, dict) else {}
+        for cid, cdata in clients.items():
+            ops = cdata.get("operations", {})
+            key = (label, cid)
+            ch = self._h_count.setdefault(key, {})
+            lh = self._h_lat.setdefault(key, {})
+            sh = self._h_spark.setdefault(key, {})
+            ac = self._h_accum.setdefault(key, {})
+            for op, o in ops.items():
+                ch.setdefault(op, [0] * _HISTORY_WIDTH)
+                lh.setdefault(op, [_ZERO_LAT] * _HISTORY_WIDTH)
+                sh.setdefault(op, [0.0] * _SPARK_TABLE_WIDTH)
+                ac.setdefault(op, 0)
+                ivc = o.get("interval_count", 0)
+                if ivc > 0:
+                    ch[op].append(ivc)
+                    lh[op].append(
+                        (
+                            o.get("interval_min_us", 0.0),
+                            o.get("interval_avg_us", 0.0),
+                            o.get("interval_max_us", 0.0),
+                        )
+                    )
+                    ac[op] += ivc
+                else:
+                    ch[op].append(0)
+                    lh[op].append(_ZERO_LAT)
+                if len(ch[op]) > _HISTORY_WIDTH:
+                    del ch[op][: len(ch[op]) - _HISTORY_WIDTH]
+                if len(lh[op]) > _HISTORY_WIDTH:
+                    del lh[op][: len(lh[op]) - _HISTORY_WIDTH]
+            if flush_spark:
+                for op in ac:
+                    sh.setdefault(op, [0.0] * _SPARK_TABLE_WIDTH)
+                    sh[op].append(float(ac[op]))
+                    if len(sh[op]) > _SPARK_TABLE_WIDTH:
+                        del sh[op][: len(sh[op]) - _SPARK_TABLE_WIDTH]
+                    ac[op] = 0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -282,6 +353,12 @@ class _Poller:
                     self.pool = pool
                     self.servers = results
                     self.fetch_count += 1
+                    self._tick += 1
+                    flush_spark = self._tick % 2 == 0
+                    for r in results:
+                        sm, serr = r["stats"]
+                        if serr is None and sm is not None:
+                            self._update_history(r["label"], sm, flush_spark)
 
                 waited = 0.0
                 while waited < self.interval and not self._stop.is_set():
@@ -679,14 +756,65 @@ def _draw_main(stdscr, poller: _Poller, sort_key: str, selected: int) -> int:
     return len(flat)
 
 
-def _draw_stats_view(stdscr, poller: _Poller, sort_key: str, selected: int) -> int:
-    """Full-screen per-operation stats for the selected instance. Returns count."""
+_GRAPH_HEIGHT = 7
+
+
+def _draw_lat_graph(stdscr, y, x, values, width, height=_GRAPH_HEIGHT):
+    """3-line min/avg/max latency graph over time (max=red ▴, avg=green •,
+    min=blue ▾). Adapted from the stats dashboard, using the live palette."""
+    data = values[-width:] if len(values) >= 2 else []
+    all_vals = [v for tup in data for v in tup if v > 0]
+    lo, hi = 0.0, (max(all_vals) if all_vals else 1.0)
+    if hi == lo:
+        hi = lo + 1
+    label_w = 8
+    plot_w = min(len(data), width) if data else width
+    has = curses.has_colors()
+    max_attr = curses.color_pair(_CP_CRIT) if has else 0
+    avg_attr = curses.color_pair(_CP_OK) if has else 0
+    min_attr = curses.color_pair(_CP_DIM) if has else 0
+
+    def row_of(v):
+        r = int((v - lo) / (hi - lo) * (height - 1))
+        return max(0, min(height - 1, height - 1 - r))
+
+    grid: list[list] = [[None] * plot_w for _ in range(height)]
+    for col, (mn, avg, mx) in enumerate(data[-plot_w:]):
+        if mx > 0:
+            grid[row_of(mx)][col] = ("▴", max_attr)
+        if mn > 0:
+            grid[row_of(mn)][col] = ("▾", min_attr)
+        if avg > 0:
+            grid[row_of(avg)][col] = ("•", avg_attr)
+    for r in range(height):
+        fmt = ".0f" if hi >= 100 else ".1f"
+        if r == 0:
+            label = f"{hi:>{label_w - 2}{fmt}} ┤"
+        elif r == height - 1:
+            label = f"{lo:>{label_w - 2}{fmt}} ┤"
+        else:
+            label = " " * (label_w - 1) + "│"
+        _safe_addstr(stdscr, y + r, x, label)
+        for col in range(plot_w):
+            cell = grid[r][col]
+            if cell is not None:
+                _safe_addstr(stdscr, y + r, x + label_w + col, cell[0], cell[1])
+    _safe_addstr(stdscr, y + height, x, " " * (label_w - 1) + "└" + "─" * plot_w)
+    return height + 1
+
+
+def _draw_stats_view(
+    stdscr, poller: _Poller, sort_key: str, selected: int, op_sel: int
+) -> int:
+    """Full per-instance dashboard: op table (+sparkline/delta), a detail box
+    and a min/avg/max latency graph for the selected op. Returns the op count."""
     stdscr.erase()
-    max_y, _ = stdscr.getmaxyx()
+    max_y, max_x = stdscr.getmaxyx()
     colors = curses.has_colors()
     header_attr = (
         (curses.color_pair(_CP_HEADER) | curses.A_BOLD) if colors else curses.A_BOLD
     )
+    accent = (curses.color_pair(_CP_WARN) | curses.A_BOLD) if colors else curses.A_BOLD
     dim = _dim(colors)
     (_pool, servers, _count) = poller.snapshot()
     flat = _flatten_instances(servers, sort_key)
@@ -695,23 +823,27 @@ def _draw_stats_view(stdscr, poller: _Poller, sort_key: str, selected: int) -> i
     _safe_addstr(stdscr, 0, 0, "  marutop · STATS", header_attr)
     _safe_addstr(stdscr, 0, 20, f"{ts}   interval {poller.interval:.1f}s")
 
+    def _footer(nops: int) -> None:
+        _safe_addstr(
+            stdscr,
+            max_y - 1,
+            0,
+            f"  esc/←:back  ↑↓:op  i:interval  q:quit"
+            f"   [inst {selected + 1}/{len(flat)}]",
+            dim,
+        )
+        stdscr.refresh()
+
     if not flat:
         _safe_addstr(stdscr, 2, 2, "(no instances)", dim)
-        _safe_addstr(stdscr, max_y - 1, 0, "  esc/←:back  q:quit", dim)
-        stdscr.refresh()
+        _footer(0)
         return 0
     if selected >= len(flat):
         selected = len(flat) - 1
 
     s, inst = flat[selected]
     slack = inst.allocated - inst.used
-    _safe_addstr(
-        stdscr,
-        2,
-        2,
-        f"instance {inst.instance_id}   @ server {s['label']}",
-        header_attr,
-    )
+    _safe_addstr(stdscr, 2, 2, f"instance {inst.instance_id}  @ {s['label']}", accent)
     _safe_addstr(
         stdscr,
         3,
@@ -722,56 +854,106 @@ def _draw_stats_view(stdscr, poller: _Poller, sort_key: str, selected: int) -> i
         dim,
     )
 
-    y = 5
     sm, err = s["stats"]
     if err is not None:
-        _safe_addstr(stdscr, y, 2, f"(stats unavailable: {err})", dim)
-    else:
-        rows = _summarize_ops(sm, inst.instance_id) if sm is not None else []
-        if not rows:
-            _safe_addstr(
-                stdscr,
-                y,
-                2,
-                "(no op stats for this instance — enable MARU_STAT=1 on the client)",
-                dim,
-            )
-        else:
-            _safe_addstr(
-                stdscr,
-                y,
-                2,
-                f"{'op':<16}  {'count':>10}  {'avg_us':>9}  {'min_us':>9}  "
-                f"{'max_us':>9}  {'hit%':>6}  {'bytes':>9}",
-                curses.A_BOLD,
-            )
-            y += 1
-            for r in rows:
-                if y >= max_y - 1:
-                    _safe_addstr(stdscr, y, 2, "(resize terminal for more)", dim)
-                    break
-                hitpct = ""
-                if r["op"] in _HIT_MISS_OPS and r["count"]:
-                    hitpct = f"{r['hit'] / r['count'] * 100:.1f}"
-                _safe_addstr(
-                    stdscr,
-                    y,
-                    2,
-                    f"{r['op']:<16}  {r['count']:>10}  {r['avg_us']:>9.1f}  "
-                    f"{r['min_us']:>9.1f}  {r['max_us']:>9.1f}  {hitpct:>6}  "
-                    f"{fmt_size(r['bytes']):>9}",
-                )
-                y += 1
+        _safe_addstr(stdscr, 5, 2, f"(stats unavailable: {err})", dim)
+        _footer(0)
+        return 0
+    rows = _summarize_ops(sm, inst.instance_id) if sm is not None else []
+    if not rows:
+        _safe_addstr(
+            stdscr,
+            5,
+            2,
+            "(no op stats for this instance — enable MARU_STAT=1 on the client)",
+            dim,
+        )
+        _footer(0)
+        return 0
 
+    op_names = [r["op"] for r in rows]
+    if op_sel >= len(op_names):
+        op_sel = len(op_names) - 1
+    c_hist, l_hist, s_hist = poller.get_history(s["label"], inst.instance_id)
+
+    # ── op table ──────────────────────────────────────────────────────────
+    y = 5
     _safe_addstr(
         stdscr,
-        max_y - 1,
-        0,
-        f"  esc/←:back  ↑↓:instance ({selected + 1}/{len(flat)})  i:interval  q:quit",
-        dim,
+        y,
+        2,
+        f"{'op':<16} {'count':>9} {'delta':>6} {'avg_us':>8} {'min_us':>8} "
+        f"{'max_us':>8}  {'activity':>{_SPARK_TABLE_WIDTH}}",
+        curses.A_BOLD,
     )
-    stdscr.refresh()
-    return len(flat)
+    y += 1
+    for i, r in enumerate(rows):
+        op = r["op"]
+        ch = c_hist.get(op, [])
+        delta = f"+{ch[-1]}" if ch and ch[-1] > 0 else ""
+        sh = s_hist.get(op, [])
+        spark = _sparkline(sh, _SPARK_TABLE_WIDTH) if any(v > 0 for v in sh) else ""
+        prefix = "▶ " if i == op_sel else "  "
+        line = (
+            f"{prefix}{op:<16} {r['count']:>9} {delta:>6} {r['avg_us']:>8.1f} "
+            f"{r['min_us']:>8.1f} {r['max_us']:>8.1f}  {spark:>{_SPARK_TABLE_WIDTH}}"
+        )
+        attr = (curses.A_REVERSE | curses.A_BOLD) if i == op_sel else 0
+        _safe_addstr(stdscr, y, 2, line, attr)
+        y += 1
+
+    # ── detail for the selected op ────────────────────────────────────────
+    sel = rows[op_sel]
+    y += 1
+    _safe_addstr(stdscr, y, 2, f"── {sel['op']} ──", accent)
+    y += 1
+    parts = [f"count: {sel['count']}"]
+    if sel["op"] in _HIT_MISS_OPS:
+        parts += [f"hit: {sel['hit']}", f"miss: {sel['miss']}"]
+    parts.append(f"bytes: {fmt_size(sel['bytes'])}")
+    _safe_addstr(stdscr, y, 2, "   ".join(parts))
+    y += 1
+    if sel["op"] in _HIT_MISS_OPS and sel["count"]:
+        pct = sel["hit"] / sel["count"]
+        bar = "█" * int(pct * 20) + "░" * (20 - int(pct * 20))
+        _safe_addstr(stdscr, y, 2, f"hit rate: {bar} {pct * 100:.1f}%")
+        y += 1
+    _safe_addstr(
+        stdscr,
+        y,
+        2,
+        f"latency (us): avg={sel['avg_us']:.1f}  min={sel['min_us']:.1f}  "
+        f"max={sel['max_us']:.1f}",
+    )
+    y += 1
+    if sel["count"] and sel["avg_us"] > 0 and sel["bytes"]:
+        total_s = sel["count"] * sel["avg_us"] / 1e6
+        if total_s > 0:
+            _safe_addstr(
+                stdscr, y, 2, f"throughput:   {sel['bytes'] / 1e6 / total_s:.1f} MB/s"
+            )
+            y += 1
+
+    # ── latency graph for the selected op ─────────────────────────────────
+    lat = l_hist.get(sel["op"], [])
+    if any(a > 0 for _, a, _ in lat) and y + _GRAPH_HEIGHT + 2 < max_y:
+        y += 1
+        _safe_addstr(stdscr, y, 2, "latency (us) over time:", dim)
+        y += 1
+        gw = min(_HISTORY_WIDTH, max_x - 14)
+        y += _draw_lat_graph(stdscr, y, 4, lat, gw)
+        _safe_addstr(
+            stdscr, y, 12, "▴=max ", curses.color_pair(_CP_CRIT) if colors else 0
+        )
+        _safe_addstr(
+            stdscr, y, 18, "•=avg ", curses.color_pair(_CP_OK) if colors else 0
+        )
+        _safe_addstr(
+            stdscr, y, 24, "▾=min", curses.color_pair(_CP_DIM) if colors else 0
+        )
+
+    _footer(len(op_names))
+    return len(op_names)
 
 
 def _init_colors() -> None:
@@ -815,25 +997,29 @@ def _tui_loop(stdscr, poller: _Poller, max_count: int) -> None:
     stdscr.timeout(100)  # UI never blocks longer than this on input
     _init_colors()
     sort_key = "name"
-    view = "main"  # "main" (overview) or "stats" (per-instance detail)
-    selected = 0
+    view = "main"  # "main" (overview) or "stats" (per-instance dashboard)
+    selected = 0  # instance index (overview)
+    op_sel = 0  # op index (stats view)
     poller.start()
     try:
         while True:
+            # `n` is the count for the CURRENT view: instances (main) or ops (stats).
             if view == "stats":
-                count = _draw_stats_view(stdscr, poller, sort_key, selected)
+                n = _draw_stats_view(stdscr, poller, sort_key, selected, op_sel)
+                if n <= 0:
+                    op_sel = 0
+                elif op_sel >= n:
+                    op_sel = n - 1
             else:
-                count = _draw_main(stdscr, poller, sort_key, selected)
-
-            # Clamp selection to the live instance count.
-            if count <= 0:
-                selected = 0
-            elif selected >= count:
-                selected = count - 1
+                n = _draw_main(stdscr, poller, sort_key, selected)
+                if n <= 0:
+                    selected = 0
+                elif selected >= n:
+                    selected = n - 1
 
             if max_count:
-                _, _, n = poller.snapshot()
-                if n >= max_count:
+                _, _, fetched_n = poller.snapshot()
+                if fetched_n >= max_count:
                     return
 
             key = stdscr.getch()
@@ -850,22 +1036,22 @@ def _tui_loop(stdscr, poller: _Poller, max_count: int) -> None:
                 if key == curses.KEY_UP:
                     selected = max(0, selected - 1)
                 elif key == curses.KEY_DOWN:
-                    selected = min(max(count - 1, 0), selected + 1)
+                    selected = min(max(n - 1, 0), selected + 1)
                 elif key in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
-                    if count > 0:
-                        view = "stats"
+                    if n > 0:
+                        view, op_sel = "stats", 0
                 elif key in (ord("s"), ord("S")):
                     i = _SORT_KEYS.index(sort_key)
                     sort_key = _SORT_KEYS[(i + 1) % len(_SORT_KEYS)]
                 elif key in (ord("i"), ord("I")):
                     _prompt_interval(stdscr, poller)
-            else:  # stats view
+            else:  # stats view — ↑↓ selects an operation
                 if key == curses.KEY_LEFT:
                     view = "main"
                 elif key == curses.KEY_UP:
-                    selected = max(0, selected - 1)
+                    op_sel = max(0, op_sel - 1)
                 elif key == curses.KEY_DOWN:
-                    selected = min(max(count - 1, 0), selected + 1)
+                    op_sel = min(max(n - 1, 0), op_sel + 1)
                 elif key in (ord("i"), ord("I")):
                     _prompt_interval(stdscr, poller)
     finally:
