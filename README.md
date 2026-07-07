@@ -195,7 +195,21 @@ For details on LMCache integration, see the [documentation](https://xcena-dev.gi
 
 ## Tools
 
-- **[pool_monitor](tools/)** — Real-time pool usage monitor (`top`-style TUI, CSV export)
+`marutop` — a single command (installed with the package) for monitoring and
+device admin. With no arguments it shows a unified `top`-style view combining
+physical DAX pools and per-instance usage; subcommands select a focused view or
+the device admin tool:
+
+```bash
+marutop                    # unified live view: DEVICES (pool) + INSTANCES
+marutop pool               # physical DAX pool gauges (CSV export with --csv)
+marutop usage              # per-instance allocated/used/slack
+marutop stats              # per-operation latency/throughput dashboard
+marutop device init /dev/dax0.0   # DAX device UUID header: init | show | clear
+```
+
+See [`tools/README.md`](tools/README.md) for full options. (The older
+`python -m tools.pool_monitor` invocations still work via thin shims.)
 
 ## License
 

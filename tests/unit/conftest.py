@@ -42,6 +42,10 @@ class MockShmClient:
     def free(self, handle):
         pass
 
+    def get_dax_path(self, region_id):
+        # Tests have a single mock pool; report a stable DEV_DAX path.
+        return "/dev/dax0.0"
+
     def mmap(self, handle, prot):
         obj = mmap.mmap(-1, handle.length)
         _mmap_objects.append(obj)

@@ -210,6 +210,27 @@ class AllocationManager:
                 acc[1] += info.handle.length
             return {iid: (acc[0], acc[1]) for iid, acc in out.items()}
 
+    def devices_by_instance(self) -> dict[str, dict[str, int]]:
+        """Per-owner allocation bytes broken down by DAX device.
+
+        Returns:
+            owner_instance_id -> {dax_path -> allocated_bytes}. The device for
+            each region is resolved via the shared-memory client's
+            ``get_dax_path`` (RM-backed, cached). Resolution happens outside the
+            lock since it may hit the network on a cache miss.
+        """
+        with self._lock:
+            snapshot = [
+                (rid, info.owner_instance_id, info.handle.length)
+                for rid, info in self._allocations.items()
+            ]
+        out: dict[str, dict[str, int]] = {}
+        for region_id, instance_id, length in snapshot:
+            dax_path = self._client.get_dax_path(region_id) or "(unknown)"
+            per_dev = out.setdefault(instance_id, {})
+            per_dev[dax_path] = per_dev.get(dax_path, 0) + length
+        return out
+
     def get_stats(self) -> dict:
         """Get allocation statistics."""
         with self._lock:

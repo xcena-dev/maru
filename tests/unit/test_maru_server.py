@@ -124,6 +124,23 @@ class TestGetUsage:
         assert by_id["instance2"]["allocated"] == 8192
         assert by_id["instance2"]["used"] == 1000
 
+    def test_get_usage_devices_breakdown(self):
+        """Each instance reports per-DAX-device allocated bytes summing to allocated."""
+        server = MaruServer()
+        server.request_alloc("instance1", 4096)
+        server.request_alloc("instance1", 4096)
+        server.request_alloc("instance2", 8192)
+
+        usage = server.get_usage()
+        by_id = {i["instance_id"]: i for i in usage["instances"]}
+
+        # MockShmClient maps every region to /dev/dax0.0.
+        assert by_id["instance1"]["devices"] == {"/dev/dax0.0": 8192}
+        assert by_id["instance2"]["devices"] == {"/dev/dax0.0": 8192}
+        # Per-device bytes sum to the instance's total allocation.
+        for inst in usage["instances"]:
+            assert sum(inst["devices"].values()) == inst["allocated"]
+
     def test_get_usage_instance_with_no_kv(self):
         """An instance that allocated but stored nothing reports used=0."""
         server = MaruServer()

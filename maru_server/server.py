@@ -305,12 +305,17 @@ class MaruServer:
             if owner is not None:
                 used_by_instance[owner] = used_by_instance.get(owner, 0) + used
 
+        # Per-instance device breakdown (region -> dax_path, resolved outside
+        # the server lock via the RM-backed cache inside the manager).
+        devices_by_instance = self._allocation_manager.devices_by_instance()
+
         instances = [
             {
                 "instance_id": instance_id,
                 "regions": regions,
                 "allocated": allocated,
                 "used": used_by_instance.get(instance_id, 0),
+                "devices": devices_by_instance.get(instance_id, {}),
             }
             for instance_id, (regions, allocated) in sorted(alloc.items())
         ]
