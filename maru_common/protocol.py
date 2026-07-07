@@ -446,6 +446,9 @@ class GetStatsResponse:
         default_factory=AllocationManagerStats
     )
     stats_manager: dict = field(default_factory=dict)
+    # Shared CXL device capacity {"total_size", "free_size"} summed across
+    # resource-manager pools; empty when the server omits it (older servers).
+    cxl_pool: dict = field(default_factory=dict)
 
 
 @dataclass

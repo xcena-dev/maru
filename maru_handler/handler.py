@@ -849,6 +849,7 @@ class MaruHandler:
                 "active_clients": stats.allocation_manager.active_clients,
             },
             "stats_manager": stats.stats_manager,
+            "cxl_pool": stats.cxl_pool,
         }
 
         if self._owned is not None:

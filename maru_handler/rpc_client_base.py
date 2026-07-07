@@ -335,6 +335,7 @@ class RpcClientBase(abc.ABC):
                 active_clients=alloc_data.get("active_clients", 0),
             ),
             stats_manager=response.get("stats_manager", {}),
+            cxl_pool=response.get("cxl_pool", {}),
         )
 
     def get_usage(self) -> GetUsageResponse:

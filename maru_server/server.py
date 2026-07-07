@@ -273,10 +273,15 @@ class MaruServer:
 
     def get_stats(self) -> dict:
         """Get server statistics."""
+        pool_total, pool_free = self._pool_totals()
         return {
             "kv_manager": self._kv_manager.get_stats(),
             "allocation_manager": self._allocation_manager.get_stats(),
             "stats_manager": self._stats_manager.get_stats(),
+            # Shared CXL device capacity from the resource manager (summed
+            # across pools). Clients use free_size to size eviction watermarks
+            # against the whole device instead of just their owned pool.
+            "cxl_pool": {"total_size": pool_total, "free_size": pool_free},
         }
 
     def get_usage(self) -> dict:
