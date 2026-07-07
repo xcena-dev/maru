@@ -223,6 +223,7 @@ def _make_stats_rpc():
             num_allocations=0, total_allocated=0, active_clients=0
         ),
         stats_manager={},
+        cxl_pool={},
     )
     return rpc
 
