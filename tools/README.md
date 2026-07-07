@@ -27,22 +27,25 @@ only shared figure is pool free):
 
 ## `marutop` (unified live view)
 
-The default screen fuses backends into one `htop`-style curses TUI — the analog
-of `pxltop`'s DEVICES + PROCESSES layout, with colored gauges (green < 60% <
-yellow < 85% < red) and interactive keys:
+The default screen is an `htop`-style curses TUI — the analog of `pxltop`'s
+DEVICES + PROCESSES layout, with colored gauges (green < 60% < yellow < 85% <
+red). It has two screens you switch between:
+
+**Overview** (default):
 
 - **DEVICES** — physical DAX pools from the Resource Manager (`:9850`).
 - **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge
   under each instance (which device its regions landed on, and how much of that
   device it holds). With no `-p`/`--host`, the local `maru-server` processes are
   **auto-discovered** (by scanning `/proc` for their `--port`) and all polled,
-  each shown under a `── server :PORT (pid N) ──` block — so multiple servers are
+  each under a `── server :PORT (pid N) ──` block — so multiple servers are
   covered without knowing their ports. Pass `-p`/`--host` to pin a single
   (possibly remote) server instead.
-- **STATS** — a compact per-op summary (count / avg latency / hit%) from the
-  same server(s), busiest op first. Populated only when clients run with
-  `MARU_STAT=1`; otherwise it shows a hint. The full latency-graph dashboard
-  stays at `marutop stats`.
+
+**STATS view** (select an instance + `enter`): a full-screen per-operation table
+for that instance — count / avg / min / max latency / hit% / bytes, busiest op
+first. Populated only when clients run with `MARU_STAT=1` (else a hint). `esc`/`←`
+returns to the overview. The separate sparkline dashboard stays at `marutop stats`.
 
 Backends are polled on a background thread, so the UI stays smooth and keys stay
 responsive even when a server is slow or unreachable (its block just shows
@@ -56,7 +59,8 @@ marutop --once             # single plain-text snapshot then exit (scriptable)
 marutop --host 10.0.0.1 -p 5556 --address 10.0.0.1:9850
 ```
 
-Keys: `s` cycle instance sort · `i` change interval · `q`/`Esc` quit.
+Keys — overview: `↑↓` select instance · `enter` open STATS · `s` sort · `i`
+interval · `q` quit.  STATS view: `↑↓` change instance · `esc`/`←` back · `q` quit.
 
 ## `marutop pool`
 

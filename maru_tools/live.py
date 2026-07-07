@@ -22,7 +22,8 @@ stay responsive even when a server is slow or unreachable.
     marutop -p 11011           # pin one server (e.g. a naru run) — disables discovery
     marutop --once             # single plain-text snapshot then exit (scriptable)
 
-Keys:  [s]ort instances   [i]nterval   [q]uit
+Keys (overview):  ↑↓ select instance · enter → per-instance STATS · s sort · i interval · q quit
+Keys (STATS view): ↑↓ instance · esc/← back · i interval · q quit
 """
 
 import argparse
@@ -123,16 +124,17 @@ def discover_servers(self_pid: int) -> list[tuple[str, int, int]]:
 # =============================================================================
 
 
-def _summarize_ops(stats_resp) -> list[dict]:
-    """Compact per-op rows from a GetStatsResponse, busiest first.
+def _summarize_ops(stats_manager: dict, client_key: str = "_all") -> list[dict]:
+    """Compact per-op rows for one client (or ``_all``), busiest first.
 
-    Uses the server-aggregated ``_all`` client. Only ops with activity are
-    returned. Stats are populated only when clients run with ``MARU_STAT=1``;
-    otherwise this is empty (the caller shows a hint).
+    ``stats_manager`` is the raw ``{"clients": {...}}`` dict from a
+    GetStatsResponse. ``client_key`` selects an instance_id (or ``_all`` for the
+    server aggregate). Only ops with activity are returned. Stats are populated
+    only when clients run with ``MARU_STAT=1`` (else empty; caller shows a hint).
     """
-    sm = getattr(stats_resp, "stats_manager", None) or {}
+    sm = stats_manager or {}
     clients = sm.get("clients", {}) if isinstance(sm, dict) else {}
-    ops = clients.get("_all", {}).get("operations", {})
+    ops = clients.get(client_key, {}).get("operations", {})
     rows = []
     for name, o in ops.items():
         count = o.get("count", 0)
@@ -143,6 +145,9 @@ def _summarize_ops(stats_resp) -> list[dict]:
                 "op": name,
                 "count": count,
                 "avg_us": o.get("avg_latency_us", 0.0),
+                "min_us": o.get("min_latency_us", 0.0),
+                "max_us": o.get("max_latency_us", 0.0),
+                "bytes": o.get("total_bytes", 0),
                 "hit": o.get("hit_count", 0),
                 "miss": o.get("miss_count", 0),
             }
@@ -259,7 +264,7 @@ class _Poller:
                     except Exception as e:  # noqa: BLE001
                         usage = (None, e)
                     try:
-                        stats = (_summarize_ops(cli.get_stats()), None)
+                        stats = (cli.get_stats().stats_manager, None)
                     except Exception as e:  # noqa: BLE001
                         stats = (None, e)
                     label = f"{host}:{port}" if self._fixed else f":{port}"
@@ -375,7 +380,8 @@ def _render_text(poller: _Poller, sort_key: str) -> str:
     for s in servers:
         if poller.auto or len(servers) > 1:
             out.append(f"  ── server {s['label']} ──")
-        rows, err = s["stats"]
+        sm, err = s["stats"]
+        rows = _summarize_ops(sm, "_all") if sm is not None else None
         out += _stats_lines(rows, err)
     return "\n".join(out + [""])
 
@@ -468,10 +474,16 @@ def _dax_short(path: str) -> str:
 
 
 def _draw_instance_rows(
-    stdscr, y: int, usage, sort_key: str, colors: bool, dev_totals: dict[str, int]
+    stdscr,
+    y: int,
+    usage,
+    sort_key: str,
+    colors: bool,
+    dev_totals: dict[str, int],
+    sel_id: str | None = None,
 ) -> int:
     hdr = (
-        f"  {'owner_instance_id':<38}  {'regions':>7}  "
+        f"    {'owner_instance_id':<38}  {'regions':>7}  "
         f"{'allocated':>9}  {'used':>9}  {'slack':>9}"
     )
     _safe_addstr(stdscr, y, 0, hdr, curses.A_BOLD)
@@ -482,18 +494,24 @@ def _draw_instance_rows(
         return y + 1
     for inst in instances:
         slack = inst.allocated - inst.used
+        selected = inst.instance_id == sel_id
         # Color a row when its reservation is nearly all live data (little
         # slack) — used/allocated is the meaningful ratio here.
         ratio = (inst.used / inst.allocated * 100) if inst.allocated else 0.0
-        cp = _color_for_ratio(ratio) if (colors and ratio >= 60.0) else 0
+        if selected:
+            attr = curses.A_REVERSE | curses.A_BOLD
+        else:
+            cp = _color_for_ratio(ratio) if (colors and ratio >= 60.0) else 0
+            attr = curses.color_pair(cp) if cp else 0
+        prefix = "  ▶ " if selected else "    "
         _safe_addstr(
             stdscr,
             y,
             0,
-            f"  {inst.instance_id:<38}  {inst.regions:>7}  "
+            f"{prefix}{inst.instance_id:<38}  {inst.regions:>7}  "
             f"{fmt_size(inst.allocated):>9}  {fmt_size(inst.used):>9}  "
             f"{fmt_size(slack):>9}",
-            curses.color_pair(cp) if cp else 0,
+            attr,
         )
         y += 1
         # Per-device gauge(s): how much of each DAX device this instance holds.
@@ -519,7 +537,7 @@ def _draw_instance_rows(
         stdscr,
         y,
         0,
-        f"  {'TOTAL':<38}  {len(instances):>7}  "
+        f"    {'TOTAL':<38}  {len(instances):>7}  "
         f"{fmt_size(total_alloc):>9}  {fmt_size(total_used):>9}  "
         f"{fmt_size(total_alloc - total_used):>9}",
         curses.A_BOLD,
@@ -531,8 +549,24 @@ def _dim(colors: bool) -> int:
     return curses.color_pair(_CP_DIM) if colors else 0
 
 
-def _draw_screen(stdscr, poller: _Poller, sort_key: str) -> None:
+def _flatten_instances(servers, sort_key: str) -> list[tuple[dict, object]]:
+    """Flat, ordered [(server, instance)] across all servers with usage data.
+
+    Matches the on-screen draw order so a selection index lines up with rows.
+    """
+    flat: list[tuple[dict, object]] = []
+    for s in servers:
+        resp, err = s["usage"]
+        if err is None and resp is not None:
+            for inst in _sort_instances(resp.instances, sort_key):
+                flat.append((s, inst))
+    return flat
+
+
+def _draw_main(stdscr, poller: _Poller, sort_key: str, selected: int) -> int:
+    """Overview screen: DEVICES + INSTANCES (selectable). Returns instance count."""
     stdscr.erase()
+    max_y, _ = stdscr.getmaxyx()
     colors = curses.has_colors()
     header_attr = (
         (curses.color_pair(_CP_HEADER) | curses.A_BOLD) if colors else curses.A_BOLD
@@ -543,6 +577,8 @@ def _draw_screen(stdscr, poller: _Poller, sort_key: str) -> None:
     fetched = count > 0
     # Device capacities (for per-instance device gauges), keyed by dax_path.
     dev_totals = {p.dax_path: p.total_size for p in pools} if pools else {}
+    flat = _flatten_instances(servers, sort_key)
+    sel_id = flat[selected][1].instance_id if 0 <= selected < len(flat) else None
 
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     _safe_addstr(stdscr, 0, 0, "  marutop", header_attr)
@@ -610,7 +646,9 @@ def _draw_screen(stdscr, poller: _Poller, sort_key: str) -> None:
                 _safe_addstr(stdscr, y, 2, f"(unavailable: {err})", dim)
                 y += 1
             else:
-                y = _draw_instance_rows(stdscr, y, resp, sort_key, colors, dev_totals)
+                y = _draw_instance_rows(
+                    stdscr, y, resp, sort_key, colors, dev_totals, sel_id
+                )
         # Shared-pool footer (all servers share one RM) — from first that answered.
         for s in servers:
             resp, err = s["usage"]
@@ -631,57 +669,109 @@ def _draw_screen(stdscr, poller: _Poller, sort_key: str) -> None:
                 y += 1
                 break
 
-    # ── STATS (compact per-op summary; needs MARU_STAT=1 on clients) ───────────
-    if fetched and servers:
-        y += 1
-        _safe_addstr(stdscr, y, 0, "  STATS", header_attr)
-        _safe_addstr(stdscr, y, 8, "(ops; needs MARU_STAT=1 on clients)", dim)
-        y += 1
-        multi = poller.auto or len(servers) > 1
-        for s in servers:
-            if multi:
-                _safe_addstr(stdscr, y, 2, f"── server {s['label']} ──", dim)
-                y += 1
-            rows, err = s["stats"]
-            y = _draw_stats_rows(stdscr, y, rows, err, colors)
-
     # ── footer key hints (pinned to last row, htop-style) ──────────────────────
-    max_y, _ = stdscr.getmaxyx()
-    footer = f"sort: {sort_key}   [s]ort  [i]nterval  [q]uit"
+    if flat:
+        footer = "↑↓:select  enter:stats  s:sort  i:interval  q:quit"
+    else:
+        footer = "s:sort  i:interval  q:quit"
     _safe_addstr(stdscr, max_y - 1, 0, "  " + footer, dim)
     stdscr.refresh()
+    return len(flat)
 
 
-def _draw_stats_rows(stdscr, y: int, rows, err, colors: bool) -> int:
+def _draw_stats_view(stdscr, poller: _Poller, sort_key: str, selected: int) -> int:
+    """Full-screen per-operation stats for the selected instance. Returns count."""
+    stdscr.erase()
+    max_y, _ = stdscr.getmaxyx()
+    colors = curses.has_colors()
+    header_attr = (
+        (curses.color_pair(_CP_HEADER) | curses.A_BOLD) if colors else curses.A_BOLD
+    )
     dim = _dim(colors)
-    if err is not None:
-        _safe_addstr(stdscr, y, 2, f"(unavailable: {err})", dim)
-        return y + 1
-    if not rows:
-        _safe_addstr(
-            stdscr, y, 2, "(no op stats — enable MARU_STAT=1 on the vLLM clients)", dim
-        )
-        return y + 1
+    (_pool, servers, _count) = poller.snapshot()
+    flat = _flatten_instances(servers, sort_key)
+
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    _safe_addstr(stdscr, 0, 0, "  marutop · STATS", header_attr)
+    _safe_addstr(stdscr, 0, 20, f"{ts}   interval {poller.interval:.1f}s")
+
+    if not flat:
+        _safe_addstr(stdscr, 2, 2, "(no instances)", dim)
+        _safe_addstr(stdscr, max_y - 1, 0, "  esc/←:back  q:quit", dim)
+        stdscr.refresh()
+        return 0
+    if selected >= len(flat):
+        selected = len(flat) - 1
+
+    s, inst = flat[selected]
+    slack = inst.allocated - inst.used
     _safe_addstr(
         stdscr,
-        y,
-        0,
-        f"  {'op':<16}  {'count':>10}  {'avg_us':>9}  {'hit%':>6}",
-        curses.A_BOLD,
+        2,
+        2,
+        f"instance {inst.instance_id}   @ server {s['label']}",
+        header_attr,
     )
-    y += 1
-    for r in rows:
-        hitpct = ""
-        if r["op"] in _HIT_MISS_OPS and r["count"]:
-            hitpct = f"{r['hit'] / r['count'] * 100:.1f}"
-        _safe_addstr(
-            stdscr,
-            y,
-            0,
-            f"  {r['op']:<16}  {r['count']:>10}  {r['avg_us']:>9.1f}  {hitpct:>6}",
-        )
-        y += 1
-    return y
+    _safe_addstr(
+        stdscr,
+        3,
+        2,
+        f"regions {inst.regions}   allocated {fmt_size(inst.allocated)}   "
+        f"used {fmt_size(inst.used)}   slack {fmt_size(slack)}   "
+        f"devices {', '.join(_dax_short(d) for d in sorted(inst.devices))}",
+        dim,
+    )
+
+    y = 5
+    sm, err = s["stats"]
+    if err is not None:
+        _safe_addstr(stdscr, y, 2, f"(stats unavailable: {err})", dim)
+    else:
+        rows = _summarize_ops(sm, inst.instance_id) if sm is not None else []
+        if not rows:
+            _safe_addstr(
+                stdscr,
+                y,
+                2,
+                "(no op stats for this instance — enable MARU_STAT=1 on the client)",
+                dim,
+            )
+        else:
+            _safe_addstr(
+                stdscr,
+                y,
+                2,
+                f"{'op':<16}  {'count':>10}  {'avg_us':>9}  {'min_us':>9}  "
+                f"{'max_us':>9}  {'hit%':>6}  {'bytes':>9}",
+                curses.A_BOLD,
+            )
+            y += 1
+            for r in rows:
+                if y >= max_y - 1:
+                    _safe_addstr(stdscr, y, 2, "(resize terminal for more)", dim)
+                    break
+                hitpct = ""
+                if r["op"] in _HIT_MISS_OPS and r["count"]:
+                    hitpct = f"{r['hit'] / r['count'] * 100:.1f}"
+                _safe_addstr(
+                    stdscr,
+                    y,
+                    2,
+                    f"{r['op']:<16}  {r['count']:>10}  {r['avg_us']:>9.1f}  "
+                    f"{r['min_us']:>9.1f}  {r['max_us']:>9.1f}  {hitpct:>6}  "
+                    f"{fmt_size(r['bytes']):>9}",
+                )
+                y += 1
+
+    _safe_addstr(
+        stdscr,
+        max_y - 1,
+        0,
+        f"  esc/←:back  ↑↓:instance ({selected + 1}/{len(flat)})  i:interval  q:quit",
+        dim,
+    )
+    stdscr.refresh()
+    return len(flat)
 
 
 def _init_colors() -> None:
@@ -725,24 +815,59 @@ def _tui_loop(stdscr, poller: _Poller, max_count: int) -> None:
     stdscr.timeout(100)  # UI never blocks longer than this on input
     _init_colors()
     sort_key = "name"
+    view = "main"  # "main" (overview) or "stats" (per-instance detail)
+    selected = 0
     poller.start()
     try:
         while True:
-            _draw_screen(stdscr, poller, sort_key)
+            if view == "stats":
+                count = _draw_stats_view(stdscr, poller, sort_key, selected)
+            else:
+                count = _draw_main(stdscr, poller, sort_key, selected)
+
+            # Clamp selection to the live instance count.
+            if count <= 0:
+                selected = 0
+            elif selected >= count:
+                selected = count - 1
 
             if max_count:
-                _, _, count = poller.snapshot()
-                if count >= max_count:
+                _, _, n = poller.snapshot()
+                if n >= max_count:
                     return
 
             key = stdscr.getch()
-            if key in (ord("q"), ord("Q"), 27, 3):  # q/Q/ESC/Ctrl-C
+            if key in (ord("q"), ord("Q"), 3):  # q / Ctrl-C
                 return
-            if key in (ord("s"), ord("S")):
-                i = _SORT_KEYS.index(sort_key)
-                sort_key = _SORT_KEYS[(i + 1) % len(_SORT_KEYS)]
-            elif key in (ord("i"), ord("I")):
-                _prompt_interval(stdscr, poller)
+            if key == 27:  # ESC: leave stats view, or quit from main
+                if view == "stats":
+                    view = "main"
+                else:
+                    return
+                continue
+
+            if view == "main":
+                if key == curses.KEY_UP:
+                    selected = max(0, selected - 1)
+                elif key == curses.KEY_DOWN:
+                    selected = min(max(count - 1, 0), selected + 1)
+                elif key in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
+                    if count > 0:
+                        view = "stats"
+                elif key in (ord("s"), ord("S")):
+                    i = _SORT_KEYS.index(sort_key)
+                    sort_key = _SORT_KEYS[(i + 1) % len(_SORT_KEYS)]
+                elif key in (ord("i"), ord("I")):
+                    _prompt_interval(stdscr, poller)
+            else:  # stats view
+                if key == curses.KEY_LEFT:
+                    view = "main"
+                elif key == curses.KEY_UP:
+                    selected = max(0, selected - 1)
+                elif key == curses.KEY_DOWN:
+                    selected = min(max(count - 1, 0), selected + 1)
+                elif key in (ord("i"), ord("I")):
+                    _prompt_interval(stdscr, poller)
     finally:
         poller.stop()
 
