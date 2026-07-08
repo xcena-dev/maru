@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """``marutop`` command entry point.
 
 A single umbrella over the maru monitoring/admin views. With no subcommand it

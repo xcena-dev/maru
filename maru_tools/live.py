@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Unified live view — the default ``marutop`` screen.
 
 Fuses backends into one ``htop``-style curses TUI, the analog of XCENA's
@@ -359,6 +361,18 @@ class _Poller:
                         sm, serr = r["stats"]
                         if serr is None and sm is not None:
                             self._update_history(r["label"], sm, flush_spark)
+                    # Drop history for servers that disappeared (keys are
+                    # (label, client_id)); otherwise auto-discovery churn grows
+                    # the key set unbounded over a long run.
+                    live_labels = {r["label"] for r in results}
+                    for hist in (
+                        self._h_count,
+                        self._h_lat,
+                        self._h_spark,
+                        self._h_accum,
+                    ):
+                        for k in [k for k in hist if k[0] not in live_labels]:
+                            del hist[k]
 
                 waited = 0.0
                 while waited < self.interval and not self._stop.is_set():

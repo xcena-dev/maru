@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Shared formatting helpers for the marutop views.
 
 These were previously duplicated verbatim across ``pool_monitor.py`` and

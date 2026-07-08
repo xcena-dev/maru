@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """DAX device UUID header management (Resource Manager device layer).
 
 The Resource Manager identifies a DEV_DAX device by a UUID written into a small

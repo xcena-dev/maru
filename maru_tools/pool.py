@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Physical DAX pool usage view (Resource Manager, default :9850).
 
 marutop pool              # one-shot snapshot

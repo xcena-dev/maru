@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Maru monitoring and admin tooling.
 
 A single ``marutop`` command umbrella (see :mod:`maru_tools.cli`) that fuses the

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Per-instance CXL usage view (MaruServer, default :5555).
 
 Shows, per client instance (owner_instance_id), how much CXL memory it

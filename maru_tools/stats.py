@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
 """Maru server operation stats dashboard (MaruServer, default :5555).
 
 Connects to MaruServer via RPC and displays real-time operation metrics
