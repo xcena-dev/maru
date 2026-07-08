@@ -278,9 +278,11 @@ class MaruServer:
             "kv_manager": self._kv_manager.get_stats(),
             "allocation_manager": self._allocation_manager.get_stats(),
             "stats_manager": self._stats_manager.get_stats(),
-            # Shared CXL device capacity from the resource manager (summed
-            # across pools). Clients use free_size to size eviction watermarks
-            # against the whole device instead of just their owned pool.
+            # Shared CXL device capacity from the resource manager, summed
+            # across the pools this server may allocate from (--dax-path
+            # scope; all pools when unrestricted). Clients use free_size to
+            # size eviction watermarks against device fill instead of just
+            # their owned pool.
             "cxl_pool": {"total_size": pool_total, "free_size": pool_free},
         }
 
@@ -328,12 +330,23 @@ class MaruServer:
         }
 
     def _pool_totals(self) -> tuple[int, int]:
-        """Return (total_bytes, free_bytes) summed across resource manager pools."""
+        """Return (total_bytes, free_bytes) summed across resource manager pools.
+
+        When the server is restricted to specific devices via ``--dax-path``,
+        only those pools are counted: ``request_alloc`` can only claim regions
+        from the configured pools, so an unrestricted sum would overstate the
+        capacity this server can actually use. Clients size eviction
+        watermarks on ``free_size`` — counting a foreign device's free space
+        defers eviction until allocation fails instead of triggering it.
+        """
         try:
             pools = self._allocation_manager.pool_stats()
         except Exception:
             logger.warning("pool_stats failed during get_usage", exc_info=True)
             return (0, 0)
+        if self._dax_paths:
+            allowed = set(self._dax_paths)
+            pools = [p for p in pools if p.dax_path in allowed]
         return (
             sum(p.total_size for p in pools),
             sum(p.free_size for p in pools),

@@ -191,6 +191,53 @@ class TestGetUsage:
         assert usage["pool_total"] == 300
         assert usage["pool_free"] == 210
 
+    def test_pool_totals_scoped_to_configured_dax_paths(self, monkeypatch):
+        """--dax-path servers count only their own pools in the totals.
+
+        request_alloc can only claim regions from the configured pools, so a
+        foreign device (e.g. a large /dev/dax0.0 used by another deployment)
+        must not inflate pool_free / cxl_pool.free_size — clients size
+        eviction watermarks on it, and counting unusable free space defers
+        eviction until allocation fails.
+        """
+        from maru_shm.types import DaxType, MaruPoolInfo
+
+        server = MaruServer(dax_paths=["/dev/dax1.0", "/dev/dax2.0"])
+        monkeypatch.setattr(
+            server._allocation_manager,
+            "pool_stats",
+            lambda: [
+                MaruPoolInfo(
+                    dax_path="/dev/dax0.0",
+                    dax_type=DaxType.DEV_DAX,
+                    total_size=1000,
+                    free_size=900,
+                    align_bytes=2 << 20,
+                ),
+                MaruPoolInfo(
+                    dax_path="/dev/dax1.0",
+                    dax_type=DaxType.DEV_DAX,
+                    total_size=100,
+                    free_size=60,
+                    align_bytes=2 << 20,
+                ),
+                MaruPoolInfo(
+                    dax_path="/dev/dax2.0",
+                    dax_type=DaxType.DEV_DAX,
+                    total_size=200,
+                    free_size=150,
+                    align_bytes=2 << 20,
+                ),
+            ],
+        )
+
+        usage = server.get_usage()
+        assert usage["pool_total"] == 300
+        assert usage["pool_free"] == 210
+
+        stats = server.get_stats()
+        assert stats["cxl_pool"] == {"total_size": 300, "free_size": 210}
+
     def test_get_usage_pool_stats_failure_is_tolerated(self, monkeypatch):
         """If the RM pool query fails, pool totals fall back to 0."""
         server = MaruServer()
