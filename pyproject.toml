@@ -42,6 +42,7 @@ docs = [
 [project.scripts]
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
+marutop = "maru_tools.cli:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"
@@ -50,7 +51,7 @@ Documentation = "https://xcena-dev.github.io/maru/"
 Organization = "https://xcena.com"
 
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*", "maru_tools*"]
 
 [tool.ruff]
 line-length = 88

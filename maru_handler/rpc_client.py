@@ -3,6 +3,7 @@
 """RPC Client for connecting to MaruServer."""
 
 import logging
+import threading
 from typing import Any
 
 import zmq
@@ -39,68 +40,84 @@ class RpcClient(RpcClientBase):
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
         self._serializer = Serializer()
+        # Serializes socket use: ZMQ sockets are not thread-safe and REQ
+        # additionally enforces strict send->recv alternation, so concurrent
+        # callers (e.g. an eviction loop and a metrics scrape both issuing
+        # get_stats) would otherwise corrupt the socket state.
+        self._lock = threading.Lock()
 
     def connect(self) -> None:
         """Connect to the server."""
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.REQ)
-        self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-        self._socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-        self._socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
-        self._socket.connect(self._server_url)
+        with self._lock:
+            self._context = zmq.Context()
+            self._socket = self._context.socket(zmq.REQ)
+            self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+            self._socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+            self._socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
+            self._socket.connect(self._server_url)
         logger.info("Connected to MaruServer at %s", self._server_url)
 
     def close(self) -> None:
         """Close the connection."""
-        if self._socket:
-            self._socket.close()
-        if self._context:
-            self._context.term()
+        with self._lock:
+            if self._socket:
+                self._socket.close()
+            if self._context:
+                self._context.term()
         logger.info("Disconnected from MaruServer")
 
     def _send_request(
         self, msg_type: MessageType, data: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a request and wait for response using poll-based timeout."""
-        if self._socket is None:
-            raise RuntimeError("Client not connected. Call connect() first.")
+        """Send a request and wait for response using poll-based timeout.
 
-        try:
-            # Encode and send binary message
-            encoded = self._serializer.encode(msg_type, data)
-            self._socket.send(encoded)
+        Thread-safe: the whole send->poll->recv exchange (including any
+        socket reset) runs under ``self._lock``; concurrent callers queue.
+        """
+        with self._lock:
+            if self._socket is None:
+                raise RuntimeError("Client not connected. Call connect() first.")
 
-            # Poll for response instead of relying on RCVTIMEO exception
-            poller = zmq.Poller()
-            poller.register(self._socket, zmq.POLLIN)
-            events = dict(poller.poll(self._timeout_ms))
+            try:
+                # Encode and send binary message
+                encoded = self._serializer.encode(msg_type, data)
+                self._socket.send(encoded)
 
-            if self._socket not in events:
-                # Timeout: no response within deadline
-                logger.error(
-                    "Timeout waiting for response from server (msg_type=%s)",
-                    msg_type,
-                )
+                # Poll for response instead of relying on RCVTIMEO exception
+                poller = zmq.Poller()
+                poller.register(self._socket, zmq.POLLIN)
+                events = dict(poller.poll(self._timeout_ms))
+
+                if self._socket not in events:
+                    # Timeout: no response within deadline
+                    logger.error(
+                        "Timeout waiting for response from server (msg_type=%s)",
+                        msg_type,
+                    )
+                    try:
+                        self._reset_socket()
+                    except Exception:
+                        logger.warning("Failed to reset socket after timeout")
+                    return {"error": "timeout", "success": False}
+
+                # Data is ready — recv won't block
+                response_data = self._socket.recv(zmq.NOBLOCK)
+                _, payload = self._serializer.decode(response_data)
+                return payload
+            except zmq.ZMQError:
+                logger.error("ZMQ error (msg_type=%s)", msg_type, exc_info=True)
                 try:
                     self._reset_socket()
                 except Exception:
-                    logger.warning("Failed to reset socket after timeout")
+                    logger.warning("Failed to reset socket after error")
                 return {"error": "timeout", "success": False}
 
-            # Data is ready — recv won't block
-            response_data = self._socket.recv(zmq.NOBLOCK)
-            _, payload = self._serializer.decode(response_data)
-            return payload
-        except zmq.ZMQError:
-            logger.error("ZMQ error (msg_type=%s)", msg_type, exc_info=True)
-            try:
-                self._reset_socket()
-            except Exception:
-                logger.warning("Failed to reset socket after error")
-            return {"error": "timeout", "success": False}
-
     def _reset_socket(self) -> None:
-        """Reset socket after timeout (REQ socket needs reset after timeout)."""
+        """Reset socket after timeout (REQ socket needs reset after timeout).
+
+        Called from ``_send_request`` with ``self._lock`` already held; must
+        not re-acquire the lock.
+        """
         if self._socket:
             self._socket.close()
         self._socket = self._context.socket(zmq.REQ)

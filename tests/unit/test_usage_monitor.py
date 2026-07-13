@@ -2,13 +2,12 @@
 # Copyright 2026 XCENA Inc.
 """Tests for the GET_USAGE client parser and the usage_monitor tool."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 from maru_common import GetUsageResponse, InstanceUsage, MessageType
 from maru_handler.rpc_client_base import RpcClientBase
+from maru_tools import usage as usage_monitor
+from maru_tools._common import fmt_size
 
 
 class _FakeClient(RpcClientBase):
@@ -64,13 +63,6 @@ class TestGetUsageClientParse:
             client.get_usage()
 
 
-# tools/ is not an installed package — load the tool module by file path.
-_TOOL_PATH = Path(__file__).resolve().parents[2] / "tools" / "usage_monitor.py"
-_spec = importlib.util.spec_from_file_location("usage_monitor", _TOOL_PATH)
-usage_monitor = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(usage_monitor)
-
-
 def _sample_usage() -> GetUsageResponse:
     return GetUsageResponse(
         instances=[
@@ -93,19 +85,19 @@ def _sample_usage() -> GetUsageResponse:
 
 
 class TestUsageMonitorRendering:
-    """usage_monitor.py formatting helpers."""
+    """marutop usage view formatting helpers."""
 
     def test_fmt_size(self):
-        assert usage_monitor._fmt_size(0) == "0B"
-        assert usage_monitor._fmt_size(1024) == "1.0K"
-        assert usage_monitor._fmt_size(1024**3) == "1.0G"
-        assert usage_monitor._fmt_size(1024**4) == "1.0T"
+        assert fmt_size(0) == "0B"
+        assert fmt_size(1024) == "1.0K"
+        assert fmt_size(1024**3) == "1.0G"
+        assert fmt_size(1024**4) == "1.0T"
 
     def test_fmt_size_negative(self):
         # Negative slack (broken upstream invariant) renders with a sign and
         # correct magnitude unit, not a bogus fractional-K value.
-        assert usage_monitor._fmt_size(-(1024**3)) == "-1.0G"
-        assert usage_monitor._fmt_size(-1024) == "-1.0K"
+        assert fmt_size(-(1024**3)) == "-1.0G"
+        assert fmt_size(-1024) == "-1.0K"
 
     def test_render_table_contains_rows(self):
         out = usage_monitor.render_table(_sample_usage(), "2026-06-15T00:00:00")

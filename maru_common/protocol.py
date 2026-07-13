@@ -465,12 +465,15 @@ class InstanceUsage:
     ``allocated`` is the sum of region sizes the instance reserved;
     ``used`` is the sum of live KV bytes stored in those regions.
     Slack (allocated - used) is derived by the consumer.
+    ``devices`` maps each DAX device path the instance holds regions on to the
+    bytes it reserved there (sums to ``allocated``); empty from older servers.
     """
 
     instance_id: str
     regions: int = 0
     allocated: int = 0
     used: int = 0
+    devices: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

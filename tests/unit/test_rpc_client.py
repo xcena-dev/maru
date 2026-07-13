@@ -2,6 +2,8 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for RpcClient to achieve 100% coverage."""
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -684,3 +686,58 @@ class TestRpcClientApiMethods:
         result = client.heartbeat()
 
         assert result is False
+
+
+class TestRpcClientThreadSafety:
+    """_send_request serializes concurrent callers on the shared REQ socket.
+
+    ZMQ sockets are not thread-safe and REQ enforces strict send->recv
+    alternation, so overlapping exchanges (e.g. an eviction loop and a
+    metrics scrape both issuing get_stats) must queue instead of interleave.
+    """
+
+    def test_concurrent_send_requests_are_serialized(self):
+        """No two send->recv exchanges overlap on the socket."""
+        client = RpcClient(server_url="tcp://127.0.0.1:9999", timeout_ms=1000)
+        client._socket = MagicMock()
+        client._context = MagicMock()
+        client._serializer = MagicMock()
+        client._serializer.encode.return_value = b"encoded"
+        client._serializer.decode.return_value = (MessageType.HEARTBEAT, {"ok": True})
+
+        in_flight = 0
+        max_in_flight = 0
+        counter_lock = threading.Lock()
+
+        def _send(_encoded):
+            nonlocal in_flight, max_in_flight
+            with counter_lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            time.sleep(0.01)  # widen the overlap window
+            with counter_lock:
+                in_flight -= 1
+
+        client._socket.send.side_effect = _send
+
+        with patch("zmq.Poller") as mock_poller:
+            poller_inst = MagicMock()
+            mock_poller.return_value = poller_inst
+            poller_inst.poll.return_value = [(client._socket, zmq.POLLIN)]
+
+            errors: list[Exception] = []
+
+            def _call():
+                try:
+                    client._send_request(MessageType.HEARTBEAT, {})
+                except Exception as e:  # pragma: no cover - failure reporting
+                    errors.append(e)
+
+            threads = [threading.Thread(target=_call) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert not errors
+        assert max_in_flight == 1, "send->recv exchanges overlapped on the socket"

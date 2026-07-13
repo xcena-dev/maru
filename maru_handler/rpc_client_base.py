@@ -360,6 +360,7 @@ class RpcClientBase(abc.ABC):
                 regions=i.get("regions", 0),
                 allocated=i.get("allocated", 0),
                 used=i.get("used", 0),
+                devices=i.get("devices", {}),
             )
             for i in response.get("instances", [])
         ]

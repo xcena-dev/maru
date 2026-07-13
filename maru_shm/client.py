@@ -355,12 +355,14 @@ class MaruShmClient:
         logger.debug("munmap(region_id=%d)", handle.region_id)
 
     def get_dax_path(self, region_id: int) -> str | None:
-        """Return the cached DAX device path for a region, or None.
+        """Return the DAX device path backing ``region_id``, or ``None``.
 
-        The path is populated on alloc/mmap; a plain dict.get is atomic in
-        CPython so no lock is taken on this read-only hot-path accessor.
+        Served from the local cache populated by ``alloc()`` / ``mmap()`` — every
+        region this client allocated is present. A cache miss returns ``None``;
+        callers treat that as an unresolved device, not an error.
         """
-        return self._path_cache.get(region_id)
+        with self._lock:
+            return self._path_cache.get(region_id)
 
     def _close_region_locked(self, region_id: int) -> None:
         """Close mmap and path cache for a region (must hold self._lock)."""

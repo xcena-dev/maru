@@ -210,6 +210,37 @@ class AllocationManager:
                 acc[1] += info.handle.length
             return {iid: (acc[0], acc[1]) for iid, acc in out.items()}
 
+    def devices_by_instance(self) -> dict[str, dict[str, int]]:
+        """Per-owner allocation bytes broken down by DAX device.
+
+        Returns:
+            owner_instance_id -> {dax_path -> allocated_bytes}. The device for
+            each region is resolved via the shared-memory client's
+            ``get_dax_path`` (served from the cache populated at ``alloc()`` —
+            every region here was allocated by this client, so it is present).
+            Resolution is done outside the lock and is best-effort: any failure
+            or missing path falls back to ``"(unknown)"`` so GET_USAGE never
+            fails on device breakdown alone.
+        """
+        with self._lock:
+            snapshot = [
+                (rid, info.owner_instance_id, info.handle.length)
+                for rid, info in self._allocations.items()
+            ]
+        resolve = getattr(self._client, "get_dax_path", None)
+        out: dict[str, dict[str, int]] = {}
+        for region_id, instance_id, length in snapshot:
+            dax_path = None
+            if resolve is not None:
+                try:
+                    dax_path = resolve(region_id)
+                except Exception:  # noqa: BLE001 - never fail usage on this
+                    dax_path = None
+            per_dev = out.setdefault(instance_id, {})
+            key = dax_path or "(unknown)"
+            per_dev[key] = per_dev.get(key, 0) + length
+        return out
+
     def get_stats(self) -> dict:
         """Get allocation statistics."""
         with self._lock:
