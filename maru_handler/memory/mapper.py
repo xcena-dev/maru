@@ -24,6 +24,34 @@ _MADV_POPULATE_WRITE = getattr(mmap_module, "MADV_POPULATE_WRITE", 23)
 _PREFAULT_ENABLED = os.environ.get("MARU_PREFAULT", "1") != "0"
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
+# CUDA pinning strategy.
+#
+# A single cudaHostRegister call fails with cudaErrorMemoryAllocation for
+# ranges >= 2^39 bytes (512 GiB) — the NVIDIA kernel driver cannot build a
+# page table for one mapping that large ("NVRM: failed to allocate page
+# table").  The limit is per call, not cumulative, so large regions are
+# registered in chunks.
+#
+#   MARU_PIN_MODE:     "eager" (default) — register all chunks synchronously
+#                      inside map_region(); the region is fully pinned when
+#                      map_region() returns.
+#                      "lazy" — return immediately and register chunks in a
+#                      background thread (LMCache LazyMemoryAllocator style).
+#                      Chunks not yet pinned degrade GPU DMA to pageable
+#                      copies but remain fully usable.
+#   MARU_PIN_CHUNK_GB: chunk size in GiB (default 128, clamped to 256 so a
+#                      chunk can never reach the 512 GiB wall; 0 = single
+#                      call, i.e. the pre-chunking behavior).
+_PIN_MODE = os.environ.get("MARU_PIN_MODE", "eager")
+if _PIN_MODE not in ("eager", "lazy"):
+    _PIN_MODE = "eager"
+try:
+    _PIN_CHUNK_BYTES = int(os.environ.get("MARU_PIN_CHUNK_GB", "128")) << 30
+except ValueError:
+    _PIN_CHUNK_BYTES = 128 << 30
+if _PIN_CHUNK_BYTES > 256 << 30:
+    _PIN_CHUNK_BYTES = 256 << 30
+
 
 def _clear_cuda_sticky_error() -> None:
     """Consume CUDA's per-thread sticky error after a failed cudaHostRegister.
@@ -47,6 +75,67 @@ def _clear_cuda_sticky_error() -> None:
             lib.cudaGetLastError()
     except (OSError, IndexError, AttributeError):
         logger.debug("could not clear CUDA sticky error", exc_info=True)
+
+
+def _cuda_pin_chunks(
+    cudart,
+    base_addr: int,
+    length: int,
+    region_id: int,
+    records: list[tuple[int, int]],
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Register [base_addr, base_addr+length) with CUDA in chunks.
+
+    Appends an (addr, size) record to ``records`` for every successfully
+    registered chunk (records are what cudaHostUnregister must be called
+    with later).  A failed chunk is logged and its sticky CUDA error
+    cleared; pinning continues so the remaining chunks still get DMA.
+    """
+    chunk = _PIN_CHUNK_BYTES if _PIN_CHUNK_BYTES > 0 else length
+    off = 0
+    while off < length:
+        if stop_event is not None and stop_event.is_set():
+            return
+        n = min(chunk, length - off)
+        rc = cudart.cudaHostRegister(base_addr + off, n, 0)
+        rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
+        if rc == 0:
+            records.append((base_addr + off, n))
+        else:
+            _clear_cuda_sticky_error()
+            logger.warning(
+                "cudaHostRegister failed for region %d chunk [+%d, +%d): "
+                "rc=%d; chunk stays unpinned (GPU DMA degraded)",
+                region_id,
+                off,
+                off + n,
+                rc,
+            )
+        off += n
+
+
+def _cuda_unpin_records(
+    cudart, records: list[tuple[int, int]], region_id: int
+) -> None:
+    """Unregister every previously pinned chunk of a region."""
+    for addr, _size in records:
+        try:
+            rc = cudart.cudaHostUnregister(addr)
+            rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
+            if rc != 0:
+                _clear_cuda_sticky_error()
+                logger.warning(
+                    "cudaHostUnregister failed for region %d addr=%#x: rc=%d",
+                    region_id,
+                    addr,
+                    rc,
+                )
+        except (RuntimeError, OSError) as e:
+            logger.warning(
+                "cudaHostUnregister failed for region %d: %s", region_id, e
+            )
+    records.clear()
 
 
 class DaxMapper:
@@ -127,6 +216,15 @@ class DaxMapper:
             )
             self._regions[region_id] = region
 
+            # Base address for CUDA pinning — resolved while the lock still
+            # guarantees the buffer view is alive (a concurrent unmap after
+            # publication would otherwise race the from_buffer export).
+            pin_addr = (
+                ctypes.addressof(ctypes.c_char.from_buffer(region._buffer_view))
+                if region._buffer_view is not None
+                else None
+            )
+
             logger.debug(
                 "Mapped region %d: length=%d",
                 region_id,
@@ -140,43 +238,55 @@ class DaxMapper:
             prefault_ms = (time.monotonic() - t0) * 1000
 
         # Outside lock: CUDA pin is idempotent
-        if region._buffer_view is not None:
+        if pin_addr is not None:
             try:
                 import torch
 
                 if torch.cuda.is_available():
-                    addr = ctypes.addressof(
-                        ctypes.c_char.from_buffer(region._buffer_view)
-                    )
-                    t0 = time.monotonic()
-                    rc = torch.cuda.cudart().cudaHostRegister(
-                        addr, handle.length, 0
-                    )
-                    cuda_pin_ms = (time.monotonic() - t0) * 1000
-                    rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
-                    if rc == 0:
-                        region._cuda_pinned = True
+                    cudart = torch.cuda.cudart()
+                    if _PIN_MODE == "lazy":
+                        thread = threading.Thread(
+                            target=self._pin_worker,
+                            args=(cudart, region, pin_addr, handle.length),
+                            daemon=True,
+                            name=f"maru-pin-{region_id}",
+                        )
+                        thread.start()
+                        # Published only after a successful start() so unmap
+                        # never joins a never-started thread.
+                        region._pin_thread = thread
                         logger.info(
-                            "CUDA pinned region %d (%d bytes)",
+                            "CUDA pinning region %d in background (%d bytes)",
                             region_id,
                             handle.length,
                         )
                     else:
-                        # NVIDIA r580+ drivers reject a single registration
-                        # of >= 512 GiB (per-registration page table hits
-                        # the kernel's kvmalloc INT_MAX cap: "NVRM: failed
-                        # to allocate page table"). Clear the per-thread
-                        # sticky error so an unrelated later CUDA call does
-                        # not crash with a misattributed OOM.
-                        _clear_cuda_sticky_error()
-                        logger.warning(
-                            "cudaHostRegister failed for region %d "
-                            "(%d bytes): rc=%d — region stays unpinned, "
-                            "GPU transfers fall back to pageable copies",
-                            region_id,
-                            handle.length,
-                            rc,
-                        )
+                        t0 = time.monotonic()
+                        with region._pin_lock:
+                            _cuda_pin_chunks(
+                                cudart, pin_addr, handle.length, region_id,
+                                region._pin_records,
+                                stop_event=region._pin_stop,
+                            )
+                            pinned = sum(n for _, n in region._pin_records)
+                            n_chunks = len(region._pin_records)
+                        cuda_pin_ms = (time.monotonic() - t0) * 1000
+                        if pinned == handle.length:
+                            logger.info(
+                                "CUDA pinned region %d (%d bytes, %d chunks)",
+                                region_id,
+                                pinned,
+                                n_chunks,
+                            )
+                        else:
+                            logger.warning(
+                                "CUDA pinned region %d PARTIALLY: %d/%d bytes"
+                                " — unpinned ranges fall back to pageable"
+                                " copies",
+                                region_id,
+                                pinned,
+                                handle.length,
+                            )
             except (ImportError, RuntimeError, OSError) as e:
                 if not isinstance(e, ImportError):
                     logger.warning(
@@ -198,6 +308,91 @@ class DaxMapper:
         )
 
         return region
+
+    @staticmethod
+    def _cuda_unpin_region(region) -> None:
+        """Stop/join any in-flight pinning, then unregister pinned chunks.
+
+        Setting _pin_stop makes a concurrent pin loop (eager in another
+        thread, or the lazy worker) exit at its next chunk boundary, so
+        acquiring _pin_lock below waits for at most one chunk.
+        """
+        region._pin_stop.set()
+        if region._pin_thread is not None:
+            region._pin_thread.join()
+            region._pin_thread = None
+        with region._pin_lock:
+            if not region._pin_records:
+                return
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    _cuda_unpin_records(
+                        torch.cuda.cudart(),
+                        region._pin_records,
+                        region.region_id,
+                    )
+            except (ImportError, RuntimeError, OSError) as e:
+                if not isinstance(e, ImportError):
+                    logger.warning(
+                        "cudaHostUnregister failed for region %d: %s",
+                        region.region_id,
+                        e,
+                    )
+
+    def _pin_worker(
+        self, cudart, region, base_addr: int, length: int
+    ) -> None:
+        """Background chunk-pinning worker (MARU_PIN_MODE=lazy).
+
+        Appends to region._pin_records as chunks are registered so that
+        unmap_region()/close() — which join this thread first — always
+        unregister exactly what was pinned.
+        """
+        t0 = time.monotonic()
+        try:
+            with region._pin_lock:
+                _cuda_pin_chunks(
+                    cudart,
+                    base_addr,
+                    length,
+                    region.region_id,
+                    region._pin_records,
+                    stop_event=region._pin_stop,
+                )
+                pinned = sum(n for _, n in region._pin_records)
+        except (RuntimeError, OSError) as e:
+            logger.warning(
+                "cudaHostRegister failed for region %d: %s",
+                region.region_id,
+                e,
+            )
+            return
+        if region._pin_stop.is_set() and pinned < length:
+            logger.info(
+                "CUDA background pinning region %d cancelled at %d/%d bytes",
+                region.region_id,
+                pinned,
+                length,
+            )
+        elif pinned < length:
+            logger.warning(
+                "CUDA background pinning region %d PARTIAL: %d/%d bytes — "
+                "unpinned ranges fall back to pageable copies",
+                region.region_id,
+                pinned,
+                length,
+            )
+        else:
+            logger.info(
+                "CUDA background pinning region %d finished: %d/%d bytes "
+                "in %.1f ms",
+                region.region_id,
+                pinned,
+                length,
+                (time.monotonic() - t0) * 1000,
+            )
 
     @staticmethod
     def _prefault_region(mmap_obj: mmap_module.mmap, region_id: int, size: int) -> None:
@@ -248,33 +443,9 @@ class DaxMapper:
                 return False
 
             try:
-                # CUDA unpin before munmap (order matters — needs buffer_view for addr)
-                if region._cuda_pinned and region._buffer_view is not None:
-                    try:
-                        import torch
-
-                        if torch.cuda.is_available():
-                            addr = ctypes.addressof(
-                                ctypes.c_char.from_buffer(region._buffer_view)
-                            )
-                            rc = torch.cuda.cudart().cudaHostUnregister(addr)
-                            rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
-                            if rc != 0:
-                                _clear_cuda_sticky_error()
-                                logger.warning(
-                                    "cudaHostUnregister failed for region "
-                                    "%d: rc=%d",
-                                    region_id,
-                                    rc,
-                                )
-                            region._cuda_pinned = False
-                    except (ImportError, RuntimeError, OSError) as e:
-                        if not isinstance(e, ImportError):
-                            logger.warning(
-                                "cudaHostUnregister failed for region %d: %s",
-                                region_id,
-                                e,
-                            )
+                # CUDA unpin before munmap (join lazy pin thread first so
+                # _pin_records is final, then unregister each pinned chunk)
+                self._cuda_unpin_region(region)
 
                 if region.is_mapped:
                     region.release()
@@ -330,32 +501,7 @@ class DaxMapper:
                     continue
                 try:
                     # CUDA unpin before munmap (order matters!)
-                    if region._cuda_pinned and region._buffer_view is not None:
-                        try:
-                            import torch
-
-                            if torch.cuda.is_available():
-                                addr = ctypes.addressof(
-                                    ctypes.c_char.from_buffer(region._buffer_view)
-                                )
-                                rc = torch.cuda.cudart().cudaHostUnregister(addr)
-                                rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
-                                if rc != 0:
-                                    _clear_cuda_sticky_error()
-                                    logger.warning(
-                                        "cudaHostUnregister failed for region "
-                                        "%d: rc=%d",
-                                        rid,
-                                        rc,
-                                    )
-                                region._cuda_pinned = False
-                        except (ImportError, RuntimeError, OSError) as e:
-                            if not isinstance(e, ImportError):
-                                logger.warning(
-                                    "cudaHostUnregister failed for region %d: %s",
-                                    rid,
-                                    e,
-                                )
+                    self._cuda_unpin_region(region)
 
                     if region.is_mapped:
                         region.release()

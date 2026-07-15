@@ -4,6 +4,7 @@
 
 import logging
 import mmap as mmap_module
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -31,9 +32,24 @@ class MappedRegion:
     _mmap_obj: mmap_module.mmap | None = field(default=None, repr=False)
     # memoryview of the entire mmap — created eagerly in __post_init__
     _buffer_view: memoryview | None = field(default=None, repr=False, init=False)
-    # True only when cudaHostRegister actually succeeded (rc == 0), so
-    # unmap/close know whether cudaHostUnregister is needed
-    _cuda_pinned: bool = field(default=False, repr=False, init=False)
+    # (addr, size) per successfully cudaHostRegister'ed chunk — the exact
+    # base addresses cudaHostUnregister must be called with on unmap
+    _pin_records: list[tuple[int, int]] = field(
+        default_factory=list, repr=False, init=False
+    )
+    # Serializes the chunk-pin loop against unmap-time unpinning; _pin_stop
+    # makes an in-flight pin loop exit at the next chunk boundary so unpin
+    # never waits for more than one chunk.
+    _pin_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, init=False
+    )
+    _pin_stop: threading.Event = field(
+        default_factory=threading.Event, repr=False, init=False
+    )
+    # Background pinning thread (MARU_PIN_MODE=lazy only)
+    _pin_thread: threading.Thread | None = field(
+        default=None, repr=False, init=False
+    )
 
     def __post_init__(self):
         if self._mmap_obj is not None:

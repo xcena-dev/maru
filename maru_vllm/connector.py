@@ -710,9 +710,13 @@ class MaruWorkerConnector:
                             )
                             success = False
                             break
-                        # CXL mmap is already cudaHostRegistered by
-                        # DaxMapper — no clone() needed, .cuda() uses
-                        # DMA directly from pinned CXL memory
+                        # CXL mmap is cudaHostRegistered by DaxMapper
+                        # (fully, before map_region returns, with the
+                        # default MARU_PIN_MODE=eager) — no clone() needed,
+                        # .cuda() uses DMA directly from pinned CXL memory.
+                        # With MARU_PIN_MODE=lazy or after a chunk pin
+                        # failure, unpinned ranges still work but fall back
+                        # to pageable copies.
                         chunk_tensor = torch.frombuffer(
                             info.view, dtype=kv_cache_layer.dtype
                         )

@@ -189,22 +189,72 @@ class TestDaxMapperCudaPin:
         assert region.is_mapped
 
 
-class TestDaxMapperPinRcCheck:
-    """cudaHostRegister return-code checking (previously ignored)."""
+class TestDaxMapperChunkedPin:
+    """Test chunked cudaHostRegister (512GiB-per-call driver limit workaround)."""
 
-    def test_register_rc_failure_warns_and_skips_unregister(self, monkeypatch):
-        """rc != 0 → warning, region unpinned, no unregister on unmap."""
+    def test_chunked_register_calls(self, monkeypatch):
+        """Region larger than the chunk size is registered in multiple calls."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 1024)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+
+        base = ctypes.addressof(ctypes.c_char.from_buffer(region._buffer_view))
+        calls = mock_cudart.cudaHostRegister.call_args_list
+        assert [c.args for c in calls] == [
+            (base, 1024, 0),
+            (base + 1024, 1024, 0),
+            (base + 2048, 1024, 0),
+            (base + 3072, 1024, 0),
+        ]
+        assert region._pin_records == [
+            (base, 1024),
+            (base + 1024, 1024),
+            (base + 2048, 1024),
+            (base + 3072, 1024),
+        ]
+
+    def test_chunked_unregister_per_record(self, monkeypatch):
+        """Unmap unregisters each pinned chunk's base address."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 2048)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+            base = ctypes.addressof(
+                ctypes.c_char.from_buffer(region._buffer_view)
+            )
+            mapper.unmap_region(1)
+
+        assert [c.args for c in mock_cudart.cudaHostUnregister.call_args_list] == [
+            (base,),
+            (base + 2048,),
+        ]
+
+    def test_register_failure_rc_checked(self, monkeypatch):
+        """Non-zero cudaHostRegister rc → warning, no record, error cleared."""
         import logging
 
         import maru_handler.memory.mapper as mapper_mod
+
+        mock_torch, mock_cudart = _mock_torch_cuda()
+        mock_cudart.cudaHostRegister.return_value = (2,)  # cudaErrorMemoryAllocation
 
         cleared = []
         monkeypatch.setattr(
             mapper_mod, "_clear_cuda_sticky_error", lambda: cleared.append(1)
         )
-
-        mock_torch, mock_cudart = _mock_torch_cuda()
-        mock_cudart.cudaHostRegister.return_value = (2,)  # cudaErrorMemoryAllocation
 
         mapper = DaxMapper()
         handle = _make_handle(1, 4096)
@@ -216,14 +266,44 @@ class TestDaxMapperPinRcCheck:
                 region = mapper.map_region(handle)
             mapper.unmap_region(1)
 
-        assert region._cuda_pinned is False
+        assert region._pin_records == []
         assert cleared == [1]
-        assert mock_warning.called
-        assert "cudaHostRegister failed" in mock_warning.call_args[0][0]
+        warnings = [c.args[0] for c in mock_warning.call_args_list]
+        assert any("cudaHostRegister failed" in w for w in warnings)
+        assert any("PARTIALLY" in w for w in warnings)
         mock_cudart.cudaHostUnregister.assert_not_called()
 
-    def test_register_rc_success_sets_pinned_and_unregisters(self):
-        """rc == 0 → pinned flag set, unmap unregisters once."""
+    def test_partial_register_failure(self, monkeypatch):
+        """One failed chunk is skipped; the others are pinned and unpinned."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 1024)
+        monkeypatch.setattr(mapper_mod, "_clear_cuda_sticky_error", lambda: None)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+        mock_cudart.cudaHostRegister.side_effect = [(0,), (2,), (0,), (0,)]
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+            base = ctypes.addressof(
+                ctypes.c_char.from_buffer(region._buffer_view)
+            )
+            assert region._pin_records == [
+                (base, 1024),
+                (base + 2048, 1024),
+                (base + 3072, 1024),
+            ]
+            mapper.unmap_region(1)
+
+        assert mock_cudart.cudaHostUnregister.call_count == 3
+
+    def test_single_call_mode_chunk_zero(self, monkeypatch):
+        """MARU_PIN_CHUNK_GB=0 registers the whole region in one call."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 0)
         mock_torch, mock_cudart = _mock_torch_cuda()
 
         mapper = DaxMapper()
@@ -231,10 +311,85 @@ class TestDaxMapperPinRcCheck:
 
         with patch.dict("sys.modules", {"torch": mock_torch}):
             region = mapper.map_region(handle)
-            assert region._cuda_pinned is True
+
+        base = ctypes.addressof(ctypes.c_char.from_buffer(region._buffer_view))
+        mock_cudart.cudaHostRegister.assert_called_once_with(base, 4096, 0)
+
+    def test_stop_event_truncates_pinning(self, monkeypatch):
+        """A pre-set stop event makes the pin loop register nothing."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 1024)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        # Pre-set the stop flag via the dataclass default the region will
+        # get — simulate by patching _cuda_pin_chunks call path: map, then
+        # verify unmap-after-stop unregisters exactly what was pinned.
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+            region._pin_stop.set()
+            # a second pin loop over the same region would now no-op
+            mapper_mod._cuda_pin_chunks(
+                mock_cudart,
+                0x1000,
+                4096,
+                1,
+                [],
+                stop_event=region._pin_stop,
+            )
             mapper.unmap_region(1)
 
-        mock_cudart.cudaHostUnregister.assert_called_once()
+        # 4 chunks from map_region only — the stopped loop added none
+        assert mock_cudart.cudaHostRegister.call_count == 4
+        assert mock_cudart.cudaHostUnregister.call_count == 4
+
+    def test_lazy_close_joins_and_unregisters(self, monkeypatch):
+        """close() in lazy mode joins the worker and unregisters chunks."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_MODE", "lazy")
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 2048)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            r1 = mapper.map_region(_make_handle(1, 4096))
+            r2 = mapper.map_region(_make_handle(2, 4096))
+            for r in (r1, r2):
+                if r._pin_thread is not None:
+                    r._pin_thread.join(timeout=5)
+            mapper.close()
+
+        assert mock_cudart.cudaHostRegister.call_count == 4
+        assert mock_cudart.cudaHostUnregister.call_count == 4
+        assert r1._pin_thread is None and r2._pin_thread is None
+        assert mapper.get_region(1) is None and mapper.get_region(2) is None
+
+    def test_lazy_mode_pins_in_background(self, monkeypatch):
+        """MARU_PIN_MODE=lazy pins on a background thread; unmap joins it."""
+        import maru_handler.memory.mapper as mapper_mod
+
+        monkeypatch.setattr(mapper_mod, "_PIN_MODE", "lazy")
+        monkeypatch.setattr(mapper_mod, "_PIN_CHUNK_BYTES", 1024)
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+            assert region._pin_thread is not None
+            region._pin_thread.join(timeout=5)
+            assert len(region._pin_records) == 4
+            mapper.unmap_region(1)
+
+        assert mock_cudart.cudaHostRegister.call_count == 4
+        assert mock_cudart.cudaHostUnregister.call_count == 4
+        assert region._pin_thread is None
 
 
 class TestDaxMapperErrorPaths:
