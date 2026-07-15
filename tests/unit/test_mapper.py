@@ -189,6 +189,54 @@ class TestDaxMapperCudaPin:
         assert region.is_mapped
 
 
+class TestDaxMapperPinRcCheck:
+    """cudaHostRegister return-code checking (previously ignored)."""
+
+    def test_register_rc_failure_warns_and_skips_unregister(self, monkeypatch):
+        """rc != 0 → warning, region unpinned, no unregister on unmap."""
+        import logging
+
+        import maru_handler.memory.mapper as mapper_mod
+
+        cleared = []
+        monkeypatch.setattr(
+            mapper_mod, "_clear_cuda_sticky_error", lambda: cleared.append(1)
+        )
+
+        mock_torch, mock_cudart = _mock_torch_cuda()
+        mock_cudart.cudaHostRegister.return_value = (2,)  # cudaErrorMemoryAllocation
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            with patch.object(
+                logging.getLogger("maru_handler.memory.mapper"), "warning"
+            ) as mock_warning:
+                region = mapper.map_region(handle)
+            mapper.unmap_region(1)
+
+        assert region._cuda_pinned is False
+        assert cleared == [1]
+        assert mock_warning.called
+        assert "cudaHostRegister failed" in mock_warning.call_args[0][0]
+        mock_cudart.cudaHostUnregister.assert_not_called()
+
+    def test_register_rc_success_sets_pinned_and_unregisters(self):
+        """rc == 0 → pinned flag set, unmap unregisters once."""
+        mock_torch, mock_cudart = _mock_torch_cuda()
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            region = mapper.map_region(handle)
+            assert region._cuda_pinned is True
+            mapper.unmap_region(1)
+
+        mock_cudart.cudaHostUnregister.assert_called_once()
+
+
 class TestDaxMapperErrorPaths:
     """Test error paths for 100% coverage."""
 

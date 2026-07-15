@@ -25,6 +25,30 @@ _PREFAULT_ENABLED = os.environ.get("MARU_PREFAULT", "1") != "0"
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
 
+def _clear_cuda_sticky_error() -> None:
+    """Consume CUDA's per-thread sticky error after a failed cudaHostRegister.
+
+    torch's cudart binding does not expose cudaGetLastError, so locate the
+    libcudart torch itself loaded (dlopen of the same path returns the
+    already-loaded instance) and consume the error there.  Without this, the
+    next error-checked CUDA call on this thread — typically an unrelated
+    kernel launch — raises a misattributed "CUDA error: out of memory".
+    """
+    try:
+        path = None
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libcudart.so" in line:
+                    path = line.rstrip("\n").split(maxsplit=5)[-1]
+                    break
+        if path:
+            lib = ctypes.CDLL(path)
+            lib.cudaGetLastError.restype = ctypes.c_int
+            lib.cudaGetLastError()
+    except (OSError, IndexError, AttributeError):
+        logger.debug("could not clear CUDA sticky error", exc_info=True)
+
+
 class DaxMapper:
     """Maps shared memory regions via MaruShmClient.
 
@@ -125,13 +149,34 @@ class DaxMapper:
                         ctypes.c_char.from_buffer(region._buffer_view)
                     )
                     t0 = time.monotonic()
-                    torch.cuda.cudart().cudaHostRegister(addr, handle.length, 0)
-                    cuda_pin_ms = (time.monotonic() - t0) * 1000
-                    logger.info(
-                        "CUDA pinned region %d (%d bytes)",
-                        region_id,
-                        handle.length,
+                    rc = torch.cuda.cudart().cudaHostRegister(
+                        addr, handle.length, 0
                     )
+                    cuda_pin_ms = (time.monotonic() - t0) * 1000
+                    rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
+                    if rc == 0:
+                        region._cuda_pinned = True
+                        logger.info(
+                            "CUDA pinned region %d (%d bytes)",
+                            region_id,
+                            handle.length,
+                        )
+                    else:
+                        # NVIDIA r580+ drivers reject a single registration
+                        # of >= 512 GiB (per-registration page table hits
+                        # the kernel's kvmalloc INT_MAX cap: "NVRM: failed
+                        # to allocate page table"). Clear the per-thread
+                        # sticky error so an unrelated later CUDA call does
+                        # not crash with a misattributed OOM.
+                        _clear_cuda_sticky_error()
+                        logger.warning(
+                            "cudaHostRegister failed for region %d "
+                            "(%d bytes): rc=%d — region stays unpinned, "
+                            "GPU transfers fall back to pageable copies",
+                            region_id,
+                            handle.length,
+                            rc,
+                        )
             except (ImportError, RuntimeError, OSError) as e:
                 if not isinstance(e, ImportError):
                     logger.warning(
@@ -204,7 +249,7 @@ class DaxMapper:
 
             try:
                 # CUDA unpin before munmap (order matters — needs buffer_view for addr)
-                if region._buffer_view is not None:
+                if region._cuda_pinned and region._buffer_view is not None:
                     try:
                         import torch
 
@@ -212,7 +257,17 @@ class DaxMapper:
                             addr = ctypes.addressof(
                                 ctypes.c_char.from_buffer(region._buffer_view)
                             )
-                            torch.cuda.cudart().cudaHostUnregister(addr)
+                            rc = torch.cuda.cudart().cudaHostUnregister(addr)
+                            rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
+                            if rc != 0:
+                                _clear_cuda_sticky_error()
+                                logger.warning(
+                                    "cudaHostUnregister failed for region "
+                                    "%d: rc=%d",
+                                    region_id,
+                                    rc,
+                                )
+                            region._cuda_pinned = False
                     except (ImportError, RuntimeError, OSError) as e:
                         if not isinstance(e, ImportError):
                             logger.warning(
@@ -275,7 +330,7 @@ class DaxMapper:
                     continue
                 try:
                     # CUDA unpin before munmap (order matters!)
-                    if region._buffer_view is not None:
+                    if region._cuda_pinned and region._buffer_view is not None:
                         try:
                             import torch
 
@@ -283,7 +338,17 @@ class DaxMapper:
                                 addr = ctypes.addressof(
                                     ctypes.c_char.from_buffer(region._buffer_view)
                                 )
-                                torch.cuda.cudart().cudaHostUnregister(addr)
+                                rc = torch.cuda.cudart().cudaHostUnregister(addr)
+                                rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
+                                if rc != 0:
+                                    _clear_cuda_sticky_error()
+                                    logger.warning(
+                                        "cudaHostUnregister failed for region "
+                                        "%d: rc=%d",
+                                        rid,
+                                        rc,
+                                    )
+                                region._cuda_pinned = False
                         except (ImportError, RuntimeError, OSError) as e:
                             if not isinstance(e, ImportError):
                                 logger.warning(
