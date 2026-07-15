@@ -149,9 +149,7 @@ class DaxMapper:
                         ctypes.c_char.from_buffer(region._buffer_view)
                     )
                     t0 = time.monotonic()
-                    rc = torch.cuda.cudart().cudaHostRegister(
-                        addr, handle.length, 0
-                    )
+                    rc = torch.cuda.cudart().cudaHostRegister(addr, handle.length, 0)
                     cuda_pin_ms = (time.monotonic() - t0) * 1000
                     rc = int(rc[0]) if isinstance(rc, tuple) else int(rc)
                     if rc == 0:
@@ -262,8 +260,7 @@ class DaxMapper:
                             if rc != 0:
                                 _clear_cuda_sticky_error()
                                 logger.warning(
-                                    "cudaHostUnregister failed for region "
-                                    "%d: rc=%d",
+                                    "cudaHostUnregister failed for region %d: rc=%d",
                                     region_id,
                                     rc,
                                 )
