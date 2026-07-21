@@ -48,16 +48,25 @@ class GaiaPrefetchPlugin:
 
     def __init__(self) -> None:
         self._coalesce = os.environ.get("MARU_GAIA_PREFETCH_COALESCE", "1") == "1"
+        # The experiment always names the single gaia device via
+        # MARU_GAIA_DEVICE_ID (same env naru/gaia-bench use to set DRAM
+        # capacity). Prefer it: pyxif's auto-enumeration (get_device_list) is
+        # not reliable across SDK builds — it returns [] on the current host,
+        # which silently made every hint a no-op. The dax-path scan is kept
+        # only as a multi-device fallback for when the env is unset.
+        dev_env = os.environ.get("MARU_GAIA_DEVICE_ID")
+        self._device_id: int | None = int(dev_env) if dev_env else None
         # dax device path -> pyxif device id, built lazily on first hint (the
-        # scan is not free and a handler may never prefetch).
+        # scan is not free and a handler may never prefetch). Fallback only.
         self._dax_to_device: dict[str, int] | None = None
         # Cumulative counters surfaced via contribute_stats.
         self._issued = 0
         self._failed = 0
         self._skipped = 0
         logger.info(
-            "Gaia prefetch plugin loaded (coalesce=%s)",
+            "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s)",
             "on" if self._coalesce else "off",
+            self._device_id if self._device_id is not None else "auto-scan",
         )
 
     # -- MaruHandlerPlugin seams -------------------------------------------
@@ -91,8 +100,23 @@ class GaiaPrefetchPlugin:
 
     # -- internals ----------------------------------------------------------
 
+    def _resolve_device_id(self, handler: MaruHandler, region_id: int) -> int | None:
+        """Resolve a mapped region to its gaia pyxif device id.
+
+        Returns the env-configured ``MARU_GAIA_DEVICE_ID`` when set (the single
+        gaia device this experiment targets); otherwise falls back to the
+        dax-path scan map (multi-device, only usable where pyxif enumeration
+        works).
+        """
+        if self._device_id is not None:
+            return self._device_id
+        dax_path = handler.get_region_dax_path(region_id)
+        if dax_path is None:
+            return None
+        return self._device_map().get(dax_path)
+
     def _device_map(self) -> dict[str, int]:
-        """Return the dax-path -> device-id map, building it once via pyxif."""
+        """Return the dax-path -> device-id map, built once via pyxif (fallback)."""
         if self._dax_to_device is None:
             dax_map: dict[str, int] = {}
             for device_id in pyxif.get_device_list():
@@ -117,7 +141,6 @@ class GaiaPrefetchPlugin:
         """
         eligible: list[tuple[int, int, int]] = []
         skipped = 0
-        device_map = self._device_map()
         for entry in batch_resp.entries:
             if not entry.found or entry.handle is None:
                 continue
@@ -125,8 +148,7 @@ class GaiaPrefetchPlugin:
             if not handler.is_region_mapped(region_id):
                 skipped += 1
                 continue
-            dax_path = handler.get_region_dax_path(region_id)
-            device_id = device_map.get(dax_path) if dax_path is not None else None
+            device_id = self._resolve_device_id(handler, region_id)
             if device_id is None:
                 skipped += 1
                 continue

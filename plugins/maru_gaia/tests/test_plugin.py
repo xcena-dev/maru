@@ -79,6 +79,11 @@ class TestCoalesce:
 
 
 class TestIssue:
+    @pytest.fixture(autouse=True)
+    def _scan_path(self, monkeypatch):
+        """Default the issue tests to the dax-scan path (env device id unset)."""
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+
     def test_address_is_handle_offset_plus_kv_offset(self, monkeypatch):
         """A single found+mapped entry hints handle.offset+kv_offset/kv_length."""
         fake = _FakePyxif()
@@ -89,6 +94,23 @@ class TestIssue:
         plugin.on_prefetch(_handler(), ["k0"], _resp(_entry(0x1000, 0x200, 0x100)))
 
         assert fake.calls == [(0, 0x1200, 0x100)]
+
+    def test_env_device_id_used_without_scan(self, monkeypatch):
+        """MARU_GAIA_DEVICE_ID resolves the device even when pyxif enumerates
+        nothing (the real-host failure mode: get_device_list() -> [])."""
+
+        class _EmptyEnumPyxif(_FakePyxif):
+            def get_device_list(self):
+                return []
+
+        fake = _EmptyEnumPyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_DEVICE_ID", "2")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_prefetch(_handler(), ["k0"], _resp(_entry(0x1000, 0x200, 0x100)))
+
+        assert fake.calls == [(2, 0x1200, 0x100)]  # device 2 from env, not scan
 
     def test_contiguous_chunks_coalesce_to_one_call(self, monkeypatch):
         fake = _FakePyxif()
