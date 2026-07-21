@@ -1,0 +1,3 @@
+# Run artifacts written by the example scripts (maru_server.log, single.log,
+# inst1.log, inst2.log, ...). Not source.
+*.log

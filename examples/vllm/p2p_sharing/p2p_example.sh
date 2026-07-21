@@ -22,14 +22,35 @@ source "$SCRIPT_DIR/env.sh"
 MODEL="${1:-${MODEL:-Qwen/Qwen2.5-0.5B}}"
 LOG_DIR="$SCRIPT_DIR"
 
-# Cleanup function
+# vLLM spawns a subprocess tree (API server + EngineCore). Killing only the
+# launcher PID leaks the children: they reparent to init and keep holding the
+# GPU. So collect the whole tree first, then TERM, then SIGKILL any survivor.
+descendants() {
+    local pid=$1 child
+    echo "$pid"
+    for child in $(pgrep -P "$pid" 2>/dev/null); do descendants "$child"; done
+}
+
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    [[ -n "${INST1_PID:-}" ]] && kill "$INST1_PID" 2>/dev/null && echo "  Stopped inst1 (PID $INST1_PID)"
-    [[ -n "${INST2_PID:-}" ]] && kill "$INST2_PID" 2>/dev/null && echo "  Stopped inst2 (PID $INST2_PID)"
-    [[ -n "${MARU_PID:-}" ]] && kill "$MARU_PID" 2>/dev/null && echo "  Stopped maru-server (PID $MARU_PID)"
-    wait 2>/dev/null
+    local pids=() p
+    if [[ -n "${INST1_PID:-}" ]]; then pids+=( $(descendants "$INST1_PID") ); fi
+    if [[ -n "${INST2_PID:-}" ]]; then pids+=( $(descendants "$INST2_PID") ); fi
+    if [[ -n "${MARU_PID:-}" ]]; then pids+=( $(descendants "$MARU_PID") ); fi
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        kill -TERM "${pids[@]}" 2>/dev/null || true
+        for _ in $(seq 1 8); do  # graceful window, then force-kill survivors
+            local alive=0
+            for p in "${pids[@]}"; do
+                if kill -0 "$p" 2>/dev/null; then alive=1; fi
+            done
+            if [[ $alive -eq 0 ]]; then break; fi
+            sleep 1
+        done
+        for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+    fi
+    wait 2>/dev/null || true
     echo "Done."
 }
 trap cleanup EXIT
@@ -60,12 +81,12 @@ echo "  maru-server started (PID $MARU_PID)"
 
 # Step 2: Launch vLLM instance 1
 echo "[Step 2] Starting vLLM instance 1 (GPU 0, port $MARU_INST1_PORT)..."
-bash "$SCRIPT_DIR/launch_vllm.sh" inst1 "$MODEL" > "$LOG_DIR/inst1.log" 2>&1 &
+bash "$SCRIPT_DIR/p2p_vllm_launcher.sh" inst1 "$MODEL" > "$LOG_DIR/inst1.log" 2>&1 &
 INST1_PID=$!
 
 # Step 3: Launch vLLM instance 2
 echo "[Step 3] Starting vLLM instance 2 (GPU 1, port $MARU_INST2_PORT)..."
-bash "$SCRIPT_DIR/launch_vllm.sh" inst2 "$MODEL" > "$LOG_DIR/inst2.log" 2>&1 &
+bash "$SCRIPT_DIR/p2p_vllm_launcher.sh" inst2 "$MODEL" > "$LOG_DIR/inst2.log" 2>&1 &
 INST2_PID=$!
 
 # Wait for instances to be ready

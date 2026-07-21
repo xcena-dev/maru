@@ -1,12 +1,12 @@
 #!/bin/bash
-# Launch a vLLM instance with Maru KV connector (direct, no LMCache)
+# Launch a vLLM instance with the Maru KV connector (direct, no LMCache).
 #
 # Usage:
-#   ./launch_vllm.sh <inst1|inst2> [model]
+#   ./p2p_vllm_launcher.sh <inst1|inst2> [model]
 #
 # Examples:
-#   ./launch_vllm.sh inst1                    # Instance 1 with default model
-#   ./launch_vllm.sh inst2 Qwen/Qwen2.5-0.5B # Instance 2 with specific model
+#   ./p2p_vllm_launcher.sh inst1                    # Instance 1 with default model
+#   ./p2p_vllm_launcher.sh inst2 Qwen/Qwen2.5-0.5B # Instance 2 with specific model
 
 set -euo pipefail
 
@@ -37,14 +37,14 @@ else
     exit 1
 fi
 
-echo "=== Maru-vLLM Direct Integration ==="
+echo "=== Maru-vLLM Direct Integration (P2P) ==="
 echo "  Instance:    $1"
 echo "  GPU Device:  $DEVICE"
 echo "  vLLM Port:   $PORT"
 echo "  Maru Server: $MARU_SERVER_URL"
 echo "  Pool Size:   $MARU_POOL_SIZE"
 echo "  Chunk Tokens: $MARU_KV_CHUNK_TOKENS"
-echo "====================================="
+echo "=========================================="
 
 # Build kv-transfer-config JSON
 KV_CONFIG=$(cat <<EOJSON

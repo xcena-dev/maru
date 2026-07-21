@@ -4,7 +4,7 @@
 #
 # Prerequisites:
 #   1. maru-server running
-#   2. Two vLLM instances running via launch_vllm.sh
+#   2. Two vLLM instances running via p2p_vllm_launcher.sh
 #
 # Usage:
 #   ./run_simple_query.sh
