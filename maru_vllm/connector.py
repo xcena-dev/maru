@@ -613,6 +613,19 @@ class MaruSchedulerConnector:
         # owns the region mappings, so firing happens there).
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
         self._pending_arrival_hint_keys: list[str] = []
+        # Arrival-hint fires the packed chunk base key, which is a real data key
+        # only in packed mode. In layerwise mode the data lives at
+        # f"{base}_L{idx}" and the base name has no object, so every hint would
+        # miss — disable it there (with a visible warning) rather than burn one
+        # guaranteed-miss lookup RPC per request arrival.
+        if self._arrival_hint_enabled and self._use_layerwise:
+            logger.warning(
+                "Maru arrival-hint (MARU_ARRIVAL_HINT=1) is unsupported with "
+                "layerwise storage (maru_use_layerwise=True); disabling it. The "
+                "packed chunk key is not a data key in layerwise mode, so every "
+                "hint would miss."
+            )
+            self._arrival_hint_enabled = False
         if self._arrival_hint_enabled:
             logger.info("Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1)")
 

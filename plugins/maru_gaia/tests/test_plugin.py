@@ -10,7 +10,13 @@ coalescing, and the unmapped-region skip.
 from types import SimpleNamespace
 
 import pytest
-from maru_gaia.plugin import GaiaPrefetchPlugin
+
+# The plugin imports pyxif (the XCENA device binding) at module load, so on a
+# host without the device SDK this whole suite is skipped rather than erroring
+# at collection.
+pytest.importorskip("pyxif")
+
+from maru_gaia.plugin import GaiaPrefetchPlugin  # noqa: E402
 
 
 class _FakePyxif:

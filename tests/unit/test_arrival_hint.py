@@ -70,6 +70,18 @@ class TestSchedulerArrivalHint:
         sched.on_new_request(_request(list(range(8))))
         assert sched._pending_arrival_hint_keys == []
 
+    def test_layerwise_mode_disables_hint(self, monkeypatch):
+        """Layerwise storage disables the hint (base key is not a data key)."""
+        monkeypatch.setenv("MARU_ARRIVAL_HINT", "1")
+        sched = MaruSchedulerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_use_layerwise": True},
+        )
+        assert sched._arrival_hint_enabled is False
+        sched.on_new_request(_request(list(range(8))))
+        assert sched._pending_arrival_hint_keys == []
+
     def test_build_connector_meta_relays_and_clears(self, monkeypatch):
         """Queued keys land in the metadata once, then the queue is cleared."""
         sched = self._scheduler(monkeypatch, enabled=True)
