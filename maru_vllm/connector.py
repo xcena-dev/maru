@@ -20,6 +20,7 @@ The connector has two roles (instantiated separately by vLLM):
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 import time
@@ -260,7 +261,14 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
 
 @dataclass
 class MaruConnectorMetadata(KVConnectorMetadata):
-    """Metadata communicated from scheduler to worker each step."""
+    """Metadata communicated from scheduler to worker each step.
+
+    ``arrival_hint_keys`` carries the chunk base keys of requests that newly
+    entered the scheduler's waiting queue since the previous step
+    (smart-prefetch arrival-hint, ``MARU_ARRIVAL_HINT=1``). The worker fires a
+    lookahead prefetch for them so the request's admission wait becomes the
+    device's SSD->DRAM fill window. Empty when the hint is disabled.
+    """
 
     requests: list[MaruReqMeta] = field(default_factory=list)
     # A write-behind store may still be reading blocks that the scheduler
@@ -271,6 +279,7 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
     # can overlap layer k compute without changing the packed storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
+    arrival_hint_keys: list[str] = field(default_factory=list)
 
 
 # ============================================================================
@@ -412,6 +421,20 @@ class MaruKVConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         assert self._scheduler is not None
         return self._scheduler.build_connector_meta(scheduler_output)
+
+    def on_new_request(self, request: Request) -> None:
+        """Queue arrival-hint prefetch keys when a request enters the queue.
+
+        Called by the vLLM scheduler right after the request is enqueued into
+        the waiting queue -- typically well before it is scheduled -- so the
+        admission wait can serve as the device's SSD->DRAM fill window. No-op
+        unless ``MARU_ARRIVAL_HINT=1`` (handled scheduler-side).
+
+        Args:
+            request: The newly arrived vLLM request.
+        """
+        if self._scheduler is not None:
+            self._scheduler.on_new_request(request)
 
     # ==================================
     # Worker-side methods
@@ -584,6 +607,42 @@ class MaruSchedulerConnector:
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
 
+        # Smart-prefetch arrival-hint (MARU_ARRIVAL_HINT=1): chunk base keys of
+        # requests that entered the waiting queue since the last step, drained
+        # into the next connector metadata for the worker to fire (the worker
+        # owns the region mappings, so firing happens there).
+        self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+        self._pending_arrival_hint_keys: list[str] = []
+        if self._arrival_hint_enabled:
+            logger.info("Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1)")
+
+    def on_new_request(self, request: Request) -> None:
+        """Queue this request's chunk keys for worker-side lookahead prefetch.
+
+        Computes the chunk base keys from the prompt tokens and stages them;
+        ``build_connector_meta`` relays them to the worker on the next step
+        (arrival -> fire latency is ~one scheduler step, negligible against the
+        0.2-2.1 s admission wait this hint exploits). The keys are the packed
+        chunk keys (one per chunk) — the worker fires them as-is, no per-layer
+        expansion, because packed storage keeps one object per chunk.
+
+        Args:
+            request: The newly arrived vLLM request.
+        """
+        if not self._arrival_hint_enabled:
+            return
+        token_ids = list(request.prompt_token_ids or [])
+        if len(token_ids) < self._kv_chunk_tokens:
+            return
+        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        if keys:
+            self._pending_arrival_hint_keys.extend(keys)
+            logger.debug(
+                "Maru arrival-hint: queued %d chunk keys for req %s",
+                len(keys),
+                request.request_id,
+            )
+
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
 
@@ -751,6 +810,12 @@ class MaruSchedulerConnector:
         meta = MaruConnectorMetadata(
             preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
         )
+
+        # Relay arrival-hint keys queued by on_new_request to the worker, then
+        # clear so each key is fired exactly once.
+        if self._pending_arrival_hint_keys:
+            meta.arrival_hint_keys = self._pending_arrival_hint_keys
+            self._pending_arrival_hint_keys = []
 
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
@@ -1068,6 +1133,10 @@ class MaruWorkerConnector:
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
 
+        # Smart-prefetch arrival-hint (MARU_ARRIVAL_HINT=1): fire a lookahead
+        # prefetch for the chunk keys relayed from the scheduler at arrival.
+        self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+
     def _ensure_handler(self):
         if self._handler is not None:
             return
@@ -1161,6 +1230,12 @@ class MaruWorkerConnector:
         self._ensure_handler()
         if self._handler is None:
             return
+
+        # Fire arrival-hint prefetch before any early return below: hints must
+        # flow even on steps that have nothing to load (a request's hint often
+        # arrives a step before the request is scheduled).
+        if self._arrival_hint_enabled and metadata.arrival_hint_keys:
+            self._fire_arrival_hints(metadata.arrival_hint_keys)
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is not None:
@@ -3097,6 +3172,30 @@ class MaruWorkerConnector:
     # ==============================
     # Helper methods
     # ==============================
+
+    def _fire_arrival_hints(self, chunk_keys: list[str]) -> None:
+        """Issue a lookahead prefetch for newly arrived requests' chunks.
+
+        Fires one ``MaruHandler.prefetch_batch`` for the chunk keys relayed
+        from the scheduler at arrival (a lookup-only call that lets a loaded
+        device plugin start the SSD->DRAM fill). Packed storage keeps one
+        object per chunk, so the chunk keys are fired as-is with no per-layer
+        expansion. Keys not stored yet are skipped by the lookup, so hints for
+        cold requests are a cheap no-op. Best-effort: a failure never disturbs
+        the load path this runs ahead of.
+
+        Args:
+            chunk_keys: Chunk base keys relayed from the scheduler at arrival.
+        """
+        try:
+            found = self._handler.prefetch_batch(chunk_keys)
+            logger.info(
+                "Maru arrival-hint: prefetch_batch found %d/%d chunk keys",
+                found,
+                len(chunk_keys),
+            )
+        except Exception:
+            logger.warning("Maru arrival-hint prefetch failed", exc_info=True)
 
     def _get_layer_index(self, layer_name: str) -> int:
         """Extract numeric layer index from layer name."""

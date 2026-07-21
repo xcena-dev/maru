@@ -258,10 +258,16 @@ class TestPluginApiContract:
             )
 
     def test_plugin_hook_names_are_stable(self):
-        """The four documented hook names exist on the MaruHandlerPlugin protocol."""
+        """The documented hook names exist on the MaruHandlerPlugin protocol."""
         from maru_handler.plugin import MaruHandlerPlugin
 
-        for hook in ("on_init", "on_batch_retrieve", "on_close", "contribute_stats"):
+        for hook in (
+            "on_init",
+            "on_batch_retrieve",
+            "on_prefetch",
+            "on_close",
+            "contribute_stats",
+        ):
             assert hasattr(MaruHandlerPlugin, hook), (
                 f"hook {hook} removed from protocol"
             )

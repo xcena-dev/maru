@@ -983,6 +983,54 @@ class MaruHandler:
         )
         return results
 
+    def prefetch_batch(self, keys: list[str]) -> int:
+        """Issue a lookahead prefetch hint for a batch of keys (no read).
+
+        Resolves ``keys`` with a single batch lookup RPC and hands the result
+        to any loaded plugin's :meth:`on_prefetch` hook, which may start a
+        hardware SSD->DRAM migration so a *future* ``batch_retrieve`` of the
+        same keys finds the data warm. Unlike ``batch_retrieve`` this maps no
+        regions and returns no memoryviews — it only looks the keys up and lets
+        the plugin hint against regions that are already mapped (see
+        :meth:`MaruHandlerPlugin.on_prefetch`).
+
+        This is the vendor-neutral seam smart-prefetch's arrival-hint fires at
+        request arrival: the hardware hint itself lives in an out-of-tree
+        plugin (Maru core stays device-agnostic). With no such plugin loaded
+        this is a cheap lookup whose only effect is the returned count.
+
+        Args:
+            keys: Chunk key strings to prefetch ahead of demand.
+
+        Returns:
+            Number of keys the lookup found (0 on RPC failure). The count is
+            informational — an unmapped-but-found key is not hinted.
+        """
+        self._ensure_connected()
+        t0 = time.monotonic()
+
+        try:
+            batch_resp = self._rpc.batch_lookup_kv(keys)
+        except Exception:
+            logger.error("prefetch_batch RPC failed", exc_info=True)
+            return 0
+
+        # Plugins observe the lookahead batch (e.g. issue prefetch hints).
+        # Guarded so the empty-plugin common case stays free on the hot path.
+        if self._plugins:
+            self._dispatch_plugins("on_prefetch", self, keys, batch_resp)
+
+        found = sum(1 for entry in batch_resp.entries if entry.found)
+        self._record_stats(
+            "prefetch_batch",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit"
+            if found == len(keys)
+            else ("partial" if found > 0 else "miss"),
+        )
+        return found
+
     def batch_store(
         self,
         keys: list[str],

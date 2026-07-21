@@ -122,6 +122,38 @@ class MaruHandlerPlugin(Protocol):
         """
         ...
 
+    def on_prefetch(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+        batch_resp: BatchLookupKVResponse,
+    ) -> None:
+        """Called at the end of ``prefetch_batch``, after a lookup-only RPC.
+
+        This is the *lookahead* counterpart of :meth:`on_batch_retrieve`: it
+        fires ahead of demand so the plugin can start an SSD->DRAM migration
+        while the caller still waits (e.g. a request's admission wait), leaving
+        the data warm for a later ``batch_retrieve`` of the same keys. The
+        argument shape and the ``keys[i]`` ↔ ``batch_resp.entries[i]``
+        correspondence are identical to :meth:`on_batch_retrieve`, and a
+        hardware hint targets the same ``handle.offset + kv_offset`` for
+        ``kv_length`` bytes.
+
+        The one difference from :meth:`on_batch_retrieve` is that
+        ``prefetch_batch`` performs **no data read and maps no regions** — it
+        only looks the keys up. A region that is not already mapped therefore
+        has no live address to hint against; the plugin must issue hints only
+        for regions where :meth:`MaruHandler.is_region_mapped` is true and skip
+        the rest (they are prefaulted on their own ``map_region`` at demand
+        time). On a cache-hit pass the regions are already mapped from the
+        populate pass, so the common case still hints every key.
+
+        Runs on the caller's path — keep it cheap and non-blocking. Same
+        soft-fail isolation and non-serialization against :meth:`on_close` as
+        :meth:`on_batch_retrieve`.
+        """
+        ...
+
     def on_close(self, handler: MaruHandler) -> None:
         """Called during ``MaruHandler.close``, while regions are still mapped.
 
