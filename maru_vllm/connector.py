@@ -1201,9 +1201,20 @@ class MaruWorkerConnector:
                         2, num_layers, ct, -1
                     )
                     if kernel is not None:
+                        # Stage the slab through the copy engine (async DMA —
+                        # the CXL mapping is cudaHostRegister'ed by the
+                        # mapper), then scatter the device-resident slab with
+                        # one brief kernel. Running the UVA kernel directly on
+                        # the host slab would occupy SMs for the whole
+                        # CXL-read duration and stall concurrent decode — the
+                        # very stall this deferred path exists to remove
+                        # (measured: TPOT stuck at the inline path's level,
+                        # while MP's media-invariant TPOT shows its bulk
+                        # bytes ride the copy engine).
                         ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                        slab_dev = slab_host.to(device, non_blocking=True)
                         ops.multi_layer_kv_transfer(
-                            slab_host,
+                            slab_dev,
                             ptrs,
                             chunk_slots,
                             device,
