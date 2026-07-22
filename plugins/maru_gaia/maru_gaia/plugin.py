@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING
 
 import pyxif
@@ -48,6 +49,12 @@ class GaiaPrefetchPlugin:
 
     def __init__(self) -> None:
         self._coalesce = os.environ.get("MARU_GAIA_PREFETCH_COALESCE", "1") == "1"
+        # Read gate (MARU_GAIA_PREFETCH_SYNC=1): at the demand-read boundary
+        # (on_batch_retrieve) block until the range is device-DRAM resident via
+        # memory_prefetch_sync instead of the fire-and-forget async hint. The
+        # arrival lookahead (on_prefetch) stays async regardless — a sync call
+        # there would block and defeat the overlap with admission wait.
+        self._sync_gate = os.environ.get("MARU_GAIA_PREFETCH_SYNC", "0") == "1"
         # The experiment always names the single gaia device via
         # MARU_GAIA_DEVICE_ID (same env naru/gaia-bench use to set DRAM
         # capacity). Prefer it: pyxif's auto-enumeration (get_device_list) is
@@ -63,10 +70,12 @@ class GaiaPrefetchPlugin:
         self._issued = 0
         self._failed = 0
         self._skipped = 0
+        self._sync_wait_us = 0  # cumulative sync read-gate block time
         logger.info(
-            "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s)",
+            "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, read_gate=%s)",
             "on" if self._coalesce else "off",
             self._device_id if self._device_id is not None else "auto-scan",
+            "sync" if self._sync_gate else "async",
         )
 
     # -- MaruHandlerPlugin seams -------------------------------------------
@@ -77,8 +86,10 @@ class GaiaPrefetchPlugin:
         keys: list[str],
         batch_resp: BatchLookupKVResponse,
     ) -> None:
-        """Reactive hint at demand read time (baseline behavior)."""
-        self._issue(handler, batch_resp, source="retrieve")
+        """Demand-read boundary. With MARU_GAIA_PREFETCH_SYNC=1 this is a sync
+        read-gate (block until DRAM-resident); otherwise the async reactive
+        hint (baseline)."""
+        self._issue(handler, batch_resp, source="retrieve", sync=self._sync_gate)
 
     def on_prefetch(
         self,
@@ -86,8 +97,10 @@ class GaiaPrefetchPlugin:
         keys: list[str],
         batch_resp: BatchLookupKVResponse,
     ) -> None:
-        """Lookahead hint fired ahead of demand by arrival-hint."""
-        self._issue(handler, batch_resp, source="prefetch")
+        """Lookahead hint fired ahead of demand by arrival-hint — always async
+        (a sync call here would block and defeat the overlap with admission
+        wait)."""
+        self._issue(handler, batch_resp, source="prefetch", sync=False)
 
     def contribute_stats(self) -> dict:
         """Cumulative prefetch counters for ``MaruHandler.get_stats``."""
@@ -96,6 +109,8 @@ class GaiaPrefetchPlugin:
             "failed": self._failed,
             "skipped": self._skipped,
             "coalesce": self._coalesce,
+            "read_gate": "sync" if self._sync_gate else "async",
+            "sync_gate_wait_ms": round(self._sync_wait_us / 1000.0, 1),
         }
 
     # -- internals ----------------------------------------------------------
@@ -131,6 +146,7 @@ class GaiaPrefetchPlugin:
         handler: MaruHandler,
         batch_resp: BatchLookupKVResponse,
         source: str,
+        sync: bool = False,
     ) -> None:
         """Resolve mapped found entries to device ranges and prefetch them.
 
@@ -138,6 +154,12 @@ class GaiaPrefetchPlugin:
         not currently mapped (only a mapped region has a live address to hint
         against). Contiguous ranges on the same device are merged when
         coalescing is enabled before dispatch.
+
+        With ``sync`` the ranges go through ``memory_prefetch_sync``, which
+        returns only once the range is device-DRAM resident (a read gate). The
+        total block time is the fill the caller's lead did not hide, logged and
+        accumulated as the direct signal of lookahead benefit. Without ``sync``
+        the async ``memory_prefetch`` returns on submission (no completion).
         """
         eligible: list[tuple[int, int, int]] = []
         skipped = 0
@@ -158,26 +180,45 @@ class GaiaPrefetchPlugin:
         chunk_count = len(eligible)
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
 
+        prefetch_fn = pyxif.memory_prefetch_sync if sync else pyxif.memory_prefetch
         issued = 0
         failed = 0
+        t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
-            status = pyxif.memory_prefetch(device_id, device_addr, size)
+            status = prefetch_fn(device_id, device_addr, size)
             if status == pyxif.MemoryStatus.Success:
                 issued += 1
             else:
                 failed += 1
                 logger.warning(
-                    "gaia_prefetch failed: device=%d addr=0x%x size=%d status=%s",
+                    "gaia_prefetch failed: device=%d addr=0x%x size=%d status=%s sync=%s",
                     device_id,
                     device_addr,
                     size,
                     status,
+                    sync,
                 )
+        wait_us = int((time.monotonic() - t0) * 1e6) if sync else 0
 
         self._issued += issued
         self._failed += failed
         self._skipped += skipped
-        if issued or failed:
+        self._sync_wait_us += wait_us
+        if not (issued or failed):
+            return
+        if sync:
+            logger.info(
+                "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
+                "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f",
+                source,
+                chunk_count,
+                len(ranges),
+                issued,
+                failed,
+                skipped,
+                wait_us / 1000.0,
+            )
+        else:
             logger.info(
                 "gaia_prefetch(%s): chunks=%d, ranges=%d (issued=%d, failed=%d), "
                 "skipped=%d, coalesce=%s",

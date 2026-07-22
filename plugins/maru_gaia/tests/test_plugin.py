@@ -28,6 +28,7 @@ class _FakePyxif:
         self._dax_path = dax_path
         self._device_id = device_id
         self.calls: list[tuple[int, int, int]] = []
+        self.sync_calls: list[tuple[int, int, int]] = []
 
     def get_device_list(self):
         return [self._device_id]
@@ -37,6 +38,10 @@ class _FakePyxif:
 
     def memory_prefetch(self, device_id, addr, size):
         self.calls.append((device_id, addr, size))
+        return self.MemoryStatus.Success
+
+    def memory_prefetch_sync(self, device_id, addr, size):
+        self.sync_calls.append((device_id, addr, size))
         return self.MemoryStatus.Success
 
 
@@ -161,6 +166,51 @@ class TestIssue:
         plugin.on_prefetch(_handler(), ["k0"], _resp(miss))
 
         assert fake.calls == []
+
+
+class TestSyncReadGate:
+    """MARU_GAIA_PREFETCH_SYNC routes the read boundary through the sync API."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_device_env(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+
+    def test_retrieve_uses_sync_when_gate_on(self, monkeypatch):
+        """on_batch_retrieve → memory_prefetch_sync (block-until-resident)."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC", "1")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["k0"], _resp(_entry(0x1000, 0, 0x100)))
+
+        assert fake.sync_calls == [(0, 0x1000, 0x100)]  # went through sync path
+        assert fake.calls == []  # not the async path
+        assert plugin.contribute_stats()["read_gate"] == "sync"
+
+    def test_retrieve_is_async_when_gate_off(self, monkeypatch):
+        """Default: on_batch_retrieve stays async (baseline reactive hint)."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.delenv("MARU_GAIA_PREFETCH_SYNC", raising=False)
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["k0"], _resp(_entry(0x1000, 0, 0x100)))
+
+        assert fake.calls == [(0, 0x1000, 0x100)]
+        assert fake.sync_calls == []
+
+    def test_arrival_lookahead_stays_async_even_with_gate_on(self, monkeypatch):
+        """on_prefetch must never block — always async regardless of the gate."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC", "1")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_prefetch(_handler(), ["k0"], _resp(_entry(0x1000, 0, 0x100)))
+
+        assert fake.calls == [(0, 0x1000, 0x100)]  # async
+        assert fake.sync_calls == []
 
 
 if __name__ == "__main__":
