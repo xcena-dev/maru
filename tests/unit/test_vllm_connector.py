@@ -826,6 +826,32 @@ class TestBuildConnectorMetaStoreAccumulation:
         assert req.block_ids == list(range(15))
         assert req.num_computed_tokens == 58
 
+    def test_preempted_ids_are_forwarded_for_store_stream_safety(self):
+        sched = self._make_scheduler()
+        output = self._output([], self._cached([], [], []), {})
+        output.preempted_req_ids = {"preempted-1", "preempted-2"}
+
+        meta = sched.build_connector_meta(output)
+
+        assert meta.preempted_req_ids == {"preempted-1", "preempted-2"}
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_request_finished_transfers_block_ownership_only_for_write_behind(
+        self, enabled
+    ):
+        from maru_vllm.connector import MaruSchedulerConnector
+
+        sched = MaruSchedulerConnector(
+            block_size=4,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_enable_write_behind": enabled},
+        )
+
+        owns_blocks, params = sched.request_finished(MagicMock(), [1, 2])
+
+        assert owns_blocks is enabled
+        assert params is None
+
 
 # =============================================================================
 # Deferred (between-step) loading
@@ -1061,6 +1087,121 @@ class TestAsyncDeferredPackedLoad:
         assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
+
+
+# =============================================================================
+# Packed-store write-behind lifecycle
+# =============================================================================
+
+
+class TestWriteBehindStoreLifecycle:
+    def _make_worker(self):
+        from maru_vllm.connector import MaruWorkerConnector
+
+        worker = MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=8,
+            extra_config={"maru_enable_write_behind": True},
+        )
+        worker._handler = MagicMock()
+        return worker
+
+    @staticmethod
+    def _reserve(worker, key="k1", req_ids=("r1",)):
+        worker._pending_store_keys.add(key)
+        worker._store_key_waiters[key] = set(req_ids)
+        for req_id in req_ids:
+            worker._request_pending_store_keys.setdefault(req_id, set()).add(key)
+
+    def test_finished_request_waits_until_all_keys_complete(self):
+        worker = self._make_worker()
+        self._reserve(worker, "k1")
+        self._reserve(worker, "k2")
+
+        assert worker.get_finished_saving({"r1"}) is None
+        worker._complete_write_behind_keys(["k1"], [True])
+        assert worker.get_finished_saving(set()) is None
+        worker._complete_write_behind_keys(["k2"], [True])
+
+        assert worker.get_finished_saving(set()) == {"r1"}
+        assert worker.get_finished_saving(set()) is None
+        assert worker._stored_keys == {"k1", "k2"}
+
+    def test_failure_releases_request_without_publishing_key(self):
+        worker = self._make_worker()
+        self._reserve(worker)
+
+        assert worker.get_finished_saving({"r1"}) is None
+        worker._complete_write_behind_keys(["k1"], [False])
+
+        assert worker.get_finished_saving(set()) == {"r1"}
+        assert "k1" not in worker._stored_keys
+        assert worker._pending_store_keys == set()
+
+    def test_shared_key_releases_all_waiters(self):
+        worker = self._make_worker()
+        self._reserve(worker, req_ids=("r1", "r2"))
+
+        assert worker.get_finished_saving({"r1", "r2"}) is None
+        worker._complete_write_behind_keys(["k1"], [True])
+
+        assert worker.get_finished_saving(set()) == {"r1", "r2"}
+
+    def test_background_registration_publishes_only_after_event(self):
+        worker = self._make_worker()
+        self._reserve(worker)
+        worker._handler.batch_store.return_value = [True]
+        event = MagicMock()
+        refs = [object()]
+        handle = object()
+
+        worker._finish_write_behind_store(event, ["k1"], [handle], refs)
+
+        event.synchronize.assert_called_once_with()
+        worker._handler.batch_store.assert_called_once_with(["k1"], [handle])
+        assert refs == []
+        assert worker._stored_keys == {"k1"}
+
+    def test_background_registration_exception_frees_handles(self):
+        worker = self._make_worker()
+        self._reserve(worker)
+        worker._handler.batch_store.side_effect = RuntimeError("rpc down")
+        event = MagicMock()
+        handle = object()
+
+        worker._finish_write_behind_store(event, ["k1"], [handle], [])
+
+        worker._handler.free.assert_called_once_with(handle)
+        assert worker._stored_keys == set()
+        assert worker._pending_store_keys == set()
+
+    def test_preemption_drains_store_stream_before_block_reuse(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        worker._store_stream = MagicMock()
+
+        worker.handle_preemptions(
+            MaruConnectorMetadata(preempted_req_ids={"preempted"})
+        )
+
+        worker._store_stream.synchronize.assert_called_once_with()
+
+    def test_shutdown_launches_batches_skipped_by_final_get_finished(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        kernel = ("ops",) * 6
+        metadata = MaruConnectorMetadata()
+        worker._queued_store_batches = [(kernel, metadata)]
+        worker._store_packed_slabs_write_behind = MagicMock()
+
+        worker.shutdown()
+
+        worker._store_packed_slabs_write_behind.assert_called_once_with(
+            kernel, metadata
+        )
+        assert worker._queued_store_batches == []
 
 
 # =============================================================================
@@ -1355,6 +1496,42 @@ class TestPackedStorage:
         assert worker._pending_slabs == {}
         assert worker._store_layers_seen == set()
 
+    def test_write_behind_launches_only_after_forward_completion(self):
+        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+
+        worker, _ = self._make_worker()
+        worker._write_behind = True
+        kernel = ("ops",) * 6
+        worker._packed_store_kernel_ctx = lambda attn: kernel
+        worker._store_packed_slabs_write_behind = MagicMock()
+        attn = self._flash_attn()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        metadata = MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=list(range(self.PROMPT)),
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+
+        for layer_name, kv_layer in zip(names, self._kv_layers(), strict=True):
+            worker.save_kv_layer(layer_name, kv_layer, attn, metadata)
+
+        worker._store_packed_slabs_write_behind.assert_not_called()
+        assert worker._queued_store_batches == [(kernel, metadata)]
+
+        worker.get_finished_saving(set())
+
+        worker._store_packed_slabs_write_behind.assert_called_once_with(
+            kernel, metadata
+        )
+        assert worker._queued_store_batches == []
+
     def test_kernel_ctx_caching_contract(self):
         """_packed_store_kernel_ctx resolves once and caches the outcome:
         empty caches -> unresolved (re-probed later), unusable kernel ->
@@ -1560,6 +1737,52 @@ class TestPackedStorage:
         worker._store_packed_slabs(kernel, _meta(12, 4))
         assert set(store.keys()) == set(chunk_keys)
         assert kernel[0].multi_layer_kv_transfer.call_count == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_write_behind_gpu_store_reports_completion(self):
+        """Exercise staged D2H and background registration."""
+        import time as _time
+
+        from maru_vllm.connector import (
+            MaruConnectorMetadata,
+            MaruReqMeta,
+            _chunk_keys,
+        )
+
+        worker, store = self._make_worker()
+        worker._write_behind = True
+        kv_layers = [kv.cuda() for kv in self._kv_layers()]
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        kernel = self._fake_store_kernel(kv_layers)
+        token_ids = list(range(self.PROMPT))
+        meta = MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=token_ids,
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+
+        worker._store_packed_slabs_write_behind(kernel, meta)
+        done = worker.get_finished_saving({"r1"})
+        deadline = _time.monotonic() + 5.0
+        while done is None and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+            done = worker.get_finished_saving(set())
+
+        assert done == {"r1"}
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        assert set(store) == set(chunk_keys)
+        assert kernel[0].multi_layer_kv_transfer.call_count == len(chunk_keys)
+        assert worker._pending_store_keys == set()
+        assert worker._request_pending_store_keys == {}
+        worker.shutdown()
 
     def test_kv2ltd_slab_scatter_contract(self):
         """Pin the KV_2LTD slab ↔ paged-buffer scatter contract the no-staging

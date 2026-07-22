@@ -212,6 +212,10 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     """Metadata communicated from scheduler to worker each step."""
 
     requests: list[MaruReqMeta] = field(default_factory=list)
+    # A write-behind store may still be reading blocks that the scheduler
+    # preempted after the previous step. The worker drains its store stream
+    # before the next forward can reuse those block IDs.
+    preempted_req_ids: set[str] = field(default_factory=set)
 
 
 # ============================================================================
@@ -246,6 +250,11 @@ class MaruKVConnector(KVConnectorBase_V1):
             RPC wait nor the copy ever blocks the engine's forward passes —
             the in-process analog of the MP server's separate-process
             retrieve (default: false)
+        maru_enable_write_behind: bool - Gather completed prompt chunks into a
+            reusable GPU staging slab after the forward, then copy them to CXL
+            with asynchronous D2H DMA. Metadata registration finishes on a
+            background thread; finished requests retain their GPU blocks until
+            get_finished() reports the store complete (default: false)
         maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
             two-stage load with one fused gather-scatter kernel that reads
             the CXL pages directly (LMCache single_layer_kv_transfer).
@@ -367,8 +376,16 @@ class MaruKVConnector(KVConnectorBase_V1):
         self._worker.save_kv_layer(layer_name, kv_layer, attn_metadata, metadata)
 
     def wait_for_save(self):
-        # CXL mmap write is synchronous
-        pass
+        # Synchronous stores complete inside save_kv_layer. Write-behind stores
+        # intentionally outlive this forward; request/block lifetime is
+        # tracked through request_finished() + get_finished().
+        return
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        """Protect blocks preempted while a write-behind D2H is in flight."""
+        assert self._worker is not None
+        assert isinstance(kv_connector_metadata, MaruConnectorMetadata)
+        self._worker.handle_preemptions(kv_connector_metadata)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -376,15 +393,28 @@ class MaruKVConnector(KVConnectorBase_V1):
         """Report requests whose deferred (between-step) KV loads completed.
 
         Args:
-            finished_req_ids: requests that finished generating (save side;
-                unused — CXL stores are synchronous).
+            finished_req_ids: requests that finished generating. In
+                write-behind mode their blocks remain owned by the connector
+                until every queued store that reads them is complete.
 
         Returns:
             ``(finished_sending, finished_recving)`` per the connector
-            contract; sending is always None.
+            contract.
         """
         assert self._worker is not None
-        return None, self._worker.get_finished_loading()
+        return (
+            self._worker.get_finished_saving(finished_req_ids),
+            self._worker.get_finished_loading(),
+        )
+
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Keep finished-request blocks alive while write-behind reads them."""
+        assert self._scheduler is not None
+        return self._scheduler.request_finished(request, block_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return block ids whose deferred load failed (vLLM recomputes them)."""
@@ -433,6 +463,7 @@ class MaruSchedulerConnector:
         self._deferred_loading = bool(
             extra_config.get("maru_enable_deferred_loading", False)
         )
+        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
         # Deferred loads registered by update_state_after_alloc, emitted once
         # by the next build_connector_meta. req_id -> (request,
         # num_matched_chunks, block_ids).
@@ -620,7 +651,9 @@ class MaruSchedulerConnector:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = MaruConnectorMetadata()
+        meta = MaruConnectorMetadata(
+            preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
+        )
 
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
@@ -760,6 +793,14 @@ class MaruSchedulerConnector:
         self._requests_need_load.clear()
         return meta
 
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Transfer block ownership to the worker for write-behind stores."""
+        return self._write_behind, None
+
 
 # ============================================================================
 # Worker-side implementation
@@ -850,6 +891,23 @@ class MaruWorkerConnector:
         # Dedicated stream for the kernel store's per-chunk D2H transfers.
         self._store_stream: torch.cuda.Stream | None = None
         self._store_stream_device: torch.device | None = None
+        # Opt-in packed-store write-behind. After the forward, the engine thread
+        # queues a short GPU gather plus copy-engine D2H on a dedicated stream;
+        # a background thread waits for its event and registers the ready keys.
+        # All state below is protected by _store_lock because the engine and
+        # completion thread both update key/request lifetimes.
+        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
+        self._store_executor: ThreadPoolExecutor | None = None
+        self._store_lock = threading.Lock()
+        self._pending_store_keys: set[str] = set()
+        self._store_key_waiters: dict[str, set[str]] = {}
+        self._request_pending_store_keys: dict[str, set[str]] = {}
+        self._finished_store_requests: set[str] = set()
+        self._store_staging: torch.Tensor | None = None
+        # save_kv_layer runs inside the model forward. In write-behind mode it
+        # records completed packed-store batches here; get_finished() launches
+        # them after the forward has produced its output.
+        self._queued_store_batches: list[tuple[tuple, MaruConnectorMetadata]] = []
         # CXL page size (bytes) auto-derived from the registered KV caches so a
         # single (chunk x layer) object exactly fills one page instead of
         # rounding up into the larger default page (~4x space waste). Set in
@@ -1348,6 +1406,46 @@ class MaruWorkerConnector:
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
         return done or None
+
+    def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
+        """Return finished requests whose write-behind stores have drained.
+
+        ``request_finished`` transfers ownership of a finished request's GPU
+        blocks to the connector. A request ID may be presented only once by
+        vLLM, so remember it until every key associated with that request has
+        finished its D2H and ``batch_store`` registration. Store failures also
+        release the request: they make that cache entry unavailable, but must
+        never leak GPU blocks.
+        """
+        if not self._write_behind:
+            return None
+        queued = self._queued_store_batches
+        self._queued_store_batches = []
+        for kernel, metadata in queued:
+            self._store_packed_slabs_write_behind(kernel, metadata)
+        with self._store_lock:
+            self._finished_store_requests.update(finished_req_ids)
+            done = {
+                req_id
+                for req_id in self._finished_store_requests
+                if req_id not in self._request_pending_store_keys
+            }
+            self._finished_store_requests.difference_update(done)
+        return done or None
+
+    def handle_preemptions(self, metadata: MaruConnectorMetadata) -> None:
+        """Drain D2H before preempted block IDs can be reused by a forward.
+
+        Metadata registration may continue in the background because it no
+        longer reads the GPU cache. Only the store stream must be complete at
+        this boundary.
+        """
+        if (
+            self._write_behind
+            and metadata.preempted_req_ids
+            and self._store_stream is not None
+        ):
+            self._store_stream.synchronize()
 
     def take_failed_load_blocks(self) -> set[int]:
         """Return (and clear) block ids whose deferred load failed."""
@@ -1980,7 +2078,13 @@ class MaruWorkerConnector:
             self._store_layers_seen.add(layer_idx)
             if len(self._store_layers_seen) >= self._num_layers:
                 self._store_layers_seen.clear()
-                self._store_packed_slabs(kernel, metadata)
+                if self._write_behind:
+                    # Launch after the forward in get_finished_saving(), not
+                    # from the final attention layer. This keeps store work off
+                    # the current step's first-token critical path.
+                    self._queued_store_batches.append((kernel, metadata))
+                else:
+                    self._store_packed_slabs(kernel, metadata)
             return
 
         for req_meta in metadata.requests:
@@ -2247,6 +2351,235 @@ class MaruWorkerConnector:
                 f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c"
             )
 
+    def _store_packed_slabs_write_behind(
+        self, kernel: tuple, metadata: MaruConnectorMetadata
+    ) -> None:
+        """Queue packed stores without blocking the engine's forward path.
+
+        The gather kernel writes one reusable device slab, followed by a
+        non-blocking device-to-CXL copy. Reuse is safe because all operations
+        share one ordered CUDA stream. Once the final D2H event fires, the
+        completion thread registers every key with Maru. Keys are reserved
+        before allocation so overlapping requests/steps never issue duplicate
+        stores while an earlier copy is still in flight.
+        """
+        handler = self._handler
+        if handler is None:
+            logger.error("Maru write-behind store: handler unavailable; skipping step")
+            return
+        ops, ptrs, pbs, block_size, head_size, fmt = kernel
+        per_layer_bytes = self._chunk_object_bytes()
+        if per_layer_bytes is None:
+            logger.error("Maru write-behind store: cannot size slab; skipping step")
+            return
+        slab_bytes = per_layer_bytes * self._num_layers
+        sample = next(iter(self._kv_caches.values()))
+        dev, dtype = sample.device, sample.dtype
+        ct = self._kv_chunk_tokens
+
+        # First collect request-to-key ownership on CPU. Shared-prefix keys
+        # retain every request ID even though only one physical copy is queued.
+        key_entries: dict[str, tuple[torch.Tensor, set[str]]] = {}
+        for req_meta in metadata.requests:
+            if not req_meta.is_store:
+                continue
+            chunk_keys = _req_chunk_keys(req_meta, ct)
+            if not chunk_keys:
+                continue
+            if req_meta.num_scheduled_tokens > 0:
+                start_chunk = req_meta.num_computed_tokens // ct
+                end_chunk = (
+                    req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
+                ) // ct
+            else:
+                start_chunk, end_chunk = 0, len(chunk_keys)
+            end_chunk = min(end_chunk, len(chunk_keys))
+            # Chunked-prefill intermediate steps have not produced a first
+            # token yet. Defer them and, on the prompt-completing step, store
+            # the whole prefix from the full accumulated block list. This
+            # avoids competing with the remaining prefill and coalesces all
+            # chunks into one write-behind batch.
+            if end_chunk < len(chunk_keys):
+                continue
+            start_chunk = 0
+            if start_chunk >= end_chunk:
+                continue
+
+            needed_tokens = end_chunk * ct
+            slot_mapping = self._build_slot_mapping(req_meta.block_ids, needed_tokens)
+            if slot_mapping.shape[0] < needed_tokens:
+                logger.error(
+                    "Maru write-behind store: block_ids covers %d tokens but "
+                    "chunks up to %d need %d for req %s; skipping",
+                    slot_mapping.shape[0],
+                    end_chunk,
+                    needed_tokens,
+                    req_meta.req_id,
+                )
+                continue
+            for ci in range(start_chunk, end_chunk):
+                base_key = chunk_keys[ci]
+                chunk_slots = slot_mapping[ci * ct : (ci + 1) * ct]
+                entry = key_entries.get(base_key)
+                if entry is None:
+                    key_entries[base_key] = (chunk_slots, {req_meta.req_id})
+                else:
+                    entry[1].add(req_meta.req_id)
+
+        # Reserve new keys and attach request waiters to both new and already
+        # pending keys. Completion of the original job wakes late joiners too.
+        to_schedule: list[tuple[str, torch.Tensor]] = []
+        with self._store_lock:
+            for base_key, (chunk_slots, req_ids) in key_entries.items():
+                if base_key in self._stored_keys:
+                    continue
+                waiters = self._store_key_waiters.setdefault(base_key, set())
+                waiters.update(req_ids)
+                for req_id in req_ids:
+                    self._request_pending_store_keys.setdefault(req_id, set()).add(
+                        base_key
+                    )
+                if base_key not in self._pending_store_keys:
+                    self._pending_store_keys.add(base_key)
+                    to_schedule.append((base_key, chunk_slots))
+
+        if not to_schedule:
+            return
+
+        if self._store_stream is None or self._store_stream_device != dev:
+            self._store_stream = torch.cuda.Stream(device=dev)
+            self._store_stream_device = dev
+        store_stream = self._store_stream
+        store_stream.wait_stream(torch.cuda.current_stream(dev))
+
+        ready_keys: list[str] = []
+        ready_handles: list[Any] = []
+        slot_refs: list[torch.Tensor] = []
+        with torch.cuda.stream(store_stream):
+            for base_key, chunk_slots in to_schedule:
+                handle = None
+                try:
+                    handle = handler.alloc(slab_bytes)
+                    slab_host = torch.frombuffer(
+                        handle.buf[:slab_bytes], dtype=dtype
+                    ).view(2, self._num_layers, ct, -1)
+                    if (
+                        self._store_staging is None
+                        or self._store_staging.shape != slab_host.shape
+                        or self._store_staging.dtype != dtype
+                        or self._store_staging.device != dev
+                    ):
+                        self._store_staging = torch.empty_like(slab_host, device=dev)
+                    chunk_slots_dev = chunk_slots.to(dev, non_blocking=True)
+                    slot_refs.append(chunk_slots_dev)
+                    ops.multi_layer_kv_transfer(
+                        self._store_staging,
+                        ptrs,
+                        chunk_slots_dev,
+                        dev,
+                        pbs,
+                        ops.TransferDirection.D2H,
+                        fmt,
+                        block_size=block_size,
+                        head_size=head_size,
+                    )
+                    # Maru cudaHostRegister's the CXL mapping, so this uses the
+                    # copy engine rather than keeping SMs busy for the D2H.
+                    slab_host.copy_(self._store_staging, non_blocking=True)
+                except Exception as e:
+                    logger.error("Maru write-behind prepare error: %s: %s", base_key, e)
+                    if handle is not None:
+                        try:
+                            handler.free(handle)
+                        except Exception:
+                            pass
+                    self._complete_write_behind_keys([base_key], [False])
+                    continue
+                ready_keys.append(base_key)
+                ready_handles.append(handle)
+
+            if not ready_keys:
+                return
+            event = torch.cuda.Event()
+            event.record(store_stream)
+
+        if self._store_executor is None:
+            self._store_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-write-behind"
+            )
+        try:
+            self._store_executor.submit(
+                self._finish_write_behind_store,
+                event,
+                ready_keys,
+                ready_handles,
+                slot_refs,
+            )
+        except Exception as e:
+            # Executor creation/submission failures are exceptional. Drain the
+            # queued copies before freeing their destination handles.
+            logger.error("Maru write-behind submit failed: %s", e)
+            event.synchronize()
+            self._free_handles_best_effort(ready_handles)
+            self._complete_write_behind_keys(ready_keys, [False] * len(ready_keys))
+
+    def _finish_write_behind_store(
+        self,
+        event: torch.cuda.Event,
+        keys: list[str],
+        handles: list[Any],
+        refs: list[Any],
+    ) -> None:
+        """Wait for D2H and register a write-behind batch off-thread."""
+        handler = self._handler
+        if handler is None:
+            logger.error("Maru write-behind completion: handler unavailable")
+            self._complete_write_behind_keys(keys, [False] * len(keys))
+            return
+        try:
+            event.synchronize()
+        except Exception as e:
+            logger.error("Maru write-behind D2H failed: %s", e)
+            self._free_handles_best_effort(handles)
+            self._complete_write_behind_keys(keys, [False] * len(keys))
+            return
+        refs.clear()  # safe to release stream inputs after the event
+
+        try:
+            results = list(handler.batch_store(keys, handles))
+        except Exception as e:
+            logger.error("Maru write-behind batch_store failed: %s", e)
+            self._free_handles_best_effort(handles)
+            self._complete_write_behind_keys(keys, [False] * len(keys))
+            return
+
+        # Treat a malformed short response as failure rather than leaving keys
+        # and request-owned blocks pending forever.
+        if len(results) < len(keys):
+            results.extend([False] * (len(keys) - len(results)))
+        self._complete_write_behind_keys(keys, results[: len(keys)])
+        if self._timing:
+            _emit_timing(
+                f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
+            )
+
+    def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
+        """Publish key outcomes and release all request waiters atomically."""
+        with self._store_lock:
+            for base_key, ok in zip(keys, results, strict=True):
+                if ok:
+                    self._stored_keys.add(base_key)
+                else:
+                    logger.warning("Maru write-behind store failed: %s", base_key)
+                self._pending_store_keys.discard(base_key)
+                for req_id in self._store_key_waiters.pop(base_key, set()):
+                    pending = self._request_pending_store_keys.get(req_id)
+                    if pending is None:
+                        continue
+                    pending.discard(base_key)
+                    if not pending:
+                        del self._request_pending_store_keys[req_id]
+
     def _discard_pending_slab(self, base_key: str) -> None:
         """Free and drop a half-filled slab handle after an error."""
         entry = self._pending_slabs.pop(base_key, None)
@@ -2303,6 +2636,25 @@ class MaruWorkerConnector:
                     pass
 
     def shutdown(self):
+        # An exceptional engine exit can skip get_finished() after the final
+        # save hooks. Launch those recorded batches while CUDA and the handler
+        # are still alive, then drain them below.
+        queued = self._queued_store_batches
+        self._queued_store_batches = []
+        for kernel, metadata in queued:
+            self._store_packed_slabs_write_behind(kernel, metadata)
+        # Write-behind jobs own CXL handles and use the handler. Drain them
+        # before closing either the CUDA stream or MaruHandler.
+        if self._store_executor is not None:
+            self._store_executor.shutdown(wait=True)
+            self._store_executor = None
+        if self._store_stream is not None:
+            try:
+                self._store_stream.synchronize()
+            except Exception as e:
+                logger.error("Error synchronizing Maru store stream: %s", e)
+            self._store_stream = None
+            self._store_staging = None
         # Drain the loader thread before touching the handler or streams:
         # an in-flight job may still be retrieving/queueing copies.
         if self._deferred_executor is not None:
