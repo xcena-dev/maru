@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -238,9 +240,12 @@ class MaruKVConnector(KVConnectorBase_V1):
         maru_enable_async_loading: bool - Overlap CXL->GPU load with compute
             through a dedicated CUDA stream (default: false)
         maru_enable_deferred_loading: bool - Load matched KV between scheduler
-            steps: the request is parked in WAITING_FOR_REMOTE_KVS while the
-            CXL->GPU transfer runs on the dedicated stream, so other requests'
-            compute is never blocked by the load (default: false)
+            steps: the request is parked in WAITING_FOR_REMOTE_KVS while a
+            background loader thread performs the whole load (Maru retrieve
+            RPC + CXL->GPU transfer on a dedicated stream), so neither the
+            RPC wait nor the copy ever blocks the engine's forward passes —
+            the in-process analog of the MP server's separate-process
+            retrieve (default: false)
         maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
             two-stage load with one fused gather-scatter kernel that reads
             the CXL pages directly (LMCache single_layer_kv_transfer).
@@ -803,6 +808,16 @@ class MaruWorkerConnector:
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        # True-async deferred loads (packed path): a single background thread
+        # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
+        # so neither the RPC wait nor the copy blocks the engine thread's
+        # forward passes (the in-process analog of MP's separate-process
+        # retrieve). _deferred_lock guards every _deferred_*/failed structure;
+        # both the loader thread and the engine thread mutate them.
+        self._deferred_lock = threading.Lock()
+        self._deferred_executor: ThreadPoolExecutor | None = None
+        self._deferred_stream: torch.cuda.Stream | None = None
+        self._deferred_stream_device: torch.device | None = None
         # Last non-None attention metadata; deferred loads run between steps
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
@@ -975,6 +990,17 @@ class MaruWorkerConnector:
             if req_meta.is_store or req_meta.num_matched_chunks == 0:
                 continue
 
+            # Packed deferred loads run entirely off-thread (retrieve RPC +
+            # H2D): submit and move on — this forward pass never waits on
+            # them. Falls through to the synchronous packed path when the
+            # async prerequisites (registered CUDA KV caches) are missing.
+            if (
+                req_meta.deferred_load
+                and not self._use_layerwise
+                and self._try_submit_deferred_packed_load(req_meta)
+            ):
+                continue
+
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
@@ -1076,6 +1102,152 @@ class MaruWorkerConnector:
                 req_meta.req_id,
             )
 
+    def _try_submit_deferred_packed_load(self, req_meta: MaruReqMeta) -> bool:
+        """Hand a packed deferred load to the background loader thread.
+
+        Returns:
+            True when the load was submitted. False when the async path
+            cannot run (KV caches not registered yet, non-CUDA or
+            multi-device layout) — the caller then falls back to the
+            synchronous packed load, which reports the request finished
+            immediately.
+        """
+        if not self._kv_caches or self._num_layers <= 0:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        devices = {kv.device for kv in self._kv_caches.values()}
+        if len(devices) != 1:
+            return False
+        device = next(iter(devices))
+        if device.type != "cuda":
+            return False
+        layers = [
+            (name, kv_cache, self._get_layer_index(name))
+            for name, kv_cache in self._kv_caches.items()
+        ]
+        if self._deferred_executor is None:
+            self._deferred_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-deferred-load"
+            )
+        self._deferred_executor.submit(
+            self._deferred_packed_load_job, req_meta, layers, device
+        )
+        return True
+
+    def _deferred_packed_load_job(
+        self,
+        req_meta: MaruReqMeta,
+        layers: list[tuple[str, torch.Tensor, int]],
+        device: torch.device,
+    ) -> None:
+        """Load one parked request's KV off-thread (retrieve + H2D + event).
+
+        Runs on the deferred-load thread. The Maru RPC client serializes
+        socket use internally, so retrieving here while the engine thread
+        stores is safe. Completion is a CUDA event on the dedicated stream,
+        observed by ``get_finished_loading``; any failure reports the
+        request's blocks through ``take_failed_load_blocks`` so vLLM
+        recomputes instead of consuming unloaded KV.
+        """
+        try:
+            handler = self._handler
+            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
+            if handler is None or num_chunks == 0:
+                self._fail_deferred_load(req_meta)
+                return
+            total_tokens = num_chunks * self._kv_chunk_tokens
+            slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+            keys = [chunk_keys[ci] for ci in range(num_chunks)]
+
+            _t0 = time.monotonic()
+            infos = self._batch_retrieve_all(keys)
+            if self._timing:
+                _emit_timing(
+                    f"deferred retrieve batch {len(keys)} keys = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
+                )
+            miss = next((i for i, v in enumerate(infos) if v is None), -1)
+            if miss >= 0:
+                logger.warning(
+                    "Maru deferred load miss: %s — recompute for req %s",
+                    keys[miss],
+                    req_meta.req_id,
+                )
+                self._fail_deferred_load(req_meta)
+                return
+
+            torch.cuda.set_device(device)
+            if self._deferred_stream is None or self._deferred_stream_device != device:
+                # Highest priority: parked requests' TTFT gates on these
+                # copies.
+                self._deferred_stream = torch.cuda.Stream(device=device, priority=-1)
+                self._deferred_stream_device = device
+            stream = self._deferred_stream
+
+            attn = self._last_attn_metadata
+            # Content-identical to _packed_load_kernel_ctx, but built from the
+            # registered KV caches and cached across calls.
+            kernel = self._packed_store_kernel_ctx(attn)
+            dtype = layers[0][1].dtype
+            ct = self._kv_chunk_tokens
+            num_layers = len(layers)
+            with torch.cuda.stream(stream):
+                slot_gpu = slot_mapping.to(device, non_blocking=True)
+                for ci in range(num_chunks):
+                    chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                    slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
+                        2, num_layers, ct, -1
+                    )
+                    if kernel is not None:
+                        ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                        ops.multi_layer_kv_transfer(
+                            slab_host,
+                            ptrs,
+                            chunk_slots,
+                            device,
+                            pbs,
+                            ops.TransferDirection.H2D,
+                            fmt,
+                            block_size=block_size,
+                            head_size=head_size,
+                        )
+                    else:
+                        slab_dev = slab_host.to(device, non_blocking=True)
+                        for layer_name, kv_cache_layer, true_idx in layers:
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                slab_dev[:, true_idx],
+                                chunk_slots,
+                                attn,
+                                layer_name,
+                                num_chunks=1,
+                            )
+                event = torch.cuda.Event()
+                event.record(stream)
+            with self._deferred_lock:
+                self._deferred_events[req_meta.req_id] = event
+                self._deferred_refs[req_meta.req_id] = [infos, slot_gpu]
+            logger.info(
+                "Maru: deferred-load scheduled %d layers x %d chunks "
+                "(%d tokens) for req %s (packed, off-thread)",
+                num_layers,
+                num_chunks,
+                total_tokens,
+                req_meta.req_id,
+            )
+        except Exception as e:
+            logger.error("Maru deferred load failed for req %s: %s", req_meta.req_id, e)
+            # Copies may already be queued referencing the CXL views; drain
+            # the stream before dropping them so no kernel reads freed memory.
+            if self._deferred_stream is not None:
+                try:
+                    self._deferred_stream.synchronize()
+                except Exception:
+                    pass
+            self._fail_deferred_load(req_meta)
+
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
 
@@ -1087,8 +1259,9 @@ class MaruWorkerConnector:
         """
         if not req_meta.deferred_load:
             return
-        self._failed_load_blocks.update(req_meta.block_ids)
-        self._deferred_done.add(req_meta.req_id)
+        with self._deferred_lock:
+            self._failed_load_blocks.update(req_meta.block_ids)
+            self._deferred_done.add(req_meta.req_id)
 
     def _schedule_deferred_loads(
         self,
@@ -1107,8 +1280,9 @@ class MaruWorkerConnector:
         device = next(iter(devices)) if len(devices) == 1 else None
         if device is None or device.type != "cuda" or not torch.cuda.is_available():
             self._load_sync(layers, entries, attn_metadata)
-            for req_meta, *_ in entries:
-                self._deferred_done.add(req_meta.req_id)
+            with self._deferred_lock:
+                for req_meta, *_ in entries:
+                    self._deferred_done.add(req_meta.req_id)
             return
 
         if self._load_stream is None or self._load_stream_device != device:
@@ -1140,8 +1314,9 @@ class MaruWorkerConnector:
                         )
                 event = torch.cuda.Event()
                 event.record(load_stream)
-            self._deferred_events[req_meta.req_id] = event
-            self._deferred_refs[req_meta.req_id] = [infos, slot_mapping_gpu]
+            with self._deferred_lock:
+                self._deferred_events[req_meta.req_id] = event
+                self._deferred_refs[req_meta.req_id] = [infos, slot_mapping_gpu]
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s",
@@ -1153,19 +1328,21 @@ class MaruWorkerConnector:
 
     def get_finished_loading(self) -> set[str] | None:
         """Return req ids whose deferred loads completed since the last call."""
-        done = set(self._deferred_done)
-        self._deferred_done.clear()
-        for req_id, event in list(self._deferred_events.items()):
-            if event.query():
-                done.add(req_id)
-                del self._deferred_events[req_id]
-                self._deferred_refs.pop(req_id, None)
+        with self._deferred_lock:
+            done = set(self._deferred_done)
+            self._deferred_done.clear()
+            for req_id, event in list(self._deferred_events.items()):
+                if event.query():
+                    done.add(req_id)
+                    del self._deferred_events[req_id]
+                    self._deferred_refs.pop(req_id, None)
         return done or None
 
     def take_failed_load_blocks(self) -> set[int]:
         """Return (and clear) block ids whose deferred load failed."""
-        failed = self._failed_load_blocks
-        self._failed_load_blocks = set()
+        with self._deferred_lock:
+            failed = self._failed_load_blocks
+            self._failed_load_blocks = set()
         return failed
 
     def _load_sync(
@@ -1440,7 +1617,8 @@ class MaruWorkerConnector:
                                 num_chunks=1,
                             )
                 if req_meta.deferred_load:
-                    self._deferred_done.add(req_meta.req_id)
+                    with self._deferred_lock:
+                        self._deferred_done.add(req_meta.req_id)
         if use_stream:
             # Loads must complete before the forward pass reads the paged cache
             # (packed makes wait_for_layer_load a no-op).
@@ -2114,6 +2292,17 @@ class MaruWorkerConnector:
                     pass
 
     def shutdown(self):
+        # Drain the loader thread before touching the handler or streams:
+        # an in-flight job may still be retrieving/queueing copies.
+        if self._deferred_executor is not None:
+            self._deferred_executor.shutdown(wait=True)
+            self._deferred_executor = None
+        if self._deferred_stream is not None:
+            try:
+                self._deferred_stream.synchronize()
+            except Exception as e:
+                logger.error("Error synchronizing Maru deferred-load stream: %s", e)
+            self._deferred_stream = None
         if self._load_stream is not None:
             try:
                 self._load_stream.synchronize()

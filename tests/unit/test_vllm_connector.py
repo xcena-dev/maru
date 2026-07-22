@@ -964,6 +964,105 @@ class TestDeferredLoading:
         assert kv.abs().sum() > 0  # KV was actually injected
 
 
+class TestAsyncDeferredPackedLoad:
+    """True-async deferred loads: retrieve + H2D run on the loader thread."""
+
+    CHUNK = 8
+
+    def _make_worker(self):
+        from maru_vllm.connector import MaruWorkerConnector
+
+        return MaruWorkerConnector(
+            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config={}
+        )
+
+    def _deferred_meta(self):
+        from maru_vllm.connector import MaruReqMeta
+
+        return MaruReqMeta(
+            req_id="r1",
+            token_ids=list(range(64)),
+            block_ids=list(range(16)),
+            is_store=False,
+            num_matched_chunks=8,
+            deferred_load=True,
+        )
+
+    def _poll_finished(self, worker, timeout_s=5.0):
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_s
+        done: set = set()
+        while _time.monotonic() < deadline:
+            finished = worker.get_finished_loading()
+            if finished:
+                done |= finished
+                return done
+            _time.sleep(0.01)
+        return done
+
+    def test_submit_refused_without_registered_caches(self):
+        worker = self._make_worker()
+        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+
+    def test_submit_refused_on_cpu_caches(self):
+        worker = self._make_worker()
+        worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1)}
+        worker._num_layers = 1
+        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_offthread_load_completes_via_event(self):
+        worker = self._make_worker()
+        # 4-dim layer keeps _packed_load_kernel_ctx unusable (dim != 5), so
+        # the job takes the per-layer inject fallback that plain host
+        # bytearrays support.
+        kv = torch.zeros(2, 16, 4, 1, device="cuda")
+        worker._kv_caches = {"l0": kv}
+        worker._num_layers = 1
+        slab_bytes = 2 * 1 * self.CHUNK * 1 * 4  # K/V x layers x tokens x fp32
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray([i + 1] * slab_bytes)),
+                region_id=0,
+                page_index=i,
+            )
+            for i in range(8)
+        ]
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = infos
+
+        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert self._poll_finished(worker) == {"r1"}
+        assert worker.take_failed_load_blocks() == set()
+        torch.cuda.synchronize()
+        assert kv.abs().sum() > 0  # KV was actually injected
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_offthread_retrieve_failure_reports_blocks(self):
+        worker = self._make_worker()
+        worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1, device="cuda")}
+        worker._num_layers = 1
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.side_effect = RuntimeError("rpc down")
+
+        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert self._poll_finished(worker) == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_offthread_miss_reports_blocks(self):
+        worker = self._make_worker()
+        worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1, device="cuda")}
+        worker._num_layers = 1
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = [None] * 8
+
+        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert self._poll_finished(worker) == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+
+
 # =============================================================================
 # Fused UVA gather-scatter load (P5)
 # =============================================================================
