@@ -2,16 +2,27 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for maru_shm.device_scanner."""
 
+import mmap
+import os
 import struct
 from unittest import mock
+
+import pytest
 
 from maru_shm.device_scanner import (
     _HEADER_FORMAT,
     _HEADER_MAGIC,
+    clear_device_header,
     read_device_uuid,
     scan_dax_devices,
     uuid_to_string,
+    write_device_header,
 )
+
+try:
+    from maru_shm import _cxl_flush
+except ImportError:  # extension not built
+    _cxl_flush = None
 
 
 # Helper to build a valid 32-byte header
@@ -129,3 +140,99 @@ class TestScanDaxDevices:
             mock.patch("maru_shm.device_scanner.os.path.exists", return_value=False),
         ):
             assert scan_dax_devices() == []
+
+
+# ── CPU cache flush (multi-host visibility) ─────────────────────────────────
+
+
+class TestCacheFlushFallback:
+    """Header R/W must keep working when the _cxl_flush extension is absent."""
+
+    def test_write_read_clear_without_extension(self, tmp_path):
+        dev = tmp_path / "dax0.0"
+        dev.write_bytes(b"\x00" * 4096)
+
+        with mock.patch("maru_shm.device_scanner._flush_range", None):
+            uuid_str = write_device_header(str(dev))
+            assert read_device_uuid(str(dev)) == uuid_str
+            clear_device_header(str(dev))
+            assert read_device_uuid(str(dev)) is None
+
+    def test_fallback_warns_once(self, tmp_path):
+        dev = tmp_path / "dax0.0"
+        dev.write_bytes(_make_header())
+
+        with (
+            mock.patch("maru_shm.device_scanner._flush_range", None),
+            mock.patch("maru_shm.device_scanner._flush_warned", False),
+            mock.patch("maru_shm.device_scanner.logger") as mock_logger,
+        ):
+            read_device_uuid(str(dev))
+            read_device_uuid(str(dev))
+
+        assert mock_logger.warning.call_count == 1
+
+    def test_no_clflush_arch_warns_once(self, tmp_path):
+        """Extension built but HAVE_CLFLUSH=0 (non-x86): same one-time warning."""
+        dev = tmp_path / "dax0.0"
+        dev.write_bytes(_make_header())
+
+        with (
+            mock.patch("maru_shm.device_scanner._HAVE_CLFLUSH", 0),
+            mock.patch("maru_shm.device_scanner._flush_warned", False),
+            mock.patch("maru_shm.device_scanner.logger") as mock_logger,
+        ):
+            read_device_uuid(str(dev))
+            read_device_uuid(str(dev))
+
+        assert mock_logger.warning.call_count == 1
+
+    def test_msync_oserror_is_swallowed(self):
+        """DEV_DAX may reject msync (EINVAL) — the helper must not raise."""
+        from maru_shm.device_scanner import _msync_best_effort
+
+        class FakeMM:
+            def flush(self):
+                raise OSError(22, "Invalid argument")
+
+        _msync_best_effort(FakeMM())
+
+
+@pytest.mark.skipif(_cxl_flush is None, reason="_cxl_flush extension not built")
+class TestFlushRangeExtension:
+    def test_flush_mmap_buffer(self, tmp_path):
+        dev = tmp_path / "dax0.0"
+        dev.write_bytes(b"\x00" * 4096)
+        fd = os.open(str(dev), os.O_RDWR)
+        try:
+            mm = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_WRITE)
+            try:
+                mm[:4] = b"abcd"
+                _cxl_flush.flush_range(mm, 0, 32)
+                assert mm[:4] == b"abcd"
+            finally:
+                mm.close()
+        finally:
+            os.close(fd)
+
+    def test_flush_readonly_buffer_defaults(self):
+        # Whole buffer, default offset/length; read-only objects are accepted
+        _cxl_flush.flush_range(b"x" * 128)
+
+    def test_flush_bytearray_with_offset(self):
+        _cxl_flush.flush_range(bytearray(256), 64, 128)
+
+    def test_zero_length_is_noop(self):
+        _cxl_flush.flush_range(b"x" * 64, 0, 0)
+
+    def test_negative_offset_rejected(self):
+        with pytest.raises(ValueError):
+            _cxl_flush.flush_range(b"x" * 64, -1, 8)
+
+    def test_offset_past_end_rejected(self):
+        with pytest.raises(ValueError):
+            _cxl_flush.flush_range(b"x" * 64, 65)
+
+    def test_length_past_end_rejected(self):
+        with pytest.raises(ValueError):
+            _cxl_flush.flush_range(b"x" * 64, 0, 128)

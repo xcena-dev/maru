@@ -7,6 +7,13 @@ import mmap
 import os
 import struct
 
+try:
+    from maru_shm._cxl_flush import HAVE_CLFLUSH as _HAVE_CLFLUSH
+    from maru_shm._cxl_flush import flush_range as _flush_range
+except ImportError:  # extension not built (no compiler at install time)
+    _flush_range = None
+    _HAVE_CLFLUSH = 0
+
 logger = logging.getLogger(__name__)
 
 # Must match C++ device_header.h
@@ -14,6 +21,37 @@ _HEADER_MAGIC = b"MARUDEV\x00"
 _HEADER_SIZE = 32
 _HEADER_FORMAT = "<8sI16sI"  # magic(8) + version(u32) + uuid(16) + reserved(u32)
 _DEFAULT_MAP_SIZE = 2 * 1024 * 1024  # 2 MiB fallback
+
+_flush_warned = False
+
+
+def _flush_header_lines(mm: mmap.mmap) -> None:
+    """Write back / invalidate the CPU cache lines holding the device header.
+
+    DEV_DAX mappings are write-back cached and msync()/mm.flush() does not
+    touch CPU caches there, while CXL 2.x has no cross-host cache coherence.
+    Without an explicit clflush, a written header sits in this host's cache
+    (invisible to other hosts sharing the device) and a read leaves a copy
+    that goes stale when another host rewrites the header.
+    """
+    global _flush_warned
+    if _flush_range is not None and _HAVE_CLFLUSH:
+        _flush_range(mm, 0, _HEADER_SIZE)
+    elif not _flush_warned:
+        _flush_warned = True
+        logger.warning(
+            "device header cache flush unavailable (extension not built, or "
+            "no clflush on this architecture); multi-host UUID visibility "
+            "not guaranteed"
+        )
+
+
+def _msync_best_effort(mm: mmap.mmap) -> None:
+    """Flush for regular-file backing (tests); DEV_DAX may reject msync."""
+    try:
+        mm.flush()
+    except OSError:
+        logger.debug("mm.flush() failed (expected on DEV_DAX)", exc_info=True)
 
 
 def _get_dax_align(dax_path: str) -> int:
@@ -42,6 +80,9 @@ def read_device_uuid(dax_path: str) -> str | None:
                 map_size = file_size
             mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_READ)
             try:
+                # Drop any locally cached copy first so the read comes from
+                # the device, not from a line another host made stale.
+                _flush_header_lines(mm)
                 data = mm[:_HEADER_SIZE]
             finally:
                 mm.close()
@@ -120,7 +161,10 @@ def write_device_header(dax_path: str, uuid_bytes: bytes | None = None) -> str:
         mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
         try:
             mm[:_HEADER_SIZE] = header
-            mm.flush()
+            # Push the store to the device; msync alone leaves it in the CPU
+            # cache on DEV_DAX, where other hosts cannot see it.
+            _flush_header_lines(mm)
+            _msync_best_effort(mm)
         finally:
             mm.close()
     finally:
@@ -140,7 +184,8 @@ def clear_device_header(dax_path: str) -> None:
         mm = mmap.mmap(fd, map_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
         try:
             mm[:_HEADER_SIZE] = b"\x00" * _HEADER_SIZE
-            mm.flush()
+            _flush_header_lines(mm)
+            _msync_best_effort(mm)
         finally:
             mm.close()
     finally:

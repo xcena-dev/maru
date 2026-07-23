@@ -25,6 +25,65 @@ _PREFAULT_ENABLED = os.environ.get("MARU_PREFAULT", "1") != "0"
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
 
+def _cuda_rc(ret) -> int:
+    """Normalize torch cudart's return value (enum, int, or 1-tuple) to int."""
+    return int(ret[0]) if isinstance(ret, tuple) else int(ret)
+
+
+def _find_libcudart_paths() -> list[str]:
+    """Return every distinct libcudart mapped into this process.
+
+    Matches on the basename so torch wheels that bundle a hashed copy
+    (``libcudart-<hash>.so.X``) are found too, and strips the
+    ``" (deleted)"`` suffix /proc/self/maps appends to unlinked files.
+    """
+    paths: list[str] = []
+    with open("/proc/self/maps") as f:
+        for line in f:
+            fields = line.rstrip("\n").split(maxsplit=5)
+            if len(fields) < 6:
+                continue
+            path = fields[5]
+            if path.endswith(" (deleted)"):
+                path = path[: -len(" (deleted)")]
+            if "libcudart" in os.path.basename(path) and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _clear_cuda_sticky_error() -> None:
+    """Consume CUDA's per-thread sticky error after a failed cudaHostRegister.
+
+    torch's cudart binding does not expose cudaGetLastError, so locate the
+    libcudart instance(s) loaded in this process (dlopen of the same path
+    returns the already-loaded instance) and consume the error there.  The
+    error state is per instance, so every mapped copy is cleared.  Without
+    this, the next error-checked CUDA call on this thread — typically an
+    unrelated kernel launch — raises a misattributed
+    "CUDA error: out of memory".
+    """
+    cleared = False
+    try:
+        for path in _find_libcudart_paths():
+            try:
+                lib = ctypes.CDLL(path)
+                lib.cudaGetLastError.restype = ctypes.c_int
+                lib.cudaGetLastError()
+                cleared = True
+            except (OSError, AttributeError):
+                logger.debug(
+                    "could not clear CUDA sticky error via %s", path, exc_info=True
+                )
+    except OSError:
+        pass
+    if not cleared:
+        logger.warning(
+            "could not clear CUDA sticky error (no loadable libcudart in "
+            "/proc/self/maps) — the next CUDA call on this thread may raise "
+            "a misattributed error"
+        )
+
+
 class DaxMapper:
     """Maps shared memory regions via MaruShmClient.
 
@@ -125,13 +184,33 @@ class DaxMapper:
                         ctypes.c_char.from_buffer(region._buffer_view)
                     )
                     t0 = time.monotonic()
-                    torch.cuda.cudart().cudaHostRegister(addr, handle.length, 0)
-                    cuda_pin_ms = (time.monotonic() - t0) * 1000
-                    logger.info(
-                        "CUDA pinned region %d (%d bytes)",
-                        region_id,
-                        handle.length,
+                    rc = _cuda_rc(
+                        torch.cuda.cudart().cudaHostRegister(addr, handle.length, 0)
                     )
+                    cuda_pin_ms = (time.monotonic() - t0) * 1000
+                    if rc == 0:
+                        region._cuda_pinned = True
+                        logger.info(
+                            "CUDA pinned region %d (%d bytes)",
+                            region_id,
+                            handle.length,
+                        )
+                    else:
+                        # NVIDIA r580+ drivers reject a single registration
+                        # of >= 512 GiB (per-registration page table hits
+                        # the kernel's kvmalloc INT_MAX cap: "NVRM: failed
+                        # to allocate page table"). Clear the per-thread
+                        # sticky error so an unrelated later CUDA call does
+                        # not crash with a misattributed OOM.
+                        _clear_cuda_sticky_error()
+                        logger.warning(
+                            "cudaHostRegister failed for region %d "
+                            "(%d bytes): rc=%d — region stays unpinned, "
+                            "GPU transfers fall back to pageable copies",
+                            region_id,
+                            handle.length,
+                            rc,
+                        )
             except (ImportError, RuntimeError, OSError) as e:
                 if not isinstance(e, ImportError):
                     logger.warning(
@@ -204,22 +283,7 @@ class DaxMapper:
 
             try:
                 # CUDA unpin before munmap (order matters — needs buffer_view for addr)
-                if region._buffer_view is not None:
-                    try:
-                        import torch
-
-                        if torch.cuda.is_available():
-                            addr = ctypes.addressof(
-                                ctypes.c_char.from_buffer(region._buffer_view)
-                            )
-                            torch.cuda.cudart().cudaHostUnregister(addr)
-                    except (ImportError, RuntimeError, OSError) as e:
-                        if not isinstance(e, ImportError):
-                            logger.warning(
-                                "cudaHostUnregister failed for region %d: %s",
-                                region_id,
-                                e,
-                            )
+                self._cuda_unpin_region(region)
 
                 if region.is_mapped:
                     region.release()
@@ -237,6 +301,33 @@ class DaxMapper:
             except Exception:
                 logger.error("Error unmapping region %d", region_id, exc_info=True)
                 return False
+
+    @staticmethod
+    def _cuda_unpin_region(region: MappedRegion) -> None:
+        """cudaHostUnregister a region that actually pinned (rc-checked)."""
+        if not (region._cuda_pinned and region._buffer_view is not None):
+            return
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(region._buffer_view))
+                rc = _cuda_rc(torch.cuda.cudart().cudaHostUnregister(addr))
+                if rc != 0:
+                    _clear_cuda_sticky_error()
+                    logger.warning(
+                        "cudaHostUnregister failed for region %d: rc=%d",
+                        region.region_id,
+                        rc,
+                    )
+                region._cuda_pinned = False
+        except (ImportError, RuntimeError, OSError) as e:
+            if not isinstance(e, ImportError):
+                logger.warning(
+                    "cudaHostUnregister failed for region %d: %s",
+                    region.region_id,
+                    e,
+                )
 
     # =========================================================================
     # Query
@@ -275,22 +366,7 @@ class DaxMapper:
                     continue
                 try:
                     # CUDA unpin before munmap (order matters!)
-                    if region._buffer_view is not None:
-                        try:
-                            import torch
-
-                            if torch.cuda.is_available():
-                                addr = ctypes.addressof(
-                                    ctypes.c_char.from_buffer(region._buffer_view)
-                                )
-                                torch.cuda.cudart().cudaHostUnregister(addr)
-                        except (ImportError, RuntimeError, OSError) as e:
-                            if not isinstance(e, ImportError):
-                                logger.warning(
-                                    "cudaHostUnregister failed for region %d: %s",
-                                    rid,
-                                    e,
-                                )
+                    self._cuda_unpin_region(region)
 
                     if region.is_mapped:
                         region.release()
