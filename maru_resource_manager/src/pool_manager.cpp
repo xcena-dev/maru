@@ -650,6 +650,14 @@ int PoolManager::loadPoolsLocked()
 
     for (auto &pool : stagedPools)
     {
+        // WAL replay returns freed extents via addExtent() (plain push_back,
+        // no merge), so the reconstructed free list is left uncoalesced:
+        // adjacent free regions remain as separate extents. That caps the
+        // largest single allocation at the biggest individual extent, far
+        // below the actual free capacity, even when nothing is allocated.
+        // Coalesce once after replay to restore contiguity (the live free
+        // path already merges inline via insertExtentSorted()).
+        coalesceFreeList(pool);
         recomputeFreeSize(pool);
     }
 
@@ -720,6 +728,8 @@ int PoolManager::rescanDevicesLocked()
     // Commit only after replay succeeds.
     for (auto &pool : stagedPools)
     {
+        // Coalesce the WAL-reconstructed free list (addExtent does not merge).
+        coalesceFreeList(pool);
         recomputeFreeSize(pool);
         pools_.push_back(std::move(pool));
     }
