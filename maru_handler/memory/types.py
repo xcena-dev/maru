@@ -31,6 +31,9 @@ class MappedRegion:
     _mmap_obj: mmap_module.mmap | None = field(default=None, repr=False)
     # memoryview of the entire mmap — created eagerly in __post_init__
     _buffer_view: memoryview | None = field(default=None, repr=False, init=False)
+    # True only when cudaHostRegister actually succeeded (rc == 0), so
+    # unmap/close know whether cudaHostUnregister is needed
+    _cuda_pinned: bool = field(default=False, repr=False, init=False)
 
     def __post_init__(self):
         if self._mmap_obj is not None:
