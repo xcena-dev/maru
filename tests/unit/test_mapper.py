@@ -236,6 +236,70 @@ class TestDaxMapperPinRcCheck:
 
         mock_cudart.cudaHostUnregister.assert_called_once()
 
+    def test_unregister_rc_failure_warns(self, monkeypatch):
+        """Non-zero cudaHostUnregister rc → warning + sticky error cleared."""
+        import logging
+
+        import maru_handler.memory.mapper as mapper_mod
+
+        cleared = []
+        monkeypatch.setattr(
+            mapper_mod, "_clear_cuda_sticky_error", lambda: cleared.append(1)
+        )
+
+        mock_torch, mock_cudart = _mock_torch_cuda()
+        mock_cudart.cudaHostUnregister.return_value = (1,)  # cudaErrorInvalidValue
+
+        mapper = DaxMapper()
+        handle = _make_handle(1, 4096)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            mapper.map_region(handle)
+            with patch.object(
+                logging.getLogger("maru_handler.memory.mapper"), "warning"
+            ) as mock_warning:
+                assert mapper.unmap_region(1) is True
+
+        assert cleared == [1]
+        assert mock_warning.called
+        assert "cudaHostUnregister failed" in mock_warning.call_args[0][0]
+
+
+class TestFindLibcudartPaths:
+    """_find_libcudart_paths: /proc/self/maps parsing."""
+
+    def _paths_from(self, maps_content, monkeypatch):
+        from io import StringIO
+        from unittest.mock import patch as _patch
+
+        import maru_handler.memory.mapper as mapper_mod
+
+        with _patch("builtins.open", return_value=StringIO(maps_content)):
+            return mapper_mod._find_libcudart_paths()
+
+    def test_matches_plain_and_hashed_names(self, monkeypatch):
+        maps = (
+            "7f00-7f01 r-xp 0 08:01 1 /usr/lib/libcudart.so.12\n"
+            "7f02-7f03 r-xp 0 08:01 2 "
+            "/venv/torch/lib/libcudart-9335f6a2.so.12\n"
+            "7f04-7f05 r-xp 0 08:01 3 /usr/lib/libc.so.6\n"
+        )
+        assert self._paths_from(maps, monkeypatch) == [
+            "/usr/lib/libcudart.so.12",
+            "/venv/torch/lib/libcudart-9335f6a2.so.12",
+        ]
+
+    def test_strips_deleted_suffix_and_dedupes(self, monkeypatch):
+        maps = (
+            "7f00-7f01 r-xp 0 08:01 1 /venv/libcudart.so.12 (deleted)\n"
+            "7f02-7f03 rw-p 0 08:01 1 /venv/libcudart.so.12 (deleted)\n"
+        )
+        assert self._paths_from(maps, monkeypatch) == ["/venv/libcudart.so.12"]
+
+    def test_ignores_anonymous_mappings(self, monkeypatch):
+        maps = "7f00-7f01 rw-p 0 00:00 0\n7f02-7f03 rw-p 0 00:00 0 [heap]\n"
+        assert self._paths_from(maps, monkeypatch) == []
+
 
 class TestDaxMapperErrorPaths:
     """Test error paths for 100% coverage."""
