@@ -10,7 +10,10 @@
  * the device, and a CPU read leaves a copy that goes stale when another host
  * rewrites the same range. clflush covers both: it writes back dirty lines
  * (writer side) and invalidates clean copies (reader side); mfence orders it
- * against the surrounding loads and stores.
+ * against the surrounding loads and stores. clflush is preferred over
+ * clflushopt/clwb: available on every x86-64 without CPUID dispatch, and the
+ * flushed ranges are tiny (header = one cache line) so throughput is
+ * irrelevant.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>

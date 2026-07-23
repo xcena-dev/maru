@@ -8,9 +8,11 @@ import os
 import struct
 
 try:
+    from maru_shm._cxl_flush import HAVE_CLFLUSH as _HAVE_CLFLUSH
     from maru_shm._cxl_flush import flush_range as _flush_range
 except ImportError:  # extension not built (no compiler at install time)
     _flush_range = None
+    _HAVE_CLFLUSH = 0
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +35,14 @@ def _flush_header_lines(mm: mmap.mmap) -> None:
     that goes stale when another host rewrites the header.
     """
     global _flush_warned
-    if _flush_range is not None:
+    if _flush_range is not None and _HAVE_CLFLUSH:
         _flush_range(mm, 0, _HEADER_SIZE)
     elif not _flush_warned:
         _flush_warned = True
         logger.warning(
-            "maru_shm._cxl_flush extension not available; skipping device "
-            "header cache flush (multi-host UUID visibility not guaranteed)"
+            "device header cache flush unavailable (extension not built, or "
+            "no clflush on this architecture); multi-host UUID visibility "
+            "not guaranteed"
         )
 
 

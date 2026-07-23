@@ -28,7 +28,9 @@ constexpr uintptr_t kCacheLineSize = 64;
 // and a header read here would leave a copy that goes stale when another
 // host rewrites it. clflush covers both: it writes back dirty lines
 // (writer side) and invalidates clean copies (reader side); mfence orders
-// it against the surrounding loads and stores.
+// it against the surrounding loads and stores. clflush is preferred over
+// clflushopt/clwb: available on every x86-64 without CPUID dispatch, and
+// the header is a single cache line so flush throughput is irrelevant.
 void flushCacheRange(const void *p, size_t n) {
 #if defined(__x86_64__) || defined(__i386__)
     const uintptr_t addr = reinterpret_cast<uintptr_t>(p);

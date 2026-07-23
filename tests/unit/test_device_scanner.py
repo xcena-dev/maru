@@ -172,6 +172,21 @@ class TestCacheFlushFallback:
 
         assert mock_logger.warning.call_count == 1
 
+    def test_no_clflush_arch_warns_once(self, tmp_path):
+        """Extension built but HAVE_CLFLUSH=0 (non-x86): same one-time warning."""
+        dev = tmp_path / "dax0.0"
+        dev.write_bytes(_make_header())
+
+        with (
+            mock.patch("maru_shm.device_scanner._HAVE_CLFLUSH", 0),
+            mock.patch("maru_shm.device_scanner._flush_warned", False),
+            mock.patch("maru_shm.device_scanner.logger") as mock_logger,
+        ):
+            read_device_uuid(str(dev))
+            read_device_uuid(str(dev))
+
+        assert mock_logger.warning.call_count == 1
+
     def test_msync_oserror_is_swallowed(self):
         """DEV_DAX may reject msync (EINVAL) — the helper must not raise."""
         from maru_shm.device_scanner import _msync_best_effort
