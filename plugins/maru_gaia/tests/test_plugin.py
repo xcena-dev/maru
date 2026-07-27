@@ -215,3 +215,60 @@ class TestSyncReadGate:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestSyncGateBudget:
+    """MARU_GAIA_PREFETCH_SYNC_BUDGET_MS bounds how long one gate may block.
+
+    The gate blocks the connector's single deferred-load thread, so an
+    unbounded cold gate delays every request queued behind this one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _gate_on(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC", "1")
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "0")
+
+    def _three_chunks(self):
+        # Non-contiguous so coalescing cannot merge them into one range.
+        return _resp(_entry(0, 0, 32), _entry(0, 1024, 32), _entry(0, 2048, 32))
+
+    def test_unbudgeted_gate_blocks_on_every_range(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "0")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["a", "b", "c"], self._three_chunks())
+
+        assert len(fake.sync_calls) == 3
+        assert fake.calls == []
+
+    def test_exhausted_budget_finishes_the_batch_asynchronously(self, monkeypatch):
+        """Once the budget is spent the remaining ranges go out as async hints."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "5")
+
+        clock = iter([0.0, 0.0, 0.010, 0.010, 0.010])
+        monkeypatch.setattr("maru_gaia.plugin.time.monotonic", lambda: next(clock))
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["a", "b", "c"], self._three_chunks())
+
+        # First range inside the budget; the 10 ms elapsed then exceeds 5 ms.
+        assert len(fake.sync_calls) == 1
+        assert len(fake.calls) == 2
+
+    def test_budget_does_not_apply_to_the_arrival_lookahead(self, monkeypatch):
+        """on_prefetch is async regardless — it must never block the caller."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "0")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_prefetch(_handler(), ["a", "b", "c"], self._three_chunks())
+
+        assert fake.sync_calls == []
+        assert len(fake.calls) == 3

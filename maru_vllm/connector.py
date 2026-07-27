@@ -612,7 +612,18 @@ class MaruSchedulerConnector:
         # into the next connector metadata for the worker to fire (the worker
         # owns the region mappings, so firing happens there).
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
-        self._pending_arrival_hint_keys: list[str] = []
+        # (req_id, chunk keys) awaiting release, oldest arrival first.
+        self._pending_arrival_hints: list[tuple[str, list[str]]] = []
+        # Released but not yet consumed by a load. MARU_ARRIVAL_HINT_DEPTH caps
+        # how many requests may be outstanding at once: the device fills hinted
+        # ranges concurrently, so hinting every queued request at once splits
+        # fill bandwidth across all of them and the one about to be read is no
+        # likelier to be resident than the last. A small window keeps the fill
+        # ordered by how soon the bytes are needed. 0 disables the cap.
+        self._arrival_hint_depth = max(
+            0, int(os.environ.get("MARU_ARRIVAL_HINT_DEPTH", "0") or 0)
+        )
+        self._arrival_hint_inflight: set[str] = set()
         # Arrival-hint fires the packed chunk base key, which is a real data key
         # only in packed mode. In layerwise mode the data lives at
         # f"{base}_L{idx}" and the base name has no object, so every hint would
@@ -627,13 +638,16 @@ class MaruSchedulerConnector:
             )
             self._arrival_hint_enabled = False
         if self._arrival_hint_enabled:
-            logger.info("Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1)")
+            logger.info(
+                "Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1, depth=%s)",
+                self._arrival_hint_depth or "unlimited",
+            )
 
     def on_new_request(self, request: Request) -> None:
         """Queue this request's chunk keys for worker-side lookahead prefetch.
 
         Computes the chunk base keys from the prompt tokens and stages them;
-        ``build_connector_meta`` relays them to the worker on the next step
+        ``build_connector_meta`` releases them to the worker on a later step
         (arrival -> fire latency is ~one scheduler step, negligible against the
         0.2-2.1 s admission wait this hint exploits). The keys are the packed
         chunk keys (one per chunk) — the worker fires them as-is, no per-layer
@@ -649,12 +663,48 @@ class MaruSchedulerConnector:
             return
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
         if keys:
-            self._pending_arrival_hint_keys.extend(keys)
+            self._pending_arrival_hints.append((request.request_id, keys))
             logger.debug(
                 "Maru arrival-hint: queued %d chunk keys for req %s",
                 len(keys),
                 request.request_id,
             )
+
+    def _release_arrival_hints(self, consumed: set[str]) -> list[str]:
+        """Retire hints whose loads were just issued, then release the next ones.
+
+        Retirement comes first so a load emitted this step frees its window slot
+        for the request behind it in the same step.
+
+        Args:
+            consumed: Request ids whose load or store metadata is in this step's
+                connector metadata — their lookahead has served its purpose.
+
+        Returns:
+            Chunk keys to relay to the worker, oldest arrival first.
+        """
+        self._arrival_hint_inflight -= consumed
+        if self._arrival_hint_depth > 0:
+            budget = self._arrival_hint_depth - len(self._arrival_hint_inflight)
+        else:
+            budget = len(self._pending_arrival_hints)
+        if budget <= 0 or not self._pending_arrival_hints:
+            return []
+
+        released = self._pending_arrival_hints[:budget]
+        self._pending_arrival_hints = self._pending_arrival_hints[budget:]
+        keys: list[str] = []
+        for req_id, req_keys in released:
+            self._arrival_hint_inflight.add(req_id)
+            keys.extend(req_keys)
+        logger.debug(
+            "Maru arrival-hint: released %d reqs (%d keys), %d inflight, %d queued",
+            len(released),
+            len(keys),
+            len(self._arrival_hint_inflight),
+            len(self._pending_arrival_hints),
+        )
+        return keys
 
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
@@ -824,12 +874,6 @@ class MaruSchedulerConnector:
             preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
         )
 
-        # Relay arrival-hint keys queued by on_new_request to the worker, then
-        # clear so each key is fired exactly once.
-        if self._pending_arrival_hint_keys:
-            meta.arrival_hint_keys = self._pending_arrival_hint_keys
-            self._pending_arrival_hint_keys = []
-
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
         # emitted exactly once here, from state stashed at allocation time.
@@ -985,6 +1029,19 @@ class MaruSchedulerConnector:
             self._active_deferred_req_ids.discard(rid)
             self._deferred_layerwise_waiting.discard(rid)
             self._deferred_layerwise_ready.discard(rid)
+
+        if self._arrival_hint_enabled:
+            # A request whose transfer metadata is in this step has consumed its
+            # lookahead; one that finished or was preempted will never consume
+            # it. Both free a window slot, so neither can strand the window.
+            consumed = {req.req_id for req in meta.requests} | set(stale_ids)
+            if self._pending_arrival_hints:
+                self._pending_arrival_hints = [
+                    entry
+                    for entry in self._pending_arrival_hints
+                    if entry[0] not in stale_ids
+                ]
+            meta.arrival_hint_keys = self._release_arrival_hints(consumed)
 
         self._requests_need_load.clear()
         return meta

@@ -55,6 +55,12 @@ class GaiaPrefetchPlugin:
         # arrival lookahead (on_prefetch) stays async regardless — a sync call
         # there would block and defeat the overlap with admission wait.
         self._sync_gate = os.environ.get("MARU_GAIA_PREFETCH_SYNC", "0") == "1"
+        # Upper bound on how long one read gate may block
+        # (MARU_GAIA_PREFETCH_SYNC_BUDGET_MS, 0 = unbounded). Ranges left when
+        # the budget runs out are hinted asynchronously instead.
+        self._sync_budget_ms = max(
+            0.0, float(os.environ.get("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "0") or 0)
+        )
         # The experiment always names the single gaia device via
         # MARU_GAIA_DEVICE_ID (same env naru/gaia-bench use to set DRAM
         # capacity). Prefer it: pyxif's auto-enumeration (get_device_list) is
@@ -180,11 +186,22 @@ class GaiaPrefetchPlugin:
         chunk_count = len(eligible)
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
 
-        prefetch_fn = pyxif.memory_prefetch_sync if sync else pyxif.memory_prefetch
         issued = 0
         failed = 0
+        degraded = 0
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
+            # The read gate blocks the single deferred-load thread, so a cold
+            # gate does not just delay this request — it delays every request
+            # queued behind it. Spend at most the budget blocking, then finish
+            # the batch asynchronously and let the transfer read what it finds.
+            gated = sync
+            if gated and self._sync_budget_ms > 0:
+                spent_ms = (time.monotonic() - t0) * 1000.0
+                if spent_ms >= self._sync_budget_ms:
+                    gated = False
+                    degraded += 1
+            prefetch_fn = pyxif.memory_prefetch_sync if gated else pyxif.memory_prefetch
             status = prefetch_fn(device_id, device_addr, size)
             if status == pyxif.MemoryStatus.Success:
                 issued += 1
@@ -209,7 +226,8 @@ class GaiaPrefetchPlugin:
         if sync:
             logger.info(
                 "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
-                "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f",
+                "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
+                "over_budget=%d",
                 source,
                 chunk_count,
                 len(ranges),
@@ -217,6 +235,7 @@ class GaiaPrefetchPlugin:
                 failed,
                 skipped,
                 wait_us / 1000.0,
+                degraded,
             )
         else:
             logger.info(

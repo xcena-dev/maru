@@ -52,23 +52,26 @@ class TestSchedulerArrivalHint:
         return MaruSchedulerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
 
     def test_enabled_queues_chunk_keys(self, monkeypatch):
-        """A prompt spanning two chunks queues two chunk base keys."""
+        """A prompt spanning two chunks queues that request's two chunk keys."""
         sched = self._scheduler(monkeypatch, enabled=True)
         sched.on_new_request(_request(list(range(8))))  # 8 tokens / 4 = 2 chunks
-        assert len(sched._pending_arrival_hint_keys) == 2
+        assert len(sched._pending_arrival_hints) == 1
+        req_id, keys = sched._pending_arrival_hints[0]
+        assert req_id == "r0"
+        assert len(keys) == 2
 
     def test_short_prompt_is_skipped(self, monkeypatch):
         """A prompt shorter than one chunk queues nothing."""
         sched = self._scheduler(monkeypatch, enabled=True)
         sched.on_new_request(_request([1, 2]))  # 2 < chunk_tokens (4)
-        assert sched._pending_arrival_hint_keys == []
+        assert sched._pending_arrival_hints == []
 
     def test_disabled_is_noop(self, monkeypatch):
         """With the hint disabled, arrival queues nothing."""
         sched = self._scheduler(monkeypatch, enabled=False)
         assert sched._arrival_hint_enabled is False
         sched.on_new_request(_request(list(range(8))))
-        assert sched._pending_arrival_hint_keys == []
+        assert sched._pending_arrival_hints == []
 
     def test_layerwise_mode_disables_hint(self, monkeypatch):
         """Layerwise storage disables the hint (base key is not a data key)."""
@@ -80,20 +83,20 @@ class TestSchedulerArrivalHint:
         )
         assert sched._arrival_hint_enabled is False
         sched.on_new_request(_request(list(range(8))))
-        assert sched._pending_arrival_hint_keys == []
+        assert sched._pending_arrival_hints == []
 
     def test_build_connector_meta_relays_and_clears(self, monkeypatch):
         """Queued keys land in the metadata once, then the queue is cleared."""
         sched = self._scheduler(monkeypatch, enabled=True)
         sched.on_new_request(_request(list(range(12))))  # 3 chunks
-        queued = list(sched._pending_arrival_hint_keys)
+        queued = list(sched._pending_arrival_hints[0][1])
         assert len(queued) == 3
 
         meta = sched.build_connector_meta(_empty_scheduler_output())
         assert isinstance(meta, MaruConnectorMetadata)
         assert meta.arrival_hint_keys == queued
         # Drained: a second build carries no stale keys.
-        assert sched._pending_arrival_hint_keys == []
+        assert sched._pending_arrival_hints == []
         meta2 = sched.build_connector_meta(_empty_scheduler_output())
         assert meta2.arrival_hint_keys == []
 
@@ -207,6 +210,80 @@ class _StubEvent:
 
     def elapsed_time(self, _end) -> float:
         return self._elapsed_ms
+
+
+class TestArrivalHintDepth:
+    """MARU_ARRIVAL_HINT_DEPTH bounds how many requests are hinted at once."""
+
+    def _scheduler(self, monkeypatch, depth: str) -> MaruSchedulerConnector:
+        monkeypatch.setenv("MARU_ARRIVAL_HINT", "1")
+        monkeypatch.setenv("MARU_ARRIVAL_HINT_DEPTH", depth)
+        return MaruSchedulerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+
+    def _arrive(self, sched, n: int) -> None:
+        for i in range(n):
+            sched.on_new_request(_request(list(range(8)), req_id=f"r{i}"))
+
+    def test_unlimited_depth_releases_every_arrival(self, monkeypatch):
+        """Depth 0 keeps the original behaviour: one burst, all requests."""
+        sched = self._scheduler(monkeypatch, "0")
+        self._arrive(sched, 4)
+        meta = sched.build_connector_meta(_empty_scheduler_output())
+        assert sched._pending_arrival_hints == []
+        assert sched._arrival_hint_inflight == {"r0", "r1", "r2", "r3"}
+        assert len(meta.arrival_hint_keys) == 8  # 4 reqs x 2 chunks
+
+    def test_depth_releases_a_window_at_a_time(self, monkeypatch):
+        """Depth 2 holds later arrivals on the host until a slot frees."""
+        sched = self._scheduler(monkeypatch, "2")
+        self._arrive(sched, 4)
+
+        first = sched.build_connector_meta(_empty_scheduler_output())
+        assert sched._arrival_hint_inflight == {"r0", "r1"}
+        assert len(first.arrival_hint_keys) == 4
+        assert len(sched._pending_arrival_hints) == 2
+
+        # Nothing consumed yet: the window stays shut.
+        second = sched.build_connector_meta(_empty_scheduler_output())
+        assert second.arrival_hint_keys == []
+        assert len(sched._pending_arrival_hints) == 2
+
+    def test_consuming_a_request_admits_the_next(self, monkeypatch):
+        """Retiring a hint frees exactly one slot, oldest arrival first."""
+        sched = self._scheduler(monkeypatch, "2")
+        self._arrive(sched, 4)
+        sched.build_connector_meta(_empty_scheduler_output())
+
+        keys = sched._release_arrival_hints({"r0"})
+        assert sched._arrival_hint_inflight == {"r1", "r2"}
+        assert len(keys) == 2
+        assert len(sched._pending_arrival_hints) == 1
+
+    def test_finished_request_cannot_strand_the_window(self, monkeypatch):
+        """A request that finishes without ever loading still frees its slot."""
+        sched = self._scheduler(monkeypatch, "1")
+        self._arrive(sched, 2)
+        sched.build_connector_meta(_empty_scheduler_output())
+        assert sched._arrival_hint_inflight == {"r0"}
+
+        out = _empty_scheduler_output()
+        out.finished_req_ids = {"r0"}
+        meta = sched.build_connector_meta(out)
+        assert sched._arrival_hint_inflight == {"r1"}
+        assert len(meta.arrival_hint_keys) == 2
+
+    def test_finished_request_drops_its_unreleased_hint(self, monkeypatch):
+        """A request finishing while still queued is dropped, not fired later."""
+        sched = self._scheduler(monkeypatch, "1")
+        self._arrive(sched, 2)
+        sched.build_connector_meta(_empty_scheduler_output())
+
+        out = _empty_scheduler_output()
+        out.finished_req_ids = {"r0", "r1"}
+        meta = sched.build_connector_meta(out)
+        assert meta.arrival_hint_keys == []
+        assert sched._pending_arrival_hints == []
+        assert sched._arrival_hint_inflight == set()
 
 
 class TestPackedLoadBandwidth:
