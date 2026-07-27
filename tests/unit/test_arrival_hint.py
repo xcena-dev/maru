@@ -193,3 +193,79 @@ class TestHandlerPrefetchBatch:
         handler._plugins = [recorder]
         assert handler.prefetch_batch(["k0"]) == 0
         assert recorder.batches == []
+
+
+class _StubEvent:
+    """Duck-typed torch.cuda.Event: always complete, fixed elapsed time."""
+
+    def __init__(self, elapsed_ms: float = 0.0, complete: bool = True) -> None:
+        self._elapsed_ms = elapsed_ms
+        self._complete = complete
+
+    def query(self) -> bool:
+        return self._complete
+
+    def elapsed_time(self, _end) -> float:
+        return self._elapsed_ms
+
+
+class TestPackedLoadBandwidth:
+    """Per-request CXL->GPU bandwidth accounting (maru_log_timing only).
+
+    This is the signal smart-prefetch is judged on: whether a request's bytes
+    came out of device DRAM or were filled from SSD on demand.
+    """
+
+    def _worker(self) -> MaruWorkerConnector:
+        return MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_log_timing": True},
+        )
+
+    def test_bandwidth_line_reports_bytes_time_and_rate(self, capsys):
+        """1 GiB in 100 ms is reported as 10.74 GB/s against the request id."""
+        MaruWorkerConnector._emit_load_bandwidth(
+            "r7", _StubEvent(100.0), _StubEvent(), 2**30, 32
+        )
+        line = capsys.readouterr().err
+        assert "packed-load 32 chunks 1024 MiB in 100.00 ms" in line
+        assert "10.74 GB/s" in line
+        assert "req r7" in line
+
+    def test_completion_drains_bandwidth_once_per_request(self, capsys):
+        """get_finished_loading emits the line once and drops the entry."""
+        worker = self._worker()
+        worker._deferred_events["r1"] = _StubEvent()
+        worker._deferred_load_bw["r1"] = (_StubEvent(50.0), _StubEvent(), 2**30, 32)
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert "req r1" in capsys.readouterr().err
+        assert worker._deferred_load_bw == {}
+
+        assert worker.get_finished_loading() is None
+        assert "packed-load" not in capsys.readouterr().err
+
+    def test_incomplete_load_reports_nothing_yet(self, capsys):
+        """A load still in flight is neither reported nor dropped."""
+        worker = self._worker()
+        worker._deferred_events["r1"] = _StubEvent(complete=False)
+        worker._deferred_load_bw["r1"] = (_StubEvent(50.0), _StubEvent(), 2**30, 32)
+
+        assert worker.get_finished_loading() is None
+        assert "packed-load" not in capsys.readouterr().err
+        assert "r1" in worker._deferred_load_bw
+
+    def test_unreadable_events_do_not_break_completion(self, capsys):
+        """A failed elapsed_time never propagates into the load path."""
+
+        class _Broken(_StubEvent):
+            def elapsed_time(self, _end):
+                raise RuntimeError("events not recorded")
+
+        worker = self._worker()
+        worker._deferred_events["r1"] = _StubEvent()
+        worker._deferred_load_bw["r1"] = (_Broken(), _StubEvent(), 2**30, 32)
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert "packed-load" not in capsys.readouterr().err

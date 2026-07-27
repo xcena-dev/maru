@@ -1045,6 +1045,13 @@ class MaruWorkerConnector:
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        # maru_log_timing only: req_id -> (start, end, bytes, chunks) CUDA
+        # timing events bracketing the CXL->GPU transfer. Read once the
+        # completion event fires, giving the per-request media read bandwidth —
+        # the signal that separates a device-DRAM read from an SSD-backed one.
+        self._deferred_load_bw: dict[
+            str, tuple[torch.cuda.Event, torch.cuda.Event, int, int]
+        ] = {}
         # True-async deferred loads (packed path): a single background thread
         # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
         # so neither the RPC wait nor the copy blocks the engine thread's
@@ -1520,13 +1527,21 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
+            load_bytes = 0
+            bw_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
             with torch.cuda.stream(stream):
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
+                if self._timing:
+                    # Bracket only the CXL->GPU bytes so the measured interval
+                    # is the media read, not the RPC or the admission wait.
+                    bw_start = torch.cuda.Event(enable_timing=True)
+                    bw_start.record(stream)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
                         2, num_layers, ct, -1
                     )
+                    load_bytes += slab_host.numel() * slab_host.element_size()
                     if kernel is not None:
                         # Stage the slab through the copy engine (async DMA —
                         # the CXL mapping is cudaHostRegister'ed by the
@@ -1562,11 +1577,22 @@ class MaruWorkerConnector:
                                 layer_name,
                                 num_chunks=1,
                             )
+                if self._timing:
+                    bw_end = torch.cuda.Event(enable_timing=True)
+                    bw_end.record(stream)
+                    bw_events = (bw_start, bw_end)
                 event = torch.cuda.Event()
                 event.record(stream)
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
                 self._deferred_refs[req_meta.req_id] = [infos, slot_gpu]
+                if bw_events is not None:
+                    self._deferred_load_bw[req_meta.req_id] = (
+                        bw_events[0],
+                        bw_events[1],
+                        load_bytes,
+                        num_chunks,
+                    )
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s (packed, off-thread)",
@@ -1886,6 +1912,7 @@ class MaruWorkerConnector:
 
     def get_finished_loading(self) -> set[str] | None:
         """Return req ids whose deferred loads completed since the last call."""
+        finished_bw = []
         with self._deferred_lock:
             done = set(self._deferred_done)
             self._deferred_done.clear()
@@ -1894,7 +1921,40 @@ class MaruWorkerConnector:
                     done.add(req_id)
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
+                    bw = self._deferred_load_bw.pop(req_id, None)
+                    if bw is not None:
+                        finished_bw.append((req_id, bw))
+        # Outside the lock: elapsed_time is safe here because the completion
+        # event was recorded after the end marker, so both have fired.
+        for req_id, (bw_start, bw_end, nbytes, nchunks) in finished_bw:
+            self._emit_load_bandwidth(req_id, bw_start, bw_end, nbytes, nchunks)
         return done or None
+
+    @staticmethod
+    def _emit_load_bandwidth(
+        req_id: str,
+        bw_start: torch.cuda.Event,
+        bw_end: torch.cuda.Event,
+        nbytes: int,
+        nchunks: int,
+    ) -> None:
+        """Emit one request's CXL->GPU transfer bandwidth.
+
+        This is the tier signal smart-prefetch is judged on: the same bytes
+        read out of device DRAM versus filled from SSD on demand differ by
+        about a factor of two, and TTFT at concurrency is too noisy to resolve
+        that. Reported per request so a partially warmed batch is visible as a
+        spread rather than averaged away.
+        """
+        try:
+            ms = bw_start.elapsed_time(bw_end)
+        except Exception:
+            return
+        gbps = (nbytes / (ms / 1000.0)) / 1e9 if ms > 0 else 0.0
+        _emit_timing(
+            f"packed-load {nchunks} chunks {nbytes / 2**20:.0f} MiB in "
+            f"{ms:.2f} ms = {gbps:.2f} GB/s (req {req_id})"
+        )
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
         """Return finished requests whose write-behind stores have drained.
@@ -3175,6 +3235,7 @@ class MaruWorkerConnector:
             self._deferred_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
+            self._deferred_load_bw.clear()
         if self._handler is not None:
             try:
                 self._handler.close()
