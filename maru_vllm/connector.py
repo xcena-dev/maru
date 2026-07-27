@@ -305,6 +305,12 @@ class MaruKVConnector(KVConnectorBase_V1):
             RPC wait nor the copy ever blocks the engine's forward passes —
             the in-process analog of the MP server's separate-process
             retrieve (default: false)
+        maru_load_admission_window: int - With deferred loading, cap how many
+            requests' packed loads may be enqueued on the deferred stream but
+            not yet complete. The loader thread blocks before each GPU
+            enqueue until fewer than this many loads are outstanding,
+            bounding same-CUDA-context interference with model steps.
+            0 = no cap, submit all loads immediately (default)
         maru_enable_write_behind: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
             with asynchronous D2H DMA. Metadata registration finishes on a
@@ -970,6 +976,16 @@ class MaruWorkerConnector:
         self._deferred_executor: ThreadPoolExecutor | None = None
         self._deferred_stream: torch.cuda.Stream | None = None
         self._deferred_stream_device: torch.device | None = None
+        # Admission window: cap the request loads enqueued on the deferred
+        # stream but not yet complete. Outstanding same-context loads delay
+        # model steps after the first resume (measured: model compute start
+        # +84.5 ms vs the MP server's separate-context +3.0 ms), so the
+        # loader thread blocks before each GPU enqueue instead of piling
+        # more work into the model's CUDA context. 0 disables the gate
+        # (submit-all, default).
+        self._load_admission_window = int(
+            extra_config.get("maru_load_admission_window", 0)
+        )
         # Packed layerwise overlap keeps the packed Maru object format. The
         # loader thread resolves only the RPC/mmap metadata; the resumed
         # forward consumes these entries layer-by-layer on _load_stream.
@@ -1405,6 +1421,9 @@ class MaruWorkerConnector:
                 self._deferred_stream_device = device
             stream = self._deferred_stream
 
+            if self._load_admission_window > 0:
+                self._wait_for_load_admission(req_meta.req_id)
+
             attn = self._last_attn_metadata
             # Content-identical to _packed_load_kernel_ctx, but built from the
             # registered KV caches and cached across calls.
@@ -1477,6 +1496,39 @@ class MaruWorkerConnector:
                 except Exception:
                     pass
             self._fail_deferred_load(req_meta)
+
+    def _wait_for_load_admission(self, req_id: str) -> None:
+        """Block until fewer than the admission window of loads are in flight.
+
+        Runs on the loader thread just before a request's GPU enqueue. Counts
+        the deferred loads whose completion event has not fired yet and, while
+        the count is at or above ``maru_load_admission_window``, waits on the
+        oldest one. The deferred stream is FIFO, so dict insertion order is
+        completion order and waiting on the oldest event is the shortest wait.
+        The gated GPU work is already enqueued and depends on nothing from
+        this thread, so the wait always terminates.
+
+        Args:
+            req_id: Request whose enqueue is being admitted (log label only).
+        """
+        wait_t0 = time.monotonic()
+        waited = False
+        while True:
+            with self._deferred_lock:
+                pending = [
+                    event
+                    for event in self._deferred_events.values()
+                    if not event.query()
+                ]
+            if len(pending) < self._load_admission_window:
+                break
+            waited = True
+            pending[0].synchronize()
+        if self._timing and waited:
+            _emit_timing(
+                f"admission wait {(time.monotonic() - wait_t0) * 1000:.2f} ms "
+                f"(req {req_id})"
+            )
 
     def _schedule_deferred_packed_layerwise_loads(
         self,

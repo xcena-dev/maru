@@ -1369,6 +1369,82 @@ class TestAsyncDeferredPackedLoad:
         assert worker.take_failed_load_blocks() == set(range(16))
 
 
+class _FakeAdmissionEvent:
+    """Stand-in CUDA event: query() flips true after synchronize()."""
+
+    def __init__(self, complete: bool = False):
+        self.complete = complete
+        self.sync_calls = 0
+
+    def query(self) -> bool:
+        return self.complete
+
+    def synchronize(self) -> None:
+        self.sync_calls += 1
+        self.complete = True
+
+
+class TestLoadAdmissionWindow:
+    """Enqueue-time admission: bound in-flight deferred loads."""
+
+    def _make_worker(self, window):
+        from maru_vllm.connector import MaruWorkerConnector
+
+        return MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=8,
+            extra_config={"maru_load_admission_window": window},
+        )
+
+    def test_window_disabled_by_default(self):
+        from maru_vllm.connector import MaruWorkerConnector
+
+        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=8, extra_config={})
+        assert worker._load_admission_window == 0
+
+    def test_window_parsed_from_extra_config(self):
+        assert self._make_worker(2)._load_admission_window == 2
+        assert self._make_worker("1")._load_admission_window == 1
+
+    def test_gate_waits_on_oldest_incomplete_load(self):
+        worker = self._make_worker(1)
+        oldest = _FakeAdmissionEvent()
+        newer = _FakeAdmissionEvent()
+        worker._deferred_events = {"r1": oldest, "r2": newer}
+
+        worker._wait_for_load_admission("r3")
+
+        assert oldest.sync_calls == 1
+        # After the oldest completes, one incomplete load (newer) remains —
+        # still at the window, so the gate waits on it too before admitting.
+        assert newer.sync_calls == 1
+
+    def test_gate_passes_below_window_without_waiting(self):
+        worker = self._make_worker(2)
+        outstanding = _FakeAdmissionEvent()
+        worker._deferred_events = {"r1": outstanding}
+
+        worker._wait_for_load_admission("r2")
+
+        assert outstanding.sync_calls == 0
+
+    def test_gate_ignores_completed_events(self):
+        worker = self._make_worker(1)
+        done = _FakeAdmissionEvent(complete=True)
+        worker._deferred_events = {"r1": done}
+
+        worker._wait_for_load_admission("r2")
+
+        assert done.sync_calls == 0
+
+    def test_gate_noop_with_empty_stream(self):
+        worker = self._make_worker(1)
+
+        worker._wait_for_load_admission("r1")
+
+        assert worker._deferred_events == {}
+
+
 # =============================================================================
 # Packed-store write-behind lifecycle
 # =============================================================================
