@@ -18,7 +18,7 @@ with MaruHandler(config) as handler:
 
     # Store: alloc → write → register
     handle = handler.alloc(size=len(data))
-    handle.buf[:len(data)] = data
+    handle.buf[: len(data)] = data
     handler.store(key=12345, handle=handle)
 
     # Retrieve (zero-copy memoryview into CXL memory)
@@ -62,7 +62,7 @@ Handle returned by `alloc()` for zero-copy writes. The caller writes data direct
 handle = handler.alloc(size=1024 * 1024)
 
 # 2. Write directly to CXL memory (zero-copy)
-handle.buf[:len(data)] = data
+handle.buf[: len(data)] = data
 
 # 3. Register the key (only metadata is sent)
 handler.store(key=42, handle=handle)

@@ -13,8 +13,8 @@ from maru import MaruConfig
 class MaruConfig:
     server_url: str = "tcp://localhost:5555"
     instance_id: str | None = None
-    pool_size: int = 104_857_600          # 100MB
-    chunk_size_bytes: int = 1_048_576     # 1MB
+    pool_size: int = 104_857_600  # 100MB
+    chunk_size_bytes: int = 1_048_576  # 1MB
     auto_connect: bool = True
     timeout_ms: int = 2000
     use_async_rpc: bool = True
@@ -52,8 +52,8 @@ with MaruHandler(config) as handler:
 config = MaruConfig(
     server_url="tcp://10.0.0.1:5555",
     instance_id="worker-0",
-    pool_size=1024 * 1024 * 1024,    # 1GB
-    chunk_size_bytes=2 * 1024 * 1024, # 2MB pages
+    pool_size=1024 * 1024 * 1024,  # 1GB
+    chunk_size_bytes=2 * 1024 * 1024,  # 2MB pages
     timeout_ms=5000,
 )
 ```
