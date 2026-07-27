@@ -310,7 +310,8 @@ class MaruKVConnector(KVConnectorBase_V1):
             not yet complete. The loader thread blocks before each GPU
             enqueue until fewer than this many loads are outstanding,
             bounding same-CUDA-context interference with model steps.
-            0 = no cap, submit all loads immediately (default)
+            Default: 1. Set 0 to disable the cap and submit all loads
+            immediately.
         maru_enable_write_behind: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
             with asynchronous D2H DMA. Metadata registration finishes on a
@@ -981,10 +982,10 @@ class MaruWorkerConnector:
         # model steps after the first resume (measured: model compute start
         # +84.5 ms vs the MP server's separate-context +3.0 ms), so the
         # loader thread blocks before each GPU enqueue instead of piling
-        # more work into the model's CUDA context. 0 disables the gate
-        # (submit-all, default).
+        # more work into the model's CUDA context. Default 1 keeps at most
+        # one load outstanding; 0 opts out to the legacy submit-all path.
         self._load_admission_window = int(
-            extra_config.get("maru_load_admission_window", 0)
+            extra_config.get("maru_load_admission_window", 1)
         )
         # Packed layerwise overlap keeps the packed Maru object format. The
         # loader thread resolves only the RPC/mmap metadata; the resumed

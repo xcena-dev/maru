@@ -1396,11 +1396,11 @@ class TestLoadAdmissionWindow:
             extra_config={"maru_load_admission_window": window},
         )
 
-    def test_window_disabled_by_default(self):
+    def test_window_one_by_default(self):
         from maru_vllm.connector import MaruWorkerConnector
 
         worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=8, extra_config={})
-        assert worker._load_admission_window == 0
+        assert worker._load_admission_window == 1
 
     def test_window_parsed_from_extra_config(self):
         assert self._make_worker(2)._load_admission_window == 2
