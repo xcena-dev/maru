@@ -3318,6 +3318,7 @@ class MaruWorkerConnector:
         Args:
             chunk_keys: Chunk base keys relayed from the scheduler at arrival.
         """
+        _t0 = time.monotonic()
         try:
             found = self._handler.prefetch_batch(chunk_keys)
             logger.info(
@@ -3327,6 +3328,14 @@ class MaruWorkerConnector:
             )
         except Exception:
             logger.warning("Maru arrival-hint prefetch failed", exc_info=True)
+        if self._timing:
+            # This runs on the engine thread inside start_load_kv, so whatever
+            # it costs is added to the step -- and therefore to every
+            # co-scheduled request's inter-token latency.
+            _emit_timing(
+                f"arrival-hint fire {len(chunk_keys)} keys = "
+                f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+            )
 
     def _get_layer_index(self, layer_name: str) -> int:
         """Extract numeric layer index from layer name."""
