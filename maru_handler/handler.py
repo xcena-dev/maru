@@ -33,7 +33,7 @@ from .memory import (
     OwnedRegionManager,
     PagedMemoryAllocator,
 )
-from .plugin import load_handler_plugins
+from .plugin import StageResult, load_handler_plugins
 from .rpc_client import RpcClient
 
 logger = logging.getLogger(__name__)
@@ -142,6 +142,59 @@ class MaruHandler:
                     type(plugin).__name__,
                     hook,
                 )
+
+    def _dispatch_stage(
+        self,
+        keys: list[str],
+        batch_resp,
+        found: int,
+    ) -> StageResult:
+        """Invoke the first stage-capable plugin and preserve its outcome.
+
+        Stage preparation is a single-device operation. The first loaded
+        plugin implementing ``on_stage`` owns the batch; additional plugins
+        are ignored with a warning rather than issuing duplicate blocking
+        migrations for the same ranges.
+        """
+        capable: list[tuple[object, Callable[..., object]]] = []
+        for plugin in self._plugins:
+            stage_hook = getattr(plugin, "on_stage", None)
+            if callable(stage_hook):
+                capable.append((plugin, stage_hook))
+        if not capable:
+            return StageResult(
+                requested_keys=len(keys),
+                found_keys=found,
+                error="no stage-capable handler plugin",
+            )
+        if len(capable) > 1:
+            logger.warning(
+                "multiple stage-capable handler plugins loaded; using %s",
+                type(capable[0][0]).__name__,
+            )
+        plugin, stage_hook = capable[0]
+        try:
+            result = stage_hook(self, keys, batch_resp)
+        except Exception as error:
+            logger.exception(
+                "handler plugin %s hook on_stage failed",
+                type(plugin).__name__,
+            )
+            return StageResult(
+                requested_keys=len(keys),
+                found_keys=found,
+                error=f"{type(error).__name__}: {error}",
+            )
+        if not isinstance(result, StageResult):
+            return StageResult(
+                requested_keys=len(keys),
+                found_keys=found,
+                error=(
+                    f"{type(plugin).__name__}.on_stage returned "
+                    f"{type(result).__name__}, expected StageResult"
+                ),
+            )
+        return result
 
     # =========================================================================
     # Public Accessors
@@ -1030,6 +1083,66 @@ class MaruHandler:
             else ("partial" if found > 0 else "miss"),
         )
         return found
+
+    def stage_batch(self, keys: list[str]) -> StageResult:
+        """Prepare a key batch and return only after its local tier is ready.
+
+        This is the completion-returning counterpart of
+        :meth:`prefetch_batch`. It performs one metadata lookup, lazily maps
+        found shared regions, and delegates the device-specific blocking
+        preparation to the first plugin implementing ``on_stage``.
+
+        The method may block for storage latency and must run on a dedicated
+        executor/helper process. A failed result never changes KV correctness;
+        the caller can issue the normal demand read or recompute.
+
+        Args:
+            keys: Chunk key strings to prepare.
+
+        Returns:
+            Strict preparation outcome. ``result.ready`` means every requested
+            key completed preparation successfully.
+        """
+        self._ensure_connected()
+        t0 = time.monotonic()
+        try:
+            batch_resp = self._rpc.batch_lookup_kv(keys)
+        except Exception as error:
+            logger.error("stage_batch RPC failed", exc_info=True)
+            return StageResult(
+                requested_keys=len(keys),
+                found_keys=0,
+                wait_ms=(time.monotonic() - t0) * 1000.0,
+                error=f"{type(error).__name__}: {error}",
+            )
+
+        found = sum(1 for entry in batch_resp.entries if entry.found)
+        for entry in batch_resp.entries:
+            if not entry.found or entry.handle is None:
+                continue
+            handle = entry.handle
+            region_id = handle.region_id
+            if self._owned.is_owned(region_id):
+                continue
+            if self._mapper.get_region(region_id) is not None:
+                continue
+            try:
+                self._mapper.map_region(handle)
+            except Exception:
+                logger.error(
+                    "stage_batch failed to map shared region %d",
+                    region_id,
+                    exc_info=True,
+                )
+
+        result = self._dispatch_stage(keys, batch_resp, found)
+        self._record_stats(
+            "stage_batch",
+            result.prepared_bytes,
+            (time.monotonic() - t0) * 1e6,
+            result="hit" if result.ready else ("partial" if found else "miss"),
+        )
+        return result
 
     def batch_store(
         self,

@@ -38,6 +38,10 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_handler import StageResult
+
+from .staging_prefetch import FifoStagePolicy, StagePlan, StageTicket
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
@@ -263,6 +267,10 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
 class MaruConnectorMetadata(KVConnectorMetadata):
     """Metadata communicated from scheduler to worker each step.
 
+    ``stage_plans`` preserves request identity while relaying bounded
+    SSD-to-device-DRAM work to a dedicated worker thread
+    (``MARU_STAGE_PIPELINE=1``).
+
     ``arrival_hint_keys`` carries the chunk base keys of requests that newly
     entered the scheduler's waiting queue since the previous step
     (smart-prefetch arrival-hint, ``MARU_ARRIVAL_HINT=1``). The worker fires a
@@ -280,6 +288,7 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # can overlap layer k compute without changing the packed storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
     arrival_hint_keys: list[str] = field(default_factory=list)
+    stage_plans: list[StagePlan] = field(default_factory=list)
 
 
 # ============================================================================
@@ -612,6 +621,35 @@ class MaruSchedulerConnector:
         # into the next connector metadata for the worker to fire (the worker
         # owns the region mappings, so firing happens there).
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+        # Completion-returning staging pipeline. The scheduler is deliberately
+        # only a bounded FIFO brain; the worker owns the blocking device call.
+        self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        self._stage_policy: FifoStagePolicy | None = None
+        if self._stage_enabled:
+            self._stage_policy = FifoStagePolicy(
+                max_requests=max(
+                    1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+                ),
+                max_bytes=max(
+                    0,
+                    int(os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)) or 0),
+                ),
+                estimated_bytes_per_key=max(
+                    1,
+                    int(
+                        os.environ.get(
+                            "MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)
+                        )
+                        or 1
+                    ),
+                ),
+            )
+        if self._stage_enabled and self._arrival_hint_enabled:
+            logger.warning(
+                "MARU_STAGE_PIPELINE=1 supersedes MARU_ARRIVAL_HINT=1; "
+                "disabling the fire-and-forget arrival hint"
+            )
+            self._arrival_hint_enabled = False
         # (req_id, chunk keys) awaiting release, oldest arrival first.
         self._pending_arrival_hints: list[tuple[str, list[str]]] = []
         # Released but not yet consumed by a load. MARU_ARRIVAL_HINT_DEPTH caps
@@ -637,21 +675,42 @@ class MaruSchedulerConnector:
                 "hint would miss."
             )
             self._arrival_hint_enabled = False
+        if self._stage_enabled and self._use_layerwise:
+            logger.warning(
+                "Maru stage pipeline is unsupported with layerwise storage; "
+                "disabling it because packed chunk base keys are not data keys"
+            )
+            self._stage_enabled = False
+            self._stage_policy = None
         if self._arrival_hint_enabled:
             logger.info(
                 "Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1, depth=%s)",
                 self._arrival_hint_depth or "unlimited",
             )
+        if self._stage_enabled:
+            logger.info(
+                "Maru SSD-to-DRAM stage pipeline enabled "
+                "(requests=%s, bytes=%s, estimate/key=%s)",
+                os.environ.get("MARU_STAGE_MAX_REQUESTS", "1"),
+                os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)),
+                os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)),
+            )
 
     def on_new_request(self, request: Request) -> None:
-        """Queue this request's chunk keys for worker-side lookahead prefetch.
+        """Queue this request's chunk keys for worker-side arrival prefetch.
 
-        Computes the chunk base keys from the prompt tokens and stages them;
+        Computes the chunk base keys from the prompt tokens and queues them;
         ``build_connector_meta`` releases them to the worker on a later step
         (arrival -> fire latency is ~one scheduler step, negligible against the
         0.2-2.1 s admission wait this hint exploits). The keys are the packed
         chunk keys (one per chunk) — the worker fires them as-is, no per-layer
         expansion, because packed storage keeps one object per chunk.
+
+        Completion-returning staging is deliberately *not* started here. A
+        preceding turn's write-behind registration may still be in flight at
+        raw arrival, so an immediate lookup can falsely miss every reusable
+        key. Staging is queued only after ``_count_matched_chunks`` confirms
+        the prefix exists.
 
         Args:
             request: The newly arrived vLLM request.
@@ -746,6 +805,10 @@ class MaruSchedulerConnector:
             Number of consecutive cached chunks from the beginning.
         """
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        return self._count_matched_chunk_keys(keys)
+
+    def _count_matched_chunk_keys(self, keys: list[str]) -> int:
+        """Count a cached prefix from precomputed packed chunk keys."""
         if not keys:
             return 0
 
@@ -806,7 +869,8 @@ class MaruSchedulerConnector:
             return 0, False
 
         _t0 = time.monotonic()
-        num_matched_chunks = self._count_matched_chunks(token_ids)
+        chunk_keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        num_matched_chunks = self._count_matched_chunk_keys(chunk_keys)
         if self._timing:
             _emit_timing(
                 f"get_num_new_matched (incl _chunk_keys) {len(token_ids)} tok = "
@@ -822,6 +886,15 @@ class MaruSchedulerConnector:
 
         if new_matched <= 0:
             return 0, False
+        if self._stage_enabled:
+            assert self._stage_policy is not None
+            matched_keys = chunk_keys[:num_matched_chunks]
+            self._stage_policy.enqueue(request.request_id, matched_keys)
+            logger.debug(
+                "Maru stage: queued %d verified chunk keys for req %s",
+                len(matched_keys),
+                request.request_id,
+            )
 
         logger.info(
             "Maru KV hit: req=%s, %d chunks (%d tokens), new=%d beyond computed=%d",
@@ -1042,6 +1115,20 @@ class MaruSchedulerConnector:
                     if entry[0] not in stale_ids
                 ]
             meta.arrival_hint_keys = self._release_arrival_hints(consumed)
+        if self._stage_enabled:
+            assert self._stage_policy is not None
+            consumed = {req.req_id for req in meta.requests}
+            meta.stage_plans = self._stage_policy.advance(
+                consumed=consumed,
+                canceled=set(stale_ids),
+            )
+            if meta.stage_plans:
+                logger.debug(
+                    "Maru stage: admitted %d reqs, %d inflight, %d queued",
+                    len(meta.stage_plans),
+                    self._stage_policy.inflight_requests,
+                    self._stage_policy.queued_requests,
+                )
 
         self._requests_need_load.clear()
         return meta
@@ -1211,6 +1298,14 @@ class MaruWorkerConnector:
         # Smart-prefetch arrival-hint (MARU_ARRIVAL_HINT=1): fire a lookahead
         # prefetch for the chunk keys relayed from the scheduler at arrival.
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+        self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        if self._stage_enabled and self._arrival_hint_enabled:
+            self._arrival_hint_enabled = False
+        if self._stage_enabled and self._use_layerwise:
+            self._stage_enabled = False
+        self._stage_executor: ThreadPoolExecutor | None = None
+        self._stage_lock = threading.Lock()
+        self._stage_tickets: dict[str, StageTicket] = {}
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -1327,6 +1422,10 @@ class MaruWorkerConnector:
         # arrives a step before the request is scheduled).
         if self._arrival_hint_enabled and metadata.arrival_hint_keys:
             self._fire_arrival_hints(metadata.arrival_hint_keys)
+        if self._stage_enabled:
+            self._cancel_stage_requests(metadata.preempted_req_ids)
+            for plan in metadata.stage_plans:
+                self._submit_stage_plan(plan)
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is not None:
@@ -1383,6 +1482,7 @@ class MaruWorkerConnector:
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
                 self._fail_deferred_load(req_meta)
+                self._release_stage_ticket(req_meta.req_id)
                 continue
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
@@ -1397,6 +1497,7 @@ class MaruWorkerConnector:
                 ]
             else:
                 keys = [chunk_keys[ci] for ci in range(num_chunks)]
+            self._await_stage(req_meta.req_id)
             try:
                 _t0 = time.monotonic()
                 infos = self._batch_retrieve_all(keys)
@@ -1410,6 +1511,7 @@ class MaruWorkerConnector:
                     "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
                 )
                 self._fail_deferred_load(req_meta)
+                self._release_stage_ticket(req_meta.req_id)
                 continue
 
             # All-or-nothing: a miss (chunk evicted between the scheduler's
@@ -1423,6 +1525,7 @@ class MaruWorkerConnector:
                     req_meta.req_id,
                 )
                 self._fail_deferred_load(req_meta)
+                self._release_stage_ticket(req_meta.req_id)
                 continue
 
             # Packed (default): keep the per-chunk slab infos whole (num_chunks
@@ -1438,7 +1541,11 @@ class MaruWorkerConnector:
         # per-(layer,chunk) copies. See design note "P6 v2 시도 2".
         if not self._use_layerwise:
             _t0 = time.monotonic()
-            self._load_packed(layers, prepared_requests, attn_metadata)
+            try:
+                self._load_packed(layers, prepared_requests, attn_metadata)
+            finally:
+                for req_meta, _, _, _ in prepared_requests:
+                    self._release_stage_ticket(req_meta.req_id)
             if self._timing:
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
@@ -1535,11 +1642,13 @@ class MaruWorkerConnector:
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
+                self._release_stage_ticket(req_meta.req_id)
                 return
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             keys = [chunk_keys[ci] for ci in range(num_chunks)]
 
+            self._await_stage(req_meta.req_id)
             _t0 = time.monotonic()
             infos = self._batch_retrieve_all(keys)
             if self._timing:
@@ -1555,6 +1664,7 @@ class MaruWorkerConnector:
                     req_meta.req_id,
                 )
                 self._fail_deferred_load(req_meta)
+                self._release_stage_ticket(req_meta.req_id)
                 return
 
             if req_meta.layerwise_load:
@@ -1687,6 +1797,7 @@ class MaruWorkerConnector:
                 except Exception:
                     pass
             self._fail_deferred_load(req_meta)
+            self._release_stage_ticket(req_meta.req_id)
 
     def _wait_for_load_admission(self, req_id: str) -> None:
         """Block until fewer than the admission window of loads are in flight.
@@ -2019,6 +2130,8 @@ class MaruWorkerConnector:
         # event was recorded after the end marker, so both have fired.
         for req_id, (bw_start, bw_end, nbytes, nchunks) in finished_bw:
             self._emit_load_bandwidth(req_id, bw_start, bw_end, nbytes, nchunks)
+        for req_id in done:
+            self._release_stage_ticket(req_id)
         return done or None
 
     @staticmethod
@@ -2080,6 +2193,8 @@ class MaruWorkerConnector:
         longer reads the GPU cache. Only the store stream must be complete at
         this boundary.
         """
+        if self._stage_enabled:
+            self._cancel_stage_requests(metadata.preempted_req_ids)
         if (
             self._write_behind
             and metadata.preempted_req_ids
@@ -3314,6 +3429,12 @@ class MaruWorkerConnector:
         if self._deferred_executor is not None:
             self._deferred_executor.shutdown(wait=True)
             self._deferred_executor = None
+        # A deferred loader may be waiting on a StageTicket, so drain that
+        # consumer before stopping its producer. Both finish before handler
+        # teardown because stage_batch uses the live handler.
+        if self._stage_executor is not None:
+            self._stage_executor.shutdown(wait=True)
+            self._stage_executor = None
         if self._deferred_stream is not None:
             try:
                 self._deferred_stream.synchronize()
@@ -3334,6 +3455,8 @@ class MaruWorkerConnector:
             self._deferred_refs.clear()
             self._deferred_done.clear()
             self._deferred_load_bw.clear()
+        with self._stage_lock:
+            self._stage_tickets.clear()
         if self._handler is not None:
             try:
                 self._handler.close()
@@ -3344,6 +3467,99 @@ class MaruWorkerConnector:
     # ==============================
     # Helper methods
     # ==============================
+
+    def _submit_stage_plan(self, plan: StagePlan) -> None:
+        """Submit one plan to the SSD-to-DRAM worker without blocking vLLM."""
+        with self._stage_lock:
+            if plan.req_id in self._stage_tickets:
+                return
+            if self._stage_executor is None:
+                self._stage_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="maru-im-stage",
+                )
+            ticket = StageTicket(plan)
+            self._stage_tickets[plan.req_id] = ticket
+            future = self._stage_executor.submit(self._run_stage, ticket)
+            ticket.bind(future)
+
+    def _run_stage(self, ticket: StageTicket) -> StageResult:
+        """Run blocking device preparation on the dedicated stage thread."""
+        ticket.mark_running()
+        handler = self._handler
+        if handler is None:
+            return StageResult(
+                requested_keys=len(ticket.plan.keys),
+                found_keys=0,
+                error="worker handler unavailable",
+            )
+        result = handler.stage_batch(list(ticket.plan.keys))
+        if self._timing:
+            _emit_timing(
+                f"stage ready={result.ready} "
+                f"{result.prepared_bytes / 2**20:.0f} MiB "
+                f"in {result.wait_ms:.2f} ms (req {ticket.plan.req_id})"
+            )
+        return result
+
+    def _await_stage(self, req_id: str) -> StageResult | None:
+        """Join a request's preparation at its demand-read boundary."""
+        with self._stage_lock:
+            ticket = self._stage_tickets.get(req_id)
+        if ticket is None:
+            return None
+        wait_t0 = time.monotonic()
+        result = ticket.wait()
+        demand_wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if result is None:
+            logger.warning(
+                "Maru stage not ready for req %s (%s); using demand read",
+                req_id,
+                ticket.error or ticket.state.value,
+            )
+            self._release_stage_ticket(req_id)
+            return None
+        logger.info(
+            "Maru stage consumed for req %s: bytes=%d, stage_ms=%s, "
+            "lead_ms=%s, demand_wait_ms=%.1f",
+            req_id,
+            result.prepared_bytes,
+            f"{ticket.stage_ms:.1f}" if ticket.stage_ms is not None else "n/a",
+            (
+                f"{ticket.ready_age_ms:.1f}"
+                if ticket.ready_age_ms is not None
+                else "n/a"
+            ),
+            demand_wait_ms,
+        )
+        if self._timing:
+            stage_ms = ticket.stage_ms
+            ready_age_ms = ticket.ready_age_ms
+            _emit_timing(
+                "stage-consume "
+                f"stage_ms={stage_ms:.2f} "
+                f"lead_ms={ready_age_ms:.2f} "
+                f"demand_wait_ms={demand_wait_ms:.2f} "
+                f"(req {req_id})"
+            )
+        return result
+
+    def _cancel_stage_requests(self, req_ids: set[str]) -> None:
+        """Cancel or discard stage work for preempted requests."""
+        if not req_ids:
+            return
+        with self._stage_lock:
+            tickets = [self._stage_tickets.pop(req_id, None) for req_id in req_ids]
+        for ticket in tickets:
+            if ticket is not None:
+                ticket.cancel()
+
+    def _release_stage_ticket(self, req_id: str) -> None:
+        """Release and remove a ticket after fallback or dependent H2D."""
+        with self._stage_lock:
+            ticket = self._stage_tickets.pop(req_id, None)
+        if ticket is not None:
+            ticket.release()
 
     def _fire_arrival_hints(self, chunk_keys: list[str]) -> None:
         """Issue a lookahead prefetch for newly arrived requests' chunks.

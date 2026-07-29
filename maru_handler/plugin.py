@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -52,6 +53,50 @@ PLUGIN_ALLOWLIST_ENV = "MARU_PLUGINS"
 #: distribution set is immutable within a process, so scan once (the scan is
 #: not free) and reuse across every MaruHandler construction.
 _discovered_entry_points: list | None = None
+
+
+@dataclass(frozen=True)
+class StageResult:
+    """Outcome of preparing one key batch for a future local read.
+
+    ``ready`` is deliberately strict: every requested key must exist, map to
+    an eligible device range, and complete its blocking preparation call.
+    Callers may still fall back to a normal demand read when it is false.
+
+    Attributes:
+        requested_keys: Number of keys in the stage request.
+        found_keys: Number of keys found by the metadata lookup.
+        eligible_keys: Found keys that resolved to a live device range.
+        prepared_bytes: Bytes whose blocking preparation completed.
+        issued_ranges: Coalesced device ranges submitted successfully.
+        failed_ranges: Device ranges whose preparation returned an error.
+        skipped_keys: Found keys that could not resolve to a live range.
+        wait_ms: Wall time spent in the blocking device preparation.
+        error: Optional lookup/plugin error summary.
+    """
+
+    requested_keys: int
+    found_keys: int
+    eligible_keys: int = 0
+    prepared_bytes: int = 0
+    issued_ranges: int = 0
+    failed_ranges: int = 0
+    skipped_keys: int = 0
+    wait_ms: float = 0.0
+    error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Return whether every requested key is ready for local consumption."""
+        return (
+            self.requested_keys > 0
+            and self.found_keys == self.requested_keys
+            and self.eligible_keys == self.found_keys
+            and self.issued_ranges > 0
+            and self.failed_ranges == 0
+            and self.skipped_keys == 0
+            and self.error is None
+        )
 
 
 def _discover_entry_points() -> list:
@@ -151,6 +196,27 @@ class MaruHandlerPlugin(Protocol):
         Runs on the caller's path — keep it cheap and non-blocking. Same
         soft-fail isolation and non-serialization against :meth:`on_close` as
         :meth:`on_batch_retrieve`.
+        """
+        ...
+
+    def on_stage(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+        batch_resp: BatchLookupKVResponse,
+    ) -> StageResult | None:
+        """Synchronously prepare a lookup batch for a future local read.
+
+        Unlike every hot-path hook above, this hook is explicitly allowed to
+        block. :meth:`MaruHandler.stage_batch` must therefore be called only
+        from a dedicated executor or helper process, never from a model or
+        scheduler critical path. A non-``None`` result is a completion
+        contract, not a fire-and-forget hint: ``result.ready`` is true only
+        after all requested ranges are locally consumable.
+
+        Plugins that do not provide a materialization/readiness operation omit
+        this hook. Exceptions are converted to a failed :class:`StageResult`
+        by the handler so demand reads can safely fall back.
         """
         ...
 

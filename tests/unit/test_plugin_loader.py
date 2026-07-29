@@ -265,6 +265,7 @@ class TestPluginApiContract:
             "on_init",
             "on_batch_retrieve",
             "on_prefetch",
+            "on_stage",
             "on_close",
             "contribute_stats",
         ):

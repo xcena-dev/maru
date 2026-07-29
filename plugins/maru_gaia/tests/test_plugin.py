@@ -213,6 +213,43 @@ class TestSyncReadGate:
         assert fake.sync_calls == []
 
 
+class TestStage:
+    """Completion-returning stage always uses the unbudgeted sync API."""
+
+    @pytest.fixture(autouse=True)
+    def _stage_env(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "0")
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "0.001")
+
+    def test_stage_syncs_every_range_and_returns_ready(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 32), _entry(0, 1024, 32))
+
+        result = plugin.on_stage(_handler(), ["a", "b"], response)
+
+        assert len(fake.sync_calls) == 2
+        assert fake.calls == []
+        assert result.ready
+        assert result.prepared_bytes == 64
+        assert result.issued_ranges == 2
+        assert plugin.contribute_stats()["stage_ready"] == 1
+
+    def test_stage_miss_is_not_ready(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        miss = SimpleNamespace(found=False, handle=None, kv_offset=0, kv_length=0)
+
+        result = plugin.on_stage(_handler(), ["missing"], _resp(miss))
+
+        assert not result.ready
+        assert result.found_keys == 0
+        assert result.prepared_bytes == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

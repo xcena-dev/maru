@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING
 
 import pyxif
 
+from maru_handler import StageResult
+
 if TYPE_CHECKING:
     from maru_common import BatchLookupKVResponse
     from maru_handler import MaruHandler
@@ -77,6 +79,10 @@ class GaiaPrefetchPlugin:
         self._failed = 0
         self._skipped = 0
         self._sync_wait_us = 0  # cumulative sync read-gate block time
+        self._stage_requests = 0
+        self._stage_ready = 0
+        self._stage_bytes = 0
+        self._stage_wait_us = 0
         logger.info(
             "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, read_gate=%s)",
             "on" if self._coalesce else "off",
@@ -95,7 +101,13 @@ class GaiaPrefetchPlugin:
         """Demand-read boundary. With MARU_GAIA_PREFETCH_SYNC=1 this is a sync
         read-gate (block until DRAM-resident); otherwise the async reactive
         hint (baseline)."""
-        self._issue(handler, batch_resp, source="retrieve", sync=self._sync_gate)
+        self._issue(
+            handler,
+            keys,
+            batch_resp,
+            source="retrieve",
+            sync=self._sync_gate,
+        )
 
     def on_prefetch(
         self,
@@ -106,7 +118,34 @@ class GaiaPrefetchPlugin:
         """Lookahead hint fired ahead of demand by arrival-hint — always async
         (a sync call here would block and defeat the overlap with admission
         wait)."""
-        self._issue(handler, batch_resp, source="prefetch", sync=False)
+        self._issue(handler, keys, batch_resp, source="prefetch", sync=False)
+
+    def on_stage(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+        batch_resp: BatchLookupKVResponse,
+    ) -> StageResult:
+        """Block on SSD-to-device-DRAM materialization for a stage worker.
+
+        ``MaruHandler.stage_batch`` invokes this hook only from a dedicated
+        executor. Unlike the demand read-gate, no wall-time budget degrades
+        remaining ranges to asynchronous hints: returning is the readiness
+        contract consumed by the request's ``StageTicket``.
+        """
+        result = self._issue(
+            handler,
+            keys,
+            batch_resp,
+            source="stage",
+            sync=True,
+            apply_sync_budget=False,
+        )
+        self._stage_requests += 1
+        self._stage_ready += int(result.ready)
+        self._stage_bytes += result.prepared_bytes
+        self._stage_wait_us += int(result.wait_ms * 1000.0)
+        return result
 
     def contribute_stats(self) -> dict:
         """Cumulative prefetch counters for ``MaruHandler.get_stats``."""
@@ -117,6 +156,10 @@ class GaiaPrefetchPlugin:
             "coalesce": self._coalesce,
             "read_gate": "sync" if self._sync_gate else "async",
             "sync_gate_wait_ms": round(self._sync_wait_us / 1000.0, 1),
+            "stage_requests": self._stage_requests,
+            "stage_ready": self._stage_ready,
+            "stage_bytes": self._stage_bytes,
+            "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
         }
 
     # -- internals ----------------------------------------------------------
@@ -150,10 +193,12 @@ class GaiaPrefetchPlugin:
     def _issue(
         self,
         handler: MaruHandler,
+        keys: list[str],
         batch_resp: BatchLookupKVResponse,
         source: str,
         sync: bool = False,
-    ) -> None:
+        apply_sync_budget: bool = True,
+    ) -> StageResult:
         """Resolve mapped found entries to device ranges and prefetch them.
 
         Skips entries that are not found, carry no handle, or whose region is
@@ -170,7 +215,10 @@ class GaiaPrefetchPlugin:
         eligible: list[tuple[int, int, int]] = []
         skipped = 0
         for entry in batch_resp.entries:
-            if not entry.found or entry.handle is None:
+            if not entry.found:
+                continue
+            if entry.handle is None:
+                skipped += 1
                 continue
             region_id = entry.handle.region_id
             if not handler.is_region_mapped(region_id):
@@ -187,8 +235,10 @@ class GaiaPrefetchPlugin:
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
 
         issued = 0
+        prepared_ranges = 0
         failed = 0
         degraded = 0
+        prepared_bytes = 0
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
             # The read gate blocks the single deferred-load thread, so a cold
@@ -196,7 +246,7 @@ class GaiaPrefetchPlugin:
             # queued behind it. Spend at most the budget blocking, then finish
             # the batch asynchronously and let the transfer read what it finds.
             gated = sync
-            if gated and self._sync_budget_ms > 0:
+            if gated and apply_sync_budget and self._sync_budget_ms > 0:
                 spent_ms = (time.monotonic() - t0) * 1000.0
                 if spent_ms >= self._sync_budget_ms:
                     gated = False
@@ -205,6 +255,9 @@ class GaiaPrefetchPlugin:
             status = prefetch_fn(device_id, device_addr, size)
             if status == pyxif.MemoryStatus.Success:
                 issued += 1
+                if gated:
+                    prepared_ranges += 1
+                    prepared_bytes += size
             else:
                 failed += 1
                 logger.warning(
@@ -221,34 +274,55 @@ class GaiaPrefetchPlugin:
         self._failed += failed
         self._skipped += skipped
         self._sync_wait_us += wait_us
-        if not (issued or failed):
-            return
-        if sync:
+        if issued or failed:
+            if sync:
+                logger.info(
+                    "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
+                    "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
+                    "over_budget=%d",
+                    source,
+                    chunk_count,
+                    len(ranges),
+                    issued,
+                    failed,
+                    skipped,
+                    wait_us / 1000.0,
+                    degraded,
+                )
+            else:
+                logger.info(
+                    "gaia_prefetch(%s): chunks=%d, ranges=%d "
+                    "(issued=%d, failed=%d), skipped=%d, coalesce=%s",
+                    source,
+                    chunk_count,
+                    len(ranges),
+                    issued,
+                    failed,
+                    skipped,
+                    self._coalesce,
+                )
+
+        found = sum(1 for entry in batch_resp.entries if entry.found)
+        result = StageResult(
+            requested_keys=len(keys),
+            found_keys=found,
+            eligible_keys=chunk_count,
+            prepared_bytes=prepared_bytes,
+            issued_ranges=prepared_ranges,
+            failed_ranges=failed,
+            skipped_keys=skipped,
+            wait_ms=wait_us / 1000.0,
+        )
+        if sync and source == "stage":
             logger.info(
-                "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
-                "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
-                "over_budget=%d",
-                source,
-                chunk_count,
-                len(ranges),
-                issued,
-                failed,
-                skipped,
-                wait_us / 1000.0,
-                degraded,
+                "gaia_stage: ready=%s, keys=%d/%d, bytes=%d, wait_ms=%.1f",
+                result.ready,
+                result.eligible_keys,
+                result.requested_keys,
+                result.prepared_bytes,
+                result.wait_ms,
             )
-        else:
-            logger.info(
-                "gaia_prefetch(%s): chunks=%d, ranges=%d (issued=%d, failed=%d), "
-                "skipped=%d, coalesce=%s",
-                source,
-                chunk_count,
-                len(ranges),
-                issued,
-                failed,
-                skipped,
-                self._coalesce,
-            )
+        return result
 
     @staticmethod
     def _coalesce_ranges(
