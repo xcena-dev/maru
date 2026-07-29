@@ -159,6 +159,17 @@ class TestBuildSlotMapping:
         assert len(slots) == 6
         assert slots.tolist() == [0, 1, 2, 3, 4, 5]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_pin_for_async_h2d_preserves_values(self):
+        worker = self._make_worker(block_size=4)
+        slots = worker._build_slot_mapping([0, 2], num_tokens=8)
+
+        pinned = worker._pin_slot_mapping_for_async_h2d(slots)
+
+        assert pinned.is_pinned()
+        assert pinned.tolist() == slots.tolist()
+        assert worker._pin_slot_mapping_for_async_h2d(pinned) is pinned
+
 
 # =============================================================================
 # MaruWorkerConnector P1/P2 helpers
@@ -1345,6 +1356,39 @@ class TestAsyncDeferredPackedLoad:
         assert kv.abs().sum() > 0  # KV was actually injected
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_offthread_load_retains_pinned_slot_source_until_event(self):
+        worker = self._make_worker()
+        kv = torch.zeros(2, 16, 4, 1, device="cuda")
+        worker._kv_caches = {"l0": kv}
+        worker._num_layers = 1
+        slab_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray([i + 1] * slab_bytes)),
+                region_id=0,
+                page_index=i,
+            )
+            for i in range(8)
+        ]
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = infos
+        meta = self._deferred_meta()
+
+        worker._deferred_packed_load_job(
+            meta,
+            [("l0", kv, 0)],
+            kv.device,
+        )
+
+        refs = worker._deferred_refs["r1"]
+        assert refs[0] == infos
+        assert refs[1].device.type == "cpu"
+        assert refs[1].is_pinned()
+        assert refs[2].device.type == "cuda"
+        torch.cuda.synchronize()
+        assert worker.get_finished_loading() == {"r1"}
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_offthread_retrieve_failure_reports_blocks(self):
         worker = self._make_worker()
         worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1, device="cuda")}
@@ -1396,11 +1440,11 @@ class TestLoadAdmissionWindow:
             extra_config={"maru_load_admission_window": window},
         )
 
-    def test_window_one_by_default(self):
+    def test_window_disabled_by_default(self):
         from maru_vllm.connector import MaruWorkerConnector
 
         worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=8, extra_config={})
-        assert worker._load_admission_window == 1
+        assert worker._load_admission_window == 0
 
     def test_window_parsed_from_extra_config(self):
         assert self._make_worker(2)._load_admission_window == 2

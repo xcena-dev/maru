@@ -310,8 +310,8 @@ class MaruKVConnector(KVConnectorBase_V1):
             not yet complete. The loader thread blocks before each GPU
             enqueue until fewer than this many loads are outstanding,
             bounding same-CUDA-context interference with model steps.
-            Default: 1. Set 0 to disable the cap and submit all loads
-            immediately.
+            Default: 0 (submit all loads immediately). Set a positive value
+            to enable the cap as a fallback safety guard.
         maru_enable_write_behind: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
             with asynchronous D2H DMA. Metadata registration finishes on a
@@ -977,15 +977,13 @@ class MaruWorkerConnector:
         self._deferred_executor: ThreadPoolExecutor | None = None
         self._deferred_stream: torch.cuda.Stream | None = None
         self._deferred_stream_device: torch.device | None = None
-        # Admission window: cap the request loads enqueued on the deferred
-        # stream but not yet complete. Outstanding same-context loads delay
-        # model steps after the first resume (measured: model compute start
-        # +84.5 ms vs the MP server's separate-context +3.0 ms), so the
-        # loader thread blocks before each GPU enqueue instead of piling
-        # more work into the model's CUDA context. Default 1 keeps at most
-        # one load outstanding; 0 opts out to the legacy submit-all path.
+        # Optional admission window: cap request loads enqueued on the
+        # deferred stream but not yet complete. Slot mappings are pinned
+        # before asynchronous H2D, so the default submit-all path no longer
+        # triggers the pageable-copy driver stall. A positive value keeps the
+        # previous request-level backpressure available as a fallback guard.
         self._load_admission_window = int(
-            extra_config.get("maru_load_admission_window", 1)
+            extra_config.get("maru_load_admission_window", 0)
         )
         # Packed layerwise overlap keeps the packed Maru object format. The
         # loader thread resolves only the RPC/mmap metadata; the resumed
@@ -1143,6 +1141,22 @@ class MaruWorkerConnector:
             + block_ids_t.reshape((num_blocks, 1)) * self._block_size
         )
         return slot_mapping.flatten()[:num_tokens]
+
+    @staticmethod
+    def _pin_slot_mapping_for_async_h2d(
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a page-locked CPU slot mapping for asynchronous H2D.
+
+        Callers invoke this helper only after selecting a CUDA load path.
+        Keeping the policy outside :meth:`_build_slot_mapping` leaves CPU
+        fallbacks and store-only paths unchanged.
+        """
+        if slot_mapping.device.type != "cpu":
+            raise ValueError("slot mapping for H2D must be a CPU tensor")
+        if slot_mapping.is_pinned():
+            return slot_mapping
+        return slot_mapping.pin_memory()
 
     def start_load_kv(
         self,
@@ -1414,6 +1428,7 @@ class MaruWorkerConnector:
                 )
                 return
 
+            slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             torch.cuda.set_device(device)
             if self._deferred_stream is None or self._deferred_stream_device != device:
                 # Highest priority: parked requests' TTFT gates on these
@@ -1478,7 +1493,11 @@ class MaruWorkerConnector:
                 event.record(stream)
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
-                self._deferred_refs[req_meta.req_id] = [infos, slot_gpu]
+                self._deferred_refs[req_meta.req_id] = [
+                    infos,
+                    slot_mapping,
+                    slot_gpu,
+                ]
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s (packed, off-thread)",
@@ -1592,6 +1611,15 @@ class MaruWorkerConnector:
             self._load_stream_device = device
         load_stream = self._load_stream
         load_stream.wait_stream(torch.cuda.current_stream(device))
+        entries = [
+            (
+                req_meta,
+                num_chunks,
+                self._pin_slot_mapping_for_async_h2d(slot_mapping),
+                infos,
+            )
+            for req_meta, num_chunks, slot_mapping, infos in entries
+        ]
 
         _t0 = time.monotonic()
         try:
@@ -1639,6 +1667,7 @@ class MaruWorkerConnector:
         # load_stream, allowing their storage to be safely reused in stream
         # order without retaining num_layers x num_chunks device buffers.
         self._active_load_refs.extend(infos for _, _, _, infos in entries)
+        self._active_load_refs.extend(slot_mapping for _, _, slot_mapping, _ in entries)
         self._active_load_refs.extend(slot_mappings_gpu)
         logger.info(
             "Maru: packed-layerwise scheduled %d layers x %d requests on load stream",
@@ -1762,6 +1791,7 @@ class MaruWorkerConnector:
         load_stream = self._load_stream
 
         for req_meta, num_chunks, slot_mapping, infos in entries:
+            slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             with torch.cuda.stream(load_stream):
                 slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
                 for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
@@ -1786,7 +1816,11 @@ class MaruWorkerConnector:
                 event.record(load_stream)
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
-                self._deferred_refs[req_meta.req_id] = [infos, slot_mapping_gpu]
+                self._deferred_refs[req_meta.req_id] = [
+                    infos,
+                    slot_mapping,
+                    slot_mapping_gpu,
+                ]
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s",
@@ -1925,10 +1959,14 @@ class MaruWorkerConnector:
 
         load_stream = self._load_stream
         load_stream.wait_stream(torch.cuda.current_stream(device))
+        slot_mappings_host = [
+            self._pin_slot_mapping_for_async_h2d(slot_mapping)
+            for _, _, slot_mapping, _ in prepared_requests
+        ]
         with torch.cuda.stream(load_stream):
             slot_mappings_gpu = [
                 slot_mapping.to(device, non_blocking=True)
-                for _, _, slot_mapping, _ in prepared_requests
+                for slot_mapping in slot_mappings_host
             ]
             # Layer-major ordering is essential for inflight >1: layer 0 for
             # every request must become ready before work for later layers.
@@ -1964,6 +2002,7 @@ class MaruWorkerConnector:
                 self._layer_load_events[layer_name] = event
 
         self._active_load_refs.extend(infos for _, _, _, infos in prepared_requests)
+        self._active_load_refs.extend(slot_mappings_host)
         self._active_load_refs.extend(slot_mappings_gpu)
         return True
 
@@ -2100,6 +2139,8 @@ class MaruWorkerConnector:
         dtype = layers[0][1].dtype
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
+                if use_stream:
+                    slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
                 slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
                 for ci in range(num_chunks):
                     slab_view = slab_infos[ci].view
