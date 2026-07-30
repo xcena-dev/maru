@@ -1232,7 +1232,17 @@ class MaruWorkerConnector:
             )
 
         for req_meta in metadata.requests:
-            if req_meta.is_store or req_meta.num_matched_chunks == 0:
+            if req_meta.is_store:
+                continue
+            if req_meta.num_matched_chunks == 0:
+                # Nothing to load, but a deferred request is still parked in
+                # WAITING_FOR_REMOTE_KVS and must be reported. The scheduler
+                # emits num_matched_chunks=0 whenever its match result is
+                # missing at allocation time (update_state_after_alloc
+                # defaults to 0), so this is the third way a parked request
+                # can reach the worker with no load to perform.
+                # _fail_deferred_load ignores inline requests.
+                self._fail_deferred_load(req_meta)
                 continue
 
             # Packed deferred loads run off-thread. The default path performs

@@ -2142,6 +2142,36 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() is None
         assert worker.take_failed_load_blocks() == set()
 
+    def test_zero_matched_chunks_degrades_deferred_load_to_recompute(self):
+        """A parked request with nothing to load must still be reported.
+
+        `update_state_after_alloc` defaults its match result to 0 when the
+        entry is missing, so the scheduler can emit a deferred request with
+        `num_matched_chunks=0`. The worker reaches its request loop normally
+        in that case — the early returns never fire — so the loop itself has
+        to report the request or it stays parked forever.
+        """
+        worker = self._make_worker()
+        worker._handler = MagicMock()
+        metadata = self._metadata()
+        metadata.requests[0].num_matched_chunks = 0
+
+        worker.start_load_kv(self._forward(), metadata)
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
+
+    def test_zero_matched_chunks_inline_load_unaffected(self):
+        worker = self._make_worker()
+        worker._handler = MagicMock()
+        metadata = self._metadata(deferred=False)
+        metadata.requests[0].num_matched_chunks = 0
+
+        worker.start_load_kv(self._forward(), metadata)
+
+        assert worker.get_finished_loading() is None
+        assert worker.take_failed_load_blocks() == set()
+
     def test_carried_store_layer_state_cleared_at_step_boundary(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
