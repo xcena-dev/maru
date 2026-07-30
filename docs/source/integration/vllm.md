@@ -191,6 +191,47 @@ Settings in `kv_connector_extra_config`:
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
 | `maru_kv_chunk_tokens` | int | `256` | KV cache chunk granularity (in tokens) |
 
+Asynchronous transfer settings, all opt-in:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `maru_enable_deferred_loading` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_enable_write_behind` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
+| `maru_load_admission_window` | int | `0` | Cap on deferred loads in flight; `0` submits all |
+| `maru_use_layerwise` | bool | `false` | Store one CXL object per (chunk, layer) instead of one packed object per chunk |
+| `maru_enable_layerwise_overlap` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
+
+### Asynchronous load and store
+
+By default both the cache-hit load and the populate store run to completion
+inside the model worker's forward pass. The two settings below move that work
+off the critical path; they are independent and can be enabled separately.
+
+`maru_enable_deferred_loading` parks a cache-hit request while a background
+thread performs the Maru lookup and the CXL→GPU transfer, then reports
+completion through a CUDA event. The forward pass no longer waits on the
+retrieve RPC.
+
+`maru_enable_write_behind` lets the store finish after the forward pass
+returns, so the first token of the current step is not delayed by the
+GPU→CXL copy and the metadata registration.
+
+`maru_load_admission_window` bounds how many deferred loads may be in flight
+at once. The default `0` submits every load immediately. Set a positive value
+only if you need request-level backpressure.
+
+### Storage granularity and overlap
+
+`maru_use_layerwise` selects the storage layout. The default (`false`) packs
+every layer of a chunk into one CXL object, so a request resolves one key per
+chunk rather than one per (chunk, layer). Setting it to `true` restores the
+per-layer objects.
+
+`maru_enable_layerwise_overlap` applies only to the packed layout and requires
+`maru_enable_deferred_loading`; it pipelines a request's per-layer transfers
+against attention compute. The connector logs a warning and disables it when
+those prerequisites are not met.
+
 ### maru_kv_chunk_tokens
 
 Controls how many tokens per chunk when storing KV cache:

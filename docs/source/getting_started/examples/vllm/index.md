@@ -1,8 +1,96 @@
 # vLLM Examples
 
-## P2P KV Cache Sharing
+Two runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
+which moves KV cache through CXL shared memory without LMCache in the serving
+path. Both live under `examples/vllm/`:
 
-Direct KV cache sharing between two vLLM instances via CXL shared memory.
+| Example | Directory | What it shows |
+|---------|-----------|---------------|
+| Single-instance verification | `examples/vllm/single/` | One instance stores KV and reuses it on a repeat request — the cheapest connector check |
+| P2P KV cache sharing | `examples/vllm/p2p_sharing/` | Two instances share KV cache, so the second skips prefill |
+
+Start with the single-instance example: it needs one GPU and isolates the
+store and load paths before any cross-instance behavior is involved.
+
+## Prerequisites
+
+- 1 GPU for the single-instance example, 2+ for P2P
+- Maru installed: `pip install -e /path/to/maru`
+- vLLM v0.14+ installed
+- `maru-server` binary available
+
+LMCache is optional. When its Python package is present the direct connector
+reuses `lmcache.c_ops` for coalesced multi-layer CUDA transfers; it does not
+run the LMCache connector or service. Without `c_ops` the connector falls back
+to a per-layer transfer.
+
+## Single-instance verification
+
+One vLLM instance stores KV to Maru on the first request and loads it back on
+a repeat. vLLM's own prefix cache is disabled in the launcher so that Maru is
+the only cache source — otherwise the repeated prompt would be served from the
+GPU-resident prefix cache and neither connector path would run.
+
+```
+            vLLM (GPU 0, prefix cache OFF)
+                      |
+                MaruKVConnector
+                      |
+                 MaruHandler ── CXL Shared Memory
+                      |
+                 MaruServer (metadata)
+
+1st request → cold: full prefill, KV stored to Maru
+2nd request → warm: prefix found in Maru, KV loaded, prefill skipped
+```
+
+### Automated
+
+```bash
+cd examples/vllm/single
+./single_example.sh                              # Default: Qwen/Qwen2.5-0.5B
+./single_example.sh --model meta-llama/Llama-3-8B
+```
+
+The script starts `maru-server` and one vLLM instance, then sends the same
+prompt twice. `Cache Hit: Yes` with a TTFT speedup confirms both paths. It
+exits non-zero on a cache miss; check `single.log` for connector errors (a
+missing `Maru: loaded N layers` message means the worker load path failed).
+
+### Step-by-step
+
+```bash
+cd examples/vllm/single
+
+# 1. Start maru-server
+source env.sh
+maru-server --port $MARU_SERVER_PORT
+
+# 2. Launch the instance (GPU 0, prefix cache OFF)
+./single_vllm_launcher.sh Qwen/Qwen2.5-0.5B
+
+# 3. Verify
+./run_simple_query.sh                            # same prompt twice
+./run_benchmark.sh --model Qwen/Qwen2.5-0.5B     # TTFT: cold vs warm
+```
+
+### Configuration
+
+Settings live in `examples/vllm/single/env.sh` and can be overridden through
+the environment:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MARU_SERVER_PORT` | `10000 + uid` | MaruServer port |
+| `MARU_INST_PORT` | `12000 + uid + 20` | vLLM instance port |
+| `MARU_POOL_SIZE` | `4G` | CXL shared memory pool size |
+| `MARU_KV_CHUNK_TOKENS` | `256` | Tokens per KV cache chunk |
+| `GPU_MEM_UTIL` | `0.1` | vLLM GPU memory utilization |
+
+## P2P KV cache sharing
+
+Two vLLM instances share KV cache through CXL shared memory. The first stores
+the prefix, the second loads it and skips prefill.
 
 ```
 Instance 1 (GPU 0)                    Instance 2 (GPU 1)
@@ -17,87 +105,41 @@ Instance 1 (GPU 0)                    Instance 2 (GPU 1)
                    MaruServer (metadata)
 ```
 
-### Prerequisites
-
-- 2+ NVIDIA GPUs
-- Maru installed: `pip install -e /path/to/maru`
-- vLLM v0.14+ installed
-- `maru-server` binary available
-
-### Quick Start
-
-Run everything with a single script:
+### Automated
 
 ```bash
-cd examples/vllm
-./p2p_example.sh [model]
-
-# Examples:
-./p2p_example.sh                        # Default: Qwen/Qwen2.5-0.5B
+cd examples/vllm/p2p_sharing
+./p2p_example.sh                                 # Default: Qwen/Qwen2.5-0.5B
 ./p2p_example.sh meta-llama/Llama-3-8B
 ```
 
-This will:
-1. Start `maru-server`
-2. Launch two vLLM instances with `MaruKVConnector`
-3. Run the P2P KV cache sharing test
-4. Clean up all processes
+The script starts `maru-server`, launches both instances, runs the sharing
+test, and cleans up every process it started.
 
-### Step-by-Step
-
-**1. Start maru-server:**
+### Step-by-step
 
 ```bash
-source examples/vllm/env.sh
+cd examples/vllm/p2p_sharing
+
+# 1. Start maru-server
+source env.sh
 maru-server --port $MARU_SERVER_PORT
+
+# 2. Launch the instances (separate terminals)
+./p2p_vllm_launcher.sh inst1 Qwen/Qwen2.5-0.5B   # GPU 0
+./p2p_vllm_launcher.sh inst2 Qwen/Qwen2.5-0.5B   # GPU 1
+
+# 3. Run the test
+./run_simple_query.sh                            # prompt + output verification
+./run_benchmark.sh --model Qwen/Qwen2.5-0.5B     # TTFT measurement
 ```
 
-**2. Launch vLLM instances:**
-
-```bash
-# Terminal 1: Instance 1 (GPU 0)
-./examples/vllm/launch_vllm.sh inst1 Qwen/Qwen2.5-0.5B
-
-# Terminal 2: Instance 2 (GPU 1)
-./examples/vllm/launch_vllm.sh inst2 Qwen/Qwen2.5-0.5B
-```
-
-**3. Run the test:**
-
-```bash
-python examples/vllm/run_benchmark.py \
-    --model Qwen/Qwen2.5-0.5B \
-    --port1 $MARU_INST1_PORT \
-    --port2 $MARU_INST2_PORT \
-    --max-tokens 64
-```
-
-### Expected Output
-
-```
-[Session 1] Instance 1 (port 13019) - Store KV
-  [store] iter 1/1: TTFT=103.0 ms, total=234.3 ms
-  [store] answer: ...
-
-[Session 2] Instance 2 (port 13020) - Retrieve KV
-  [retrieve] iter 1/1: TTFT=42.7 ms, total=177.2 ms
-  [retrieve] answer: ...
-
-============================================================
-  Maru-vLLM Direct P2P KV Cache Sharing
-============================================================
-  Instance 1 (store):    TTFT = 103.0 ms
-  Instance 2 (retrieve): TTFT = 42.7 ms
-  TTFT Speedup:         2.41x
-  Cache Hit:            Yes
-============================================================
-```
-
-Instance 2 shows lower TTFT because it loads KV cache from CXL instead of recomputing prefill.
+Instance 2 should report a lower TTFT and `Cache Hit: Yes`, because it loads
+the KV cache from CXL instead of recomputing prefill.
 
 ### Configuration
 
-All settings are in `examples/vllm/env.sh`:
+Settings live in `examples/vllm/p2p_sharing/env.sh`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -108,18 +150,21 @@ All settings are in `examples/vllm/env.sh`:
 | `MARU_KV_CHUNK_TOKENS` | `256` | Tokens per KV cache chunk |
 | `GPU_MEM_UTIL` | `0.1` | vLLM GPU memory utilization |
 
-### Test Options
+The two examples use different instance ports, so they do not collide when run
+on the same machine.
 
-```bash
-python examples/vllm/run_benchmark.py --help
+### Troubleshooting
 
-Options:
-  --model MODEL          Model name (default: Qwen/Qwen2.5-0.5B)
-  --port1 PORT           Instance 1 port
-  --port2 PORT           Instance 2 port
-  --max-tokens N         Max tokens to generate (default: 64)
-  --repeat-count N       Repeat test N times (default: 1)
-  --wait-time SEC        Wait between sessions for CXL propagation (default: 3.0)
-```
+**Instance 2 TTFT is not faster.** Check the Instance 2 log for
+`Maru: loaded N layers`. If it is absent, confirm `maru-server` is running and
+that both instances connect to it. For very small models with short prompts the
+CXL retrieve overhead can exceed the prefill it saves.
 
-For integration details, see [vLLM](../../../integration/vllm.md).
+**Garbage output on Instance 2.** KV cache corruption — confirm the load is
+using per-chunk injection rather than a concatenated 1D load.
+
+## Further reading
+
+Each example directory has a README with its full file listing. For connector
+configuration — including the asynchronous load and store settings — see
+[vLLM](../../../integration/vllm.md).
