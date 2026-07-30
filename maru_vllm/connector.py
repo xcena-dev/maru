@@ -953,10 +953,15 @@ class MaruWorkerConnector:
         self._load_stream_device: torch.device | None = None
         self._layer_load_events: dict[str, torch.cuda.Event] = {}
         self._effective_page_size_bytes: int | None = None
-        # Keep mmap-backed MemoryInfo and device slot mappings alive until the
-        # next forward pass. The asynchronous H2D copies may still reference
-        # them after start_load_kv returns.
-        self._active_load_refs: list[Any] = []
+        # Keep mmap-backed MemoryInfo and pinned/device slot mappings alive
+        # while their queued H2D copies may still read them: one (event, refs)
+        # entry per scheduled batch, with the event recorded after the batch's
+        # last copy. Entries are released only once the event has completed —
+        # under vLLM async scheduling the next step's start_load_kv can run
+        # while the previous step's copies are still queued on _load_stream,
+        # so a time-based clear would free memory those copies still read
+        # (the CXL mmap views are outside every CUDA allocator's tracking).
+        self._active_load_refs: list[tuple[torch.cuda.Event, list[Any]]] = []
         # Deferred (between-step) loads in flight: req_id -> completion event
         # on the load stream, plus refs keeping mmap/GPU buffers alive until
         # completion is observed via get_finished_loading(). _deferred_done
@@ -1025,6 +1030,10 @@ class MaruWorkerConnector:
         # layers_written). Registered once when all layers are present.
         # (Fallback path only — the kernel store writes whole slabs at once.)
         self._pending_slabs: dict[str, tuple[Any, set[int]]] = {}
+        # Slab handles a step-boundary sweep could not free because the
+        # handler was down. Retried by the next sweep; kept out of
+        # _pending_slabs so no later layer resumes writing into them.
+        self._orphan_slab_handles: list[Any] = []
         # Coalesced packed store: multi_layer_kv_transfer ctx built from the
         # registered KV caches, cached because the pointer table is static.
         # None = unresolved, False = kernel unusable (per-layer fallback).
@@ -1172,8 +1181,18 @@ class MaruWorkerConnector:
         prompt on a 32-layer model) into a few batched calls; that per-op RPC
         round-trip dominated cache-hit TTFT/TPOT.
         """
+        # Step boundary: per-step store state must not leak into this step,
+        # even when this method bails out early below. A carried-over
+        # _store_layers_seen would let a later step's packed store fire before
+        # its last layers have written the paged cache (stale KV registered as
+        # valid); an incomplete fallback slab can never complete once the step
+        # that allocated it ended.
+        self._store_layers_seen.clear()
+        self._reclaim_stale_pending_slabs()
+
         self._ensure_handler()
         if self._handler is None:
+            self._abort_deferred_loads(metadata)
             return
 
         attn_metadata = forward_context.attn_metadata
@@ -1199,11 +1218,12 @@ class MaruWorkerConnector:
                 (layer_name, kv_cache_layer, self._get_layer_index(layer_name))
             )
         if not layers:
+            self._abort_deferred_loads(metadata)
             return
 
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]] = []
         self._layer_load_events.clear()
-        self._active_load_refs.clear()
+        self._release_completed_load_refs()
         if metadata.layerwise_load_req_ids:
             self._schedule_deferred_packed_layerwise_loads(
                 layers,
@@ -1662,13 +1682,18 @@ class MaruWorkerConnector:
             self._layer_load_events.clear()
             return
 
-        # CXL views and GPU slot mappings must outlive the queued H2D copies.
-        # CUDA's caching allocator tracks the short-lived layer_dev tensors on
-        # load_stream, allowing their storage to be safely reused in stream
-        # order without retaining num_layers x num_chunks device buffers.
-        self._active_load_refs.extend(infos for _, _, _, infos in entries)
-        self._active_load_refs.extend(slot_mapping for _, _, slot_mapping, _ in entries)
-        self._active_load_refs.extend(slot_mappings_gpu)
+        # CXL views and slot mappings must outlive the queued H2D copies: a
+        # batch event recorded after every copy gates the release of these
+        # refs (next start_load_kv). CUDA's caching allocator tracks the
+        # short-lived layer_dev tensors on load_stream, allowing their storage
+        # to be safely reused in stream order without retaining
+        # num_layers x num_chunks device buffers.
+        batch_event = torch.cuda.Event()
+        batch_event.record(load_stream)
+        refs: list[Any] = [infos for _, _, _, infos in entries]
+        refs.extend(slot_mapping for _, _, slot_mapping, _ in entries)
+        refs.extend(slot_mappings_gpu)
+        self._active_load_refs.append((batch_event, refs))
         logger.info(
             "Maru: packed-layerwise scheduled %d layers x %d requests on load stream",
             len(layers),
@@ -1761,6 +1786,24 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
+
+    def _abort_deferred_loads(self, metadata: MaruConnectorMetadata) -> None:
+        """Degrade every deferred load in ``metadata`` to recompute.
+
+        Called before ``start_load_kv`` returns without iterating
+        ``metadata.requests`` (worker handler unavailable, no attention
+        layers). The scheduler has already parked these requests in
+        WAITING_FOR_REMOTE_KVS; unless they are reported through
+        ``get_finished_loading`` (with their blocks through
+        ``get_block_ids_with_load_errors``), vLLM keeps them parked forever
+        and never frees their blocks. Inline requests are unaffected —
+        ``_fail_deferred_load`` ignores them.
+
+        Args:
+            metadata: The step's connector metadata.
+        """
+        for req_meta in metadata.requests:
+            self._fail_deferred_load(req_meta)
 
     def _schedule_deferred_loads(
         self,
@@ -2001,9 +2044,14 @@ class MaruWorkerConnector:
                 event.record(load_stream)
                 self._layer_load_events[layer_name] = event
 
-        self._active_load_refs.extend(infos for _, _, _, infos in prepared_requests)
-        self._active_load_refs.extend(slot_mappings_host)
-        self._active_load_refs.extend(slot_mappings_gpu)
+        # A batch event recorded after every copy gates the release of these
+        # refs (next start_load_kv).
+        batch_event = torch.cuda.Event()
+        batch_event.record(load_stream)
+        refs: list[Any] = [infos for _, _, _, infos in prepared_requests]
+        refs.extend(slot_mappings_host)
+        refs.extend(slot_mappings_gpu)
+        self._active_load_refs.append((batch_event, refs))
         return True
 
     def _ensure_fused_ops(self) -> bool:
@@ -2320,6 +2368,23 @@ class MaruWorkerConnector:
         event = self._layer_load_events.get(layer_name)
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
+
+    def _release_completed_load_refs(self) -> None:
+        """Drop load-batch refs whose queued copies have completed.
+
+        Each ``_active_load_refs`` entry pairs the refs of one scheduled load
+        batch with the event recorded after that batch's last copy. Entries
+        whose event has not completed are retained: under vLLM async
+        scheduling this method (called from the next step's
+        ``start_load_kv``) can run while the previous step's copies are still
+        queued, and the pinned slot mappings and CXL mmap views must outlive
+        those copies.
+        """
+        if not self._active_load_refs:
+            return
+        self._active_load_refs = [
+            entry for entry in self._active_load_refs if not entry[0].query()
+        ]
 
     def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
@@ -3030,16 +3095,60 @@ class MaruWorkerConnector:
                         del self._request_pending_store_keys[req_id]
 
     def _discard_pending_slab(self, base_key: str) -> None:
-        """Free and drop a half-filled slab handle after an error."""
+        """Drop a half-filled slab entry after an error and free its handle.
+
+        The entry always leaves ``_pending_slabs`` so a later layer of the
+        same chunk cannot resume writing into a discarded slab. A handle that
+        cannot be freed yet (no live handler) is parked in
+        ``_orphan_slab_handles`` for the next sweep instead of being dropped
+        on the floor.
+        """
         entry = self._pending_slabs.pop(base_key, None)
-        if entry is not None and entry[0] is not None:
-            handler = self._handler
-            if handler is None:
-                return
-            try:
-                handler.free(entry[0])
-            except Exception:
-                pass
+        if entry is None or entry[0] is None:
+            return
+        self._free_slab_handle(entry[0])
+
+    def _free_slab_handle(self, handle: Any) -> None:
+        """Free one slab handle, parking it for retry if no handler is up."""
+        handler = self._handler
+        if handler is None:
+            self._orphan_slab_handles.append(handle)
+            return
+        try:
+            handler.free(handle)
+        except Exception:
+            pass
+
+    def _reclaim_stale_pending_slabs(self) -> None:
+        """Free fallback slabs left incomplete by a previous step.
+
+        ``_pending_slabs`` entries are strictly intra-step: every layer of a
+        chunk writes its plane within one step, and complete entries are
+        registered and removed immediately. Any entry still present at a step
+        boundary is unfinishable — a mid-chunk error discarded the original
+        slab and a later layer re-created the entry with a ``written`` set
+        that can never reach ``_num_layers``, or part of the step's
+        ``save_kv_layer`` calls were skipped while the handler was
+        unavailable. Left alone, each such entry pins a slab-sized CXL
+        allocation forever.
+
+        Handles orphaned by an earlier sweep that ran without a handler are
+        retried here first.
+        """
+        if self._orphan_slab_handles and self._handler is not None:
+            orphans = self._orphan_slab_handles
+            self._orphan_slab_handles = []
+            for handle in orphans:
+                self._free_slab_handle(handle)
+        if not self._pending_slabs:
+            return
+        stale = list(self._pending_slabs)
+        for base_key in stale:
+            self._discard_pending_slab(base_key)
+        logger.warning(
+            "Maru packed store: reclaimed %d stale slab(s) at step boundary",
+            len(stale),
+        )
 
     def _free_handles_best_effort(self, handles: list) -> None:
         """Free alloc handles after a ``batch_store`` call raised.

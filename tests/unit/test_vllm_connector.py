@@ -1563,6 +1563,50 @@ class TestPackedStorage:
         attn.__class__ = type("FlashMetadata", (), {})
         return attn
 
+    def test_mid_chunk_store_error_slab_reclaimed_at_next_step(self):
+        """A mid-chunk store error must not leak the re-created slab.
+
+        Layer 0 fills the slab; layer 1 raises inside the slab write (its
+        float64 extract inflates slab_bytes past the allocated buffer — a
+        stand-in for any transient copy error), discarding the original
+        slab; layer 2 re-creates the entry with ``written={2}``, which can
+        never reach ``_num_layers``. The next step boundary must reclaim it
+        instead of pinning the CXL page forever.
+        """
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker, store = self._make_worker()
+        kv_layers = self._kv_layers()
+        attn = self._flash_attn()
+        token_ids = list(range(self.CHUNK))  # 1 chunk
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+
+        def _meta():
+            return store_metadata(
+                token_ids=token_ids,
+                block_ids=[0, 1],
+                num_scheduled_tokens=self.CHUNK,
+            )
+
+        worker.save_kv_layer(names[0], kv_layers[0], attn, _meta())
+        worker.save_kv_layer(names[1], kv_layers[1].double(), attn, _meta())
+        worker.save_kv_layer(names[2], kv_layers[2], attn, _meta())
+
+        assert store == {}
+        assert len(worker._pending_slabs) == 1  # re-created, unfinishable
+        stale_handle = next(iter(worker._pending_slabs.values()))[0]
+
+        forward = SimpleNamespace(
+            no_compile_layers={
+                names[0]: SimpleNamespace(kv_cache=kv_layers[0]),
+            },
+            attn_metadata=None,
+        )
+        worker.start_load_kv(forward, MaruConnectorMetadata())
+
+        assert worker._pending_slabs == {}
+        worker._handler.free.assert_called_with(stale_handle)
+
     def test_store_one_key_per_chunk_then_load_roundtrip(self):
         from maru_vllm.connector import (
             MaruConnectorMetadata,
@@ -2027,3 +2071,176 @@ class TestPackedStorage:
         for li in range(num_layers):
             for ti in range(ct):
                 assert torch.equal(paged[li][:, int(slots[ti]), :], slab[:, li, ti, :])
+
+
+# =============================================================================
+# start_load_kv early-return safety and step-boundary state reset
+# =============================================================================
+
+
+class TestStartLoadKvEarlyReturnSafety:
+    """Early returns must strand no parked request and leak no per-step state.
+
+    ``start_load_kv`` can return before iterating ``metadata.requests``
+    (worker handler in connect backoff, no attention layers). Deferred
+    requests are already parked in WAITING_FOR_REMOTE_KVS and must degrade
+    to recompute via ``get_finished_loading``/``take_failed_load_blocks``
+    instead of hanging. Independently, the previous step's packed-store
+    dispatch state (``_store_layers_seen``, incomplete ``_pending_slabs``)
+    must be reset at the step boundary even when the method bails out early.
+    """
+
+    def _make_worker(self):
+        return make_worker(block_size=4, kv_chunk_tokens=8)
+
+    def _worker_in_backoff(self):
+        import time as _time
+
+        worker = self._make_worker()
+        worker._handler = None
+        worker._handler_retry_after = _time.monotonic() + 60.0
+        return worker
+
+    def _metadata(self, deferred=True):
+        return deferred_metadata(
+            token_ids=list(range(16)),
+            block_ids=[0, 1, 2, 3],
+            num_matched_chunks=2,
+            deferred_load=deferred,
+        )
+
+    def _forward(self, with_layer=True):
+        layers = {}
+        if with_layer:
+            layers["model.layers.0.self_attn"] = SimpleNamespace(
+                kv_cache=torch.zeros(2, 4, 4, 1)
+            )
+        return SimpleNamespace(no_compile_layers=layers, attn_metadata=None)
+
+    def test_handler_outage_degrades_deferred_load_to_recompute(self):
+        worker = self._worker_in_backoff()
+
+        worker.start_load_kv(self._forward(), self._metadata())
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
+
+    def test_no_attention_layers_degrades_deferred_load_to_recompute(self):
+        worker = self._make_worker()
+        worker._handler = MagicMock()
+
+        worker.start_load_kv(self._forward(with_layer=False), self._metadata())
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
+
+    def test_inline_load_unaffected_by_handler_outage(self):
+        worker = self._worker_in_backoff()
+
+        worker.start_load_kv(self._forward(), self._metadata(deferred=False))
+
+        assert worker.get_finished_loading() is None
+        assert worker.take_failed_load_blocks() == set()
+
+    def test_carried_store_layer_state_cleared_at_step_boundary(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        worker._handler = MagicMock()
+        worker._num_layers = 4
+        worker._store_layers_seen.update({2, 3})
+
+        worker.start_load_kv(self._forward(), MaruConnectorMetadata())
+
+        assert worker._store_layers_seen == set()
+
+    def test_store_layer_state_cleared_even_in_handler_outage(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker_in_backoff()
+        worker._store_layers_seen.update({2, 3})
+
+        worker.start_load_kv(self._forward(), MaruConnectorMetadata())
+
+        assert worker._store_layers_seen == set()
+
+    def test_stale_pending_slab_reclaimed_at_step_boundary(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        handler = MagicMock()
+        worker._handler = handler
+        handle = SimpleNamespace(buf=memoryview(bytearray(4)))
+        worker._pending_slabs["chunk-a"] = (handle, {1})
+
+        worker.start_load_kv(self._forward(), MaruConnectorMetadata())
+
+        assert worker._pending_slabs == {}
+        handler.free.assert_called_once_with(handle)
+
+    def test_slab_orphaned_through_outage_is_freed_on_recovery(self):
+        """An outage must neither leak the handle nor leave it reusable.
+
+        The sweep cannot free a handle while the handler is down, so it
+        parks it. Leaving the entry in ``_pending_slabs`` instead would let
+        a later layer of the same chunk — once the handler recovers
+        mid-step — resume writing into a slab that was already condemned,
+        mixing planes written in different steps.
+        """
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker_in_backoff()
+        handle = SimpleNamespace(buf=memoryview(bytearray(4)))
+        worker._pending_slabs["chunk-a"] = (handle, {1})
+
+        worker.start_load_kv(self._forward(), MaruConnectorMetadata())
+        assert worker._pending_slabs == {}  # not reusable by a later layer
+        assert worker._orphan_slab_handles == [handle]  # but not leaked
+
+        handler = MagicMock()
+        worker._handler = handler
+        worker.start_load_kv(self._forward(), MaruConnectorMetadata())
+        assert worker._orphan_slab_handles == []
+        handler.free.assert_called_once_with(handle)
+
+
+# =============================================================================
+# Event-gated release of in-flight load references
+# =============================================================================
+
+
+class TestActiveLoadRefsRelease:
+    """Load-batch refs are dropped only after their queued copies complete.
+
+    Under vLLM async scheduling the next step's ``start_load_kv`` can run
+    while the previous step's H2D copies are still queued on the load
+    stream; releasing the pinned slot mappings and CXL mmap views on that
+    time basis (instead of event completion) would let the copies read
+    freed memory.
+    """
+
+    def _make_worker(self):
+        return make_worker(block_size=4, kv_chunk_tokens=8)
+
+    def test_pending_batch_survives_release(self):
+        worker = self._make_worker()
+        done = MagicMock()
+        done.query.return_value = True
+        pending = MagicMock()
+        pending.query.return_value = False
+        kept_refs = ["cxl-view"]
+        worker._active_load_refs = [(done, ["drained-view"]), (pending, kept_refs)]
+
+        worker._release_completed_load_refs()
+
+        assert worker._active_load_refs == [(pending, kept_refs)]
+
+    def test_completed_batches_all_drop(self):
+        worker = self._make_worker()
+        done = MagicMock()
+        done.query.return_value = True
+        worker._active_load_refs = [(done, ["a"]), (done, ["b"])]
+
+        worker._release_completed_load_refs()
+
+        assert worker._active_load_refs == []
