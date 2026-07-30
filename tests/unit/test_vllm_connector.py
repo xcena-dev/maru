@@ -20,6 +20,20 @@ from maru_vllm.connector import (
     _chunk_keys,
     _parse_size,
 )
+from tests.unit.vllm_connector_helpers import (
+    attach_capturing_handler,
+    capture_float32,
+    deferred_metadata,
+    deferred_req_meta,
+    fake_cached_reqs,
+    fake_new_request_data,
+    fake_scheduler_output,
+    make_bare_worker,
+    make_flash_attn_metadata,
+    make_scheduler,
+    make_worker,
+    store_metadata,
+)
 
 # =============================================================================
 # _parse_size
@@ -136,11 +150,7 @@ class TestChunkKeys:
 class TestBuildSlotMapping:
     def _make_worker(self, block_size=16):
         """Create a minimal MaruWorkerConnector for testing."""
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
-        worker._block_size = block_size
-        return worker
+        return make_bare_worker(block_size=block_size)
 
     def test_single_block(self):
         worker = self._make_worker(block_size=16)
@@ -178,9 +188,7 @@ class TestBuildSlotMapping:
 
 class TestBatchRetrieveAll:
     def test_splits_payload_and_preserves_order(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.side_effect = lambda keys: [
             f"info:{k}" for k in keys
@@ -201,13 +209,7 @@ class TestBatchRetrieveAll:
 
 class TestBatchStoreLayer:
     def test_registers_all_chunks_with_one_batch_store(self):
-        from maru_vllm.connector import (
-            MaruConnectorMetadata,
-            MaruReqMeta,
-            MaruWorkerConnector,
-        )
-
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4, kv_chunk_tokens=4, extra_config={"maru_use_layerwise": True}
         )
         worker._handler = MagicMock()
@@ -219,19 +221,12 @@ class TestBatchStoreLayer:
         worker._num_layers = 1
 
         kv_layer = torch.arange(2 * 2 * 4 * 2, dtype=torch.float32).reshape(2, 2, 4, 2)
-        attn_metadata = MagicMock()
-        attn_metadata.__class__ = type("FlashMetadata", (), {})
-        metadata = MaruConnectorMetadata(
-            requests=[
-                MaruReqMeta(
-                    req_id="request-1",
-                    token_ids=list(range(8)),
-                    block_ids=[0, 1],
-                    is_store=True,
-                    num_scheduled_tokens=8,
-                    num_computed_tokens=0,
-                )
-            ]
+        attn_metadata = make_flash_attn_metadata()
+        metadata = store_metadata(
+            req_id="request-1",
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_scheduled_tokens=8,
         )
 
         worker.save_kv_layer(
@@ -249,13 +244,7 @@ class TestBatchStoreLayer:
 
 class TestChunkObjectBytes:
     def _make_worker(self, block_size=16, chunk_tokens=256):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        return MaruWorkerConnector(
-            block_size=block_size,
-            kv_chunk_tokens=chunk_tokens,
-            extra_config={},
-        )
+        return make_worker(block_size=block_size, kv_chunk_tokens=chunk_tokens)
 
     def test_flash_layout(self):
         worker = self._make_worker()
@@ -279,13 +268,7 @@ class TestChunkObjectBytes:
 class TestRegisterKVCaches:
     def test_eagerly_connects_after_deriving_packed_page_size(self):
         """Keep expensive CXL mapping off the first populate request path."""
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
-            block_size=16,
-            kv_chunk_tokens=256,
-            extra_config={},
-        )
+        worker = make_worker(block_size=16, kv_chunk_tokens=256)
         observed_page_sizes = []
         worker._ensure_handler = lambda: observed_page_sizes.append(
             worker._page_size_bytes
@@ -301,13 +284,7 @@ class TestRegisterKVCaches:
         assert observed_page_sizes == [per_layer_bytes * len(kv_caches)]
 
     def test_empty_registration_does_not_connect_with_default_page_size(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
-            block_size=16,
-            kv_chunk_tokens=256,
-            extra_config={},
-        )
+        worker = make_worker(block_size=16, kv_chunk_tokens=256)
         worker._ensure_handler = MagicMock()
 
         worker.register_kv_caches({})
@@ -315,13 +292,7 @@ class TestRegisterKVCaches:
         worker._ensure_handler.assert_not_called()
 
     def test_eager_failure_does_not_back_off_first_request_retry(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
-            block_size=16,
-            kv_chunk_tokens=256,
-            extra_config={},
-        )
+        worker = make_worker(block_size=16, kv_chunk_tokens=256)
         kv_caches = {
             "layer0": torch.empty(2, 8, 16, 8, dtype=torch.float16),
         }
@@ -338,9 +309,7 @@ class TestRegisterKVCaches:
 
 class TestAsyncLayerLoad:
     def test_cpu_layout_falls_back_to_sync(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=4,
             extra_config={"maru_enable_async_loading": True},
@@ -350,9 +319,7 @@ class TestAsyncLayerLoad:
         assert not worker._schedule_async_loads(layers, [], MagicMock())
 
     def test_wait_for_layer_joins_event_on_current_stream(self, monkeypatch):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
         event = MagicMock()
         current_stream = MagicMock()
         worker._layer_load_events = {"layer": event}
@@ -363,9 +330,7 @@ class TestAsyncLayerLoad:
         current_stream.wait_event.assert_called_once_with(event)
 
     def test_chunk_runs_coalesce_consecutive_full_pages(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
         worker._effective_page_size_bytes = 4
         region = bytearray(b"aaaabbbbcccc")
         infos = [
@@ -384,9 +349,7 @@ class TestAsyncLayerLoad:
         assert bytes(runs[0][2]) == bytes(region)
 
     def test_chunk_runs_keep_gapped_pages_separate(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
         worker._effective_page_size_bytes = 4
         region = bytearray(b"aaaabbbbcccc")
         infos = [
@@ -399,15 +362,12 @@ class TestAsyncLayerLoad:
         assert [(start, count) for start, count, _ in runs] == [(0, 1), (1, 1)]
 
     def test_coalesced_flash_chunks_preserve_kv_layout(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=4, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
         source = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32).reshape(2, 2, 4, 3)
         destination = torch.zeros_like(source)
         chunk_0_slots = torch.tensor([0, 1, 2, 3])
         chunk_1_slots = torch.tensor([4, 5, 6, 7])
-        attn_metadata = MagicMock()
-        attn_metadata.__class__ = type("FlashMetadata", (), {})
+        attn_metadata = make_flash_attn_metadata()
         chunks = [
             worker._extract_kv_from_layer(
                 source, slots, attn_metadata, "model.layers.0.self_attn"
@@ -435,12 +395,9 @@ class TestAsyncLayerLoad:
 
 class TestGetLayerIndex:
     def _make_worker(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
-        worker._block_size = 16
-        worker._kv_caches = {"layer_a": None, "layer_b": None}
-        return worker
+        return make_bare_worker(
+            block_size=16, kv_caches={"layer_a": None, "layer_b": None}
+        )
 
     def test_standard_layer_name(self):
         worker = self._make_worker()
@@ -465,11 +422,7 @@ class TestKVLayerRoundtrip:
     """Test inject/extract roundtrip for Flash attention layout (default)."""
 
     def _make_worker(self, block_size=4):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
-        worker._block_size = block_size
-        return worker
+        return make_bare_worker(block_size=block_size)
 
     def test_flash_roundtrip(self):
         """Flash attention: [2, num_pages, page_size, head_dim]"""
@@ -482,8 +435,7 @@ class TestKVLayerRoundtrip:
         slot_mapping = torch.tensor([0, 1, 2, 3])
 
         # Use a plain object as attn_metadata (not MLA or Triton → Flash branch)
-        attn_metadata = MagicMock()
-        attn_metadata.__class__ = type("FlashMetadata", (), {})
+        attn_metadata = make_flash_attn_metadata()
 
         worker._inject_kv_into_layer(
             kv_cache, src_data, slot_mapping, attn_metadata, "layer0"
@@ -505,8 +457,7 @@ class TestKVLayerRoundtrip:
         # Slots from block 0 (0-3) and block 3 (12-15), take first 4
         slot_mapping = torch.tensor([0, 1, 12, 13])
 
-        attn_metadata = MagicMock()
-        attn_metadata.__class__ = type("FlashMetadata", (), {})
+        attn_metadata = make_flash_attn_metadata()
 
         worker._inject_kv_into_layer(
             kv_cache, src_data, slot_mapping, attn_metadata, "layer0"
@@ -526,8 +477,7 @@ class TestKVLayerRoundtrip:
         src_data = torch.randn(2, 4, head_dim)
         slot_mapping = torch.tensor([0, 1, 2, 3])
 
-        inner_meta = MagicMock()
-        inner_meta.__class__ = type("FlashMetadata", (), {})
+        inner_meta = make_flash_attn_metadata()
         attn_metadata = {"layer0": inner_meta, "layer1": inner_meta}
 
         worker._inject_kv_into_layer(
@@ -621,32 +571,19 @@ class TestChunkedPrefillFragmentedStore:
     PROMPT = 64  # 8 chunks, 16 blocks
 
     def _make_worker(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=self.BLOCK,
             kv_chunk_tokens=self.CHUNK,
             extra_config={"maru_use_layerwise": True},
         )
-        stored: dict[str, torch.Tensor | str] = {}
-
-        def _alloc(nbytes):
-            return SimpleNamespace(buf=memoryview(bytearray(max(nbytes, 4))))
-
-        def _batch_store(keys, handles):
-            for key, handle in zip(keys, handles, strict=True):
-                stored[key] = torch.frombuffer(
-                    bytes(handle.buf), dtype=torch.float32
-                ).clone()
-            return [True] * len(keys)
+        stored = attach_capturing_handler(
+            worker, capture=capture_float32, min_alloc_bytes=4
+        )
 
         def _store(key, handle=None):
             stored[key] = "DONE"
             return True
 
-        worker._handler = MagicMock()
-        worker._handler.alloc.side_effect = _alloc
-        worker._handler.batch_store.side_effect = _batch_store
         worker._handler.store.side_effect = _store
         worker._num_layers = 1
         return worker, stored
@@ -661,32 +598,21 @@ class TestChunkedPrefillFragmentedStore:
         return kv
 
     def _run_steps(self, worker, steps):
-        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
-
         kv = self._kv_layer()
-        attn = MagicMock()
-        attn.__class__ = type("FlashMetadata", (), {})
+        attn = make_flash_attn_metadata()
         token_ids = list(range(self.PROMPT))
         for block_ids, sched, computed in steps:
-            metadata = MaruConnectorMetadata(
-                requests=[
-                    MaruReqMeta(
-                        req_id="r1",
-                        token_ids=token_ids,
-                        block_ids=block_ids,
-                        is_store=True,
-                        num_scheduled_tokens=sched,
-                        num_computed_tokens=computed,
-                    )
-                ]
+            metadata = store_metadata(
+                token_ids=token_ids,
+                block_ids=block_ids,
+                num_scheduled_tokens=sched,
+                num_computed_tokens=computed,
             )
             worker.save_kv_layer("model.layers.0.self_attn", kv, attn, metadata)
         return token_ids
 
     def test_fragmented_steps_store_all_chunks_with_correct_data(self):
         """Boundaries 20/40 are not chunk-aligned; no chunk may be lost."""
-        from maru_vllm.connector import MaruSchedulerConnector
-
         worker, stored = self._make_worker()
         # block_ids accumulate from token 0, as the fixed scheduler builds
         # them for continuation steps.
@@ -712,7 +638,7 @@ class TestChunkedPrefillFragmentedStore:
                 f"chunk {ci} stored data from wrong slots"
             )
 
-        sched = MaruSchedulerConnector(
+        sched = make_scheduler(
             block_size=self.BLOCK,
             kv_chunk_tokens=self.CHUNK,
             extra_config={"maru_use_layerwise": True},
@@ -759,37 +685,22 @@ class TestBuildConnectorMetaStoreAccumulation:
     CHUNK = 8
 
     def _make_scheduler(self):
-        from maru_vllm.connector import MaruSchedulerConnector
-
-        return MaruSchedulerConnector(
-            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config={}
-        )
+        return make_scheduler(block_size=4, kv_chunk_tokens=self.CHUNK)
 
     @staticmethod
     def _output(new_reqs, cached, num_scheduled):
-        return SimpleNamespace(
-            scheduled_new_reqs=new_reqs,
-            scheduled_cached_reqs=cached,
-            num_scheduled_tokens=num_scheduled,
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-        )
+        return fake_scheduler_output(new_reqs, cached, num_scheduled)
 
     @staticmethod
     def _cached(req_ids, new_block_ids, num_computed, resumed=()):
-        return SimpleNamespace(
-            req_ids=req_ids,
-            new_block_ids=new_block_ids,
-            num_computed_tokens=num_computed,
-            resumed_req_ids=set(resumed),
-        )
+        return fake_cached_reqs(req_ids, new_block_ids, num_computed, resumed)
 
     def test_continuation_meta_carries_accumulated_blocks(self):
         sched = self._make_scheduler()
         token_ids = list(range(64))
 
-        new_req = SimpleNamespace(
-            req_id="r1", prompt_token_ids=token_ids, block_ids=([0, 1, 2, 3, 4],)
+        new_req = fake_new_request_data(
+            prompt_token_ids=token_ids, block_ids=[0, 1, 2, 3, 4]
         )
         meta1 = sched.build_connector_meta(
             self._output([new_req], self._cached([], [], []), {"r1": 20})
@@ -821,8 +732,8 @@ class TestBuildConnectorMetaStoreAccumulation:
     def test_continuation_step_without_new_blocks_still_stores(self):
         sched = self._make_scheduler()
         token_ids = list(range(64))
-        new_req = SimpleNamespace(
-            req_id="r1", prompt_token_ids=token_ids, block_ids=(list(range(15)),)
+        new_req = fake_new_request_data(
+            prompt_token_ids=token_ids, block_ids=list(range(15))
         )
         sched.build_connector_meta(
             self._output([new_req], self._cached([], [], []), {"r1": 58})
@@ -850,9 +761,7 @@ class TestBuildConnectorMetaStoreAccumulation:
     def test_request_finished_transfers_block_ownership_only_for_write_behind(
         self, enabled
     ):
-        from maru_vllm.connector import MaruSchedulerConnector
-
-        sched = MaruSchedulerConnector(
+        sched = make_scheduler(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={"maru_enable_write_behind": enabled},
@@ -873,9 +782,7 @@ class TestDeferredLoading:
     CHUNK = 8
 
     def _make_scheduler(self, deferred=True, layerwise_overlap=False):
-        from maru_vllm.connector import MaruSchedulerConnector
-
-        sched = MaruSchedulerConnector(
+        sched = make_scheduler(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={
@@ -913,18 +820,7 @@ class TestDeferredLoading:
         blocks.get_block_ids.return_value = ([3, 4, 5],)
         sched.update_state_after_alloc(request, blocks, 64)
 
-        out = SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                new_block_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=set(),
-            ),
-            num_scheduled_tokens={},
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-        )
+        out = fake_scheduler_output()
         meta = sched.build_connector_meta(out)
         assert len(meta.requests) == 1
         req = meta.requests[0]
@@ -947,35 +843,18 @@ class TestDeferredLoading:
         blocks.get_block_ids.return_value = ([3, 4, 5],)
         sched.update_state_after_alloc(request, blocks, 64)
 
-        empty = SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                new_block_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=set(),
-            ),
-            num_scheduled_tokens={},
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-        )
+        empty = fake_scheduler_output()
         first = sched.build_connector_meta(empty)
         assert first.requests[0].deferred_load
         assert first.requests[0].layerwise_load
         assert first.layerwise_load_req_ids == set()
 
         sched.update_state_after_alloc(request, MagicMock(), 0)
-        resumed = SimpleNamespace(
-            req_id="r1",
-            prompt_token_ids=request.prompt_token_ids,
-            block_ids=([3, 4, 5],),
+        resumed = fake_new_request_data(
+            prompt_token_ids=request.prompt_token_ids, block_ids=[3, 4, 5]
         )
-        output = SimpleNamespace(
-            scheduled_new_reqs=[resumed],
-            scheduled_cached_reqs=empty.scheduled_cached_reqs,
-            num_scheduled_tokens={"r1": 1},
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
+        output = fake_scheduler_output(
+            [resumed], empty.scheduled_cached_reqs, {"r1": 1}
         )
 
         second = sched.build_connector_meta(output)
@@ -994,18 +873,7 @@ class TestDeferredLoading:
             blocks.get_block_ids.return_value = ([3, 4, 5],)
             sched.update_state_after_alloc(request, blocks, 64)
 
-        output = SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                new_block_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=set(),
-            ),
-            num_scheduled_tokens={},
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-        )
+        output = fake_scheduler_output()
         metadata = sched.build_connector_meta(output)
 
         assert len(metadata.requests) == 2
@@ -1014,18 +882,7 @@ class TestDeferredLoading:
 
     def test_staggered_admission_sees_live_deferred_concurrency(self):
         sched = self._make_scheduler(layerwise_overlap=True)
-        output = SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                new_block_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=set(),
-            ),
-            num_scheduled_tokens={},
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-        )
+        output = fake_scheduler_output()
 
         first_request = self._request()
         sched._last_match_result[first_request.request_id] = 8
@@ -1054,18 +911,11 @@ class TestDeferredLoading:
         assert sched._active_deferred_req_ids == {"r2"}
 
     def test_failed_deferred_load_reports_blocks_and_completion(self):
-        from maru_vllm.connector import MaruReqMeta, MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
-            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config={}
-        )
-        meta = MaruReqMeta(
-            req_id="r1",
+        worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
+        meta = deferred_req_meta(
             token_ids=list(range(64)),
             block_ids=[7, 8, 9],
-            is_store=False,
             num_matched_chunks=8,
-            deferred_load=True,
         )
         worker._fail_deferred_load(meta)
         assert worker.get_finished_loading() == {"r1"}
@@ -1074,15 +924,7 @@ class TestDeferredLoading:
         assert worker.take_failed_load_blocks() == set()
 
     def test_cpu_deferred_load_completes_synchronously(self):
-        from maru_vllm.connector import (
-            MaruConnectorMetadata,
-            MaruReqMeta,
-            MaruWorkerConnector,
-        )
-
-        worker = MaruWorkerConnector(
-            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config={}
-        )
+        worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
         kv = torch.zeros(2, 16, 4, 1)
         chunk_bytes = 2 * self.CHUNK * 4  # K/V x tokens x fp32
         infos = [
@@ -1100,17 +942,10 @@ class TestDeferredLoading:
 
         layer = SimpleNamespace(kv_cache=kv)
         fwd = SimpleNamespace(no_compile_layers={"l0": layer}, attn_metadata=None)
-        metadata = MaruConnectorMetadata(
-            requests=[
-                MaruReqMeta(
-                    req_id="r1",
-                    token_ids=list(range(64)),
-                    block_ids=list(range(16)),
-                    is_store=False,
-                    num_matched_chunks=8,
-                    deferred_load=True,
-                )
-            ]
+        metadata = deferred_metadata(
+            token_ids=list(range(64)),
+            block_ids=list(range(16)),
+            num_matched_chunks=8,
         )
         worker.start_load_kv(fwd, metadata)
         assert worker.get_finished_loading() == {"r1"}
@@ -1124,22 +959,13 @@ class TestAsyncDeferredPackedLoad:
     CHUNK = 8
 
     def _make_worker(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        return MaruWorkerConnector(
-            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config={}
-        )
+        return make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
 
     def _deferred_meta(self):
-        from maru_vllm.connector import MaruReqMeta
-
-        return MaruReqMeta(
-            req_id="r1",
+        return deferred_req_meta(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
-            is_store=False,
             num_matched_chunks=8,
-            deferred_load=True,
         )
 
     def _poll_finished(self, worker, timeout_s=5.0):
@@ -1166,9 +992,7 @@ class TestAsyncDeferredPackedLoad:
         assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
 
     def test_layerwise_mode_background_job_stops_after_retrieve(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={
@@ -1204,9 +1028,9 @@ class TestAsyncDeferredPackedLoad:
         assert worker._deferred_events == {}
 
     def test_layerwise_activation_cpu_fallback_preserves_packed_layout(self):
-        from maru_vllm.connector import MaruConnectorMetadata, MaruWorkerConnector
+        from maru_vllm.connector import MaruConnectorMetadata
 
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=4,
             extra_config={
@@ -1253,9 +1077,9 @@ class TestAsyncDeferredPackedLoad:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_layerwise_activation_records_one_event_per_layer(self):
-        from maru_vllm.connector import MaruConnectorMetadata, MaruWorkerConnector
+        from maru_vllm.connector import MaruConnectorMetadata
 
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=4,
             extra_config={
@@ -1312,9 +1136,9 @@ class TestAsyncDeferredPackedLoad:
         torch.testing.assert_close(kv1.cpu(), source[:, :, 1].permute(1, 0, 2, 3))
 
     def test_preemption_discards_retained_layerwise_load(self):
-        from maru_vllm.connector import MaruConnectorMetadata, MaruWorkerConnector
+        from maru_vllm.connector import MaruConnectorMetadata
 
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={
@@ -1432,18 +1256,14 @@ class TestLoadAdmissionWindow:
     """Enqueue-time admission: bound in-flight deferred loads."""
 
     def _make_worker(self, window):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        return MaruWorkerConnector(
+        return make_worker(
             block_size=4,
             kv_chunk_tokens=8,
             extra_config={"maru_load_admission_window": window},
         )
 
     def test_window_disabled_by_default(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(block_size=4, kv_chunk_tokens=8, extra_config={})
+        worker = make_worker(block_size=4, kv_chunk_tokens=8)
         assert worker._load_admission_window == 0
 
     def test_window_parsed_from_extra_config(self):
@@ -1496,9 +1316,7 @@ class TestLoadAdmissionWindow:
 
 class TestWriteBehindStoreLifecycle:
     def _make_worker(self):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
+        worker = make_worker(
             block_size=4,
             kv_chunk_tokens=8,
             extra_config={"maru_enable_write_behind": True},
@@ -1613,14 +1431,11 @@ class TestFusedLoad:
     CHUNK = 8
 
     def _make_worker(self, fused=True):
-        from maru_vllm.connector import MaruWorkerConnector
-
-        worker = MaruWorkerConnector(
+        return make_worker(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={"maru_enable_fused_load": fused},
         )
-        return worker
 
     def _fake_ops(self):
         ops = MagicMock()
