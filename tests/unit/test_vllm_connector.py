@@ -16,8 +16,10 @@ pytest.importorskip("torch", reason="torch not installed")
 import torch
 
 from maru_vllm.connector import (
+    _RENAMED_KNOBS,
     _align_down,
     _chunk_keys,
+    _get_knob,
     _parse_size,
 )
 from tests.unit.vllm_connector_helpers import (
@@ -38,6 +40,103 @@ from tests.unit.vllm_connector_helpers import (
 # =============================================================================
 # _parse_size
 # =============================================================================
+
+
+class TestRenamedKnobs:
+    """The current knob names, and the deprecated ones they replaced."""
+
+    def test_current_name_is_read(self):
+        assert _get_knob({"maru_async_load": True}, "maru_async_load") is True
+
+    def test_deprecated_name_is_still_accepted(self):
+        for current, legacy in _RENAMED_KNOBS.items():
+            assert _get_knob({legacy: True}, current) is True
+
+    def test_current_name_wins_over_deprecated(self):
+        config = {"maru_async_load": False, "maru_enable_deferred_loading": True}
+        assert _get_knob(config, "maru_async_load") is False
+
+    def test_deprecated_name_warns(self, caplog):
+        with caplog.at_level("WARNING"):
+            _get_knob({"maru_enable_write_behind": True}, "maru_async_store")
+        assert "maru_enable_write_behind is deprecated" in caplog.text
+        assert "maru_async_store" in caplog.text
+
+    def test_current_name_does_not_warn(self, caplog):
+        with caplog.at_level("WARNING"):
+            _get_knob({"maru_async_store": True}, "maru_async_store")
+        assert "deprecated" not in caplog.text
+
+    def test_default_when_neither_name_present(self):
+        assert _get_knob({}, "maru_async_load") is False
+        assert _get_knob({}, "maru_async_load", default=True) is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"maru_async_load": True, "maru_async_store": True},
+            {"maru_enable_deferred_loading": True, "maru_enable_write_behind": True},
+        ],
+        ids=["current-names", "deprecated-names"],
+    )
+    def test_scheduler_wiring_matches_under_either_name(self, config):
+        scheduler = make_scheduler(block_size=4, kv_chunk_tokens=4, extra_config=config)
+        assert scheduler._deferred_loading is True
+        assert scheduler._write_behind is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"maru_async_load": True, "maru_overlap_load_with_compute": True},
+            {
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        ],
+        ids=["current-names", "deprecated-names"],
+    )
+    def test_layerwise_overlap_enables_under_either_name(self, config):
+        for connector in (
+            make_scheduler(block_size=4, kv_chunk_tokens=4, extra_config=config),
+            make_worker(block_size=4, kv_chunk_tokens=4, extra_config=config),
+        ):
+            assert connector._layerwise_overlap is True
+
+    def test_overlap_still_requires_async_load(self):
+        scheduler = make_scheduler(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_overlap_load_with_compute": True},
+        )
+        assert scheduler._layerwise_overlap is False
+
+    def test_naru_current_output_still_wires_through(self):
+        """The extra_config naru emits today must keep working as-is.
+
+        naru writes the deprecated names and still passes the two removed
+        knobs; neither may crash or silently change the wiring.
+        """
+        naru_extra = {
+            "maru_enable_deferred_loading": True,
+            "maru_enable_write_behind": True,
+            "maru_enable_layerwise_overlap": False,
+            "maru_load_admission_window": 1,
+            "maru_use_layerwise": False,
+            "maru_enable_async_loading": True,
+            "maru_enable_fused_load": False,
+            "maru_log_timing": False,
+        }
+        scheduler = make_scheduler(
+            block_size=4, kv_chunk_tokens=4, extra_config=naru_extra
+        )
+        worker = make_worker(block_size=4, kv_chunk_tokens=4, extra_config=naru_extra)
+
+        assert scheduler._deferred_loading is True
+        assert scheduler._write_behind is True
+        assert worker._write_behind is True
+        assert worker._load_admission_window == 1
+        assert scheduler._layerwise_overlap is False
+        assert worker._layerwise_overlap is False
 
 
 class TestParseSize:

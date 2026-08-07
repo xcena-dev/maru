@@ -49,6 +49,19 @@ logger = init_logger(__name__)
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
 
+# Knobs renamed to name the axis the deployer actually chooses, mapped to the
+# name each one replaced. The former names stay accepted for one release so
+# existing recipes and launch scripts keep working; _get_knob warns when one
+# is used. "async"/"deferred" previously named two different things — the
+# retired maru_enable_async_loading held the "async" name while
+# maru_enable_deferred_loading was the mechanism vLLM itself calls async
+# loading (the request parks in WAITING_FOR_REMOTE_KVS).
+_RENAMED_KNOBS: dict[str, str] = {
+    "maru_async_load": "maru_enable_deferred_loading",
+    "maru_async_store": "maru_enable_write_behind",
+    "maru_overlap_load_with_compute": "maru_enable_layerwise_overlap",
+}
+
 _cuda_runtime: Any = None
 _cuda_memcpy2d_async: Any = None
 _cuda_memcpy2d_unavailable = False
@@ -57,6 +70,34 @@ _cuda_memcpy2d_unavailable = False
 # ============================================================================
 # Utilities
 # ============================================================================
+
+
+def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> Any:
+    """Read a connector knob, accepting the deprecated name it replaced.
+
+    The current name wins whenever it is present, so a config carrying both
+    behaves the same as one carrying only the current name.
+
+    Args:
+        extra_config: vLLM kv_connector_extra_config dict.
+        key: Current knob name; see ``_RENAMED_KNOBS`` for the ones that
+            have a deprecated alias.
+        default: Value returned when neither name is present.
+
+    Returns:
+        The configured value, or ``default``.
+    """
+    if key in extra_config:
+        return extra_config[key]
+    legacy = _RENAMED_KNOBS.get(key)
+    if legacy is not None and legacy in extra_config:
+        logger.warning(
+            "Maru: %s is deprecated and will be removed; use %s instead",
+            legacy,
+            key,
+        )
+        return extra_config[legacy]
+    return default
 
 
 def _emit_timing(msg: str) -> None:
@@ -289,38 +330,50 @@ class MaruKVConnector(KVConnectorBase_V1):
     Partial prefix reuse is supported: if the first N chunks of a prompt
     are cached, only the remaining tokens need to be computed.
 
-    Configuration via kv_connector_extra_config:
+    Configuration via kv_connector_extra_config.
+
+    Deployment wiring:
         maru_server_url: str    - MaruServer address (default: tcp://localhost:5555)
         maru_pool_size: str|int - CXL pool size (default: 1G, supports '4G', '500M')
         maru_instance_id: str   - Unique instance ID (default: auto-generated)
         maru_chunk_size: str|int - Maru page size for CXL pages (default: 4M)
         maru_eager_map: bool    - Pre-map shared regions on connect (default: true)
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
-        maru_enable_deferred_loading: bool - Load matched KV between scheduler
-            steps: the request is parked in WAITING_FOR_REMOTE_KVS while a
-            background loader thread performs the whole load (Maru retrieve
-            RPC + CXL->GPU transfer on a dedicated stream), so neither the
-            RPC wait nor the copy ever blocks the engine's forward passes —
-            the in-process analog of the MP server's separate-process
-            retrieve (default: false)
-        maru_load_admission_window: int - With deferred loading, cap how many
+
+    Performance axes — the knobs a deployer actually chooses between:
+        maru_async_load: bool - Load matched KV between scheduler steps: the
+            request is parked in WAITING_FOR_REMOTE_KVS while a background
+            loader thread performs the whole load (Maru retrieve RPC +
+            CXL->GPU transfer on a dedicated stream), so neither the RPC wait
+            nor the copy ever blocks the engine's forward passes — the
+            in-process analog of the MP server's separate-process retrieve.
+            This is what vLLM itself calls an async load
+            (get_num_new_matched_tokens returns async_load=True).
+            (default: false; was maru_enable_deferred_loading)
+        maru_async_store: bool - Gather completed prompt chunks into a
+            reusable GPU staging slab after the forward, then copy them to CXL
+            with asynchronous D2H DMA. Metadata registration finishes on a
+            background thread; finished requests retain their GPU blocks until
+            get_finished() reports the store complete
+            (default: false; was maru_enable_write_behind)
+        maru_overlap_load_with_compute: bool - With maru_async_load and packed
+            storage, park only through the Maru retrieve RPC. The resumed
+            forward transfers each layer on a dedicated CUDA stream and waits
+            on per-layer events, overlapping layer k+1 load with layer k
+            compute. Requires maru_async_load=true and
+            maru_use_layerwise=false
+            (default: false; was maru_enable_layerwise_overlap)
+
+    Diagnostics and fallback guards — leave these alone in normal operation:
+        maru_load_admission_window: int - With maru_async_load, cap how many
             requests' packed loads may be enqueued on the deferred stream but
             not yet complete. The loader thread blocks before each GPU
             enqueue until fewer than this many loads are outstanding,
             bounding same-CUDA-context interference with model steps.
             Default: 0 (submit all loads immediately). Set a positive value
             to enable the cap as a fallback safety guard.
-        maru_enable_write_behind: bool - Gather completed prompt chunks into a
-            reusable GPU staging slab after the forward, then copy them to CXL
-            with asynchronous D2H DMA. Metadata registration finishes on a
-            background thread; finished requests retain their GPU blocks until
-            get_finished() reports the store complete (default: false)
-        maru_enable_layerwise_overlap: bool - With deferred loading and packed
-            storage, park only through the Maru retrieve RPC. The resumed
-            forward transfers each layer on a dedicated CUDA stream and waits
-            on per-layer events, overlapping layer k+1 load with layer k
-            compute. Requires maru_enable_deferred_loading=true and
-            maru_use_layerwise=false (default: false)
+        maru_log_timing: bool - Emit per-request timing diagnostics to stderr
+            (default: false)
         maru_use_layerwise: bool - Store one CXL object per (chunk, layer)
             (True) or one packed object per chunk holding all layers (False,
             default — mirrors LMCache use_layerwise=False). Packed cuts
@@ -329,7 +382,12 @@ class MaruKVConnector(KVConnectorBase_V1):
             multi_layer_kv_transfer kernel directly on the pinned CXL slab
             (no staging) when available — load scatters a whole slab into the
             paged cache per chunk, store gathers one D2H transfer per chunk —
-            falling back to per-layer copies otherwise. See design note P6.
+            falling back to per-layer copies otherwise. Packed wins on every
+            measured axis; layerwise is kept for debugging the storage format.
+            See design note P6.
+
+    The former names listed above are still accepted and log a deprecation
+    warning; see ``_RENAMED_KNOBS``.
     """
 
     def __init__(
@@ -518,24 +576,24 @@ class MaruSchedulerConnector:
         self._requests_need_load: dict[str, tuple[Request, int]] = {}
         # req_id -> (request, num_matched_chunks)
 
-        # Deferred (between-step) loading: matched KV is transferred while the
+        # Asynchronous load (between-step): matched KV is transferred while the
         # request waits in WAITING_FOR_REMOTE_KVS instead of stalling its
-        # first forward pass. Mirrors LMCache's enable_async_loading.
-        self._deferred_loading = bool(
-            extra_config.get("maru_enable_deferred_loading", False)
-        )
-        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
+        # first forward pass. This is the mechanism vLLM itself calls async
+        # loading — get_num_new_matched_tokens returns async_load=True.
+        self._deferred_loading = bool(_get_knob(extra_config, "maru_async_load"))
+        self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
-        self._layerwise_overlap = bool(
-            extra_config.get("maru_enable_layerwise_overlap", False)
-            and self._deferred_loading
-            and not self._use_layerwise
+        overlap_requested = bool(
+            _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        if extra_config.get("maru_enable_layerwise_overlap", False) and not (
+        self._layerwise_overlap = bool(
+            overlap_requested and self._deferred_loading and not self._use_layerwise
+        )
+        if overlap_requested and not (
             self._deferred_loading and not self._use_layerwise
         ):
             logger.warning(
-                "Maru packed-layerwise overlap requires deferred loading and "
+                "Maru packed-layerwise overlap requires maru_async_load=true and "
                 "maru_use_layerwise=false; disabling it"
             )
         # Deferred loads registered by update_state_after_alloc, emitted once
@@ -1001,17 +1059,16 @@ class MaruWorkerConnector:
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
         # objects and the layer-wise async overlap path.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
-        self._layerwise_overlap = bool(
-            extra_config.get("maru_enable_layerwise_overlap", False)
-            and extra_config.get("maru_enable_deferred_loading", False)
-            and not self._use_layerwise
+        async_load = bool(_get_knob(extra_config, "maru_async_load"))
+        overlap_requested = bool(
+            _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        if extra_config.get("maru_enable_layerwise_overlap", False) and not (
-            extra_config.get("maru_enable_deferred_loading", False)
-            and not self._use_layerwise
-        ):
+        self._layerwise_overlap = bool(
+            overlap_requested and async_load and not self._use_layerwise
+        )
+        if overlap_requested and not (async_load and not self._use_layerwise):
             logger.warning(
-                "Maru packed-layerwise overlap requires deferred loading and "
+                "Maru packed-layerwise overlap requires maru_async_load=true and "
                 "maru_use_layerwise=false; disabling it"
             )
         # Packed store accumulates a chunk's per-layer slices across the
@@ -1039,7 +1096,7 @@ class MaruWorkerConnector:
         # a background thread waits for its event and registers the ready keys.
         # All state below is protected by _store_lock because the engine and
         # completion thread both update key/request lifetimes.
-        self._write_behind = bool(extra_config.get("maru_enable_write_behind", False))
+        self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._store_executor: ThreadPoolExecutor | None = None
         self._store_lock = threading.Lock()
         self._pending_store_keys: set[str] = set()
