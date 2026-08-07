@@ -246,23 +246,116 @@ class TestChunkObjectBytes:
     def _make_worker(self, block_size=16, chunk_tokens=256):
         return make_worker(block_size=block_size, kv_chunk_tokens=chunk_tokens)
 
-    def test_flash_layout(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(2, 8, 16, 8, dtype=torch.float16)}
+    def _with_caches(self, worker, tensor):
+        """Register caches the way the worker does, resolving the layout."""
+        worker._kv_caches = {"layer": tensor}
+        worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+        return worker
 
-        assert worker._chunk_object_bytes() == 2 * 8 * 256 * 2
+    def test_flash_layout_kv_axis_first(self):
+        """vLLM <= 0.22.1 on CUDA, and ROCm throughout: [2, NB, BS, NH, HS]."""
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(2, 8, 16, 4, 2, dtype=torch.float16)
+        )
+
+        assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
+
+    def test_flash_layout_kv_axis_second(self):
+        """vLLM 0.23.0+ moved the K/V axis to position 1: [NB, 2, BS, NH, HS].
+
+        Same tensor, same bytes per token. Reading the axes positionally made
+        the connector skip every store on this layout, which is how a real run
+        ended up with a 0% cache hit rate.
+        """
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(8, 2, 16, 4, 2, dtype=torch.float16)
+        )
+
+        assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
 
     def test_mla_layout(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(8, 16, 12, dtype=torch.float16)}
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(8, 16, 12, dtype=torch.float16)
+        )
 
         assert worker._chunk_object_bytes() == 12 * 256 * 2
 
     def test_unrecognized_layout_keeps_default(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(3, 5, dtype=torch.float16)}
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(3, 5, dtype=torch.float16)
+        )
 
         assert worker._chunk_object_bytes() is None
+
+    def test_block_size_mismatch_keeps_default(self):
+        """A layout whose block axis disagrees with vLLM's configured block
+        size means the axes were misread, so refuse rather than size a page
+        from a plausible-looking wrong number."""
+        worker = self._with_caches(
+            self._make_worker(block_size=32),
+            torch.empty(8, 2, 16, 4, 2, dtype=torch.float16),
+        )
+
+        assert worker._chunk_object_bytes() is None
+
+
+class TestDetectKVLayout:
+    """``_detect_kv_layout`` is pure, so every axis order is checkable here."""
+
+    NB, BS, NH, HS = 7, 16, 4, 32
+
+    def _expect(self, shape, kv_layout, kv_axis, fmt):
+        from maru_vllm.connector import _detect_kv_layout
+
+        got = _detect_kv_layout(shape, self.BS, kv_layout)
+        assert got is not None, f"{shape} {kv_layout} went unrecognized"
+        assert (got.num_blocks, got.block_size, got.num_heads, got.head_size) == (
+            self.NB,
+            self.BS,
+            self.NH,
+            self.HS,
+        )
+        assert got.page_buffer_size == self.NB * self.BS
+        assert got.kv_axis == kv_axis
+        assert got.format_name == fmt
+
+    def test_kv_axis_first(self):
+        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
+        self._expect((2, NB, BS, NH, HS), "NHD", 0, "NL_X_TWO_NB_BS_NH_HS")
+        self._expect((2, NB, NH, BS, HS), "HND", 0, "NL_X_TWO_NB_NH_BS_HS")
+
+    def test_kv_axis_second(self):
+        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
+        self._expect((NB, 2, BS, NH, HS), "NHD", 1, "NL_X_NB_TWO_BS_NH_HS")
+        self._expect((NB, 2, NH, BS, HS), "HND", 1, "NL_X_NB_TWO_NH_BS_HS")
+
+    def test_kv_axis_fused(self):
+        """vLLM 0.26.0 dropped the K/V axis and doubled the last dimension."""
+        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
+        self._expect((NB, BS, NH, 2 * HS), "NHD", None, "NL_X_NB_BS_NH_TWO_HS")
+        self._expect((NB, NH, BS, 2 * HS), "HND", None, "NL_X_NB_NH_BS_TWO_HS")
+
+    def test_mla(self):
+        from maru_vllm.connector import _detect_kv_layout
+
+        got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
+        assert got is not None
+        assert got.page_buffer_size == self.NB * self.BS
+        assert got.format_name == "NL_X_NB_BS_HS"
+
+    def test_rejects_when_block_size_disagrees(self):
+        from maru_vllm.connector import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, self.NH, self.HS)
+        # Right shape, wrong layout hint: the block axis lands on num_heads.
+        assert _detect_kv_layout(shape, self.BS, "HND") is None
+        # Right hint, block size the engine never configured.
+        assert _detect_kv_layout(shape, 32, "NHD") is None
+
+    def test_rejects_unknown_rank(self):
+        from maru_vllm.connector import _detect_kv_layout
+
+        assert _detect_kv_layout((3, 5), self.BS, "NHD") is None
 
 
 class TestRegisterKVCaches:

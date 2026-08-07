@@ -61,8 +61,13 @@ def make_bare_worker(
 
     worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
     worker._block_size = block_size
+    worker._kv_caches = {}
+    # Resolved in register_kv_caches on a real connector; do it here so layout
+    # aware helpers see the same value they would in production.
+    worker._kv_layout = None
     if kv_caches is not None:
         worker._kv_caches = kv_caches
+        worker._kv_layout = worker._resolve_kv_layout(kv_caches)
     return worker
 
 
