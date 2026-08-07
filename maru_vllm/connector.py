@@ -296,8 +296,6 @@ class MaruKVConnector(KVConnectorBase_V1):
         maru_chunk_size: str|int - Maru page size for CXL pages (default: 4M)
         maru_eager_map: bool    - Pre-map shared regions on connect (default: true)
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
-        maru_enable_async_loading: bool - Overlap CXL->GPU load with compute
-            through a dedicated CUDA stream (default: false)
         maru_enable_deferred_loading: bool - Load matched KV between scheduler
             steps: the request is parked in WAITING_FOR_REMOTE_KVS while a
             background loader thread performs the whole load (Maru retrieve
@@ -323,11 +321,6 @@ class MaruKVConnector(KVConnectorBase_V1):
             on per-layer events, overlapping layer k+1 load with layer k
             compute. Requires maru_enable_deferred_loading=true and
             maru_use_layerwise=false (default: false)
-        maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
-            two-stage load with one fused gather-scatter kernel that reads
-            the CXL pages directly (LMCache single_layer_kv_transfer).
-            Requires maru_enable_async_loading and the Flash KV layout;
-            falls back to memcpy otherwise (default: false)
         maru_use_layerwise: bool - Store one CXL object per (chunk, layer)
             (True) or one packed object per chunk holding all layers (False,
             default — mirrors LMCache use_layerwise=False). Packed cuts
@@ -948,7 +941,6 @@ class MaruWorkerConnector:
         # chunk_base_key -> set of stored layer indices
         self._chunk_layer_progress: dict[str, set[int]] = {}
         self._num_layers: int = 0
-        self._async_loading = bool(extra_config.get("maru_enable_async_loading", False))
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
         self._layer_load_events: dict[str, torch.cuda.Event] = {}
@@ -999,11 +991,8 @@ class MaruWorkerConnector:
         # Last non-None attention metadata; deferred loads run between steps
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
-        # P5: fused UVA gather-scatter load. SMs read the host-registered CXL
-        # pages directly and scatter into the paged KV cache in one kernel
-        # (LMCache single_layer_kv_transfer), replacing the two-stage
-        # cudaMemcpy H2D + inject path whose DMA tops out ~20 GiB/s.
-        self._fused_load = bool(extra_config.get("maru_enable_fused_load", False))
+        # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
+        # for LMCache's multi_layer_kv_transfer kernel on the packed path.
         self._lmc_ops: Any = None
 
         # P6: storage granularity. Default (off) packs all layers of a chunk
@@ -1341,17 +1330,11 @@ class MaruWorkerConnector:
             )
             return
 
-        async_scheduled = False
-        if self._async_loading:
-            async_scheduled = self._schedule_async_loads(layers, inline, attn_metadata)
-        if not async_scheduled:
-            self._load_sync(layers, inline, attn_metadata)
+        self._load_sync(layers, inline, attn_metadata)
 
-        mode = "async-scheduled" if async_scheduled else "loaded"
         for req_meta, num_chunks, _, _ in inline:
             logger.info(
-                "Maru: batch-%s %d layers x %d chunks (%d tokens) for req %s",
-                mode,
+                "Maru: batch-loaded %d layers x %d chunks (%d tokens) for req %s",
                 len(layers),
                 num_chunks,
                 num_chunks * self._kv_chunk_tokens,
@@ -1976,179 +1959,6 @@ class MaruWorkerConnector:
                         layer_name,
                     )
 
-    def _schedule_async_loads(
-        self,
-        layers: list[tuple[str, torch.Tensor, int]],
-        prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
-        attn_metadata: AttentionMetadata,
-    ) -> bool:
-        """Schedule layer-major CXL->GPU loads on a dedicated CUDA stream.
-
-        One event is recorded after every layer. ``wait_for_layer_load`` makes
-        the model's current stream wait only for that layer, allowing later
-        layer transfers to overlap with attention compute.
-
-        Returns:
-            True when asynchronous loads were scheduled. CPU or mixed-device
-            layouts return False and use the synchronous fallback.
-        """
-        devices = {layer.device for _, layer, _ in layers}
-        if len(devices) != 1:
-            logger.warning(
-                "Maru async load requires one CUDA device; falling back to sync"
-            )
-            return False
-        device = next(iter(devices))
-        if device.type != "cuda" or not torch.cuda.is_available():
-            logger.warning(
-                "Maru async load requires CUDA tensors; falling back to sync"
-            )
-            return False
-
-        if self._load_stream is None or self._load_stream_device != device:
-            # Highest priority: cache-hit loads gate TTFT directly.
-            self._load_stream = torch.cuda.Stream(device=device, priority=-1)
-            self._load_stream_device = device
-
-        load_stream = self._load_stream
-        load_stream.wait_stream(torch.cuda.current_stream(device))
-        slot_mappings_host = [
-            self._pin_slot_mapping_for_async_h2d(slot_mapping)
-            for _, _, slot_mapping, _ in prepared_requests
-        ]
-        with torch.cuda.stream(load_stream):
-            slot_mappings_gpu = [
-                slot_mapping.to(device, non_blocking=True)
-                for slot_mapping in slot_mappings_host
-            ]
-            # Layer-major ordering is essential for inflight >1: layer 0 for
-            # every request must become ready before work for later layers.
-            for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                use_fused = self._use_fused_load(attn_metadata, layer_name)
-                for (_, num_chunks, _, infos), slot_mapping_gpu in zip(
-                    prepared_requests, slot_mappings_gpu, strict=True
-                ):
-                    base = li * num_chunks
-                    for chunk_start, run_chunks, run_view in self._chunk_runs(
-                        infos[base : base + num_chunks]
-                    ):
-                        token_start = chunk_start * self._kv_chunk_tokens
-                        token_end = (chunk_start + run_chunks) * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping_gpu[token_start:token_end]
-                        if use_fused and self._fused_run_transfer(
-                            kv_cache_layer, run_view, run_chunks, chunk_slots
-                        ):
-                            continue
-                        chunk_tensor = torch.frombuffer(
-                            run_view, dtype=kv_cache_layer.dtype
-                        )
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            chunk_tensor.to(device, non_blocking=True),
-                            chunk_slots,
-                            attn_metadata,
-                            layer_name,
-                            num_chunks=run_chunks,
-                        )
-                event = torch.cuda.Event()
-                event.record(load_stream)
-                self._layer_load_events[layer_name] = event
-
-        # A batch event recorded after every copy gates the release of these
-        # refs (next start_load_kv).
-        batch_event = torch.cuda.Event()
-        batch_event.record(load_stream)
-        refs: list[Any] = [infos for _, _, _, infos in prepared_requests]
-        refs.extend(slot_mappings_host)
-        refs.extend(slot_mappings_gpu)
-        self._active_load_refs.append((batch_event, refs))
-        return True
-
-    def _ensure_fused_ops(self) -> bool:
-        """Resolve ``lmcache.c_ops`` lazily; disable fused load if absent."""
-        if not self._fused_load:
-            return False
-        if self._lmc_ops is not None:
-            return True
-        try:
-            import lmcache.c_ops as lmc_ops
-
-            self._lmc_ops = lmc_ops
-            return True
-        except ImportError:
-            logger.warning(
-                "maru_enable_fused_load: lmcache.c_ops unavailable; "
-                "using memcpy+inject path"
-            )
-            self._fused_load = False
-            return False
-
-    def _use_fused_load(self, attn_metadata: Any, layer_name: str) -> bool:
-        """Fused load applies only to the Flash paged-KV layout.
-
-        MLA/Triton layouts keep the memcpy+inject path; layout dispatch
-        mirrors ``_inject_kv_into_layer``.
-        """
-        if not self._ensure_fused_ops():
-            return False
-        from vllm.model_executor.layers.attention.mla_attention import (
-            MLACommonMetadata,
-        )
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-
-        layer_meta = (
-            attn_metadata[layer_name]
-            if isinstance(attn_metadata, dict)
-            else attn_metadata
-        )
-        return not isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata))
-
-    def _fused_run_transfer(
-        self,
-        kv_cache_layer: torch.Tensor,
-        run_view: memoryview,
-        run_chunks: int,
-        chunk_slots: torch.Tensor,
-    ) -> bool:
-        """Scatter a CXL page run into paged KV with one kernel per chunk.
-
-        The kernel (LMCache ``single_layer_kv_transfer``) reads the
-        host-registered CXL bytes directly from device (UVA) — no staging
-        copy. Sources per chunk are ``[K/V, chunk_tokens, hidden]``
-        (``token_major=False``); the vLLM Flash layer is
-        ``[2, num_blocks, block_size, heads, head_size]``
-        (``NL_X_TWO_NB_BS_NH_HS``).
-
-        Returns:
-            True when the run was handled; False to fall back to memcpy.
-        """
-        if not self._fused_load:
-            return False
-        obj_bytes = self._chunk_object_bytes()
-        if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
-            return False
-        ops = self._lmc_ops
-        ct = self._kv_chunk_tokens
-        try:
-            for i in range(run_chunks):
-                src = torch.frombuffer(
-                    run_view[i * obj_bytes : (i + 1) * obj_bytes],
-                    dtype=kv_cache_layer.dtype,
-                ).view(2, ct, -1)
-                ops.single_layer_kv_transfer(
-                    src,
-                    kv_cache_layer,
-                    chunk_slots[i * ct : (i + 1) * ct],
-                    ops.TransferDirection.H2D,
-                    ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
-                    token_major=False,
-                )
-        except Exception as e:
-            logger.error("Maru fused load failed (%s); disabling fused path", e)
-            self._fused_load = False
-            return False
-        return True
-
     def _load_packed(
         self,
         layers: list[tuple[str, torch.Tensor, int]],
@@ -2264,9 +2074,8 @@ class MaruWorkerConnector:
         Returns ``(ops, kv_cache_pointers, page_buffer_size, block_size,
         head_size, engine_kv_format)`` when the fused no-staging kernel is
         usable: Flash layout, CUDA, and ``lmcache.c_ops`` importable. This is
-        the DEFAULT packed load whenever available (not gated on
-        maru_enable_fused_load — that flag is the separate P5 single-layer
-        experiment). The pointer table is indexed by each layer's true
+        the DEFAULT packed load whenever available — it is not gated on any
+        configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
         Paged buffers must be the vLLM Flash tensor
         ``[2, num_blocks, block_size, num_heads, head_size]``.
@@ -2290,7 +2099,7 @@ class MaruWorkerConnector:
         )
         if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
             return None
-        # Resolve lmcache.c_ops (independent of maru_enable_fused_load).
+        # Resolve lmcache.c_ops lazily.
         if self._lmc_ops is None:
             try:
                 import lmcache.c_ops as lmc_ops

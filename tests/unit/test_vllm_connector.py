@@ -307,17 +307,7 @@ class TestRegisterKVCaches:
         assert worker._handler_retry_after == 0.0
 
 
-class TestAsyncLayerLoad:
-    def test_cpu_layout_falls_back_to_sync(self):
-        worker = make_worker(
-            block_size=4,
-            kv_chunk_tokens=4,
-            extra_config={"maru_enable_async_loading": True},
-        )
-        layers = [("layer", torch.empty(2, 1, 4, 2), 0)]
-
-        assert not worker._schedule_async_loads(layers, [], MagicMock())
-
+class TestLayerLoadHelpers:
     def test_wait_for_layer_joins_event_on_current_stream(self, monkeypatch):
         worker = make_worker(block_size=4, kv_chunk_tokens=4)
         event = MagicMock()
@@ -1420,84 +1410,6 @@ class TestWriteBehindStoreLifecycle:
             kernel, metadata
         )
         assert worker._queued_store_batches == []
-
-
-# =============================================================================
-# Fused UVA gather-scatter load (P5)
-# =============================================================================
-
-
-class TestFusedLoad:
-    CHUNK = 8
-
-    def _make_worker(self, fused=True):
-        return make_worker(
-            block_size=4,
-            kv_chunk_tokens=self.CHUNK,
-            extra_config={"maru_enable_fused_load": fused},
-        )
-
-    def _fake_ops(self):
-        ops = MagicMock()
-        ops.TransferDirection.H2D = "H2D"
-        ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS = "FLASH"
-        return ops
-
-    def test_disabled_flag_skips_fused(self):
-        worker = self._make_worker(fused=False)
-        assert worker._ensure_fused_ops() is False
-
-    def test_flash_meta_selects_fused_and_dict_meta_dispatches(self):
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        flash_meta = MagicMock()
-        flash_meta.__class__ = type("FlashMetadata", (), {})
-        assert worker._use_fused_load(flash_meta, "l0") is True
-        assert worker._use_fused_load({"l0": flash_meta}, "l0") is True
-
-    def test_fused_run_transfer_calls_kernel_per_chunk(self):
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        worker._lmc_ops = ops
-        # (chunk x layer) object: [2, 8 tokens, hidden=2] fp32 = 128 B
-        obj_bytes = 2 * self.CHUNK * 2 * 4
-        worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
-        run_view = memoryview(bytearray(range(0, 256)))[: 2 * obj_bytes]
-        slots = torch.arange(2 * self.CHUNK)
-
-        ok = worker._fused_run_transfer(kv_layer, run_view, 2, slots)
-        assert ok is True
-        assert ops.single_layer_kv_transfer.call_count == 2
-        args, kwargs = ops.single_layer_kv_transfer.call_args_list[1]
-        src, dst, slot_arg = args[0], args[1], args[2]
-        assert src.shape == (2, self.CHUNK, 2) and src.dtype == kv_layer.dtype
-        assert dst is kv_layer
-        assert slot_arg.tolist() == list(range(self.CHUNK, 2 * self.CHUNK))
-        assert args[3] == "H2D" and args[4] == "FLASH"
-        assert kwargs == {"token_major": False}
-
-    def test_fused_run_transfer_kernel_error_disables_and_falls_back(self):
-        worker = self._make_worker()
-        ops = self._fake_ops()
-        ops.single_layer_kv_transfer.side_effect = RuntimeError("boom")
-        worker._lmc_ops = ops
-        obj_bytes = 2 * self.CHUNK * 2 * 4
-        worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
-        run_view = memoryview(bytearray(obj_bytes))
-        ok = worker._fused_run_transfer(kv_layer, run_view, 1, torch.arange(self.CHUNK))
-        assert ok is False and worker._fused_load is False
-
-    def test_insufficient_run_bytes_falls_back(self):
-        worker = self._make_worker()
-        worker._lmc_ops = self._fake_ops()
-        worker._chunk_object_bytes = lambda: 128
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
-        ok = worker._fused_run_transfer(
-            kv_layer, memoryview(bytearray(100)), 1, torch.arange(self.CHUNK)
-        )
-        assert ok is False
 
 
 # =============================================================================
