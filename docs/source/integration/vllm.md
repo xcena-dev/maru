@@ -199,6 +199,12 @@ Asynchronous transfer settings, all opt-in:
 | `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
 
+Storage format — how a request's KV is grouped into CXL objects:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `maru_use_layerwise` | bool | `false` | `false` = chunkwise: one object per chunk holding every layer. `true` = layerwise: one object per (chunk, layer) |
+
 Diagnostics and fallback guards — leave these at their defaults in normal
 operation:
 
@@ -206,7 +212,6 @@ operation:
 |-----------|------|---------|-------------|
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
 | `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
-| `maru_use_layerwise` | bool | `false` | Store one CXL object per (chunk, layer) instead of one packed object per chunk |
 
 #### Renamed parameters
 
@@ -245,10 +250,24 @@ positive value only if you need request-level backpressure.
 
 ### Storage granularity and overlap
 
-`maru_use_layerwise` selects the storage layout. The default (`false`) packs
-every layer of a chunk into one CXL object, so a request resolves one key per
-chunk rather than one per (chunk, layer). Setting it to `true` restores the
-per-layer objects.
+`maru_use_layerwise` selects how a request's KV is grouped into CXL objects.
+The two layouts differ throughout the store and load paths:
+
+| | chunkwise (`false`, default) | layerwise (`true`) |
+|---|---|---|
+| One CXL object holds | every layer of one chunk | one (chunk, layer) pair |
+| Key | `<chunk_key>` | `<chunk_key>_L<layer_idx>` |
+| Keys per request | chunks | chunks x layers |
+| CXL page size | per-layer size x layers | per-layer size |
+| Completion marker | the chunk key itself, registered once every layer is written | a separate `_DONE` key |
+| Store | one gathered D2H per chunk | one write per layer |
+| Load | whole slab per chunk, contiguous pages coalesced | one retrieve per (layer, chunk) |
+
+The key count is the practical difference: a 64k prompt on a 32-layer model
+resolves 59 keys chunkwise versus 1,888 layerwise, and that ratio carries
+straight into retrieve metadata RPC volume. Chunkwise is the default for that
+reason; layerwise remains available for deployments that need per-layer
+object granularity.
 
 `maru_overlap_load_with_compute` applies only to the packed layout and
 requires `maru_async_load`; it pipelines a request's per-layer transfers

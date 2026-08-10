@@ -364,6 +364,21 @@ class MaruKVConnector(KVConnectorBase_V1):
             maru_use_layerwise=false
             (default: false; was maru_enable_layerwise_overlap)
 
+    Storage format — how a request's KV is grouped into CXL objects:
+        maru_use_layerwise: bool - False (default) is chunkwise: one CXL
+            object per chunk holding every layer, keyed by the chunk key,
+            registered only once all layers are written (the key is its own
+            completion marker). True is layerwise: one object per
+            (chunk, layer), keyed <chunk>_L<idx>, with a separate _DONE
+            marker. Chunkwise resolves one key per chunk instead of
+            chunks x layers — 59 vs 1,888 keys for a 64k prompt on 32 layers
+            — which is why it is the default; the same ratio applies to
+            retrieve metadata RPC volume. Chunkwise transfers use LMCache's
+            multi_layer_kv_transfer kernel directly on the pinned CXL slab
+            (no staging) when available — load scatters a whole slab into the
+            paged cache per chunk, store gathers one D2H per chunk — falling
+            back to per-layer copies otherwise. See design note P6.
+
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_load_admission_window: int - With maru_async_load, cap how many
             requests' packed loads may be enqueued on the deferred stream but
@@ -374,17 +389,6 @@ class MaruKVConnector(KVConnectorBase_V1):
             to enable the cap as a fallback safety guard.
         maru_log_timing: bool - Emit per-request timing diagnostics to stderr
             (default: false)
-        maru_use_layerwise: bool - Store one CXL object per (chunk, layer)
-            (True) or one packed object per chunk holding all layers (False,
-            default — mirrors LMCache use_layerwise=False). Packed cuts
-            retrieve metadata 32x (1,888->59 keys/req) and drops the _DONE
-            marker. Both packed transfers use LMCache's
-            multi_layer_kv_transfer kernel directly on the pinned CXL slab
-            (no staging) when available — load scatters a whole slab into the
-            paged cache per chunk, store gathers one D2H transfer per chunk —
-            falling back to per-layer copies otherwise. Packed wins on every
-            measured axis; layerwise is kept for debugging the storage format.
-            See design note P6.
 
     The former names listed above are still accepted and log a deprecation
     warning; see ``_RENAMED_KNOBS``.
