@@ -1007,6 +1007,10 @@ class MaruWorkerConnector:
         # _failed_load_blocks feeds get_block_ids_with_load_errors so vLLM
         # recomputes instead of consuming unloaded KV.
         self._deferred_events: dict[str, torch.cuda.Event] = {}
+        # Populated only under maru_log_timing; paired with _deferred_events
+        # so the CXL->GPU copy is measured on the GPU timeline, not by a wall
+        # clock around a job that only submits the copy and returns.
+        self._deferred_start_events: dict[str, torch.cuda.Event] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
@@ -1516,7 +1520,10 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
+            start_event = torch.cuda.Event(enable_timing=True) if self._timing else None
             with torch.cuda.stream(stream):
+                if start_event is not None:
+                    start_event.record(stream)
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
@@ -1558,10 +1565,13 @@ class MaruWorkerConnector:
                                 layer_name,
                                 num_chunks=1,
                             )
-                event = torch.cuda.Event()
+                # elapsed_time needs both ends timed, so match start_event.
+                event = torch.cuda.Event(enable_timing=self._timing)
                 event.record(stream)
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
+                if start_event is not None:
+                    self._deferred_start_events[req_meta.req_id] = start_event
                 self._deferred_refs[req_meta.req_id] = [
                     infos,
                     slot_mapping,
@@ -1932,6 +1942,15 @@ class MaruWorkerConnector:
                     done.add(req_id)
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
+                    start = self._deferred_start_events.pop(req_id, None)
+                    if start is not None:
+                        # Both events have fired, so this is the CXL->GPU
+                        # copy's duration on the GPU timeline, excluding the
+                        # time the request spent queued before it.
+                        _emit_timing(
+                            "deferred gpu-load "
+                            f"{start.elapsed_time(event):.2f} ms (req {req_id})"
+                        )
         return done or None
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
@@ -2532,6 +2551,10 @@ class MaruWorkerConnector:
             pending_keys: list[str] = []
             pending_bases: list[str] = []
             pending_handles: list = []
+            # Timing accumulators. extract is async submission; dst.copy_
+            # forces the D2H sync, so the GPU gather cost shows up in copy.
+            _t_extract = _t_alloc = _t_copy = 0.0
+            _store_bytes = 0
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
                 maru_key = f"{base_key}_L{layer_idx}"
@@ -2545,6 +2568,7 @@ class MaruWorkerConnector:
 
                 handle = None
                 try:
+                    _t0 = time.monotonic()
                     chunk_slots_gpu = chunk_slots.to(kv_layer.device)
                     kv_data = self._extract_kv_from_layer(
                         kv_layer,
@@ -2554,13 +2578,20 @@ class MaruWorkerConnector:
                     )
                     kv_contig = kv_data.detach().contiguous()
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
+                    _t1 = time.monotonic()
 
                     # Zero-copy path: alloc CXL page, GPU→CXL direct copy
                     handle = self._handler.alloc(nbytes)
                     dst = torch.frombuffer(
                         handle.buf[:nbytes], dtype=kv_contig.dtype
                     ).reshape(kv_contig.shape)
+                    _t2 = time.monotonic()
                     dst.copy_(kv_contig)  # GPU→CXL mmap (single cudaMemcpy)
+                    _t3 = time.monotonic()
+                    _t_extract += _t1 - _t0
+                    _t_alloc += _t2 - _t1
+                    _t_copy += _t3 - _t2
+                    _store_bytes += nbytes
                 except Exception as e:
                     logger.error("Maru save prepare error: %s: %s", maru_key, e)
                     if handle is not None:
@@ -2580,6 +2611,7 @@ class MaruWorkerConnector:
             # Phase 2: single batched register. batch_store takes ownership of
             # every handle (it frees duplicates/failures internally); it only
             # raises before consuming any, so the except path frees them all.
+            _t0 = time.monotonic()
             try:
                 results = self._handler.batch_store(pending_keys, pending_handles)
             except Exception as e:
@@ -2588,6 +2620,16 @@ class MaruWorkerConnector:
                 )
                 self._free_handles_best_effort(pending_handles)
                 continue
+            if self._timing:
+                _emit_timing(
+                    f"store layerwise L{layer_idx} {len(pending_keys)}c "
+                    f"{_store_bytes / 1e6:.1f}MB "
+                    f"extract={_t_extract * 1000:.2f} "
+                    f"alloc={_t_alloc * 1000:.2f} "
+                    f"copy={_t_copy * 1000:.2f} "
+                    f"rpc={(time.monotonic() - _t0) * 1000:.2f} ms "
+                    f"(req {req_meta.req_id})"
+                )
 
             # Phase 3: mark stored; write each chunk's _DONE marker once all
             # layers for that chunk have been stored.
@@ -2906,9 +2948,11 @@ class MaruWorkerConnector:
 
         if not ready_keys:
             return
+        _t0 = time.monotonic()
         if use_stream:
             assert self._store_stream is not None
             self._store_stream.synchronize()
+        _t_sync = time.monotonic()
         # batch_store takes ownership of every handle (frees duplicates and
         # failures internally); it only raises before consuming any, so the
         # except path must free them all.
@@ -2918,14 +2962,19 @@ class MaruWorkerConnector:
             logger.error("Maru packed batch_store failed: %s", e)
             self._free_handles_best_effort(ready_handles)
             return
+        _t_rpc = time.monotonic()
         for base_key, ok in zip(ready_keys, results, strict=False):
             if ok:
                 self._stored_keys.add(base_key)
             else:
                 logger.warning("Maru packed store failed: %s", base_key)
         if self._timing:
+            # sync covers the gather kernel plus the D2H to CXL queued on the
+            # store stream; rpc is the batched metadata registration.
             _emit_timing(
-                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c"
+                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c "
+                f"sync={(_t_sync - _t0) * 1000:.2f} "
+                f"rpc={(_t_rpc - _t_sync) * 1000:.2f} ms"
             )
 
     def _store_packed_slabs_write_behind(
@@ -3122,6 +3171,7 @@ class MaruWorkerConnector:
             return
         refs.clear()  # safe to release stream inputs after the event
 
+        _t0 = time.monotonic()
         try:
             results = list(handler.batch_store(keys, handles))
         except Exception as e:
@@ -3137,7 +3187,8 @@ class MaruWorkerConnector:
         self._complete_write_behind_keys(keys, results[: len(keys)])
         if self._timing:
             _emit_timing(
-                f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
+                f"write-behind packed-store {self._num_layers}L x {len(keys)}c "
+                f"rpc={(time.monotonic() - _t0) * 1000:.2f} ms"
             )
 
     def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
@@ -3298,6 +3349,7 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._deferred_layerwise_loads.clear()
             self._deferred_events.clear()
+            self._deferred_start_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
         if self._handler is not None:
