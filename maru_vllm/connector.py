@@ -74,10 +74,14 @@ def _emit_timing(msg: str) -> None:
     ``vllm.*`` handler namespace, so its records are never captured in the
     engine logs. Timing diagnostics therefore go straight to stderr, which
     the process log does capture.
+
+    The epoch timestamp is what lets a per-request timeline be rebuilt from
+    the log (tools/plot_request_timeline.py) and joined with client-side
+    records; durations alone cannot be placed on a time axis.
     """
     import sys
 
-    print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
+    print(f"Maru timing: t={time.time():.3f} {msg}", file=sys.stderr, flush=True)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -1457,6 +1461,12 @@ class MaruWorkerConnector:
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
                 return
+            if self._timing:
+                # Timeline anchor: everything between this line and the
+                # retrieve line is queueing inside the loader, not transfer.
+                _emit_timing(
+                    f"deferred load start {num_chunks}c (req {req_meta.req_id})"
+                )
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             keys = [chunk_keys[ci] for ci in range(num_chunks)]
