@@ -141,17 +141,32 @@ def _align_down(num_tokens: int, block_size: int) -> int:
 class KVLayout:
     """Where each dimension sits in vLLM's paged KV tensor.
 
+    The axis order is a property of the *attention backend*, not of the
+    NHD/HND cache layout. vLLM allocates with the NHD/HND permutation applied
+    and then permutes straight back (``gpu_model_runner`` ends the attention
+    branch with ``kv_caches[layer_name] = kv_cache.permute(*inv_order)``), so
+    what the connector receives always has the backend's
+    ``get_kv_cache_shape()`` as its ``.shape``. HND changes only the strides.
+
+    That split decides who needs what. Every torch-side path here selects
+    slots by shape and is stride-agnostic, so it needs the axis indices below
+    and nothing else. Only the LMCache kernel, which takes a raw pointer and
+    walks memory itself, needs the physical order — that is what
+    ``format_name`` carries, and it is the one place NHD/HND is consulted.
+
     Attributes:
         num_blocks: Pages in the paged cache.
         block_size: Tokens per page.
-        num_heads: KV heads (post-GQA).
+        num_heads: KV heads (post-GQA), or 1 when the head axis is flattened.
         head_size: Width of one head.
-        kv_axis: Index of the K/V axis, or None when K and V are fused into
-            the last dimension (vLLM 0.26+).
-        format_name: ``lmcache.c_ops.EngineKVFormat`` member name for this
-            layout. Only consulted on the packed-kernel path, which already
-            requires ``lmcache.c_ops``; the rest of the connector reads the
-            dimensions above and needs no LMCache at all.
+        kv_axis: Index of the K/V axis, or None when K and V share the last
+            dimension (cpu_attn, flash_attn_diffkv, turboquant, MLA).
+        block_axis: Index of the ``num_blocks`` axis.
+        token_axis: Index of the ``block_size`` axis.
+        format_name: ``lmcache.c_ops.EngineKVFormat`` member name, or None
+            when this layout has no kernel form and must use per-layer
+            transfers. Only the packed-kernel path reads it; the rest of the
+            connector needs no LMCache at all.
     """
 
     num_blocks: int
@@ -159,7 +174,9 @@ class KVLayout:
     num_heads: int
     head_size: int
     kv_axis: int | None
-    format_name: str
+    block_axis: int
+    token_axis: int
+    format_name: str | None
 
     @property
     def page_buffer_size(self) -> int:
@@ -167,98 +184,181 @@ class KVLayout:
         return self.num_blocks * self.block_size
 
 
+def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
+    """Every reading of ``shape`` that some vLLM attention backend produces.
+
+    Listed in descending priority, which only decides ties that the
+    cross-checks in ``_detect_kv_layout`` could not settle. Each entry names a
+    backend so the list can be checked against vLLM rather than trusted.
+
+    ``hnd`` picks the ``format_name`` only. It never moves an axis: the shape
+    vLLM hands us is the same either way (see :class:`KVLayout`).
+    """
+    rank = len(shape)
+    out: list[KVLayout] = []
+
+    def add(kv, blk, tok, nh, hs, fmt):
+        out.append(KVLayout(shape[blk], shape[tok], nh, hs, kv, blk, tok, fmt))
+
+    if rank == 5:
+        if shape[0] == 2:
+            # (2, NB, BS, NH, HS) — rocm_attn.
+            add(
+                0,
+                1,
+                2,
+                shape[3],
+                shape[4],
+                "NL_X_TWO_NB_NH_BS_HS" if hnd else "NL_X_TWO_NB_BS_NH_HS",
+            )
+        if shape[1] == 2:
+            # (NB, 2, BS, NH, HS) — flash_attn, flashinfer, flex_attention,
+            # triton_attn, rocm_aiter_*. The common case since vLLM 0.23.
+            add(
+                1,
+                0,
+                2,
+                shape[3],
+                shape[4],
+                "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS",
+            )
+    elif rank == 4:
+        # No shipped backend emits a rank-4 tensor with a K/V axis, but maru
+        # accepted this form before the layout was detected at all, so keep
+        # reading it. The head axes are already flattened, hence num_heads=1
+        # and no kernel format.
+        if shape[0] == 2:
+            add(0, 1, 2, 1, shape[3], None)
+        if shape[1] == 2:
+            add(1, 0, 2, 1, shape[3], None)
+        if shape[3] % 2 == 0:
+            # K and V share the last dimension: (NB, BS, NH, 2*HS) for
+            # flash_attn_diffkv and turboquant_attn, (NB, NH, BS, 2*HS) for
+            # cpu_attn. No kernel format on purpose — diffkv splits the last
+            # dimension unevenly (head_size + head_size_v) and turboquant packs
+            # quantization scales into it, and neither is what LMCache's
+            # ``*_TWO_HS`` constants describe. Per-layer transfers handle all
+            # three correctly because they never interpret that dimension.
+            add(None, 0, 1, shape[2], shape[3] // 2, None)
+            add(None, 0, 2, shape[1], shape[3] // 2, None)
+    elif rank == 3:
+        # (NB, BS, HS) — the MLA family keeps one latent vector per token, so
+        # there is neither a K/V axis nor a head axis.
+        add(None, 0, 1, 1, shape[2], "NL_X_NB_BS_HS")
+    return out
+
+
 def _detect_kv_layout(
     shape: tuple[int, ...],
     block_size: int,
     kv_layout: str,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
 ) -> KVLayout | None:
-    """Resolve vLLM's paged KV axis order, or None if it is not recognized.
+    """Resolve which axis of a paged KV tensor is which, or None if unknown.
 
-    Two authorities decide the layout and neither is guessed:
+    The axis order is per-backend and has moved repeatedly — the K/V axis led
+    the shape on ROCm, sits at position 1 for flash_attn since 0.23, and is
+    absent entirely when K and V share the last dimension — so it is read off
+    the tensor rather than assumed. Every shape a shipped backend produces is
+    enumerated in :func:`_kv_layout_candidates`; this function picks the one
+    the engine's own numbers agree with.
 
-    - the tensor ``shape`` says where the K/V axis sits, or that K and V were
-      fused into the last dimension;
-    - ``kv_layout`` ("NHD" or "HND", from vLLM's ``get_kv_cache_layout()``)
-      says whether block_size or num_heads comes first. These two produce the
-      *same* logical shape and differ only in stride, so the shape alone can
-      never separate them.
+    A wrong pick yields a plausible page count rather than an error, so the
+    cross-checks are what separate "recognized" from "happens to parse":
 
-    Hardcoding the order does not work: vLLM has moved it repeatedly. The K/V
-    axis led the shape through 0.22.1, moved to position 1 in 0.23.0, and was
-    folded into the last dimension in 0.26.0.
+    - ``block_size`` must land on the axis it was configured for. Required.
+    - ``num_kv_heads`` must land on the head axis, when known. This is what
+      separates the two rank-4 fused orders, which are otherwise
+      indistinguishable whenever ``num_kv_heads == block_size``.
+    - ``head_size`` breaks any remaining tie. It is a tiebreak rather than a
+      requirement because triton_attn appends ``scale_pad`` to it.
 
     Args:
         shape: Shape of one layer's KV tensor.
-        block_size: Tokens per page, from ``vllm_config.cache_config``. Used
-            to cross-check the detected axis order.
-        kv_layout: vLLM's resolved cache layout, "NHD" or "HND".
+        block_size: Tokens per page, from ``vllm_config.cache_config``.
+        kv_layout: vLLM's resolved cache layout, "NHD" or "HND". Selects the
+            LMCache kernel format; it does not move any axis.
+        num_kv_heads: KV heads per rank, when known. Skip for MLA, where
+            vLLM reports 1 regardless of the latent width.
+        head_size: Width of one head, when known.
 
     Returns:
-        The resolved layout, or None when the shape matches no known form or
-        fails the block_size cross-check. Callers keep their existing
-        fallback in that case rather than guessing.
+        The resolved layout, or None when no candidate survives. Callers keep
+        their existing fallback in that case rather than guessing.
     """
-    hnd = kv_layout == "HND"
-    rank = len(shape)
-    got: tuple[int, int, int, int, int | None, str] | None = None
-
-    if rank >= 4 and shape[0] == 2 and (rank == 4 or shape[2] == block_size or hnd):
-        # [2, NB, NH, BS, HS] (HND) / [2, NB, BS, NH, HS] (NHD). vLLM <= 0.22.1
-        # on CUDA, and ROCm throughout. Rank 4 is the same layout with the head
-        # axes already flattened into a hidden dimension.
-        nb = shape[1]
-        if rank == 4:
-            nh, bs, hs = 1, shape[2], shape[3]
-        else:
-            nh, bs = (shape[2], shape[3]) if hnd else (shape[3], shape[2])
-            hs = shape[4]
-        fmt = "NL_X_TWO_NB_NH_BS_HS" if hnd else "NL_X_TWO_NB_BS_NH_HS"
-        got = (nb, bs, nh, hs, 0, fmt)
-    elif rank >= 4 and shape[1] == 2 and (rank == 4 or shape[2] == block_size or hnd):
-        # [NB, 2, NH, BS, HS] (HND) / [NB, 2, BS, NH, HS] (NHD). vLLM 0.23.0+.
-        nb = shape[0]
-        if rank == 4:
-            nh, bs, hs = 1, shape[2], shape[3]
-        else:
-            nh, bs = (shape[2], shape[3]) if hnd else (shape[3], shape[2])
-            hs = shape[4]
-        fmt = "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS"
-        got = (nb, bs, nh, hs, 1, fmt)
-    elif rank == 4:
-        # [NB, NH, BS, 2*HS] (HND) / [NB, BS, NH, 2*HS] (NHD). vLLM 0.26.0+
-        # dropped the K/V axis and doubled the last dimension instead.
-        nb = shape[0]
-        nh, bs = (shape[1], shape[2]) if hnd else (shape[2], shape[1])
-        if shape[3] % 2 == 0:
-            fmt = "NL_X_NB_NH_BS_TWO_HS" if hnd else "NL_X_NB_BS_NH_TWO_HS"
-            got = (nb, bs, nh, shape[3] // 2, None, fmt)
-    elif rank == 3:
-        # MLA keeps one latent vector per token, so there is no K/V axis and
-        # no head axis. NHD and HND do not differ here.
-        got = (shape[0], shape[1], 1, shape[2], None, "NL_X_NB_BS_HS")
-
-    if got is None or got[1] != block_size:
-        # A wrong axis pick reads a plausible but wrong page count rather than
-        # raising, so verify against the block size vLLM actually configured.
+    scored: list[tuple[int, int, KVLayout]] = []
+    for priority, cand in enumerate(_kv_layout_candidates(shape, kv_layout == "HND")):
+        if cand.block_size != block_size:
+            continue
+        # A flattened candidate reports num_heads=1 because it cannot see the
+        # head axis, so it is exempt from the head check rather than failing
+        # it. That exemption is also why it must lose to a fused candidate
+        # that does match, which the score below arranges.
+        flattened = cand.kv_axis is not None and len(shape) == 4
+        score = 0
+        if num_kv_heads is not None and not flattened:
+            if cand.num_heads != num_kv_heads:
+                continue
+            score += 2
+        if head_size is not None and cand.head_size == head_size:
+            score += 1
+        scored.append((-score, priority, cand))
+    if not scored:
         return None
-    return KVLayout(*got)
+    scored.sort()
+    return scored[0][2]
+
+
+def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
+    """Return a view of ``t`` with axes reordered to ``[2?, NB, BS, ...]``.
+
+    ``movedim`` returns a view, so this costs nothing and an index-put through
+    the result writes into ``t`` itself. Reordering here is what lets extract
+    and inject share one indexing expression instead of each carrying a branch
+    per axis order — and it must stay a view: the reshape-based flattening
+    this replaced silently copied whenever the cache was non-contiguous, which
+    is exactly what HND allocation produces.
+    """
+    if layout.kv_axis is None:
+        return t.movedim((layout.block_axis, layout.token_axis), (0, 1))
+    return t.movedim((layout.kv_axis, layout.block_axis, layout.token_axis), (0, 1, 2))
+
+
+_kv_cache_layout_warned = False
 
 
 def _vllm_kv_cache_layout() -> str:
     """Return vLLM's resolved cache layout, "NHD" or "HND".
 
-    NHD and HND produce identical logical shapes and differ only in stride, so
-    this cannot be read off a tensor. vLLM caches the answer and clears that
-    cache when it changes, so what we read is what allocated the tensors.
+    This is the physical memory order, which no tensor can report: NHD and HND
+    give identical shapes and differ only in stride. It matters solely for
+    picking the LMCache kernel format, so a wrong answer misdescribes memory
+    to that kernel rather than mis-reading the tensor.
+
+    ``get_kv_cache_layout`` asserts when called outside a
+    ``set_current_vllm_config`` context, so the failure is real and worth
+    seeing once — a silent "NHD" on an HND deployment would hand the kernel a
+    format that does not match memory.
 
     Returns:
-        The layout, or vLLM's documented default outside a config context.
+        The layout, or vLLM's documented default when it cannot be read.
     """
+    global _kv_cache_layout_warned
     try:
         from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
         return get_kv_cache_layout()
-    except Exception:
+    except Exception as e:
+        if not _kv_cache_layout_warned:
+            _kv_cache_layout_warned = True
+            logger.warning(
+                "MaruWorkerConnector: cannot read vLLM's KV cache layout "
+                "(%s: %s); assuming NHD. Packed-kernel transfers would be "
+                "wrong on an HND deployment.",
+                type(e).__name__,
+                e,
+            )
         return "NHD"
 
 
@@ -504,10 +604,33 @@ class MaruKVConnector(KVConnectorBase_V1):
             self._worker = None
         elif role == KVConnectorRole.WORKER:
             self._scheduler = None
+            # Read the KV geometry here, where vllm_config is in hand, rather
+            # than querying vLLM from the worker: get_current_vllm_config()
+            # asserts outside a config context. get_num_kv_heads is per rank,
+            # so it already matches what the paged tensor holds. MLA reports 1
+            # regardless of the latent width, so leave the check off there.
+            num_kv_heads: int | None = None
+            head_size: int | None = None
+            try:
+                model_config = vllm_config.model_config
+                if model_config is not None and not model_config.use_mla:
+                    num_kv_heads = model_config.get_num_kv_heads(
+                        vllm_config.parallel_config
+                    )
+                    head_size = model_config.get_head_size()
+            except Exception as e:
+                logger.warning(
+                    "Maru: cannot read KV geometry from vllm_config (%s: %s); "
+                    "layout detection will cross-check block_size only",
+                    type(e).__name__,
+                    e,
+                )
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
             )
 
     # ==================================
@@ -1058,10 +1181,17 @@ class MaruWorkerConnector:
         block_size: int,
         kv_chunk_tokens: int,
         extra_config: dict[str, Any],
+        num_kv_heads: int | None = None,
+        head_size: int | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        # Cross-checks for layout detection. Optional: without them detection
+        # still verifies block_size, it just cannot separate the two rank-4
+        # fused orders when num_kv_heads happens to equal block_size.
+        self._num_kv_heads = num_kv_heads
+        self._head_size = head_size
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -2244,9 +2374,8 @@ class MaruWorkerConnector:
         The kernel (LMCache ``single_layer_kv_transfer``) reads the
         host-registered CXL bytes directly from device (UVA) — no staging
         copy. Sources per chunk are ``[K/V, chunk_tokens, hidden]``
-        (``token_major=False``); the vLLM Flash layer is
-        ``[2, num_blocks, block_size, heads, head_size]``
-        (``NL_X_TWO_NB_BS_NH_HS``).
+        (``token_major=False``); the paged layer's dimensions and engine KV
+        format both come from the layout resolved at registration.
 
         Returns:
             True when the run was handled; False to fall back to memcpy.
@@ -2403,10 +2532,13 @@ class MaruWorkerConnector:
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
-        # Whatever axis order vLLM chose, register_kv_caches resolved it. An
-        # unresolved layout means we must not hand raw pointers to the kernel.
+        # Whatever axis order the backend chose, register_kv_caches resolved
+        # it. An unresolved layout means we must not hand raw pointers to the
+        # kernel. Neither may a layout with no kernel form: the fused orders
+        # deliberately carry no format because the kernel's *_TWO_HS constants
+        # do not describe how diffkv and turboquant fill that dimension.
         layout = self._kv_layout
-        if layout is None:
+        if layout is None or layout.format_name is None:
             return None
         # Flash layout only (exclude MLA/Triton).
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -3431,10 +3563,11 @@ class MaruWorkerConnector:
     ) -> None:
         """Inject loaded KV cache data into the paged GPU buffer.
 
-        Handles different attention backend layouts:
-        - MLA: [num_pages, page_size, ...]
+        The exact inverse of ``_extract_kv_from_layer``, branch for branch:
+        - MLA: [num_blocks, block_size, ...]
         - Triton: [num_blocks, num_kv_heads, block_size, head_dim]
-        - Default (Flash): [2, num_pages, page_size, ...]
+        - Everything else: whatever axis order the backend chose, resolved at
+          registration and canonicalized before the scatter.
         """
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadata,
@@ -3461,20 +3594,35 @@ class MaruWorkerConnector:
             src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
-            # Flash attention: [2, num_pages, page_size, ...]
-            num_pages = dst_kv_cache.shape[1]
-            page_size = dst_kv_cache.shape[2]
-            flat = dst_kv_cache.reshape(2, num_pages * page_size, -1)
+            layout = self._resolved_kv_layout(dst_kv_cache)
+            if layout is None:
+                # Same refusal as the extract side: the caller catches this and
+                # the request recomputes, which beats scattering scrambled KV.
+                raise RuntimeError(
+                    "Maru: cannot inject KV for layout "
+                    f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
+                )
+            # A view, so the index-put below lands in dst_kv_cache itself.
+            canon = _canonical_paged_view(dst_kv_cache, layout)
+            ntok = slot_mapping.shape[0]
+            # Slab ordering, independent of the paged axis order.
             if num_chunks == 1:
-                src = src_kv_data.reshape(2, slot_mapping.shape[0], -1)
+                src = src_kv_data.reshape(2, ntok, -1)
             else:
-                tokens_per_chunk = slot_mapping.shape[0] // num_chunks
+                tokens_per_chunk = ntok // num_chunks
                 src = (
                     src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, -1)
                     .permute(1, 0, 2, 3)
-                    .reshape(2, slot_mapping.shape[0], -1)
+                    .reshape(2, ntok, -1)
                 )
-            flat[:, slot_mapping] = src
+            blocks = slot_mapping // layout.block_size
+            offsets = slot_mapping % layout.block_size
+            if layout.kv_axis is not None:
+                canon[:, blocks, offsets] = src.reshape(2, ntok, *canon.shape[3:])
+            else:
+                # Undo the extract side's halving of each token's row.
+                merged = src.transpose(0, 1).reshape(ntok, -1)
+                canon[blocks, offsets] = merged.reshape(ntok, *canon.shape[2:])
 
     def _extract_kv_from_layer(
         self,
@@ -3507,43 +3655,64 @@ class MaruWorkerConnector:
             offsets = slot_mapping % self._block_size
             return kv_layer[block_idxs, :, offsets]
         else:
-            # Flash. Callers expect [2, num_tokens, hidden], but the K/V axis
-            # sits at 0 through vLLM 0.22.1 and at 1 from 0.23.0. Gather the
-            # wanted slots first and permute the result: permuting the whole
-            # paged cache would need a contiguous copy of the entire cache,
-            # while this touches only a chunk's worth of rows.
-            # Prefer the layout resolved at registration, but fall back to
-            # the tensor in hand so this works before registration too.
-            layout = getattr(self, "_kv_layout", None) or _detect_kv_layout(
-                tuple(kv_layer.shape), self._block_size, _vllm_kv_cache_layout()
-            )
-            if layout is None or layout.kv_axis not in (0, 1):
+            # Flash and everything else that is neither MLA nor Triton.
+            # Callers expect [2, num_tokens, hidden]; the paged tensor's axis
+            # order is whatever the backend chose. Canonicalize to
+            # [2?, NB, BS, ...] and gather only the wanted slots — permuting
+            # the whole cache would copy all of it.
+            layout = self._resolved_kv_layout(kv_layer)
+            if layout is None:
                 # Refusing here degrades the request to recompute. Guessing an
                 # axis order would silently register scrambled KV instead.
                 raise RuntimeError(
                     "Maru: cannot extract KV for layout "
-                    f"{tuple(kv_layer.shape)}; expected a Flash paged tensor "
-                    "with the K/V axis at 0 or 1"
+                    f"{tuple(kv_layer.shape)}; unrecognized paged KV tensor"
                 )
+            canon = _canonical_paged_view(kv_layer, layout)
             blocks = slot_mapping // layout.block_size
             offsets = slot_mapping % layout.block_size
-            if layout.kv_axis == 0:  # [2, NB, BS, ...]
-                gathered = kv_layer[:, blocks, offsets]  # [2, ntok, ...]
-            else:  # [NB, 2, BS, ...]
-                gathered = kv_layer[blocks, :, offsets].transpose(0, 1)
-            return gathered.reshape(2, gathered.shape[1], -1)
+            if layout.kv_axis is not None:
+                gathered = canon[:, blocks, offsets]  # [2, ntok, ...]
+                return gathered.reshape(2, gathered.shape[1], -1)
+            # K and V share the last dimension. The leading 2 the slab format
+            # wants is a storage convention here, not a semantic split: halving
+            # each token's row is a bijection that _inject_kv_into_layer
+            # reverses exactly, and it claims nothing about where K ends and V
+            # begins — which is the point, because diffkv splits that
+            # dimension unevenly and turboquant packs scales into it.
+            gathered = canon[blocks, offsets]  # [ntok, ...]
+            ntok = gathered.shape[0]
+            return gathered.reshape(ntok, 2, -1).transpose(0, 1)
+
+    def _resolved_kv_layout(self, kv_layer: torch.Tensor) -> KVLayout | None:
+        """Layout for ``kv_layer``: the registered one, else detect in place.
+
+        register_kv_caches resolves this once. The fallback covers connectors
+        whose caches were attached directly, which is how several tests and
+        the pre-registration paths reach these helpers.
+        """
+        if self._kv_layout is not None:
+            return self._kv_layout
+        return _detect_kv_layout(
+            tuple(kv_layer.shape),
+            self._block_size,
+            _vllm_kv_cache_layout(),
+            self._num_kv_heads,
+            self._head_size,
+        )
 
     def _resolve_kv_layout(self, kv_caches: dict[str, torch.Tensor]) -> KVLayout | None:
         """Detect the paged KV axis order once, at registration.
 
-        Asks vLLM for the NHD/HND setting rather than inferring it: the two
-        produce identical logical shapes and differ only in stride, so the
-        tensor cannot tell them apart. vLLM caches that answer and clears the
-        cache when it changes, so what we read here is what was used to
-        allocate these tensors.
+        Reads the axis order off the tensor and cross-checks it against the
+        engine's own block_size and KV geometry. The NHD/HND setting is asked
+        of vLLM separately, and only to name the kernel format — it permutes
+        strides, not axes.
 
         Args:
-            kv_caches: The registered per-layer KV tensors.
+            kv_caches: The registered per-layer KV tensors. The first is taken
+                as representative; hybrid models whose layers differ in shape
+                are not supported here, as before.
 
         Returns:
             The resolved layout, or None when it is unrecognized. Callers then
@@ -3556,7 +3725,13 @@ class MaruWorkerConnector:
         if not hasattr(sample, "shape"):
             return None
         kv_layout = _vllm_kv_cache_layout()
-        layout = _detect_kv_layout(tuple(sample.shape), self._block_size, kv_layout)
+        layout = _detect_kv_layout(
+            tuple(sample.shape),
+            self._block_size,
+            kv_layout,
+            self._num_kv_heads,
+            self._head_size,
+        )
         if layout is None:
             logger.warning(
                 "MaruWorkerConnector: unrecognized KV layout %s "
@@ -3596,9 +3771,7 @@ class MaruWorkerConnector:
             return None
         # Normally resolved in register_kv_caches; resolve here as well so a
         # connector that had caches attached directly still sizes correctly.
-        layout = getattr(self, "_kv_layout", None) or self._resolve_kv_layout(
-            self._kv_caches
-        )
+        layout = self._kv_layout or self._resolve_kv_layout(self._kv_caches)
         if layout is None:
             return None
         layer = next(iter(self._kv_caches.values()))

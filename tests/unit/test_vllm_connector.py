@@ -300,14 +300,19 @@ class TestChunkObjectBytes:
 
 
 class TestDetectKVLayout:
-    """``_detect_kv_layout`` is pure, so every axis order is checkable here."""
+    """``_detect_kv_layout`` is pure, so every axis order is checkable here.
+
+    The shapes below are each some shipped vLLM backend's
+    ``get_kv_cache_shape()`` return value, not hypotheticals.
+    """
 
     NB, BS, NH, HS = 7, 16, 4, 32
 
-    def _expect(self, shape, kv_layout, kv_axis, fmt):
+    def _expect(self, shape, kv_layout, axes, fmt, **kw):
+        """Assert the resolved dims and (kv, block, token) axis indices."""
         from maru_vllm.connector import _detect_kv_layout
 
-        got = _detect_kv_layout(shape, self.BS, kv_layout)
+        got = _detect_kv_layout(shape, self.BS, kv_layout, **kw)
         assert got is not None, f"{shape} {kv_layout} went unrecognized"
         assert (got.num_blocks, got.block_size, got.num_heads, got.head_size) == (
             self.NB,
@@ -316,24 +321,92 @@ class TestDetectKVLayout:
             self.HS,
         )
         assert got.page_buffer_size == self.NB * self.BS
-        assert got.kv_axis == kv_axis
+        assert (got.kv_axis, got.block_axis, got.token_axis) == axes
         assert got.format_name == fmt
+        return got
 
     def test_kv_axis_first(self):
+        """``(2, NB, BS, NH, HS)`` — rocm_attn."""
         nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
-        self._expect((2, nb, bs, nh, hs), "NHD", 0, "NL_X_TWO_NB_BS_NH_HS")
-        self._expect((2, nb, nh, bs, hs), "HND", 0, "NL_X_TWO_NB_NH_BS_HS")
+        self._expect((2, nb, bs, nh, hs), "NHD", (0, 1, 2), "NL_X_TWO_NB_BS_NH_HS")
 
     def test_kv_axis_second(self):
+        """``(NB, 2, BS, NH, HS)`` — flash_attn, flashinfer, flex, triton."""
         nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
-        self._expect((nb, 2, bs, nh, hs), "NHD", 1, "NL_X_NB_TWO_BS_NH_HS")
-        self._expect((nb, 2, nh, bs, hs), "HND", 1, "NL_X_NB_TWO_NH_BS_HS")
+        self._expect((nb, 2, bs, nh, hs), "NHD", (1, 0, 2), "NL_X_NB_TWO_BS_NH_HS")
 
-    def test_kv_axis_fused(self):
-        """vLLM 0.26.0 dropped the K/V axis and doubled the last dimension."""
+    def test_hnd_moves_no_axis_only_the_kernel_format(self):
+        """HND permutes strides, not axes.
+
+        vLLM allocates with the NHD/HND permutation applied and then permutes
+        straight back (``gpu_model_runner``: ``kv_cache.permute(*inv_order)``),
+        so the shape handed to the connector is identical under both. Reading
+        HND as a different axis order made every HND deployment fail the
+        block_size cross-check and go unrecognized — the same empty-pool
+        outcome this detection exists to prevent. Only the kernel, which walks
+        raw memory, sees the difference.
+        """
         nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
-        self._expect((nb, bs, nh, 2 * hs), "NHD", None, "NL_X_NB_BS_NH_TWO_HS")
-        self._expect((nb, nh, bs, 2 * hs), "HND", None, "NL_X_NB_NH_BS_TWO_HS")
+        nhd = self._expect(
+            (nb, 2, bs, nh, hs), "NHD", (1, 0, 2), "NL_X_NB_TWO_BS_NH_HS"
+        )
+        hnd = self._expect(
+            (nb, 2, bs, nh, hs), "HND", (1, 0, 2), "NL_X_NB_TWO_NH_BS_HS"
+        )
+        assert (nhd.kv_axis, nhd.block_axis, nhd.token_axis) == (
+            hnd.kv_axis,
+            hnd.block_axis,
+            hnd.token_axis,
+        )
+
+    def test_fused_last_dimension(self):
+        """K and V sharing the last dimension, both orders.
+
+        ``(NB, BS, NH, 2*HS)`` is flash_attn_diffkv and turboquant_attn;
+        ``(NB, NH, BS, 2*HS)`` is cpu_attn. Neither gets a kernel format: the
+        LMCache ``*_TWO_HS`` constants describe an even K/V split, which
+        diffkv (head_size + head_size_v) and turboquant (packed scales) do not
+        provide.
+        """
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((nb, bs, nh, 2 * hs), "NHD", (None, 0, 1), None)
+        self._expect((nb, nh, bs, 2 * hs), "HND", (None, 0, 2), None)
+
+    def test_fused_orders_separated_by_num_kv_heads(self):
+        """When num_kv_heads == block_size the two fused orders are identical
+        shapes, and only the engine's own head count can tell them apart."""
+        from maru_vllm.connector import _detect_kv_layout
+
+        bs = self.BS
+        shape = (self.NB, bs, bs, 2 * self.HS)  # NH == BS: ambiguous alone
+        got = _detect_kv_layout(shape, bs, "NHD", num_kv_heads=bs, head_size=self.HS)
+        assert got is not None
+        assert got.num_heads == bs
+
+    def test_head_count_rejects_a_wrong_reading(self):
+        """A candidate that parses but disagrees with the engine is refused."""
+        from maru_vllm.connector import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, self.NH, self.HS)
+        assert (
+            _detect_kv_layout(shape, self.BS, "NHD", num_kv_heads=self.NH) is not None
+        )
+        assert (
+            _detect_kv_layout(shape, self.BS, "NHD", num_kv_heads=self.NH + 1) is None
+        )
+
+    def test_two_kv_heads_does_not_hijack_a_fused_shape(self):
+        """``(NB, 2, BS, F)`` from cpu_attn with 2 KV heads must not read as a
+        K/V axis at position 1, which would treat the head axis as K/V."""
+        from maru_vllm.connector import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, 2 * self.HS)
+        got = _detect_kv_layout(
+            shape, self.BS, "HND", num_kv_heads=2, head_size=self.HS
+        )
+        assert got is not None
+        assert got.kv_axis is None, "fused shape misread as having a K/V axis"
+        assert (got.block_axis, got.token_axis, got.num_heads) == (0, 2, 2)
 
     def test_mla(self):
         from maru_vllm.connector import _detect_kv_layout
@@ -341,15 +414,14 @@ class TestDetectKVLayout:
         got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
         assert got is not None
         assert got.page_buffer_size == self.NB * self.BS
+        assert (got.kv_axis, got.block_axis, got.token_axis) == (None, 0, 1)
         assert got.format_name == "NL_X_NB_BS_HS"
 
     def test_rejects_when_block_size_disagrees(self):
         from maru_vllm.connector import _detect_kv_layout
 
         shape = (self.NB, 2, self.BS, self.NH, self.HS)
-        # Right shape, wrong layout hint: the block axis lands on num_heads.
-        assert _detect_kv_layout(shape, self.BS, "HND") is None
-        # Right hint, block size the engine never configured.
+        # Block size the engine never configured.
         assert _detect_kv_layout(shape, 32, "NHD") is None
 
     def test_rejects_unknown_rank(self):
@@ -581,6 +653,115 @@ class TestKVLayerRoundtrip:
         )
 
         torch.testing.assert_close(extracted, src_data)
+
+
+# Every shape below is some shipped backend's get_kv_cache_shape() output.
+# (label, shape_fn(nb, bs, nh, hs), num_kv_heads)
+_PAGED_LAYOUTS = [
+    ("rocm_attn", lambda nb, bs, nh, hs: (2, nb, bs, nh, hs), None),
+    ("flash_attn", lambda nb, bs, nh, hs: (nb, 2, bs, nh, hs), None),
+    ("diffkv_fused", lambda nb, bs, nh, hs: (nb, bs, nh, 2 * hs), None),
+    ("cpu_attn_fused", lambda nb, bs, nh, hs: (nb, nh, bs, 2 * hs), None),
+    ("flash_attn_2_kv_heads", lambda nb, bs, nh, hs: (nb, 2, bs, 2, hs), 2),
+    ("cpu_attn_2_kv_heads", lambda nb, bs, nh, hs: (nb, 2, bs, 2 * hs), 2),
+]
+
+
+class TestKVLayerRoundtripAllLayouts:
+    """inject -> extract must be an exact identity for every layout accepted.
+
+    The pre-existing round-trip tests only ever built ``[2, NB, BS, HD]``, so
+    a ``_inject_kv_into_layer`` that hardcoded that order stayed green while
+    it was broken for every other backend. These parametrize the shape.
+    """
+
+    NB, BS, NH, HS = 5, 4, 3, 8
+
+    def _cache(self, shape_fn, hnd_strides=False):
+        shape = shape_fn(self.NB, self.BS, self.NH, self.HS)
+        t = torch.zeros(shape)
+        if hnd_strides and len(shape) == 5:
+            # Reproduce what HND allocation leaves behind: same shape, head and
+            # block axes swapped in memory, so the tensor is not contiguous.
+            t = t.permute(0, 1, 3, 2, 4).contiguous().permute(0, 1, 3, 2, 4)
+            assert not t.is_contiguous()
+        return t
+
+    @pytest.mark.parametrize(
+        "label,shape_fn,num_kv_heads",
+        _PAGED_LAYOUTS,
+        ids=[layout[0] for layout in _PAGED_LAYOUTS],
+    )
+    @pytest.mark.parametrize("hnd_strides", [False, True], ids=["nhd", "hnd"])
+    def test_roundtrip(self, label, shape_fn, num_kv_heads, hnd_strides):
+        kv_cache = self._cache(shape_fn, hnd_strides)
+        worker = make_bare_worker(
+            block_size=self.BS,
+            kv_caches={"layer0": kv_cache},
+            num_kv_heads=num_kv_heads,
+            head_size=self.HS,
+        )
+        assert worker._kv_layout is not None, f"{label} {tuple(kv_cache.shape)}"
+
+        ntok = 2 * self.BS
+        hidden = kv_cache.numel() // (2 * self.NB * self.BS)
+        src = torch.randn(2, ntok, hidden)
+        # Slots from two different pages, so a wrong block/offset split shows.
+        slots = torch.cat(
+            [torch.arange(self.BS), torch.arange(3 * self.BS, 4 * self.BS)]
+        )
+        meta = make_flash_attn_metadata()
+
+        worker._inject_kv_into_layer(kv_cache, src, slots, meta, "layer0")
+        got = worker._extract_kv_from_layer(kv_cache, slots, meta, "layer0")
+
+        torch.testing.assert_close(got, src)
+
+    def test_untouched_slots_stay_zero(self):
+        """A wrong axis split can round-trip and still scribble elsewhere."""
+        kv_cache = self._cache(lambda nb, bs, nh, hs: (nb, 2, bs, nh, hs))
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"layer0": kv_cache}, head_size=self.HS
+        )
+        slots = torch.arange(self.BS)
+        meta = make_flash_attn_metadata()
+        worker._inject_kv_into_layer(
+            kv_cache, torch.randn(2, self.BS, self.NH * self.HS), slots, meta, "layer0"
+        )
+
+        # Page 0 was written; every other page must be untouched.
+        assert torch.count_nonzero(kv_cache[1:]) == 0
+
+    def test_extract_is_identical_across_axis_orders(self):
+        """The same logical cache in two axis orders must extract to the same
+        bytes, or two engines sharing a CXL pool would disagree."""
+        meta = make_flash_attn_metadata()
+        slots = torch.arange(2 * self.BS)
+        kv_axis_second = torch.randn(self.NB, 2, self.BS, self.NH, self.HS)
+        kv_axis_first = kv_axis_second.permute(1, 0, 2, 3, 4).contiguous()
+
+        out = []
+        for cache in (kv_axis_first, kv_axis_second):
+            worker = make_bare_worker(
+                block_size=self.BS, kv_caches={"layer0": cache}, head_size=self.HS
+            )
+            out.append(worker._extract_kv_from_layer(cache, slots, meta, "layer0"))
+
+        assert torch.equal(out[0], out[1])
+
+    def test_refuses_unrecognized_layout(self):
+        """Refusing degrades the request to recompute; guessing would register
+        scrambled KV."""
+        worker = make_bare_worker(block_size=self.BS)
+        cache = torch.zeros(3, 5)
+        meta = make_flash_attn_metadata()
+
+        with pytest.raises(RuntimeError, match="unrecognized paged KV tensor"):
+            worker._extract_kv_from_layer(cache, torch.arange(2), meta, "layer0")
+        with pytest.raises(RuntimeError, match="unrecognized paged KV tensor"):
+            worker._inject_kv_into_layer(
+                cache, torch.zeros(2, 2, 1), torch.arange(2), meta, "layer0"
+            )
 
 
 # =============================================================================
