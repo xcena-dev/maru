@@ -965,17 +965,25 @@ class TestChunkedPrefillFragmentedStore:
         worker._num_layers = 1
         return worker, stored
 
-    def _kv_layer(self):
-        # Flash layout (2, num_blocks, block_size, head=1); K value at
-        # slot s is s, V value is 1000 + s, so stored bytes reveal exactly
-        # which token positions were extracted.
-        kv = torch.empty(2, 16, self.BLOCK, 1)
-        kv[0] = torch.arange(64, dtype=torch.float32).reshape(16, self.BLOCK, 1)
-        kv[1] = 1000 + torch.arange(64, dtype=torch.float32).reshape(16, self.BLOCK, 1)
+    def _kv_layer(self, layout="legacy"):
+        # K value at slot s is s, V value is 1000 + s, so stored bytes
+        # reveal exactly which token positions were extracted. Same logical
+        # data in both paged axis orders — the pipeline must not care.
+        k = torch.arange(64, dtype=torch.float32)
+        if layout == "legacy":
+            # (2, NB, BS, H) — the pre-0.23 order these tests always used.
+            kv = torch.empty(2, 16, self.BLOCK, 1)
+            kv[0] = k.reshape(16, self.BLOCK, 1)
+            kv[1] = 1000 + k.reshape(16, self.BLOCK, 1)
+        else:
+            # (NB, 2, BS, NH, HS) — vLLM 0.23+ flash_attn.
+            kv = torch.empty(16, 2, self.BLOCK, 1, 1)
+            kv[:, 0] = k.reshape(16, self.BLOCK, 1, 1)
+            kv[:, 1] = 1000 + k.reshape(16, self.BLOCK, 1, 1)
         return kv
 
-    def _run_steps(self, worker, steps):
-        kv = self._kv_layer()
+    def _run_steps(self, worker, steps, layout="legacy"):
+        kv = self._kv_layer(layout)
         attn = make_flash_attn_metadata()
         token_ids = list(range(self.PROMPT))
         for block_ids, sched, computed in steps:
@@ -988,7 +996,8 @@ class TestChunkedPrefillFragmentedStore:
             worker.save_kv_layer("model.layers.0.self_attn", kv, attn, metadata)
         return token_ids
 
-    def test_fragmented_steps_store_all_chunks_with_correct_data(self):
+    @pytest.mark.parametrize("layout", ["legacy", "vllm023"])
+    def test_fragmented_steps_store_all_chunks_with_correct_data(self, layout):
         """Boundaries 20/40 are not chunk-aligned; no chunk may be lost."""
         worker, stored = self._make_worker()
         # block_ids accumulate from token 0, as the fixed scheduler builds
@@ -1000,6 +1009,7 @@ class TestChunkedPrefillFragmentedStore:
                 (list(range(0, 10)), 20, 20),
                 (list(range(0, 16)), 24, 40),
             ],
+            layout,
         )
 
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
@@ -1051,6 +1061,87 @@ class TestChunkedPrefillFragmentedStore:
         # index 5 need 40.
         self._run_steps(worker, [(list(range(5, 10)), 20, 20)])
         assert not stored, "step with insufficient block coverage must store nothing"
+
+
+class TestStoreLoadRoundtripModernLayout:
+    """Full public-API loop at the vLLM 0.23 shape (NB, 2, BS, NH, HS).
+
+    The extract/inject units are covered per layout, but the pipeline
+    between them — chunk keys, slab slicing, the per-layer load fallback —
+    only ever ran under the legacy (2, NB, BS, H) shape in tests, which is
+    how a broken inject shipped. save_kv_layer writes into a dict store and
+    start_load_kv reads it back into a zeroed cache of the same shape; the
+    caches must match bit for bit.
+    """
+
+    BLOCK, CHUNK, PROMPT = 4, 8, 64
+
+    def _modern_cache(self):
+        kv = torch.empty(16, 2, self.BLOCK, 1, 1)
+        k = torch.arange(64, dtype=torch.float32)
+        kv[:, 0] = k.reshape(16, self.BLOCK, 1, 1)
+        kv[:, 1] = 1000 + k.reshape(16, self.BLOCK, 1, 1)
+        return kv
+
+    def _make_worker(self):
+        return make_worker(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_use_layerwise": True},
+        )
+
+    def test_roundtrip(self):
+        from types import SimpleNamespace
+
+        # Store round: save every chunk of the prompt.
+        src = self._modern_cache()
+        writer = self._make_worker()
+        stored = attach_capturing_handler(writer, min_alloc_bytes=4)
+        writer._handler.store.side_effect = lambda key, handle=None: (
+            stored.__setitem__(key, "DONE") or True
+        )
+        writer._num_layers = 1
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(16)),
+            num_scheduled_tokens=self.PROMPT,
+            num_computed_tokens=0,
+        )
+        writer.save_kv_layer(
+            "model.layers.0.self_attn", src, make_flash_attn_metadata(), metadata
+        )
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        assert all(f"{k}_L0" in stored for k in chunk_keys)
+
+        # Load round: a second engine with a zeroed cache of the same shape
+        # reads the shared pool back.
+        dst = torch.zeros_like(src)
+        reader = self._make_worker()
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(view=memoryview(stored[k]), region_id=0, page_index=i)
+            for i, k in enumerate(keys)
+        ]
+        reader._num_layers = 1
+        fwd = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=dst)
+            },
+            attn_metadata=None,
+        )
+        reader.start_load_kv(
+            fwd,
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(16)),
+                num_matched_chunks=len(chunk_keys),
+            ),
+        )
+        assert reader.get_finished_loading() == {"r1"}
+        assert reader.take_failed_load_blocks() == set()
+
+        torch.testing.assert_close(dst, src)
 
 
 # =============================================================================
