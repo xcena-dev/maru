@@ -212,8 +212,8 @@ def _detect_kv_layout(
         else:
             nh, bs = (shape[2], shape[3]) if hnd else (shape[3], shape[2])
             hs = shape[4]
-        got = (nb, bs, nh, hs, 0,
-               "NL_X_TWO_NB_NH_BS_HS" if hnd else "NL_X_TWO_NB_BS_NH_HS")
+        fmt = "NL_X_TWO_NB_NH_BS_HS" if hnd else "NL_X_TWO_NB_BS_NH_HS"
+        got = (nb, bs, nh, hs, 0, fmt)
     elif rank >= 4 and shape[1] == 2 and (rank == 4 or shape[2] == block_size or hnd):
         # [NB, 2, NH, BS, HS] (HND) / [NB, 2, BS, NH, HS] (NHD). vLLM 0.23.0+.
         nb = shape[0]
@@ -222,16 +222,16 @@ def _detect_kv_layout(
         else:
             nh, bs = (shape[2], shape[3]) if hnd else (shape[3], shape[2])
             hs = shape[4]
-        got = (nb, bs, nh, hs, 1,
-               "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS")
+        fmt = "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS"
+        got = (nb, bs, nh, hs, 1, fmt)
     elif rank == 4:
         # [NB, NH, BS, 2*HS] (HND) / [NB, BS, NH, 2*HS] (NHD). vLLM 0.26.0+
         # dropped the K/V axis and doubled the last dimension instead.
         nb = shape[0]
         nh, bs = (shape[1], shape[2]) if hnd else (shape[2], shape[1])
         if shape[3] % 2 == 0:
-            got = (nb, bs, nh, shape[3] // 2, None,
-                   "NL_X_NB_NH_BS_TWO_HS" if hnd else "NL_X_NB_BS_NH_TWO_HS")
+            fmt = "NL_X_NB_NH_BS_TWO_HS" if hnd else "NL_X_NB_BS_NH_TWO_HS"
+            got = (nb, bs, nh, shape[3] // 2, None, fmt)
     elif rank == 3:
         # MLA keeps one latent vector per token, so there is no K/V axis and
         # no head axis. NHD and HND do not differ here.
@@ -3533,9 +3533,7 @@ class MaruWorkerConnector:
                 gathered = kv_layer[blocks, :, offsets].transpose(0, 1)
             return gathered.reshape(2, gathered.shape[1], -1)
 
-    def _resolve_kv_layout(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> "KVLayout | None":
+    def _resolve_kv_layout(self, kv_caches: dict[str, torch.Tensor]) -> KVLayout | None:
         """Detect the paged KV axis order once, at registration.
 
         Asks vLLM for the NHD/HND setting rather than inferring it: the two

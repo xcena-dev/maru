@@ -320,20 +320,20 @@ class TestDetectKVLayout:
         assert got.format_name == fmt
 
     def test_kv_axis_first(self):
-        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
-        self._expect((2, NB, BS, NH, HS), "NHD", 0, "NL_X_TWO_NB_BS_NH_HS")
-        self._expect((2, NB, NH, BS, HS), "HND", 0, "NL_X_TWO_NB_NH_BS_HS")
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((2, nb, bs, nh, hs), "NHD", 0, "NL_X_TWO_NB_BS_NH_HS")
+        self._expect((2, nb, nh, bs, hs), "HND", 0, "NL_X_TWO_NB_NH_BS_HS")
 
     def test_kv_axis_second(self):
-        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
-        self._expect((NB, 2, BS, NH, HS), "NHD", 1, "NL_X_NB_TWO_BS_NH_HS")
-        self._expect((NB, 2, NH, BS, HS), "HND", 1, "NL_X_NB_TWO_NH_BS_HS")
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((nb, 2, bs, nh, hs), "NHD", 1, "NL_X_NB_TWO_BS_NH_HS")
+        self._expect((nb, 2, nh, bs, hs), "HND", 1, "NL_X_NB_TWO_NH_BS_HS")
 
     def test_kv_axis_fused(self):
         """vLLM 0.26.0 dropped the K/V axis and doubled the last dimension."""
-        NB, BS, NH, HS = self.NB, self.BS, self.NH, self.HS
-        self._expect((NB, BS, NH, 2 * HS), "NHD", None, "NL_X_NB_BS_NH_TWO_HS")
-        self._expect((NB, NH, BS, 2 * HS), "HND", None, "NL_X_NB_NH_BS_TWO_HS")
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((nb, bs, nh, 2 * hs), "NHD", None, "NL_X_NB_BS_NH_TWO_HS")
+        self._expect((nb, nh, bs, 2 * hs), "HND", None, "NL_X_NB_NH_BS_TWO_HS")
 
     def test_mla(self):
         from maru_vllm.connector import _detect_kv_layout
