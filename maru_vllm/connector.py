@@ -190,14 +190,17 @@ def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
         out.append(KVLayout(shape[blk], shape[tok], nh, hs, kv, blk, tok, fmt))
 
     if rank == 5:
+        # (NB, 2, BS, NH, HS) — flash_attn, flashinfer, flex, triton, aiter.
+        # Listed before rocm_attn: when num_blocks == 2 both readings pass
+        # every cross-check and the shape cannot separate them, so the tie
+        # goes to the far more common backend family.
+        if shape[1] == 2:
+            fmt = "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS"
+            add(1, 0, 2, shape[3], shape[4], fmt)
         # (2, NB, BS, NH, HS) — rocm_attn
         if shape[0] == 2:
             fmt = "NL_X_TWO_NB_NH_BS_HS" if hnd else "NL_X_TWO_NB_BS_NH_HS"
             add(0, 1, 2, shape[3], shape[4], fmt)
-        # (NB, 2, BS, NH, HS) — flash_attn, flashinfer, flex, triton, aiter
-        if shape[1] == 2:
-            fmt = "NL_X_NB_TWO_NH_BS_HS" if hnd else "NL_X_NB_TWO_BS_NH_HS"
-            add(1, 0, 2, shape[3], shape[4], fmt)
     elif rank == 4:
         # Head axes flattened, hence num_heads=1. No shipped backend emits
         # this, but maru read it before layouts were detected at all.
@@ -213,8 +216,12 @@ def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
             # do not provide. Per-layer transfers never read that dimension.
             add(None, 0, 1, shape[2], shape[3] // 2)
             add(None, 0, 2, shape[1], shape[3] // 2)
-    elif rank == 3:  # (NB, BS, HS) — MLA, one latent vector per token
-        add(None, 0, 1, 1, shape[2], "NL_X_NB_BS_HS")
+    elif rank == 3:
+        # (NB, BS, HS) — MLA, one latent vector per token. No kernel format:
+        # the fused transfer path stores K/V-half-major bytes, not the
+        # token-major rows NL_X_NB_BS_HS describes, and sparse-MLA metadata
+        # does not subclass MLACommonMetadata so it would reach the kernel.
+        add(None, 0, 1, 1, shape[2])
     return out
 
 
@@ -264,7 +271,26 @@ def _detect_kv_layout(
         return None
     # Sort on the ranking pair only; KVLayout is not orderable.
     scored.sort(key=lambda s: s[:2])
-    return scored[0][2]
+    best = scored[0][2]
+    rivals = [
+        c
+        for neg, _, c in scored[1:]
+        if neg == scored[0][0]
+        and (c.kv_axis, c.block_axis, c.token_axis)
+        != (best.kv_axis, best.block_axis, best.token_axis)
+    ]
+    if rivals:
+        # Genuinely ambiguous — the readings differ and every cross-check
+        # passed both. Priority picks the common backend; log the choice
+        # because a wrong pick produces wrong bytes, not an error.
+        logger.warning(
+            "Maru KV layout ambiguous for shape %s: using kv_axis=%s, "
+            "rejected kv_axis=%s",
+            shape,
+            best.kv_axis,
+            [c.kv_axis for c in rivals],
+        )
+    return best
 
 
 def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
@@ -3528,7 +3554,12 @@ class MaruWorkerConnector:
             flat = dst_kv_cache.reshape(num_pages * page_size, -1)
             src = src_kv_data.reshape(slot_mapping.shape[0], -1)
             flat[slot_mapping] = src
-        elif isinstance(layer_meta, TritonAttentionMetadata):
+        elif (
+            isinstance(layer_meta, TritonAttentionMetadata) and dst_kv_cache.dim() == 4
+        ):
+            # Legacy rank-4 Triton; rank-5 takes the layout branch (see
+            # _extract_kv_from_layer). This reshape assumes dim 1 is the head
+            # axis and would misplace rank-5's K/V axis.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
@@ -3559,6 +3590,11 @@ class MaruWorkerConnector:
             if layout.kv_axis is not None:
                 canon[:, blocks, offsets] = src.reshape(2, ntok, *canon.shape[3:])
             else:
+                if canon.shape[2:].numel() % 2:
+                    raise RuntimeError(
+                        "Maru: cannot inject KV for layout "
+                        f"{tuple(dst_kv_cache.shape)}; odd fused K/V row width"
+                    )
                 # Undo the extract side's halving of each token's row.
                 merged = src.transpose(0, 1).reshape(ntok, -1)
                 canon[blocks, offsets] = merged.reshape(ntok, *canon.shape[2:])
@@ -3589,7 +3625,10 @@ class MaruWorkerConnector:
             num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
             flat = kv_layer.reshape(num_pages * page_size, -1)
             return flat[slot_mapping]
-        elif isinstance(layer_meta, TritonAttentionMetadata):
+        elif isinstance(layer_meta, TritonAttentionMetadata) and kv_layer.dim() == 4:
+            # Legacy rank-4 Triton (NB, NH, BS, HD). Rank-5 Triton is the
+            # common (NB, 2, BS, NH, HS) and takes the layout branch, which
+            # also keeps its slab bytes K/V-major like every other backend.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             return kv_layer[block_idxs, :, offsets]
@@ -3613,6 +3652,13 @@ class MaruWorkerConnector:
             # Fused: the leading 2 is a storage convention, not a K/V split.
             # Halving each row is a bijection inject reverses, and claims
             # nothing about where K ends — diffkv splits it unevenly.
+            if canon.shape[2:].numel() % 2:
+                # Cannot halve an odd row. No shipped backend produces one,
+                # but refuse cleanly rather than fail inside the reshape.
+                raise RuntimeError(
+                    "Maru: cannot extract KV for layout "
+                    f"{tuple(kv_layer.shape)}; odd fused K/V row width"
+                )
             gathered = canon[blocks, offsets]  # [ntok, ...]
             ntok = gathered.shape[0]
             return gathered.reshape(ntok, 2, -1).transpose(0, 1)
@@ -3620,17 +3666,38 @@ class MaruWorkerConnector:
     def _layout_for(self, kv_layer: torch.Tensor) -> KVLayout | None:
         """Layout for ``kv_layer``: the registered one, else detect in place.
 
-        The fallback covers caches attached without register_kv_caches.
+        The registered layout describes the first registered layer, so it is
+        applied only when it actually fits this tensor — ``movedim`` with a
+        rank-5 layout succeeds on a rank-3 tensor and returns wrong bytes, so
+        a hybrid model's odd layers must be re-detected, not assumed. The
+        detection fallback also covers caches attached without
+        register_kv_caches.
         """
-        if self._kv_layout is not None:
-            return self._kv_layout
+        shape = tuple(kv_layer.shape)
+        layout = self._kv_layout
+        if layout is not None and self._layout_fits(layout, shape):
+            return layout
         return _detect_kv_layout(
-            tuple(kv_layer.shape),
+            shape,
             self._block_size,
             _vllm_kv_cache_layout(),
             self._num_kv_heads,
             self._head_size,
         )
+
+    @staticmethod
+    def _layout_fits(layout: KVLayout, shape: tuple[int, ...]) -> bool:
+        """Whether ``layout``'s axis assignments describe ``shape``."""
+        try:
+            if shape[layout.block_axis] != layout.num_blocks:
+                return False
+            if shape[layout.token_axis] != layout.block_size:
+                return False
+            if layout.kv_axis is not None and shape[layout.kv_axis] != 2:
+                return False
+        except IndexError:
+            return False
+        return True
 
     def _resolve_kv_layout(self, kv_caches: dict[str, torch.Tensor]) -> KVLayout | None:
         """Detect the paged KV axis order once, at registration.

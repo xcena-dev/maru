@@ -415,7 +415,33 @@ class TestDetectKVLayout:
         assert got is not None
         assert got.page_buffer_size == self.NB * self.BS
         assert (got.kv_axis, got.block_axis, got.token_axis) == (None, 0, 1)
-        assert got.format_name == "NL_X_NB_BS_HS"
+
+    def test_mla_gets_no_kernel_format(self):
+        """rank-3 must stay off the raw-pointer kernel (pre-detection gating
+        was dim() != 5). The fused transfer path stores K/V-half-major bytes,
+        not the token-major rows NL_X_NB_BS_HS describes, and sparse-MLA
+        metadata is not MLACommonMetadata, so a format here would reach the
+        kernel and silently mis-order memory."""
+        from maru_vllm.connector import _detect_kv_layout
+
+        got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
+        assert got is not None and got.format_name is None
+
+    def test_two_blocks_resolves_to_the_common_backend(self):
+        """(2, 2, BS, NH, HS): a flash_attn cache with num_blocks == 2 also
+        parses as rocm_attn and no cross-check can separate the two, so the
+        tie must go to the far more common kv_axis=1 family."""
+        from maru_vllm.connector import _detect_kv_layout
+
+        got = _detect_kv_layout(
+            (2, 2, self.BS, self.NH, self.HS),
+            self.BS,
+            "NHD",
+            num_kv_heads=self.NH,
+            head_size=self.HS,
+        )
+        assert got is not None
+        assert got.kv_axis == 1
 
     def test_rejects_when_block_size_disagrees(self):
         from maru_vllm.connector import _detect_kv_layout
@@ -762,6 +788,83 @@ class TestKVLayerRoundtripAllLayouts:
             worker._inject_kv_into_layer(
                 cache, torch.zeros(2, 2, 1), torch.arange(2), meta, "layer0"
             )
+
+    def test_hybrid_layer_is_redetected(self):
+        """A registered rank-5 layout must not be applied to another layer of
+        a different shape: movedim succeeds on the wrong rank and returns
+        wrong bytes silently. A hybrid model's odd layer re-detects from its
+        own shape (sparse-MLA metadata is not MLACommonMetadata, so it lands
+        in the layout branch)."""
+        flash = torch.zeros(self.NB, 2, self.BS, self.NH, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"L0": flash}, head_size=self.HS
+        )
+        assert worker._kv_layout is not None and worker._kv_layout.kv_axis == 1
+
+        mla = torch.zeros(self.NB, self.BS, 2 * self.HS)
+        meta = make_flash_attn_metadata()
+        slots = torch.arange(self.BS)
+        src = torch.randn(2, self.BS, self.HS)
+
+        worker._inject_kv_into_layer(mla, src, slots, meta, "L1")
+        got = worker._extract_kv_from_layer(mla, slots, meta, "L1")
+
+        torch.testing.assert_close(got, src)
+
+    def test_odd_fused_width_is_refused_cleanly(self):
+        """An odd fused row cannot be halved. No shipped backend emits one
+        (turboquant explicitly rounds up to even), but the refusal must name
+        the cause instead of failing inside a reshape."""
+        worker = make_bare_worker(block_size=self.BS)
+        cache = torch.zeros(self.NB, self.BS, 577)
+        meta = make_flash_attn_metadata()
+
+        with pytest.raises(RuntimeError, match="odd fused"):
+            worker._extract_kv_from_layer(cache, torch.arange(2), meta, "L0")
+        with pytest.raises(RuntimeError, match="odd fused"):
+            worker._inject_kv_into_layer(
+                cache, torch.zeros(2, 2, 288), torch.arange(2), meta, "L0"
+            )
+
+    def _make_triton_metadata(self):
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+
+        meta = MagicMock()
+        meta.__class__ = type("TritonMeta", (TritonAttentionMetadata,), {})
+        return meta
+
+    def test_triton_rank5_takes_the_layout_branch(self):
+        """triton_attn is rank-5 (NB, 2, BS, NH, HS) on current vLLM. The
+        legacy Triton branch assumed rank-4 with heads at dim 1, so its inject
+        raised a shape mismatch on the K/V axis — and its extract was
+        token-major, unlike every other backend's slab bytes."""
+        kv = torch.zeros(self.NB, 2, self.BS, self.NH, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"L0": kv}, head_size=self.HS
+        )
+        meta = self._make_triton_metadata()
+        slots = torch.cat(
+            [torch.arange(self.BS), torch.arange(3 * self.BS, 4 * self.BS)]
+        )
+        src = torch.randn(2, slots.shape[0], self.NH * self.HS)
+
+        worker._inject_kv_into_layer(kv, src, slots, meta, "L0")
+        got = worker._extract_kv_from_layer(kv, slots, meta, "L0")
+
+        torch.testing.assert_close(got, src)
+
+    def test_triton_rank4_legacy_branch_kept(self):
+        """Old rank-4 Triton (NB, NH, BS, HD) keeps its dedicated branch."""
+        kv = torch.zeros(self.NB, self.NH, self.BS, self.HS)
+        worker = make_bare_worker(block_size=self.BS)
+        meta = self._make_triton_metadata()
+        slots = torch.arange(self.BS)
+        src = torch.randn(self.BS, self.NH, self.HS)
+
+        worker._inject_kv_into_layer(kv, src, slots, meta, "L0")
+        got = worker._extract_kv_from_layer(kv, slots, meta, "L0")
+
+        torch.testing.assert_close(got, src)
 
 
 # =============================================================================
