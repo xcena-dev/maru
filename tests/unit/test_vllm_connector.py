@@ -310,7 +310,7 @@ class TestDetectKVLayout:
 
     def _expect(self, shape, kv_layout, axes, fmt, **kw):
         """Assert the resolved dims and (kv, block, token) axis indices."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         got = _detect_kv_layout(shape, self.BS, kv_layout, **kw)
         assert got is not None, f"{shape} {kv_layout} went unrecognized"
@@ -375,7 +375,7 @@ class TestDetectKVLayout:
     def test_fused_orders_separated_by_num_kv_heads(self):
         """When num_kv_heads == block_size the two fused orders are identical
         shapes, and only the engine's own head count can tell them apart."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         bs = self.BS
         shape = (self.NB, bs, bs, 2 * self.HS)  # NH == BS: ambiguous alone
@@ -385,7 +385,7 @@ class TestDetectKVLayout:
 
     def test_head_count_rejects_a_wrong_reading(self):
         """A candidate that parses but disagrees with the engine is refused."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         shape = (self.NB, 2, self.BS, self.NH, self.HS)
         assert (
@@ -398,7 +398,7 @@ class TestDetectKVLayout:
     def test_two_kv_heads_does_not_hijack_a_fused_shape(self):
         """``(NB, 2, BS, F)`` from cpu_attn with 2 KV heads must not read as a
         K/V axis at position 1, which would treat the head axis as K/V."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         shape = (self.NB, 2, self.BS, 2 * self.HS)
         got = _detect_kv_layout(
@@ -409,7 +409,7 @@ class TestDetectKVLayout:
         assert (got.block_axis, got.token_axis, got.num_heads) == (0, 2, 2)
 
     def test_mla(self):
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
         assert got is not None
@@ -422,7 +422,7 @@ class TestDetectKVLayout:
         not the token-major rows NL_X_NB_BS_HS describes, and sparse-MLA
         metadata is not MLACommonMetadata, so a format here would reach the
         kernel and silently mis-order memory."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
         assert got is not None and got.format_name is None
@@ -431,7 +431,7 @@ class TestDetectKVLayout:
         """(2, 2, BS, NH, HS): a flash_attn cache with num_blocks == 2 also
         parses as rocm_attn and no cross-check can separate the two, so the
         tie must go to the far more common kv_axis=1 family."""
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         got = _detect_kv_layout(
             (2, 2, self.BS, self.NH, self.HS),
@@ -444,14 +444,14 @@ class TestDetectKVLayout:
         assert got.kv_axis == 1
 
     def test_rejects_when_block_size_disagrees(self):
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         shape = (self.NB, 2, self.BS, self.NH, self.HS)
         # Block size the engine never configured.
         assert _detect_kv_layout(shape, 32, "NHD") is None
 
     def test_rejects_unknown_rank(self):
-        from maru_vllm.connector import _detect_kv_layout
+        from maru_vllm.kv_layout import _detect_kv_layout
 
         assert _detect_kv_layout((3, 5), self.BS, "NHD") is None
 
