@@ -208,6 +208,44 @@ marutop device clear /dev/dax0.0         # clear header (zero-fill)
 marutop device clear --yes /dev/dax0.0   # clear without prompt
 ```
 
+## `plot_request_timeline.py` (per-request KV load timeline)
+
+Standalone script (not part of `marutop`; needs `matplotlib`). Turns an engine
+stderr log into one horizontal bar per request — x = time since the round
+started, y = requests — split into the phases of a deferred KV load: `wait`,
+`queue`, `retrieve`, `gpu copy`, `notify`, `sched wait`, `prefill`, `decode`.
+It also prints a per-phase median/p90/max table.
+
+To reproduce end to end:
+
+1. **Enable timing logs** — in the vLLM launch config, add
+   `"maru_log_timing": true` to `kv_connector_extra_config` (same place as
+   `maru_server_address`). Every phase boundary is then logged as a
+   `Maru timing: t=<epoch> ...` line on the engine's stderr.
+2. **Run a workload and capture stderr** — e.g. a naru benchmark run, or any
+   serving run whose engine log you keep.
+3. **Plot**:
+
+   ```bash
+   # engine log alone (load phases only)
+   python tools/plot_request_timeline.py engine.stderr.log --out timeline.png
+
+   # + naru per-request CSV: exact join by response_id, adds wait/prefill/
+   # decode and restricts the chart to that round
+   R=/path/to/naru/results/<ts>; D=$R/long-doc-.../maru-direct-async
+   python tools/plot_request_timeline.py $D/raw/....inst2.log \
+     --naru-csv $D/processed/inst2_query_round.csv \
+     --out $R/timeline.png --title "..."
+
+   # + generic client JSONL ({"name","start","first_token","end"} per line,
+   # submission order) when there is no naru CSV
+   python tools/plot_request_timeline.py engine.stderr.log --client results.jsonl
+   ```
+
+The `sched wait` phase (load reaped -> vLLM rescheduled the request) only
+appears on engine logs produced by a connector with the `resumed` timing
+marker (this branch); older logs still plot, just without that phase.
+
 ## Legacy invocation
 
 The old module invocations still work from the repo root via thin shims that

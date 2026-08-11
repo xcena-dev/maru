@@ -1083,6 +1083,31 @@ class TestChunkedPrefillFragmentedStore:
         self._run_steps(worker, [(list(range(5, 10)), 20, 20)])
         assert not stored, "step with insufficient block coverage must store nothing"
 
+    def test_store_timing_breakdown_emitted_when_enabled(self, capsys):
+        """maru_log_timing must break the store down into its phases, and must
+        stay silent when off (the default)."""
+        worker = make_worker(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_use_layerwise": True, "maru_log_timing": True},
+        )
+        attach_capturing_handler(worker, min_alloc_bytes=4)
+        worker._handler.store.side_effect = lambda key, handle=None: True
+        worker._num_layers = 1
+        self._run_steps(worker, [(list(range(0, 16)), 64, 0)])
+
+        err = capsys.readouterr().err
+        line = next((ln for ln in err.splitlines() if "store layerwise" in ln), None)
+        assert line is not None, f"no timing line in stderr: {err!r}"
+        for field in ("extract=", "alloc=", "copy=", "rpc=", "MB"):
+            assert field in line, f"missing {field} in: {line}"
+
+        # Off by default: the same run must emit nothing.
+        worker2, _ = self._make_worker()
+        capsys.readouterr()
+        self._run_steps(worker2, [(list(range(0, 16)), 64, 0)])
+        assert "Maru timing" not in capsys.readouterr().err
+
 
 class TestStoreLoadRoundtripModernLayout:
     """Full public-API loop at the vLLM 0.23 shape (NB, 2, BS, NH, HS).

@@ -74,10 +74,14 @@ def _emit_timing(msg: str) -> None:
     ``vllm.*`` handler namespace, so its records are never captured in the
     engine logs. Timing diagnostics therefore go straight to stderr, which
     the process log does capture.
+
+    The epoch timestamp is what lets a per-request timeline be rebuilt from
+    the log (tools/plot_request_timeline.py) and joined with client-side
+    records; durations alone cannot be placed on a time axis.
     """
     import sys
 
-    print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
+    print(f"Maru timing: t={time.time():.3f} {msg}", file=sys.stderr, flush=True)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -590,6 +594,11 @@ class MaruSchedulerConnector:
         # views for per-layer transfer.
         self._deferred_layerwise_waiting: set[str] = set()
         self._deferred_layerwise_ready: set[str] = set()
+        # Timing only: parked requests we have not yet seen rescheduled. The
+        # "resumed sched" line this feeds is the engine-side split of the
+        # reap -> first-token interval, which client-side data cannot place
+        # exactly (clock-anchor ambiguity).
+        self._awaiting_resume: set[str] = set()
 
         # Cached match results from get_num_new_matched_tokens,
         # consumed by update_state_after_alloc to avoid redundant RPC.
@@ -637,14 +646,23 @@ class MaruSchedulerConnector:
             self._extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
         )
         try:
+            _t0 = time.monotonic()
             self._handler = _create_maru_handler(
                 self._extra_config, pool_size_override=chunk_size
             )
+            if self._timing and self._handler is not None:
+                # First-call cost (connect + pool mmap). Without this line the
+                # whole thing lands inside one request's get_num_new_matched
+                # and reads as a 900 ms lookup.
+                _emit_timing(
+                    f"handler connect scheduler = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                )
         except Exception:
             self._handler_retry_after = time.monotonic() + 5.0
             logger.warning("Scheduler MaruHandler creation failed, backing off 5s")
 
-    def _count_matched_chunks(self, token_ids: list[int]) -> int:
+    def _count_matched_chunks(self, token_ids: list[int], req_id: str = "?") -> int:
         """Count how many consecutive prefix chunks are cached in Maru.
 
         Uses batch_exists for efficiency: single RPC call checks all chunks.
@@ -684,7 +702,7 @@ class MaruSchedulerConnector:
             if self._timing:
                 _emit_timing(
                     f"lookup batch_exists {len(remaining_keys)} keys = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_id})"
                 )
         except Exception as e:
             logger.warning("Maru batch_exists failed: %s", e)
@@ -713,11 +731,12 @@ class MaruSchedulerConnector:
             return 0, False
 
         _t0 = time.monotonic()
-        num_matched_chunks = self._count_matched_chunks(token_ids)
+        num_matched_chunks = self._count_matched_chunks(token_ids, request.request_id)
         if self._timing:
             _emit_timing(
                 f"get_num_new_matched (incl _chunk_keys) {len(token_ids)} tok = "
-                f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                f"{(time.monotonic() - _t0) * 1000:.2f} ms "
+                f"(req {request.request_id})"
             )
         if num_matched_chunks == 0:
             return 0, False
@@ -796,6 +815,8 @@ class MaruSchedulerConnector:
         ) in self._pending_deferred_loads.items():
             if layerwise_singleton:
                 self._deferred_layerwise_waiting.add(req_id)
+            if self._timing:
+                self._awaiting_resume.add(req_id)
             meta.requests.append(
                 MaruReqMeta(
                     req_id=req_id,
@@ -808,6 +829,15 @@ class MaruSchedulerConnector:
                 )
             )
         self._pending_deferred_loads.clear()
+
+        if self._awaiting_resume:
+            # A parked request reappearing in a step is the moment vLLM
+            # rescheduled it after the load finished. The token count is how
+            # much prefill it was actually given to recompute.
+            for req_id, ntok in scheduler_output.num_scheduled_tokens.items():
+                if req_id in self._awaiting_resume:
+                    self._awaiting_resume.discard(req_id)
+                    _emit_timing(f"resumed sched {ntok} tok (req {req_id})")
 
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
@@ -1007,6 +1037,10 @@ class MaruWorkerConnector:
         # _failed_load_blocks feeds get_block_ids_with_load_errors so vLLM
         # recomputes instead of consuming unloaded KV.
         self._deferred_events: dict[str, torch.cuda.Event] = {}
+        # Populated only under maru_log_timing; paired with _deferred_events
+        # so the CXL->GPU copy is measured on the GPU timeline, not by a wall
+        # clock around a job that only submits the copy and returns.
+        self._deferred_start_events: dict[str, torch.cuda.Event] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
@@ -1134,7 +1168,13 @@ class MaruWorkerConnector:
             self._effective_page_size_bytes = _parse_size(
                 extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
             )
+            _t0 = time.monotonic()
             self._handler = _create_maru_handler(extra_config)
+            if self._timing and self._handler is not None:
+                # First-call cost (connect + full pool mmap + host-register).
+                _emit_timing(
+                    f"handler connect worker = {(time.monotonic() - _t0) * 1000:.2f} ms"
+                )
         except Exception:
             self._handler_retry_after = time.monotonic() + 5.0
             logger.warning("Worker MaruHandler creation failed, backing off 5s")
@@ -1357,9 +1397,12 @@ class MaruWorkerConnector:
             _t0 = time.monotonic()
             self._load_packed(layers, prepared_requests, attn_metadata)
             if self._timing:
+                # One wall covers every request in the step; name them so the
+                # time is never attributed to the wrong request.
+                _reqs = ",".join(r.req_id for r, _, _, _ in prepared_requests)
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (reqs {_reqs})"
                 )
             return
 
@@ -1453,9 +1496,22 @@ class MaruWorkerConnector:
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
                 return
+            if self._timing:
+                # Timeline anchor: everything between this line and the
+                # retrieve line is queueing inside the loader, not transfer.
+                _emit_timing(
+                    f"deferred load start {num_chunks}c (req {req_meta.req_id})"
+                )
+            _t0 = time.monotonic()
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             keys = [chunk_keys[ci] for ci in range(num_chunks)]
+            if self._timing:
+                # Chunk-key hashing happened above (start marker), slots here.
+                _emit_timing(
+                    f"deferred slots {total_tokens} tok = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
+                )
 
             _t0 = time.monotonic()
             infos = self._batch_retrieve_all(keys)
@@ -1497,7 +1553,15 @@ class MaruWorkerConnector:
                 )
                 return
 
+            _t0 = time.monotonic()
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
+            if self._timing:
+                # cudaHostRegister of the slot tensor; a slow line here means
+                # pinning is the bottleneck, not the copy itself.
+                _emit_timing(
+                    f"deferred pin = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
+                )
             torch.cuda.set_device(device)
             if self._deferred_stream is None or self._deferred_stream_device != device:
                 # Highest priority: parked requests' TTFT gates on these
@@ -1516,7 +1580,11 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
+            start_event = torch.cuda.Event(enable_timing=True) if self._timing else None
+            _t_submit = time.monotonic()
             with torch.cuda.stream(stream):
+                if start_event is not None:
+                    start_event.record(stream)
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
@@ -1558,10 +1626,23 @@ class MaruWorkerConnector:
                                 layer_name,
                                 num_chunks=1,
                             )
-                event = torch.cuda.Event()
+                # elapsed_time needs both ends timed, so match start_event.
+                event = torch.cuda.Event(enable_timing=self._timing)
                 event.record(stream)
+            if self._timing:
+                # CPU wall of enqueueing all chunk copies. Async H2D should
+                # make this near zero; a large value means the copies degraded
+                # to synchronous (e.g. the CXL mapping is not host-registered)
+                # and the "gpu-load" time is really submission-bound.
+                _emit_timing(
+                    f"deferred submit {num_chunks}c = "
+                    f"{(time.monotonic() - _t_submit) * 1000:.2f} ms "
+                    f"(req {req_meta.req_id})"
+                )
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
+                if start_event is not None:
+                    self._deferred_start_events[req_meta.req_id] = start_event
                 self._deferred_refs[req_meta.req_id] = [
                     infos,
                     slot_mapping,
@@ -1752,9 +1833,10 @@ class MaruWorkerConnector:
             len(entries),
         )
         if self._timing:
+            _reqs = ",".join(r.req_id for r, _, _, _ in entries)
             _emit_timing(
                 f"packed-layerwise schedule {len(layers)}L x {len(entries)}r = "
-                f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                f"{(time.monotonic() - _t0) * 1000:.2f} ms (reqs {_reqs})"
             )
 
     def _copy_packed_layer_to_device(
@@ -1959,6 +2041,15 @@ class MaruWorkerConnector:
                     done.add(req_id)
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
+                    start = self._deferred_start_events.pop(req_id, None)
+                    if start is not None:
+                        # Both events have fired, so this is the CXL->GPU
+                        # copy's duration on the GPU timeline, excluding the
+                        # time the request spent queued before it.
+                        _emit_timing(
+                            "deferred gpu-load "
+                            f"{start.elapsed_time(event):.2f} ms (req {req_id})"
+                        )
         return done or None
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
@@ -2606,6 +2697,10 @@ class MaruWorkerConnector:
             pending_keys: list[str] = []
             pending_bases: list[str] = []
             pending_handles: list = []
+            # Timing accumulators. extract is async submission; dst.copy_
+            # forces the D2H sync, so the GPU gather cost shows up in copy.
+            _t_extract = _t_alloc = _t_copy = 0.0
+            _store_bytes = 0
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
                 maru_key = f"{base_key}_L{layer_idx}"
@@ -2619,6 +2714,7 @@ class MaruWorkerConnector:
 
                 handle = None
                 try:
+                    _t0 = time.monotonic()
                     chunk_slots_gpu = chunk_slots.to(kv_layer.device)
                     kv_data = self._extract_kv_from_layer(
                         kv_layer,
@@ -2628,13 +2724,20 @@ class MaruWorkerConnector:
                     )
                     kv_contig = kv_data.detach().contiguous()
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
+                    _t1 = time.monotonic()
 
                     # Zero-copy path: alloc CXL page, GPU→CXL direct copy
                     handle = self._handler.alloc(nbytes)
                     dst = torch.frombuffer(
                         handle.buf[:nbytes], dtype=kv_contig.dtype
                     ).reshape(kv_contig.shape)
+                    _t2 = time.monotonic()
                     dst.copy_(kv_contig)  # GPU→CXL mmap (single cudaMemcpy)
+                    _t3 = time.monotonic()
+                    _t_extract += _t1 - _t0
+                    _t_alloc += _t2 - _t1
+                    _t_copy += _t3 - _t2
+                    _store_bytes += nbytes
                 except Exception as e:
                     logger.error("Maru save prepare error: %s: %s", maru_key, e)
                     if handle is not None:
@@ -2654,6 +2757,7 @@ class MaruWorkerConnector:
             # Phase 2: single batched register. batch_store takes ownership of
             # every handle (it frees duplicates/failures internally); it only
             # raises before consuming any, so the except path frees them all.
+            _t0 = time.monotonic()
             try:
                 results = self._handler.batch_store(pending_keys, pending_handles)
             except Exception as e:
@@ -2662,6 +2766,16 @@ class MaruWorkerConnector:
                 )
                 self._free_handles_best_effort(pending_handles)
                 continue
+            if self._timing:
+                _emit_timing(
+                    f"store layerwise L{layer_idx} {len(pending_keys)}c "
+                    f"{_store_bytes / 1e6:.1f}MB "
+                    f"extract={_t_extract * 1000:.2f} "
+                    f"alloc={_t_alloc * 1000:.2f} "
+                    f"copy={_t_copy * 1000:.2f} "
+                    f"rpc={(time.monotonic() - _t0) * 1000:.2f} ms "
+                    f"(req {req_meta.req_id})"
+                )
 
             # Phase 3: mark stored; write each chunk's _DONE marker once all
             # layers for that chunk have been stored.
@@ -2907,6 +3021,7 @@ class MaruWorkerConnector:
 
         ready_keys: list[str] = []
         ready_handles: list = []
+        contrib_reqs: set[str] = set()
         # Requests sharing a prefix can yield the same base_key within one
         # step; the single deferred batch_store no longer dedupes them the way
         # the per-request fallback's eager _stored_keys updates did.
@@ -2977,12 +3092,15 @@ class MaruWorkerConnector:
                         continue
                     ready_keys.append(base_key)
                     ready_handles.append(handle)
+                    contrib_reqs.add(req_meta.req_id)
 
         if not ready_keys:
             return
+        _t0 = time.monotonic()
         if use_stream:
             assert self._store_stream is not None
             self._store_stream.synchronize()
+        _t_sync = time.monotonic()
         # batch_store takes ownership of every handle (frees duplicates and
         # failures internally); it only raises before consuming any, so the
         # except path must free them all.
@@ -2992,14 +3110,20 @@ class MaruWorkerConnector:
             logger.error("Maru packed batch_store failed: %s", e)
             self._free_handles_best_effort(ready_handles)
             return
+        _t_rpc = time.monotonic()
         for base_key, ok in zip(ready_keys, results, strict=False):
             if ok:
                 self._stored_keys.add(base_key)
             else:
                 logger.warning("Maru packed store failed: %s", base_key)
         if self._timing:
+            # sync covers the gather kernel plus the D2H to CXL queued on the
+            # store stream; rpc is the batched metadata registration.
             _emit_timing(
-                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c"
+                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c "
+                f"sync={(_t_sync - _t0) * 1000:.2f} "
+                f"rpc={(_t_rpc - _t_sync) * 1000:.2f} ms "
+                f"(reqs {','.join(sorted(contrib_reqs))})"
             )
 
     def _store_packed_slabs_write_behind(
@@ -3196,6 +3320,7 @@ class MaruWorkerConnector:
             return
         refs.clear()  # safe to release stream inputs after the event
 
+        _t0 = time.monotonic()
         try:
             results = list(handler.batch_store(keys, handles))
         except Exception as e:
@@ -3208,10 +3333,19 @@ class MaruWorkerConnector:
         # and request-owned blocks pending forever.
         if len(results) < len(keys):
             results.extend([False] * (len(keys) - len(results)))
+        if self._timing:
+            # Read the key->request waiters before completion pops them. Only
+            # finished requests wait on keys, so this can be a subset.
+            with self._store_lock:
+                _reqs = sorted(
+                    {r for k in keys for r in self._store_key_waiters.get(k, ())}
+                )
         self._complete_write_behind_keys(keys, results[: len(keys)])
         if self._timing:
             _emit_timing(
-                f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
+                f"write-behind packed-store {self._num_layers}L x {len(keys)}c "
+                f"rpc={(time.monotonic() - _t0) * 1000:.2f} ms "
+                f"(reqs {','.join(_reqs) if _reqs else '?'})"
             )
 
     def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
@@ -3372,6 +3506,7 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._deferred_layerwise_loads.clear()
             self._deferred_events.clear()
+            self._deferred_start_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
         if self._handler is not None:
