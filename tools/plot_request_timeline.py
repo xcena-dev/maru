@@ -200,11 +200,14 @@ def join_naru_csv(reqs: dict[str, Request], path: str) -> None:
 
     # t0 feasibility band: reap_i <= t0 + ft_rel_i  and  t0 + start_rel_i <=
     # submit_i for every joined request. Midpoint balances the two errors.
+    # Layerwise runs have no reap; the reschedule marker bounds t0 the same
+    # way (the first token cannot precede the reschedule either).
     lo, hi = [], []
     for r, rec in joined:
         ft_rel, start_rel = float(rec["ttft_time"]), float(rec["request_start"])
-        if r.reap:
-            lo.append(r.reap - ft_rel)
+        anchor = r.reap or r.resumed
+        if anchor:
+            lo.append(anchor - ft_rel)
         if r.submit:
             hi.append(r.submit - start_rel)
     if not lo or not hi:
