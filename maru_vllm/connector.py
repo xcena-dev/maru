@@ -2207,10 +2207,20 @@ class MaruWorkerConnector:
             # Unrecognized, or a layout the kernel constants cannot describe
             # (MLA, fused K/V): keep the memcpy+inject fallback.
             return False
-        if not kv_cache_layer.is_contiguous():
-            # single_layer_kv_transfer reads its dimensions positionally from
-            # the logical shape, so an HND (stride-permuted) cache would hand
-            # it swapped head/token axes.
+        kernel_layer = kv_cache_layer
+        if layout.format_name.endswith("NH_BS_HS"):
+            # HND: the kernel reads NH from size(2) and BS from size(3) and
+            # expects physical (.., NH, BS, HS) order, but vLLM hands out the
+            # logical (.., BS, NH, HS) shape with permuted strides. Undo the
+            # permutation (LMCache does the same before its kernel calls).
+            # Both HND formats maru resolves are rank-5 with NH at 3, BS at 2.
+            kernel_layer = kv_cache_layer.movedim(3, 2)
+        if not kernel_layer.is_contiguous():
+            # Strides that match neither an NHD nor a pure HND allocation —
+            # the kernel walks raw memory, so nothing would catch the misread.
+            # NB: this check alone cannot carry the HND permute above, because
+            # is_contiguous() ignores strides of size-1 dims and an HND cache
+            # with one KV head per rank slips through as "contiguous".
             return False
         obj_bytes = self._chunk_object_bytes()
         if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
@@ -2232,7 +2242,7 @@ class MaruWorkerConnector:
                 ).view(2, ct, -1)
                 ops.single_layer_kv_transfer(
                     src,
-                    kv_cache_layer,
+                    kernel_layer,
                     chunk_slots[i * ct : (i + 1) * ct],
                     ops.TransferDirection.H2D,
                     kv_format,

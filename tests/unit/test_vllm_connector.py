@@ -1969,8 +1969,20 @@ class TestFusedLoad:
         ops.EngineKVFormat = SimpleNamespace(
             NL_X_TWO_NB_BS_NH_HS="FLASH",
             NL_X_NB_TWO_BS_NH_HS="FLASH023",
+            NL_X_TWO_NB_NH_BS_HS="ROCM_HND",
+            NL_X_NB_TWO_NH_BS_HS="FLASH_HND",
         )
         return ops
+
+    def _hnd_cache(self, nb, bs, nh, hs):
+        """An HND cache exactly as vLLM allocates one: physical (NB, 2, NH,
+        BS, HS) storage permuted back to the logical (NB, 2, BS, NH, HS)
+        shape (gpu_model_runner), so only the strides say HND."""
+        order = (0, 1, 3, 2, 4)  # flash_attn get_kv_cache_stride_order() HND
+        logical = (nb, 2, bs, nh, hs)
+        phys = tuple(logical[i] for i in order)
+        inv = [order.index(i) for i in range(5)]
+        return torch.zeros(phys).permute(inv)
 
     def test_disabled_flag_skips_fused(self):
         worker = self._make_worker(fused=False)
@@ -2049,8 +2061,9 @@ class TestFusedLoad:
         assert ops.single_layer_kv_transfer.call_count == 0
 
     def test_fused_refuses_non_contiguous_cache(self):
-        """single_layer_kv_transfer reads dimensions positionally from the
-        logical shape, so an HND (stride-permuted) cache would hand it
+        """A cache with HND strides whose layout resolved to an NHD format
+        (the case _vllm_kv_cache_layout warns about: physical layout
+        misreported as NHD) gets no permute, and the kernel would read
         swapped head/token axes. Fall back instead."""
         worker = self._make_worker()
         worker._lmc_ops = self._fake_ops()
@@ -2058,6 +2071,62 @@ class TestFusedLoad:
         kv_layer = torch.zeros(4, 2, 2, 4, 2).permute(0, 1, 3, 2, 4)
         assert tuple(kv_layer.shape) == (4, 2, 4, 2, 2)
         assert not kv_layer.is_contiguous()
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is False
+        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
+
+    @pytest.mark.parametrize("nh", [1, 2], ids=["nh1", "nh2"])
+    def test_fused_hnd_cache_hands_kernel_the_physical_view(self, nh):
+        """On HND the kernel reads NH from size(2) and BS from size(3) of the
+        tensor it is handed (mem_kernels.cu positional reads), so the cache
+        must arrive in physical (NB, 2, NH, BS, HS) order.
+
+        nh=1 is the trap: torch.is_contiguous() ignores strides of size-1
+        dims, so a contiguity guard passes the logical view through and the
+        kernel swaps NH and BS. nh=1 is common — a model with as many KV
+        heads as the TP degree runs one head per rank.
+        """
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        hs = 2
+        worker = self._make_worker()
+        ops = self._fake_ops()
+        worker._lmc_ops = ops
+        obj_bytes = 2 * self.CHUNK * nh * hs * 4
+        worker._chunk_object_bytes = lambda: obj_bytes
+        kv_layer = self._hnd_cache(nb=4, bs=4, nh=nh, hs=hs)
+        worker._kv_layout = _detect_kv_layout(
+            tuple(kv_layer.shape), 4, "HND", num_kv_heads=nh, head_size=hs
+        )
+        assert worker._kv_layout.format_name == "NL_X_NB_TWO_NH_BS_HS"
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(obj_bytes)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is True
+        args, _ = ops.single_layer_kv_transfer.call_args
+        dst = args[1]
+        assert (dst.size(2), dst.size(3)) == (nh, 4)  # physical NH, BS
+        assert dst.is_contiguous()
+        assert dst.data_ptr() == kv_layer.data_ptr()  # a view, not a copy
+        assert args[4] == "FLASH_HND"
+
+    def test_fused_hnd_cache_with_foreign_strides_falls_back(self):
+        """An HND-format layout whose tensor is not a pure HND allocation
+        (here: a strided slice) cannot be fixed by the permute; refuse it."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        worker = self._make_worker()
+        worker._lmc_ops = self._fake_ops()
+        worker._chunk_object_bytes = lambda: 128
+        kv_layer = torch.zeros(4, 2, 4, 2, 4)[..., ::2]  # (4, 2, 4, 2, 2)
+        worker._kv_layout = _detect_kv_layout(
+            tuple(kv_layer.shape), 4, "HND", num_kv_heads=2, head_size=2
+        )
+        assert worker._kv_layout.format_name == "NL_X_NB_TWO_NH_BS_HS"
 
         ok = worker._fused_run_transfer(
             kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
