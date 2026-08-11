@@ -1271,6 +1271,140 @@ class TestBuildConnectorMetaStoreAccumulation:
 # =============================================================================
 
 
+class _FakeEvent:
+    """CUDA-event stand-in whose completion the test controls."""
+
+    def __init__(self):
+        self.fired = False
+
+    def query(self):
+        return self.fired
+
+
+class TestEarlyUnpark:
+    """Watermark reporting: unpark at layer K, release refs at the end.
+
+    The GPU copy itself needs CUDA; these tests pin the lifecycle logic that
+    surrounds it — report exactly once, refs outlive the tail, per-layer
+    events are pruned, and a failure before the watermark never reports.
+    """
+
+    def _worker(self, **extra):
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=8,
+            extra_config={"maru_enable_deferred_loading": True, **extra},
+        )
+        return worker
+
+    def test_knob_defaults_off(self):
+        assert self._worker()._early_unpark_layers == 0
+        assert self._worker(maru_early_unpark_layers=22)._early_unpark_layers == 22
+
+    def test_watermark_reports_once_and_refs_outlive_tail(self):
+        worker = self._worker(maru_early_unpark_layers=1)
+        wmark, final = _FakeEvent(), _FakeEvent()
+        worker._deferred_watermark_events["r1"] = wmark
+        worker._deferred_events["r1"] = final
+        worker._deferred_refs["r1"] = ["mmap-view"]
+        worker._early_layer_events["l0"] = [("r1", _FakeEvent())]
+
+        assert worker.get_finished_loading() is None  # nothing fired yet
+
+        wmark.fired = True
+        assert worker.get_finished_loading() == {"r1"}  # reported at watermark
+        assert worker._deferred_refs["r1"], "refs must outlive the tail copies"
+        assert worker._early_layer_events, "tail waits still need the events"
+
+        assert worker.get_finished_loading() is None  # no double report
+
+        final.fired = True
+        assert worker.get_finished_loading() is None  # already reported
+        assert "r1" not in worker._deferred_refs
+        assert not worker._early_layer_events
+        assert "r1" not in worker._deferred_reported
+
+    def test_final_outrunning_watermark_reports_once(self):
+        worker = self._worker(maru_early_unpark_layers=1)
+        wmark, final = _FakeEvent(), _FakeEvent()
+        worker._deferred_watermark_events["r1"] = wmark
+        worker._deferred_events["r1"] = final
+        wmark.fired = True
+        final.fired = True
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.get_finished_loading() is None
+        assert not worker._deferred_watermark_events
+
+    def test_plain_deferred_load_unchanged(self):
+        worker = self._worker()
+        final = _FakeEvent()
+        worker._deferred_events["r1"] = final
+        assert worker.get_finished_loading() is None
+        final.fired = True
+        assert worker.get_finished_loading() == {"r1"}
+
+    def test_failure_before_watermark_never_reports_early(self):
+        worker = self._worker(maru_early_unpark_layers=1)
+        worker._early_layer_events["l0"] = [("r1", _FakeEvent())]
+        worker._deferred_watermark_events["r1"] = _FakeEvent()
+        meta = deferred_req_meta(
+            token_ids=list(range(64)), block_ids=[7, 8], num_matched_chunks=8
+        )
+        worker._fail_deferred_load(meta)
+
+        # Reported through the failure path (recompute), not the watermark,
+        # and no stale per-layer events remain for future steps to wait on.
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {7, 8}
+        assert not worker._early_layer_events
+        assert not worker._deferred_watermark_events
+
+    def test_wait_scoped_to_the_steps_own_requests(self):
+        """A step waits only on copies of requests it contains. v1 waited on
+        every in-flight copy, which stalled decode peers on other requests'
+        unfired events — measured +10% TPOT (results/20260811_040115)."""
+        worker = self._worker(maru_early_unpark_layers=1)
+        e1, e2 = _FakeEvent(), _FakeEvent()
+        worker._early_layer_events["l0"] = [("r1", e1), ("r2", e2)]
+
+        waited = []
+        stream = SimpleNamespace(wait_event=waited.append)
+        with patch("torch.cuda.current_stream", return_value=stream):
+            worker._step_req_ids = frozenset({"r1", "r2"})
+            worker.wait_for_layer_load("l0")
+            assert waited == [e1, e2]  # both in the step: both waited
+
+            waited.clear()
+            worker._step_req_ids = frozenset({"r1"})
+            worker.wait_for_layer_load("l0")
+            assert waited == [e1]  # r2's copy is not this step's problem
+
+            waited.clear()
+            worker._step_req_ids = frozenset()  # a pure decode-peer step
+            worker.wait_for_layer_load("l0")
+            worker.wait_for_layer_load("l1")  # no entries: legal no-op
+            assert waited == []
+
+    def test_step_membership_comes_from_the_metadata(self):
+        """start_load_kv refreshes the step scope every step, and the
+        scheduler publishes the step's request ids in the metadata."""
+        worker = self._worker(maru_early_unpark_layers=1)
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker._handler = MagicMock()  # keep _ensure_handler off real CXL
+        worker._step_req_ids = frozenset({"stale"})
+        fwd = SimpleNamespace(no_compile_layers={}, attn_metadata=None)
+        meta = MaruConnectorMetadata(step_req_ids={"r1", "r2"})
+        worker.start_load_kv(fwd, meta)
+        assert worker._step_req_ids == frozenset({"r1", "r2"})
+
+        sched = make_scheduler(block_size=4, kv_chunk_tokens=8)
+        out = fake_scheduler_output(num_scheduled_tokens={"a": 2, "b": 32})
+        built = sched.build_connector_meta(out)
+        assert built.step_req_ids == {"a", "b"}
+
+
 class TestDeferredLoading:
     CHUNK = 8
 
