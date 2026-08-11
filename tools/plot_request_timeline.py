@@ -15,6 +15,11 @@ Phases reconstructed from the log alone:
               measured; placed right after retrieve, where the job submits it)
     notify    GPU copy done -> reaped by get_finished_loading
 
+Layerwise-overlap runs (maru_enable_layerwise_overlap) emit no gpu-load
+line: the loader reports right after the retrieve and the copies run inside
+the resumed forward. There "sched wait" spans retrieve -> reschedule and
+"prefill" contains the overlapped per-layer copies.
+
 With ``--client results.jsonl`` (one JSON object per line, in submission
 order: {"name": ..., "start": epoch_s, "first_token": epoch_s, "end":
 epoch_s}), two more phases appear: prefill (notify -> first token) and decode
@@ -99,6 +104,11 @@ class Request:
             out.append(("notify", gpu_end, self.reap))
         if self.reap and self.resumed and self.resumed > self.reap:
             out.append(("sched wait", self.reap, self.resumed))
+        elif self.reap is None and r_end and self.resumed and self.resumed > r_end:
+            # Layerwise overlap: the loader reports right after the retrieve
+            # (no gpu-load line), so the whole retrieve -> reschedule gap is
+            # unpark latency. The per-layer copies then run inside "prefill".
+            out.append(("sched wait", r_end, self.resumed))
         ft, end = self.client.get("first_token"), self.client.get("end")
         anchor = self.resumed or self.reap or gpu_end
         if anchor and ft and ft > anchor:
