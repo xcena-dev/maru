@@ -1656,23 +1656,26 @@ class MaruWorkerConnector:
         if device is None or device.type != "cuda" or not torch.cuda.is_available():
             # Correctness fallback for CPU/mixed layouts. It preserves packed
             # storage but cannot overlap because there is no common CUDA stream.
-            for _, num_chunks, slot_mapping, infos in entries:
-                for layer_name, kv_cache_layer, true_idx in layers:
-                    for ci in range(num_chunks):
-                        slab_host = torch.frombuffer(
-                            infos[ci].view, dtype=kv_cache_layer.dtype
-                        ).view(2, self._num_layers, self._kv_chunk_tokens, -1)
-                        chunk_start = ci * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping[
-                            chunk_start : chunk_start + self._kv_chunk_tokens
-                        ]
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            slab_host[:, true_idx].to(kv_cache_layer.device),
-                            chunk_slots.to(kv_cache_layer.device),
-                            attn_metadata,
-                            layer_name,
-                        )
+            for req_meta, num_chunks, slot_mapping, infos in entries:
+                try:
+                    for layer_name, kv_cache_layer, true_idx in layers:
+                        for ci in range(num_chunks):
+                            slab_host = torch.frombuffer(
+                                infos[ci].view, dtype=kv_cache_layer.dtype
+                            ).view(2, self._num_layers, self._kv_chunk_tokens, -1)
+                            chunk_start = ci * self._kv_chunk_tokens
+                            chunk_slots = slot_mapping[
+                                chunk_start : chunk_start + self._kv_chunk_tokens
+                            ]
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                slab_host[:, true_idx].to(kv_cache_layer.device),
+                                chunk_slots.to(kv_cache_layer.device),
+                                attn_metadata,
+                                layer_name,
+                            )
+                except Exception as e:
+                    self._fail_load(req_meta, e)
             return
 
         if self._load_stream is None or self._load_stream_device != device:
@@ -1836,6 +1839,24 @@ class MaruWorkerConnector:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
 
+    def _fail_load(self, req_meta: MaruReqMeta, exc: Exception) -> None:
+        """Contain one request's load failure instead of letting it raise.
+
+        vLLM calls ``start_load_kv`` outside its own try, so an exception
+        from a load path (e.g. an unrecognized-layout refusal from inject)
+        would kill the engine. Reporting the blocks through
+        ``get_block_ids_with_load_errors`` makes vLLM recompute them, which
+        is the contract the refusal was designed for; a deferred request is
+        additionally marked done so it unparks.
+        """
+        logger.error(
+            "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
+        )
+        with self._deferred_lock:
+            self._failed_load_blocks.update(req_meta.block_ids)
+            if req_meta.deferred_load:
+                self._deferred_done.add(req_meta.req_id)
+
     def _abort_deferred_loads(self, metadata: MaruConnectorMetadata) -> None:
         """Degrade every deferred load in ``metadata`` to recompute.
 
@@ -1884,28 +1905,34 @@ class MaruWorkerConnector:
 
         for req_meta, num_chunks, slot_mapping, infos in entries:
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-            with torch.cuda.stream(load_stream):
-                slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
-                for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                    base = li * num_chunks
-                    for chunk_start, run_chunks, run_view in self._chunk_runs(
-                        infos[base : base + num_chunks]
-                    ):
-                        chunk_tensor = torch.frombuffer(
-                            run_view, dtype=kv_cache_layer.dtype
-                        )
-                        token_start = chunk_start * self._kv_chunk_tokens
-                        token_end = (chunk_start + run_chunks) * self._kv_chunk_tokens
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            chunk_tensor.to(device, non_blocking=True),
-                            slot_mapping_gpu[token_start:token_end],
-                            attn_metadata,
-                            layer_name,
-                            num_chunks=run_chunks,
-                        )
-                event = torch.cuda.Event()
-                event.record(load_stream)
+            try:
+                with torch.cuda.stream(load_stream):
+                    slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
+                    for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
+                        base = li * num_chunks
+                        for chunk_start, run_chunks, run_view in self._chunk_runs(
+                            infos[base : base + num_chunks]
+                        ):
+                            chunk_tensor = torch.frombuffer(
+                                run_view, dtype=kv_cache_layer.dtype
+                            )
+                            token_start = chunk_start * self._kv_chunk_tokens
+                            token_end = (
+                                chunk_start + run_chunks
+                            ) * self._kv_chunk_tokens
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                chunk_tensor.to(device, non_blocking=True),
+                                slot_mapping_gpu[token_start:token_end],
+                                attn_metadata,
+                                layer_name,
+                                num_chunks=run_chunks,
+                            )
+                    event = torch.cuda.Event()
+                    event.record(load_stream)
+            except Exception as e:
+                self._fail_load(req_meta, e)
+                continue
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
                 self._deferred_refs[req_meta.req_id] = [
@@ -1995,25 +2022,28 @@ class MaruWorkerConnector:
         attn_metadata: AttentionMetadata,
     ) -> None:
         """Inject prepared CXL chunks synchronously on the current stream."""
-        for _, num_chunks, slot_mapping, infos in prepared_requests:
-            for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                base = li * num_chunks
-                for ci in range(num_chunks):
-                    info = infos[base + ci]
-                    chunk_tensor = torch.frombuffer(
-                        info.view, dtype=kv_cache_layer.dtype
-                    )
-                    chunk_start = ci * self._kv_chunk_tokens
-                    chunk_slots = slot_mapping[
-                        chunk_start : chunk_start + self._kv_chunk_tokens
-                    ]
-                    self._inject_kv_into_layer(
-                        kv_cache_layer,
-                        chunk_tensor.to(kv_cache_layer.device),
-                        chunk_slots.to(kv_cache_layer.device),
-                        attn_metadata,
-                        layer_name,
-                    )
+        for req_meta, num_chunks, slot_mapping, infos in prepared_requests:
+            try:
+                for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
+                    base = li * num_chunks
+                    for ci in range(num_chunks):
+                        info = infos[base + ci]
+                        chunk_tensor = torch.frombuffer(
+                            info.view, dtype=kv_cache_layer.dtype
+                        )
+                        chunk_start = ci * self._kv_chunk_tokens
+                        chunk_slots = slot_mapping[
+                            chunk_start : chunk_start + self._kv_chunk_tokens
+                        ]
+                        self._inject_kv_into_layer(
+                            kv_cache_layer,
+                            chunk_tensor.to(kv_cache_layer.device),
+                            chunk_slots.to(kv_cache_layer.device),
+                            attn_metadata,
+                            layer_name,
+                        )
+            except Exception as e:
+                self._fail_load(req_meta, e)
 
     def _schedule_async_loads(
         self,
@@ -2062,33 +2092,43 @@ class MaruWorkerConnector:
             ]
             # Layer-major ordering is essential for inflight >1: layer 0 for
             # every request must become ready before work for later layers.
+            failed: set[int] = set()
             for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
                 use_fused = self._use_fused_load(attn_metadata, layer_name)
-                for (_, num_chunks, _, infos), slot_mapping_gpu in zip(
-                    prepared_requests, slot_mappings_gpu, strict=True
-                ):
-                    base = li * num_chunks
-                    for chunk_start, run_chunks, run_view in self._chunk_runs(
-                        infos[base : base + num_chunks]
-                    ):
-                        token_start = chunk_start * self._kv_chunk_tokens
-                        token_end = (chunk_start + run_chunks) * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping_gpu[token_start:token_end]
-                        if use_fused and self._fused_run_transfer(
-                            kv_cache_layer, run_view, run_chunks, chunk_slots
+                for ri, (
+                    (req_meta, num_chunks, _, infos),
+                    slot_mapping_gpu,
+                ) in enumerate(zip(prepared_requests, slot_mappings_gpu, strict=True)):
+                    if ri in failed:
+                        continue
+                    try:
+                        base = li * num_chunks
+                        for chunk_start, run_chunks, run_view in self._chunk_runs(
+                            infos[base : base + num_chunks]
                         ):
-                            continue
-                        chunk_tensor = torch.frombuffer(
-                            run_view, dtype=kv_cache_layer.dtype
-                        )
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            chunk_tensor.to(device, non_blocking=True),
-                            chunk_slots,
-                            attn_metadata,
-                            layer_name,
-                            num_chunks=run_chunks,
-                        )
+                            token_start = chunk_start * self._kv_chunk_tokens
+                            token_end = (
+                                chunk_start + run_chunks
+                            ) * self._kv_chunk_tokens
+                            chunk_slots = slot_mapping_gpu[token_start:token_end]
+                            if use_fused and self._fused_run_transfer(
+                                kv_cache_layer, run_view, run_chunks, chunk_slots
+                            ):
+                                continue
+                            chunk_tensor = torch.frombuffer(
+                                run_view, dtype=kv_cache_layer.dtype
+                            )
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                chunk_tensor.to(device, non_blocking=True),
+                                chunk_slots,
+                                attn_metadata,
+                                layer_name,
+                                num_chunks=run_chunks,
+                            )
+                    except Exception as e:
+                        failed.add(ri)
+                        self._fail_load(req_meta, e)
                 event = torch.cuda.Event()
                 event.record(load_stream)
                 self._layer_load_events[layer_name] = event
@@ -2162,10 +2202,27 @@ class MaruWorkerConnector:
         """
         if not self._fused_load:
             return False
+        layout = self._layout_for(kv_cache_layer)
+        if layout is None or layout.format_name is None:
+            # Unrecognized, or a layout the kernel constants cannot describe
+            # (MLA, fused K/V): keep the memcpy+inject fallback.
+            return False
+        if not kv_cache_layer.is_contiguous():
+            # single_layer_kv_transfer reads its dimensions positionally from
+            # the logical shape, so an HND (stride-permuted) cache would hand
+            # it swapped head/token axes.
+            return False
         obj_bytes = self._chunk_object_bytes()
         if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
             return False
         ops = self._lmc_ops
+        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        if kv_format is None:
+            logger.warning(
+                "Maru fused load: kernel has no format %s; using memcpy fallback",
+                layout.format_name,
+            )
+            return False
         ct = self._kv_chunk_tokens
         try:
             for i in range(run_chunks):
@@ -2178,7 +2235,7 @@ class MaruWorkerConnector:
                     kv_cache_layer,
                     chunk_slots[i * ct : (i + 1) * ct],
                     ops.TransferDirection.H2D,
-                    ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                    kv_format,
                     token_major=False,
                 )
         except Exception as e:
@@ -2235,41 +2292,48 @@ class MaruWorkerConnector:
         dtype = layers[0][1].dtype
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
-                if use_stream:
-                    slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-                slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
-                for ci in range(num_chunks):
-                    slab_view = slab_infos[ci].view
-                    chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
-                    # KV_2LTD host tensor aliasing pinned CXL: [2, L, tokens, h]
-                    slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
-                        2, num_layers, ct, -1
-                    )
-                    if kernel is not None:
-                        ops, ptrs, pbs, block_size, head_size, fmt = kernel
-                        ops.multi_layer_kv_transfer(
-                            slab_host,
-                            ptrs,
-                            chunk_slots,
-                            dev,
-                            pbs,
-                            ops.TransferDirection.H2D,
-                            fmt,
-                            block_size=block_size,
-                            head_size=head_size,
+                try:
+                    if use_stream:
+                        slot_mapping = self._pin_slot_mapping_for_async_h2d(
+                            slot_mapping
                         )
-                    else:
-                        # Fallback: per-layer slice -> inject (same slab).
-                        slab_dev = slab_host.to(dev, non_blocking=use_stream)
-                        for layer_name, kv_cache_layer, true_idx in layers:
-                            self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                slab_dev[:, true_idx],
+                    slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
+                    for ci in range(num_chunks):
+                        slab_view = slab_infos[ci].view
+                        chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                        # KV_2LTD host tensor aliasing pinned CXL:
+                        # [2, L, tokens, h]
+                        slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
+                            2, num_layers, ct, -1
+                        )
+                        if kernel is not None:
+                            ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                            ops.multi_layer_kv_transfer(
+                                slab_host,
+                                ptrs,
                                 chunk_slots,
-                                attn,
-                                layer_name,
-                                num_chunks=1,
+                                dev,
+                                pbs,
+                                ops.TransferDirection.H2D,
+                                fmt,
+                                block_size=block_size,
+                                head_size=head_size,
                             )
+                        else:
+                            # Fallback: per-layer slice -> inject (same slab).
+                            slab_dev = slab_host.to(dev, non_blocking=use_stream)
+                            for layer_name, kv_cache_layer, true_idx in layers:
+                                self._inject_kv_into_layer(
+                                    kv_cache_layer,
+                                    slab_dev[:, true_idx],
+                                    chunk_slots,
+                                    attn,
+                                    layer_name,
+                                    num_chunks=1,
+                                )
+                except Exception as e:
+                    self._fail_load(req_meta, e)
+                    continue
                 if req_meta.deferred_load:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)

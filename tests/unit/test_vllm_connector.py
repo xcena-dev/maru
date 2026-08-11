@@ -811,6 +811,27 @@ class TestKVLayerRoundtripAllLayouts:
 
         torch.testing.assert_close(got, src)
 
+    def test_rank4_fused_layer_not_read_through_registered_rank5_layout(self):
+        """Exact-shape matching in _layout_fits.
+
+        A rank-5 layout's block, token, and K/V axis positions can all land
+        on matching dims of a rank-4 fused tensor with two KV heads, which
+        would read the head axis as K/V. The layer must re-detect as fused.
+        """
+        flash = torch.zeros(self.NB, 2, self.BS, 2, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS,
+            kv_caches={"L0": flash},
+            num_kv_heads=2,
+            head_size=self.HS,
+        )
+        assert worker._kv_layout is not None and worker._kv_layout.kv_axis == 1
+
+        fused = torch.zeros(self.NB, 2, self.BS, 2 * self.HS)  # cpu_attn-style
+        layout = worker._layout_for(fused)
+        assert layout is not None
+        assert layout.kv_axis is None, "head axis misread as K/V"
+
     def test_odd_fused_width_is_refused_cleanly(self):
         """An odd fused row cannot be halved. No shipped backend emits one
         (turboquant explicitly rounds up to even), but the refusal must name
@@ -1420,6 +1441,41 @@ class TestDeferredLoading:
         assert worker.take_failed_load_blocks() == set()
         assert kv.abs().sum() > 0  # KV was actually injected
 
+    def test_load_failure_recomputes_instead_of_raising(self):
+        """An inject refusal during load must never escape start_load_kv.
+
+        vLLM calls start_load_kv outside its own try, so a raise here kills
+        the engine. The request's blocks must go through the failed-blocks
+        path (get_block_ids_with_load_errors) so vLLM recomputes them, and
+        the request must still unpark via get_finished_loading.
+        """
+        worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
+        chunk_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray(chunk_bytes)), region_id=0, page_index=i
+            )
+            for i in range(8)
+        ]
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = infos
+        worker._num_layers = 1
+
+        bad_cache = torch.zeros(3, 5)  # unrecognizable layout: inject refuses
+        fwd = SimpleNamespace(
+            no_compile_layers={"l0": SimpleNamespace(kv_cache=bad_cache)},
+            attn_metadata=None,
+        )
+        metadata = deferred_metadata(
+            token_ids=list(range(64)),
+            block_ids=list(range(16)),
+            num_matched_chunks=8,
+        )
+
+        worker.start_load_kv(fwd, metadata)  # must not raise
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+
 
 class TestAsyncDeferredPackedLoad:
     """True-async deferred loads: retrieve + H2D run on the loader thread."""
@@ -1908,7 +1964,12 @@ class TestFusedLoad:
     def _fake_ops(self):
         ops = MagicMock()
         ops.TransferDirection.H2D = "H2D"
-        ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS = "FLASH"
+        # A real namespace, not a MagicMock: the connector probes formats with
+        # getattr(..., None), which a MagicMock would satisfy for any name.
+        ops.EngineKVFormat = SimpleNamespace(
+            NL_X_TWO_NB_BS_NH_HS="FLASH",
+            NL_X_NB_TWO_BS_NH_HS="FLASH023",
+        )
         return ops
 
     def test_disabled_flag_skips_fused(self):
@@ -1923,14 +1984,27 @@ class TestFusedLoad:
         assert worker._use_fused_load(flash_meta, "l0") is True
         assert worker._use_fused_load({"l0": flash_meta}, "l0") is True
 
-    def test_fused_run_transfer_calls_kernel_per_chunk(self):
+    @pytest.mark.parametrize(
+        "shape,expected_format",
+        [
+            ((2, 4, 4, 1, 2), "FLASH"),  # legacy [2, NB, BS, NH, HS]
+            ((4, 2, 4, 1, 2), "FLASH023"),  # vLLM 0.23+ [NB, 2, BS, NH, HS]
+        ],
+        ids=["legacy", "vllm023"],
+    )
+    def test_fused_run_transfer_calls_kernel_per_chunk(self, shape, expected_format):
+        """The kernel format must follow the cache's actual axis order.
+
+        The pre-fix code hardcoded NL_X_TWO_NB_BS_NH_HS, so on vLLM 0.23+ the
+        kernel walked raw memory with the K/V and block axes swapped.
+        """
         worker = self._make_worker()
         ops = self._fake_ops()
         worker._lmc_ops = ops
         # (chunk x layer) object: [2, 8 tokens, hidden=2] fp32 = 128 B
         obj_bytes = 2 * self.CHUNK * 2 * 4
         worker._chunk_object_bytes = lambda: obj_bytes
-        kv_layer = torch.zeros(2, 4, 4, 1, 2)
+        kv_layer = torch.zeros(*shape)
         run_view = memoryview(bytearray(range(0, 256)))[: 2 * obj_bytes]
         slots = torch.arange(2 * self.CHUNK)
 
@@ -1942,8 +2016,54 @@ class TestFusedLoad:
         assert src.shape == (2, self.CHUNK, 2) and src.dtype == kv_layer.dtype
         assert dst is kv_layer
         assert slot_arg.tolist() == list(range(self.CHUNK, 2 * self.CHUNK))
-        assert args[3] == "H2D" and args[4] == "FLASH"
+        assert args[3] == "H2D" and args[4] == expected_format
         assert kwargs == {"token_major": False}
+
+    def test_fused_refuses_layout_without_kernel_format(self):
+        """rank-3 (sparse MLA) and fused caches carry no kernel format and
+        must fall back to memcpy+inject, mirroring _packed_load_kernel_ctx."""
+        worker = self._make_worker()
+        worker._lmc_ops = self._fake_ops()
+        worker._chunk_object_bytes = lambda: 128
+        kv_layer = torch.zeros(4, 4, 4)  # rank-3, block_size=4
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is False
+        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
+
+    def test_fused_refuses_missing_format_constant(self):
+        """An older c_ops build without the needed constant falls back."""
+        worker = self._make_worker()
+        ops = self._fake_ops()
+        del ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+        worker._lmc_ops = ops
+        worker._chunk_object_bytes = lambda: 128
+        kv_layer = torch.zeros(4, 2, 4, 1, 2)
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is False
+        assert ops.single_layer_kv_transfer.call_count == 0
+
+    def test_fused_refuses_non_contiguous_cache(self):
+        """single_layer_kv_transfer reads dimensions positionally from the
+        logical shape, so an HND (stride-permuted) cache would hand it
+        swapped head/token axes. Fall back instead."""
+        worker = self._make_worker()
+        worker._lmc_ops = self._fake_ops()
+        worker._chunk_object_bytes = lambda: 128
+        kv_layer = torch.zeros(4, 2, 2, 4, 2).permute(0, 1, 3, 2, 4)
+        assert tuple(kv_layer.shape) == (4, 2, 4, 2, 2)
+        assert not kv_layer.is_contiguous()
+
+        ok = worker._fused_run_transfer(
+            kv_layer, memoryview(bytearray(256)), 1, torch.arange(self.CHUNK)
+        )
+        assert ok is False
+        assert worker._lmc_ops.single_layer_kv_transfer.call_count == 0
 
     def test_fused_run_transfer_kernel_error_disables_and_falls_back(self):
         worker = self._make_worker()

@@ -44,6 +44,10 @@ class KVLayout:
             dimension (cpu_attn, flash_attn_diffkv, turboquant, MLA).
         block_axis: Index of the ``num_blocks`` axis.
         token_axis: Index of the ``block_size`` axis.
+        shape: The tensor shape this layout was detected from. A resolved
+            layout describes exactly this shape and no other; ``_layout_fits``
+            compares against it, so a hybrid model's differently-shaped layer
+            can never be read through another layer's geometry.
         format_name: ``lmcache.c_ops.EngineKVFormat`` member, or None when
             this layout has no kernel form and must use per-layer transfers.
             Read only by the packed-kernel path, which walks memory itself.
@@ -56,6 +60,7 @@ class KVLayout:
     kv_axis: int | None
     block_axis: int
     token_axis: int
+    shape: tuple[int, ...]
     format_name: str | None
 
     @property
@@ -74,7 +79,7 @@ def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
     out: list[KVLayout] = []
 
     def add(kv, blk, tok, nh, hs, fmt=None):
-        out.append(KVLayout(shape[blk], shape[tok], nh, hs, kv, blk, tok, fmt))
+        out.append(KVLayout(shape[blk], shape[tok], nh, hs, kv, blk, tok, shape, fmt))
 
     if rank == 5:
         # (NB, 2, BS, NH, HS) — flash_attn, flashinfer, flex, triton, aiter.
@@ -98,9 +103,13 @@ def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
         if shape[3] % 2 == 0:
             # K and V share the last dimension: (NB, BS, NH, 2*HS) for diffkv
             # and turboquant, (NB, NH, BS, 2*HS) for cpu_attn. No kernel
-            # format — LMCache's *_TWO_HS constants mean an even split, which
-            # diffkv (head_size + head_size_v) and turboquant (packed scales)
-            # do not provide. Per-layer transfers never read that dimension.
+            # format — maru's fused extract stores each token's row folded to
+            # [2, ntok, R/2] (K/V-half-major), while LMCache's *_TWO_HS slabs
+            # are token-major rows, and the current device kernels do not
+            # dispatch those constants at all (host gather/scatter path only).
+            # A token-major fused slab could use them later. The per-layer
+            # path never reads that dimension, which is also what keeps
+            # diffkv's uneven split and turboquant's packed scales safe.
             add(None, 0, 1, shape[2], shape[3] // 2)
             add(None, 0, 2, shape[1], shape[3] // 2)
     elif rank == 3:
@@ -225,14 +234,12 @@ def _vllm_kv_cache_layout() -> str:
 
 
 def _layout_fits(layout: KVLayout, shape: tuple[int, ...]) -> bool:
-    """Whether ``layout``'s axis assignments describe ``shape``."""
-    try:
-        if shape[layout.block_axis] != layout.num_blocks:
-            return False
-        if shape[layout.token_axis] != layout.block_size:
-            return False
-        if layout.kv_axis is not None and shape[layout.kv_axis] != 2:
-            return False
-    except IndexError:
-        return False
-    return True
+    """Whether ``layout`` describes ``shape``: exact shape equality.
+
+    Checking only the named axes was not enough — a rank-5 layout's block,
+    token, and K/V positions can all land on matching dims of a rank-4 fused
+    tensor with two KV heads, which would read the head axis as K/V. A layout
+    is detected from one concrete shape and applies to that shape alone;
+    anything else re-detects.
+    """
+    return tuple(shape) == layout.shape
