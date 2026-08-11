@@ -246,10 +246,9 @@ class MaruReqMeta:
     # For load: the request is parked in WAITING_FOR_REMOTE_KVS and the worker
     # loads between scheduler steps, reporting completion via get_finished().
     deferred_load: bool = False
-    # Adaptive packed-layerwise mode: the loader thread stops after retrieve
-    # and the resumed forward pipelines this request by layer. Scheduler sets
-    # this only for a singleton deferred-admission batch; at higher admission
-    # concurrency the completed whole-request background DMA remains faster.
+    # Packed-layerwise mode: the loader thread stops after retrieve and the
+    # resumed forward pipelines this request by layer. Set for every deferred
+    # load when maru_enable_layerwise_overlap is on, at any concurrency.
     layerwise_load: bool = False
     # Per-step memo of _chunk_keys(token_ids). The same MaruReqMeta object is
     # shared across a step's per-layer save_kv_layer calls (and the step's
@@ -333,8 +332,10 @@ class MaruKVConnector(KVConnectorBase_V1):
             storage, park only through the Maru retrieve RPC. The resumed
             forward transfers each layer on a dedicated CUDA stream and waits
             on per-layer events, overlapping layer k+1 load with layer k
-            compute. Requires maru_enable_deferred_loading=true and
-            maru_use_layerwise=false (default: false)
+            compute. Applies to every deferred load at any concurrency; a
+            step's activations share one event per layer. Requires
+            maru_enable_deferred_loading=true and maru_use_layerwise=false
+            (default: false)
         maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
             two-stage load with one fused gather-scatter kernel that reads
             the CXL pages directly (LMCache single_layer_kv_transfer).
@@ -582,11 +583,9 @@ class MaruSchedulerConnector:
         # by the next build_connector_meta. req_id -> (request,
         # num_matched_chunks, block_ids).
         self._pending_deferred_loads: dict[str, tuple[Request, int, list[int]]] = {}
-        # Deferred-hit requests that are still live in the scheduler. Pending
-        # admissions alone are not a concurrency signal: a burst may arrive
-        # one request per scheduler step while earlier requests are decoding.
-        # Keep the live set until finish/preemption so packed-layerwise is used
-        # only when the serving workload is actually singleton.
+        # Deferred-hit requests that are still live in the scheduler, kept
+        # until finish/preemption. Diagnostics/introspection only since
+        # packed-layerwise stopped gating on singleton concurrency.
         self._active_deferred_req_ids: set[str] = set()
         # Requests emitted for deferred packed loading remain here until vLLM's
         # second update_state_after_alloc call says they are ready to resume.
@@ -803,17 +802,19 @@ class MaruSchedulerConnector:
         # Deferred loads first: these requests are parked in
         # WAITING_FOR_REMOTE_KVS (not scheduled), so their load metadata is
         # emitted exactly once here, from state stashed at allocation time.
-        layerwise_singleton = (
-            self._layerwise_overlap
-            and len(self._pending_deferred_loads) == 1
-            and len(self._active_deferred_req_ids) == 1
-        )
+        # With layerwise overlap on, every deferred load parks only through
+        # the retrieve and lets its resumed forward pull layers; concurrent
+        # activations share one event per layer on the load stream (FIFO), so
+        # a later activation's waits subsume earlier copies. The events live
+        # for a single step (cleared at the next start_load_kv), so only the
+        # activation step's own forward ever gates on them.
+        layerwise = self._layerwise_overlap
         for req_id, (
             request,
             num_chunks,
             block_ids,
         ) in self._pending_deferred_loads.items():
-            if layerwise_singleton:
+            if layerwise:
                 self._deferred_layerwise_waiting.add(req_id)
             if self._timing:
                 self._awaiting_resume.add(req_id)
@@ -825,7 +826,7 @@ class MaruSchedulerConnector:
                     is_store=False,
                     num_matched_chunks=num_chunks,
                     deferred_load=True,
-                    layerwise_load=layerwise_singleton,
+                    layerwise_load=layerwise,
                 )
             )
         self._pending_deferred_loads.clear()

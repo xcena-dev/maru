@@ -1375,7 +1375,15 @@ class TestDeferredLoading:
         assert second.layerwise_load_req_ids == {"r1"}
         assert sched.build_connector_meta(empty).layerwise_load_req_ids == set()
 
-    def test_concurrent_deferred_batch_keeps_whole_request_dma(self):
+    def test_concurrent_deferred_batch_goes_layerwise(self):
+        """Concurrent deferred loads all take the layerwise-overlap path.
+
+        The first cut gated layerwise on a singleton load (exactly one
+        pending and one active) and sent concurrent batches to whole-request
+        DMA, where the copy sits on the TTFT critical path. Generalized, the
+        knob alone decides: every deferred load parks only through the
+        retrieve and lets its resumed forward pull layers.
+        """
         sched = self._make_scheduler(layerwise_overlap=True)
         for req_id in ("r1", "r2"):
             request = SimpleNamespace(
@@ -1391,10 +1399,10 @@ class TestDeferredLoading:
         metadata = sched.build_connector_meta(output)
 
         assert len(metadata.requests) == 2
-        assert not any(request.layerwise_load for request in metadata.requests)
-        assert sched._deferred_layerwise_waiting == set()
+        assert all(request.layerwise_load for request in metadata.requests)
+        assert sched._deferred_layerwise_waiting == {"r1", "r2"}
 
-    def test_staggered_admission_sees_live_deferred_concurrency(self):
+    def test_staggered_admission_stays_layerwise(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         output = fake_scheduler_output()
 
@@ -1416,13 +1424,49 @@ class TestDeferredLoading:
         sched.update_state_after_alloc(second_request, second_blocks, 64)
         second = sched.build_connector_meta(output)
 
-        assert not second.requests[0].layerwise_load
+        assert second.requests[0].layerwise_load
         assert sched._active_deferred_req_ids == {"r1", "r2"}
 
         finished = SimpleNamespace(**vars(output))
         finished.finished_req_ids = {"r1"}
         sched.build_connector_meta(finished)
         assert sched._active_deferred_req_ids == {"r2"}
+
+    def test_concurrent_layerwise_handshake_activates_both(self):
+        """Both resumed requests reach layerwise_load_req_ids the same step."""
+        sched = self._make_scheduler(layerwise_overlap=True)
+        empty = fake_scheduler_output()
+        requests = []
+        for req_id in ("r1", "r2"):
+            request = SimpleNamespace(
+                request_id=req_id,
+                prompt_token_ids=list(range(64)),
+            )
+            requests.append(request)
+            sched._last_match_result[req_id] = 8
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([3, 4, 5],)
+            sched.update_state_after_alloc(request, blocks, 64)
+        first = sched.build_connector_meta(empty)
+        assert all(r.layerwise_load for r in first.requests)
+
+        for request in requests:
+            sched.update_state_after_alloc(request, MagicMock(), 0)
+        resumed = [
+            fake_new_request_data(
+                prompt_token_ids=request.prompt_token_ids,
+                block_ids=[3, 4, 5],
+                req_id=request.request_id,
+            )
+            for request in requests
+        ]
+        output = fake_scheduler_output(
+            resumed, empty.scheduled_cached_reqs, {"r1": 1, "r2": 1}
+        )
+
+        second = sched.build_connector_meta(output)
+        assert second.layerwise_load_req_ids == {"r1", "r2"}
+        assert sched.build_connector_meta(empty).layerwise_load_req_ids == set()
 
     def test_failed_deferred_load_reports_blocks_and_completion(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
@@ -1623,6 +1667,56 @@ class TestAsyncDeferredPackedLoad:
         torch.testing.assert_close(kv1, source[:, 1].view_as(kv1))
         assert worker._deferred_layerwise_loads == {}
         assert worker._layer_load_events == {}
+
+    def test_layerwise_activation_handles_concurrent_requests(self):
+        """One activation step drains every retained load, not just one."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 1
+        kv = torch.zeros(2, 2, 4, 1)
+        for i, req_id in enumerate(("r1", "r2")):
+            source = torch.full((2, 1, 4, 1), float(i + 1))
+            info = SimpleNamespace(
+                view=memoryview(bytearray(source.numpy().tobytes())),
+                region_id=0,
+                page_index=i,
+            )
+            meta = deferred_req_meta(
+                token_ids=list(range(4)),
+                block_ids=[i],
+                num_matched_chunks=1,
+                req_id=req_id,
+            )
+            worker._deferred_layerwise_loads[req_id] = (
+                meta,
+                1,
+                torch.arange(i * 4, (i + 1) * 4),
+                [info],
+            )
+        forward = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv)
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1", "r2"}),
+        )
+
+        torch.testing.assert_close(kv[:, 0], torch.full((2, 4, 1), 1.0))
+        torch.testing.assert_close(kv[:, 1], torch.full((2, 4, 1), 2.0))
+        assert worker._deferred_layerwise_loads == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_layerwise_activation_records_one_event_per_layer(self):
