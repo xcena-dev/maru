@@ -37,14 +37,25 @@ from dataclasses import dataclass, field
 
 # Validated categorical palette (dataviz reference, light mode, fixed slot
 # order — do not re-order: the order is the CVD-safety mechanism).
-PHASE_ORDER = ["queue", "retrieve", "gpu copy", "notify", "prefill", "decode"]
+PHASE_ORDER = [
+    "wait",  # client sent -> loader picked it up (HTTP+tokenize+queue+lookup)
+    "queue",
+    "retrieve",
+    "gpu copy",
+    "notify",
+    "sched wait",  # load reaped -> vLLM rescheduled the request (engine-exact)
+    "prefill",
+    "decode",
+]
 PHASE_COLORS = {
-    "queue": "#2a78d6",
-    "retrieve": "#eb6834",
-    "gpu copy": "#1baf7a",
-    "notify": "#eda100",
-    "prefill": "#e87ba4",
-    "decode": "#008300",
+    "wait": "#2a78d6",
+    "queue": "#eb6834",
+    "retrieve": "#1baf7a",
+    "gpu copy": "#eda100",
+    "notify": "#e87ba4",
+    "sched wait": "#008300",
+    "prefill": "#e34948",
+    "decode": "#4a3aa7",
 }
 SURFACE, INK, INK_2 = "#fcfcfb", "#1a1a19", "#5f5e56"
 
@@ -61,11 +72,19 @@ class Request:
     retrieve_ms: float | None = None
     gpu_ms: float | None = None
     reap: float | None = None  # emitted at get_finished_loading
+    resumed: float | None = None  # vLLM rescheduled the request
+    resumed_ntok: int | None = None  # tokens it was given to recompute
     client: dict = field(default_factory=dict)
+    # Sub-phase durations, reported in the stats table only (they overlap or
+    # nest inside the bar phases, so drawing them would double-count).
+    extras: dict[str, float] = field(default_factory=dict)
 
     def phases(self) -> list[tuple[str, float, float]]:
         """Return (phase, start_epoch, end_epoch) tuples, best effort."""
         out = []
+        arrive = self.client.get("arrive_epoch")
+        if arrive and self.submit and self.submit > arrive:
+            out.append(("wait", arrive, self.submit))
         r_end = self.retrieve_end
         r_start = r_end - self.retrieve_ms / 1e3 if r_end and self.retrieve_ms else None
         if self.submit and r_start:
@@ -78,13 +97,19 @@ class Request:
             out.append(("gpu copy", r_end, gpu_end))
         if gpu_end and self.reap and self.reap > gpu_end:
             out.append(("notify", gpu_end, self.reap))
+        if self.reap and self.resumed and self.resumed > self.reap:
+            out.append(("sched wait", self.reap, self.resumed))
         ft, end = self.client.get("first_token"), self.client.get("end")
-        anchor = self.reap or gpu_end
+        anchor = self.resumed or self.reap or gpu_end
         if anchor and ft and ft > anchor:
             out.append(("prefill", anchor, ft))
         if ft and end and end > ft:
             out.append(("decode", ft, end))
         return out
+
+    @property
+    def label(self) -> str:
+        return self.client.get("name") or self.req_id
 
 
 def parse_log(path: str) -> dict[str, Request]:
@@ -111,6 +136,20 @@ def parse_log(path: str) -> dict[str, Request]:
             r.retrieve_end, r.retrieve_ms = t, float(ms.group("ms"))
         elif msg.startswith("deferred gpu-load") and ms:
             r.gpu_ms, r.reap = float(ms.group("ms")), t
+        elif msg.startswith("resumed sched"):
+            r.resumed = t
+            mt = re.search(r"resumed sched (\d+) tok", msg)
+            r.resumed_ntok = int(mt.group(1)) if mt else None
+        elif ms:
+            # Sub-phases nested inside the bar phases: table-only.
+            for tag in (
+                "deferred slots",
+                "deferred pin",
+                "deferred submit",
+                "admission wait",
+            ):
+                if msg.startswith(tag):
+                    r.extras[tag] = float(ms.group("ms"))
     return reqs
 
 
@@ -125,16 +164,71 @@ def join_client(reqs: dict[str, Request], path: str) -> None:
         r.client = rec
 
 
+def join_naru_csv(reqs: dict[str, Request], path: str) -> None:
+    """Join a naru per-request CSV exactly, and drop unjoined requests.
+
+    The CSV's ``response_id`` is a prefix of the engine request id, so the
+    join is exact, not order-based. Its times are relative to the round
+    start; the round's epoch t0 is recovered from two hard constraints that
+    hold because client and engine share one clock: the first token cannot
+    precede the load's completion (reap), and the load cannot start before
+    the client sent the request. Requests absent from the CSV (e.g. the
+    warmup round) are removed, so the chart shows exactly the CSV's round.
+    """
+    import csv as _csv
+
+    rows = list(_csv.DictReader(open(path)))
+    by_prefix = {row["response_id"]: row for row in rows}
+
+    joined: list[tuple[Request, dict]] = []
+    for r in list(reqs.values()):
+        rec = next((v for k, v in by_prefix.items() if r.req_id.startswith(k)), None)
+        if rec is None:
+            del reqs[r.req_id]
+            continue
+        joined.append((r, rec))
+
+    # t0 feasibility band: reap_i <= t0 + ft_rel_i  and  t0 + start_rel_i <=
+    # submit_i for every joined request. Midpoint balances the two errors.
+    lo, hi = [], []
+    for r, rec in joined:
+        ft_rel, start_rel = float(rec["ttft_time"]), float(rec["request_start"])
+        if r.reap:
+            lo.append(r.reap - ft_rel)
+        if r.submit:
+            hi.append(r.submit - start_rel)
+    if not lo or not hi:
+        print("naru-csv: not enough engine anchors to place client times")
+        return
+    t0 = (max(lo) + min(hi)) / 2
+    slack = (min(hi) - max(lo)) * 1e3
+    print(f"naru-csv: joined {len(joined)} requests, anchor slack {slack:.0f} ms")
+    for r, rec in joined:
+        r.client = {
+            "name": f"r{rec['prompt_id']} ({rec['response_id']})",
+            "arrive_epoch": t0 + float(rec["request_start"]),
+            "first_token": t0 + float(rec["ttft_time"]),
+            "end": t0 + float(rec["request_end"]),
+        }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("log", help="engine stderr log with 'Maru timing' lines")
     ap.add_argument("--client", help="client JSONL: name/start/first_token/end")
+    ap.add_argument(
+        "--naru-csv",
+        help="naru per-request CSV (e.g. inst2_query_round.csv): exact join "
+        "by response_id, chart restricted to that round",
+    )
     ap.add_argument("--out", default="timeline.png")
     ap.add_argument("--title", default="Per-request KV load timeline")
     args = ap.parse_args()
 
     reqs = parse_log(args.log)
-    if args.client:
+    if args.naru_csv:
+        join_naru_csv(reqs, args.naru_csv)
+    elif args.client:
         join_client(reqs, args.client)
     rows = [r for r in reqs.values() if r.phases()]
     rows.sort(key=lambda r: r.submit or r.retrieve_end or 0)
@@ -149,15 +243,32 @@ def main() -> int:
             durations[name].append((e - s) * 1e3)
 
     # Table view (also the relief for below-3:1 slots in the legend).
-    print(f"{'phase':<10} {'n':>4} {'median ms':>10} {'p90 ms':>10} {'max ms':>10}")
+    extras: dict[str, list[float]] = {}
+    for r in rows:
+        for tag, v in r.extras.items():
+            extras.setdefault(tag, []).append(v)
+    print(f"{'phase':<16} {'n':>4} {'median ms':>10} {'p90 ms':>10} {'max ms':>10}")
     for name in PHASE_ORDER:
         d = durations[name]
         if not d:
             continue
         d.sort()
         print(
-            f"{name:<10} {len(d):>4} {statistics.median(d):>10.1f} "
+            f"{name:<16} {len(d):>4} {statistics.median(d):>10.1f} "
             f"{d[int(0.9 * (len(d) - 1))]:>10.1f} {d[-1]:>10.1f}"
+        )
+    for name in sorted(extras):
+        d = sorted(extras[name])
+        print(
+            f"  {name:<14} {len(d):>4} {statistics.median(d):>10.1f} "
+            f"{d[int(0.9 * (len(d) - 1))]:>10.1f} {d[-1]:>10.1f}  (nested)"
+        )
+
+    ntoks = sorted(r.resumed_ntok for r in rows if r.resumed_ntok is not None)
+    if ntoks:
+        print(
+            f"recomputed tokens per resumed request: median "
+            f"{ntoks[len(ntoks) // 2]}, max {ntoks[-1]}"
         )
 
     import matplotlib
@@ -182,7 +293,7 @@ def main() -> int:
                 linewidth=0.8,
             )
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([r.req_id for r in rows], fontsize=7, color=INK_2)
+    ax.set_yticklabels([r.label for r in rows], fontsize=7, color=INK_2)
     ax.invert_yaxis()
     ax.set_xlabel("time since round start (ms)", color=INK_2)
     ax.set_title(args.title, color=INK, loc="left", fontsize=12)
