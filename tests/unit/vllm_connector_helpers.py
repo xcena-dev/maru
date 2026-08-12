@@ -37,6 +37,8 @@ def make_worker(
     block_size: int,
     kv_chunk_tokens: int,
     extra_config: dict[str, Any] | None = None,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
 ) -> MaruWorkerConnector:
     """Construct a MaruWorkerConnector (no CXL hardware or GPU required)."""
     from maru_vllm.connector import MaruWorkerConnector
@@ -45,12 +47,16 @@ def make_worker(
         block_size=block_size,
         kv_chunk_tokens=kv_chunk_tokens,
         extra_config={} if extra_config is None else extra_config,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
     )
 
 
 def make_bare_worker(
     block_size: int = 16,
     kv_caches: dict[str, Any] | None = None,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
 ) -> MaruWorkerConnector:
     """Allocate a MaruWorkerConnector without running __init__.
 
@@ -61,8 +67,15 @@ def make_bare_worker(
 
     worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
     worker._block_size = block_size
+    worker._kv_caches = {}
+    worker._num_kv_heads = num_kv_heads
+    worker._head_size = head_size
+    # Resolved in register_kv_caches on a real connector; do it here so layout
+    # aware helpers see the same value they would in production.
+    worker._kv_layout = None
     if kv_caches is not None:
         worker._kv_caches = kv_caches
+        worker._kv_layout = worker._resolve_kv_layout(kv_caches)
     return worker
 
 

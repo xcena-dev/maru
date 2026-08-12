@@ -345,23 +345,214 @@ class TestChunkObjectBytes:
     def _make_worker(self, block_size=16, chunk_tokens=256):
         return make_worker(block_size=block_size, kv_chunk_tokens=chunk_tokens)
 
-    def test_flash_layout(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(2, 8, 16, 8, dtype=torch.float16)}
+    def _with_caches(self, worker, tensor):
+        """Register caches the way the worker does, resolving the layout."""
+        worker._kv_caches = {"layer": tensor}
+        worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+        return worker
 
-        assert worker._chunk_object_bytes() == 2 * 8 * 256 * 2
+    def test_flash_layout_kv_axis_first(self):
+        """vLLM <= 0.22.1 on CUDA, and ROCm throughout: [2, NB, BS, NH, HS]."""
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(2, 8, 16, 4, 2, dtype=torch.float16)
+        )
+
+        assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
+
+    def test_flash_layout_kv_axis_second(self):
+        """vLLM 0.23.0+ moved the K/V axis to position 1: [NB, 2, BS, NH, HS].
+
+        Same tensor, same bytes per token. Reading the axes positionally made
+        the connector skip every store on this layout, which is how a real run
+        ended up with a 0% cache hit rate.
+        """
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(8, 2, 16, 4, 2, dtype=torch.float16)
+        )
+
+        assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
 
     def test_mla_layout(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(8, 16, 12, dtype=torch.float16)}
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(8, 16, 12, dtype=torch.float16)
+        )
 
         assert worker._chunk_object_bytes() == 12 * 256 * 2
 
     def test_unrecognized_layout_keeps_default(self):
-        worker = self._make_worker()
-        worker._kv_caches = {"layer": torch.empty(3, 5, dtype=torch.float16)}
+        worker = self._with_caches(
+            self._make_worker(), torch.empty(3, 5, dtype=torch.float16)
+        )
 
         assert worker._chunk_object_bytes() is None
+
+    def test_block_size_mismatch_keeps_default(self):
+        """A layout whose block axis disagrees with vLLM's configured block
+        size means the axes were misread, so refuse rather than size a page
+        from a plausible-looking wrong number."""
+        worker = self._with_caches(
+            self._make_worker(block_size=32),
+            torch.empty(8, 2, 16, 4, 2, dtype=torch.float16),
+        )
+
+        assert worker._chunk_object_bytes() is None
+
+
+class TestDetectKVLayout:
+    """``_detect_kv_layout`` is pure, so every axis order is checkable here.
+
+    The shapes below are each some shipped vLLM backend's
+    ``get_kv_cache_shape()`` return value, not hypotheticals.
+    """
+
+    NB, BS, NH, HS = 7, 16, 4, 32
+
+    def _expect(self, shape, kv_layout, axes, fmt, **kw):
+        """Assert the resolved dims and (kv, block, token) axis indices."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        got = _detect_kv_layout(shape, self.BS, kv_layout, **kw)
+        assert got is not None, f"{shape} {kv_layout} went unrecognized"
+        assert (got.num_blocks, got.block_size, got.num_heads, got.head_size) == (
+            self.NB,
+            self.BS,
+            self.NH,
+            self.HS,
+        )
+        assert got.page_buffer_size == self.NB * self.BS
+        assert (got.kv_axis, got.block_axis, got.token_axis) == axes
+        assert got.format_name == fmt
+        return got
+
+    def test_kv_axis_first(self):
+        """``(2, NB, BS, NH, HS)`` — rocm_attn."""
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((2, nb, bs, nh, hs), "NHD", (0, 1, 2), "NL_X_TWO_NB_BS_NH_HS")
+
+    def test_kv_axis_second(self):
+        """``(NB, 2, BS, NH, HS)`` — flash_attn, flashinfer, flex, triton."""
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((nb, 2, bs, nh, hs), "NHD", (1, 0, 2), "NL_X_NB_TWO_BS_NH_HS")
+
+    def test_hnd_moves_no_axis_only_the_kernel_format(self):
+        """HND permutes strides, not axes.
+
+        vLLM allocates with the NHD/HND permutation applied and then permutes
+        straight back (``gpu_model_runner``: ``kv_cache.permute(*inv_order)``),
+        so the shape handed to the connector is identical under both. Reading
+        HND as a different axis order made every HND deployment fail the
+        block_size cross-check and go unrecognized — the same empty-pool
+        outcome this detection exists to prevent. Only the kernel, which walks
+        raw memory, sees the difference.
+        """
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        nhd = self._expect(
+            (nb, 2, bs, nh, hs), "NHD", (1, 0, 2), "NL_X_NB_TWO_BS_NH_HS"
+        )
+        hnd = self._expect(
+            (nb, 2, bs, nh, hs), "HND", (1, 0, 2), "NL_X_NB_TWO_NH_BS_HS"
+        )
+        assert (nhd.kv_axis, nhd.block_axis, nhd.token_axis) == (
+            hnd.kv_axis,
+            hnd.block_axis,
+            hnd.token_axis,
+        )
+
+    def test_fused_last_dimension(self):
+        """K and V sharing the last dimension, both orders.
+
+        ``(NB, BS, NH, 2*HS)`` is flash_attn_diffkv and turboquant_attn;
+        ``(NB, NH, BS, 2*HS)`` is cpu_attn. Neither gets a kernel format: the
+        LMCache ``*_TWO_HS`` constants describe an even K/V split, which
+        diffkv (head_size + head_size_v) and turboquant (packed scales) do not
+        provide.
+        """
+        nb, bs, nh, hs = self.NB, self.BS, self.NH, self.HS
+        self._expect((nb, bs, nh, 2 * hs), "NHD", (None, 0, 1), None)
+        self._expect((nb, nh, bs, 2 * hs), "HND", (None, 0, 2), None)
+
+    def test_fused_orders_separated_by_num_kv_heads(self):
+        """When num_kv_heads == block_size the two fused orders are identical
+        shapes, and only the engine's own head count can tell them apart."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        bs = self.BS
+        shape = (self.NB, bs, bs, 2 * self.HS)  # NH == BS: ambiguous alone
+        got = _detect_kv_layout(shape, bs, "NHD", num_kv_heads=bs, head_size=self.HS)
+        assert got is not None
+        assert got.num_heads == bs
+
+    def test_head_count_rejects_a_wrong_reading(self):
+        """A candidate that parses but disagrees with the engine is refused."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, self.NH, self.HS)
+        assert (
+            _detect_kv_layout(shape, self.BS, "NHD", num_kv_heads=self.NH) is not None
+        )
+        assert (
+            _detect_kv_layout(shape, self.BS, "NHD", num_kv_heads=self.NH + 1) is None
+        )
+
+    def test_two_kv_heads_does_not_hijack_a_fused_shape(self):
+        """``(NB, 2, BS, F)`` from cpu_attn with 2 KV heads must not read as a
+        K/V axis at position 1, which would treat the head axis as K/V."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, 2 * self.HS)
+        got = _detect_kv_layout(
+            shape, self.BS, "HND", num_kv_heads=2, head_size=self.HS
+        )
+        assert got is not None
+        assert got.kv_axis is None, "fused shape misread as having a K/V axis"
+        assert (got.block_axis, got.token_axis, got.num_heads) == (0, 2, 2)
+
+    def test_mla(self):
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
+        assert got is not None
+        assert got.page_buffer_size == self.NB * self.BS
+        assert (got.kv_axis, got.block_axis, got.token_axis) == (None, 0, 1)
+
+    def test_mla_gets_no_kernel_format(self):
+        """rank-3 must stay off the raw-pointer kernel (pre-detection gating
+        was dim() != 5). The fused transfer path stores K/V-half-major bytes,
+        not the token-major rows NL_X_NB_BS_HS describes, and sparse-MLA
+        metadata is not MLACommonMetadata, so a format here would reach the
+        kernel and silently mis-order memory."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        got = _detect_kv_layout((self.NB, self.BS, 656), self.BS, "NHD")
+        assert got is not None and got.format_name is None
+
+    def test_two_blocks_resolves_to_the_common_backend(self):
+        """(2, 2, BS, NH, HS): a flash_attn cache with num_blocks == 2 also
+        parses as rocm_attn and no cross-check can separate the two, so the
+        tie must go to the far more common kv_axis=1 family."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        got = _detect_kv_layout(
+            (2, 2, self.BS, self.NH, self.HS),
+            self.BS,
+            "NHD",
+            num_kv_heads=self.NH,
+            head_size=self.HS,
+        )
+        assert got is not None
+        assert got.kv_axis == 1
+
+    def test_rejects_when_block_size_disagrees(self):
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        shape = (self.NB, 2, self.BS, self.NH, self.HS)
+        # Block size the engine never configured.
+        assert _detect_kv_layout(shape, 32, "NHD") is None
+
+    def test_rejects_unknown_rank(self):
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        assert _detect_kv_layout((3, 5), self.BS, "NHD") is None
 
 
 class TestRegisterKVCaches:
@@ -604,6 +795,213 @@ class TestKVLayerRoundtrip:
         torch.testing.assert_close(extracted, src_data)
 
 
+# Every shape below is some shipped backend's get_kv_cache_shape() output.
+# (label, shape_fn(nb, bs, nh, hs), num_kv_heads)
+_PAGED_LAYOUTS = [
+    ("rocm_attn", lambda nb, bs, nh, hs: (2, nb, bs, nh, hs), None),
+    ("flash_attn", lambda nb, bs, nh, hs: (nb, 2, bs, nh, hs), None),
+    ("diffkv_fused", lambda nb, bs, nh, hs: (nb, bs, nh, 2 * hs), None),
+    ("cpu_attn_fused", lambda nb, bs, nh, hs: (nb, nh, bs, 2 * hs), None),
+    ("flash_attn_2_kv_heads", lambda nb, bs, nh, hs: (nb, 2, bs, 2, hs), 2),
+    ("cpu_attn_2_kv_heads", lambda nb, bs, nh, hs: (nb, 2, bs, 2 * hs), 2),
+]
+
+
+class TestKVLayerRoundtripAllLayouts:
+    """inject -> extract must be an exact identity for every layout accepted.
+
+    The pre-existing round-trip tests only ever built ``[2, NB, BS, HD]``, so
+    a ``_inject_kv_into_layer`` that hardcoded that order stayed green while
+    it was broken for every other backend. These parametrize the shape.
+    """
+
+    NB, BS, NH, HS = 5, 4, 3, 8
+
+    def _cache(self, shape_fn, hnd_strides=False):
+        shape = shape_fn(self.NB, self.BS, self.NH, self.HS)
+        t = torch.zeros(shape)
+        if hnd_strides and len(shape) == 5:
+            # Reproduce what HND allocation leaves behind: same shape, head and
+            # block axes swapped in memory, so the tensor is not contiguous.
+            t = t.permute(0, 1, 3, 2, 4).contiguous().permute(0, 1, 3, 2, 4)
+            assert not t.is_contiguous()
+        return t
+
+    @pytest.mark.parametrize(
+        "label,shape_fn,num_kv_heads",
+        _PAGED_LAYOUTS,
+        ids=[layout[0] for layout in _PAGED_LAYOUTS],
+    )
+    @pytest.mark.parametrize("hnd_strides", [False, True], ids=["nhd", "hnd"])
+    def test_roundtrip(self, label, shape_fn, num_kv_heads, hnd_strides):
+        kv_cache = self._cache(shape_fn, hnd_strides)
+        worker = make_bare_worker(
+            block_size=self.BS,
+            kv_caches={"layer0": kv_cache},
+            num_kv_heads=num_kv_heads,
+            head_size=self.HS,
+        )
+        assert worker._kv_layout is not None, f"{label} {tuple(kv_cache.shape)}"
+
+        ntok = 2 * self.BS
+        hidden = kv_cache.numel() // (2 * self.NB * self.BS)
+        src = torch.randn(2, ntok, hidden)
+        # Slots from two different pages, so a wrong block/offset split shows.
+        slots = torch.cat(
+            [torch.arange(self.BS), torch.arange(3 * self.BS, 4 * self.BS)]
+        )
+        meta = make_flash_attn_metadata()
+
+        worker._inject_kv_into_layer(kv_cache, src, slots, meta, "layer0")
+        got = worker._extract_kv_from_layer(kv_cache, slots, meta, "layer0")
+
+        torch.testing.assert_close(got, src)
+
+    def test_untouched_slots_stay_zero(self):
+        """A wrong axis split can round-trip and still scribble elsewhere."""
+        kv_cache = self._cache(lambda nb, bs, nh, hs: (nb, 2, bs, nh, hs))
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"layer0": kv_cache}, head_size=self.HS
+        )
+        slots = torch.arange(self.BS)
+        meta = make_flash_attn_metadata()
+        worker._inject_kv_into_layer(
+            kv_cache, torch.randn(2, self.BS, self.NH * self.HS), slots, meta, "layer0"
+        )
+
+        # Page 0 was written; every other page must be untouched.
+        assert torch.count_nonzero(kv_cache[1:]) == 0
+
+    def test_extract_is_identical_across_axis_orders(self):
+        """The same logical cache in two axis orders must extract to the same
+        bytes, or two engines sharing a CXL pool would disagree."""
+        meta = make_flash_attn_metadata()
+        slots = torch.arange(2 * self.BS)
+        kv_axis_second = torch.randn(self.NB, 2, self.BS, self.NH, self.HS)
+        kv_axis_first = kv_axis_second.permute(1, 0, 2, 3, 4).contiguous()
+
+        out = []
+        for cache in (kv_axis_first, kv_axis_second):
+            worker = make_bare_worker(
+                block_size=self.BS, kv_caches={"layer0": cache}, head_size=self.HS
+            )
+            out.append(worker._extract_kv_from_layer(cache, slots, meta, "layer0"))
+
+        assert torch.equal(out[0], out[1])
+
+    def test_refuses_unrecognized_layout(self):
+        """Refusing degrades the request to recompute; guessing would register
+        scrambled KV."""
+        worker = make_bare_worker(block_size=self.BS)
+        cache = torch.zeros(3, 5)
+        meta = make_flash_attn_metadata()
+
+        with pytest.raises(RuntimeError, match="unrecognized paged KV tensor"):
+            worker._extract_kv_from_layer(cache, torch.arange(2), meta, "layer0")
+        with pytest.raises(RuntimeError, match="unrecognized paged KV tensor"):
+            worker._inject_kv_into_layer(
+                cache, torch.zeros(2, 2, 1), torch.arange(2), meta, "layer0"
+            )
+
+    def test_hybrid_layer_is_redetected(self):
+        """A registered rank-5 layout must not be applied to another layer of
+        a different shape: movedim succeeds on the wrong rank and returns
+        wrong bytes silently. A hybrid model's odd layer re-detects from its
+        own shape (sparse-MLA metadata is not MLACommonMetadata, so it lands
+        in the layout branch)."""
+        flash = torch.zeros(self.NB, 2, self.BS, self.NH, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"L0": flash}, head_size=self.HS
+        )
+        assert worker._kv_layout is not None and worker._kv_layout.kv_axis == 1
+
+        mla = torch.zeros(self.NB, self.BS, 2 * self.HS)
+        meta = make_flash_attn_metadata()
+        slots = torch.arange(self.BS)
+        src = torch.randn(2, self.BS, self.HS)
+
+        worker._inject_kv_into_layer(mla, src, slots, meta, "L1")
+        got = worker._extract_kv_from_layer(mla, slots, meta, "L1")
+
+        torch.testing.assert_close(got, src)
+
+    def test_rank4_fused_layer_not_read_through_registered_rank5_layout(self):
+        """Exact-shape matching in _layout_fits.
+
+        A rank-5 layout's block, token, and K/V axis positions can all land
+        on matching dims of a rank-4 fused tensor with two KV heads, which
+        would read the head axis as K/V. The layer must re-detect as fused.
+        """
+        flash = torch.zeros(self.NB, 2, self.BS, 2, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS,
+            kv_caches={"L0": flash},
+            num_kv_heads=2,
+            head_size=self.HS,
+        )
+        assert worker._kv_layout is not None and worker._kv_layout.kv_axis == 1
+
+        fused = torch.zeros(self.NB, 2, self.BS, 2 * self.HS)  # cpu_attn-style
+        layout = worker._layout_for(fused)
+        assert layout is not None
+        assert layout.kv_axis is None, "head axis misread as K/V"
+
+    def test_odd_fused_width_is_refused_cleanly(self):
+        """An odd fused row cannot be halved. No shipped backend emits one
+        (turboquant explicitly rounds up to even), but the refusal must name
+        the cause instead of failing inside a reshape."""
+        worker = make_bare_worker(block_size=self.BS)
+        cache = torch.zeros(self.NB, self.BS, 577)
+        meta = make_flash_attn_metadata()
+
+        with pytest.raises(RuntimeError, match="odd fused"):
+            worker._extract_kv_from_layer(cache, torch.arange(2), meta, "L0")
+        with pytest.raises(RuntimeError, match="odd fused"):
+            worker._inject_kv_into_layer(
+                cache, torch.zeros(2, 2, 288), torch.arange(2), meta, "L0"
+            )
+
+    def _make_triton_metadata(self):
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+
+        meta = MagicMock()
+        meta.__class__ = type("TritonMeta", (TritonAttentionMetadata,), {})
+        return meta
+
+    def test_triton_rank5_takes_the_layout_branch(self):
+        """triton_attn is rank-5 (NB, 2, BS, NH, HS) on current vLLM. The
+        legacy Triton branch assumed rank-4 with heads at dim 1, so its inject
+        raised a shape mismatch on the K/V axis — and its extract was
+        token-major, unlike every other backend's slab bytes."""
+        kv = torch.zeros(self.NB, 2, self.BS, self.NH, self.HS)
+        worker = make_bare_worker(
+            block_size=self.BS, kv_caches={"L0": kv}, head_size=self.HS
+        )
+        meta = self._make_triton_metadata()
+        slots = torch.cat(
+            [torch.arange(self.BS), torch.arange(3 * self.BS, 4 * self.BS)]
+        )
+        src = torch.randn(2, slots.shape[0], self.NH * self.HS)
+
+        worker._inject_kv_into_layer(kv, src, slots, meta, "L0")
+        got = worker._extract_kv_from_layer(kv, slots, meta, "L0")
+
+        torch.testing.assert_close(got, src)
+
+    def test_triton_rank4_legacy_branch_kept(self):
+        """Old rank-4 Triton (NB, NH, BS, HD) keeps its dedicated branch."""
+        kv = torch.zeros(self.NB, self.NH, self.BS, self.HS)
+        worker = make_bare_worker(block_size=self.BS)
+        meta = self._make_triton_metadata()
+        slots = torch.arange(self.BS)
+        src = torch.randn(self.BS, self.NH, self.HS)
+
+        worker._inject_kv_into_layer(kv, src, slots, meta, "L0")
+        got = worker._extract_kv_from_layer(kv, slots, meta, "L0")
+
+        torch.testing.assert_close(got, src)
+
+
 # =============================================================================
 # MaruSchedulerConnector._count_matched_chunks (mocked handler)
 # =============================================================================
@@ -702,17 +1100,25 @@ class TestChunkedPrefillFragmentedStore:
         worker._num_layers = 1
         return worker, stored
 
-    def _kv_layer(self):
-        # Flash layout (2, num_blocks, block_size, head=1); K value at
-        # slot s is s, V value is 1000 + s, so stored bytes reveal exactly
-        # which token positions were extracted.
-        kv = torch.empty(2, 16, self.BLOCK, 1)
-        kv[0] = torch.arange(64, dtype=torch.float32).reshape(16, self.BLOCK, 1)
-        kv[1] = 1000 + torch.arange(64, dtype=torch.float32).reshape(16, self.BLOCK, 1)
+    def _kv_layer(self, layout="legacy"):
+        # K value at slot s is s, V value is 1000 + s, so stored bytes
+        # reveal exactly which token positions were extracted. Same logical
+        # data in both paged axis orders — the pipeline must not care.
+        k = torch.arange(64, dtype=torch.float32)
+        if layout == "legacy":
+            # (2, NB, BS, H) — the pre-0.23 order these tests always used.
+            kv = torch.empty(2, 16, self.BLOCK, 1)
+            kv[0] = k.reshape(16, self.BLOCK, 1)
+            kv[1] = 1000 + k.reshape(16, self.BLOCK, 1)
+        else:
+            # (NB, 2, BS, NH, HS) — vLLM 0.23+ flash_attn.
+            kv = torch.empty(16, 2, self.BLOCK, 1, 1)
+            kv[:, 0] = k.reshape(16, self.BLOCK, 1, 1)
+            kv[:, 1] = 1000 + k.reshape(16, self.BLOCK, 1, 1)
         return kv
 
-    def _run_steps(self, worker, steps):
-        kv = self._kv_layer()
+    def _run_steps(self, worker, steps, layout="legacy"):
+        kv = self._kv_layer(layout)
         attn = make_flash_attn_metadata()
         token_ids = list(range(self.PROMPT))
         for block_ids, sched, computed in steps:
@@ -725,7 +1131,8 @@ class TestChunkedPrefillFragmentedStore:
             worker.save_kv_layer("model.layers.0.self_attn", kv, attn, metadata)
         return token_ids
 
-    def test_fragmented_steps_store_all_chunks_with_correct_data(self):
+    @pytest.mark.parametrize("layout", ["legacy", "vllm023"])
+    def test_fragmented_steps_store_all_chunks_with_correct_data(self, layout):
         """Boundaries 20/40 are not chunk-aligned; no chunk may be lost."""
         worker, stored = self._make_worker()
         # block_ids accumulate from token 0, as the fixed scheduler builds
@@ -737,6 +1144,7 @@ class TestChunkedPrefillFragmentedStore:
                 (list(range(0, 10)), 20, 20),
                 (list(range(0, 16)), 24, 40),
             ],
+            layout,
         )
 
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
@@ -788,6 +1196,87 @@ class TestChunkedPrefillFragmentedStore:
         # index 5 need 40.
         self._run_steps(worker, [(list(range(5, 10)), 20, 20)])
         assert not stored, "step with insufficient block coverage must store nothing"
+
+
+class TestStoreLoadRoundtripModernLayout:
+    """Full public-API loop at the vLLM 0.23 shape (NB, 2, BS, NH, HS).
+
+    The extract/inject units are covered per layout, but the pipeline
+    between them — chunk keys, slab slicing, the per-layer load fallback —
+    only ever ran under the legacy (2, NB, BS, H) shape in tests, which is
+    how a broken inject shipped. save_kv_layer writes into a dict store and
+    start_load_kv reads it back into a zeroed cache of the same shape; the
+    caches must match bit for bit.
+    """
+
+    BLOCK, CHUNK, PROMPT = 4, 8, 64
+
+    def _modern_cache(self):
+        kv = torch.empty(16, 2, self.BLOCK, 1, 1)
+        k = torch.arange(64, dtype=torch.float32)
+        kv[:, 0] = k.reshape(16, self.BLOCK, 1, 1)
+        kv[:, 1] = 1000 + k.reshape(16, self.BLOCK, 1, 1)
+        return kv
+
+    def _make_worker(self):
+        return make_worker(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_use_layerwise": True},
+        )
+
+    def test_roundtrip(self):
+        from types import SimpleNamespace
+
+        # Store round: save every chunk of the prompt.
+        src = self._modern_cache()
+        writer = self._make_worker()
+        stored = attach_capturing_handler(writer, min_alloc_bytes=4)
+        writer._handler.store.side_effect = lambda key, handle=None: (
+            stored.__setitem__(key, "DONE") or True
+        )
+        writer._num_layers = 1
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(16)),
+            num_scheduled_tokens=self.PROMPT,
+            num_computed_tokens=0,
+        )
+        writer.save_kv_layer(
+            "model.layers.0.self_attn", src, make_flash_attn_metadata(), metadata
+        )
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        assert all(f"{k}_L0" in stored for k in chunk_keys)
+
+        # Load round: a second engine with a zeroed cache of the same shape
+        # reads the shared pool back.
+        dst = torch.zeros_like(src)
+        reader = self._make_worker()
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(view=memoryview(stored[k]), region_id=0, page_index=i)
+            for i, k in enumerate(keys)
+        ]
+        reader._num_layers = 1
+        fwd = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=dst)
+            },
+            attn_metadata=None,
+        )
+        reader.start_load_kv(
+            fwd,
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(16)),
+                num_matched_chunks=len(chunk_keys),
+            ),
+        )
+        assert reader.get_finished_loading() == {"r1"}
+        assert reader.take_failed_load_blocks() == set()
+
+        torch.testing.assert_close(dst, src)
 
 
 # =============================================================================
@@ -1088,6 +1577,41 @@ class TestDeferredLoading:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == set()
         assert kv.abs().sum() > 0  # KV was actually injected
+
+    def test_load_failure_recomputes_instead_of_raising(self):
+        """An inject refusal during load must never escape start_load_kv.
+
+        vLLM calls start_load_kv outside its own try, so a raise here kills
+        the engine. The request's blocks must go through the failed-blocks
+        path (get_block_ids_with_load_errors) so vLLM recomputes them, and
+        the request must still unpark via get_finished_loading.
+        """
+        worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
+        chunk_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray(chunk_bytes)), region_id=0, page_index=i
+            )
+            for i in range(8)
+        ]
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = infos
+        worker._num_layers = 1
+
+        bad_cache = torch.zeros(3, 5)  # unrecognizable layout: inject refuses
+        fwd = SimpleNamespace(
+            no_compile_layers={"l0": SimpleNamespace(kv_cache=bad_cache)},
+            attn_metadata=None,
+        )
+        metadata = deferred_metadata(
+            token_ids=list(range(64)),
+            block_ids=list(range(16)),
+            num_matched_chunks=8,
+        )
+
+        worker.start_load_kv(fwd, metadata)  # must not raise
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
 
 
 class TestAsyncDeferredPackedLoad:

@@ -37,6 +37,14 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_vllm.kv_layout import (
+    KVLayout,
+    _canonical_paged_view,
+    _detect_kv_layout,
+    _layout_fits,
+    _vllm_kv_cache_layout,
+)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
@@ -450,10 +458,31 @@ class MaruKVConnector(KVConnectorBase_V1):
             self._worker = None
         elif role == KVConnectorRole.WORKER:
             self._scheduler = None
+            # Read here, where vllm_config is in hand: get_current_vllm_config()
+            # asserts outside a config context. get_num_kv_heads is per rank, so
+            # it matches the paged tensor; MLA reports 1 either way, so skip it.
+            num_kv_heads: int | None = None
+            head_size: int | None = None
+            try:
+                model_config = vllm_config.model_config
+                if model_config is not None and not model_config.use_mla:
+                    num_kv_heads = model_config.get_num_kv_heads(
+                        vllm_config.parallel_config
+                    )
+                    head_size = model_config.get_head_size()
+            except Exception as e:
+                logger.warning(
+                    "Maru: cannot read KV geometry from vllm_config (%s: %s); "
+                    "layout detection will cross-check block_size only",
+                    type(e).__name__,
+                    e,
+                )
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
             )
 
     # ==================================
@@ -1003,10 +1032,16 @@ class MaruWorkerConnector:
         block_size: int,
         kv_chunk_tokens: int,
         extra_config: dict[str, Any],
+        num_kv_heads: int | None = None,
+        head_size: int | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        # Layout cross-checks. Optional; without them detection still verifies
+        # block_size, but cannot separate the two rank-4 fused orders.
+        self._num_kv_heads = num_kv_heads
+        self._head_size = head_size
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -1018,6 +1053,9 @@ class MaruWorkerConnector:
         # chunk_base_key -> set of stored layer indices
         self._chunk_layer_progress: dict[str, set[int]] = {}
         self._num_layers: int = 0
+        # Resolved once in register_kv_caches; None when the layout is not
+        # recognized, which keeps every caller on its existing fallback.
+        self._kv_layout: KVLayout | None = None
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
         # layer_name -> events to wait on before that layer's compute. A
@@ -1178,6 +1216,7 @@ class MaruWorkerConnector:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
         self._num_layers = len(kv_caches)
+        self._kv_layout = self._resolve_kv_layout(kv_caches)
         # Derive the CXL page size from the model's KV geometry so each
         # (chunk x layer) object fills exactly one page (no page-rounding waste).
         # Runs before the first _ensure_handler (start_load_kv / save_kv_layer),
@@ -1853,23 +1892,26 @@ class MaruWorkerConnector:
         if device is None or device.type != "cuda" or not torch.cuda.is_available():
             # Correctness fallback for CPU/mixed layouts. It preserves packed
             # storage but cannot overlap because there is no common CUDA stream.
-            for _, num_chunks, slot_mapping, infos in entries:
-                for layer_name, kv_cache_layer, true_idx in layers:
-                    for ci in range(num_chunks):
-                        slab_host = torch.frombuffer(
-                            infos[ci].view, dtype=kv_cache_layer.dtype
-                        ).view(2, self._num_layers, self._kv_chunk_tokens, -1)
-                        chunk_start = ci * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping[
-                            chunk_start : chunk_start + self._kv_chunk_tokens
-                        ]
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            slab_host[:, true_idx].to(kv_cache_layer.device),
-                            chunk_slots.to(kv_cache_layer.device),
-                            attn_metadata,
-                            layer_name,
-                        )
+            for req_meta, num_chunks, slot_mapping, infos in entries:
+                try:
+                    for layer_name, kv_cache_layer, true_idx in layers:
+                        for ci in range(num_chunks):
+                            slab_host = torch.frombuffer(
+                                infos[ci].view, dtype=kv_cache_layer.dtype
+                            ).view(2, self._num_layers, self._kv_chunk_tokens, -1)
+                            chunk_start = ci * self._kv_chunk_tokens
+                            chunk_slots = slot_mapping[
+                                chunk_start : chunk_start + self._kv_chunk_tokens
+                            ]
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                slab_host[:, true_idx].to(kv_cache_layer.device),
+                                chunk_slots.to(kv_cache_layer.device),
+                                attn_metadata,
+                                layer_name,
+                            )
+                except Exception as e:
+                    self._fail_load(req_meta, e)
             return
 
         if self._load_stream is None or self._load_stream_device != device:
@@ -2033,6 +2075,24 @@ class MaruWorkerConnector:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
 
+    def _fail_load(self, req_meta: MaruReqMeta, exc: Exception) -> None:
+        """Contain one request's load failure instead of letting it raise.
+
+        vLLM calls ``start_load_kv`` outside its own try, so an exception
+        from a load path (e.g. an unrecognized-layout refusal from inject)
+        would kill the engine. Reporting the blocks through
+        ``get_block_ids_with_load_errors`` makes vLLM recompute them, which
+        is the contract the refusal was designed for; a deferred request is
+        additionally marked done so it unparks.
+        """
+        logger.error(
+            "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
+        )
+        with self._deferred_lock:
+            self._failed_load_blocks.update(req_meta.block_ids)
+            if req_meta.deferred_load:
+                self._deferred_done.add(req_meta.req_id)
+
     def _abort_deferred_loads(self, metadata: MaruConnectorMetadata) -> None:
         """Degrade every deferred load in ``metadata`` to recompute.
 
@@ -2081,28 +2141,34 @@ class MaruWorkerConnector:
 
         for req_meta, num_chunks, slot_mapping, infos in entries:
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-            with torch.cuda.stream(load_stream):
-                slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
-                for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                    base = li * num_chunks
-                    for chunk_start, run_chunks, run_view in self._chunk_runs(
-                        infos[base : base + num_chunks]
-                    ):
-                        chunk_tensor = torch.frombuffer(
-                            run_view, dtype=kv_cache_layer.dtype
-                        )
-                        token_start = chunk_start * self._kv_chunk_tokens
-                        token_end = (chunk_start + run_chunks) * self._kv_chunk_tokens
-                        self._inject_kv_into_layer(
-                            kv_cache_layer,
-                            chunk_tensor.to(device, non_blocking=True),
-                            slot_mapping_gpu[token_start:token_end],
-                            attn_metadata,
-                            layer_name,
-                            num_chunks=run_chunks,
-                        )
-                event = torch.cuda.Event()
-                event.record(load_stream)
+            try:
+                with torch.cuda.stream(load_stream):
+                    slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
+                    for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
+                        base = li * num_chunks
+                        for chunk_start, run_chunks, run_view in self._chunk_runs(
+                            infos[base : base + num_chunks]
+                        ):
+                            chunk_tensor = torch.frombuffer(
+                                run_view, dtype=kv_cache_layer.dtype
+                            )
+                            token_start = chunk_start * self._kv_chunk_tokens
+                            token_end = (
+                                chunk_start + run_chunks
+                            ) * self._kv_chunk_tokens
+                            self._inject_kv_into_layer(
+                                kv_cache_layer,
+                                chunk_tensor.to(device, non_blocking=True),
+                                slot_mapping_gpu[token_start:token_end],
+                                attn_metadata,
+                                layer_name,
+                                num_chunks=run_chunks,
+                            )
+                    event = torch.cuda.Event()
+                    event.record(load_stream)
+            except Exception as e:
+                self._fail_load(req_meta, e)
+                continue
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
                 self._deferred_refs[req_meta.req_id] = [
@@ -2206,25 +2272,28 @@ class MaruWorkerConnector:
         attn_metadata: AttentionMetadata,
     ) -> None:
         """Inject prepared CXL chunks synchronously on the current stream."""
-        for _, num_chunks, slot_mapping, infos in prepared_requests:
-            for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
-                base = li * num_chunks
-                for ci in range(num_chunks):
-                    info = infos[base + ci]
-                    chunk_tensor = torch.frombuffer(
-                        info.view, dtype=kv_cache_layer.dtype
-                    )
-                    chunk_start = ci * self._kv_chunk_tokens
-                    chunk_slots = slot_mapping[
-                        chunk_start : chunk_start + self._kv_chunk_tokens
-                    ]
-                    self._inject_kv_into_layer(
-                        kv_cache_layer,
-                        chunk_tensor.to(kv_cache_layer.device),
-                        chunk_slots.to(kv_cache_layer.device),
-                        attn_metadata,
-                        layer_name,
-                    )
+        for req_meta, num_chunks, slot_mapping, infos in prepared_requests:
+            try:
+                for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
+                    base = li * num_chunks
+                    for ci in range(num_chunks):
+                        info = infos[base + ci]
+                        chunk_tensor = torch.frombuffer(
+                            info.view, dtype=kv_cache_layer.dtype
+                        )
+                        chunk_start = ci * self._kv_chunk_tokens
+                        chunk_slots = slot_mapping[
+                            chunk_start : chunk_start + self._kv_chunk_tokens
+                        ]
+                        self._inject_kv_into_layer(
+                            kv_cache_layer,
+                            chunk_tensor.to(kv_cache_layer.device),
+                            chunk_slots.to(kv_cache_layer.device),
+                            attn_metadata,
+                            layer_name,
+                        )
+            except Exception as e:
+                self._fail_load(req_meta, e)
 
     def _load_packed(
         self,
@@ -2274,41 +2343,48 @@ class MaruWorkerConnector:
         dtype = layers[0][1].dtype
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
-                if use_stream:
-                    slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-                slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
-                for ci in range(num_chunks):
-                    slab_view = slab_infos[ci].view
-                    chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
-                    # KV_2LTD host tensor aliasing pinned CXL: [2, L, tokens, h]
-                    slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
-                        2, num_layers, ct, -1
-                    )
-                    if kernel is not None:
-                        ops, ptrs, pbs, block_size, head_size, fmt = kernel
-                        ops.multi_layer_kv_transfer(
-                            slab_host,
-                            ptrs,
-                            chunk_slots,
-                            dev,
-                            pbs,
-                            ops.TransferDirection.H2D,
-                            fmt,
-                            block_size=block_size,
-                            head_size=head_size,
+                try:
+                    if use_stream:
+                        slot_mapping = self._pin_slot_mapping_for_async_h2d(
+                            slot_mapping
                         )
-                    else:
-                        # Fallback: per-layer slice -> inject (same slab).
-                        slab_dev = slab_host.to(dev, non_blocking=use_stream)
-                        for layer_name, kv_cache_layer, true_idx in layers:
-                            self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                slab_dev[:, true_idx],
+                    slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
+                    for ci in range(num_chunks):
+                        slab_view = slab_infos[ci].view
+                        chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                        # KV_2LTD host tensor aliasing pinned CXL:
+                        # [2, L, tokens, h]
+                        slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
+                            2, num_layers, ct, -1
+                        )
+                        if kernel is not None:
+                            ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                            ops.multi_layer_kv_transfer(
+                                slab_host,
+                                ptrs,
                                 chunk_slots,
-                                attn,
-                                layer_name,
-                                num_chunks=1,
+                                dev,
+                                pbs,
+                                ops.TransferDirection.H2D,
+                                fmt,
+                                block_size=block_size,
+                                head_size=head_size,
                             )
+                        else:
+                            # Fallback: per-layer slice -> inject (same slab).
+                            slab_dev = slab_host.to(dev, non_blocking=use_stream)
+                            for layer_name, kv_cache_layer, true_idx in layers:
+                                self._inject_kv_into_layer(
+                                    kv_cache_layer,
+                                    slab_dev[:, true_idx],
+                                    chunk_slots,
+                                    attn,
+                                    layer_name,
+                                    num_chunks=1,
+                                )
+                except Exception as e:
+                    self._fail_load(req_meta, e)
+                    continue
                 if req_meta.deferred_load:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
@@ -2344,14 +2420,16 @@ class MaruWorkerConnector:
         the DEFAULT packed load whenever available — it is not gated on any
         configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
-        Paged buffers must be the vLLM Flash tensor
-        ``[2, num_blocks, block_size, num_heads, head_size]``.
+        Works with whatever paged axis order vLLM chose: dimensions and the
+        engine KV format both come from the layout resolved at registration.
         """
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
-        sample = layers[0][1]
-        if sample.dim() != 5:  # [2, num_blocks, block_size, num_heads, head_size]
+        # No resolved layout, or one with no kernel form (the fused orders),
+        # means we must not hand raw pointers to the kernel.
+        layout = self._kv_layout
+        if layout is None or layout.format_name is None:
             return None
         # Flash layout only (exclude MLA/Triton).
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -2378,20 +2456,33 @@ class MaruWorkerConnector:
                     "per-layer inject fallback"
                 )
                 return None
-        num_blocks, block_size, num_heads, head_size = sample.shape[1:]
-        page_buffer_size = num_blocks * block_size
+        # Dimensions and format come from one layout, so they cannot disagree.
+        # The kernel takes raw pointers, so torch would not catch it if they did.
+        block_size = layout.block_size
+        head_size = layout.head_size
+        page_buffer_size = layout.page_buffer_size
         # Pointer table indexed by true layer index (== slab layer dim).
         ptrs = torch.empty(len(layers), dtype=torch.int64, device="cpu")
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
         ops = self._lmc_ops
+        # An older c_ops build may not carry every format; take the per-layer
+        # fallback rather than raising out of the load path.
+        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        if kv_format is None:
+            logger.warning(
+                "Maru packed load: kernel has no format %s; using per-layer "
+                "inject fallback",
+                layout.format_name,
+            )
+            return None
         return (
             ops,
             ptrs.to(device),
             page_buffer_size,
             block_size,
             head_size,
-            ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            kv_format,
         )
 
     def _chunk_runs(self, infos: list[Any]) -> list[tuple[int, int, memoryview]]:
@@ -3371,10 +3462,11 @@ class MaruWorkerConnector:
     ) -> None:
         """Inject loaded KV cache data into the paged GPU buffer.
 
-        Handles different attention backend layouts:
-        - MLA: [num_pages, page_size, ...]
+        The exact inverse of ``_extract_kv_from_layer``, branch for branch:
+        - MLA: [num_blocks, block_size, ...]
         - Triton: [num_blocks, num_kv_heads, block_size, head_dim]
-        - Default (Flash): [2, num_pages, page_size, ...]
+        - Everything else: whatever axis order the backend chose, resolved at
+          registration and canonicalized before the scatter.
         """
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadata,
@@ -3395,26 +3487,50 @@ class MaruWorkerConnector:
             flat = dst_kv_cache.reshape(num_pages * page_size, -1)
             src = src_kv_data.reshape(slot_mapping.shape[0], -1)
             flat[slot_mapping] = src
-        elif isinstance(layer_meta, TritonAttentionMetadata):
+        elif (
+            isinstance(layer_meta, TritonAttentionMetadata) and dst_kv_cache.dim() == 4
+        ):
+            # Legacy rank-4 Triton; rank-5 takes the layout branch (see
+            # _extract_kv_from_layer). This reshape assumes dim 1 is the head
+            # axis and would misplace rank-5's K/V axis.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
-            # Flash attention: [2, num_pages, page_size, ...]
-            num_pages = dst_kv_cache.shape[1]
-            page_size = dst_kv_cache.shape[2]
-            flat = dst_kv_cache.reshape(2, num_pages * page_size, -1)
+            layout = self._layout_for(dst_kv_cache)
+            if layout is None:
+                # Same refusal as extract; the caller recomputes instead.
+                raise RuntimeError(
+                    "Maru: cannot inject KV for layout "
+                    f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
+                )
+            # A view, so the index-put below lands in dst_kv_cache itself.
+            canon = _canonical_paged_view(dst_kv_cache, layout)
+            ntok = slot_mapping.shape[0]
+            # Slab ordering, independent of the paged axis order.
             if num_chunks == 1:
-                src = src_kv_data.reshape(2, slot_mapping.shape[0], -1)
+                src = src_kv_data.reshape(2, ntok, -1)
             else:
-                tokens_per_chunk = slot_mapping.shape[0] // num_chunks
+                tokens_per_chunk = ntok // num_chunks
                 src = (
                     src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, -1)
                     .permute(1, 0, 2, 3)
-                    .reshape(2, slot_mapping.shape[0], -1)
+                    .reshape(2, ntok, -1)
                 )
-            flat[:, slot_mapping] = src
+            blocks = slot_mapping // layout.block_size
+            offsets = slot_mapping % layout.block_size
+            if layout.kv_axis is not None:
+                canon[:, blocks, offsets] = src.reshape(2, ntok, *canon.shape[3:])
+            else:
+                if canon.shape[2:].numel() % 2:
+                    raise RuntimeError(
+                        "Maru: cannot inject KV for layout "
+                        f"{tuple(dst_kv_cache.shape)}; odd fused K/V row width"
+                    )
+                # Undo the extract side's halving of each token's row.
+                merged = src.transpose(0, 1).reshape(ntok, -1)
+                canon[blocks, offsets] = merged.reshape(ntok, *canon.shape[2:])
 
     def _extract_kv_from_layer(
         self,
@@ -3442,55 +3558,135 @@ class MaruWorkerConnector:
             num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
             flat = kv_layer.reshape(num_pages * page_size, -1)
             return flat[slot_mapping]
-        elif isinstance(layer_meta, TritonAttentionMetadata):
+        elif isinstance(layer_meta, TritonAttentionMetadata) and kv_layer.dim() == 4:
+            # Legacy rank-4 Triton (NB, NH, BS, HD). Rank-5 Triton is the
+            # common (NB, 2, BS, NH, HS) and takes the layout branch, which
+            # also keeps its slab bytes K/V-major like every other backend.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             return kv_layer[block_idxs, :, offsets]
         else:
-            num_pages, page_size = kv_layer.shape[1], kv_layer.shape[2]
-            flat = kv_layer.reshape(2, num_pages * page_size, -1)
-            return flat[:, slot_mapping]
+            # Callers expect [2, num_tokens, hidden]. Gather the wanted slots
+            # from the canonical view; permuting the whole cache would copy it.
+            layout = self._layout_for(kv_layer)
+            if layout is None:
+                # Refusing degrades the request to recompute. Guessing an axis
+                # order would silently register scrambled KV instead.
+                raise RuntimeError(
+                    "Maru: cannot extract KV for layout "
+                    f"{tuple(kv_layer.shape)}; unrecognized paged KV tensor"
+                )
+            canon = _canonical_paged_view(kv_layer, layout)
+            blocks = slot_mapping // layout.block_size
+            offsets = slot_mapping % layout.block_size
+            if layout.kv_axis is not None:
+                gathered = canon[:, blocks, offsets]  # [2, ntok, ...]
+                return gathered.reshape(2, gathered.shape[1], -1)
+            # Fused: the leading 2 is a storage convention, not a K/V split.
+            # Halving each row is a bijection inject reverses, and claims
+            # nothing about where K ends — diffkv splits it unevenly.
+            if canon.shape[2:].numel() % 2:
+                # Cannot halve an odd row. No shipped backend produces one,
+                # but refuse cleanly rather than fail inside the reshape.
+                raise RuntimeError(
+                    "Maru: cannot extract KV for layout "
+                    f"{tuple(kv_layer.shape)}; odd fused K/V row width"
+                )
+            gathered = canon[blocks, offsets]  # [ntok, ...]
+            ntok = gathered.shape[0]
+            return gathered.reshape(ntok, 2, -1).transpose(0, 1)
+
+    def _layout_for(self, kv_layer: torch.Tensor) -> KVLayout | None:
+        """Layout for ``kv_layer``: the registered one, else detect in place.
+
+        The registered layout describes the first registered layer, so it is
+        applied only when it actually fits this tensor — ``movedim`` with a
+        rank-5 layout succeeds on a rank-3 tensor and returns wrong bytes, so
+        a hybrid model's odd layers must be re-detected, not assumed. The
+        detection fallback also covers caches attached without
+        register_kv_caches.
+        """
+        shape = tuple(kv_layer.shape)
+        layout = self._kv_layout
+        if layout is not None and _layout_fits(layout, shape):
+            return layout
+        return _detect_kv_layout(
+            shape,
+            self._block_size,
+            _vllm_kv_cache_layout(),
+            self._num_kv_heads,
+            self._head_size,
+        )
+
+    def _resolve_kv_layout(self, kv_caches: dict[str, torch.Tensor]) -> KVLayout | None:
+        """Detect the paged KV axis order once, at registration.
+
+        Args:
+            kv_caches: The registered per-layer KV tensors. The first is taken
+                as representative; hybrid models whose layers differ in shape
+                are not supported, as before.
+
+        Returns:
+            The resolved layout, or None when it is unrecognized. Callers then
+            keep the default CXL page size and per-layer copies, exactly as
+            before this detection existed.
+        """
+        if not kv_caches:
+            return None
+        sample = next(iter(kv_caches.values()))
+        if not hasattr(sample, "shape"):
+            return None
+        kv_layout = _vllm_kv_cache_layout()
+        layout = _detect_kv_layout(
+            tuple(sample.shape),
+            self._block_size,
+            kv_layout,
+            self._num_kv_heads,
+            self._head_size,
+        )
+        if layout is None:
+            logger.warning(
+                "MaruWorkerConnector: unrecognized KV layout %s "
+                "(block_size=%d, kv_layout=%s); keeping default CXL page size "
+                "and per-layer transfers",
+                tuple(sample.shape),
+                self._block_size,
+                kv_layout,
+            )
+            return None
+        logger.info(
+            "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d "
+            "num_heads=%d head_size=%d",
+            layout.format_name,
+            kv_layout,
+            layout.num_blocks,
+            layout.block_size,
+            layout.num_heads,
+            layout.head_size,
+        )
+        return layout
 
     def _chunk_object_bytes(self) -> int | None:
         """Return the byte size of one ``(chunk x layer)`` KV object, or None.
 
-        A stored object holds ``kv_chunk_tokens`` tokens of one layer's KV. Its
-        size is ``kv_chunk_tokens x per_token_per_layer_bytes``, where the
-        per-token footprint is read from a registered KV cache tensor:
-        ``per_token_bytes = layer.numel() * element_size / token_slots`` and
-        ``token_slots = num_blocks x block_size``.
+        A stored object holds ``kv_chunk_tokens`` tokens of one layer's KV, so
+        its size is ``kv_chunk_tokens x per_token_per_layer_bytes``. The
+        per-token footprint divides the layer tensor by its token slots, which
+        ``register_kv_caches`` already resolved for whatever axis order vLLM
+        chose.
 
-        The token-slot dimensions differ per attention layout (mirrors
-        ``_extract_kv_from_layer``); the block/page dimension is identified by
-        matching ``block_size``:
-
-        - Flash (default): ``[2, num_blocks, block_size, ...]``  -> slots = d1*d2
-        - Triton: ``[num_blocks, num_kv_heads, block_size, head_dim]`` -> d0*d2
-        - MLA: ``[num_blocks, block_size, ...]``                 -> slots = d0*d1
-
-        Returns None for an unrecognized layout so the caller keeps the
-        configured/default page size rather than guessing wrong.
+        Returns:
+            Object size in bytes, or None when the layout was unrecognized, so
+            the caller keeps the default CXL page size rather than guessing.
         """
         if not self._kv_caches:
             return None
-        layer = next(iter(self._kv_caches.values()))
-        shape = tuple(layer.shape)
-        bs = self._block_size
-        token_slots: int | None = None
-        if len(shape) >= 3 and shape[0] == 2 and shape[2] == bs:
-            token_slots = shape[1] * shape[2]  # Flash
-        elif len(shape) == 4 and shape[2] == bs:
-            token_slots = shape[0] * shape[2]  # Triton
-        elif len(shape) >= 2 and shape[1] == bs:
-            token_slots = shape[0] * shape[1]  # MLA
-        if not token_slots:
-            logger.warning(
-                "MaruWorkerConnector: unrecognized KV layout %s (block_size=%d); "
-                "keeping default CXL page size",
-                shape,
-                bs,
-            )
+        # Normally resolved in register_kv_caches; resolve here as well so a
+        # connector that had caches attached directly still sizes correctly.
+        layout = self._kv_layout or self._resolve_kv_layout(self._kv_caches)
+        if layout is None:
             return None
+        layer = next(iter(self._kv_caches.values()))
         total_bytes = int(layer.numel()) * int(layer.element_size())
-        per_token_bytes = total_bytes // token_slots
+        per_token_bytes = total_bytes // layout.page_buffer_size
         return int(per_token_bytes * self._kv_chunk_tokens)
