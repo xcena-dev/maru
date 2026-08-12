@@ -274,6 +274,22 @@ requires `maru_async_load`; it pipelines a request's per-layer transfers
 against attention compute. The connector logs a warning and disables it when
 those prerequisites are not met.
 
+The loader thread queues the per-layer copies while the request is still
+parked and the request is released once its first layer has landed, so the
+remaining layers arrive during its own attention rather than being issued
+inside the forward pass. All parked-request transfers share one stream. That
+keeps each at full CXL bandwidth — splitting them across streams makes the
+per-layer transfer time scale with the number of loading requests and overrun
+per-layer compute — and it means a later request's first layer only lands
+once the earlier one has finished, so requests take their turn without any
+extra admission mechanism.
+
+The knob therefore applies at any concurrency. On a 16k prompt with a 66%
+external hit rate it lowered cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8
+concurrent requests, and raised throughput throughout; per-token generation
+time rose 4-5% at 4 and 8 concurrent requests, which is the cost of every
+request starting earlier.
+
 ### maru_kv_chunk_tokens
 
 Controls how many tokens per chunk when storing KV cache:

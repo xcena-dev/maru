@@ -411,12 +411,37 @@ class TestLayerLoadHelpers:
         worker = make_worker(block_size=4, kv_chunk_tokens=4)
         event = MagicMock()
         current_stream = MagicMock()
-        worker._layer_load_events = {"layer": event}
+        worker._layer_load_events = {"layer": [event]}
         monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
 
         worker.wait_for_layer_load("layer")
 
         current_stream.wait_event.assert_called_once_with(event)
+
+    def test_wait_for_layer_joins_every_requests_event(self, monkeypatch):
+        """Each request that loaded this layer contributes its own event."""
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
+        first, second = MagicMock(), MagicMock()
+        current_stream = MagicMock()
+        worker._layer_load_events = {"layer": [first, second]}
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+
+        worker.wait_for_layer_load("layer")
+
+        assert [c.args[0] for c in current_stream.wait_event.call_args_list] == [
+            first,
+            second,
+        ]
+
+    def test_wait_for_layer_without_events_is_a_no_op(self, monkeypatch):
+        worker = make_worker(block_size=4, kv_chunk_tokens=4)
+        current_stream = MagicMock()
+        worker._layer_load_events = {}
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+
+        worker.wait_for_layer_load("layer")
+
+        current_stream.wait_event.assert_not_called()
 
     def test_chunk_runs_coalesce_consecutive_full_pages(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=4)
@@ -950,7 +975,13 @@ class TestDeferredLoading:
         assert second.layerwise_load_req_ids == {"r1"}
         assert sched.build_connector_meta(empty).layerwise_load_req_ids == set()
 
-    def test_concurrent_deferred_batch_keeps_whole_request_dma(self):
+    def test_every_request_in_a_concurrent_batch_takes_the_layerwise_path(self):
+        """Request count no longer gates the path.
+
+        The transfers are serialised on one stream, so each request's own
+        layers arrive faster than its attention consumes them however many
+        requests are loading at once.
+        """
         sched = self._make_scheduler(layerwise_overlap=True)
         for req_id in ("r1", "r2"):
             request = SimpleNamespace(
@@ -966,10 +997,27 @@ class TestDeferredLoading:
         metadata = sched.build_connector_meta(output)
 
         assert len(metadata.requests) == 2
+        assert all(request.layerwise_load for request in metadata.requests)
+        assert sched._deferred_layerwise_waiting == {"r1", "r2"}
+
+    def test_overlap_off_keeps_every_request_on_the_whole_request_path(self):
+        sched = self._make_scheduler(layerwise_overlap=False)
+        for req_id in ("r1", "r2"):
+            request = SimpleNamespace(
+                request_id=req_id,
+                prompt_token_ids=list(range(64)),
+            )
+            sched._last_match_result[req_id] = 8
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([3, 4, 5],)
+            sched.update_state_after_alloc(request, blocks, 64)
+
+        metadata = sched.build_connector_meta(fake_scheduler_output())
+
         assert not any(request.layerwise_load for request in metadata.requests)
         assert sched._deferred_layerwise_waiting == set()
 
-    def test_staggered_admission_sees_live_deferred_concurrency(self):
+    def test_staggered_admission_tracks_live_deferred_requests(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         output = fake_scheduler_output()
 
@@ -991,7 +1039,7 @@ class TestDeferredLoading:
         sched.update_state_after_alloc(second_request, second_blocks, 64)
         second = sched.build_connector_meta(output)
 
-        assert not second.requests[0].layerwise_load
+        assert second.requests[0].layerwise_load
         assert sched._active_deferred_req_ids == {"r1", "r2"}
 
         finished = SimpleNamespace(**vars(output))
@@ -1324,6 +1372,130 @@ class TestAsyncDeferredPackedLoad:
         assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
+
+
+class TestPreIssuedLayerwiseHandoff:
+    """Copies queued while a request was parked reach the forward as events.
+
+    The forward must not re-issue them, and a batch may mix pre-issued
+    requests with ones whose copies still have to be issued in the forward.
+    """
+
+    LAYERS = ("model.layers.0.self_attn", "model.layers.1.self_attn")
+
+    def _worker(self):
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        return worker
+
+    def _forward(self):
+        kv = [torch.zeros(2, 1, 4, 1) for _ in self.LAYERS]
+        return SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=t)
+                for name, t in zip(self.LAYERS, kv, strict=True)
+            },
+            attn_metadata=None,
+        )
+
+    def test_pre_issued_events_install_without_reissuing(self, monkeypatch):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        reissued: list[set[str]] = []
+        monkeypatch.setattr(
+            worker,
+            "_schedule_deferred_packed_layerwise_loads",
+            lambda layers, req_ids, attn: reissued.append(set(req_ids)),
+        )
+
+        worker.start_load_kv(
+            self._forward(),
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+
+        assert reissued == []
+        assert worker._layer_load_events == {
+            name: [event] for name, event in events.items()
+        }
+        assert worker._deferred_layerwise_events == {}
+
+    def test_mixed_batch_issues_only_the_request_without_queued_copies(
+        self, monkeypatch
+    ):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        reissued: list[set[str]] = []
+        monkeypatch.setattr(
+            worker,
+            "_schedule_deferred_packed_layerwise_loads",
+            lambda layers, req_ids, attn: reissued.append(set(req_ids)),
+        )
+
+        worker.start_load_kv(
+            self._forward(),
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1", "r2"}),
+        )
+
+        assert reissued == [{"r2"}]
+        assert worker._layer_load_events == {
+            name: [event] for name, event in events.items()
+        }
+
+    def test_release_gate_is_the_first_layer_in_execution_order(self, monkeypatch):
+        """Layer index orders the wait; the events dict does not carry it."""
+        worker = self._worker()
+        first, second = MagicMock(), MagicMock()
+        # Dict order reversed against execution order on purpose.
+        events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+
+        assert worker._unpark_gate_event(events, layers) is first
+
+    def test_release_gate_is_none_without_queued_copies(self):
+        worker = self._worker()
+        layers = [(name, None, i) for i, name in enumerate(self.LAYERS)]
+
+        assert worker._unpark_gate_event({}, layers) is None
+
+    def test_release_gate_clamps_to_the_layers_that_exist(self, monkeypatch):
+        import maru_vllm.connector as connector
+
+        monkeypatch.setattr(connector, "_LAYERWISE_RELEASE_AFTER_LAYERS", 99)
+        worker = self._worker()
+        first, second = MagicMock(), MagicMock()
+        events = {self.LAYERS[0]: first, self.LAYERS[1]: second}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+
+        assert worker._unpark_gate_event(events, layers) is second
+
+    def test_preempting_a_request_drains_its_queued_copies(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+
+        worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r1"}))
+
+        # The blocks are about to be reassigned, so the copies must finish
+        # rather than be forgotten while still writing.
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker._deferred_layerwise_events == {}
 
 
 class _FakeAdmissionEvent:
