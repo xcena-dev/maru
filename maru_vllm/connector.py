@@ -20,6 +20,7 @@ The connector has two roles (instantiated separately by vLLM):
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 import time
@@ -82,6 +83,100 @@ def _emit_timing(msg: str) -> None:
     import sys
 
     print(f"Maru timing: t={time.time():.3f} {msg}", file=sys.stderr, flush=True)
+
+
+def _parse_early_resume(value: Any) -> int | str:
+    """Parse maru_early_resume_layers: "auto", or a layer count (0 = off)."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "maru_early_resume_layers=%r is neither 'auto' nor an integer; "
+            "disabling early resume",
+            value,
+        )
+        return 0
+
+
+class _EmaStat:
+    """Exponential moving average with a mean-absolute-deviation band."""
+
+    def __init__(self, alpha: float = 0.25):
+        self._alpha = alpha
+        self.mean: float | None = None
+        self.dev: float = 0.0
+        self.count = 0
+
+    def observe(self, value: float) -> None:
+        if self.mean is None:
+            self.mean = value
+        else:
+            self.dev += self._alpha * (abs(value - self.mean) - self.dev)
+            self.mean += self._alpha * (value - self.mean)
+        self.count += 1
+
+
+class _EarlyResumeController:
+    """Size the early-resume watermark K from measured rates.
+
+    The knee model validated by the K sweep (results/20260811_094939): the
+    resumed forward never stalls on the copy tail iff
+
+        K >= L - (R + p*(L-1)) / c
+
+    with c the copy pace (ms/layer, measured from the load's CUDA events),
+    p the forward's per-layer pace (measured from wait_for_layer_load call
+    walls), and R the report -> reschedule latency (measured from the
+    request reappearing in a step). Below that knee TTFT is copy-bound and
+    a smaller K only buys stall risk; above it every extra layer delays the
+    report by c ms, unconditionally.
+
+    That asymmetry sets the tuning posture: overshooting K is a certain
+    TTFT loss, while undershooting costs only a brief per-layer wait on the
+    tail (a TPOT p99 blip — the sweep's k6 point). So the controller aims
+    at the knee of the EMA means and adds a small fixed margin for jitter,
+    rather than compounding per-signal worst-case bands.
+    """
+
+    WARMUP_SAMPLES = 3  # per signal, before trusting the model
+    MARGIN_LAYERS = 2
+
+    def __init__(self) -> None:
+        self._copy = _EmaStat()  # ms per layer
+        self._forward = _EmaStat()  # ms per layer
+        self._resched = _EmaStat()  # ms
+
+    def observe_copy(self, ms_per_layer: float) -> None:
+        if ms_per_layer > 0:
+            self._copy.observe(ms_per_layer)
+
+    def observe_forward(self, ms_per_layer: float) -> None:
+        if ms_per_layer > 0:
+            self._forward.observe(ms_per_layer)
+
+    def observe_resched(self, ms: float) -> None:
+        if ms > 0:
+            self._resched.observe(ms)
+
+    def k(self, num_layers: int) -> int:
+        """Watermark for the next load: the EMA-mean knee plus the margin."""
+        if num_layers <= 1:
+            return 0
+        warm = min(self._copy.count, self._forward.count, self._resched.count)
+        if warm < self.WARMUP_SAMPLES:
+            # Cold start: report a little early while the estimators fill.
+            # L-4 keeps the tail shorter than any plausible reschedule
+            # latency, so it cannot stall even with the rates unknown.
+            return max(1, num_layers - 4)
+        c = max(self._copy.mean, 1e-3)
+        knee = (
+            num_layers
+            - (self._resched.mean + self._forward.mean * (num_layers - 1)) / c
+        )
+        k = math.ceil(knee) + self.MARGIN_LAYERS
+        return min(max(k, 1), num_layers - 1)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -283,6 +378,12 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
     # can overlap layer k compute without changing the packed storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
+    # Every request scheduled in this step. Scopes the worker's per-layer
+    # waits: a step waits only on in-flight early-resume copies of requests it
+    # actually contains. Without the scope, decode peers stall on other
+    # requests' not-yet-fired layer events — measured as +10% TPOT
+    # (results/20260811_040115).
+    step_req_ids: set[str] = field(default_factory=set)
 
 
 # ============================================================================
@@ -335,6 +436,16 @@ class MaruKVConnector(KVConnectorBase_V1):
             on per-layer events, overlapping layer k+1 load with layer k
             compute. Requires maru_enable_deferred_loading=true and
             maru_use_layerwise=false (default: false)
+        maru_early_resume_layers: int | "auto" - Early resume: report a
+            deferred load finished once this many layers have landed, so
+            vLLM's reschedule latency overlaps the still-copying tail
+            instead of following it; the resumed forward's per-layer waits
+            gate correctness. Measured at 32k/if8/100%-hit: TTFT p50 -30%
+            with throughput and e2e unchanged (results/20260811_094939).
+            "auto" sizes the watermark at the copy/forward rate-matching
+            knee from live measurements; an integer pins it; 0 disables
+            (report on full completion). Applies to the deferred packed
+            load path (default: 0)
         maru_enable_fused_load: bool - Replace the cudaMemcpy H2D + inject
             two-stage load with one fused gather-scatter kernel that reads
             the CXL pages directly (LMCache single_layer_kv_transfer).
@@ -797,7 +908,10 @@ class MaruSchedulerConnector:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MaruConnectorMetadata(
-            preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
+            preempted_req_ids=set(scheduler_output.preempted_req_ids or ()),
+            step_req_ids=set(
+                getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+            ),
         )
 
         # Deferred loads first: these requests are parked in
@@ -1020,6 +1134,30 @@ class MaruWorkerConnector:
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
         self._layer_load_events: dict[str, torch.cuda.Event] = {}
+        # Early resume: report a deferred load finished once K layers have
+        # landed, and let the resumed forward's per-layer waits cover the
+        # still-copying tail. 0 disables (report on full completion); "auto"
+        # sizes K from measured copy/forward/reschedule rates (see
+        # _EarlyResumeController). The point is overlapping vLLM's reschedule
+        # latency (~85 ms measured: notify + sched wait) with the copy's tail
+        # instead of serializing after it; the tail is sized so on-time copies
+        # make every per-layer wait a no-op and no batch peer ever stalls.
+        self._early_resume = _parse_early_resume(
+            extra_config.get("maru_early_resume_layers", 0)
+        )
+        self._early_resume_ctl = _EarlyResumeController()
+        # Per-layer completion events of in-flight early-resume loads. Kept
+        # apart from _layer_load_events (single-event, owned by the older
+        # paths): several requests may be in flight, so each layer holds a
+        # list of (req_id, event). Guarded by _deferred_lock.
+        self._early_layer_events: dict[str, list[tuple[str, torch.cuda.Event]]] = {}
+        # Requests scheduled in the current step (from the step's metadata).
+        # Scopes the per-layer waits: a step must never wait on another
+        # request's in-flight copy (measured +10% TPOT when it did).
+        self._step_req_ids: frozenset[str] = frozenset()
+        # Forward-pace sampling state (auto mode; see _observe_forward_pace).
+        self._pace_calls = 0
+        self._pace_first_wall = 0.0
         self._effective_page_size_bytes: int | None = None
         # Keep mmap-backed MemoryInfo and pinned/device slot mappings alive
         # while their queued H2D copies may still read them: one (event, refs)
@@ -1041,6 +1179,17 @@ class MaruWorkerConnector:
         # so the CXL->GPU copy is measured on the GPU timeline, not by a wall
         # clock around a job that only submits the copy and returns.
         self._deferred_start_events: dict[str, torch.cuda.Event] = {}
+        # Early resume: the watermark layer's event. Registered together with
+        # the final event (below), only after every per-layer event exists, so
+        # a reportable request always has its full wait set in place. A
+        # request reported here is remembered in _deferred_reported so the
+        # final event's completion does not report it a second time (vLLM
+        # accepts each request id once).
+        self._deferred_watermark_events: dict[str, torch.cuda.Event] = {}
+        self._deferred_reported: set[str] = set()
+        # Early resume auto mode: report walls of watermark-reported requests
+        # awaiting their reschedule, feeding the controller's R estimate.
+        self._early_report_walls: dict[str, float] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
@@ -1268,6 +1417,16 @@ class MaruWorkerConnector:
         # that allocated it ended.
         self._store_layers_seen.clear()
         self._reclaim_stale_pending_slabs()
+        # This step's membership, for scoping the per-layer waits below, and
+        # (auto mode) the reschedule-latency sample of resumed requests.
+        step_ids = frozenset(getattr(metadata, "step_req_ids", ()) or ())
+        self._step_req_ids = step_ids
+        if self._early_report_walls:
+            now = time.monotonic()
+            for req_id in step_ids & set(self._early_report_walls):
+                self._early_resume_ctl.observe_resched(
+                    (now - self._early_report_walls.pop(req_id)) * 1e3
+                )
 
         self._ensure_handler()
         if self._handler is None:
@@ -1440,6 +1599,12 @@ class MaruWorkerConnector:
                 req_meta.req_id,
             )
 
+    def _resolve_early_resume_k(self, num_layers: int) -> int:
+        """The watermark for this load: the fixed knob, or the controller."""
+        if self._early_resume == "auto":
+            return self._early_resume_ctl.k(num_layers)
+        return int(self._early_resume)
+
     def _try_submit_deferred_packed_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a packed deferred load to the background loader thread.
 
@@ -1580,54 +1745,95 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
-            start_event = torch.cuda.Event(enable_timing=True) if self._timing else None
+            early_k = self._resolve_early_resume_k(num_layers)
+            # Early resume needs the pitched layer-major gather; without it
+            # (or with a watermark at/after the last layer) the bulk path is
+            # strictly better.
+            use_early = 0 < early_k < num_layers and (
+                _get_cuda_memcpy2d_async() is not None
+            )
+            # Timing events feed the timing log and (auto mode) the copy-rate
+            # estimate, so early-resume loads always carry them.
+            want_timing = self._timing or use_early
+            start_event = torch.cuda.Event(enable_timing=True) if want_timing else None
+            watermark_event: torch.cuda.Event | None = None
             _t_submit = time.monotonic()
             with torch.cuda.stream(stream):
                 if start_event is not None:
                     start_event.record(stream)
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
-                for ci in range(num_chunks):
-                    chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
-                    slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
-                        2, num_layers, ct, -1
-                    )
-                    if kernel is not None:
-                        # Stage the slab through the copy engine (async DMA —
-                        # the CXL mapping is cudaHostRegister'ed by the
-                        # mapper), then scatter the device-resident slab with
-                        # one brief kernel. Running the UVA kernel directly on
-                        # the host slab would occupy SMs for the whole
-                        # CXL-read duration and stall concurrent decode — the
-                        # very stall this deferred path exists to remove
-                        # (measured: TPOT stuck at the inline path's level,
-                        # while MP's media-invariant TPOT shows its bulk
-                        # bytes ride the copy engine).
-                        ops, ptrs, pbs, block_size, head_size, fmt = kernel
-                        slab_dev = slab_host.to(device, non_blocking=True)
-                        ops.multi_layer_kv_transfer(
-                            slab_dev,
-                            ptrs,
-                            chunk_slots,
-                            device,
-                            pbs,
-                            ops.TransferDirection.H2D,
-                            fmt,
-                            block_size=block_size,
-                            head_size=head_size,
+                if use_early:
+                    # Layer-major, in forward order: the resumed request's
+                    # attention consumes layers 0..N-1 in order, so copy in
+                    # that order and record one event per layer. The request
+                    # is reported at the watermark layer's event; the resumed
+                    # forward's per-layer waits cover the still-copying tail.
+                    ntok = num_chunks * ct
+                    for li, (layer_name, kv_cache_layer, true_idx) in enumerate(
+                        sorted(layers, key=lambda entry: entry[2])
+                    ):
+                        layer_dev = self._copy_packed_layer_to_device(
+                            infos, num_chunks, true_idx, kv_cache_layer, stream
                         )
-                    else:
-                        slab_dev = slab_host.to(device, non_blocking=True)
-                        for layer_name, kv_cache_layer, true_idx in layers:
-                            self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                slab_dev[:, true_idx],
-                                chunk_slots,
-                                attn,
-                                layer_name,
-                                num_chunks=1,
+                        self._inject_kv_into_layer(
+                            kv_cache_layer,
+                            layer_dev,
+                            slot_gpu[:ntok],
+                            attn,
+                            layer_name,
+                            num_chunks=num_chunks,
+                        )
+                        layer_event = torch.cuda.Event()
+                        layer_event.record(stream)
+                        with self._deferred_lock:
+                            self._early_layer_events.setdefault(layer_name, []).append(
+                                (req_meta.req_id, layer_event)
                             )
+                        if li + 1 == early_k:
+                            watermark_event = layer_event
+                else:
+                    for ci in range(num_chunks):
+                        chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                        slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
+                            2, num_layers, ct, -1
+                        )
+                        if kernel is not None:
+                            # Stage the slab through the copy engine (async DMA —
+                            # the CXL mapping is cudaHostRegister'ed by the
+                            # mapper), then scatter the device-resident slab with
+                            # one brief kernel. Running the UVA kernel directly on
+                            # the host slab would occupy SMs for the whole
+                            # CXL-read duration and stall concurrent decode — the
+                            # very stall this deferred path exists to remove
+                            # (measured: TPOT stuck at the inline path's level,
+                            # while MP's media-invariant TPOT shows its bulk
+                            # bytes ride the copy engine).
+                            ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                            slab_dev = slab_host.to(device, non_blocking=True)
+                            ops.multi_layer_kv_transfer(
+                                slab_dev,
+                                ptrs,
+                                chunk_slots,
+                                device,
+                                pbs,
+                                ops.TransferDirection.H2D,
+                                fmt,
+                                block_size=block_size,
+                                head_size=head_size,
+                            )
+                        else:
+                            slab_dev = slab_host.to(device, non_blocking=True)
+                            for layer_name, kv_cache_layer, true_idx in layers:
+                                self._inject_kv_into_layer(
+                                    kv_cache_layer,
+                                    slab_dev[:, true_idx],
+                                    chunk_slots,
+                                    attn,
+                                    layer_name,
+                                    num_chunks=1,
+                                )
                 # elapsed_time needs both ends timed, so match start_event.
-                event = torch.cuda.Event(enable_timing=self._timing)
+                event = torch.cuda.Event(enable_timing=want_timing)
                 event.record(stream)
             if self._timing:
                 # CPU wall of enqueueing all chunk copies. Async H2D should
@@ -1641,6 +1847,10 @@ class MaruWorkerConnector:
                 )
             with self._deferred_lock:
                 self._deferred_events[req_meta.req_id] = event
+                if watermark_event is not None:
+                    # Registered after every per-layer event above, so a
+                    # reportable request always has its full wait set.
+                    self._deferred_watermark_events[req_meta.req_id] = watermark_event
                 if start_event is not None:
                     self._deferred_start_events[req_meta.req_id] = start_event
                 self._deferred_refs[req_meta.req_id] = [
@@ -1920,6 +2130,13 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
+            # A failed early-resume load was never reported (its watermark is
+            # registered last), so dropping its state here is safe — and its
+            # per-layer events must not linger for future steps to wait on.
+            self._deferred_watermark_events.pop(req_meta.req_id, None)
+            self._deferred_reported.discard(req_meta.req_id)
+            self._early_report_walls.pop(req_meta.req_id, None)
+            self._prune_early_layer_events(req_meta.req_id)
 
     def _fail_load(self, req_meta: MaruReqMeta, exc: Exception) -> None:
         """Contain one request's load failure instead of letting it raise.
@@ -2032,25 +2249,66 @@ class MaruWorkerConnector:
             )
 
     def get_finished_loading(self) -> set[str] | None:
-        """Return req ids whose deferred loads completed since the last call."""
+        """Return req ids whose deferred loads completed since the last call.
+
+        Early-resume requests are reported at their watermark event, while
+        their refs (mmap views, pinned slot mappings) are released only at the
+        final event — the tail copies still read them. The resumed forward's
+        per-layer waits bridge the gap.
+        """
         with self._deferred_lock:
             done = set(self._deferred_done)
             self._deferred_done.clear()
+            for req_id, wevent in list(self._deferred_watermark_events.items()):
+                if wevent.query():
+                    done.add(req_id)
+                    self._deferred_reported.add(req_id)
+                    del self._deferred_watermark_events[req_id]
+                    self._early_report_walls[req_id] = time.monotonic()
+                    if self._timing:
+                        _emit_timing(f"early resume at watermark (req {req_id})")
             for req_id, event in list(self._deferred_events.items()):
                 if event.query():
-                    done.add(req_id)
+                    if req_id not in self._deferred_reported:
+                        done.add(req_id)
+                    self._deferred_reported.discard(req_id)
+                    # The final event outruns an unpolled watermark; never
+                    # report twice.
+                    self._deferred_watermark_events.pop(req_id, None)
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
+                    self._prune_early_layer_events(req_id)
                     start = self._deferred_start_events.pop(req_id, None)
                     if start is not None:
-                        # Both events have fired, so this is the CXL->GPU
-                        # copy's duration on the GPU timeline, excluding the
-                        # time the request spent queued before it.
-                        _emit_timing(
-                            "deferred gpu-load "
-                            f"{start.elapsed_time(event):.2f} ms (req {req_id})"
-                        )
+                        elapsed = start.elapsed_time(event)
+                        if self._num_layers > 0:
+                            # Auto early-resume: the copy's per-layer pace.
+                            self._early_resume_ctl.observe_copy(
+                                elapsed / self._num_layers
+                            )
+                        if self._timing:
+                            # Both events have fired, so this is the CXL->GPU
+                            # copy's duration on the GPU timeline, excluding
+                            # the time the request spent queued before it.
+                            _emit_timing(
+                                f"deferred gpu-load {elapsed:.2f} ms (req {req_id})"
+                            )
         return done or None
+
+    def _prune_early_layer_events(self, req_id: str) -> None:
+        """Drop a completed request's per-layer events. Caller holds the lock."""
+        if not self._early_layer_events:
+            return
+        for layer_name in list(self._early_layer_events):
+            remaining = [
+                entry
+                for entry in self._early_layer_events[layer_name]
+                if entry[0] != req_id
+            ]
+            if remaining:
+                self._early_layer_events[layer_name] = remaining
+            else:
+                del self._early_layer_events[layer_name]
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
         """Return finished requests whose write-behind stores have drained.
@@ -2592,10 +2850,55 @@ class MaruWorkerConnector:
         return runs
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Make the model stream wait for an asynchronously loaded layer."""
+        """Make the model stream wait for an asynchronously loaded layer.
+
+        An empty registry is a legal no-op — vLLM calls this on every step,
+        loads or not. Early-resume entries can never be missing for a resumed
+        request: its watermark (what makes it reportable) is registered only
+        after all of its per-layer events are.
+        """
+        self._observe_forward_pace()
         event = self._layer_load_events.get(layer_name)
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
+        if not self._early_layer_events:
+            return
+        with self._deferred_lock:
+            # Scope to this step's requests: a decode peer's step must never
+            # gate on another request's in-flight copy. The owner's own waits
+            # are no-ops when the tail arrived on time.
+            entries = [
+                layer_event
+                for req_id, layer_event in self._early_layer_events.get(layer_name, ())
+                if req_id in self._step_req_ids
+            ]
+        if entries:
+            stream = torch.cuda.current_stream()
+            for layer_event in entries:
+                stream.wait_event(layer_event)
+
+    def _observe_forward_pace(self) -> None:
+        """Sample the forward's per-layer pace from this step's wait calls.
+
+        ``wait_for_layer_load`` fires once per KV layer per step, in forward
+        order, so first-call -> last-call wall time divided by the layer gaps
+        is the pace at which a resumed forward consumes layers — the p of the
+        early-resume knee model. Costs two clock reads and a counter per call;
+        sampled only while auto mode has in-flight early loads.
+        """
+        if self._early_resume != "auto" or not self._early_layer_events:
+            self._pace_calls = 0
+            return
+        now = time.monotonic()
+        calls = getattr(self, "_pace_calls", 0)
+        if calls == 0:
+            self._pace_first_wall = now
+        self._pace_calls = calls + 1
+        if self._num_layers > 1 and self._pace_calls == self._num_layers:
+            self._early_resume_ctl.observe_forward(
+                (now - self._pace_first_wall) * 1e3 / (self._num_layers - 1)
+            )
+            self._pace_calls = 0
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
@@ -3507,6 +3810,10 @@ class MaruWorkerConnector:
             self._deferred_layerwise_loads.clear()
             self._deferred_events.clear()
             self._deferred_start_events.clear()
+            self._deferred_watermark_events.clear()
+            self._deferred_reported.clear()
+            self._early_layer_events.clear()
+            self._early_report_walls.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
         if self._handler is not None:
