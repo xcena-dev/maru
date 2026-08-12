@@ -274,6 +274,8 @@ requires `maru_async_load`; it pipelines a request's per-layer transfers
 against attention compute. The connector logs a warning and disables it when
 those prerequisites are not met.
 
+![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived and the rest of the transfer hides behind compute; when transfer is slower than compute, gaps open at every layer and stall the rest of the batch too](../image/layerwise_overlap_concept.png)
+
 The loader thread queues the per-layer copies while the request is still
 parked and the request is released once its first layer has landed, so the
 remaining layers arrive during its own attention rather than being issued
