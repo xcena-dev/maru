@@ -274,23 +274,24 @@ requires `maru_async_load`; it pipelines a request's per-layer transfers
 against attention compute. The connector logs a warning and disables it when
 those prerequisites are not met.
 
-![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived and the rest of the transfer hides behind compute; when transfer is slower than compute, gaps open at every layer and stall the rest of the batch too](../image/layerwise_overlap_concept.png)
+![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
 The loader thread queues the per-layer copies while the request is still
-parked and the request is released once its first layer has landed, so the
-remaining layers arrive during its own attention rather than being issued
-inside the forward pass. All parked-request transfers share one stream. That
-keeps each at full CXL bandwidth — splitting them across streams makes the
-per-layer transfer time scale with the number of loading requests and overrun
-per-layer compute — and it means a later request's first layer only lands
-once the earlier one has finished, so requests take their turn without any
-extra admission mechanism.
+parked and the request is released once its first layer has landed, so its
+prefill compute runs while the remaining layers arrive rather than after them.
+A cache-hit request computes only the tokens left over past its cached chunks,
+so one layer of compute is shorter than one layer of transfer: the compute
+fits inside the transfer and the transfer time is what sets time to first
+token. All parked-request transfers share one stream. That keeps each at full
+CXL bandwidth — splitting them across streams makes each transfer take as many
+times longer as there are loading requests, raising that floor — and it means
+a later request's first layer only lands once the earlier one has finished, so
+requests take their turn without any extra admission mechanism.
 
-The knob therefore applies at any concurrency. On a 16k prompt with a 66%
-external hit rate it lowered cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8
-concurrent requests, and raised throughput throughout; per-token generation
-time rose 4-5% at 4 and 8 concurrent requests, which is the cost of every
-request starting earlier.
+The knob therefore applies at any concurrency. On a 16k prompt it lowered
+cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and
+raised throughput throughout; per-token generation time rose 4-5% at 4 and 8
+concurrent requests, which is the cost of every request starting earlier.
 
 ### maru_kv_chunk_tokens
 
