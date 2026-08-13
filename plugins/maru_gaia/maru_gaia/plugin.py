@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,13 @@ class GaiaPrefetchPlugin:
         # arrival lookahead (on_prefetch) stays async regardless — a sync call
         # there would block and defeat the overlap with admission wait.
         self._sync_gate = os.environ.get("MARU_GAIA_PREFETCH_SYNC", "0") == "1"
+        # HyMCache-local mode stages explicit request windows. The ordinary
+        # on_batch_retrieve hook would otherwise fire one whole-request
+        # reactive hint before the bounded pipeline starts and contaminate the
+        # transport-substitution experiment.
+        self._hymcache_local = (
+            int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0) > 0
+        )
         # Upper bound on how long one read gate may block
         # (MARU_GAIA_PREFETCH_SYNC_BUDGET_MS, 0 = unbounded). Ranges left when
         # the budget runs out are hinted asynchronously instead.
@@ -71,9 +79,44 @@ class GaiaPrefetchPlugin:
         # only as a multi-device fallback for when the env is unset.
         dev_env = os.environ.get("MARU_GAIA_DEVICE_ID")
         self._device_id: int | None = int(dev_env) if dev_env else None
+        self._gaia_devices: dict[int, bool] = {}
         # dax device path -> pyxif device id, built lazily on first hint (the
         # scan is not free and a handler may never prefetch). Fallback only.
         self._dax_to_device: dict[str, int] | None = None
+        # Stage pin lease (MARU_GAIA_STAGE_PIN=1): on_stage materializes via
+        # memory_pin instead of memory_prefetch_sync, so the staged bytes stay
+        # DRAM-resident until on_stage_release unpins them (the READY ->
+        # consume protection window). Pins are tracked per key batch so the
+        # release and the on_close leak guard unpin exactly what was taken.
+        self._stage_pin = os.environ.get("MARU_GAIA_STAGE_PIN", "0") == "1"
+        # Issue stage calls in sub-ranges of at most this many bytes
+        # (MARU_GAIA_STAGE_SPLIT_BYTES, 0 = whole coalesced ranges). Bounded
+        # calls serve two purposes: very large single pins can time out the
+        # firmware ioctl, and the pyxif binding holds the GIL for the whole
+        # blocking call — sub-ranges open GIL windows so the caller process's
+        # Python threads keep running during a multi-hundred-ms fill. Pin
+        # defaults to 1 GiB when unset; prefetch_sync keeps whole ranges.
+        split_env = int(os.environ.get("MARU_GAIA_STAGE_SPLIT_BYTES", "0") or 0)
+        if split_env <= 0 and self._stage_pin:
+            split_env = 1 << 30
+        self._stage_split_bytes = max(0, split_env)
+        # Pin admission budget (MARU_GAIA_PIN_BUDGET_BYTES, 0 = unlimited).
+        # The firmware pin capacity is bounded (~half the DRAM cache) and an
+        # over-capacity pin ioctl observed on-device blocks ~61 s per call
+        # before failing — freezing the caller process via the GIL. Pieces
+        # that would exceed the budget are therefore never pinned; they
+        # degrade to memory_prefetch_sync (resident but evictable), keeping
+        # the stage's readiness contract without touching the pin limit.
+        self._pin_budget_bytes = max(
+            0, int(os.environ.get("MARU_GAIA_PIN_BUDGET_BYTES", "0") or 0)
+        )
+        self._pin_lock = threading.Lock()
+        self._pinned: dict[tuple[str, ...], list[tuple[int, int, int]]] = {}
+        self._pinned_bytes = 0
+        self._stage_pinned_ranges = 0
+        self._stage_unpinned_ranges = 0
+        self._stage_unpin_failed = 0
+        self._stage_pin_degraded = 0
         # Cumulative counters surfaced via contribute_stats.
         self._issued = 0
         self._failed = 0
@@ -84,10 +127,12 @@ class GaiaPrefetchPlugin:
         self._stage_bytes = 0
         self._stage_wait_us = 0
         logger.info(
-            "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, read_gate=%s)",
+            "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, "
+            "read_gate=%s, stage_api=%s)",
             "on" if self._coalesce else "off",
             self._device_id if self._device_id is not None else "auto-scan",
             "sync" if self._sync_gate else "async",
+            "memory_pin" if self._stage_pin else "memory_prefetch_sync",
         )
 
     # -- MaruHandlerPlugin seams -------------------------------------------
@@ -101,6 +146,8 @@ class GaiaPrefetchPlugin:
         """Demand-read boundary. With MARU_GAIA_PREFETCH_SYNC=1 this is a sync
         read-gate (block until DRAM-resident); otherwise the async reactive
         hint (baseline)."""
+        if self._hymcache_local:
+            return
         self._issue(
             handler,
             keys,
@@ -140,12 +187,38 @@ class GaiaPrefetchPlugin:
             source="stage",
             sync=True,
             apply_sync_budget=False,
+            pin=self._stage_pin,
         )
         self._stage_requests += 1
         self._stage_ready += int(result.ready)
         self._stage_bytes += result.prepared_bytes
         self._stage_wait_us += int(result.wait_ms * 1000.0)
         return result
+
+    def on_stage_release(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+    ) -> None:
+        """Unpin the device ranges a prior pinned stage of ``keys`` holds.
+
+        Idempotent: a batch that never pinned (pin lease off, stage failed
+        before any pin, or already released) is a cheap dictionary miss.
+        """
+        with self._pin_lock:
+            ranges = self._pinned.pop(tuple(keys), None)
+        if ranges:
+            self._unpin_ranges(ranges)
+
+    def on_close(self, handler: MaruHandler) -> None:
+        """Leak guard: unpin every range still held when the handler closes."""
+        with self._pin_lock:
+            leftover = list(self._pinned.values())
+            self._pinned.clear()
+        for ranges in leftover:
+            self._unpin_ranges(ranges)
+        with self._pin_lock:
+            self._pinned_bytes = 0
 
     def contribute_stats(self) -> dict:
         """Cumulative prefetch counters for ``MaruHandler.get_stats``."""
@@ -160,6 +233,14 @@ class GaiaPrefetchPlugin:
             "stage_ready": self._stage_ready,
             "stage_bytes": self._stage_bytes,
             "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
+            "stage_pin": self._stage_pin,
+            "stage_split_bytes": self._stage_split_bytes,
+            "stage_pinned_ranges": self._stage_pinned_ranges,
+            "stage_unpinned_ranges": self._stage_unpinned_ranges,
+            "stage_unpin_failed": self._stage_unpin_failed,
+            "stage_pin_degraded": self._stage_pin_degraded,
+            "pin_budget_bytes": self._pin_budget_bytes,
+            "pinned_bytes": self._pinned_bytes,
         }
 
     # -- internals ----------------------------------------------------------
@@ -173,7 +254,7 @@ class GaiaPrefetchPlugin:
         works).
         """
         if self._device_id is not None:
-            return self._device_id
+            return self._device_id if self._is_gaia_device(self._device_id) else None
         dax_path = handler.get_region_dax_path(region_id)
         if dax_path is None:
             return None
@@ -184,11 +265,36 @@ class GaiaPrefetchPlugin:
         if self._dax_to_device is None:
             dax_map: dict[str, int] = {}
             for device_id in pyxif.get_device_list():
+                if not self._is_gaia_device(device_id):
+                    continue
                 for region in pyxif.cxl_get_regions(device_id):
                     dax_map[region.dax_device] = device_id
             self._dax_to_device = dax_map
             logger.info("gaia_prefetch: dax_to_device_map=%s", dax_map)
         return self._dax_to_device
+
+    def _is_gaia_device(self, device_id: int) -> bool:
+        """Return whether ``device_id`` implements InfiniteMemory commands."""
+        if device_id in self._gaia_devices:
+            return self._gaia_devices[device_id]
+        try:
+            info = pyxif.get_device_info(device_id)
+            enabled = info is not None and bool(info.gaia_enabled())
+        except Exception:
+            enabled = False
+            logger.warning(
+                "gaia_prefetch: failed to validate device %d; ignoring it",
+                device_id,
+                exc_info=True,
+            )
+        self._gaia_devices[device_id] = enabled
+        if not enabled:
+            logger.error(
+                "gaia_prefetch: device %d is not gaia-enabled; no InfiniteMemory "
+                "command will be issued",
+                device_id,
+            )
+        return enabled
 
     def _issue(
         self,
@@ -198,6 +304,7 @@ class GaiaPrefetchPlugin:
         source: str,
         sync: bool = False,
         apply_sync_budget: bool = True,
+        pin: bool = False,
     ) -> StageResult:
         """Resolve mapped found entries to device ranges and prefetch them.
 
@@ -233,12 +340,15 @@ class GaiaPrefetchPlugin:
 
         chunk_count = len(eligible)
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
+        if source == "stage" and self._stage_split_bytes > 0:
+            ranges = self._split_ranges(ranges, self._stage_split_bytes)
 
         issued = 0
         prepared_ranges = 0
         failed = 0
         degraded = 0
         prepared_bytes = 0
+        pinned: list[tuple[int, int, int]] = []
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
             # The read gate blocks the single deferred-load thread, so a cold
@@ -251,24 +361,71 @@ class GaiaPrefetchPlugin:
                 if spent_ms >= self._sync_budget_ms:
                     gated = False
                     degraded += 1
-            prefetch_fn = pyxif.memory_prefetch_sync if gated else pyxif.memory_prefetch
-            status = prefetch_fn(device_id, device_addr, size)
+            pin_this = pin and gated
+            if pin_this and self._pin_budget_bytes > 0:
+                with self._pin_lock:
+                    over_budget = self._pinned_bytes + size > self._pin_budget_bytes
+                if over_budget:
+                    # Never issue an over-budget pin (the ioctl can block for
+                    # a minute per call); keep readiness via the evictable
+                    # sync fill instead.
+                    pin_this = False
+                    self._stage_pin_degraded += 1
+            if pin_this:
+                # memory_pin returns at DRAM-load completion AND protects the
+                # range from eviction until the matching unpin — the stage's
+                # residency lease.
+                prefetch_fn = pyxif.memory_pin
+            elif gated:
+                prefetch_fn = pyxif.memory_prefetch_sync
+            else:
+                prefetch_fn = pyxif.memory_prefetch
+            try:
+                status = prefetch_fn(device_id, device_addr, size)
+            except Exception:
+                failed += 1
+                logger.warning(
+                    "gaia_prefetch raised: device=%d addr=0x%x size=%d sync=%s pin=%s",
+                    device_id,
+                    device_addr,
+                    size,
+                    sync,
+                    pin,
+                    exc_info=True,
+                )
+                continue
             if status == pyxif.MemoryStatus.Success:
                 issued += 1
                 if gated:
                     prepared_ranges += 1
                     prepared_bytes += size
+                    if pin_this:
+                        pinned.append((device_id, device_addr, size))
+                        with self._pin_lock:
+                            self._pinned_bytes += size
             else:
                 failed += 1
                 logger.warning(
-                    "gaia_prefetch failed: device=%d addr=0x%x size=%d status=%s sync=%s",
+                    "gaia_prefetch failed: device=%d addr=0x%x size=%d status=%s "
+                    "sync=%s pin=%s",
                     device_id,
                     device_addr,
                     size,
                     status,
                     sync,
+                    pin,
                 )
         wait_us = int((time.monotonic() - t0) * 1e6) if sync else 0
+        if pinned:
+            batch = tuple(keys)
+            with self._pin_lock:
+                # A re-stage of a still-held batch replaces its lease; unpin
+                # the old ranges outside the lock below.
+                previous = self._pinned.pop(batch, None)
+                self._pinned[batch] = pinned
+            self._stage_pinned_ranges += len(pinned)
+            if previous:
+                self._unpin_ranges(previous)
 
         self._issued += issued
         self._failed += failed
@@ -323,6 +480,50 @@ class GaiaPrefetchPlugin:
                 result.wait_ms,
             )
         return result
+
+    def _unpin_ranges(self, ranges: list[tuple[int, int, int]]) -> None:
+        """Unpin previously pinned ranges, counting (not raising) failures."""
+        for device_id, device_addr, size in ranges:
+            try:
+                status = pyxif.memory_unpin(device_id, device_addr, size)
+            except Exception:
+                self._stage_unpin_failed += 1
+                logger.warning(
+                    "gaia_stage unpin raised: device=%d addr=0x%x size=%d",
+                    device_id,
+                    device_addr,
+                    size,
+                    exc_info=True,
+                )
+                continue
+            if status == pyxif.MemoryStatus.Success:
+                self._stage_unpinned_ranges += 1
+                with self._pin_lock:
+                    self._pinned_bytes = max(0, self._pinned_bytes - size)
+            else:
+                self._stage_unpin_failed += 1
+                logger.warning(
+                    "gaia_stage unpin failed: device=%d addr=0x%x size=%d status=%s",
+                    device_id,
+                    device_addr,
+                    size,
+                    status,
+                )
+
+    @staticmethod
+    def _split_ranges(
+        ranges: list[tuple[int, int, int]],
+        max_bytes: int,
+    ) -> list[tuple[int, int, int]]:
+        """Split ``(device_id, addr, size)`` ranges into ≤ ``max_bytes`` pieces."""
+        pieces: list[tuple[int, int, int]] = []
+        for device_id, addr, size in ranges:
+            offset = 0
+            while offset < size:
+                piece = min(max_bytes, size - offset)
+                pieces.append((device_id, addr + offset, piece))
+                offset += piece
+        return pieces
 
     @staticmethod
     def _coalesce_ranges(

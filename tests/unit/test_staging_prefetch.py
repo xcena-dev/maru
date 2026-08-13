@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,9 +18,11 @@ from maru_vllm.connector import (
 )
 from maru_vllm.staging_prefetch import (
     FifoStagePolicy,
+    HymCacheRollingPipeline,
     StagePlan,
     StageState,
     StageTicket,
+    build_hymcache_objects,
 )
 
 
@@ -47,6 +49,210 @@ def _empty_scheduler_output() -> SimpleNamespace:
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )
+
+
+class TestHymCacheRollingWindow:
+    def test_builds_one_ordered_object_per_llama_block(self):
+        mib = 1024**2
+        keys = [f"k{i}" for i in range(9)]
+
+        objects = build_hymcache_objects(
+            "r0",
+            keys,
+            [16 * mib] * len(keys),
+        )
+
+        assert [obj.key for obj in objects] == keys
+        assert [obj.index for obj in objects] == list(range(9))
+        assert [obj.nbytes for obj in objects] == [16 * mib] * 9
+
+    def test_128_mib_rolling_window_holds_eight_llama_blocks(self):
+        mib = 1024**2
+        objects = build_hymcache_objects(
+            "r0",
+            [f"k{i}" for i in range(9)],
+            [16 * mib] * 9,
+        )
+        events: list[str] = []
+        active = 0
+        peak = 0
+
+        def stage(obj):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            events.append(f"stage-{obj.index}")
+            return obj.key
+
+        def release(obj):
+            nonlocal active
+            active -= 1
+            events.append(f"release-{obj.index}")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            HymCacheRollingPipeline(executor, window_bytes=128 * mib).run(
+                [objects],
+                stage=stage,
+                consume=lambda obj, result: None,
+                release=release,
+            )
+
+        assert peak == 8
+        assert events.index("release-0") < events.index("stage-8")
+        assert active == 0
+
+    def test_oversized_object_runs_alone_without_reordering(self):
+        objects = build_hymcache_objects(
+            "r0",
+            ["a", "big", "c"],
+            [4, 20, 4],
+        )
+        events: list[str] = []
+        active_bytes = 0
+        max_active_bytes = 0
+
+        def stage(obj):
+            nonlocal active_bytes, max_active_bytes
+            active_bytes += obj.nbytes
+            max_active_bytes = max(max_active_bytes, active_bytes)
+            events.append(f"stage-{obj.key}")
+            return obj.key
+
+        def consume(obj, result):
+            assert result == obj.key
+            events.append(f"consume-{obj.key}")
+
+        def release(obj):
+            nonlocal active_bytes
+            active_bytes -= obj.nbytes
+            events.append(f"release-{obj.key}")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            HymCacheRollingPipeline(executor, window_bytes=8).run(
+                [objects],
+                stage=stage,
+                consume=consume,
+                release=release,
+            )
+
+        assert [event for event in events if event.startswith("consume-")] == [
+            "consume-a",
+            "consume-big",
+            "consume-c",
+        ]
+        assert events.index("release-a") < events.index("stage-big")
+        assert events.index("release-big") < events.index("stage-c")
+        assert max_active_bytes == 20
+        assert active_bytes == 0
+
+    def test_issue_next_precedes_consume_and_leases_stay_bounded(self):
+        objects = build_hymcache_objects(
+            "r0",
+            ["a", "b", "c"],
+            [4, 4, 4],
+        )
+        events: list[str] = []
+        next_staged = threading.Event()
+        active_leases = 0
+        max_active_leases = 0
+        lock = threading.Lock()
+
+        def stage(obj):
+            nonlocal active_leases, max_active_leases
+            with lock:
+                active_leases += 1
+                max_active_leases = max(max_active_leases, active_leases)
+                events.append(f"stage-{obj.index}")
+            if obj.index == 1:
+                next_staged.set()
+            return obj.key
+
+        def consume(obj, result):
+            events.append(f"consume-start-{obj.index}")
+            assert result == obj.key
+            if obj.index == 0:
+                assert next_staged.wait(timeout=1.0)
+            events.append(f"consume-end-{obj.index}")
+
+        def release(obj):
+            nonlocal active_leases
+            with lock:
+                events.append(f"release-{obj.index}")
+                active_leases -= 1
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            timings = HymCacheRollingPipeline(executor, window_bytes=8).run(
+                [objects],
+                stage=stage,
+                consume=consume,
+                release=release,
+            )
+
+        assert events.index("stage-1") < events.index("consume-end-0")
+        assert events.index("release-0") < events.index("stage-2")
+        assert max_active_leases == 2
+        assert active_leases == 0
+        assert [timing.object.index for timing in timings] == [0, 1, 2]
+
+    def test_concurrent_requests_fill_initial_depth_round_robin(self):
+        requests = [
+            build_hymcache_objects("r0", ["a0", "a1"], [4, 4]),
+            build_hymcache_objects("r1", ["b0", "b1"], [4, 4]),
+        ]
+        staged: list[str] = []
+
+        def stage(obj):
+            staged.append(obj.key)
+            return obj.key
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            HymCacheRollingPipeline(executor, window_bytes=8).run(
+                requests,
+                stage=stage,
+                consume=lambda obj, result: None,
+                release=lambda obj: None,
+            )
+
+        assert staged == ["a0", "b0", "a1", "b1"]
+
+    def test_connector_mode_excludes_other_hint_pipelines(self, monkeypatch):
+        monkeypatch.setenv("MARU_HYMCACHE_WINDOW_BYTES", str(128 * 1024**2))
+        monkeypatch.setenv("MARU_STAGE_PIPELINE", "1")
+        monkeypatch.setenv("MARU_ARRIVAL_HINT", "1")
+
+        scheduler = MaruSchedulerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={},
+        )
+        worker = MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_enable_deferred_loading": True},
+        )
+
+        assert scheduler._hymcache_window_bytes == 128 * 1024**2
+        assert not scheduler._stage_enabled
+        assert not scheduler._arrival_hint_enabled
+        assert worker._hymcache_window_bytes == 128 * 1024**2
+        assert not worker._stage_enabled
+        assert not worker._arrival_hint_enabled
+        assert not worker._try_submit_deferred_packed_load(SimpleNamespace())
+        worker.shutdown()
+
+    def test_packed_load_dispatches_to_hymcache_path(self, monkeypatch):
+        monkeypatch.setenv("MARU_HYMCACHE_WINDOW_BYTES", "4096")
+        worker = MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={},
+        )
+        worker._load_packed_hymcache = MagicMock()
+
+        worker._load_packed([], [], None)
+
+        worker._load_packed_hymcache.assert_called_once_with([], [], None)
+        worker.shutdown()
 
 
 class TestFifoStagePolicy:

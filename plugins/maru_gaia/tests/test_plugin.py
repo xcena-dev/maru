@@ -33,6 +33,9 @@ class _FakePyxif:
     def get_device_list(self):
         return [self._device_id]
 
+    def get_device_info(self, device_id):
+        return SimpleNamespace(gaia_enabled=lambda: True)
+
     def cxl_get_regions(self, device_id):
         return [SimpleNamespace(dax_device=self._dax_path)]
 
@@ -116,6 +119,45 @@ class TestIssue:
         plugin.on_prefetch(_handler(), ["k0"], _resp(_entry(0x1000, 0x200, 0x100)))
 
         assert fake.calls == [(2, 0x1200, 0x100)]  # device 2 from env, not scan
+
+    def test_non_gaia_env_device_is_rejected(self, monkeypatch):
+        fake = _FakePyxif()
+        fake.get_device_info = lambda device_id: SimpleNamespace(
+            gaia_enabled=lambda: False
+        )
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_DEVICE_ID", "2")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_prefetch(_handler(), ["k0"], _resp(_entry(0x1000, 0x200, 0x100)))
+
+        assert fake.calls == []
+        assert plugin._skipped == 1
+
+    def test_auto_scan_ignores_non_gaia_devices(self, monkeypatch):
+        fake = _FakePyxif()
+        fake.get_device_list = lambda: [0, 1]
+        fake.get_device_info = lambda device_id: SimpleNamespace(
+            gaia_enabled=lambda: device_id == 1
+        )
+        fake.cxl_get_regions = lambda device_id: [
+            SimpleNamespace(dax_device=f"/dev/dax{device_id}.0")
+        ]
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_prefetch(
+            _handler(dax_path="/dev/dax0.0"),
+            ["k0"],
+            _resp(_entry(0x1000, 0, 0x100)),
+        )
+        plugin.on_prefetch(
+            _handler(dax_path="/dev/dax1.0"),
+            ["k1"],
+            _resp(_entry(0x2000, 0, 0x100)),
+        )
+
+        assert fake.calls == [(1, 0x2000, 0x100)]
 
     def test_contiguous_chunks_coalesce_to_one_call(self, monkeypatch):
         fake = _FakePyxif()
@@ -212,6 +254,17 @@ class TestSyncReadGate:
         assert fake.calls == [(0, 0x1000, 0x100)]  # async
         assert fake.sync_calls == []
 
+    def test_hymcache_local_skips_whole_request_reactive_hint(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_HYMCACHE_WINDOW_BYTES", "128")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["k0"], _resp(_entry(0x1000, 0, 0x100)))
+
+        assert fake.calls == []
+        assert fake.sync_calls == []
+
 
 class TestStage:
     """Completion-returning stage always uses the unbudgeted sync API."""
@@ -248,6 +301,156 @@ class TestStage:
         assert not result.ready
         assert result.found_keys == 0
         assert result.prepared_bytes == 0
+
+    def test_stage_split_bounds_sync_call_size(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "64")
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 160))
+
+        result = plugin.on_stage(_handler(), ["a"], response)
+
+        assert [size for (_, _, size) in fake.sync_calls] == [64, 64, 32]
+        assert result.ready
+        assert result.prepared_bytes == 160
+
+
+class TestStagePinLease:
+    """MARU_GAIA_STAGE_PIN=1: on_stage pins; release/close unpin the lease."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_env(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_PIN", "1")
+        # Small split so the tests exercise sub-range pins deterministically.
+        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "64")
+
+    def _pin_fake(self, monkeypatch):
+        fake = _FakePyxif()
+        fake.pin_calls = []
+        fake.unpin_calls = []
+
+        def memory_pin(device_id, addr, size):
+            fake.pin_calls.append((device_id, addr, size))
+            return fake.MemoryStatus.Success
+
+        def memory_unpin(device_id, addr, size):
+            fake.unpin_calls.append((device_id, addr, size))
+            return fake.MemoryStatus.Success
+
+        fake.memory_pin = memory_pin
+        fake.memory_unpin = memory_unpin
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        return fake
+
+    def test_stage_pins_split_ranges_and_release_unpins_them(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 96))
+
+        result = plugin.on_stage(_handler(), ["a"], response)
+
+        assert result.ready
+        assert fake.pin_calls == [(0, 0, 64), (0, 64, 32)]
+        assert fake.sync_calls == []  # pin replaces prefetch_sync
+
+        plugin.on_stage_release(_handler(), ["a"])
+        assert fake.unpin_calls == fake.pin_calls
+
+    def test_release_is_idempotent(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        plugin = GaiaPrefetchPlugin()
+        plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        plugin.on_stage_release(_handler(), ["a"])
+        plugin.on_stage_release(_handler(), ["a"])
+
+        assert len(fake.unpin_calls) == 1
+
+    def test_release_of_unknown_batch_is_noop(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_stage_release(_handler(), ["never-staged"])
+
+        assert fake.unpin_calls == []
+
+    def test_close_unpins_leftover_leases(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        plugin = GaiaPrefetchPlugin()
+        plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+        plugin.on_stage(_handler(), ["b"], _resp(_entry(0, 1024, 32)))
+        plugin.on_stage_release(_handler(), ["a"])
+
+        plugin.on_close(_handler())
+
+        assert (0, 1024, 32) in fake.unpin_calls
+        assert len(fake.unpin_calls) == 2
+        stats = plugin.contribute_stats()
+        assert stats["stage_pinned_ranges"] == 2
+        assert stats["stage_unpinned_ranges"] == 2
+        assert stats["stage_unpin_failed"] == 0
+
+    def test_pin_budget_degrades_overflow_to_prefetch_sync(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        monkeypatch.setenv("MARU_GAIA_PIN_BUDGET_BYTES", "96")
+        plugin = GaiaPrefetchPlugin()
+
+        # First lease: 64 fits, next 64-piece would exceed 96 -> degraded.
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 128)))
+
+        assert result.ready  # readiness holds via the sync fill
+        assert fake.pin_calls == [(0, 0, 64)]
+        assert fake.sync_calls == [(0, 64, 64)]
+        assert plugin.contribute_stats()["stage_pin_degraded"] == 1
+        assert plugin.contribute_stats()["pinned_bytes"] == 64
+
+        # Second batch while the first lease is held: everything degrades.
+        result2 = plugin.on_stage(_handler(), ["b"], _resp(_entry(0, 1024, 64)))
+        assert result2.ready
+        assert fake.pin_calls == [(0, 0, 64)]
+        assert fake.sync_calls == [(0, 64, 64), (0, 1024, 64)]
+
+        # Releasing the first lease returns its budget.
+        plugin.on_stage_release(_handler(), ["a"])
+        assert plugin.contribute_stats()["pinned_bytes"] == 0
+        plugin.on_stage(_handler(), ["c"], _resp(_entry(0, 2048, 64)))
+        assert fake.pin_calls == [(0, 0, 64), (0, 2048, 64)]
+
+    def test_restage_replaces_lease_and_unpins_old_ranges(self, monkeypatch):
+        fake = self._pin_fake(monkeypatch)
+        plugin = GaiaPrefetchPlugin()
+        plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 2048, 32)))
+
+        assert fake.unpin_calls == [(0, 0, 32)]
+        plugin.on_stage_release(_handler(), ["a"])
+        assert fake.unpin_calls == [(0, 0, 32), (0, 2048, 32)]
+
+    def test_partial_pin_exception_keeps_successful_lease_releasable(
+        self, monkeypatch
+    ):
+        fake = self._pin_fake(monkeypatch)
+
+        def memory_pin(device_id, addr, size):
+            fake.pin_calls.append((device_id, addr, size))
+            if addr == 64:
+                raise TimeoutError("injected timeout")
+            return fake.MemoryStatus.Success
+
+        fake.memory_pin = memory_pin
+        plugin = GaiaPrefetchPlugin()
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 96)))
+
+        assert not result.ready
+        assert fake.pin_calls == [(0, 0, 64), (0, 64, 32)]
+        plugin.on_stage_release(_handler(), ["a"])
+        assert fake.unpin_calls == [(0, 0, 64)]
+        assert plugin.contribute_stats()["pinned_bytes"] == 0
 
 
 if __name__ == "__main__":

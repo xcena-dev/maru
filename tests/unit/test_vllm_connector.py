@@ -837,6 +837,32 @@ class TestBuildConnectorMetaStoreAccumulation:
         assert req.block_ids == list(range(15))
         assert req.num_computed_tokens == 58
 
+    def test_external_hit_load_also_publishes_new_suffix(self):
+        sched = self._make_scheduler()
+        token_ids = list(range(24))
+        request = SimpleNamespace(request_id="r1", prompt_token_ids=token_ids)
+        sched._requests_need_load["r1"] = (request, 1)
+        new_req = SimpleNamespace(
+            req_id="r1",
+            prompt_token_ids=token_ids,
+            block_ids=(list(range(6)),),
+            num_computed_tokens=8,
+        )
+
+        meta = sched.build_connector_meta(
+            self._output([new_req], self._cached([], [], []), {"r1": 16})
+        )
+
+        assert len(meta.requests) == 2
+        load, store = meta.requests
+        assert not load.is_store
+        assert load.num_matched_chunks == 1
+        assert store.is_store
+        assert store.num_computed_tokens == 8
+        assert store.num_scheduled_tokens == 16
+        assert store.block_ids == list(range(6))
+        assert "r1" not in sched._requests_need_store
+
     def test_preempted_ids_are_forwarded_for_store_stream_safety(self):
         sched = self._make_scheduler()
         output = self._output([], self._cached([], [], []), {})

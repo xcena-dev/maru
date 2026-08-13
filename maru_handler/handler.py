@@ -1144,6 +1144,23 @@ class MaruHandler:
         )
         return result
 
+    def stage_release(self, keys: list[str]) -> None:
+        """Release device resources held by a prior :meth:`stage_batch`.
+
+        Dispatches ``on_stage_release`` to every loaded plugin with the same
+        key list the stage received — the lease-ending counterpart of
+        ``on_stage``. Idempotent and cheap when nothing is held (plugins are
+        required to no-op for unknown batches), so callers may invoke it on
+        every terminal path of a staged batch without tracking whether the
+        stage actually pinned anything. No RPC is involved.
+
+        Args:
+            keys: The chunk key strings the matching ``stage_batch`` staged.
+        """
+        if not keys:
+            return
+        self._dispatch_plugins("on_stage_release", self, keys)
+
     def batch_store(
         self,
         keys: list[str],

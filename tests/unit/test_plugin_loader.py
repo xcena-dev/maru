@@ -100,6 +100,15 @@ class TestLoadHandlerPlugins:
         )
         assert len(plugins) == 1
 
+    def test_none_env_disables_all(self, monkeypatch, caplog):
+        """The reserved MARU_PLUGINS=none value explicitly loads nothing."""
+        monkeypatch.setenv("MARU_PLUGINS", "none")
+        plugins = load_handler_plugins(
+            entry_points_iter=[_ep("od", "collections:OrderedDict")]
+        )
+        assert plugins == []
+        assert "matched no installed plugin" not in caplog.text
+
     def test_factory_returning_none_is_skipped(self, caplog, monkeypatch):
         """A factory that returns None is dropped, not kept as a dead plugin."""
         # maru_handler logger has propagate=False (own handler); let records

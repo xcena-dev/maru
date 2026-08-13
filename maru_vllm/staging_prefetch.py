@@ -13,11 +13,172 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future
+from collections.abc import Callable, Sequence
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Generic, TypeVar
 
 from maru_handler import StageResult
+
+_StageValue = TypeVar("_StageValue")
+
+
+@dataclass(frozen=True)
+class HymCacheObject:
+    """One ordered request-local KV object in a rolling prefetch window."""
+
+    req_id: str
+    index: int
+    key: str
+    nbytes: int
+
+
+def build_hymcache_objects(
+    req_id: str,
+    keys: Sequence[str],
+    key_sizes: Sequence[int],
+) -> list[HymCacheObject]:
+    """Build the ordered KV-object stream consumed by a rolling window.
+
+    Args:
+        req_id: Request identifier used only for tracing.
+        keys: Ordered request-local KV object keys.
+        key_sizes: Payload bytes corresponding one-to-one with ``keys``.
+
+    Returns:
+        One descriptor per input object, in the original request order.
+
+    Raises:
+        ValueError: If keys and sizes cannot define valid objects.
+    """
+    if len(keys) != len(key_sizes):
+        raise ValueError("keys and key_sizes must have the same length")
+    if any(size <= 0 for size in key_sizes):
+        raise ValueError("key sizes must be positive")
+
+    return [
+        HymCacheObject(
+            req_id=req_id,
+            index=index,
+            key=key,
+            nbytes=size,
+        )
+        for index, (key, size) in enumerate(zip(keys, key_sizes, strict=True))
+    ]
+
+
+@dataclass(frozen=True)
+class HymCacheObjectTiming:
+    """Host-side wait and consume durations for one pipeline object."""
+
+    object: HymCacheObject
+    demand_wait_ms: float
+    consume_ms: float
+
+
+class HymCacheRollingPipeline(Generic[_StageValue]):
+    """Run HyMCache's per-request byte-bounded rolling object window.
+
+    Each request may have at most ``window_bytes`` scheduled for staging at a
+    time (except that one oversized object is admitted alone). Objects are
+    initially issued round-robin across requests. Once an object's CXL-to-GPU
+    consumption completes, its release is queued before replacement objects
+    from the same request, preserving the byte bound while keeping Stage 1
+    ahead of Stage 2.
+    """
+
+    def __init__(self, executor: Executor, *, window_bytes: int) -> None:
+        if window_bytes <= 0:
+            raise ValueError("window_bytes must be positive")
+        self._executor = executor
+        self._window_bytes = window_bytes
+
+    def run(
+        self,
+        requests: Sequence[Sequence[HymCacheObject]],
+        *,
+        stage: Callable[[HymCacheObject], _StageValue],
+        consume: Callable[[HymCacheObject, _StageValue], None],
+        release: Callable[[HymCacheObject], None],
+    ) -> list[HymCacheObjectTiming]:
+        """Run all request streams and drain every release before returning."""
+        object_streams = [tuple(objects) for objects in requests if objects]
+        if not object_streams:
+            return []
+
+        next_indices = [0] * len(object_streams)
+        admitted_bytes = [0] * len(object_streams)
+        pending: deque[tuple[int, HymCacheObject, Future[_StageValue]]] = deque()
+        release_futures: list[Future[None]] = []
+        timings: list[HymCacheObjectTiming] = []
+
+        def admit_one(request_index: int) -> bool:
+            next_index = next_indices[request_index]
+            objects = object_streams[request_index]
+            if next_index >= len(objects):
+                return False
+            obj = objects[next_index]
+            live_bytes = admitted_bytes[request_index]
+            if live_bytes and live_bytes + obj.nbytes > self._window_bytes:
+                return False
+            pending.append(
+                (request_index, obj, self._executor.submit(stage, obj))
+            )
+            next_indices[request_index] += 1
+            admitted_bytes[request_index] += obj.nbytes
+            return True
+
+        # Fill every request's initial window in object-depth order rather
+        # than letting the first request monopolize the device queue.
+        admitted = True
+        while admitted:
+            admitted = False
+            for request_index in range(len(object_streams)):
+                admitted = admit_one(request_index) or admitted
+
+        try:
+            while pending:
+                request_index, obj, future = pending.popleft()
+                wait_t0 = time.monotonic()
+                try:
+                    result = future.result()
+                except BaseException:
+                    release_futures.append(self._executor.submit(release, obj))
+                    raise
+                demand_wait_ms = (time.monotonic() - wait_t0) * 1000.0
+
+                consume_t0 = time.monotonic()
+                try:
+                    consume(obj, result)
+                finally:
+                    # Replacement stages are submitted only after this release.
+                    # Previously admitted objects remain ahead in the queue and
+                    # overlap the current CXL->GPU transfer.
+                    release_futures.append(self._executor.submit(release, obj))
+                    admitted_bytes[request_index] -= obj.nbytes
+                    while admit_one(request_index):
+                        pass
+                timings.append(
+                    HymCacheObjectTiming(
+                        object=obj,
+                        demand_wait_ms=demand_wait_ms,
+                        consume_ms=(time.monotonic() - consume_t0) * 1000.0,
+                    )
+                )
+        finally:
+            # If a consumer failed, every already-issued stage still gets a
+            # matching release. Objects not yet admitted acquired no lease.
+            while pending:
+                _, obj, future = pending.popleft()
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+                release_futures.append(self._executor.submit(release, obj))
+            for future in release_futures:
+                future.result()
+        return timings
 
 
 @dataclass(frozen=True)

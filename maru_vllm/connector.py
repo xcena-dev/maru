@@ -40,7 +40,14 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 from maru_handler import StageResult
 
-from .staging_prefetch import FifoStagePolicy, StagePlan, StageTicket
+from .staging_prefetch import (
+    FifoStagePolicy,
+    HymCacheObject,
+    HymCacheRollingPipeline,
+    StagePlan,
+    StageTicket,
+    build_hymcache_objects,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -263,6 +270,32 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
     return req_meta._chunk_keys_memo
 
 
+_HINT_PLAN_PREFIX = "maru-hint:"
+
+
+def _hint_plan_id(session_id: str) -> str:
+    """Stage-plan id for a session hint (namespaced apart from vLLM req ids)."""
+    return f"{_HINT_PLAN_PREFIX}{session_id}"
+
+
+def _request_session_params(request: Request) -> tuple[str | None, str | None]:
+    """Extract (session_id, imminent_session) from a request's transfer params.
+
+    Both ride on the OpenAI ``extra_body.kv_transfer_params`` dict, which
+    vLLM carries verbatim on the Request object. Returns ``None`` for absent
+    or malformed values — session hints are strictly opt-in per request.
+    """
+    params = getattr(request, "kv_transfer_params", None)
+    if not isinstance(params, dict):
+        return None, None
+    session = params.get("maru_session_id")
+    imminent = params.get("maru_imminent_session")
+    return (
+        str(session) if session else None,
+        str(imminent) if imminent else None,
+    )
+
+
 @dataclass
 class MaruConnectorMetadata(KVConnectorMetadata):
     """Metadata communicated from scheduler to worker each step.
@@ -289,6 +322,14 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     layerwise_load_req_ids: set[str] = field(default_factory=set)
     arrival_hint_keys: list[str] = field(default_factory=list)
     stage_plans: list[StagePlan] = field(default_factory=list)
+    # Session-hint staging (MARU_STAGE_TRIGGER=turn_end|imminent): an
+    # arriving load request joins the ticket staged under its session's hint
+    # plan id via this req_id -> plan_id alias. Empty in match mode.
+    stage_aliases: dict[str, str] = field(default_factory=dict)
+    # Hint plan ids whose target request will never join (finished/preempted
+    # or scheduled without a load) — the worker drops those tickets so a
+    # pinned stage cannot outlive its consumer.
+    stage_release_ids: list[str] = field(default_factory=list)
 
 
 # ============================================================================
@@ -624,6 +665,17 @@ class MaruSchedulerConnector:
         # Completion-returning staging pipeline. The scheduler is deliberately
         # only a bounded FIFO brain; the worker owns the blocking device call.
         self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        self._hymcache_window_bytes = max(
+            0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
+        )
+        if self._hymcache_window_bytes > 0:
+            if self._arrival_hint_enabled or self._stage_enabled:
+                logger.warning(
+                    "MARU_HYMCACHE_WINDOW_BYTES supersedes arrival/session/request "
+                    "staging; disabling those non-HyMCache hint paths"
+                )
+            self._arrival_hint_enabled = False
+            self._stage_enabled = False
         self._stage_policy: FifoStagePolicy | None = None
         if self._stage_enabled:
             self._stage_policy = FifoStagePolicy(
@@ -695,6 +747,44 @@ class MaruSchedulerConnector:
                 os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)),
                 os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)),
             )
+        # What fires a StagePlan (MARU_STAGE_TRIGGER):
+        #   match    — at the arriving request's verified match (the staging
+        #              P0 behavior; stage cost lands inside this request's
+        #              TTFT). Default.
+        #   turn_end — at request completion, re-stage the session's own
+        #              confirmed prefix for its next turn.
+        #   imminent — when a request carries a gateway hint that another
+        #              session's turn is about to arrive, stage that
+        #              session's confirmed prefix from the registry.
+        # turn_end/imminent identify sessions via
+        # ``kv_transfer_params.maru_session_id`` (OpenAI extra_body) and join
+        # the arriving request to its hint ticket through a req-id alias
+        # relayed in the connector metadata.
+        self._stage_trigger = os.environ.get("MARU_STAGE_TRIGGER", "match")
+        if self._stage_trigger not in ("match", "turn_end", "imminent"):
+            logger.warning(
+                "Unknown MARU_STAGE_TRIGGER=%r; falling back to 'match'",
+                self._stage_trigger,
+            )
+            self._stage_trigger = "match"
+        if self._stage_enabled and self._stage_trigger != "match":
+            logger.info(
+                "Maru stage trigger: %s (session-hint mode)", self._stage_trigger
+            )
+        # session_id -> confirmed prefix chunk keys, recorded at request
+        # completion (the just-stored keys ARE the prefix the session's next
+        # turn will re-read; no future request content is used).
+        self._session_keys: dict[str, tuple[str, ...]] = {}
+        # Arriving req_id -> hint plan id, until relayed to the worker.
+        self._pending_stage_aliases: dict[str, str] = {}
+        # Relayed aliases, kept until their request finishes: a hint plan
+        # admitted in the same step its target is scheduled re-enters the
+        # policy's inflight window after the consumed-set was applied, so its
+        # slot (and worker ticket, on failure paths) is reclaimed at finish.
+        self._relayed_stage_aliases: dict[str, str] = {}
+        # Hint plan ids whose worker tickets must be dropped (their target
+        # request finished or was preempted without consuming the ticket).
+        self._pending_stage_releases: list[str] = []
 
     def on_new_request(self, request: Request) -> None:
         """Queue this request's chunk keys for worker-side arrival prefetch.
@@ -864,6 +954,11 @@ class MaruSchedulerConnector:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        # Session-hint bookkeeping must run before any early return: a
+        # request's alias (and the imminent-session stage it carries) matter
+        # even when this request itself has nothing to load.
+        if self._stage_enabled and self._stage_trigger != "match":
+            self._process_session_hints(request)
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
             return 0, False
@@ -886,7 +981,7 @@ class MaruSchedulerConnector:
 
         if new_matched <= 0:
             return 0, False
-        if self._stage_enabled:
+        if self._stage_enabled and self._stage_trigger == "match":
             assert self._stage_policy is not None
             matched_keys = chunk_keys[:num_matched_chunks]
             self._stage_policy.enqueue(request.request_id, matched_keys)
@@ -983,7 +1078,8 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_ready.discard(new_req.req_id)
                 self._deferred_layerwise_waiting.discard(new_req.req_id)
 
-            if new_req.req_id in self._requests_need_load:
+            needs_load = new_req.req_id in self._requests_need_load
+            if needs_load:
                 # Load cached chunks from maru
                 _, num_chunks = self._requests_need_load[new_req.req_id]
                 meta.requests.append(
@@ -998,35 +1094,38 @@ class MaruSchedulerConnector:
                         num_matched_chunks=num_chunks,
                     )
                 )
-            else:
-                # Store new prompt chunks to maru. num_computed_tokens is
-                # non-zero when a prefix was already covered externally (a
-                # request resuming after a deferred load) — only the chunks
-                # completed beyond it are stored.
-                num_scheduled = scheduler_output.num_scheduled_tokens.get(
-                    new_req.req_id, len(token_ids)
+
+            # Store chunks completed by this forward even when the same request
+            # first loads an external prefix. A metadata batch may contain both
+            # entries for one request: start_load_kv consumes the load entry
+            # before the forward, while save_kv_layer consumes the store entry
+            # afterwards. Making these mutually exclusive left every external-
+            # hit request load-only, so later conversation turns never published
+            # their newly computed suffix and matched depth could not grow.
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(
+                new_req.req_id, len(token_ids)
+            )
+            num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
+            meta.requests.append(
+                MaruReqMeta(
+                    req_id=new_req.req_id,
+                    token_ids=token_ids,
+                    # Single KV cache group (see note above)
+                    block_ids=new_req.block_ids[0],
+                    is_store=True,
+                    num_scheduled_tokens=num_scheduled,
+                    num_computed_tokens=num_computed,
                 )
-                num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
-                meta.requests.append(
-                    MaruReqMeta(
-                        req_id=new_req.req_id,
-                        token_ids=token_ids,
-                        # Single KV cache group (see note above)
-                        block_ids=new_req.block_ids[0],
-                        is_store=True,
-                        num_scheduled_tokens=num_scheduled,
-                        num_computed_tokens=num_computed,
-                    )
+            )
+            # If chunked prefill means not all chunks are covered, track for
+            # store continuation in subsequent steps.
+            num_full_chunks = len(token_ids) // self._kv_chunk_tokens
+            stored_chunks = (num_computed + num_scheduled) // self._kv_chunk_tokens
+            if stored_chunks < num_full_chunks:
+                self._requests_need_store[new_req.req_id] = (
+                    token_ids,
+                    list(new_req.block_ids[0]),
                 )
-                # If chunked prefill means not all chunks are covered,
-                # track for store continuation in subsequent steps.
-                num_full_chunks = len(token_ids) // self._kv_chunk_tokens
-                stored_chunks = (num_computed + num_scheduled) // self._kv_chunk_tokens
-                if stored_chunks < num_full_chunks:
-                    self._requests_need_store[new_req.req_id] = (
-                        token_ids,
-                        list(new_req.block_ids[0]),
-                    )
 
         # Cached requests: chunked-prefill continuations and resumed loads.
         # Do NOT gate the store on ``resumed`` — chunked-prefill requests
@@ -1118,9 +1217,37 @@ class MaruSchedulerConnector:
         if self._stage_enabled:
             assert self._stage_policy is not None
             consumed = {req.req_id for req in meta.requests}
+            canceled = set(stale_ids)
+            if self._stage_trigger != "match":
+                # A scheduled load joins its session's hint ticket: the alias
+                # is relayed to the worker and the hint's policy slot is
+                # consumed. Store-only metas leave the alias pending — a
+                # request that never loads resolves at finish/preempt below,
+                # where the ticket is dropped so a pinned stage cannot
+                # outlive its consumer.
+                for req in meta.requests:
+                    if req.is_store or req.num_matched_chunks <= 0:
+                        continue
+                    alias = self._pending_stage_aliases.pop(req.req_id, None)
+                    if alias is not None:
+                        meta.stage_aliases[req.req_id] = alias
+                        consumed.add(alias)
+                        self._relayed_stage_aliases[req.req_id] = alias
+                for rid in stale_ids:
+                    alias = self._pending_stage_aliases.pop(
+                        rid, None
+                    ) or self._relayed_stage_aliases.pop(rid, None)
+                    if alias is not None:
+                        canceled.add(alias)
+                        self._pending_stage_releases.append(alias)
+                if self._pending_stage_releases:
+                    meta.stage_release_ids = list(
+                        dict.fromkeys(self._pending_stage_releases)
+                    )
+                    self._pending_stage_releases.clear()
             meta.stage_plans = self._stage_policy.advance(
                 consumed=consumed,
-                canceled=set(stale_ids),
+                canceled=canceled,
             )
             if meta.stage_plans:
                 logger.debug(
@@ -1139,7 +1266,63 @@ class MaruSchedulerConnector:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Transfer block ownership to the worker for write-behind stores."""
+        if self._stage_enabled and self._stage_trigger != "match":
+            self._record_session_prefix(request)
         return self._write_behind, None
+
+    def _process_session_hints(self, request: Request) -> None:
+        """Register hint bookkeeping for an arriving session request.
+
+        Aliases the arriving request to its own session's hint plan id so the
+        worker's demand join finds the staged ticket, and — in imminent
+        mode — fires a stage for the gateway-hinted next session using the
+        confirmed prefix recorded in the session registry. Idempotent across
+        scheduling retries of the same request.
+        """
+        assert self._stage_policy is not None
+        session_id, imminent = _request_session_params(request)
+        if session_id:
+            self._pending_stage_aliases.setdefault(
+                request.request_id, _hint_plan_id(session_id)
+            )
+        if self._stage_trigger != "imminent" or not imminent:
+            return
+        keys = self._session_keys.get(imminent)
+        if keys and self._stage_policy.enqueue(_hint_plan_id(imminent), list(keys)):
+            logger.debug(
+                "Maru stage: queued %d hint keys for session %s (hinted by req %s)",
+                len(keys),
+                imminent,
+                request.request_id,
+            )
+
+    def _record_session_prefix(self, request: Request) -> None:
+        """Record the finished turn's confirmed prefix for its session.
+
+        The keys just stored for this request are exactly the prefix the
+        session's next turn will re-read — future request content is never
+        consulted. In turn_end mode the prefix is also staged immediately.
+        """
+        session_id, _ = _request_session_params(request)
+        if not session_id:
+            return
+        token_ids = list(request.prompt_token_ids or [])
+        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        if not keys:
+            return
+        # Bounded registry: long deployments cycle many sessions; evict the
+        # oldest entry rather than growing without limit.
+        if session_id not in self._session_keys and len(self._session_keys) >= 16384:
+            self._session_keys.pop(next(iter(self._session_keys)))
+        self._session_keys[session_id] = tuple(keys)
+        if self._stage_trigger == "turn_end":
+            assert self._stage_policy is not None
+            if self._stage_policy.enqueue(_hint_plan_id(session_id), keys):
+                logger.debug(
+                    "Maru stage: queued %d turn-end keys for session %s",
+                    len(keys),
+                    session_id,
+                )
 
 
 # ============================================================================
@@ -1299,13 +1482,45 @@ class MaruWorkerConnector:
         # prefetch for the chunk keys relayed from the scheduler at arrival.
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
         self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        self._hymcache_window_bytes = max(
+            0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
+        )
+        if self._hymcache_window_bytes > 0:
+            if self._use_layerwise:
+                logger.warning(
+                    "HyMCache local substitution requires packed KV objects; "
+                    "disabling MARU_HYMCACHE_WINDOW_BYTES for layerwise storage"
+                )
+                self._hymcache_window_bytes = 0
+            else:
+                if self._arrival_hint_enabled or self._stage_enabled:
+                    logger.warning(
+                        "HyMCache local substitution supersedes arrival/session/"
+                        "request staging; disabling those hint paths"
+                    )
+                self._arrival_hint_enabled = False
+                self._stage_enabled = False
+                logger.info(
+                    "HyMCache local CXL pipeline enabled (window_bytes=%d)",
+                    self._hymcache_window_bytes,
+                )
         if self._stage_enabled and self._arrival_hint_enabled:
             self._arrival_hint_enabled = False
         if self._stage_enabled and self._use_layerwise:
             self._stage_enabled = False
         self._stage_executor: ThreadPoolExecutor | None = None
+        self._hymcache_executor: ThreadPoolExecutor | None = None
         self._stage_lock = threading.Lock()
         self._stage_tickets: dict[str, StageTicket] = {}
+        # Session-hint staging: arriving req_id -> hint plan id, relayed via
+        # connector metadata. Demand join/release resolve through this map so
+        # a request consumes the ticket staged before it arrived.
+        self._stage_aliases: dict[str, str] = {}
+        # When the stage plugin pins ranges (MARU_GAIA_STAGE_PIN=1), every
+        # dropped ticket must also release its device pins. The release job
+        # rides the single-worker stage executor, which serializes it after
+        # any still-running stage for the same plan.
+        self._stage_pin_enabled = os.environ.get("MARU_GAIA_STAGE_PIN", "0") == "1"
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -1424,8 +1639,14 @@ class MaruWorkerConnector:
             self._fire_arrival_hints(metadata.arrival_hint_keys)
         if self._stage_enabled:
             self._cancel_stage_requests(metadata.preempted_req_ids)
+            if metadata.stage_aliases:
+                self._stage_aliases.update(metadata.stage_aliases)
             for plan in metadata.stage_plans:
                 self._submit_stage_plan(plan)
+            # Hint tickets whose target request will never join: drop them
+            # (and their device pins) instead of stranding READY work.
+            for hint_id in metadata.stage_release_ids:
+                self._release_stage_ticket(hint_id)
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is not None:
@@ -1597,6 +1818,11 @@ class MaruWorkerConnector:
             synchronous packed load, which reports the request finished
             immediately.
         """
+        # HyMCache-faithful mode owns the request-local issue/wait/release loop
+        # in _load_packed. Sending the request to this whole-request loader
+        # would bypass its bounded windows and change the pipeline contract.
+        if self._hymcache_window_bytes > 0:
+            return False
         if not self._kv_caches or self._num_layers <= 0:
             return False
         if not torch.cuda.is_available():
@@ -2431,6 +2657,14 @@ class MaruWorkerConnector:
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
         """
+        if self._hymcache_window_bytes > 0:
+            self._load_packed_hymcache(
+                layers,
+                prepared_requests,
+                attn_metadata,
+            )
+            return
+
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
         num_layers = len(layers)
         ct = self._kv_chunk_tokens
@@ -2463,37 +2697,18 @@ class MaruWorkerConnector:
                     slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
                 slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
                 for ci in range(num_chunks):
-                    slab_view = slab_infos[ci].view
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
-                    # KV_2LTD host tensor aliasing pinned CXL: [2, L, tokens, h]
-                    slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
-                        2, num_layers, ct, -1
+                    self._enqueue_packed_chunk(
+                        layers=layers,
+                        kernel=kernel,
+                        attn=attn,
+                        slab_view=slab_infos[ci].view,
+                        chunk_slots=chunk_slots,
+                        dev=dev,
+                        use_stream=use_stream,
+                        dtype=dtype,
+                        num_layers=num_layers,
                     )
-                    if kernel is not None:
-                        ops, ptrs, pbs, block_size, head_size, fmt = kernel
-                        ops.multi_layer_kv_transfer(
-                            slab_host,
-                            ptrs,
-                            chunk_slots,
-                            dev,
-                            pbs,
-                            ops.TransferDirection.H2D,
-                            fmt,
-                            block_size=block_size,
-                            head_size=head_size,
-                        )
-                    else:
-                        # Fallback: per-layer slice -> inject (same slab).
-                        slab_dev = slab_host.to(dev, non_blocking=use_stream)
-                        for layer_name, kv_cache_layer, true_idx in layers:
-                            self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                slab_dev[:, true_idx],
-                                chunk_slots,
-                                attn,
-                                layer_name,
-                                num_chunks=1,
-                            )
                 if req_meta.deferred_load:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
@@ -2517,6 +2732,253 @@ class MaruWorkerConnector:
                 _emit_timing(
                     f"packed-load {mode} {num_layers}L x {num_chunks}c (req {req_meta.req_id})"
                 )
+
+    def _load_packed_hymcache(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Run HyMCache's bounded two-stage pipeline with local CXL reads.
+
+        Each request keeps an actual-byte rolling window of ordered packed KV
+        objects. Objects ahead of the consumer are synchronously materialized
+        from SSD into device DRAM on a helper thread while the current object
+        is read from mapped CXL memory into the GPU KV cache. Each object is
+        released immediately after its CUDA transfer completes and replaced
+        at the tail, matching HyMCache's per-object prefetch/read-token
+        lifecycle while substituting local CXL->GPU for RDMA GET.
+        """
+        attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
+        num_layers = len(layers)
+        ct = self._kv_chunk_tokens
+        kernel = self._packed_load_kernel_ctx(layers, attn)
+        dev = layers[0][1].device
+        use_stream = kernel is not None or (
+            dev.type == "cuda" and torch.cuda.is_available()
+        )
+        if use_stream:
+            if self._load_stream is None or self._load_stream_device != dev:
+                self._load_stream = torch.cuda.Stream(device=dev, priority=-1)
+                self._load_stream_device = dev
+            self._load_stream.wait_stream(torch.cuda.current_stream(dev))
+
+        if self._hymcache_executor is None:
+            self._hymcache_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="maru-hymcache-stage",
+            )
+        pipeline = HymCacheRollingPipeline[StageResult](
+            self._hymcache_executor,
+            window_bytes=self._hymcache_window_bytes,
+        )
+        dtype = layers[0][1].dtype
+        mode = "kernel" if kernel is not None else "fallback"
+
+        request_objects: list[list[HymCacheObject]] = []
+        contexts: dict[str, tuple[MaruReqMeta, torch.Tensor, list[Any]]] = {}
+        gpu_ms: dict[tuple[str, int], float] = {}
+        for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
+            if use_stream:
+                slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
+                assert self._load_stream is not None
+                with torch.cuda.stream(self._load_stream):
+                    slot_gpu = slot_mapping.to(dev, non_blocking=True)
+            else:
+                slot_gpu = slot_mapping.to(dev)
+
+            keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)[:num_chunks]
+            key_sizes: list[int] = []
+            for info in slab_infos:
+                view = info.view
+                key_sizes.append(view.nbytes if hasattr(view, "nbytes") else len(view))
+            objects = build_hymcache_objects(
+                req_meta.req_id,
+                keys,
+                key_sizes,
+            )
+            if req_meta.req_id in contexts:
+                raise ValueError(f"duplicate HyMCache request id: {req_meta.req_id}")
+            contexts[req_meta.req_id] = (req_meta, slot_gpu, slab_infos)
+            request_objects.append(objects)
+
+        rolling_requests = 0
+        tail_admissions = 0
+        for objects in request_objects:
+            initial_bytes = 0
+            initial_objects = 0
+            for obj in objects:
+                if (
+                    initial_bytes
+                    and initial_bytes + obj.nbytes > self._hymcache_window_bytes
+                ):
+                    break
+                initial_bytes += obj.nbytes
+                initial_objects += 1
+            tail_objects = len(objects) - initial_objects
+            if tail_objects:
+                rolling_requests += 1
+                tail_admissions += tail_objects
+
+        def _stage(obj: HymCacheObject) -> StageResult:
+            handler = self._handler
+            if handler is None:
+                return StageResult(
+                    requested_keys=1,
+                    found_keys=0,
+                    error="worker handler unavailable",
+                )
+            return handler.stage_batch([obj.key])
+
+        def _consume(obj: HymCacheObject, result: StageResult) -> None:
+            _, slot_gpu, slab_infos = contexts[obj.req_id]
+            if not result.ready:
+                logger.warning(
+                    "HyMCache-local stage failed open for req %s object %d: %s; "
+                    "using demand CXL read",
+                    obj.req_id,
+                    obj.index,
+                    result.error or "partial preparation",
+                )
+
+            if use_stream:
+                assert self._load_stream is not None
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                stream_ctx = torch.cuda.stream(self._load_stream)
+            else:
+                import contextlib
+
+                start_event = None
+                end_event = None
+                stream_ctx = contextlib.nullcontext()
+
+            with stream_ctx:
+                if start_event is not None:
+                    start_event.record()
+                chunk_slots = slot_gpu[obj.index * ct : (obj.index + 1) * ct]
+                self._enqueue_packed_chunk(
+                    layers=layers,
+                    kernel=kernel,
+                    attn=attn,
+                    slab_view=slab_infos[obj.index].view,
+                    chunk_slots=chunk_slots,
+                    dev=dev,
+                    use_stream=use_stream,
+                    dtype=dtype,
+                    num_layers=num_layers,
+                )
+                if end_event is not None:
+                    end_event.record()
+            if end_event is not None:
+                end_event.synchronize()
+                assert start_event is not None
+                gpu_ms[(obj.req_id, obj.index)] = start_event.elapsed_time(end_event)
+
+        def _release(obj: HymCacheObject) -> None:
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.stage_release([obj.key])
+            except Exception:
+                logger.warning(
+                    "HyMCache-local release failed for req %s object %d",
+                    obj.req_id,
+                    obj.index,
+                    exc_info=True,
+                )
+
+        timings = pipeline.run(
+            request_objects,
+            stage=_stage,
+            consume=_consume,
+            release=_release,
+        )
+        logger.info(
+            "Maru: HyMCache-local rolling summary requests=%d "
+            "rolling_requests=%d tail_admissions=%d max_objects=%d "
+            "window_bytes=%d",
+            len(request_objects),
+            rolling_requests,
+            tail_admissions,
+            max(len(objects) for objects in request_objects),
+            self._hymcache_window_bytes,
+        )
+
+        timings_by_req: dict[str, list[Any]] = {}
+        for timing in timings:
+            timings_by_req.setdefault(timing.object.req_id, []).append(timing)
+
+        for objects in request_objects:
+            req_id = objects[0].req_id
+            req_meta, _, _ = contexts[req_id]
+            if req_meta.deferred_load:
+                with self._deferred_lock:
+                    self._deferred_done.add(req_meta.req_id)
+
+            logger.info(
+                "Maru: HyMCache-local loaded %d layers x %d objects "
+                "for req %s (%s, window=%d bytes)",
+                num_layers,
+                len(objects),
+                req_meta.req_id,
+                mode,
+                self._hymcache_window_bytes,
+            )
+            if self._timing:
+                for timing in timings_by_req.get(req_id, []):
+                    obj = timing.object
+                    _emit_timing(
+                        "hymcache-object "
+                        f"idx={obj.index}/{len(objects)} "
+                        f"bytes={obj.nbytes} "
+                        f"demand_wait_ms={timing.demand_wait_ms:.2f} "
+                        f"cxl_gpu_ms={gpu_ms.get((req_id, obj.index), timing.consume_ms):.2f} "
+                        f"(req {req_meta.req_id})"
+                    )
+
+    def _enqueue_packed_chunk(
+        self,
+        *,
+        layers: list[tuple[str, torch.Tensor, int]],
+        kernel: tuple | None,
+        attn: Any,
+        slab_view: memoryview,
+        chunk_slots: torch.Tensor,
+        dev: torch.device,
+        use_stream: bool,
+        dtype: torch.dtype,
+        num_layers: int,
+    ) -> None:
+        """Enqueue one packed CXL object into its GPU KV-cache slots."""
+        ct = self._kv_chunk_tokens
+        slab_host = torch.frombuffer(slab_view, dtype=dtype).view(2, num_layers, ct, -1)
+        if kernel is not None:
+            ops, ptrs, pbs, block_size, head_size, fmt = kernel
+            ops.multi_layer_kv_transfer(
+                slab_host,
+                ptrs,
+                chunk_slots,
+                dev,
+                pbs,
+                ops.TransferDirection.H2D,
+                fmt,
+                block_size=block_size,
+                head_size=head_size,
+            )
+            return
+
+        slab_dev = slab_host.to(dev, non_blocking=use_stream)
+        for layer_name, kv_cache_layer, true_idx in layers:
+            self._inject_kv_into_layer(
+                kv_cache_layer,
+                slab_dev[:, true_idx],
+                chunk_slots,
+                attn,
+                layer_name,
+                num_chunks=1,
+            )
 
     def _packed_load_kernel_ctx(
         self, layers: list[tuple[str, torch.Tensor, int]], attn_metadata: Any
@@ -3429,10 +3891,23 @@ class MaruWorkerConnector:
         if self._deferred_executor is not None:
             self._deferred_executor.shutdown(wait=True)
             self._deferred_executor = None
+        # The HyMCache-local executor owns blocking SSD->DRAM stage calls and
+        # their matching release jobs. Drain it while the handler/plugins are
+        # still alive so no residency lease can survive teardown.
+        if self._hymcache_executor is not None:
+            self._hymcache_executor.shutdown(wait=True)
+            self._hymcache_executor = None
         # A deferred loader may be waiting on a StageTicket, so drain that
         # consumer before stopping its producer. Both finish before handler
-        # teardown because stage_batch uses the live handler.
+        # teardown because stage_batch uses the live handler. Release every
+        # remaining ticket first so pinned stages queue their unpin jobs onto
+        # the executor before it drains (handler.close's plugin on_close is
+        # the final leak guard for anything that slips through).
         if self._stage_executor is not None:
+            with self._stage_lock:
+                remaining = list(self._stage_tickets)
+            for ticket_id in remaining:
+                self._release_stage_ticket(ticket_id)
             self._stage_executor.shutdown(wait=True)
             self._stage_executor = None
         if self._deferred_stream is not None:
@@ -3503,9 +3978,14 @@ class MaruWorkerConnector:
         return result
 
     def _await_stage(self, req_id: str) -> StageResult | None:
-        """Join a request's preparation at its demand-read boundary."""
+        """Join a request's preparation at its demand-read boundary.
+
+        Session-hint staging keys the ticket by hint plan id; the arriving
+        request resolves through its metadata-relayed alias.
+        """
         with self._stage_lock:
-            ticket = self._stage_tickets.get(req_id)
+            ticket_id = self._stage_aliases.get(req_id, req_id)
+            ticket = self._stage_tickets.get(ticket_id)
         if ticket is None:
             return None
         wait_t0 = time.monotonic()
@@ -3549,17 +4029,54 @@ class MaruWorkerConnector:
         if not req_ids:
             return
         with self._stage_lock:
-            tickets = [self._stage_tickets.pop(req_id, None) for req_id in req_ids]
+            tickets = []
+            for req_id in req_ids:
+                ticket_id = self._stage_aliases.pop(req_id, req_id)
+                tickets.append(self._stage_tickets.pop(ticket_id, None))
         for ticket in tickets:
             if ticket is not None:
                 ticket.cancel()
+                self._dispatch_stage_release(ticket)
 
     def _release_stage_ticket(self, req_id: str) -> None:
         """Release and remove a ticket after fallback or dependent H2D."""
         with self._stage_lock:
-            ticket = self._stage_tickets.pop(req_id, None)
+            ticket_id = self._stage_aliases.pop(req_id, req_id)
+            ticket = self._stage_tickets.pop(ticket_id, None)
         if ticket is not None:
             ticket.release()
+            self._dispatch_stage_release(ticket)
+
+    def _dispatch_stage_release(self, ticket: StageTicket) -> None:
+        """Queue the device-pin release for a dropped ticket.
+
+        Runs on the single-worker stage executor, which serializes it after
+        any still-running stage of the same plan — so an unpin can never
+        race the pin it undoes. No-op unless the pin lease is enabled.
+        """
+        if not self._stage_pin_enabled or self._stage_executor is None:
+            return
+        keys = list(ticket.plan.keys)
+
+        def _release_job() -> None:
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.stage_release(keys)
+            except Exception:
+                logger.warning(
+                    "Maru stage release failed (plan %s)",
+                    ticket.plan.req_id,
+                    exc_info=True,
+                )
+
+        try:
+            self._stage_executor.submit(_release_job)
+        except RuntimeError:
+            # Executor already shut down; the plugin's on_close unpins
+            # anything left as the final leak guard.
+            pass
 
     def _fire_arrival_hints(self, chunk_keys: list[str]) -> None:
         """Issue a lookahead prefetch for newly arrived requests' chunks.

@@ -26,6 +26,7 @@ function) returning an object that implements any subset of
 Selecting plugins at runtime::
 
     MARU_PLUGINS=my_plugin,other   # only these names load; unset → all load
+    MARU_PLUGINS=none              # explicitly disable every plugin
 """
 
 from __future__ import annotations
@@ -46,7 +47,8 @@ logger = logging.getLogger(__name__)
 #: Entry-point group scanned for handler plugins.
 PLUGIN_GROUP = "maru.handler_plugins"
 
-#: Comma-separated allowlist of plugin *names* to load. Unset/empty → load all.
+#: Comma-separated allowlist of plugin *names* to load. Unset/empty → load all;
+#: the reserved value ``none`` disables all plugins.
 PLUGIN_ALLOWLIST_ENV = "MARU_PLUGINS"
 
 #: Process-level cache of the discovered entry points. The installed
@@ -220,6 +222,23 @@ class MaruHandlerPlugin(Protocol):
         """
         ...
 
+    def on_stage_release(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+    ) -> None:
+        """Release per-stage device resources held for ``keys``.
+
+        Called via :meth:`MaruHandler.stage_release` when the consumer of a
+        prior :meth:`on_stage` batch is done with it (or will never arrive) —
+        the counterpart that ends a stage's residency lease. ``keys`` is the
+        same list the matching :meth:`on_stage` received. Must be idempotent
+        and a cheap no-op for batches that hold nothing (never staged, stage
+        failed, or lease already released). Plugins whose stages hold no
+        releasable resource omit this hook.
+        """
+        ...
+
     def on_close(self, handler: MaruHandler) -> None:
         """Called during ``MaruHandler.close``, while regions are still mapped.
 
@@ -248,10 +267,12 @@ class MaruHandlerPlugin(Protocol):
 
 
 def _get_allowlist() -> set[str] | None:
-    """Parse ``MARU_PLUGINS`` into a name set, or ``None`` when unset/empty."""
+    """Parse ``MARU_PLUGINS``; ``none`` is the explicit disable sentinel."""
     raw = os.environ.get(PLUGIN_ALLOWLIST_ENV, "").strip()
     if not raw:
         return None
+    if raw.lower() == "none":
+        return set()
     return {name.strip() for name in raw.split(",") if name.strip()}
 
 
