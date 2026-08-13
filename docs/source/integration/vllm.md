@@ -198,6 +198,7 @@ Asynchronous transfer settings, all opt-in:
 | `maru_async_load` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
 | `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
+| `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
 
 Storage format — how a request's KV is grouped into CXL objects:
 
@@ -277,8 +278,10 @@ those prerequisites are not met.
 ![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
 The loader thread queues the per-layer copies while the request is still
-parked and the request is released once its first layer has landed, so its
-prefill compute runs while the remaining layers arrive rather than after them.
+parked. The load is reported complete — which is what lets vLLM schedule the
+request — once `maru_overlap_release_after_layers` of them have landed, one
+layer by default, so the request's prefill compute runs while the remaining
+layers arrive rather than after them.
 A cache-hit request computes only the tokens left over past its cached chunks,
 so one layer of compute is shorter than one layer of transfer: the compute
 fits inside the transfer and the transfer time is what sets time to first
@@ -292,6 +295,61 @@ The knob therefore applies at any concurrency. On a 16k prompt it lowered
 cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and
 raised throughput throughout; per-token generation time rose 4-5% at 4 and 8
 concurrent requests, which is the cost of every request starting earlier.
+
+#### Choosing the release point
+
+`maru_overlap_release_after_layers` sets how many layers must be copied
+before the load is reported complete. The layers still in flight at that
+point are waited for inside the request's own forward pass, and those waits
+are taken on the model stream, which carries the whole batched step — so
+reporting early charges one request's remaining load time to every request
+scheduled alongside it.
+
+Waiting for more layers first keeps that cost out of the batch: while the
+request is unscheduled it is the only thing waiting on its own load. It does
+not delay the request's own first token either, which needs the last layer no
+matter when the request was scheduled — the hold is free while it stays inside
+the delay the scheduler takes to re-admit the request anyway, and only past
+that does the count begin costing time to first token.
+
+Which way to err depends on whether a layer's copy or a layer's compute takes
+longer:
+
+- **Compute slower than the copy** — the forward pass never catches up, there
+  is nothing left to wait on, and the default of `1` is already right.
+- **Copy slower than compute** — the forward pass catches up almost at once
+  and blocks on layers still in flight. Raising the count trades those blocks
+  away.
+
+Longer prompts and more concurrent loads both push a deployment toward the
+second case. The value is an absolute layer count, not a fraction of model
+depth, so one tuned on a 32-layer model does not carry to an 80-layer one,
+and a value at or above a model's KV-layer count reports the load only after
+the last layer — the overlap turned off in all but name. Sweep it per
+deployment.
+
+```bash
+vllm serve <model> \
+    --kv-transfer-config '{
+        "kv_connector": "MaruKVConnector",
+        "kv_connector_module_path": "maru_vllm",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "maru_server_url": "tcp://localhost:5555",
+            "maru_pool_size": "4G",
+            "maru_async_load": true,
+            "maru_overlap_load_with_compute": true,
+            "maru_overlap_release_after_layers": 7
+        }
+    }'
+```
+
+The count is read only by the overlap path, so `maru_overlap_load_with_compute`
+must be on for it to mean anything — along with the overlap's own
+prerequisites, `maru_async_load` enabled and chunkwise storage
+(`maru_use_layerwise` left at `false`). Raising the count on its own changes
+nothing; the connector logs a warning saying so, and a separate warning if the
+overlap was requested but its prerequisites are unmet.
 
 ### maru_kv_chunk_tokens
 
