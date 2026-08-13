@@ -290,6 +290,30 @@ class TestStage:
         assert result.issued_ranges == 2
         assert plugin.contribute_stats()["stage_ready"] == 1
 
+    def test_stage_does_not_pin_by_default(self, monkeypatch):
+        """The measured smart-prefetch setting calls prefetch_sync only.
+
+        Every 2026-08-11 campaign run reported pin/unpin deltas of 0, and the
+        next comparison keeps that contract, so a default-on pin would
+        silently change what the setting means.
+        """
+        fake = _FakePyxif()
+        pin_calls: list[tuple[int, int, int]] = []
+        fake.memory_pin = lambda device_id, addr, size: pin_calls.append(
+            (device_id, addr, size)
+        )
+        monkeypatch.delenv("MARU_GAIA_STAGE_PIN", raising=False)
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+
+        result = plugin.on_stage(
+            _handler(), ["a", "b"], _resp(_entry(0, 0, 32), _entry(0, 1024, 32))
+        )
+
+        assert result.ready
+        assert len(fake.sync_calls) == 2
+        assert pin_calls == []
+
     def test_stage_miss_is_not_ready(self, monkeypatch):
         fake = _FakePyxif()
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
@@ -430,9 +454,7 @@ class TestStagePinLease:
         plugin.on_stage_release(_handler(), ["a"])
         assert fake.unpin_calls == [(0, 0, 32), (0, 2048, 32)]
 
-    def test_partial_pin_exception_keeps_successful_lease_releasable(
-        self, monkeypatch
-    ):
+    def test_partial_pin_exception_keeps_successful_lease_releasable(self, monkeypatch):
         fake = self._pin_fake(monkeypatch)
 
         def memory_pin(device_id, addr, size):

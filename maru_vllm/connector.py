@@ -84,6 +84,117 @@ def _emit_timing(msg: str) -> None:
     print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
 
 
+def _slab_nbytes(view: Any) -> int:
+    """Byte size of one packed object's host view."""
+    return view.nbytes if hasattr(view, "nbytes") else len(view)
+
+
+def _format_kv_object_timing(
+    *,
+    req_id: str,
+    index: int,
+    total: int,
+    nbytes: int,
+    cxl_gpu_ms: float,
+    prefetched: bool,
+) -> str:
+    """Format one per-object GPU-read record.
+
+    Both the demand-load path (no Stage 1) and the HyMCache window path emit
+    this exact shape so a single parser reads either run. ``prefetch=1`` means
+    ``memory_prefetch_sync`` ran for that object before the CXL->GPU copy.
+    """
+    return (
+        f"kv-object idx={index}/{total} bytes={nbytes} "
+        f"cxl_gpu_ms={cxl_gpu_ms:.2f} prefetch={int(prefetched)} (req {req_id})"
+    )
+
+
+@dataclass
+class PackedObjectRecord:
+    """One object's measured CXL->GPU copy time."""
+
+    req_id: str
+    index: int
+    total: int
+    nbytes: int
+    cxl_gpu_ms: float
+
+
+class PackedObjectTimer:
+    """Per-object CUDA timing for the demand-load packed path.
+
+    Events are recorded around each object's enqueue on the load stream and
+    read only after the caller's single end-of-batch synchronize. There is
+    deliberately no per-object synchronize: draining the stream between
+    objects would serialize the very pipelining this path is measured for,
+    so the instrumented run would no longer measure the uninstrumented one.
+
+    ``event_factory`` exists so tests can drive the bookkeeping without CUDA.
+    """
+
+    def __init__(self, event_factory: Any = None) -> None:
+        self._event_factory = event_factory
+        self._pending: list[tuple[str, int, int, int, Any, Any]] = []
+        self._expected: dict[str, int] = {}
+
+    def _new_event(self) -> Any:
+        if self._event_factory is not None:
+            return self._event_factory()
+        return torch.cuda.Event(enable_timing=True)
+
+    def expect(self, req_id: str, count: int) -> None:
+        """Declare how many objects a request should produce."""
+        self._expected[req_id] = count
+
+    def begin(self, req_id: str, index: int, total: int, nbytes: int) -> Any:
+        """Record the start event; returns a handle for :meth:`end`."""
+        start_event = self._new_event()
+        start_event.record()
+        handle = (req_id, index, total, nbytes, start_event)
+        return handle
+
+    def end(self, handle: Any) -> None:
+        """Record the end event for a handle from :meth:`begin`."""
+        req_id, index, total, nbytes, start_event = handle
+        end_event = self._new_event()
+        end_event.record()
+        self._pending.append((req_id, index, total, nbytes, start_event, end_event))
+
+    def collect(self) -> tuple[list[PackedObjectRecord], list[str]]:
+        """Read elapsed times after the caller's single stream synchronize.
+
+        Returns the records plus a list of problem descriptions (a duplicate
+        (request, object) pair, or a request short of its declared count).
+        """
+        records: list[PackedObjectRecord] = []
+        problems: list[str] = []
+        seen: set[tuple[str, int]] = set()
+        for req_id, index, total, nbytes, start_event, end_event in self._pending:
+            key = (req_id, index)
+            if key in seen:
+                problems.append(f"duplicate object record req={req_id} idx={index}")
+                continue
+            seen.add(key)
+            records.append(
+                PackedObjectRecord(
+                    req_id=req_id,
+                    index=index,
+                    total=total,
+                    nbytes=nbytes,
+                    cxl_gpu_ms=start_event.elapsed_time(end_event),
+                )
+            )
+        for req_id, count in self._expected.items():
+            measured = sum(1 for r in records if r.req_id == req_id)
+            if measured != count:
+                problems.append(
+                    f"incomplete object records req={req_id} "
+                    f"measured={measured} expected={count}"
+                )
+        return records, problems
+
+
 def _get_cuda_memcpy2d_async() -> Any:
     """Resolve ``cudaMemcpy2DAsync`` lazily for pitched packed-slab DMA.
 
@@ -2691,13 +2802,29 @@ class MaruWorkerConnector:
             stream_ctx = contextlib.nullcontext()
 
         dtype = layers[0][1].dtype
+        # Per-object GPU-read timing for the demand-load baseline. Only the
+        # stream path can be timed with CUDA events; the CPU fallback keeps its
+        # old behaviour and says so in its log line instead.
+        timer = PackedObjectTimer() if (self._timing and use_stream) else None
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 if use_stream:
                     slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
                 slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
+                if timer is not None:
+                    timer.expect(req_meta.req_id, num_chunks)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                    handle = (
+                        timer.begin(
+                            req_meta.req_id,
+                            ci,
+                            num_chunks,
+                            _slab_nbytes(slab_infos[ci].view),
+                        )
+                        if timer is not None
+                        else None
+                    )
                     self._enqueue_packed_chunk(
                         layers=layers,
                         kernel=kernel,
@@ -2709,6 +2836,9 @@ class MaruWorkerConnector:
                         dtype=dtype,
                         num_layers=num_layers,
                     )
+                    if handle is not None:
+                        assert timer is not None
+                        timer.end(handle)
                 if req_meta.deferred_load:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
@@ -2717,6 +2847,14 @@ class MaruWorkerConnector:
             # (packed makes wait_for_layer_load a no-op).
             assert self._load_stream is not None
             self._load_stream.synchronize()
+
+        # Safe only after the synchronize above: every recorded event has
+        # completed, so elapsed_time needs no per-object wait of its own.
+        object_records: list[PackedObjectRecord] = []
+        if timer is not None:
+            object_records, problems = timer.collect()
+            for problem in problems:
+                logger.warning("Maru: packed object timing %s", problem)
 
         for req_meta, num_chunks, _, _ in prepared_requests:
             mode = "kernel" if kernel is not None else "fallback"
@@ -2729,9 +2867,22 @@ class MaruWorkerConnector:
                 mode,
             )
             if self._timing:
+                suffix = "" if use_stream else " cuda_timing=unavailable"
                 _emit_timing(
-                    f"packed-load {mode} {num_layers}L x {num_chunks}c (req {req_meta.req_id})"
+                    f"packed-load {mode} {num_layers}L x {num_chunks}c "
+                    f"(req {req_meta.req_id}){suffix}"
                 )
+        for record in object_records:
+            _emit_timing(
+                _format_kv_object_timing(
+                    req_id=record.req_id,
+                    index=record.index,
+                    total=record.total,
+                    nbytes=record.nbytes,
+                    cxl_gpu_ms=record.cxl_gpu_ms,
+                    prefetched=False,
+                )
+            )
 
     def _load_packed_hymcache(
         self,
@@ -2778,6 +2929,9 @@ class MaruWorkerConnector:
         request_objects: list[list[HymCacheObject]] = []
         contexts: dict[str, tuple[MaruReqMeta, torch.Tensor, list[Any]]] = {}
         gpu_ms: dict[tuple[str, int], float] = {}
+        # Objects whose Stage 1 failed open and were therefore read on demand,
+        # exactly like the W=0 baseline reads them.
+        demand_read: set[tuple[str, int]] = set()
         for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
             if use_stream:
                 slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
@@ -2833,6 +2987,7 @@ class MaruWorkerConnector:
         def _consume(obj: HymCacheObject, result: StageResult) -> None:
             _, slot_gpu, slab_infos = contexts[obj.req_id]
             if not result.ready:
+                demand_read.add((obj.req_id, obj.index))
                 logger.warning(
                     "HyMCache-local stage failed open for req %s object %d: %s; "
                     "using demand CXL read",
@@ -2929,13 +3084,28 @@ class MaruWorkerConnector:
             if self._timing:
                 for timing in timings_by_req.get(req_id, []):
                     obj = timing.object
+                    copy_ms = gpu_ms.get((req_id, obj.index), timing.consume_ms)
+                    # Kept for the analysis scripts written against the
+                    # 2026-08-11 campaign logs.
                     _emit_timing(
                         "hymcache-object "
                         f"idx={obj.index}/{len(objects)} "
                         f"bytes={obj.nbytes} "
                         f"demand_wait_ms={timing.demand_wait_ms:.2f} "
-                        f"cxl_gpu_ms={gpu_ms.get((req_id, obj.index), timing.consume_ms):.2f} "
+                        f"cxl_gpu_ms={copy_ms:.2f} "
                         f"(req {req_meta.req_id})"
+                    )
+                    # Shared shape: the demand-load path emits the same record
+                    # so one parser reads either setting.
+                    _emit_timing(
+                        _format_kv_object_timing(
+                            req_id=req_meta.req_id,
+                            index=obj.index,
+                            total=len(objects),
+                            nbytes=obj.nbytes,
+                            cxl_gpu_ms=copy_ms,
+                            prefetched=(req_id, obj.index) not in demand_read,
+                        )
                     )
 
     def _enqueue_packed_chunk(

@@ -254,6 +254,33 @@ class TestHymCacheRollingWindow:
         worker._load_packed_hymcache.assert_called_once_with([], [], None)
         worker.shutdown()
 
+    def test_no_window_keeps_demand_path_and_stages_nothing(self, monkeypatch):
+        """W=0 is the demand-load baseline: no Stage 1 call may be issued.
+
+        The GPU-read timing added to the demand path must not turn it into a
+        prefetching setting, so this pins that nothing reaches the handler's
+        staging entry point.
+        """
+        import torch
+
+        monkeypatch.delenv("MARU_HYMCACHE_WINDOW_BYTES", raising=False)
+        worker = MaruWorkerConnector(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={},
+        )
+        worker._load_packed_hymcache = MagicMock()
+        handler = MagicMock()
+        worker._handler = handler
+        layers = [("model.layers.0.self_attn", torch.zeros(2, 4, 1, 1), 0)]
+
+        worker._load_packed(layers, [], None)
+
+        assert worker._hymcache_window_bytes == 0
+        worker._load_packed_hymcache.assert_not_called()
+        handler.stage_batch.assert_not_called()
+        worker.shutdown()
+
 
 class TestFifoStagePolicy:
     def test_request_window_preserves_fifo(self):
