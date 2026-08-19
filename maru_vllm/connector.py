@@ -336,6 +336,13 @@ class MaruKVConnector(KVConnectorBase_V1):
             the CXL pages directly (LMCache single_layer_kv_transfer).
             Requires maru_enable_async_loading and the Flash KV layout;
             falls back to memcpy otherwise (default: false)
+        maru_use_lmcache_kernels: bool - Borrow LMCache's compiled transfer
+            kernels (multi_layer/single_layer_kv_transfer) for the packed
+            GPU<->CXL copies when the lmcache package provides them. The
+            KV-format/transfer enums are resolved from lmcache.c_ops or,
+            on newer LMCache, from lmcache.lmcache_native. Set false to
+            force the pure-torch per-layer paths — for benchmarking the
+            fallback or isolating lmcache issues (default: true)
         maru_use_layerwise: bool - Store one CXL object per (chunk, layer)
             (True) or one packed object per chunk holding all layers (False,
             default — mirrors LMCache use_layerwise=False). Packed cuts
@@ -954,6 +961,48 @@ class MaruSchedulerConnector:
 # ============================================================================
 
 
+def _resolve_lmc_ops() -> Any | None:
+    """Bundle lmcache's transfer kernels and KV-type enums into one namespace.
+
+    Older LMCache builds (and the xcena fork) expose everything on the
+    compiled ``lmcache.c_ops`` module. Newer upstream builds route
+    ``lmcache.c_ops`` through a device-ops shim that carries the kernels but
+    not the ``EngineKVFormat`` / ``TransferDirection`` enums, which moved into
+    the ``lmcache.lmcache_native`` extension. Resolve whichever combination is
+    present and return a namespace with the legacy ``ops.<name>`` shape so
+    call sites work against either generation. Returns None when the kernels
+    or the enums cannot be found (callers take the per-layer fallback).
+    """
+    from types import SimpleNamespace
+
+    try:
+        import lmcache.c_ops as lmc_ops
+    except ImportError:
+        return None
+    multi = getattr(lmc_ops, "multi_layer_kv_transfer", None)
+    single = getattr(lmc_ops, "single_layer_kv_transfer", None)
+    if multi is None or single is None:
+        return None
+    kv_format = getattr(lmc_ops, "EngineKVFormat", None)
+    direction = getattr(lmc_ops, "TransferDirection", None)
+    if kv_format is None or direction is None:
+        try:
+            from lmcache.lmcache_native import (  # type: ignore[import-not-found]
+                EngineKVFormat,
+                TransferDirection,
+            )
+
+            kv_format, direction = EngineKVFormat, TransferDirection
+        except ImportError:
+            return None
+    return SimpleNamespace(
+        multi_layer_kv_transfer=multi,
+        single_layer_kv_transfer=single,
+        EngineKVFormat=kv_format,
+        TransferDirection=direction,
+    )
+
+
 class MaruWorkerConnector:
     """Worker-side: performs GPU <-> CXL data transfers in chunk granularity."""
 
@@ -987,6 +1036,10 @@ class MaruWorkerConnector:
         # recognized, which keeps every caller on its existing fallback.
         self._kv_layout: KVLayout | None = None
         self._async_loading = bool(extra_config.get("maru_enable_async_loading", False))
+        # Gate for borrowing LMCache's compiled transfer kernels. False forces
+        # the pure-torch per-layer paths even when lmcache is installed —
+        # useful for benchmarking the fallback or isolating lmcache issues.
+        self._use_lmc_kernels = bool(extra_config.get("maru_use_lmcache_kernels", True))
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
         self._layer_load_events: dict[str, torch.cuda.Event] = {}
@@ -2144,23 +2197,28 @@ class MaruWorkerConnector:
         return True
 
     def _ensure_fused_ops(self) -> bool:
-        """Resolve ``lmcache.c_ops`` lazily; disable fused load if absent."""
+        """Resolve the lmcache kernels/enums lazily; disable fused load if absent."""
         if not self._fused_load:
             return False
-        if self._lmc_ops is not None:
-            return True
-        try:
-            import lmcache.c_ops as lmc_ops
-
-            self._lmc_ops = lmc_ops
-            return True
-        except ImportError:
+        if not self._use_lmc_kernels:
             logger.warning(
-                "maru_enable_fused_load: lmcache.c_ops unavailable; "
+                "maru_enable_fused_load requires maru_use_lmcache_kernels; "
                 "using memcpy+inject path"
             )
             self._fused_load = False
             return False
+        if self._lmc_ops is not None:
+            return True
+        resolved = _resolve_lmc_ops()
+        if resolved is None:
+            logger.warning(
+                "maru_enable_fused_load: lmcache kernels/KV-type enums "
+                "unavailable; using memcpy+inject path"
+            )
+            self._fused_load = False
+            return False
+        self._lmc_ops = resolved
+        return True
 
     def _use_fused_load(self, attn_metadata: Any, layer_name: str) -> bool:
         """Fused load applies only to the Flash paged-KV layout.
@@ -2226,7 +2284,15 @@ class MaruWorkerConnector:
         if obj_bytes is None or run_view.nbytes < run_chunks * obj_bytes:
             return False
         ops = self._lmc_ops
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        # getattr on ops itself as well: newer LMCache builds expose c_ops via
+        # a device-ops shim that has no EngineKVFormat at all, and only the
+        # inner lookup was guarded before — the shim raised out of the load path.
+        kv_format_enum = getattr(ops, "EngineKVFormat", None)
+        kv_format = (
+            getattr(kv_format_enum, layout.format_name, None)
+            if kv_format_enum is not None
+            else None
+        )
         if kv_format is None:
             logger.warning(
                 "Maru fused load: kernel has no format %s; using memcpy fallback",
@@ -2404,18 +2470,18 @@ class MaruWorkerConnector:
         )
         if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
             return None
-        # Resolve lmcache.c_ops (independent of maru_enable_fused_load).
+        if not self._use_lmc_kernels:
+            return None
+        # Resolve the lmcache kernels/enums (independent of maru_enable_fused_load).
         if self._lmc_ops is None:
-            try:
-                import lmcache.c_ops as lmc_ops
-
-                self._lmc_ops = lmc_ops
-            except ImportError:
+            resolved = _resolve_lmc_ops()
+            if resolved is None:
                 logger.warning(
-                    "Maru packed load: lmcache.c_ops unavailable; using "
-                    "per-layer inject fallback"
+                    "Maru packed load: lmcache kernels/KV-type enums "
+                    "unavailable; using per-layer inject fallback"
                 )
                 return None
+            self._lmc_ops = resolved
         # Dimensions and format come from one layout, so they cannot disagree.
         # The kernel takes raw pointers, so torch would not catch it if they did.
         block_size = layout.block_size
@@ -2426,9 +2492,16 @@ class MaruWorkerConnector:
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
         ops = self._lmc_ops
-        # An older c_ops build may not carry every format; take the per-layer
-        # fallback rather than raising out of the load path.
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        # An older c_ops build may not carry every format — and newer LMCache
+        # builds expose c_ops via a device-ops shim with no EngineKVFormat at
+        # all — so guard both lookups and take the per-layer fallback rather
+        # than raising out of the load path.
+        kv_format_enum = getattr(ops, "EngineKVFormat", None)
+        kv_format = (
+            getattr(kv_format_enum, layout.format_name, None)
+            if kv_format_enum is not None
+            else None
+        )
         if kv_format is None:
             logger.warning(
                 "Maru packed load: kernel has no format %s; using per-layer "
