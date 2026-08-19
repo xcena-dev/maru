@@ -893,6 +893,24 @@ class MaruSchedulerConnector:
                 )
             self._arrival_hint_enabled = False
             self._stage_enabled = False
+            if self._layerwise_overlap:
+                # The two consume the same bytes in opposite orders and cannot
+                # both be in effect. The window walks whole packed objects
+                # (every layer of chunk c, then chunk c+1) so an object can be
+                # released and its slot refilled; layerwise overlap walks
+                # layers (layer k of every chunk, then k+1) so attention layer
+                # k can start while layer k+1 is still transferring. Under the
+                # window order every layer completes at the same moment, so
+                # there is no per-layer event to overlap; under the layer order
+                # layer 0 already touches every object, so no window bounds
+                # anything. The window wins: it is the mode the caller asked
+                # for by setting a byte budget.
+                logger.warning(
+                    "MARU_HYMCACHE_WINDOW_BYTES supersedes "
+                    "maru_overlap_load_with_compute (object-order vs "
+                    "layer-order consumption); disabling the overlap"
+                )
+            self._layerwise_overlap = False
         self._stage_policy: FifoStagePolicy | None = None
         if self._stage_enabled:
             self._stage_policy = FifoStagePolicy(
@@ -1638,6 +1656,25 @@ class MaruWorkerConnector:
         self._layerwise_streams: list[torch.cuda.Stream] = []
         self._layerwise_stream_device: torch.device | None = None
         self._layerwise_stream_rr = 0
+        # maru_log_timing only. Per-layer transfer spans of the layerwise
+        # overlap path, so a run can show whether layer k's transfer really
+        # ran while layer k-1 computed instead of asserting that it did.
+        # req_id -> (done_event, epoch_event, [(layer_idx, start, end, nbytes)])
+        self._layerwise_spans: dict[
+            str,
+            tuple[
+                torch.cuda.Event,
+                torch.cuda.Event,
+                list[tuple[int, Any, Any, int]],
+            ],
+        ] = {}
+        # (layer_name, before-wait, after-wait) pairs on the compute stream,
+        # one per wait_for_layer_load call. Their gap is the time the forward
+        # actually stalled on that layer's transfer — the quantity that says
+        # whether the overlap worked, rather than that it was enabled.
+        self._layer_wait_spans: list[
+            tuple[str, torch.cuda.Event, torch.cuda.Event]
+        ] = []
         # Last non-None attention metadata; deferred loads run between steps
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
@@ -1745,6 +1782,13 @@ class MaruWorkerConnector:
                     )
                 self._arrival_hint_enabled = False
                 self._stage_enabled = False
+                if self._layerwise_overlap:
+                    logger.warning(
+                        "MARU_HYMCACHE_WINDOW_BYTES supersedes "
+                        "maru_overlap_load_with_compute (object-order vs "
+                        "layer-order consumption); disabling the overlap"
+                    )
+                self._layerwise_overlap = False
                 logger.info(
                     "HyMCache local CXL pipeline enabled (window_bytes=%d)",
                     self._hymcache_window_bytes,
@@ -1875,6 +1919,8 @@ class MaruWorkerConnector:
         # that allocated it ended.
         self._store_layers_seen.clear()
         self._reclaim_stale_pending_slabs()
+        if self._timing:
+            self._emit_layerwise_timing()
 
         self._ensure_handler()
         if self._handler is None:
@@ -2444,12 +2490,26 @@ class MaruWorkerConnector:
             tokens = num_chunks * self._kv_chunk_tokens
             _t0 = time.monotonic()
             events: dict[str, torch.cuda.Event] = {}
+            spans: list[tuple[int, Any, Any, int]] = []
+            epoch_event: torch.cuda.Event | None = None
             with torch.cuda.stream(stream):
                 slot_gpu = pinned.to(device, non_blocking=True)
+                if self._timing:
+                    epoch_event = torch.cuda.Event(enable_timing=True)
+                    epoch_event.record(stream)
                 for layer_name, kv_cache_layer, true_idx in layers:
+                    if self._timing:
+                        span_start = torch.cuda.Event(enable_timing=True)
+                        span_start.record(stream)
                     layer_dev = self._copy_packed_layer_to_device(
                         infos, num_chunks, true_idx, kv_cache_layer, stream
                     )
+                    if self._timing:
+                        copy_done = torch.cuda.Event(enable_timing=True)
+                        copy_done.record(stream)
+                        spans.append(
+                            (true_idx, span_start, copy_done, layer_dev.nbytes)
+                        )
                     self._inject_kv_into_layer(
                         kv_cache_layer,
                         layer_dev,
@@ -2467,6 +2527,12 @@ class MaruWorkerConnector:
             done_event.record(stream)
             with self._deferred_lock:
                 self._active_load_refs.append((done_event, [infos, pinned, slot_gpu]))
+                if spans and epoch_event is not None:
+                    self._layerwise_spans[req_meta.req_id] = (
+                        done_event,
+                        epoch_event,
+                        spans,
+                    )
             if self._timing:
                 _emit_timing(
                     f"offthread layerwise issue {len(layers)}L x 1r = "
@@ -3249,8 +3315,20 @@ class MaruWorkerConnector:
         if not events:
             return
         stream = torch.cuda.current_stream()
+        if not self._timing:
+            for event in events:
+                stream.wait_event(event)
+            return
+        # Bracket the waits on the compute stream itself: the gap between the
+        # two marks is exactly how long this layer's attention was held back
+        # by its transfer. Near zero for layers the overlap covered.
+        before = torch.cuda.Event(enable_timing=True)
+        before.record(stream)
         for event in events:
             stream.wait_event(event)
+        after = torch.cuda.Event(enable_timing=True)
+        after.record(stream)
+        self._layer_wait_spans.append((layer_name, before, after))
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
@@ -4492,6 +4570,59 @@ class MaruWorkerConnector:
             # Executor already shut down; the plugin's on_close unpins
             # anything left as the final leak guard.
             pass
+
+    def _emit_layerwise_timing(self) -> None:
+        """Emit the layerwise overlap's two timelines (maru_log_timing only).
+
+        ``kv-layer-transfer`` gives each layer's CXL->GPU transfer span on the
+        load stream, on one axis per request. ``kv-layer-stall`` gives how long
+        the forward's attention was held at each layer's load wait. Together
+        they separate "the transfer was issued per layer" from "the transfer
+        was actually hidden", which duration totals alone cannot.
+
+        Called at a step boundary, so the events being read belong to work the
+        device has already finished. Entries whose events have not completed
+        are kept for a later call.
+        """
+        with self._deferred_lock:
+            ready = [
+                (req_id, entry)
+                for req_id, entry in self._layerwise_spans.items()
+                if entry[0].query()
+            ]
+            for req_id, _ in ready:
+                del self._layerwise_spans[req_id]
+        for req_id, (_, epoch, spans) in ready:
+            for layer_idx, start, end, nbytes in spans:
+                try:
+                    start_ms = epoch.elapsed_time(start)
+                    end_ms = epoch.elapsed_time(end)
+                except Exception:
+                    break
+                _emit_timing(
+                    "kv-layer-transfer "
+                    f"layer={layer_idx} "
+                    f"start_ms={start_ms:.3f} "
+                    f"end_ms={end_ms:.3f} "
+                    f"bytes={nbytes} "
+                    f"(req {req_id})"
+                )
+
+        pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        for layer_name, before, after in self._layer_wait_spans:
+            if not after.query():
+                pending.append((layer_name, before, after))
+                continue
+            try:
+                stall_ms = before.elapsed_time(after)
+            except Exception:
+                continue
+            _emit_timing(
+                "kv-layer-stall "
+                f"layer={self._get_layer_index(layer_name)} "
+                f"stall_ms={stall_ms:.3f}"
+            )
+        self._layer_wait_spans = pending
 
     @staticmethod
     def _emit_load_bandwidth(
