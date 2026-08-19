@@ -187,6 +187,7 @@ class GaiaPrefetchPlugin:
         select a byte range inside the key's object; ``None`` means whole.
         Always asynchronous — this is a lookahead, never a gate.
         """
+        t0 = time.monotonic()
         commands = 0
         issued_bytes = 0
         skipped = 0
@@ -233,7 +234,7 @@ class GaiaPrefetchPlugin:
                         exc_info=True,
                     )
                     continue
-                if status is not None and status is not True and status != 0:
+                if status != pyxif.MemoryStatus.Success:
                     self._failed += 1
                     continue
                 self._issued += 1
@@ -241,11 +242,13 @@ class GaiaPrefetchPlugin:
                 issued_bytes += size
         self._skipped += skipped
         logger.info(
-            "gaia_prefetch(grouped): groups=%d, cmds=%d, bytes=%d, skipped=%d",
+            "gaia_prefetch(grouped): groups=%d, cmds=%d, bytes=%d, skipped=%d, "
+            "issue_ms=%.2f",
             group_count,
             commands,
             issued_bytes,
             skipped,
+            (time.monotonic() - t0) * 1000.0,
         )
 
     def on_stage(

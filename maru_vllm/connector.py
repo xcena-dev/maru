@@ -2308,27 +2308,16 @@ class MaruWorkerConnector:
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
 
-            _t0 = time.monotonic()
-            infos = self._batch_retrieve_all(keys)
-            if self._timing:
-                _emit_timing(
-                    f"deferred retrieve batch {len(keys)} keys = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
-                )
-            miss = next((i for i, v in enumerate(infos) if v is None), -1)
-            if miss >= 0:
-                logger.warning(
-                    "Maru deferred load miss: %s — recompute for req %s",
-                    keys[miss],
-                    req_meta.req_id,
-                )
-                self._fail_deferred_load(req_meta)
-                return
-
+            _job_t0 = time.monotonic()
             if self._layer_hint_enabled:
                 # One hint group per layer, whole objects: fill follows the
-                # layer run order instead of address order. Requires the
-                # retrieve hint off (MARU_GAIA_RETRIEVE_HINT=0).
+                # layer run order instead of address order. Fired BEFORE the
+                # retrieve so the retrieve's RPC/mmap wall overlaps the fill's
+                # head — in steady state the regions are already mapped from
+                # the previous pass, which is all the plugin needs to resolve
+                # addresses (a cold region is skipped and simply fills on
+                # demand). Requires the retrieve hint off
+                # (MARU_GAIA_RETRIEVE_HINT=0).
                 try:
                     handler.prefetch_grouped(
                         _layerwise_key_groups(
@@ -2341,6 +2330,32 @@ class MaruWorkerConnector:
                         req_meta.req_id,
                         exc_info=True,
                     )
+            _hint_done = time.monotonic()
+
+            infos = self._batch_retrieve_all(keys)
+            _retrieve_done = time.monotonic()
+            if self._timing:
+                _emit_timing(
+                    f"deferred retrieve batch {len(keys)} keys = "
+                    f"{(_retrieve_done - _hint_done) * 1000:.2f} ms "
+                    f"(req {req_meta.req_id})"
+                )
+                _emit_timing(
+                    "job-milestones "
+                    f"t0={_job_t0:.6f} "
+                    f"hint_done={_hint_done:.6f} "
+                    f"retrieve_done={_retrieve_done:.6f} "
+                    f"(req {req_meta.req_id})"
+                )
+            miss = next((i for i, v in enumerate(infos) if v is None), -1)
+            if miss >= 0:
+                logger.warning(
+                    "Maru deferred load miss: %s — recompute for req %s",
+                    keys[miss],
+                    req_meta.req_id,
+                )
+                self._fail_deferred_load(req_meta)
+                return
 
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             torch.cuda.set_device(device)
@@ -2420,6 +2435,10 @@ class MaruWorkerConnector:
                     )
                     self._deferred_done.add(req_meta.req_id)
                 return
+            if self._timing:
+                _emit_timing(
+                    f"job-queued t={time.monotonic():.6f} (req {req_meta.req_id})"
+                )
             logger.info(
                 "Maru: deferred layerwise-storage load queued %d layers x %d "
                 "chunks (%d tokens) for req %s",
@@ -2467,6 +2486,35 @@ class MaruWorkerConnector:
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             keys = [chunk_keys[ci] for ci in range(num_chunks)]
 
+            if self._layer_hint_enabled:
+                # Re-order the device fill to match consumption: one hint
+                # group per layer(-group), each group the scattered slivers of
+                # that layer inside every packed object. Fired BEFORE the
+                # retrieve so its RPC/mmap wall overlaps the fill's head
+                # (steady-state regions are already mapped; a cold region is
+                # skipped and fills on demand). The whole-request retrieve
+                # hint must be off (MARU_GAIA_RETRIEVE_HINT=0) or its
+                # address-order fill races this one. Plane geometry comes from
+                # the registered caches — the slabs are not retrieved yet.
+                object_bytes = self._chunk_object_bytes()
+                if object_bytes:
+                    plane_bytes = object_bytes // (2 * self._num_layers)
+                    try:
+                        handler.prefetch_grouped(
+                            _packed_layer_span_groups(
+                                keys,
+                                self._num_layers,
+                                plane_bytes,
+                                self._layer_hint_group,
+                            )
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Maru layer-span hint failed for req %s",
+                            req_meta.req_id,
+                            exc_info=True,
+                        )
+
             _t0 = time.monotonic()
             infos = self._batch_retrieve_all(keys)
             if self._timing:
@@ -2483,30 +2531,6 @@ class MaruWorkerConnector:
                 )
                 self._fail_deferred_load(req_meta)
                 return
-
-            if self._layer_hint_enabled:
-                # Re-order the device fill to match consumption: one hint
-                # group per layer(-group), each group the scattered slivers of
-                # that layer inside every packed object. The whole-request
-                # retrieve hint must be off in this mode
-                # (MARU_GAIA_RETRIEVE_HINT=0) or its address-order fill races
-                # this one.
-                plane_bytes = _slab_nbytes(infos[0].view) // (2 * self._num_layers)
-                try:
-                    handler.prefetch_grouped(
-                        _packed_layer_span_groups(
-                            keys,
-                            self._num_layers,
-                            plane_bytes,
-                            self._layer_hint_group,
-                        )
-                    )
-                except Exception:
-                    logger.warning(
-                        "Maru layer-span hint failed for req %s",
-                        req_meta.req_id,
-                        exc_info=True,
-                    )
 
             if req_meta.layerwise_load:
                 # The RPC/mmap part is complete. Either queue the per-layer
@@ -3228,6 +3252,10 @@ class MaruWorkerConnector:
                         finished_bw.append((req_id, bw))
         # Outside the lock: elapsed_time is safe here because the completion
         # event was recorded after the end marker, so both have fired.
+        if self._timing and done:
+            now = time.monotonic()
+            for req_id in done:
+                _emit_timing(f"unpark t={now:.6f} (req {req_id})")
         for req_id, (bw_start, bw_end, nbytes, nchunks) in finished_bw:
             self._emit_load_bandwidth(req_id, bw_start, bw_end, nbytes, nchunks)
         for req_id in done:
@@ -3639,6 +3667,12 @@ class MaruWorkerConnector:
             for event in events:
                 stream.wait_event(event)
             return
+        if not self._layer_wait_spans:
+            # First gated layer of this forward: a wall stamp here, joined
+            # with the loader's job-milestones and the unpark stamp, splits
+            # the span between unparking and the forward actually reaching
+            # its first attention layer.
+            _emit_timing(f"first-wait t={time.monotonic():.6f} layer={layer_name}")
         # Bracket the waits on the compute stream itself: the gap between the
         # two marks is exactly how long this layer's attention was held back
         # by its transfer. Near zero for layers the overlap covered.
