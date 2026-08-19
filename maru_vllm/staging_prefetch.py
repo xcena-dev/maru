@@ -131,8 +131,18 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
         stage: Callable[[HymCacheObject], _StageValue],
         consume: Callable[[HymCacheObject, _StageValue], None],
         release: Callable[[HymCacheObject], None],
+        issue: Callable[[HymCacheObject], None] | None = None,
     ) -> list[HymCacheObjectTiming]:
-        """Run all request streams and drain every release before returning."""
+        """Run all request streams and drain every release before returning.
+
+        ``issue`` splits admission into HyMCache's two steps. Without it an
+        object is admitted by submitting its blocking ``stage``, so only one
+        object is ever in the device at a time no matter how deep the window
+        is. With it, admission first fires a non-blocking hint for the object
+        and ``stage`` becomes the readiness check on a fetch already under way,
+        so window depth reaches the device. It is called on the caller's
+        thread, before the object's stage is submitted, and must not block.
+        """
         object_streams = [tuple(objects) for objects in requests if objects]
         if not object_streams:
             return []
@@ -162,6 +172,8 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
             live_bytes = admitted_bytes[request_index]
             if live_bytes and live_bytes + obj.nbytes > self._window_bytes:
                 return False
+            if issue is not None:
+                issue(obj)
             submitted_at = time.monotonic()
             pending.append(
                 (

@@ -779,6 +779,12 @@ class MaruSchedulerConnector:
         self._hymcache_window_bytes = max(
             0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
         )
+        # Split admission into hint-then-wait so window depth reaches the
+        # device. Off by default: the blocking-only path is what every
+        # campaign through 2026-08-19 measured.
+        self._hymcache_async_issue = (
+            os.environ.get("MARU_HYMCACHE_ASYNC_ISSUE", "0") or "0"
+        ).strip().lower() not in ("", "0", "false", "no")
         if self._hymcache_window_bytes > 0:
             if self._arrival_hint_enabled or self._stage_enabled:
                 logger.warning(
@@ -1596,6 +1602,12 @@ class MaruWorkerConnector:
         self._hymcache_window_bytes = max(
             0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
         )
+        # Split admission into hint-then-wait so window depth reaches the
+        # device. Off by default: the blocking-only path is what every
+        # campaign through 2026-08-19 measured.
+        self._hymcache_async_issue = (
+            os.environ.get("MARU_HYMCACHE_ASYNC_ISSUE", "0") or "0"
+        ).strip().lower() not in ("", "0", "false", "no")
         if self._hymcache_window_bytes > 0:
             if self._use_layerwise:
                 logger.warning(
@@ -3030,6 +3042,27 @@ class MaruWorkerConnector:
                 assert start_event is not None
                 gpu_ms[(obj.req_id, obj.index)] = start_event.elapsed_time(end_event)
 
+        def _issue(obj: HymCacheObject) -> None:
+            """Fire the non-blocking device hint that ``_stage`` then waits on.
+
+            ``prefetch_batch`` resolves the key and hands it to the plugin's
+            lookahead hook, which submits the migration without waiting for
+            completion. Failures are not fatal: the blocking ``_stage`` that
+            follows still brings the object in, just without the head start.
+            """
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.prefetch_batch([obj.key])
+            except Exception:
+                logger.warning(
+                    "HyMCache-local async issue failed for req %s object %d",
+                    obj.req_id,
+                    obj.index,
+                    exc_info=True,
+                )
+
         def _release(obj: HymCacheObject) -> None:
             handler = self._handler
             if handler is None:
@@ -3049,6 +3082,7 @@ class MaruWorkerConnector:
             stage=_stage,
             consume=_consume,
             release=_release,
+            issue=_issue if self._hymcache_async_issue else None,
         )
         logger.info(
             "Maru: HyMCache-local rolling summary requests=%d "

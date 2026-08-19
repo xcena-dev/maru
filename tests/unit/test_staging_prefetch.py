@@ -9,6 +9,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from maru import MaruConfig, MaruHandler
 from maru_handler import StageResult
 from maru_vllm.connector import (
@@ -18,6 +20,7 @@ from maru_vllm.connector import (
 )
 from maru_vllm.staging_prefetch import (
     FifoStagePolicy,
+    HymCacheObject,
     HymCacheRollingPipeline,
     StagePlan,
     StageState,
@@ -616,3 +619,120 @@ class TestObjectSpans:
                     release=released.append,
                 )
         assert len(released) == 2
+
+
+class TestIssueThenWait:
+    """Admission splits into a non-blocking hint and a blocking readiness wait.
+
+    Without ``issue`` the pipeline can only put one object into the device at a
+    time, because admission *is* the blocking stage. These lock the ordering
+    that lets window depth reach the device.
+    """
+
+    def _objects(self, count: int, nbytes: int = 16) -> list[HymCacheObject]:
+        return [
+            HymCacheObject(req_id="r", index=i, key=f"k{i}", nbytes=nbytes)
+            for i in range(count)
+        ]
+
+    def test_issue_fires_before_the_object_is_staged(self) -> None:
+        order: list[str] = []
+        objects = self._objects(3)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            HymCacheRollingPipeline(pool, window_bytes=32).run(
+                [objects],
+                issue=lambda o: order.append(f"issue{o.index}"),
+                stage=lambda o: order.append(f"stage{o.index}") or o.index,
+                consume=lambda o, _v: order.append(f"consume{o.index}"),
+                release=lambda o: None,
+            )
+        for i in range(3):
+            assert order.index(f"issue{i}") < order.index(f"stage{i}")
+
+    def test_whole_window_is_hinted_before_the_first_consume(self) -> None:
+        """The point of the hint: object 1 is already moving while 0 is read."""
+        order: list[str] = []
+        objects = self._objects(4)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            HymCacheRollingPipeline(pool, window_bytes=32).run(
+                [objects],
+                issue=lambda o: order.append(f"issue{o.index}"),
+                stage=lambda o: o.index,
+                consume=lambda o, _v: order.append(f"consume{o.index}"),
+                release=lambda o: None,
+            )
+        assert order.index("issue1") < order.index("consume0")
+
+    def test_issue_count_matches_object_count(self) -> None:
+        issued: list[int] = []
+        objects = self._objects(6)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            HymCacheRollingPipeline(pool, window_bytes=32).run(
+                [objects],
+                issue=lambda o: issued.append(o.index),
+                stage=lambda o: o.index,
+                consume=lambda o, _v: None,
+                release=lambda o: None,
+            )
+        assert issued == list(range(6))
+
+    def test_window_still_bounds_how_far_the_hint_runs_ahead(self) -> None:
+        """A hint outside the window would defeat the byte bound."""
+        live: list[int] = []
+        peak = 0
+        objects = self._objects(6)
+
+        def _issue(obj: HymCacheObject) -> None:
+            nonlocal peak
+            live.append(obj.index)
+            peak = max(peak, len(live))
+
+        def _consume(obj: HymCacheObject, _v: int) -> None:
+            live.remove(obj.index)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            HymCacheRollingPipeline(pool, window_bytes=32).run(
+                [objects], issue=_issue, stage=lambda o: o.index,
+                consume=_consume, release=lambda o: None,
+            )
+        assert peak == 2  # window_bytes 32 / nbytes 16
+
+    def test_absent_issue_keeps_the_previous_behaviour(self) -> None:
+        """No hint: an object's only device contact is its blocking stage.
+
+        Where a later object's stage lands relative to an earlier consume is a
+        scheduling race, so only the per-object order and the consume order are
+        asserted.
+        """
+        order: list[str] = []
+        objects = self._objects(3)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            HymCacheRollingPipeline(pool, window_bytes=32).run(
+                [objects],
+                stage=lambda o: order.append(f"stage{o.index}") or o.index,
+                consume=lambda o, _v: order.append(f"consume{o.index}"),
+                release=lambda o: None,
+            )
+        assert [e for e in order if e.startswith("consume")] == [
+            "consume0", "consume1", "consume2",
+        ]
+        for i in range(3):
+            assert order.index(f"stage{i}") < order.index(f"consume{i}")
+        assert not any(e.startswith("issue") for e in order)
+
+    def test_a_failing_hint_does_not_stop_the_stream(self) -> None:
+        """The blocking stage still brings the object in without the hint."""
+        consumed: list[int] = []
+        objects = self._objects(3)
+
+        def _issue(obj: HymCacheObject) -> None:
+            if obj.index == 1:
+                raise RuntimeError("device busy")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(RuntimeError):
+                HymCacheRollingPipeline(pool, window_bytes=32).run(
+                    [objects], issue=_issue, stage=lambda o: o.index,
+                    consume=lambda o, _v: consumed.append(o.index),
+                    release=lambda o: None,
+                )
