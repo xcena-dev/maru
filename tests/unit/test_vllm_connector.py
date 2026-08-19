@@ -3175,3 +3175,258 @@ class TestActiveLoadRefsRelease:
         worker._release_completed_load_refs()
 
         assert worker._active_load_refs == []
+
+
+class TestKvOpsResolution:
+    """The placement kernels are resolved once, and their absence is loud.
+
+    An unbuilt extension costs measured throughput but raises nothing, so the
+    warning is the only signal a deployment gets. These tests pin that it is
+    emitted, that it names the fix, and that it does not repeat per load.
+    """
+
+    @staticmethod
+    def _reset() -> None:
+        import maru_vllm.connector as conn
+
+        conn._kv_ops_module = None
+        conn._kv_ops_warned = False
+
+    def teardown_method(self) -> None:
+        self._reset()
+
+    def test_returns_module_when_extension_built(self, monkeypatch):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        stub = SimpleNamespace(is_available=lambda: True, import_error=lambda: None)
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+
+        assert conn._resolve_kv_ops() is stub
+
+    def test_caches_the_resolved_module(self, monkeypatch):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        calls = []
+
+        class Stub:
+            @staticmethod
+            def is_available():
+                calls.append(1)
+                return True
+
+            @staticmethod
+            def import_error():
+                return None
+
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", Stub)
+
+        assert conn._resolve_kv_ops() is Stub
+        assert conn._resolve_kv_ops() is Stub
+        assert len(calls) == 1
+
+    def test_unbuilt_extension_warns_once_and_names_the_fix(self, monkeypatch, caplog):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        stub = SimpleNamespace(
+            is_available=lambda: False,
+            import_error=lambda: ImportError("no _C"),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+
+        with caplog.at_level("WARNING"):
+            assert conn._resolve_kv_ops() is None
+            assert conn._resolve_kv_ops() is None
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "nvcc" in message
+        assert "Reinstall maru" in message
+
+    def test_kernel_ctx_takes_the_fallback_when_unbuilt(self, monkeypatch):
+        """An unbuilt extension must reach the per-layer path, not raise."""
+        self._reset()
+        stub = SimpleNamespace(
+            is_available=lambda: False, import_error=lambda: ImportError("no _C")
+        )
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+        worker = make_bare_worker()
+        worker._kv_ops = None
+        worker._kv_layout = SimpleNamespace(format_name="NL_X_NB_TWO_BS_NH_HS")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        layer = torch.zeros(2, 2, 4, 1)
+        monkeypatch.setattr(
+            type(layer), "device", property(lambda _self: torch.device("cuda"))
+        )
+
+        assert (
+            worker._packed_load_kernel_ctx(
+                [("l0", layer, 0)], make_flash_attn_metadata()
+            )
+            is None
+        )
+
+
+class TestPackedLayerCopyPlan:
+    """The gather plan must select the requested layer, in request token order.
+
+    A wrong offset here copies a neighbouring layer's bytes and the load still
+    reports success, so the plan is replayed against a synthetic packed slab
+    and compared with the gather it stands for. Byte arithmetic only — no CUDA.
+    """
+
+    @staticmethod
+    def _worker(num_layers: int, chunk_tokens: int, page_size: int | None):
+        worker = make_bare_worker()
+        worker._num_layers = num_layers
+        worker._kv_chunk_tokens = chunk_tokens
+        worker._effective_page_size_bytes = page_size
+        return worker
+
+    @staticmethod
+    def _slab(num_chunks: int, num_layers: int, chunk_tokens: int, hidden: int):
+        """A packed slab whose every element encodes where it came from."""
+        return torch.arange(
+            num_chunks * 2 * num_layers * chunk_tokens * hidden, dtype=torch.int32
+        ).view(num_chunks, 2, num_layers, chunk_tokens, hidden)
+
+    def _replay(self, plan, slab, run_offsets, destination_numel, itemsize):
+        """Execute a plan over flat byte buffers, as cudaMemcpy2DAsync would."""
+        source = slab.reshape(-1).contiguous().numpy().tobytes()
+        destination = bytearray(destination_numel * itemsize)
+        for copy in plan:
+            base = run_offsets[copy.run_index]
+            for row in range(copy.rows):
+                src = base + copy.source_offset + row * copy.source_pitch
+                dst = copy.destination_offset + row * copy.destination_pitch
+                destination[dst : dst + copy.width_bytes] = source[
+                    src : src + copy.width_bytes
+                ]
+        return torch.frombuffer(bytes(destination), dtype=torch.int32)
+
+    @pytest.mark.parametrize("layer_idx", [0, 1, 2])
+    def test_contiguous_run_gathers_the_requested_layer(self, layer_idx):
+        num_chunks, num_layers, chunk_tokens, hidden = 3, 3, 4, 2
+        itemsize = 4
+        plane_bytes = chunk_tokens * hidden * itemsize
+        slab_bytes = 2 * num_layers * plane_bytes
+        worker = self._worker(num_layers, chunk_tokens, slab_bytes)
+        slab = self._slab(num_chunks, num_layers, chunk_tokens, hidden)
+
+        plan = worker._packed_layer_copy_plan(
+            runs=[(0, num_chunks)],
+            num_chunks=num_chunks,
+            layer_idx=layer_idx,
+            plane_bytes=plane_bytes,
+        )
+        got = self._replay(
+            plan, slab, [0], 2 * num_chunks * chunk_tokens * hidden, itemsize
+        )
+
+        # [2, num_chunks * chunk_tokens, hidden]: K for every chunk, then V.
+        expected = slab[:, :, layer_idx].permute(1, 0, 2, 3).reshape(-1).contiguous()
+        assert torch.equal(got, expected)
+
+    def test_gapped_runs_produce_the_same_gather(self):
+        """Two runs must land in the same order as one covering both chunks."""
+        num_chunks, num_layers, chunk_tokens, hidden = 2, 4, 2, 3
+        itemsize = 4
+        plane_bytes = chunk_tokens * hidden * itemsize
+        slab_bytes = 2 * num_layers * plane_bytes
+        worker = self._worker(num_layers, chunk_tokens, slab_bytes)
+        slab = self._slab(num_chunks, num_layers, chunk_tokens, hidden)
+
+        # One run per chunk, each starting at its own slab base.
+        plan = worker._packed_layer_copy_plan(
+            runs=[(0, 1), (1, 1)],
+            num_chunks=num_chunks,
+            layer_idx=2,
+            plane_bytes=plane_bytes,
+        )
+        got = self._replay(
+            plan,
+            slab,
+            [0, slab_bytes],
+            2 * num_chunks * chunk_tokens * hidden,
+            itemsize,
+        )
+
+        expected = slab[:, :, 2].permute(1, 0, 2, 3).reshape(-1).contiguous()
+        assert torch.equal(got, expected)
+
+    def test_single_chunk_run_pitch_covers_the_width(self):
+        """A one-row copy still needs pitch >= width or cudaMemcpy2D errors."""
+        worker = self._worker(num_layers=2, chunk_tokens=4, page_size=None)
+
+        plan = worker._packed_layer_copy_plan(
+            runs=[(0, 1)], num_chunks=1, layer_idx=0, plane_bytes=32
+        )
+
+        assert all(c.source_pitch >= c.width_bytes for c in plan)
+        assert all(c.destination_pitch >= c.width_bytes for c in plan)
+
+    def test_plan_is_two_copies_per_run(self):
+        worker = self._worker(num_layers=2, chunk_tokens=4, page_size=64)
+
+        plan = worker._packed_layer_copy_plan(
+            runs=[(0, 2), (2, 1)], num_chunks=3, layer_idx=1, plane_bytes=32
+        )
+
+        assert len(plan) == 4
+        assert [c.run_index for c in plan] == [0, 0, 1, 1]
+        assert [c.rows for c in plan] == [2, 2, 1, 1]
+
+
+class TestPlacePackedLayer:
+    """Both placement branches must write the same bytes to the same slots."""
+
+    def test_kernel_branch_calls_the_single_layer_entry_point(self):
+        worker = make_bare_worker()
+        recorded = {}
+
+        class Ops:
+            TransferDirection = SimpleNamespace(H2D="h2d")
+
+            @staticmethod
+            def single_layer_kv_transfer(*args, **kwargs):
+                recorded["args"] = args
+                recorded["kwargs"] = kwargs
+
+        layer = torch.zeros(2, 2, 4, 1)
+        staged = torch.zeros(2, 8, 1)
+        slots = torch.arange(8)
+        kernel = (Ops, "ptrs", 16, 2, 1, "fmt")
+
+        worker._place_packed_layer(layer, staged, slots, None, "l0", kernel)
+
+        assert recorded["args"][0] is staged
+        assert recorded["args"][1] is layer
+        assert recorded["args"][2] is slots
+        assert recorded["args"][3] == "h2d"
+        assert recorded["args"][4] == "fmt"
+        # token_major=False is the [2, num_tokens, hidden] contract the staging
+        # tensor is built to; True would transpose K and V.
+        assert recorded["kwargs"] == {"token_major": False}
+
+    def test_fallback_branch_injects_as_one_run(self, monkeypatch):
+        worker = make_bare_worker()
+        recorded = {}
+
+        def fake_inject(*args, **kwargs):
+            recorded["args"] = args
+            recorded["kwargs"] = kwargs
+
+        monkeypatch.setattr(worker, "_inject_kv_into_layer", fake_inject)
+        layer = torch.zeros(2, 2, 4, 1)
+        staged = torch.zeros(2, 8, 1)
+        slots = torch.arange(8)
+
+        worker._place_packed_layer(layer, staged, slots, "attn", "l0", None)
+
+        # num_chunks=1 is what makes _inject_kv_into_layer read the staging
+        # tensor as [2, num_tokens, hidden] rather than chunk-major.
+        assert recorded["kwargs"] == {"num_chunks": 1}
+        assert recorded["args"][1] is staged

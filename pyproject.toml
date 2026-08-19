@@ -50,8 +50,13 @@ Repository = "https://github.com/xcena-dev/maru"
 Documentation = "https://xcena-dev.github.io/maru/"
 Organization = "https://xcena.com"
 
+[tool.setuptools.package-data]
+# The vendored kernel sources are build inputs, so they have to travel with the
+# sdist; VENDOR.md travels with them because it is the provenance record.
+maru_kv_ops = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.cpp", "csrc/*.h", "VENDOR.md"]
+
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*", "maru_tools*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*", "maru_tools*", "maru_kv_ops*"]
 
 [tool.ruff]
 line-length = 88

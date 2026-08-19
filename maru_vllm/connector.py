@@ -89,10 +89,75 @@ _cuda_runtime: Any = None
 _cuda_memcpy2d_async: Any = None
 _cuda_memcpy2d_unavailable = False
 
+_kv_ops_module: Any = None
+_kv_ops_warned = False
+
+
+@dataclass(frozen=True)
+class _PitchedCopy:
+    """One ``cudaMemcpy2DAsync`` in a packed-layer gather.
+
+    Offsets are byte offsets, not addresses: the destination is relative to the
+    staging tensor and the source to run ``run_index``'s base, so the plan can
+    be built and checked before any pointer exists.
+    """
+
+    run_index: int
+    destination_offset: int
+    destination_pitch: int
+    source_offset: int
+    source_pitch: int
+    width_bytes: int
+    rows: int
+
 
 # ============================================================================
 # Utilities
 # ============================================================================
+
+
+def _resolve_kv_ops() -> Any | None:
+    """Return the paged-KV placement kernels, or None with one warning.
+
+    The kernels place a chunk's whole slab in one launch per chunk; without
+    them every load and store degrades to a copy per layer, which measured 148
+    vs 142.4 ms on a single-request cache hit and turned a chunk's single store
+    transfer into one per (chunk, layer). That gap is invisible in serving
+    metrics — it looks like a slower deployment, not an error — so the warning
+    names the build step that fixes it, and is emitted once per process rather
+    than once per load.
+
+    Returns:
+        The ``maru_kv_ops`` module when its extension is built, else None.
+    """
+    global _kv_ops_module, _kv_ops_warned
+    if _kv_ops_module is not None:
+        return _kv_ops_module
+    try:
+        import maru_kv_ops
+    except ImportError as error:  # pragma: no cover - package ships with maru
+        if not _kv_ops_warned:
+            _kv_ops_warned = True
+            logger.warning(
+                "Maru KV placement kernels unavailable (%s); every load and "
+                "store falls back to a copy per layer. Reinstall maru so "
+                "maru_kv_ops is importable.",
+                error,
+            )
+        return None
+    if not maru_kv_ops.is_available():
+        if not _kv_ops_warned:
+            _kv_ops_warned = True
+            logger.warning(
+                "Maru KV placement kernels were not built (%s); every load and "
+                "store falls back to a copy per layer, which is materially "
+                "slower. Reinstall maru on a host with the CUDA toolkit "
+                "(nvcc) and PyTorch to build them.",
+                maru_kv_ops.import_error(),
+            )
+        return None
+    _kv_ops_module = maru_kv_ops
+    return _kv_ops_module
 
 
 def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> Any:
@@ -1143,8 +1208,8 @@ class MaruWorkerConnector:
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
         # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
-        # for LMCache's multi_layer_kv_transfer kernel on the packed path.
-        self._lmc_ops: Any = None
+        # for the maru_kv_ops placement kernels on the packed path.
+        self._kv_ops: Any = None
 
         # P6: storage granularity. Default (off) packs all layers of a chunk
         # into one CXL object with one key — matching LMCache use_layerwise=
@@ -1847,6 +1912,11 @@ class MaruWorkerConnector:
         forward waits per layer instead of issuing anything itself. The
         transfer also gets a head start over the forward.
 
+        Each layer is staged through the copy engine and then placed by one
+        kernel launch, the same split the whole-request deferred path uses: the
+        media read rides the copy engine so it cannot hold SMs for its whole
+        duration, and only the address rearrangement runs on SMs.
+
         Args:
             req_meta: Metadata of the parked request.
             num_chunks: Chunks matched for this request.
@@ -1867,6 +1937,7 @@ class MaruWorkerConnector:
             pinned = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             attn = self._last_attn_metadata
             tokens = num_chunks * self._kv_chunk_tokens
+            kernel = self._packed_store_kernel_ctx(attn)
             _t0 = time.monotonic()
             events: dict[str, torch.cuda.Event] = {}
             with torch.cuda.stream(stream):
@@ -1875,13 +1946,13 @@ class MaruWorkerConnector:
                     layer_dev = self._copy_packed_layer_to_device(
                         infos, num_chunks, true_idx, kv_cache_layer, stream
                     )
-                    self._inject_kv_into_layer(
+                    self._place_packed_layer(
                         kv_cache_layer,
                         layer_dev,
                         slot_gpu[:tokens],
                         attn,
                         layer_name,
-                        num_chunks=num_chunks,
+                        kernel,
                     )
                     event = torch.cuda.Event()
                     event.record(stream)
@@ -1923,10 +1994,13 @@ class MaruWorkerConnector:
 
         The background loader already completed Maru RPC/mmap lookup. This
         method runs at the beginning of the resumed forward: for layer k it
-        copies only that layer's K/V slices from every packed CXL slab, injects
+        copies only that layer's K/V slices from every packed CXL slab, places
         them into paged KV on ``_load_stream``, and records an event. Attention
         layer k waits for only that event, leaving layer k+1 transfer queued in
         parallel with layer k compute. No device-wide synchronize is used.
+
+        Placement takes the same kernel the loader-thread path uses, falling
+        back to a per-layer index-put where the kernel is unusable.
         """
         entries: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]] = []
         missing: list[str] = []
@@ -1994,6 +2068,7 @@ class MaruWorkerConnector:
         # says nothing about those: they are loading correctly and their
         # forward must still wait on them.
         issued: dict[str, torch.cuda.Event] = {}
+        kernel = self._packed_store_kernel_ctx(attn_metadata)
         try:
             with torch.cuda.stream(load_stream):
                 slot_mappings_gpu = [
@@ -2011,13 +2086,13 @@ class MaruWorkerConnector:
                             kv_cache_layer,
                             load_stream,
                         )
-                        self._inject_kv_into_layer(
+                        self._place_packed_layer(
                             kv_cache_layer,
                             layer_dev,
                             slot_gpu[: num_chunks * self._kv_chunk_tokens],
                             attn_metadata,
                             layer_name,
-                            num_chunks=num_chunks,
+                            kernel,
                         )
                     event = torch.cuda.Event()
                     event.record(load_stream)
@@ -2072,9 +2147,16 @@ class MaruWorkerConnector:
         One packed page is ``[2, layers, tokens, hidden]``. For a contiguous
         page run, each layer's K (or V) plane is a fixed-width row separated
         by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather every chunk
-        directly from registered CXL into ``[chunks, 2, tokens, hidden]``.
-        The caller can then inject all chunks with one kernel. Gapped page
-        allocations become multiple pitched runs but keep the same output.
+        directly from registered CXL. Gapped page allocations become multiple
+        pitched runs but keep the same output.
+
+        Returns:
+            ``[2, num_chunks * chunk_tokens, hidden]`` on the layer's device —
+            every chunk's K plane, then every chunk's V plane. Token order is
+            the request's, so index ``t`` of the middle axis is the token
+            ``slot_mapping[t]`` places. That is the shape
+            ``single_layer_kv_transfer`` reads with ``token_major=False``, and
+            the shape ``_inject_kv_into_layer`` reads with ``num_chunks=1``.
         """
         if not infos or num_chunks <= 0:
             raise ValueError("packed layer copy requires at least one chunk")
@@ -2087,44 +2169,138 @@ class MaruWorkerConnector:
         )
         hidden = first_slab.shape[-1]
         layer_dev = torch.empty(
-            (num_chunks, 2, self._kv_chunk_tokens, hidden),
+            (2, num_chunks * self._kv_chunk_tokens, hidden),
             dtype=kv_cache_layer.dtype,
             device=kv_cache_layer.device,
         )
-        plane_bytes = self._kv_chunk_tokens * hidden * kv_cache_layer.element_size()
-        slab_bytes = 2 * self._num_layers * plane_bytes
-        destination_pitch = 2 * plane_bytes
+        runs = self._chunk_runs(infos[:num_chunks])
+        # Held, not just their pointers: these alias the CXL mapping the copies
+        # read from, and the copies are still queued when this returns.
+        run_views = [
+            torch.frombuffer(run_view, dtype=kv_cache_layer.dtype)
+            for _, _, run_view in runs
+        ]
+        plan = self._packed_layer_copy_plan(
+            runs=[(start, count) for start, count, _ in runs],
+            num_chunks=num_chunks,
+            layer_idx=layer_idx,
+            plane_bytes=self._kv_chunk_tokens * hidden * kv_cache_layer.element_size(),
+        )
+        for copy in plan:
+            error = copy_2d(
+                layer_dev.data_ptr() + copy.destination_offset,
+                copy.destination_pitch,
+                run_views[copy.run_index].data_ptr() + copy.source_offset,
+                copy.source_pitch,
+                copy.width_bytes,
+                copy.rows,
+                1,  # cudaMemcpyHostToDevice
+                stream.cuda_stream,
+            )
+            if error != 0:
+                raise RuntimeError(f"cudaMemcpy2DAsync failed with code {error}")
+        return layer_dev
 
-        for chunk_start, run_chunks, run_view in self._chunk_runs(infos[:num_chunks]):
-            run_host = torch.frombuffer(run_view, dtype=kv_cache_layer.dtype)
+    def _packed_layer_copy_plan(
+        self,
+        runs: list[tuple[int, int]],
+        num_chunks: int,
+        layer_idx: int,
+        plane_bytes: int,
+    ) -> list[_PitchedCopy]:
+        """Lay out the pitched copies that gather one layer.
+
+        Split out from ``_copy_packed_layer_to_device`` because it is the part
+        that can be wrong without failing: a mis-derived offset copies the
+        neighbouring layer's bytes, and the load still reports success. Keeping
+        it free of tensors and CUDA lets a test replay it against a synthetic
+        slab and compare against the gather it is supposed to perform.
+
+        Args:
+            runs: ``(first chunk index, chunk count)`` per contiguous page run,
+                as ``_chunk_runs`` found them.
+            num_chunks: Chunks in the request, so the destination's K/V split.
+            layer_idx: Layer to gather, indexing the slab's layer axis.
+            plane_bytes: Bytes of one (chunk, layer, K or V) plane.
+
+        Returns:
+            Copies to issue, two per run (K then V). Offsets are relative to
+            the destination tensor and to each run's own base.
+        """
+        slab_bytes = 2 * self._num_layers * plane_bytes
+        half_bytes = num_chunks * plane_bytes
+        page_size = self._effective_page_size_bytes
+        plan: list[_PitchedCopy] = []
+        for run_index, (chunk_start, run_chunks) in enumerate(runs):
+            # Within a run, consecutive chunks sit one page apart. A single-chunk
+            # run has no second row, so its pitch only has to be >= the width.
             source_pitch = (
-                self._effective_page_size_bytes
-                if run_chunks > 1 and self._effective_page_size_bytes is not None
-                else slab_bytes
+                page_size if run_chunks > 1 and page_size is not None else slab_bytes
             )
             for kv_idx in range(2):
-                destination = (
-                    layer_dev.data_ptr()
-                    + chunk_start * destination_pitch
-                    + kv_idx * plane_bytes
+                plan.append(
+                    _PitchedCopy(
+                        run_index=run_index,
+                        # Chunks of one K/V half land back to back, so a run's
+                        # destination rows are adjacent: pitch is one plane.
+                        destination_offset=kv_idx * half_bytes
+                        + chunk_start * plane_bytes,
+                        destination_pitch=plane_bytes,
+                        source_offset=(kv_idx * self._num_layers + layer_idx)
+                        * plane_bytes,
+                        source_pitch=source_pitch,
+                        width_bytes=plane_bytes,
+                        rows=run_chunks,
+                    )
                 )
-                source = (
-                    run_host.data_ptr()
-                    + (kv_idx * self._num_layers + layer_idx) * plane_bytes
-                )
-                error = copy_2d(
-                    destination,
-                    destination_pitch,
-                    source,
-                    source_pitch,
-                    plane_bytes,
-                    run_chunks,
-                    1,  # cudaMemcpyHostToDevice
-                    stream.cuda_stream,
-                )
-                if error != 0:
-                    raise RuntimeError(f"cudaMemcpy2DAsync failed with code {error}")
-        return layer_dev
+        return plan
+
+    def _place_packed_layer(
+        self,
+        kv_cache_layer: torch.Tensor,
+        layer_dev: torch.Tensor,
+        slot_gpu: torch.Tensor,
+        attn_metadata: Any,
+        layer_name: str,
+        kernel: tuple | None,
+    ) -> None:
+        """Scatter one staged layer into the paged cache.
+
+        Both branches place the same bytes at the same addresses; they differ in
+        who computes those addresses. The kernel takes ``slot_gpu`` as it is and
+        derives each token's block and offset inline. The fallback has to
+        materialise those as two index tensors first, so it issues three kernels
+        per layer where the first issues one.
+
+        Args:
+            kv_cache_layer: The layer's paged KV tensor.
+            layer_dev: Device-resident ``[2, num_tokens, hidden]`` staging
+                tensor from ``_copy_packed_layer_to_device``.
+            slot_gpu: Device slot mapping covering exactly those tokens.
+            attn_metadata: Attention metadata for the fallback's layout dispatch.
+            layer_name: Layer being placed, for the fallback's dispatch.
+            kernel: Context from ``_packed_store_kernel_ctx``, or None to take
+                the fallback.
+        """
+        if kernel is None:
+            self._inject_kv_into_layer(
+                kv_cache_layer,
+                layer_dev,
+                slot_gpu,
+                attn_metadata,
+                layer_name,
+                num_chunks=1,
+            )
+            return
+        ops, _ptrs, _pbs, _block_size, _head_size, fmt = kernel
+        ops.single_layer_kv_transfer(
+            layer_dev,
+            kv_cache_layer,
+            slot_gpu,
+            ops.TransferDirection.H2D,
+            fmt,
+            token_major=False,
+        )
 
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
@@ -2408,12 +2584,12 @@ class MaruWorkerConnector:
         """Load per-chunk slabs with no GPU staging (P6 v2, packed).
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
-        whole to LMCache's ``multi_layer_kv_transfer``, which reads the pinned
+        whole to ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
         ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's 1,888
         tiny copies and the reverted GPU-staging OOM. Non-Flash layouts, CPU,
-        or a missing ``lmcache.c_ops`` fall back to a per-layer inject that
+        or an unbuilt ``maru_kv_ops`` fall back to a per-layer inject that
         reads the same slab slices.
 
         Deferred (between-step) requests are marked finished immediately (the
@@ -2520,8 +2696,8 @@ class MaruWorkerConnector:
 
         Returns ``(ops, kv_cache_pointers, page_buffer_size, block_size,
         head_size, engine_kv_format)`` when the fused no-staging kernel is
-        usable: Flash layout, CUDA, and ``lmcache.c_ops`` importable. This is
-        the DEFAULT packed load whenever available — it is not gated on any
+        usable: Flash layout, CUDA, and a built ``maru_kv_ops``. This is the
+        DEFAULT packed load whenever available — it is not gated on any
         configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
         Works with whatever paged axis order vLLM chose: dimensions and the
@@ -2548,18 +2724,12 @@ class MaruWorkerConnector:
         )
         if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
             return None
-        # Resolve lmcache.c_ops lazily.
-        if self._lmc_ops is None:
-            try:
-                import lmcache.c_ops as lmc_ops
-
-                self._lmc_ops = lmc_ops
-            except ImportError:
-                logger.warning(
-                    "Maru packed load: lmcache.c_ops unavailable; using "
-                    "per-layer inject fallback"
-                )
+        # Resolve the placement kernels lazily.
+        if self._kv_ops is None:
+            ops_module = _resolve_kv_ops()
+            if ops_module is None:
                 return None
+            self._kv_ops = ops_module
         # Dimensions and format come from one layout, so they cannot disagree.
         # The kernel takes raw pointers, so torch would not catch it if they did.
         block_size = layout.block_size
@@ -2569,8 +2739,8 @@ class MaruWorkerConnector:
         ptrs = torch.empty(len(layers), dtype=torch.int64, device="cpu")
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
-        ops = self._lmc_ops
-        # An older c_ops build may not carry every format; take the per-layer
+        ops = self._kv_ops
+        # A kernel build predating a format cannot place it; take the per-layer
         # fallback rather than raising out of the load path.
         kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
         if kv_format is None:
@@ -2858,7 +3028,7 @@ class MaruWorkerConnector:
           writes each chunk's slab with one ``multi_layer_kv_transfer(D2H)``
           — the store-side mirror of ``_load_packed``, collapsing
           ``(chunk x layer)`` GPU->CXL copies into one transfer per chunk.
-        - **Fallback** (non-Flash layout, CPU, or no ``lmcache.c_ops``): each
+        - **Fallback** (non-Flash layout, CPU, or unbuilt ``maru_kv_ops``): each
           layer's Flash extract ``[2, chunk_tokens, hidden]`` is written to
           ``slab[:, layer_idx]`` as before. Non-Flash extracts have a
           different rank and will raise (caught below → chunk skipped →
@@ -2986,13 +3156,16 @@ class MaruWorkerConnector:
                     logger.warning("Maru packed store failed: %s", base_key)
 
     def _packed_store_kernel_ctx(self, attn_metadata: Any) -> tuple | None:
-        """Kernel ctx for the coalesced packed store, or None for the fallback.
+        """Cached kernel ctx built from the registered caches, or None.
 
-        Same contract as ``_packed_load_kernel_ctx`` but built from the
-        registered KV caches (``save_kv_layer`` only sees one layer per call)
-        and cached — the pointer table is static after ``register_kv_caches``.
+        Named for the coalesced packed store, its first caller, but it now
+        serves every path that has no per-call layer list: the store (where
+        ``save_kv_layer`` sees one layer at a time) and the two asynchronous
+        loads (which run off the engine thread, after the forward that would
+        have supplied one). Same contract as ``_packed_load_kernel_ctx``, and
+        cached — the pointer table is static after ``register_kv_caches``.
         The kernel/fallback decision is stable across a step's per-layer calls
-        because every gate (device, tensor rank, layout, c_ops import) is
+        because every gate (device, tensor rank, layout, kernel import) is
         static, so the two paths never mix within one step. An unusable kernel
         is cached as ``False`` to avoid re-probing (e.g. re-attempting the
         import) on every per-layer call.
