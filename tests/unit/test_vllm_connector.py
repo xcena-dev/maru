@@ -2021,6 +2021,178 @@ class TestPreIssuedLayerwiseHandoff:
             event.synchronize.assert_called_once_with()
         assert worker._deferred_layerwise_events == {}
 
+    def test_aborting_a_parked_request_drains_before_reporting_it(self):
+        """An aborted request's blocks are freed the moment loading is
+        reported, and its forward never runs to wait on the later layers."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        # Gate has not fired: the request is still parked mid-transfer.
+        gate = MagicMock()
+        gate.query.return_value = False
+        worker._deferred_events["r1"] = gate
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker._deferred_layerwise_events == {}
+        # The report is still owed — vLLM holds the blocks until it arrives —
+        # but only now that every copy has landed.
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker._deferred_events == {}
+        # And exactly once: the request is gone from vLLM after the free.
+        assert worker.get_finished_loading() is None
+
+    def test_aborting_mid_retrieve_defers_the_report_to_the_loader(self, monkeypatch):
+        """The abort can land while the loader thread is still retrieving,
+        when there is nothing queued yet for the drain to wait on."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        worker._inflight_deferred_req_ids.add("r1")
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        # Nothing to report yet — the copies do not exist.
+        assert worker.get_finished_loading() is None
+        assert worker._abandoned_req_ids == {"r1"}
+
+        # The loader queues them a moment later and finds the request gone.
+        events = {name: MagicMock() for name in self.LAYERS}
+        meta = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_matched_chunks=2,
+        )
+        meta.layerwise_load = True
+        monkeypatch.setattr(
+            worker, "_batch_retrieve_all", lambda keys: [MagicMock(), MagicMock()]
+        )
+        monkeypatch.setattr(
+            worker,
+            "_issue_layerwise_copies_offthread",
+            lambda *args, **kwargs: events,
+        )
+
+        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+
+        # Copies finished before the report that frees the blocks.
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() == {"r1"}
+        # No handoff was installed for a request that will never run.
+        assert worker._deferred_layerwise_events == {}
+        assert worker._deferred_events == {}
+        assert worker._abandoned_req_ids == set()
+        assert worker._inflight_deferred_req_ids == set()
+
+    def test_abort_landing_between_queueing_and_publishing_is_not_lost(
+        self, monkeypatch
+    ):
+        """The narrowest window: the engine thread drains while the loader is
+        between queueing its copies and publishing them."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        worker._inflight_deferred_req_ids.add("r1")
+        events = {name: MagicMock() for name in self.LAYERS}
+        meta = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_matched_chunks=2,
+        )
+        meta.layerwise_load = True
+        monkeypatch.setattr(
+            worker, "_batch_retrieve_all", lambda keys: [MagicMock(), MagicMock()]
+        )
+
+        def issue_then_abort(*args, **kwargs):
+            worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+            return events
+
+        monkeypatch.setattr(
+            worker, "_issue_layerwise_copies_offthread", issue_then_abort
+        )
+
+        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker._deferred_events == {}
+
+    def test_draining_an_already_reported_request_does_not_report_again(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        events = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(events)
+        # No gate: get_finished_loading() already reported this request.
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+
+        for event in events.values():
+            event.synchronize.assert_called_once_with()
+        assert worker.get_finished_loading() is None
+
+    def test_finishing_a_request_that_never_parked_costs_nothing(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+
+        worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r9"}))
+
+        assert worker.get_finished_loading() is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_issue_failure_spares_the_events_of_other_requests(self, monkeypatch):
+        """A forward-issue failure says nothing about requests whose copies
+        the loader thread already queued and handed over."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._worker()
+        pre_issued = {name: MagicMock() for name in self.LAYERS}
+        worker._deferred_layerwise_events["r1"] = dict(pre_issued)
+        failing = deferred_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[7, 8],
+            num_matched_chunks=2,
+        )
+        worker._deferred_layerwise_loads["r2"] = (
+            failing,
+            2,
+            torch.arange(8),
+            [MagicMock(), MagicMock()],
+        )
+        monkeypatch.setattr(
+            worker,
+            "_copy_packed_layer_to_device",
+            MagicMock(side_effect=RuntimeError("copy failed")),
+        )
+        kv = [torch.zeros(2, 2, 4, 1, device="cuda") for _ in self.LAYERS]
+        forward = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=t)
+                for name, t in zip(self.LAYERS, kv, strict=True)
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1", "r2"}),
+        )
+
+        # r1 is loading correctly; its forward must still wait per layer.
+        assert worker._layer_load_events == {
+            name: [event] for name, event in pre_issued.items()
+        }
+        # Only the request that failed is recomputed.
+        assert worker.take_failed_load_blocks() == {7, 8}
+
 
 class _FakeAdmissionEvent:
     """Stand-in CUDA event: query() flips true after synchronize()."""
@@ -2205,6 +2377,28 @@ class TestWriteBehindStoreLifecycle:
             kernel, metadata
         )
         assert worker._queued_store_batches == []
+
+    def test_shutdown_drains_layerwise_streams_before_unmapping(self):
+        """Copies queued off-thread read pinned buffers and CXL views that
+        closing the handler unmaps, and they run on no other stream."""
+        worker = self._make_worker()
+        order: list[str] = []
+        stream = MagicMock()
+        stream.synchronize.side_effect = lambda: order.append("drain")
+        worker._layerwise_streams = [stream]
+        handler = MagicMock()
+        handler.close.side_effect = lambda: order.append("unmap")
+        worker._handler = handler
+        worker._active_load_refs.append((MagicMock(), ["cxl view"]))
+        # A run where every request took the off-thread path never creates
+        # _load_stream, which is what the release used to hang off.
+        assert worker._load_stream is None
+
+        worker.shutdown()
+
+        assert order == ["drain", "unmap"]
+        assert worker._layerwise_streams == []
+        assert worker._active_load_refs == []
 
 
 # =============================================================================

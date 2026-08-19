@@ -23,6 +23,7 @@ import hashlib
 import re
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -133,6 +134,19 @@ def _emit_timing(msg: str) -> None:
     import sys
 
     print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
+
+
+def _drain_events(events: Iterable[Any]) -> None:
+    """Wait out queued copies whose destination blocks are being reclaimed.
+
+    Best effort: a device already torn down raises here, and there is nothing
+    left to protect in that case.
+    """
+    for event in events:
+        try:
+            event.synchronize()
+        except Exception as e:
+            logger.warning("Maru: could not drain a queued layer copy: %s", e)
 
 
 def _get_cuda_memcpy2d_async() -> Any:
@@ -330,6 +344,11 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # preempted after the previous step. The worker drains its store stream
     # before the next forward can reuse those block IDs.
     preempted_req_ids: set[str] = field(default_factory=set)
+    # Requests that finished or were aborted between the previous and the
+    # current step. A request aborted while parked keeps its blocks only until
+    # the connector reports its load complete, so the worker must drain the
+    # copies it queued for that request before that report goes out.
+    finished_req_ids: set[str] = field(default_factory=set)
     # Deferred packed loads whose metadata RPC completed between steps. The
     # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
     # can overlap layer k compute without changing the packed storage format.
@@ -849,7 +868,8 @@ class MaruSchedulerConnector:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MaruConnectorMetadata(
-            preempted_req_ids=set(scheduler_output.preempted_req_ids or ())
+            preempted_req_ids=set(scheduler_output.preempted_req_ids or ()),
+            finished_req_ids=set(scheduler_output.finished_req_ids or ()),
         )
 
         # Deferred loads first: these requests are parked in
@@ -1081,6 +1101,13 @@ class MaruWorkerConnector:
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        # Loads the background thread has taken but not yet accounted for, and
+        # those among them whose request was abandoned meanwhile. A request
+        # aborted while parked keeps its blocks until this connector reports
+        # its load complete; these two sets are what let that report wait for
+        # copies queued after the abort was seen.
+        self._inflight_deferred_req_ids: set[str] = set()
+        self._abandoned_req_ids: set[str] = set()
         # True-async deferred loads (packed path): a single background thread
         # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
         # so neither the RPC wait nor the copy blocks the engine thread's
@@ -1505,6 +1532,11 @@ class MaruWorkerConnector:
             self._deferred_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="maru-deferred-load"
             )
+        # Marked before the job can run: until it queues its copies there is
+        # nothing for handle_preemptions to drain, so an abort arriving in
+        # that window is recorded against this id instead.
+        with self._deferred_lock:
+            self._inflight_deferred_req_ids.add(req_meta.req_id)
         self._deferred_executor.submit(
             self._deferred_packed_load_job, req_meta, layers, device
         )
@@ -1569,22 +1601,42 @@ class MaruWorkerConnector:
                     else None
                 )
                 with self._deferred_lock:
-                    if events is not None:
-                        self._deferred_layerwise_events[req_meta.req_id] = events
-                        if gate is not None:
-                            # Hold the request until enough layers have landed.
-                            # get_finished_loading promotes it when the gate
-                            # event fires, so nothing blocks the loader thread.
-                            self._deferred_events[req_meta.req_id] = gate
-                    else:
-                        self._deferred_layerwise_loads[req_meta.req_id] = (
-                            req_meta,
-                            num_chunks,
-                            slot_mapping,
-                            infos,
-                        )
-                    if events is None or gate is None:
+                    # Checked and published under one lock: a drain running in
+                    # between would otherwise mark the request abandoned after
+                    # this thread had already decided it was live.
+                    abandoned = req_meta.req_id in self._abandoned_req_ids
+                    self._abandoned_req_ids.discard(req_meta.req_id)
+                    if not abandoned:
+                        if events is not None:
+                            self._deferred_layerwise_events[req_meta.req_id] = events
+                            if gate is not None:
+                                # Hold the request until enough layers have
+                                # landed. get_finished_loading promotes it when
+                                # the gate event fires, so nothing blocks the
+                                # loader thread.
+                                self._deferred_events[req_meta.req_id] = gate
+                        else:
+                            self._deferred_layerwise_loads[req_meta.req_id] = (
+                                req_meta,
+                                num_chunks,
+                                slot_mapping,
+                                infos,
+                            )
+                        if events is None or gate is None:
+                            self._deferred_done.add(req_meta.req_id)
+                if abandoned:
+                    # The request was aborted while this load ran, so no
+                    # forward will wait per layer and the completion report is
+                    # what frees its blocks. The copies finish first, on this
+                    # thread rather than the engine's.
+                    logger.info(
+                        "Maru: draining abandoned layerwise load for req %s",
+                        req_meta.req_id,
+                    )
+                    _drain_events(events.values() if events else ())
+                    with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
+                    return
                 logger.info(
                     "Maru: deferred retrieve ready for packed-layerwise load "
                     "%d chunks (%d tokens) for req %s (%s)",
@@ -1685,6 +1737,12 @@ class MaruWorkerConnector:
                 except Exception:
                     pass
             self._fail_deferred_load(req_meta)
+        finally:
+            # This load is accounted for now, however it ended. An abort
+            # arriving after this point finds the queued copies themselves.
+            with self._deferred_lock:
+                self._inflight_deferred_req_ids.discard(req_meta.req_id)
+                self._abandoned_req_ids.discard(req_meta.req_id)
 
     def _wait_for_load_admission(self, req_id: str) -> None:
         """Block until fewer than the admission window of loads are in flight.
@@ -1930,6 +1988,12 @@ class MaruWorkerConnector:
         ]
 
         _t0 = time.monotonic()
+        # Collected locally and published only once every layer is queued.
+        # _layer_load_events already holds the events of requests whose copies
+        # the loader thread issued ahead of this forward, and a failure here
+        # says nothing about those: they are loading correctly and their
+        # forward must still wait on them.
+        issued: dict[str, torch.cuda.Event] = {}
         try:
             with torch.cuda.stream(load_stream):
                 slot_mappings_gpu = [
@@ -1957,7 +2021,7 @@ class MaruWorkerConnector:
                         )
                     event = torch.cuda.Event()
                     event.record(load_stream)
-                    self._layer_load_events.setdefault(layer_name, []).append(event)
+                    issued[layer_name] = event
         except Exception as e:
             logger.error("Maru packed-layerwise activation failed: %s", e)
             try:
@@ -1967,8 +2031,10 @@ class MaruWorkerConnector:
             with self._deferred_lock:
                 for req_meta, *_ in entries:
                     self._failed_load_blocks.update(req_meta.block_ids)
-            self._layer_load_events.clear()
             return
+
+        for layer_name, event in issued.items():
+            self._layer_load_events.setdefault(layer_name, []).append(event)
 
         # CXL views and slot mappings must outlive the queued H2D copies: a
         # batch event recorded after every copy gates the release of these
@@ -2224,7 +2290,16 @@ class MaruWorkerConnector:
         return done or None
 
     def handle_preemptions(self, metadata: MaruConnectorMetadata) -> None:
-        """Drain D2H before preempted block IDs can be reused by a forward.
+        """Drain transfers before the scheduler reclaims the blocks they write.
+
+        vLLM calls this before the step's forward and before
+        ``get_finished_loading``, which makes it the one place that covers both
+        ways a parked request's blocks are taken away:
+
+        - Preemption returns the blocks to the pool right away.
+        - A request that finished or was aborted while parked keeps its blocks
+          until the connector reports its load complete, and vLLM frees them
+          the moment that report arrives.
 
         Metadata registration may continue in the background because it no
         longer reads the GPU cache. Only the store stream must be complete at
@@ -2237,26 +2312,55 @@ class MaruWorkerConnector:
         ):
             self._store_stream.synchronize()
 
-        if not self._layerwise_overlap or not metadata.preempted_req_ids:
+        if not self._layerwise_overlap:
             return
-        # A preempted request gives its blocks back, so anything still holding
-        # them has to go. Entries whose copies were never issued are simply
-        # dropped — the request redoes the match/load handshake on fresh
-        # blocks. Copies already queued off-thread are writing into blocks
-        # about to be reassigned, so they are drained first. Preemption is
-        # rare, so paying a synchronize is the right trade.
+        if metadata.preempted_req_ids:
+            self._drain_layerwise_copies(metadata.preempted_req_ids, report=False)
+        if metadata.finished_req_ids:
+            self._drain_layerwise_copies(metadata.finished_req_ids, report=True)
+
+    def _drain_layerwise_copies(self, req_ids: set[str], report: bool) -> None:
+        """Complete the queued copies of requests losing their blocks.
+
+        Entries whose copies were never issued are simply dropped — a
+        preempted request redoes the match/load handshake on fresh blocks, and
+        a finished one wants nothing. Copies already queued off-thread are
+        writing into blocks about to be reassigned, so they are drained first.
+        Preemption and abort are both rare, so paying a synchronize is the
+        right trade.
+
+        Args:
+            req_ids: Requests whose blocks the scheduler is reclaiming.
+            report: Whether the reclaim is waiting on a completion report.
+                The gate releases a request once its first layer lands, so a
+                request that will never run a forward still owes its remaining
+                layers before that report may go out. The report is still
+                owed — withholding it strands the blocks — so it is queued
+                here, now that the copies are complete. A request whose gate
+                fired in an earlier step is drained without reporting again:
+                vLLM has already freed it and would reject a second report.
+                A load still running on the background thread has no copies to
+                drain yet, so the abort is recorded against it instead and the
+                loader honours it once it has queued them.
+        """
         drain: list[torch.cuda.Event] = []
+        owed: set[str] = set()
         with self._deferred_lock:
-            for req_id in metadata.preempted_req_ids:
+            for req_id in req_ids:
                 self._deferred_layerwise_loads.pop(req_id, None)
                 pre_issued = self._deferred_layerwise_events.pop(req_id, None)
-                if pre_issued:
-                    drain.extend(pre_issued.values())
-        for event in drain:
-            try:
-                event.synchronize()
-            except Exception:
-                pass
+                if not pre_issued:
+                    if report and req_id in self._inflight_deferred_req_ids:
+                        self._abandoned_req_ids.add(req_id)
+                    continue
+                drain.extend(pre_issued.values())
+                if report and self._deferred_events.pop(req_id, None) is not None:
+                    self._deferred_refs.pop(req_id, None)
+                    owed.add(req_id)
+        _drain_events(drain)
+        if owed:
+            with self._deferred_lock:
+                self._deferred_done |= owed
 
     def take_failed_load_blocks(self) -> set[int]:
         """Return (and clear) block ids whose deferred load failed."""
@@ -3417,14 +3521,27 @@ class MaruWorkerConnector:
             except Exception as e:
                 logger.error("Error synchronizing Maru load stream: %s", e)
             self._load_stream = None
-            self._layer_load_events.clear()
-            self._active_load_refs.clear()
+        # Copies the loader thread queued read pinned buffers and CXL views
+        # that the lines below drop and unmap. A run where every request took
+        # the off-thread path never created _load_stream, so these streams are
+        # the only thing still holding that memory.
+        for stream in self._layerwise_streams:
+            try:
+                stream.synchronize()
+            except Exception as e:
+                logger.error("Error synchronizing Maru layerwise stream: %s", e)
+        self._layerwise_streams = []
+        self._layerwise_stream_device = None
+        self._layer_load_events.clear()
+        self._active_load_refs.clear()
         with self._deferred_lock:
             self._deferred_layerwise_loads.clear()
             self._deferred_layerwise_events.clear()
             self._deferred_events.clear()
             self._deferred_refs.clear()
             self._deferred_done.clear()
+            self._inflight_deferred_req_ids.clear()
+            self._abandoned_req_ids.clear()
         if self._handler is not None:
             try:
                 self._handler.close()
