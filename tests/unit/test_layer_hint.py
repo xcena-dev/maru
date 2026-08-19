@@ -302,3 +302,72 @@ class TestDeferredLayerwiseRouting:
         assert worker._layer_hint_enabled is False
         assert worker._layer_hint_group == 1
         worker.shutdown()
+
+
+class TestRetrievePiggyback:
+    """hint_groups ride batch_retrieve's own lookup — no extra RPC."""
+
+    def _handler(self) -> MaruHandler:
+        handler = MaruHandler(MaruConfig(auto_connect=False))
+        handler._connected = True
+        handler._owned = MagicMock()
+        handler._owned.is_owned.return_value = True
+        handler._rpc = MagicMock()
+        return handler
+
+    def test_groups_dispatch_before_any_extra_rpc(self):
+        handler = self._handler()
+        # Not-found entries keep the retrieval tail (region mmap) out of
+        # the test; the hint dispatch happens regardless and the plugin is
+        # the one that filters unusable entries.
+        handler._rpc.batch_lookup_kv.return_value = SimpleNamespace(
+            entries=[_entry(found=False), _entry(found=False)]
+        )
+        recorder = MagicMock()
+        handler._plugins = [recorder]
+
+        assert handler.batch_retrieve(
+            ["k0", "k1"], hint_groups=[[(1, None, None)], [(0, 0, 4096)]]
+        ) == [None, None]
+
+        assert handler._rpc.batch_lookup_kv.call_count == 1
+        (_, groups, entries) = recorder.on_prefetch_grouped.call_args.args
+        assert groups == [[("k1", None, None)], [("k0", 0, 4096)]]
+        assert set(entries) == {"k0", "k1"}
+
+    def test_no_groups_means_no_dispatch(self):
+        handler = self._handler()
+        handler._rpc.batch_lookup_kv.return_value = SimpleNamespace(
+            entries=[_entry(found=False)]
+        )
+        recorder = MagicMock()
+        handler._plugins = [recorder]
+        handler.batch_retrieve(["k0"])
+        recorder.on_prefetch_grouped.assert_not_called()
+
+    def test_batched_retrieve_splits_groups_at_chunk_boundaries(self, monkeypatch):
+        worker = MaruWorkerConnector(
+            block_size=16, kv_chunk_tokens=128, extra_config={}
+        )
+        calls: list = []
+
+        class _Handler:
+            def batch_retrieve(self, keys, hint_groups=None):
+                calls.append((list(keys), hint_groups))
+                return [None] * len(keys)
+
+        worker._handler = _Handler()
+        keys = [f"k{i}" for i in range(5)]
+        # One group straddles the 2-key chunk boundary; order must survive.
+        groups = [
+            [(0, None, None), (1, None, None), (2, None, None)],
+            [(3, 0, 64), (4, None, None)],
+        ]
+
+        worker._batch_retrieve_all(keys, batch_size=2, hint_groups=groups)
+
+        assert [c[0] for c in calls] == [["k0", "k1"], ["k2", "k3"], ["k4"]]
+        assert calls[0][1] == [[(0, None, None), (1, None, None)]]
+        assert calls[1][1] == [[(0, None, None)], [(1, 0, 64)]]
+        assert calls[2][1] == [[(0, None, None)]]
+        worker.shutdown()

@@ -935,7 +935,11 @@ class MaruHandler:
     # Batch Operations
     # =========================================================================
 
-    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | None]:
+    def batch_retrieve(
+        self,
+        keys: list[str],
+        hint_groups: list[list[tuple[int, int | None, int | None]]] | None = None,
+    ) -> list[MemoryInfo | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
         Uses a single batch RPC call for lookup, returns zero-copy
@@ -949,6 +953,11 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
+            hint_groups: Optional ordered lookahead piggybacked on this
+                call's own metadata lookup — no extra RPC. Each entry is
+                ``(key index, offset, length)``; see
+                :meth:`prefetch_grouped` for the group semantics. Dispatched
+                before the region mmaps so the device fill leads them.
 
         Returns:
             List of MemoryInfo (None for keys not found)
@@ -961,6 +970,14 @@ class MaruHandler:
         except Exception:
             logger.error("batch_retrieve RPC failed", exc_info=True)
             return [None] * len(keys)
+
+        if hint_groups and self._plugins:
+            entries = dict(zip(keys, batch_resp.entries, strict=False))
+            groups = [
+                [(keys[i], offset, length) for i, offset, length in group]
+                for group in hint_groups
+            ]
+            self._dispatch_plugins("on_prefetch_grouped", self, groups, entries)
 
         results: list[MemoryInfo | None] = []
         for i, entry in enumerate(batch_resp.entries):

@@ -2309,30 +2309,25 @@ class MaruWorkerConnector:
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
 
             _job_t0 = time.monotonic()
+            hint_groups = None
             if self._layer_hint_enabled:
-                # One hint group per layer, whole objects: fill follows the
-                # layer run order instead of address order. Fired BEFORE the
-                # retrieve so the retrieve's RPC/mmap wall overlaps the fill's
-                # head — in steady state the regions are already mapped from
-                # the previous pass, which is all the plugin needs to resolve
-                # addresses (a cold region is skipped and simply fills on
-                # demand). Requires the retrieve hint off
-                # (MARU_GAIA_RETRIEVE_HINT=0).
-                try:
-                    handler.prefetch_grouped(
-                        _layerwise_key_groups(
-                            chunk_keys, [idx for _, _, idx in ordered_layers]
-                        )
-                    )
-                except Exception:
-                    logger.warning(
-                        "Maru layerwise key hint failed for req %s",
-                        req_meta.req_id,
-                        exc_info=True,
-                    )
+                # One hint group per layer, whole objects, piggybacked on the
+                # retrieve's own metadata lookup (no extra RPC): the fill
+                # follows the layer run order instead of address order, and
+                # it starts before the region mmaps. Requires the retrieve
+                # hint off (MARU_GAIA_RETRIEVE_HINT=0) or the whole-request
+                # address-order hint races this one.
+                nc = num_chunks
+                hint_groups = [
+                    [(li * nc + ci, None, None) for ci in range(nc)]
+                    for li in range(len(ordered_layers))
+                ]
             _hint_done = time.monotonic()
 
-            infos = self._batch_retrieve_all(keys)
+            if hint_groups:
+                infos = self._batch_retrieve_all(keys, hint_groups=hint_groups)
+            else:
+                infos = self._batch_retrieve_all(keys)
             _retrieve_done = time.monotonic()
             if self._timing:
                 _emit_timing(
@@ -2486,37 +2481,32 @@ class MaruWorkerConnector:
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             keys = [chunk_keys[ci] for ci in range(num_chunks)]
 
+            hint_groups = None
             if self._layer_hint_enabled:
                 # Re-order the device fill to match consumption: one hint
                 # group per layer(-group), each group the scattered slivers of
-                # that layer inside every packed object. Fired BEFORE the
-                # retrieve so its RPC/mmap wall overlaps the fill's head
-                # (steady-state regions are already mapped; a cold region is
-                # skipped and fills on demand). The whole-request retrieve
-                # hint must be off (MARU_GAIA_RETRIEVE_HINT=0) or its
-                # address-order fill races this one. Plane geometry comes from
-                # the registered caches — the slabs are not retrieved yet.
+                # that layer inside every packed object, piggybacked on the
+                # retrieve's own metadata lookup (no extra RPC). The
+                # whole-request retrieve hint must be off
+                # (MARU_GAIA_RETRIEVE_HINT=0) or its address-order fill races
+                # this one. Plane geometry comes from the registered caches —
+                # the slabs are not retrieved yet.
                 object_bytes = self._chunk_object_bytes()
                 if object_bytes:
                     plane_bytes = object_bytes // (2 * self._num_layers)
-                    try:
-                        handler.prefetch_grouped(
-                            _packed_layer_span_groups(
-                                keys,
-                                self._num_layers,
-                                plane_bytes,
-                                self._layer_hint_group,
-                            )
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Maru layer-span hint failed for req %s",
-                            req_meta.req_id,
-                            exc_info=True,
-                        )
+                    span_groups = _packed_layer_span_groups(
+                        list(range(len(keys))),
+                        self._num_layers,
+                        plane_bytes,
+                        self._layer_hint_group,
+                    )
+                    hint_groups = span_groups
 
             _t0 = time.monotonic()
-            infos = self._batch_retrieve_all(keys)
+            if hint_groups:
+                infos = self._batch_retrieve_all(keys, hint_groups=hint_groups)
+            else:
+                infos = self._batch_retrieve_all(keys)
             if self._timing:
                 _emit_timing(
                     f"deferred retrieve batch {len(keys)} keys = "
@@ -3702,20 +3692,46 @@ class MaruWorkerConnector:
                 entry for entry in self._active_load_refs if not entry[0].query()
             ]
 
-    def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
+    def _batch_retrieve_all(
+        self,
+        keys: list[str],
+        batch_size: int = 1024,
+        hint_groups: list[list[tuple[int, int | None, int | None]]] | None = None,
+    ) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
 
         A single request can produce num_layers x num_chunks keys (thousands),
         so the batch RPC is split into ``batch_size``-key chunks to bound
         payload while keeping RPC count ~O(len(keys) / batch_size).
+
+        ``hint_groups`` (global key indices) piggyback on each chunk's own
+        lookup: a group is split at a chunk boundary into per-chunk
+        sub-groups, which preserves the overall issue order because chunks
+        are retrieved in key order.
         """
         handler = self._handler
         assert handler is not None
         if len(keys) <= batch_size:
+            if hint_groups:
+                return list(handler.batch_retrieve(keys, hint_groups=hint_groups))
             return list(handler.batch_retrieve(keys))
         out: list[Any] = []
         for i in range(0, len(keys), batch_size):
-            out.extend(handler.batch_retrieve(keys[i : i + batch_size]))
+            chunk = keys[i : i + batch_size]
+            local_groups = []
+            if hint_groups:
+                for group in hint_groups:
+                    local = [
+                        (gi - i, offset, length)
+                        for gi, offset, length in group
+                        if i <= gi < i + batch_size
+                    ]
+                    if local:
+                        local_groups.append(local)
+            if local_groups:
+                out.extend(handler.batch_retrieve(chunk, hint_groups=local_groups))
+            else:
+                out.extend(handler.batch_retrieve(chunk))
         return out
 
     def save_kv_layer(
