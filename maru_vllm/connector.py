@@ -2297,13 +2297,21 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
+            load_bytes = 0
+            bw_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
             with torch.cuda.stream(stream):
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
+                if self._timing:
+                    # Bracket only the CXL->GPU bytes so the measured interval
+                    # is the media read, not the RPC or the admission wait.
+                    bw_start = torch.cuda.Event(enable_timing=True)
+                    bw_start.record(stream)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
                         2, num_layers, ct, -1
                     )
+                    load_bytes += slab_host.numel() * slab_host.element_size()
                     if kernel is not None:
                         # Stage the slab through the copy engine (async DMA —
                         # the CXL mapping is cudaHostRegister'ed by the
@@ -2339,6 +2347,10 @@ class MaruWorkerConnector:
                                 layer_name,
                                 num_chunks=1,
                             )
+                if self._timing:
+                    bw_end = torch.cuda.Event(enable_timing=True)
+                    bw_end.record(stream)
+                    bw_events = (bw_start, bw_end)
                 event = torch.cuda.Event()
                 event.record(stream)
             with self._deferred_lock:
@@ -2348,6 +2360,13 @@ class MaruWorkerConnector:
                     slot_mapping,
                     slot_gpu,
                 ]
+                if bw_events is not None:
+                    self._deferred_load_bw[req_meta.req_id] = (
+                        bw_events[0],
+                        bw_events[1],
+                        load_bytes,
+                        num_chunks,
+                    )
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s (packed, off-thread)",
