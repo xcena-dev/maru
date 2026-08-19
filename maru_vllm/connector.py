@@ -330,6 +330,46 @@ def _request_session_params(request: Request) -> tuple[str | None, str | None]:
     )
 
 
+def _layerwise_key_groups(
+    chunk_keys: list[str], layer_indices: list[int]
+) -> list[list[tuple[str, None, None]]]:
+    """Hint groups for layerwise storage, one group per layer in run order.
+
+    Each group holds that layer's per-chunk object keys whole (offset/length
+    ``None``), so ``prefetch_grouped`` fills layer 0's objects first, then
+    layer 1's — the order the resumed forward will consume them.
+    """
+    return [
+        [(f"{ck}_L{idx}", None, None) for ck in chunk_keys] for idx in layer_indices
+    ]
+
+
+def _packed_layer_span_groups(
+    chunk_keys: list[str],
+    num_layers: int,
+    plane_bytes: int,
+    group_layers: int,
+) -> list[list[tuple[str, int, int]]]:
+    """Hint groups for packed storage: each layer's planes inside every object.
+
+    A packed object is ``[K, layer 0..L-1][V, layer 0..L-1]`` with one
+    ``plane_bytes`` plane per (kv, layer). Layer ``l``'s bytes therefore sit at
+    offsets ``l*plane`` and ``(L+l)*plane`` of every chunk object — scattered,
+    one 2*plane sliver per object. ``group_layers`` widens each sliver to
+    cover that many adjacent layers, trading finer fill order for fewer,
+    larger device commands (adjacent layers' planes are contiguous).
+    """
+    groups: list[list[tuple[str, int, int]]] = []
+    for start in range(0, num_layers, group_layers):
+        span = min(group_layers, num_layers - start) * plane_bytes
+        group: list[tuple[str, int, int]] = []
+        for chunk_key in chunk_keys:
+            group.append((chunk_key, start * plane_bytes, span))
+            group.append((chunk_key, (num_layers + start) * plane_bytes, span))
+        groups.append(group)
+    return groups
+
+
 def _slab_nbytes(view: Any) -> int:
     """Byte size of one packed object's host view."""
     return view.nbytes if hasattr(view, "nbytes") else len(view)
@@ -820,15 +860,14 @@ class MaruSchedulerConnector:
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        self._layerwise_overlap = bool(
-            overlap_requested and self._deferred_loading and not self._use_layerwise
-        )
-        if overlap_requested and not (
-            self._deferred_loading and not self._use_layerwise
-        ):
+        # Overlap works in both storage layouts: packed objects go through the
+        # pitched per-layer gather, per-(chunk,layer) objects through the
+        # layerwise-storage loader. Only the asynchronous load is a
+        # prerequisite — the release gate lives on the parked request.
+        self._layerwise_overlap = bool(overlap_requested and self._deferred_loading)
+        if overlap_requested and not self._deferred_loading:
             logger.warning(
-                "Maru packed-layerwise overlap requires maru_async_load=true and "
-                "maru_use_layerwise=false; disabling it"
+                "Maru layerwise overlap requires maru_async_load=true; disabling it"
             )
         # Deferred loads registered by update_state_after_alloc, emitted once
         # by the next build_connector_meta. req_id -> (request,
@@ -1700,13 +1739,12 @@ class MaruWorkerConnector:
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        self._layerwise_overlap = bool(
-            overlap_requested and async_load and not self._use_layerwise
-        )
-        if overlap_requested and not (async_load and not self._use_layerwise):
+        # Mirrors the scheduler: overlap is layout-agnostic, async load is the
+        # prerequisite (see the scheduler-side comment).
+        self._layerwise_overlap = bool(overlap_requested and async_load)
+        if overlap_requested and not async_load:
             logger.warning(
-                "Maru packed-layerwise overlap requires maru_async_load=true and "
-                "maru_use_layerwise=false; disabling it"
+                "Maru layerwise overlap requires maru_async_load=true; disabling it"
             )
         # Packed store accumulates a chunk's per-layer slices across the
         # per-layer save_kv_layer calls of one step: base_key -> (handle,
@@ -1811,6 +1849,17 @@ class MaruWorkerConnector:
         self._stage_tickets: dict[str, StageTicket] = {}
         self._stage_aliases: dict[str, str] = {}
         self._stage_pin_enabled = os.environ.get("MARU_GAIA_STAGE_PIN", "0") == "1"
+        # Ordered layer-major fill hints (MARU_LAYER_HINT=1). The deferred
+        # loaders fire one hint group per layer (prefetch_grouped) so the
+        # device fills bytes in the order attention will consume them instead
+        # of address order. MARU_LAYER_HINT_GROUP batches that many adjacent
+        # layers per group — on packed storage a group of G layers is one
+        # contiguous G*plane sliver per object, so larger G means fewer,
+        # larger device commands.
+        self._layer_hint_enabled = os.environ.get("MARU_LAYER_HINT", "0") == "1"
+        self._layer_hint_group = max(
+            1, int(os.environ.get("MARU_LAYER_HINT_GROUP", "1") or 1)
+        )
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -1993,11 +2042,21 @@ class MaruWorkerConnector:
                     for layer_name, event in pre_issued.items():
                         self._layer_load_events.setdefault(layer_name, []).append(event)
             if issue_here:
-                self._schedule_deferred_packed_layerwise_loads(
-                    layers,
-                    issue_here,
-                    attn_metadata,
-                )
+                if self._use_layerwise:
+                    # The layerwise-storage loader always publishes its events
+                    # from the loader thread; a request reaching activation
+                    # without them already went through the failure path.
+                    logger.warning(
+                        "Maru layerwise activation without pre-issued events "
+                        "for req(s) %s; recompute already reported",
+                        ", ".join(sorted(issue_here)),
+                    )
+                else:
+                    self._schedule_deferred_packed_layerwise_loads(
+                        layers,
+                        issue_here,
+                        attn_metadata,
+                    )
 
         for req_meta in metadata.requests:
             if req_meta.is_store:
@@ -2022,6 +2081,16 @@ class MaruWorkerConnector:
                 req_meta.deferred_load
                 and not self._use_layerwise
                 and self._try_submit_deferred_packed_load(req_meta)
+            ):
+                continue
+            # Layerwise storage takes its own off-thread loader when overlap
+            # is on: per-(chunk,layer) objects are copied layer by layer with
+            # an event after each, so the resumed forward waits per layer.
+            if (
+                req_meta.deferred_load
+                and self._use_layerwise
+                and self._layerwise_overlap
+                and self._try_submit_deferred_layerwise_load(req_meta)
             ):
                 continue
 
@@ -2171,6 +2240,206 @@ class MaruWorkerConnector:
         )
         return True
 
+    def _try_submit_deferred_layerwise_load(self, req_meta: MaruReqMeta) -> bool:
+        """Hand a layerwise-storage deferred load to the background thread.
+
+        Returns:
+            True when the load was submitted. False when the async path
+            cannot run (KV caches not registered yet, non-CUDA or
+            multi-device layout) — the caller then falls back to the
+            synchronous layerwise load, which reports the request finished
+            immediately.
+        """
+        if self._hymcache_window_bytes > 0:
+            return False
+        if not self._kv_caches or self._num_layers <= 0:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        devices = {kv.device for kv in self._kv_caches.values()}
+        if len(devices) != 1:
+            return False
+        device = next(iter(devices))
+        if device.type != "cuda":
+            return False
+        layers = [
+            (name, kv_cache, self._get_layer_index(name))
+            for name, kv_cache in self._kv_caches.items()
+        ]
+        if self._deferred_executor is None:
+            self._deferred_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-deferred-load"
+            )
+        with self._deferred_lock:
+            self._inflight_deferred_req_ids.add(req_meta.req_id)
+        self._deferred_executor.submit(
+            self._deferred_layerwise_store_load_job, req_meta, layers, device
+        )
+        return True
+
+    def _deferred_layerwise_store_load_job(
+        self,
+        req_meta: MaruReqMeta,
+        layers: list[tuple[str, torch.Tensor, int]],
+        device: torch.device,
+    ) -> None:
+        """Load one parked request's per-(chunk,layer) objects, layer by layer.
+
+        Runs on the deferred-load thread. Retrieves every (chunk, layer)
+        object, optionally re-orders the device fill with one hint group per
+        layer, then queues each layer's H2D copies with an event after the
+        layer — the request unparks once the gate layer has landed and the
+        resumed forward waits per layer, exactly like the packed overlap.
+        Unlike the packed path there is no pitched gather: an object already
+        holds a single layer's slice, so the copy is a plain per-run H2D.
+        """
+        try:
+            handler = self._handler
+            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
+            if handler is None or num_chunks == 0:
+                self._fail_deferred_load(req_meta)
+                return
+            chunk_keys = chunk_keys[:num_chunks]
+            ordered_layers = sorted(layers, key=lambda item: item[2])
+            keys = [
+                f"{ck}_L{idx}" for (_, _, idx) in ordered_layers for ck in chunk_keys
+            ]
+            total_tokens = num_chunks * self._kv_chunk_tokens
+            slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+
+            _t0 = time.monotonic()
+            infos = self._batch_retrieve_all(keys)
+            if self._timing:
+                _emit_timing(
+                    f"deferred retrieve batch {len(keys)} keys = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
+                )
+            miss = next((i for i, v in enumerate(infos) if v is None), -1)
+            if miss >= 0:
+                logger.warning(
+                    "Maru deferred load miss: %s — recompute for req %s",
+                    keys[miss],
+                    req_meta.req_id,
+                )
+                self._fail_deferred_load(req_meta)
+                return
+
+            if self._layer_hint_enabled:
+                # One hint group per layer, whole objects: fill follows the
+                # layer run order instead of address order. Requires the
+                # retrieve hint off (MARU_GAIA_RETRIEVE_HINT=0).
+                try:
+                    handler.prefetch_grouped(
+                        _layerwise_key_groups(
+                            chunk_keys, [idx for _, _, idx in ordered_layers]
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Maru layerwise key hint failed for req %s",
+                        req_meta.req_id,
+                        exc_info=True,
+                    )
+
+            slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
+            torch.cuda.set_device(device)
+            stream = self._layerwise_stream_for(device)
+            attn = self._last_attn_metadata
+            ct = self._kv_chunk_tokens
+            events: dict[str, torch.cuda.Event] = {}
+            spans: list[tuple[int, Any, Any, int]] = []
+            epoch_event: torch.cuda.Event | None = None
+            with torch.cuda.stream(stream):
+                slot_gpu = slot_mapping.to(device, non_blocking=True)
+                if self._timing:
+                    epoch_event = torch.cuda.Event(enable_timing=True)
+                    epoch_event.record(stream)
+                for li, (layer_name, kv_cache_layer, true_idx) in enumerate(
+                    ordered_layers
+                ):
+                    base = li * num_chunks
+                    layer_bytes = 0
+                    if self._timing:
+                        span_start = torch.cuda.Event(enable_timing=True)
+                        span_start.record(stream)
+                    for chunk_start, run_chunks, run_view in self._chunk_runs(
+                        infos[base : base + num_chunks]
+                    ):
+                        run_host = torch.frombuffer(
+                            run_view, dtype=kv_cache_layer.dtype
+                        )
+                        layer_bytes += _slab_nbytes(run_view)
+                        token_start = chunk_start * ct
+                        token_end = (chunk_start + run_chunks) * ct
+                        self._inject_kv_into_layer(
+                            kv_cache_layer,
+                            run_host.to(device, non_blocking=True),
+                            slot_gpu[token_start:token_end],
+                            attn,
+                            layer_name,
+                            num_chunks=run_chunks,
+                        )
+                    if self._timing:
+                        span_end = torch.cuda.Event(enable_timing=True)
+                        span_end.record(stream)
+                        spans.append((true_idx, span_start, span_end, layer_bytes))
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    events[layer_name] = event
+                done_event = torch.cuda.Event()
+                done_event.record(stream)
+            gate = self._unpark_gate_event(events, layers)
+            with self._deferred_lock:
+                abandoned = req_meta.req_id in self._abandoned_req_ids
+                self._abandoned_req_ids.discard(req_meta.req_id)
+                if not abandoned:
+                    self._deferred_layerwise_events[req_meta.req_id] = events
+                    self._active_load_refs.append(
+                        (done_event, [infos, slot_mapping, slot_gpu])
+                    )
+                    if gate is not None:
+                        self._deferred_events[req_meta.req_id] = gate
+                    else:
+                        self._deferred_done.add(req_meta.req_id)
+                    if spans and epoch_event is not None:
+                        self._layerwise_spans[req_meta.req_id] = (
+                            done_event,
+                            epoch_event,
+                            spans,
+                        )
+            if abandoned:
+                logger.info(
+                    "Maru: draining abandoned layerwise-storage load for req %s",
+                    req_meta.req_id,
+                )
+                _drain_events(events.values())
+                with self._deferred_lock:
+                    self._active_load_refs.append(
+                        (done_event, [infos, slot_mapping, slot_gpu])
+                    )
+                    self._deferred_done.add(req_meta.req_id)
+                return
+            logger.info(
+                "Maru: deferred layerwise-storage load queued %d layers x %d "
+                "chunks (%d tokens) for req %s",
+                len(ordered_layers),
+                num_chunks,
+                total_tokens,
+                req_meta.req_id,
+            )
+        except Exception as e:
+            logger.error(
+                "Maru deferred layerwise load failed for req %s: %s",
+                req_meta.req_id,
+                e,
+            )
+            self._fail_deferred_load(req_meta)
+        finally:
+            with self._deferred_lock:
+                self._inflight_deferred_req_ids.discard(req_meta.req_id)
+                self._abandoned_req_ids.discard(req_meta.req_id)
+
     def _deferred_packed_load_job(
         self,
         req_meta: MaruReqMeta,
@@ -2214,6 +2483,30 @@ class MaruWorkerConnector:
                 )
                 self._fail_deferred_load(req_meta)
                 return
+
+            if self._layer_hint_enabled:
+                # Re-order the device fill to match consumption: one hint
+                # group per layer(-group), each group the scattered slivers of
+                # that layer inside every packed object. The whole-request
+                # retrieve hint must be off in this mode
+                # (MARU_GAIA_RETRIEVE_HINT=0) or its address-order fill races
+                # this one.
+                plane_bytes = _slab_nbytes(infos[0].view) // (2 * self._num_layers)
+                try:
+                    handler.prefetch_grouped(
+                        _packed_layer_span_groups(
+                            keys,
+                            self._num_layers,
+                            plane_bytes,
+                            self._layer_hint_group,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Maru layer-span hint failed for req %s",
+                        req_meta.req_id,
+                        exc_info=True,
+                    )
 
             if req_meta.layerwise_load:
                 # The RPC/mmap part is complete. Either queue the per-layer

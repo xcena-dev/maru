@@ -1084,6 +1084,60 @@ class MaruHandler:
         )
         return found
 
+    def prefetch_grouped(
+        self,
+        groups: list[list[tuple[str, int | None, int | None]]],
+    ) -> int:
+        """Issue ordered lookahead hints, optionally over byte ranges of a key.
+
+        One metadata lookup covers every distinct key across all groups; the
+        plugin's ``on_prefetch_grouped`` hook then issues the groups strictly
+        in list order, coalescing only list-adjacent contiguous ranges. This
+        is what lets a caller stage data in the order it will consume it
+        (e.g. attention layer by attention layer) instead of the address
+        order a sorted coalesce would impose.
+
+        Args:
+            groups: Ordered hint groups. Each entry is ``(key, offset,
+                length)`` — ``offset``/``length`` select a byte range inside
+                the key's object, ``None`` meaning the whole object.
+
+        Returns:
+            Number of distinct keys the lookup found (0 on RPC failure). As
+            with :meth:`prefetch_batch`, the count is informational.
+        """
+        self._ensure_connected()
+        t0 = time.monotonic()
+        distinct: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for key, _, _ in group:
+                if key not in seen:
+                    seen.add(key)
+                    distinct.append(key)
+        if not distinct:
+            return 0
+        try:
+            batch_resp = self._rpc.batch_lookup_kv(distinct)
+        except Exception:
+            logger.error("prefetch_grouped RPC failed", exc_info=True)
+            return 0
+
+        entries = dict(zip(distinct, batch_resp.entries, strict=False))
+        if self._plugins:
+            self._dispatch_plugins("on_prefetch_grouped", self, groups, entries)
+
+        found = sum(1 for entry in batch_resp.entries if entry.found)
+        self._record_stats(
+            "prefetch_grouped",
+            0,
+            (time.monotonic() - t0) * 1e6,
+            result="hit"
+            if found == len(distinct)
+            else ("partial" if found > 0 else "miss"),
+        )
+        return found
+
     def stage_batch(self, keys: list[str]) -> StageResult:
         """Prepare a key batch and return only after its local tier is ready.
 

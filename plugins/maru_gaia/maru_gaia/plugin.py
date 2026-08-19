@@ -65,6 +65,11 @@ class GaiaPrefetchPlugin:
         self._hymcache_local = (
             int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0) > 0
         )
+        # Ordered layer-major hints (prefetch_grouped) fill in consumption
+        # order. The demand-read hook's whole-request hint coalesces by
+        # address and would race that order, so callers that fire grouped
+        # hints turn this hook off (MARU_GAIA_RETRIEVE_HINT=0).
+        self._retrieve_hint = os.environ.get("MARU_GAIA_RETRIEVE_HINT", "1") == "1"
         # Upper bound on how long one read gate may block
         # (MARU_GAIA_PREFETCH_SYNC_BUDGET_MS, 0 = unbounded). Ranges left when
         # the budget runs out are hinted asynchronously instead.
@@ -146,7 +151,7 @@ class GaiaPrefetchPlugin:
         """Demand-read boundary. With MARU_GAIA_PREFETCH_SYNC=1 this is a sync
         read-gate (block until DRAM-resident); otherwise the async reactive
         hint (baseline)."""
-        if self._hymcache_local:
+        if self._hymcache_local or not self._retrieve_hint:
             return
         self._issue(
             handler,
@@ -166,6 +171,82 @@ class GaiaPrefetchPlugin:
         (a sync call here would block and defeat the overlap with admission
         wait)."""
         self._issue(handler, keys, batch_resp, source="prefetch", sync=False)
+
+    def on_prefetch_grouped(
+        self,
+        handler: MaruHandler,
+        groups: list[list[tuple[str, int | None, int | None]]],
+        entries: dict,
+    ) -> None:
+        """Ordered lookahead over key byte ranges, group by group.
+
+        Groups are issued strictly in list order and coalescing folds only
+        list-adjacent contiguous ranges, so the device's fill follows the
+        caller's consumption order (its command queue is FIFO) instead of the
+        address order the sorted coalesce imposes. A triple's offset/length
+        select a byte range inside the key's object; ``None`` means whole.
+        Always asynchronous — this is a lookahead, never a gate.
+        """
+        commands = 0
+        issued_bytes = 0
+        skipped = 0
+        group_count = 0
+        for group in groups:
+            eligible: list[tuple[int, int, int]] = []
+            for key, offset, length in group:
+                entry = entries.get(key)
+                if entry is None or not entry.found or entry.handle is None:
+                    skipped += 1
+                    continue
+                region_id = entry.handle.region_id
+                if not handler.is_region_mapped(region_id):
+                    skipped += 1
+                    continue
+                device_id = self._resolve_device_id(handler, region_id)
+                if device_id is None:
+                    skipped += 1
+                    continue
+                base = entry.handle.offset + entry.kv_offset
+                start = base + (offset or 0)
+                size = entry.kv_length if length is None else length
+                # Clamp to the object so a caller's stale layout math can
+                # never hint past the allocation.
+                size = max(0, min(size, entry.kv_length - (offset or 0)))
+                if size == 0:
+                    skipped += 1
+                    continue
+                eligible.append((device_id, start, size))
+            if not eligible:
+                continue
+            group_count += 1
+            ranges = self._coalesce_ordered(eligible) if self._coalesce else eligible
+            for device_id, device_addr, size in ranges:
+                try:
+                    status = pyxif.memory_prefetch(device_id, device_addr, size)
+                except Exception:
+                    self._failed += 1
+                    logger.warning(
+                        "gaia grouped prefetch raised: device=%d addr=0x%x size=%d",
+                        device_id,
+                        device_addr,
+                        size,
+                        exc_info=True,
+                    )
+                    continue
+                if status is not None and status is not True and status != 0:
+                    self._failed += 1
+                    continue
+                self._issued += 1
+                commands += 1
+                issued_bytes += size
+        self._skipped += skipped
+        logger.info(
+            "gaia_prefetch(grouped): groups=%d, cmds=%d, bytes=%d, skipped=%d",
+            group_count,
+            commands,
+            issued_bytes,
+            skipped,
+        )
 
     def on_stage(
         self,
@@ -524,6 +605,27 @@ class GaiaPrefetchPlugin:
                 pieces.append((device_id, addr + offset, piece))
                 offset += piece
         return pieces
+
+    @staticmethod
+    def _coalesce_ordered(
+        chunks: list[tuple[int, int, int]],
+    ) -> list[tuple[int, int, int]]:
+        """Merge contiguous ranges without reordering them.
+
+        Folds an entry into its list predecessor only when they are contiguous
+        on the same device. Unlike :meth:`_coalesce_ranges` this never sorts,
+        so the issue order — and therefore the device's fill order — stays the
+        caller's consumption order.
+        """
+        merged: list[tuple[int, int, int]] = []
+        for dev, addr, length in chunks:
+            if merged:
+                pdev, paddr, plen = merged[-1]
+                if pdev == dev and paddr + plen == addr:
+                    merged[-1] = (pdev, paddr, plen + length)
+                    continue
+            merged.append((dev, addr, length))
+        return merged
 
     @staticmethod
     def _coalesce_ranges(
