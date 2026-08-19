@@ -70,11 +70,41 @@ def build_hymcache_objects(
 
 @dataclass(frozen=True)
 class HymCacheObjectTiming:
-    """Host-side wait and consume durations for one pipeline object."""
+    """When each stage of one pipeline object happened, and for how long.
+
+    The four ``*_at`` values are ``time.monotonic()`` stamps, so a caller can
+    lay Stage 1 and Stage 2 on one time axis and see where they overlap. That
+    overlap is the whole point of the window, and durations alone cannot show
+    it: two objects with identical stage and copy durations can be perfectly
+    pipelined or fully serialized.
+
+    ``ready_age_ms`` is how far Stage 1 finished ahead of the consumer -- the
+    lead the window actually bought.
+    """
 
     object: HymCacheObject
     demand_wait_ms: float
     consume_ms: float
+    submitted_at: float = 0.0
+    stage_started_at: float = 0.0
+    stage_completed_at: float = 0.0
+    consume_started_at: float = 0.0
+    consume_completed_at: float = 0.0
+
+    @property
+    def stage_ms(self) -> float:
+        """Wall time the stage worker spent on this object."""
+        return (self.stage_completed_at - self.stage_started_at) * 1000.0
+
+    @property
+    def queue_ms(self) -> float:
+        """Time the object waited in the worker queue before staging began."""
+        return (self.stage_started_at - self.submitted_at) * 1000.0
+
+    @property
+    def ready_age_ms(self) -> float:
+        """How long the object sat ready before its CXL->GPU copy started."""
+        return (self.consume_started_at - self.stage_completed_at) * 1000.0
 
 
 class HymCacheRollingPipeline(Generic[_StageValue]):
@@ -109,9 +139,19 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
 
         next_indices = [0] * len(object_streams)
         admitted_bytes = [0] * len(object_streams)
-        pending: deque[tuple[int, HymCacheObject, Future[_StageValue]]] = deque()
+        pending: deque[tuple[int, HymCacheObject, Future[_StageValue], float]] = deque()
         release_futures: list[Future[None]] = []
         timings: list[HymCacheObjectTiming] = []
+        # Stamped inside the worker so the stage lane can be drawn against the
+        # consume lane; the future alone says nothing about when it ran.
+        stage_spans: dict[tuple[str, int], tuple[float, float]] = {}
+
+        def timed_stage(obj: HymCacheObject) -> _StageValue:
+            started = time.monotonic()
+            try:
+                return stage(obj)
+            finally:
+                stage_spans[(obj.req_id, obj.index)] = (started, time.monotonic())
 
         def admit_one(request_index: int) -> bool:
             next_index = next_indices[request_index]
@@ -122,8 +162,14 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
             live_bytes = admitted_bytes[request_index]
             if live_bytes and live_bytes + obj.nbytes > self._window_bytes:
                 return False
+            submitted_at = time.monotonic()
             pending.append(
-                (request_index, obj, self._executor.submit(stage, obj))
+                (
+                    request_index,
+                    obj,
+                    self._executor.submit(timed_stage, obj),
+                    submitted_at,
+                )
             )
             next_indices[request_index] += 1
             admitted_bytes[request_index] += obj.nbytes
@@ -139,7 +185,7 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
 
         try:
             while pending:
-                request_index, obj, future = pending.popleft()
+                request_index, obj, future, submitted_at = pending.popleft()
                 wait_t0 = time.monotonic()
                 try:
                     result = future.result()
@@ -159,18 +205,27 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
                     admitted_bytes[request_index] -= obj.nbytes
                     while admit_one(request_index):
                         pass
+                consume_done = time.monotonic()
+                stage_started, stage_completed = stage_spans.pop(
+                    (obj.req_id, obj.index), (submitted_at, wait_t0)
+                )
                 timings.append(
                     HymCacheObjectTiming(
                         object=obj,
                         demand_wait_ms=demand_wait_ms,
-                        consume_ms=(time.monotonic() - consume_t0) * 1000.0,
+                        consume_ms=(consume_done - consume_t0) * 1000.0,
+                        submitted_at=submitted_at,
+                        stage_started_at=stage_started,
+                        stage_completed_at=stage_completed,
+                        consume_started_at=consume_t0,
+                        consume_completed_at=consume_done,
                     )
                 )
         finally:
             # If a consumer failed, every already-issued stage still gets a
             # matching release. Objects not yet admitted acquired no lease.
             while pending:
-                _, obj, future = pending.popleft()
+                _, obj, future, _submitted = pending.popleft()
                 try:
                     future.result()
                 except BaseException:

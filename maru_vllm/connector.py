@@ -3064,6 +3064,9 @@ class MaruWorkerConnector:
         timings_by_req: dict[str, list[Any]] = {}
         for timing in timings:
             timings_by_req.setdefault(timing.object.req_id, []).append(timing)
+        # One origin for the whole batch so spans from different requests are
+        # comparable on the same axis.
+        epoch = min((t.submitted_at for t in timings), default=0.0)
 
         for objects in request_objects:
             req_id = objects[0].req_id
@@ -3085,6 +3088,22 @@ class MaruWorkerConnector:
                 for timing in timings_by_req.get(req_id, []):
                     obj = timing.object
                     copy_ms = gpu_ms.get((req_id, obj.index), timing.consume_ms)
+                    # Stage 1 and Stage 2 on one time axis, relative to the
+                    # first submit in this batch. Durations alone cannot show
+                    # whether the two lanes overlapped; these can.
+                    _emit_timing(
+                        "kv-object-span "
+                        f"idx={obj.index}/{len(objects)} "
+                        f"submit_ms={(timing.submitted_at - epoch) * 1000.0:.3f} "
+                        f"stage_start_ms={(timing.stage_started_at - epoch) * 1000.0:.3f} "
+                        f"stage_end_ms={(timing.stage_completed_at - epoch) * 1000.0:.3f} "
+                        f"copy_start_ms={(timing.consume_started_at - epoch) * 1000.0:.3f} "
+                        f"copy_end_ms={(timing.consume_completed_at - epoch) * 1000.0:.3f} "
+                        f"queue_ms={timing.queue_ms:.3f} "
+                        f"stage_ms={timing.stage_ms:.3f} "
+                        f"ready_age_ms={timing.ready_age_ms:.3f} "
+                        f"(req {req_meta.req_id})"
+                    )
                     # Kept for the analysis scripts written against the
                     # 2026-08-11 campaign logs.
                     _emit_timing(

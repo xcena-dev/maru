@@ -523,3 +523,96 @@ class TestHandlerStageBatch:
 
         assert not result.ready
         assert result.error == "no stage-capable handler plugin"
+
+
+class TestObjectSpans:
+    """The window's value is that Stage 1 overlaps Stage 2.
+
+    Durations alone cannot show that overlap, so the pipeline stamps when each
+    phase happened. These tests pin the stamps against a stage that sleeps a
+    known amount, so a regression that drops or mis-orders them is caught here
+    rather than in a campaign whose plots then cannot be drawn.
+    """
+
+    def _objects(self, count: int, nbytes: int = 16):
+        from maru_vllm.staging_prefetch import HymCacheObject
+
+        return [
+            HymCacheObject(req_id="r1", index=i, key=f"k{i}", nbytes=nbytes)
+            for i in range(count)
+        ]
+
+    def _run(self, count: int, window_bytes: int, stage_delay: float = 0.0):
+        import time
+
+        from maru_vllm.staging_prefetch import HymCacheRollingPipeline
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pipeline = HymCacheRollingPipeline(executor, window_bytes=window_bytes)
+
+            def stage(obj):
+                if stage_delay:
+                    time.sleep(stage_delay)
+                return _ready_result()
+
+            return pipeline.run(
+                [self._objects(count)],
+                stage=stage,
+                consume=lambda obj, result: None,
+                release=lambda obj: None,
+            )
+
+    def test_stamps_are_ordered_within_each_object(self):
+        for timing in self._run(4, window_bytes=32):
+            assert timing.submitted_at <= timing.stage_started_at
+            assert timing.stage_started_at <= timing.stage_completed_at
+            assert timing.stage_completed_at <= timing.consume_started_at
+            assert timing.consume_started_at <= timing.consume_completed_at
+
+    def test_stage_duration_reflects_the_worker_not_the_queue(self):
+        """queue_ms and stage_ms must not be the same number.
+
+        A later object waits in the queue behind earlier ones; only its own
+        stage call should land in stage_ms.
+        """
+        timings = self._run(4, window_bytes=32, stage_delay=0.02)
+        for timing in timings:
+            assert timing.stage_ms >= 18.0, timing.stage_ms
+        # The last object queues behind the earlier ones, the first does not.
+        assert timings[0].queue_ms < timings[-1].queue_ms
+
+    def test_ready_age_is_the_lead_the_window_bought(self):
+        """With a window of two, object 0 is consumed while object 1 stages."""
+        timings = self._run(4, window_bytes=32, stage_delay=0.02)
+        assert all(t.ready_age_ms >= 0.0 for t in timings)
+        # Object 0 is consumed as soon as it is ready, so its lead is small;
+        # later objects were staged well before their turn came.
+        assert timings[0].ready_age_ms < timings[-1].ready_age_ms
+
+    def test_a_failed_stage_releases_exactly_what_it_admitted(self):
+        """A raising stage aborts the run without leaking or over-releasing.
+
+        The window admits two 16-byte objects into a 32-byte budget; the third
+        never gets a lease because the failure happens before any release frees
+        room. So two releases is correct and three would mean releasing a lease
+        that was never taken.
+        """
+        import pytest as _pytest
+
+        from maru_vllm.staging_prefetch import HymCacheRollingPipeline
+
+        released = []
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pipeline = HymCacheRollingPipeline(executor, window_bytes=32)
+
+            def stage(obj):
+                raise RuntimeError("boom")
+
+            with _pytest.raises(RuntimeError):
+                pipeline.run(
+                    [self._objects(3)],
+                    stage=stage,
+                    consume=lambda obj, result: None,
+                    release=released.append,
+                )
+        assert len(released) == 2
