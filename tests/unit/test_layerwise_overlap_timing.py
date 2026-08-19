@@ -262,3 +262,72 @@ class TestSpanStateIsThreadGuarded:
         t.join(timeout=2.0)
         assert done.is_set()
         worker.shutdown()
+
+
+class TestInlineHitAlsoStores:
+    """An inline cache hit must still publish the suffix it computes.
+
+    A conversation's turn N loads the prefix its earlier turns stored and
+    computes the rest. If the load metadata suppressed the store metadata, that
+    newly computed rest would never reach Maru and turn N+1 would match no
+    deeper than turn 1 — the matched prefix could not grow. The asynchronous
+    load path parks the request and emits its store on resume, so only the
+    inline path can reach one step holding both.
+    """
+
+    CHUNK = 8
+
+    def _sched(self) -> MaruSchedulerConnector:
+        # Third Party
+        from tests.unit.vllm_connector_helpers import make_scheduler
+
+        return make_scheduler(block_size=4, kv_chunk_tokens=self.CHUNK)
+
+    def _output(self, new_reqs, num_scheduled):
+        # Third Party
+        from tests.unit.vllm_connector_helpers import (
+            fake_cached_reqs,
+            fake_scheduler_output,
+        )
+
+        return fake_scheduler_output(
+            new_reqs, fake_cached_reqs([], [], []), num_scheduled
+        )
+
+    def _new_req(self, token_ids, block_ids):
+        # Third Party
+        from tests.unit.vllm_connector_helpers import fake_new_request_data
+
+        return fake_new_request_data(prompt_token_ids=token_ids, block_ids=block_ids)
+
+    def test_hit_request_emits_both_load_and_store(self):
+        sched = self._sched()
+        token_ids = list(range(32))
+        request = SimpleNamespace(prompt_token_ids=token_ids, request_id="r1")
+        sched._requests_need_load["r1"] = (request, 2)
+
+        meta = sched.build_connector_meta(
+            self._output(
+                [self._new_req(token_ids, [0, 1, 2, 3, 4, 5, 6, 7])], {"r1": 32}
+            )
+        )
+
+        loads = [r for r in meta.requests if not r.is_store]
+        stores = [r for r in meta.requests if r.is_store]
+        assert [r.num_matched_chunks for r in loads] == [2]
+        assert len(stores) == 1
+        assert stores[0].num_scheduled_tokens == 32
+        assert stores[0].token_ids == token_ids
+
+    def test_partially_scheduled_hit_keeps_store_continuation(self):
+        sched = self._sched()
+        token_ids = list(range(64))
+        request = SimpleNamespace(prompt_token_ids=token_ids, request_id="r1")
+        sched._requests_need_load["r1"] = (request, 2)
+
+        sched.build_connector_meta(
+            self._output([self._new_req(token_ids, list(range(15)))], {"r1": 20})
+        )
+
+        assert "r1" in sched._requests_need_store
+        assert sched._requests_need_store["r1"][0] == token_ids

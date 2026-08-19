@@ -1207,35 +1207,43 @@ class MaruSchedulerConnector:
                         num_matched_chunks=num_chunks,
                     )
                 )
-            else:
-                # Store new prompt chunks to maru. num_computed_tokens is
-                # non-zero when a prefix was already covered externally (a
-                # request resuming after a deferred load) — only the chunks
-                # completed beyond it are stored.
-                num_scheduled = scheduler_output.num_scheduled_tokens.get(
-                    new_req.req_id, len(token_ids)
+
+            # Store the chunks this forward completes even when the same
+            # request first loads an external prefix. One metadata batch may
+            # carry both entries for one request: start_load_kv consumes the
+            # load entry before the forward, save_kv_layer the store entry
+            # after it. Only the inline load path reaches here with a pending
+            # load — an asynchronous load parks the request and emits its
+            # store on resume — and making the two exclusive left every inline
+            # cache hit load-only, so a conversation's later turns never
+            # published their newly computed suffix and the matched prefix
+            # could not grow past the first turn.
+            # num_computed_tokens is non-zero when a prefix was already covered
+            # externally; only the chunks completed beyond it are stored.
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(
+                new_req.req_id, len(token_ids)
+            )
+            num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
+            meta.requests.append(
+                MaruReqMeta(
+                    req_id=new_req.req_id,
+                    token_ids=token_ids,
+                    # Single KV cache group (see note above)
+                    block_ids=new_req.block_ids[0],
+                    is_store=True,
+                    num_scheduled_tokens=num_scheduled,
+                    num_computed_tokens=num_computed,
                 )
-                num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
-                meta.requests.append(
-                    MaruReqMeta(
-                        req_id=new_req.req_id,
-                        token_ids=token_ids,
-                        # Single KV cache group (see note above)
-                        block_ids=new_req.block_ids[0],
-                        is_store=True,
-                        num_scheduled_tokens=num_scheduled,
-                        num_computed_tokens=num_computed,
-                    )
+            )
+            # If chunked prefill means not all chunks are covered, track for
+            # store continuation in subsequent steps.
+            num_full_chunks = len(token_ids) // self._kv_chunk_tokens
+            stored_chunks = (num_computed + num_scheduled) // self._kv_chunk_tokens
+            if stored_chunks < num_full_chunks:
+                self._requests_need_store[new_req.req_id] = (
+                    token_ids,
+                    list(new_req.block_ids[0]),
                 )
-                # If chunked prefill means not all chunks are covered,
-                # track for store continuation in subsequent steps.
-                num_full_chunks = len(token_ids) // self._kv_chunk_tokens
-                stored_chunks = (num_computed + num_scheduled) // self._kv_chunk_tokens
-                if stored_chunks < num_full_chunks:
-                    self._requests_need_store[new_req.req_id] = (
-                        token_ids,
-                        list(new_req.block_ids[0]),
-                    )
 
         # Cached requests: chunked-prefill continuations and resumed loads.
         # Do NOT gate the store on ``resumed`` — chunked-prefill requests
