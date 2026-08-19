@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maru-gaia-plugin"
+version = "0.1.0"
+description = "Gaia (XCENA InfiniteMemory) SSD->DRAM prefetch plugin for Maru"
+requires-python = ">=3.12"
+# pyxif is the XCENA device Python binding, provided by the device SDK on the
+# host rather than from PyPI, so it is intentionally not a pip dependency here.
+dependencies = []
+
+[project.entry-points."maru.handler_plugins"]
+gaia = "maru_gaia.plugin:GaiaPrefetchPlugin"
+
+[tool.setuptools]
+packages = ["maru_gaia"]

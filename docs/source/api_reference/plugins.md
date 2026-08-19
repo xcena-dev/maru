@@ -42,18 +42,22 @@ exception raised inside one is logged and swallowed.
 |------|--------------|---------|
 | `on_init(handler)` | end of `MaruHandler.__init__` (not yet connected — `mapper` is `None`) | cheap setup only |
 | `on_batch_retrieve(handler, keys, batch_resp)` | end of `batch_retrieve`, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
+| `on_prefetch(handler, keys, batch_resp)` | during `prefetch_batch`, before a future read | issue a non-blocking lookahead hint |
+| `on_stage(handler, keys, batch_resp) -> StageResult \| None` | during `stage_batch`, after found regions are mapped | perform blocking preparation and return a strict readiness result; caller must use a dedicated executor/helper |
 | `on_close(handler)` | during `close`, while regions are still mapped and RPC is live | release resources tied to mapped memory |
 | `contribute_stats() -> dict \| None` | during `get_stats` | returns a dict merged under `stats["plugins"][<PluginClassName>]` |
 
-In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A
-found entry exposes a `handle` (region/offset) whose region is already mapped,
-so a plugin can act on real memory addresses.
+In the batch hooks, `keys[i]` corresponds to `batch_resp.entries[i]`. A found
+entry exposes a `handle` (region/offset). `on_batch_retrieve` and `on_stage`
+run after found shared regions have been mapped, so a plugin can act on real
+memory addresses. `on_stage` is the only hook allowed to block; invoke
+`MaruHandler.stage_batch()` only from a dedicated executor or helper process.
 
 ## Stable accessor surface
 
 ```{admonition} Contract — do not break without deprecation
 :class: warning
-The following `MaruHandler` methods, together with the four hook signatures
+The following `MaruHandler` methods, together with the hook signatures
 above, are the **public, stable plugin API**. Plugins live in separate
 packages on independent release cycles, so renaming, removing, or changing the
 behaviour of any of these is a breaking change for every plugin in the field
@@ -83,8 +87,9 @@ minimal stable accessor contract above).
 
 ## Writing a plugin
 
-A hardware/vendor plugin typically implements `on_batch_retrieve` to issue
-device hints (prefetch/pin) against the mapped regions of a batch, and
-`on_close` to release any device resources before regions are unmapped. See
+A hardware/vendor plugin typically implements `on_batch_retrieve` or
+`on_prefetch` for best-effort hints, `on_stage` for completion-returning
+materialization, and `on_close` to release any device resources before regions
+are unmapped. See
 [`maru_handler/plugin.py`](https://github.com/xcena-dev/maru/blob/main/maru_handler/plugin.py)
 for the full interface definition.

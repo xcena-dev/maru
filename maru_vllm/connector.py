@@ -20,6 +20,7 @@ The connector has two roles (instantiated separately by vLLM):
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 import time
@@ -294,6 +295,138 @@ def _create_maru_handler(
 # ============================================================================
 
 
+
+_HINT_PLAN_PREFIX = "maru-hint:"
+
+def _hint_plan_id(session_id: str) -> str:
+    """Stage-plan id for a session hint (namespaced apart from vLLM req ids)."""
+    return f"{_HINT_PLAN_PREFIX}{session_id}"
+
+def _request_session_params(request: Request) -> tuple[str | None, str | None]:
+    """Extract (session_id, imminent_session) from a request's transfer params.
+
+    Both ride on the OpenAI ``extra_body.kv_transfer_params`` dict, which
+    vLLM carries verbatim on the Request object. Returns ``None`` for absent
+    or malformed values — session hints are strictly opt-in per request.
+    """
+    params = getattr(request, "kv_transfer_params", None)
+    if not isinstance(params, dict):
+        return None, None
+    session = params.get("maru_session_id")
+    imminent = params.get("maru_imminent_session")
+    return (
+        str(session) if session else None,
+        str(imminent) if imminent else None,
+    )
+
+def _slab_nbytes(view: Any) -> int:
+    """Byte size of one packed object's host view."""
+    return view.nbytes if hasattr(view, "nbytes") else len(view)
+
+@dataclass
+class PackedObjectRecord:
+    """One object's measured CXL->GPU copy time."""
+
+    req_id: str
+    index: int
+    total: int
+    nbytes: int
+    cxl_gpu_ms: float
+
+class PackedObjectTimer:
+    """Per-object CUDA timing for the demand-load packed path.
+
+    Events are recorded around each object's enqueue on the load stream and
+    read only after the caller's single end-of-batch synchronize. There is
+    deliberately no per-object synchronize: draining the stream between
+    objects would serialize the very pipelining this path is measured for,
+    so the instrumented run would no longer measure the uninstrumented one.
+
+    ``event_factory`` exists so tests can drive the bookkeeping without CUDA.
+    """
+
+    def __init__(self, event_factory: Any = None) -> None:
+        self._event_factory = event_factory
+        self._pending: list[tuple[str, int, int, int, Any, Any]] = []
+        self._expected: dict[str, int] = {}
+
+    def _new_event(self) -> Any:
+        if self._event_factory is not None:
+            return self._event_factory()
+        return torch.cuda.Event(enable_timing=True)
+
+    def expect(self, req_id: str, count: int) -> None:
+        """Declare how many objects a request should produce."""
+        self._expected[req_id] = count
+
+    def begin(self, req_id: str, index: int, total: int, nbytes: int) -> Any:
+        """Record the start event; returns a handle for :meth:`end`."""
+        start_event = self._new_event()
+        start_event.record()
+        handle = (req_id, index, total, nbytes, start_event)
+        return handle
+
+    def end(self, handle: Any) -> None:
+        """Record the end event for a handle from :meth:`begin`."""
+        req_id, index, total, nbytes, start_event = handle
+        end_event = self._new_event()
+        end_event.record()
+        self._pending.append((req_id, index, total, nbytes, start_event, end_event))
+
+    def collect(self) -> tuple[list[PackedObjectRecord], list[str]]:
+        """Read elapsed times after the caller's single stream synchronize.
+
+        Returns the records plus a list of problem descriptions (a duplicate
+        (request, object) pair, or a request short of its declared count).
+        """
+        records: list[PackedObjectRecord] = []
+        problems: list[str] = []
+        seen: set[tuple[str, int]] = set()
+        for req_id, index, total, nbytes, start_event, end_event in self._pending:
+            key = (req_id, index)
+            if key in seen:
+                problems.append(f"duplicate object record req={req_id} idx={index}")
+                continue
+            seen.add(key)
+            records.append(
+                PackedObjectRecord(
+                    req_id=req_id,
+                    index=index,
+                    total=total,
+                    nbytes=nbytes,
+                    cxl_gpu_ms=start_event.elapsed_time(end_event),
+                )
+            )
+        for req_id, count in self._expected.items():
+            measured = sum(1 for r in records if r.req_id == req_id)
+            if measured != count:
+                problems.append(
+                    f"incomplete object records req={req_id} "
+                    f"measured={measured} expected={count}"
+                )
+        return records, problems
+
+def _format_kv_object_timing(
+    *,
+    req_id: str,
+    index: int,
+    total: int,
+    nbytes: int,
+    cxl_gpu_ms: float,
+    prefetched: bool,
+) -> str:
+    """Format one per-object GPU-read record.
+
+    Both the demand-load path (no Stage 1) and the HyMCache window path emit
+    this exact shape so a single parser reads either run. ``prefetch=1`` means
+    ``memory_prefetch_sync`` ran for that object before the CXL->GPU copy.
+    """
+    return (
+        f"kv-object idx={index}/{total} bytes={nbytes} "
+        f"cxl_gpu_ms={cxl_gpu_ms:.2f} prefetch={int(prefetched)} (req {req_id})"
+    )
+
+
 @dataclass
 class MaruReqMeta:
     """Metadata for a single request's KV cache operation."""
@@ -353,6 +486,11 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
     # can overlap layer k compute without changing the packed storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
+    # --- smart-prefetch / HyMCache relay (ported onto #70) ---
+    arrival_hint_keys: list[str] = field(default_factory=list)
+    stage_plans: list[StagePlan] = field(default_factory=list)
+    stage_aliases: dict[str, str] = field(default_factory=dict)
+    stage_release_ids: list[str] = field(default_factory=list)
 
 
 # ============================================================================
@@ -618,6 +756,20 @@ class MaruKVConnector(KVConnectorBase_V1):
                 logger.error("Error closing scheduler MaruHandler: %s", e)
             self._scheduler._handler = None
 
+    def on_new_request(self, request: Request) -> None:
+        """Queue arrival-hint prefetch keys when a request enters the queue.
+
+        Called by the vLLM scheduler right after the request is enqueued into
+        the waiting queue -- typically well before it is scheduled -- so the
+        admission wait can serve as the device's SSD->DRAM fill window. No-op
+        unless ``MARU_ARRIVAL_HINT=1`` (handled scheduler-side).
+
+        Args:
+            request: The newly arrived vLLM request.
+        """
+        if self._scheduler is not None:
+            self._scheduler.on_new_request(request)
+
 
 # ============================================================================
 # Scheduler-side implementation
@@ -702,6 +854,26 @@ class MaruSchedulerConnector:
 
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
+        # --- smart-prefetch / HyMCache window state (ported onto #70) ---
+        self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+        self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        self._hymcache_window_bytes = max(
+            0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
+        )
+        self._hymcache_async_issue = (
+            os.environ.get("MARU_HYMCACHE_ASYNC_ISSUE", "0") or "0"
+        ).strip().lower() not in ("", "0", "false", "no")
+        self._stage_policy: FifoStagePolicy | None = None
+        self._pending_arrival_hints: list[tuple[str, list[str]]] = []
+        self._arrival_hint_depth = max(
+            0, int(os.environ.get("MARU_ARRIVAL_HINT_DEPTH", "0") or 0)
+        )
+        self._arrival_hint_inflight: set[str] = set()
+        self._stage_trigger = os.environ.get("MARU_STAGE_TRIGGER", "match")
+        self._session_keys: dict[str, tuple[str, ...]] = {}
+        self._pending_stage_aliases: dict[str, str] = {}
+        self._relayed_stage_aliases: dict[str, str] = {}
+        self._pending_stage_releases: list[str] = []
 
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
@@ -1038,6 +1210,181 @@ class MaruSchedulerConnector:
         """Transfer block ownership to the worker for write-behind stores."""
         return self._write_behind, None
 
+    def _count_matched_chunk_keys(self, keys: list[str]) -> int:
+        """Count a cached prefix from precomputed packed chunk keys."""
+        if not keys:
+            return 0
+
+        # Check local cache first - find longest prefix of known keys.
+        # We use a "_DONE" marker (written after all layers are stored)
+        # rather than checking a single layer, to avoid false positives
+        # when a partial layer store failure leaves only some layers.
+        local_hits = 0
+        for key in keys:
+            sentinel = self._chunk_exists_key(key)
+            if sentinel in self._known_keys:
+                local_hits += 1
+            else:
+                break
+
+        if local_hits == len(keys):
+            return local_hits
+
+        # Need to check remaining chunks via RPC
+        self._ensure_handler()
+        if self._handler is None:
+            return local_hits
+
+        # Check all unchecked chunks at once via batch_exists
+        remaining_keys = [self._chunk_exists_key(k) for k in keys[local_hits:]]
+        try:
+            _t0 = time.monotonic()
+            results = self._handler.batch_exists(remaining_keys)
+            if self._timing:
+                _emit_timing(
+                    f"lookup batch_exists {len(remaining_keys)} keys = "
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                )
+        except Exception as e:
+            logger.warning("Maru batch_exists failed: %s", e)
+            return local_hits
+
+        # Count consecutive hits
+        rpc_hits = 0
+        for exists in results:
+            if not exists:
+                break
+            rpc_hits += 1
+
+        # Cache the newly discovered keys
+        for i in range(rpc_hits):
+            self._known_keys.add(remaining_keys[i])
+
+        return local_hits + rpc_hits
+
+    def _process_session_hints(self, request: Request) -> None:
+        """Register hint bookkeeping for an arriving session request.
+
+        Aliases the arriving request to its own session's hint plan id so the
+        worker's demand join finds the staged ticket, and — in imminent
+        mode — fires a stage for the gateway-hinted next session using the
+        confirmed prefix recorded in the session registry. Idempotent across
+        scheduling retries of the same request.
+        """
+        assert self._stage_policy is not None
+        session_id, imminent = _request_session_params(request)
+        if session_id:
+            self._pending_stage_aliases.setdefault(
+                request.request_id, _hint_plan_id(session_id)
+            )
+        if self._stage_trigger != "imminent" or not imminent:
+            return
+        keys = self._session_keys.get(imminent)
+        if keys and self._stage_policy.enqueue(_hint_plan_id(imminent), list(keys)):
+            logger.debug(
+                "Maru stage: queued %d hint keys for session %s (hinted by req %s)",
+                len(keys),
+                imminent,
+                request.request_id,
+            )
+
+    def _record_session_prefix(self, request: Request) -> None:
+        """Record the finished turn's confirmed prefix for its session.
+
+        The keys just stored for this request are exactly the prefix the
+        session's next turn will re-read — future request content is never
+        consulted. In turn_end mode the prefix is also staged immediately.
+        """
+        session_id, _ = _request_session_params(request)
+        if not session_id:
+            return
+        token_ids = list(request.prompt_token_ids or [])
+        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        if not keys:
+            return
+        # Bounded registry: long deployments cycle many sessions; evict the
+        # oldest entry rather than growing without limit.
+        if session_id not in self._session_keys and len(self._session_keys) >= 16384:
+            self._session_keys.pop(next(iter(self._session_keys)))
+        self._session_keys[session_id] = tuple(keys)
+        if self._stage_trigger == "turn_end":
+            assert self._stage_policy is not None
+            if self._stage_policy.enqueue(_hint_plan_id(session_id), keys):
+                logger.debug(
+                    "Maru stage: queued %d turn-end keys for session %s",
+                    len(keys),
+                    session_id,
+                )
+
+    def _release_arrival_hints(self, consumed: set[str]) -> list[str]:
+        """Retire hints whose loads were just issued, then release the next ones.
+
+        Retirement comes first so a load emitted this step frees its window slot
+        for the request behind it in the same step.
+
+        Args:
+            consumed: Request ids whose load or store metadata is in this step's
+                connector metadata — their lookahead has served its purpose.
+
+        Returns:
+            Chunk keys to relay to the worker, oldest arrival first.
+        """
+        self._arrival_hint_inflight -= consumed
+        if self._arrival_hint_depth > 0:
+            budget = self._arrival_hint_depth - len(self._arrival_hint_inflight)
+        else:
+            budget = len(self._pending_arrival_hints)
+        if budget <= 0 or not self._pending_arrival_hints:
+            return []
+
+        released = self._pending_arrival_hints[:budget]
+        self._pending_arrival_hints = self._pending_arrival_hints[budget:]
+        keys: list[str] = []
+        for req_id, req_keys in released:
+            self._arrival_hint_inflight.add(req_id)
+            keys.extend(req_keys)
+        logger.debug(
+            "Maru arrival-hint: released %d reqs (%d keys), %d inflight, %d queued",
+            len(released),
+            len(keys),
+            len(self._arrival_hint_inflight),
+            len(self._pending_arrival_hints),
+        )
+        return keys
+
+    def on_new_request(self, request: Request) -> None:
+        """Queue this request's chunk keys for worker-side arrival prefetch.
+
+        Computes the chunk base keys from the prompt tokens and queues them;
+        ``build_connector_meta`` releases them to the worker on a later step
+        (arrival -> fire latency is ~one scheduler step, negligible against the
+        0.2-2.1 s admission wait this hint exploits). The keys are the packed
+        chunk keys (one per chunk) — the worker fires them as-is, no per-layer
+        expansion, because packed storage keeps one object per chunk.
+
+        Completion-returning staging is deliberately *not* started here. A
+        preceding turn's write-behind registration may still be in flight at
+        raw arrival, so an immediate lookup can falsely miss every reusable
+        key. Staging is queued only after ``_count_matched_chunks`` confirms
+        the prefix exists.
+
+        Args:
+            request: The newly arrived vLLM request.
+        """
+        if not self._arrival_hint_enabled:
+            return
+        token_ids = list(request.prompt_token_ids or [])
+        if len(token_ids) < self._kv_chunk_tokens:
+            return
+        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        if keys:
+            self._pending_arrival_hints.append((request.request_id, keys))
+            logger.debug(
+                "Maru arrival-hint: queued %d chunk keys for req %s",
+                len(keys),
+                request.request_id,
+            )
+
 
 # ============================================================================
 # Worker-side implementation
@@ -1213,6 +1560,24 @@ class MaruWorkerConnector:
 
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
+        # --- smart-prefetch / HyMCache window state (ported onto #70) ---
+        self._deferred_load_bw: dict[
+            str, tuple[torch.cuda.Event, torch.cuda.Event, int, int]
+        ] = {}
+        self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
+        self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        self._hymcache_window_bytes = max(
+            0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
+        )
+        self._hymcache_async_issue = (
+            os.environ.get("MARU_HYMCACHE_ASYNC_ISSUE", "0") or "0"
+        ).strip().lower() not in ("", "0", "false", "no")
+        self._stage_executor: ThreadPoolExecutor | None = None
+        self._hymcache_executor: ThreadPoolExecutor | None = None
+        self._stage_lock = threading.Lock()
+        self._stage_tickets: dict[str, StageTicket] = {}
+        self._stage_aliases: dict[str, str] = {}
+        self._stage_pin_enabled = os.environ.get("MARU_GAIA_STAGE_PIN", "0") == "1"
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -3807,3 +4172,504 @@ class MaruWorkerConnector:
         total_bytes = int(layer.numel()) * int(layer.element_size())
         per_token_bytes = total_bytes // layout.page_buffer_size
         return int(per_token_bytes * self._kv_chunk_tokens)
+
+    def _await_stage(self, req_id: str) -> StageResult | None:
+        """Join a request's preparation at its demand-read boundary.
+
+        Session-hint staging keys the ticket by hint plan id; the arriving
+        request resolves through its metadata-relayed alias.
+        """
+        with self._stage_lock:
+            ticket_id = self._stage_aliases.get(req_id, req_id)
+            ticket = self._stage_tickets.get(ticket_id)
+        if ticket is None:
+            return None
+        wait_t0 = time.monotonic()
+        result = ticket.wait()
+        demand_wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if result is None:
+            logger.warning(
+                "Maru stage not ready for req %s (%s); using demand read",
+                req_id,
+                ticket.error or ticket.state.value,
+            )
+            self._release_stage_ticket(req_id)
+            return None
+        logger.info(
+            "Maru stage consumed for req %s: bytes=%d, stage_ms=%s, "
+            "lead_ms=%s, demand_wait_ms=%.1f",
+            req_id,
+            result.prepared_bytes,
+            f"{ticket.stage_ms:.1f}" if ticket.stage_ms is not None else "n/a",
+            (
+                f"{ticket.ready_age_ms:.1f}"
+                if ticket.ready_age_ms is not None
+                else "n/a"
+            ),
+            demand_wait_ms,
+        )
+        if self._timing:
+            stage_ms = ticket.stage_ms
+            ready_age_ms = ticket.ready_age_ms
+            _emit_timing(
+                "stage-consume "
+                f"stage_ms={stage_ms:.2f} "
+                f"lead_ms={ready_age_ms:.2f} "
+                f"demand_wait_ms={demand_wait_ms:.2f} "
+                f"(req {req_id})"
+            )
+        return result
+
+    def _cancel_stage_requests(self, req_ids: set[str]) -> None:
+        """Cancel or discard stage work for preempted requests."""
+        if not req_ids:
+            return
+        with self._stage_lock:
+            tickets = []
+            for req_id in req_ids:
+                ticket_id = self._stage_aliases.pop(req_id, req_id)
+                tickets.append(self._stage_tickets.pop(ticket_id, None))
+        for ticket in tickets:
+            if ticket is not None:
+                ticket.cancel()
+                self._dispatch_stage_release(ticket)
+
+    def _dispatch_stage_release(self, ticket: StageTicket) -> None:
+        """Queue the device-pin release for a dropped ticket.
+
+        Runs on the single-worker stage executor, which serializes it after
+        any still-running stage of the same plan — so an unpin can never
+        race the pin it undoes. No-op unless the pin lease is enabled.
+        """
+        if not self._stage_pin_enabled or self._stage_executor is None:
+            return
+        keys = list(ticket.plan.keys)
+
+        def _release_job() -> None:
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.stage_release(keys)
+            except Exception:
+                logger.warning(
+                    "Maru stage release failed (plan %s)",
+                    ticket.plan.req_id,
+                    exc_info=True,
+                )
+
+        try:
+            self._stage_executor.submit(_release_job)
+        except RuntimeError:
+            # Executor already shut down; the plugin's on_close unpins
+            # anything left as the final leak guard.
+            pass
+
+    @staticmethod
+    def _emit_load_bandwidth(
+        req_id: str,
+        bw_start: torch.cuda.Event,
+        bw_end: torch.cuda.Event,
+        nbytes: int,
+        nchunks: int,
+    ) -> None:
+        """Emit one request's CXL->GPU transfer bandwidth.
+
+        This is the tier signal smart-prefetch is judged on: the same bytes
+        read out of device DRAM versus filled from SSD on demand differ by
+        about a factor of two, and TTFT at concurrency is too noisy to resolve
+        that. Reported per request so a partially warmed batch is visible as a
+        spread rather than averaged away.
+        """
+        try:
+            ms = bw_start.elapsed_time(bw_end)
+        except Exception:
+            return
+        gbps = (nbytes / (ms / 1000.0)) / 1e9 if ms > 0 else 0.0
+        _emit_timing(
+            f"packed-load {nchunks} chunks {nbytes / 2**20:.0f} MiB in "
+            f"{ms:.2f} ms = {gbps:.2f} GB/s (req {req_id})"
+        )
+
+    def _enqueue_packed_chunk(
+        self,
+        *,
+        layers: list[tuple[str, torch.Tensor, int]],
+        kernel: tuple | None,
+        attn: Any,
+        slab_view: memoryview,
+        chunk_slots: torch.Tensor,
+        dev: torch.device,
+        use_stream: bool,
+        dtype: torch.dtype,
+        num_layers: int,
+    ) -> None:
+        """Enqueue one packed CXL object into its GPU KV-cache slots."""
+        ct = self._kv_chunk_tokens
+        slab_host = torch.frombuffer(slab_view, dtype=dtype).view(2, num_layers, ct, -1)
+        if kernel is not None:
+            ops, ptrs, pbs, block_size, head_size, fmt = kernel
+            ops.multi_layer_kv_transfer(
+                slab_host,
+                ptrs,
+                chunk_slots,
+                dev,
+                pbs,
+                ops.TransferDirection.H2D,
+                fmt,
+                block_size=block_size,
+                head_size=head_size,
+            )
+            return
+
+        slab_dev = slab_host.to(dev, non_blocking=use_stream)
+        for layer_name, kv_cache_layer, true_idx in layers:
+            self._inject_kv_into_layer(
+                kv_cache_layer,
+                slab_dev[:, true_idx],
+                chunk_slots,
+                attn,
+                layer_name,
+                num_chunks=1,
+            )
+
+    def _fire_arrival_hints(self, chunk_keys: list[str]) -> None:
+        """Issue a lookahead prefetch for newly arrived requests' chunks.
+
+        Fires one ``MaruHandler.prefetch_batch`` for the chunk keys relayed
+        from the scheduler at arrival (a lookup-only call that lets a loaded
+        device plugin start the SSD->DRAM fill). Packed storage keeps one
+        object per chunk, so the chunk keys are fired as-is with no per-layer
+        expansion. Keys not stored yet are skipped by the lookup, so hints for
+        cold requests are a cheap no-op. Best-effort: a failure never disturbs
+        the load path this runs ahead of.
+
+        Args:
+            chunk_keys: Chunk base keys relayed from the scheduler at arrival.
+        """
+        _t0 = time.monotonic()
+        try:
+            found = self._handler.prefetch_batch(chunk_keys)
+            logger.info(
+                "Maru arrival-hint: prefetch_batch found %d/%d chunk keys",
+                found,
+                len(chunk_keys),
+            )
+        except Exception:
+            logger.warning("Maru arrival-hint prefetch failed", exc_info=True)
+        if self._timing:
+            # This runs on the engine thread inside start_load_kv, so whatever
+            # it costs is added to the step -- and therefore to every
+            # co-scheduled request's inter-token latency.
+            _emit_timing(
+                f"arrival-hint fire {len(chunk_keys)} keys = "
+                f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+            )
+
+    def _load_packed_hymcache(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Run HyMCache's bounded two-stage pipeline with local CXL reads.
+
+        Each request keeps an actual-byte rolling window of ordered packed KV
+        objects. Objects ahead of the consumer are synchronously materialized
+        from SSD into device DRAM on a helper thread while the current object
+        is read from mapped CXL memory into the GPU KV cache. Each object is
+        released immediately after its CUDA transfer completes and replaced
+        at the tail, matching HyMCache's per-object prefetch/read-token
+        lifecycle while substituting local CXL->GPU for RDMA GET.
+        """
+        attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
+        num_layers = len(layers)
+        ct = self._kv_chunk_tokens
+        kernel = self._packed_load_kernel_ctx(layers, attn)
+        dev = layers[0][1].device
+        use_stream = kernel is not None or (
+            dev.type == "cuda" and torch.cuda.is_available()
+        )
+        if use_stream:
+            if self._load_stream is None or self._load_stream_device != dev:
+                self._load_stream = torch.cuda.Stream(device=dev, priority=-1)
+                self._load_stream_device = dev
+            self._load_stream.wait_stream(torch.cuda.current_stream(dev))
+
+        if self._hymcache_executor is None:
+            self._hymcache_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="maru-hymcache-stage",
+            )
+        pipeline = HymCacheRollingPipeline[StageResult](
+            self._hymcache_executor,
+            window_bytes=self._hymcache_window_bytes,
+        )
+        dtype = layers[0][1].dtype
+        mode = "kernel" if kernel is not None else "fallback"
+
+        request_objects: list[list[HymCacheObject]] = []
+        contexts: dict[str, tuple[MaruReqMeta, torch.Tensor, list[Any]]] = {}
+        gpu_ms: dict[tuple[str, int], float] = {}
+        # Objects whose Stage 1 failed open and were therefore read on demand,
+        # exactly like the W=0 baseline reads them.
+        demand_read: set[tuple[str, int]] = set()
+        for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
+            if use_stream:
+                slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
+                assert self._load_stream is not None
+                with torch.cuda.stream(self._load_stream):
+                    slot_gpu = slot_mapping.to(dev, non_blocking=True)
+            else:
+                slot_gpu = slot_mapping.to(dev)
+
+            keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)[:num_chunks]
+            key_sizes: list[int] = []
+            for info in slab_infos:
+                view = info.view
+                key_sizes.append(view.nbytes if hasattr(view, "nbytes") else len(view))
+            objects = build_hymcache_objects(
+                req_meta.req_id,
+                keys,
+                key_sizes,
+            )
+            if req_meta.req_id in contexts:
+                raise ValueError(f"duplicate HyMCache request id: {req_meta.req_id}")
+            contexts[req_meta.req_id] = (req_meta, slot_gpu, slab_infos)
+            request_objects.append(objects)
+
+        rolling_requests = 0
+        tail_admissions = 0
+        for objects in request_objects:
+            initial_bytes = 0
+            initial_objects = 0
+            for obj in objects:
+                if (
+                    initial_bytes
+                    and initial_bytes + obj.nbytes > self._hymcache_window_bytes
+                ):
+                    break
+                initial_bytes += obj.nbytes
+                initial_objects += 1
+            tail_objects = len(objects) - initial_objects
+            if tail_objects:
+                rolling_requests += 1
+                tail_admissions += tail_objects
+
+        def _stage(obj: HymCacheObject) -> StageResult:
+            handler = self._handler
+            if handler is None:
+                return StageResult(
+                    requested_keys=1,
+                    found_keys=0,
+                    error="worker handler unavailable",
+                )
+            return handler.stage_batch([obj.key])
+
+        def _consume(obj: HymCacheObject, result: StageResult) -> None:
+            _, slot_gpu, slab_infos = contexts[obj.req_id]
+            if not result.ready:
+                demand_read.add((obj.req_id, obj.index))
+                logger.warning(
+                    "HyMCache-local stage failed open for req %s object %d: %s; "
+                    "using demand CXL read",
+                    obj.req_id,
+                    obj.index,
+                    result.error or "partial preparation",
+                )
+
+            if use_stream:
+                assert self._load_stream is not None
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                stream_ctx = torch.cuda.stream(self._load_stream)
+            else:
+                import contextlib
+
+                start_event = None
+                end_event = None
+                stream_ctx = contextlib.nullcontext()
+
+            with stream_ctx:
+                if start_event is not None:
+                    start_event.record()
+                chunk_slots = slot_gpu[obj.index * ct : (obj.index + 1) * ct]
+                self._enqueue_packed_chunk(
+                    layers=layers,
+                    kernel=kernel,
+                    attn=attn,
+                    slab_view=slab_infos[obj.index].view,
+                    chunk_slots=chunk_slots,
+                    dev=dev,
+                    use_stream=use_stream,
+                    dtype=dtype,
+                    num_layers=num_layers,
+                )
+                if end_event is not None:
+                    end_event.record()
+            if end_event is not None:
+                end_event.synchronize()
+                assert start_event is not None
+                gpu_ms[(obj.req_id, obj.index)] = start_event.elapsed_time(end_event)
+
+        def _issue(obj: HymCacheObject) -> None:
+            """Fire the non-blocking device hint that ``_stage`` then waits on.
+
+            ``prefetch_batch`` resolves the key and hands it to the plugin's
+            lookahead hook, which submits the migration without waiting for
+            completion. Failures are not fatal: the blocking ``_stage`` that
+            follows still brings the object in, just without the head start.
+            """
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.prefetch_batch([obj.key])
+            except Exception:
+                logger.warning(
+                    "HyMCache-local async issue failed for req %s object %d",
+                    obj.req_id,
+                    obj.index,
+                    exc_info=True,
+                )
+
+        def _release(obj: HymCacheObject) -> None:
+            handler = self._handler
+            if handler is None:
+                return
+            try:
+                handler.stage_release([obj.key])
+            except Exception:
+                logger.warning(
+                    "HyMCache-local release failed for req %s object %d",
+                    obj.req_id,
+                    obj.index,
+                    exc_info=True,
+                )
+
+        timings = pipeline.run(
+            request_objects,
+            stage=_stage,
+            consume=_consume,
+            release=_release,
+            issue=_issue if self._hymcache_async_issue else None,
+        )
+        logger.info(
+            "Maru: HyMCache-local rolling summary requests=%d "
+            "rolling_requests=%d tail_admissions=%d max_objects=%d "
+            "window_bytes=%d",
+            len(request_objects),
+            rolling_requests,
+            tail_admissions,
+            max(len(objects) for objects in request_objects),
+            self._hymcache_window_bytes,
+        )
+
+        timings_by_req: dict[str, list[Any]] = {}
+        for timing in timings:
+            timings_by_req.setdefault(timing.object.req_id, []).append(timing)
+        # One origin for the whole batch so spans from different requests are
+        # comparable on the same axis.
+        epoch = min((t.submitted_at for t in timings), default=0.0)
+
+        for objects in request_objects:
+            req_id = objects[0].req_id
+            req_meta, _, _ = contexts[req_id]
+            if req_meta.deferred_load:
+                with self._deferred_lock:
+                    self._deferred_done.add(req_meta.req_id)
+
+            logger.info(
+                "Maru: HyMCache-local loaded %d layers x %d objects "
+                "for req %s (%s, window=%d bytes)",
+                num_layers,
+                len(objects),
+                req_meta.req_id,
+                mode,
+                self._hymcache_window_bytes,
+            )
+            if self._timing:
+                for timing in timings_by_req.get(req_id, []):
+                    obj = timing.object
+                    copy_ms = gpu_ms.get((req_id, obj.index), timing.consume_ms)
+                    # Stage 1 and Stage 2 on one time axis, relative to the
+                    # first submit in this batch. Durations alone cannot show
+                    # whether the two lanes overlapped; these can.
+                    _emit_timing(
+                        "kv-object-span "
+                        f"idx={obj.index}/{len(objects)} "
+                        f"submit_ms={(timing.submitted_at - epoch) * 1000.0:.3f} "
+                        f"stage_start_ms={(timing.stage_started_at - epoch) * 1000.0:.3f} "
+                        f"stage_end_ms={(timing.stage_completed_at - epoch) * 1000.0:.3f} "
+                        f"copy_start_ms={(timing.consume_started_at - epoch) * 1000.0:.3f} "
+                        f"copy_end_ms={(timing.consume_completed_at - epoch) * 1000.0:.3f} "
+                        f"queue_ms={timing.queue_ms:.3f} "
+                        f"stage_ms={timing.stage_ms:.3f} "
+                        f"ready_age_ms={timing.ready_age_ms:.3f} "
+                        f"(req {req_meta.req_id})"
+                    )
+                    # Kept for the analysis scripts written against the
+                    # 2026-08-11 campaign logs.
+                    _emit_timing(
+                        "hymcache-object "
+                        f"idx={obj.index}/{len(objects)} "
+                        f"bytes={obj.nbytes} "
+                        f"demand_wait_ms={timing.demand_wait_ms:.2f} "
+                        f"cxl_gpu_ms={copy_ms:.2f} "
+                        f"(req {req_meta.req_id})"
+                    )
+                    # Shared shape: the demand-load path emits the same record
+                    # so one parser reads either setting.
+                    _emit_timing(
+                        _format_kv_object_timing(
+                            req_id=req_meta.req_id,
+                            index=obj.index,
+                            total=len(objects),
+                            nbytes=obj.nbytes,
+                            cxl_gpu_ms=copy_ms,
+                            prefetched=(req_id, obj.index) not in demand_read,
+                        )
+                    )
+
+    def _release_stage_ticket(self, req_id: str) -> None:
+        """Release and remove a ticket after fallback or dependent H2D."""
+        with self._stage_lock:
+            ticket_id = self._stage_aliases.pop(req_id, req_id)
+            ticket = self._stage_tickets.pop(ticket_id, None)
+        if ticket is not None:
+            ticket.release()
+            self._dispatch_stage_release(ticket)
+
+    def _run_stage(self, ticket: StageTicket) -> StageResult:
+        """Run blocking device preparation on the dedicated stage thread."""
+        ticket.mark_running()
+        handler = self._handler
+        if handler is None:
+            return StageResult(
+                requested_keys=len(ticket.plan.keys),
+                found_keys=0,
+                error="worker handler unavailable",
+            )
+        result = handler.stage_batch(list(ticket.plan.keys))
+        if self._timing:
+            _emit_timing(
+                f"stage ready={result.ready} "
+                f"{result.prepared_bytes / 2**20:.0f} MiB "
+                f"in {result.wait_ms:.2f} ms (req {ticket.plan.req_id})"
+            )
+        return result
+
+    def _submit_stage_plan(self, plan: StagePlan) -> None:
+        """Submit one plan to the SSD-to-DRAM worker without blocking vLLM."""
+        with self._stage_lock:
+            if plan.req_id in self._stage_tickets:
+                return
+            if self._stage_executor is None:
+                self._stage_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="maru-im-stage",
+                )
+            ticket = StageTicket(plan)
+            self._stage_tickets[plan.req_id] = ticket
+            future = self._stage_executor.submit(self._run_stage, ticket)
+            ticket.bind(future)

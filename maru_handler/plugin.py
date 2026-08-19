@@ -26,6 +26,7 @@ function) returning an object that implements any subset of
 Selecting plugins at runtime::
 
     MARU_PLUGINS=my_plugin,other   # only these names load; unset → all load
+    MARU_PLUGINS=none              # explicitly disable every plugin
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -45,13 +47,58 @@ logger = logging.getLogger(__name__)
 #: Entry-point group scanned for handler plugins.
 PLUGIN_GROUP = "maru.handler_plugins"
 
-#: Comma-separated allowlist of plugin *names* to load. Unset/empty → load all.
+#: Comma-separated allowlist of plugin *names* to load. Unset/empty → load all;
+#: the reserved value ``none`` disables all plugins.
 PLUGIN_ALLOWLIST_ENV = "MARU_PLUGINS"
 
 #: Process-level cache of the discovered entry points. The installed
 #: distribution set is immutable within a process, so scan once (the scan is
 #: not free) and reuse across every MaruHandler construction.
 _discovered_entry_points: list | None = None
+
+
+@dataclass(frozen=True)
+class StageResult:
+    """Outcome of preparing one key batch for a future local read.
+
+    ``ready`` is deliberately strict: every requested key must exist, map to
+    an eligible device range, and complete its blocking preparation call.
+    Callers may still fall back to a normal demand read when it is false.
+
+    Attributes:
+        requested_keys: Number of keys in the stage request.
+        found_keys: Number of keys found by the metadata lookup.
+        eligible_keys: Found keys that resolved to a live device range.
+        prepared_bytes: Bytes whose blocking preparation completed.
+        issued_ranges: Coalesced device ranges submitted successfully.
+        failed_ranges: Device ranges whose preparation returned an error.
+        skipped_keys: Found keys that could not resolve to a live range.
+        wait_ms: Wall time spent in the blocking device preparation.
+        error: Optional lookup/plugin error summary.
+    """
+
+    requested_keys: int
+    found_keys: int
+    eligible_keys: int = 0
+    prepared_bytes: int = 0
+    issued_ranges: int = 0
+    failed_ranges: int = 0
+    skipped_keys: int = 0
+    wait_ms: float = 0.0
+    error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Return whether every requested key is ready for local consumption."""
+        return (
+            self.requested_keys > 0
+            and self.found_keys == self.requested_keys
+            and self.eligible_keys == self.found_keys
+            and self.issued_ranges > 0
+            and self.failed_ranges == 0
+            and self.skipped_keys == 0
+            and self.error is None
+        )
 
 
 def _discover_entry_points() -> list:
@@ -122,6 +169,76 @@ class MaruHandlerPlugin(Protocol):
         """
         ...
 
+    def on_prefetch(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+        batch_resp: BatchLookupKVResponse,
+    ) -> None:
+        """Called at the end of ``prefetch_batch``, after a lookup-only RPC.
+
+        This is the *lookahead* counterpart of :meth:`on_batch_retrieve`: it
+        fires ahead of demand so the plugin can start an SSD->DRAM migration
+        while the caller still waits (e.g. a request's admission wait), leaving
+        the data warm for a later ``batch_retrieve`` of the same keys. The
+        argument shape and the ``keys[i]`` ↔ ``batch_resp.entries[i]``
+        correspondence are identical to :meth:`on_batch_retrieve`, and a
+        hardware hint targets the same ``handle.offset + kv_offset`` for
+        ``kv_length`` bytes.
+
+        The one difference from :meth:`on_batch_retrieve` is that
+        ``prefetch_batch`` performs **no data read and maps no regions** — it
+        only looks the keys up. A region that is not already mapped therefore
+        has no live address to hint against; the plugin must issue hints only
+        for regions where :meth:`MaruHandler.is_region_mapped` is true and skip
+        the rest (they are prefaulted on their own ``map_region`` at demand
+        time). On a cache-hit pass the regions are already mapped from the
+        populate pass, so the common case still hints every key.
+
+        Runs on the caller's path — keep it cheap and non-blocking. Same
+        soft-fail isolation and non-serialization against :meth:`on_close` as
+        :meth:`on_batch_retrieve`.
+        """
+        ...
+
+    def on_stage(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+        batch_resp: BatchLookupKVResponse,
+    ) -> StageResult | None:
+        """Synchronously prepare a lookup batch for a future local read.
+
+        Unlike every hot-path hook above, this hook is explicitly allowed to
+        block. :meth:`MaruHandler.stage_batch` must therefore be called only
+        from a dedicated executor or helper process, never from a model or
+        scheduler critical path. A non-``None`` result is a completion
+        contract, not a fire-and-forget hint: ``result.ready`` is true only
+        after all requested ranges are locally consumable.
+
+        Plugins that do not provide a materialization/readiness operation omit
+        this hook. Exceptions are converted to a failed :class:`StageResult`
+        by the handler so demand reads can safely fall back.
+        """
+        ...
+
+    def on_stage_release(
+        self,
+        handler: MaruHandler,
+        keys: list[str],
+    ) -> None:
+        """Release per-stage device resources held for ``keys``.
+
+        Called via :meth:`MaruHandler.stage_release` when the consumer of a
+        prior :meth:`on_stage` batch is done with it (or will never arrive) —
+        the counterpart that ends a stage's residency lease. ``keys`` is the
+        same list the matching :meth:`on_stage` received. Must be idempotent
+        and a cheap no-op for batches that hold nothing (never staged, stage
+        failed, or lease already released). Plugins whose stages hold no
+        releasable resource omit this hook.
+        """
+        ...
+
     def on_close(self, handler: MaruHandler) -> None:
         """Called during ``MaruHandler.close``, while regions are still mapped.
 
@@ -150,10 +267,12 @@ class MaruHandlerPlugin(Protocol):
 
 
 def _get_allowlist() -> set[str] | None:
-    """Parse ``MARU_PLUGINS`` into a name set, or ``None`` when unset/empty."""
+    """Parse ``MARU_PLUGINS``; ``none`` is the explicit disable sentinel."""
     raw = os.environ.get(PLUGIN_ALLOWLIST_ENV, "").strip()
     if not raw:
         return None
+    if raw.lower() == "none":
+        return set()
     return {name.strip() for name in raw.split(",") if name.strip()}
 
 
