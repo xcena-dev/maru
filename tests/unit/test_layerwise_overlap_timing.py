@@ -331,3 +331,41 @@ class TestInlineHitAlsoStores:
 
         assert "r1" in sched._requests_need_store
         assert sched._requests_need_store["r1"][0] == token_ids
+
+
+class TestWhyTheOrdersCannotCompose:
+    """The two halves that made a combined config a half-applied state.
+
+    Kept as a test rather than a comment because the exclusion above is only
+    justified by what happened without it: the window's loader declines the
+    request, so the overlap's activation step finds nothing retained and warns
+    once per request while the window quietly does the whole load. Both halves
+    are asserted here so a later change that removes the exclusion has to
+    confront them.
+    """
+
+    def test_the_window_loader_declines_the_request(self, monkeypatch):
+        monkeypatch.setenv("MARU_HYMCACHE_WINDOW_BYTES", WINDOW)
+        worker = MaruWorkerConnector(
+            block_size=16, kv_chunk_tokens=128, extra_config={"maru_async_load": True}
+        )
+        worker._kv_caches = {"model.layers.0.self_attn": MagicMock()}
+        worker._num_layers = 32
+        assert worker._try_submit_deferred_packed_load(SimpleNamespace()) is False
+        worker.shutdown()
+
+    def test_activation_without_a_retained_load_warns_and_does_nothing(
+        self, monkeypatch, caplog
+    ):
+        # Third Party
+        import logging
+
+        monkeypatch.delenv("MARU_HYMCACHE_WINDOW_BYTES", raising=False)
+        worker = MaruWorkerConnector(
+            block_size=16, kv_chunk_tokens=128, extra_config={}
+        )
+        with caplog.at_level(logging.WARNING):
+            worker._schedule_deferred_packed_layerwise_loads([], {"r0"}, None)
+        assert "missing retained load" in caplog.text
+        assert "r0" in caplog.text
+        worker.shutdown()
