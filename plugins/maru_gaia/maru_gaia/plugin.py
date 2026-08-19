@@ -192,6 +192,12 @@ class GaiaPrefetchPlugin:
         issued_bytes = 0
         skipped = 0
         group_count = 0
+        # A request's thousands of keys live in a handful of regions, and
+        # mapped-ness plus the device id are region properties — resolving
+        # them once per region instead of once per triple is what keeps this
+        # loop off the loader thread's critical path (measured: ~6 us per
+        # triple resolve, ~23 ms at 3,776 layerwise keys).
+        region_device: dict[int, int | None] = {}
         for group in groups:
             eligible: list[tuple[int, int, int]] = []
             for key, offset, length in group:
@@ -200,10 +206,13 @@ class GaiaPrefetchPlugin:
                     skipped += 1
                     continue
                 region_id = entry.handle.region_id
-                if not handler.is_region_mapped(region_id):
-                    skipped += 1
-                    continue
-                device_id = self._resolve_device_id(handler, region_id)
+                if region_id not in region_device:
+                    region_device[region_id] = (
+                        self._resolve_device_id(handler, region_id)
+                        if handler.is_region_mapped(region_id)
+                        else None
+                    )
+                device_id = region_device[region_id]
                 if device_id is None:
                     skipped += 1
                     continue
