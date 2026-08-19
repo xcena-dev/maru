@@ -692,8 +692,11 @@ class TestIssueThenWait:
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             HymCacheRollingPipeline(pool, window_bytes=32).run(
-                [objects], issue=_issue, stage=lambda o: o.index,
-                consume=_consume, release=lambda o: None,
+                [objects],
+                issue=_issue,
+                stage=lambda o: o.index,
+                consume=_consume,
+                release=lambda o: None,
             )
         assert peak == 2  # window_bytes 32 / nbytes 16
 
@@ -714,7 +717,9 @@ class TestIssueThenWait:
                 release=lambda o: None,
             )
         assert [e for e in order if e.startswith("consume")] == [
-            "consume0", "consume1", "consume2",
+            "consume0",
+            "consume1",
+            "consume2",
         ]
         for i in range(3):
             assert order.index(f"stage{i}") < order.index(f"consume{i}")
@@ -732,7 +737,9 @@ class TestIssueThenWait:
         with ThreadPoolExecutor(max_workers=1) as pool:
             with pytest.raises(RuntimeError):
                 HymCacheRollingPipeline(pool, window_bytes=32).run(
-                    [objects], issue=_issue, stage=lambda o: o.index,
+                    [objects],
+                    issue=_issue,
+                    stage=lambda o: o.index,
                     consume=lambda o, _v: consumed.append(o.index),
                     release=lambda o: None,
                 )
