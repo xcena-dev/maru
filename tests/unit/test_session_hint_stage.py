@@ -383,3 +383,27 @@ class TestTriggerValidation:
     def test_known_triggers_accepted(self, monkeypatch, trigger):
         sched = _make_scheduler(monkeypatch, trigger)
         assert sched._stage_trigger == trigger
+
+
+class TestDemandReadsActive:
+    """Worker-side ground truth for the plugin's stage-yield probe."""
+
+    def _worker_with_events(self, *done_flags: bool) -> MaruWorkerConnector:
+        import threading
+
+        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
+        worker._deferred_lock = threading.Lock()
+        worker._active_load_refs = [
+            (SimpleNamespace(query=lambda done=done: done), [])
+            for done in done_flags
+        ]
+        return worker
+
+    def test_no_refs_is_inactive(self):
+        assert self._worker_with_events()._demand_reads_active() is False
+
+    def test_incomplete_copy_is_active(self):
+        assert self._worker_with_events(True, False)._demand_reads_active() is True
+
+    def test_all_complete_is_inactive(self):
+        assert self._worker_with_events(True, True)._demand_reads_active() is False

@@ -1982,6 +1982,11 @@ class MaruWorkerConnector:
                 extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
             )
             self._handler = _create_maru_handler(extra_config)
+            # Stage-yield ground truth: a demand read is "active" while any
+            # scheduled load's copy batch has not completed on-stream. The
+            # probe queries the CUDA events directly, so it sees the current
+            # state regardless of the lazy ref cleanup cadence.
+            self._handler.set_demand_probe(self._demand_reads_active)
         except Exception:
             self._handler_retry_after = time.monotonic() + 5.0
             logger.warning("Worker MaruHandler creation failed, backing off 5s")
@@ -3780,6 +3785,19 @@ class MaruWorkerConnector:
         after = torch.cuda.Event(enable_timing=True)
         after.record(stream)
         self._layer_wait_spans.append((layer_name, before, after))
+
+    def _demand_reads_active(self) -> bool:
+        """Return whether any scheduled demand-load copy batch is still running.
+
+        Ground truth for the plugin's stage-yield decision (relayed through
+        ``MaruHandler.set_demand_probe``): each ``_active_load_refs`` entry
+        carries the CUDA event recorded after its batch's last copy, so
+        querying the events sees the live state even between the lazy
+        cleanup passes of ``_release_completed_load_refs``.
+        """
+        with self._deferred_lock:
+            entries = list(self._active_load_refs)
+        return any(not event.query() for event, _ in entries)
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.

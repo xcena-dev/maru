@@ -476,7 +476,7 @@ class GaiaPrefetchPlugin:
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
             if source == "stage" and self._stage_yield_ms > 0:
-                yielded_ms += self._yield_to_demand(yielded_ms)
+                yielded_ms += self._yield_to_demand(handler, yielded_ms)
             # The read gate blocks the single deferred-load thread, so a cold
             # gate does not just delay this request — it delays every request
             # queued behind it. Spend at most the budget blocking, then finish
@@ -611,22 +611,39 @@ class GaiaPrefetchPlugin:
             )
         return result
 
-    def _yield_to_demand(self, yielded_so_far_ms: float) -> float:
-        """Pause while a demand read is recent; return the milliseconds waited.
+    def _yield_to_demand(self, handler: MaruHandler, yielded_so_far_ms: float) -> float:
+        """Pause while a demand read is recent or in flight; return ms waited.
 
-        The stage sub-call train releases the device whenever a demand read
-        ran within the last ``_stage_yield_ms`` — the pause ends when the
-        demand quiet window elapses or the batch's cumulative yield budget
-        (``_stage_yield_budget_ms``) is spent, whichever comes first. The
-        budget is the starvation guard: on a device that is never quiet the
-        stage proceeds anyway and the admission policy's deadline decides
-        whether the result still matters.
+        Two signals gate the stage sub-call train (hybrid — either pauses):
+
+        - **Recent start**: a demand read seam fired within the last
+          ``_stage_yield_ms`` — covers the phase before the read's copy batch
+          (and its completion event) exists.
+        - **In flight**: ``handler.demand_active()`` — the serving
+          integration's live probe over scheduled copy batches. This closes
+          the recent-start rule's blind side: a demand fill that started
+          longer than the window ago but is still running (measured to
+          collide with the stage's transfer, experiment note §5.7.3).
+
+        The pause ends when both signals clear or the batch's cumulative
+        yield budget (``_stage_yield_budget_ms``) is spent, whichever comes
+        first. The budget is the starvation guard: on a device that is never
+        quiet the stage proceeds anyway and the admission policy's deadline
+        decides whether the result still matters.
         """
+        demand_active = getattr(handler, "demand_active", None)
         waited_ms = 0.0
         while True:
             quiet_ms = (time.monotonic() - self._last_demand_at) * 1000.0
             if quiet_ms >= self._stage_yield_ms:
-                return waited_ms
+                in_flight = False
+                if demand_active is not None:
+                    try:
+                        in_flight = bool(demand_active())
+                    except Exception:
+                        in_flight = False  # fail open — never block staging
+                if not in_flight:
+                    return waited_ms
             if yielded_so_far_ms + waited_ms >= self._stage_yield_budget_ms:
                 self._stage_yield_budget_hits += 1
                 return waited_ms

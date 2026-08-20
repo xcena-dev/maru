@@ -620,3 +620,58 @@ class TestStageDemandYield:
 
         assert plugin._last_demand_at == clock.monotonic()
         assert fake.calls == [] and fake.sync_calls == []
+
+    def test_in_flight_probe_extends_the_pause(self, monkeypatch):
+        """A demand fill older than the window but still running keeps the
+        stage paused — the in-flight probe closes the recent-start blind side."""
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "50")
+        plugin = GaiaPrefetchPlugin()
+        # Demand started long ago (timestamp rule sees quiet) but its copy is
+        # still in flight for another 30 ms of fake time.
+        plugin._last_demand_at = clock.monotonic() - 10.0
+        in_flight_until = clock.monotonic() + 0.030
+        handler = _handler()
+        handler.demand_active = lambda: clock.monotonic() < in_flight_until
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert 28 <= result.yielded_ms <= 34
+
+    def test_probe_failure_fails_open(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "50")
+        plugin = GaiaPrefetchPlugin()
+        plugin._last_demand_at = clock.monotonic() - 10.0
+        handler = _handler()
+
+        def broken() -> bool:
+            raise RuntimeError("probe died")
+
+        handler.demand_active = broken
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert result.yielded_ms == 0.0
+
+    def test_probe_absent_uses_timestamp_rule_only(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "50")
+        plugin = GaiaPrefetchPlugin()
+        plugin._last_demand_at = clock.monotonic() - 10.0
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert result.yielded_ms == 0.0

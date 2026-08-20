@@ -1932,3 +1932,35 @@ class TestFixedPoolAllocation:
             handler.alloc(size=4)
 
         handler.close()
+
+
+class TestDemandProbe:
+    """set_demand_probe / demand_active — stage-yield ground-truth relay."""
+
+    def _handler(self):
+        return MaruHandler(MaruConfig(auto_connect=False))
+
+    def test_no_probe_means_inactive(self):
+        assert self._handler().demand_active() is False
+
+    def test_probe_value_is_relayed(self):
+        handler = self._handler()
+        handler.set_demand_probe(lambda: True)
+        assert handler.demand_active() is True
+        handler.set_demand_probe(lambda: False)
+        assert handler.demand_active() is False
+
+    def test_probe_failure_fails_open(self):
+        handler = self._handler()
+
+        def broken() -> bool:
+            raise RuntimeError("probe died")
+
+        handler.set_demand_probe(broken)
+        assert handler.demand_active() is False
+
+    def test_none_clears_the_probe(self):
+        handler = self._handler()
+        handler.set_demand_probe(lambda: True)
+        handler.set_demand_probe(None)
+        assert handler.demand_active() is False

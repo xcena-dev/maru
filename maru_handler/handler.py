@@ -107,6 +107,11 @@ class MaruHandler:
         self._key_to_location: dict[str, tuple[int, int]] = {}
         self._connected = False
 
+        # Live demand-read activity probe (set by the serving integration).
+        # Device plugins consult it through demand_active() to yield
+        # speculative staging to in-flight demand reads.
+        self._demand_probe: Callable[[], bool] | None = None
+
         # Region-added callback (set by CxlMemoryAdapter)
         self._on_region_added: Callable[[int, int], None] | None = None
 
@@ -1154,6 +1159,34 @@ class MaruHandler:
             else ("partial" if found > 0 else "miss"),
         )
         return found
+
+    def set_demand_probe(self, probe: Callable[[], bool] | None) -> None:
+        """Register a live demand-read activity probe.
+
+        The serving integration owns the ground truth of "a demand read is
+        executing right now" (e.g. a scheduled copy batch whose completion
+        event has not fired). Registering it here lets device plugins yield
+        speculative staging to demand without knowing the integration.
+
+        Args:
+            probe: Zero-argument callable returning True while at least one
+                demand read is in flight. None clears the probe.
+        """
+        self._demand_probe = probe
+
+    def demand_active(self) -> bool:
+        """Return whether a demand read is in flight right now.
+
+        False when no probe is registered or the probe raises — a broken
+        probe must degrade to "no yield", never block staging.
+        """
+        probe = self._demand_probe
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
 
     def stage_batch(self, keys: list[str]) -> StageResult:
         """Prepare a key batch and return only after its local tier is ready.
