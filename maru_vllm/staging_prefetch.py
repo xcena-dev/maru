@@ -250,12 +250,18 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
 
 @dataclass(frozen=True)
 class StagePlan:
-    """Scheduler-to-worker request staging command."""
+    """Scheduler-to-worker request staging command.
+
+    ``deadline_at`` is the estimated arrival time of the request this plan
+    serves (same clock as ``queued_at``). FIFO admission ignores it; the
+    deadline policy orders and expires by it. 0.0 means "no deadline".
+    """
 
     req_id: str
     keys: tuple[str, ...]
     estimated_bytes: int
     queued_at: float = field(default_factory=time.monotonic, compare=False)
+    deadline_at: float = field(default=0.0, compare=False)
 
 
 class FifoStagePolicy:
@@ -363,6 +369,158 @@ class FifoStagePolicy:
     def inflight_requests(self) -> int:
         """Number of admitted requests not yet consumed or canceled."""
         return len(self._inflight)
+
+
+class DeadlineStagePolicy:
+    """Admit the plans whose targets arrive soonest, under global budgets.
+
+    The session-staging coordinator's admission layer. Each queued plan
+    carries a deadline — the estimated arrival time of the request it serves
+    (from an imminent hint). Three rules distinguish it from FIFO:
+
+    - **Earliest deadline first.** The plan whose target arrives soonest is
+      admitted first, regardless of enqueue order.
+    - **Expiry.** A plan whose deadline passed more than ``grace_s`` ago is
+      dropped instead of staged: its target already arrived, the demand path
+      owns that data now, and a late stage only burns fill bandwidth and a
+      budget slot.
+    - **Replace on re-enqueue.** Re-enqueueing a QUEUED id replaces its keys
+      and deadline (the newest confirmed prefix and arrival estimate win)
+      instead of being rejected. An id that is only INFLIGHT may queue a new
+      plan, exactly like FIFO.
+
+    ``advance`` keeps FIFO's contract: ``consumed`` retires an admitted slot
+    and strands in the queue, ``canceled`` removes everywhere, ``released``
+    frees an inflight slot WITHOUT touching queued plans (a session-keyed id
+    may already hold the session's next plan there).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_requests: int,
+        max_bytes: int,
+        estimated_bytes_per_key: int,
+        deadline_s: float,
+        grace_s: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_requests <= 0:
+            raise ValueError("max_requests must be positive")
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if estimated_bytes_per_key <= 0:
+            raise ValueError("estimated_bytes_per_key must be positive")
+        if deadline_s <= 0:
+            raise ValueError("deadline_s must be positive")
+        if grace_s < 0:
+            raise ValueError("grace_s must be non-negative")
+        self._max_requests = max_requests
+        self._max_bytes = max_bytes
+        self._estimated_bytes_per_key = estimated_bytes_per_key
+        self._deadline_s = deadline_s
+        self._grace_s = grace_s
+        self._clock = clock
+        self._queued: dict[str, StagePlan] = {}
+        self._inflight: dict[str, StagePlan] = {}
+        self._expired_total = 0
+        self._replaced_total = 0
+
+    def enqueue(
+        self,
+        req_id: str,
+        keys: list[str],
+        *,
+        deadline_at: float | None = None,
+    ) -> bool:
+        """Queue one plan, replacing any queued plan with the same id.
+
+        ``deadline_at`` defaults to ``now + deadline_s`` — the hint's arrival
+        estimate when the hinter supplies no explicit time.
+        """
+        if not keys:
+            return False
+        if req_id in self._queued:
+            self._replaced_total += 1
+        self._queued[req_id] = StagePlan(
+            req_id=req_id,
+            keys=tuple(keys),
+            estimated_bytes=len(keys) * self._estimated_bytes_per_key,
+            queued_at=self._clock(),
+            deadline_at=(
+                deadline_at
+                if deadline_at is not None
+                else self._clock() + self._deadline_s
+            ),
+        )
+        return True
+
+    def advance(
+        self,
+        *,
+        consumed: set[str],
+        canceled: set[str],
+        released: set[str] = frozenset(),  # type: ignore[assignment]
+    ) -> list[StagePlan]:
+        """Expire late plans, then admit the earliest deadlines that fit."""
+        for req_id in consumed | canceled | set(released):
+            self._inflight.pop(req_id, None)
+        for req_id in canceled:
+            self._queued.pop(req_id, None)
+
+        now = self._clock()
+        expired = [
+            req_id
+            for req_id, plan in self._queued.items()
+            if now > plan.deadline_at + self._grace_s
+        ]
+        for req_id in expired:
+            del self._queued[req_id]
+        self._expired_total += len(expired)
+
+        admitted: list[StagePlan] = []
+        inflight_bytes = sum(plan.estimated_bytes for plan in self._inflight.values())
+        for plan in sorted(self._queued.values(), key=lambda p: p.deadline_at):
+            if len(self._inflight) >= self._max_requests:
+                break
+            fits_bytes = (
+                self._max_bytes == 0
+                or inflight_bytes + plan.estimated_bytes <= self._max_bytes
+            )
+            if not fits_bytes:
+                # An oversized earliest plan may run alone so a conservative
+                # byte estimate cannot starve it forever.
+                if self._inflight or admitted:
+                    break
+            del self._queued[plan.req_id]
+            self._inflight[plan.req_id] = plan
+            inflight_bytes += plan.estimated_bytes
+            admitted.append(plan)
+        # A matched request whose load metadata left in this scheduler step
+        # cannot benefit from a plan relayed later.
+        for req_id in consumed:
+            self._queued.pop(req_id, None)
+        return admitted
+
+    @property
+    def queued_requests(self) -> int:
+        """Number of plans waiting for a stage slot."""
+        return len(self._queued)
+
+    @property
+    def inflight_requests(self) -> int:
+        """Number of admitted plans not yet consumed, released, or canceled."""
+        return len(self._inflight)
+
+    @property
+    def expired_total(self) -> int:
+        """Plans dropped because their deadline (plus grace) passed unadmitted."""
+        return self._expired_total
+
+    @property
+    def replaced_total(self) -> int:
+        """Queued plans superseded by a re-enqueue of the same id."""
+        return self._replaced_total
 
 
 class StageState(StrEnum):

@@ -21,7 +21,12 @@ from maru_vllm.connector import (
     _hint_plan_id,
     _request_session_params,
 )
-from maru_vllm.staging_prefetch import StagePlan, StageTicket
+from maru_vllm.staging_prefetch import (
+    DeadlineStagePolicy,
+    FifoStagePolicy,
+    StagePlan,
+    StageTicket,
+)
 
 CHUNK = 8
 
@@ -64,6 +69,31 @@ def _make_scheduler(monkeypatch, trigger: str) -> MaruSchedulerConnector:
     sched = MaruSchedulerConnector(block_size=4, kv_chunk_tokens=CHUNK, extra_config={})
     sched._handler = MagicMock()
     return sched
+
+
+class TestPolicySelection:
+    def test_default_policy_is_fifo(self, monkeypatch):
+        monkeypatch.delenv("MARU_STAGE_POLICY", raising=False)
+        sched = _make_scheduler(monkeypatch, "imminent")
+        assert isinstance(sched._stage_policy, FifoStagePolicy)
+
+    def test_deadline_policy_selected_by_env(self, monkeypatch):
+        monkeypatch.setenv("MARU_STAGE_POLICY", "deadline")
+        sched = _make_scheduler(monkeypatch, "imminent")
+        assert isinstance(sched._stage_policy, DeadlineStagePolicy)
+
+    def test_unknown_policy_falls_back_to_fifo(self, monkeypatch):
+        monkeypatch.setenv("MARU_STAGE_POLICY", "bogus")
+        sched = _make_scheduler(monkeypatch, "imminent")
+        assert isinstance(sched._stage_policy, FifoStagePolicy)
+
+    def test_deadline_policy_serves_imminent_hint(self, monkeypatch):
+        monkeypatch.setenv("MARU_STAGE_POLICY", "deadline")
+        sched = _make_scheduler(monkeypatch, "imminent")
+        sched._session_keys["s2"] = ("kv_a", "kv_b")
+        sched._handler.batch_exists.return_value = [False, False]
+        sched.get_num_new_matched_tokens(_request(req_id="r1", imminent="s2"), 0)
+        assert sched._stage_policy.queued_requests == 1
 
 
 class TestSessionParams:

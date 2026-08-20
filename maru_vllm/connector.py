@@ -48,6 +48,7 @@ from maru_vllm.kv_layout import (
     _vllm_kv_cache_layout,
 )
 from maru_vllm.staging_prefetch import (
+    DeadlineStagePolicy,
     FifoStagePolicy,
     HymCacheObject,
     HymCacheRollingPipeline,
@@ -950,26 +951,63 @@ class MaruSchedulerConnector:
                     "layer-order consumption); disabling the overlap"
                 )
             self._layerwise_overlap = False
-        self._stage_policy: FifoStagePolicy | None = None
+        # Admission policy (MARU_STAGE_POLICY):
+        #   fifo     — oldest first under request/byte budgets (baseline).
+        #   deadline — the session-staging coordinator's admission layer:
+        #              earliest arrival estimate first, late plans expire
+        #              instead of staging, re-enqueue replaces a queued plan.
+        #              Deadline defaults to enqueue + MARU_STAGE_DEADLINE_MS;
+        #              a plan older than deadline + MARU_STAGE_GRACE_MS is
+        #              dropped (its target already arrived — demand path owns
+        #              the data, a late fill only burns fill bandwidth).
+        self._stage_policy: FifoStagePolicy | DeadlineStagePolicy | None = None
+        self._stage_policy_kind = (
+            os.environ.get("MARU_STAGE_POLICY", "fifo").strip().lower() or "fifo"
+        )
+        if self._stage_policy_kind not in ("fifo", "deadline"):
+            logger.warning(
+                "Unknown MARU_STAGE_POLICY=%r; falling back to 'fifo'",
+                self._stage_policy_kind,
+            )
+            self._stage_policy_kind = "fifo"
+        self._stage_expired_seen = 0
         if self._stage_enabled:
-            self._stage_policy = FifoStagePolicy(
-                max_requests=max(
-                    1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
-                ),
-                max_bytes=max(
-                    0,
-                    int(os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)) or 0),
-                ),
-                estimated_bytes_per_key=max(
-                    1,
-                    int(
-                        os.environ.get(
-                            "MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)
-                        )
-                        or 1
-                    ),
+            max_requests = max(
+                1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+            )
+            max_bytes = max(
+                0,
+                int(os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)) or 0),
+            )
+            estimated_bytes_per_key = max(
+                1,
+                int(
+                    os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2))
+                    or 1
                 ),
             )
+            if self._stage_policy_kind == "deadline":
+                self._stage_policy = DeadlineStagePolicy(
+                    max_requests=max_requests,
+                    max_bytes=max_bytes,
+                    estimated_bytes_per_key=estimated_bytes_per_key,
+                    deadline_s=max(
+                        0.001,
+                        float(os.environ.get("MARU_STAGE_DEADLINE_MS", "500") or 500)
+                        / 1000.0,
+                    ),
+                    grace_s=max(
+                        0.0,
+                        float(os.environ.get("MARU_STAGE_GRACE_MS", "200") or 200)
+                        / 1000.0,
+                    ),
+                )
+            else:
+                self._stage_policy = FifoStagePolicy(
+                    max_requests=max_requests,
+                    max_bytes=max_bytes,
+                    estimated_bytes_per_key=estimated_bytes_per_key,
+                )
         if self._stage_enabled and self._arrival_hint_enabled:
             logger.warning(
                 "MARU_STAGE_PIPELINE=1 supersedes MARU_ARRIVAL_HINT=1; "
@@ -1016,7 +1054,8 @@ class MaruSchedulerConnector:
         if self._stage_enabled:
             logger.info(
                 "Maru SSD-to-DRAM stage pipeline enabled "
-                "(requests=%s, bytes=%s, estimate/key=%s)",
+                "(policy=%s, requests=%s, bytes=%s, estimate/key=%s)",
+                self._stage_policy_kind,
                 os.environ.get("MARU_STAGE_MAX_REQUESTS", "1"),
                 os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)),
                 os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)),
@@ -1050,7 +1089,7 @@ class MaruSchedulerConnector:
             # _emit_timing); staging state must be visible there to audit runs.
             _emit_timing(
                 f"stage init: enabled={self._stage_enabled} "
-                f"trigger={self._stage_trigger}"
+                f"trigger={self._stage_trigger} policy={self._stage_policy_kind}"
             )
         # session_id -> confirmed prefix chunk keys, recorded at request
         # completion (the just-stored keys ARE the prefix the session's next
@@ -1424,6 +1463,14 @@ class MaruSchedulerConnector:
                 canceled=canceled,
                 released=released,
             )
+            if self._timing and isinstance(self._stage_policy, DeadlineStagePolicy):
+                expired_total = self._stage_policy.expired_total
+                if expired_total != self._stage_expired_seen:
+                    _emit_timing(
+                        f"stage expired: +{expired_total - self._stage_expired_seen} "
+                        f"total={expired_total} t={time.time():.6f}"
+                    )
+                    self._stage_expired_seen = expired_total
             if meta.stage_plans:
                 logger.debug(
                     "Maru stage: admitted %d reqs, %d inflight, %d queued",
