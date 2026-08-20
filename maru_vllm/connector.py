@@ -1480,9 +1480,7 @@ class MaruSchedulerConnector:
                 )
                 if self._timing:
                     step_tokens = sum(
-                        getattr(
-                            scheduler_output, "num_scheduled_tokens", {}
-                        ).values()
+                        getattr(scheduler_output, "num_scheduled_tokens", {}).values()
                     )
                     _emit_timing(
                         f"stage advance: admitted="
@@ -2106,8 +2104,7 @@ class MaruWorkerConnector:
                 self._release_stage_ticket(hint_id)
             if metadata.stage_plans and self._timing:
                 _emit_timing(
-                    f"stage worker: received "
-                    f"{[p.req_id for p in metadata.stage_plans]}"
+                    f"stage worker: received {[p.req_id for p in metadata.stage_plans]}"
                 )
             for plan in metadata.stage_plans:
                 self._submit_stage_plan(plan)

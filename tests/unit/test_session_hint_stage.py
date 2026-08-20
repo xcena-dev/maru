@@ -394,8 +394,7 @@ class TestDemandReadsActive:
         worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
         worker._deferred_lock = threading.Lock()
         worker._active_load_refs = [
-            (SimpleNamespace(query=lambda done=done: done), [])
-            for done in done_flags
+            (SimpleNamespace(query=lambda done=done: done), []) for done in done_flags
         ]
         return worker
 
