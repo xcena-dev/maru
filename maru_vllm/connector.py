@@ -1520,18 +1520,33 @@ class MaruSchedulerConnector:
         assert self._stage_policy is not None
         session_id, imminent = _request_session_params(request)
         if session_id:
+            first_seen = request.request_id not in self._pending_stage_aliases
             self._pending_stage_aliases.setdefault(
                 request.request_id, _hint_plan_id(session_id)
             )
+            if first_seen and self._timing:
+                _emit_timing(
+                    f"stage arrive: session={session_id} t={time.time():.6f} "
+                    f"(req {request.request_id})"
+                )
         if self._stage_trigger != "imminent" or not imminent:
             return
         keys = self._session_keys.get(imminent)
-        if keys and self._stage_policy.enqueue(_hint_plan_id(imminent), list(keys)):
+        queued = bool(keys) and self._stage_policy.enqueue(
+            _hint_plan_id(imminent), list(keys)
+        )
+        if queued:
             logger.debug(
                 "Maru stage: queued %d hint keys for session %s (hinted by req %s)",
-                len(keys),
+                len(keys or ()),
                 imminent,
                 request.request_id,
+            )
+        if self._timing:
+            _emit_timing(
+                f"stage imminent: session={imminent} keys={len(keys or ())} "
+                f"queued={queued} t={time.time():.6f} "
+                f"(carrier {request.request_id})"
             )
 
     def _record_session_prefix(self, request: Request) -> None:
@@ -5429,7 +5444,8 @@ class MaruWorkerConnector:
             _emit_timing(
                 f"stage ready={result.ready} "
                 f"{result.prepared_bytes / 2**20:.0f} MiB "
-                f"in {result.wait_ms:.2f} ms (req {ticket.plan.req_id})"
+                f"in {result.wait_ms:.2f} ms t={time.time():.6f} "
+                f"(req {ticket.plan.req_id})"
             )
         return result
 
@@ -5437,7 +5453,8 @@ class MaruWorkerConnector:
         """Submit one plan to the SSD-to-DRAM worker without blocking vLLM."""
         if self._timing:
             _emit_timing(
-                f"stage submit: plan={plan.req_id} keys={len(plan.keys)}"
+                f"stage submit: plan={plan.req_id} keys={len(plan.keys)} "
+                f"t={time.time():.6f}"
             )
         with self._stage_lock:
             if plan.req_id in self._stage_tickets:
