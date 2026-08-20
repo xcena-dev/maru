@@ -396,6 +396,7 @@ class TestDemandReadsActive:
         worker._active_load_refs = [
             (SimpleNamespace(query=lambda done=done: done), []) for done in done_flags
         ]
+        worker._demand_load_depth = 0
         return worker
 
     def test_no_refs_is_inactive(self):
@@ -406,3 +407,23 @@ class TestDemandReadsActive:
 
     def test_all_complete_is_inactive(self):
         assert self._worker_with_events(True, True)._demand_reads_active() is False
+
+    def test_open_demand_window_is_active_without_events(self):
+        """The sync packed path records no CUDA events — the depth counter is
+        the only signal that sees it (v2 blind spot, experiment note §5.7.3)."""
+        worker = self._worker_with_events()
+        worker._enter_demand_load()
+        assert worker._demand_reads_active() is True
+        worker._exit_demand_load()
+        assert worker._demand_reads_active() is False
+
+    def test_windows_nest_and_never_go_negative(self):
+        worker = self._worker_with_events()
+        worker._enter_demand_load()
+        worker._enter_demand_load()
+        worker._exit_demand_load()
+        assert worker._demand_reads_active() is True
+        worker._exit_demand_load()
+        worker._exit_demand_load()  # extra exit clamps at zero
+        assert worker._demand_reads_active() is False
+        assert worker._demand_load_depth == 0

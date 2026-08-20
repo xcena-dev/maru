@@ -1752,6 +1752,10 @@ class MaruWorkerConnector:
         # so a time-based clear would free memory those copies still read
         # (the CXL mmap views are outside every CUDA allocator's tracking).
         self._active_load_refs: list[tuple[torch.cuda.Event, list[Any]]] = []
+        # Demand-load windows currently open on any thread (sync packed loads
+        # run on the forward thread and record no CUDA events, so the event
+        # registry alone cannot see them — the stage-yield probe needs this).
+        self._demand_load_depth = 0
         # Deferred (between-step) loads in flight: req_id -> completion event
         # on the load stream, plus refs keeping mmap/GPU buffers alive until
         # completion is observed via get_finished_loading(). _deferred_done
@@ -2223,6 +2227,7 @@ class MaruWorkerConnector:
             else:
                 keys = [chunk_keys[ci] for ci in range(num_chunks)]
             self._await_stage(req_meta.req_id)
+            self._enter_demand_load()
             try:
                 _t0 = time.monotonic()
                 infos = self._batch_retrieve_all(keys)
@@ -2238,6 +2243,8 @@ class MaruWorkerConnector:
                 self._fail_deferred_load(req_meta)
                 self._release_stage_ticket(req_meta.req_id)
                 continue
+            finally:
+                self._exit_demand_load()
 
             # All-or-nothing: a miss (chunk evicted between the scheduler's
             # exists-check and this load) aborts the request's load so we never
@@ -2266,9 +2273,11 @@ class MaruWorkerConnector:
         # per-(layer,chunk) copies. See design note "P6 v2 시도 2".
         if not self._use_layerwise:
             _t0 = time.monotonic()
+            self._enter_demand_load()
             try:
                 self._load_packed(layers, prepared_requests, attn_metadata)
             finally:
+                self._exit_demand_load()
                 for req_meta, _, _, _ in prepared_requests:
                     self._release_stage_ticket(req_meta.req_id)
             if self._timing:
@@ -2295,7 +2304,11 @@ class MaruWorkerConnector:
             )
             return
 
-        self._load_sync(layers, inline, attn_metadata)
+        self._enter_demand_load()
+        try:
+            self._load_sync(layers, inline, attn_metadata)
+        finally:
+            self._exit_demand_load()
 
         for req_meta, num_chunks, _, _ in inline:
             logger.info(
@@ -2579,6 +2592,7 @@ class MaruWorkerConnector:
         blocks through ``take_failed_load_blocks`` so vLLM recomputes instead
         of consuming unloaded KV.
         """
+        self._enter_demand_load()
         try:
             handler = self._handler
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
@@ -2802,6 +2816,7 @@ class MaruWorkerConnector:
                     pass
             self._fail_deferred_load(req_meta)
         finally:
+            self._exit_demand_load()
             # This load is accounted for now, however it ended. An abort
             # arriving after this point finds the queued copies themselves.
             with self._deferred_lock:
@@ -3784,17 +3799,35 @@ class MaruWorkerConnector:
         self._layer_wait_spans.append((layer_name, before, after))
 
     def _demand_reads_active(self) -> bool:
-        """Return whether any scheduled demand-load copy batch is still running.
+        """Return whether a demand load is executing right now.
 
         Ground truth for the plugin's stage-yield decision (relayed through
-        ``MaruHandler.set_demand_probe``): each ``_active_load_refs`` entry
-        carries the CUDA event recorded after its batch's last copy, so
-        querying the events sees the live state even between the lazy
-        cleanup passes of ``_release_completed_load_refs``.
+        ``MaruHandler.set_demand_probe``). Two sources, either positive:
+
+        - ``_demand_load_depth`` — open demand-load windows bracketed around
+          the retrieve and copy phases on every load path. The default sync
+          packed path runs on the forward thread and records no CUDA events,
+          so this is the only signal that sees it (the v2 probe missed it —
+          experiment note §5.7.3 후속).
+        - ``_active_load_refs`` events — copy batches queued on a stream that
+          outlive their issuing call; querying the events sees the live state
+          regardless of the lazy cleanup cadence.
         """
         with self._deferred_lock:
+            if self._demand_load_depth > 0:
+                return True
             entries = list(self._active_load_refs)
         return any(not event.query() for event, _ in entries)
+
+    def _enter_demand_load(self) -> None:
+        """Open a demand-load window for the stage-yield probe."""
+        with self._deferred_lock:
+            self._demand_load_depth += 1
+
+    def _exit_demand_load(self) -> None:
+        """Close a demand-load window opened by ``_enter_demand_load``."""
+        with self._deferred_lock:
+            self._demand_load_depth = max(0, self._demand_load_depth - 1)
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
