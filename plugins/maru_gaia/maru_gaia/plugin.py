@@ -127,6 +127,8 @@ class GaiaPrefetchPlugin:
         self._last_demand_at = 0.0
         self._stage_yield_us = 0
         self._stage_yield_budget_hits = 0
+        self._stage_probe_checks = 0
+        self._stage_probe_hits = 0
         # Pin admission budget (MARU_GAIA_PIN_BUDGET_BYTES, 0 = unlimited).
         # The firmware pin capacity is bounded (~half the DRAM cache) and an
         # over-capacity pin ioctl observed on-device blocks ~61 s per call
@@ -355,6 +357,8 @@ class GaiaPrefetchPlugin:
             "stage_yield_ms": self._stage_yield_ms,
             "stage_yield_wait_ms": round(self._stage_yield_us / 1000.0, 1),
             "stage_yield_budget_hits": self._stage_yield_budget_hits,
+            "stage_probe_checks": self._stage_probe_checks,
+            "stage_probe_hits": self._stage_probe_hits,
             "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
             "stage_pin": self._stage_pin,
             "stage_split_bytes": self._stage_split_bytes,
@@ -473,10 +477,15 @@ class GaiaPrefetchPlugin:
         prepared_bytes = 0
         pinned: list[tuple[int, int, int]] = []
         yielded_ms = 0.0
+        probe_checks = 0
+        probe_hits = 0
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
             if source == "stage" and self._stage_yield_ms > 0:
-                yielded_ms += self._yield_to_demand(handler, yielded_ms)
+                waited_ms, checks, hits = self._yield_to_demand(handler, yielded_ms)
+                yielded_ms += waited_ms
+                probe_checks += checks
+                probe_hits += hits
             # The read gate blocks the single deferred-load thread, so a cold
             # gate does not just delay this request — it delays every request
             # queued behind it. Spend at most the budget blocking, then finish
@@ -587,6 +596,8 @@ class GaiaPrefetchPlugin:
 
         found = sum(1 for entry in batch_resp.entries if entry.found)
         self._stage_yield_us += int(yielded_ms * 1000)
+        self._stage_probe_checks += probe_checks
+        self._stage_probe_hits += probe_hits
         result = StageResult(
             requested_keys=len(keys),
             found_keys=found,
@@ -597,6 +608,8 @@ class GaiaPrefetchPlugin:
             skipped_keys=skipped,
             wait_ms=wait_us / 1000.0,
             yielded_ms=yielded_ms,
+            probe_checks=probe_checks,
+            probe_hits=probe_hits,
         )
         if sync and source == "stage":
             logger.info(
@@ -611,8 +624,16 @@ class GaiaPrefetchPlugin:
             )
         return result
 
-    def _yield_to_demand(self, handler: MaruHandler, yielded_so_far_ms: float) -> float:
-        """Pause while a demand read is recent or in flight; return ms waited.
+    def _yield_to_demand(
+        self, handler: MaruHandler, yielded_so_far_ms: float
+    ) -> tuple[float, int, int]:
+        """Pause while a demand read is recent or in flight.
+
+        Returns:
+            ``(waited_ms, probe_checks, probe_hits)`` — the pause plus the
+            wiring echo: how many times the in-flight probe was consulted and
+            how many consultations saw an active demand read. A zero check
+            count in a run's stage lines means the probe is not wired at all.
 
         Two signals gate the stage sub-call train (hybrid — either pauses):
 
@@ -633,20 +654,25 @@ class GaiaPrefetchPlugin:
         """
         demand_active = getattr(handler, "demand_active", None)
         waited_ms = 0.0
+        checks = 0
+        hits = 0
         while True:
             quiet_ms = (time.monotonic() - self._last_demand_at) * 1000.0
             if quiet_ms >= self._stage_yield_ms:
                 in_flight = False
                 if demand_active is not None:
+                    checks += 1
                     try:
                         in_flight = bool(demand_active())
                     except Exception:
                         in_flight = False  # fail open — never block staging
-                if not in_flight:
-                    return waited_ms
+                if in_flight:
+                    hits += 1
+                else:
+                    return waited_ms, checks, hits
             if yielded_so_far_ms + waited_ms >= self._stage_yield_budget_ms:
                 self._stage_yield_budget_hits += 1
-                return waited_ms
+                return waited_ms, checks, hits
             pause_s = 0.002
             time.sleep(pause_s)
             waited_ms += pause_s * 1000.0

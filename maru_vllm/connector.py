@@ -1756,6 +1756,8 @@ class MaruWorkerConnector:
         # run on the forward thread and record no CUDA events, so the event
         # registry alone cannot see them — the stage-yield probe needs this).
         self._demand_load_depth = 0
+        # Cumulative opened windows — wiring echo for run audits.
+        self._demand_load_windows = 0
         # Deferred (between-step) loads in flight: req_id -> completion event
         # on the load stream, plus refs keeping mmap/GPU buffers alive until
         # completion is observed via get_finished_loading(). _deferred_done
@@ -2283,7 +2285,8 @@ class MaruWorkerConnector:
             if self._timing:
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+                    f"{(time.monotonic() - _t0) * 1000:.2f} ms "
+                    f"windows={self._demand_load_windows}"
                 )
             return
 
@@ -3823,6 +3826,7 @@ class MaruWorkerConnector:
         """Open a demand-load window for the stage-yield probe."""
         with self._deferred_lock:
             self._demand_load_depth += 1
+            self._demand_load_windows += 1
 
     def _exit_demand_load(self) -> None:
         """Close a demand-load window opened by ``_enter_demand_load``."""
@@ -5541,7 +5545,8 @@ class MaruWorkerConnector:
                 f"{result.prepared_bytes / 2**20:.0f} MiB "
                 f"in {result.wait_ms:.2f} ms t={time.time():.6f} "
                 f"(req {ticket.plan.req_id}) "
-                f"yield={result.yielded_ms:.0f} ms"
+                f"yield={result.yielded_ms:.0f} ms "
+                f"probe={result.probe_hits}/{result.probe_checks}"
             )
         return result
 

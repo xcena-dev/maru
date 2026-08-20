@@ -397,6 +397,7 @@ class TestDemandReadsActive:
             (SimpleNamespace(query=lambda done=done: done), []) for done in done_flags
         ]
         worker._demand_load_depth = 0
+        worker._demand_load_windows = 0
         return worker
 
     def test_no_refs_is_inactive(self):
@@ -427,3 +428,98 @@ class TestDemandReadsActive:
         worker._exit_demand_load()  # extra exit clamps at zero
         assert worker._demand_reads_active() is False
         assert worker._demand_load_depth == 0
+
+
+class TestDemandWindowRealPath:
+    """The v2/v3 blind-spot class is a probe whose signal source is not on the
+    executed path — so these tests walk the REAL ``start_load_kv`` sync packed
+    path and assert the probe reads True inside it, not just that the counter
+    arithmetic works."""
+
+    def _worker(self) -> MaruWorkerConnector:
+        import threading
+
+        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
+        worker._deferred_lock = threading.Lock()
+        worker._active_load_refs = []
+        worker._demand_load_depth = 0
+        worker._demand_load_windows = 0
+        worker._store_layers_seen = set()
+        worker._reclaim_stale_pending_slabs = lambda: None
+        worker._timing = False
+        worker._ensure_handler = lambda: None
+        worker._handler = MagicMock()
+        worker._arrival_hint_enabled = False
+        worker._stage_enabled = False
+        worker._layer_load_events = {}
+        worker._kv_chunk_tokens = CHUNK
+        worker._use_layerwise = False
+        worker._last_attn_metadata = object()
+        worker._await_stage = lambda req_id: None
+        worker._release_stage_ticket = lambda req_id: None
+        worker._build_slot_mapping = lambda block_ids, total: MagicMock()
+        worker._get_layer_index = lambda name: 0
+        return worker
+
+    def test_probe_is_true_inside_retrieve_and_packed_load(self, monkeypatch):
+        worker = self._worker()
+        seen: dict = {}
+
+        def fake_retrieve(keys, **kwargs):
+            seen["retrieve_active"] = worker._demand_reads_active()
+            return [object() for _ in keys]
+
+        def fake_load_packed(layers, prepared, attn):
+            seen["load_active"] = worker._demand_reads_active()
+
+        worker._batch_retrieve_all = fake_retrieve
+        worker._load_packed = fake_load_packed
+        monkeypatch.setattr(
+            "maru_vllm.connector._req_chunk_keys", lambda meta, ct: ["k0"]
+        )
+
+        layer = SimpleNamespace(kv_cache=MagicMock())
+        fw = SimpleNamespace(no_compile_layers={"l0": layer}, attn_metadata=object())
+        req_meta = SimpleNamespace(
+            req_id="r1",
+            is_store=False,
+            num_matched_chunks=1,
+            deferred_load=False,
+            block_ids=([0],),
+        )
+        meta = SimpleNamespace(
+            requests=[req_meta],
+            layerwise_load_req_ids=[],
+            arrival_hint_keys=[],
+            stage_aliases={},
+            stage_release_ids=[],
+            stage_plans=[],
+            preempted_req_ids=set(),
+        )
+
+        worker.start_load_kv(fw, meta)
+
+        assert seen == {"retrieve_active": True, "load_active": True}
+        assert worker._demand_reads_active() is False
+        assert worker._demand_load_windows == 2  # retrieve + packed load
+
+    def test_ensure_handler_wires_the_probe(self, monkeypatch):
+        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
+        import threading
+
+        worker._deferred_lock = threading.Lock()
+        worker._active_load_refs = []
+        worker._demand_load_depth = 0
+        worker._demand_load_windows = 0
+        worker._handler = None
+        worker._handler_retry_after = 0.0
+        worker._extra_config = {}
+        worker._page_size_bytes = None
+        created = MagicMock()
+        monkeypatch.setattr(
+            "maru_vllm.connector._create_maru_handler", lambda cfg: created
+        )
+
+        worker._ensure_handler()
+
+        created.set_demand_probe.assert_called_once_with(worker._demand_reads_active)

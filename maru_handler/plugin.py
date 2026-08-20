@@ -78,6 +78,9 @@ class StageResult:
             here as well — subtract ``yielded_ms`` for pure device time.
         yielded_ms: Wall time the preparation spent paused between sub-calls,
             yielding the device to concurrent demand reads.
+        probe_checks: Demand-probe consultations during this batch (wiring
+            echo — zero means the probe was never even asked).
+        probe_hits: Consultations that observed an in-flight demand read.
         error: Optional lookup/plugin error summary.
     """
 
@@ -90,6 +93,8 @@ class StageResult:
     skipped_keys: int = 0
     wait_ms: float = 0.0
     yielded_ms: float = 0.0
+    probe_checks: int = 0
+    probe_hits: int = 0
     error: str | None = None
 
     @property
