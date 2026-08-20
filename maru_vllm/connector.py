@@ -1045,6 +1045,13 @@ class MaruSchedulerConnector:
             logger.info(
                 "Maru stage trigger: %s (session-hint mode)", self._stage_trigger
             )
+        if self._timing:
+            # The connector logger never reaches the engine log (see
+            # _emit_timing); staging state must be visible there to audit runs.
+            _emit_timing(
+                f"stage init: enabled={self._stage_enabled} "
+                f"trigger={self._stage_trigger}"
+            )
         # session_id -> confirmed prefix chunk keys, recorded at request
         # completion (the just-stored keys ARE the prefix the session's next
         # turn will re-read; no future request content is used).
@@ -1375,6 +1382,7 @@ class MaruSchedulerConnector:
             assert self._stage_policy is not None
             consumed = {req.req_id for req in meta.requests}
             canceled = set(stale_ids)
+            released: set[str] = set()
             if self._stage_trigger != "match":
                 # A scheduled load joins its session's hint ticket: the alias
                 # is relayed to the worker and the hint's policy slot is
@@ -1391,12 +1399,21 @@ class MaruSchedulerConnector:
                         consumed.add(alias)
                         self._relayed_stage_aliases[req.req_id] = alias
                 for rid in stale_ids:
-                    alias = self._pending_stage_aliases.pop(
-                        rid, None
-                    ) or self._relayed_stage_aliases.pop(rid, None)
-                    if alias is not None:
-                        canceled.add(alias)
-                        self._pending_stage_releases.append(alias)
+                    pending = self._pending_stage_aliases.pop(rid, None)
+                    if pending is not None and self._stage_trigger == "imminent":
+                        # A hinted request died before loading: its queued
+                        # stage is garbage — cancel it and drop the ticket.
+                        canceled.add(pending)
+                        self._pending_stage_releases.append(pending)
+                    relayed = self._relayed_stage_aliases.pop(rid, None)
+                    if relayed is not None:
+                        # The stage was consumed during the request's life:
+                        # free the policy slot and drop the worker ticket,
+                        # but leave the queue alone — in turn_end mode the
+                        # same id already holds the NEXT turn's plan, queued
+                        # at this request's completion.
+                        released.add(relayed)
+                        self._pending_stage_releases.append(relayed)
                 if self._pending_stage_releases:
                     meta.stage_release_ids = list(
                         dict.fromkeys(self._pending_stage_releases)
@@ -1405,6 +1422,7 @@ class MaruSchedulerConnector:
             meta.stage_plans = self._stage_policy.advance(
                 consumed=consumed,
                 canceled=canceled,
+                released=released,
             )
             if meta.stage_plans:
                 logger.debug(
@@ -1413,6 +1431,17 @@ class MaruSchedulerConnector:
                     self._stage_policy.inflight_requests,
                     self._stage_policy.queued_requests,
                 )
+                if self._timing:
+                    step_tokens = sum(
+                        getattr(
+                            scheduler_output, "num_scheduled_tokens", {}
+                        ).values()
+                    )
+                    _emit_timing(
+                        f"stage advance: admitted="
+                        f"{[p.req_id for p in meta.stage_plans]} "
+                        f"step_tokens={step_tokens}"
+                    )
 
         self._requests_need_load.clear()
         return meta
@@ -1514,6 +1543,8 @@ class MaruSchedulerConnector:
         """
         session_id, _ = _request_session_params(request)
         if not session_id:
+            if self._timing:
+                _emit_timing("stage turn_end: finished request carries no session id")
             return
         token_ids = list(request.prompt_token_ids or [])
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
@@ -1526,11 +1557,17 @@ class MaruSchedulerConnector:
         self._session_keys[session_id] = tuple(keys)
         if self._stage_trigger == "turn_end":
             assert self._stage_policy is not None
-            if self._stage_policy.enqueue(_hint_plan_id(session_id), keys):
+            queued = self._stage_policy.enqueue(_hint_plan_id(session_id), keys)
+            if queued:
                 logger.debug(
                     "Maru stage: queued %d turn-end keys for session %s",
                     len(keys),
                     session_id,
+                )
+            if self._timing:
+                _emit_timing(
+                    f"stage turn_end: session={session_id} keys={len(keys)} "
+                    f"queued={queued}"
                 )
 
     def _release_arrival_hints(self, consumed: set[str]) -> list[str]:
@@ -1993,12 +2030,20 @@ class MaruWorkerConnector:
             self._cancel_stage_requests(metadata.preempted_req_ids)
             if metadata.stage_aliases:
                 self._stage_aliases.update(metadata.stage_aliases)
-            for plan in metadata.stage_plans:
-                self._submit_stage_plan(plan)
             # Hint tickets whose target request will never join: drop them
             # (and their device pins) instead of stranding READY work.
+            # Releases run BEFORE submits — a session's fresh plan can arrive
+            # in the same metadata as its previous ticket's release under the
+            # same plan id, and must not be swallowed by the dying ticket.
             for hint_id in metadata.stage_release_ids:
                 self._release_stage_ticket(hint_id)
+            if metadata.stage_plans and self._timing:
+                _emit_timing(
+                    f"stage worker: received "
+                    f"{[p.req_id for p in metadata.stage_plans]}"
+                )
+            for plan in metadata.stage_plans:
+                self._submit_stage_plan(plan)
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is not None:
@@ -5390,6 +5435,10 @@ class MaruWorkerConnector:
 
     def _submit_stage_plan(self, plan: StagePlan) -> None:
         """Submit one plan to the SSD-to-DRAM worker without blocking vLLM."""
+        if self._timing:
+            _emit_timing(
+                f"stage submit: plan={plan.req_id} keys={len(plan.keys)}"
+            )
         with self._stage_lock:
             if plan.req_id in self._stage_tickets:
                 return

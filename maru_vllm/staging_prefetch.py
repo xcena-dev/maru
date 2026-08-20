@@ -282,8 +282,14 @@ class FifoStagePolicy:
         self._inflight: dict[str, StagePlan] = {}
 
     def enqueue(self, req_id: str, keys: list[str]) -> bool:
-        """Queue one request once, returning whether it was accepted."""
-        if not keys or req_id in self._queued_ids or req_id in self._inflight:
+        """Queue one request once, returning whether it was accepted.
+
+        An id that is only INFLIGHT may re-queue: session-hint plan ids are
+        keyed by session, and in turn_end mode the next turn's plan is queued
+        at the moment the previous turn — whose stage may still hold the
+        inflight slot — finishes. The old instance leaves via its release.
+        """
+        if not keys or req_id in self._queued_ids:
             return False
         plan = StagePlan(
             req_id=req_id,
@@ -299,6 +305,7 @@ class FifoStagePolicy:
         *,
         consumed: set[str],
         canceled: set[str],
+        released: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> list[StagePlan]:
         """Retire stale work and admit the oldest plans that fit.
 
@@ -307,8 +314,14 @@ class FifoStagePolicy:
         its deferred load; the load then joins its worker-side ticket. An
         oversized oldest request may run alone so FIFO does not deadlock
         permanently on a conservative byte estimate.
+
+        ``released`` frees an inflight slot WITHOUT touching queued plans.
+        Session-hint plan ids are keyed by session, so when a request retires
+        the stage it consumed, that same id may already hold the session's
+        NEXT plan in the queue (queued at the request's completion in
+        turn_end mode) — a full cancel would silently kill it.
         """
-        for req_id in consumed | canceled:
+        for req_id in consumed | canceled | set(released):
             self._inflight.pop(req_id, None)
         if canceled and self._queued:
             self._queued = deque(

@@ -159,6 +159,43 @@ class TestBuildMetaAliasPlumbing:
         # The worker drops the (already consumed) ticket idempotently.
         assert meta2.stage_release_ids == [_hint_plan_id("s1")]
 
+    def test_turn_end_plan_survives_its_requests_finish_sweep(self, monkeypatch):
+        """The finish sweep must not cancel the plan queued at that finish.
+
+        Live regression (2026-08-20): every arriving session request registers
+        a pending alias to its session's hint plan id; when the request
+        finished, the stale sweep canceled that id — killing the turn-end
+        plan the same finish had just queued, so no stage was ever admitted.
+        """
+        sched = _make_scheduler(monkeypatch, "turn_end")
+        req = _request(req_id="r1", session="s1")
+        # Arrival registers the alias (get_num_new_matched path).
+        sched._process_session_hints(req)
+        assert sched._pending_stage_aliases == {"r1": _hint_plan_id("s1")}
+        # Completion queues the next turn's plan.
+        sched.request_finished(req, [])
+        # The next step sweeps r1 as finished — the fresh plan must survive
+        # and be admitted.
+        meta = sched.build_connector_meta(_output(finished=["r1"]))
+        assert [p.req_id for p in meta.stage_plans] == [_hint_plan_id("s1")]
+        assert "r1" not in sched._pending_stage_aliases
+
+    def test_turn_end_relayed_release_spares_fresh_plan(self, monkeypatch):
+        """Retiring a consumed stage must not kill the same-id queued plan."""
+        sched = _make_scheduler(monkeypatch, "turn_end")
+        # Steady state: r2 consumed its session's stage earlier (alias
+        # relayed, plan inflight), then finishes — queueing the next plan.
+        sched._relayed_stage_aliases["r2"] = _hint_plan_id("s1")
+        sched._stage_policy.enqueue(_hint_plan_id("s1"), ["k0"])
+        assert sched._stage_policy.advance(consumed=set(), canceled=set())
+        req = _request(req_id="r2", session="s1")
+        sched.request_finished(req, [])
+        meta = sched.build_connector_meta(_output(finished=["r2"]))
+        # The consumed stage's ticket drops, its slot frees, and the fresh
+        # plan is admitted into it.
+        assert meta.stage_release_ids == [_hint_plan_id("s1")]
+        assert [p.req_id for p in meta.stage_plans] == [_hint_plan_id("s1")]
+
     def test_stale_request_emits_ticket_release(self, monkeypatch):
         sched = _make_scheduler(monkeypatch, "imminent")
         self._prime_hint(sched)
