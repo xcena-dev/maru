@@ -105,6 +105,28 @@ class GaiaPrefetchPlugin:
         if split_env <= 0 and self._stage_pin:
             split_env = 1 << 30
         self._stage_split_bytes = max(0, split_env)
+        # Demand-yield (MARU_GAIA_STAGE_DEMAND_YIELD_MS, 0 = off): between
+        # stage sub-calls, pause while a demand read ran within the last
+        # N ms. The device serves fill commands in arrival order, so an
+        # unyielding stage sub-call train makes concurrent demand fills
+        # queue behind it — measured as the whole loss of the imminent
+        # campaign (requests overlapping a stage window p50 334 ms vs 212 ms
+        # clean; experiment note §5.7.1). Yielding moves stage work into
+        # demand-idle windows; the stage stretches, which the admission
+        # policy's deadline/expiry manages. STAGE_YIELD_BUDGET_MS caps the
+        # cumulative pause per stage batch so a busy device cannot starve a
+        # stage forever (default 2000 ms).
+        self._stage_yield_ms = max(
+            0.0,
+            float(os.environ.get("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "0") or 0),
+        )
+        self._stage_yield_budget_ms = max(
+            0.0,
+            float(os.environ.get("MARU_GAIA_STAGE_YIELD_BUDGET_MS", "2000") or 0),
+        )
+        self._last_demand_at = 0.0
+        self._stage_yield_us = 0
+        self._stage_yield_budget_hits = 0
         # Pin admission budget (MARU_GAIA_PIN_BUDGET_BYTES, 0 = unlimited).
         # The firmware pin capacity is bounded (~half the DRAM cache) and an
         # over-capacity pin ioctl observed on-device blocks ~61 s per call
@@ -133,11 +155,12 @@ class GaiaPrefetchPlugin:
         self._stage_wait_us = 0
         logger.info(
             "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, "
-            "read_gate=%s, stage_api=%s)",
+            "read_gate=%s, stage_api=%s, stage_yield_ms=%s)",
             "on" if self._coalesce else "off",
             self._device_id if self._device_id is not None else "auto-scan",
             "sync" if self._sync_gate else "async",
             "memory_pin" if self._stage_pin else "memory_prefetch_sync",
+            self._stage_yield_ms or "off",
         )
 
     # -- MaruHandlerPlugin seams -------------------------------------------
@@ -151,6 +174,10 @@ class GaiaPrefetchPlugin:
         """Demand-read boundary. With MARU_GAIA_PREFETCH_SYNC=1 this is a sync
         read-gate (block until DRAM-resident); otherwise the async reactive
         hint (baseline)."""
+        # Demand-activity mark for the stage yield loop — the demand fill the
+        # stage must not queue-block starts here, whether or not this seam
+        # goes on to issue a hint of its own.
+        self._last_demand_at = time.monotonic()
         if self._hymcache_local or not self._retrieve_hint:
             return
         self._issue(
@@ -325,6 +352,9 @@ class GaiaPrefetchPlugin:
             "stage_requests": self._stage_requests,
             "stage_ready": self._stage_ready,
             "stage_bytes": self._stage_bytes,
+            "stage_yield_ms": self._stage_yield_ms,
+            "stage_yield_wait_ms": round(self._stage_yield_us / 1000.0, 1),
+            "stage_yield_budget_hits": self._stage_yield_budget_hits,
             "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
             "stage_pin": self._stage_pin,
             "stage_split_bytes": self._stage_split_bytes,
@@ -442,8 +472,11 @@ class GaiaPrefetchPlugin:
         degraded = 0
         prepared_bytes = 0
         pinned: list[tuple[int, int, int]] = []
+        yielded_ms = 0.0
         t0 = time.monotonic()
         for device_id, device_addr, size in ranges:
+            if source == "stage" and self._stage_yield_ms > 0:
+                yielded_ms += self._yield_to_demand(yielded_ms)
             # The read gate blocks the single deferred-load thread, so a cold
             # gate does not just delay this request — it delays every request
             # queued behind it. Spend at most the budget blocking, then finish
@@ -553,6 +586,7 @@ class GaiaPrefetchPlugin:
                 )
 
         found = sum(1 for entry in batch_resp.entries if entry.found)
+        self._stage_yield_us += int(yielded_ms * 1000)
         result = StageResult(
             requested_keys=len(keys),
             found_keys=found,
@@ -562,17 +596,43 @@ class GaiaPrefetchPlugin:
             failed_ranges=failed,
             skipped_keys=skipped,
             wait_ms=wait_us / 1000.0,
+            yielded_ms=yielded_ms,
         )
         if sync and source == "stage":
             logger.info(
-                "gaia_stage: ready=%s, keys=%d/%d, bytes=%d, wait_ms=%.1f",
+                "gaia_stage: ready=%s, keys=%d/%d, bytes=%d, wait_ms=%.1f, "
+                "yielded_ms=%.1f",
                 result.ready,
                 result.eligible_keys,
                 result.requested_keys,
                 result.prepared_bytes,
                 result.wait_ms,
+                result.yielded_ms,
             )
         return result
+
+    def _yield_to_demand(self, yielded_so_far_ms: float) -> float:
+        """Pause while a demand read is recent; return the milliseconds waited.
+
+        The stage sub-call train releases the device whenever a demand read
+        ran within the last ``_stage_yield_ms`` — the pause ends when the
+        demand quiet window elapses or the batch's cumulative yield budget
+        (``_stage_yield_budget_ms``) is spent, whichever comes first. The
+        budget is the starvation guard: on a device that is never quiet the
+        stage proceeds anyway and the admission policy's deadline decides
+        whether the result still matters.
+        """
+        waited_ms = 0.0
+        while True:
+            quiet_ms = (time.monotonic() - self._last_demand_at) * 1000.0
+            if quiet_ms >= self._stage_yield_ms:
+                return waited_ms
+            if yielded_so_far_ms + waited_ms >= self._stage_yield_budget_ms:
+                self._stage_yield_budget_hits += 1
+                return waited_ms
+            pause_s = 0.002
+            time.sleep(pause_s)
+            waited_ms += pause_s * 1000.0
 
     def _unpin_ranges(self, ranges: list[tuple[int, int, int]]) -> None:
         """Unpin previously pinned ranges, counting (not raising) failures."""

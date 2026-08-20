@@ -73,7 +73,11 @@ class StageResult:
         issued_ranges: Coalesced device ranges submitted successfully.
         failed_ranges: Device ranges whose preparation returned an error.
         skipped_keys: Found keys that could not resolve to a live range.
-        wait_ms: Wall time spent in the blocking device preparation.
+        wait_ms: Wall time spent in the blocking device preparation. When the
+            plugin yields to demand reads mid-batch, that pause is included
+            here as well — subtract ``yielded_ms`` for pure device time.
+        yielded_ms: Wall time the preparation spent paused between sub-calls,
+            yielding the device to concurrent demand reads.
         error: Optional lookup/plugin error summary.
     """
 
@@ -85,6 +89,7 @@ class StageResult:
     failed_ranges: int = 0
     skipped_keys: int = 0
     wait_ms: float = 0.0
+    yielded_ms: float = 0.0
     error: str | None = None
 
     @property

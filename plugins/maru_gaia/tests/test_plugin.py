@@ -7,6 +7,7 @@ address computation (``handle.offset + kv_offset`` for ``kv_length``), range
 coalescing, and the unmapped-region skip.
 """
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -513,7 +514,10 @@ class TestSyncGateBudget:
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
         monkeypatch.setenv("MARU_GAIA_PREFETCH_SYNC_BUDGET_MS", "5")
 
-        clock = iter([0.0, 0.0, 0.010, 0.010, 0.010])
+        # First three reads (demand mark, batch t0, range-1 budget check) sit
+        # at 0.0 so range 1 is gated; every later read sees 10 ms — past the
+        # 5 ms budget — so ranges 2..3 degrade to async.
+        clock = itertools.chain([0.0, 0.0, 0.0], itertools.repeat(0.010))
         monkeypatch.setattr("maru_gaia.plugin.time.monotonic", lambda: next(clock))
         plugin = GaiaPrefetchPlugin()
 
@@ -534,3 +538,85 @@ class TestSyncGateBudget:
 
         assert fake.sync_calls == []
         assert len(fake.calls) == 3
+
+
+class _FakeTime:
+    """Deterministic clock: sleep advances monotonic, nothing really waits."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, dt):
+        self.now += dt
+
+    def time(self):
+        return self.now
+
+
+class TestStageDemandYield:
+    """Stage sub-calls pause while a demand read is recent (device yield)."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "0")
+
+    def test_yield_off_by_default(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.delenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", raising=False)
+        plugin = GaiaPrefetchPlugin()
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert result.yielded_ms == 0.0
+        assert plugin.contribute_stats()["stage_yield_wait_ms"] == 0.0
+
+    def test_stage_waits_out_the_demand_quiet_window(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "50")
+        plugin = GaiaPrefetchPlugin()
+        plugin.on_batch_retrieve(_handler(), ["d"], _resp(_entry(0, 4096, 32)))
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert 48 <= result.yielded_ms <= 54
+        assert plugin.contribute_stats()["stage_yield_wait_ms"] >= 48
+
+    def test_yield_budget_caps_the_pause(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "1000000")
+        monkeypatch.setenv("MARU_GAIA_STAGE_YIELD_BUDGET_MS", "30")
+        plugin = GaiaPrefetchPlugin()
+        plugin.on_batch_retrieve(_handler(), ["d"], _resp(_entry(0, 4096, 32)))
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready  # the stage proceeds; starvation guard, not a fail
+        assert 28 <= result.yielded_ms <= 34
+        assert plugin.contribute_stats()["stage_yield_budget_hits"] >= 1
+
+    def test_retrieve_marks_demand_even_when_hint_disabled(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_RETRIEVE_HINT", "0")
+        monkeypatch.setenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "50")
+        plugin = GaiaPrefetchPlugin()
+
+        plugin.on_batch_retrieve(_handler(), ["d"], _resp(_entry(0, 0, 32)))
+
+        assert plugin._last_demand_at == clock.monotonic()
+        assert fake.calls == [] and fake.sync_calls == []

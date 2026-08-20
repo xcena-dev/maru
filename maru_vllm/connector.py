@@ -5492,7 +5492,8 @@ class MaruWorkerConnector:
                 f"stage ready={result.ready} "
                 f"{result.prepared_bytes / 2**20:.0f} MiB "
                 f"in {result.wait_ms:.2f} ms t={time.time():.6f} "
-                f"(req {ticket.plan.req_id})"
+                f"(req {ticket.plan.req_id}) "
+                f"yield={result.yielded_ms:.0f} ms"
             )
         return result
 
