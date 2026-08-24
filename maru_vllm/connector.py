@@ -1463,6 +1463,11 @@ class MaruSchedulerConnector:
                 canceled=canceled,
                 released=released,
             )
+            if self._timing:
+                drain = getattr(self._stage_policy, "drain_events", None)
+                if drain is not None:
+                    for line in drain():
+                        _emit_timing(line)
             if self._timing and isinstance(self._stage_policy, DeadlineStagePolicy):
                 expired_total = self._stage_policy.expired_total
                 if expired_total != self._stage_expired_seen:

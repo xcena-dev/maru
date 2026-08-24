@@ -286,6 +286,29 @@ class FifoStagePolicy:
         self._queued: deque[StagePlan] = deque()
         self._queued_ids: set[str] = set()
         self._inflight: dict[str, StagePlan] = {}
+        self._admitted_at: dict[str, float] = {}
+        self._events: list[str] = []
+        self._blocked_steps = 0
+
+    def drain_events(self) -> list[str]:
+        """Return and clear the window accounting lines recorded so far.
+
+        Each line reports one admission or one slot retirement with the slot
+        occupancy at that moment, so the caller can emit them to the timing
+        channel. Draining keeps the buffer from growing without bound when
+        the caller does not consume it every step.
+
+        Returns:
+            The recorded lines in chronological order.
+        """
+        out = self._events
+        self._events = []
+        return out
+
+    @property
+    def blocked_steps(self) -> int:
+        """Scheduler steps in which a queued plan found no free slot."""
+        return self._blocked_steps
 
     def enqueue(self, req_id: str, keys: list[str]) -> bool:
         """Queue one request once, returning whether it was accepted.
@@ -327,8 +350,22 @@ class FifoStagePolicy:
         NEXT plan in the queue (queued at the request's completion in
         turn_end mode) — a full cancel would silently kill it.
         """
-        for req_id in consumed | canceled | set(released):
-            self._inflight.pop(req_id, None)
+        now = time.monotonic()
+        reasons = (
+            ("consumed", consumed),
+            ("canceled", canceled),
+            ("released", set(released)),
+        )
+        for reason, ids in reasons:
+            for req_id in ids:
+                if self._inflight.pop(req_id, None) is None:
+                    continue
+                held = now - self._admitted_at.pop(req_id, now)
+                self._events.append(
+                    f"stage slot retire: plan={req_id} reason={reason} "
+                    f"held={held * 1e3:.1f} ms window={len(self._inflight)}"
+                    f"/{self._max_requests}"
+                )
         if canceled and self._queued:
             self._queued = deque(
                 plan for plan in self._queued if plan.req_id not in canceled
@@ -348,8 +385,16 @@ class FifoStagePolicy:
             self._queued.popleft()
             self._queued_ids.remove(plan.req_id)
             self._inflight[plan.req_id] = plan
+            self._admitted_at[plan.req_id] = now
             inflight_bytes += plan.estimated_bytes
             admitted.append(plan)
+            self._events.append(
+                f"stage slot admit: plan={plan.req_id} "
+                f"window={len(self._inflight)}/{self._max_requests} "
+                f"bytes={inflight_bytes / 1024**2:.0f}"
+                f"/{self._max_bytes / 1024**2:.0f} MiB "
+                f"queued={len(self._queued)}"
+            )
         # A matched request whose load metadata left in this scheduler step
         # cannot benefit from a plan relayed later. Keep the admitted subset
         # and discard only the consumed requests still stranded in the queue.
@@ -358,6 +403,8 @@ class FifoStagePolicy:
                 plan for plan in self._queued if plan.req_id not in consumed
             )
             self._queued_ids = {plan.req_id for plan in self._queued}
+        if self._queued and not admitted:
+            self._blocked_steps += 1
         return admitted
 
     @property
