@@ -116,6 +116,13 @@ class GaiaPrefetchPlugin:
         # policy's deadline/expiry manages. STAGE_YIELD_BUDGET_MS caps the
         # cumulative pause per stage batch so a busy device cannot starve a
         # stage forever (default 2000 ms).
+        # 조각 사이에 두는 무조건 간격(ms). 양보(_stage_yield_ms)와 달리 demand
+        # 진행 여부를 묻지 않는다 — 장치 명령 큐를 주기적으로 비워, 도착한
+        # 읽기가 기다리는 최대 시간을 채움 전체가 아니라 조각 하나로 줄이는 것이
+        # 목적이다. 신호원이 없어도 성립한다.
+        self._stage_pace_ms = max(
+            0.0, float(os.environ.get("MARU_GAIA_STAGE_PACE_MS", "0") or 0.0)
+        )
         self._stage_yield_ms = max(
             0.0,
             float(os.environ.get("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "0") or 0),
@@ -480,7 +487,11 @@ class GaiaPrefetchPlugin:
         probe_checks = 0
         probe_hits = 0
         t0 = time.monotonic()
-        for device_id, device_addr, size in ranges:
+        paced_ms = 0.0
+        for range_index, (device_id, device_addr, size) in enumerate(ranges):
+            if source == "stage" and self._stage_pace_ms > 0 and range_index > 0:
+                time.sleep(self._stage_pace_ms / 1000.0)
+                paced_ms += self._stage_pace_ms
             if source == "stage" and self._stage_yield_ms > 0:
                 waited_ms, checks, hits = self._yield_to_demand(handler, yielded_ms)
                 yielded_ms += waited_ms
@@ -571,7 +582,7 @@ class GaiaPrefetchPlugin:
                 logger.info(
                     "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
                     "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
-                    "over_budget=%d",
+                    "over_budget=%d, paced_ms=%.1f",
                     source,
                     chunk_count,
                     len(ranges),
@@ -580,6 +591,7 @@ class GaiaPrefetchPlugin:
                     skipped,
                     wait_us / 1000.0,
                     degraded,
+                    paced_ms,
                 )
             else:
                 logger.info(
