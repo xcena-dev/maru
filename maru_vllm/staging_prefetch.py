@@ -327,6 +327,10 @@ class FifoStagePolicy:
         )
         self._queued.append(plan)
         self._queued_ids.add(req_id)
+        self._events.append(
+            f"stage slot queue: plan={req_id} keys={len(keys)} "
+            f"depth={len(self._queued)} t={time.time():.6f}"
+        )
         return True
 
     def advance(
@@ -364,7 +368,7 @@ class FifoStagePolicy:
                 self._events.append(
                     f"stage slot retire: plan={req_id} reason={reason} "
                     f"held={held * 1e3:.1f} ms window={len(self._inflight)}"
-                    f"/{self._max_requests}"
+                    f"/{self._max_requests} t={time.time():.6f}"
                 )
         if canceled and self._queued:
             self._queued = deque(
@@ -393,7 +397,7 @@ class FifoStagePolicy:
                 f"window={len(self._inflight)}/{self._max_requests} "
                 f"bytes={inflight_bytes / 1024**2:.0f}"
                 f"/{self._max_bytes / 1024**2:.0f} MiB "
-                f"queued={len(self._queued)}"
+                f"queued={len(self._queued)} t={time.time():.6f}"
             )
         # A matched request whose load metadata left in this scheduler step
         # cannot benefit from a plan relayed later. Keep the admitted subset
