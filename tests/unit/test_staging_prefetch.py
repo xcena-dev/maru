@@ -356,6 +356,132 @@ class TestFifoStagePolicy:
         assert policy.queued_requests == 0
 
 
+class TestFifoStageHoldAndDelay:
+    """The two knobs that separate draining the queue from timing the fill."""
+
+    def test_default_holds_the_slot_until_the_turn_consumes_it(self):
+        """Without hold_s the slot survives any amount of elapsed time."""
+        now = [100.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("r0", ["a"])
+        policy.enqueue("r1", ["b"])
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "r0"
+        ]
+
+        now[0] += 60.0
+        assert policy.advance(consumed=set(), canceled=set()) == []
+        assert policy.queued_requests == 1
+
+        assert [p.req_id for p in policy.advance(consumed={"r0"}, canceled=set())] == [
+            "r1"
+        ]
+
+    def test_hold_returns_the_slot_without_waiting_for_consumption(self):
+        """A held-out slot frees the next plan and is logged as reason=hold."""
+        now = [100.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            hold_s=0.4,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("r0", ["a"])
+        policy.enqueue("r1", ["b"])
+        policy.advance(consumed=set(), canceled=set())
+        policy.drain_events()
+
+        now[0] += 0.3
+        assert policy.advance(consumed=set(), canceled=set()) == []
+
+        now[0] += 0.2
+        admitted = policy.advance(consumed=set(), canceled=set())
+
+        assert [p.req_id for p in admitted] == ["r1"]
+        retires = [e for e in policy.drain_events() if "slot retire" in e]
+        assert len(retires) == 1 and "reason=hold" in retires[0]
+
+    def test_hold_leaves_a_consumed_slot_to_the_consumed_path(self):
+        """Consumption in the same step wins, so the reason stays truthful."""
+        now = [100.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            hold_s=0.4,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("r0", ["a"])
+        policy.advance(consumed=set(), canceled=set())
+        policy.drain_events()
+
+        now[0] += 0.5
+        policy.advance(consumed={"r0"}, canceled=set())
+
+        retires = [e for e in policy.drain_events() if "slot retire" in e]
+        assert len(retires) == 1 and "reason=consumed" in retires[0]
+
+    def test_queue_delay_withholds_a_plan_until_its_delay_elapses(self):
+        """The delay sets when the fill starts, and order is preserved."""
+        now = [100.0]
+        policy = FifoStagePolicy(
+            max_requests=2,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            queue_delay_s=1.0,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("r0", ["a"])
+        now[0] += 0.5
+        policy.enqueue("r1", ["b"])
+
+        assert policy.advance(consumed=set(), canceled=set()) == []
+
+        now[0] += 0.5  # r0 는 1.0 초 지났고 r1 은 0.5 초다
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "r0"
+        ]
+
+        now[0] += 0.5
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "r1"
+        ]
+
+    def test_both_knobs_drain_the_queue_and_still_pace_the_fill(self):
+        """Hold empties the window; delay decides how early each fill runs."""
+        now = [100.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            hold_s=0.3,
+            queue_delay_s=2.0,
+            clock=lambda: now[0],
+        )
+        for i in range(3):
+            policy.enqueue(f"r{i}", ["a"])
+
+        assert policy.advance(consumed=set(), canceled=set()) == []
+        assert policy.queued_requests == 3
+
+        now[0] += 2.0
+        admitted = []
+        for _ in range(6):
+            admitted += [
+                p.req_id for p in policy.advance(consumed=set(), canceled=set())
+            ]
+            now[0] += 0.3
+
+        assert admitted == ["r0", "r1", "r2"]
+        assert policy.queued_requests == 0
+
+
 class TestStageTicket:
     def test_ready_future_is_consumed_then_released(self):
         plan = StagePlan("r0", ("k0",), 4096)

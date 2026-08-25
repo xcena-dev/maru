@@ -1003,10 +1003,24 @@ class MaruSchedulerConnector:
                     ),
                 )
             else:
+                # MARU_STAGE_HOLD_MS: 승인 뒤 이만큼 지나면 소비를 기다리지 않고
+                #   자리를 반환한다. 0(기본)은 종전대로 소비까지 붙든다.
+                # MARU_STAGE_QUEUE_DELAY_MS: 등록된 plan 을 이만큼 뒤에야 통과
+                #   후보로 삼는다. 줄이 빈 상태에서 이 값이 발사 시점을, 따라서
+                #   올려 둔 몫이 축출에 노출되는 시간을 직접 정한다.
                 self._stage_policy = FifoStagePolicy(
                     max_requests=max_requests,
                     max_bytes=max_bytes,
                     estimated_bytes_per_key=estimated_bytes_per_key,
+                    hold_s=max(
+                        0.0,
+                        float(os.environ.get("MARU_STAGE_HOLD_MS", "0") or 0) / 1000.0,
+                    ),
+                    queue_delay_s=max(
+                        0.0,
+                        float(os.environ.get("MARU_STAGE_QUEUE_DELAY_MS", "0") or 0)
+                        / 1000.0,
+                    ),
                 )
         if self._stage_enabled and self._arrival_hint_enabled:
             logger.warning(
@@ -1089,7 +1103,10 @@ class MaruSchedulerConnector:
             # _emit_timing); staging state must be visible there to audit runs.
             _emit_timing(
                 f"stage init: enabled={self._stage_enabled} "
-                f"trigger={self._stage_trigger} policy={self._stage_policy_kind}"
+                f"trigger={self._stage_trigger} policy={self._stage_policy_kind} "
+                f"hold_ms={os.environ.get('MARU_STAGE_HOLD_MS', '0')} "
+                f"queue_delay_ms={os.environ.get('MARU_STAGE_QUEUE_DELAY_MS', '0')} "
+                f"window={os.environ.get('MARU_STAGE_MAX_REQUESTS', '1')}"
             )
         # session_id -> confirmed prefix chunk keys, recorded at request
         # completion (the just-stored keys ARE the prefix the session's next

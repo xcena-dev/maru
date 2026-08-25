@@ -265,7 +265,23 @@ class StagePlan:
 
 
 class FifoStagePolicy:
-    """Admit oldest requests under bounded request and byte windows."""
+    """Admit oldest requests under bounded request and byte windows.
+
+    Two optional knobs separate what one window slot currently does twice.
+
+    ``hold_s`` bounds how long an admitted plan keeps its slot. The default
+    0 keeps the original contract: the slot is held until the arriving turn
+    consumes it, which paces admission at the turn arrival rate and so makes
+    the fill land just before arrival. A positive value returns the slot that
+    long after admission instead, so admission runs at device speed and the
+    standing queue drains.
+
+    ``queue_delay_s`` withholds a freshly queued plan from admission for that
+    long. With the queue drained, this alone sets how early the fill happens,
+    and therefore how long the staged copy sits exposed to eviction before
+    its turn arrives. Order is preserved: every plan waits the same delay, so
+    checking the head is enough.
+    """
 
     def __init__(
         self,
@@ -273,6 +289,9 @@ class FifoStagePolicy:
         max_requests: int,
         max_bytes: int,
         estimated_bytes_per_key: int,
+        hold_s: float = 0.0,
+        queue_delay_s: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_requests <= 0:
             raise ValueError("max_requests must be positive")
@@ -280,9 +299,16 @@ class FifoStagePolicy:
             raise ValueError("max_bytes must be non-negative")
         if estimated_bytes_per_key <= 0:
             raise ValueError("estimated_bytes_per_key must be positive")
+        if hold_s < 0:
+            raise ValueError("hold_s must be non-negative")
+        if queue_delay_s < 0:
+            raise ValueError("queue_delay_s must be non-negative")
         self._max_requests = max_requests
         self._max_bytes = max_bytes
         self._estimated_bytes_per_key = estimated_bytes_per_key
+        self._hold_s = hold_s
+        self._queue_delay_s = queue_delay_s
+        self._clock = clock
         self._queued: deque[StagePlan] = deque()
         self._queued_ids: set[str] = set()
         self._inflight: dict[str, StagePlan] = {}
@@ -324,6 +350,7 @@ class FifoStagePolicy:
             req_id=req_id,
             keys=tuple(keys),
             estimated_bytes=len(keys) * self._estimated_bytes_per_key,
+            queued_at=self._clock(),
         )
         self._queued.append(plan)
         self._queued_ids.add(req_id)
@@ -354,11 +381,22 @@ class FifoStagePolicy:
         NEXT plan in the queue (queued at the request's completion in
         turn_end mode) — a full cancel would silently kill it.
         """
-        now = time.monotonic()
+        now = self._clock()
+        # 보유 시간이 지난 자리는 소비를 기다리지 않고 돌려준다. 그러면 승인이
+        # 도착률이 아니라 장치 속도로 돌아 서 있던 줄이 빠진다.
+        held_out: set[str] = set()
+        if self._hold_s > 0:
+            held_out = {
+                req_id
+                for req_id, at in self._admitted_at.items()
+                if now - at >= self._hold_s
+            }
+            held_out -= consumed | canceled | set(released)
         reasons = (
             ("consumed", consumed),
             ("canceled", canceled),
             ("released", set(released)),
+            ("hold", held_out),
         )
         for reason, ids in reasons:
             for req_id in ids:
@@ -380,6 +418,11 @@ class FifoStagePolicy:
         inflight_bytes = sum(plan.estimated_bytes for plan in self._inflight.values())
         while self._queued and len(self._inflight) < self._max_requests:
             plan = self._queued[0]
+            # 등록 지연이 걸려 있으면 그만큼 지나야 통과시킨다. 모든 plan 이 같은
+            # 지연을 쓰고 줄이 등록 순서이므로 머리만 보면 된다.
+            if self._queue_delay_s > 0 and now - plan.queued_at < self._queue_delay_s:
+                self._blocked_steps += 1
+                break
             fits_bytes = (
                 self._max_bytes == 0
                 or inflight_bytes + plan.estimated_bytes <= self._max_bytes
