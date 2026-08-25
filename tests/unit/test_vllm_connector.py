@@ -2363,6 +2363,93 @@ class TestLayerwiseFormatOverlap:
         assert worker._deferred_layerwise_loads == {}
         assert worker._deferred_layerwise_events == {}
 
+    def test_offthread_job_truncated_retrieve_recomputes_while_parked(self):
+        """A short batch_retrieve response (fewer infos than keys, no Nones)
+        must fail the load while parked — never inject an uninitialized
+        staging tail as if it were a successful cache hit."""
+        worker = self._layerwise_worker()
+        obj_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=i
+            )
+            for i in range(15)  # one short of 8 chunks x 2 layers
+        ]
+        worker._handler.batch_retrieve.return_value = infos
+
+        worker._deferred_packed_load_job(
+            self._deferred_meta(),
+            [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
+            torch.device("cpu"),
+        )
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+        assert worker._deferred_layerwise_loads == {}
+        assert worker._deferred_layerwise_events == {}
+
+    def test_sync_path_truncated_retrieve_recomputes(self, caplog):
+        """The synchronous load path rejects a short retrieve response the
+        same way, before any per-layer indexing can misattribute objects."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_use_layerwise": True, "maru_async_load": True},
+        )
+        worker._num_layers = 2
+        worker._handler = MagicMock()
+        obj_bytes = 2 * 4 * 4
+        worker._handler.batch_retrieve.return_value = [
+            SimpleNamespace(
+                view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=0
+            )
+        ]  # one short of 1 chunk x 2 layers
+        meta = deferred_req_meta(
+            token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
+        )
+
+        with caplog.at_level("ERROR"):
+            worker.start_load_kv(
+                self._forward(torch.zeros(2, 1, 4, 1), torch.zeros(2, 1, 4, 1)),
+                MaruConnectorMetadata(requests=[meta]),
+            )
+
+        assert "1 infos for 2 keys" in caplog.text
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {0}
+
+    def test_layerwise_gather_rejects_short_layer_infos(self):
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        info = SimpleNamespace(
+            view=memoryview(bytearray(2 * 4 * 4)), region_id=0, page_index=0
+        )
+
+        with pytest.raises(ValueError):
+            worker._copy_layerwise_layer_to_device([info], 2, torch.zeros(2, 1, 4, 1))
+
+    def test_mismarked_layerwise_request_logs_an_error(self, caplog):
+        """The defensive guard in the off-thread job must be loud: a request
+        reaching it means a wiring bug, and silently recomputing would look
+        like a cache-hit-rate drop with no diagnostic."""
+        worker = self._layerwise_worker()
+        meta = self._deferred_meta()
+        meta.layerwise_load = False
+
+        with caplog.at_level("ERROR"):
+            worker._deferred_packed_load_job(
+                meta,
+                [("l0", torch.zeros(2, 16, 4, 1), 0)],
+                torch.device("cpu"),
+            )
+
+        assert "layerwise" in caplog.text.lower()
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+
     def test_activation_cpu_fallback_preserves_layerwise_objects(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
