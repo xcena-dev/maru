@@ -1438,7 +1438,7 @@ class TestDeferredLoading:
         sched.update_state_after_alloc(self._request(), MagicMock(), 0)
         assert sched._pending_deferred_loads == {}
 
-    def test_second_alloc_activates_packed_layerwise_load_once(self):
+    def test_second_alloc_activates_layerwise_load_once(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         request = self._request()
         sched._last_match_result[request.request_id] = 8
@@ -1644,13 +1644,13 @@ class TestAsyncDeferredPackedLoad:
 
     def test_submit_refused_without_registered_caches(self):
         worker = self._make_worker()
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
 
     def test_submit_refused_on_cpu_caches(self):
         worker = self._make_worker()
         worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1)}
         worker._num_layers = 1
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
 
     def test_layerwise_mode_background_job_stops_after_retrieve(self):
         worker = make_worker(
@@ -1676,7 +1676,7 @@ class TestAsyncDeferredPackedLoad:
         meta = self._deferred_meta()
         meta.layerwise_load = True
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             meta,
             [("l0", torch.zeros(2, 16, 4, 1), 0)],
             torch.device("cpu"),
@@ -1688,7 +1688,7 @@ class TestAsyncDeferredPackedLoad:
         assert retained[3] == infos
         assert worker._deferred_events == {}
 
-    def test_layerwise_activation_cpu_fallback_preserves_packed_layout(self):
+    def test_layerwise_activation_cpu_fallback_preserves_chunkwise_layout(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = make_worker(
@@ -1834,7 +1834,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set()
         torch.cuda.synchronize()
@@ -1859,7 +1859,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler.batch_retrieve.return_value = infos
         meta = self._deferred_meta()
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             meta,
             [("l0", kv, 0)],
             kv.device,
@@ -1881,7 +1881,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.side_effect = RuntimeError("rpc down")
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
@@ -1893,7 +1893,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = [None] * 8
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
@@ -1939,7 +1939,7 @@ class TestPreIssuedLayerwiseHandoff:
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_packed_layerwise_loads",
+            "_schedule_deferred_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -1965,7 +1965,7 @@ class TestPreIssuedLayerwiseHandoff:
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_packed_layerwise_loads",
+            "_schedule_deferred_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -2077,7 +2077,7 @@ class TestPreIssuedLayerwiseHandoff:
             lambda *args, **kwargs: events,
         )
 
-        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+        worker._deferred_load_job(meta, [], torch.device("cpu"))
 
         # Copies finished before the report that frees the blocks.
         for event in events.values():
@@ -2117,7 +2117,7 @@ class TestPreIssuedLayerwiseHandoff:
             worker, "_issue_layerwise_copies_offthread", issue_then_abort
         )
 
-        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+        worker._deferred_load_job(meta, [], torch.device("cpu"))
 
         for event in events.values():
             event.synchronize.assert_called_once_with()
@@ -2169,7 +2169,7 @@ class TestPreIssuedLayerwiseHandoff:
         )
         monkeypatch.setattr(
             worker,
-            "_copy_packed_layer_to_device",
+            "_copy_chunkwise_layer_to_device",
             MagicMock(side_effect=RuntimeError("copy failed")),
         )
         kv = [torch.zeros(2, 2, 4, 1, device="cuda") for _ in self.LAYERS]
@@ -2319,7 +2319,7 @@ class TestLayerwiseFormatOverlap:
         worker._handler.batch_retrieve.return_value = infos
         meta = self._deferred_meta()
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             meta,
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
@@ -2350,7 +2350,7 @@ class TestLayerwiseFormatOverlap:
         infos[12] = None  # one (chunk, layer) object of the last layer evicted
         worker._handler.batch_retrieve.return_value = infos
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             self._deferred_meta(),
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
@@ -2378,7 +2378,7 @@ class TestLayerwiseFormatOverlap:
         ]
         worker._handler.batch_retrieve.return_value = infos
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             self._deferred_meta(),
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
@@ -2441,7 +2441,7 @@ class TestLayerwiseFormatOverlap:
         meta.layerwise_load = False
 
         with caplog.at_level("ERROR"):
-            worker._deferred_packed_load_job(
+            worker._deferred_load_job(
                 meta,
                 [("l0", torch.zeros(2, 16, 4, 1), 0)],
                 torch.device("cpu"),
@@ -2570,7 +2570,7 @@ class TestLayerwiseFormatOverlap:
         submitted: list[str] = []
         monkeypatch.setattr(
             worker,
-            "_try_submit_deferred_packed_load",
+            "_try_submit_deferred_load",
             lambda req_meta: submitted.append(req_meta.req_id) or True,
         )
         meta = self._deferred_meta()
@@ -2595,7 +2595,7 @@ class TestLayerwiseFormatOverlap:
         submitted: list[str] = []
         monkeypatch.setattr(
             worker,
-            "_try_submit_deferred_packed_load",
+            "_try_submit_deferred_load",
             lambda req_meta: submitted.append(req_meta.req_id) or True,
         )
         sources = [

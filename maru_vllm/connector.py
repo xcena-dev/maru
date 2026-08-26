@@ -698,8 +698,8 @@ class MaruSchedulerConnector:
         # Deferred-hit requests that are still live in the scheduler. Pending
         # admissions alone are not a concurrency signal: a burst may arrive
         # one request per scheduler step while earlier requests are decoding.
-        # Keep the live set until finish/preemption so packed-layerwise is used
-        # only when the serving workload is actually singleton.
+        # Keep the live set until finish/preemption so the layerwise overlap is
+        # used only when the serving workload is actually singleton.
         self._active_deferred_req_ids: set[str] = set()
         # Requests emitted for deferred packed loading remain here until vLLM's
         # second update_state_after_alloc call says they are ready to resume.
@@ -1135,7 +1135,7 @@ class MaruWorkerConnector:
         # copies queued after the abort was seen.
         self._inflight_deferred_req_ids: set[str] = set()
         self._abandoned_req_ids: set[str] = set()
-        # True-async deferred loads (packed path): a single background thread
+        # True-async deferred loads: a single background thread
         # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
         # so neither the RPC wait nor the copy blocks the engine thread's
         # forward passes (the in-process analog of MP's separate-process
@@ -1403,7 +1403,7 @@ class MaruWorkerConnector:
                     for layer_name, event in pre_issued.items():
                         self._layer_load_events.setdefault(layer_name, []).append(event)
             if issue_here:
-                self._schedule_deferred_packed_layerwise_loads(
+                self._schedule_deferred_layerwise_loads(
                     layers,
                     issue_here,
                     attn_metadata,
@@ -1423,8 +1423,8 @@ class MaruWorkerConnector:
                 self._fail_deferred_load(req_meta)
                 continue
 
-            # Packed deferred loads run off-thread. The default path performs
-            # retrieve + whole-request H2D there; packed layerwise overlap
+            # Deferred loads run off-thread. The default path performs
+            # retrieve + whole-request H2D there; the layerwise overlap
             # performs only retrieve and lets the resumed forward activate
             # per-layer H2D events. Falls through to the synchronous path
             # when the async prerequisites are missing. Layerwise-format
@@ -1434,7 +1434,7 @@ class MaruWorkerConnector:
             if (
                 req_meta.deferred_load
                 and (not self._use_layerwise or req_meta.layerwise_load)
-                and self._try_submit_deferred_packed_load(req_meta)
+                and self._try_submit_deferred_load(req_meta)
             ):
                 continue
 
@@ -1539,8 +1539,8 @@ class MaruWorkerConnector:
                 req_meta.req_id,
             )
 
-    def _try_submit_deferred_packed_load(self, req_meta: MaruReqMeta) -> bool:
-        """Hand a packed deferred load to the background loader thread.
+    def _try_submit_deferred_load(self, req_meta: MaruReqMeta) -> bool:
+        """Hand a deferred load to the background loader thread.
 
         Returns:
             True when the load was submitted. False when the async path
@@ -1573,11 +1573,11 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
         self._deferred_executor.submit(
-            self._deferred_packed_load_job, req_meta, layers, device
+            self._deferred_load_job, req_meta, layers, device
         )
         return True
 
-    def _deferred_packed_load_job(
+    def _deferred_load_job(
         self,
         req_meta: MaruReqMeta,
         layers: list[tuple[str, torch.Tensor, int]],
@@ -1953,7 +1953,7 @@ class MaruWorkerConnector:
                             infos[true_idx], num_chunks, kv_cache_layer
                         )
                     else:
-                        layer_dev = self._copy_packed_layer_to_device(
+                        layer_dev = self._copy_chunkwise_layer_to_device(
                             infos, num_chunks, true_idx, kv_cache_layer, stream
                         )
                     self._inject_kv_into_layer(
@@ -1994,7 +1994,7 @@ class MaruWorkerConnector:
                     pass
             return None
 
-    def _schedule_deferred_packed_layerwise_loads(
+    def _schedule_deferred_layerwise_loads(
         self,
         layers: list[tuple[str, torch.Tensor, int]],
         req_ids: set[str],
@@ -2103,7 +2103,7 @@ class MaruWorkerConnector:
                                 infos[true_idx], num_chunks, kv_cache_layer
                             )
                         else:
-                            layer_dev = self._copy_packed_layer_to_device(
+                            layer_dev = self._copy_chunkwise_layer_to_device(
                                 infos,
                                 num_chunks,
                                 true_idx,
@@ -2158,7 +2158,7 @@ class MaruWorkerConnector:
                 f"{(time.monotonic() - _t0) * 1000:.2f} ms"
             )
 
-    def _copy_packed_layer_to_device(
+    def _copy_chunkwise_layer_to_device(
         self,
         infos: list[Any],
         num_chunks: int,
@@ -2166,14 +2166,16 @@ class MaruWorkerConnector:
         kv_cache_layer: torch.Tensor,
         stream: torch.cuda.Stream,
     ) -> torch.Tensor:
-        """DMA one layer from packed chunk pages into one device tensor.
+        """DMA one layer from chunkwise pages into one device tensor.
 
-        One packed page is ``[2, layers, tokens, hidden]``. For a contiguous
-        page run, each layer's K (or V) plane is a fixed-width row separated
-        by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather every chunk
-        directly from registered CXL into ``[chunks, 2, tokens, hidden]``.
-        The caller can then inject all chunks with one kernel. Gapped page
-        allocations become multiple pitched runs but keep the same output.
+        A chunkwise page packs every layer of one chunk into
+        ``[2, layers, tokens, hidden]``, so one layer is strided. For a
+        contiguous page run, each layer's K (or V) plane is a fixed-width row
+        separated by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather
+        every chunk directly from registered CXL into
+        ``[chunks, 2, tokens, hidden]``. The caller can then inject all chunks
+        with one kernel. Gapped page allocations become multiple pitched runs
+        but keep the same output.
         """
         if not infos or num_chunks <= 0:
             raise ValueError("packed layer copy requires at least one chunk")
