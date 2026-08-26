@@ -2197,8 +2197,9 @@ class TestPreIssuedLayerwiseHandoff:
 class TestLayerwiseFormatOverlap:
     """Overlap load-with-compute on the layerwise storage format.
 
-    The overlap machinery originally required the packed layout; these tests
-    pin the extension that lets `maru_use_layerwise=true` deployments keep it.
+    The overlap machinery originally required the chunkwise layout; these
+    tests pin the extension that lets `maru_use_layerwise=true` deployments
+    keep it.
     """
 
     CHUNK = 8

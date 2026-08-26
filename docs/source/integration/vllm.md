@@ -271,8 +271,8 @@ object granularity.
 
 `maru_overlap_load_with_compute` works with either storage layout and
 requires `maru_async_load`; it pipelines a request's per-layer transfers
-against attention compute. Under the packed layout each layer is sliced out
-of the packed chunk slabs; under the layerwise layout each layer's own chunk
+against attention compute. Under the chunkwise layout each layer is sliced
+out of the chunkwise slabs; under the layerwise layout each layer's own chunk
 objects are gathered directly. Every (chunk, layer) key is still resolved
 before the request is released, so the layerwise layout pays its full
 metadata RPC volume up front — only the transfers overlap compute. The
