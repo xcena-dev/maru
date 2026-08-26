@@ -1438,7 +1438,7 @@ class TestDeferredLoading:
         sched.update_state_after_alloc(self._request(), MagicMock(), 0)
         assert sched._pending_deferred_loads == {}
 
-    def test_second_alloc_activates_packed_layerwise_load_once(self):
+    def test_second_alloc_activates_layerwise_load_once(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         request = self._request()
         sched._last_match_result[request.request_id] = 8
@@ -1644,13 +1644,13 @@ class TestAsyncDeferredPackedLoad:
 
     def test_submit_refused_without_registered_caches(self):
         worker = self._make_worker()
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
 
     def test_submit_refused_on_cpu_caches(self):
         worker = self._make_worker()
         worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1)}
         worker._num_layers = 1
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is False
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
 
     def test_layerwise_mode_background_job_stops_after_retrieve(self):
         worker = make_worker(
@@ -1676,7 +1676,7 @@ class TestAsyncDeferredPackedLoad:
         meta = self._deferred_meta()
         meta.layerwise_load = True
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             meta,
             [("l0", torch.zeros(2, 16, 4, 1), 0)],
             torch.device("cpu"),
@@ -1688,7 +1688,7 @@ class TestAsyncDeferredPackedLoad:
         assert retained[3] == infos
         assert worker._deferred_events == {}
 
-    def test_layerwise_activation_cpu_fallback_preserves_packed_layout(self):
+    def test_layerwise_activation_cpu_fallback_preserves_chunkwise_layout(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = make_worker(
@@ -1834,7 +1834,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set()
         torch.cuda.synchronize()
@@ -1859,7 +1859,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler.batch_retrieve.return_value = infos
         meta = self._deferred_meta()
 
-        worker._deferred_packed_load_job(
+        worker._deferred_load_job(
             meta,
             [("l0", kv, 0)],
             kv.device,
@@ -1881,7 +1881,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.side_effect = RuntimeError("rpc down")
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
@@ -1893,7 +1893,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = [None] * 8
 
-        assert worker._try_submit_deferred_packed_load(self._deferred_meta()) is True
+        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
@@ -1939,7 +1939,7 @@ class TestPreIssuedLayerwiseHandoff:
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_packed_layerwise_loads",
+            "_schedule_deferred_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -1965,7 +1965,7 @@ class TestPreIssuedLayerwiseHandoff:
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_packed_layerwise_loads",
+            "_schedule_deferred_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -2077,7 +2077,7 @@ class TestPreIssuedLayerwiseHandoff:
             lambda *args, **kwargs: events,
         )
 
-        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+        worker._deferred_load_job(meta, [], torch.device("cpu"))
 
         # Copies finished before the report that frees the blocks.
         for event in events.values():
@@ -2117,7 +2117,7 @@ class TestPreIssuedLayerwiseHandoff:
             worker, "_issue_layerwise_copies_offthread", issue_then_abort
         )
 
-        worker._deferred_packed_load_job(meta, [], torch.device("cpu"))
+        worker._deferred_load_job(meta, [], torch.device("cpu"))
 
         for event in events.values():
             event.synchronize.assert_called_once_with()
@@ -2169,7 +2169,7 @@ class TestPreIssuedLayerwiseHandoff:
         )
         monkeypatch.setattr(
             worker,
-            "_copy_packed_layer_to_device",
+            "_copy_chunkwise_layer_to_device",
             MagicMock(side_effect=RuntimeError("copy failed")),
         )
         kv = [torch.zeros(2, 2, 4, 1, device="cuda") for _ in self.LAYERS]
@@ -2192,6 +2192,507 @@ class TestPreIssuedLayerwiseHandoff:
         }
         # Only the request that failed is recomputed.
         assert worker.take_failed_load_blocks() == {7, 8}
+
+
+class TestLayerwiseFormatOverlap:
+    """Overlap load-with-compute on the layerwise storage format.
+
+    The overlap machinery originally required the chunkwise layout; these
+    tests pin the extension that lets `maru_use_layerwise=true` deployments
+    keep it.
+    """
+
+    CHUNK = 8
+    CONFIG = {
+        "maru_use_layerwise": True,
+        "maru_async_load": True,
+        "maru_overlap_load_with_compute": True,
+    }
+
+    def test_gates_open_for_layerwise_format(self, caplog):
+        with caplog.at_level("WARNING"):
+            scheduler = make_scheduler(
+                block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(self.CONFIG)
+            )
+            worker = make_worker(
+                block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(self.CONFIG)
+            )
+
+        assert scheduler._layerwise_overlap is True
+        assert worker._layerwise_overlap is True
+        assert "disabling" not in caplog.text
+
+    def test_overlap_still_requires_async_load(self, caplog):
+        config = {"maru_use_layerwise": True, "maru_overlap_load_with_compute": True}
+        with caplog.at_level("WARNING"):
+            scheduler = make_scheduler(
+                block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(config)
+            )
+            worker = make_worker(
+                block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(config)
+            )
+
+        assert scheduler._layerwise_overlap is False
+        assert worker._layerwise_overlap is False
+        assert "disabling" in caplog.text
+
+    def test_layerwise_gather_coalesces_runs_and_keeps_gapped_pages(self):
+        """Consecutive per-(chunk,layer) pages combine into one copy; a
+        gapped page is copied alone; output is chunk-ordered and flat."""
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        kv_cache_layer = torch.zeros(2, 1, 4, 1)  # dtype/device donor
+        obj_elems = 2 * 4 * 1  # K/V x tokens x hidden
+        obj_bytes = obj_elems * 4
+        worker._effective_page_size_bytes = obj_bytes
+        src = torch.arange(3 * obj_elems, dtype=torch.float32)
+        region = bytearray(src[: 2 * obj_elems].numpy().tobytes())
+        infos = [
+            SimpleNamespace(
+                view=memoryview(region)[i * obj_bytes : (i + 1) * obj_bytes],
+                region_id=0,
+                page_index=i,
+            )
+            for i in range(2)
+        ]
+        infos.append(
+            SimpleNamespace(
+                view=memoryview(bytearray(src[2 * obj_elems :].numpy().tobytes())),
+                region_id=1,
+                page_index=7,
+            )
+        )
+
+        out = worker._copy_layerwise_layer_to_device(infos, 3, kv_cache_layer)
+
+        assert out.shape == (3 * obj_elems,)
+        torch.testing.assert_close(out, src)
+
+    def test_scheduler_marks_layerwise_load_on_deferred_meta(self):
+        sched = make_scheduler(
+            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(self.CONFIG)
+        )
+        sched._handler = MagicMock()
+        request = SimpleNamespace(request_id="r1", prompt_token_ids=list(range(64)))
+        sched._last_match_result[request.request_id] = 8
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([3, 4, 5],)
+        sched.update_state_after_alloc(request, blocks, 64)
+
+        meta = sched.build_connector_meta(fake_scheduler_output())
+        assert meta.requests[0].deferred_load
+        assert meta.requests[0].layerwise_load
+
+    def _layerwise_worker(self, num_layers=2):
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(self.CONFIG)
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = num_layers
+        return worker
+
+    def _deferred_meta(self):
+        meta = deferred_req_meta(
+            token_ids=list(range(64)),
+            block_ids=list(range(16)),
+            num_matched_chunks=8,
+        )
+        meta.layerwise_load = True
+        return meta
+
+    def test_offthread_job_retrieves_layer_major_keys(self):
+        """The loader thread resolves every (chunk, layer) key before any
+        release gate can exist, and retains them keyed by true layer index."""
+        from maru_vllm.connector import _chunk_keys
+
+        worker = self._layerwise_worker()
+        obj_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray([i + 1] * obj_bytes)),
+                region_id=0,
+                page_index=i,
+            )
+            for i in range(16)  # 8 chunks x 2 layers
+        ]
+        worker._handler.batch_retrieve.return_value = infos
+        meta = self._deferred_meta()
+
+        worker._deferred_load_job(
+            meta,
+            [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
+            torch.device("cpu"),
+        )
+
+        chunk_keys = _chunk_keys(meta.token_ids, self.CHUNK)
+        expected_keys = [f"{ck}_L0" for ck in chunk_keys] + [
+            f"{ck}_L1" for ck in chunk_keys
+        ]
+        worker._handler.batch_retrieve.assert_called_once_with(expected_keys)
+        # CPU makes the off-thread issue fail, so the job retains the views
+        # for the resumed forward — keyed by true layer index.
+        retained = worker._deferred_layerwise_loads["r1"]
+        assert retained[3] == {0: infos[:8], 1: infos[8:]}
+        assert worker.get_finished_loading() == {"r1"}
+
+    def test_offthread_job_miss_recomputes_while_parked(self):
+        """Any missing (chunk, layer) object fails the whole load before the
+        request is released — vLLM recomputes instead of consuming holes."""
+        worker = self._layerwise_worker()
+        obj_bytes = 2 * self.CHUNK * 4
+        infos: list = [
+            SimpleNamespace(
+                view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=i
+            )
+            for i in range(16)
+        ]
+        infos[12] = None  # one (chunk, layer) object of the last layer evicted
+        worker._handler.batch_retrieve.return_value = infos
+
+        worker._deferred_load_job(
+            self._deferred_meta(),
+            [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
+            torch.device("cpu"),
+        )
+
+        # The failed lookup really covered every (chunk, layer) key.
+        (retrieved_keys,) = worker._handler.batch_retrieve.call_args.args
+        assert len(retrieved_keys) == 16
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+        assert worker._deferred_layerwise_loads == {}
+        assert worker._deferred_layerwise_events == {}
+
+    def test_offthread_job_truncated_retrieve_recomputes_while_parked(self):
+        """A short batch_retrieve response (fewer infos than keys, no Nones)
+        must fail the load while parked — never inject an uninitialized
+        staging tail as if it were a successful cache hit."""
+        worker = self._layerwise_worker()
+        obj_bytes = 2 * self.CHUNK * 4
+        infos = [
+            SimpleNamespace(
+                view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=i
+            )
+            for i in range(15)  # one short of 8 chunks x 2 layers
+        ]
+        worker._handler.batch_retrieve.return_value = infos
+
+        worker._deferred_load_job(
+            self._deferred_meta(),
+            [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
+            torch.device("cpu"),
+        )
+
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+        assert worker._deferred_layerwise_loads == {}
+        assert worker._deferred_layerwise_events == {}
+
+    def test_sync_path_truncated_retrieve_recomputes(self, caplog):
+        """The synchronous load path rejects a short retrieve response the
+        same way, before any per-layer indexing can misattribute objects."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_use_layerwise": True, "maru_async_load": True},
+        )
+        worker._num_layers = 2
+        worker._handler = MagicMock()
+        obj_bytes = 2 * 4 * 4
+        worker._handler.batch_retrieve.return_value = [
+            SimpleNamespace(
+                view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=0
+            )
+        ]  # one short of 1 chunk x 2 layers
+        meta = deferred_req_meta(
+            token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
+        )
+
+        with caplog.at_level("ERROR"):
+            worker.start_load_kv(
+                self._forward(torch.zeros(2, 1, 4, 1), torch.zeros(2, 1, 4, 1)),
+                MaruConnectorMetadata(requests=[meta]),
+            )
+
+        assert "1 infos for 2 keys" in caplog.text
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == {0}
+
+    def test_layerwise_gather_rejects_short_layer_infos(self):
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        info = SimpleNamespace(
+            view=memoryview(bytearray(2 * 4 * 4)), region_id=0, page_index=0
+        )
+
+        with pytest.raises(ValueError):
+            worker._copy_layerwise_layer_to_device([info], 2, torch.zeros(2, 1, 4, 1))
+
+    def test_mismarked_layerwise_request_logs_an_error(self, caplog):
+        """The defensive guard in the off-thread job must be loud: a request
+        reaching it means a wiring bug, and silently recomputing would look
+        like a cache-hit-rate drop with no diagnostic."""
+        worker = self._layerwise_worker()
+        meta = self._deferred_meta()
+        meta.layerwise_load = False
+
+        with caplog.at_level("ERROR"):
+            worker._deferred_load_job(
+                meta,
+                [("l0", torch.zeros(2, 16, 4, 1), 0)],
+                torch.device("cpu"),
+            )
+
+        assert "layerwise" in caplog.text.lower()
+        assert worker.get_finished_loading() == {"r1"}
+        assert worker.take_failed_load_blocks() == set(range(16))
+
+    def test_activation_cpu_fallback_preserves_layerwise_objects(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        sources = [
+            torch.arange(2 * 4, dtype=torch.float32).view(2, 4, 1) + 100 * li
+            for li in range(2)
+        ]
+        payload = {
+            li: [
+                SimpleNamespace(
+                    view=memoryview(bytearray(src.numpy().tobytes())),
+                    region_id=li,
+                    page_index=0,
+                )
+            ]
+            for li, src in enumerate(sources)
+        }
+        meta = self._deferred_meta()
+        meta.num_matched_chunks = 1
+        meta.block_ids = [0]
+        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), payload)
+        kv0 = torch.zeros(2, 1, 4, 1)
+        kv1 = torch.zeros_like(kv0)
+        forward = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv0),
+                "model.layers.1.self_attn": SimpleNamespace(kv_cache=kv1),
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+
+        torch.testing.assert_close(kv0, sources[0].view_as(kv0))
+        torch.testing.assert_close(kv1, sources[1].view_as(kv1))
+        assert worker._deferred_layerwise_loads == {}
+        assert worker._layer_load_events == {}
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_activation_records_one_event_per_layer_for_layerwise_objects(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        # Per layer: 2 chunks, each object [2(KV), 4 tokens, 1 hidden], laid
+        # out consecutively in one region so _chunk_runs coalesces them.
+        sources = [
+            torch.arange(2 * 2 * 4, dtype=torch.float32).view(2, 2, 4, 1) + 100 * li
+            for li in range(2)
+        ]
+        obj_bytes = sources[0][0].numel() * sources[0].element_size()
+        worker._effective_page_size_bytes = obj_bytes
+        payload = {}
+        for li, src in enumerate(sources):
+            region = bytearray(src.numpy().tobytes())
+            payload[li] = [
+                SimpleNamespace(
+                    view=memoryview(region)[ci * obj_bytes : (ci + 1) * obj_bytes],
+                    region_id=li,
+                    page_index=ci,
+                )
+                for ci in range(2)
+            ]
+        meta = self._deferred_meta()
+        meta.num_matched_chunks = 2
+        meta.block_ids = [0, 1]
+        worker._deferred_layerwise_loads["r1"] = (meta, 2, torch.arange(8), payload)
+        kv0 = torch.zeros(2, 2, 4, 1, device="cuda")
+        kv1 = torch.zeros_like(kv0)
+        forward = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv0),
+                "model.layers.1.self_attn": SimpleNamespace(kv_cache=kv1),
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+
+        assert set(worker._layer_load_events) == {
+            "model.layers.0.self_attn",
+            "model.layers.1.self_attn",
+        }
+        worker.wait_for_layer_load("model.layers.0.self_attn")
+        worker.wait_for_layer_load("model.layers.1.self_attn")
+        torch.cuda.synchronize()
+        torch.testing.assert_close(kv0.cpu(), sources[0].permute(1, 0, 2, 3))
+        torch.testing.assert_close(kv1.cpu(), sources[1].permute(1, 0, 2, 3))
+
+    def _forward(self, kv0, kv1):
+        return SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv0),
+                "model.layers.1.self_attn": SimpleNamespace(kv_cache=kv1),
+            },
+            attn_metadata=make_flash_attn_metadata(),
+        )
+
+    def test_start_load_kv_submits_layerwise_overlap_offthread(self, monkeypatch):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._layerwise_worker()
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            worker,
+            "_try_submit_deferred_load",
+            lambda req_meta: submitted.append(req_meta.req_id) or True,
+        )
+        meta = self._deferred_meta()
+
+        worker.start_load_kv(
+            self._forward(torch.zeros(2, 16, 4, 1), torch.zeros(2, 16, 4, 1)),
+            MaruConnectorMetadata(requests=[meta]),
+        )
+
+        assert submitted == ["r1"]
+        worker._handler.batch_retrieve.assert_not_called()
+
+    def test_overlap_off_layerwise_keeps_the_sync_path(self, monkeypatch):
+        from maru_vllm.connector import MaruConnectorMetadata, _chunk_keys
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={"maru_use_layerwise": True, "maru_async_load": True},
+        )
+        worker._num_layers = 2
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            worker,
+            "_try_submit_deferred_load",
+            lambda req_meta: submitted.append(req_meta.req_id) or True,
+        )
+        sources = [
+            torch.arange(2 * 4, dtype=torch.float32).view(2, 4, 1) + 100 * li
+            for li in range(2)
+        ]
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = [
+            SimpleNamespace(
+                view=memoryview(bytearray(src.numpy().tobytes())),
+                region_id=li,
+                page_index=0,
+            )
+            for li, src in enumerate(sources)
+        ]
+        meta = deferred_req_meta(
+            token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
+        )
+        assert meta.layerwise_load is False  # overlap off: scheduler never marks
+        kv0 = torch.zeros(2, 1, 4, 1)
+        kv1 = torch.zeros_like(kv0)
+
+        worker.start_load_kv(
+            self._forward(kv0, kv1), MaruConnectorMetadata(requests=[meta])
+        )
+
+        assert submitted == []
+        (retrieved_keys,) = worker._handler.batch_retrieve.call_args.args
+        base = _chunk_keys(meta.token_ids, 4)[0]
+        assert retrieved_keys == [f"{base}_L0", f"{base}_L1"]
+        assert worker.get_finished_loading() == {"r1"}
+        torch.testing.assert_close(kv0, sources[0].view_as(kv0))
+        torch.testing.assert_close(kv1, sources[1].view_as(kv1))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_offthread_overlap_end_to_end_on_cuda(self):
+        """Loader thread queues per-layer copies from layerwise objects, the
+        gate unparks the request, and the resumed forward waits per layer."""
+        import time as _time
+
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+        )
+        kv0 = torch.zeros(2, 2, 4, 1, device="cuda")
+        kv1 = torch.zeros_like(kv0)
+        worker._kv_caches = {
+            "model.layers.0.self_attn": kv0,
+            "model.layers.1.self_attn": kv1,
+        }
+        worker._num_layers = 2
+        sources = [
+            torch.arange(2 * 2 * 4, dtype=torch.float32).view(2, 2, 4, 1) + 100 * li
+            for li in range(2)
+        ]
+        obj_bytes = sources[0][0].numel() * sources[0].element_size()
+        infos = []
+        for src in sources:  # layer-major, matching the job's key order
+            region = bytearray(src.numpy().tobytes())
+            infos.extend(
+                SimpleNamespace(
+                    view=memoryview(region)[ci * obj_bytes : (ci + 1) * obj_bytes],
+                    region_id=0,
+                    page_index=ci,
+                )
+                for ci in range(2)
+            )
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = infos
+        meta = deferred_req_meta(
+            token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=2
+        )
+        meta.layerwise_load = True
+
+        worker.start_load_kv(
+            self._forward(kv0, kv1), MaruConnectorMetadata(requests=[meta])
+        )
+
+        deadline = _time.monotonic() + 5.0
+        finished: set = set()
+        while _time.monotonic() < deadline and not finished:
+            finished = worker.get_finished_loading() or set()
+            _time.sleep(0.01)
+        assert finished == {"r1"}
+        # The copies were queued off-thread; the resumed forward only
+        # installs their events and waits per layer.
+        worker.start_load_kv(
+            self._forward(kv0, kv1),
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+        assert set(worker._layer_load_events) == set(worker._kv_caches)
+        for name in worker._kv_caches:
+            worker.wait_for_layer_load(name)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(kv0.cpu(), sources[0].permute(1, 0, 2, 3))
+        torch.testing.assert_close(kv1.cpu(), sources[1].permute(1, 0, 2, 3))
 
 
 class _FakeAdmissionEvent:

@@ -214,6 +214,37 @@ def _align_down(num_tokens: int, block_size: int) -> int:
     return (num_tokens // block_size) * block_size
 
 
+def _chunk_layer_key(base_key: str, layer_idx: int) -> str:
+    """Key of one (chunk, layer) object under the layerwise storage format.
+
+    The single owner of the ``_L<idx>`` suffix — the store, the sync load,
+    and the off-thread load must all agree on it, or a mismatch presents as
+    a 100%-miss cache (recompute) rather than an error.
+    """
+    return f"{base_key}_L{layer_idx}"
+
+
+def _load_keys(
+    chunk_keys: list[str],
+    num_chunks: int,
+    layers: list[tuple[str, torch.Tensor, int]],
+    use_layerwise: bool,
+) -> list[str]:
+    """Retrieve keys for one request's matched chunks.
+
+    Chunkwise: one key per chunk. Layerwise: one key per (chunk, layer),
+    layer-major in the caller's own layer order — consumers must index the
+    result with that same order (or re-key by true layer index).
+    """
+    if use_layerwise:
+        return [
+            _chunk_layer_key(chunk_keys[ci], layer_idx)
+            for (_, _, layer_idx) in layers
+            for ci in range(num_chunks)
+        ]
+    return [chunk_keys[ci] for ci in range(num_chunks)]
+
+
 def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     """Generate maru keys for each chunk of the token prefix.
 
@@ -311,10 +342,10 @@ class MaruReqMeta:
     # For load: the request is parked in WAITING_FOR_REMOTE_KVS and the worker
     # loads between scheduler steps, reporting completion via get_finished().
     deferred_load: bool = False
-    # Adaptive packed-layerwise mode: the loader thread stops after retrieve
-    # and the resumed forward pipelines this request by layer. Scheduler sets
-    # this only for a singleton deferred-admission batch; at higher admission
-    # concurrency the completed whole-request background DMA remains faster.
+    # Layerwise-overlap mode: the loader thread stops after retrieve and the
+    # resumed forward pipelines this request by layer. Set for every deferred
+    # load when maru_overlap_load_with_compute is on, under either storage
+    # format.
     layerwise_load: bool = False
     # Per-step memo of _chunk_keys(token_ids). The same MaruReqMeta object is
     # shared across a step's per-layer save_kv_layer calls (and the step's
@@ -349,9 +380,9 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # the connector reports its load complete, so the worker must drain the
     # copies it queued for that request before that report goes out.
     finished_req_ids: set[str] = field(default_factory=set)
-    # Deferred packed loads whose metadata RPC completed between steps. The
-    # resumed forward consumes their CXL views layer-by-layer, so layer k+1 H2D
-    # can overlap layer k compute without changing the packed storage format.
+    # Deferred loads whose metadata RPC completed between steps. The resumed
+    # forward consumes their CXL views layer-by-layer, so layer k+1 H2D can
+    # overlap layer k compute regardless of the storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
 
 
@@ -397,14 +428,15 @@ class MaruKVConnector(KVConnectorBase_V1):
             background thread; finished requests retain their GPU blocks until
             get_finished() reports the store complete
             (default: false; was maru_enable_write_behind)
-        maru_overlap_load_with_compute: bool - With maru_async_load and packed
-            storage, queue a parked request's per-layer transfers while it
-            waits and release it once its first layer has landed, so the
-            remaining layers arrive during its own attention. The transfers
-            share one stream, which keeps each at full bandwidth and makes a
-            later request's first layer land only after the earlier one has
-            finished. Applies at any concurrency. Requires
-            maru_async_load=true and maru_use_layerwise=false
+        maru_overlap_load_with_compute: bool - With maru_async_load, queue a
+            parked request's per-layer transfers while it waits and release
+            it once its first layer has landed, so the remaining layers
+            arrive during its own attention. Works under either storage
+            format: chunkwise slabs are sliced per layer, layerwise objects
+            are gathered per layer. The transfers share one stream, which keeps
+            each at full bandwidth and makes a later request's first layer
+            land only after the earlier one has finished. Applies at any
+            concurrency. Requires maru_async_load=true
             (default: false; was maru_enable_layerwise_overlap)
 
     Storage format — how a request's KV is grouped into CXL objects:
@@ -414,13 +446,13 @@ class MaruKVConnector(KVConnectorBase_V1):
             completion marker). True is layerwise: one object per
             (chunk, layer), keyed <chunk>_L<idx>, with a separate _DONE
             marker. Chunkwise resolves one key per chunk instead of
-            chunks x layers — 59 vs 1,888 keys for a 64k prompt on 32 layers
-            — which is why it is the default; the same ratio applies to
-            retrieve metadata RPC volume. Chunkwise transfers use LMCache's
-            multi_layer_kv_transfer kernel directly on the pinned CXL slab
-            (no staging) when available — load scatters a whole slab into the
-            paged cache per chunk, store gathers one D2H per chunk — falling
-            back to per-layer copies otherwise. See design note P6.
+            chunks x layers, so layerwise multiplies both the key count and
+            the retrieve metadata RPC volume by the model's layer count —
+            which is why chunkwise is the default. Chunkwise transfers use
+            LMCache's multi_layer_kv_transfer kernel directly on the pinned
+            CXL slab (no staging) when available — load scatters a whole slab
+            into the paged cache per chunk, store gathers one D2H per chunk —
+            falling back to per-layer copies otherwise. See design note P6.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_load_admission_window: int - With maru_async_load, cap how many
@@ -654,15 +686,10 @@ class MaruSchedulerConnector:
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        self._layerwise_overlap = bool(
-            overlap_requested and self._deferred_loading and not self._use_layerwise
-        )
-        if overlap_requested and not (
-            self._deferred_loading and not self._use_layerwise
-        ):
+        self._layerwise_overlap = bool(overlap_requested and self._deferred_loading)
+        if overlap_requested and not self._deferred_loading:
             logger.warning(
-                "Maru packed-layerwise overlap requires maru_async_load=true and "
-                "maru_use_layerwise=false; disabling it"
+                "Maru layerwise overlap requires maru_async_load=true; disabling it"
             )
         # Deferred loads registered by update_state_after_alloc, emitted once
         # by the next build_connector_meta. req_id -> (request,
@@ -671,8 +698,8 @@ class MaruSchedulerConnector:
         # Deferred-hit requests that are still live in the scheduler. Pending
         # admissions alone are not a concurrency signal: a burst may arrive
         # one request per scheduler step while earlier requests are decoding.
-        # Keep the live set until finish/preemption so packed-layerwise is used
-        # only when the serving workload is actually singleton.
+        # Keep the live set until finish/preemption so the layerwise overlap is
+        # used only when the serving workload is actually singleton.
         self._active_deferred_req_ids: set[str] = set()
         # Requests emitted for deferred packed loading remain here until vLLM's
         # second update_state_after_alloc call says they are ready to resume.
@@ -1108,7 +1135,7 @@ class MaruWorkerConnector:
         # copies queued after the abort was seen.
         self._inflight_deferred_req_ids: set[str] = set()
         self._abandoned_req_ids: set[str] = set()
-        # True-async deferred loads (packed path): a single background thread
+        # True-async deferred loads: a single background thread
         # runs the whole load — Maru retrieve RPC + H2D on _deferred_stream —
         # so neither the RPC wait nor the copy blocks the engine thread's
         # forward passes (the in-process analog of MP's separate-process
@@ -1126,11 +1153,14 @@ class MaruWorkerConnector:
         self._load_admission_window = int(
             extra_config.get("maru_load_admission_window", 0)
         )
-        # Packed layerwise overlap keeps the packed Maru object format. The
-        # loader thread resolves only the RPC/mmap metadata; the resumed
-        # forward consumes these entries layer-by-layer on _load_stream.
+        # Overlap loads whose off-thread copy issue failed: the loader thread
+        # resolved the RPC/mmap metadata and the resumed forward consumes
+        # these entries layer-by-layer on _load_stream. The retained views are
+        # a flat per-chunk list of chunkwise slabs, or (under
+        # maru_use_layerwise) a dict keyed by true layer index.
         self._deferred_layerwise_loads: dict[
-            str, tuple[MaruReqMeta, int, torch.Tensor, list[Any]]
+            str,
+            tuple[MaruReqMeta, int, torch.Tensor, list[Any] | dict[int, list[Any]]],
         ] = {}
         # Per-layer copies queued by the loader thread while the request was
         # parked; the resumed forward waits on these instead of issuing
@@ -1150,19 +1180,16 @@ class MaruWorkerConnector:
         # into one CXL object with one key — matching LMCache use_layerwise=
         # False — so a request resolves num_chunks keys instead of
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
-        # objects and the layer-wise async overlap path.
+        # objects. The overlap path below works under either format.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
         async_load = bool(_get_knob(extra_config, "maru_async_load"))
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
         )
-        self._layerwise_overlap = bool(
-            overlap_requested and async_load and not self._use_layerwise
-        )
-        if overlap_requested and not (async_load and not self._use_layerwise):
+        self._layerwise_overlap = bool(overlap_requested and async_load)
+        if overlap_requested and not async_load:
             logger.warning(
-                "Maru packed-layerwise overlap requires maru_async_load=true and "
-                "maru_use_layerwise=false; disabling it"
+                "Maru layerwise overlap requires maru_async_load=true; disabling it"
             )
         # Packed store accumulates a chunk's per-layer slices across the
         # per-layer save_kv_layer calls of one step: base_key -> (handle,
@@ -1317,9 +1344,8 @@ class MaruWorkerConnector:
         P1 (batch retrieve): all ``(layer x chunk)`` keys of a request are
         fetched with a single batched ``batch_retrieve`` (payload-bounded RPC
         chunks) instead of one RPC per ``(layer, chunk)``. This collapses
-        ``num_layers x num_chunks`` single retrieves (e.g. ~8,000 for a 64k
-        prompt on a 32-layer model) into a few batched calls; that per-op RPC
-        round-trip dominated cache-hit TTFT/TPOT.
+        ``num_layers x num_chunks`` single retrieves into a few batched
+        calls; that per-op RPC round-trip dominated cache-hit TTFT/TPOT.
         """
         # Step boundary: per-step store state must not leak into this step,
         # even when this method bails out early below. A carried-over
@@ -1377,7 +1403,7 @@ class MaruWorkerConnector:
                     for layer_name, event in pre_issued.items():
                         self._layer_load_events.setdefault(layer_name, []).append(event)
             if issue_here:
-                self._schedule_deferred_packed_layerwise_loads(
+                self._schedule_deferred_layerwise_loads(
                     layers,
                     issue_here,
                     attn_metadata,
@@ -1397,15 +1423,18 @@ class MaruWorkerConnector:
                 self._fail_deferred_load(req_meta)
                 continue
 
-            # Packed deferred loads run off-thread. The default path performs
-            # retrieve + whole-request H2D there; packed layerwise overlap
+            # Deferred loads run off-thread. The default path performs
+            # retrieve + whole-request H2D there; the layerwise overlap
             # performs only retrieve and lets the resumed forward activate
-            # per-layer H2D events. Falls through to the synchronous packed
-            # path when the async prerequisites are missing.
+            # per-layer H2D events. Falls through to the synchronous path
+            # when the async prerequisites are missing. Layerwise-format
+            # requests go off-thread only when the scheduler marked them for
+            # overlap — the job's whole-request branch only understands
+            # chunkwise slabs.
             if (
                 req_meta.deferred_load
-                and not self._use_layerwise
-                and self._try_submit_deferred_packed_load(req_meta)
+                and (not self._use_layerwise or req_meta.layerwise_load)
+                and self._try_submit_deferred_load(req_meta)
             ):
                 continue
 
@@ -1419,14 +1448,7 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
-            if self._use_layerwise:
-                keys = [
-                    f"{chunk_keys[ci]}_L{layer_idx}"
-                    for (_, _, layer_idx) in layers
-                    for ci in range(num_chunks)
-                ]
-            else:
-                keys = [chunk_keys[ci] for ci in range(num_chunks)]
+            keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
                 infos = self._batch_retrieve_all(keys)
@@ -1438,6 +1460,19 @@ class MaruWorkerConnector:
             except Exception as e:
                 logger.error(
                     "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
+                )
+                self._fail_deferred_load(req_meta)
+                continue
+
+            if len(infos) != len(keys):
+                # A truncated response would otherwise shift every later
+                # layer's objects by one position — silent wrong KV.
+                logger.error(
+                    "Maru retrieve returned %d infos for %d keys — "
+                    "recompute for req %s",
+                    len(infos),
+                    len(keys),
+                    req_meta.req_id,
                 )
                 self._fail_deferred_load(req_meta)
                 continue
@@ -1504,8 +1539,8 @@ class MaruWorkerConnector:
                 req_meta.req_id,
             )
 
-    def _try_submit_deferred_packed_load(self, req_meta: MaruReqMeta) -> bool:
-        """Hand a packed deferred load to the background loader thread.
+    def _try_submit_deferred_load(self, req_meta: MaruReqMeta) -> bool:
+        """Hand a deferred load to the background loader thread.
 
         Returns:
             True when the load was submitted. False when the async path
@@ -1538,25 +1573,26 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
         self._deferred_executor.submit(
-            self._deferred_packed_load_job, req_meta, layers, device
+            self._deferred_load_job, req_meta, layers, device
         )
         return True
 
-    def _deferred_packed_load_job(
+    def _deferred_load_job(
         self,
         req_meta: MaruReqMeta,
         layers: list[tuple[str, torch.Tensor, int]],
         device: torch.device,
     ) -> None:
-        """Prepare one parked request's packed KV off-thread.
+        """Prepare one parked request's KV off-thread.
 
         Runs on the deferred-load thread. The Maru RPC client serializes
         socket use internally, so retrieving here while the engine thread
         stores is safe. The default mode also performs H2D and records a CUDA
-        event. Packed-layerwise mode stops after retrieve and retains the CXL
-        views for the resumed forward. Any failure reports the request's
-        blocks through ``take_failed_load_blocks`` so vLLM recomputes instead
-        of consuming unloaded KV.
+        event. Layerwise-overlap mode stops after retrieve and retains the CXL
+        views (chunkwise slabs, or per-(chunk,layer) objects under
+        ``maru_use_layerwise``) for the resumed forward. Any failure reports
+        the request's blocks through ``take_failed_load_blocks`` so vLLM
+        recomputes instead of consuming unloaded KV.
         """
         try:
             handler = self._handler
@@ -1565,9 +1601,26 @@ class MaruWorkerConnector:
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
                 return
+            if self._use_layerwise and not req_meta.layerwise_load:
+                # The whole-request branch below only understands chunkwise
+                # slabs; the submit gate never sends this combination, so a
+                # request reaching it means a wiring bug — recompute instead,
+                # and say so: silently failing here would present as a
+                # cache-hit-rate drop with no diagnostic.
+                logger.error(
+                    "Maru wiring bug: layerwise-format deferred load for req %s "
+                    "reached the off-thread job without layerwise_load; "
+                    "recomputing",
+                    req_meta.req_id,
+                )
+                self._fail_deferred_load(req_meta)
+                return
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
-            keys = [chunk_keys[ci] for ci in range(num_chunks)]
+            # Layerwise keys come back layer-major in this job's own layer
+            # order — consumers index the retained dict by true layer index,
+            # never by list position.
+            keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
 
             _t0 = time.monotonic()
             infos = self._batch_retrieve_all(keys)
@@ -1576,6 +1629,18 @@ class MaruWorkerConnector:
                     f"deferred retrieve batch {len(keys)} keys = "
                     f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
                 )
+            if len(infos) != len(keys):
+                # A truncated response would otherwise pass the None scan and
+                # leave staging-buffer tails uninitialized — silent corruption.
+                logger.error(
+                    "Maru deferred retrieve returned %d infos for %d keys — "
+                    "recompute for req %s",
+                    len(infos),
+                    len(keys),
+                    req_meta.req_id,
+                )
+                self._fail_deferred_load(req_meta)
+                return
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
             if miss >= 0:
                 logger.warning(
@@ -1589,11 +1654,20 @@ class MaruWorkerConnector:
             if req_meta.layerwise_load:
                 # The RPC/mmap part is complete. Either queue the per-layer
                 # copies here, while the request is still parked, or retain
-                # the packed CXL views so the resumed forward issues them.
-                # Either way the packed keys/pages are preserved and the bulk
-                # load overlaps the request's own compute.
+                # the CXL views so the resumed forward issues them. Either
+                # way the keys/pages are preserved and the bulk load overlaps
+                # the request's own compute.
+                payload: Any = infos
+                if self._use_layerwise:
+                    # Key by true layer index: the resumed forward walks its
+                    # own no_compile_layers order, which need not match this
+                    # job's layer list.
+                    payload = {
+                        true_idx: infos[li * num_chunks : (li + 1) * num_chunks]
+                        for li, (_, _, true_idx) in enumerate(layers)
+                    }
                 events = self._issue_layerwise_copies_offthread(
-                    req_meta, num_chunks, slot_mapping, infos, layers, device
+                    req_meta, num_chunks, slot_mapping, payload, layers, device
                 )
                 gate = (
                     self._unpark_gate_event(events, layers)
@@ -1620,7 +1694,7 @@ class MaruWorkerConnector:
                                 req_meta,
                                 num_chunks,
                                 slot_mapping,
-                                infos,
+                                payload,
                             )
                         if events is None or gate is None:
                             self._deferred_done.add(req_meta.req_id)
@@ -1638,7 +1712,7 @@ class MaruWorkerConnector:
                         self._deferred_done.add(req_meta.req_id)
                     return
                 logger.info(
-                    "Maru: deferred retrieve ready for packed-layerwise load "
+                    "Maru: deferred retrieve ready for layerwise-overlap load "
                     "%d chunks (%d tokens) for req %s (%s)",
                     num_chunks,
                     total_tokens,
@@ -1834,7 +1908,7 @@ class MaruWorkerConnector:
         req_meta: MaruReqMeta,
         num_chunks: int,
         slot_mapping: torch.Tensor,
-        infos: list[Any],
+        infos: list[Any] | dict[int, list[Any]],
         layers: list[tuple[str, torch.Tensor, int]],
         device: torch.device,
     ) -> dict[str, torch.cuda.Event] | None:
@@ -1851,7 +1925,9 @@ class MaruWorkerConnector:
             req_meta: Metadata of the parked request.
             num_chunks: Chunks matched for this request.
             slot_mapping: Host slot mapping covering those chunks.
-            infos: Retrieved CXL views, one per chunk.
+            infos: Retrieved CXL views — a flat per-chunk list of chunkwise
+                slabs, or (under ``maru_use_layerwise``) a dict keyed by true
+                layer index holding that layer's per-chunk objects.
             layers: (layer_name, paged kv tensor, layer index) for every layer.
             device: CUDA device holding the paged KV.
 
@@ -1872,9 +1948,14 @@ class MaruWorkerConnector:
             with torch.cuda.stream(stream):
                 slot_gpu = pinned.to(device, non_blocking=True)
                 for layer_name, kv_cache_layer, true_idx in layers:
-                    layer_dev = self._copy_packed_layer_to_device(
-                        infos, num_chunks, true_idx, kv_cache_layer, stream
-                    )
+                    if self._use_layerwise:
+                        layer_dev = self._copy_layerwise_layer_to_device(
+                            infos[true_idx], num_chunks, kv_cache_layer
+                        )
+                    else:
+                        layer_dev = self._copy_chunkwise_layer_to_device(
+                            infos, num_chunks, true_idx, kv_cache_layer, stream
+                        )
                     self._inject_kv_into_layer(
                         kv_cache_layer,
                         layer_dev,
@@ -1913,22 +1994,26 @@ class MaruWorkerConnector:
                     pass
             return None
 
-    def _schedule_deferred_packed_layerwise_loads(
+    def _schedule_deferred_layerwise_loads(
         self,
         layers: list[tuple[str, torch.Tensor, int]],
         req_ids: set[str],
         attn_metadata: AttentionMetadata | None,
     ) -> None:
-        """Activate retrieved packed slabs as a layer-major H2D pipeline.
+        """Activate retained CXL views as a layer-major H2D pipeline.
 
         The background loader already completed Maru RPC/mmap lookup. This
         method runs at the beginning of the resumed forward: for layer k it
-        copies only that layer's K/V slices from every packed CXL slab, injects
-        them into paged KV on ``_load_stream``, and records an event. Attention
-        layer k waits for only that event, leaving layer k+1 transfer queued in
-        parallel with layer k compute. No device-wide synchronize is used.
+        copies only that layer's KV — sliced from every chunkwise CXL slab, or
+        (under ``maru_use_layerwise``) gathered from that layer's own chunk
+        objects — into paged KV on ``_load_stream``, and records an event.
+        Attention layer k waits for only that event, leaving layer k+1
+        transfer queued in parallel with layer k compute. No device-wide
+        synchronize is used.
         """
-        entries: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]] = []
+        entries: list[
+            tuple[MaruReqMeta, int, torch.Tensor, list[Any] | dict[int, list[Any]]]
+        ] = []
         missing: list[str] = []
         with self._deferred_lock:
             for req_id in req_ids:
@@ -1939,7 +2024,7 @@ class MaruWorkerConnector:
                     entries.append(entry)
         if missing:
             logger.warning(
-                "Maru packed-layerwise activation missing retained load(s): %s",
+                "Maru layerwise-overlap activation missing retained load(s): %s",
                 ", ".join(sorted(missing)),
             )
         if not entries:
@@ -1948,22 +2033,31 @@ class MaruWorkerConnector:
         devices = {layer.device for _, layer, _ in layers}
         device = next(iter(devices)) if len(devices) == 1 else None
         if device is None or device.type != "cuda" or not torch.cuda.is_available():
-            # Correctness fallback for CPU/mixed layouts. It preserves packed
-            # storage but cannot overlap because there is no common CUDA stream.
+            # Correctness fallback for CPU/mixed layouts. It preserves the
+            # storage format but cannot overlap because there is no common
+            # CUDA stream.
             for req_meta, num_chunks, slot_mapping, infos in entries:
                 try:
                     for layer_name, kv_cache_layer, true_idx in layers:
                         for ci in range(num_chunks):
-                            slab_host = torch.frombuffer(
-                                infos[ci].view, dtype=kv_cache_layer.dtype
-                            ).view(2, self._num_layers, self._kv_chunk_tokens, -1)
+                            if self._use_layerwise:
+                                layer_host = torch.frombuffer(
+                                    infos[true_idx][ci].view,
+                                    dtype=kv_cache_layer.dtype,
+                                )
+                            else:
+                                layer_host = torch.frombuffer(
+                                    infos[ci].view, dtype=kv_cache_layer.dtype
+                                ).view(2, self._num_layers, self._kv_chunk_tokens, -1)[
+                                    :, true_idx
+                                ]
                             chunk_start = ci * self._kv_chunk_tokens
                             chunk_slots = slot_mapping[
                                 chunk_start : chunk_start + self._kv_chunk_tokens
                             ]
                             self._inject_kv_into_layer(
                                 kv_cache_layer,
-                                slab_host[:, true_idx].to(kv_cache_layer.device),
+                                layer_host.to(kv_cache_layer.device),
                                 chunk_slots.to(kv_cache_layer.device),
                                 attn_metadata,
                                 layer_name,
@@ -2004,13 +2098,18 @@ class MaruWorkerConnector:
                     for (_, num_chunks, _, infos), slot_gpu in zip(
                         entries, slot_mappings_gpu, strict=True
                     ):
-                        layer_dev = self._copy_packed_layer_to_device(
-                            infos,
-                            num_chunks,
-                            true_idx,
-                            kv_cache_layer,
-                            load_stream,
-                        )
+                        if self._use_layerwise:
+                            layer_dev = self._copy_layerwise_layer_to_device(
+                                infos[true_idx], num_chunks, kv_cache_layer
+                            )
+                        else:
+                            layer_dev = self._copy_chunkwise_layer_to_device(
+                                infos,
+                                num_chunks,
+                                true_idx,
+                                kv_cache_layer,
+                                load_stream,
+                            )
                         self._inject_kv_into_layer(
                             kv_cache_layer,
                             layer_dev,
@@ -2023,7 +2122,7 @@ class MaruWorkerConnector:
                     event.record(load_stream)
                     issued[layer_name] = event
         except Exception as e:
-            logger.error("Maru packed-layerwise activation failed: %s", e)
+            logger.error("Maru layerwise-overlap activation failed: %s", e)
             try:
                 load_stream.synchronize()
             except Exception:
@@ -2049,17 +2148,17 @@ class MaruWorkerConnector:
         refs.extend(slot_mappings_gpu)
         self._active_load_refs.append((batch_event, refs))
         logger.info(
-            "Maru: packed-layerwise scheduled %d layers x %d requests on load stream",
+            "Maru: layerwise-overlap scheduled %d layers x %d requests on load stream",
             len(layers),
             len(entries),
         )
         if self._timing:
             _emit_timing(
-                f"packed-layerwise schedule {len(layers)}L x {len(entries)}r = "
+                f"layerwise-overlap schedule {len(layers)}L x {len(entries)}r = "
                 f"{(time.monotonic() - _t0) * 1000:.2f} ms"
             )
 
-    def _copy_packed_layer_to_device(
+    def _copy_chunkwise_layer_to_device(
         self,
         infos: list[Any],
         num_chunks: int,
@@ -2067,14 +2166,16 @@ class MaruWorkerConnector:
         kv_cache_layer: torch.Tensor,
         stream: torch.cuda.Stream,
     ) -> torch.Tensor:
-        """DMA one layer from packed chunk pages into one device tensor.
+        """DMA one layer from chunkwise pages into one device tensor.
 
-        One packed page is ``[2, layers, tokens, hidden]``. For a contiguous
-        page run, each layer's K (or V) plane is a fixed-width row separated
-        by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather every chunk
-        directly from registered CXL into ``[chunks, 2, tokens, hidden]``.
-        The caller can then inject all chunks with one kernel. Gapped page
-        allocations become multiple pitched runs but keep the same output.
+        A chunkwise page packs every layer of one chunk into
+        ``[2, layers, tokens, hidden]``, so one layer is strided. For a
+        contiguous page run, each layer's K (or V) plane is a fixed-width row
+        separated by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather
+        every chunk directly from registered CXL into
+        ``[chunks, 2, tokens, hidden]``. The caller can then inject all chunks
+        with one kernel. Gapped page allocations become multiple pitched runs
+        but keep the same output.
         """
         if not infos or num_chunks <= 0:
             raise ValueError("packed layer copy requires at least one chunk")
@@ -2125,6 +2226,44 @@ class MaruWorkerConnector:
                 if error != 0:
                     raise RuntimeError(f"cudaMemcpy2DAsync failed with code {error}")
         return layer_dev
+
+    def _copy_layerwise_layer_to_device(
+        self,
+        layer_infos: list[Any],
+        num_chunks: int,
+        kv_cache_layer: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather one layer's per-(chunk,layer) objects into one flat tensor.
+
+        Layerwise objects are single-layer and contiguous, so no pitched copy
+        is needed: each ``_chunk_runs`` run becomes one contiguous H2D copy.
+        ``copy_`` enqueues on the current stream, so CUDA callers must run
+        inside a ``torch.cuda.stream(...)`` context. The flat
+        ``num_chunks x object`` result is what ``_inject_kv_into_layer``
+        expects with ``num_chunks=num_chunks`` (the same contract as the
+        sync layerwise load path).
+        """
+        if not layer_infos or num_chunks <= 0:
+            raise ValueError("layerwise layer copy requires at least one chunk")
+        if len(layer_infos) < num_chunks:
+            # Writing fewer runs than num_chunks would leave uninitialized
+            # tails in the staging tensor and inject them as KV.
+            raise ValueError(
+                f"layerwise layer copy got {len(layer_infos)} objects "
+                f"for {num_chunks} chunks"
+            )
+        dtype = kv_cache_layer.dtype
+        obj_elems = layer_infos[0].view.nbytes // kv_cache_layer.element_size()
+        out = torch.empty(
+            num_chunks * obj_elems, dtype=dtype, device=kv_cache_layer.device
+        )
+        for chunk_start, run_chunks, run_view in self._chunk_runs(
+            layer_infos[:num_chunks]
+        ):
+            out[chunk_start * obj_elems : (chunk_start + run_chunks) * obj_elems].copy_(
+                torch.frombuffer(run_view, dtype=dtype), non_blocking=True
+            )
+        return out
 
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
@@ -2411,10 +2550,10 @@ class MaruWorkerConnector:
         whole to LMCache's ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
-        ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's 1,888
-        tiny copies and the reverted GPU-staging OOM. Non-Flash layouts, CPU,
-        or a missing ``lmcache.c_ops`` fall back to a per-layer inject that
-        reads the same slab slices.
+        ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
+        per-(layer, chunk) copies and the reverted GPU-staging OOM. Non-Flash
+        layouts, CPU, or a missing ``lmcache.c_ops`` fall back to a per-layer
+        inject that reads the same slab slices.
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
@@ -2427,7 +2566,7 @@ class MaruWorkerConnector:
         # Queue all per-chunk transfers on a dedicated high-priority stream and
         # sync once at the end — mirrors LMCache batched_to_gpu (per-chunk
         # multi_layer_kv_transfer on its load_stream, one synchronize). Keeps
-        # the 59 launches pipelined instead of serializing on the compute
+        # the per-chunk launches pipelined instead of serializing on the compute
         # stream. Falls back to the current stream on CPU/non-CUDA.
         dev = layers[0][1].device
         use_stream = kernel is not None or (
@@ -2762,7 +2901,7 @@ class MaruWorkerConnector:
             pending_handles: list = []
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
-                maru_key = f"{base_key}_L{layer_idx}"
+                maru_key = _chunk_layer_key(base_key, layer_idx)
                 if maru_key in self._stored_keys:
                     continue
 

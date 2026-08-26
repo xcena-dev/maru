@@ -197,7 +197,7 @@ Asynchronous transfer settings, all opt-in:
 |-----------|------|---------|-------------|
 | `maru_async_load` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
 | `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
-| `maru_overlap_load_with_compute` | bool | `false` | Overlap a packed load's per-layer transfers with attention compute |
+| `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 
 Storage format — how a request's KV is grouped into CXL objects:
 
@@ -263,16 +263,21 @@ The two layouts differ throughout the store and load paths:
 | Store | one gathered D2H per chunk | one write per layer |
 | Load | whole slab per chunk, contiguous pages coalesced | one retrieve per (layer, chunk) |
 
-The key count is the practical difference: a 64k prompt on a 32-layer model
-resolves 59 keys chunkwise versus 1,888 layerwise, and that ratio carries
-straight into retrieve metadata RPC volume. Chunkwise is the default for that
-reason; layerwise remains available for deployments that need per-layer
-object granularity.
+The key count is the practical difference: layerwise resolves one key per
+(chunk, layer) instead of one per chunk, so both the key count and the
+retrieve metadata RPC volume grow by the model's layer count. Chunkwise is
+the default for that reason; layerwise remains available for deployments that
+need per-layer object granularity.
 
-`maru_overlap_load_with_compute` applies only to the packed layout and
+`maru_overlap_load_with_compute` works with either storage layout and
 requires `maru_async_load`; it pipelines a request's per-layer transfers
-against attention compute. The connector logs a warning and disables it when
-those prerequisites are not met.
+against attention compute. Under the chunkwise layout each layer is sliced
+out of the chunkwise slabs; under the layerwise layout each layer's own chunk
+objects are gathered directly. Every (chunk, layer) key is still resolved
+before the request is released, so the layerwise layout pays its full
+metadata RPC volume up front — only the transfers overlap compute. The
+connector logs a warning and disables the knob when `maru_async_load` is
+off.
 
 ![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
