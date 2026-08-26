@@ -446,13 +446,13 @@ class MaruKVConnector(KVConnectorBase_V1):
             completion marker). True is layerwise: one object per
             (chunk, layer), keyed <chunk>_L<idx>, with a separate _DONE
             marker. Chunkwise resolves one key per chunk instead of
-            chunks x layers — ~250 vs ~8,000 keys for a 64k prompt on 32
-            layers — which is why it is the default; the same ratio applies to
-            retrieve metadata RPC volume. Chunkwise transfers use LMCache's
-            multi_layer_kv_transfer kernel directly on the pinned CXL slab
-            (no staging) when available — load scatters a whole slab into the
-            paged cache per chunk, store gathers one D2H per chunk — falling
-            back to per-layer copies otherwise. See design note P6.
+            chunks x layers, so layerwise multiplies both the key count and
+            the retrieve metadata RPC volume by the model's layer count —
+            which is why chunkwise is the default. Chunkwise transfers use
+            LMCache's multi_layer_kv_transfer kernel directly on the pinned
+            CXL slab (no staging) when available — load scatters a whole slab
+            into the paged cache per chunk, store gathers one D2H per chunk —
+            falling back to per-layer copies otherwise. See design note P6.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_load_admission_window: int - With maru_async_load, cap how many
@@ -1344,9 +1344,8 @@ class MaruWorkerConnector:
         P1 (batch retrieve): all ``(layer x chunk)`` keys of a request are
         fetched with a single batched ``batch_retrieve`` (payload-bounded RPC
         chunks) instead of one RPC per ``(layer, chunk)``. This collapses
-        ``num_layers x num_chunks`` single retrieves (e.g. ~8,000 for a 64k
-        prompt on a 32-layer model) into a few batched calls; that per-op RPC
-        round-trip dominated cache-hit TTFT/TPOT.
+        ``num_layers x num_chunks`` single retrieves into a few batched
+        calls; that per-op RPC round-trip dominated cache-hit TTFT/TPOT.
         """
         # Step boundary: per-step store state must not leak into this step,
         # even when this method bails out early below. A carried-over
@@ -2549,10 +2548,10 @@ class MaruWorkerConnector:
         whole to LMCache's ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
-        ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's ~8,000
-        tiny copies and the reverted GPU-staging OOM. Non-Flash layouts, CPU,
-        or a missing ``lmcache.c_ops`` fall back to a per-layer inject that
-        reads the same slab slices.
+        ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
+        per-(layer, chunk) copies and the reverted GPU-staging OOM. Non-Flash
+        layouts, CPU, or a missing ``lmcache.c_ops`` fall back to a per-layer
+        inject that reads the same slab slices.
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
@@ -2565,7 +2564,7 @@ class MaruWorkerConnector:
         # Queue all per-chunk transfers on a dedicated high-priority stream and
         # sync once at the end — mirrors LMCache batched_to_gpu (per-chunk
         # multi_layer_kv_transfer on its load_stream, one synchronize). Keeps
-        # the ~250 launches pipelined instead of serializing on the compute
+        # the per-chunk launches pipelined instead of serializing on the compute
         # stream. Falls back to the current stream on CPU/non-CUDA.
         dev = layers[0][1].device
         use_stream = kernel is not None or (

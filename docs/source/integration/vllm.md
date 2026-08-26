@@ -263,11 +263,11 @@ The two layouts differ throughout the store and load paths:
 | Store | one gathered D2H per chunk | one write per layer |
 | Load | whole slab per chunk, contiguous pages coalesced | one retrieve per (layer, chunk) |
 
-The key count is the practical difference: a 64k prompt on a 32-layer model
-resolves ~250 keys chunkwise versus ~8,000 layerwise, and that ratio carries
-straight into retrieve metadata RPC volume. Chunkwise is the default for that
-reason; layerwise remains available for deployments that need per-layer
-object granularity.
+The key count is the practical difference: layerwise resolves one key per
+(chunk, layer) instead of one per chunk, so both the key count and the
+retrieve metadata RPC volume grow by the model's layer count. Chunkwise is
+the default for that reason; layerwise remains available for deployments that
+need per-layer object granularity.
 
 `maru_overlap_load_with_compute` works with either storage layout and
 requires `maru_async_load`; it pipelines a request's per-layer transfers
