@@ -123,6 +123,20 @@ class GaiaPrefetchPlugin:
         self._stage_pace_ms = max(
             0.0, float(os.environ.get("MARU_GAIA_STAGE_PACE_MS", "0") or 0.0)
         )
+        # 한 방 발사(MARU_GAIA_STAGE_ASYNC=1). 한 턴 몫을 코얼레스된 범위 그대로
+        # 비동기 memory_prefetch 로 제출하고 완료를 기다리지 않는다. 제출만 하므로
+        # 호스트가 GIL 을 붙드는 시간이 사라지고, 조각 분할·조각 간 간격·양보가
+        # 모두 필요 없어진다. 이 모드에서 StageResult.ready 는 「적재 완료」가
+        # 아니라 「발사 완료」를 뜻하고, 도착한 요청은 티켓을 기다리지 않는다.
+        # 대신 도착 시점에 적재가 덜 끝났으면 그만큼을 장치에서 읽는다.
+        self._stage_async = os.environ.get("MARU_GAIA_STAGE_ASYNC", "0") == "1"
+        # 발사만 하는 모드에서는 완료를 기다릴 대상이 없으므로 고정 상주(pin)와
+        # 섞어 쓸 수 없다. pin 은 완료 시점에 돌아오는 호출이기 때문이다.
+        if self._stage_async and self._stage_pin:
+            logger.warning(
+                "gaia_prefetch: STAGE_ASYNC=1 overrides STAGE_PIN=1 (pin blocks)"
+            )
+            self._stage_pin = False
         self._stage_yield_ms = max(
             0.0,
             float(os.environ.get("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "0") or 0),
@@ -168,7 +182,9 @@ class GaiaPrefetchPlugin:
             "on" if self._coalesce else "off",
             self._device_id if self._device_id is not None else "auto-scan",
             "sync" if self._sync_gate else "async",
-            "memory_pin" if self._stage_pin else "memory_prefetch_sync",
+            "memory_prefetch (발사만)"
+            if self._stage_async
+            else ("memory_pin" if self._stage_pin else "memory_prefetch_sync"),
             self._stage_yield_ms or "off",
         )
 
@@ -309,15 +325,27 @@ class GaiaPrefetchPlugin:
         remaining ranges to asynchronous hints: returning is the readiness
         contract consumed by the request's ``StageTicket``.
         """
-        result = self._issue(
-            handler,
-            keys,
-            batch_resp,
-            source="stage",
-            sync=True,
-            apply_sync_budget=False,
-            pin=self._stage_pin,
-        )
+        if self._stage_async:
+            result = self._issue(
+                handler,
+                keys,
+                batch_resp,
+                source="stage",
+                sync=False,
+                apply_sync_budget=False,
+                pin=False,
+                fire_and_forget=True,
+            )
+        else:
+            result = self._issue(
+                handler,
+                keys,
+                batch_resp,
+                source="stage",
+                sync=True,
+                apply_sync_budget=False,
+                pin=self._stage_pin,
+            )
         self._stage_requests += 1
         self._stage_ready += int(result.ready)
         self._stage_bytes += result.prepared_bytes
@@ -369,6 +397,7 @@ class GaiaPrefetchPlugin:
             "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
             "stage_pin": self._stage_pin,
             "stage_split_bytes": self._stage_split_bytes,
+            "stage_async": self._stage_async,
             "stage_pinned_ranges": self._stage_pinned_ranges,
             "stage_unpinned_ranges": self._stage_unpinned_ranges,
             "stage_unpin_failed": self._stage_unpin_failed,
@@ -439,6 +468,7 @@ class GaiaPrefetchPlugin:
         sync: bool = False,
         apply_sync_budget: bool = True,
         pin: bool = False,
+        fire_and_forget: bool = False,
     ) -> StageResult:
         """Resolve mapped found entries to device ranges and prefetch them.
 
@@ -474,7 +504,7 @@ class GaiaPrefetchPlugin:
 
         chunk_count = len(eligible)
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
-        if source == "stage" and self._stage_split_bytes > 0:
+        if source == "stage" and not fire_and_forget and self._stage_split_bytes > 0:
             ranges = self._split_ranges(ranges, self._stage_split_bytes)
 
         issued = 0
@@ -489,10 +519,15 @@ class GaiaPrefetchPlugin:
         t0 = time.monotonic()
         paced_ms = 0.0
         for range_index, (device_id, device_addr, size) in enumerate(ranges):
-            if source == "stage" and self._stage_pace_ms > 0 and range_index > 0:
+            if (
+                source == "stage"
+                and not fire_and_forget
+                and self._stage_pace_ms > 0
+                and range_index > 0
+            ):
                 time.sleep(self._stage_pace_ms / 1000.0)
                 paced_ms += self._stage_pace_ms
-            if source == "stage" and self._stage_yield_ms > 0:
+            if source == "stage" and not fire_and_forget and self._stage_yield_ms > 0:
                 waited_ms, checks, hits = self._yield_to_demand(handler, yielded_ms)
                 yielded_ms += waited_ms
                 probe_checks += checks
@@ -542,7 +577,9 @@ class GaiaPrefetchPlugin:
                 continue
             if status == pyxif.MemoryStatus.Success:
                 issued += 1
-                if gated:
+                if gated or fire_and_forget:
+                    # 발사 전용 모드에서는 제출 성공을 준비로 센다 — 기다릴 완료
+                    # 신호가 없으므로 ready 의 뜻이 「발사 완료」로 바뀐다.
                     prepared_ranges += 1
                     prepared_bytes += size
                     if pin_this:

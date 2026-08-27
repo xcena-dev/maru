@@ -248,6 +248,174 @@ class HymCacheRollingPipeline(Generic[_StageValue]):
         return timings
 
 
+class ObservedTurnEstimator:
+    """Estimate when a session's next turn will start, from measurement only.
+
+    Two signals, both visible to a running engine:
+
+    * the gap between that session's last two turn *starts*. It already
+      contains the session's think time and however long it waited for a
+      serving slot from its position in the batch, so one number per session
+      beats one global average — the first session of a wave waits almost
+      nothing and the last waits nearly a whole wave.
+    * how long a fill has recently taken on the device.
+
+    Nothing here reads a configured think time or a session count. Until a
+    session has two turn starts, ``launch_at`` returns None and the caller must
+    decide what to do without an estimate rather than invent one.
+
+    The simulator study behind this
+    (`_vault/_design/infinitememory/20260827_coupled-serving-e0-device-evidence-and-gate.md`)
+    found the estimate unbiased but spread wider than one fill, so a margin is
+    required; and that the margin must stay under the cache's lifetime
+    ``(cache slots / prefix) * insertion interval`` or the prefix is evicted
+    before its turn reads it.
+    """
+
+    def __init__(self, *, margin_s: float, weight: float = 0.5) -> None:
+        if margin_s < 0:
+            raise ValueError("margin_s must be non-negative")
+        if not 0.0 < weight <= 1.0:
+            raise ValueError("weight must be in (0, 1]")
+        self._margin_s = margin_s
+        self._weight = weight
+        self._lock = threading.Lock()
+        self._last_start: dict[str, float] = {}
+        self._interval: dict[str, float] = {}
+        self._fill_s: float | None = None
+
+    def note_turn_start(self, session_id: str, at: float) -> None:
+        """Record that this session's turn began at ``at``."""
+        with self._lock:
+            previous = self._last_start.get(session_id)
+            self._last_start[session_id] = at
+            if previous is None:
+                return
+            sample = at - previous
+            if sample <= 0:
+                return
+            old = self._interval.get(session_id)
+            self._interval[session_id] = (
+                sample if old is None else old + self._weight * (sample - old)
+            )
+
+    def note_fill(self, seconds: float) -> None:
+        """Record how long one fill took on the device."""
+        if seconds <= 0:
+            return
+        with self._lock:
+            if self._fill_s is None:
+                self._fill_s = seconds
+            else:
+                self._fill_s += self._weight * (seconds - self._fill_s)
+
+    def launch_at(self, session_id: str) -> float | None:
+        """Earliest instant this session's fill should start, or None.
+
+        None means there is not enough history yet. Returns a value on the same
+        clock as ``note_turn_start``.
+        """
+        with self._lock:
+            interval = self._interval.get(session_id)
+            last = self._last_start.get(session_id)
+            fill = self._fill_s
+        if interval is None or last is None or fill is None:
+            return None
+        return last + interval - fill - self._margin_s
+
+    def snapshot(self) -> str:
+        """One line of state, for the timing log."""
+        with self._lock:
+            sessions = len(self._interval)
+            fill = self._fill_s
+        fill_text = "?" if fill is None else f"{fill * 1e3:.0f}"
+        return f"sessions={sessions} fill_ms={fill_text} margin_ms={self._margin_s * 1e3:.0f}"
+
+
+class StageCompletionMailbox:
+    """Carry fill completions from the worker half to the scheduler half.
+
+    Admission lives on the scheduler connector (it owns the queue) while the
+    blocking fill runs on the worker connector, so the worker cannot hand the
+    window slot back directly. Both halves are separate objects created for
+    their own ``KVConnectorRole``; when they share a process this mailbox is
+    the only link between them.
+
+    Publishing is called from the stage worker thread and draining from the
+    scheduler step, so both take the lock. Draining is destructive: each
+    completion is reported once.
+
+    A deployment where the two halves do NOT share a process (the worker
+    publishes into a different interpreter) drains nothing. ``published`` lets
+    the scheduler notice that and say so instead of silently never releasing
+    a slot.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done: set[str] = set()
+        self._published = 0
+
+    def publish(self, req_id: str) -> None:
+        """Record that one plan's fill finished."""
+        with self._lock:
+            self._done.add(req_id)
+            self._published += 1
+
+    def drain(self) -> set[str]:
+        """Take and clear the completions recorded since the last call."""
+        with self._lock:
+            if not self._done:
+                return set()
+            done = self._done
+            self._done = set()
+        return done
+
+    @property
+    def published(self) -> int:
+        """How many completions have ever been published into this mailbox."""
+        with self._lock:
+            return self._published
+
+
+# 한 프로세스 안의 두 커넥터 절반이 공유한다. 역할마다 객체가 따로 만들어지므로
+# 모듈 수준에 두는 것이 둘을 잇는 유일한 방법이다.
+STAGE_COMPLETIONS = StageCompletionMailbox()
+
+
+class FillDurationMailbox:
+    """Carry measured fill durations from the worker half to the scheduler half.
+
+    The fill runs on the worker connector and the launch decision is made on
+    the scheduler connector, so the measurement has to cross the same gap the
+    completion mailbox crosses. Publishing is one float; draining takes the
+    samples recorded since the last call.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: list[float] = []
+
+    def publish(self, seconds: float) -> None:
+        """Record one fill's wall time."""
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._samples.append(seconds)
+
+    def drain(self) -> list[float]:
+        """Take and clear the samples recorded since the last call."""
+        with self._lock:
+            if not self._samples:
+                return []
+            out = self._samples
+            self._samples = []
+        return out
+
+
+FILL_DURATIONS = FillDurationMailbox()
+
+
 @dataclass(frozen=True)
 class StagePlan:
     """Scheduler-to-worker request staging command.
@@ -261,6 +429,9 @@ class StagePlan:
     keys: tuple[str, ...]
     estimated_bytes: int
     queued_at: float = field(default_factory=time.monotonic, compare=False)
+    # 이 계획이 스스로 정한 가장 이른 발사 시각. None 이면 제약이 없다. 고정
+    # 지연과 다른 점은 계획마다 다르다는 것이다 — 각자의 마감에서 거꾸로 셈한다.
+    not_before: float | None = field(default=None, compare=False)
     deadline_at: float = field(default=0.0, compare=False)
 
 
@@ -336,13 +507,21 @@ class FifoStagePolicy:
         """Scheduler steps in which a queued plan found no free slot."""
         return self._blocked_steps
 
-    def enqueue(self, req_id: str, keys: list[str]) -> bool:
+    def enqueue(
+        self, req_id: str, keys: list[str], *, not_before: float | None = None
+    ) -> bool:
         """Queue one request once, returning whether it was accepted.
 
         An id that is only INFLIGHT may re-queue: session-hint plan ids are
         keyed by session, and in turn_end mode the next turn's plan is queued
         at the moment the previous turn — whose stage may still hold the
         inflight slot — finishes. The old instance leaves via its release.
+
+        ``not_before`` is this plan's own earliest launch instant, on this
+        policy's clock. A caller that can estimate when the target turn will
+        arrive uses it to place the fill just ahead of that instant; one that
+        cannot leaves it None. Unlike ``queue_delay_s`` it is per plan, so
+        plans do not all wait the same amount.
         """
         if not keys or req_id in self._queued_ids:
             return False
@@ -350,6 +529,7 @@ class FifoStagePolicy:
             req_id=req_id,
             keys=tuple(keys),
             estimated_bytes=len(keys) * self._estimated_bytes_per_key,
+            not_before=not_before,
             queued_at=self._clock(),
         )
         self._queued.append(plan)
@@ -366,8 +546,16 @@ class FifoStagePolicy:
         consumed: set[str],
         canceled: set[str],
         released: set[str] = frozenset(),  # type: ignore[assignment]
+        completed: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> list[StagePlan]:
         """Retire stale work and admit the oldest plans that fit.
+
+        ``completed`` frees the inflight slot of a plan whose fill finished.
+        This is what the slot is for: it bounds how many fills the device has
+        at once, so it must come back when the device is done — not on a wall
+        clock (``hold_s``) and not when the data is later consumed. Like
+        ``released`` it leaves queued plans alone, and it never drops the
+        worker ticket: the arriving request still waits on that ticket.
 
         ``consumed`` retires a previously admitted window slot. A newly queued
         matched request may still be admitted in the same scheduler step as
@@ -391,8 +579,9 @@ class FifoStagePolicy:
                 for req_id, at in self._admitted_at.items()
                 if now - at >= self._hold_s
             }
-            held_out -= consumed | canceled | set(released)
+            held_out -= consumed | canceled | set(released) | set(completed)
         reasons = (
+            ("complete", set(completed)),
             ("consumed", consumed),
             ("canceled", canceled),
             ("released", set(released)),
@@ -418,6 +607,11 @@ class FifoStagePolicy:
         inflight_bytes = sum(plan.estimated_bytes for plan in self._inflight.values())
         while self._queued and len(self._inflight) < self._max_requests:
             plan = self._queued[0]
+            # 계획이 자기 발사 시각을 갖고 있으면 그때까지 기다린다. 줄이 마감
+            # 순서와 같으므로 머리만 보면 된다 — 머리가 가장 이른 마감이다.
+            if plan.not_before is not None and now < plan.not_before:
+                self._blocked_steps += 1
+                break
             # 등록 지연이 걸려 있으면 그만큼 지나야 통과시킨다. 모든 plan 이 같은
             # 지연을 쓰고 줄이 등록 순서이므로 머리만 보면 된다.
             if self._queue_delay_s > 0 and now - plan.queued_at < self._queue_delay_s:
@@ -555,9 +749,10 @@ class DeadlineStagePolicy:
         consumed: set[str],
         canceled: set[str],
         released: set[str] = frozenset(),  # type: ignore[assignment]
+        completed: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> list[StagePlan]:
         """Expire late plans, then admit the earliest deadlines that fit."""
-        for req_id in consumed | canceled | set(released):
+        for req_id in consumed | canceled | set(released) | set(completed):
             self._inflight.pop(req_id, None)
         for req_id in canceled:
             self._queued.pop(req_id, None)

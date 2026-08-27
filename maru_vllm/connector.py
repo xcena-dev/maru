@@ -48,10 +48,13 @@ from maru_vllm.kv_layout import (
     _vllm_kv_cache_layout,
 )
 from maru_vllm.staging_prefetch import (
+    FILL_DURATIONS,
+    STAGE_COMPLETIONS,
     DeadlineStagePolicy,
     FifoStagePolicy,
     HymCacheObject,
     HymCacheRollingPipeline,
+    ObservedTurnEstimator,
     StagePlan,
     StageTicket,
     build_hymcache_objects,
@@ -1022,6 +1025,39 @@ class MaruSchedulerConnector:
                         / 1000.0,
                     ),
                 )
+        # MARU_STAGE_RELEASE: 창 자리를 언제 돌려주는가.
+        #   consume (기본, 종전 동작) — 그 접두사를 도착한 턴이 소비할 때.
+        #   complete — 적재가 끝날 때. 자리가 지키는 것은 「장치에 동시에 걸린
+        #     적재 수」이므로 이것이 그 뜻에 맞는 시점이다. 시각 타이머
+        #     (MARU_STAGE_HOLD_MS)는 완료와 무관한 시각에 놓아 두 방향으로
+        #     어긋나므로, complete 를 쓸 때는 타이머를 두지 않는다.
+        release_mode = (
+            os.environ.get("MARU_STAGE_RELEASE", "consume").strip().lower() or "consume"
+        )
+        if release_mode not in {"consume", "complete"}:
+            logger.warning(
+                "Unknown MARU_STAGE_RELEASE=%r; falling back to 'consume'",
+                release_mode,
+            )
+            release_mode = "consume"
+        self._stage_release_on_complete = release_mode == "complete"
+        # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
+        # 있다는 뜻이므로 아래에서 한 번 경고한다.
+        self._stage_release_seen = 0
+        self._stage_release_warned = False
+        # MARU_STAGE_MARGIN_MS: 관측으로 추정한 마감보다 이만큼 앞서 적재를 건다.
+        #   0 (기본) — 추정을 쓰지 않는다. 등록 즉시 통과 후보가 된다.
+        #   양수 — 그 세션의 지난 두 턴 시작 간격과 최근 적재 소요로 마감을
+        #     추정하고, 마감 − 적재 − 여유 에 발사한다. 여유는 추정의 퍼짐보다
+        #     크고 캐시의 수명보다 작아야 한다.
+        margin_ms = max(0.0, float(os.environ.get("MARU_STAGE_MARGIN_MS", "0") or 0))
+        self._stage_estimator = (
+            ObservedTurnEstimator(margin_s=margin_ms / 1000.0)
+            if margin_ms > 0
+            else None
+        )
+        self._stage_max_requests = max_requests if self._stage_enabled else 1
+
         if self._stage_enabled and self._arrival_hint_enabled:
             logger.warning(
                 "MARU_STAGE_PIPELINE=1 supersedes MARU_ARRIVAL_HINT=1; "
@@ -1106,7 +1142,8 @@ class MaruSchedulerConnector:
                 f"trigger={self._stage_trigger} policy={self._stage_policy_kind} "
                 f"hold_ms={os.environ.get('MARU_STAGE_HOLD_MS', '0')} "
                 f"queue_delay_ms={os.environ.get('MARU_STAGE_QUEUE_DELAY_MS', '0')} "
-                f"window={os.environ.get('MARU_STAGE_MAX_REQUESTS', '1')}"
+                f"window={os.environ.get('MARU_STAGE_MAX_REQUESTS', '1')} "
+                f"release={'complete' if self._stage_release_on_complete else 'consume'}"
             )
         # session_id -> confirmed prefix chunk keys, recorded at request
         # completion (the just-stored keys ARE the prefix the session's next
@@ -1475,10 +1512,33 @@ class MaruSchedulerConnector:
                         dict.fromkeys(self._pending_stage_releases)
                     )
                     self._pending_stage_releases.clear()
+            if self._stage_estimator is not None:
+                for seconds in FILL_DURATIONS.drain():
+                    self._stage_estimator.note_fill(seconds)
+            completed = (
+                STAGE_COMPLETIONS.drain() if self._stage_release_on_complete else set()
+            )
+            if self._stage_release_on_complete:
+                self._stage_release_seen += len(completed)
+                if (
+                    not self._stage_release_warned
+                    and self._stage_release_seen == 0
+                    and self._stage_policy.inflight_requests >= self._stage_max_requests
+                ):
+                    # 칸이 다 찼는데 완료를 한 건도 못 받았다. 워커 절반이 다른
+                    # 프로세스에 있어 우편함이 닿지 않는 배치다 — 이 모드로는
+                    # 자리가 영원히 돌아오지 않으므로 알려야 한다.
+                    self._stage_release_warned = True
+                    logger.warning(
+                        "MARU_STAGE_RELEASE=complete but no fill completion has "
+                        "arrived while the window is full; the worker half is "
+                        "probably in another process. Slots will not come back."
+                    )
             meta.stage_plans = self._stage_policy.advance(
                 consumed=consumed,
                 canceled=canceled,
                 released=released,
+                completed=completed,
             )
             if self._timing:
                 drain = getattr(self._stage_policy, "drain_events", None)
@@ -1591,11 +1651,15 @@ class MaruSchedulerConnector:
             self._pending_stage_aliases.setdefault(
                 request.request_id, _hint_plan_id(session_id)
             )
-            if first_seen and self._timing:
-                _emit_timing(
-                    f"stage arrive: session={session_id} t={time.time():.6f} "
-                    f"(req {request.request_id})"
-                )
+            if first_seen:
+                if self._stage_estimator is not None:
+                    # 이 요청이 서빙에 들어온 시각이 그 세션의 턴 시작이다.
+                    self._stage_estimator.note_turn_start(session_id, time.monotonic())
+                if self._timing:
+                    _emit_timing(
+                        f"stage arrive: session={session_id} t={time.time():.6f} "
+                        f"(req {request.request_id})"
+                    )
         if self._stage_trigger != "imminent" or not imminent:
             return
         keys = self._session_keys.get(imminent)
@@ -1639,7 +1703,14 @@ class MaruSchedulerConnector:
         self._session_keys[session_id] = tuple(keys)
         if self._stage_trigger == "turn_end":
             assert self._stage_policy is not None
-            queued = self._stage_policy.enqueue(_hint_plan_id(session_id), keys)
+            launch_at = (
+                self._stage_estimator.launch_at(session_id)
+                if self._stage_estimator is not None
+                else None
+            )
+            queued = self._stage_policy.enqueue(
+                _hint_plan_id(session_id), keys, not_before=launch_at
+            )
             if queued:
                 logger.debug(
                     "Maru stage: queued %d turn-end keys for session %s",
@@ -1647,9 +1718,10 @@ class MaruSchedulerConnector:
                     session_id,
                 )
             if self._timing:
+                launch_text = "none" if launch_at is None else f"{launch_at:.6f}"
                 _emit_timing(
                     f"stage turn_end: session={session_id} keys={len(keys)} "
-                    f"queued={queued}"
+                    f"queued={queued} launch_at={launch_text}"
                 )
 
     def _release_arrival_hints(self, consumed: set[str]) -> list[str]:
@@ -5560,7 +5632,9 @@ class MaruWorkerConnector:
                 found_keys=0,
                 error="worker handler unavailable",
             )
+        _stage_t0 = time.monotonic()
         result = handler.stage_batch(list(ticket.plan.keys))
+        FILL_DURATIONS.publish(time.monotonic() - _stage_t0)
         if self._timing:
             _emit_timing(
                 f"stage ready={result.ready} "
@@ -5591,3 +5665,9 @@ class MaruWorkerConnector:
             self._stage_tickets[plan.req_id] = ticket
             future = self._stage_executor.submit(self._run_stage, ticket)
             ticket.bind(future)
+            # 적재가 끝나는 순간 창 자리를 놓을 수 있게 우편함에 알린다. 티켓은
+            # 그대로 남는다 — 도착한 요청이 그것을 기다린다. 스케줄러 절반이
+            # consume 모드면 우편함을 비우지 않으므로 이 알림은 무해하다.
+            future.add_done_callback(
+                lambda _f, rid=plan.req_id: STAGE_COMPLETIONS.publish(rid)
+            )

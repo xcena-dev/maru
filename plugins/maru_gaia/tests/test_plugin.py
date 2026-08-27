@@ -341,6 +341,76 @@ class TestStage:
         assert result.prepared_bytes == 160
 
 
+class TestStageAsync:
+    """MARU_GAIA_STAGE_ASYNC=1 — 한 방 발사 모드."""
+
+    def test_async_stage_issues_one_async_call_per_coalesced_range(self, monkeypatch):
+        """발사만 하므로 sync 호출이 없고 조각 분할도 하지 않는다."""
+        fake = _FakePyxif()
+        monkeypatch.setenv("MARU_GAIA_STAGE_ASYNC", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "16")
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 32), _entry(0, 32, 32))
+
+        result = plugin.on_stage(_handler(), ["a", "b"], response)
+
+        assert fake.sync_calls == []
+        assert fake.calls == [(0, 0, 64)]
+        assert result.ready
+        assert result.issued_ranges == 1
+        assert result.prepared_bytes == 64
+
+    def test_async_stage_reports_no_block_time(self, monkeypatch):
+        """기다리지 않으므로 wait_ms 와 조각 간 쉼이 0 이다."""
+        fake = _FakePyxif()
+        monkeypatch.setenv("MARU_GAIA_STAGE_ASYNC", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_PACE_MS", "50")
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 32), _entry(0, 1024, 32))
+
+        result = plugin.on_stage(_handler(), ["a", "b"], response)
+
+        assert result.wait_ms == 0.0
+        assert result.yielded_ms == 0.0
+        assert len(fake.calls) == 2
+
+    def test_async_stage_overrides_pin(self, monkeypatch):
+        """pin 은 완료 시점에 돌아오는 호출이라 발사 모드와 섞을 수 없다."""
+        fake = _FakePyxif()
+        pin_calls: list[tuple[int, int, int]] = []
+        fake.memory_pin = lambda device_id, addr, size: pin_calls.append(
+            (device_id, addr, size)
+        )
+        monkeypatch.setenv("MARU_GAIA_STAGE_ASYNC", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_PIN", "1")
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 32))
+
+        result = plugin.on_stage(_handler(), ["a"], response)
+
+        assert pin_calls == []
+        assert result.ready
+        assert plugin.contribute_stats()["stage_async"] is True
+
+    def test_sync_stage_stays_the_default(self, monkeypatch):
+        """플래그가 없으면 기존 동작(완료까지 대기)을 그대로 지킨다."""
+        fake = _FakePyxif()
+        monkeypatch.delenv("MARU_GAIA_STAGE_ASYNC", raising=False)
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 32))
+
+        result = plugin.on_stage(_handler(), ["a"], response)
+
+        assert len(fake.sync_calls) == 1
+        assert fake.calls == []
+        assert result.ready
+        assert plugin.contribute_stats()["stage_async"] is False
+
+
 class TestStagePinLease:
     """MARU_GAIA_STAGE_PIN=1: on_stage pins; release/close unpin the lease."""
 

@@ -20,8 +20,11 @@ from maru_vllm.connector import (
 )
 from maru_vllm.staging_prefetch import (
     FifoStagePolicy,
+    FillDurationMailbox,
     HymCacheObject,
     HymCacheRollingPipeline,
+    ObservedTurnEstimator,
+    StageCompletionMailbox,
     StagePlan,
     StageState,
     StageTicket,
@@ -285,6 +288,179 @@ class TestHymCacheRollingWindow:
         worker.shutdown()
 
 
+class TestStageCompletionMailbox:
+    def test_drain_reports_each_completion_once(self):
+        box = StageCompletionMailbox()
+        box.publish("r0")
+        box.publish("r1")
+
+        assert box.drain() == {"r0", "r1"}
+        assert box.drain() == set()
+
+    def test_duplicate_publish_of_one_plan_counts_once_in_the_drain(self):
+        box = StageCompletionMailbox()
+        box.publish("r0")
+        box.publish("r0")
+
+        assert box.drain() == {"r0"}
+
+    def test_published_counts_every_publish_so_a_split_process_is_visible(self):
+        box = StageCompletionMailbox()
+        assert box.published == 0
+
+        box.publish("r0")
+        box.drain()
+
+        # 비운 뒤에도 누계는 남는다 — 스케줄러가 「완료를 한 건도 못 받았다」와
+        # 「받았지만 지금은 없다」를 구별하는 근거다.
+        assert box.published == 1
+
+    def test_publish_from_many_threads_loses_nothing(self):
+        box = StageCompletionMailbox()
+        # 스레드 수는 잠금이 실제로 걸리는지 보일 만큼만 둔다. 많이 띄우면 같은
+        # 프로세스의 시각 민감한 테스트를 흔든다.
+        ids = [f"r{i}" for i in range(24)]
+
+        threads = [threading.Thread(target=box.publish, args=(rid,)) for rid in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert box.drain() == set(ids)
+        assert box.published == len(ids)
+
+
+class TestObservedTurnEstimator:
+    def test_it_refuses_to_answer_without_history(self):
+        est = ObservedTurnEstimator(margin_s=1.0)
+
+        assert est.launch_at("u1") is None
+
+    def test_one_turn_start_is_not_enough(self):
+        est = ObservedTurnEstimator(margin_s=1.0)
+        est.note_turn_start("u1", 100.0)
+        est.note_fill(0.3)
+
+        # 간격을 알려면 시작이 둘 있어야 한다.
+        assert est.launch_at("u1") is None
+
+    def test_it_needs_a_fill_measurement_too(self):
+        est = ObservedTurnEstimator(margin_s=1.0)
+        est.note_turn_start("u1", 100.0)
+        est.note_turn_start("u1", 107.0)
+
+        # 적재가 얼마나 걸리는지 모르면 언제 시작해야 하는지도 모른다.
+        assert est.launch_at("u1") is None
+
+    def test_launch_is_the_estimate_minus_the_fill_and_the_margin(self):
+        est = ObservedTurnEstimator(margin_s=1.0)
+        est.note_turn_start("u1", 100.0)
+        est.note_turn_start("u1", 107.0)
+        est.note_fill(0.3)
+
+        # 다음 시작 추정 107 + 7 = 114, 거기서 적재 0.3 과 여유 1.0 을 뺀다.
+        assert est.launch_at("u1") == pytest.approx(112.7)
+
+    def test_each_session_keeps_its_own_interval(self):
+        est = ObservedTurnEstimator(margin_s=0.0)
+        est.note_fill(0.5)
+        for session, step in (("u1", 4.0), ("u2", 9.0)):
+            est.note_turn_start(session, 10.0)
+            est.note_turn_start(session, 10.0 + step)
+
+        # 라운드 안 위치가 다르면 간격도 다르다. 전역 평균은 둘 다 틀린다.
+        assert est.launch_at("u1") == pytest.approx(14.0 + 4.0 - 0.5)
+        assert est.launch_at("u2") == pytest.approx(19.0 + 9.0 - 0.5)
+
+    def test_a_backwards_or_equal_timestamp_is_ignored(self):
+        est = ObservedTurnEstimator(margin_s=0.0)
+        est.note_fill(0.5)
+        est.note_turn_start("u1", 100.0)
+        est.note_turn_start("u1", 100.0)
+
+        assert est.launch_at("u1") is None
+
+    def test_the_estimate_follows_a_changed_interval(self):
+        est = ObservedTurnEstimator(margin_s=0.0, weight=1.0)
+        est.note_fill(0.0 + 0.5)
+        est.note_turn_start("u1", 0.0)
+        est.note_turn_start("u1", 10.0)
+        first = est.launch_at("u1")
+        est.note_turn_start("u1", 14.0)
+        second = est.launch_at("u1")
+
+        # 가중치 1 이면 최신 간격만 본다: 10 → 4 로 줄면 추정도 따라 준다.
+        assert first == pytest.approx(20.0 - 0.5)
+        assert second == pytest.approx(18.0 - 0.5)
+
+
+class TestPerPlanLaunchInstant:
+    def test_a_plan_waits_for_its_own_launch_instant(self):
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("u1", ["a"], not_before=5.0)
+
+        assert policy.advance(consumed=set(), canceled=set()) == []
+
+        now[0] = 5.0
+
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "u1"
+        ]
+
+    def test_a_plan_without_a_launch_instant_goes_at_once(self):
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+        )
+        policy.enqueue("u1", ["a"])
+
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "u1"
+        ]
+
+    def test_plans_do_not_all_wait_the_same_amount(self):
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=2,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("early", ["a"], not_before=1.0)
+        policy.enqueue("late", ["b"], not_before=9.0)
+
+        now[0] = 1.0
+        first = policy.advance(consumed=set(), canceled=set())
+
+        # 고정 지연과 다른 점이 이것이다 — 계획마다 자기 시각을 갖는다.
+        assert [p.req_id for p in first] == ["early"]
+
+
+class TestFillDurationMailbox:
+    def test_drain_reports_each_sample_once(self):
+        box = FillDurationMailbox()
+        box.publish(0.3)
+        box.publish(0.4)
+
+        assert box.drain() == [0.3, 0.4]
+        assert box.drain() == []
+
+    def test_a_non_positive_sample_is_dropped(self):
+        box = FillDurationMailbox()
+        box.publish(0.0)
+        box.publish(-1.0)
+
+        assert box.drain() == []
+
+
 class TestFifoStagePolicy:
     def test_request_window_preserves_fifo(self):
         policy = FifoStagePolicy(
@@ -301,6 +477,77 @@ class TestFifoStagePolicy:
 
         second = policy.advance(consumed={"r0"}, canceled=set())
         assert [plan.req_id for plan in second] == ["r1"]
+
+    def test_completed_frees_the_slot_without_waiting_for_consumption(self):
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+        )
+        assert policy.enqueue("r0", ["a"])
+        assert policy.enqueue("r1", ["b"])
+
+        first = policy.advance(consumed=set(), canceled=set())
+        assert [plan.req_id for plan in first] == ["r0"]
+
+        # r0 의 적재가 끝났다. 그 접두사는 아직 소비되지 않았지만, 창 자리가
+        # 지키는 것은 「장치에 동시에 걸린 적재 수」이므로 지금 돌아와야 한다.
+        second = policy.advance(consumed=set(), canceled=set(), completed={"r0"})
+
+        assert [plan.req_id for plan in second] == ["r1"]
+        assert policy.inflight_requests == 1
+
+    def test_completed_leaves_queued_plans_alone(self):
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+        )
+        policy.enqueue("s0", ["a"])
+        policy.advance(consumed=set(), canceled=set())
+        # turn_end 모드에서는 같은 세션 id 가 다음 턴 계획을 이미 줄에 갖는다.
+        policy.enqueue("s0", ["b"])
+
+        admitted = policy.advance(consumed=set(), canceled=set(), completed={"s0"})
+
+        assert [plan.req_id for plan in admitted] == ["s0"]
+        assert policy.queued_requests == 0
+
+    def test_completed_retire_is_logged_with_its_own_reason(self):
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+        )
+        policy.enqueue("r0", ["a"])
+        policy.advance(consumed=set(), canceled=set())
+        policy.drain_events()
+
+        policy.advance(consumed=set(), canceled=set(), completed={"r0"})
+
+        retires = [line for line in policy.drain_events() if "slot retire" in line]
+        assert len(retires) == 1
+        assert "reason=complete" in retires[0]
+
+    def test_completed_and_hold_do_not_retire_the_same_slot_twice(self):
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            hold_s=0.010,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("r0", ["a"])
+        policy.advance(consumed=set(), canceled=set())
+        policy.drain_events()
+        now[0] += 0.020
+
+        policy.advance(consumed=set(), canceled=set(), completed={"r0"})
+
+        retires = [line for line in policy.drain_events() if "slot retire" in line]
+        assert len(retires) == 1
+        assert "reason=complete" in retires[0]
 
     def test_byte_window_blocks_younger_request(self):
         policy = FifoStagePolicy(
