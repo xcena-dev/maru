@@ -5,7 +5,7 @@
 **vLLM v0.14+** — required for `KVConnectorBase_V1` support:
 
 ```bash
-pip install vllm
+uv pip install vllm
 ```
 
 See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)

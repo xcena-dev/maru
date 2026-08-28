@@ -4,8 +4,8 @@ This example demonstrates how to run LMCache with disaggregated prefill on a sin
 
 ### Prerequisites
 
-- Install [LMCache](https://github.com/LMCache/LMCache). You can simply run `pip install lmcache`.
-- Install [Maru](https://github.com/xcena-dev/maru). Run `pip install -e .` from the maru repo root.
+- Install [LMCache](https://github.com/LMCache/LMCache). You can simply run `uv pip install lmcache`.
+- Install [Maru](https://github.com/xcena-dev/maru). Run `uv pip install -e .` from the maru repo root.
 - At least 2 GPUs
 
 ### Usage

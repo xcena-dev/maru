@@ -31,8 +31,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
       - name: Install dependencies
-        run: pip install -e ".[docs]"
+        run: uv pip install --system -e ".[docs]"
 
       - name: Build docs
         run: sphinx-build -b html docs/ docs/_build/html

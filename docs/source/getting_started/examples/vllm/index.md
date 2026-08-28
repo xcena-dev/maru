@@ -15,7 +15,7 @@ store and load paths before any cross-instance behavior is involved.
 ## Prerequisites
 
 - 1 GPU for the single-instance example, 2+ for P2P
-- Maru installed: `pip install -e /path/to/maru`
+- Maru installed: `uv pip install -e /path/to/maru`
 - vLLM v0.14+ installed
 - `maru-server` binary available
 

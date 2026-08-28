@@ -29,7 +29,7 @@ ensure_python_library_installed() {
     echo "Checking if $1 is installed..."
     python3 -c "import $1" > /dev/null 2>&1
     if [ $? -ne 0 ]; then
-        echo "$1 is not installed. Please install it via pip install $1."
+        echo "$1 is not installed. Please install it via uv pip install $1."
         exit 1
     else
         echo "$1 is installed."
