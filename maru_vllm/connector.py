@@ -1006,7 +1006,7 @@ class MaruSchedulerConnector:
                     ),
                 )
             else:
-                # MARU_STAGE_HOLD_MS: 승인 뒤 이만큼 지나면 소비를 기다리지 않고
+                # MARU_STAGE_HOLD_MS: 채움기로 넘긴 뒤 이만큼 지나면 소비를 기다리지 않고
                 #   자리를 반환한다. 0(기본)은 종전대로 소비까지 붙든다.
                 # MARU_STAGE_QUEUE_DELAY_MS: 등록된 plan 을 이만큼 뒤에야 통과
                 #   후보로 삼는다. 줄이 빈 상태에서 이 값이 발사 시점을, 따라서
@@ -2001,6 +2001,12 @@ class MaruWorkerConnector:
         # prefetch for the chunk keys relayed from the scheduler at arrival.
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
         self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
+        # 창 크기는 「장치가 한 번에 갖는 적재 수」다. 스케줄러 절반이 그만큼
+        # 내보내므로 실행 절반도 그만큼 열어 둔다 — 하나로 묶어 두면 넘어온
+        # 것이 쌓이기만 하고 실행은 직렬이라 그 뜻이 성립하지 않는다.
+        self._stage_max_requests = max(
+            1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+        )
         self._hymcache_window_bytes = max(
             0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
         )
@@ -5657,8 +5663,11 @@ class MaruWorkerConnector:
             if plan.req_id in self._stage_tickets:
                 return
             if self._stage_executor is None:
+                # 창 크기가 「장치가 한 번에 갖는 적재 수」라는 뜻이 되려면 실행
+                # 쪽도 그만큼 열려 있어야 한다. 작업자를 하나로 묶어 두면 넘어온
+                # 것이 쌓이기만 하고 실행은 직렬이라 그 뜻이 성립하지 않는다.
                 self._stage_executor = ThreadPoolExecutor(
-                    max_workers=1,
+                    max_workers=self._stage_max_requests,
                     thread_name_prefix="maru-im-stage",
                 )
             ticket = StageTicket(plan)

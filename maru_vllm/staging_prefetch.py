@@ -570,7 +570,7 @@ class FifoStagePolicy:
         turn_end mode) — a full cancel would silently kill it.
         """
         now = self._clock()
-        # 보유 시간이 지난 자리는 소비를 기다리지 않고 돌려준다. 그러면 승인이
+        # 보유 시간이 지난 자리는 소비를 기다리지 않고 돌려준다. 그러면 내보내기가
         # 도착률이 아니라 장치 속도로 돌아 서 있던 줄이 빠진다.
         held_out: set[str] = set()
         if self._hold_s > 0:
