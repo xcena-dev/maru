@@ -1026,21 +1026,28 @@ class MaruSchedulerConnector:
                     ),
                 )
         # MARU_STAGE_RELEASE: 창 자리를 언제 돌려주는가.
-        #   consume (기본, 종전 동작) — 그 접두사를 도착한 턴이 소비할 때.
-        #   complete — 적재가 끝날 때. 자리가 지키는 것은 「장치에 동시에 걸린
-        #     적재 수」이므로 이것이 그 뜻에 맞는 시점이다. 시각 타이머
-        #     (MARU_STAGE_HOLD_MS)는 완료와 무관한 시각에 놓아 두 방향으로
-        #     어긋나므로, complete 를 쓸 때는 타이머를 두지 않는다.
+        #   consume (기본, 종전 동작) — 그 접두사를 소비한 요청이 끝날 때. 읽기가
+        #     끝난 뒤에도 그 턴이 디코딩을 마칠 때까지 자리가 잡혀 있다.
+        #   read — 읽기가 끝날 때. 접두사가 실제로 필요한 것은 GPU 로 복사를 마칠
+        #     때까지이므로, 자리가 「장치 DRAM 에 남아 있어야 하는 접두사 수」를
+        #     지키는 뜻이라면 이것이 그 시점이다. 읽기가 스케줄러 스텝 안에서 막고
+        #     도는 경로에서만 옳다 — 지연 적재나 레이어별 겹침을 켜면 relay 시점에
+        #     읽기가 끝나지 않으므로 consume 을 쓴다.
+        #   complete — 적재가 끝날 때. 자리가 지키는 것이 「장치에 동시에 걸린
+        #     적재 수」인 경우의 시점이다. 시각 타이머 (MARU_STAGE_HOLD_MS)는
+        #     완료와 무관한 시각에 놓아 두 방향으로 어긋나므로, complete 를 쓸
+        #     때는 타이머를 두지 않는다.
         release_mode = (
             os.environ.get("MARU_STAGE_RELEASE", "consume").strip().lower() or "consume"
         )
-        if release_mode not in {"consume", "complete"}:
+        if release_mode not in {"consume", "read", "complete"}:
             logger.warning(
                 "Unknown MARU_STAGE_RELEASE=%r; falling back to 'consume'",
                 release_mode,
             )
             release_mode = "consume"
         self._stage_release_on_complete = release_mode == "complete"
+        self._stage_release_on_read = release_mode == "read"
         # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
         # 있다는 뜻이므로 아래에서 한 번 경고한다.
         self._stage_release_seen = 0
@@ -1143,7 +1150,9 @@ class MaruSchedulerConnector:
                 f"hold_ms={os.environ.get('MARU_STAGE_HOLD_MS', '0')} "
                 f"queue_delay_ms={os.environ.get('MARU_STAGE_QUEUE_DELAY_MS', '0')} "
                 f"window={os.environ.get('MARU_STAGE_MAX_REQUESTS', '1')} "
-                f"release={'complete' if self._stage_release_on_complete else 'consume'}"
+                f"fill_workers="
+                f"{os.environ.get('MARU_STAGE_FILL_WORKERS', '') or 'window'} "
+                f"release={release_mode}"
             )
         # session_id -> confirmed prefix chunk keys, recorded at request
         # completion (the just-stored keys ARE the prefix the session's next
@@ -1156,6 +1165,10 @@ class MaruSchedulerConnector:
         # policy's inflight window after the consumed-set was applied, so its
         # slot (and worker ticket, on failure paths) is reclaimed at finish.
         self._relayed_stage_aliases: dict[str, str] = {}
+        # MARU_STAGE_RELEASE=read 에서, 지난 스텝에 워커로 넘긴 (요청, 표) 쌍.
+        # 읽기는 그 스텝의 워커 통과에서 막고 돌므로, 다음 스텝이 시작될 때는
+        # 이미 끝나 있다. 그때 자리를 돌려준다.
+        self._stage_relayed_last_step: list[tuple[str, str]] = []
         # Hint plan ids whose worker tickets must be dropped (their target
         # request finished or was preempted without consuming the ticket).
         self._pending_stage_releases: list[str] = []
@@ -1476,6 +1489,15 @@ class MaruSchedulerConnector:
             consumed = {req.req_id for req in meta.requests}
             canceled = set(stale_ids)
             released: set[str] = set()
+            if self._stage_release_on_read and self._stage_relayed_last_step:
+                # 지난 스텝에 넘긴 것들의 읽기는 끝났다. 이번 스텝 몫을 담기
+                # 전에 먼저 비운다.
+                for req_id, alias in self._stage_relayed_last_step:
+                    if self._relayed_stage_aliases.pop(req_id, None) is None:
+                        continue
+                    released.add(alias)
+                    self._pending_stage_releases.append(alias)
+                self._stage_relayed_last_step.clear()
             if self._stage_trigger != "match":
                 # A scheduled load joins its session's hint ticket: the alias
                 # is relayed to the worker and the hint's policy slot is
@@ -1491,6 +1513,8 @@ class MaruSchedulerConnector:
                         meta.stage_aliases[req.req_id] = alias
                         consumed.add(alias)
                         self._relayed_stage_aliases[req.req_id] = alias
+                        if self._stage_release_on_read:
+                            self._stage_relayed_last_step.append((req.req_id, alias))
                 for rid in stale_ids:
                     pending = self._pending_stage_aliases.pop(rid, None)
                     if pending is not None and self._stage_trigger == "imminent":
@@ -2001,11 +2025,20 @@ class MaruWorkerConnector:
         # prefetch for the chunk keys relayed from the scheduler at arrival.
         self._arrival_hint_enabled = os.environ.get("MARU_ARRIVAL_HINT", "0") == "1"
         self._stage_enabled = os.environ.get("MARU_STAGE_PIPELINE", "0") == "1"
-        # 창 크기는 「장치가 한 번에 갖는 적재 수」다. 스케줄러 절반이 그만큼
-        # 내보내므로 실행 절반도 그만큼 열어 둔다 — 하나로 묶어 두면 넘어온
-        # 것이 쌓이기만 하고 실행은 직렬이라 그 뜻이 성립하지 않는다.
+        # 창 크기(MARU_STAGE_MAX_REQUESTS)와 실행 절반의 작업자 수는 뜻이
+        # 다르다. release=consume/read 에서 창은 「장치 DRAM 에 동시에 놓아 둘
+        # 접두사 수」이고, 작업자 수는 「장치에 동시에 걸 적재 수」다. 창을 칸
+        # 수만큼 키우면서 장치에는 한 건씩만 걸고 싶은 경우가 있으므로 별도
+        # 손잡이로 둔다. 기본값은 창 크기 — 종전 동작을 그대로 둔다.
         self._stage_max_requests = max(
             1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+        )
+        self._stage_fill_workers = max(
+            1,
+            int(
+                os.environ.get("MARU_STAGE_FILL_WORKERS", "")
+                or self._stage_max_requests
+            ),
         )
         self._hymcache_window_bytes = max(
             0, int(os.environ.get("MARU_HYMCACHE_WINDOW_BYTES", "0") or 0)
@@ -5663,11 +5696,10 @@ class MaruWorkerConnector:
             if plan.req_id in self._stage_tickets:
                 return
             if self._stage_executor is None:
-                # 창 크기가 「장치가 한 번에 갖는 적재 수」라는 뜻이 되려면 실행
-                # 쪽도 그만큼 열려 있어야 한다. 작업자를 하나로 묶어 두면 넘어온
-                # 것이 쌓이기만 하고 실행은 직렬이라 그 뜻이 성립하지 않는다.
+                # 장치에 동시에 걸 적재 수. 창 크기와 다를 수 있다 —
+                # MARU_STAGE_FILL_WORKERS 참고.
                 self._stage_executor = ThreadPoolExecutor(
-                    max_workers=self._stage_max_requests,
+                    max_workers=self._stage_fill_workers,
                     thread_name_prefix="maru-im-stage",
                 )
             ticket = StageTicket(plan)

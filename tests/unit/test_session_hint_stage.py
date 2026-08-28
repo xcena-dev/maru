@@ -63,9 +63,15 @@ def _output(new_reqs=(), finished=(), num_scheduled=None):
     )
 
 
-def _make_scheduler(monkeypatch, trigger: str) -> MaruSchedulerConnector:
+def _make_scheduler(
+    monkeypatch, trigger: str, release: str | None = None
+) -> MaruSchedulerConnector:
     monkeypatch.setenv("MARU_STAGE_PIPELINE", "1")
     monkeypatch.setenv("MARU_STAGE_TRIGGER", trigger)
+    if release is None:
+        monkeypatch.delenv("MARU_STAGE_RELEASE", raising=False)
+    else:
+        monkeypatch.setenv("MARU_STAGE_RELEASE", release)
     sched = MaruSchedulerConnector(block_size=4, kv_chunk_tokens=CHUNK, extra_config={})
     sched._handler = MagicMock()
     return sched
@@ -225,6 +231,73 @@ class TestBuildMetaAliasPlumbing:
         # plan is admitted into it.
         assert meta.stage_release_ids == [_hint_plan_id("s1")]
         assert [p.req_id for p in meta.stage_plans] == [_hint_plan_id("s1")]
+
+    def test_read_release_frees_the_slot_one_step_after_the_relay(self, monkeypatch):
+        """release=read 는 읽기가 끝난 다음 스텝에 자리를 돌려준다.
+
+        접두사가 장치 DRAM 에 남아 있어야 하는 것은 GPU 로 복사를 마칠 때까지다.
+        읽기는 relay 한 그 스텝의 워커 통과에서 막고 도므로, 다음 스텝이
+        시작될 때는 끝나 있다. 기본값 consume 은 그 요청이 끝날 때까지 자리를
+        잡고 있어, 디코딩 동안 칸을 헛되게 물고 있었다.
+        """
+        sched = _make_scheduler(monkeypatch, "imminent", release="read")
+        self._prime_hint(sched)
+        req = _request(req_id="r1", session="s1")
+        sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
+        sched._requests_need_load["r1"] = (req, 2)
+
+        # relay 한 스텝에서는 아직 돌려주지 않는다 — 읽기가 이 스텝에서 돈다.
+        meta = sched.build_connector_meta(_output(new_reqs=[req]))
+        assert meta.stage_aliases == {"r1": _hint_plan_id("s1")}
+        assert meta.stage_release_ids == []
+        assert sched._stage_policy.inflight_requests == 1
+
+        # 다음 스텝. 요청은 아직 디코딩 중인데 자리가 돌아온다.
+        meta2 = sched.build_connector_meta(_output())
+        assert meta2.stage_release_ids == [_hint_plan_id("s1")]
+        assert sched._stage_policy.inflight_requests == 0
+        assert sched._relayed_stage_aliases == {}
+
+    def test_consume_release_holds_the_slot_until_the_request_finishes(
+        self, monkeypatch
+    ):
+        """기본값 consume 의 종전 동작 — 요청이 끝날 때까지 자리를 잡고 있다."""
+        sched = _make_scheduler(monkeypatch, "imminent")
+        self._prime_hint(sched)
+        req = _request(req_id="r1", session="s1")
+        sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
+        sched._requests_need_load["r1"] = (req, 2)
+
+        sched.build_connector_meta(_output(new_reqs=[req]))
+        meta2 = sched.build_connector_meta(_output())
+        assert meta2.stage_release_ids == []
+        assert sched._stage_policy.inflight_requests == 1
+
+        meta3 = sched.build_connector_meta(_output(finished=["r1"]))
+        assert meta3.stage_release_ids == [_hint_plan_id("s1")]
+        assert sched._stage_policy.inflight_requests == 0
+
+    def test_read_release_does_not_double_release_a_finished_request(self, monkeypatch):
+        """relay 한 스텝에 그 요청이 끝나면 해제는 한 번만 나간다."""
+        sched = _make_scheduler(monkeypatch, "imminent", release="read")
+        self._prime_hint(sched)
+        req = _request(req_id="r1", session="s1")
+        sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
+        sched._requests_need_load["r1"] = (req, 2)
+
+        sched.build_connector_meta(_output(new_reqs=[req]))
+        # 같은 스텝에 끝난 경우: 끝남 쪽이 먼저 해제한다.
+        meta2 = sched.build_connector_meta(_output(finished=["r1"]))
+        assert meta2.stage_release_ids == [_hint_plan_id("s1")]
+        assert sched._stage_policy.inflight_requests == 0
+        # 그 다음 스텝에 또 나가지 않는다.
+        meta3 = sched.build_connector_meta(_output())
+        assert meta3.stage_release_ids == []
+
+    def test_unknown_release_mode_falls_back_to_consume(self, monkeypatch):
+        sched = _make_scheduler(monkeypatch, "imminent", release="nonsense")
+        assert sched._stage_release_on_read is False
+        assert sched._stage_release_on_complete is False
 
     def test_stale_request_emits_ticket_release(self, monkeypatch):
         sched = _make_scheduler(monkeypatch, "imminent")
