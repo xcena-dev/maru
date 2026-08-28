@@ -443,6 +443,70 @@ class TestPerPlanLaunchInstant:
         # 고정 지연과 다른 점이 이것이다 — 계획마다 자기 시각을 갖는다.
         assert [p.req_id for p in first] == ["early"]
 
+    def test_a_plan_that_is_due_goes_past_one_that_is_not(self):
+        """줄 머리가 아직 때가 아니어도 뒤에 선 계획은 나간다.
+
+        줄은 등록 순서인데 발사 시각은 세션마다 다른 턴 간격이 정하므로 두 순서는
+        어긋난다. 머리에서 멈추면 여유가 계획별 발사 시각이 아니라 줄 전체의 방출
+        속도를 조절하는 손잡이가 되어 버린다.
+        """
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("head", ["a"], not_before=9.0)
+        policy.enqueue("tail", ["b"], not_before=1.0)
+
+        now[0] = 1.0
+
+        assert [p.req_id for p in policy.advance(consumed=set(), canceled=set())] == [
+            "tail"
+        ]
+
+    def test_a_skipped_plan_stays_queued_and_goes_when_it_is_due(self):
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=1,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("head", ["a"], not_before=9.0)
+        policy.enqueue("tail", ["b"], not_before=1.0)
+
+        now[0] = 1.0
+        policy.advance(consumed=set(), canceled=set())
+        assert policy.queued_requests == 1
+
+        now[0] = 9.0
+
+        assert [
+            p.req_id for p in policy.advance(consumed={"tail"}, canceled=set())
+        ] == ["head"]
+
+    def test_skipped_plans_keep_their_order_among_themselves(self):
+        now = [0.0]
+        policy = FifoStagePolicy(
+            max_requests=2,
+            max_bytes=0,
+            estimated_bytes_per_key=100,
+            clock=lambda: now[0],
+        )
+        policy.enqueue("second", ["a"], not_before=8.0)
+        policy.enqueue("third", ["b"], not_before=9.0)
+        policy.enqueue("first", ["c"], not_before=1.0)
+
+        now[0] = 1.0
+        policy.advance(consumed=set(), canceled=set())
+
+        now[0] = 9.0
+        rest = policy.advance(consumed={"first"}, canceled=set())
+
+        assert [p.req_id for p in rest] == ["second", "third"]
+
 
 class TestFillDurationMailbox:
     def test_drain_reports_each_sample_once(self):

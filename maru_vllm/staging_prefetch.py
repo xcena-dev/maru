@@ -605,13 +605,18 @@ class FifoStagePolicy:
 
         admitted: list[StagePlan] = []
         inflight_bytes = sum(plan.estimated_bytes for plan in self._inflight.values())
+        # 아직 자기 발사 시각이 안 된 계획을 잠시 빼 두었다가 되돌린다. 줄은 등록
+        # 순서인데 발사 시각은 세션마다 다른 턴 간격이 정하므로 두 순서는 어긋난다.
+        # 머리에서 멈추면 이미 때가 된 뒤쪽 계획까지 함께 막혀, 여유가 계획별 발사
+        # 시각이 아니라 줄 전체의 방출 속도를 조절하는 손잡이가 되어 버린다.
+        deferred: deque[StagePlan] = deque()
+        blocked = False
         while self._queued and len(self._inflight) < self._max_requests:
             plan = self._queued[0]
-            # 계획이 자기 발사 시각을 갖고 있으면 그때까지 기다린다. 줄이 마감
-            # 순서와 같으므로 머리만 보면 된다 — 머리가 가장 이른 마감이다.
             if plan.not_before is not None and now < plan.not_before:
-                self._blocked_steps += 1
-                break
+                blocked = True
+                deferred.append(self._queued.popleft())
+                continue
             # 등록 지연이 걸려 있으면 그만큼 지나야 통과시킨다. 모든 plan 이 같은
             # 지연을 쓰고 줄이 등록 순서이므로 머리만 보면 된다.
             if self._queue_delay_s > 0 and now - plan.queued_at < self._queue_delay_s:
@@ -636,6 +641,10 @@ class FifoStagePolicy:
                 f"/{self._max_bytes / 1024**2:.0f} MiB "
                 f"queued={len(self._queued)} t={time.time():.6f}"
             )
+        if deferred:
+            self._queued.extendleft(reversed(deferred))
+        if blocked:
+            self._blocked_steps += 1
         # A matched request whose load metadata left in this scheduler step
         # cannot benefit from a plan relayed later. Keep the admitted subset
         # and discard only the consumed requests still stranded in the queue.
