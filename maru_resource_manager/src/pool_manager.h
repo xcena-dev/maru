@@ -49,6 +49,14 @@ struct PoolState
 class MetadataStore;
 class WalStore;
 
+/// Extract the dax_region index from a dev_dax device name ("dax3.7" -> 3).
+///
+/// The kernel names every dev_dax "dax<dax_region id>.<dev_dax id>", so this is
+/// authoritative for every provider (pmem, CXL region, hmem) and, unlike parsing
+/// the sysfs link target, does not depend on the device hierarchy layout.
+/// Exposed for testing.
+bool parseRegionIndexFromDaxName(const std::string &devName, uint32_t &outIndex);
+
 class PoolManager
 {
 public:
