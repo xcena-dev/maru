@@ -3827,14 +3827,24 @@ class MaruWorkerConnector:
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
         ops = self._lmc_ops
-        # An older c_ops build may not carry every format; take the per-layer
-        # fallback rather than raising out of the load path.
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        # An older c_ops build may not carry every format, and a newer one may
+        # not carry EngineKVFormat at all — recent LMCache routes c_ops through
+        # a device-ops shim that does not expose it. Guard the container as well
+        # as the member: the import succeeds either way, so reaching straight
+        # for ops.EngineKVFormat raises AttributeError out of the load path and
+        # kills the engine, where the intent is to fall back per layer.
+        fmt_enum = getattr(ops, "EngineKVFormat", None)
+        kv_format = (
+            getattr(fmt_enum, layout.format_name, None)
+            if fmt_enum is not None
+            else None
+        )
         if kv_format is None:
             logger.warning(
-                "Maru packed load: kernel has no format %s; using per-layer "
-                "inject fallback",
+                "Maru packed load: kernel has no format %s (EngineKVFormat "
+                "%s); using per-layer inject fallback",
                 layout.format_name,
+                "missing" if fmt_enum is None else "present",
             )
             return None
         return (
