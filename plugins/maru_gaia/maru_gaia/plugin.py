@@ -411,6 +411,22 @@ class GaiaPrefetchPlugin:
             self._unpin_ranges(ranges)
         with self._pin_lock:
             self._pinned_bytes = 0
+        # 고정 임대가 실제로 걸렸는지는 이 카운터로만 알 수 있는데, 여기까지는
+        # contribute_stats 로만 나가 아무 로그에도 실리지 않았다. 그래서 STAGE_PIN=1
+        # 로 돌린 옛 잡들이 「고정이 효과 없다」인지 「고정이 안 걸렸다」인지 사후에
+        # 가릴 수 없었다. 실행 끝에 한 줄 남긴다.
+        logger.info(
+            "gaia_stage_pin summary: pin=%s asked=%d unpinned=%d unpin_failed=%d "
+            "degraded=%d leftover_batches=%d split_bytes=%d budget_bytes=%d",
+            self._stage_pin,
+            self._stage_pinned_ranges,
+            self._stage_unpinned_ranges,
+            self._stage_unpin_failed,
+            self._stage_pin_degraded,
+            len(leftover),
+            self._stage_split_bytes,
+            self._pin_budget_bytes,
+        )
 
     def contribute_stats(self) -> dict:
         """Cumulative prefetch counters for ``MaruHandler.get_stats``."""
