@@ -4674,6 +4674,7 @@ class MaruWorkerConnector:
             logger.error("Maru write-behind completion: handler unavailable")
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
+        t_wait = time.monotonic()
         try:
             event.synchronize()
         except Exception as e:
@@ -4681,6 +4682,7 @@ class MaruWorkerConnector:
             self._free_handles_best_effort(handles)
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
+        t_d2h = time.monotonic()
         refs.clear()  # safe to release stream inputs after the event
 
         try:
@@ -4696,9 +4698,17 @@ class MaruWorkerConnector:
         if len(results) < len(keys):
             results.extend([False] * (len(keys) - len(results)))
         self._complete_write_behind_keys(keys, results[: len(keys)])
+        t_store = time.monotonic()
         if self._timing:
+            # 쓰기를 타임라인에 올리려면 시각과 소요가 함께 있어야 한다. d2h 는
+            # GPU 에서 호스트로 내려오기를 기다린 시간, store 는 그 뒤 장치에
+            # 실제로 넣은 시간이고, t 는 장치에 넣기 시작한 시각이다(적재·읽기
+            # 줄과 같은 time.time 시계).
             _emit_timing(
-                f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
+                f"write-behind packed-store {self._num_layers}L x {len(keys)}c "
+                f"d2h={(t_d2h - t_wait) * 1e3:.1f} ms "
+                f"store={(t_store - t_d2h) * 1e3:.1f} ms "
+                f"t={time.time() - (t_store - t_d2h):.6f}"
             )
 
     def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:

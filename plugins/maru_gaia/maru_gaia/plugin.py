@@ -31,6 +31,7 @@ Environment:
 from __future__ import annotations
 
 import logging
+import itertools
 import os
 import threading
 import time
@@ -130,6 +131,38 @@ class GaiaPrefetchPlugin:
         # 아니라 「발사 완료」를 뜻하고, 도착한 요청은 티켓을 기다리지 않는다.
         # 대신 도착 시점에 적재가 덜 끝났으면 그만큼을 장치에서 읽는다.
         self._stage_async = os.environ.get("MARU_GAIA_STAGE_ASYNC", "0") == "1"
+        # 적재 직후 재확인(MARU_GAIA_STAGE_REPROBE=1, 측정 전용). 적재가 끝난
+        # 직후에 같은 범위를 한 번 더 memory_prefetch_sync 로 부르고 그 시간을
+        # 로그에 남긴다. 이미 장치 DRAM 에 있으면 그 호출은 거의 즉시 돌아오고
+        # (접두사가 전부 상주한 셀에서 16.2 ms 로 관측), 없으면 다시 전송
+        # 시간만큼 걸린다. 곧 「적재가 데이터를 상주시켰는가」를 시간으로 묻는
+        # 유일한 경로다 — pyxif 에 상주 여부를 묻는 호출이 없다.
+        #
+        # 값은 표본 간격이다 — 0 은 끔, N 은 N 번째 적재마다 한 번. 매 적재마다
+        # 걸면 장치의 적재 부하가 두 배가 되어 파이프라인 자체가 흔들리므로,
+        # 기준선을 유지한 채 재려면 띄엄띄엄 재야 한다.
+        #
+        # 주의: 재확인 자체가 적재이므로 재확인이 걸린 턴의 밀려남은 기준선과
+        # 비교할 수 없다. 읽어야 하는 값은 reprobe_ms 뿐이다.
+        self._stage_reprobe_every = max(
+            0, int(os.environ.get("MARU_GAIA_STAGE_REPROBE", "0") or 0)
+        )
+        self._stage_reprobe_seq = itertools.count()
+        # 상주 지도(MARU_GAIA_MAP_EVERY=N, 측정 전용). 요구 읽기 경계에서 접두사를
+        # 16 MiB 조각으로 쪼개 조각마다 memory_prefetch_sync 를 걸고 각 호출에
+        # 걸린 시간을 기록한다. 상주한 조각은 0.1 ms 안에, 없는 조각은 조각 하나를
+        # 전송하는 시간(16 MiB / 약 11 GB/s = 1.5 ms)만큼 걸리므로, 시간의 자리가
+        # 곧 「접두사 안에서 어디가 비어 있는지」의 지도가 된다.
+        #
+        # 주의: 지도를 뜨는 것 자체가 없는 조각을 채우므로, 지도가 걸린 요청의
+        # 읽기 시간과 첫 토큰은 그 셀의 다른 요청과 비교할 수 없다. N 번째 요청에만
+        # 걸어 나머지를 온전히 남긴다.
+        self._map_every = max(0, int(os.environ.get("MARU_GAIA_MAP_EVERY", "0") or 0))
+        self._map_chunk = max(
+            1, int(os.environ.get("MARU_GAIA_MAP_CHUNK_BYTES", str(16 << 20)) or 1))
+        # 상주/부재를 가르는 컷. 위 두 값 사이가 한 자리 이상 벌어지므로 넉넉하다.
+        self._map_thr_ms = float(os.environ.get("MARU_GAIA_MAP_THRESHOLD_MS", "0.5"))
+        self._map_seq = itertools.count()
         # 발사만 하는 모드에서는 완료를 기다릴 대상이 없으므로 고정 상주(pin)와
         # 섞어 쓸 수 없다. pin 은 완료 시점에 돌아오는 호출이기 때문이다.
         if self._stage_async and self._stage_pin:
@@ -203,6 +236,8 @@ class GaiaPrefetchPlugin:
         # stage must not queue-block starts here, whether or not this seam
         # goes on to issue a hint of its own.
         self._last_demand_at = time.monotonic()
+        if self._map_every and next(self._map_seq) % self._map_every == 0:
+            self._residency_map(handler, batch_resp)
         if self._hymcache_local or not self._retrieve_hint:
             return
         self._issue(
@@ -525,8 +560,12 @@ class GaiaPrefetchPlugin:
                 and self._stage_pace_ms > 0
                 and range_index > 0
             ):
+                # 요청한 값이 아니라 **실제로 쉰 시간**을 더한다. sub-ms 는
+                # 스케줄러 해상도 때문에 요청보다 길게 잘 수 있어, 요청값을
+                # 그대로 기록하면 순 전송(= 적재 소요 − 쉼)이 왜곡된다.
+                t_sleep = time.monotonic()
                 time.sleep(self._stage_pace_ms / 1000.0)
-                paced_ms += self._stage_pace_ms
+                paced_ms += (time.monotonic() - t_sleep) * 1000.0
             if source == "stage" and not fire_and_forget and self._stage_yield_ms > 0:
                 waited_ms, checks, hits = self._yield_to_demand(handler, yielded_ms)
                 yielded_ms += waited_ms
@@ -599,6 +638,28 @@ class GaiaPrefetchPlugin:
                     pin,
                 )
         wait_us = int((time.monotonic() - t0) * 1e6) if sync else 0
+        reprobe_ms = -1.0
+        if (
+            self._stage_reprobe_every
+            and next(self._stage_reprobe_seq) % self._stage_reprobe_every == 0
+            and sync
+            and source == "stage"
+            and not fire_and_forget
+            and ranges
+        ):
+            t_rp = time.monotonic()
+            for device_id, device_addr, size in ranges:
+                try:
+                    pyxif.memory_prefetch_sync(device_id, device_addr, size)
+                except Exception:
+                    logger.warning(
+                        "gaia stage reprobe raised: device=%d addr=0x%x size=%d",
+                        device_id,
+                        device_addr,
+                        size,
+                        exc_info=True,
+                    )
+            reprobe_ms = (time.monotonic() - t_rp) * 1000.0
         if pinned:
             batch = tuple(keys)
             with self._pin_lock:
@@ -619,7 +680,7 @@ class GaiaPrefetchPlugin:
                 logger.info(
                     "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
                     "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
-                    "over_budget=%d, paced_ms=%.1f",
+                    "over_budget=%d, paced_ms=%.1f, reprobe_ms=%.1f",
                     source,
                     chunk_count,
                     len(ranges),
@@ -629,6 +690,7 @@ class GaiaPrefetchPlugin:
                     wait_us / 1000.0,
                     degraded,
                     paced_ms,
+                    reprobe_ms,
                 )
             else:
                 logger.info(
@@ -754,6 +816,71 @@ class GaiaPrefetchPlugin:
                     size,
                     status,
                 )
+
+    def _residency_map(
+        self, handler: MaruHandler, batch_resp: BatchLookupKVResponse
+    ) -> None:
+        """Time a per-chunk prefetch over the prefix and log where it is absent.
+
+        Splits the prefix into ``MARU_GAIA_MAP_CHUNK_BYTES`` pieces, issues one
+        blocking ``memory_prefetch_sync`` per piece, and classifies each piece
+        by how long that call took: a resident piece returns within
+        ``MARU_GAIA_MAP_THRESHOLD_MS``, an absent one takes as long as
+        transferring the piece. The logged map preserves prefix order, so the
+        pattern of absences is readable directly.
+
+        Measurement only: the probe itself fills the absent pieces, so the
+        read and first-token times of a probed request are not comparable to
+        the cell's other requests.
+        """
+        eligible: list[tuple[int, int, int]] = []
+        for entry in batch_resp.entries:
+            if not entry.found or entry.handle is None:
+                continue
+            region_id = entry.handle.region_id
+            if not handler.is_region_mapped(region_id):
+                continue
+            device_id = self._resolve_device_id(handler, region_id)
+            if device_id is None:
+                continue
+            eligible.append(
+                (device_id, entry.handle.offset + entry.kv_offset, entry.kv_length)
+            )
+        if not eligible:
+            return
+        ranges = self._split_ranges(
+            self._coalesce_ordered(eligible) if self._coalesce else eligible,
+            self._map_chunk,
+        )
+        marks: list[str] = []
+        absent_ms = 0.0
+        total_ms = 0.0
+        for device_id, device_addr, size in ranges:
+            t = time.monotonic()
+            try:
+                pyxif.memory_prefetch_sync(device_id, device_addr, size)
+            except Exception:
+                marks.append("?")
+                continue
+            took = (time.monotonic() - t) * 1000.0
+            total_ms += took
+            if took >= self._map_thr_ms:
+                marks.append("#")
+                absent_ms += took
+            else:
+                marks.append(".")
+        absent = sum(1 for m in marks if m == "#")
+        logger.info(
+            "gaia_resmap: chunks=%d, absent=%d (%.1f%%), thr=%.2fms, "
+            "probe_ms=%.1f, absent_ms=%.1f, map=%s",
+            len(marks),
+            absent,
+            100.0 * absent / len(marks) if marks else 0.0,
+            self._map_thr_ms,
+            total_ms,
+            absent_ms,
+            "".join(marks),
+        )
 
     @staticmethod
     def _split_ranges(
