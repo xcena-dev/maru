@@ -1015,13 +1015,18 @@ class GaiaPrefetchPlugin:
             consultations saw an active write. A zero check count in a run's
             stage lines means the probe is not wired at all.
 
-        Why the fill yields and not the write: the write's D2H copy is already
-        queued on the GPU stream by the time the host could act, so the host
-        cannot move it. The fill, by contrast, completes a median 1.27 s before
+        Why the fill yields and not the write: the write's device copy carries
+        the request's own first token behind it — a regression over 131 requests
+        puts 0.90 +/- 0.03 ms of "read end to first token" on every millisecond
+        of that copy. The fill, by contrast, completes a median 1.27 s before
         the request that needs it arrives, so tens of milliseconds of delay are
-        free. Measured stakes — a write overlapping a whole-prefix fill takes
-        52-57 ms instead of 26 ms, and that write then lands on the request's
-        critical path between its read and its first token.
+        free. Measured stakes — the same 16 MiB copy takes 34.2 ms while a
+        whole-prefix fill runs and 6.0 ms when none does (0.46 vs 2.7 GB/s).
+
+        Yield density is set by the fill's issue granularity: this runs once per
+        range, so a whole-prefix fill offers only ~6 pause points across its
+        145 ms window while ``MARU_GAIA_STAGE_SPLIT_BYTES`` at 16 MiB offers
+        ~110, letting the device clear within about one piece's transfer.
 
         The pause ends when the write clears or the batch's cumulative budget
         (``MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS``) is spent, whichever comes
