@@ -111,6 +111,12 @@ class MaruHandler:
         # Device plugins consult it through demand_active() to yield
         # speculative staging to in-flight demand reads.
         self._demand_probe: Callable[[], bool] | None = None
+        # Same shape for the write side: plugins consult store_active() to keep
+        # a speculative fill off the device while a write-behind's bytes are in
+        # flight. Measured need — a fill overlapping a write-behind doubles the
+        # write (26 -> 52 ms) and that write then lands on the request's
+        # critical path (design note 20260902_three-way-device-contention).
+        self._store_probe: Callable[[], bool] | None = None
 
         # Region-added callback (set by CxlMemoryAdapter)
         self._on_region_added: Callable[[int, int], None] | None = None
@@ -1173,6 +1179,35 @@ class MaruHandler:
                 demand read is in flight. None clears the probe.
         """
         self._demand_probe = probe
+
+    def set_store_probe(self, probe: Callable[[], bool] | None) -> None:
+        """Register a live write-behind activity probe.
+
+        The serving integration owns the ground truth of "a write-behind's
+        bytes are moving right now" (a queued D2H batch whose completion event
+        has not fired, or its device registration still running). Registering
+        it here lets device plugins keep a speculative fill off the device for
+        that window without knowing the integration.
+
+        Args:
+            probe: Zero-argument callable returning True while at least one
+                write-behind batch is in flight. None clears the probe.
+        """
+        self._store_probe = probe
+
+    def store_active(self) -> bool:
+        """Return whether a write-behind batch is in flight right now.
+
+        False when no probe is registered or the probe raises — a broken probe
+        must degrade to "no yield", never block staging.
+        """
+        probe = self._store_probe
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
 
     def demand_active(self) -> bool:
         """Return whether a demand read is in flight right now.

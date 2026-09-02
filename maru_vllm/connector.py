@@ -1994,6 +1994,11 @@ class MaruWorkerConnector:
         # completion thread both update key/request lifetimes.
         self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._store_executor: ThreadPoolExecutor | None = None
+        # 진행 중인 되쓰기 배치. (완료 이벤트, 남은 단계) 로 들고 있고 gaia
+        # 플러그인이 store_active() 로 물어 적재를 그 구간 밖으로 미룬다.
+        # 창은 [스트림에 큐한 순간, 장치 등록이 끝난 순간] 이다 — 그 안에서
+        # GPU→장치 바이트가 움직인다.
+        self._store_inflight = 0
         self._store_lock = threading.Lock()
         self._pending_store_keys: set[str] = set()
         self._store_key_waiters: dict[str, set[str]] = {}
@@ -2124,6 +2129,7 @@ class MaruWorkerConnector:
             # probe queries the CUDA events directly, so it sees the current
             # state regardless of the lazy ref cleanup cadence.
             self._handler.set_demand_probe(self._demand_reads_active)
+            self._handler.set_store_probe(self._store_writes_active)
         except Exception:
             self._handler_retry_after = time.monotonic() + 5.0
             logger.warning("Worker MaruHandler creation failed, backing off 5s")
@@ -3965,6 +3971,18 @@ class MaruWorkerConnector:
             entries = list(self._active_load_refs)
         return any(not event.query() for event, _ in entries)
 
+    def _store_writes_active(self) -> bool:
+        """Return whether a write-behind batch's bytes are in flight right now.
+
+        Ground truth for the plugin's fill-yield decision (relayed through
+        ``MaruHandler.set_store_probe``). Counted from the moment the D2H
+        copies are queued on the store stream to the moment the device
+        registration returns, because the queued copy can start at any point
+        inside that span and the host cannot narrow it further.
+        """
+        with self._store_lock:
+            return self._store_inflight > 0
+
     def _enter_demand_load(self) -> None:
         """Open a demand-load window for the stage-yield probe."""
         with self._deferred_lock:
@@ -4655,6 +4673,8 @@ class MaruWorkerConnector:
             self._store_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="maru-write-behind"
             )
+        with self._store_lock:
+            self._store_inflight += 1
         try:
             self._store_executor.submit(
                 self._finish_write_behind_store,
@@ -4664,6 +4684,8 @@ class MaruWorkerConnector:
                 slot_refs,
             )
         except Exception as e:
+            with self._store_lock:
+                self._store_inflight = max(0, self._store_inflight - 1)
             # Executor creation/submission failures are exceptional. Drain the
             # queued copies before freeing their destination handles.
             logger.error("Maru write-behind submit failed: %s", e)
@@ -4679,6 +4701,20 @@ class MaruWorkerConnector:
         refs: list[Any],
     ) -> None:
         """Wait for D2H and register a write-behind batch off-thread."""
+        try:
+            self._finish_write_behind_store_inner(event, keys, handles, refs)
+        finally:
+            with self._store_lock:
+                self._store_inflight = max(0, self._store_inflight - 1)
+
+    def _finish_write_behind_store_inner(
+        self,
+        event: torch.cuda.Event,
+        keys: list[str],
+        handles: list[Any],
+        refs: list[Any],
+    ) -> None:
+        """Body of ``_finish_write_behind_store`` (the caller closes the window)."""
         handler = self._handler
         if handler is None:
             logger.error("Maru write-behind completion: handler unavailable")

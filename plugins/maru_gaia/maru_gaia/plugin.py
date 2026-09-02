@@ -238,6 +238,22 @@ class GaiaPrefetchPlugin:
             0.0,
             float(os.environ.get("MARU_GAIA_STAGE_YIELD_BUDGET_MS", "2000") or 0),
         )
+        # 되쓰기와 겹치지 않게 적재를 미루는 손잡이. 켜면 각 범위 호출 전에
+        # 되쓰기가 진행 중인지 묻고, 진행 중이면 예산 안에서 쉰다. 적재는 요청
+        # 도착보다 중앙 1.27 초 먼저 끝나므로 수십 ms 미룰 여유가 있고, 되쓰기는
+        # 적재와 겹치지 않으면 16 MiB 를 26 ms 에 옮긴다
+        # (설계 노트 20260902_three-way-device-contention).
+        self._stage_avoid_store = (
+            os.environ.get("MARU_GAIA_STAGE_AVOID_STORE", "0") or "0"
+        ) not in ("0", "", "false", "False")
+        self._stage_avoid_store_budget_ms = max(
+            0.0,
+            float(os.environ.get("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "200") or 0),
+        )
+        self._stage_avoid_store_us = 0
+        self._stage_avoid_store_checks = 0
+        self._stage_avoid_store_hits = 0
+        self._stage_avoid_store_budget_hits = 0
         self._last_demand_at = 0.0
         self._stage_yield_us = 0
         self._stage_yield_budget_hits = 0
@@ -287,7 +303,7 @@ class GaiaPrefetchPlugin:
         self._stage_wait_us = 0
         logger.info(
             "Gaia prefetch plugin loaded (coalesce=%s, device_id=%s, "
-            "read_gate=%s, stage_api=%s, stage_yield_ms=%s)",
+            "read_gate=%s, stage_api=%s, stage_yield_ms=%s, avoid_store=%s)",
             "on" if self._coalesce else "off",
             self._device_id if self._device_id is not None else "auto-scan",
             "sync" if self._sync_gate else "async",
@@ -295,6 +311,9 @@ class GaiaPrefetchPlugin:
             if self._stage_async
             else ("memory_pin" if self._stage_pin else "memory_prefetch_sync"),
             self._stage_yield_ms or "off",
+            f"on (budget {self._stage_avoid_store_budget_ms:.0f} ms)"
+            if self._stage_avoid_store
+            else "off",
         )
 
     # -- MaruHandlerPlugin seams -------------------------------------------
@@ -513,6 +532,11 @@ class GaiaPrefetchPlugin:
             "coalesce": self._coalesce,
             "read_gate": "sync" if self._sync_gate else "async",
             "sync_gate_wait_ms": round(self._sync_wait_us / 1000.0, 1),
+            "stage_avoid_store": self._stage_avoid_store,
+            "stage_avoid_store_ms": round(self._stage_avoid_store_us / 1000.0, 1),
+            "stage_avoid_store_checks": self._stage_avoid_store_checks,
+            "stage_avoid_store_hits": self._stage_avoid_store_hits,
+            "stage_avoid_store_budget_hits": self._stage_avoid_store_budget_hits,
             "stage_requests": self._stage_requests,
             "stage_ready": self._stage_ready,
             "stage_bytes": self._stage_bytes,
@@ -645,6 +669,9 @@ class GaiaPrefetchPlugin:
         probe_hits = 0
         t0 = time.monotonic()
         paced_ms = 0.0
+        avoided_ms = 0.0
+        avoid_checks = 0
+        avoid_hits = 0
         for range_index, (device_id, device_addr, size) in enumerate(ranges):
             if (
                 source == "stage"
@@ -663,6 +690,11 @@ class GaiaPrefetchPlugin:
                 yielded_ms += waited_ms
                 probe_checks += checks
                 probe_hits += hits
+            if source == "stage" and not fire_and_forget and self._stage_avoid_store:
+                waited_ms, checks, hits = self._yield_to_store(handler, avoided_ms)
+                avoided_ms += waited_ms
+                avoid_checks += checks
+                avoid_hits += hits
             # The read gate blocks the single deferred-load thread, so a cold
             # gate does not just delay this request — it delays every request
             # queued behind it. Spend at most the budget blocking, then finish
@@ -852,12 +884,16 @@ class GaiaPrefetchPlugin:
         self._failed += failed
         self._skipped += skipped
         self._sync_wait_us += wait_us
+        self._stage_avoid_store_us += int(avoided_ms * 1000)
+        self._stage_avoid_store_checks += avoid_checks
+        self._stage_avoid_store_hits += avoid_hits
         if issued or failed:
             if sync:
                 logger.info(
                     "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
                     "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
-                    "over_budget=%d, paced_ms=%.1f, reprobe_ms=%.1f",
+                    "over_budget=%d, paced_ms=%.1f, reprobe_ms=%.1f, "
+                    "avoided_store_ms=%.1f, avoid_checks=%d/%d",
                     source,
                     chunk_count,
                     len(ranges),
@@ -868,6 +904,9 @@ class GaiaPrefetchPlugin:
                     degraded,
                     paced_ms,
                     reprobe_ms,
+                    avoided_ms,
+                    avoid_hits,
+                    avoid_checks,
                 )
             else:
                 logger.info(
@@ -960,6 +999,52 @@ class GaiaPrefetchPlugin:
                     return waited_ms, checks, hits
             if yielded_so_far_ms + waited_ms >= self._stage_yield_budget_ms:
                 self._stage_yield_budget_hits += 1
+                return waited_ms, checks, hits
+            pause_s = 0.002
+            time.sleep(pause_s)
+            waited_ms += pause_s * 1000.0
+
+    def _yield_to_store(
+        self, handler: MaruHandler, avoided_so_far_ms: float
+    ) -> tuple[float, int, int]:
+        """Pause while a write-behind batch's bytes are in flight.
+
+        Returns:
+            ``(waited_ms, probe_checks, probe_hits)`` — the pause plus the
+            wiring echo: how many times the probe was consulted and how many
+            consultations saw an active write. A zero check count in a run's
+            stage lines means the probe is not wired at all.
+
+        Why the fill yields and not the write: the write's D2H copy is already
+        queued on the GPU stream by the time the host could act, so the host
+        cannot move it. The fill, by contrast, completes a median 1.27 s before
+        the request that needs it arrives, so tens of milliseconds of delay are
+        free. Measured stakes — a write overlapping a whole-prefix fill takes
+        52-57 ms instead of 26 ms, and that write then lands on the request's
+        critical path between its read and its first token.
+
+        The pause ends when the write clears or the batch's cumulative budget
+        (``MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS``) is spent, whichever comes
+        first. The budget is the starvation guard: on a device that always has
+        a write in flight the fill proceeds anyway.
+        """
+        store_active = getattr(handler, "store_active", None)
+        if store_active is None:
+            return 0.0, 0, 0
+        waited_ms = 0.0
+        checks = 0
+        hits = 0
+        while True:
+            checks += 1
+            try:
+                in_flight = bool(store_active())
+            except Exception:
+                in_flight = False  # fail open — never block staging
+            if not in_flight:
+                return waited_ms, checks, hits
+            hits += 1
+            if avoided_so_far_ms + waited_ms >= self._stage_avoid_store_budget_ms:
+                self._stage_avoid_store_budget_hits += 1
                 return waited_ms, checks, hits
             pause_s = 0.002
             time.sleep(pause_s)

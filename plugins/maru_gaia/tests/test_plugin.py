@@ -745,3 +745,131 @@ class TestStageDemandYield:
 
         assert result.ready
         assert result.yielded_ms == 0.0
+
+
+class TestStageAvoidStore:
+    """Stage sub-calls pause while a write-behind's bytes are in flight.
+
+    Why this gate exists: a fill overlapping a whole-prefix write-behind
+    doubles that write (26 -> 52 ms measured), and the lengthened write then
+    lands on the request's critical path between its read and its first token
+    (design note 20260902_three-way-device-contention). The fill yields rather
+    than the write because the write's D2H copy is already queued on the GPU
+    stream, while the fill completes a median 1.27 s before it is needed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
+        monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "0")
+        monkeypatch.delenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", raising=False)
+
+    def test_off_by_default(self, monkeypatch):
+        """Every campaign through 2026-09-02 ran without this gate."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.delenv("MARU_GAIA_STAGE_AVOID_STORE", raising=False)
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+        handler.store_active = lambda: True  # would pause if the gate were on
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        stats = plugin.contribute_stats()
+        assert result.ready
+        assert stats["stage_avoid_store"] is False
+        assert stats["stage_avoid_store_ms"] == 0.0
+        assert stats["stage_avoid_store_checks"] == 0
+
+    def test_stage_waits_until_the_write_clears(self, monkeypatch):
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "1")
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+        # 다섯 번은 되쓰기가 진행 중이라 답하고 그 뒤 비운다 (2 ms x 5 = 10 ms).
+        remaining = itertools.count()
+        handler.store_active = lambda: next(remaining) < 5
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        stats = plugin.contribute_stats()
+        assert result.ready
+        assert 8 <= stats["stage_avoid_store_ms"] <= 12
+        assert stats["stage_avoid_store_hits"] == 5
+        assert stats["stage_avoid_store_checks"] == 6  # 다섯 번 걸리고 한 번 통과
+        assert len(fake.sync_calls) == 1  # 적재는 결국 나간다
+
+    def test_budget_caps_the_pause(self, monkeypatch):
+        """A device that always has a write in flight must not starve the fill."""
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "30")
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+        handler.store_active = lambda: True
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        stats = plugin.contribute_stats()
+        assert result.ready  # 적재는 진행한다. 굶주림 방지이지 실패가 아니다
+        assert 28 <= stats["stage_avoid_store_ms"] <= 34
+        assert stats["stage_avoid_store_budget_hits"] >= 1
+        assert len(fake.sync_calls) == 1
+
+    def test_budget_is_shared_across_the_batch(self, monkeypatch):
+        """Two ranges share one budget, so a batch cannot pause twice over."""
+        fake = _FakePyxif()
+        clock = _FakeTime()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setattr("maru_gaia.plugin.time", clock)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "1")
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "30")
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+        handler.store_active = lambda: True
+
+        result = plugin.on_stage(
+            handler, ["a", "b"], _resp(_entry(0, 0, 32), _entry(0, 1024, 32))
+        )
+
+        stats = plugin.contribute_stats()
+        assert result.ready
+        assert 28 <= stats["stage_avoid_store_ms"] <= 34
+        assert len(fake.sync_calls) == 2
+
+    def test_broken_probe_fails_open(self, monkeypatch):
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "1")
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+
+        def broken():
+            raise RuntimeError("probe blew up")
+
+        handler.store_active = broken
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        assert result.ready
+        assert plugin.contribute_stats()["stage_avoid_store_ms"] == 0.0
+
+    def test_probe_absent_does_not_pause(self, monkeypatch):
+        """An integration without the probe (older connector) must not block."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "1")
+        plugin = GaiaPrefetchPlugin()
+
+        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 32)))
+
+        stats = plugin.contribute_stats()
+        assert result.ready
+        assert stats["stage_avoid_store_ms"] == 0.0
+        assert stats["stage_avoid_store_checks"] == 0
