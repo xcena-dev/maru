@@ -155,9 +155,9 @@ class GaiaPrefetchPlugin:
         # 그 다음 이미 올라온 범위를 memory_pin 으로 잠근다.
         #
         # 잠그는 단위는 MARU_GAIA_PIN_AFTER_FILL_BYTES 가 정한다 (0 = 합친 범위
-        # 통째로). 「올리면서 잠그는」 1 GiB 호출에서는 셀 아홉 중 다섯이 죽었는데,
-        # 이미 상주하는 범위를 잠그는 호출은 SSD 를 읽을 필요가 없어 훨씬 짧게
-        # 끝나므로 큰 단위도 될 수 있다 — 그 확인이 이 손잡이의 목적이다.
+        # 통째로). pin 이 내부에서 prefetch_sync 를 하므로, 이미 상주하는 범위에
+        # 걸면 그 내부 적재가 할 일이 없어 짧게 끝난다 — 실측 중앙 1.3 ms · p90
+        # 1.7 ms 이고 접두사 1.72 GiB 를 6 개 호출로 잠가도 실패·사망이 없다.
         self._pin_after_fill = os.environ.get("MARU_GAIA_PIN_AFTER_FILL", "0") == "1"
         self._pin_after_fill_bytes = max(
             0, int(os.environ.get("MARU_GAIA_PIN_AFTER_FILL_BYTES", "0") or 0)
@@ -686,9 +686,15 @@ class GaiaPrefetchPlugin:
                     pin_this = False
                     self._stage_pin_degraded += 1
             if pin_this:
-                # memory_pin returns at DRAM-load completion AND protects the
-                # range from eviction until the matching unpin — the stage's
-                # residency lease.
+                # memory_pin 은 내부에서 prefetch_sync 를 완료한 뒤 그 범위를
+                # 축출 대상에서 제외한다 (2026-09-02 펌웨어 팀 확인 — xif 헤더와
+                # 구현에는 설명이 없고 MemorySubOpcode::Pin 을 보내는 것뿐이다).
+                #
+                # 곧 이 분기는 적재까지 pin 에 맡기는 것이므로 SSD 읽기가 호출
+                # 안에 갇힌다. 1 GiB 단위로 부른 셀 아홉 중 다섯에서 엔진이 요청
+                # 21~25 건 만에 죽었다 (긴 호출이 GPU→CXL 되쓰기와 겹쳐 깨진다).
+                # 통째로 올리면서 지키려면 MARU_GAIA_PIN_AFTER_FILL=1 로 두 단계를
+                # 쓴다 — 그때 pin 은 1.3 ms 에 끝난다.
                 prefetch_fn = pyxif.memory_pin
             elif gated:
                 prefetch_fn = pyxif.memory_prefetch_sync
