@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import itertools
 import os
+import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -46,6 +47,43 @@ if TYPE_CHECKING:
     from maru_handler import MaruHandler
 
 logger = logging.getLogger(__name__)
+
+
+# 고정에 쓸 예산을 장치 상한의 몇 할까지 잡을지. 상한에 딱 붙이면 다른 프로세스나
+# 아직 안 풀린 고정과 겹쳐 거절이 나므로 한 뼘 남긴다.
+_PIN_BUDGET_FRACTION = 0.9
+# 고정 호출 하나의 크기 상한 기본값 (MARU_GAIA_STAGE_SPLIT_BYTES 미지정 시).
+_PIN_SPLIT_DEFAULT = 16 << 20
+_XCENA_CLI = "xcena_cli"
+
+
+def _read_pin_threshold(device_id: "int | None", *, cli: str = _XCENA_CLI) -> int:
+    """장치가 허용하는 고정 총량을 바이트로 읽는다 (못 읽으면 0).
+
+    ``xcena_cli im get-smart <id> -v`` 의 ``pin_threshold`` 줄을 쓴다. pyxif 의
+    ``get_device_info`` 는 이 값을 노출하지 않는다. 실패는 조용히 0 을 돌려주고
+    호출자가 예산 없음으로 이어가게 한다 — 이 값을 못 읽는다고 적재를 막을 일은
+    아니기 때문이다.
+    """
+    if device_id is None:
+        return 0
+    try:
+        out = subprocess.run(
+            [cli, "im", "get-smart", str(device_id), "-v"],
+            capture_output=True, text=True, timeout=20.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if out.returncode != 0:
+        return 0
+    for line in (out.stdout or "").splitlines():
+        parts = line.split(":")
+        if len(parts) == 2 and parts[0].strip() == "pin_threshold":
+            try:
+                return int(parts[1].strip())
+            except ValueError:
+                return 0
+    return 0
 
 
 class GaiaPrefetchPlugin:
@@ -100,11 +138,17 @@ class GaiaPrefetchPlugin:
         # calls serve two purposes: very large single pins can time out the
         # firmware ioctl, and the pyxif binding holds the GIL for the whole
         # blocking call — sub-ranges open GIL windows so the caller process's
-        # Python threads keep running during a multi-hundred-ms fill. Pin
-        # defaults to 1 GiB when unset; prefetch_sync keeps whole ranges.
+        # Python threads keep running during a multi-hundred-ms fill.
+        #
+        # Pin defaults to 16 MiB when unset; prefetch_sync keeps whole ranges.
+        # The default used to be 1 GiB, and at that size the engine died in
+        # five of ten measured pin cells: a GPU-to-CXL write-behind copy
+        # overlapping such a call failed with CUDA "unspecified launch
+        # failure" (or the engine spun without progress), ending the cell
+        # inside 21 requests. No cell issuing 16 MiB pins has reproduced it.
         split_env = int(os.environ.get("MARU_GAIA_STAGE_SPLIT_BYTES", "0") or 0)
         if split_env <= 0 and self._stage_pin:
-            split_env = 1 << 30
+            split_env = _PIN_SPLIT_DEFAULT
         self._stage_split_bytes = max(0, split_env)
         # Demand-yield (MARU_GAIA_STAGE_DEMAND_YIELD_MS, 0 = off): between
         # stage sub-calls, pause while a demand read ran within the last
@@ -193,6 +237,22 @@ class GaiaPrefetchPlugin:
         self._pin_budget_bytes = max(
             0, int(os.environ.get("MARU_GAIA_PIN_BUDGET_BYTES", "0") or 0)
         )
+        # 예산을 안 주면 장치가 알려 주는 상한에서 잡는다. 상한은 캐시 용량의
+        # 절반이 기본값이고 최대가 캐시 − 8 GiB 여서, 미리 채워 둘 자리 수만 보고
+        # 고정하면 접두사가 자라는 순간 상한을 넘는다 (자리 4 개 × 접두사 최대
+        # 1.91 GiB = 7.62 GiB 대 상한 8 GiB 에서 거절 855 건). 호스트가 세는 수와
+        # 장치가 두는 선을 맞춰 둔다.
+        if self._stage_pin and self._pin_budget_bytes == 0:
+            ceiling = _read_pin_threshold(self._device_id)
+            if ceiling:
+                self._pin_budget_bytes = int(ceiling * _PIN_BUDGET_FRACTION)
+                logger.info(
+                    "gaia_prefetch: pin budget from device ceiling "
+                    "(device=%s, ceiling=%d B, budget=%d B)",
+                    self._device_id,
+                    ceiling,
+                    self._pin_budget_bytes,
+                )
         self._pin_lock = threading.Lock()
         self._pinned: dict[tuple[str, ...], list[tuple[int, int, int]]] = {}
         self._pinned_bytes = 0
@@ -653,6 +713,29 @@ class GaiaPrefetchPlugin:
                     sync,
                     pin,
                 )
+                # 고정이 거절되면 그 범위를 그냥 버리고 있었다. 고정만 못 한 것이
+                # 아니라 바이트가 DRAM 으로 올라오지도 않아, 읽기가 그 조각만큼
+                # SSD 로 내려갔다 (거절 855 건이 난 셀에서 접두사의 5.7 % 가 그렇게
+                # 비었다). 축출 가능한 적재로 한 번 되돌아가 적어도 상주는 남긴다.
+                if pin_this:
+                    try:
+                        fb = pyxif.memory_prefetch_sync(device_id, device_addr, size)
+                    except Exception:
+                        fb = None
+                        logger.warning(
+                            "gaia_prefetch fallback raised: device=%d addr=0x%x size=%d",
+                            device_id,
+                            device_addr,
+                            size,
+                            exc_info=True,
+                        )
+                    if fb == pyxif.MemoryStatus.Success:
+                        self._stage_pin_degraded += 1
+                        issued += 1
+                        failed -= 1
+                        if gated or fire_and_forget:
+                            prepared_ranges += 1
+                            prepared_bytes += size
         wait_us = int((time.monotonic() - t0) * 1e6) if sync else 0
         reprobe_ms = -1.0
         if (
