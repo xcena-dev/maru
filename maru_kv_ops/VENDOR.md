@@ -50,12 +50,37 @@ unbound. Deleting them would shrink the build, but it would also mean the files
 are no longer byte-identical to a known upstream revision, which is what lets a
 refresh be a plain copy and a diff. The build cost is paid once per install.
 
+### Copied contents
+
+SHA-256 of each file as copied from the revision above. `tests/unit/test_kv_ops.py`
+recomputes these, so a copy that lands without its revision being updated fails
+the suite instead of passing as the recorded revision.
+
+| File | SHA-256 |
+|---|---|
+| `csrc/engine_kv_format.h` | `cba3e779b1244ff32952afed2922e935bb582b8b493a62dfd5c6dde163de4d2f` |
+| `csrc/kv_transfer_types.h` | `80a56023fd6a2995467249016f05c4128acd2068edfba35df2e16230fb2dee9c` |
+| `csrc/mem_kernels.cu` | `c24fb1836d6fe8ad81cfabfae44551a3c958f1f58fa441ece8fbcf563e677741` |
+| `csrc/mem_kernels.cuh` | `829f00e9201b22e375969a0128139aa426f483e57553132aa27d9ddf70f378e2` |
+| `csrc/mp_mem_kernels.cu` | `ebfc61e4499382b63741f9323cadddca78f9dbee57d914dab0a20d7df32ad7b9` |
+| `csrc/mp_mem_kernels.cuh` | `aae0da1fd17773f6a4fe151e7bf20cc883ae7a45fa7327b1fa37cbe5adc7045e` |
+
+Regenerate with:
+
+```bash
+cd maru_kv_ops/csrc && sha256sum *.h *.cu *.cuh
+```
+
 ## Refreshing
 
 1. Copy the files listed above, minus `pybind.cpp`, from the target revision.
 2. Re-read `pybind.cpp` against the new headers: a signature or enum change
    upstream shows up here as a compile error, which is the intent.
-3. Update the revision table above, including what moved and why.
-4. Re-run the connector unit tests, then compare against the previous revision
+3. Update the revision table above, including what moved and why, and
+   regenerate the SHA-256 table with the command given there.
+4. Check that `single_layer_kv_transfer` still dispatches every format
+   `maru_vllm.kv_layout` emits — `tests/unit/test_kv_ops.py` reads the switch
+   in `mem_kernels.cu` and fails when one is dropped.
+5. Re-run the connector unit tests, then compare against the previous revision
    on device before adopting. A refresh changes kernel behaviour and cannot be
    validated by unit tests alone.
