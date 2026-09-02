@@ -3399,6 +3399,43 @@ class TestPackedLayerCopyPlan:
         expected = slab[:, :, 2].permute(1, 0, 2, 3).reshape(-1).contiguous()
         assert torch.equal(got, expected)
 
+    def test_gapped_multi_chunk_runs_stay_contiguous_per_half(self):
+        """Chunked prefill's real shape: two runs, several chunks each.
+
+        This is where the destination arithmetic can go wrong without any
+        symptom. A run's rows are one page apart at the source but adjacent at
+        the destination, and the second run has to resume inside the K half
+        where the first left off — not at the half's start, and not past the
+        boundary into V.
+        """
+        num_chunks, num_layers, chunk_tokens, hidden = 4, 3, 2, 2
+        itemsize = 4
+        plane_bytes = chunk_tokens * hidden * itemsize
+        slab_bytes = 2 * num_layers * plane_bytes
+        worker = self._worker(num_layers, chunk_tokens, slab_bytes)
+        # Five slots hold the four chunks: the second run starts at slot 3, so
+        # slot 2 is the gap a fresh allocation burst leaves behind.
+        occupied = [0, 1, 3, 4]
+        slab = self._slab(len(occupied) + 1, num_layers, chunk_tokens, hidden)
+
+        plan = worker._packed_layer_copy_plan(
+            runs=[(0, 2), (2, 2)],
+            num_chunks=num_chunks,
+            layer_idx=1,
+            plane_bytes=plane_bytes,
+        )
+        got = self._replay(
+            plan,
+            slab,
+            [0, 3 * slab_bytes],
+            2 * num_chunks * chunk_tokens * hidden,
+            itemsize,
+        )
+
+        expected = slab[occupied][:, :, 1].permute(1, 0, 2, 3).reshape(-1).contiguous()
+        assert torch.equal(got, expected)
+        assert [c.rows for c in plan] == [2, 2, 2, 2]
+
     def test_single_chunk_run_pitch_covers_the_width(self):
         """A one-row copy still needs pitch >= width or cudaMemcpy2D errors."""
         worker = self._worker(num_layers=2, chunk_tokens=4, page_size=None)
