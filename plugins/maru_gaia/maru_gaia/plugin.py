@@ -146,8 +146,24 @@ class GaiaPrefetchPlugin:
         # overlapping such a call failed with CUDA "unspecified launch
         # failure" (or the engine spun without progress), ending the cell
         # inside 21 requests. No cell issuing 16 MiB pins has reproduced it.
+        # 적재와 고정을 두 단계로 가른다 (MARU_GAIA_PIN_AFTER_FILL=1).
+        #
+        # 기본 동작은 memory_pin 하나로 「올리면서 잠그는」 것이라, 고정을 켜면
+        # 적재 명령의 모양이 고정 호출 크기에 끌려간다 — 적재를 통째로 보내면서
+        # 고정하는 조합을 만들 수 없었다. 이 손잡이를 켜면 먼저
+        # memory_prefetch_sync 로 합친 범위를 통째로 올리고(적재 소요 147 ms),
+        # 그 다음 이미 올라온 범위를 memory_pin 으로 잠근다.
+        #
+        # 잠그는 단위는 MARU_GAIA_PIN_AFTER_FILL_BYTES 가 정한다 (0 = 합친 범위
+        # 통째로). 「올리면서 잠그는」 1 GiB 호출에서는 셀 아홉 중 다섯이 죽었는데,
+        # 이미 상주하는 범위를 잠그는 호출은 SSD 를 읽을 필요가 없어 훨씬 짧게
+        # 끝나므로 큰 단위도 될 수 있다 — 그 확인이 이 손잡이의 목적이다.
+        self._pin_after_fill = os.environ.get("MARU_GAIA_PIN_AFTER_FILL", "0") == "1"
+        self._pin_after_fill_bytes = max(
+            0, int(os.environ.get("MARU_GAIA_PIN_AFTER_FILL_BYTES", "0") or 0)
+        )
         split_env = int(os.environ.get("MARU_GAIA_STAGE_SPLIT_BYTES", "0") or 0)
-        if split_env <= 0 and self._stage_pin:
+        if split_env <= 0 and self._stage_pin and not self._pin_after_fill:
             split_env = _PIN_SPLIT_DEFAULT
         self._stage_split_bytes = max(0, split_env)
         # Demand-yield (MARU_GAIA_STAGE_DEMAND_YIELD_MS, 0 = off): between
@@ -657,7 +673,9 @@ class GaiaPrefetchPlugin:
                 if spent_ms >= self._sync_budget_ms:
                     gated = False
                     degraded += 1
-            pin_this = pin and gated
+            # 두 단계 모드에서는 이 루프가 적재만 한다. 고정은 루프가 끝난 뒤
+            # 이미 올라온 범위에 대해 따로 건다.
+            pin_this = pin and gated and not self._pin_after_fill
             if pin_this and self._pin_budget_bytes > 0:
                 with self._pin_lock:
                     over_budget = self._pinned_bytes + size > self._pin_budget_bytes
@@ -736,6 +754,60 @@ class GaiaPrefetchPlugin:
                         if gated or fire_and_forget:
                             prepared_ranges += 1
                             prepared_bytes += size
+        # 두 단계 모드의 고정 단계 — 적재가 끝난 범위를 잠근다.
+        pin_ms = -1.0
+        if pin and self._pin_after_fill and prepared_ranges > 0:
+            pin_ranges = (
+                self._split_ranges(ranges, self._pin_after_fill_bytes)
+                if self._pin_after_fill_bytes > 0
+                else ranges
+            )
+            t_pin = time.monotonic()
+            pin_ok = pin_fail = 0
+            for device_id, device_addr, size in pin_ranges:
+                if self._pin_budget_bytes > 0:
+                    with self._pin_lock:
+                        over = self._pinned_bytes + size > self._pin_budget_bytes
+                    if over:
+                        self._stage_pin_degraded += 1
+                        continue
+                try:
+                    st = pyxif.memory_pin(device_id, device_addr, size)
+                except Exception:
+                    pin_fail += 1
+                    logger.warning(
+                        "gaia_pin_after_fill raised: device=%d addr=0x%x size=%d",
+                        device_id,
+                        device_addr,
+                        size,
+                        exc_info=True,
+                    )
+                    continue
+                if st == pyxif.MemoryStatus.Success:
+                    pin_ok += 1
+                    pinned.append((device_id, device_addr, size))
+                    with self._pin_lock:
+                        self._pinned_bytes += size
+                else:
+                    pin_fail += 1
+                    logger.warning(
+                        "gaia_pin_after_fill failed: device=%d addr=0x%x size=%d status=%s",
+                        device_id,
+                        device_addr,
+                        size,
+                        st,
+                    )
+            pin_ms = (time.monotonic() - t_pin) * 1000.0
+            logger.info(
+                "gaia_pin_after_fill: calls=%d, pinned=%d, failed=%d, "
+                "unit_bytes=%d, pin_ms=%.1f",
+                len(pin_ranges),
+                pin_ok,
+                pin_fail,
+                self._pin_after_fill_bytes,
+                pin_ms,
+            )
+
         wait_us = int((time.monotonic() - t0) * 1e6) if sync else 0
         reprobe_ms = -1.0
         if (
