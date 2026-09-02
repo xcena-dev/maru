@@ -76,7 +76,30 @@ To install **without the Resource Manager** (e.g., on nodes that only run LLM in
 
 <br/>
 
-### 1.3 Development Install
+### 1.3 KV Placement Kernels (vLLM connector)
+
+The vLLM connector moves a request's KV cache between a Maru CXL object and vLLM's paged cache with the CUDA kernels in `maru_kv_ops`. Those kernels are a build product of this package, and building them needs **PyTorch importable by the interpreter that will run the engine, plus the CUDA toolkit (`nvcc`)**. On a host without either, Maru installs anyway and the connector copies one layer at a time — correct, but materially slower, and the connector logs a warning naming this step.
+
+`install.sh` handles this: it looks for PyTorch in the target environment and, when it finds it, installs with `--no-build-isolation` so the build can see it, then reports whether the kernels are callable.
+
+Installing by hand needs that flag passed explicitly. An isolated build gets only the packages in `[build-system].requires`, so it never sees PyTorch and skips the kernels silently:
+
+```bash
+uv pip install setuptools wheel          # the build backend, in this environment
+uv pip install -e . --no-build-isolation
+```
+
+Check the result at any time:
+
+```bash
+python -c "import maru_kv_ops; print(maru_kv_ops.is_available(), maru_kv_ops.import_error())"
+```
+
+`True None` means the connector takes the kernel path. Anything else prints why it cannot, and `MARU_SKIP_KV_OPS=1` skips the build outright when that is what you want.
+
+<br/>
+
+### 1.4 Development Install
 
 To work on Maru itself, install the `dev` extra (pytest, mypy, ruff, pre-commit) instead of running `install.sh`:
 

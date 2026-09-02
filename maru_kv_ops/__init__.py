@@ -19,6 +19,7 @@ Attributes:
 """
 
 # Standard
+import importlib as _importlib
 from typing import Any
 
 __all__ = [
@@ -42,8 +43,12 @@ try:
     # import fails with a missing-libc10 OSError even when it built fine.
     import torch  # noqa: F401
 
-    # Local
-    from maru_kv_ops import _C  # type: ignore[attr-defined]
+    # Imported by name rather than as ``from maru_kv_ops import _C``: this
+    # module is still executing, so a from-import of a submodule that was
+    # never built reports the partially initialised package and suggests a
+    # circular import. ``_IMPORT_ERROR`` is read out to operators verbatim, so
+    # it has to say the extension is missing.
+    _C = _importlib.import_module("maru_kv_ops._C")  # type: ignore[assignment]
 except Exception as exc:  # pragma: no cover - depends on build environment
     # Broad on purpose: a mismatched torch ABI raises neither ImportError nor
     # any other single type, and an unusable extension must degrade to the

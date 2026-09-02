@@ -79,10 +79,51 @@ else
     INSTALL_CMD=(pip install)
 fi
 
+# --- Decide whether the KV placement kernels can be built ------------------
+
+# setup.py describes the maru_kv_ops CUDA extension through
+# torch.utils.cpp_extension, so PyTorch has to be importable while the build
+# runs. A PEP 517 isolated build only gets the packages in
+# [build-system].requires, so it never sees the PyTorch installed in the target
+# environment and the extension is skipped without a word — the vLLM connector
+# then copies one layer at a time, which is materially slower. Turning
+# isolation off is what points the build at the interpreter the serving engine
+# uses, and it means the build backend has to be present there already.
+TARGET_PYTHON="${VIRTUAL_ENV:+${VIRTUAL_ENV}/bin/python}"
+TARGET_PYTHON="${TARGET_PYTHON:-$(command -v python3)}"
+
+BUILD_ARGS=()
+if "$TARGET_PYTHON" -c 'import torch' >/dev/null 2>&1; then
+    echo "PyTorch found; building Maru with the KV placement kernels ..."
+    "${INSTALL_CMD[@]}" "setuptools>=61.0" wheel
+    BUILD_ARGS=(--no-build-isolation)
+else
+    echo "Note: PyTorch is not installed in the target environment."
+    echo "      Maru installs without the KV placement kernels, and the vLLM"
+    echo "      connector falls back to a copy per layer. Install PyTorch and"
+    echo "      the CUDA toolkit, then rerun this script to build them."
+    echo ""
+fi
+
 # --- Install Python package ------------------------------------------------
 
 echo "Installing Maru Python package ..."
-"${INSTALL_CMD[@]}" -e "${SCRIPT_DIR}"
+"${INSTALL_CMD[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -e "${SCRIPT_DIR}"
+
+# --- Report whether the kernels are callable -------------------------------
+
+# An unbuilt extension raises nothing at runtime, so the install is where it
+# can still be reported against what was asked for.
+if [ ${#BUILD_ARGS[@]} -gt 0 ]; then
+    if "$TARGET_PYTHON" -c 'import maru_kv_ops, sys; sys.exit(0 if maru_kv_ops.is_available() else 1)' 2>/dev/null; then
+        echo "KV placement kernels: built."
+    else
+        echo ""
+        echo "Warning: the KV placement kernels did not build."
+        "$TARGET_PYTHON" -c 'import maru_kv_ops; print("         reason:", maru_kv_ops.import_error())' 2>/dev/null || true
+        echo "         The vLLM connector will use its slower per-layer copy path."
+    fi
+fi
 
 # --- Build and install resource manager ------------------------------------
 
