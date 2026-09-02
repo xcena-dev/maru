@@ -21,6 +21,7 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - gcc: 13.3.0+
 - cmake: 3.28.3+
 - git
+- [uv](https://docs.astral.sh/uv/) — recommended Python package installer
 - CXL DAX device (`/dev/dax*`) or emulation environment
   - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
 
@@ -28,7 +29,12 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 sudo apt-get update
 sudo apt-get install -y python3 python3-venv python3-pip git \
     build-essential cmake libnuma-dev
+
+# uv — used for all Python installs in this guide
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+> **Note:** `install.sh` uses `uv` when available and falls back to `pip` otherwise, so uv is recommended but not required.
 
 <br/>
 
@@ -46,9 +52,13 @@ git clone https://github.com/xcena-dev/maru
 (Optional) Create a virtual environment and activate it:
 
 ```bash
-python3 -m venv .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 ```
+
+> Pass `--python 3.12` explicitly so the interpreter matches the one your LLM
+> engine (vLLM, SGLang) was built against. Without it, uv may pick any
+> interpreter satisfying `requires-python >= 3.12`.
 
 Install all components (Python package + Resource Manager):
 
@@ -63,6 +73,46 @@ To install **without the Resource Manager** (e.g., on nodes that only run LLM in
 ```
 
 > **Note:** Client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager.
+
+<br/>
+
+### 1.3 Development Install
+
+To work on Maru itself, install the `dev` extra (pytest, mypy, ruff, pre-commit) instead of running `install.sh`:
+
+```bash
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+Without uv, the same install works through pip:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Install the git hooks once, so lint and format run on every commit:
+
+```bash
+pre-commit install
+```
+
+Then run the unit tests (these need neither a CXL device nor a running service):
+
+```bash
+pytest -m "not integration" --ignore=tests/sglang
+```
+
+To reproduce the lint job exactly, run the hooks against the whole tree. This
+uses the ruff version pinned in `.pre-commit-config.yaml` — the same version CI
+runs:
+
+```bash
+pre-commit run --all-files
+```
 
 <br/>
 

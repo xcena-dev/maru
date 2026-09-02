@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Console script entry point for installing the Maru Resource Manager.
 
-Wraps the cmake build + install workflow so that after `pip install -e .`,
+Wraps the cmake build + install workflow so that after `uv pip install -e .`,
 a single `sudo $(which install-maru-resource-manager)` builds and installs
 the Maru Resource Manager.
 """
@@ -107,7 +107,7 @@ def _do_install(args: argparse.Namespace) -> int:
         fprintf(
             sys.stderr,
             "Error: maru_resource_manager source directory not found.\n"
-            "This command requires an editable install: pip install -e .\n",
+            "This command requires an editable install: uv pip install -e .\n",
         )
         return 1
 

@@ -10,12 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
-      - name: Install ruff
-        run: pip install ruff
+          enable-cache: true
+
+      # Pinned to the same version as .pre-commit-config.yaml so CI and local
+      # pre-commit agree. Bump both together.
       - name: Run ruff check
-        run: ruff check .
+        run: uvx ruff@0.16.5 check .
+
       - name: Run ruff format check
-        run: ruff format --check .
+        run: uvx ruff@0.16.5 format --check .

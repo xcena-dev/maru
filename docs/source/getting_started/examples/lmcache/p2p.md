@@ -9,7 +9,7 @@ When multiple vLLM instances serve the same or similar prompts, they redundantly
 ## Prerequisites
 
 - At least **2 GPUs**
-- [LMCache](https://github.com/LMCache/LMCache) **>= v0.3.14** installed (`pip install lmcache`)
+- [LMCache](https://github.com/LMCache/LMCache) **>= v0.3.14** installed (`uv pip install lmcache`)
 - [vLLM](https://docs.vllm.ai/) installed
 - Maru installed (see {doc}`../../installation`)
 

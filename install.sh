@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # NOTE: We recommend using a virtual environment before running this script.
-#   python3 -m venv .venv && source .venv/bin/activate
+#   uv venv --python 3.12 .venv && source .venv/bin/activate
+# (or, without uv: python3 -m venv .venv && source .venv/bin/activate)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -56,14 +57,32 @@ check_cmd gcc build-essential
 
 if [ -z "${VIRTUAL_ENV:-}" ]; then
     echo "Warning: No virtual environment detected."
-    echo "We recommend using a venv: python3 -m venv .venv && source .venv/bin/activate"
+    echo "We recommend using a venv: uv venv --python 3.12 .venv && source .venv/bin/activate"
     echo ""
+fi
+
+# --- Select the Python installer -------------------------------------------
+
+# uv is preferred (much faster resolve/build); pip remains a working fallback.
+if command -v uv &>/dev/null; then
+    INSTALL_CMD=(uv pip install)
+    # uv refuses to guess a target when no virtual environment is active,
+    # so point it at the python3 on PATH to match pip's behaviour.
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        INSTALL_CMD+=(--python "$(command -v python3)")
+    fi
+else
+    echo "Note: uv not found, falling back to pip."
+    echo "      Installing uv makes this step significantly faster:"
+    echo "        curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo ""
+    INSTALL_CMD=(pip install)
 fi
 
 # --- Install Python package ------------------------------------------------
 
 echo "Installing Maru Python package ..."
-pip install -e "${SCRIPT_DIR}"
+"${INSTALL_CMD[@]}" -e "${SCRIPT_DIR}"
 
 # --- Build and install resource manager ------------------------------------
 
