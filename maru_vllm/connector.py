@@ -4595,6 +4595,7 @@ class MaruWorkerConnector:
         # Reserve new keys and attach request waiters to both new and already
         # pending keys. Completion of the original job wakes late joiners too.
         to_schedule: list[tuple[str, torch.Tensor]] = []
+        sched_req_ids: set[str] = set()
         with self._store_lock:
             for base_key, (chunk_slots, req_ids) in key_entries.items():
                 if base_key in self._stored_keys:
@@ -4608,6 +4609,7 @@ class MaruWorkerConnector:
                 if base_key not in self._pending_store_keys:
                     self._pending_store_keys.add(base_key)
                     to_schedule.append((base_key, chunk_slots))
+                    sched_req_ids.update(req_ids)
 
         if not to_schedule:
             return
@@ -4616,8 +4618,21 @@ class MaruWorkerConnector:
             self._store_stream = torch.cuda.Stream(device=dev)
             self._store_stream_device = dev
         store_stream = self._store_stream
+        # 되쓰기 시간의 구성을 가르려면 세 지점이 필요하다. store_stream 은 이 시점에
+        # 비어 있으므로 ev_enqueue 는 곧바로 실행되고, wait_stream 뒤의 ev_wait 는 기다린
+        # 계산이 끝난 순간에 실행된다. 두 이벤트의 간격이 「계산을 기다린 시간」이다.
+        ev_enqueue: torch.cuda.Event | None = None
+        ev_wait: torch.cuda.Event | None = None
+        if self._timing:
+            ev_enqueue = torch.cuda.Event(enable_timing=True)
+            ev_enqueue.record(store_stream)
         store_stream.wait_stream(torch.cuda.current_stream(dev))
+        if self._timing:
+            ev_wait = torch.cuda.Event(enable_timing=True)
+            ev_wait.record(store_stream)
 
+        ev_gather: torch.cuda.Event | None = None
+        ev_copy: torch.cuda.Event | None = None
         ready_keys: list[str] = []
         ready_handles: list[Any] = []
         slot_refs: list[torch.Tensor] = []
@@ -4649,9 +4664,17 @@ class MaruWorkerConnector:
                         block_size=block_size,
                         head_size=head_size,
                     )
+                    if self._timing and ev_gather is None:
+                        # 첫 조각의 모으기 커널까지. 조각 하나인 되쓰기가 대부분이므로
+                        # 이 한 조각이 사실상 전체다.
+                        ev_gather = torch.cuda.Event(enable_timing=True)
+                        ev_gather.record(store_stream)
                     # Maru cudaHostRegister's the CXL mapping, so this uses the
                     # copy engine rather than keeping SMs busy for the D2H.
                     slab_host.copy_(self._store_staging, non_blocking=True)
+                    if self._timing and ev_copy is None and ev_gather is not None:
+                        ev_copy = torch.cuda.Event(enable_timing=True)
+                        ev_copy.record(store_stream)
                 except Exception as e:
                     logger.error("Maru write-behind prepare error: %s: %s", base_key, e)
                     if handle is not None:
@@ -4666,7 +4689,7 @@ class MaruWorkerConnector:
 
             if not ready_keys:
                 return
-            event = torch.cuda.Event()
+            event = torch.cuda.Event(enable_timing=bool(self._timing))
             event.record(store_stream)
 
         if self._store_executor is None:
@@ -4682,6 +4705,8 @@ class MaruWorkerConnector:
                 ready_keys,
                 ready_handles,
                 slot_refs,
+                (ev_enqueue, ev_wait, ev_gather, ev_copy),
+                sorted(sched_req_ids),
             )
         except Exception as e:
             with self._store_lock:
@@ -4699,10 +4724,14 @@ class MaruWorkerConnector:
         keys: list[str],
         handles: list[Any],
         refs: list[Any],
+        marks: tuple[Any, Any, Any, Any] = (None, None, None, None),
+        req_ids: list[str] | None = None,
     ) -> None:
         """Wait for D2H and register a write-behind batch off-thread."""
         try:
-            self._finish_write_behind_store_inner(event, keys, handles, refs)
+            self._finish_write_behind_store_inner(
+                event, keys, handles, refs, marks, req_ids
+            )
         finally:
             with self._store_lock:
                 self._store_inflight = max(0, self._store_inflight - 1)
@@ -4713,6 +4742,8 @@ class MaruWorkerConnector:
         keys: list[str],
         handles: list[Any],
         refs: list[Any],
+        marks: tuple[Any, Any, Any, Any] = (None, None, None, None),
+        req_ids: list[str] | None = None,
     ) -> None:
         """Body of ``_finish_write_behind_store`` (the caller closes the window)."""
         handler = self._handler
@@ -4755,7 +4786,44 @@ class MaruWorkerConnector:
                 f"d2h={(t_d2h - t_wait) * 1e3:.1f} ms "
                 f"store={(t_store - t_d2h) * 1e3:.1f} ms "
                 f"t={time.time() - (t_store - t_d2h):.6f}"
+                f"{self._write_behind_gpu_marks(event, marks)}"
+                f" reqs={','.join(req_ids[:3]) if req_ids else '-'}"
             )
+
+    def _write_behind_gpu_marks(
+        self, event: torch.cuda.Event, marks: tuple[Any, Any, Any, Any]
+    ) -> str:
+        """Split the write-behind's GPU time into wait / gather / copy.
+
+        ``marks`` holds the events recorded around the launch: before the
+        stream wait, after it, after the first chunk's gather kernel and after
+        that chunk's copy. Their gaps say how much of the observed store time
+        was spent waiting for queued compute rather than moving bytes.
+
+        Args:
+            event: the batch's completion event (already synchronized).
+            marks: (ev_enqueue, ev_wait, ev_gather, ev_copy); any may be None.
+
+        Returns:
+            A log fragment beginning with a space, or an empty string when the
+            events are unavailable.
+        """
+        ev_enqueue, ev_wait, ev_gather, ev_copy = marks
+        if ev_enqueue is None or ev_wait is None:
+            return ""
+        try:
+            parts = [
+                f" wait={ev_enqueue.elapsed_time(ev_wait):.2f} ms",
+                f" gpu={ev_wait.elapsed_time(event):.2f} ms",
+            ]
+            if ev_gather is not None:
+                parts.append(f" gather0={ev_wait.elapsed_time(ev_gather):.2f} ms")
+                if ev_copy is not None:
+                    parts.append(f" copy0={ev_gather.elapsed_time(ev_copy):.2f} ms")
+            return "".join(parts)
+        except Exception as e:  # 계측이 본 경로를 막지 않는다
+            logger.debug("Maru write-behind GPU marks unavailable: %s", e)
+            return ""
 
     def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
         """Publish key outcomes and release all request waiters atomically."""
