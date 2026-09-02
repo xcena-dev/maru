@@ -2220,8 +2220,10 @@ class MaruWorkerConnector:
             device=kv_cache_layer.device,
         )
         runs = self._chunk_runs(infos[:num_chunks])
-        # Held, not just their pointers: these alias the CXL mapping the copies
-        # read from, and the copies are still queued when this returns.
+        # These alias the CXL mapping the copies read from. They only have to
+        # outlive the loop below, which is where the copies are queued; what
+        # keeps the mapping alive until the copies actually run is the caller
+        # retaining ``infos`` against the stream's completion event.
         run_views = [
             torch.frombuffer(run_view, dtype=kv_cache_layer.dtype)
             for _, _, run_view in runs
@@ -2317,6 +2319,15 @@ class MaruWorkerConnector:
         derives each token's block and offset inline. The fallback has to
         materialise those as two index tensors first, so it issues three kernels
         per layer where the first issues one.
+
+        That equivalence is the layout branch of ``_inject_kv_into_layer``,
+        with and without a K/V axis. Its MLA and legacy rank-4 Triton branches
+        reinterpret the staging buffer without consulting ``num_chunks``, so
+        they read a K/V-half-major slab as if it were token-major. Both derive
+        the same shapes from this staging tensor as from the chunk-major one it
+        replaced, and neither shape fits the paged tensor they assign to, so
+        those combinations raise out of the load and the request is recomputed
+        — the same outcome as before, not something this shape introduces.
 
         Args:
             kv_cache_layer: The layer's paged KV tensor.
@@ -3213,8 +3224,8 @@ class MaruWorkerConnector:
         The kernel/fallback decision is stable across a step's per-layer calls
         because every gate (device, tensor rank, layout, kernel import) is
         static, so the two paths never mix within one step. An unusable kernel
-        is cached as ``False`` to avoid re-probing (e.g. re-attempting the
-        import) on every per-layer call.
+        sets ``_store_kernel_unusable`` so it is not re-probed (e.g. the import
+        re-attempted) on every per-layer call.
         """
         if self._store_kernel_unusable:
             return None
@@ -3231,13 +3242,16 @@ class MaruWorkerConnector:
             self._store_kernel_unusable = True
         else:
             self._store_kernel_ctx = ctx
+        # Whichever path resolves this first gets to log it, and since the
+        # asynchronous loads now do, the message cannot name the store or a
+        # direction: the same context serves H2D placement and D2H stores.
         if ctx is not None:
             logger.info(
-                "Maru packed store: coalesced kernel D2H enabled (%d layers)",
+                "Maru packed transfers: coalesced kernel enabled (%d layers)",
                 self._num_layers,
             )
         else:
-            logger.info("Maru packed store: kernel unusable; per-layer fallback")
+            logger.info("Maru packed transfers: kernel unusable; per-layer fallback")
         return ctx
 
     def _store_packed_slabs(
