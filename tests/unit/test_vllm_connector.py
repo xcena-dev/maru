@@ -2633,7 +2633,7 @@ class TestPackedStorage:
         assert sched_lw._chunk_exists_key("kv_abc") == "kv_abc_DONE"
 
     def _fake_store_kernel(self, kv_layers):
-        """Fake multi_layer_kv_transfer ctx mirroring the c_ops D2H branch.
+        """Fake multi_layer_kv_transfer ctx mirroring the kernel D2H branch.
 
         For engine_kv_format NL_X_TWO_NB_BS_NH_HS the D2H direction gathers
         ``paged[:, slots]`` of every layer into the KV_2LTD slab
@@ -2996,8 +2996,8 @@ class TestPackedStorage:
         i.e. for engine_kv_format NL_X_TWO_NB_BS_NH_HS the slab must be
         [2, num_layers, tokens, hidden] and each layer's paged buffer
         [2, page_buffer_size, hidden]. If our _save_kv_layer_packed layout ever
-        diverges from this, the (bit-exact) assertion breaks. The real c_ops
-        kernel is validated end-to-end by the device benchmark.
+        diverges from this, the (bit-exact) assertion breaks. The real
+        maru_kv_ops kernel is validated end-to-end by the device benchmark.
         """
         num_layers, ct, hidden = 3, self.CHUNK, 2
         page_buffer_size = 32
