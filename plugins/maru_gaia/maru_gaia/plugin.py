@@ -254,6 +254,19 @@ class GaiaPrefetchPlugin:
         self._stage_avoid_store_checks = 0
         self._stage_avoid_store_hits = 0
         self._stage_avoid_store_budget_hits = 0
+        # 발사 전 게이트. 자리를 비운 요청의 되쓰기가 끝나기를 기다린 뒤 올리기를
+        # 시작한다. 되쓰기 시각은 예측할 수 없으므로(도착 +20~249 ms) 예측하지 않고
+        # 관측한다 — 이 값이 「되쓰기가 나타나기를 기다리는 창」이고, 창 안에 나타나면
+        # 그것이 끝날 때까지 더 기다린다. 나타나지 않으면(그 턴이 새 조각을 만들지
+        # 않은 경우, 실측 29 %) 그냥 발사한다.
+        self._stage_launch_gate_ms = max(
+            0.0,
+            float(os.environ.get("MARU_GAIA_STAGE_LAUNCH_GATE_MS", "0") or 0),
+        )
+        self._stage_launch_us = 0
+        self._stage_launch_calls = 0
+        self._stage_launch_saw_store = 0
+        self._stage_launch_timeouts = 0
         self._last_demand_at = 0.0
         self._stage_yield_us = 0
         self._stage_yield_budget_hits = 0
@@ -667,6 +680,10 @@ class GaiaPrefetchPlugin:
         yielded_ms = 0.0
         probe_checks = 0
         probe_hits = 0
+        launch_ms = 0.0
+        launch_saw = False
+        if source == "stage" and not fire_and_forget and self._stage_launch_gate_ms > 0:
+            launch_ms, launch_saw = self._gate_before_launch(handler)
         t0 = time.monotonic()
         paced_ms = 0.0
         avoided_ms = 0.0
@@ -893,7 +910,7 @@ class GaiaPrefetchPlugin:
                     "gaia_prefetch_sync(%s): chunks=%d, ranges=%d "
                     "(issued=%d, failed=%d), skipped=%d, gate_wait_ms=%.1f, "
                     "over_budget=%d, paced_ms=%.1f, reprobe_ms=%.1f, "
-                    "avoided_store_ms=%.1f, avoid_checks=%d/%d",
+                    "avoided_store_ms=%.1f, avoid_checks=%d/%d, launch_gate_ms=%.1f",
                     source,
                     chunk_count,
                     len(ranges),
@@ -907,6 +924,7 @@ class GaiaPrefetchPlugin:
                     avoided_ms,
                     avoid_hits,
                     avoid_checks,
+                    launch_ms,
                 )
             else:
                 logger.info(
@@ -1003,6 +1021,57 @@ class GaiaPrefetchPlugin:
             pause_s = 0.002
             time.sleep(pause_s)
             waited_ms += pause_s * 1000.0
+
+    def _gate_before_launch(self, handler: MaruHandler) -> tuple[float, bool]:
+        """올리기를 내기 전에, 방금 자리를 비운 요청의 되쓰기가 끝나기를 기다린다.
+
+        자리는 그 접두사를 쓸 요청이 도착하는 순간에 반납되고 그 즉시 다음 계획이
+        발사된다. 그런데 그 요청의 되쓰기는 자기 프리필이 끝난 뒤에 오므로, 발사된
+        올리기가 도는 동안 되쓰기가 그 안으로 들어온다 (실측 겹침 99 %).
+
+        되쓰기 시각은 예측할 수 없다 — 도착 기준 p10 +20 ms, 중앙 +108, p90 +249 ms
+        이고, 새 토큰이 조각 하나를 넘지 않으면 되쓰기 자체가 없다 (실측 29 %).
+        그래서 창을 비워 두는 방식으로는 피할 수 없고, 대신 **관측**한다.
+
+        ``MARU_GAIA_STAGE_LAUNCH_GATE_MS`` 동안 되쓰기가 나타나기를 기다린다. 나타나면
+        그것이 끝날 때까지 더 기다리되 전체를 그 두 배로 묶는다. 창 안에 나타나지
+        않으면 그냥 발사한다.
+
+        Args:
+            handler: 되쓰기 진행 여부를 알려 주는 프로브를 가진 핸들러.
+
+        Returns:
+            ``(기다린 시간 ms, 그 사이 되쓰기를 보았는가)``.
+        """
+        store_active = getattr(handler, "store_active", None)
+        if store_active is None:
+            return 0.0, False
+        appear_ms = self._stage_launch_gate_ms
+        cap_ms = appear_ms * 2.0
+        began = time.monotonic()
+        saw = False
+        while True:
+            waited_ms = (time.monotonic() - began) * 1000.0
+            try:
+                active = bool(store_active())
+            except Exception:
+                active = False  # fail open — never block staging
+            if active:
+                saw = True
+            elif saw or waited_ms >= appear_ms:
+                break
+            if waited_ms >= cap_ms:
+                self._stage_launch_timeouts += 1
+                break
+            time.sleep(0.002)
+        waited_ms = (time.monotonic() - began) * 1000.0
+        self._stage_launch_us += int(waited_ms * 1000)
+        self._stage_launch_calls += 1
+        if saw:
+            self._stage_launch_saw_store += 1
+        logger.info("gaia_stage: launch_gate t=%.6f ms=%.1f saw_store=%d",
+                    began, waited_ms, int(saw))
+        return waited_ms, saw
 
     def _yield_to_store(
         self, handler: MaruHandler, avoided_so_far_ms: float
