@@ -1039,6 +1039,7 @@ class GaiaPrefetchPlugin:
         waited_ms = 0.0
         checks = 0
         hits = 0
+        began = 0.0
         while True:
             checks += 1
             try:
@@ -1046,14 +1047,35 @@ class GaiaPrefetchPlugin:
             except Exception:
                 in_flight = False  # fail open — never block staging
             if not in_flight:
+                self._log_yield_span(began, waited_ms)
                 return waited_ms, checks, hits
             hits += 1
+            if waited_ms == 0.0:
+                began = time.time()
             if avoided_so_far_ms + waited_ms >= self._stage_avoid_store_budget_ms:
                 self._stage_avoid_store_budget_hits += 1
+                self._log_yield_span(began, waited_ms)
                 return waited_ms, checks, hits
             pause_s = 0.002
             time.sleep(pause_s)
             waited_ms += pause_s * 1000.0
+
+    def _log_yield_span(self, began: float, waited_ms: float) -> None:
+        """Leave each pause on the timeline: when it began and how long it lasted.
+
+        The staging call logs only the pause total, so a measured timeline cannot
+        tell device transfer apart from the open call window without this. Only
+        actual pauses are logged — a few per call — so the line count stays in
+        the hundreds and the stamp shares the ``time.time`` clock with the read,
+        fill and write-behind lines.
+
+        Args:
+            began: wall clock at which the pause started.
+            waited_ms: how long the pause lasted.
+        """
+        if waited_ms <= 0.0:
+            return
+        logger.info("gaia_stage: yield_span t=%.6f ms=%.1f", began, waited_ms)
 
     def _unpin_ranges(self, ranges: list[tuple[int, int, int]]) -> None:
         """Unpin previously pinned ranges, counting (not raising) failures."""
