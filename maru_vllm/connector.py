@@ -1078,6 +1078,8 @@ class MaruSchedulerConnector:
         # `update_connector_output` 으로 오는 완료 통보를 쓴다.
         self._store_scheduled: set[str] = set()
         self._store_done: set[str] = set()
+        # 반납 판정을 몇 스텝 미뤘는지 (계측용).
+        self._store_hold_steps: dict[str, int] = {}
         # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
         # 있다는 뜻이므로 아래에서 한 번 경고한다.
         self._stage_release_seen = 0
@@ -1418,6 +1420,9 @@ class MaruSchedulerConnector:
                 )
             )
             self._store_scheduled.add(new_req.req_id)
+            if self._stage_release_on_store:
+                _emit_timing(f"stage store scheduled: req={new_req.req_id} path=new "
+                             f"t={time.time():.6f}")
             # If chunked prefill means not all chunks are covered, track for
             # store continuation in subsequent steps.
             num_full_chunks = len(token_ids) // self._kv_chunk_tokens
@@ -1485,6 +1490,9 @@ class MaruSchedulerConnector:
                     )
                 )
                 self._store_scheduled.add(req_id)
+                if self._stage_release_on_store:
+                    _emit_timing(f"stage store scheduled: req={req_id} path=cont "
+                                 f"t={time.time():.6f}")
                 # Drop tracking once all full chunks have been stored.
                 total_scheduled = num_computed + num_new
                 num_full_chunks = len(token_ids) // self._kv_chunk_tokens
@@ -1529,11 +1537,26 @@ class MaruSchedulerConnector:
                 # 아직 비우지 않고 다음 스텝에 다시 본다.
                 still: list[tuple[str, str]] = []
                 for req_id, alias in self._stage_relayed_last_step:
+                    if self._stage_release_on_store:
+                        # 판정을 그대로 남긴다. 이 세 값이면 「예정에 없었다」와
+                        # 「완료가 먼저 왔다」와 「미뤘다」가 갈린다.
+                        sched = req_id in self._store_scheduled
+                        done = req_id in self._store_done
+                        self._store_hold_steps[req_id] = (
+                            self._store_hold_steps.get(req_id, 0) + 1
+                        )
+                        _emit_timing(
+                            f"stage release check: plan={alias} scheduled={int(sched)} "
+                            f"done={int(done)} held_steps="
+                            f"{self._store_hold_steps[req_id]} "
+                            f"t={time.time():.6f}"
+                        )
                     if self._stage_release_on_store and self._store_pending(req_id):
                         still.append((req_id, alias))
                         continue
                     self._store_scheduled.discard(req_id)
                     self._store_done.discard(req_id)
+                    self._store_hold_steps.pop(req_id, None)
                     if self._relayed_stage_aliases.pop(req_id, None) is None:
                         continue
                     released.add(alias)
@@ -1662,6 +1685,9 @@ class MaruSchedulerConnector:
         """
         if req_ids:
             self._store_done.update(req_ids)
+            if self._stage_release_on_store:
+                _emit_timing(f"stage store finished: n={len(req_ids)} "
+                             f"t={time.time():.6f}")
 
     def request_finished(
         self,
