@@ -86,60 +86,72 @@ def _read_pin_threshold(device_id: "int | None", *, cli: str = _XCENA_CLI) -> in
     return 0
 
 
-_SMART_STATUS_FIELDS = ("used_dram_bytes", "dirty_dram_bytes", "pin_bytes")
+# GaiaSmartLog 해독 — 오프셋은 xcena_cli 의 gaia_smart_layout.json 에서 왔다.
+# 4 KB 로그의 [1024, 4096) 이 GaiaStats 이고, 그 안의 상대 오프셋이 버전으로 갈린다.
+# 버전은 GaiaStats 선두 uint64 다.
+_SMART_LAYOUT = {
+    2: {"status": 144, "counters": 272},
+    3: {"status": 272, "counters": 400},
+}
+_SMART_STATUS = ("used_dram_bytes", "dirty_dram_bytes", "pin_bytes")
+_SMART_COUNTERS = ("page_hit", "page_miss")
 
 
-def _read_smart_status(device_id: int, *, cli: str = _XCENA_CLI) -> dict:
-    """장치의 지금 상태를 읽는다 — 캐시가 담은 양 · 아직 SSD 로 안 내려간 양 · 고정된 양.
+def _decode_smart(log: bytes) -> dict:
+    """gaia_get_smart 가 준 4 KB 블록에서 상태와 카운터를 뽑는다.
 
-    ``xcena_cli im get-smart <id> -v`` 의 ``Status`` 블록이다. 같은 출력의
-    ``counters`` 블록은 장치 수명 누적이라 그 순간 점유를 말하지 못한다.
+    필드 배치는 펌웨어가 정하고 버전으로 갈리므로 xif 는 블록을 그대로 준다.
+    여기서 그 버전의 오프셋으로 해독한다.
+
+    Args:
+        log: gaia_get_smart 의 반환값 (GAIA_SMART_LOG_SIZE 바이트).
+
+    Returns:
+        읽은 필드를 담은 사전. 버전을 모르면 version 만 담아 돌려준다.
+    """
+    base = pyxif.GAIA_SMART_STATS_OFFSET
+    if len(log) < base + 8:
+        return {}
+    version = int.from_bytes(log[base:base + 8], "little")
+    got = {"version": version}
+    lay = _SMART_LAYOUT.get(version)
+    if lay is None:
+        return got
+    for group, names in (("status", _SMART_STATUS), ("counters", _SMART_COUNTERS)):
+        off = base + lay[group]
+        for i, name in enumerate(names):
+            lo = off + i * 8
+            if lo + 8 <= len(log):
+                got[name] = int.from_bytes(log[lo:lo + 8], "little")
+    return got
+
+
+def read_smart(device_id: int) -> dict:
+    """장치 상태를 한 번의 라이브러리 호출로 읽는다 (프로세스를 띄우지 않는다).
+
+    종전 경로(``xcena_cli im get-smart``)는 호출당 약 370 ms 이고 그중 365 ms 가
+    프로세스 시작이라 사건 경계에 넣을 수 없었다. 이 호출은 서빙 프로세스 안에서
+    돌고 장치 왕복 동안 GIL 을 놓는다.
 
     Args:
         device_id: 장치 번호.
-        cli: 명령 이름.
 
     Returns:
-        읽은 필드만 담은 사전. 실패하면 빈 사전.
+        해독한 사전. 실패하면 빈 사전.
     """
+    fn = getattr(pyxif, "gaia_get_smart", None)
+    if fn is None:
+        return {}
     try:
-        out = subprocess.run(
-            [cli, "im", "get-smart", str(device_id), "-v"],
-            capture_output=True, text=True, timeout=20.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        return _decode_smart(fn(device_id))
+    except Exception:
         return {}
-    if out.returncode != 0:
-        return {}
-    got: dict = {}
-    in_status = False
-    for line in (out.stdout or "").splitlines():
-        stripped = line.strip()
-        if stripped.endswith(":") and not stripped.startswith("-"):
-            # 섹션 머리. pin_bytes 는 Status 와 counters 양쪽에 나오는데 counters
-            # 쪽은 장치 수명 누적이므로 Status 안에서만 읽는다.
-            in_status = stripped.rstrip(":").lower() == "status"
-            continue
-        if not in_status:
-            continue
-        parts = line.split(":")
-        if len(parts) != 2:
-            continue
-        key = parts[0].strip()
-        if key in _SMART_STATUS_FIELDS:
-            try:
-                got[key] = int(parts[1].strip())
-            except ValueError:
-                continue
-    return got
 
 
 def _start_smart_sampler(device_id: int, period_s: float) -> None:
     """장치 상태를 주기적으로 찍는 배경 스레드를 띄운다.
 
-    한 호출이 약 370 ms 인데 그중 대부분이 프로세스 시작이라 사건 경계에는 넣을 수
-    없다. 대신 일정 간격으로 찍어 추이를 남긴다 — 되쓰기가 캐시에 남기는 dirty 몫이
-    대책에 따라 어떻게 달라지는지 보려는 것이다.
+    사건 경계 계측은 따로 부르고(``smart_mark``), 이 스레드는 추이를 남긴다.
 
     Args:
         device_id: 장치 번호.
@@ -147,17 +159,30 @@ def _start_smart_sampler(device_id: int, period_s: float) -> None:
     """
     def loop() -> None:
         while True:
-            got = _read_smart_status(device_id)
-            if got:
-                logger.info(
-                    "gaia_smart: t=%.6f used=%d dirty=%d pin=%d",
-                    time.time(), got.get("used_dram_bytes", -1),
-                    got.get("dirty_dram_bytes", -1), got.get("pin_bytes", -1),
-                )
+            smart_mark(device_id, "tick")
             time.sleep(period_s)
 
     th = threading.Thread(target=loop, name="gaia-smart-sampler", daemon=True)
     th.start()
+
+
+def smart_mark(device_id: int, where: str) -> None:
+    """그 순간의 장치 상태를 사건 이름과 함께 한 줄 남긴다.
+
+    Args:
+        device_id: 장치 번호.
+        where: 사건 이름 (예: ``stage_begin`` · ``stage_end``).
+    """
+    got = read_smart(device_id)
+    if not got:
+        return
+    logger.info(
+        "gaia_smart: at=%s t=%.6f v=%d used=%d dirty=%d pin=%d hit=%d miss=%d",
+        where, time.time(), got.get("version", -1),
+        got.get("used_dram_bytes", -1), got.get("dirty_dram_bytes", -1),
+        got.get("pin_bytes", -1), got.get("page_hit", -1),
+        got.get("page_miss", -1),
+    )
 
 
 class GaiaPrefetchPlugin:
@@ -340,6 +365,10 @@ class GaiaPrefetchPlugin:
         # 장치 상태 표집 간격 (ms). 0 이면 안 찍는다.
         smart_ms = max(0.0, float(
             os.environ.get("MARU_GAIA_SMART_SAMPLE_MS", "0") or 0))
+        # 사건 경계 계측 (적재 앞뒤 · 읽기 앞뒤). 표집과 따로 켠다.
+        self._smart_mark = (
+            os.environ.get("MARU_GAIA_SMART_MARK", "0") or "0"
+        ) not in ("0", "", "false", "False")
         if smart_ms > 0 and self._device_id is not None:
             _start_smart_sampler(self._device_id, smart_ms / 1000.0)
         self._stage_launch_us = 0
@@ -423,6 +452,10 @@ class GaiaPrefetchPlugin:
         # stage must not queue-block starts here, whether or not this seam
         # goes on to issue a hint of its own.
         self._last_demand_at = time.monotonic()
+        if self._smart_mark and self._device_id is not None:
+            # 요청이 접두사를 읽기 직전. 이 앞뒤의 page_miss 차이가 「미리 올린
+            # 것이 읽을 때 남아 있었나」를 직접 센다.
+            smart_mark(self._device_id, "read_begin")
         if self._map_every and next(self._map_seq) % self._map_every == 0:
             self._residency_map(handler, batch_resp)
         if self._hymcache_local or not self._retrieve_hint:
@@ -761,6 +794,10 @@ class GaiaPrefetchPlugin:
         probe_hits = 0
         launch_ms = 0.0
         launch_saw = False
+        mark = (source == "stage" and not fire_and_forget
+                and self._smart_mark and self._device_id is not None)
+        if mark:
+            smart_mark(self._device_id, "stage_begin")
         if source == "stage" and not fire_and_forget and self._stage_launch_gate_ms > 0:
             launch_ms, launch_saw = self._gate_before_launch(handler)
         t0 = time.monotonic()
@@ -1046,6 +1083,8 @@ class GaiaPrefetchPlugin:
                 result.wait_ms,
                 result.yielded_ms,
             )
+        if mark:
+            smart_mark(self._device_id, "stage_end")
         return result
 
     def _yield_to_demand(
