@@ -2519,6 +2519,7 @@ class MaruWorkerConnector:
                     f"{(time.monotonic() - _t0) * 1000:.2f} ms "
                     f"windows={self._demand_load_windows}"
                 )
+            self._smart_mark_read_end()
             return
 
         deferred = [e for e in prepared_requests if e[0].deferred_load]
@@ -4085,6 +4086,30 @@ class MaruWorkerConnector:
         """Close a demand-load window opened by ``_enter_demand_load``."""
         with self._deferred_lock:
             self._demand_load_depth = max(0, self._demand_load_depth - 1)
+
+    def _smart_mark_read_end(self) -> None:
+        """Stamp device counters right after the demand read (instrumentation).
+
+        Paired with the plugin's ``read_begin`` mark: the ``page_miss`` delta
+        across the pair counts directly whether the staged prefix was still
+        device-DRAM resident when the request read it, instead of inferring
+        residency from read duration. Measurement-only and off unless
+        ``MARU_GAIA_SMART_MARK=1``; failures are swallowed so it can never
+        affect the read path.
+        """
+        if os.environ.get("MARU_GAIA_SMART_MARK", "0") != "1":
+            return
+        try:
+            # Local import: the mark lives in the gaia plugin, which is absent
+            # on devices without the SSD tier.
+            from maru_gaia.plugin import smart_mark
+
+            dev_env = os.environ.get("MARU_GAIA_DEVICE_ID")
+            if not dev_env:
+                return
+            smart_mark(int(dev_env), "read_end")
+        except Exception:
+            pass
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
