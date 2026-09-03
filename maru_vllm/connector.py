@@ -1949,6 +1949,12 @@ class MaruWorkerConnector:
         self._kv_layout: KVLayout | None = None
         self._load_stream: torch.cuda.Stream | None = None
         self._load_stream_device: torch.device | None = None
+        # Demand-read breakdown (MARU_LOAD_EVENTS=1): three reusable CUDA
+        # events split the read into the GPU-side wait for the compute stream
+        # and the transfer itself, while wall clocks split the CPU side into
+        # setup, launch loop, and the closing synchronize. Measurement only.
+        self._load_events: tuple[torch.cuda.Event, ...] | None = None
+        self._load_events_device: torch.device | None = None
         # layer_name -> events to wait on before that layer's compute. A
         # list because pre-issued requests each contribute their own event.
         self._layer_load_events: dict[str, list[torch.cuda.Event]] = {}
@@ -3775,6 +3781,7 @@ class MaruWorkerConnector:
             )
             return
 
+        _t0_read = time.monotonic()
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
         num_layers = len(layers)
         ct = self._kv_chunk_tokens
@@ -3789,11 +3796,19 @@ class MaruWorkerConnector:
         use_stream = kernel is not None or (
             dev.type == "cuda" and torch.cuda.is_available()
         )
+        events = self._read_events(dev) if use_stream else None
+        _t_setup_done = time.monotonic()
         if use_stream:
             if self._load_stream is None or self._load_stream_device != dev:
                 self._load_stream = torch.cuda.Stream(device=dev, priority=-1)
                 self._load_stream_device = dev
+            if events is not None:
+                # Recorded before the cross-stream dependency: the gap to
+                # wait_end is how long the load stream sat blocked on compute.
+                events[0].record(self._load_stream)
             self._load_stream.wait_stream(torch.cuda.current_stream(dev))
+            if events is not None:
+                events[1].record(self._load_stream)
             stream_ctx = torch.cuda.stream(self._load_stream)
         else:
             import contextlib
@@ -3801,6 +3816,7 @@ class MaruWorkerConnector:
             stream_ctx = contextlib.nullcontext()
 
         dtype = layers[0][1].dtype
+        _t_launch_begin = time.monotonic()
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3848,11 +3864,24 @@ class MaruWorkerConnector:
                 if req_meta.deferred_load:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
+        if events is not None:
+            assert self._load_stream is not None
+            events[2].record(self._load_stream)
+        _t_launch_done = time.monotonic()
         if use_stream:
             # Loads must complete before the forward pass reads the paged cache
             # (packed makes wait_for_layer_load a no-op).
             assert self._load_stream is not None
             self._load_stream.synchronize()
+        _t_sync_done = time.monotonic()
+        if events is not None:
+            self._emit_read_split(
+                events,
+                chunks=sum(n for _, n, _, _ in prepared_requests),
+                setup_ms=(_t_setup_done - _t0_read) * 1000.0,
+                launch_ms=(_t_launch_done - _t_launch_begin) * 1000.0,
+                sync_ms=(_t_sync_done - _t_launch_done) * 1000.0,
+            )
 
         for req_meta, num_chunks, _, _ in prepared_requests:
             mode = "kernel" if kernel is not None else "fallback"
@@ -4110,6 +4139,67 @@ class MaruWorkerConnector:
             smart_mark(int(dev_env), "read_end")
         except Exception:
             pass
+
+    def _read_events(self, device: torch.device) -> tuple[torch.cuda.Event, ...] | None:
+        """Reusable CUDA events for the demand-read breakdown, or None if off.
+
+        Three events per device, created once: wait_begin, wait_end, and
+        transfer_done. Off unless ``MARU_LOAD_EVENTS=1`` — recording costs a
+        stream operation each, so it must not be on by default.
+
+        Args:
+            device: The device the load stream runs on.
+
+        Returns:
+            The three events, or ``None`` when the breakdown is disabled or
+            CUDA is unavailable.
+        """
+        if os.environ.get("MARU_LOAD_EVENTS", "0") != "1":
+            return None
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        if self._load_events is None or self._load_events_device != device:
+            self._load_events = tuple(
+                torch.cuda.Event(enable_timing=True) for _ in range(3)
+            )
+            self._load_events_device = device
+        return self._load_events
+
+    def _emit_read_split(
+        self,
+        events: tuple[torch.cuda.Event, ...],
+        chunks: int,
+        setup_ms: float,
+        launch_ms: float,
+        sync_ms: float,
+    ) -> None:
+        """Log one line splitting a demand read into its five parts.
+
+        The two GPU-side parts come from the CUDA events, which are readable
+        only after the closing synchronize: ``wait`` is how long the load
+        stream was blocked on the compute stream, ``xfer`` is how long the
+        transfers themselves ran. The three CPU-side parts are wall clocks:
+        ``setup`` resolves the kernel context, ``launch`` is the enqueue loop,
+        and ``sync`` is the closing synchronize. ``launch`` and ``sync`` cover
+        the same span the GPU parts do, so they are not additive with them.
+
+        Args:
+            events: wait_begin, wait_end, transfer_done.
+            chunks: Chunks transferred in this read.
+            setup_ms: Kernel-context resolution, wall clock.
+            launch_ms: Enqueue loop, wall clock.
+            sync_ms: Closing synchronize, wall clock.
+        """
+        try:
+            wait_ms = events[0].elapsed_time(events[1])
+            xfer_ms = events[1].elapsed_time(events[2])
+        except Exception:
+            return
+        _emit_timing(
+            f"packed-load split wait={wait_ms:.3f} ms xfer={xfer_ms:.3f} ms "
+            f"setup={setup_ms:.3f} ms launch={launch_ms:.3f} ms "
+            f"sync={sync_ms:.3f} ms chunks={chunks} t={time.time():.6f}"
+        )
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
