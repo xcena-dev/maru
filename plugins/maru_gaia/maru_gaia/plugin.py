@@ -86,6 +86,80 @@ def _read_pin_threshold(device_id: "int | None", *, cli: str = _XCENA_CLI) -> in
     return 0
 
 
+_SMART_STATUS_FIELDS = ("used_dram_bytes", "dirty_dram_bytes", "pin_bytes")
+
+
+def _read_smart_status(device_id: int, *, cli: str = _XCENA_CLI) -> dict:
+    """장치의 지금 상태를 읽는다 — 캐시가 담은 양 · 아직 SSD 로 안 내려간 양 · 고정된 양.
+
+    ``xcena_cli im get-smart <id> -v`` 의 ``Status`` 블록이다. 같은 출력의
+    ``counters`` 블록은 장치 수명 누적이라 그 순간 점유를 말하지 못한다.
+
+    Args:
+        device_id: 장치 번호.
+        cli: 명령 이름.
+
+    Returns:
+        읽은 필드만 담은 사전. 실패하면 빈 사전.
+    """
+    try:
+        out = subprocess.run(
+            [cli, "im", "get-smart", str(device_id), "-v"],
+            capture_output=True, text=True, timeout=20.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if out.returncode != 0:
+        return {}
+    got: dict = {}
+    in_status = False
+    for line in (out.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":") and not stripped.startswith("-"):
+            # 섹션 머리. pin_bytes 는 Status 와 counters 양쪽에 나오는데 counters
+            # 쪽은 장치 수명 누적이므로 Status 안에서만 읽는다.
+            in_status = stripped.rstrip(":").lower() == "status"
+            continue
+        if not in_status:
+            continue
+        parts = line.split(":")
+        if len(parts) != 2:
+            continue
+        key = parts[0].strip()
+        if key in _SMART_STATUS_FIELDS:
+            try:
+                got[key] = int(parts[1].strip())
+            except ValueError:
+                continue
+    return got
+
+
+def _start_smart_sampler(device_id: int, period_s: float) -> None:
+    """장치 상태를 주기적으로 찍는 배경 스레드를 띄운다.
+
+    한 호출이 약 370 ms 인데 그중 대부분이 프로세스 시작이라 사건 경계에는 넣을 수
+    없다. 대신 일정 간격으로 찍어 추이를 남긴다 — 되쓰기가 캐시에 남기는 dirty 몫이
+    대책에 따라 어떻게 달라지는지 보려는 것이다.
+
+    Args:
+        device_id: 장치 번호.
+        period_s: 표집 간격 (초).
+    """
+    def loop() -> None:
+        while True:
+            got = _read_smart_status(device_id)
+            if got:
+                logger.info(
+                    "gaia_smart: t=%.6f used=%d dirty=%d pin=%d",
+                    time.time(), got.get("used_dram_bytes", -1),
+                    got.get("dirty_dram_bytes", -1), got.get("pin_bytes", -1),
+                )
+            time.sleep(period_s)
+
+    th = threading.Thread(target=loop, name="gaia-smart-sampler", daemon=True)
+    th.start()
+
+
 class GaiaPrefetchPlugin:
     """Issues gaia device prefetch hints at MaruHandler's retrieve seams."""
 
@@ -263,6 +337,11 @@ class GaiaPrefetchPlugin:
             0.0,
             float(os.environ.get("MARU_GAIA_STAGE_LAUNCH_GATE_MS", "0") or 0),
         )
+        # 장치 상태 표집 간격 (ms). 0 이면 안 찍는다.
+        smart_ms = max(0.0, float(
+            os.environ.get("MARU_GAIA_SMART_SAMPLE_MS", "0") or 0))
+        if smart_ms > 0 and self._device_id is not None:
+            _start_smart_sampler(self._device_id, smart_ms / 1000.0)
         self._stage_launch_us = 0
         self._stage_launch_calls = 0
         self._stage_launch_saw_store = 0

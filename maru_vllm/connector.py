@@ -785,10 +785,28 @@ class MaruKVConnector(KVConnectorBase_V1):
             contract.
         """
         assert self._worker is not None
-        return (
-            self._worker.get_finished_saving(finished_req_ids),
-            self._worker.get_finished_loading(),
-        )
+        saved = self._worker.get_finished_saving(finished_req_ids)
+        if saved and self._scheduler is not None:
+            # 같은 프로세스에 스케줄러 역할이 함께 있으면 바로 알린다. 아니면
+            # 아래 update_connector_output 이 받는다.
+            self._scheduler.note_store_finished(saved)
+        return (saved, self._worker.get_finished_loading())
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        """워커가 끝낸 저장을 스케줄러에 알린다.
+
+        자리 반납을 그 요청의 저장 완료 뒤로 미루는 모드(``MARU_STAGE_RELEASE=store``)
+        는 이 통보로 완료를 안다. 스케줄러는 워커의 저장 대기 목록을 볼 수 없다.
+
+        Args:
+            connector_output: vLLM 이 넘기는 커넥터 출력. ``finished_sending`` 이
+                저장이 끝난 요청 id 집합이다.
+        """
+        if self._scheduler is None:
+            return
+        done = getattr(connector_output, "finished_sending", None)
+        if done:
+            self._scheduler.note_store_finished(set(done))
 
     def request_finished(
         self,
@@ -1055,6 +1073,11 @@ class MaruSchedulerConnector:
         # 밀리므로 겹칠 구간이 사라진다. 자리를 더 붙잡는 시간은 중앙 141 ms 이고
         # 선행 시간 1.29 초 안이다.
         self._stage_release_on_store = release_mode == "store"
+        # store 모드가 쓰는 두 집합. 저장이 예정된 요청과, 워커가 저장을 끝냈다고
+        # 알려 온 요청이다. 스케줄러는 워커의 저장 대기 목록을 직접 볼 수 없으므로
+        # `update_connector_output` 으로 오는 완료 통보를 쓴다.
+        self._store_scheduled: set[str] = set()
+        self._store_done: set[str] = set()
         # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
         # 있다는 뜻이므로 아래에서 한 번 경고한다.
         self._stage_release_seen = 0
@@ -1394,6 +1417,7 @@ class MaruSchedulerConnector:
                     num_computed_tokens=num_computed,
                 )
             )
+            self._store_scheduled.add(new_req.req_id)
             # If chunked prefill means not all chunks are covered, track for
             # store continuation in subsequent steps.
             num_full_chunks = len(token_ids) // self._kv_chunk_tokens
@@ -1460,6 +1484,7 @@ class MaruSchedulerConnector:
                         num_computed_tokens=num_computed,
                     )
                 )
+                self._store_scheduled.add(req_id)
                 # Drop tracking once all full chunks have been stored.
                 total_scheduled = num_computed + num_new
                 num_full_chunks = len(token_ids) // self._kv_chunk_tokens
@@ -1504,11 +1529,11 @@ class MaruSchedulerConnector:
                 # 아직 비우지 않고 다음 스텝에 다시 본다.
                 still: list[tuple[str, str]] = []
                 for req_id, alias in self._stage_relayed_last_step:
-                    if self._stage_release_on_store and self._request_pending_store_keys.get(
-                        req_id
-                    ):
+                    if self._stage_release_on_store and self._store_pending(req_id):
                         still.append((req_id, alias))
                         continue
+                    self._store_scheduled.discard(req_id)
+                    self._store_done.discard(req_id)
                     if self._relayed_stage_aliases.pop(req_id, None) is None:
                         continue
                     released.add(alias)
@@ -1612,6 +1637,31 @@ class MaruSchedulerConnector:
 
         self._requests_need_load.clear()
         return meta
+
+    def _store_pending(self, req_id: str) -> bool:
+        """그 요청의 저장이 아직 안 끝났는가 (자리 반납을 미룰지 판정).
+
+        저장이 예정된 적이 없으면 기다릴 것이 없다 — 새로 계산한 토큰이 조각 하나를
+        넘지 않은 턴이며 실측 29 % 다. 예정되었고 완료 통보가 아직 안 왔으면 미룬다.
+
+        Args:
+            req_id: 자리를 잡고 있던 계획을 소비한 요청.
+
+        Returns:
+            자리 반납을 미뤄야 하면 True.
+        """
+        if req_id not in self._store_scheduled:
+            return False
+        return req_id not in self._store_done
+
+    def note_store_finished(self, req_ids: set[str]) -> None:
+        """워커가 저장을 끝냈다고 알려 온 요청들을 기록한다.
+
+        Args:
+            req_ids: 저장이 끝난 요청 id 들.
+        """
+        if req_ids:
+            self._store_done.update(req_ids)
 
     def request_finished(
         self,
