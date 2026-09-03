@@ -1040,7 +1040,7 @@ class MaruSchedulerConnector:
         release_mode = (
             os.environ.get("MARU_STAGE_RELEASE", "consume").strip().lower() or "consume"
         )
-        if release_mode not in {"consume", "read", "complete"}:
+        if release_mode not in {"consume", "read", "complete", "store"}:
             logger.warning(
                 "Unknown MARU_STAGE_RELEASE=%r; falling back to 'consume'",
                 release_mode,
@@ -1048,6 +1048,13 @@ class MaruSchedulerConnector:
             release_mode = "consume"
         self._stage_release_on_complete = release_mode == "complete"
         self._stage_release_on_read = release_mode == "read"
+        # store — 읽기가 끝나고 **그 요청의 저장까지 끝난 뒤에** 자리를 돌려준다.
+        # read 로 돌려주면 그 요청이 아직 되쓰기를 하지 않았는데 자리가 비어, 줄에
+        # 서 있던 다른 세션의 적재가 곧바로 발사되고 그 요청의 되쓰기가 그 적재 창
+        # 안으로 들어온다 (실측 겹침 98 %). 저장 완료까지 붙잡으면 발사가 그 뒤로
+        # 밀리므로 겹칠 구간이 사라진다. 자리를 더 붙잡는 시간은 중앙 141 ms 이고
+        # 선행 시간 1.29 초 안이다.
+        self._stage_release_on_store = release_mode == "store"
         # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
         # 있다는 뜻이므로 아래에서 한 번 경고한다.
         self._stage_release_seen = 0
@@ -1489,15 +1496,24 @@ class MaruSchedulerConnector:
             consumed = {req.req_id for req in meta.requests}
             canceled = set(stale_ids)
             released: set[str] = set()
-            if self._stage_release_on_read and self._stage_relayed_last_step:
+            if (
+                self._stage_release_on_read or self._stage_release_on_store
+            ) and self._stage_relayed_last_step:
                 # 지난 스텝에 넘긴 것들의 읽기는 끝났다. 이번 스텝 몫을 담기
-                # 전에 먼저 비운다.
+                # 전에 먼저 비운다. store 모드에서는 그 요청의 저장이 남아 있으면
+                # 아직 비우지 않고 다음 스텝에 다시 본다.
+                still: list[tuple[str, str]] = []
                 for req_id, alias in self._stage_relayed_last_step:
+                    if self._stage_release_on_store and self._request_pending_store_keys.get(
+                        req_id
+                    ):
+                        still.append((req_id, alias))
+                        continue
                     if self._relayed_stage_aliases.pop(req_id, None) is None:
                         continue
                     released.add(alias)
                     self._pending_stage_releases.append(alias)
-                self._stage_relayed_last_step.clear()
+                self._stage_relayed_last_step = still
             if self._stage_trigger != "match":
                 # A scheduled load joins its session's hint ticket: the alias
                 # is relayed to the worker and the hint's policy slot is
@@ -1513,7 +1529,7 @@ class MaruSchedulerConnector:
                         meta.stage_aliases[req.req_id] = alias
                         consumed.add(alias)
                         self._relayed_stage_aliases[req.req_id] = alias
-                        if self._stage_release_on_read:
+                        if self._stage_release_on_read or self._stage_release_on_store:
                             self._stage_relayed_last_step.append((req.req_id, alias))
                 for rid in stale_ids:
                     pending = self._pending_stage_aliases.pop(rid, None)
