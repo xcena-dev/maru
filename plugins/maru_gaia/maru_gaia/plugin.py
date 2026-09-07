@@ -90,11 +90,17 @@ def _read_pin_threshold(device_id: "int | None", *, cli: str = _XCENA_CLI) -> in
 # 4 KB 로그의 [1024, 4096) 이 GaiaStats 이고, 그 안의 상대 오프셋이 버전으로 갈린다.
 # 버전은 GaiaStats 선두 uint64 다.
 _SMART_LAYOUT = {
-    2: {"status": 144, "counters": 272},
-    3: {"status": 272, "counters": 400},
+    2: {"status": 144, "counters": 272, "bytes": 1536},
+    3: {"status": 272, "counters": 400, "bytes": 1536},
 }
 _SMART_STATUS = ("used_dram_bytes", "dirty_dram_bytes", "pin_bytes")
 _SMART_COUNTERS = ("page_hit", "page_miss")
+# bytes 그룹만 항목이 **16 바이트**(128 비트 카운터)다 — status·counters 는 8 바이트다.
+# xcena_cli 의 smart.py 가 `bytes_offset + idx * 16` 으로 읽는다. 예약된 자리(None)도
+# 자리를 차지하므로 건너뛰지 않아야 뒤 필드의 오프셋이 맞는다. 버전 2 와 3 의 순서가 같다.
+_SMART_BYTES = ("prefetch", "pin", "unpin", "unpin_all", None, None, None,
+                "unmap", "commit", "flush", "nvme_read", "nvme_write")
+_SMART_BYTES_STRIDE = 16
 
 
 def _decode_smart(log: bytes) -> dict:
@@ -117,12 +123,21 @@ def _decode_smart(log: bytes) -> dict:
     lay = _SMART_LAYOUT.get(version)
     if lay is None:
         return got
-    for group, names in (("status", _SMART_STATUS), ("counters", _SMART_COUNTERS)):
-        off = base + lay[group]
+    for group, names in (("status", _SMART_STATUS), ("counters", _SMART_COUNTERS),
+                         ("bytes", _SMART_BYTES)):
+        off = lay.get(group)
+        if off is None:
+            continue
+        off += base
+        wide = group == "bytes"
+        step = _SMART_BYTES_STRIDE if wide else 8
         for i, name in enumerate(names):
-            lo = off + i * 8
-            if lo + 8 <= len(log):
-                got[name] = int.from_bytes(log[lo:lo + 8], "little")
+            if name is None:
+                continue
+            lo = off + i * step
+            if lo + step <= len(log):
+                key = f"{name}_bytes" if wide else name
+                got[key] = int.from_bytes(log[lo:lo + step], "little")
     return got
 
 
@@ -177,11 +192,14 @@ def smart_mark(device_id: int, where: str) -> None:
     if not got:
         return
     logger.info(
-        "gaia_smart: at=%s t=%.6f v=%d used=%d dirty=%d pin=%d hit=%d miss=%d",
+        "gaia_smart: at=%s t=%.6f v=%d used=%d dirty=%d pin=%d hit=%d miss=%d "
+        "ssdr=%d ssdw=%d pf=%d",
         where, time.time(), got.get("version", -1),
         got.get("used_dram_bytes", -1), got.get("dirty_dram_bytes", -1),
         got.get("pin_bytes", -1), got.get("page_hit", -1),
         got.get("page_miss", -1),
+        got.get("nvme_read_bytes", -1), got.get("nvme_write_bytes", -1),
+        got.get("prefetch_bytes", -1),
     )
 
 
