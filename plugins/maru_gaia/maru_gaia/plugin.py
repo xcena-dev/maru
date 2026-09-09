@@ -137,6 +137,8 @@ def _decode_smart(log: bytes) -> dict:
             lo = off + i * step
             if lo + step <= len(log):
                 key = f"{name}_bytes" if wide else name
+                if wide and name == "pin":
+                    key = "pin_command_bytes"
                 got[key] = int.from_bytes(log[lo:lo + step], "little")
     return got
 
