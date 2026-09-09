@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -551,6 +552,28 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     stage_release_ids: list[str] = field(default_factory=list)
 
 
+@dataclass
+class MaruStoreCompletionMetadata(KVConnectorWorkerMetadata):
+    """Worker acknowledgements that a prompt's pending stores have drained.
+
+    This does not transfer ownership of GPU blocks or assert cache admission
+    succeeded. Failed stores also drain; retrieval still checks key presence.
+    """
+
+    completed_workers: dict[str, set[int]] = field(default_factory=dict)
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> MaruStoreCompletionMetadata:
+        """Combine distinct worker acknowledgements without losing late ranks."""
+        if not isinstance(other, MaruStoreCompletionMetadata):
+            raise TypeError("Expected MaruStoreCompletionMetadata")
+        combined = {rid: set(ranks) for rid, ranks in self.completed_workers.items()}
+        for rid, ranks in other.completed_workers.items():
+            combined.setdefault(rid, set()).update(ranks)
+        return MaruStoreCompletionMetadata(combined)
+
+
 # ============================================================================
 # Main Connector
 # ============================================================================
@@ -641,6 +664,7 @@ class MaruKVConnector(KVConnectorBase_V1):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
+        self._store_worker_count = max(1, vllm_config.parallel_config.world_size)
         self._block_size = vllm_config.cache_config.block_size
         extra = self._kv_transfer_config.kv_connector_extra_config
         self._kv_chunk_tokens = int(
@@ -792,18 +816,26 @@ class MaruKVConnector(KVConnectorBase_V1):
             self._scheduler.note_store_finished(saved)
         return (saved, self._worker.get_finished_loading())
 
-    def update_connector_output(self, connector_output: Any) -> None:
-        """워커가 끝낸 저장을 스케줄러에 알린다.
+    def build_connector_worker_meta(self) -> MaruStoreCompletionMetadata | None:
+        """Report prompt-store drain independently of response completion."""
+        if self._worker is None:
+            return None
+        return self._worker.build_store_completion_metadata()
 
-        자리 반납을 그 요청의 저장 완료 뒤로 미루는 모드(``MARU_STAGE_RELEASE=store``)
-        는 이 통보로 완료를 안다. 스케줄러는 워커의 저장 대기 목록을 볼 수 없다.
+    def update_connector_output(self, connector_output: Any) -> None:
+        """Relay prompt-store drain without freeing a generating request's blocks.
 
         Args:
-            connector_output: vLLM 이 넘기는 커넥터 출력. ``finished_sending`` 이
-                저장이 끝난 요청 id 집합이다.
+            connector_output: Worker metadata reports prompt stores; the
+                legacy ``finished_sending`` path remains a terminal fallback.
         """
         if self._scheduler is None:
             return
+        metadata = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(metadata, MaruStoreCompletionMetadata):
+            self._scheduler.note_store_worker_completion(
+                metadata, self._store_worker_count
+            )
         done = getattr(connector_output, "finished_sending", None)
         if done:
             self._scheduler.note_store_finished(set(done))
@@ -1078,6 +1110,7 @@ class MaruSchedulerConnector:
         # `update_connector_output` 으로 오는 완료 통보를 쓴다.
         self._store_scheduled: set[str] = set()
         self._store_done: set[str] = set()
+        self._store_completed_workers: dict[str, set[int]] = {}
         # 반납 판정을 몇 스텝 미뤘는지 (계측용).
         self._store_hold_steps: dict[str, int] = {}
         # 우편함에서 실제로 받은 완료 수. 0 이면 워커 절반이 다른 프로세스에
@@ -1204,6 +1237,8 @@ class MaruSchedulerConnector:
         # Hint plan ids whose worker tickets must be dropped (their target
         # request finished or was preempted without consuming the ticket).
         self._pending_stage_releases: list[str] = []
+        # Explicit terminal turns cancel both queued and admitted successors.
+        self._pending_stage_cancellations: set[str] = set()
 
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
@@ -1528,6 +1563,8 @@ class MaruSchedulerConnector:
             assert self._stage_policy is not None
             consumed = {req.req_id for req in meta.requests}
             canceled = set(stale_ids)
+            canceled.update(self._pending_stage_cancellations)
+            self._pending_stage_cancellations.clear()
             released: set[str] = set()
             if (
                 self._stage_release_on_read or self._stage_release_on_store
@@ -1556,6 +1593,7 @@ class MaruSchedulerConnector:
                         continue
                     self._store_scheduled.discard(req_id)
                     self._store_done.discard(req_id)
+                    self._store_completed_workers.pop(req_id, None)
                     self._store_hold_steps.pop(req_id, None)
                     if self._relayed_stage_aliases.pop(req_id, None) is None:
                         continue
@@ -1586,6 +1624,17 @@ class MaruSchedulerConnector:
                         # stage is garbage — cancel it and drop the ticket.
                         canceled.add(pending)
                         self._pending_stage_releases.append(pending)
+                    if (
+                        self._stage_release_on_store
+                        and rid in scheduler_output.finished_req_ids
+                        and rid not in (scheduler_output.preempted_req_ids or ())
+                        and self._store_pending(rid)
+                    ):
+                        # A short response can end before its prompt store
+                        # acknowledgement arrives. Keep the relayed alias and
+                        # its credit in the normal store-drain polling path;
+                        # the next turn's queued plan must not spend it yet.
+                        continue
                     relayed = self._relayed_stage_aliases.pop(rid, None)
                     if relayed is not None:
                         # The stage was consumed during the request's life:
@@ -1627,6 +1676,10 @@ class MaruSchedulerConnector:
                 canceled=canceled,
                 released=released,
                 completed=completed,
+                # Session aliases identify resident prefixes. Relaying the
+                # load must not fund replacement fills before the configured
+                # read/store/request completion returns their credit.
+                retain_consumed=self._stage_trigger != "match",
             )
             if self._timing:
                 drain = getattr(self._stage_policy, "drain_events", None)
@@ -1677,16 +1730,33 @@ class MaruSchedulerConnector:
             return False
         return req_id not in self._store_done
 
+    def note_store_worker_completion(
+        self, metadata: MaruStoreCompletionMetadata, worker_count: int
+    ) -> None:
+        """Wait for every worker, accumulating acknowledgements across steps."""
+        done = set()
+        for req_id, ranks in metadata.completed_workers.items():
+            if req_id not in self._store_scheduled or req_id in self._store_done:
+                continue
+            completed = self._store_completed_workers.setdefault(req_id, set())
+            completed.update(ranks)
+            if len(completed) >= worker_count:
+                done.add(req_id)
+                del self._store_completed_workers[req_id]
+        self.note_store_finished(done)
+
     def note_store_finished(self, req_ids: set[str]) -> None:
         """워커가 저장을 끝냈다고 알려 온 요청들을 기록한다.
 
         Args:
             req_ids: 저장이 끝난 요청 id 들.
         """
+        req_ids = (req_ids & self._store_scheduled) - self._store_done
         if req_ids:
             self._store_done.update(req_ids)
             if self._stage_release_on_store:
                 _emit_timing(f"stage store finished: n={len(req_ids)} "
+                             f"reqs={sorted(req_ids)} "
                              f"t={time.time():.6f}")
 
     def request_finished(
@@ -1807,6 +1877,18 @@ class MaruSchedulerConnector:
         if not session_id:
             if self._timing:
                 _emit_timing("stage turn_end: finished request carries no session id")
+            return
+        params = getattr(request, "kv_transfer_params", None)
+        if isinstance(params, dict) and params.get("maru_session_end") is True:
+            plan_id = _hint_plan_id(session_id)
+            self._session_keys.pop(session_id, None)
+            self._pending_stage_cancellations.add(plan_id)
+            self._pending_stage_releases.append(plan_id)
+            if self._timing:
+                _emit_timing(
+                    f"stage session end: session={session_id} "
+                    f"t={time.time():.6f} (req {request.request_id})"
+                )
             return
         token_ids = list(request.prompt_token_ids or [])
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
@@ -2098,10 +2180,18 @@ class MaruWorkerConnector:
         # GPU→장치 바이트가 움직인다.
         self._store_inflight = 0
         self._store_lock = threading.Lock()
+        self._store_ready = threading.Condition(self._store_lock)
+        self._stage_store_wait_s = max(
+            0.0, float(os.environ.get("MARU_STAGE_STORE_WAIT_MS", "2000")) / 1000.0
+        )
         self._pending_store_keys: set[str] = set()
         self._store_key_waiters: dict[str, set[str]] = {}
         self._request_pending_store_keys: dict[str, set[str]] = {}
         self._finished_store_requests: set[str] = set()
+        self._prompt_store_waiters: set[str] = set()
+        self._store_worker_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
         self._store_staging: torch.Tensor | None = None
         # save_kv_layer runs inside the model forward. In write-behind mode it
         # records completed packed-store batches here; get_finished() launches
@@ -3633,6 +3723,22 @@ class MaruWorkerConnector:
         self._queued_store_batches = []
         for kernel, metadata in queued:
             self._store_packed_slabs_write_behind(kernel, metadata)
+            # The packed async path defers all chunks until the final prompt
+            # step. Observe it only after launch has reserved pending keys;
+            # no-op/deduplicated stores can then report drain immediately.
+            complete_prompts = {
+                req.req_id
+                for req in metadata.requests
+                if req.is_store
+                and (
+                    req.num_scheduled_tokens <= 0
+                    or req.num_computed_tokens + req.num_scheduled_tokens
+                    >= len(req.token_ids) // self._kv_chunk_tokens
+                    * self._kv_chunk_tokens
+                )
+            }
+            with self._store_lock:
+                self._prompt_store_waiters.update(complete_prompts)
         with self._store_lock:
             self._finished_store_requests.update(finished_req_ids)
             done = {
@@ -3642,6 +3748,30 @@ class MaruWorkerConnector:
             }
             self._finished_store_requests.difference_update(done)
         return done or None
+
+    def build_store_completion_metadata(self) -> MaruStoreCompletionMetadata | None:
+        """Drain prompt-store notifications, preserving GPU block ownership.
+
+        Pending keys disappear only after their D2H and registration outcome.
+        Reporting here uses the public worker-to-scheduler metadata channel;
+        ``get_finished_saving`` still requires actual response completion.
+        """
+        with self._store_lock:
+            done = self._prompt_store_waiters.difference(
+                self._request_pending_store_keys
+            )
+            self._prompt_store_waiters.difference_update(done)
+        if not done:
+            return None
+        if self._timing:
+            for req_id in sorted(done):
+                _emit_timing(
+                    f"store drain notice: req={req_id} rank={self._store_worker_rank} "
+                    f"t={time.time():.6f}"
+                )
+        return MaruStoreCompletionMetadata(
+            {req_id: {self._store_worker_rank} for req_id in done}
+        )
 
     def handle_preemptions(self, metadata: MaruConnectorMetadata) -> None:
         """Drain transfers before the scheduler reclaims the blocks they write.
@@ -5048,6 +5178,7 @@ class MaruWorkerConnector:
                     pending.discard(base_key)
                     if not pending:
                         del self._request_pending_store_keys[req_id]
+            self._store_ready.notify_all()
 
     def _discard_pending_slab(self, base_key: str) -> None:
         """Drop a half-filled slab entry after an error and free its handle.
@@ -6001,6 +6132,29 @@ class MaruWorkerConnector:
                 requested_keys=len(ticket.plan.keys),
                 found_keys=0,
                 error="worker handler unavailable",
+            )
+        # A response can finish while write-behind still owns its new keys.
+        # Stage only after those keys have been registered; the completion
+        # thread needs this same lock, so Condition.wait releases it.
+        materialize_start = time.monotonic()
+        with self._store_ready:
+            materialized = self._store_ready.wait_for(
+                lambda: not self._pending_store_keys.intersection(ticket.plan.keys),
+                timeout=self._stage_store_wait_s,
+            )
+        materialize_ms = (time.monotonic() - materialize_start) * 1000.0
+        if self._timing:
+            _emit_timing(
+                f"stage materialize ready={materialized} "
+                f"wait={materialize_ms:.2f} ms t={time.time():.6f} "
+                f"(req {ticket.plan.req_id})"
+            )
+        if not materialized:
+            return StageResult(
+                requested_keys=len(ticket.plan.keys),
+                found_keys=0,
+                wait_ms=materialize_ms,
+                error="write-behind registration wait timed out",
             )
         _stage_t0 = time.monotonic()
         result = handler.stage_batch(list(ticket.plan.keys))

@@ -169,6 +169,45 @@ class TestSchedulerTriggers:
 
 
 class TestBuildMetaAliasPlumbing:
+    def test_terminal_sessions_release_full_window_for_remaining_session(
+        self, monkeypatch
+    ):
+        """Four finished conversations must not strand the live tail of a replay."""
+        monkeypatch.setenv("MARU_STAGE_MAX_REQUESTS", "4")
+        sched = _make_scheduler(monkeypatch, "turn_end", release="read")
+        for i in range(4):
+            sid = f"done{i}"
+            sched._session_keys[sid] = ("k0",)
+            sched._stage_policy.enqueue(_hint_plan_id(sid), ["k0"])
+        assert len(sched._stage_policy.advance(consumed=set(), canceled=set())) == 4
+        sched._stage_policy.enqueue(_hint_plan_id("live"), ["next"])
+        for i in range(4):
+            req = _request(req_id=f"final{i}", session=f"done{i}")
+            req.kv_transfer_params["maru_session_end"] = True
+            sched.request_finished(req, [])
+        meta = sched.build_connector_meta(
+            _output(finished=[f"final{i}" for i in range(4)])
+        )
+        assert [p.req_id for p in meta.stage_plans] == [_hint_plan_id("live")]
+        assert sched._stage_policy.inflight_requests == 1
+        assert sched._stage_policy.queued_requests == 0
+        assert set(meta.stage_release_ids) == {
+            _hint_plan_id(f"done{i}") for i in range(4)
+        }
+        assert sched._session_keys == {}
+
+    def test_terminal_request_without_load_cancels_queued_successor(self, monkeypatch):
+        sched = _make_scheduler(monkeypatch, "turn_end", release="read")
+        sched._stage_policy.enqueue(_hint_plan_id("done"), ["k0"])
+        req = _request(session="done", tokens=0)
+        req.kv_transfer_params["maru_session_end"] = True
+        sched.request_finished(req, [])
+        meta = sched.build_connector_meta(_output(finished=[req.request_id]))
+        assert meta.stage_plans == []
+        assert meta.stage_release_ids == [_hint_plan_id("done")]
+        assert sched._stage_policy.queued_requests == 0
+        assert sched._stage_policy.inflight_requests == 0
+
     def _prime_hint(self, sched, session="s1"):
         sched._session_keys[session] = ("kv_a", "kv_b")
         assert sched._stage_policy.enqueue(_hint_plan_id(session), ["kv_a", "kv_b"])
@@ -257,6 +296,75 @@ class TestBuildMetaAliasPlumbing:
         assert meta2.stage_release_ids == [_hint_plan_id("s1")]
         assert sched._stage_policy.inflight_requests == 0
         assert sched._relayed_stage_aliases == {}
+
+    @pytest.mark.parametrize("policy", ["fifo", "deadline"])
+    @pytest.mark.parametrize("release", ["read", "store", "consume"])
+    @pytest.mark.parametrize("limit", ["requests", "bytes"])
+    def test_preadmitted_hint_keeps_credit_until_release(
+        self, monkeypatch, policy, release, limit
+    ):
+        """A resident prefix and its replacement cannot spend the same credit."""
+        monkeypatch.setenv("MARU_STAGE_POLICY", policy)
+        monkeypatch.setenv(
+            "MARU_STAGE_MAX_REQUESTS", "1" if limit == "requests" else "8"
+        )
+        monkeypatch.setenv("MARU_STAGE_EST_BYTES_PER_KEY", "16")
+        monkeypatch.setenv("MARU_STAGE_MAX_BYTES", "0" if limit == "requests" else "32")
+        sched = _make_scheduler(monkeypatch, "turn_end", release=release)
+        self._prime_hint(sched)
+        first = sched.build_connector_meta(_output())
+        assert [p.req_id for p in first.stage_plans] == [_hint_plan_id("s1")]
+        assert sched._stage_policy.enqueue(_hint_plan_id("s2"), ["other_a", "other_b"])
+        req = _request(req_id="r1", session="s1")
+        sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
+        sched._requests_need_load["r1"] = (req, 2)
+
+        reading = sched.build_connector_meta(_output(new_reqs=[req]))
+
+        assert reading.stage_aliases == {"r1": _hint_plan_id("s1")}
+        assert reading.stage_release_ids == []
+        assert reading.stage_plans == []
+        assert sched._stage_policy.inflight_requests == 1
+        assert sched._stage_policy.queued_requests == 1
+        if release == "consume":
+            assert sched.build_connector_meta(_output()).stage_plans == []
+            following = sched.build_connector_meta(_output(finished=["r1"]))
+        elif release == "store":
+            sched._store_scheduled.add("r1")
+            assert sched.build_connector_meta(_output()).stage_plans == []
+            sched._store_done.add("r1")
+            following = sched.build_connector_meta(_output())
+        else:
+            following = sched.build_connector_meta(_output())
+        assert following.stage_release_ids == [_hint_plan_id("s1")]
+        assert [p.req_id for p in following.stage_plans] == [_hint_plan_id("s2")]
+        assert sched._stage_policy.inflight_requests == 1
+        assert sched._stage_policy.queued_requests == 0
+
+    @pytest.mark.parametrize("policy", ["fifo", "deadline"])
+    def test_arrived_unadmitted_hint_is_not_staged_after_its_read(
+        self, monkeypatch, policy
+    ):
+        """Retaining a live lease must not retain an obsolete queued plan."""
+        monkeypatch.setenv("MARU_STAGE_POLICY", policy)
+        monkeypatch.setenv("MARU_STAGE_MAX_REQUESTS", "1")
+        sched = _make_scheduler(monkeypatch, "turn_end", release="read")
+        self._prime_hint(sched)
+        assert sched.build_connector_meta(_output()).stage_plans
+        sched._stage_policy.enqueue(_hint_plan_id("s2"), ["other_a", "other_b"])
+        req = _request(req_id="r2", session="s2")
+        sched._pending_stage_aliases["r2"] = _hint_plan_id("s2")
+        sched._requests_need_load["r2"] = (req, 2)
+        assert sched.build_connector_meta(_output(new_reqs=[req])).stage_plans == []
+        assert sched._stage_policy.inflight_requests == 1
+        assert sched._stage_policy.queued_requests == 0
+        # The occupied window later opens, but the already-read s2 stays gone.
+        assert (
+            sched._stage_policy.advance(
+                consumed=set(), canceled=set(), released={_hint_plan_id("s1")}
+            )
+            == []
+        )
 
     def test_consume_release_holds_the_slot_until_the_request_finishes(
         self, monkeypatch

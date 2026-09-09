@@ -547,6 +547,7 @@ class FifoStagePolicy:
         canceled: set[str],
         released: set[str] = frozenset(),  # type: ignore[assignment]
         completed: set[str] = frozenset(),  # type: ignore[assignment]
+        retain_consumed: bool = False,
     ) -> list[StagePlan]:
         """Retire stale work and admit the oldest plans that fit.
 
@@ -568,6 +569,10 @@ class FifoStagePolicy:
         the stage it consumed, that same id may already hold the session's
         NEXT plan in the queue (queued at the request's completion in
         turn_end mode) — a full cancel would silently kill it.
+
+        With ``retain_consumed``, a relayed load keeps its admitted credit
+        until an explicit release, cancellation, or completion. Consumed
+        plans still stranded in the queue are dropped as usual.
         """
         now = self._clock()
         # 보유 시간이 지난 자리는 소비를 기다리지 않고 돌려준다. 그러면 내보내기가
@@ -582,7 +587,7 @@ class FifoStagePolicy:
             held_out -= consumed | canceled | set(released) | set(completed)
         reasons = (
             ("complete", set(completed)),
-            ("consumed", consumed),
+            ("consumed", set() if retain_consumed else consumed),
             ("canceled", canceled),
             ("released", set(released)),
             ("hold", held_out),
@@ -759,9 +764,17 @@ class DeadlineStagePolicy:
         canceled: set[str],
         released: set[str] = frozenset(),  # type: ignore[assignment]
         completed: set[str] = frozenset(),  # type: ignore[assignment]
+        retain_consumed: bool = False,
     ) -> list[StagePlan]:
-        """Expire late plans, then admit the earliest deadlines that fit."""
-        for req_id in consumed | canceled | set(released) | set(completed):
+        """Expire late plans, then admit the earliest deadlines that fit.
+
+        ``retain_consumed`` keeps admitted credit until an explicit release,
+        cancellation, or completion; consumed queued plans are still dropped.
+        """
+        retired = canceled | set(released) | set(completed)
+        if not retain_consumed:
+            retired |= consumed
+        for req_id in retired:
             self._inflight.pop(req_id, None)
         for req_id in canceled:
             self._queued.pop(req_id, None)
