@@ -73,6 +73,15 @@ logger = init_logger(__name__)
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
 
+# 멀티턴 미리 올리기의 기본 동작. 장치 DRAM 을 저장 총량의 절반 아래로 두고도
+# 큰 캐시와 같은 응답 속도가 나온 구성이며, 독립 실행 다섯 번으로 확인했다
+# (설계 노트 20260910_multiturn-prefetch-dram-parity-paper). 실험자가 다시
+# 고를 필요가 없도록 그 값을 기본으로 둔다.
+_DEFAULT_STAGE_TRIGGER = "turn_end"
+_DEFAULT_STAGE_RELEASE = "store"
+_DEFAULT_STAGE_MAX_REQUESTS = 18
+_DEFAULT_STAGE_MAX_BYTES = 10 * 1024**3
+
 # Knobs renamed to name the axis the deployer actually chooses, mapped to the
 # name each one replaced. The former names stay accepted for one release so
 # existing recipes and launch scripts keep working; _get_knob warns when one
@@ -227,6 +236,77 @@ def _parse_size(size_str: str | int) -> int:
 def _align_down(num_tokens: int, block_size: int) -> int:
     """Align the number of tokens down to the block size boundary."""
     return (num_tokens // block_size) * block_size
+
+
+def _kv_object_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig | None,
+    kv_chunk_tokens: int,
+    block_size: int,
+) -> int | None:
+    """Return the byte size of the KV one chunk key stores, or None.
+
+    The scheduler admits staging plans under a byte budget, so it needs the
+    size of what one key brings into device DRAM. The worker reads that size
+    off the registered KV tensors (``_chunk_object_bytes``); the scheduler has
+    no tensors, so it derives the same number from the engine's own geometry.
+    Two sources, most exact first:
+
+    1. ``kv_cache_config``, whose per-group spec reports the bytes of one
+       block of one layer. Summing ``layers x blocks-per-chunk x block bytes``
+       over the groups covers quantized and MLA caches as vLLM sizes them.
+    2. ``model_config``, when the engine has not built the cache config yet:
+       ``layers x 2 x kv_heads x head_size x dtype`` per token.
+
+    Args:
+        vllm_config: The engine config this connector was built with.
+        kv_cache_config: The resolved cache config, when vLLM passed one.
+        kv_chunk_tokens: Tokens one maru chunk key covers.
+        block_size: Tokens per paged-cache block.
+
+    Returns:
+        Bytes one chunk key stores, or None when neither source is readable,
+        so the caller can fall back rather than admit against a wrong budget.
+    """
+    blocks_per_chunk = max(1, kv_chunk_tokens // max(1, block_size))
+    if kv_cache_config is not None:
+        try:
+            total = 0
+            for group in kv_cache_config.kv_cache_groups:
+                layers = len(group.layer_names)
+                total += layers * blocks_per_chunk * group.kv_cache_spec.page_size_bytes
+            if total > 0:
+                return int(total)
+        except Exception as e:
+            logger.warning(
+                "Maru: cannot size a KV object from kv_cache_config (%s: %s); "
+                "falling back to the model geometry",
+                type(e).__name__,
+                e,
+            )
+    try:
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        num_layers = model_config.get_num_layers(parallel_config)
+        num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_size = model_config.get_head_size()
+        dtype = model_config.dtype
+        cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        if cache_dtype not in (None, "auto"):
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+            dtype = STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype, dtype)
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        per_token = num_layers * 2 * num_kv_heads * head_size * element_size
+        if per_token > 0:
+            return int(per_token * kv_chunk_tokens)
+    except Exception as e:
+        logger.warning(
+            "Maru: cannot size a KV object from the model config (%s: %s)",
+            type(e).__name__,
+            e,
+        )
+    return None
 
 
 def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
@@ -693,6 +773,12 @@ class MaruKVConnector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
+                kv_object_bytes=_kv_object_bytes(
+                    vllm_config,
+                    kv_cache_config,
+                    self._kv_chunk_tokens,
+                    self._block_size,
+                ),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -892,10 +978,15 @@ class MaruSchedulerConnector:
         block_size: int,
         kv_chunk_tokens: int,
         extra_config: dict[str, Any],
+        kv_object_bytes: int | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        # 키 하나가 장치 DRAM 으로 가져오는 바이트. 적재 창의 용량 예산을 키
+        # 개수로 환산하는 눈금이다. 모델 지오메트리에서 나오므로 설정할 값이
+        # 아니다 — 잘못 주면 「상한 10 GiB」가 조용히 다른 양이 된다.
+        self._kv_object_bytes = kv_object_bytes
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -1014,6 +1105,8 @@ class MaruSchedulerConnector:
         #              dropped (its target already arrived — demand path owns
         #              the data, a late fill only burns fill bandwidth).
         self._stage_policy: FifoStagePolicy | DeadlineStagePolicy | None = None
+        # 실제로 쓰는 창 크기. 적재를 끄면 0 으로 남아 초기화 로그가 그렇게 찍는다.
+        self._stage_window_size = 0
         self._stage_policy_kind = (
             os.environ.get("MARU_STAGE_POLICY", "fifo").strip().lower() or "fifo"
         )
@@ -1026,19 +1119,36 @@ class MaruSchedulerConnector:
         self._stage_expired_seen = 0
         if self._stage_enabled:
             max_requests = max(
-                1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+                1,
+                int(
+                    os.environ.get(
+                        "MARU_STAGE_MAX_REQUESTS", str(_DEFAULT_STAGE_MAX_REQUESTS)
+                    )
+                    or _DEFAULT_STAGE_MAX_REQUESTS
+                ),
             )
             max_bytes = max(
                 0,
-                int(os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)) or 0),
-            )
-            estimated_bytes_per_key = max(
-                1,
                 int(
-                    os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2))
-                    or 1
+                    os.environ.get(
+                        "MARU_STAGE_MAX_BYTES", str(_DEFAULT_STAGE_MAX_BYTES)
+                    )
+                    or 0
                 ),
             )
+            # 눈금은 모델이 정한다. 계산이 실패한 경우에만 기본 청크 크기의
+            # 자리를 대신 쓰되, 그때는 예산이 어긋날 수 있음을 남긴다.
+            if self._kv_object_bytes and self._kv_object_bytes > 0:
+                estimated_bytes_per_key = self._kv_object_bytes
+            else:
+                estimated_bytes_per_key = 32 * 1024**2
+                logger.warning(
+                    "Maru stage: KV object size unknown; admitting against a "
+                    "%d byte placeholder, so MARU_STAGE_MAX_BYTES will not "
+                    "mean what it says",
+                    estimated_bytes_per_key,
+                )
+            self._stage_window_size = max_requests
             if self._stage_policy_kind == "deadline":
                 self._stage_policy = DeadlineStagePolicy(
                     max_requests=max_requests,
@@ -1088,11 +1198,12 @@ class MaruSchedulerConnector:
         #     완료와 무관한 시각에 놓아 두 방향으로 어긋나므로, complete 를 쓸
         #     때는 타이머를 두지 않는다.
         release_mode = (
-            os.environ.get("MARU_STAGE_RELEASE", "consume").strip().lower() or "consume"
+            os.environ.get("MARU_STAGE_RELEASE", _DEFAULT_STAGE_RELEASE).strip().lower()
+            or _DEFAULT_STAGE_RELEASE
         )
         if release_mode not in {"consume", "read", "complete", "store"}:
             logger.warning(
-                "Unknown MARU_STAGE_RELEASE=%r; falling back to 'consume'",
+                "Unknown MARU_STAGE_RELEASE=%r; falling back to the default",
                 release_mode,
             )
             release_mode = "consume"
@@ -1168,6 +1279,7 @@ class MaruSchedulerConnector:
             )
             self._stage_enabled = False
             self._stage_policy = None
+            self._stage_window_size = 0
         if self._arrival_hint_enabled:
             logger.info(
                 "Maru arrival-hint prefetch enabled (MARU_ARRIVAL_HINT=1, depth=%s)",
@@ -1176,11 +1288,11 @@ class MaruSchedulerConnector:
         if self._stage_enabled:
             logger.info(
                 "Maru SSD-to-DRAM stage pipeline enabled "
-                "(policy=%s, requests=%s, bytes=%s, estimate/key=%s)",
+                "(policy=%s, requests=%s, bytes=%s, kv object=%s bytes)",
                 self._stage_policy_kind,
-                os.environ.get("MARU_STAGE_MAX_REQUESTS", "1"),
-                os.environ.get("MARU_STAGE_MAX_BYTES", str(8 * 1024**3)),
-                os.environ.get("MARU_STAGE_EST_BYTES_PER_KEY", str(32 * 1024**2)),
+                max_requests,
+                max_bytes,
+                self._kv_object_bytes if self._kv_object_bytes else "unknown",
             )
         # What fires a StagePlan (MARU_STAGE_TRIGGER):
         #   match    — at the arriving request's verified match (the staging
@@ -1195,13 +1307,15 @@ class MaruSchedulerConnector:
         # ``kv_transfer_params.maru_session_id`` (OpenAI extra_body) and join
         # the arriving request to its hint ticket through a req-id alias
         # relayed in the connector metadata.
-        self._stage_trigger = os.environ.get("MARU_STAGE_TRIGGER", "match")
+        self._stage_trigger = os.environ.get(
+            "MARU_STAGE_TRIGGER", _DEFAULT_STAGE_TRIGGER
+        )
         if self._stage_trigger not in ("match", "turn_end", "imminent"):
             logger.warning(
-                "Unknown MARU_STAGE_TRIGGER=%r; falling back to 'match'",
+                "Unknown MARU_STAGE_TRIGGER=%r; falling back to the default",
                 self._stage_trigger,
             )
-            self._stage_trigger = "match"
+            self._stage_trigger = _DEFAULT_STAGE_TRIGGER
         if self._stage_enabled and self._stage_trigger != "match":
             logger.info(
                 "Maru stage trigger: %s (session-hint mode)", self._stage_trigger
@@ -1209,14 +1323,16 @@ class MaruSchedulerConnector:
         if self._timing:
             # The connector logger never reaches the engine log (see
             # _emit_timing); staging state must be visible there to audit runs.
+            # 환경변수가 아니라 실제로 쓰는 값을 찍는다. 설정하지 않은 손잡이를
+            # 환경에서 되읽으면 코드 기본값이 아니라 그 자리의 문자열이 나와,
+            # 감사하는 사람이 창 크기를 1 로 읽는 일이 생긴다.
             _emit_timing(
                 f"stage init: enabled={self._stage_enabled} "
                 f"trigger={self._stage_trigger} policy={self._stage_policy_kind} "
                 f"hold_ms={os.environ.get('MARU_STAGE_HOLD_MS', '0')} "
                 f"queue_delay_ms={os.environ.get('MARU_STAGE_QUEUE_DELAY_MS', '0')} "
-                f"window={os.environ.get('MARU_STAGE_MAX_REQUESTS', '1')} "
-                f"fill_workers="
-                f"{os.environ.get('MARU_STAGE_FILL_WORKERS', '') or 'window'} "
+                f"window={self._stage_window_size} "
+                f"kv_object_bytes={self._kv_object_bytes or 'unknown'} "
                 f"release={release_mode}"
             )
         # session_id -> confirmed prefix chunk keys, recorded at request
@@ -2236,7 +2352,13 @@ class MaruWorkerConnector:
         # 수만큼 키우면서 장치에는 한 건씩만 걸고 싶은 경우가 있으므로 별도
         # 손잡이로 둔다. 기본값은 창 크기 — 종전 동작을 그대로 둔다.
         self._stage_max_requests = max(
-            1, int(os.environ.get("MARU_STAGE_MAX_REQUESTS", "1") or 1)
+            1,
+            int(
+                os.environ.get(
+                    "MARU_STAGE_MAX_REQUESTS", str(_DEFAULT_STAGE_MAX_REQUESTS)
+                )
+                or _DEFAULT_STAGE_MAX_REQUESTS
+            ),
         )
         self._stage_fill_workers = max(
             1,

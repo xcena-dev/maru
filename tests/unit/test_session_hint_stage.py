@@ -229,7 +229,7 @@ class TestBuildMetaAliasPlumbing:
         assert sched._stage_policy.enqueue(_hint_plan_id(session), ["kv_a", "kv_b"])
 
     def test_load_request_consumes_hint_and_relays_alias(self, monkeypatch):
-        sched = _make_scheduler(monkeypatch, "imminent")
+        sched = _make_scheduler(monkeypatch, "imminent", release="consume")
         self._prime_hint(sched)
         req = _request(req_id="r1", session="s1")
         sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
@@ -385,8 +385,8 @@ class TestBuildMetaAliasPlumbing:
     def test_consume_release_holds_the_slot_until_the_request_finishes(
         self, monkeypatch
     ):
-        """기본값 consume 의 종전 동작 — 요청이 끝날 때까지 자리를 잡고 있다."""
-        sched = _make_scheduler(monkeypatch, "imminent")
+        """consume 모드 — 요청이 끝날 때까지 자리를 잡고 있다."""
+        sched = _make_scheduler(monkeypatch, "imminent", release="consume")
         self._prime_hint(sched)
         req = _request(req_id="r1", session="s1")
         sched._pending_stage_aliases["r1"] = _hint_plan_id("s1")
@@ -572,9 +572,9 @@ class TestMetadataDefaults:
 
 
 class TestTriggerValidation:
-    def test_unknown_trigger_falls_back_to_match(self, monkeypatch):
+    def test_unknown_trigger_falls_back_to_the_default(self, monkeypatch):
         sched = _make_scheduler(monkeypatch, "sometimes")
-        assert sched._stage_trigger == "match"
+        assert sched._stage_trigger == "turn_end"
 
     @pytest.mark.parametrize("trigger", ["match", "turn_end", "imminent"])
     def test_known_triggers_accepted(self, monkeypatch, trigger):
@@ -720,3 +720,54 @@ class TestDemandWindowRealPath:
         worker._ensure_handler()
 
         created.set_demand_probe.assert_called_once_with(worker._demand_reads_active)
+
+
+class TestDefaultsComeFromCode:
+    """확인된 구성의 값이 코드 기본값이므로 설정이 그것을 적을 필요가 없다."""
+
+    def _scheduler(self, monkeypatch, *, staged: bool, object_bytes=None):
+        for knob in (
+            "MARU_STAGE_TRIGGER",
+            "MARU_STAGE_RELEASE",
+            "MARU_STAGE_MAX_REQUESTS",
+            "MARU_STAGE_MAX_BYTES",
+            "MARU_STAGE_POLICY",
+        ):
+            monkeypatch.delenv(knob, raising=False)
+        monkeypatch.setenv("MARU_STAGE_PIPELINE", "1" if staged else "0")
+        return MaruSchedulerConnector(
+            block_size=4,
+            kv_chunk_tokens=CHUNK,
+            extra_config={"maru_log_timing": True},
+            kv_object_bytes=object_bytes,
+        )
+
+    def test_multiturn_defaults_need_no_environment(self, monkeypatch):
+        sched = self._scheduler(monkeypatch, staged=True, object_bytes=16 << 20)
+
+        assert sched._stage_trigger == "turn_end"
+        assert sched._stage_release_on_store is True
+        assert sched._stage_window_size == 18
+        assert sched._stage_policy._max_bytes == 10 * 1024**3
+
+    def test_byte_budget_is_scaled_by_the_real_object_size(self, monkeypatch):
+        """용량 상한을 키 개수로 환산하는 눈금은 모델이 정한다."""
+        sched = self._scheduler(monkeypatch, staged=True, object_bytes=16 << 20)
+        assert sched._stage_policy._estimated_bytes_per_key == 16 << 20
+
+        bigger = self._scheduler(monkeypatch, staged=True, object_bytes=48 << 20)
+        assert bigger._stage_policy._estimated_bytes_per_key == 48 << 20
+
+    def test_init_line_reports_the_value_in_use_not_the_environment(
+        self, monkeypatch, capsys
+    ):
+        """적재를 끈 셀에서도 초기화 줄이 돌고, 창 크기를 실제 값으로 찍는다."""
+        self._scheduler(monkeypatch, staged=False)
+        off = capsys.readouterr().err
+        assert "stage init: enabled=False" in off
+        assert "window=0" in off
+
+        self._scheduler(monkeypatch, staged=True, object_bytes=16 << 20)
+        on = capsys.readouterr().err
+        assert "window=18" in on
+        assert "kv_object_bytes=16777216" in on

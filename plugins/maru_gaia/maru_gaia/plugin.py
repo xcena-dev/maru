@@ -52,8 +52,6 @@ logger = logging.getLogger(__name__)
 # 고정에 쓸 예산을 장치 상한의 몇 할까지 잡을지. 상한에 딱 붙이면 다른 프로세스나
 # 아직 안 풀린 고정과 겹쳐 거절이 나므로 한 뼘 남긴다.
 _PIN_BUDGET_FRACTION = 0.9
-# 고정 호출 하나의 크기 상한 기본값 (MARU_GAIA_STAGE_SPLIT_BYTES 미지정 시).
-_PIN_SPLIT_DEFAULT = 16 << 20
 _XCENA_CLI = "xcena_cli"
 
 
@@ -252,19 +250,12 @@ class GaiaPrefetchPlugin:
         # consume protection window). Pins are tracked per key batch so the
         # release and the on_close leak guard unpin exactly what was taken.
         self._stage_pin = os.environ.get("MARU_GAIA_STAGE_PIN", "0") == "1"
-        # Issue stage calls in sub-ranges of at most this many bytes
-        # (MARU_GAIA_STAGE_SPLIT_BYTES, 0 = whole coalesced ranges). Bounded
-        # calls serve two purposes: very large single pins can time out the
-        # firmware ioctl, and the pyxif binding holds the GIL for the whole
-        # blocking call — sub-ranges open GIL windows so the caller process's
-        # Python threads keep running during a multi-hundred-ms fill.
-        #
-        # Pin defaults to 16 MiB when unset; prefetch_sync keeps whole ranges.
-        # The default used to be 1 GiB, and at that size the engine died in
-        # five of ten measured pin cells: a GPU-to-CXL write-behind copy
-        # overlapping such a call failed with CUDA "unspecified launch
-        # failure" (or the engine spun without progress), ending the cell
-        # inside 21 requests. No cell issuing 16 MiB pins has reproduced it.
+        # 적재 명령 하나는 KV 객체 하나만큼만 보낸다 (on_stage 참고). 크기를
+        # 묶어 보내던 시절 1 GiB 호출은 측정한 고정 셀 열 개 중 다섯에서 엔진을
+        # 죽였다 — GPU 에서 CXL 로 되쓰는 복사가 그런 호출과 겹치면 CUDA 가
+        # "unspecified launch failure" 로 끝나거나 엔진이 진행 없이 돌았고, 셀이
+        # 요청 21 개 안에 끝났다. 객체 크기(이 모델에서 16 MiB)로 보낸 셀에서는
+        # 재현되지 않았다.
         # 적재와 고정을 두 단계로 가른다 (MARU_GAIA_PIN_AFTER_FILL=1).
         #
         # 기본 동작은 memory_pin 하나로 「올리면서 잠그는」 것이라, 고정을 켜면
@@ -281,11 +272,11 @@ class GaiaPrefetchPlugin:
         self._pin_after_fill_bytes = max(
             0, int(os.environ.get("MARU_GAIA_PIN_AFTER_FILL_BYTES", "0") or 0)
         )
-        split_env = int(os.environ.get("MARU_GAIA_STAGE_SPLIT_BYTES", "0") or 0)
-        if split_env <= 0 and self._stage_pin and not self._pin_after_fill:
-            split_env = _PIN_SPLIT_DEFAULT
-        self._stage_split_bytes = max(0, split_env)
-        # Demand-yield (MARU_GAIA_STAGE_DEMAND_YIELD_MS, 0 = off): between
+        # 적재가 실제로 쓴 객체 하나의 크기. 손잡이가 아니라 관측값이다 —
+        # on_stage 가 조회 응답에서 읽어 기록하고, 통계와 종료 로그가 보고한다.
+        self._stage_object_bytes = 0
+        # Demand-yield (MARU_GAIA_STAGE_DEMAND_YIELD_MS, 0 = off, default on):
+        # between
         # stage sub-calls, pause while a demand read ran within the last
         # N ms. The device serves fill commands in arrival order, so an
         # unyielding stage sub-call train makes concurrent demand fills
@@ -351,7 +342,7 @@ class GaiaPrefetchPlugin:
             self._stage_pin = False
         self._stage_yield_ms = max(
             0.0,
-            float(os.environ.get("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "0") or 0),
+            float(os.environ.get("MARU_GAIA_STAGE_DEMAND_YIELD_MS", "1.0") or 0),
         )
         self._stage_yield_budget_ms = max(
             0.0,
@@ -363,11 +354,13 @@ class GaiaPrefetchPlugin:
         # 적재와 겹치지 않으면 16 MiB 를 26 ms 에 옮긴다
         # (설계 노트 20260902_three-way-device-contention).
         self._stage_avoid_store = (
-            os.environ.get("MARU_GAIA_STAGE_AVOID_STORE", "0") or "0"
+            os.environ.get("MARU_GAIA_STAGE_AVOID_STORE", "1") or "1"
         ) not in ("0", "", "false", "False")
         self._stage_avoid_store_budget_ms = max(
             0.0,
-            float(os.environ.get("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "200") or 0),
+            float(
+                os.environ.get("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "1000") or 0
+            ),
         )
         self._stage_avoid_store_us = 0
         self._stage_avoid_store_checks = 0
@@ -657,14 +650,14 @@ class GaiaPrefetchPlugin:
         # 가릴 수 없었다. 실행 끝에 한 줄 남긴다.
         logger.info(
             "gaia_stage_pin summary: pin=%s asked=%d unpinned=%d unpin_failed=%d "
-            "degraded=%d leftover_batches=%d split_bytes=%d budget_bytes=%d",
+            "degraded=%d leftover_batches=%d object_bytes=%d budget_bytes=%d",
             self._stage_pin,
             self._stage_pinned_ranges,
             self._stage_unpinned_ranges,
             self._stage_unpin_failed,
             self._stage_pin_degraded,
             len(leftover),
-            self._stage_split_bytes,
+            self._stage_object_bytes,
             self._pin_budget_bytes,
         )
 
@@ -692,7 +685,7 @@ class GaiaPrefetchPlugin:
             "stage_probe_hits": self._stage_probe_hits,
             "stage_wait_ms": round(self._stage_wait_us / 1000.0, 1),
             "stage_pin": self._stage_pin,
-            "stage_split_bytes": self._stage_split_bytes,
+            "stage_object_bytes": self._stage_object_bytes,
             "stage_async": self._stage_async,
             "stage_pinned_ranges": self._stage_pinned_ranges,
             "stage_unpinned_ranges": self._stage_unpinned_ranges,
@@ -799,9 +792,19 @@ class GaiaPrefetchPlugin:
             eligible.append((device_id, device_addr, entry.kv_length))
 
         chunk_count = len(eligible)
+        # 적재 명령 하나의 크기는 KV 객체 하나의 크기다. 합치기는 주소가 이어지는
+        # 객체를 묶어 명령 수를 줄이지만, 그렇게 묶은 범위는 다시 객체 경계로
+        # 나누어 보낸다 — 저장 단위가 곧 적재 단위이므로 실험자가 고를 값이 아니다.
+        # 경계를 지키는 이유가 셋 있다. 아주 큰 호출 하나는 펌웨어 ioctl 을 시간
+        # 초과로 끝낼 수 있고, pyxif 바인딩이 호출 내내 GIL 을 잡으므로 호출을
+        # 나누어야 호출자 프로세스의 다른 스레드가 돌며, 조각 사이가 곧 되쓰기와
+        # 요청 읽기에 양보할 수 있는 지점이 된다.
+        object_bytes = max((length for _, _, length in eligible), default=0)
+        if object_bytes > 0:
+            self._stage_object_bytes = object_bytes
         ranges = self._coalesce_ranges(eligible) if self._coalesce else eligible
-        if source == "stage" and not fire_and_forget and self._stage_split_bytes > 0:
-            ranges = self._split_ranges(ranges, self._stage_split_bytes)
+        if source == "stage" and not fire_and_forget and object_bytes > 0:
+            ranges = self._split_ranges(ranges, object_bytes)
 
         issued = 0
         prepared_ranges = 0
@@ -1231,9 +1234,9 @@ class GaiaPrefetchPlugin:
         whole-prefix fill runs and 6.0 ms when none does (0.46 vs 2.7 GB/s).
 
         Yield density is set by the fill's issue granularity: this runs once per
-        range, so a whole-prefix fill offers only ~6 pause points across its
-        145 ms window while ``MARU_GAIA_STAGE_SPLIT_BYTES`` at 16 MiB offers
-        ~110, letting the device clear within about one piece's transfer.
+        range, so a whole-prefix fill would offer only ~6 pause points across
+        its 145 ms window, while one call per KV object (16 MiB on this model)
+        offers ~110, letting the device clear within about one piece's transfer.
 
         The pause ends when the write clears or the batch's cumulative budget
         (``MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS``) is spent, whichever comes

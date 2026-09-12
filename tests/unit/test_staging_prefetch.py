@@ -831,6 +831,8 @@ class TestStageTicket:
 class TestSchedulerStageRelay:
     def test_arrival_is_relayed_as_request_plan(self, monkeypatch):
         monkeypatch.setenv("MARU_STAGE_PIPELINE", "1")
+        # 도착 시점 적재는 기본이 아니므로 이 시험은 그것을 명시한다.
+        monkeypatch.setenv("MARU_STAGE_TRIGGER", "match")
         monkeypatch.delenv("MARU_ARRIVAL_HINT", raising=False)
         scheduler = MaruSchedulerConnector(
             block_size=4,

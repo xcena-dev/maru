@@ -327,18 +327,33 @@ class TestStage:
         assert result.found_keys == 0
         assert result.prepared_bytes == 0
 
-    def test_stage_split_bounds_sync_call_size(self, monkeypatch):
+    def test_stage_issues_one_call_per_kv_object(self, monkeypatch):
+        """이어진 객체를 합쳐도 명령은 객체 경계로 다시 나뉜다."""
         fake = _FakePyxif()
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
-        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "64")
         plugin = GaiaPrefetchPlugin()
-        response = _resp(_entry(0, 0, 160))
+        # 주소가 이어진 64 바이트 객체 세 개. 합치면 192 바이트 한 범위가 된다.
+        response = _resp(_entry(0, 0, 64), _entry(0, 64, 64), _entry(0, 128, 64))
 
-        result = plugin.on_stage(_handler(), ["a"], response)
+        result = plugin.on_stage(_handler(), ["a", "b", "c"], response)
 
-        assert [size for (_, _, size) in fake.sync_calls] == [64, 64, 32]
+        assert [size for (_, _, size) in fake.sync_calls] == [64, 64, 64]
         assert result.ready
-        assert result.prepared_bytes == 160
+        assert result.prepared_bytes == 192
+        assert plugin.contribute_stats()["stage_object_bytes"] == 64
+
+    def test_stage_object_size_follows_the_stored_object(self, monkeypatch):
+        """객체가 커지면 명령도 같이 커진다 — 설정으로 정하지 않는다."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        plugin = GaiaPrefetchPlugin()
+        response = _resp(_entry(0, 0, 160), _entry(0, 160, 160))
+
+        result = plugin.on_stage(_handler(), ["a", "b"], response)
+
+        assert [size for (_, _, size) in fake.sync_calls] == [160, 160]
+        assert result.prepared_bytes == 320
+        assert plugin.contribute_stats()["stage_object_bytes"] == 160
 
 
 class TestStageAsync:
@@ -348,7 +363,6 @@ class TestStageAsync:
         """발사만 하므로 sync 호출이 없고 조각 분할도 하지 않는다."""
         fake = _FakePyxif()
         monkeypatch.setenv("MARU_GAIA_STAGE_ASYNC", "1")
-        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "16")
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
         plugin = GaiaPrefetchPlugin()
         response = _resp(_entry(0, 0, 32), _entry(0, 32, 32))
@@ -419,8 +433,7 @@ class TestStagePinLease:
         monkeypatch.delenv("MARU_GAIA_DEVICE_ID", raising=False)
         monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "1")
         monkeypatch.setenv("MARU_GAIA_STAGE_PIN", "1")
-        # Small split so the tests exercise sub-range pins deterministically.
-        monkeypatch.setenv("MARU_GAIA_STAGE_SPLIT_BYTES", "64")
+        # 이 테스트들의 객체는 64 바이트라, 고정도 객체마다 한 번씩 걸린다.
 
     def _pin_fake(self, monkeypatch):
         fake = _FakePyxif()
@@ -440,18 +453,19 @@ class TestStagePinLease:
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
         return fake
 
-    def test_stage_pins_split_ranges_and_release_unpins_them(self, monkeypatch):
+    def test_stage_pins_each_object_and_release_unpins_them(self, monkeypatch):
         fake = self._pin_fake(monkeypatch)
         plugin = GaiaPrefetchPlugin()
-        response = _resp(_entry(0, 0, 96))
+        # 주소가 이어진 객체 두 개. 합쳐도 고정은 객체 경계로 나뉘어 걸린다.
+        response = _resp(_entry(0, 0, 64), _entry(0, 64, 32))
 
-        result = plugin.on_stage(_handler(), ["a"], response)
+        result = plugin.on_stage(_handler(), ["a", "b"], response)
 
         assert result.ready
         assert fake.pin_calls == [(0, 0, 64), (0, 64, 32)]
         assert fake.sync_calls == []  # pin replaces prefetch_sync
 
-        plugin.on_stage_release(_handler(), ["a"])
+        plugin.on_stage_release(_handler(), ["a", "b"])
         assert fake.unpin_calls == fake.pin_calls
 
     def test_release_is_idempotent(self, monkeypatch):
@@ -493,8 +507,10 @@ class TestStagePinLease:
         monkeypatch.setenv("MARU_GAIA_PIN_BUDGET_BYTES", "96")
         plugin = GaiaPrefetchPlugin()
 
-        # First lease: 64 fits, next 64-piece would exceed 96 -> degraded.
-        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 128)))
+        # 첫 객체 64 는 들어가고, 다음 객체 64 는 96 을 넘으므로 강등된다.
+        result = plugin.on_stage(
+            _handler(), ["a", "b"], _resp(_entry(0, 0, 64), _entry(0, 64, 64))
+        )
 
         assert result.ready  # readiness holds via the sync fill
         assert fake.pin_calls == [(0, 0, 64)]
@@ -503,15 +519,15 @@ class TestStagePinLease:
         assert plugin.contribute_stats()["pinned_bytes"] == 64
 
         # Second batch while the first lease is held: everything degrades.
-        result2 = plugin.on_stage(_handler(), ["b"], _resp(_entry(0, 1024, 64)))
+        result2 = plugin.on_stage(_handler(), ["c"], _resp(_entry(0, 1024, 64)))
         assert result2.ready
         assert fake.pin_calls == [(0, 0, 64)]
         assert fake.sync_calls == [(0, 64, 64), (0, 1024, 64)]
 
         # Releasing the first lease returns its budget.
-        plugin.on_stage_release(_handler(), ["a"])
+        plugin.on_stage_release(_handler(), ["a", "b"])
         assert plugin.contribute_stats()["pinned_bytes"] == 0
-        plugin.on_stage(_handler(), ["c"], _resp(_entry(0, 2048, 64)))
+        plugin.on_stage(_handler(), ["d"], _resp(_entry(0, 2048, 64)))
         assert fake.pin_calls == [(0, 0, 64), (0, 2048, 64)]
 
     def test_restage_replaces_lease_and_unpins_old_ranges(self, monkeypatch):
@@ -537,11 +553,13 @@ class TestStagePinLease:
         fake.memory_pin = memory_pin
         plugin = GaiaPrefetchPlugin()
 
-        result = plugin.on_stage(_handler(), ["a"], _resp(_entry(0, 0, 96)))
+        result = plugin.on_stage(
+            _handler(), ["a", "b"], _resp(_entry(0, 0, 64), _entry(0, 64, 32))
+        )
 
         assert not result.ready
         assert fake.pin_calls == [(0, 0, 64), (0, 64, 32)]
-        plugin.on_stage_release(_handler(), ["a"])
+        plugin.on_stage_release(_handler(), ["a", "b"])
         assert fake.unpin_calls == [(0, 0, 64)]
         assert plugin.contribute_stats()["pinned_bytes"] == 0
 
@@ -764,14 +782,31 @@ class TestStageAvoidStore:
         monkeypatch.setenv("MARU_GAIA_PREFETCH_COALESCE", "0")
         monkeypatch.delenv("MARU_GAIA_STAGE_DEMAND_YIELD_MS", raising=False)
 
-    def test_off_by_default(self, monkeypatch):
-        """Every campaign through 2026-09-02 ran without this gate."""
+    def test_on_by_default(self, monkeypatch):
+        """확인된 구성이 이 문을 켠 채 돌았으므로 기본으로 켜져 있다."""
         fake = _FakePyxif()
         monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
         monkeypatch.delenv("MARU_GAIA_STAGE_AVOID_STORE", raising=False)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE_BUDGET_MS", "5")
         plugin = GaiaPrefetchPlugin()
         handler = _handler()
-        handler.store_active = lambda: True  # would pause if the gate were on
+        handler.store_active = lambda: True  # 되쓰기가 도는 중이면 쉰다
+
+        result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
+
+        stats = plugin.contribute_stats()
+        assert result.ready
+        assert stats["stage_avoid_store"] is True
+        assert stats["stage_avoid_store_checks"] > 0
+
+    def test_explicitly_disabled_never_pauses(self, monkeypatch):
+        """끄면 되쓰기가 도는 중이어도 묻지 않고 그대로 적재한다."""
+        fake = _FakePyxif()
+        monkeypatch.setattr("maru_gaia.plugin.pyxif", fake)
+        monkeypatch.setenv("MARU_GAIA_STAGE_AVOID_STORE", "0")
+        plugin = GaiaPrefetchPlugin()
+        handler = _handler()
+        handler.store_active = lambda: True
 
         result = plugin.on_stage(handler, ["a"], _resp(_entry(0, 0, 32)))
 
