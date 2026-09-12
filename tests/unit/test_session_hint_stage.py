@@ -93,6 +93,22 @@ class TestPolicySelection:
         sched = _make_scheduler(monkeypatch, "imminent")
         assert isinstance(sched._stage_policy, FifoStagePolicy)
 
+    @pytest.mark.parametrize("policy", ["fifo", "deadline"])
+    def test_turn_end_staging_reaches_either_policy(self, monkeypatch, policy):
+        """Turn-end staging must queue under both admission policies.
+
+        The two policies name the arrival estimate differently, so calling
+        one with the other's keyword raised TypeError inside the scheduler
+        step and killed the engine. Either policy must accept the turn-end
+        enqueue.
+        """
+        monkeypatch.setenv("MARU_STAGE_POLICY", policy)
+        sched = _make_scheduler(monkeypatch, "turn_end")
+        sched._record_session_prefix(
+            _request(req_id="r1", tokens=4 * CHUNK, session="s1")
+        )
+        assert sched._stage_policy.queued_requests == 1
+
     def test_deadline_policy_serves_imminent_hint(self, monkeypatch):
         monkeypatch.setenv("MARU_STAGE_POLICY", "deadline")
         sched = _make_scheduler(monkeypatch, "imminent")

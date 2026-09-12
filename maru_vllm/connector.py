@@ -1906,9 +1906,21 @@ class MaruSchedulerConnector:
                 if self._stage_estimator is not None
                 else None
             )
-            queued = self._stage_policy.enqueue(
-                _hint_plan_id(session_id), keys, not_before=launch_at
-            )
+            # Both policies want the same thing here — when this session's
+            # next turn is expected — but they use it differently and so name
+            # it differently. FIFO holds the plan until that instant
+            # (``not_before``); the deadline policy orders by it and drops a
+            # plan once it has passed (``deadline_at``). Passing the wrong
+            # name raises, which is why the deadline policy could not be used
+            # with turn-end staging before.
+            if self._stage_policy_kind == "deadline":
+                queued = self._stage_policy.enqueue(
+                    _hint_plan_id(session_id), keys, deadline_at=launch_at
+                )
+            else:
+                queued = self._stage_policy.enqueue(
+                    _hint_plan_id(session_id), keys, not_before=launch_at
+                )
             if queued:
                 logger.debug(
                     "Maru stage: queued %d turn-end keys for session %s",
