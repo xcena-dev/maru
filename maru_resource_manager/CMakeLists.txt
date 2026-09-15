@@ -69,6 +69,7 @@ if(MARU_BUILD_TESTS)
     add_executable(maru_rm_tests
         tests/test_device_header.cpp
         tests/test_pool_manager_uuid.cpp
+        tests/test_dax_region_index.cpp
         ${RM_LIB_SOURCES}
     )
 
