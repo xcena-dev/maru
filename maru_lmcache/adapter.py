@@ -3,7 +3,8 @@
 """CxlMemoryAdapter — LMCache MemoryAllocatorInterface adapter over MaruHandler.
 
 Adapts Maru's page-based CXL memory to LMCache's MemoryObj interface.
-Pre-creates TensorMemoryObj per page via region-added callback from MaruHandler.
+Pre-creates canonical KV objects per page via MaruHandler's region callback;
+other allocation layouts use independent zero-copy views over those pages.
 Address encoding uses bit-packing: (region_id << 32) | page_index.
 """
 
@@ -52,8 +53,8 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         self._lock = threading.Lock()
 
         # LMCache metadata for MemoryObj construction
-        self._shapes = shapes
-        self._dtypes = dtypes
+        self._shapes = list(shapes)
+        self._dtypes = list(dtypes)
         self._fmt = fmt
         self._chunk_size = chunk_size
 
@@ -115,18 +116,19 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
                 )
                 return
 
-            flat_dtype = self._dtypes[0]
-            tensor = torch.frombuffer(buf, dtype=flat_dtype)
+            # TensorMemoryObj's group offsets are in bytes, even when
+            # groups use different dtypes. Keep the backing view untyped.
+            tensor = torch.frombuffer(buf, dtype=torch.uint8)
 
             metadata = MemoryObjMetadata(
                 shape=self._shapes[0],
-                dtype=flat_dtype,
+                dtype=self._dtypes[0],
                 address=self.encode_address(region_id, pid),
                 phy_size=chunk_size,
                 ref_count=1,
                 fmt=self._fmt,
-                shapes=self._shapes if len(self._shapes) > 1 else None,
-                dtypes=self._dtypes if len(self._dtypes) > 1 else None,
+                shapes=list(self._shapes),
+                dtypes=list(self._dtypes),
             )
             objs.append(TensorMemoryObj(tensor, metadata, parent_allocator=None))
 
@@ -171,20 +173,22 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: str | None = None,
     ) -> MemoryObj | None:
-        """Allocate a CXL page and return the pooled MemoryObj.
+        """Allocate a CXL page with the requested tensor layout.
 
-        Pool objects are pre-created with the canonical shapes/dtypes/fmt
-        from __init__. The shapes/dtypes/fmt arguments are accepted for
-        interface compatibility but the pool's metadata is used.
+        Canonical KV requests reuse pre-created pool objects. Other layouts
+        get independent metadata and a zero-copy byte view of the same page
+        pool, so KV and serialized scratch buffers can coexist in flight.
+        Requests larger than a single page cannot be satisfied.
 
         Args:
-            shapes: Tensor shape(s) (for size computation only).
-            dtypes: Tensor dtype(s) (for size computation only).
-            fmt: Memory format (unused, pool has canonical fmt).
+            shapes: Tensor shape(s) exposed by the returned object.
+            dtypes: Tensor dtype(s) exposed by the returned object.
+            fmt: Memory format. UNDEFINED inherits the canonical format only
+                for full/partial KV layouts; scratch layouts remain UNDEFINED.
             allocator_type: Unused, for interface compatibility.
 
         Returns:
-            TensorMemoryObj from the pool, or None on failure.
+            TensorMemoryObj viewing a pool page, or None on failure.
         """
         shapes_list, dtypes_list = self._adapt_shapes_and_dtypes(shapes, dtypes)
 
@@ -192,7 +196,7 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         for shape, dtype in zip(shapes_list, dtypes_list, strict=True):
             size += shape.numel() * dtype.itemsize
 
-        if size == 0:
+        if size <= 0 or size > self._chunk_size:
             return None
 
         try:
@@ -214,14 +218,17 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         obj = region_pool[pid]
         logger.debug("[Maru] allocate rid=%d pid=%d size=%d", rid, pid, size)
 
-        # Partial chunk: return a view with adjusted shape to match actual
-        # token count, preventing CUDA kernel OOB on slot_mapping.
-        token_dim = self._fmt.token_dim()
-        if size < self._chunk_size and token_dim < len(self._shapes[0]):
-            single_token_size = self._chunk_size // self._shapes[0][token_dim]
-            return self._create_partial_view(obj, size, single_token_size)
-
-        return obj
+        if fmt == MemoryFormat.UNDEFINED and self._is_kv_layout(
+            shapes_list, dtypes_list
+        ):
+            fmt = self._fmt
+        if (
+            shapes_list == self._shapes
+            and dtypes_list == self._dtypes
+            and fmt == self._fmt
+        ):
+            return obj
+        return self._create_layout_view(obj, shapes_list, dtypes_list, fmt, size)
 
     def batched_allocate(
         self,
@@ -328,9 +335,12 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         actual_size: int,
         single_token_size: int,
     ) -> MemoryObj | None:
-        """Look up a pooled MemoryObj by (region_id, page_index).
+        """Look up canonical KV data by (region_id, page_index).
 
         For shared regions, builds the pool on-demand if not yet created.
+        Locations carry a byte count, not arbitrary layout metadata. Retrieval
+        therefore uses the adapter's canonical full/partial KV layout; scratch
+        buffers with other layouts must remain local to their allocation.
 
         Args:
             region_id: The region ID from retrieve response.
@@ -339,7 +349,8 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
             single_token_size: Bytes per single token (for partial chunk).
 
         Returns:
-            MemoryObj from the pool, or None if not found.
+            MemoryObj from the pool or a partial view. None if the location or
+            extent is invalid, or the region cannot be resolved.
         """
         with self._lock:
             region_pool = self._pool.get(region_id)
@@ -352,7 +363,7 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
             if region_pool is None:
                 return None
 
-        if page_index >= len(region_pool):
+        if page_index < 0 or page_index >= len(region_pool):
             logger.error(
                 "Page index %d out of range for region %d (pool size=%d)",
                 page_index,
@@ -362,6 +373,9 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
             return None
 
         source = region_pool[page_index]
+
+        if actual_size <= 0 or actual_size > self._chunk_size:
+            return None
 
         if actual_size == self._chunk_size:
             logger.debug(
@@ -377,7 +391,11 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
             actual_size,
             self._chunk_size,
         )
-        return self._create_partial_view(source, actual_size, single_token_size)
+        try:
+            return self._create_partial_view(source, actual_size, single_token_size)
+        except ValueError as exc:
+            logger.debug("[Maru] invalid partial chunk: %s", exc)
+            return None
 
     def _create_partial_view(
         self,
@@ -388,7 +406,7 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
         """Create a partial-chunk view from a pooled MemoryObj.
 
         The pool object is not mutated. Returns a new TensorMemoryObj
-        with a sliced tensor and adjusted shape.
+        with a sliced byte tensor and adjusted per-group shapes.
 
         Args:
             source: The full-chunk pooled MemoryObj.
@@ -397,22 +415,70 @@ class CxlMemoryAdapter(MemoryAllocatorInterface):
 
         Returns:
             New TensorMemoryObj with sliced data and adjusted shape.
+
+        Raises:
+            ValueError: If the extent cannot represent whole canonical KV tokens.
         """
-        # Slice the flat raw_data tensor to actual_size elements
-        dtype_size = source.metadata.dtype.itemsize
-        sliced_tensor = source.raw_data[: actual_size // dtype_size]
-
-        shape_list = list(source.metadata.shape)
-        shape_list[self._fmt.token_dim()] = actual_size // single_token_size
-
-        metadata = MemoryObjMetadata(
-            shape=torch.Size(shape_list),
-            dtype=source.metadata.dtype,
-            address=source.metadata.address,
-            phy_size=actual_size,
-            ref_count=1,
-            fmt=source.metadata.fmt,
-            shapes=source.metadata.shapes,
-            dtypes=source.metadata.dtypes,
+        if single_token_size <= 0 or actual_size % single_token_size:
+            raise ValueError("Partial chunk must contain a whole number of tokens")
+        tokens = actual_size // single_token_size
+        token_dim = self._fmt.token_dim()
+        shapes = []
+        for full_shape in self._shapes:
+            if token_dim >= len(full_shape) or not 0 < tokens <= full_shape[token_dim]:
+                raise ValueError("Partial chunk token count exceeds canonical layout")
+            shape = list(full_shape)
+            shape[token_dim] = tokens
+            shapes.append(torch.Size(shape))
+        size = sum(
+            shape.numel() * dtype.itemsize
+            for shape, dtype in zip(shapes, self._dtypes, strict=True)
         )
-        return TensorMemoryObj(sliced_tensor, metadata, parent_allocator=None)
+        if size != actual_size:
+            raise ValueError("Partial chunk byte size does not match canonical layout")
+        return self._create_layout_view(
+            source, shapes, self._dtypes, self._fmt, actual_size
+        )
+
+    def _is_kv_layout(
+        self, shapes: list[torch.Size], dtypes: list[torch.dtype]
+    ) -> bool:
+        """Return whether only the canonical KV token dimensions differ."""
+        if dtypes != self._dtypes or len(shapes) != len(self._shapes):
+            return False
+        if shapes == self._shapes:
+            return True
+        token_dim = self._fmt.token_dim()
+        for shape, full in zip(shapes, self._shapes, strict=True):
+            if len(shape) != len(full) or token_dim >= len(full):
+                return False
+            if not 0 < shape[token_dim] <= full[token_dim]:
+                return False
+            if any(
+                a != b
+                for i, (a, b) in enumerate(zip(shape, full, strict=True))
+                if i != token_dim
+            ):
+                return False
+        return True
+
+    def _create_layout_view(
+        self,
+        source: TensorMemoryObj,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        size: int,
+    ) -> TensorMemoryObj:
+        """Wrap requested bytes without copying or mutating the pool metadata."""
+        metadata = MemoryObjMetadata(
+            shape=shapes[0],
+            dtype=dtypes[0],
+            address=source.metadata.address,
+            phy_size=size,
+            ref_count=1,
+            fmt=fmt,
+            shapes=list(shapes),
+            dtypes=list(dtypes),
+        )
+        return TensorMemoryObj(source.raw_data[:size], metadata, parent_allocator=None)
