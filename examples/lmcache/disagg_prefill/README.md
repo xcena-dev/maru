@@ -29,8 +29,8 @@ This is the simplest configuration to get started with disaggregated prefill.
 
 Before running any example, ensure you have:
 
-- [LMCache](https://github.com/LMCache/LMCache) installed: `pip install lmcache`
-- [Maru](https://github.com/xcena-dev/maru) installed: `pip install -e .`
+- [LMCache](https://github.com/LMCache/LMCache) installed: `uv pip install lmcache`
+- [Maru](https://github.com/xcena-dev/maru) installed: `uv pip install -e .`
 - Sufficient GPU resources (see individual example requirements)
 
 ## Quick Start

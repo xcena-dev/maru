@@ -21,7 +21,7 @@ Instance 1 (GPU 0)                    Instance 2 (GPU 1)
 ## Prerequisites
 
 - 2+ NVIDIA GPUs
-- maru installed: `pip install -e /path/to/maru`
+- maru installed: `uv pip install -e /path/to/maru`
 - vLLM v0.14+ installed
 - maru-server binary available
 - LMCache is optional. When its Python package is installed, the direct

@@ -9,7 +9,7 @@ on:
 jobs:
   comment:
     if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, sw-devops-gha-general]
     steps:
       - name: Download coverage artifacts
         uses: actions/download-artifact@v4

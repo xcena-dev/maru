@@ -23,7 +23,7 @@ P2P sharing without network transfer.
 is included in a release):
 
 ```bash
-pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirectory=python"
+uv pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirectory=python"
 ```
 
 See [SGLang installation docs](https://docs.sglang.ai/start/install.html)
@@ -164,7 +164,7 @@ for details on the write-through flush mechanism.
 |---------|-------|-----|
 | `RuntimeError: Failed to connect MaruHandler` | MaruServer not running | Start `maru-server --port 5555` |
 | No cache hits on Instance 2 | Write-through not flushed | Send two queries to Instance 1 first (hit-count threshold) and wait ~3s |
-| `ImportError: maru_sglang` | Package not installed | Run `pip install -e .` from `maru/` root |
+| `ImportError: maru_sglang` | Package not installed | Run `uv pip install -e .` from `maru/` root |
 | Low TTFT speedup (< 1.5×) | Prompt too short for meaningful prefill savings | Use longer prompts (> 500 tokens) |
 
 > **See also:** [Architecture Overview](../design_doc/architecture_overview.md),

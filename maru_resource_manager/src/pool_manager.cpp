@@ -272,9 +272,46 @@ static void deleteFsDaxFile(const std::string &mountPoint, uint64_t regionId)
     ::unlink(filename.c_str());
 }
 
+bool parseRegionIndexFromDaxName(const std::string &devName, uint32_t &outIndex)
+{
+    // The kernel names every dev_dax "dax<dax_region id>.<dev_dax id>", whatever
+    // the provider is (pmem, CXL region, or hmem), so the device name carries the
+    // region index directly. Unlike the sysfs link target it does not depend on
+    // where the dax_region sits in the device hierarchy.
+    if (devName.compare(0, 3, "dax") != 0)
+    {
+        return false;
+    }
+    const char *p = devName.c_str() + 3;
+    if (!std::isdigit(static_cast<unsigned char>(*p)))
+    {
+        return false;
+    }
+    char *end = nullptr;
+    unsigned long v = std::strtoul(p, &end, 10);
+    if (end == p || *end != '.' ||
+        !std::isdigit(static_cast<unsigned char>(end[1])))
+    {
+        return false;
+    }
+    outIndex = static_cast<uint32_t>(v);
+    return true;
+}
+
 static bool getRegionIndexForDax(const std::string &devName,
                                  uint32_t &outIndex)
 {
+    // Prefer the device name: parseRegionIndexFromTarget() takes the first
+    // "region<N>" anywhere in the link target, which picks up an unrelated
+    // ancestor when one happens to be named that way, and finds nothing at all
+    // for an hmem-backed device (".../devices/platform/hmem.0/dax0.0" has no
+    // region component). The link target stays as a fallback for any layout
+    // whose device name does not parse.
+    if (parseRegionIndexFromDaxName(devName, outIndex))
+    {
+        return true;
+    }
+
     std::string sysfsPath = std::string(kSysBusDaxDevices) + "/" + devName;
     char buf[PATH_MAX];
     ssize_t n = ::readlink(sysfsPath.c_str(), buf, sizeof(buf) - 1);
@@ -349,6 +386,14 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
             uint32_t regionId = 0;
             if (!getRegionIndexForDax(name, regionId))
             {
+                // Skipping silently here is what made an undiscoverable device
+                // look like an absent one: the daemon only reports "no CXL/DAX
+                // devices found" and never says which device it passed over.
+                logf(LogLevel::Warn,
+                     "scanDevices: cannot determine dax_region index for /dev/%s "
+                     "(unexpected device name and no region in its sysfs link) — "
+                     "skipping, its capacity will not be available",
+                     name);
                 continue;
             }
             std::string devPath = std::string(kDevPrefix) + name;
