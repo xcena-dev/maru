@@ -6,6 +6,7 @@ Tests pure functions and layout helpers without requiring CXL hardware,
 a running MaruServer, or GPU. All tensors are CPU-only.
 """
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1280,6 +1281,333 @@ class TestStoreLoadRoundtripModernLayout:
 
 
 # =============================================================================
+# Packed (default chunkwise) store -> load round trip
+# =============================================================================
+
+
+class TestPackedStoreLoadRoundtrip:
+    """The default packed format's full loop, across more than one layer.
+
+    ``TestStoreLoadRoundtripModernLayout`` drives the same public API with
+    ``maru_use_layerwise=True`` and a single layer. The default format — one
+    CXL object per chunk holding every layer as ``[2, num_layers,
+    chunk_tokens, hidden]`` — had no loop test, so a store/load disagreement
+    about the slab's layer or K/V axis would not surface here.
+
+    ``test_slab_bytes_are_kv_2ltd`` pins the on-media arrangement against a
+    reading built here rather than the connector's own, because a round trip
+    alone still passes when both halves share one wrong convention — the case
+    that matters when the producer and the consumer are different processes.
+
+    CPU only, so ``lmcache.c_ops`` is unavailable and both halves take the
+    per-layer fallback. The fused-kernel and GPU-staging
+    (``maru_async_store``) paths need a GPU.
+    """
+
+    BLOCK, CHUNK, PROMPT = 4, 8, 64
+    LAYERS, HEADS, HEAD_SIZE = 3, 2, 3
+    NUM_BLOCKS = PROMPT // BLOCK
+    HIDDEN = HEADS * HEAD_SIZE
+
+    def _layer_names(self):
+        return [f"model.layers.{i}.self_attn" for i in range(self.LAYERS)]
+
+    def _source_caches(self):
+        """One distinct cache per layer at the vLLM 0.23 shape.
+
+        Shape is ``(num_blocks, 2, block_size, num_heads, head_size)``; each
+        layer is offset by 10,000 so a layer swap inside the slab cannot pass.
+        """
+        shape = (self.NUM_BLOCKS, 2, self.BLOCK, self.HEADS, self.HEAD_SIZE)
+        numel = self.NUM_BLOCKS * 2 * self.BLOCK * self.HEADS * self.HEAD_SIZE
+        return {
+            name: (idx * 10_000 + torch.arange(numel, dtype=torch.float32)).reshape(
+                shape
+            )
+            for idx, name in enumerate(self._layer_names())
+        }
+
+    def _make_worker(self, caches):
+        """A packed worker with caches registered but no handler connected."""
+        worker = make_worker(block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK)
+        worker._kv_caches = caches
+        worker._num_layers = len(caches)
+        worker._kv_layout = worker._resolve_kv_layout(caches)
+        return worker
+
+    def _store(self, caches):
+        """Run one store step over the whole prompt; return the pool and tokens."""
+        writer = self._make_worker(caches)
+        stored = attach_capturing_handler(writer, capture=bytearray)
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(self.NUM_BLOCKS)),
+            num_scheduled_tokens=self.PROMPT,
+        )
+        attn_metadata = make_flash_attn_metadata()
+        for name in self._layer_names():
+            writer.save_kv_layer(name, caches[name], attn_metadata, metadata)
+        return stored, token_ids
+
+    def test_slab_bytes_are_kv_2ltd(self):
+        """Every stored slab holds K/V, layer and token on the declared axes."""
+        caches = self._source_caches()
+        stored, token_ids = self._store(caches)
+
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        assert set(stored) == set(chunk_keys), "one object per chunk, no _L suffix"
+
+        names = self._layer_names()
+        for ci, base_key in enumerate(chunk_keys):
+            slab = torch.frombuffer(stored[base_key], dtype=torch.float32).view(
+                2, self.LAYERS, self.CHUNK, self.HIDDEN
+            )
+            for layer_idx, name in enumerate(names):
+                cache = caches[name]
+                for ti in range(self.CHUNK):
+                    block, offset = divmod(ci * self.CHUNK + ti, self.BLOCK)
+                    for kv in (0, 1):
+                        torch.testing.assert_close(
+                            slab[kv, layer_idx, ti],
+                            cache[block, kv, offset].reshape(self.HIDDEN),
+                        )
+
+    def test_roundtrip_restores_every_layer(self):
+        """A second engine reading the same pool rebuilds every layer exactly."""
+        src = self._source_caches()
+        stored, token_ids = self._store(src)
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+
+        dst = {name: torch.zeros_like(tensor) for name, tensor in src.items()}
+        reader = self._make_worker(dst)
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(view=memoryview(stored[key]), region_id=0, page_index=i)
+            for i, key in enumerate(keys)
+        ]
+        forward_context = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=tensor) for name, tensor in dst.items()
+            },
+            attn_metadata=make_flash_attn_metadata(),
+        )
+
+        reader.start_load_kv(
+            forward_context,
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(self.NUM_BLOCKS)),
+                num_matched_chunks=len(chunk_keys),
+            ),
+        )
+
+        assert reader.get_finished_loading() == {"r1"}
+        assert reader.take_failed_load_blocks() == set()
+        for name in self._layer_names():
+            torch.testing.assert_close(dst[name], src[name])
+
+
+# =============================================================================
+# Packed store -> load round trip through the fused kernel (GPU)
+# =============================================================================
+
+
+class _PageLockedPool:
+    """Handler stand-in backed by page-locked host memory.
+
+    ``multi_layer_kv_transfer`` reaches a host destination through
+    ``cudaHostGetDevicePointer``, so the pool must hand out memory the driver
+    knows about, the way a CUDA-registered CXL mapping does in production. A
+    stored key keeps the same bytes for the reader rather than copying them,
+    which is also what the shared pool does.
+    """
+
+    def __init__(self):
+        self.objects: dict = {}
+        self._live: list = []
+
+    def alloc(self, nbytes: int):
+        backing = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+        self._live.append(backing)
+        return SimpleNamespace(buf=memoryview(backing.numpy()), backing=backing)
+
+    def batch_store(self, keys, handles):
+        for key, handle in zip(keys, handles, strict=True):
+            self.objects[key] = handle
+        return [True] * len(keys)
+
+    def batch_retrieve(self, keys):
+        return [
+            SimpleNamespace(view=self.objects[key].buf, region_id=0, page_index=i)
+            if key in self.objects
+            else None
+            for i, key in enumerate(keys)
+        ]
+
+    def attach(self, worker) -> None:
+        handler = MagicMock()
+        handler.alloc.side_effect = self.alloc
+        handler.batch_store.side_effect = self.batch_store
+        handler.batch_retrieve.side_effect = self.batch_retrieve
+        worker._handler = handler
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel needs CUDA")
+class TestPackedKernelRoundtripGPU:
+    """The packed loop on the two paths a CPU test cannot reach.
+
+    The store side has two fused-kernel variants. The default writes the paged
+    cache straight into the page-locked pool; ``maru_async_store`` gathers into
+    a GPU staging slab first and copies that down. Both declare the same
+    ``[2, num_layers, chunk_tokens, hidden]`` object, so a reader must not be
+    able to tell which one produced it, and both must agree byte for byte.
+
+    No CXL device is involved: page-locked host memory stands in for the
+    mapping, which is what the kernel addresses either way.
+    """
+
+    BLOCK, CHUNK, PROMPT = 8, 8, 64
+    LAYERS, HEADS, HEAD_SIZE = 3, 2, 8
+    NUM_BLOCKS = PROMPT // BLOCK
+    HIDDEN = HEADS * HEAD_SIZE
+
+    def _layer_names(self):
+        return [f"model.layers.{i}.self_attn" for i in range(self.LAYERS)]
+
+    def _source_caches(self):
+        """One distinct CUDA cache per layer at the vLLM 0.23 shape."""
+        shape = (self.NUM_BLOCKS, 2, self.BLOCK, self.HEADS, self.HEAD_SIZE)
+        numel = self.NUM_BLOCKS * 2 * self.BLOCK * self.HEADS * self.HEAD_SIZE
+        return {
+            name: (idx * 10_000 + torch.arange(numel, dtype=torch.float32))
+            .reshape(shape)
+            .cuda()
+            for idx, name in enumerate(self._layer_names())
+        }
+
+    def _make_worker(self, caches, extra_config=None):
+        worker = make_worker(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config=extra_config,
+            num_kv_heads=self.HEADS,
+            head_size=self.HEAD_SIZE,
+        )
+        worker._kv_caches = caches
+        worker._num_layers = len(caches)
+        worker._kv_layout = worker._resolve_kv_layout(caches)
+        assert worker._kv_layout is not None, "layout must resolve"
+        assert worker._kv_layout.format_name is not None, "kernel format required"
+        return worker
+
+    def _store(self, caches, *, write_behind: bool):
+        """Run one store step; return the pool and the prompt's token ids."""
+        pool = _PageLockedPool()
+        worker = self._make_worker(
+            caches, extra_config={"maru_async_store": True} if write_behind else None
+        )
+        pool.attach(worker)
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(self.NUM_BLOCKS)),
+            num_scheduled_tokens=self.PROMPT,
+        )
+        attn_metadata = make_flash_attn_metadata()
+        for name in self._layer_names():
+            worker.save_kv_layer(name, caches[name], attn_metadata, metadata)
+
+        expected = self.PROMPT // self.CHUNK
+        deadline = time.monotonic() + 30.0
+        while len(pool.objects) < expected and time.monotonic() < deadline:
+            worker.get_finished_saving(set())
+            time.sleep(0.01)
+        assert len(pool.objects) == expected, (
+            f"{len(pool.objects)} of {expected} chunks registered"
+        )
+        return pool, token_ids
+
+    def _load(self, pool, token_ids, num_chunks):
+        """Read the pool back into zeroed caches; return them."""
+        src = self._source_caches()
+        dst = {name: torch.zeros_like(tensor) for name, tensor in src.items()}
+        reader = self._make_worker(dst)
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = pool.batch_retrieve
+        forward_context = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=tensor) for name, tensor in dst.items()
+            },
+            attn_metadata=make_flash_attn_metadata(),
+        )
+        reader.start_load_kv(
+            forward_context,
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(self.NUM_BLOCKS)),
+                num_matched_chunks=num_chunks,
+            ),
+        )
+        # On CUDA a deferred packed load always goes to the background loader
+        # thread, so the request is reported on a later call, not this one.
+        deadline = time.monotonic() + 30.0
+        finished = None
+        while finished is None and time.monotonic() < deadline:
+            finished = reader.get_finished_loading()
+            if finished is None:
+                time.sleep(0.01)
+        assert finished == {"r1"}
+        assert reader.take_failed_load_blocks() == set()
+        return dst
+
+    def _slab_bytes(self, pool, token_ids):
+        keys = _chunk_keys(token_ids, self.CHUNK)
+        return [bytes(pool.objects[key].buf) for key in keys]
+
+    @pytest.mark.parametrize("write_behind", [False, True], ids=["direct", "staging"])
+    def test_roundtrip_restores_every_layer(self, write_behind):
+        """Either store variant round-trips every layer of every chunk exactly."""
+        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
+        src = self._source_caches()
+        pool, token_ids = self._store(src, write_behind=write_behind)
+        dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK)
+        for name in self._layer_names():
+            torch.testing.assert_close(dst[name], src[name])
+
+    def test_staging_and_direct_stores_agree_byte_for_byte(self):
+        """GPU staging must not change the stored object's arrangement."""
+        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
+        caches = self._source_caches()
+        direct, token_ids = self._store(caches, write_behind=False)
+        staged, _ = self._store(caches, write_behind=True)
+        assert self._slab_bytes(direct, token_ids) == self._slab_bytes(
+            staged, token_ids
+        )
+
+    def test_slab_bytes_are_kv_2ltd(self):
+        """The stored object holds K/V, layer and token on the declared axes."""
+        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
+        caches = self._source_caches()
+        pool, token_ids = self._store(caches, write_behind=False)
+
+        names = self._layer_names()
+        host = {name: tensor.cpu() for name, tensor in caches.items()}
+        for ci, raw in enumerate(self._slab_bytes(pool, token_ids)):
+            slab = torch.frombuffer(bytearray(raw), dtype=torch.float32).view(
+                2, self.LAYERS, self.CHUNK, self.HIDDEN
+            )
+            for layer_idx, name in enumerate(names):
+                for ti in range(self.CHUNK):
+                    block, offset = divmod(ci * self.CHUNK + ti, self.BLOCK)
+                    for kv in (0, 1):
+                        torch.testing.assert_close(
+                            slab[kv, layer_idx, ti],
+                            host[name][block, kv, offset].reshape(self.HIDDEN),
+                        )
+
+
+# =============================================================================
 # build_connector_meta: store-side block accumulation across steps
 # =============================================================================
 
@@ -1402,9 +1730,13 @@ class TestDeferredLoading:
         )
 
     def test_matched_tokens_reported_async(self):
+        # 70 tokens is eight full chunks plus a remainder, so every cached
+        # chunk is reportable. An exact-multiple prompt is a different case:
+        # one token is held back so the engine still has work, which
+        # TestFullPromptHitLeavesWorkForTheEngine covers.
         sched = self._make_scheduler()
         sched._handler.batch_exists.return_value = [True] * 8
-        matched, load_async = sched.get_num_new_matched_tokens(self._request(), 0)
+        matched, load_async = sched.get_num_new_matched_tokens(self._request(70), 0)
         assert matched == 64 and load_async is True
 
     def test_sync_mode_reports_sync(self):
@@ -3217,3 +3549,69 @@ class TestActiveLoadRefsRelease:
         worker._release_completed_load_refs()
 
         assert worker._active_load_refs == []
+
+
+# =============================================================================
+# A full-prompt hit has to leave the engine something to run
+# =============================================================================
+
+
+class TestFullPromptHitLeavesWorkForTheEngine:
+    """vLLM kills the engine when a scheduled request has nothing left to run.
+
+    ``scheduler.py`` computes ``num_new_tokens = request.num_tokens -
+    num_computed_tokens`` and asserts it is positive. A connector that reports
+    every prompt token as an external hit drives that to zero, and the engine
+    core dies with ``AssertionError`` rather than serving the request.
+
+    The case is reached whenever the prompt length is an exact multiple of the
+    chunk size, because then the chunk keys cover the prompt with no remainder.
+    Prompts of 8,192 and 32,768 tokens against 256-token chunks are exactly
+    that, which is why a workload built on round input sizes meets it and one
+    built on arbitrary lengths never does.
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _make_scheduler(self):
+        scheduler = make_scheduler(
+            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+        )
+        scheduler._handler = MagicMock()
+        return scheduler
+
+    @staticmethod
+    def _request(num_tokens: int):
+        return SimpleNamespace(
+            request_id="r1", prompt_token_ids=list(range(num_tokens))
+        )
+
+    @pytest.mark.parametrize("num_tokens", [64, 128, 256])
+    def test_exact_multiple_prompt_keeps_a_token_to_compute(self, num_tokens):
+        scheduler = self._make_scheduler()
+        scheduler._handler.batch_exists.return_value = [True] * (
+            num_tokens // self.CHUNK
+        )
+        matched, _ = scheduler.get_num_new_matched_tokens(self._request(num_tokens), 0)
+        assert matched < num_tokens, (
+            f"reported {matched} of {num_tokens} prompt tokens as an external "
+            "hit; the scheduler then has no token to run and raises "
+            "assert num_new_tokens > 0, killing the engine core"
+        )
+
+    @pytest.mark.parametrize("num_tokens", [64, 128, 256])
+    def test_reported_count_stays_block_aligned(self, num_tokens):
+        scheduler = self._make_scheduler()
+        scheduler._handler.batch_exists.return_value = [True] * (
+            num_tokens // self.CHUNK
+        )
+        matched, _ = scheduler.get_num_new_matched_tokens(self._request(num_tokens), 0)
+        assert matched % self.BLOCK == 0
+
+    def test_prompt_with_a_partial_last_chunk_is_unchanged(self):
+        """The common case keeps reporting every cached chunk."""
+        scheduler = self._make_scheduler()
+        scheduler._handler.batch_exists.return_value = [True] * 8
+        matched, _ = scheduler.get_num_new_matched_tokens(self._request(70), 0)
+        assert matched == 64
