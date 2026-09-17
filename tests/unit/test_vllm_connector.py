@@ -1907,13 +1907,14 @@ class TestPreIssuedLayerwiseHandoff:
 
     LAYERS = ("model.layers.0.self_attn", "model.layers.1.self_attn")
 
-    def _worker(self):
+    def _worker(self, **extra):
         worker = make_worker(
             block_size=4,
             kv_chunk_tokens=4,
             extra_config={
                 "maru_enable_deferred_loading": True,
                 "maru_enable_layerwise_overlap": True,
+                **extra,
             },
         )
         worker._handler = MagicMock()
@@ -1979,9 +1980,9 @@ class TestPreIssuedLayerwiseHandoff:
             name: [event] for name, event in events.items()
         }
 
-    def test_release_gate_is_the_first_layer_in_execution_order(self, monkeypatch):
+    def test_release_gate_follows_execution_order(self):
         """Layer index orders the wait; the events dict does not carry it."""
-        worker = self._worker()
+        worker = self._worker(maru_overlap_release_after_layers=1)
         first, second = MagicMock(), MagicMock()
         # Dict order reversed against execution order on purpose.
         events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
@@ -1995,16 +1996,57 @@ class TestPreIssuedLayerwiseHandoff:
 
         assert worker._unpark_gate_event({}, layers) is None
 
-    def test_release_gate_clamps_to_the_layers_that_exist(self, monkeypatch):
-        import maru_vllm.connector as connector
-
-        monkeypatch.setattr(connector, "_LAYERWISE_RELEASE_AFTER_LAYERS", 99)
-        worker = self._worker()
+    def test_release_gate_clamps_to_the_layers_that_exist(self):
+        worker = self._worker(maru_overlap_release_after_layers=99)
         first, second = MagicMock(), MagicMock()
         events = {self.LAYERS[0]: first, self.LAYERS[1]: second}
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
 
         assert worker._unpark_gate_event(events, layers) is second
+
+    def test_release_gate_honours_the_knob(self):
+        """The layer the gate picks is the knob's, in execution order."""
+        worker = self._worker(maru_overlap_release_after_layers=2)
+        first, second = MagicMock(), MagicMock()
+        events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+
+        assert worker._unpark_gate_event(events, layers) is second
+
+    def test_release_gate_parses_its_knob(self):
+        """The default is what shipped; a higher count is a sweep's answer."""
+        assert self._worker()._release_after == 1
+        assert self._worker(maru_overlap_release_after_layers=7)._release_after == 7
+        assert self._worker(maru_overlap_release_after_layers="3")._release_after == 3
+        assert self._worker(maru_overlap_release_after_layers=0)._release_after == 1
+        assert self._worker(maru_overlap_release_after_layers="x")._release_after == 1
+
+    def test_release_gate_warns_when_the_overlap_is_off(self, caplog):
+        with caplog.at_level("WARNING"):
+            worker = make_worker(
+                block_size=4,
+                kv_chunk_tokens=4,
+                extra_config={
+                    "maru_async_load": True,
+                    "maru_overlap_load_with_compute": False,
+                    "maru_overlap_release_after_layers": 7,
+                },
+            )
+        assert not worker._layerwise_overlap
+        assert "maru_overlap_release_after_layers=7 has no effect" in caplog.text
+        assert "maru_overlap_load_with_compute" in caplog.text
+
+    def test_release_gate_is_silent_when_the_overlap_is_on(self, caplog):
+        with caplog.at_level("WARNING"):
+            worker = self._worker(maru_overlap_release_after_layers=7)
+        assert worker._layerwise_overlap
+        assert "has no effect" not in caplog.text
+
+    def test_release_gate_at_its_default_does_not_warn(self, caplog):
+        """Leaving the count alone is not a request, so it stays silent."""
+        with caplog.at_level("WARNING"):
+            make_worker(block_size=4, kv_chunk_tokens=4, extra_config={})
+        assert "maru_overlap_release_after_layers" not in caplog.text
 
     def test_preempting_a_request_drains_its_queued_copies(self):
         from maru_vllm.connector import MaruConnectorMetadata

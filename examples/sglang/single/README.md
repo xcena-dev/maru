@@ -4,7 +4,7 @@ Run a single SGLang instance with Maru HiCache L3 backend (CXL shared memory).
 
 ## Prerequisites
 
-1. Install Maru: `pip install -e .` (from the `maru/` root)
+1. Install Maru: `uv pip install -e .` (from the `maru/` root)
 2. SGLang with [sgl-project/sglang#20560](https://github.com/sgl-project/sglang/pull/20560)
 3. At least 1 GPU available
 

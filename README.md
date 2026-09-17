@@ -88,12 +88,16 @@ All components run on the same machine in a single-node setup. For multi-node de
 - OS: Ubuntu 24.04 LTS+
 - Python: 3.12+
 - gcc: 13.3.0+, cmake: 3.28.3+
+- [uv](https://docs.astral.sh/uv/) (recommended; `install.sh` falls back to pip)
 - CXL DAX device (`/dev/dax*`) or emulation environment
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y python3 python3-venv python3-pip git \
     build-essential cmake libnuma-dev
+
+# uv — used for all Python installs below
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ### Installation
@@ -102,7 +106,7 @@ sudo apt-get install -y python3 python3-venv python3-pip git \
 git clone https://github.com/xcena-dev/maru
 cd maru
 
-python3 -m venv .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 ./install.sh
 ```

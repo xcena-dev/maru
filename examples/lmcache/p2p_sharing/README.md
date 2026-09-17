@@ -12,7 +12,7 @@ Maru provides CXL shared memory backed storage, eliminating the need for P2P tra
 
 ```bash
 cd ~/maru
-pip install -e .
+uv pip install -e .
 ```
 
 2. At least 2 GPUs available

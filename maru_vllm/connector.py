@@ -80,10 +80,28 @@ _RENAMED_KNOBS: dict[str, str] = {
 # requests take their turn without any extra admission mechanism.
 _LAYERWISE_STREAM_COUNT = 1
 
-# A parked request is released once this many of its layers have landed. The
-# rest arrive while its own attention runs. Waiting for more only delays the
-# start: the transfer already outruns compute at full bandwidth.
+# Layers that must land before get_finished_loading() reports the load done,
+# which is when vLLM will schedule the request's prefill. The rest are waited
+# for on the model stream, which runs the whole batched step, so reporting early
+# charges one request's load time to the whole batch, while waiting longer costs
+# this request's first token nothing while the hold stays inside the delay the
+# scheduler takes to re-admit the request anyway.
 _LAYERWISE_RELEASE_AFTER_LAYERS = 1
+
+
+def _parse_release_after(value: Any) -> int:
+    """Parse maru_overlap_release_after_layers into a layer count."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "maru_overlap_release_after_layers=%r is not an integer; using %d",
+            value,
+            _LAYERWISE_RELEASE_AFTER_LAYERS,
+        )
+        return _LAYERWISE_RELEASE_AFTER_LAYERS
+    return max(1, parsed)
+
 
 _cuda_runtime: Any = None
 _cuda_memcpy2d_async: Any = None
@@ -406,6 +424,17 @@ class MaruKVConnector(KVConnectorBase_V1):
             finished. Applies at any concurrency. Requires
             maru_async_load=true and maru_use_layerwise=false
             (default: false; was maru_enable_layerwise_overlap)
+        maru_overlap_release_after_layers: int - Layers that must land
+            before get_finished_loading() reports the load done and vLLM
+            schedules the prefill. The rest are waited for on the model
+            stream, which runs the whole batched step, so reporting early
+            charges one request's load time to the whole batch, while
+            waiting longer costs its first token nothing while the hold
+            stays inside the scheduler's re-admission delay. Where it
+            should sit turns on a layer's copy time against a layer of
+            compute: sweep it per deployment. Requires
+            maru_overlap_load_with_compute=true; warns if raised without it
+            (default: 1)
 
     Storage format — how a request's KV is grouped into CXL objects:
         maru_use_layerwise: bool - False (default) is chunkwise: one CXL
@@ -1164,6 +1193,23 @@ class MaruWorkerConnector:
                 "Maru packed-layerwise overlap requires maru_async_load=true and "
                 "maru_use_layerwise=false; disabling it"
             )
+        self._release_after = _parse_release_after(
+            _get_knob(
+                extra_config,
+                "maru_overlap_release_after_layers",
+                _LAYERWISE_RELEASE_AFTER_LAYERS,
+            )
+        )
+        if (
+            not self._layerwise_overlap
+            and self._release_after != _LAYERWISE_RELEASE_AFTER_LAYERS
+        ):
+            # Inert on its own, so say so — a sweep would otherwise look broken.
+            logger.warning(
+                "maru_overlap_release_after_layers=%d has no effect without "
+                "maru_overlap_load_with_compute; ignoring it",
+                self._release_after,
+            )
         # Packed store accumulates a chunk's per-layer slices across the
         # per-layer save_kv_layer calls of one step: base_key -> (handle,
         # layers_written). Registered once when all layers are present.
@@ -1805,7 +1851,7 @@ class MaruWorkerConnector:
         ordered = [name for name in ordered if name in events]
         if not ordered:
             return None
-        count = min(_LAYERWISE_RELEASE_AFTER_LAYERS, len(ordered))
+        count = min(self._release_after, len(ordered))
         return events[ordered[count - 1]]
 
     def _layerwise_stream_for(self, device: torch.device) -> torch.cuda.Stream:

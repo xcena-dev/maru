@@ -4,7 +4,7 @@ Demonstrates Maru's core functionality: zero-copy KV store on CXL shared memory.
 
 ## Prerequisites
 
-- Maru installed (`pip install -e .`)
+- Maru installed (`uv pip install -e .`)
 - Maru Resource Manager running (`systemctl status maru-resourced`)
 - CXL DAX device available (`/dev/dax*`)
 
