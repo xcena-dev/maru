@@ -416,3 +416,182 @@ class TestClose:
         assert len(adapter._pool) == 0
         # Callback should be unregistered (set to None)
         assert handler.set_on_region_added.call_count == 2  # init + close
+
+
+class TestLayoutContract:
+    """Exercise public tensor views while keeping several layouts in flight."""
+
+    @pytest.mark.parametrize("tokens", [16, 32])
+    def test_single_group_metadata_and_retrieval(self, tokens: int) -> None:
+        """Full and partial KV pages expose the same singular/plural layout."""
+        handler = _make_mock_handler()
+        full = torch.Size([2, 2, 32, 2])
+        shape = torch.Size([2, 2, tokens, 2])
+        adapter = CxlMemoryAdapter(
+            handler, [full], [torch.float32], MemoryFormat.KV_2LTD, 1024
+        )
+        try:
+            obj = adapter.allocate(shape, torch.float32)
+            assert obj is not None
+            assert obj.get_shapes() == [shape]
+            assert obj.get_dtypes() == [torch.float32]
+            obj.get_tensor(0).fill_(7)
+            assert torch.equal(obj.tensor, obj.get_tensor(0))
+            rid, pid = adapter.decode_address(obj.metadata.address)
+            retrieved = adapter.get_by_location(rid, pid, obj.get_size(), 32)
+            assert retrieved is not None
+            assert retrieved.get_shapes() == [shape]
+            assert retrieved.get_dtypes() == [torch.float32]
+            assert retrieved.get_size() == shape.numel() * 4
+            assert torch.all(retrieved.get_tensor(0) == 7)
+        finally:
+            adapter.close()
+
+    @pytest.mark.parametrize("size", [63, 512, 1024])
+    def test_byte_buffer_does_not_change_live_kv_layout(self, size: int) -> None:
+        """A byte scratch allocation has exactly the requested extent and dtype."""
+        handler = _make_mock_handler()
+        shape = torch.Size([2, 2, 32, 2])
+        adapter = CxlMemoryAdapter(
+            handler, [shape], [torch.float32], MemoryFormat.KV_2LTD, 1024
+        )
+        try:
+            kv = adapter.allocate(shape, torch.float32)
+            scratch = adapter.allocate(
+                torch.Size([size]), torch.uint8, MemoryFormat.BINARY_BUFFER
+            )
+            assert kv is not None and scratch is not None
+            assert scratch.tensor.dtype == torch.uint8
+            assert scratch.tensor.shape == (size,)
+            assert scratch.get_shapes() == [torch.Size([size])]
+            assert scratch.get_dtypes() == [torch.uint8]
+            assert scratch.get_size() == size
+            assert len(scratch.byte_array) == size
+            assert scratch.metadata.fmt == MemoryFormat.BINARY_BUFFER
+            assert torch.equal(scratch.tensor, scratch.get_tensor(0))
+            scratch.tensor.fill_(17)
+            rid, pid = adapter.decode_address(scratch.metadata.address)
+            buf = handler.get_buffer_view(rid, pid * 1024, size)
+            assert bytes(buf) == bytes([17]) * size
+            assert kv.tensor.shape == shape
+            assert kv.get_shapes() == [shape]
+            assert kv.get_dtypes() == [torch.float32]
+            assert kv.get_size() == 1024
+        finally:
+            adapter.close()
+
+    @pytest.mark.parametrize("tokens", [8, 16])
+    def test_packed_groups_use_byte_offsets(self, tokens: int) -> None:
+        """Mixed dtypes and partial groups retain independent, correct views."""
+        shapes = [torch.Size([2, 1, 16, 2]), torch.Size([2, 1, 16, 2])]
+        partial = [torch.Size([2, 1, tokens, 2])] * 2
+        dtypes = [torch.float16, torch.float32]
+        handler = _make_mock_handler(pool_size=1536, chunk_size=384)
+        adapter = CxlMemoryAdapter(handler, shapes, dtypes, MemoryFormat.KV_2LTD, 384)
+        try:
+            obj = adapter.allocate(partial, dtypes)
+            assert obj is not None
+            assert obj.get_shapes() == partial
+            assert obj.get_dtypes() == dtypes
+            obj.get_tensor(0).fill_(3)
+            obj.get_tensor(1).fill_(5)
+            assert obj.get_size() == tokens * 24
+            rid, pid = adapter.decode_address(obj.metadata.address)
+            other = adapter.get_by_location(rid, pid, obj.get_size(), 24)
+            assert other is not None
+            assert other.get_shapes() == partial
+            assert other.get_dtypes() == dtypes
+            assert torch.all(other.get_tensor(0) == 3)
+            assert torch.all(other.get_tensor(1) == 5)
+            assert other.get_tensor(1).data_ptr() == (
+                other.get_tensor(0).data_ptr() + partial[0].numel() * 2
+            )
+        finally:
+            adapter.close()
+
+    def test_oversized_request_does_not_allocate_page(self) -> None:
+        """The fixed page pool cannot satisfy a request larger than one page."""
+        handler = _make_mock_handler()
+        adapter = _make_adapter(handler)
+        try:
+            assert adapter.allocate(torch.Size([1025]), torch.uint8) is None
+            handler.alloc.assert_not_called()
+        finally:
+            adapter.close()
+
+    def test_requested_format_is_preserved(self) -> None:
+        """An explicit format is not replaced by the pool's canonical tag."""
+        handler = _make_mock_handler()
+        adapter = _make_adapter(handler)
+        try:
+            obj = adapter.allocate(
+                torch.Size([256]), torch.float32, MemoryFormat.BINARY_BUFFER
+            )
+            assert obj is not None
+            assert obj.metadata.fmt == MemoryFormat.BINARY_BUFFER
+        finally:
+            adapter.close()
+
+    def test_default_format_byte_buffer_uses_requested_layout(self) -> None:
+        """MP scratch allocations omit fmt and still need byte-shaped views."""
+        handler = _make_mock_handler()
+        adapter = _make_adapter(handler)
+        try:
+            obj = adapter.allocate(torch.Size([63]), torch.uint8)
+            assert obj is not None
+            assert obj.tensor.shape == (63,)
+            assert obj.tensor.dtype == torch.uint8
+            assert obj.metadata.fmt == MemoryFormat.UNDEFINED
+        finally:
+            adapter.close()
+
+    def test_partial_views_do_not_mutate_other_live_views(self) -> None:
+        """Different token views of a page keep independent group metadata."""
+        handler = _make_mock_handler()
+        shape = torch.Size([2, 2, 32, 2])
+        adapter = CxlMemoryAdapter(
+            handler, [shape], [torch.float32], MemoryFormat.KV_2LTD, 1024
+        )
+        try:
+            full = adapter.get_by_location(100, 0, 1024, 32)
+            half = adapter.get_by_location(100, 0, 512, 32)
+            quarter = adapter.get_by_location(100, 0, 256, 32)
+            assert full is not None and half is not None and quarter is not None
+            assert full.get_shapes() == [shape]
+            assert half.get_shapes() == [torch.Size([2, 2, 16, 2])]
+            assert quarter.get_shapes() == [torch.Size([2, 2, 8, 2])]
+            assert full.get_size() == 1024
+            assert half.get_size() == 512
+            assert quarter.get_size() == 256
+            assert full.get_tensor(0).data_ptr() == half.get_tensor(0).data_ptr()
+            assert half.get_tensor(0).data_ptr() == quarter.get_tensor(0).data_ptr()
+        finally:
+            adapter.close()
+
+    @pytest.mark.parametrize(
+        ("page", "size", "token_size"),
+        [
+            (-1, 1024, 32),
+            (0, 0, 32),
+            (0, 1025, 32),
+            (0, 511, 32),
+            (0, 512, 0),
+            (0, 512, 64),
+        ],
+    )
+    def test_invalid_retrieval_extent_is_rejected(
+        self, page: int, size: int, token_size: int
+    ) -> None:
+        """Malformed locations must not expose bytes under an incorrect layout."""
+        handler = _make_mock_handler()
+        adapter = CxlMemoryAdapter(
+            handler,
+            [torch.Size([2, 2, 32, 2])],
+            [torch.float32],
+            MemoryFormat.KV_2LTD,
+            1024,
+        )
+        try:
+            assert adapter.get_by_location(100, page, size, token_size) is None
+        finally:
+            adapter.close()
