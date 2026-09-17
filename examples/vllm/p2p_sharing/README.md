@@ -21,13 +21,15 @@ Instance 1 (GPU 0)                    Instance 2 (GPU 1)
 ## Prerequisites
 
 - 2+ NVIDIA GPUs
-- maru installed: `uv pip install -e /path/to/maru`
+- maru installed with its KV placement kernels: `./install.sh` from the maru
+  source tree, or `uv pip install -e /path/to/maru --no-build-isolation` in an
+  environment that already has PyTorch and the CUDA toolkit. The direct
+  connector carries its own CUDA kernels for the coalesced multi-layer
+  transfers and falls back to a transfer per layer without them, which is
+  materially slower. Check with
+  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"`.
 - vLLM v0.14+ installed
 - maru-server binary available
-- LMCache is optional. When its Python package is installed, the direct
-  connector reuses `lmcache.c_ops` for coalesced multi-layer CUDA transfers;
-  it does not run the LMCache connector or service. Without `c_ops`, Maru uses
-  the compatible per-layer fallback.
 
 ## Quick Start (Automated)
 
