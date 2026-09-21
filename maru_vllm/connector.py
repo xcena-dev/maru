@@ -42,6 +42,7 @@ from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
     _detect_kv_layout,
+    _kernel_paged_view,
     _layout_fits,
     _vllm_kv_cache_layout,
 )
@@ -2320,6 +2321,12 @@ class MaruWorkerConnector:
         materialise those as two index tensors first, so it issues three kernels
         per layer where the first issues one.
 
+        They also differ in what they can read off the destination. The
+        fallback indexes by the logical shape and follows strides, so an HND
+        cache needs nothing special; the kernel counts heads and page slots
+        from the destination's own shape, so HND reaches it through
+        ``_kernel_paged_view``.
+
         That equivalence is the layout branch of ``_inject_kv_into_layer``,
         with and without a K/V axis. Its MLA and legacy rank-4 Triton branches
         reinterpret the staging buffer without consulting ``num_chunks``, so
@@ -2350,9 +2357,13 @@ class MaruWorkerConnector:
             )
             return
         ops, _ptrs, _pbs, _block_size, _head_size, fmt = kernel
+        # The kernel reads the head count and page size off the destination's
+        # own shape, so an HND cache has to arrive in its physical axis order.
+        # A kernel context is only built from a resolved layout, so the None
+        # the helper also accepts cannot arrive here.
         ops.single_layer_kv_transfer(
             layer_dev,
-            kv_cache_layer,
+            _kernel_paged_view(kv_cache_layer, self._kv_layout),
             slot_gpu,
             ops.TransferDirection.H2D,
             fmt,

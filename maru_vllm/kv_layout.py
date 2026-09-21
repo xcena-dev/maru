@@ -24,6 +24,15 @@ except ImportError:  # keeps this module importable without vLLM (pure tests)
     logger = logging.getLogger(__name__)
 
 
+# Formats whose pages are laid out head-major. vLLM permutes an HND
+# allocation straight back, so the choice survives only in ``format_name``:
+# the registered tensor keeps the backend's token-major shape and differs in
+# its strides alone. Both come from the rank-5 branch of
+# ``_kv_layout_candidates``, where the head axis directly follows the token
+# axis — which is what ``_kernel_paged_view`` relies on.
+_HND_FORMATS = frozenset({"NL_X_NB_TWO_NH_BS_HS", "NL_X_TWO_NB_NH_BS_HS"})
+
+
 @dataclass(frozen=True)
 class KVLayout:
     """Where each dimension sits in vLLM's paged KV tensor.
@@ -67,6 +76,11 @@ class KVLayout:
     def page_buffer_size(self) -> int:
         """Total token slots in the cache (``num_blocks * block_size``)."""
         return self.num_blocks * self.block_size
+
+    @property
+    def is_hnd(self) -> bool:
+        """Whether the pages hold one head's tokens together (head-major)."""
+        return self.format_name in _HND_FORMATS
 
 
 def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
@@ -202,6 +216,35 @@ def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
 
 
 _kv_cache_layout_warned = False
+
+
+def _kernel_paged_view(t: torch.Tensor, layout: KVLayout | None) -> torch.Tensor:
+    """Return ``t`` with its shape in the axis order the kernel reads.
+
+    ``single_layer_kv_transfer`` takes the paged tensor itself and reads the
+    head count off ``size(2)`` and the page size off ``size(3)``, so its HND
+    branch expects the head axis where the memory actually puts it. vLLM
+    hands over the backend's token-major shape for both layouts (see
+    :class:`KVLayout`), so an HND tensor reaches the kernel describing itself
+    as NHD and the two counts arrive swapped. Transposing the pair restores
+    the physical order. It stays a view, which is what the kernel
+    dereferences, and it costs nothing: only the shape and strides move.
+
+    ``multi_layer_kv_transfer`` needs no such view — it is told the page size
+    and head width outright and never reads them off the paged tensor.
+
+    Args:
+        t: The layer's paged KV tensor as vLLM registered it.
+        layout: The layout resolved for that tensor, when one was.
+
+    Returns:
+        ``t`` unchanged for NHD, and its head-major view for HND. An
+        unresolved layout leaves ``t`` alone: there is no recorded HND to
+        undo, and no kernel context is built from one either.
+    """
+    if layout is None or not layout.is_hnd:
+        return t
+    return t.transpose(layout.token_axis, layout.token_axis + 1)
 
 
 def _vllm_kv_cache_layout() -> str:

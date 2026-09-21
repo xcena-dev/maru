@@ -3490,6 +3490,102 @@ class TestPlacePackedLayer:
         # tensor is built to; True would transpose K and V.
         assert recorded["kwargs"] == {"token_major": False}
 
+    # Page size and head count differ, so reading one where the other belongs
+    # changes the answer. Equal values would hide exactly the swap under test.
+    HND_NB, HND_BS, HND_NH, HND_HS = 6, 16, 4, 8
+
+    def _hnd_case(self, shape, fmt):
+        """Return a worker whose resolved layout is that HND format."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        layout = _detect_kv_layout(
+            shape,
+            self.HND_BS,
+            "HND",
+            num_kv_heads=self.HND_NH,
+            head_size=self.HND_HS,
+        )
+        assert layout is not None and layout.format_name == fmt
+        worker = make_bare_worker(block_size=self.HND_BS)
+        worker._kv_layout = layout
+        return worker
+
+    @staticmethod
+    def _recording_ops():
+        recorded: dict = {}
+
+        class Ops:
+            TransferDirection = SimpleNamespace(H2D="h2d")
+
+            @staticmethod
+            def single_layer_kv_transfer(*args, **kwargs):
+                recorded["args"] = args
+
+        return Ops, recorded
+
+    @pytest.mark.parametrize(
+        "shape_fn,fmt",
+        [
+            (lambda nb, bs, nh, hs: (2, nb, bs, nh, hs), "NL_X_TWO_NB_NH_BS_HS"),
+            (lambda nb, bs, nh, hs: (nb, 2, bs, nh, hs), "NL_X_NB_TWO_NH_BS_HS"),
+        ],
+        ids=["kv-first", "block-first"],
+    )
+    def test_hnd_destination_reaches_the_kernel_head_major(self, shape_fn, fmt):
+        """An HND cache must describe itself to the kernel as head-major.
+
+        vLLM registers an HND allocation with the backend's token-major
+        shape and records the layout in the strides alone, while the
+        kernel's HND branch takes the head count from ``size(2)`` and the
+        page size from ``size(3)``. Handing over the registered tensor
+        therefore swaps the two and the load writes to the wrong addresses.
+        """
+        nb, bs, nh, hs = self.HND_NB, self.HND_BS, self.HND_NH, self.HND_HS
+        shape = shape_fn(nb, bs, nh, hs)
+        worker = self._hnd_case(shape, fmt)
+        layer = torch.zeros(shape)
+        ops, recorded = self._recording_ops()
+
+        worker._place_packed_layer(
+            layer,
+            torch.zeros(2, bs, nh * hs),
+            torch.arange(bs),
+            None,
+            "l0",
+            (ops, "ptrs", nb * bs, bs, hs, "fmt"),
+        )
+
+        dest = recorded["args"][1]
+        assert dest.shape[2] == nh, "kernel would read the page size as heads"
+        assert dest.shape[3] == bs, "kernel would read the head count as pages"
+        # A view, not a copy: the kernel writes through the pointer it is given.
+        assert dest.data_ptr() == layer.data_ptr()
+
+    def test_nhd_destination_reaches_the_kernel_unchanged(self):
+        """NHD already describes itself the way the kernel reads it."""
+        from maru_vllm.kv_layout import _detect_kv_layout
+
+        nb, bs, nh, hs = self.HND_NB, self.HND_BS, self.HND_NH, self.HND_HS
+        layout = _detect_kv_layout(
+            (nb, 2, bs, nh, hs), bs, "NHD", num_kv_heads=nh, head_size=hs
+        )
+        assert layout is not None and layout.format_name == "NL_X_NB_TWO_BS_NH_HS"
+        worker = make_bare_worker(block_size=bs)
+        worker._kv_layout = layout
+        layer = torch.zeros(nb, 2, bs, nh, hs)
+        ops, recorded = self._recording_ops()
+
+        worker._place_packed_layer(
+            layer,
+            torch.zeros(2, bs, nh * hs),
+            torch.arange(bs),
+            None,
+            "l0",
+            (ops, "ptrs", nb * bs, bs, hs, "fmt"),
+        )
+
+        assert recorded["args"][1] is layer
+
     def test_fallback_branch_injects_as_one_run(self, monkeypatch):
         worker = make_bare_worker()
         recorded = {}
