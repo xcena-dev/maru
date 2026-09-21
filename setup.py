@@ -18,6 +18,17 @@ _FALLBACK_NOTE = (
     "toolkit, without build isolation (install.sh does this for you)."
 )
 
+_FALLBACK_PREFIX = (
+    "The vLLM connector will use its per-layer fallback copy path, which is "
+    "materially slower."
+)
+
+_NO_TARGET_ARCH_NOTE = (
+    f"{_FALLBACK_PREFIX} This host has the toolchain but no GPU to read a "
+    "target architecture from. Name the architectures to build for, e.g. "
+    "TORCH_CUDA_ARCH_LIST=9.0;12.0, and the extension builds without one."
+)
+
 
 def _nvcc_path() -> str | None:
     """Locate nvcc the way ``torch.utils.cpp_extension`` will.
@@ -104,6 +115,13 @@ def _optional_kv_ops_build(base: type) -> type:
     Maru's core still has to install on such a host, so the preflight is run
     here first and a refusal drops the extension rather than the install.
 
+    Resolving the target architectures is checked alongside it. That step
+    runs per source file *inside* the compile loop, yet a host with no
+    visible GPU and no ``TORCH_CUDA_ARCH_LIST`` gives it nothing to name and
+    it raises an ``IndexError`` that setuptools does not treat as a compiler
+    error, so it too takes the whole install down. Naming a list keeps such a
+    host building the extension; naming none now drops it.
+
     Args:
         base: PyTorch's ``BuildExtension`` command class.
 
@@ -118,9 +136,9 @@ def _optional_kv_ops_build(base: type) -> type:
             if refusal is None:
                 super().build_extensions()
                 return
+            error, note = refusal
             print(
-                f"maru: cannot build the maru_kv_ops extension ({refusal}). "
-                f"{_FALLBACK_NOTE}",
+                f"maru: cannot build the maru_kv_ops extension ({error}). {note}",
                 file=sys.stderr,
             )
             self.extensions = [
@@ -141,11 +159,12 @@ def _optional_kv_ops_build(base: type) -> type:
             """
             return list(self.extensions)  # type: ignore[has-type]
 
-        def _kv_ops_refusal(self) -> Exception | None:
+        def _kv_ops_refusal(self) -> tuple[Exception, str] | None:
             """Ask PyTorch's own checks whether this build can start.
 
             Returns:
-                The exception the preflight raises, or None when it passes,
+                The exception a preflight raises paired with the note that
+                resolves that particular refusal, or None when they pass,
                 when the extension is not being built anyway, or when the
                 checks are not where this expects them (a PyTorch refactor
                 then leaves behaviour exactly as it is without them).
@@ -156,12 +175,26 @@ def _optional_kv_ops_build(base: type) -> type:
 
             check_cuda_version = getattr(cpp_extension, "_check_cuda_version", None)
             check_abi = getattr(self, "_check_abi", None)
-            if check_cuda_version is None or check_abi is None:
+            if check_cuda_version is not None and check_abi is not None:
+                try:
+                    check_cuda_version(*check_abi())
+                except Exception as error:
+                    return error, _FALLBACK_NOTE
+            # Which architectures to emit is settled next, and PyTorch settles
+            # it from TORCH_CUDA_ARCH_LIST or, failing that, from the visible
+            # devices. A build host with neither leaves it with nothing to
+            # name and the lookup raises, which happens per source file inside
+            # the compile loop where optional=True cannot reach. Asking for
+            # the flags here turns that into one more reason to drop the
+            # extension, and leaves an explicit list building on a host with
+            # no GPU, exactly as before.
+            arch_flags = getattr(cpp_extension, "_get_cuda_arch_flags", None)
+            if arch_flags is None:
                 return None
             try:
-                check_cuda_version(*check_abi())
+                arch_flags()
             except Exception as error:
-                return error
+                return error, _NO_TARGET_ARCH_NOTE
             return None
 
     return _OptionalKVOpsBuild
