@@ -48,7 +48,7 @@ class KVLayout:
             layout describes exactly this shape and no other; ``_layout_fits``
             compares against it, so a hybrid model's differently-shaped layer
             can never be read through another layer's geometry.
-        format_name: ``lmcache.c_ops.EngineKVFormat`` member, or None when
+        format_name: ``maru_kv_ops.EngineKVFormat`` member, or None when
             this layout has no kernel form and must use per-layer transfers.
             Read only by the packed-kernel path, which walks memory itself.
     """

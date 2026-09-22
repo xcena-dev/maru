@@ -3718,3 +3718,96 @@ class TestActiveLoadRefsRelease:
         worker._release_completed_load_refs()
 
         assert worker._active_load_refs == []
+
+
+class TestKvOpsResolution:
+    """The placement kernels are resolved once, and their absence is loud.
+
+    An unbuilt extension costs measured throughput but raises nothing, so the
+    warning is the only signal a deployment gets. These tests pin that it is
+    emitted, that it names the fix, and that it does not repeat per load.
+    """
+
+    @staticmethod
+    def _reset() -> None:
+        import maru_vllm.connector as conn
+
+        conn._kv_ops_module = None
+        conn._kv_ops_warned = False
+
+    def teardown_method(self) -> None:
+        self._reset()
+
+    def test_returns_module_when_extension_built(self, monkeypatch):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        stub = SimpleNamespace(is_available=lambda: True, import_error=lambda: None)
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+
+        assert conn._resolve_kv_ops() is stub
+
+    def test_caches_the_resolved_module(self, monkeypatch):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        calls = []
+
+        class Stub:
+            @staticmethod
+            def is_available():
+                calls.append(1)
+                return True
+
+            @staticmethod
+            def import_error():
+                return None
+
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", Stub)
+
+        assert conn._resolve_kv_ops() is Stub
+        assert conn._resolve_kv_ops() is Stub
+        assert len(calls) == 1
+
+    def test_unbuilt_extension_warns_once_and_names_the_fix(self, monkeypatch, caplog):
+        import maru_vllm.connector as conn
+
+        self._reset()
+        stub = SimpleNamespace(
+            is_available=lambda: False,
+            import_error=lambda: ImportError("no _C"),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+
+        with caplog.at_level("WARNING"):
+            assert conn._resolve_kv_ops() is None
+            assert conn._resolve_kv_ops() is None
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "nvcc" in message
+        assert "Reinstall maru" in message
+
+    def test_kernel_ctx_takes_the_fallback_when_unbuilt(self, monkeypatch):
+        """An unbuilt extension must reach the per-layer path, not raise."""
+        self._reset()
+        stub = SimpleNamespace(
+            is_available=lambda: False, import_error=lambda: ImportError("no _C")
+        )
+        monkeypatch.setitem(__import__("sys").modules, "maru_kv_ops", stub)
+        worker = make_bare_worker()
+        worker._kv_ops = None
+        worker._kv_layout = SimpleNamespace(format_name="NL_X_NB_TWO_BS_NH_HS")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        layer = torch.zeros(2, 2, 4, 1)
+        monkeypatch.setattr(
+            type(layer), "device", property(lambda _self: torch.device("cuda"))
+        )
+
+        assert (
+            worker._packed_load_kernel_ctx(
+                [("l0", layer, 0)], make_flash_attn_metadata()
+            )
+            is None
+        )
