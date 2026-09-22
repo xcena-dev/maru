@@ -21,7 +21,14 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Maru paged-KV placement kernels";
 
-  py::enum_<TransferDirection>(m, "TransferDirection")
+  // Registered module-locally. The vendored headers define these types, so
+  // LMCache's own extension binds the identical C++ types under the identical
+  // names; without this the second of the two to be imported into a process
+  // aborts with "type is already registered", and which one loses depends on
+  // import order. Nothing hands these values across an extension boundary —
+  // they are produced from this module and consumed by this module's entry
+  // points — so keeping them local costs nothing.
+  py::enum_<TransferDirection>(m, "TransferDirection", py::module_local())
       .value("H2D", TransferDirection::H2D)
       .value("D2H", TransferDirection::D2H)
       .export_values();
@@ -30,7 +37,7 @@ PYBIND11_MODULE(_C, m) {
   // only the four rank-5 vLLM forms today: the enum is a plain header enum, a
   // value costs nothing, and binding all of them keeps a format added by a
   // future refresh usable without touching this file.
-  py::enum_<EngineKVFormat>(m, "EngineKVFormat")
+  py::enum_<EngineKVFormat>(m, "EngineKVFormat", py::module_local())
       .value("NB_NL_TWO_BS_NH_HS", EngineKVFormat::NB_NL_TWO_BS_NH_HS)
       .value("NL_X_TWO_NB_BS_NH_HS", EngineKVFormat::NL_X_TWO_NB_BS_NH_HS)
       .value("NL_X_NB_TWO_BS_NH_HS", EngineKVFormat::NL_X_NB_TWO_BS_NH_HS)
@@ -76,7 +83,7 @@ PYBIND11_MODULE(_C, m) {
         py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
         py::call_guard<py::gil_scoped_release>());
 
-  py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
+  py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc", py::module_local())
       .def(py::init<>())
       .def_readwrite("kv_size", &PageBufferShapeDesc::kv_size)
       .def_readwrite("nl", &PageBufferShapeDesc::nl)
