@@ -525,7 +525,7 @@ class MaruKVConnector(KVConnectorBase_V1):
             chunks x layers, so layerwise multiplies both the key count and
             the retrieve metadata RPC volume by the model's layer count —
             which is why chunkwise is the default. Chunkwise transfers use
-            LMCache's multi_layer_kv_transfer kernel directly on the pinned
+            the multi_layer_kv_transfer kernel directly on the pinned
             CXL slab (no staging) when available — load scatters a whole slab
             into the paged cache per chunk, store gathers one D2H per chunk —
             falling back to per-layer copies otherwise. See design note P6.
@@ -1248,8 +1248,6 @@ class MaruWorkerConnector:
         # Last non-None attention metadata; deferred loads run between steps
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
-        # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
-        # for LMCache's multi_layer_kv_transfer kernel on the packed path.
         # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
         # for the maru_kv_ops placement kernels on the packed path.
         self._kv_ops: Any = None
@@ -2642,7 +2640,7 @@ class MaruWorkerConnector:
         """Load per-chunk slabs with no GPU staging (P6 v2, packed).
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
-        whole to LMCache's ``multi_layer_kv_transfer``, which reads the pinned
+        whole to ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
         ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
@@ -3071,7 +3069,7 @@ class MaruWorkerConnector:
 
         vLLM calls this once per layer. Each chunk completed in this step is
         written as one slab in **KV_2LTD layout** ``[2, num_layers,
-        chunk_tokens, hidden]`` — the format LMCache's
+        chunk_tokens, hidden]`` — the format the vendored
         ``multi_layer_kv_transfer`` consumes on load, so the packed load can
         hand the whole slab to that kernel (no GPU staging). The slab (one key
         = ``base_key``) is registered once complete, so its key presence is
