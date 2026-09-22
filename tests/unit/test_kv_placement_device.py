@@ -17,10 +17,19 @@ Needs a device and a built extension.
 """
 
 import pytest
-import torch
 
-import maru_kv_ops
-from maru_vllm.kv_layout import _canonical_paged_view, _detect_kv_layout
+# Every test here launches a kernel, so the whole module needs PyTorch and
+# cannot run where CI runs. Skipping at import keeps a torch-less host from
+# failing collection, which aborts the entire run rather than this file.
+# (``test_kv_ops.py`` must NOT do this: its provenance and format guards are
+# exactly the ones that have to run on a host without PyTorch.)
+torch = pytest.importorskip("torch", reason="placement kernels need PyTorch")
+
+import maru_kv_ops  # noqa: E402
+from maru_vllm.kv_layout import (  # noqa: E402
+    _canonical_paged_view,
+    _detect_kv_layout,
+)
 
 requires_device = pytest.mark.skipif(
     not torch.cuda.is_available() or not maru_kv_ops.is_available(),
