@@ -26,6 +26,7 @@ class RpcHandlerMixin:
         """Return cached handler dispatch dict (built once per instance)."""
         if self._handlers is None:
             self._handlers = {
+                MessageType.STORAGE.value: self._handle_storage,
                 MessageType.REQUEST_ALLOC.value: self._handle_request_alloc,
                 MessageType.RETURN_ALLOC.value: self._handle_return_alloc,
                 MessageType.LIST_ALLOCATIONS.value: self._handle_list_allocations,
@@ -260,7 +261,22 @@ class RpcHandlerMixin:
         return {}
 
     def _handle_handshake(self, req: Any) -> dict:
+        from maru_common.storage_types import (
+            MIXED_STORAGE_CAPABILITY,
+            STORAGE_CAPABILITY,
+        )
+
         return {
             "success": True,
             "rm_address": self._server.rm_address,
+            "capabilities": [STORAGE_CAPABILITY]
+            + (
+                [MIXED_STORAGE_CAPABILITY]
+                if self._server.replica_directory.supports_mixed
+                else []
+            ),
+            "server_epoch": self._server.replica_directory.server_epoch,
         }
+
+    def _handle_storage(self, req: Any) -> dict:
+        return self._server.replica_directory.execute(req.action, req.payload)

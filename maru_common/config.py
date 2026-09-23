@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass
 
+from .storage_policy import validate_order
+
 
 def _parse_env_bool(name: str) -> bool | None:
     """Parse an optional boolean env var.
@@ -54,6 +56,15 @@ class MaruConfig:
     expand_size: int | None = None  # Expansion size in bytes (None means use pool_size)
     rm_address: str = "127.0.0.1:9850"  # Resource manager TCP address (host:port)
     enable_stats: bool = False  # Enable handler-side stats reporting to server
+    storage_backend: str = "cxl"
+    metadata_only: bool = False
+    engine_id: str | None = None  # Shared by one scheduler and one CPU worker
+    cache_namespace: str | None = None
+    node_id: str | None = None  # Defaults to hostname; used for CPU host budgets
+    storage_schema: str = "opaque-bytes-v1"
+    cxl_pool_size: int | None = None  # Fixed CXL budget in mixed mode
+    write_order: tuple[str, ...] = ("cpu", "cxl")
+    read_order: tuple[str, ...] = ("cpu", "cxl")
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -75,7 +86,39 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
-        if self.pool_size < self.chunk_size_bytes:
+        if self.storage_backend not in {"cpu", "cxl", "mixed"}:
+            raise ValueError("storage_backend must be 'cpu', 'cxl' or 'mixed'")
+        if self.storage_backend == "mixed":
+            if (
+                type(self.cxl_pool_size) is not int
+                or self.cxl_pool_size <= 0
+                or (
+                    not self.metadata_only
+                    and self.cxl_pool_size < self.chunk_size_bytes
+                )
+            ):
+                raise ValueError(
+                    "mixed storage requires cxl_pool_size >= chunk_size_bytes"
+                )
+            if self.cxl_pool_size // self.chunk_size_bytes > 1_000_000:
+                raise ValueError("CXL pool supports at most 1000000 pages")
+            for name in ("write_order", "read_order"):
+                setattr(self, name, validate_order(getattr(self, name)))
+        elif self.cxl_pool_size is not None:
+            raise ValueError("cxl_pool_size is only supported by mixed storage")
+        if self.storage_backend in {"cpu", "mixed"}:
+            if not self.engine_id or not self.cache_namespace:
+                raise ValueError("CPU storage requires engine_id and cache_namespace")
+            if self.expand_size is not None:
+                raise ValueError("CPU M1 uses a fixed pool; expand_size is unsupported")
+            if (
+                not self.metadata_only
+                and self.pool_size // self.chunk_size_bytes > 1_000_000
+            ):
+                raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.pool_size < 0:
+            raise ValueError("pool_size must be nonnegative")
+        if not self.metadata_only and self.pool_size < self.chunk_size_bytes:
             raise ValueError(
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"

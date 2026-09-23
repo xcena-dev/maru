@@ -336,6 +336,8 @@ class RpcClientBase(abc.ABC):
             ),
             stats_manager=response.get("stats_manager", {}),
             cxl_pool=response.get("cxl_pool", {}),
+            cpu_storage=response.get("cpu_storage", {}),
+            l1_storage=response.get("l1_storage", {}),
         )
 
     def get_usage(self) -> GetUsageResponse:
@@ -368,6 +370,8 @@ class RpcClientBase(abc.ABC):
             instances=instances,
             pool_total=response.get("pool_total", 0),
             pool_free=response.get("pool_free", 0),
+            cpu_storage=response.get("cpu_storage", {}),
+            l1_storage=response.get("l1_storage", {}),
         )
 
     def report_stats(self, entries: list[dict]) -> None:
@@ -386,3 +390,17 @@ class RpcClientBase(abc.ABC):
     def handshake(self) -> dict:
         """Perform handshake with server. Returns server config (rm_address, etc.)."""
         return self._send_request(MessageType.HANDSHAKE, {})
+
+    def storage(self, action: str, payload: dict) -> dict:
+        """Execute an operation in the opt-in storage directory."""
+        from maru_common.storage_types import StorageError, StorageUnavailableError
+
+        response = self._send_request(
+            MessageType.STORAGE, {"action": action, "payload": payload}
+        )
+        if not response.get("success"):
+            error = response.get("error", "Invalid storage response")
+            if error == "timeout" or "success" not in response:
+                raise StorageUnavailableError(error)
+            raise StorageError(error)
+        return response["result"]

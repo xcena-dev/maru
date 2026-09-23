@@ -180,6 +180,48 @@ vllm serve <model> \
 
 ## Configuration
 
+### CPU DRAM cache (M1)
+
+Opt in with `maru_storage_backend="cpu"` to store KV in the worker's local DRAM.
+Start the server with `maru-server --cpu-only`; this avoids all CXL/RM
+initialization. The default backend remains CXL.
+
+CPU mode requires `maru_cpu_pool_size`, a unique `maru_engine_id` per engine,
+an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`, and
+`kv_load_failure_policy="recompute"` in the KV transfer configuration. It supports
+one worker, homogeneous unquantized KV layers and synchronous chunkwise transfers.
+A full pool skips new stores. Sharing, eviction and async/layerwise CPU transfers
+are not enabled in M1.
+
+The server tracks process-local CPU replicas and capacity. The scheduler uses a
+metadata-only connection and cannot read CPU payloads. `marutop usage` displays
+CPU pool usage. Expired sessions stop producing hits; M1 requires restarting
+CPU workers after a metadata server restart.
+
+See the [CPU example and lifecycle notes](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md)
+for the complete launch configuration, limits and handler read-lease API.
+
+### CPU and CXL together (M2a)
+
+Set `maru_storage_backend="mixed"`, provide both `maru_cpu_pool_size` and
+`maru_cxl_pool_size`, and run a CXL-enabled server (without `--cpu-only`). Both
+pools belong to the same worker; one prefix can span both media. The CPU mode's
+single-worker, eager and synchronous-transfer requirements also apply.
+
+`maru_write_order=["cpu", "cxl"]` fills CPU first and falls back to CXL when full.
+Reverse the list for CXL-first placement. `maru_read_order` independently selects
+an existing replica; its default is also `["cpu", "cxl"]`. Both pools are fixed:
+when both are full, new stores are skipped. The directory records and reports
+CPU/CXL pools separately through `l1_storage` and `marutop usage`.
+
+This stage scopes both pools to the owning worker and isolates typed CXL keys
+from the legacy shared cache. Cross-engine CXL access, automatic replication,
+eviction and SSD are later milestones. See the
+[mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
+for launch configuration, memory lifetime and validation instructions.
+
+### Connector settings
+
 Settings in `kv_connector_extra_config`:
 
 | Parameter | Type | Default | Description |

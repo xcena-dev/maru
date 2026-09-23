@@ -20,6 +20,7 @@ The connector has two roles (instantiated separately by vLLM):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import threading
 import time
@@ -38,6 +39,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_common.storage_types import StorageError
 from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
@@ -345,10 +347,116 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     return keys
 
 
+def _validate_storage_config(extra: dict[str, Any]) -> bool:
+    """Validate M1's opt-in boundary before any cache data can be used."""
+    backend = extra.get("maru_storage_backend", "cxl")
+    if backend not in {"cxl", "cpu", "mixed"}:
+        raise ValueError("maru_storage_backend must be 'cxl', 'cpu' or 'mixed'")
+    if backend == "cxl":
+        return False
+    for name in ("maru_engine_id", "maru_cache_namespace", "maru_cpu_pool_size"):
+        if not extra.get(name):
+            raise ValueError(f"CPU storage requires {name}")
+    if "maru_pool_size" in extra:
+        raise ValueError("Use maru_cpu_pool_size for CPU storage, not maru_pool_size")
+    if _parse_size(extra["maru_cpu_pool_size"]) <= 0:
+        raise ValueError("maru_cpu_pool_size must be positive")
+    if backend == "mixed":
+        from maru_common.storage_policy import validate_order
+
+        if (
+            not extra.get("maru_cxl_pool_size")
+            or _parse_size(extra["maru_cxl_pool_size"]) <= 0
+        ):
+            raise ValueError("Mixed storage requires positive maru_cxl_pool_size")
+        for name in ("maru_write_order", "maru_read_order"):
+            validate_order(extra.get(name, ["cpu", "cxl"]))
+    elif any(
+        name in extra
+        for name in ("maru_cxl_pool_size", "maru_write_order", "maru_read_order")
+    ):
+        raise ValueError(
+            "CXL capacity and placement order settings require mixed storage"
+        )
+    for knob in (
+        "maru_async_load",
+        "maru_async_store",
+        "maru_overlap_load_with_compute",
+    ):
+        if _get_knob(extra, knob):
+            raise ValueError(f"CPU M1 does not support {knob}")
+    if extra.get("maru_use_layerwise", False):
+        raise ValueError("CPU M1 supports sync chunkwise storage only")
+    return True
+
+
+def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
+    """Bind a caller-supplied model revision namespace to engine geometry."""
+    if (
+        getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
+        != "recompute"
+    ):
+        raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
+    parallel = config.parallel_config
+    if any(
+        getattr(parallel, name, 1) != 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    ):
+        raise ValueError("CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1")
+    model = config.model_config
+    if not getattr(model, "enforce_eager", False):
+        raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
+    if config.cache_config.cache_dtype not in {
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+    }:
+        raise ValueError("CPU M1 does not support quantized KV caches")
+    if (
+        getattr(config, "lora_config", None) is not None
+        or getattr(model, "is_multimodal_model", False)
+        or getattr(model, "use_mla", False)
+    ):
+        raise ValueError("CPU M1 supports text-only models without LoRA or MLA")
+    identity = {
+        "namespace": extra["maru_cache_namespace"],
+        "model": model.model,
+        "revision": getattr(model, "revision", None),
+        "model_config": model.hf_config.to_dict(),
+        "dtype": str(model.dtype),
+        "kv_dtype": config.cache_config.cache_dtype,
+        "block_size": config.cache_config.block_size,
+        "chunk_tokens": extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS),
+        "format": "maru-KV_2LTD-v1",
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return {**extra, "maru_cache_namespace": digest}
+
+
+def _cpu_bypass_request(request: Any) -> bool:
+    """M1 does not key embeddings, adapter state, multimodal data or salts."""
+    return (
+        getattr(request, "prompt_embeds", None) is not None
+        or getattr(request, "cache_salt", None) is not None
+        or bool(getattr(request, "mm_features", None))
+        or bool(getattr(request, "lora_request", None))
+    )
+
+
 def _create_maru_handler(
     extra_config: dict[str, Any],
     *,
     pool_size_override: int | None = None,
+    metadata_only: bool = False,
 ):
     """Create and connect a MaruHandler from extra_config.
 
@@ -360,6 +468,7 @@ def _create_maru_handler(
     """
     from maru import MaruConfig, MaruHandler
 
+    cpu_mode = _validate_storage_config(extra_config)
     server_url = extra_config.get("maru_server_url", "tcp://localhost:5555")
     pool_size = (
         pool_size_override
@@ -369,6 +478,10 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
+    if cpu_mode:
+        pool_size = _parse_size(extra_config["maru_cpu_pool_size"])
+    if metadata_only:
+        pool_size = 0
     cfg = MaruConfig(
         server_url=server_url,
         pool_size=pool_size,
@@ -376,6 +489,19 @@ def _create_maru_handler(
         instance_id=instance_id,
         auto_connect=False,
         eager_map=eager_map,
+        storage_backend=extra_config.get("maru_storage_backend", "cxl"),
+        metadata_only=metadata_only,
+        engine_id=extra_config.get("maru_engine_id"),
+        cache_namespace=extra_config.get("maru_cache_namespace"),
+        node_id=extra_config.get("maru_node_id"),
+        storage_schema=extra_config.get("_maru_storage_schema", "opaque-bytes-v1"),
+        cxl_pool_size=(
+            _parse_size(extra_config["maru_cxl_pool_size"])
+            if extra_config.get("maru_storage_backend") == "mixed"
+            else None
+        ),
+        write_order=extra_config.get("maru_write_order", ("cpu", "cxl")),
+        read_order=extra_config.get("maru_read_order", ("cpu", "cxl")),
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
@@ -555,6 +681,13 @@ class MaruKVConnector(KVConnectorBase_V1):
 
         self._block_size = vllm_config.cache_config.block_size
         extra = self._kv_transfer_config.kv_connector_extra_config
+        if _validate_storage_config(extra):
+            extra = _cpu_engine_config(extra, vllm_config)
+            if (
+                kv_cache_config is not None
+                and len(kv_cache_config.kv_cache_groups) != 1
+            ):
+                raise ValueError("CPU M1 requires one KV cache group")
         self._kv_chunk_tokens = int(
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
@@ -735,6 +868,8 @@ class MaruKVConnector(KVConnectorBase_V1):
 class MaruSchedulerConnector:
     """Scheduler-side: checks chunk-by-chunk which prefix is cached in Maru."""
 
+    _cpu_mode = False
+
     def __init__(
         self,
         block_size: int,
@@ -744,6 +879,8 @@ class MaruSchedulerConnector:
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        self._cpu_mode = _validate_storage_config(extra_config)
+        self._cpu_bypass_requests: set[str] = set()
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -821,21 +958,16 @@ class MaruSchedulerConnector:
             return
         if time.monotonic() < self._handler_retry_after:
             return
-        # Scheduler only needs metadata lookups (batch_exists), not
-        # data storage. Use the minimum pool that satisfies MaruConfig's
-        # pool_size >= chunk_size_bytes constraint.
-        # A metadata-only connect mode in MaruHandler would eliminate
-        # this waste entirely.
-        chunk_size = _parse_size(
-            self._extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
-        )
+        # A scheduler never allocates or maps a data pool.
         try:
-            self._handler = _create_maru_handler(
-                self._extra_config, pool_size_override=chunk_size
-            )
-        except Exception:
+            self._handler = _create_maru_handler(self._extra_config, metadata_only=True)
+        except Exception as exc:
+            if self._cpu_mode and isinstance(exc, StorageError):
+                raise ValueError(f"CPU cache setup rejected: {exc}") from exc
             self._handler_retry_after = time.monotonic() + 5.0
-            logger.warning("Scheduler MaruHandler creation failed, backing off 5s")
+            logger.warning(
+                "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
+            )
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
         """Count how many consecutive prefix chunks are cached in Maru.
@@ -848,6 +980,17 @@ class MaruSchedulerConnector:
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
         if not keys:
             return 0
+
+        if self._cpu_mode:
+            self._ensure_handler()
+            if self._handler is None:
+                return 0
+            try:
+                results = self._handler.batch_exists(keys)
+            except Exception:
+                return 0
+            # Re-probe each time: CPU residency is tied to a live worker session.
+            return next((i for i, hit in enumerate(results) if not hit), len(results))
 
         # Check local cache first - find longest prefix of known keys.
         # We use a "_DONE" marker (written after all layers are stored)
@@ -901,6 +1044,9 @@ class MaruSchedulerConnector:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        if self._cpu_mode and _cpu_bypass_request(request):
+            self._cpu_bypass_requests.add(request.request_id)
+            return 0, False
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
             return 0, False
@@ -1010,6 +1156,11 @@ class MaruSchedulerConnector:
         self._pending_deferred_loads.clear()
 
         for new_req in scheduler_output.scheduled_new_reqs:
+            if self._cpu_mode and (
+                new_req.req_id in self._cpu_bypass_requests
+                or _cpu_bypass_request(new_req)
+            ):
+                continue
             token_ids = list(new_req.prompt_token_ids or [])
 
             if new_req.req_id in self._deferred_layerwise_ready:
@@ -1130,6 +1281,7 @@ class MaruSchedulerConnector:
         if scheduler_output.preempted_req_ids:
             stale_ids = stale_ids | scheduler_output.preempted_req_ids
         for rid in stale_ids:
+            self._cpu_bypass_requests.discard(rid)
             self._requests_need_store.pop(rid, None)
             self._requests_need_load.pop(rid, None)
             self._pending_deferred_loads.pop(rid, None)
@@ -1155,7 +1307,9 @@ class MaruSchedulerConnector:
 
 
 class MaruWorkerConnector:
-    """Worker-side: performs GPU <-> CXL data transfers in chunk granularity."""
+    """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
+
+    _cpu_mode = False
 
     def __init__(
         self,
@@ -1168,6 +1322,7 @@ class MaruWorkerConnector:
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
+        self._cpu_mode = _validate_storage_config(extra_config)
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
@@ -1363,14 +1518,52 @@ class MaruWorkerConnector:
                 extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
             )
             self._handler = _create_maru_handler(extra_config)
-        except Exception:
+        except Exception as exc:
+            if self._cpu_mode and isinstance(exc, StorageError):
+                raise ValueError(f"CPU cache setup rejected: {exc}") from exc
             self._handler_retry_after = time.monotonic() + 5.0
-            logger.warning("Worker MaruHandler creation failed, backing off 5s")
+            logger.warning(
+                "Worker MaruHandler creation failed, backing off 5s: %s", exc
+            )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
         self._num_layers = len(kv_caches)
         self._kv_layout = self._resolve_kv_layout(kv_caches)
+        if self._cpu_mode:
+            layout = self._kv_layout
+            if (
+                layout is None
+                or layout.kv_axis is None
+                or sorted(self._get_layer_index(name) for name in kv_caches)
+                != list(range(self._num_layers))
+            ):
+                raise ValueError(
+                    "CPU M1 requires a recognized K/V layout and contiguous layer IDs"
+                )
+            sample = next(iter(kv_caches.values()))
+            if sample.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+                raise ValueError("CPU M1 requires an unquantized KV dtype")
+            if any(
+                tuple(t.shape) != tuple(sample.shape)
+                or t.dtype != sample.dtype
+                or t.device != sample.device
+                for t in kv_caches.values()
+            ):
+                raise ValueError("CPU M1 requires homogeneous KV cache layers")
+            schema = {
+                "format": "KV_2LTD-v1",
+                "layers": sorted(kv_caches),
+                "dtype": str(sample.dtype),
+                "chunk_tokens": self._kv_chunk_tokens,
+                "heads": layout.num_heads,
+                "head_size": layout.head_size,
+                "block_size": layout.block_size,
+            }
+            self._extra_config = {
+                **self._extra_config,
+                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+            }
         # Derive the CXL page size from the model's KV geometry so each
         # (chunk x layer) object fills exactly one page (no page-rounding waste).
         # Runs before the first _ensure_handler (start_load_kv / save_kv_layer),
@@ -1382,6 +1575,22 @@ class MaruWorkerConnector:
             self._page_size_bytes = per_layer * self._num_layers
         else:
             self._page_size_bytes = per_layer
+        if self._cpu_mode and self._page_size_bytes is not None:
+            configured_page = _parse_size(
+                self._extra_config.get("maru_chunk_size", self._page_size_bytes)
+            )
+            if configured_page < self._page_size_bytes:
+                raise ValueError(
+                    "maru_chunk_size cannot hold one CPU chunkwise KV object"
+                )
+            if _parse_size(self._extra_config["maru_cpu_pool_size"]) < configured_page:
+                raise ValueError("maru_cpu_pool_size cannot hold one CPU cache page")
+            if (
+                self._extra_config.get("maru_storage_backend") == "mixed"
+                and _parse_size(self._extra_config["maru_cxl_pool_size"])
+                < configured_page
+            ):
+                raise ValueError("maru_cxl_pool_size cannot hold one CXL cache page")
         logger.info(
             "MaruWorkerConnector: registered %d KV cache layers "
             "(auto CXL page size: %s bytes)",
@@ -1565,6 +1774,8 @@ class MaruWorkerConnector:
                 continue
 
             if len(infos) != len(keys):
+                if self._cpu_mode:
+                    self._handler.release_retrieved(infos)
                 # A truncated response would otherwise shift every later
                 # layer's objects by one position — silent wrong KV.
                 logger.error(
@@ -1582,6 +1793,8 @@ class MaruWorkerConnector:
             # inject a partially-populated (corrupt) KV cache — vLLM recomputes.
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
             if miss >= 0:
+                if self._cpu_mode:
+                    self._handler.release_retrieved(infos)
                 logger.warning(
                     "Maru load miss: %s — aborting load for req %s (recompute)",
                     keys[miss],
@@ -1603,7 +1816,12 @@ class MaruWorkerConnector:
         # per-(layer,chunk) copies. See design note "P6 v2 시도 2".
         if not self._use_layerwise:
             _t0 = time.monotonic()
-            self._load_packed(layers, prepared_requests, attn_metadata)
+            try:
+                self._load_packed(layers, prepared_requests, attn_metadata)
+            finally:
+                if self._cpu_mode:
+                    for _, _, _, infos in prepared_requests:
+                        self._handler.release_retrieved(infos)
             if self._timing:
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
@@ -2374,6 +2592,11 @@ class MaruWorkerConnector:
         unparks it from WAITING_FOR_REMOTE_KVS). Inline loads need neither —
         the sync path simply recomputes.
         """
+        if self._cpu_mode and not req_meta.is_store and req_meta.num_matched_chunks > 0:
+            self._fail_load(
+                req_meta, RuntimeError("CPU replica unavailable during load")
+            )
+            return
         if not req_meta.deferred_load:
             return
         with self._deferred_lock:
@@ -2669,8 +2892,8 @@ class MaruWorkerConnector:
         # the per-chunk launches pipelined instead of serializing on the compute
         # stream. Falls back to the current stream on CPU/non-CUDA.
         dev = layers[0][1].device
-        use_stream = kernel is not None or (
-            dev.type == "cuda" and torch.cuda.is_available()
+        use_stream = not self._cpu_mode and (
+            kernel is not None or (dev.type == "cuda" and torch.cuda.is_available())
         )
         if use_stream:
             if self._load_stream is None or self._load_stream_device != dev:
@@ -2766,6 +2989,8 @@ class MaruWorkerConnector:
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration.
         """
+        if self._cpu_mode:
+            return None  # M1 CPU pools are pageable, not direct-access GPU memory.
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
@@ -2919,7 +3144,7 @@ class MaruWorkerConnector:
         """
         handler = self._handler
         assert handler is not None
-        if len(keys) <= batch_size:
+        if self._cpu_mode or len(keys) <= batch_size:
             return list(handler.batch_retrieve(keys))
         out: list[Any] = []
         for i in range(0, len(keys), batch_size):
@@ -2996,7 +3221,7 @@ class MaruWorkerConnector:
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
                 maru_key = _chunk_layer_key(base_key, layer_idx)
-                if maru_key in self._stored_keys:
+                if self._is_stored(maru_key):
                     continue
 
                 # Extract this chunk's slots (absolute token positions)
@@ -3058,7 +3283,7 @@ class MaruWorkerConnector:
                 if not ok:
                     logger.warning("Maru store failed: %s", maru_key)
                     continue
-                self._stored_keys.add(maru_key)
+                self._record_stored(maru_key)
                 progress = self._chunk_layer_progress.setdefault(base_key, set())
                 progress.add(layer_idx)
                 if self._num_layers > 0 and len(progress) >= self._num_layers:
@@ -3160,7 +3385,7 @@ class MaruWorkerConnector:
             ready_handles: list = []
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
-                if base_key in self._stored_keys:
+                if self._is_stored(base_key):
                     continue
 
                 chunk_slots = slot_mapping[
@@ -3214,7 +3439,7 @@ class MaruWorkerConnector:
                 continue
             for base_key, ok in zip(ready_keys, results, strict=False):
                 if ok:
-                    self._stored_keys.add(base_key)
+                    self._record_stored(base_key)
                 else:
                     logger.warning("Maru packed store failed: %s", base_key)
 
@@ -3334,7 +3559,7 @@ class MaruWorkerConnector:
 
                 for ci in range(start_chunk, end_chunk):
                     base_key = chunk_keys[ci]
-                    if base_key in self._stored_keys or base_key in seen_keys:
+                    if self._is_stored(base_key) or base_key in seen_keys:
                         continue
                     seen_keys.add(base_key)
                     handle = None
@@ -3381,7 +3606,7 @@ class MaruWorkerConnector:
             return
         for base_key, ok in zip(ready_keys, results, strict=False):
             if ok:
-                self._stored_keys.add(base_key)
+                self._record_stored(base_key)
             else:
                 logger.warning("Maru packed store failed: %s", base_key)
         if self._timing:
@@ -3469,7 +3694,7 @@ class MaruWorkerConnector:
         to_schedule: list[tuple[str, torch.Tensor]] = []
         with self._store_lock:
             for base_key, (chunk_slots, req_ids) in key_entries.items():
-                if base_key in self._stored_keys:
+                if self._is_stored(base_key):
                     continue
                 waiters = self._store_key_waiters.setdefault(base_key, set())
                 waiters.update(req_ids)
@@ -3606,7 +3831,7 @@ class MaruWorkerConnector:
         with self._store_lock:
             for base_key, ok in zip(keys, results, strict=True):
                 if ok:
-                    self._stored_keys.add(base_key)
+                    self._record_stored(base_key)
                 else:
                     logger.warning("Maru write-behind store failed: %s", base_key)
                 self._pending_store_keys.discard(base_key)
@@ -3691,6 +3916,15 @@ class MaruWorkerConnector:
                 handler.free(handle)
             except Exception:
                 pass
+
+    def _is_stored(self, key: str) -> bool:
+        if self._cpu_mode:
+            return self._handler is not None and self._handler.has_local(key)
+        return key in self._stored_keys
+
+    def _record_stored(self, key: str) -> None:
+        if not self._cpu_mode:
+            self._stored_keys.add(key)
 
     def _write_done_marker(self, base_key: str) -> None:
         """Write a chunk's ``_DONE`` marker once all its layers are stored.

@@ -70,6 +70,25 @@ def render_table(usage: GetUsageResponse, ts: str) -> str:
         f"{fmt_size(usage.pool_total)} total  "
         f"{usage_bar(pool_used, usage.pool_total)}"
     )
+    cpu_pools = (usage.l1_storage or usage.cpu_storage).get("pools", [])
+    if cpu_pools:
+        lines.extend(
+            [
+                "",
+                "  L1 CPU DRAM / CXL (process-local pools)",
+                f"  {'engine_id':<28}  {'medium':<6}  {'state':<8}  {'capacity':>9}  "
+                f"{'allocated':>9}  {'KV bytes':>9}  {'uncertain':>9}",
+            ]
+        )
+        for pool in sorted(cpu_pools, key=lambda p: (p["engine_id"], p["pool_id"])):
+            state = "active" if pool["active"] else "expired"
+            lines.append(
+                f"  {pool['engine_id']:<28}  {pool.get('medium', 'cpu'):<6}  {state:<8}  "
+                f"{fmt_size(pool['capacity_bytes']):>9}  "
+                f"{fmt_size(pool['allocated_bytes']):>9}  "
+                f"{fmt_size(pool['ready_bytes']):>9}  "
+                f"{fmt_size(pool['quarantined_bytes']):>9}"
+            )
     return "\n".join(lines)
 
 
