@@ -16,12 +16,23 @@ Two seams are implemented:
 - :meth:`on_prefetch` — lookahead hint fired *ahead* of demand by smart-prefetch's
   arrival-hint, turning a request's admission wait into the device's fill window.
 
+``on_batch_retrieve`` also carries the record-order lookahead
+(``MARU_GAIA_LOOKAHEAD_DEPTH``): it records the order in which demand reads ask
+for their keys and, on a replayed pass, hands the batch ``depth`` positions
+later to ``MaruHandler.prefetch_batch``. The fill then runs while earlier
+requests are still being served, which is a longer lead than the arrival hint
+can reach. Maru core is unchanged — the seam already carries the batch's keys.
+
 Both target the payload address the handler exposes for a found key:
 ``entry.handle.offset + entry.kv_offset`` for ``entry.kv_length`` bytes, and only
 for regions that are already mapped (an unmapped region has no live address and
 is prefaulted on its own ``map_region`` at demand time).
 
 Environment:
+    MARU_GAIA_LOOKAHEAD_DEPTH=k    Fire a hint for the batch k positions later
+        in the recorded demand-read order. 0 (default) records nothing and
+        fires nothing. Needs the read order to repeat; the first pass only
+        records.
     MARU_GAIA_PREFETCH_COALESCE=0  Disable coalescing of contiguous
         ``(device_id, addr)`` ranges into one ``memory_prefetch`` call.
         Default on: without it a single arrival burst expands to thousands of
@@ -30,8 +41,8 @@ Environment:
 
 from __future__ import annotations
 
-import logging
 import itertools
+import logging
 import os
 import subprocess
 import threading
@@ -55,7 +66,7 @@ _PIN_BUDGET_FRACTION = 0.9
 _XCENA_CLI = "xcena_cli"
 
 
-def _read_pin_threshold(device_id: "int | None", *, cli: str = _XCENA_CLI) -> int:
+def _read_pin_threshold(device_id: int | None, *, cli: str = _XCENA_CLI) -> int:
     """장치가 허용하는 고정 총량을 바이트로 읽는다 (못 읽으면 0).
 
     ``xcena_cli im get-smart <id> -v`` 의 ``pin_threshold`` 줄을 쓴다. pyxif 의
@@ -226,6 +237,16 @@ class GaiaPrefetchPlugin:
         # address and would race that order, so callers that fire grouped
         # hints turn this hook off (MARU_GAIA_RETRIEVE_HINT=0).
         self._retrieve_hint = os.environ.get("MARU_GAIA_RETRIEVE_HINT", "1") == "1"
+        # Record-order lookahead (MARU_GAIA_LOOKAHEAD_DEPTH). A demand-read
+        # batch is identified by its exact key sequence, so the first pass
+        # only records the order and a replayed pass fires ahead of it.
+        self._lookahead_depth = max(
+            0, int(os.environ.get("MARU_GAIA_LOOKAHEAD_DEPTH", "0") or 0)
+        )
+        self._lookahead_lock = threading.Lock()
+        self._seen_order: list[list[str]] = []
+        self._batch_index: dict[tuple[str, ...], int] = {}
+        self._lookahead_fired = 0
         # Upper bound on how long one read gate may block
         # (MARU_GAIA_PREFETCH_SYNC_BUDGET_MS, 0 = unbounded). Ranges left when
         # the budget runs out are hinted asynchronously instead.
@@ -471,15 +492,64 @@ class GaiaPrefetchPlugin:
             smart_mark(self._device_id, "read_begin")
         if self._map_every and next(self._map_seq) % self._map_every == 0:
             self._residency_map(handler, batch_resp)
-        if self._hymcache_local or not self._retrieve_hint:
+        if self._hymcache_local:
             return
-        self._issue(
-            handler,
-            keys,
-            batch_resp,
-            source="retrieve",
-            sync=self._sync_gate,
-        )
+        if self._retrieve_hint:
+            self._issue(
+                handler,
+                keys,
+                batch_resp,
+                source="retrieve",
+                sync=self._sync_gate,
+            )
+        # After the demand hint, so this read keeps the device's queue first.
+        self._fire_record_order_lookahead(handler, keys)
+
+    def _fire_record_order_lookahead(
+        self, handler: MaruHandler, keys: list[str]
+    ) -> None:
+        """Record this demand-read batch and hint the one ``depth`` ahead.
+
+        The first sighting of a batch records its position. When the same
+        batch is seen again the batch ``depth`` positions later in the
+        recorded order is handed to ``MaruHandler.prefetch_batch``, which
+        resolves the keys and comes back through :meth:`on_prefetch`. Near
+        the end of the recorded order there is nothing ahead to fire.
+        """
+        depth = self._lookahead_depth
+        if depth <= 0 or not keys:
+            return
+        signature = tuple(keys)
+        target: list[str] | None = None
+        with self._lookahead_lock:
+            index = self._batch_index.get(signature)
+            if index is None:
+                self._batch_index[signature] = len(self._seen_order)
+                self._seen_order.append(list(keys))
+                return
+            ahead = index + depth
+            if ahead < len(self._seen_order):
+                target = self._seen_order[ahead]
+        if target is None:
+            return
+        try:
+            found = handler.prefetch_batch(target)
+        except Exception:
+            logger.warning("gaia lookahead prefetch_batch failed", exc_info=True)
+            return
+        self._lookahead_fired += 1
+        # 첫 발사와 그 뒤 25 회마다 INFO 로 남긴다. on_close 는 실행 경로에 따라
+        # 호출되지 않아, 거기에만 요약을 두면 「앞서 걸었는데 효과가 없었다」와
+        # 「앞서 걸리지 않았다」를 실행 로그로 가릴 수 없다.
+        if self._lookahead_fired == 1 or self._lookahead_fired % 25 == 0:
+            logger.info(
+                "gaia_lookahead: fired=%d depth=%d keys=%d/%d recorded=%d",
+                self._lookahead_fired,
+                depth,
+                found,
+                len(target),
+                len(self._seen_order),
+            )
 
     def on_prefetch(
         self,
@@ -660,6 +730,15 @@ class GaiaPrefetchPlugin:
             self._stage_object_bytes,
             self._pin_budget_bytes,
         )
+        # 같은 이유로 앞서 발사한 횟수도 한 줄 남긴다. 발사 자체는 debug 로만
+        # 나가므로, INFO 로 도는 실행에서는 「앞서 걸었는데 효과가 없었다」와
+        # 「앞서 걸리지 않았다」를 사후에 가릴 수 없다.
+        logger.info(
+            "gaia_lookahead summary: depth=%d fired=%d recorded_batches=%d",
+            self._lookahead_depth,
+            self._lookahead_fired,
+            len(self._seen_order),
+        )
 
     def contribute_stats(self) -> dict:
         """Cumulative prefetch counters for ``MaruHandler.get_stats``."""
@@ -669,6 +748,8 @@ class GaiaPrefetchPlugin:
             "skipped": self._skipped,
             "coalesce": self._coalesce,
             "read_gate": "sync" if self._sync_gate else "async",
+            "lookahead_depth": self._lookahead_depth,
+            "lookahead_fired": self._lookahead_fired,
             "sync_gate_wait_ms": round(self._sync_wait_us / 1000.0, 1),
             "stage_avoid_store": self._stage_avoid_store,
             "stage_avoid_store_ms": round(self._stage_avoid_store_us / 1000.0, 1),
