@@ -869,6 +869,13 @@ class MaruSchedulerConnector:
             return 0, False
 
         matched_tokens = num_matched_chunks * self._kv_chunk_tokens
+        # vLLM schedules a request only while it still has a token to compute:
+        # scheduler.schedule() asserts num_new_tokens > 0 and the engine core
+        # dies otherwise. A prompt whose length is an exact multiple of
+        # kv_chunk_tokens is covered by its chunk keys with no remainder, so
+        # reporting every chunk would report the whole prompt. Hold one token
+        # back; the block alignment below then leaves a whole block to run.
+        matched_tokens = min(matched_tokens, len(token_ids) - 1)
         # Align to block size
         matched_tokens = _align_down(matched_tokens, self._block_size)
         new_matched = matched_tokens - num_computed_tokens
