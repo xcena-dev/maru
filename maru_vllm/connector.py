@@ -107,10 +107,57 @@ _cuda_runtime: Any = None
 _cuda_memcpy2d_async: Any = None
 _cuda_memcpy2d_unavailable = False
 
+_kv_ops_module: Any = None
+_kv_ops_warned = False
+
 
 # ============================================================================
 # Utilities
 # ============================================================================
+
+
+def _resolve_kv_ops() -> Any | None:
+    """Return the paged-KV placement kernels, or None with one warning.
+
+    The kernels place a chunk's whole slab in one launch per chunk; without
+    them every load and store degrades to a copy per layer, which measured 148
+    vs 142.4 ms on a single-request cache hit and turned a chunk's single store
+    transfer into one per (chunk, layer). That gap is invisible in serving
+    metrics — it looks like a slower deployment, not an error — so the warning
+    names the build step that fixes it, and is emitted once per process rather
+    than once per load.
+
+    Returns:
+        The ``maru_kv_ops`` module when its extension is built, else None.
+    """
+    global _kv_ops_module, _kv_ops_warned
+    if _kv_ops_module is not None:
+        return _kv_ops_module
+    try:
+        import maru_kv_ops
+    except ImportError as error:  # pragma: no cover - package ships with maru
+        if not _kv_ops_warned:
+            _kv_ops_warned = True
+            logger.warning(
+                "Maru KV placement kernels unavailable (%s); every load and "
+                "store falls back to a copy per layer. Reinstall maru so "
+                "maru_kv_ops is importable.",
+                error,
+            )
+        return None
+    if not maru_kv_ops.is_available():
+        if not _kv_ops_warned:
+            _kv_ops_warned = True
+            logger.warning(
+                "Maru KV placement kernels were not built (%s); every load and "
+                "store falls back to a copy per layer, which is materially "
+                "slower. Reinstall maru on a host with the CUDA toolkit "
+                "(nvcc) and PyTorch to build them.",
+                maru_kv_ops.import_error(),
+            )
+        return None
+    _kv_ops_module = maru_kv_ops
+    return _kv_ops_module
 
 
 def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> Any:
@@ -478,7 +525,7 @@ class MaruKVConnector(KVConnectorBase_V1):
             chunks x layers, so layerwise multiplies both the key count and
             the retrieve metadata RPC volume by the model's layer count —
             which is why chunkwise is the default. Chunkwise transfers use
-            LMCache's multi_layer_kv_transfer kernel directly on the pinned
+            the multi_layer_kv_transfer kernel directly on the pinned
             CXL slab (no staging) when available — load scatters a whole slab
             into the paged cache per chunk, store gathers one D2H per chunk —
             falling back to per-layer copies otherwise. See design note P6.
@@ -1209,8 +1256,8 @@ class MaruWorkerConnector:
         # (possibly with no forward pass) and reuse it for layout dispatch.
         self._last_attn_metadata: Any = None
         # Resolved lazily by _packed_load_kernel_ctx / _packed_store_kernel_ctx
-        # for LMCache's multi_layer_kv_transfer kernel on the packed path.
-        self._lmc_ops: Any = None
+        # for the maru_kv_ops placement kernels on the packed path.
+        self._kv_ops: Any = None
 
         # P6: storage granularity. Default (off) packs all layers of a chunk
         # into one CXL object with one key — matching LMCache use_layerwise=
@@ -2600,12 +2647,12 @@ class MaruWorkerConnector:
         """Load per-chunk slabs with no GPU staging (P6 v2, packed).
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
-        whole to LMCache's ``multi_layer_kv_transfer``, which reads the pinned
+        whole to ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
         ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
         per-(layer, chunk) copies and the reverted GPU-staging OOM. Non-Flash
-        layouts, CPU, or a missing ``lmcache.c_ops`` fall back to a per-layer
+        layouts, CPU, or an unbuilt ``maru_kv_ops`` fall back to a per-layer
         inject that reads the same slab slices.
 
         Deferred (between-step) requests are marked finished immediately (the
@@ -2712,7 +2759,7 @@ class MaruWorkerConnector:
 
         Returns ``(ops, kv_cache_pointers, page_buffer_size, block_size,
         head_size, engine_kv_format)`` when the fused no-staging kernel is
-        usable: Flash layout, CUDA, and ``lmcache.c_ops`` importable. This is
+        usable: Flash layout, CUDA, and a built ``maru_kv_ops``. This is
         the DEFAULT packed load whenever available — it is not gated on any
         configuration knob. The pointer table is indexed by each layer's true
         ``_get_layer_index`` so it aligns with the slab's layer dimension.
@@ -2740,18 +2787,12 @@ class MaruWorkerConnector:
         )
         if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
             return None
-        # Resolve lmcache.c_ops lazily.
-        if self._lmc_ops is None:
-            try:
-                import lmcache.c_ops as lmc_ops
-
-                self._lmc_ops = lmc_ops
-            except ImportError:
-                logger.warning(
-                    "Maru packed load: lmcache.c_ops unavailable; using "
-                    "per-layer inject fallback"
-                )
+        # Resolve the placement kernels lazily.
+        if self._kv_ops is None:
+            ops_module = _resolve_kv_ops()
+            if ops_module is None:
                 return None
+            self._kv_ops = ops_module
         # Dimensions and format come from one layout, so they cannot disagree.
         # The kernel takes raw pointers, so torch would not catch it if they did.
         block_size = layout.block_size
@@ -2761,8 +2802,8 @@ class MaruWorkerConnector:
         ptrs = torch.empty(len(layers), dtype=torch.int64, device="cpu")
         for _, kv_cache_layer, true_idx in layers:
             ptrs[true_idx] = kv_cache_layer.data_ptr()
-        ops = self._lmc_ops
-        # An older c_ops build may not carry every format; take the per-layer
+        ops = self._kv_ops
+        # A kernel build predating a format cannot place it; take the per-layer
         # fallback rather than raising out of the load path.
         kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
         if kv_format is None:
@@ -3035,7 +3076,7 @@ class MaruWorkerConnector:
 
         vLLM calls this once per layer. Each chunk completed in this step is
         written as one slab in **KV_2LTD layout** ``[2, num_layers,
-        chunk_tokens, hidden]`` — the format LMCache's
+        chunk_tokens, hidden]`` — the format the vendored
         ``multi_layer_kv_transfer`` consumes on load, so the packed load can
         hand the whole slab to that kernel (no GPU staging). The slab (one key
         = ``base_key``) is registered once complete, so its key presence is
@@ -3050,7 +3091,7 @@ class MaruWorkerConnector:
           writes each chunk's slab with one ``multi_layer_kv_transfer(D2H)``
           — the store-side mirror of ``_load_packed``, collapsing
           ``(chunk x layer)`` GPU->CXL copies into one transfer per chunk.
-        - **Fallback** (non-Flash layout, CPU, or no ``lmcache.c_ops``): each
+        - **Fallback** (non-Flash layout, CPU, or an unbuilt ``maru_kv_ops``): each
           layer's Flash extract ``[2, chunk_tokens, hidden]`` is written to
           ``slab[:, layer_idx]`` as before. Non-Flash extracts have a
           different rank and will raise (caught below → chunk skipped →
