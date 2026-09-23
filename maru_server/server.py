@@ -29,13 +29,26 @@ class MaruServer:
         self,
         rm_address: str | None = None,
         dax_paths: list[str] | None = None,
+        enable_cxl: bool = True,
+        cpu_capacity_limit: int = 64 * 1024**3,
+        cpu_session_ttl: float = 30,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
         self._dax_paths = dax_paths
-        self._allocation_manager = AllocationManager(rm_address=rm_address)
+        from .replica_directory import ReplicaDirectory
+
+        self._allocation_manager = (
+            AllocationManager(rm_address=rm_address) if enable_cxl else None
+        )
         self._kv_manager = KVManager()
         self._stats_manager = StatsManager()
         self._lock = RLock()  # Coordinates cross-manager operations
+        self.replica_directory = ReplicaDirectory(
+            cpu_capacity_limit,
+            cpu_session_ttl,
+            reserve_cxl=self.request_alloc if enable_cxl else None,
+            release_cxl=self._release_storage_region if enable_cxl else None,
+        )
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
@@ -72,6 +85,12 @@ class MaruServer:
         """Resource manager address used by this server."""
         return self._rm_address
 
+    def _release_storage_region(self, owner: str, region_id: int) -> bool:
+        """Idempotent release of a typed pool, after the owner unmaps it."""
+        if self._allocation_manager.get_handle(region_id) is None:
+            return True
+        return self.return_alloc(owner, region_id)
+
     # =========================================================================
     # Allocation Management
     # =========================================================================
@@ -82,6 +101,8 @@ class MaruServer:
         When ``--dax-path`` is configured, iterates over the server's
         dax_path list (fill-first fallback). Otherwise uses any available pool.
         """
+        if self._allocation_manager is None:
+            return None
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
@@ -107,6 +128,8 @@ class MaruServer:
 
     def return_alloc(self, instance_id: str, region_id: int) -> bool:
         """Handle allocation return request from client."""
+        if self._allocation_manager is None:
+            return False
         success = self._allocation_manager.release(instance_id, region_id)
         if success:
             logger.info("Released region_id=%d by %s", region_id, instance_id)
@@ -116,10 +139,14 @@ class MaruServer:
         self, exclude_instance_id: str | None = None
     ) -> list[MaruHandle]:
         """List all active allocation handles."""
+        if self._allocation_manager is None:
+            return []
         return self._allocation_manager.list_allocations(exclude_instance_id)
 
     def client_disconnected(self, instance_id: str) -> None:
         """Handle client disconnection."""
+        if self._allocation_manager is None:
+            return
         self._allocation_manager.disconnect_client(instance_id)
         logger.info("Client %s disconnected, released allocations", instance_id)
 
@@ -131,6 +158,8 @@ class MaruServer:
         self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> bool:
         """Register a KV entry."""
+        if self._allocation_manager is None:
+            return False
         with self._lock:
             is_new, alloc_to_ref = self._kv_manager.register(
                 key, region_id, kv_offset, kv_length
@@ -144,6 +173,8 @@ class MaruServer:
 
     def lookup_kv(self, key: str) -> dict | None:
         """Lookup a KV entry and return handle with KV location info."""
+        if self._allocation_manager is None:
+            return None
         with self._lock:
             entry = self._kv_manager.lookup(key)
             if entry is None:
@@ -195,6 +226,8 @@ class MaruServer:
         Returns:
             List of booleans indicating if each entry was newly registered
         """
+        if self._allocation_manager is None:
+            return [False] * len(entries)
         with self._lock:
             results = []
             for key, region_id, kv_offset, kv_length in entries:
@@ -216,6 +249,8 @@ class MaruServer:
         Returns:
             List of dicts with handle/kv_offset/kv_length, or None for each key
         """
+        if self._allocation_manager is None:
+            return [None] * len(keys)
         with self._lock:
             entries = self._kv_manager.batch_lookup(keys)
             results = []
@@ -276,7 +311,11 @@ class MaruServer:
         pool_total, pool_free = self._pool_totals()
         return {
             "kv_manager": self._kv_manager.get_stats(),
-            "allocation_manager": self._allocation_manager.get_stats(),
+            "allocation_manager": (
+                self._allocation_manager.get_stats()
+                if self._allocation_manager
+                else {"num_allocations": 0, "total_allocated": 0, "active_clients": 0}
+            ),
             "stats_manager": self._stats_manager.get_stats(),
             # Shared CXL device capacity from the resource manager, summed
             # across the pools this server may allocate from (--dax-path
@@ -284,6 +323,8 @@ class MaruServer:
             # size eviction watermarks against device fill instead of just
             # their owned pool.
             "cxl_pool": {"total_size": pool_total, "free_size": pool_free},
+            "cpu_storage": self.replica_directory.get_usage("cpu"),
+            "l1_storage": self.replica_directory.get_usage(),
         }
 
     def get_usage(self) -> dict:
@@ -296,6 +337,14 @@ class MaruServer:
         """
         # Snapshot in-memory manager state atomically; the RM pool query is
         # done outside the lock since it performs a network round-trip.
+        if self._allocation_manager is None:
+            return {
+                "instances": [],
+                "pool_total": 0,
+                "pool_free": 0,
+                "cpu_storage": self.replica_directory.get_usage("cpu"),
+                "l1_storage": self.replica_directory.get_usage(),
+            }
         with self._lock:
             alloc = self._allocation_manager.allocated_by_instance()
             owners = self._allocation_manager.region_owners()
@@ -306,6 +355,14 @@ class MaruServer:
             owner = owners.get(region_id)
             if owner is not None:
                 used_by_instance[owner] = used_by_instance.get(owner, 0) + used
+
+        l1_usage = self.replica_directory.get_usage()
+        for pool in l1_usage["pools"]:
+            if pool["medium"] == "cxl":
+                owner = pool["owner_instance_id"]
+                used_by_instance[owner] = (
+                    used_by_instance.get(owner, 0) + pool["ready_bytes"]
+                )
 
         # Per-instance device breakdown (region -> dax_path, resolved outside
         # the server lock via the RM-backed cache inside the manager).
@@ -327,6 +384,11 @@ class MaruServer:
             "instances": instances,
             "pool_total": pool_total,
             "pool_free": pool_free,
+            "cpu_storage": {
+                **l1_usage,
+                "pools": [p for p in l1_usage["pools"] if p["medium"] == "cpu"],
+            },
+            "l1_storage": l1_usage,
         }
 
     def _pool_totals(self) -> tuple[int, int]:
@@ -339,6 +401,8 @@ class MaruServer:
         watermarks on ``free_size`` — counting a foreign device's free space
         defers eviction until allocation fails instead of triggering it.
         """
+        if self._allocation_manager is None:
+            return (0, 0)
         try:
             pools = self._allocation_manager.pool_stats()
         except Exception:
@@ -355,7 +419,8 @@ class MaruServer:
     def close(self) -> None:
         """Shutdown the server and release resources."""
         self._stats_manager.close()
-        self._allocation_manager.close()
+        if self._allocation_manager is not None:
+            self._allocation_manager.close()
         logger.info("MaruServer closed")
 
 
@@ -417,12 +482,30 @@ def main() -> None:
             "If omitted, any available pool is used."
         ),
     )
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Run CPU metadata storage without connecting to a CXL resource manager",
+    )
+    parser.add_argument(
+        "--cpu-capacity-limit",
+        type=int,
+        default=64 * 1024**3,
+        help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
+    )
     args = parser.parse_args()
+    if args.cpu_only and args.dax_paths:
+        parser.error("--cpu-only cannot be combined with --dax-path")
 
     setup_logging(args.log_level)
 
     # Create server
-    server = MaruServer(rm_address=args.rm_address, dax_paths=args.dax_paths)
+    server = MaruServer(
+        rm_address=args.rm_address,
+        dax_paths=args.dax_paths,
+        enable_cxl=not args.cpu_only,
+        cpu_capacity_limit=args.cpu_capacity_limit,
+    )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers

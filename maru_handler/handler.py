@@ -35,6 +35,7 @@ from .memory import (
 )
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
+from .storage.cpu import CpuAllocation, CpuReadLease
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,11 @@ class MaruHandler:
                 timeout_ms=self._config.timeout_ms,
             )
         self._mapper: DaxMapper | None = None
+        self._cpu = None
+        if self._config.storage_backend in {"cpu", "mixed"}:
+            from .storage.client import CpuStorageClient
+
+            self._cpu = CpuStorageClient(self._config, self._rpc)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -257,6 +263,14 @@ class MaruHandler:
         Returns:
             True if successful
         """
+        if self._cpu is not None:
+            self._connected = self._cpu.connect()
+            return self._connected
+        if self._config.metadata_only:
+            if not self._connected:
+                self._rpc.connect()
+                self._connected = True
+            return True
         if self._connected:
             return True
 
@@ -409,6 +423,15 @@ class MaruHandler:
         Sets ``_closing`` event to reject new operations, then acquires
         ``_write_lock`` to wait for in-flight writes before teardown.
         """
+        if self._cpu is not None:
+            self._cpu.close()
+            self._connected = False
+            return
+        if self._config.metadata_only:
+            if self._connected:
+                self._rpc.close()
+            self._connected = False
+            return
         if not self._connected:
             return
 
@@ -462,7 +485,7 @@ class MaruHandler:
     # KV Operations
     # =========================================================================
 
-    def alloc(self, size: int) -> AllocHandle:
+    def alloc(self, size: int) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
         The caller writes directly to ``handle.buf``, then passes the handle
@@ -478,6 +501,10 @@ class MaruHandler:
             RuntimeError: If not connected or closing
             ValueError: If size exceeds chunk_size or allocation fails
         """
+        if self._cpu is not None:
+            return self._cpu.alloc(size)
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -533,10 +560,12 @@ class MaruHandler:
         self._record_stats("alloc", size, (time.monotonic() - t0) * 1e6)
         return handle
 
-    def free(self, handle: AllocHandle) -> None:
+    def free(self, handle: AllocHandle | CpuAllocation) -> None:
         """Free a page previously obtained via alloc().
 
         Can be called before store() (discard) or after (eviction).
+        CPU M1 only frees unsubmitted writes: store transfers ownership to
+        the pool, including when its RPC outcome is unknown.
 
         Args:
             handle: AllocHandle from alloc()
@@ -544,6 +573,10 @@ class MaruHandler:
         Raises:
             ValueError: If handle is not tracked (already freed or invalid)
         """
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        if self._cpu is not None:
+            return self._cpu.free(handle)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -575,7 +608,7 @@ class MaruHandler:
     def store(
         self,
         key: str,
-        handle: AllocHandle,
+        handle: AllocHandle | CpuAllocation,
     ) -> bool:
         """Register a pre-written page in the KV cache (zero-copy).
 
@@ -589,6 +622,10 @@ class MaruHandler:
         Returns:
             True if successful
         """
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        if self._cpu is not None:
+            return self._cpu.batch_store([key], [handle])[0]
         self._ensure_connected()
         t0 = time.monotonic()
         store_size = 0
@@ -656,8 +693,11 @@ class MaruHandler:
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
 
-    def retrieve(self, key: str) -> MemoryInfo | None:
+    def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
         """Retrieve a zero-copy MemoryInfo from the KV cache.
+
+        CPU storage returns a CpuReadLease instead. Explicitly release it
+        after the final read/copy, or use it as a context manager.
 
         Returns a MemoryInfo with a memoryview slice of the mmap region.
         Works for both owned (RW) and shared (RO) regions.
@@ -671,6 +711,10 @@ class MaruHandler:
         Returns:
             MemoryInfo with memoryview, or None if not found
         """
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        if self._cpu is not None:
+            return self._cpu.batch_retrieve([key])[0]
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -730,6 +774,8 @@ class MaruHandler:
         Returns:
             True if exists
         """
+        if self._cpu is not None:
+            return self._cpu.batch_exists([key])[0]
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.exists_kv(key)
@@ -752,6 +798,10 @@ class MaruHandler:
         Returns:
             True if exists (and was pinned)
         """
+        if self._cpu is not None:
+            raise NotImplementedError(
+                "CPU M1 uses read leases and does not support eviction/pinning"
+            )
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.pin_kv(key)
@@ -769,6 +819,10 @@ class MaruHandler:
         Returns:
             True if unpinned successfully
         """
+        if self._cpu is not None:
+            raise NotImplementedError(
+                "CPU M1 uses read leases and does not support eviction/pinning"
+            )
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.unpin(key)
@@ -789,6 +843,10 @@ class MaruHandler:
         Returns:
             True if deleted
         """
+        if self._cpu is not None:
+            raise NotImplementedError(
+                "CPU M1 uses read leases and does not support eviction/pinning"
+            )
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -850,6 +908,8 @@ class MaruHandler:
             },
             "stats_manager": stats.stats_manager,
             "cxl_pool": stats.cxl_pool,
+            "cpu_storage": getattr(stats, "cpu_storage", {}),
+            "l1_storage": getattr(stats, "l1_storage", {}),
         }
 
         if self._owned is not None:
@@ -882,8 +942,11 @@ class MaruHandler:
     # Batch Operations
     # =========================================================================
 
-    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | None]:
+    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | CpuReadLease | None]:
         """Retrieve multiple values as MemoryInfo in batch.
+
+        CPU results are CpuReadLease objects; release every non-None result
+        after the final read/copy (or call release_retrieved on the list).
 
         Uses a single batch RPC call for lookup, returns zero-copy
         memoryview slices for both owned (RW) and shared (RO) regions.
@@ -900,6 +963,10 @@ class MaruHandler:
         Returns:
             List of MemoryInfo (None for keys not found)
         """
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        if self._cpu is not None:
+            return self._cpu.batch_retrieve(keys)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -986,7 +1053,7 @@ class MaruHandler:
     def batch_store(
         self,
         keys: list[str],
-        handles: list[AllocHandle],
+        handles: list[AllocHandle | CpuAllocation],
     ) -> list[bool]:
         """Register multiple pre-written pages in batch (zero-copy).
 
@@ -1000,6 +1067,10 @@ class MaruHandler:
         Returns:
             List of booleans indicating success for each key
         """
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        if self._cpu is not None:
+            return self._cpu.batch_store(keys, handles)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1105,6 +1176,8 @@ class MaruHandler:
         Returns:
             List of booleans indicating existence for each key
         """
+        if self._cpu is not None:
+            return self._cpu.batch_exists(keys)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1131,6 +1204,10 @@ class MaruHandler:
         Returns:
             List of booleans — True if key exists (and was pinned).
         """
+        if self._cpu is not None:
+            raise NotImplementedError(
+                "CPU M1 uses read leases and does not support eviction/pinning"
+            )
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_pin_kv(keys).results
@@ -1152,6 +1229,10 @@ class MaruHandler:
         Returns:
             List of booleans — True if successfully unpinned.
         """
+        if self._cpu is not None:
+            raise NotImplementedError(
+                "CPU M1 uses read leases and does not support eviction/pinning"
+            )
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_unpin(keys).results
@@ -1199,6 +1280,8 @@ class MaruHandler:
     @property
     def connected(self) -> bool:
         """Check if connected."""
+        if self._cpu is not None:
+            return self._cpu.connected
         return self._connected
 
     # =========================================================================
@@ -1305,11 +1388,31 @@ class MaruHandler:
             len(response.allocations),
         )
 
+    def has_local(self, key: str) -> bool:
+        """Whether this handler still owns a committed CPU replica."""
+        return (
+            self._cpu.has_local(key)
+            if self._cpu is not None
+            else key in self._key_to_location
+        )
+
+    def release_retrieved(self, infos: list) -> None:
+        """Release CPU read leases after the last read/GPU copy has completed."""
+        if self._cpu is not None:
+            for info in infos:
+                if info is not None:
+                    info.release()
+
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""
+        if self._cpu is not None:
+            self._cpu._ensure(data=False)
+            return
         if self._closing.is_set():
             raise RuntimeError("Handler is closing")
-        if not self._connected or self._owned is None:
+        if not self._connected or (
+            self._owned is None and not self._config.metadata_only
+        ):
             raise RuntimeError("Not connected. Call connect() first.")
 
     # =========================================================================

@@ -57,6 +57,9 @@ class MessageType(IntEnum):
     BATCH_PIN_KV = 0x23
     BATCH_UNPIN_KV = 0x24
 
+    # Opt-in storage directory, independent of legacy CXL key semantics.
+    STORAGE = 0x30
+
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
     HEARTBEAT = 0xF1
@@ -449,6 +452,8 @@ class GetStatsResponse:
     # Shared CXL device capacity {"total_size", "free_size"} summed across
     # resource-manager pools; empty when the server omits it (older servers).
     cxl_pool: dict = field(default_factory=dict)
+    cpu_storage: dict = field(default_factory=dict)
+    l1_storage: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -488,6 +493,8 @@ class GetUsageResponse:
     instances: list[InstanceUsage] = field(default_factory=list)
     pool_total: int = 0
     pool_free: int = 0
+    cpu_storage: dict = field(default_factory=dict)
+    l1_storage: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -535,6 +542,23 @@ class HandshakeResponse:
     server_version: int = PROTOCOL_VERSION
     rm_address: str | None = None
     error: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    server_epoch: str | None = None
+
+
+@dataclass
+class StorageRequest:
+    """Capability-negotiated metadata operations; contains no KV bytes."""
+
+    action: str
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass
+class StorageResponse:
+    success: bool
+    result: dict = field(default_factory=dict)
+    error: str | None = None
 
 
 @dataclass
@@ -557,6 +581,7 @@ class ShutdownResponse:
 
 # Map message types to request/response classes
 MESSAGE_CLASSES = {
+    MessageType.STORAGE: (StorageRequest, StorageResponse),
     # Allocation Management
     MessageType.REQUEST_ALLOC: (RequestAllocRequest, RequestAllocResponse),
     MessageType.RETURN_ALLOC: (ReturnAllocRequest, ReturnAllocResponse),

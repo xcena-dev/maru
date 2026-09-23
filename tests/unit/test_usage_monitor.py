@@ -121,3 +121,27 @@ class TestUsageMonitorRendering:
         assert row0[1] == "vllm-0"
         # slack column == allocated - used
         assert int(row0[5]) == int(row0[3]) - int(row0[4])
+
+    def test_cpu_usage_survives_wire_parsing_and_is_visible(self):
+        usage = _FakeClient(
+            {
+                "cpu_storage": {
+                    "pools": [
+                        {
+                            "pool_id": "cpu-pool",
+                            "engine_id": "cpu-engine",
+                            "active": False,
+                            "capacity_bytes": 4096,
+                            "allocated_bytes": 2048,
+                            "ready_bytes": 1000,
+                            "quarantined_bytes": 1024,
+                        }
+                    ]
+                }
+            }
+        ).get_usage()
+        table = usage_monitor.render_table(usage, "now")
+        assert "CPU DRAM" in table
+        assert "cpu-engine" in table
+        assert "expired" in table
+        assert "4.0K" in table
