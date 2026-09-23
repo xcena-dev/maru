@@ -14,7 +14,8 @@ jobs:
       - name: Download coverage artifacts
         uses: actions/download-artifact@v4
         with:
-          name: coverage-report
+          # Use the minimum supported Python version as the coverage baseline.
+          name: coverage-report-3.12
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 

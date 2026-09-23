@@ -8,6 +8,19 @@
 
 ## Running
 
+CI runs the core unit tests on Python 3.12, 3.13, and 3.14. Each version
+uploads its own coverage report; PR coverage comments use Python 3.12 as
+the baseline. SGLang tests and integration tests are excluded, and tests
+requiring optional dependencies may be skipped.
+
+To reproduce a CI test run locally, choose a version from the matrix:
+
+```bash
+uv venv --python 3.13 .venv-3.13
+uv pip install --python .venv-3.13/bin/python -e ".[dev]"
+.venv-3.13/bin/python -m pytest -m "not integration" --ignore=tests/sglang
+```
+
 ```bash
 # Unit tests only
 pytest -v tests/ -m "not integration"
