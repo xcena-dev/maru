@@ -841,7 +841,10 @@ class TestSchedulerStageRelay:
         )
         request = SimpleNamespace(
             request_id="r0",
-            prompt_token_ids=list(range(8)),
+            # Nine tokens, not eight: a prompt that its chunk keys cover with
+            # no remainder would report as a whole-prompt hit, which the
+            # connector caps (see TestWholePromptHit).
+            prompt_token_ids=list(range(9)),
         )
 
         scheduler._count_matched_chunk_keys = lambda keys: 2
