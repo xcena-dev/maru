@@ -3,26 +3,81 @@ name: Test
 on:
   pull_request:
 
+# The maru_action pool is a fixed number of runners on one host, so a rapid
+# push sequence would otherwise queue three jobs per push behind each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   unit-test-matrix:
     name: unit-test (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # maru_action is registered against this repository alone and lives on
+    # 192.168.97.60 (xfusion-1288hv7), alongside the lab's Nexus mirror.
+    runs-on: [self-hosted, maru_action]
+    timeout-minutes: 30
+    # A self-hosted runner reuses its workspace and its host between builds, so
+    # the suite runs in a throwaway container instead of against host state.
+    container:
+      image: ubuntu:22.04
+      volumes:
+        # Keep the uv download caches on the host: 97.60 reaches the internet
+        # through the lab proxy, and re-fetching three interpreters plus the
+        # dependency set on every push is the bulk of the run time.
+        - /home/sw-devops/cache/maru/uv:/root/.cache/uv
+        - /home/sw-devops/cache/maru/python:/root/.local/share/uv/python
+    env:
+      NEXUS_URL: http://192.168.97.60:8081
+      # The lab host has no dependable direct route to pypi.org; the Nexus
+      # proxy in front of it is the same one the other 97.60 workflows use.
+      UV_DEFAULT_INDEX: http://192.168.97.60:8081/repository/pypi-proxy/simple
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
+      - name: Install base packages
+        run: |
+          # Nexus apt proxy, matching xcena-dev/.github's claude-review.yml.
+          for suite in jammy jammy-updates jammy-security; do
+            echo "deb ${NEXUS_URL}/repository/ubuntu-proxy/ $suite main restricted universe multiverse"
+          done > /etc/apt/sources.list
+          apt-get update -qq
+          # build-essential is not optional here: maru_shm._cxl_flush is an
+          # optional=True C extension, so without a compiler it is silently
+          # dropped and device_scanner falls back to a no-op flush — the suite
+          # would still pass while testing a different build than ubuntu-latest
+          # produced.
+          # systemd is here for the systemctl binary alone. The installer
+          # tests reach subprocess.run(["systemctl", ...]) outside their own
+          # patches; on ubuntu-latest that call found the binary, returned
+          # non-zero into capture_output and was ignored, so they passed. In a
+          # bare container the call raises FileNotFoundError and five tests
+          # fail — a CI-environment difference, not a code change.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates build-essential systemd
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          # The host volumes above already persist the caches; the hosted cache
+          # would ship them back to GitHub over the lab link on every run.
+          enable-cache: false
+
+      - name: Create the interpreter environment
+        run: |
+          # Replaces actions/setup-python: uv fetches the interpreter itself,
+          # which keeps 3.14 available without a tool-cache entry on the host,
+          # and keeps the install out of the container's system Python.
+          uv venv --python ${{ matrix.python-version }}
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
+
       - name: Run unit tests with coverage
         run: |
           pytest -m "not integration" \
@@ -50,7 +105,7 @@ jobs:
     name: unit-test
     if: ${{ always() }}
     needs: unit-test-matrix
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, maru_action]
     steps:
       - name: Require every Python version to pass
         env:
