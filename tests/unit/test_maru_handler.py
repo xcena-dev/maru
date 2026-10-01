@@ -988,6 +988,35 @@ class TestMaruHandlerCoverage:
 
         handler.close()
 
+    def test_batch_store_lost_register_race_frees_page(self):
+        """A key another client registers between the existence check and the
+        register RPC comes back False from the server. batch_store must release
+        that page and report the key as stored, exactly as store() does."""
+        handler = _make_mock_handler()
+
+        batch_exists_resp = MagicMock()
+        batch_exists_resp.results = [False, False]
+        handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
+
+        batch_resp = MagicMock()
+        batch_resp.success = True
+        batch_resp.results = [False, True]  # key 1 lost the race, key 2 is new
+        handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
+
+        h1 = handler.alloc(size=2)
+        h1.buf[:2] = b"d1"
+        h2 = handler.alloc(size=2)
+        h2.buf[:2] = b"d2"
+        results = handler.batch_store(keys=["1", "2"], handles=[h1, h2])
+
+        assert results == [True, True]
+        assert "1" not in handler._key_to_location
+        assert "2" in handler._key_to_location
+        # Key 1's page went back to the pool; only key 2's page stays allocated.
+        assert handler._owned.get_stats()["total_allocated_pages"] == 1
+
+        handler.close()
+
     # =================================================================
     # batch_exists() happy path
     # =================================================================

@@ -1065,7 +1065,12 @@ class MaruHandler:
             handles: List of AllocHandle from alloc()
 
         Returns:
-            List of booleans indicating success for each key
+            One bool per key. True means the key is registered in the pool
+            after this call: either this call registered it, or it already
+            existed (in the local map, on the server, or registered by
+            another client while this call ran). A page this handler did
+            not register is returned to the allocator. False means the
+            register RPC failed, in which case every page is freed.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -1144,10 +1149,29 @@ class MaruHandler:
 
                 batch_idx = 0
                 for i in range(len(keys)):
-                    if results[i] and i in allocations:
-                        if batch_idx < len(batch_resp.results):
-                            results[i] = batch_resp.results[batch_idx]
-                        batch_idx += 1
+                    if i not in allocations:
+                        continue
+                    is_new = (
+                        batch_resp.results[batch_idx]
+                        if batch_idx < len(batch_resp.results)
+                        else True
+                    )
+                    batch_idx += 1
+                    if is_new:
+                        continue
+                    # Another client registered the key between the
+                    # existence check and this RPC. The key is in the pool,
+                    # so it counts as stored (as store() reports it); the
+                    # page written here is referenced by nobody and goes
+                    # back to the allocator.
+                    rid, pidx = allocations.pop(i)
+                    self._owned.free(rid, pidx)
+                    logger.debug(
+                        "batch_store: key=%s lost register race, freed page (region=%d, page=%d)",
+                        keys[i],
+                        rid,
+                        pidx,
+                    )
 
             # Track
             for i, key in enumerate(keys):
