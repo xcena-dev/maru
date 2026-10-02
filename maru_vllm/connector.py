@@ -1130,6 +1130,11 @@ class MaruSchedulerConnector:
         self._last_match_result: dict[str, int] = {}
         self._load_starts: dict[str, int] = {}
         self._load_ranges: dict[str, tuple[int, int]] = {}
+        # Requests handed an asynchronous lease-backed load. vLLM asks again
+        # only when that load failed from its first block; the stored keys
+        # are still in the pool, so answering with the same hit would retry
+        # the failing load forever.
+        self._async_load_issued: set[str] = set()
 
         # Requests that need continued store across chunked prefill steps.
         # req_id -> (full prompt token_ids, block ids accumulated from the
@@ -1259,6 +1264,12 @@ class MaruSchedulerConnector:
         if self._lease_mode and _unkeyed_request(request):
             self._unkeyed_requests.add(request.request_id)
             return 0, False
+        if request.request_id in self._async_load_issued:
+            logger.warning(
+                "Maru: req %s returned after a failed load; recomputing it",
+                request.request_id,
+            )
+            return 0, False
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
             return 0, False
@@ -1327,6 +1338,8 @@ class MaruSchedulerConnector:
         if self._lease_mode:
             start = self._load_starts.pop(request.request_id, 0)
             self._load_ranges[request.request_id] = (start, start + num_external_tokens)
+            if self._deferred_loading:
+                self._async_load_issued.add(request.request_id)
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
@@ -1532,6 +1545,7 @@ class MaruSchedulerConnector:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Transfer block ownership to the worker for write-behind stores."""
+        self._async_load_issued.discard(request.request_id)
         if request.request_id in self._awaiting_deferred_recv:
             # vLLM already retains a parked request's blocks until its receive
             # completes. Claiming send ownership too produces a second free.

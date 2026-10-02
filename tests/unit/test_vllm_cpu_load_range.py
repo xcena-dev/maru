@@ -342,3 +342,17 @@ def test_a_failed_deferred_lease_batch_unparks_for_recompute():
     worker._load_leased_request(layers, meta, worker._last_attn_metadata)
     assert worker._deferred_done == {"parked"}
     assert worker.take_failed_load_blocks() == {2, 3, 4, 5}  # chunk 1 onward
+
+
+def test_a_request_back_from_a_failed_async_load_is_recomputed():
+    scheduler = make_scheduler(4, 8, remote_extra(maru_async_load=True))
+    scheduler._count_matched_chunks = lambda tokens: 2
+    request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
+    hit = scheduler.get_num_new_matched_tokens(request, 0)
+    assert hit == (12, True)
+    blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
+    scheduler.update_state_after_alloc(request, blocks, 12)
+    # vLLM asks again only after the load failed from its first block.
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.request_finished(request, [0, 1, 2])
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)
