@@ -858,3 +858,65 @@ def test_an_error_reply_to_a_probe_does_not_stop_calls(pool, monkeypatch):
         h._storage.maintain()
     assert h.batch_exists(["k"]) == [True]
     h.close()
+
+
+def test_only_timeouts_in_a_row_stop_calls(pool, monkeypatch):
+    from maru_remote.client import RemoteError, RemoteTimeout
+
+    h = remote_handler(pool.url)
+    outcomes = iter(
+        [
+            RemoteTimeout("t"),
+            RemoteError("busy"),
+            RemoteTimeout("t"),
+            RemoteTimeout("t"),
+        ]
+    )
+
+    def probe():
+        raise next(outcomes)
+
+    monkeypatch.setattr(h._storage._probe, "connect", probe)
+    for _ in range(3):  # timeout, error reply, timeout: not two in a row
+        h._storage.maintain()
+    assert h._storage._retry_at == 0.0
+    h._storage.maintain()  # the second timeout in a row
+    assert h._storage._retry_at > 0.0
+    h.close()
+
+
+def test_a_pending_reconnect_alone_does_not_stop_calls(pool, monkeypatch):
+    from maru_remote.client import RemoteTimeout
+
+    h = remote_handler(pool.url)
+    h._storage._reconnect = True  # e.g. an existence check met a restart
+
+    def timeout():
+        raise RemoteTimeout("t")
+
+    monkeypatch.setattr(h._storage._probe, "connect", timeout)
+    h._storage.maintain()  # one slow probe while the server is busy
+    assert h._storage._retry_at == 0.0
+    h.close()
+
+
+def test_a_layout_error_waits_for_the_retry_period(pool, monkeypatch):
+    h = remote_handler(pool.url)
+    clock = FakeClock()
+    h._storage._clock = clock
+    calls = []
+
+    def bad_layout(hello):
+        calls.append(1)
+        raise StorageError("page smaller than an object")
+
+    monkeypatch.setattr(h._storage, "_check_hello", bad_layout)
+    h._storage._reconnect = True
+    h._storage.maintain()  # reconnect fails on the layout
+    h._storage.maintain()
+    h._storage.maintain()  # probes succeed, but no retry inside the period
+    assert len(calls) == 1
+    clock.advance(10.0)  # past remote_retry_s
+    h._storage.maintain()
+    assert len(calls) == 2
+    h.close()
