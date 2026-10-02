@@ -31,6 +31,8 @@ def test_load_only_external_tokens(config, start, end, failure):
     worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
     worker._ensure_handler = lambda: None
     worker._handler = Mock() if failure != "handler" else None
+    if worker._handler is not None:
+        worker._handler.retrieve_capacity.return_value = None
     meta = MaruReqMeta(
         "load",
         list(range(16)),
@@ -174,3 +176,82 @@ def test_real_scheduler_preserves_other_request_sharing_prefix(
     assert affected == {"loading"}
     assert loading.num_computed_tokens == 4
     assert decoding.num_computed_tokens == 17
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 3])
+def test_bounded_read_buffers_load_in_batches(capacity):
+    """A backend with bounded read buffers gets batches it can hold, each
+    released before the next is retrieved."""
+    worker = make_worker(4, 8, remote_extra(), num_kv_heads=1, head_size=1)
+    cache = torch.full((12, 2, 4, 1, 1), -1.0)
+    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
+    worker._ensure_handler = lambda: None
+    worker._handler = Mock()
+    worker._handler.retrieve_capacity.return_value = capacity
+    meta = MaruReqMeta(
+        "load",
+        list(range(24)),
+        list(range(6)),
+        False,
+        num_matched_chunks=3,
+        load_start_token=0,
+        load_end_token=24,
+    )
+    keys = _req_chunk_keys(meta, 8)
+    slabs = {
+        key: torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1) + i * 100
+        for i, key in enumerate(keys)
+    }
+    held = []
+
+    def retrieve(requested):
+        assert len(requested) <= capacity and not held
+        held.extend(requested)
+        return [
+            SimpleNamespace(view=bytearray(slabs[k].numpy().tobytes()))
+            for k in requested
+        ]
+
+    worker._handler.release_retrieved.side_effect = lambda infos: held.clear()
+    worker._batch_retrieve_all = retrieve
+    context = SimpleNamespace(
+        attn_metadata=make_flash_attn_metadata(),
+        no_compile_layers={"layer": SimpleNamespace(kv_cache=cache)},
+    )
+    worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
+    assert not worker.take_failed_load_blocks()
+    assert worker._handler.release_retrieved.call_count == -(-3 // capacity)
+    for token in range(24):
+        value = cache[token // 4, :, token % 4, 0, 0]
+        torch.testing.assert_close(value, slabs[keys[token // 8]][:, 0, token % 8, 0])
+
+
+def test_a_missing_later_batch_fails_only_from_that_batch():
+    worker = make_worker(4, 8, remote_extra(), num_kv_heads=1, head_size=1)
+    cache = torch.full((12, 2, 4, 1, 1), -1.0)
+    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
+    worker._ensure_handler = lambda: None
+    worker._handler = Mock()
+    worker._handler.retrieve_capacity.return_value = 1
+    meta = MaruReqMeta(
+        "load",
+        list(range(24)),
+        list(range(6)),
+        False,
+        num_matched_chunks=3,
+        load_start_token=0,
+        load_end_token=24,
+    )
+    keys = _req_chunk_keys(meta, 8)
+    slab = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1)
+    worker._batch_retrieve_all = lambda req: (
+        [None]
+        if req[0] == keys[1]
+        else [SimpleNamespace(view=bytearray(slab.numpy().tobytes()))]
+    )
+    context = SimpleNamespace(
+        attn_metadata=make_flash_attn_metadata(),
+        no_compile_layers={"layer": SimpleNamespace(kv_cache=cache)},
+    )
+    worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
+    assert worker.take_failed_load_blocks() == {2, 3, 4, 5}  # chunk 1 onward

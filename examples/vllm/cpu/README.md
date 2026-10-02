@@ -5,7 +5,9 @@ locations, capacity and owner session. This mode needs neither a CXL device nor
 the Maru Resource Manager. The model still runs on a GPU.
 
 This first version supports one worker (`TP=PP=DP=1`), homogeneous, unquantized
-KV layers, chunkwise storage and synchronous transfers under `--enforce-eager`.
+KV layers, chunkwise storage and synchronous transfers under `--enforce-eager`
+and `--no-async-scheduling` (a failed synchronous load cannot be recomputed
+safely while vLLM schedules the next step ahead).
 It has a fixed capacity: once full, new cache stores are skipped and existing
 entries remain reusable. To use CPU and CXL in the same engine, use the
 [mixed L1 mode](../mixed/README.md). Automatic eviction, host CPU sharing,
@@ -32,7 +34,7 @@ python -m maru_server --cpu-only --host 127.0.0.1 --port 5555
 Start vLLM with your text model (replace the model and namespace):
 
 ```bash
-vllm serve <model> --enforce-eager \
+vllm serve <model> --enforce-eager --no-async-scheduling \
   --kv-transfer-config '{
     "kv_connector": "MaruKVConnector",
     "kv_connector_module_path": "maru_vllm",

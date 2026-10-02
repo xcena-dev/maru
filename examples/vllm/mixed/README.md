@@ -17,7 +17,7 @@ Do not use `--cpu-only` for mixed mode. An optional `--dax-path /dev/daxX.Y`
 restricts the server's CXL allocation to that RM pool.
 
 ```bash
-vllm serve <model> --enforce-eager \
+vllm serve <model> --enforce-eager --no-async-scheduling \
   --kv-transfer-config '{
     "kv_connector": "MaruKVConnector",
     "kv_connector_module_path": "maru_vllm",
