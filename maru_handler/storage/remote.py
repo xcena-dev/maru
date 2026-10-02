@@ -42,10 +42,8 @@ logger = logging.getLogger(__name__)
 
 _CREATED = "CREATED"
 _ALREADY_PRESENT = "ALREADY_PRESENT"
-# How long the keys this handler remembers storing are trusted without
-# hearing from the server; after that the maintenance thread confirms the run.
-_STORED_KEYS_CHECK_S = 5.0
-# Period of the maintenance thread (reconnect, run check, eviction sync).
+# Period of the maintenance thread: one ping of its own probe client, then a
+# reconnect (server restarted or back) or an eviction sync when needed.
 _MAINTAIN_INTERVAL_S = 1.0
 
 
@@ -118,6 +116,11 @@ class RemoteStorageClient:
         self._closed = False
         self._maintainer: threading.Thread | None = None
         self._stop_maintainer = threading.Event()
+        # Control-only client of the maintenance thread: its probes never
+        # hold the I/O lock or the main client's socket.
+        self._probe: Any = None
+        # Serializes eviction syncs of the I/O threads and the maintenance thread.
+        self._evict_lock = threading.Lock()
         self.counters = {
             "stores": 0,
             "store_bytes": 0,
@@ -183,6 +186,12 @@ class RemoteStorageClient:
                 self._client = self._transport = self._staging = None
             self._stored.clear()
             self._rejected.clear()
+            maintainer, self._maintainer = self._maintainer, None
+        if maintainer is not None:
+            maintainer.join(timeout=self.config.timeout_ms / 1000 + 1.0)
+        if self._probe is not None:
+            self._probe.close()
+            self._probe = None
 
     def _ensure(self, data: bool = True) -> None:
         """Raise unless the backend is connected (and has a data path).
@@ -323,7 +332,9 @@ class RemoteStorageClient:
                 return [False] * len(keys)
             try:
                 scoped = [self._scope(k) for k in keys]
-                return list(self._after_restart(lambda: self._client.exists(scoped)))
+                found = list(self._client.exists(scoped))
+                self._last_contact = self._clock()
+                return found
             except Exception as exc:
                 self._fail(exc, "exists")
                 return [False] * len(keys)
@@ -360,21 +371,17 @@ class RemoteStorageClient:
                 self._fail(exc, "ping")
                 return False
 
-    def _confirm_run(self) -> None:
-        """Ping the server; on a restart, reconnect (which forgets stored keys)."""
-        if not self._ready():
-            return
-        try:
-            self._client.ping()
-            self._last_contact = self._clock()
-        except Exception as exc:
-            self._fail(exc, "ping")
-            self._ready()
-
     def _start_maintainer(self) -> None:
-        """Start the maintenance thread once (I/O lock held)."""
+        """Start the maintenance thread and its probe client once."""
         if self._maintainer is not None:
             return
+        self._probe = self._client_factory(
+            self.config.remote_url,
+            None,
+            client_id=f"{self._client_id()}-probe",
+            timeout_ms=self.config.timeout_ms,
+        )
+        self._stop_maintainer.clear()
         self._maintainer = threading.Thread(
             target=self._maintain_loop, name="maru-remote-maintain", daemon=True
         )
@@ -390,34 +397,62 @@ class RemoteStorageClient:
     def maintain(self) -> None:
         """One round of background upkeep, off the engine and scheduler paths.
 
-        Reconnects when a reconnect is due, confirms the server run after a
-        few seconds of silence (forgetting remembered keys on a restart), and
-        drops remembered keys the server reported evicted.
+        Pings the server with the probe client without holding the I/O lock.
+        A failed ping stops calls for the retry period. A changed server run,
+        or a pending reconnect, reconnects under the I/O lock only once the
+        server has answered, so the reconnect is fast. Otherwise remembered
+        keys the server reported evicted are dropped.
         """
-        with self._lock:
-            if not self.connected or self._closed:
-                return
-            if self._reconnect:
-                self._ready()
-            elif self._clock() - self._last_contact > _STORED_KEYS_CHECK_S:
-                self._confirm_run()
-            if self._staging is not None and self._ready(connect=False):
-                self._sync_evictions()
+        probe = self._probe
+        if probe is None or not self.connected or self._closed:
+            return
+        if self._clock() < self._retry_at:
+            return
+        try:
+            probe.connect()  # a ping: learns the generation and eviction count
+        except Exception as exc:
+            if not self._reconnect:
+                self._trip(exc)
+            return
+        if self._reconnect or probe.generation != getattr(
+            self._client, "generation", ""
+        ):
+            with self._lock:
+                if self.connected and not self._closed:
+                    self._reconnect = True
+                    self._ready()
+            return
+        if self._staging is not None:
+            with self._evict_lock:
+                self._sync_evictions(probe)
 
-    def _sync_evictions(self) -> None:
-        """Drop remembered keys the server has evicted (I/O lock held).
+    def _sync_from_io(self) -> None:
+        """Eviction sync from a load or store (I/O lock held); never waits.
 
-        Costs a control call only when the server reports new evictions. If
-        the server no longer lists all of them, every remembered key is
-        forgotten. A failed call leaves the keys for the next attempt.
+        When the maintenance thread is syncing, it covers the same evictions.
         """
-        evictions = getattr(self._client, "evictions", 0)
+        if self._evict_lock.acquire(blocking=False):
+            try:
+                self._sync_evictions(self._client)
+            finally:
+                self._evict_lock.release()
+
+    def _sync_evictions(self, client: Any) -> None:
+        """Drop remembered keys the server has evicted (eviction lock held).
+
+        Costs a control call only when ``client``'s last reply reported new
+        evictions. If the server no longer lists all of them, every
+        remembered key is forgotten. A failed call leaves the keys for the
+        next attempt.
+        """
+        evictions = getattr(client, "evictions", 0)
         if evictions == self._evictions_seen:
             return
         try:
-            keys, complete = self._client.evicted_since(self._evictions_seen)
+            keys, complete = client.evicted_since(self._evictions_seen)
         except Exception as exc:
-            self._fail(exc, "evicted_since")
+            if client is self._client:
+                self._fail(exc, "evicted_since")
             return
         if complete:
             prefix = f"{self._namespace}/"
@@ -668,7 +703,7 @@ class RemoteStorageClient:
         if not self._ready():
             return [False] * len(keys)
         assert self._staging is not None
-        self._sync_evictions()
+        self._sync_from_io()
         now = self._clock()
         first: dict[str, int] = {}
         for i, key in enumerate(keys):
@@ -759,7 +794,7 @@ class RemoteStorageClient:
                 self._rejected.pop(keys[i], None)
             else:
                 self._rejected[keys[i]] = self._clock() + self.config.remote_retry_s
-        self._sync_evictions()  # this reservation may have evicted keys
+        self._sync_from_io()  # this reservation may have evicted keys
         nbytes = sum(handles[i].size for i in order)
         self.counters["store_bytes"] += nbytes
         self.counters["write_seconds"] += t2 - t1
@@ -794,7 +829,7 @@ class RemoteStorageClient:
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote lookup failed: {exc}") from exc
         t1 = time.perf_counter()
-        self._sync_evictions()
+        self._sync_from_io()
         found = [i for i, e in enumerate(entries) if e is not None]
         for i, e in enumerate(entries):
             if e is None:
