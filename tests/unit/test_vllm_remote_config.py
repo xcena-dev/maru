@@ -139,3 +139,43 @@ def test_scheduler_probes_the_server_every_time():
         "H", (), {"batch_exists": lambda self, keys: [True, False]}
     )()
     assert scheduler._count_matched_chunks(list(range(8))) == 1
+
+
+def test_namespace_ignores_where_and_with_which_library_a_node_loaded_weights():
+    a, b = engine_config(), engine_config()
+    a.model_config.model, b.model_config.model = "/data/models/x", "/mnt/nfs/x"
+    a.model_config.hf_config = type(
+        "C",
+        (),
+        {
+            "to_dict": lambda self: {
+                "heads": 4,
+                "_name_or_path": "/data/models/x",
+                "transformers_version": "5.11.0",
+            }
+        },
+    )()
+    b.model_config.hf_config = type(
+        "C",
+        (),
+        {
+            "to_dict": lambda self: {
+                "heads": 4,
+                "_name_or_path": "/mnt/nfs/x",
+                "transformers_version": "5.12.0",
+            }
+        },
+    )()
+    assert (
+        conn._bind_lease_namespace(remote_extra(), a)["maru_cache_namespace"]
+        == conn._bind_lease_namespace(remote_extra(), b)["maru_cache_namespace"]
+    )
+
+
+def test_default_staging_holds_at_least_64_objects():
+    assert conn._remote_staging_bytes({}, 3 * 1024**2) == 1024**3
+    assert conn._remote_staging_bytes({}, 32 * 1024**2) == 64 * 32 * 1024**2
+    assert (
+        conn._remote_staging_bytes({"maru_remote_staging_size": "64M"}, 32 * 1024**2)
+        == 64 * 1024**2
+    )

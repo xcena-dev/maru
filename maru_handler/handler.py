@@ -1414,6 +1414,17 @@ class MaruHandler:
             else key in self._key_to_location
         )
 
+    def retrieve_capacity(self) -> int | None:
+        """How many objects one ``batch_retrieve`` can hold right now.
+
+        Returns:
+            The free read buffers of a backend with bounded ones (the remote
+            backend's staging slots), or None when one call can return any
+            number of objects (cxl, cpu, mixed).
+        """
+        fn = getattr(self._storage, "retrieve_capacity", None)
+        return fn() if fn is not None else None
+
     def release_retrieved(self, infos: list) -> None:
         """Release read leases after the last read/GPU copy has completed."""
         if self._storage is not None:
