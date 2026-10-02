@@ -242,6 +242,8 @@ def test_outage_skips_calls_until_retry_then_reconnects(pool):
         h.batch_retrieve(["before"])
     pool.start()  # a new server generation
     clock.advance(6.0)
+    assert h.batch_exists(["before"]) == [False]  # the scheduler path never reconnects
+    h._storage.maintain()  # the maintenance thread's round reconnects
     assert h.batch_exists(["before"]) == [True]  # keys live in the MaruServer
     assert not h.has_local("before")  # the restart cleared what this handler knew
     assert _store(h, "after", b"2")
@@ -470,9 +472,12 @@ def test_remembered_keys_are_revalidated_after_silence(pool):
     assert _store(h, "k", b"1") and h.has_local("k")
     pool.stop()
     pool.start()  # a new run that this handler has not talked to yet
-    assert h.has_local("k")  # within the trust window: no call is made
+    assert h.has_local("k")  # answered from memory: no call is made
+    h._storage.maintain()
+    assert h.has_local("k")  # within the trust window the run is not checked
     clock.advance(6.0)
-    assert not h.has_local("k")  # the ping saw the new run and forgot the key
+    h._storage.maintain()  # the maintenance thread's ping sees the new run
+    assert not h.has_local("k")
     h.close()
 
 
@@ -618,14 +623,13 @@ def test_has_local_does_not_wait_for_a_transfer_in_flight(pool):
     held.wait(5)
     try:
         t0 = time.monotonic()
-        assert h.has_local("k")  # recent contact: no ping needed
-        clock.advance(10.0)  # a ping would be due
-        assert h.has_local("k") is False  # answered without waiting
+        clock.advance(10.0)  # a run check would be due
+        assert h.has_local("k")  # answered from memory, without the lock
+        assert not h.has_local("other")
         assert time.monotonic() - t0 < 0.5
     finally:
         done.set()
         t.join()
-    assert h.has_local("k")  # confirmed once the lock is free
     h.close()
 
 
@@ -732,3 +736,19 @@ def test_a_truncated_eviction_log_forgets_every_remembered_key(
         b.close()
     finally:
         node.stop()
+
+
+def test_the_maintenance_thread_reconnects_after_an_outage(pool, monkeypatch):
+    import maru_handler.storage.remote as remote_mod
+
+    monkeypatch.setattr(remote_mod, "_MAINTAIN_INTERVAL_S", 0.05)
+    h = remote_handler(pool.url, retry_s=0.2)
+    assert _store(h, "k", b"1")
+    pool.stop()
+    assert h.batch_exists(["k"]) == [False]  # a control timeout trips the backend
+    pool.start()
+    deadline = time.monotonic() + 5.0
+    while h.batch_exists(["k"]) != [True] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert h.batch_exists(["k"]) == [True]  # reconnected off the caller's path
+    h.close()

@@ -43,8 +43,10 @@ logger = logging.getLogger(__name__)
 _CREATED = "CREATED"
 _ALREADY_PRESENT = "ALREADY_PRESENT"
 # How long the keys this handler remembers storing are trusted without
-# hearing from the server; after that has_local confirms the server run.
+# hearing from the server; after that the maintenance thread confirms the run.
 _STORED_KEYS_CHECK_S = 5.0
+# Period of the maintenance thread (reconnect, run check, eviction sync).
+_MAINTAIN_INTERVAL_S = 1.0
 
 
 def _default_transport(agent_name: str, ucx_device: str) -> Any:
@@ -114,6 +116,8 @@ class RemoteStorageClient:
         self._quarantined_slots: set[int] = set()
         self._reads = 0
         self._closed = False
+        self._maintainer: threading.Thread | None = None
+        self._stop_maintainer = threading.Event()
         self.counters = {
             "stores": 0,
             "store_bytes": 0,
@@ -164,6 +168,7 @@ class RemoteStorageClient:
                 )
             self._closed = True
             self.connected = False
+            self._stop_maintainer.set()
             for q in self._quarantine:
                 if q.pending.poll() and q.tickets:
                     self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
@@ -242,27 +247,14 @@ class RemoteStorageClient:
     def has_local(self, key: str) -> bool:
         """Whether this handler stored (or found) ``key`` in the current server run.
 
-        The remembered keys belong to one server run. If the server has not
-        been heard from for a few seconds, a ping confirms the run first; a
-        restart clears the remembered keys so they are stored again. Keys the
-        server evicts are dropped on the next load or store, which asks the
-        server for them; until then a remembered key may already be gone.
-
-        Callers on the engine thread must not wait for another thread's
-        transfer: while one holds the transfer lock the answer is False, so
-        the caller stores again and the server reports the key present.
+        Answers from memory and never calls the server, so the engine thread
+        never waits on the network. The remembered keys belong to one server
+        run: the maintenance thread confirms the run after a few seconds of
+        silence and forgets them on a restart, and it or the next load or
+        store drops the keys the server evicted. Until then a remembered key
+        may already be gone.
         """
-        if not self.connected or key not in self._stored:
-            return False
-        if self._clock() - self._last_contact <= _STORED_KEYS_CHECK_S:
-            return True
-        if not self._lock.acquire(blocking=False):
-            return False
-        try:
-            self._confirm_run()
-            return key in self._stored
-        finally:
-            self._lock.release()
+        return self.connected and key in self._stored
 
     def batch_store(
         self, keys: list[str], handles: list[RemoteAllocation]
@@ -318,12 +310,16 @@ class RemoteStorageClient:
             return self._staging.free_count() if self._staging is not None else 0
 
     def batch_exists(self, keys: list[str]) -> list[bool]:
-        """Report which keys are in the pool (all False while the server is down)."""
+        """Report which keys are in the pool (all False while the server is down).
+
+        Callers sit on vLLM's scheduler path, so a reconnect that is due is
+        left to the maintenance thread; until it succeeds every key misses.
+        """
         with self._lock:
             self._ensure(data=False)
             if not keys:
                 return []
-            if not self._ready():
+            if not self._ready(connect=False):
                 return [False] * len(keys)
             try:
                 scoped = [self._scope(k) for k in keys]
@@ -374,6 +370,39 @@ class RemoteStorageClient:
         except Exception as exc:
             self._fail(exc, "ping")
             self._ready()
+
+    def _start_maintainer(self) -> None:
+        """Start the maintenance thread once (I/O lock held)."""
+        if self._maintainer is not None:
+            return
+        self._maintainer = threading.Thread(
+            target=self._maintain_loop, name="maru-remote-maintain", daemon=True
+        )
+        self._maintainer.start()
+
+    def _maintain_loop(self) -> None:
+        while not self._stop_maintainer.wait(_MAINTAIN_INTERVAL_S):
+            try:
+                self.maintain()
+            except Exception:  # keep the thread alive; the next round retries
+                logger.warning("remote storage maintenance failed", exc_info=True)
+
+    def maintain(self) -> None:
+        """One round of background upkeep, off the engine and scheduler paths.
+
+        Reconnects when a reconnect is due, confirms the server run after a
+        few seconds of silence (forgetting remembered keys on a restart), and
+        drops remembered keys the server reported evicted.
+        """
+        with self._lock:
+            if not self.connected or self._closed:
+                return
+            if self._reconnect:
+                self._ready()
+            elif self._clock() - self._last_contact > _STORED_KEYS_CHECK_S:
+                self._confirm_run()
+            if self._staging is not None and self._ready(connect=False):
+                self._sync_evictions()
 
     def _sync_evictions(self) -> None:
         """Drop remembered keys the server has evicted (I/O lock held).
@@ -438,6 +467,7 @@ class RemoteStorageClient:
             ) from exc
         self._client = client
         self.connected = True
+        self._start_maintainer()
         return True
 
     def _connect_data(self) -> bool:
@@ -481,6 +511,7 @@ class RemoteStorageClient:
             raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
         self.connected = True
+        self._start_maintainer()
         self._evictions_seen = getattr(client, "evictions", 0)
         self._last_contact = self._clock()
         logger.info(
@@ -544,12 +575,19 @@ class RemoteStorageClient:
 
     # ---- availability -------------------------------------------------------------
 
-    def _ready(self) -> bool:
-        """True if the server may be called now; reconnects when one is due."""
+    def _ready(self, connect: bool = True) -> bool:
+        """True if the server may be called now; reconnects when one is due.
+
+        Args:
+            connect: Reconnect here when one is due; False reports the server
+                unavailable instead (for callers that must not wait).
+        """
         if self._clock() < self._retry_at:
             return False
         if not self._reconnect:
             return True
+        if not connect:
+            return False
         old = getattr(self._client, "generation", "")
         try:
             hello = self._client.connect()
