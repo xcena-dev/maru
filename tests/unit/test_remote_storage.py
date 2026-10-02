@@ -552,3 +552,34 @@ def test_local_staging_errors_are_configuration_errors(pool):
     ):
         with pytest.raises(StorageError, match="staging"):
             remote_handler(pool.url)
+
+
+def test_alloc_and_lease_release_do_not_wait_for_a_transfer_in_flight(pool):
+    import threading
+    import time as _time
+
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    assert _store(h, "k", b"x")
+    (lease,) = h.batch_retrieve(["k"])
+    io_lock = h._storage._lock
+    held, done = threading.Event(), threading.Event()
+
+    def hold_io_lock():  # stands in for a store or load running its RDMA
+        with io_lock:
+            held.set()
+            done.wait(5)
+
+    t = threading.Thread(target=hold_io_lock)
+    t.start()
+    held.wait(5)
+    try:
+        t0 = _time.monotonic()
+        a = h.alloc(1)
+        lease.release()
+        h.free(a)
+        assert h.retrieve_capacity() == 4
+        assert _time.monotonic() - t0 < 0.5
+    finally:
+        done.set()
+        t.join()
+    h.close()

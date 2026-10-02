@@ -86,7 +86,12 @@ class RemoteStorageClient:
         """
         self.config = config
         self.connected = False
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()  # control requests and RDMA transfers
+        # Slot bookkeeping only. alloc, free and lease release take this lock
+        # alone, so the engine thread never waits for a transfer or a control
+        # request another thread is running under ``_lock``. Lock order:
+        # ``_lock`` before ``_slot_lock``.
+        self._slot_lock = threading.Lock()
         self._clock = clock
         self._transport_factory = transport_factory or _default_transport
         self._client_factory = client_factory or _default_client
@@ -162,9 +167,10 @@ class RemoteStorageClient:
                 self._client.close()
             if self._transport is not None:
                 self._transport.close()
-            if self._staging is not None:
-                self._staging.close()
-            self._client = self._transport = self._staging = None
+            with self._slot_lock:
+                if self._staging is not None:
+                    self._staging.close()
+                self._client = self._transport = self._staging = None
             self._stored.clear()
             self._rejected.clear()
 
@@ -193,27 +199,34 @@ class RemoteStorageClient:
             StorageUnavailableError: while the server is considered down.
             MemoryError: if every slot is in use.
         """
-        with self._lock:
+        # Return slots of ended timed-out transfers when nobody holds the I/O
+        # lock; never wait for it.
+        if self._quarantine and self._lock.acquire(blocking=False):
+            try:
+                self._reap_slots()
+            finally:
+                self._lock.release()
+        with self._slot_lock:
             self._ensure()
-            self._reap()
-            assert self._staging is not None
-            if type(size) is not int or not 0 < size <= self._staging.slot_bytes:
+            staging = self._staging
+            assert staging is not None
+            if type(size) is not int or not 0 < size <= staging.slot_bytes:
                 raise ValueError("remote allocation must fit in one staging slot")
             if self._clock() < max(self._retry_at, self._store_retry_at):
                 raise StorageUnavailableError(
                     "remote storage is unavailable or full; skipping store"
                 )
-            slots = self._staging.take(1)
+            slots = staging.take(1)
             if slots is None:
                 raise MemoryError(
                     "remote staging buffer is full; skipping new cache admission"
                 )
             slot = slots[0]
-            return RemoteAllocation(self._staging.view(slot)[:size], slot, size)
+            return RemoteAllocation(staging.view(slot)[:size], slot, size)
 
     def free(self, handle: RemoteAllocation) -> None:
         """Return an unsubmitted allocation; a submitted one is owned by batch_store."""
-        with self._lock:
+        with self._slot_lock:
             if not isinstance(handle, RemoteAllocation) or handle.state != "writing":
                 return
             handle.state = "freed"
@@ -285,7 +298,7 @@ class RemoteStorageClient:
 
     def retrieve_capacity(self) -> int:
         """Free staging slots: the most objects one batch_retrieve can hold now."""
-        with self._lock:
+        with self._slot_lock:
             return self._staging.free_count() if self._staging is not None else 0
 
     def batch_exists(self, keys: list[str]) -> list[bool]:
@@ -729,7 +742,8 @@ class RemoteStorageClient:
             leases[i] = RemoteReadLease(
                 self._staging.view(s)[:n], keys[i], functools.partial(self._end_read, s)
             )
-        self._reads += len(found)
+        with self._slot_lock:
+            self._reads += len(found)
         nbytes = sum(lengths)
         self.counters["read_seconds"] += t2 - t1
         self.counters["loads"] += 1
@@ -747,7 +761,7 @@ class RemoteStorageClient:
 
     def _end_read(self, slot: int) -> None:
         """Lease release: return its slot."""
-        with self._lock:
+        with self._slot_lock:
             self._reads -= 1
             if self._staging is not None:
                 self._staging.give(slot)
@@ -773,23 +787,31 @@ class RemoteStorageClient:
             len(tickets),
         )
 
-    def _reap(self) -> None:
-        """Return the buffers of quarantined transfers that have ended."""
-        if not self._quarantine:
-            return
-        keep: list[QuarantinedTransfer] = []
+    def _reap_slots(self) -> None:
+        """Return the staging slots of quarantined transfers that have ended.
+
+        Local work only (no control request), so ``alloc`` may run it.
+        """
         for q in self._quarantine:
-            if not q.slots and not q.tickets:
-                continue
-            if q.slots:
-                if not q.pending.poll():
-                    keep.append(q)
-                    continue
+            if q.slots and q.pending.poll():
                 for s in q.slots:
                     self._quarantined_slots.discard(s)
                     if self._staging is not None:
                         self._staging.give(s)
                 q.slots = []
+
+    def _reap(self) -> None:
+        """Return the buffers of quarantined transfers that have ended."""
+        if not self._quarantine:
+            return
+        self._reap_slots()
+        keep: list[QuarantinedTransfer] = []
+        for q in self._quarantine:
+            if not q.slots and not q.tickets:
+                continue
+            if q.slots:  # still in flight
+                keep.append(q)
+                continue
             if q.tickets:
                 if self._clock() < self._retry_at:
                     keep.append(q)  # the server is considered down: ask later
