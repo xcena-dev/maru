@@ -1425,6 +1425,17 @@ class MaruHandler:
         fn = getattr(self._storage, "retrieve_capacity", None)
         return fn() if fn is not None else None
 
+    def storage_gpu_accessible(self) -> bool:
+        """Whether the GPU can read and write stored buffers directly.
+
+        Returns:
+            True for mapped CXL regions and for a remote backend whose staging
+            buffer is page-locked for CUDA; False for the CPU and mixed pools.
+        """
+        if self._storage is None:
+            return True
+        return bool(getattr(self._storage, "gpu_accessible", False))
+
     def release_retrieved(self, infos: list) -> None:
         """Release read leases after the last read/GPU copy has completed."""
         if self._storage is not None:

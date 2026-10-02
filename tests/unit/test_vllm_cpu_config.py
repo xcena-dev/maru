@@ -177,3 +177,13 @@ def test_only_the_remote_backend_requires_async_scheduling_off():
         _bind_lease_namespace(remote, config)
     config.scheduler_config.async_scheduling = False
     assert _bind_lease_namespace(remote, config)["maru_cache_namespace"]
+    # An asynchronous load reports its failure before the request is scheduled.
+    config.scheduler_config.async_scheduling = True
+    remote["maru_async_load"] = True
+    assert _bind_lease_namespace(remote, config)["maru_cache_namespace"]
+
+
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
+def test_cpu_mode_keeps_synchronous_transfers(knob):
+    with pytest.raises(ValueError, match="does not support"):
+        _validate_storage_config({**extra(), knob: True})

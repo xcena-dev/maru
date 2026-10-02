@@ -288,3 +288,57 @@ def test_a_failed_batch_copy_stops_the_later_batches():
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
     assert len(requested) == 1  # the later batches are not read
     assert worker._handler.release_retrieved.call_count == 1
+
+
+def _deferred_remote_worker(capacity):
+    worker = make_worker(4, 8, remote_extra(), num_kv_heads=1, head_size=1)
+    cache = torch.full((12, 2, 4, 1, 1), -1.0)
+    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
+    worker._handler = Mock()
+    worker._handler.retrieve_capacity.return_value = capacity
+    worker._handler.storage_gpu_accessible.return_value = False
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    meta = MaruReqMeta(
+        "parked",
+        list(range(24)),
+        list(range(6)),
+        False,
+        num_matched_chunks=3,
+        load_start_token=0,
+        load_end_token=24,
+        deferred_load=True,
+    )
+    return worker, cache, meta, [("layer", cache, 0)]
+
+
+def test_a_deferred_lease_load_unparks_only_after_its_last_batch():
+    worker, cache, meta, layers = _deferred_remote_worker(capacity=1)
+    keys = _req_chunk_keys(meta, 8)
+    slab = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1)
+    seen_done = []
+
+    def retrieve(requested):
+        seen_done.append("parked" in worker._deferred_done)
+        return [SimpleNamespace(view=bytearray(slab.numpy().tobytes()))]
+
+    worker._batch_retrieve_all = retrieve
+    worker._load_leased_request(layers, meta, worker._last_attn_metadata)
+    assert seen_done == [False, False, False]  # never unparked between batches
+    assert worker._deferred_done == {"parked"}
+    assert not worker.take_failed_load_blocks()
+    assert worker._handler.release_retrieved.call_count == len(keys)
+    torch.testing.assert_close(cache[0, :, 0, 0, 0], slab[:, 0, 0, 0])
+
+
+def test_a_failed_deferred_lease_batch_unparks_for_recompute():
+    worker, _cache, meta, layers = _deferred_remote_worker(capacity=1)
+    keys = _req_chunk_keys(meta, 8)
+    slab = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1)
+    worker._batch_retrieve_all = lambda req: (
+        [None]
+        if req[0] == keys[1]
+        else [SimpleNamespace(view=bytearray(slab.numpy().tobytes()))]
+    )
+    worker._load_leased_request(layers, meta, worker._last_attn_metadata)
+    assert worker._deferred_done == {"parked"}
+    assert worker.take_failed_load_blocks() == {2, 3, 4, 5}  # chunk 1 onward

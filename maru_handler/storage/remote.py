@@ -278,6 +278,11 @@ class RemoteStorageClient:
             self.counters["stores" if all(results) else "stores_failed"] += 1
             return results
 
+    @property
+    def gpu_accessible(self) -> bool:
+        """Whether GPU kernels and async copies may read and write the slots."""
+        return self._staging is not None and self._staging.cuda_registered
+
     def retrieve_capacity(self) -> int:
         """Free staging slots: the most objects one batch_retrieve can hold now."""
         with self._lock:
@@ -414,6 +419,9 @@ class RemoteStorageClient:
             ) from exc
         try:  # local resources only once the server is known to be usable
             staging = StagingBuffer(self.config.pool_size, self.config.chunk_size_bytes)
+            # Page-locked for CUDA first so the GPU kernels and async copies
+            # can use the slots directly; NIXL registers the same memory.
+            staging.cuda_register()
             transport.register(staging.address, staging.nbytes, "maru-remote-staging")
         except Exception as exc:
             self._discard(client, transport, staging)
