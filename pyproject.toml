@@ -34,6 +34,9 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
+remote = [
+    "nixl>=1.2",
+]
 docs = [
     "sphinx>=7.0",
     "shibuya",
@@ -46,6 +49,7 @@ docs = [
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
 marutop = "maru_tools.cli:main"
+maru-remote-server = "maru_remote.__main__:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"
@@ -59,7 +63,7 @@ Organization = "https://xcena.com"
 maru_kv_ops = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.cpp", "csrc/*.h", "VENDOR.md"]
 
 [tool.setuptools.packages.find]
-include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*", "maru_tools*", "maru_kv_ops*"]
+include = ["maru*", "maru_server*", "maru_common*", "maru_shm*", "maru_vllm*", "maru_lmcache*", "maru_sglang*", "maru_tools*", "maru_kv_ops*", "maru_remote*"]
 
 [tool.ruff]
 line-length = 88
