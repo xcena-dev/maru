@@ -248,7 +248,8 @@ failure is reported before the request is scheduled, so async scheduling can
 stay on. Loads are split into batches the staging buffer can hold. When the
 pool is unreachable, lookups miss and stores are skipped for
 `maru_remote_retry_s` (default 30 s) while requests compute normally. A full
-pool evicts its least recently read keys. See the
+pool evicts its least recently read keys; a prefix that is already in the
+pool, including one another worker stored, is not written again. See the
 [remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
 for launch commands, failure behaviour and the trust model.
 
