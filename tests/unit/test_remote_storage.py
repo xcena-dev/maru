@@ -583,3 +583,31 @@ def test_alloc_and_lease_release_do_not_wait_for_a_transfer_in_flight(pool):
         done.set()
         t.join()
     h.close()
+
+
+def test_has_local_does_not_wait_for_a_transfer_in_flight(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
+    assert _store(h, "k", b"x")
+    held, done = threading.Event(), threading.Event()
+
+    def hold_io_lock():
+        with h._storage._lock:
+            held.set()
+            done.wait(5)
+
+    t = threading.Thread(target=hold_io_lock)
+    t.start()
+    held.wait(5)
+    try:
+        t0 = time.monotonic()
+        assert h.has_local("k")  # recent contact: no ping needed
+        clock.advance(10.0)  # a ping would be due
+        assert h.has_local("k") is False  # answered without waiting
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        done.set()
+        t.join()
+    assert h.has_local("k")  # confirmed once the lock is free
+    h.close()

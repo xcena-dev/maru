@@ -240,13 +240,22 @@ class RemoteStorageClient:
         The remembered keys belong to one server run. If the server has not
         been heard from for a few seconds, a ping confirms the run first; a
         restart clears the remembered keys so they are stored again.
+
+        Callers on the engine thread must not wait for another thread's
+        transfer: while one holds the transfer lock the answer is False, so
+        the caller stores again and the server reports the key present.
         """
-        with self._lock:
-            if not self.connected or key not in self._stored:
-                return False
-            if self._clock() - self._last_contact > _STORED_KEYS_CHECK_S:
-                self._confirm_run()
+        if not self.connected or key not in self._stored:
+            return False
+        if self._clock() - self._last_contact <= _STORED_KEYS_CHECK_S:
+            return True
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._confirm_run()
             return key in self._stored
+        finally:
+            self._lock.release()
 
     def batch_store(
         self, keys: list[str], handles: list[RemoteAllocation]
