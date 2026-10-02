@@ -433,6 +433,11 @@ def test_connector_store_on_one_worker_load_on_another(pool):
         for name, tensor in src.items():
             writer.save_kv_layer(name, tensor, attn, meta)
         assert pool.stats()["reservations"] == before["reservations"] == 0
+        # The reader read the prefix in this run, so it does not store it back.
+        for name, tensor in dst.items():
+            reader.save_kv_layer(name, tensor, attn, meta)
+        counters = reader._handler.get_stats()["remote_storage"]["counters"]
+        assert counters["stores"] == 0 and counters["store_bytes"] == 0
         # The pool goes away: the hit is reported as a load error (recompute).
         pool.stop()
         reader.start_load_kv(context, load)
@@ -637,6 +642,53 @@ def test_stores_beyond_capacity_evict_the_least_recently_read(
         assert _store(h, "new", b"3") is True
         assert h.batch_exists(["old", "warm", "new"]) == [False, True, True]
         assert node.stats()["evicted"] == 1
+        h.close()
+    finally:
+        node.stop()
+
+
+def test_a_key_read_in_this_run_is_not_stored_again(pool):
+    writer, reader = remote_handler(pool.url), remote_handler(pool.url)
+    assert _store(writer, "k", b"1" * 100)
+    assert not reader.has_local("k")
+    (lease,) = reader.batch_retrieve(["k"])
+    lease.release()
+    assert reader.has_local("k")
+    (missing,) = reader.batch_retrieve(["gone"])
+    assert missing is None and not reader.has_local("gone")
+    writer.close()
+    reader.close()
+
+
+def test_a_store_of_a_present_key_skips_the_write(pool):
+    writer, other = remote_handler(pool.url), remote_handler(pool.url)
+    assert _store(writer, "k", b"1" * 100)
+    assert _store(other, "k", b"1" * 100) is True  # stored by another writer
+    counters = other.get_stats()["remote_storage"]["counters"]
+    assert counters["store_skipped_present"] == 1 and counters["store_bytes"] == 0
+    assert pool.stats()["reservations"] == 0
+    assert other.has_local("k")
+    writer.close()
+    other.close()
+
+
+def test_an_eviction_makes_the_writer_store_evicted_keys_again(
+    pool_handler, unused_port
+):
+    node = PoolNode(pool_handler, unused_port, capacity_bytes=2 * PAGE)
+    node.start()
+    try:
+        h = remote_handler(node.url, staging=4 * PAGE)
+        assert _store(h, "old", b"1") and _store(h, "warm", b"2")
+        (lease,) = h.batch_retrieve(["warm"])
+        lease.release()
+        assert _store(h, "new", b"3")  # evicts "old"
+        # Evicted keys are not named, so every remembered key is forgotten.
+        assert not h.has_local("old") and not h.has_local("warm")
+        assert _store(h, "warm", b"2")  # still present: no WRITE
+        assert h.get_stats()["remote_storage"]["counters"]["store_skipped_present"] == 1
+        assert _store(h, "old", b"1")  # written again (evicts "new" this time)
+        assert h.batch_exists(["old"]) == [True]
         h.close()
     finally:
         node.stop()

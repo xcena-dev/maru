@@ -192,8 +192,10 @@ class RemoteServer:
             msg: Decoded request map with an ``op`` field.
 
         Returns:
-            ``{"ok": True, "generation": ..., ...fields}`` on success, or
-            ``{"ok": False, "generation": ..., "error": str}`` on failure.
+            ``{"ok": True, "generation": ..., "evictions": ..., ...fields}``
+            on success, or ``{"ok": False, "generation": ..., "error": str}``
+            on failure. ``evictions`` counts the keys evicted in this server
+            run, so a client can tell that keys it remembers may be gone.
         """
         name = msg.get("op")
         op = self._ops.get(name) if isinstance(name, str) else None
@@ -214,7 +216,13 @@ class RemoteServer:
             }
         try:
             with self._lock:
-                return {"ok": True, "generation": self._generation, **op(msg)}
+                reply = op(msg)
+                return {
+                    "ok": True,
+                    "generation": self._generation,
+                    "evictions": self._evicted,
+                    **reply,
+                }
         except PoolFullError as exc:
             return {
                 "ok": False,

@@ -99,7 +99,10 @@ class RemoteStorageClient:
         self._client: Any = None
         self._transport: Any = None
         self._staging: StagingBuffer | None = None
+        # Keys this handler stored or read in the current server run. A hint
+        # for skipping stores: forgotten on a restart or a server eviction.
         self._stored: set[str] = set()
+        self._evictions_seen = 0
         # Keys the server refused to publish, with the time to try them again.
         self._rejected: dict[str, float] = {}
         self._retry_at = 0.0
@@ -114,6 +117,7 @@ class RemoteStorageClient:
             "stores": 0,
             "store_bytes": 0,
             "stores_failed": 0,
+            "store_skipped_present": 0,
             "loads": 0,
             "load_bytes": 0,
             "loads_failed": 0,
@@ -239,13 +243,18 @@ class RemoteStorageClient:
 
         The remembered keys belong to one server run. If the server has not
         been heard from for a few seconds, a ping confirms the run first; a
-        restart clears the remembered keys so they are stored again.
+        restart clears the remembered keys so they are stored again. So does
+        an eviction the server reports: the evicted keys are not named, and
+        a store of a key that is still present skips the WRITE.
 
         Callers on the engine thread must not wait for another thread's
         transfer: while one holds the transfer lock the answer is False, so
         the caller stores again and the server reports the key present.
         """
-        if not self.connected or key not in self._stored:
+        if not self.connected:
+            return False
+        self._forget_if_evicted()
+        if key not in self._stored:
             return False
         if self._clock() - self._last_contact <= _STORED_KEYS_CHECK_S:
             return True
@@ -368,6 +377,17 @@ class RemoteStorageClient:
             self._fail(exc, "ping")
             self._ready()
 
+    def _forget_if_evicted(self) -> None:
+        """Forget the remembered keys once the server reports a new eviction.
+
+        Safe without the I/O lock: a key forgotten by a concurrent call is
+        only stored again, and that store finds it present.
+        """
+        evictions = getattr(self._client, "evictions", 0)
+        if evictions != self._evictions_seen:
+            self._evictions_seen = evictions
+            self._stored.clear()
+
     def stats(self) -> dict[str, Any]:
         """Local counters, staging occupancy and (if reachable) server counters."""
         with self._lock:
@@ -450,6 +470,7 @@ class RemoteStorageClient:
             raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
         self.connected = True
+        self._evictions_seen = getattr(client, "evictions", 0)
         self._last_contact = self._clock()
         logger.info(
             "remote storage connected to %s (pool %s, page %d B, %d staging slots of %d B)",
@@ -540,6 +561,7 @@ class RemoteStorageClient:
             )
             self._stored.clear()
             self._rejected.clear()
+            self._evictions_seen = getattr(self._client, "evictions", 0)
         else:
             logger.info("remote server reachable again")
         return True
@@ -607,6 +629,24 @@ class RemoteStorageClient:
         if not order:
             return [False] * len(keys)
         t0 = time.perf_counter()
+        try:  # a key another writer stored, or one forgotten after an eviction
+            present = self._after_restart(
+                lambda: self._client.exists([self._scope(keys[i]) for i in order])
+            )
+        except Exception as exc:
+            self._fail(exc, "exists")
+            return [False] * len(keys)
+        self._forget_if_evicted()
+        ok_by_key: dict[str, bool] = {}
+        for i, found in zip(order, present, strict=True):
+            if found:
+                ok_by_key[keys[i]] = True
+                self._stored.add(keys[i])
+                self._rejected.pop(keys[i], None)
+        order = [i for i, found in zip(order, present, strict=True) if not found]
+        self.counters["store_skipped_present"] += len(ok_by_key)
+        if not order:
+            return [ok_by_key.get(k, False) for k in keys]
         sizes = [handles[i].size for i in order]
         try:
             pages = self._after_restart(lambda: self._client.reserve(sizes))
@@ -620,7 +660,7 @@ class RemoteStorageClient:
                 self._store_retry_at = self._clock() + self.config.remote_retry_s
             else:
                 self._fail(exc, "reserve")
-            return [False] * len(keys)
+            return [ok_by_key.get(k, False) for k in keys]
         t1 = time.perf_counter()
         tickets = [p["ticket"] for p in pages]
         pairs = [
@@ -640,11 +680,11 @@ class RemoteStorageClient:
         except TransferTimeout as exc:
             self._isolate(exc.pending, [handles[i].slot for i in order], tickets)
             self._trip(exc)
-            return [False] * len(keys)
+            return [ok_by_key.get(k, False) for k in keys]
         except Exception as exc:  # the transfer ended in an error state
             self._abandon_quietly(tickets)
             self._trip(exc)
-            return [False] * len(keys)
+            return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
             statuses = self._client.publish(
@@ -656,9 +696,9 @@ class RemoteStorageClient:
             self._fail(exc, "publish")
             if not isinstance(exc, RemoteTimeout | RemoteUnreachable):
                 self._abandon_quietly(tickets)  # unknown tickets are skipped
-            return [False] * len(keys)
+            return [ok_by_key.get(k, False) for k in keys]
         t3 = time.perf_counter()
-        ok_by_key: dict[str, bool] = {}
+        self._forget_if_evicted()
         for i, status in zip(order, statuses, strict=True):
             ok = status in (_CREATED, _ALREADY_PRESENT)
             ok_by_key[keys[i]] = ok
@@ -671,7 +711,7 @@ class RemoteStorageClient:
         self.counters["store_bytes"] += nbytes
         self.counters["write_seconds"] += t2 - t1
         logger.debug(
-            "remote store: %d keys, %d bytes, reserve %.2f ms, write %.2f ms, publish %.2f ms",
+            "remote store: %d keys, %d bytes, check+reserve %.2f ms, write %.2f ms, publish %.2f ms",
             len(order),
             nbytes,
             (t1 - t0) * 1e3,
@@ -701,7 +741,11 @@ class RemoteStorageClient:
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote lookup failed: {exc}") from exc
         t1 = time.perf_counter()
+        self._forget_if_evicted()
         found = [i for i, e in enumerate(entries) if e is not None]
+        for i, e in enumerate(entries):
+            if e is None:
+                self._stored.discard(keys[i])
         if not found:
             return [None] * len(keys)
         lengths = [int(entries[i]["length"]) for i in found]
@@ -748,6 +792,7 @@ class RemoteStorageClient:
         t3 = time.perf_counter()
         leases: list[RemoteReadLease | None] = [None] * len(keys)
         for s, i, n in zip(slots, found, lengths, strict=True):
+            self._stored.add(keys[i])  # present in this run: no need to store it
             leases[i] = RemoteReadLease(
                 self._staging.view(s)[:n], keys[i], functools.partial(self._end_read, s)
             )
