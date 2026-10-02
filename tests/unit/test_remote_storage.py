@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MaruHandler(storage_backend="remote") against an in-process pool node.
+
+The pool node is real code: a MaruServer, a CXL-backend MaruHandler on
+anonymous memory, and a RemoteServer on a ZMQ REP loop. Only NIXL is faked,
+by an agent that copies bytes between registered ranges.
+"""
+
+import threading
+import time
+from unittest.mock import patch
+
+import pytest
+
+from maru_common.config import MaruConfig
+from maru_common.storage_types import StorageError, StorageUnavailableError
+from maru_handler import MaruHandler
+from maru_remote.server import RemoteServer, serve_forever
+from maru_remote.transport import NixlTransport
+from tests.unit.remote_fakes import FakeClock, FakeNixlAgent, reset_fake_agents
+
+PAGE = 64 * 1024
+POOL_AGENT = "maru-remote-test"
+
+
+@pytest.fixture(autouse=True)
+def _fake_nixl():
+    reset_fake_agents()
+
+    def factory(name, ucx_device):
+        return NixlTransport(name, agent=FakeNixlAgent(name))
+
+    with patch("maru_handler.storage.remote._default_transport", side_effect=factory):
+        yield
+    reset_fake_agents()
+
+
+@pytest.fixture
+def pool_handler(server_thread, server_port):
+    h = MaruHandler(
+        MaruConfig(
+            server_url=f"tcp://127.0.0.1:{server_port}",
+            pool_size=32 * PAGE,
+            chunk_size_bytes=PAGE,
+            auto_connect=False,
+            use_async_rpc=False,
+        )
+    )
+    h.connect()
+    yield h
+    h.close()
+
+
+class PoolNode:
+    """A RemoteServer on its own REP thread; restartable on the same port."""
+
+    def __init__(self, handler, port, ttl=10.0):
+        self.handler = handler
+        self.url = f"tcp://127.0.0.1:{port}"
+        self.ttl = ttl
+        self.server = None
+        self._stop = None
+        self._thread = None
+
+    def start(self):
+        self.server = RemoteServer(
+            self.handler,
+            NixlTransport(POOL_AGENT, agent=FakeNixlAgent(POOL_AGENT)),
+            pool_id="test",
+            reservation_ttl_s=self.ttl,
+        )
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=serve_forever,
+            args=(self.server, self.url),
+            kwargs={"stop_event": self._stop, "sweep_interval_s": 0.05},
+            daemon=True,
+        )
+        self._thread.start()
+        time.sleep(0.05)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self.server.close()
+
+    def stats(self):
+        return self.server.handle({"op": "stats"})
+
+
+@pytest.fixture
+def pool(pool_handler, unused_port):
+    node = PoolNode(pool_handler, unused_port)
+    node.start()
+    yield node
+    node.stop()
+
+
+@pytest.fixture
+def unused_port():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def remote_handler(
+    url, *, namespace="ns-a", staging=8 * PAGE, metadata_only=False, **kw
+):
+    cfg = MaruConfig(
+        storage_backend="remote",
+        remote_url=url,
+        cache_namespace=namespace,
+        pool_size=0 if metadata_only else staging,
+        chunk_size_bytes=PAGE,
+        metadata_only=metadata_only,
+        auto_connect=False,
+        timeout_ms=300,
+        remote_transfer_timeout_s=kw.pop("transfer_timeout", 0.05),
+        remote_retry_s=kw.pop("retry_s", 5.0),
+        **kw,
+    )
+    h = MaruHandler(cfg)
+    assert h.connect()
+    return h
+
+
+def _store(h, key, payload: bytes):
+    a = h.alloc(len(payload))
+    a.buf[:] = payload
+    return h.batch_store([key], [a])[0]
+
+
+def test_store_exists_retrieve_release_roundtrip(pool):
+    h = remote_handler(pool.url)
+    assert _store(h, "k1", b"x" * 1000) is True
+    assert h.batch_exists(["k1", "k2"]) == [True, False]
+    assert h.has_local("k1")
+    lease, missing = h.batch_retrieve(["k1", "k2"])
+    assert missing is None and bytes(lease.view) == b"x" * 1000
+    staging = h.get_stats()["remote_storage"]
+    assert staging["outstanding_leases"] == 1
+    h.release_retrieved([lease, missing])
+    stats = h.get_stats()["remote_storage"]
+    assert (
+        stats["outstanding_leases"] == 0
+        and stats["staging_free"] == stats["staging_slots"]
+    )
+    assert stats["server"]["tickets"] == 0  # unpinned right after the READ
+    h.close()
+
+
+def test_two_workers_share_one_namespace(pool):
+    a = remote_handler(pool.url)
+    b = remote_handler(pool.url)
+    assert _store(a, "shared", b"\x01\x02" * 500)
+    (lease,) = b.batch_retrieve(["shared"])
+    assert bytes(lease.view) == b"\x01\x02" * 500
+    lease.release()
+    assert _store(b, "shared", b"other" * 10) is True  # already present: True
+    (again,) = a.batch_retrieve(["shared"])
+    assert bytes(again.view) == b"\x01\x02" * 500  # first value wins
+    again.release()
+    a.close()
+    b.close()
+
+
+def test_namespaces_do_not_share_keys(pool):
+    a = remote_handler(pool.url, namespace="ns-a")
+    other = remote_handler(pool.url, namespace="ns-b")
+    assert _store(a, "k", b"a" * 10)
+    assert other.batch_exists(["k"]) == [False]
+    assert other.batch_retrieve(["k"]) == [None]
+    a.close()
+    other.close()
+
+
+def test_metadata_only_handler_checks_existence_only(pool):
+    a = remote_handler(pool.url)
+    _store(a, "k", b"z")
+    sched = remote_handler(pool.url, metadata_only=True)
+    assert sched.batch_exists(["k", "nope"]) == [True, False]
+    with pytest.raises(RuntimeError):
+        sched.alloc(1)
+    assert FakeNixlAgent.registry.keys() >= {POOL_AGENT}
+    assert not any(
+        n.startswith("maru-remote-client") and n.endswith(sched.instance_id)
+        for n in FakeNixlAgent.registry
+    )  # no NIXL agent for control-only
+    sched.close()
+    a.close()
+
+
+def test_unreachable_server_is_unavailable_not_a_config_error(unused_port):
+    with pytest.raises(StorageUnavailableError):
+        remote_handler(f"tcp://127.0.0.1:{unused_port}")
+
+
+def test_page_smaller_than_an_object_is_a_config_error(pool):
+    cfg = MaruConfig(
+        storage_backend="remote",
+        remote_url=pool.url,
+        cache_namespace="ns",
+        pool_size=8 * PAGE * 2,
+        chunk_size_bytes=2 * PAGE,
+        auto_connect=False,
+        timeout_ms=300,
+    )
+    with pytest.raises(StorageError, match="page"):
+        MaruHandler(cfg).connect()
+
+
+def test_reservation_lifetime_must_cover_two_transfer_timeouts(pool):
+    with pytest.raises(StorageError, match="twice"):
+        remote_handler(pool.url, transfer_timeout=6.0)  # pool TTL is 10 s
+
+
+def test_outage_skips_calls_until_retry_then_reconnects(pool):
+    h = remote_handler(pool.url)
+    clock = FakeClock()
+    h._storage._clock = clock
+    assert _store(h, "before", b"1")
+    pool.stop()
+    t0 = time.monotonic()
+    assert h.batch_exists(["before"]) == [False]  # one control timeout trips it
+    assert h.batch_exists(["before"]) == [False]  # skipped without waiting
+    assert time.monotonic() - t0 < 1.0
+    with pytest.raises(StorageUnavailableError):
+        h.alloc(1)
+    with pytest.raises(StorageUnavailableError):
+        h.batch_retrieve(["before"])
+    pool.start()  # a new server generation
+    clock.advance(6.0)
+    assert h.batch_exists(["before"]) == [True]  # keys live in the MaruServer
+    assert not h.has_local("before")  # the restart cleared what this handler knew
+    assert _store(h, "after", b"2")
+    h.close()
+
+
+def test_restart_is_detected_on_the_next_reply(pool):
+    h = remote_handler(pool.url)
+    assert _store(h, "k", b"1")
+    pool.stop()
+    pool.start()
+    assert h.batch_exists(["k"]) == [False]  # the reply's generation differs
+    assert h.batch_exists(["k"]) == [True]  # reconnected without a cool-down
+    h.close()
+
+
+def test_write_timeout_isolates_slots_and_pages_until_it_ends(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    client_agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    client_agent.stall = True
+    assert _store(h, "slow", b"s" * PAGE) is False
+    stats = h.get_stats()["remote_storage"]
+    assert stats["quarantined_slots"] == 1 and stats["staging_free"] == 3
+    server = pool.stats()
+    assert server["quarantined"] == 1 and server["reservations"] == 0
+    client_agent.stall = False
+    client_agent.finish_stalled()  # the late WRITE lands in the quarantined page
+    h._storage._retry_at = 0.0  # end the cool-down without waiting
+    assert _store(h, "next", b"n" * 10) is True
+    stats = h.get_stats()["remote_storage"]
+    assert stats["quarantined_slots"] == 0 and stats["staging_free"] == 4
+    assert pool.stats()["quarantined"] == 0
+    assert h.batch_exists(["slow"]) == [False]  # the timed-out key was never published
+    h.close()
+
+
+def test_read_timeout_isolates_slots_and_releases_protection(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    assert _store(h, "k", b"r" * 100)
+    agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    agent.stall = True
+    with pytest.raises(StorageUnavailableError):
+        h.batch_retrieve(["k"])
+    assert h.get_stats()["remote_storage"]["quarantined_slots"] == 1
+    assert pool.stats()["tickets"] == 0  # a late READ only lands in the isolated slot
+    agent.stall = False
+    agent.finish_stalled()
+    h._storage._retry_at = 0.0
+    (lease,) = h.batch_retrieve(["k"])
+    assert bytes(lease.view) == b"r" * 100
+    lease.release()
+    assert h.get_stats()["remote_storage"]["quarantined_slots"] == 0
+    h.close()
+
+
+def test_full_staging_fails_fast_and_releases_protection(pool):
+    h = remote_handler(pool.url, staging=2 * PAGE)
+    assert _store(h, "a", b"1") and _store(h, "b", b"2")
+    held = h.alloc(1)
+    with pytest.raises(MemoryError):
+        h.batch_retrieve(["a", "b"])  # two objects, one free slot
+    assert pool.stats()["tickets"] == 0
+    h.alloc(1)
+    with pytest.raises(MemoryError):
+        h.alloc(1)
+    h.free(held)
+    h.close()
+
+
+def test_close_refuses_while_leases_are_outstanding(pool):
+    h = remote_handler(pool.url)
+    _store(h, "k", b"1")
+    (lease,) = h.batch_retrieve(["k"])
+    with pytest.raises(RuntimeError, match="lease"):
+        h.close()
+    lease.release()
+    h.close()
+
+
+def test_pin_and_delete_are_not_part_of_the_lease_contract(pool):
+    h = remote_handler(pool.url)
+    with pytest.raises(NotImplementedError, match="remote"):
+        h.pin("k")
+    with pytest.raises(NotImplementedError, match="remote"):
+        h.delete("k")
+    h.close()
+
+
+def test_healthcheck_follows_the_remote_server(pool):
+    h = remote_handler(pool.url)
+    assert h.healthcheck() is True
+    pool.stop()
+    assert h.healthcheck() is False
+    pool.start()
+    h._storage._retry_at = 0.0
+    assert h.healthcheck() is True
+    h.close()
+
+
+def test_connector_store_on_one_worker_load_on_another(pool):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+    from types import SimpleNamespace
+
+    from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+    from tests.unit.vllm_connector_helpers import (
+        make_flash_attn_metadata,
+        make_scheduler,
+        make_worker,
+        store_metadata,
+    )
+
+    extra = {
+        "maru_storage_backend": "remote",
+        "maru_remote_url": pool.url,
+        "maru_cache_namespace": "test-model-v1",
+        "maru_remote_staging_size": "64K",
+        "maru_remote_timeout_s": 0.05,
+    }
+
+    def caches(fill):
+        return {
+            f"model.layers.{i}.self_attn": torch.arange(
+                8 * 2 * 4 * 2 * 8, dtype=torch.float32
+            ).reshape(8, 2, 4, 2, 8)
+            * fill
+            + i * 2048
+            for i in range(2)
+        }
+
+    writer, reader = (
+        make_worker(4, 4, extra, num_kv_heads=2, head_size=8) for _ in range(2)
+    )
+    scheduler = make_scheduler(4, 4, extra)
+    src, dst = caches(1.0), caches(0.0)
+    for t in dst.values():
+        t.zero_()
+    attn = make_flash_attn_metadata()
+    tokens = list(range(9))  # two full chunks plus one token of compute
+    try:
+        writer.register_kv_caches(src)
+        reader.register_kv_caches(dst)
+        meta = store_metadata(
+            token_ids=tokens, block_ids=[0, 1, 2], num_scheduled_tokens=9
+        )
+        for name, tensor in reversed(list(src.items())):
+            writer.save_kv_layer(name, tensor, attn, meta)
+        request = SimpleNamespace(request_id="load", prompt_token_ids=tokens)
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (8, False)
+        context = SimpleNamespace(
+            attn_metadata=attn,
+            no_compile_layers={n: SimpleNamespace(kv_cache=t) for n, t in dst.items()},
+        )
+        load = MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="load",
+                    token_ids=tokens,
+                    block_ids=[4, 5, 6],
+                    is_store=False,
+                    num_matched_chunks=2,
+                )
+            ]
+        )
+        reader.start_load_kv(context, load)
+        assert not reader.take_failed_load_blocks()
+        for name in src:
+            torch.testing.assert_close(dst[name][4:6], src[name][0:2], rtol=0, atol=0)
+            assert torch.count_nonzero(dst[name][6]) == 0
+        stats = reader._handler.get_stats()["remote_storage"]
+        assert stats["outstanding_leases"] == 0 and stats["counters"]["loads"] == 1
+        # Storing the same prefix again is skipped: the writer knows it is there.
+        before = pool.stats()
+        for name, tensor in src.items():
+            writer.save_kv_layer(name, tensor, attn, meta)
+        assert pool.stats()["reservations"] == before["reservations"] == 0
+        # The pool goes away: the hit is reported as a load error (recompute).
+        pool.stop()
+        reader.start_load_kv(context, load)
+        assert reader.take_failed_load_blocks() == {4, 5}
+        pool.start()
+    finally:
+        for w in (writer, reader):
+            w.shutdown()
+        if scheduler._handler:
+            scheduler._handler.close()

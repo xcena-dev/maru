@@ -12,6 +12,7 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
 from tests.unit.test_vllm_cpu_config import extra, mixed_extra
+from tests.unit.test_vllm_remote_config import remote_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -19,7 +20,7 @@ from tests.unit.vllm_connector_helpers import (
 )
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_extra()])
 @pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
 @pytest.mark.parametrize(
     "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]
@@ -81,7 +82,7 @@ def test_load_only_external_tokens(config, start, end, failure):
         torch.testing.assert_close(value, expected)
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_extra()])
 def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
     scheduler = make_scheduler(4, 8, config)
     scheduler._count_matched_chunks = lambda tokens: 2
@@ -105,7 +106,7 @@ def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
     assert (meta.load_start_token, meta.load_end_token) == (4, 8)
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_extra()])
 @pytest.mark.parametrize("other_running", [False, True])
 def test_real_scheduler_preserves_other_request_sharing_prefix(
     tmp_path, config, other_running

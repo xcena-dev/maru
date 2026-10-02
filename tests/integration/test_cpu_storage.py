@@ -89,7 +89,7 @@ def test_cpu_handler_without_rm_or_dax(cpu_server, async_rpc, monkeypatch):
         for h in (worker, scheduler, other):
             assert h.connect()
             assert h._mapper is None
-        assert scheduler._cpu.pool is None
+        assert scheduler._storage.pool is None
         handle = worker.alloc(4)
         handle.buf[:] = b"test"
         assert worker.store("prefix", handle)
@@ -206,7 +206,7 @@ def test_connector_roundtrip_and_lost_hit_recomputes(cpu_server, device):
         request.prompt_token_ids = tokens[:4]
         assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
         # Cache fills at one page: admitting another object cannot overwrite it.
-        assert worker._handler._cpu.pool.usage()["allocated_bytes"] == 1024
+        assert worker._handler._storage.pool.usage()["allocated_bytes"] == 1024
         different = store_metadata(
             token_ids=list(range(10, 15)), block_ids=[0, 1], num_scheduled_tokens=5
         )
