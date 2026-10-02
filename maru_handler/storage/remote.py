@@ -45,6 +45,9 @@ _ALREADY_PRESENT = "ALREADY_PRESENT"
 # Period of the maintenance thread: one ping of its own probe client, then a
 # reconnect (server restarted or back) or an eviction sync when needed.
 _MAINTAIN_INTERVAL_S = 1.0
+# Reply deadline of a probe ping (capped by the control timeout); a ping
+# needs well under a millisecond, so a short deadline detects outages fast.
+_PROBE_TIMEOUT_MS = 500
 
 
 def _default_transport(agent_name: str, ucx_device: str) -> Any:
@@ -109,7 +112,6 @@ class RemoteStorageClient:
         self._retry_at = 0.0
         self._store_retry_at = 0.0
         self._reconnect = False
-        self._last_contact = 0.0
         self._quarantine: list[QuarantinedTransfer] = []
         self._quarantined_slots: set[int] = set()
         self._reads = 0
@@ -258,10 +260,9 @@ class RemoteStorageClient:
 
         Answers from memory and never calls the server, so the engine thread
         never waits on the network. The remembered keys belong to one server
-        run: the maintenance thread confirms the run after a few seconds of
-        silence and forgets them on a restart, and it or the next load or
-        store drops the keys the server evicted. Until then a remembered key
-        may already be gone.
+        run: the maintenance thread checks the run every round and forgets
+        them on a restart, and it or the next load or store drops the keys
+        the server evicted. Until then a remembered key may already be gone.
         """
         return self.connected and key in self._stored
 
@@ -333,7 +334,6 @@ class RemoteStorageClient:
             try:
                 scoped = [self._scope(k) for k in keys]
                 found = list(self._client.exists(scoped))
-                self._last_contact = self._clock()
                 return found
             except Exception as exc:
                 self._fail(exc, "exists")
@@ -354,18 +354,17 @@ class RemoteStorageClient:
             self._reap()
             if not keys:
                 return []
-            if not self._ready():
+            if not self._ready(connect=False):
                 raise StorageUnavailableError("remote storage is unavailable")
             return self._retrieve_locked(keys)
 
     def ping(self) -> bool:
         """True if the remote server answers now."""
         with self._lock:
-            if not self.connected or not self._ready():
+            if not self.connected or not self._ready(connect=False):
                 return False
             try:
                 self._client.ping()
-                self._last_contact = self._clock()
                 return True
             except Exception as exc:
                 self._fail(exc, "ping")
@@ -379,7 +378,7 @@ class RemoteStorageClient:
             self.config.remote_url,
             None,
             client_id=f"{self._client_id()}-probe",
-            timeout_ms=self.config.timeout_ms,
+            timeout_ms=min(self.config.timeout_ms, _PROBE_TIMEOUT_MS),
         )
         self._stop_maintainer.clear()
         self._maintainer = threading.Thread(
@@ -397,22 +396,20 @@ class RemoteStorageClient:
     def maintain(self) -> None:
         """One round of background upkeep, off the engine and scheduler paths.
 
-        Pings the server with the probe client without holding the I/O lock.
-        A failed ping stops calls for the retry period. A changed server run,
-        or a pending reconnect, reconnects under the I/O lock only once the
-        server has answered, so the reconnect is fast. Otherwise remembered
-        keys the server reported evicted are dropped.
+        The only place that reconnects after an outage or a restart. Pings
+        the server with the probe client without holding the I/O lock, also
+        while calls are stopped: a failed ping keeps calls stopped, and the
+        first answer after an outage (or a changed server run) reconnects
+        right away under the I/O lock. Otherwise drops remembered keys the
+        server reported evicted.
         """
         probe = self._probe
         if probe is None or not self.connected or self._closed:
             return
-        if self._clock() < self._retry_at:
-            return
         try:
             probe.connect()  # a ping: learns the generation and eviction count
         except Exception as exc:
-            if not self._reconnect:
-                self._trip(exc)
+            self._trip(exc)
             return
         if self._reconnect or probe.generation != getattr(
             self._client, "generation", ""
@@ -420,6 +417,7 @@ class RemoteStorageClient:
             with self._lock:
                 if self.connected and not self._closed:
                     self._reconnect = True
+                    self._retry_at = 0.0  # the server answered just now
                     self._ready()
             return
         if self._staging is not None:
@@ -476,7 +474,7 @@ class RemoteStorageClient:
             if self._staging is not None:
                 out["staging_slots"] = self._staging.count
                 out["staging_free"] = self._staging.free_count()
-            if self.connected and self._ready():
+            if self.connected and self._ready(connect=False):
                 try:
                     out["server"] = self._client.stats()
                 except Exception as exc:
@@ -548,7 +546,6 @@ class RemoteStorageClient:
         self.connected = True
         self._start_maintainer()
         self._evictions_seen = getattr(client, "evictions", 0)
-        self._last_contact = self._clock()
         logger.info(
             "remote storage connected to %s (pool %s, page %d B, %d staging slots of %d B)",
             self.config.remote_url,
@@ -636,16 +633,16 @@ class RemoteStorageClient:
             self._trip(exc)
             return False
         self._reconnect = False
-        self._last_contact = self._clock()
         if self._client.generation != old:
             logger.warning(
                 "remote server restarted (generation %s -> %s); forgetting stored keys",
                 old,
                 self._client.generation,
             )
-            self._stored.clear()
-            self._rejected.clear()
-            self._evictions_seen = getattr(self._client, "evictions", 0)
+            with self._evict_lock:
+                self._stored.clear()
+                self._rejected.clear()
+                self._evictions_seen = getattr(self._client, "evictions", 0)
         else:
             logger.info("remote server reachable again")
         return True
@@ -665,12 +662,11 @@ class RemoteStorageClient:
             if not self._ready():
                 raise
             result = call()
-        self._last_contact = self._clock()
         return result
 
     def _trip(self, exc: BaseException) -> None:
         """Stop calling the server for ``remote_retry_s`` after a failure."""
-        if self._clock() >= self._retry_at:
+        if self._clock() >= self._retry_at and not self._reconnect:
             logger.warning(
                 "remote storage unavailable for %.0fs: %s",
                 self.config.remote_retry_s,
@@ -700,7 +696,7 @@ class RemoteStorageClient:
         from maru_remote.transport import TransferTimeout
 
         self._reap()
-        if not self._ready():
+        if not self._ready(connect=False):
             return [False] * len(keys)
         assert self._staging is not None
         self._sync_from_io()
