@@ -468,8 +468,11 @@ def _bind_lease_namespace(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     reuse their own replicas (cpu/mixed); any geometry change splits them.
     """
     label = _lease_label(extra)
-    if getattr(getattr(config, "scheduler_config", None), "async_scheduling", False):
-        # A failed synchronous load is reported after the step's forward; with
+    if extra.get("maru_storage_backend") == "remote" and getattr(
+        getattr(config, "scheduler_config", None), "async_scheduling", False
+    ):
+        # Remote loads fail in normal operation (pool outage or restart). A
+        # failed synchronous load is reported after the step's forward; with
         # async scheduling vLLM has already scheduled the next step for the
         # request, and recovering from the failure then crashes the engine.
         raise ValueError(

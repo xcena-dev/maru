@@ -164,20 +164,16 @@ def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     assert scheduler._count_matched_chunks(list(range(8))) == 0
 
 
-@pytest.mark.parametrize("backend", ["cpu", "remote"])
-def test_lease_backends_require_async_scheduling_off(backend):
+def test_only_the_remote_backend_requires_async_scheduling_off():
     config = engine_config()
     config.scheduler_config = SimpleNamespace(async_scheduling=True)
-    settings = (
-        extra()
-        if backend == "cpu"
-        else {
-            "maru_storage_backend": "remote",
-            "maru_remote_url": "tcp://pool:6600",
-            "maru_cache_namespace": "model-revision-1",
-        }
-    )
+    assert _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
+    remote = {
+        "maru_storage_backend": "remote",
+        "maru_remote_url": "tcp://pool:6600",
+        "maru_cache_namespace": "model-revision-1",
+    }
     with pytest.raises(ValueError, match="--no-async-scheduling"):
-        _bind_lease_namespace(settings, config)
+        _bind_lease_namespace(remote, config)
     config.scheduler_config.async_scheduling = False
-    assert _bind_lease_namespace(settings, config)["maru_cache_namespace"]
+    assert _bind_lease_namespace(remote, config)["maru_cache_namespace"]
