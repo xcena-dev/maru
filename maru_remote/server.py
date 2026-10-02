@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -116,6 +117,8 @@ class RemoteServer:
         reservation_ttl_s: float = 60.0,
         ticket_ttl_s: float = 120.0,
         quarantine_ttl_s: float = 600.0,
+        capacity_bytes: int | None = None,
+        evict: bool = True,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -129,9 +132,24 @@ class RemoteServer:
             quarantine_ttl_s: How long pages of a timed-out WRITE stay out of
                 circulation when their client never abandons them (it died).
                 Must exceed any time the NIC could still deliver that WRITE.
+            capacity_bytes: Most pool bytes this server may hold in pages
+                (reserved, published or quarantined); None uses the device
+                until allocation fails.
+            evict: When a reservation finds the pool full, delete the least
+                recently read published keys (never pinned ones) to make
+                room. Otherwise the reservation fails with ``POOL_FULL``.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
+        self._capacity_pages = (
+            None
+            if capacity_bytes is None
+            else capacity_bytes // handler.get_chunk_size()
+        )
+        self._evict_enabled = evict
+        # Keys published through this server, least recently read first.
+        self._lru: OrderedDict[str, None] = OrderedDict()
+        self._evicted = 0
         self._transport = transport
         self._pool_id = pool_id
         self._generation = uuid.uuid4().hex
@@ -360,10 +378,17 @@ class RemoteServer:
         allocated: list[AllocHandle] = []
         reserved: dict[str, _Reservation] = {}
         pages: list[dict[str, Any]] = []
+        if self._capacity_pages is not None:
+            over = self._used_pages() + len(sizes) - self._capacity_pages
+            if over > 0 and self._evict(over) < over:
+                raise PoolFullError(
+                    f"capacity of {self._capacity_pages} pages reached and "
+                    "nothing more can be evicted"
+                )
         try:
             for size in sizes:
                 try:
-                    handle = cast(AllocHandle, self._handler.alloc(size))
+                    handle = self._alloc_page(size)
                 except ValueError as exc:
                     # Only exhaustion pauses the client's stores; any other
                     # allocation fault is reported as a plain error.
@@ -459,8 +484,10 @@ class RemoteServer:
                 statuses.append(REJECTED)
             elif was:
                 statuses.append(ALREADY_PRESENT)
+                self._touch(key)
             elif stored[i]:
                 statuses.append(CREATED)
+                self._touch(key)
             else:
                 # Another writer may have registered the key between the
                 # existence check and the register RPC.
@@ -552,6 +579,9 @@ class RemoteServer:
         entries = self._locate(keys)
         if protect:
             self._protect(ticket_id, keys, entries)
+        for key, entry in zip(keys, entries, strict=True):
+            if entry is not None:
+                self._touch(key)
         return {"entries": entries, "md_version": self._md_version}
 
     def _op_release(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -592,6 +622,10 @@ class RemoteServer:
             "regions": len(self._regions),
             "md_version": self._md_version,
             "page_bytes": self._page_bytes,
+            "used_pages": self._used_pages(),
+            "capacity_pages": self._capacity_pages,
+            "lru_keys": len(self._lru),
+            "evicted": self._evicted,
         }
 
     def _op_ping(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -633,6 +667,52 @@ class RemoteServer:
         if pinned:
             deadline = self._clock() + self._ticket_ttl_s
             self._tickets[ticket_id] = _Ticket(pinned, deadline)
+
+    def _touch(self, key: str) -> None:
+        """Mark ``key`` most recently used."""
+        self._lru[key] = None
+        self._lru.move_to_end(key)
+
+    def _used_pages(self) -> int:
+        """Pages this server's handler holds in its own regions."""
+        stats = self._handler.owned_region_manager.get_stats()
+        return int(stats["total_allocated_pages"])
+
+    def _alloc_page(self, size: int) -> AllocHandle:
+        """Allocate one page, evicting one LRU key if the allocator is full."""
+        try:
+            return cast(AllocHandle, self._handler.alloc(size))
+        except ValueError as exc:
+            if not str(exc).startswith("Cannot allocate page") or self._evict(1) < 1:
+                raise
+            return cast(AllocHandle, self._handler.alloc(size))
+
+    def _evict(self, n: int) -> int:
+        """Delete up to ``n`` least recently read published keys.
+
+        Pinned keys (being read) and keys MaruServer no longer knows are
+        skipped. Returns the number of pages freed.
+        """
+        if not self._evict_enabled or n <= 0:
+            return 0
+        freed = 0
+        for key in list(self._lru):
+            if freed >= n:
+                break
+            del self._lru[key]
+            try:
+                deleted = self._handler.delete(key)
+            except Exception:  # keep serving; the key stays where it is
+                logger.warning("eviction of %s failed", key, exc_info=True)
+                deleted = False
+            if deleted:
+                freed += 1
+            elif self._handler.exists(key):
+                self._lru[key] = None  # pinned: keep it, most recent end
+        self._evicted += freed
+        if freed:
+            logger.info("evicted %d least recently read keys", freed)
+        return freed
 
     def _locate(self, keys: list[str]) -> list[dict[str, Any] | None]:
         """Remote locations of ``keys``; None for missing or unreadable keys.

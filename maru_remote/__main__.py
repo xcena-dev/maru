@@ -100,6 +100,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=600.0,
         help="seconds a timed-out WRITE's pages stay unused if never abandoned",
     )
+    p.add_argument(
+        "--capacity",
+        type=parse_size,
+        default=None,
+        help="most pool bytes to hold (default: until the device is full)",
+    )
+    p.add_argument(
+        "--eviction",
+        choices=("lru", "none"),
+        default="lru",
+        help="when full: delete least recently read keys, or refuse new stores",
+    )
     p.add_argument("--log-level", default="INFO", help="logging level name")
     return p
 
@@ -143,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
             reservation_ttl_s=args.reservation_ttl,
             ticket_ttl_s=args.ticket_ttl,
             quarantine_ttl_s=args.quarantine_ttl,
+            capacity_bytes=args.capacity,
+            evict=args.eviction == "lru",
         )
         try:
             _serve_until_signalled(server, args.ctrl_url)
