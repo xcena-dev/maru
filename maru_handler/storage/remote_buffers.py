@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import mmap
+import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ class StagingBuffer:
 
         self.address = buffer_address(self._view)
         self._free: deque[int] = deque(range(count))
+        self._free_lock = threading.Lock()  # engine, loader and store threads
         self.cuda_registered = False
 
     def cuda_register(self) -> bool:
@@ -77,17 +79,20 @@ class StagingBuffer:
 
     def take(self, n: int = 1) -> list[int] | None:
         """Take ``n`` free slots, or None (and take nothing) if fewer remain."""
-        if len(self._free) < n:
-            return None
-        return [self._free.popleft() for _ in range(n)]
+        with self._free_lock:
+            if len(self._free) < n:
+                return None
+            return [self._free.popleft() for _ in range(n)]
 
     def give(self, slot: int) -> None:
         """Return one slot."""
-        self._free.append(slot)
+        with self._free_lock:
+            self._free.append(slot)
 
     def free_count(self) -> int:
         """Number of free slots."""
-        return len(self._free)
+        with self._free_lock:
+            return len(self._free)
 
     def view(self, slot: int) -> memoryview:
         """Writable view of one whole slot."""
