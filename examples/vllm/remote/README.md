@@ -95,9 +95,9 @@ can be compared. `maru_engine_id` is not needed.
   releases the leases. A missing chunk or any failure is reported to vLLM as a
   load error and the tokens are recomputed.
 - **Pool unreachable at start.** The engine starts without the cache and retries
-  every 5 seconds. A pool whose pages are smaller than one KV object, or whose
-  reservation lifetime is shorter than twice `maru_remote_timeout_s`, is rejected
-  at start.
+  every `maru_remote_retry_s`. A pool whose pages are smaller than one KV object,
+  or whose reservation or read-protection lifetime is shorter than twice
+  `maru_remote_timeout_s`, is rejected at start.
 - **Outage.** After a failed or timed-out control request the worker stops
   calling the pool for `maru_remote_retry_s`: lookups miss, stores are skipped and
   requests compute normally. It then reconnects.
@@ -113,11 +113,17 @@ can be compared. `maru_engine_id` is not needed.
   together; the server logs a warning when it finds regions it does not own.
 - **Full pool.** Without eviction, a full pool answers reservations with
   `POOL_FULL`; the worker then skips stores (not loads) for `maru_remote_retry_s`.
+- **Refused keys.** A key the pool refuses to publish (for example a key of an
+  earlier run that is still pinned) is not written again for
+  `maru_remote_retry_s`.
 - **Timed-out transfers.** Memory a timed-out RDMA transfer may still reach is
   not reused: its staging slots stay isolated until NIXL reports the transfer
   ended, and the pool keeps the pages of a timed-out WRITE out of circulation
   until the worker confirms the end (or, if the worker died, for
-  `--quarantine-ttl`, 600 s by default).
+  `--quarantine-ttl`, 600 s by default). If the pool restarts while such a
+  transfer is still pending, the worker drops the old pool's NIXL peer with
+  the isolated transfer outstanding; that ordering has not been exercised on
+  hardware.
 
 ## Trust model
 

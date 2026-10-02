@@ -362,10 +362,14 @@ class RemoteServer:
         pages: list[dict[str, Any]] = []
         try:
             for size in sizes:
-                try:  # sizes are validated, so a failure here is exhaustion
+                try:
                     handle = cast(AllocHandle, self._handler.alloc(size))
                 except ValueError as exc:
-                    raise PoolFullError(str(exc)) from exc
+                    # Only exhaustion pauses the client's stores; any other
+                    # allocation fault is reported as a plain error.
+                    if str(exc).startswith("Cannot allocate page"):
+                        raise PoolFullError(str(exc)) from exc
+                    raise
                 allocated.append(handle)
                 addr = buffer_address(handle.buf)
                 region = self._region_for_address(addr)

@@ -2885,11 +2885,19 @@ class MaruWorkerConnector:
                     self._fail_deferred_load(rest)
                     return
                 part = replace(req_meta, load_start_token=lo, load_end_token=hi)
-                self._load_packed(
+                failed = self._load_packed(
                     layers, [(part, len(keys), slot_mapping, infos)], attn_metadata
                 )
             finally:
                 handler.release_retrieved(infos)
+            if failed:
+                # This batch is already reported; vLLM recomputes from its
+                # first block, so the later batches are not worth reading.
+                if hi < end:
+                    self._fail_deferred_load(
+                        replace(req_meta, load_start_token=hi, load_end_token=end)
+                    )
+                return
 
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
@@ -3197,7 +3205,7 @@ class MaruWorkerConnector:
         layers: list[tuple[str, torch.Tensor, int]],
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
         attn_metadata: AttentionMetadata,
-    ) -> None:
+    ) -> set[str]:
         """Load per-chunk slabs with no GPU staging (P6 v2, packed).
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
@@ -3211,6 +3219,10 @@ class MaruWorkerConnector:
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
+
+        Returns:
+            Ids of the requests whose copy failed (already reported for
+            recompute through ``_fail_load``).
         """
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
         num_layers = len(layers)
@@ -3238,6 +3250,7 @@ class MaruWorkerConnector:
             stream_ctx = contextlib.nullcontext()
 
         dtype = layers[0][1].dtype
+        failed: set[str] = set()
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3292,6 +3305,7 @@ class MaruWorkerConnector:
                                 )
                 except Exception as e:
                     self._fail_load(req_meta, e)
+                    failed.add(req_meta.req_id)
                     continue
                 if req_meta.deferred_load:
                     with self._deferred_lock:
@@ -3316,6 +3330,7 @@ class MaruWorkerConnector:
                 _emit_timing(
                     f"packed-load {mode} {num_layers}L x {num_chunks}c (req {req_meta.req_id})"
                 )
+        return failed
 
     def _packed_load_kernel_ctx(
         self, layers: list[tuple[str, torch.Tensor, int]], attn_metadata: Any
@@ -3606,8 +3621,9 @@ class MaruWorkerConnector:
                 continue
 
             # Phase 2: single batched register. batch_store takes ownership of
-            # every handle (it frees duplicates/failures internally); it only
-            # raises before consuming any, so the except path frees them all.
+            # every handle (it frees duplicates/failures internally). It raises
+            # before consuming any, or (lease backends) after returning them,
+            # where a later free is a no-op; so the except path frees them all.
             try:
                 results = self._handler.batch_store(pending_keys, pending_handles)
             except Exception as e:
@@ -3941,8 +3957,9 @@ class MaruWorkerConnector:
             assert self._store_stream is not None
             self._store_stream.synchronize()
         # batch_store takes ownership of every handle (frees duplicates and
-        # failures internally); it only raises before consuming any, so the
-        # except path must free them all.
+        # failures internally). It raises before consuming any, or (lease
+        # backends) after returning them, where a later free is a no-op; so
+        # the except path must free them all.
         try:
             results = handler.batch_store(ready_keys, ready_handles)
         except Exception as e:
@@ -4267,9 +4284,10 @@ class MaruWorkerConnector:
         """Free alloc handles after a ``batch_store`` call raised.
 
         ``batch_store`` owns the handles once it runs (it frees duplicates and
-        failures internally); every exception it lets escape is raised before
-        any handle is consumed (connection/closing/length checks), so freeing
-        them here cannot double-free. Without this, a single RPC hiccup during
+        failures internally). The CXL path raises only before any handle is
+        consumed (connection/closing/length checks); a lease backend that
+        raises later has already returned its handles and ignores a free of
+        them. Either way freeing them here cannot double-free. Without this, a single RPC hiccup during
         a store step would leak every not-yet-registered CXL page.
         """
         handler = self._handler

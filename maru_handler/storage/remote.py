@@ -95,6 +95,8 @@ class RemoteStorageClient:
         self._transport: Any = None
         self._staging: StagingBuffer | None = None
         self._stored: set[str] = set()
+        # Keys the server refused to publish, with the time to try them again.
+        self._rejected: dict[str, float] = {}
         self._retry_at = 0.0
         self._store_retry_at = 0.0
         self._reconnect = False
@@ -164,6 +166,7 @@ class RemoteStorageClient:
                 self._staging.close()
             self._client = self._transport = self._staging = None
             self._stored.clear()
+            self._rejected.clear()
 
     def _ensure(self, data: bool = True) -> None:
         """Raise unless the backend is connected (and has a data path).
@@ -506,6 +509,7 @@ class RemoteStorageClient:
                 self._client.generation,
             )
             self._stored.clear()
+            self._rejected.clear()
         else:
             logger.info("remote server reachable again")
         return True
@@ -563,10 +567,15 @@ class RemoteStorageClient:
         if not self._ready():
             return [False] * len(keys)
         assert self._staging is not None
+        now = self._clock()
         first: dict[str, int] = {}
         for i, key in enumerate(keys):
+            if self._rejected.get(key, 0.0) > now:
+                continue  # refused recently: do not spend another WRITE on it
             first.setdefault(key, i)
         order = list(first.values())
+        if not order:
+            return [False] * len(keys)
         t0 = time.perf_counter()
         sizes = [handles[i].size for i in order]
         try:
@@ -625,6 +634,9 @@ class RemoteStorageClient:
             ok_by_key[keys[i]] = ok
             if ok:
                 self._stored.add(keys[i])
+                self._rejected.pop(keys[i], None)
+            else:
+                self._rejected[keys[i]] = self._clock() + self.config.remote_retry_s
         nbytes = sum(handles[i].size for i in order)
         self.counters["store_bytes"] += nbytes
         self.counters["write_seconds"] += t2 - t1
@@ -636,7 +648,7 @@ class RemoteStorageClient:
             (t2 - t1) * 1e3,
             (t3 - t2) * 1e3,
         )
-        return [ok_by_key[k] for k in keys]
+        return [ok_by_key.get(k, False) for k in keys]
 
     def _retrieve_locked(self, keys: list[str]) -> list[RemoteReadLease | None]:
         """Lookup with protection, READ into staging, unpin (lock held)."""
