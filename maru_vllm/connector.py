@@ -545,6 +545,17 @@ def _unkeyed_request(request: Any) -> bool:
     )
 
 
+def _handler_backoff_s(extra_config: dict[str, Any]) -> float:
+    """Seconds before retrying a failed handler connection.
+
+    A remote pool that cannot be reached costs a control timeout per attempt,
+    so the remote backend waits ``maru_remote_retry_s`` like its own breaker.
+    """
+    if extra_config.get("maru_storage_backend") == "remote":
+        return float(extra_config.get("maru_remote_retry_s", 30.0))
+    return 5.0
+
+
 def _remote_staging_bytes(extra_config: dict[str, Any], page_bytes: int) -> int:
     """Staging buffer size: the setting, or at least 64 KV objects (1 GiB minimum)."""
     if "maru_remote_staging_size" in extra_config:
@@ -1127,9 +1138,12 @@ class MaruSchedulerConnector:
                 raise ValueError(
                     f"{_lease_label(self._extra_config)} setup rejected: {exc}"
                 ) from exc
-            self._handler_retry_after = time.monotonic() + 5.0
+            backoff = _handler_backoff_s(self._extra_config)
+            self._handler_retry_after = time.monotonic() + backoff
             logger.warning(
-                "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
+                "Scheduler MaruHandler creation failed, backing off %.0fs: %s",
+                backoff,
+                exc,
             )
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
@@ -1721,9 +1735,12 @@ class MaruWorkerConnector:
                 raise ValueError(
                     f"{_lease_label(self._extra_config)} setup rejected: {exc}"
                 ) from exc
-            self._handler_retry_after = time.monotonic() + 5.0
+            backoff = _handler_backoff_s(self._extra_config)
+            self._handler_retry_after = time.monotonic() + backoff
             logger.warning(
-                "Worker MaruHandler creation failed, backing off 5s: %s", exc
+                "Worker MaruHandler creation failed, backing off %.0fs: %s",
+                backoff,
+                exc,
             )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):

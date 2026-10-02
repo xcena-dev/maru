@@ -179,3 +179,9 @@ def test_default_staging_holds_at_least_64_objects():
         conn._remote_staging_bytes({"maru_remote_staging_size": "64M"}, 32 * 1024**2)
         == 64 * 1024**2
     )
+
+
+def test_unreachable_pool_retries_on_the_remote_retry_period():
+    assert conn._handler_backoff_s(remote_extra()) == 30.0
+    assert conn._handler_backoff_s(remote_extra(maru_remote_retry_s=7)) == 7.0
+    assert conn._handler_backoff_s({"maru_storage_backend": "cpu"}) == 5.0
