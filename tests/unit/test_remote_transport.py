@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NIXL wrapper: registration bounds, batched transfers, unreleased timeouts."""
 
-import numpy as np
 import pytest
 
 from maru_remote.transport import NixlTransport, TransferTimeout, buffer_address
@@ -26,7 +25,7 @@ def pair():
 
 
 def _buf(n, fill=0):
-    arr = np.full(n, fill, dtype=np.uint8)
+    arr = bytearray([fill]) * n
     return arr, buffer_address(arr)
 
 
@@ -40,12 +39,12 @@ def test_multi_range_write_then_read(pair):
         (dst, dst_addr, a),
         (remote, remote_addr, b),
     ):
-        t.register(addr, arr.nbytes)
+        t.register(addr, len(arr))
     a.write(peer, [(src_addr, remote_addr, 32), (src_addr + 32, remote_addr + 96, 32)])
-    assert remote[:32].tolist() == [7] * 32 and remote[96:].tolist() == [7] * 32
-    assert remote[32:96].tolist() == [0] * 64
+    assert list(remote[:32]) == [7] * 32 and list(remote[96:]) == [7] * 32
+    assert list(remote[32:96]) == [0] * 64
     a.read(peer, [(dst_addr, remote_addr + 96, 32)])
-    assert dst[:32].tolist() == [7] * 32
+    assert list(dst[:32]) == [7] * 32
 
 
 def test_unregistered_remote_range_is_refused(pair):
@@ -70,7 +69,7 @@ def test_timeout_keeps_the_handle_until_the_transfer_ends(pair):
     assert fake.released == []  # the NIC may still touch the buffers
     assert pending.poll() is False
     assert fake.finish_stalled() == 1
-    assert remote.tolist() == [3] * 16  # the late transfer landed
+    assert list(remote) == [3] * 16  # the late transfer landed
     assert pending.poll() is True and len(fake.released) == 1
     assert pending.poll() is True and len(fake.released) == 1  # idempotent
 

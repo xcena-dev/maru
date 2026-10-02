@@ -3,7 +3,6 @@
 
 from unittest.mock import patch
 
-import numpy as np
 import pytest
 
 from maru_common.config import MaruConfig
@@ -78,20 +77,18 @@ def _publish(server, *pairs):
 
 
 def _write_remote(worker, peer, page, payload: bytes):
-    src = np.frombuffer(bytearray(payload), dtype=np.uint8)
-    worker.register(buffer_address(src), src.nbytes)
-    worker.write(
-        peer, [(buffer_address(src), page["base"] + page["offset"], src.nbytes)]
-    )
+    src = bytearray(payload)
+    worker.register(buffer_address(src), len(src))
+    worker.write(peer, [(buffer_address(src), page["base"] + page["offset"], len(src))])
 
 
 def _read_remote(worker, peer, entry) -> bytes:
-    dst = np.zeros(entry["length"], dtype=np.uint8)
-    worker.register(buffer_address(dst), dst.nbytes)
+    dst = bytearray(entry["length"])
+    worker.register(buffer_address(dst), len(dst))
     worker.read(
-        peer, [(buffer_address(dst), entry["base"] + entry["offset"], dst.nbytes)]
+        peer, [(buffer_address(dst), entry["base"] + entry["offset"], len(dst))]
     )
-    return dst.tobytes()
+    return bytes(dst)
 
 
 def test_hello_reports_layout_lifetimes_and_registered_region(server):
