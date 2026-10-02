@@ -60,6 +60,8 @@ logger = init_logger(__name__)
 
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
+# Internal key the connector adds to the extra config for the remote backend.
+_MAX_MODEL_LEN_KEY = "_maru_max_model_len"
 # Staging buffer of the remote storage backend (local RDMA source/target).
 DEFAULT_REMOTE_STAGING = 1024**3
 
@@ -544,7 +546,24 @@ def _bind_lease_namespace(extra: dict[str, Any], config: Any) -> dict[str, Any]:
         digest[:16],
         extra["maru_cache_namespace"],
     )
-    return {**extra, "maru_cache_namespace": digest}
+    bound = {**extra, "maru_cache_namespace": digest}
+    if extra.get("maru_storage_backend") == "remote":
+        async_scheduling = bool(
+            getattr(
+                getattr(config, "scheduler_config", None), "async_scheduling", False
+            )
+        )
+        logger.info(
+            "Maru remote storage transfers: loads %s, stores %s, vLLM async "
+            "scheduling %s",
+            "async" if _get_knob(extra, "maru_async_load") else "sync",
+            "async" if _get_knob(extra, "maru_async_store") else "sync",
+            "on" if async_scheduling else "off",
+        )
+        max_len = getattr(getattr(config, "model_config", None), "max_model_len", None)
+        if isinstance(max_len, int) and max_len > 0:
+            bound[_MAX_MODEL_LEN_KEY] = max_len
+    return bound
 
 
 def _unkeyed_request(request: Any) -> bool:
@@ -569,10 +588,13 @@ def _handler_backoff_s(extra_config: dict[str, Any]) -> float:
 
 
 def _remote_staging_bytes(extra_config: dict[str, Any], page_bytes: int) -> int:
-    """Staging buffer size: the setting, or at least 64 KV objects (1 GiB minimum)."""
+    """Staging buffer size: the setting, or the largest of 1 GiB, 64 KV objects
+    and one longest prompt's chunks (an async store stages a whole prompt)."""
     if "maru_remote_staging_size" in extra_config:
         return _parse_size(extra_config["maru_remote_staging_size"])
-    return max(DEFAULT_REMOTE_STAGING, 64 * page_bytes)
+    ct = int(extra_config.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS))
+    prompt_chunks = -(-int(extra_config.get(_MAX_MODEL_LEN_KEY, 0)) // ct)
+    return max(DEFAULT_REMOTE_STAGING, 64 * page_bytes, prompt_chunks * page_bytes)
 
 
 def _remote_handler_settings(extra_config: dict[str, Any]) -> dict[str, Any]:
@@ -2952,6 +2974,12 @@ class MaruWorkerConnector:
                 self._fail_deferred_load(rest)
                 return
         if req_meta.deferred_load:
+            logger.info(
+                "Maru: deferred leased load of %d chunks in %d batches for req %s",
+                len(chunk_keys),
+                -(-len(chunk_keys) // step),
+                req_meta.req_id,
+            )
             with self._deferred_lock:
                 self._deferred_done.add(req_meta.req_id)
 
@@ -4185,7 +4213,12 @@ class MaruWorkerConnector:
                     # copy engine rather than keeping SMs busy for the D2H.
                     slab_host.copy_(self._store_staging, non_blocking=True)
                 except Exception as e:
-                    logger.error("Maru write-behind prepare error: %s: %s", base_key, e)
+                    if isinstance(e, MemoryError | StorageUnavailableError):
+                        self._note_store_skip(base_key, e)  # rate-limited
+                    else:
+                        logger.error(
+                            "Maru write-behind prepare error: %s: %s", base_key, e
+                        )
                     if handle is not None:
                         try:
                             handler.free(handle)
