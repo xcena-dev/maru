@@ -22,7 +22,16 @@ logger = logging.getLogger(__name__)
 
 
 class RemoteError(RuntimeError):
-    """The server replied with ok=False, or the reply was malformed."""
+    """The server replied with ok=False, or the reply was malformed.
+
+    Attributes:
+        code: Machine-readable reason from the server (e.g. ``"POOL_FULL"``),
+            or None.
+    """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class RemoteTimeout(RemoteError):  # noqa: N818 (public name)
@@ -291,8 +300,10 @@ class RemoteClient:
             op: Request name.
             expect: Reply fields the caller reads; a reply without one of
                 them is an error rather than a ``KeyError``.
-            check_generation: Raise :class:`RemoteRestarted` when the reply
-                comes from a different server generation.
+            check_generation: Send the generation this client connected to
+                (the server refuses the request without executing it if it
+                restarted since) and raise :class:`RemoteRestarted` when the
+                reply comes from a different generation.
             **fields: Request fields.
 
         Returns:
@@ -306,6 +317,8 @@ class RemoteClient:
             RemoteError: if the reply has ``ok`` False, cannot be decoded or
                 lacks an expected field.
         """
+        if check_generation and self.generation:
+            fields["generation"] = self.generation
         with self._lock:
             try:
                 sock = self._socket()
@@ -330,7 +343,9 @@ class RemoteClient:
                 f"({self.generation} -> {generation})"
             )
         if not reply.get("ok"):
-            raise RemoteError(f"remote {op}: {reply.get('error', 'remote error')}")
+            raise RemoteError(
+                f"remote {op}: {reply.get('error', 'remote error')}", reply.get("code")
+            )
         missing = [name for name in expect if name not in reply]
         if missing:
             raise RemoteError(f"remote {op}: reply lacks {', '.join(missing)}")

@@ -179,7 +179,7 @@ def test_quarantined_pages_survive_expiry_until_abandoned(server, handler, clock
     tickets = [p["ticket"] for p in pages]
     assert server.handle({"op": "quarantine", "tickets": tickets})["quarantined"] == 2
     allocated = handler.owned_region_manager.get_stats()["total_allocated_pages"]
-    clock.advance(1000.0)
+    clock.advance(100.0)  # past the reservation lifetime, within quarantine
     server.sweep()
     stats = server.handle({"op": "stats"})
     assert stats["quarantined"] == 2 and stats["reservations"] == 0
@@ -312,6 +312,70 @@ def test_keys_left_by_an_earlier_run_are_missing_and_replaced(
         page2 = _reserve(srv2, PAGE)[0]
         assert _publish(srv2, (page2["ticket"], "old"))["statuses"] == ["CREATED"]
         assert srv2.handle({"op": "exists", "keys": ["old"]})["found"] == [True]
+    finally:
+        srv2.close()
+        fresh.close()
+
+
+def test_never_abandoned_quarantine_expires(server, handler, clock):
+    pages = _reserve(server, PAGE)
+    server.handle({"op": "quarantine", "tickets": [pages[0]["ticket"]]})
+    allocated = handler.owned_region_manager.get_stats()["total_allocated_pages"]
+    clock.advance(601.0)
+    server.sweep()
+    assert server.handle({"op": "stats"})["quarantined"] == 0
+    assert (
+        handler.owned_region_manager.get_stats()["total_allocated_pages"]
+        == allocated - 1
+    )
+
+
+def test_full_pool_is_reported_with_a_code(server, handler):
+    with patch.object(handler, "alloc", side_effect=ValueError("pool exhausted")):
+        r = server.handle({"op": "reserve", "client_id": "w", "sizes": [PAGE]})
+    assert r["ok"] is False and r["code"] == "POOL_FULL"
+
+
+def test_requests_from_an_earlier_run_are_refused_unexecuted(server):
+    page = _reserve(server, PAGE)[0]
+    r = server.handle(
+        {
+            "op": "publish",
+            "generation": "old-run",
+            "entries": [{"ticket": page["ticket"], "key": "k"}],
+        }
+    )
+    assert r["ok"] is False and r["generation"] == server.generation
+    assert server.handle({"op": "stats"})["reservations"] == 1  # nothing ran
+
+
+def test_a_pinned_stale_key_is_rejected_not_reported_stored(
+    server, handler, server_port
+):
+    page = _reserve(server, PAGE)[0]
+    _publish(server, (page["ticket"], "old"))
+    assert handler.batch_pin(["old"]) == [True]  # an earlier run died holding a read
+    fresh = MaruHandler(
+        MaruConfig(
+            server_url=f"tcp://127.0.0.1:{server_port}",
+            pool_size=16 * PAGE,
+            chunk_size_bytes=PAGE,
+            auto_connect=False,
+            use_async_rpc=False,
+        )
+    )
+    fresh.connect()
+    reset_fake_agents()
+    srv2 = RemoteServer(
+        fresh, NixlTransport("pool2", agent=FakeNixlAgent("pool2")), pool_id="p2"
+    )
+    try:
+        allocated = fresh.owned_region_manager.get_stats()["total_allocated_pages"]
+        page2 = _reserve(srv2, PAGE)[0]
+        assert _publish(srv2, (page2["ticket"], "old"))["statuses"] == ["REJECTED"]
+        assert (
+            fresh.owned_region_manager.get_stats()["total_allocated_pages"] == allocated
+        )
     finally:
         srv2.close()
         fresh.close()
