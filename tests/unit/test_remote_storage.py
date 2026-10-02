@@ -948,3 +948,23 @@ def test_a_failed_transfer_keeps_calls_stopped_although_probes_answer(pool):
     h._storage.maintain()
     assert _store(h, "next", b"n") is True
     h.close()
+
+
+def test_a_restart_reconnects_although_a_transfer_failed(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
+    agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    agent.stall = True
+    assert _store(h, "slow", b"s" * PAGE) is False  # the WRITE times out
+    agent.stall = False
+    agent.finish_stalled()
+    pool.stop()
+    pool.start()  # a new server run, well inside the retry period
+    h._storage.maintain()
+    assert _store(h, "next", b"n") is True  # reconnected to the new run
+    h.close()
