@@ -233,17 +233,22 @@ MaruServer. Engines on different servers that use the same
 
 Provide `maru_remote_url` (the pool node's control endpoint),
 `maru_remote_ucx_device` (the local RDMA NIC) and `maru_cache_namespace`.
-`maru_remote_staging_size` (default: 64 KV objects, at least `1G`) sizes the
-worker's RDMA staging buffer.
-The remote backend uses the CPU mode's synchronous chunkwise path, so the same
-requirements apply: `--enforce-eager`, `TP=PP=DP=1`, unquantized KV and
-`kv_load_failure_policy="recompute"`. It also requires `--no-async-scheduling`:
-remote loads can fail while the pool is down or restarting, and with vLLM's
-asynchronous scheduling a failed synchronous load cannot be recomputed safely,
-so the connector refuses to start with it. Loads are split into
-batches the staging buffer can hold. When the pool is unreachable, lookups miss
-and stores are skipped for `maru_remote_retry_s` (default 30 s) while requests
-compute normally. See the
+`maru_remote_staging_size` (default: one `max_model_len` prompt, at least 64 KV
+objects and `1G`) sizes the worker's RDMA staging buffer, which is page-locked
+for CUDA. The remote backend follows CPU mode's lease rules (the pool is
+re-checked for every request, only the external token range is loaded, leases
+are released after the copy) but uses the default transfer path: the
+`maru_kv_ops` kernels and `maru_async_load` / `maru_async_store`, which are
+recommended. The requirements are `--enforce-eager`, `TP=PP=DP=1`, unquantized
+KV, chunkwise storage and `kv_load_failure_policy="recompute"`. Synchronous
+remote loads also require `--no-async-scheduling`: remote loads can fail while
+the pool is down or restarting, and a failed synchronous load cannot be
+recomputed safely under vLLM's async scheduling. With `maru_async_load` the
+failure is reported before the request is scheduled, so async scheduling can
+stay on. Loads are split into batches the staging buffer can hold. When the
+pool is unreachable, lookups miss and stores are skipped for
+`maru_remote_retry_s` (default 30 s) while requests compute normally. A full
+pool evicts its least recently read keys. See the
 [remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
 for launch commands, failure behaviour and the trust model.
 
