@@ -79,6 +79,8 @@ class RemoteClient:
         self.peer = ""
         self.md_version = -1
         self.generation = ""
+        # Keys the server has evicted in its current run, as of the last reply.
+        self.evictions = 0
         self.hello: dict[str, Any] = {}
         self._url = ctrl_url
         self._timeout_ms = timeout_ms
@@ -349,6 +351,9 @@ class RemoteClient:
         missing = [name for name in expect if name not in reply]
         if missing:
             raise RemoteError(f"remote {op}: reply lacks {', '.join(missing)}")
+        evictions = reply.get("evictions")
+        if isinstance(evictions, int) and not isinstance(evictions, bool):
+            self.evictions = evictions
         return reply
 
     def _socket(self) -> zmq.Socket:

@@ -424,6 +424,7 @@ def test_a_full_pool_evicts_the_least_recently_read_key(handler):
         ]
         stats = srv.handle({"op": "stats"})
         assert stats["evicted"] == 1 and stats["used_pages"] == 3
+        assert srv.handle({"op": "ping"})["evictions"] == 1  # on every reply
     finally:
         srv.close()
 
