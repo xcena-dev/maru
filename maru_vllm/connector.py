@@ -3431,7 +3431,8 @@ class MaruWorkerConnector:
           ``(chunk x layer)`` GPU->CXL copies into one transfer per chunk.
         - **Fallback** (non-Flash layout, CPU, or an unbuilt ``maru_kv_ops``): each
           layer's Flash extract ``[2, chunk_tokens, hidden]`` is written to
-          ``slab[:, layer_idx]`` as before. Non-Flash extracts have a
+          ``slab[0, layer_idx]`` and ``slab[1, layer_idx]``, one contiguous
+          copy per K/V plane. Non-Flash extracts have a
           different rank and will raise (caught below → chunk skipped →
           recompute).
         """
@@ -3523,12 +3524,15 @@ class MaruWorkerConnector:
                         handle, written = pending
 
                     # Whole slab as [2, num_layers, tokens, hidden]; write this
-                    # layer's [2, tokens, hidden] plane (strided K/V write).
+                    # layer's K and V planes.
                     slab_bytes = layer_bytes * self._num_layers
                     slab = torch.frombuffer(
                         handle.buf[:slab_bytes], dtype=kv_contig.dtype
                     ).view(kv2, self._num_layers, ntok, hidden)
-                    slab[:, layer_idx].copy_(kv_contig)  # GPU->CXL
+                    # K and V planes are each contiguous in the slab; copying
+                    # them separately avoids a strided cross-device copy.
+                    for plane in range(kv2):
+                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->slab
                     written.add(layer_idx)
                 except Exception as e:
                     logger.error("Maru packed save error: %s: %s", base_key, e)
