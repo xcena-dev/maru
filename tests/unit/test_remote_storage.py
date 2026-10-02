@@ -766,10 +766,12 @@ def test_existence_checks_do_not_wait_for_a_maintenance_probe(pool, monkeypatch)
     probe = h._storage._probe
     started, release = threading.Event(), threading.Event()
 
+    from maru_remote.client import RemoteTimeout
+
     def slow_connect():
         started.set()
         release.wait(5)  # a server that does not answer the probe
-        raise TimeoutError("probe timed out")
+        raise RemoteTimeout("probe timed out")
 
     monkeypatch.setattr(probe, "connect", slow_connect)
     t = threading.Thread(target=h._storage.maintain)
@@ -783,7 +785,10 @@ def test_existence_checks_do_not_wait_for_a_maintenance_probe(pool, monkeypatch)
     finally:
         release.set()
         t.join()
-    assert h.batch_exists(["k"]) == [False]  # the failed probe tripped the backend
+    assert h._storage._retry_at == 0.0  # one failed probe does not stop calls
+    release.set()
+    h._storage.maintain()  # the second failure in a row does
+    assert h._storage._retry_at > 0.0
     h.close()
 
 
@@ -809,7 +814,8 @@ def test_a_server_that_returns_is_reconnected_before_the_retry_period_ends(pool)
     h = remote_handler(pool.url, retry_s=600.0)
     assert _store(h, "k", b"1")
     pool.stop()
-    h._storage.maintain()  # the probe fails: calls stop for the retry period
+    h._storage.maintain()  # one failed probe: a slow server is not an outage
+    h._storage.maintain()  # the second in a row stops calls for the retry period
     assert h.batch_exists(["k"]) == [False]
     h._storage.maintain()  # still down: still stopped, no exception
     pool.start()
@@ -824,7 +830,8 @@ def test_loads_and_stores_leave_the_reconnect_to_the_maintenance_thread(pool):
     h._storage._clock = clock
     assert _store(h, "k", b"1")
     pool.stop()
-    h._storage.maintain()  # trips
+    h._storage.maintain()
+    h._storage.maintain()  # two failed probes in a row: calls stop
     clock.advance(10.0)  # the retry period is over, the server still down
     t0 = time.monotonic()
     assert _store(h, "k2", b"2") is False
@@ -834,4 +841,20 @@ def test_loads_and_stores_leave_the_reconnect_to_the_maintenance_thread(pool):
     pool.start()
     h._storage.maintain()
     assert _store(h, "k2", b"2") is True
+    h.close()
+
+
+def test_an_error_reply_to_a_probe_does_not_stop_calls(pool, monkeypatch):
+    from maru_remote.client import RemoteError
+
+    h = remote_handler(pool.url)
+    assert _store(h, "k", b"1")
+
+    def error_reply():
+        raise RemoteError("remote ping: busy")
+
+    monkeypatch.setattr(h._storage._probe, "connect", error_reply)
+    for _ in range(3):
+        h._storage.maintain()
+    assert h.batch_exists(["k"]) == [True]
     h.close()

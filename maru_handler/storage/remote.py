@@ -48,6 +48,10 @@ _MAINTAIN_INTERVAL_S = 1.0
 # Reply deadline of a probe ping (capped by the control timeout); a ping
 # needs well under a millisecond, so a short deadline detects outages fast.
 _PROBE_TIMEOUT_MS = 500
+# Consecutive failed probes that stop calls. The server serves one request
+# at a time, so a long request (a region mapped while reserving pages takes
+# up to ~2 s) must not read as an outage.
+_PROBE_FAILURES_TO_STOP = 2
 
 
 def _default_transport(agent_name: str, ucx_device: str) -> Any:
@@ -123,6 +127,10 @@ class RemoteStorageClient:
         self._probe: Any = None
         # Serializes eviction syncs of the I/O threads and the maintenance thread.
         self._evict_lock = threading.Lock()
+        self._probe_failures = 0
+        # The server answered but cannot serve this handler (layout changed):
+        # reconnect only after the retry period, not on every probe.
+        self._layout_error = False
         self.counters = {
             "stores": 0,
             "store_bytes": 0,
@@ -403,13 +411,23 @@ class RemoteStorageClient:
         right away under the I/O lock. Otherwise drops remembered keys the
         server reported evicted.
         """
+        from maru_remote.client import RemoteTimeout, RemoteUnreachable
+
         probe = self._probe
         if probe is None or not self.connected or self._closed:
             return
         try:
             probe.connect()  # a ping: learns the generation and eviction count
-        except Exception as exc:
-            self._trip(exc)
+        except (RemoteTimeout, RemoteUnreachable) as exc:
+            self._probe_failures += 1
+            if self._reconnect or self._probe_failures >= _PROBE_FAILURES_TO_STOP:
+                self._trip(exc)
+            return
+        except Exception as exc:  # the server answered with an error
+            logger.warning("remote probe failed: %s", exc)
+            return
+        self._probe_failures = 0
+        if self._layout_error and self._clock() < self._retry_at:
             return
         if self._reconnect or probe.generation != getattr(
             self._client, "generation", ""
@@ -544,8 +562,8 @@ class RemoteStorageClient:
             raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
         self.connected = True
-        self._start_maintainer()
         self._evictions_seen = getattr(client, "evictions", 0)
+        self._start_maintainer()
         logger.info(
             "remote storage connected to %s (pool %s, page %d B, %d staging slots of %d B)",
             self.config.remote_url,
@@ -628,11 +646,13 @@ class RemoteStorageClient:
         except StorageError as exc:
             logger.error("remote server layout changed and cannot be used: %s", exc)
             self._trip(exc)
+            self._layout_error = True
             return False
         except Exception as exc:
             self._trip(exc)
             return False
         self._reconnect = False
+        self._layout_error = False
         if self._client.generation != old:
             logger.warning(
                 "remote server restarted (generation %s -> %s); forgetting stored keys",
