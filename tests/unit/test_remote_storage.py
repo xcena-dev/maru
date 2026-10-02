@@ -24,6 +24,14 @@ POOL_AGENT = "maru-remote-test"
 
 
 @pytest.fixture(autouse=True)
+def _no_background_maintenance(monkeypatch):
+    """Tests run maintenance rounds themselves unless they shorten the period."""
+    import maru_handler.storage.remote as remote_mod
+
+    monkeypatch.setattr(remote_mod, "_MAINTAIN_INTERVAL_S", 3600.0)
+
+
+@pytest.fixture(autouse=True)
 def _fake_nixl():
     reset_fake_agents()
 
@@ -284,7 +292,7 @@ def test_write_timeout_isolates_slots_and_pages_until_it_ends(pool):
     assert server["quarantined"] == 1 and server["reservations"] == 0
     client_agent.stall = False
     client_agent.finish_stalled()  # the late WRITE lands in the quarantined page
-    h._storage._retry_at = 0.0  # end the cool-down without waiting
+    h._storage.maintain()  # the server answers the probe: reconnect now
     assert _store(h, "next", b"n" * 10) is True
     stats = h.get_stats()["remote_storage"]
     assert stats["quarantined_slots"] == 0 and stats["staging_free"] == 4
@@ -308,7 +316,7 @@ def test_read_timeout_isolates_slots_and_releases_protection(pool):
     assert pool.stats()["tickets"] == 0  # a late READ only lands in the isolated slot
     agent.stall = False
     agent.finish_stalled()
-    h._storage._retry_at = 0.0
+    h._storage.maintain()  # the server answers the probe: reconnect now
     (lease,) = h.batch_retrieve(["k"])
     assert bytes(lease.view) == b"r" * 100
     lease.release()
@@ -355,7 +363,7 @@ def test_healthcheck_follows_the_remote_server(pool):
     pool.stop()
     assert h.healthcheck() is False
     pool.start()
-    h._storage._retry_at = 0.0
+    h._storage.maintain()  # the server answers the probe: reconnect now
     assert h.healthcheck() is True
     h.close()
 
@@ -795,3 +803,35 @@ def test_the_maintenance_thread_drops_keys_another_worker_evicted(
         b.close()
     finally:
         node.stop()
+
+
+def test_a_server_that_returns_is_reconnected_before_the_retry_period_ends(pool):
+    h = remote_handler(pool.url, retry_s=600.0)
+    assert _store(h, "k", b"1")
+    pool.stop()
+    h._storage.maintain()  # the probe fails: calls stop for the retry period
+    assert h.batch_exists(["k"]) == [False]
+    h._storage.maintain()  # still down: still stopped, no exception
+    pool.start()
+    h._storage.maintain()  # the server answers: reconnect at once
+    assert h.batch_exists(["k"]) == [True]
+    h.close()
+
+
+def test_loads_and_stores_leave_the_reconnect_to_the_maintenance_thread(pool):
+    h = remote_handler(pool.url)
+    clock = FakeClock()
+    h._storage._clock = clock
+    assert _store(h, "k", b"1")
+    pool.stop()
+    h._storage.maintain()  # trips
+    clock.advance(10.0)  # the retry period is over, the server still down
+    t0 = time.monotonic()
+    assert _store(h, "k2", b"2") is False
+    with pytest.raises(StorageUnavailableError):
+        h.batch_retrieve(["k"])
+    assert time.monotonic() - t0 < 0.2  # neither tried to reconnect
+    pool.start()
+    h._storage.maintain()
+    assert _store(h, "k2", b"2") is True
+    h.close()
