@@ -189,11 +189,8 @@ Start the server with `maru-server --cpu-only`; this avoids all CXL/RM
 initialization. The default backend remains CXL.
 
 CPU mode requires `maru_cpu_pool_size`, a unique `maru_engine_id` per engine,
-an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`,
-`--no-async-scheduling` and `kv_load_failure_policy="recompute"` in the KV
-transfer configuration. Loads run synchronously inside the step; with vLLM's
-asynchronous scheduling a failed load could not be recomputed safely, so the
-connector refuses to start with it. It supports
+an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`, and
+`kv_load_failure_policy="recompute"` in the KV transfer configuration. It supports
 one worker, homogeneous unquantized KV layers and synchronous chunkwise transfers.
 A full pool skips new stores. Sharing, eviction and async/layerwise CPU transfers
 are not enabled in M1.
@@ -239,8 +236,11 @@ Provide `maru_remote_url` (the pool node's control endpoint),
 `maru_remote_staging_size` (default: 64 KV objects, at least `1G`) sizes the
 worker's RDMA staging buffer.
 The remote backend uses the CPU mode's synchronous chunkwise path, so the same
-requirements apply: `--enforce-eager`, `--no-async-scheduling`, `TP=PP=DP=1`,
-unquantized KV and `kv_load_failure_policy="recompute"`. Loads are split into
+requirements apply: `--enforce-eager`, `TP=PP=DP=1`, unquantized KV and
+`kv_load_failure_policy="recompute"`. It also requires `--no-async-scheduling`:
+remote loads can fail while the pool is down or restarting, and with vLLM's
+asynchronous scheduling a failed synchronous load cannot be recomputed safely,
+so the connector refuses to start with it. Loads are split into
 batches the staging buffer can hold. When the pool is unreachable, lookups miss
 and stores are skipped for `maru_remote_retry_s` (default 30 s) while requests
 compute normally. See the
