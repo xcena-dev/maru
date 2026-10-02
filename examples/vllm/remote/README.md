@@ -57,7 +57,9 @@ The pool grows past `--pool-size` region by region as Maru's CXL pool does,
 up to `--capacity` (or until the device is full). A reservation that would
 exceed it evicts the least recently read published keys; keys being read are
 pinned and never evicted. `--eviction none` instead refuses new stores when
-full.
+full. Workers skip storing keys they stored or read in the current server run;
+after the server reports an eviction they check which keys are still present
+and write only the missing ones, so evicted prefixes are stored again.
 `MARU_PLUGINS=none` keeps device plugins out of the server process and the empty
 `CUDA_VISIBLE_DEVICES` keeps it from registering the pool with CUDA.
 
