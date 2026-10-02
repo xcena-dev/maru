@@ -54,8 +54,9 @@ def pool_handler(server_thread, server_port):
 class PoolNode:
     """A RemoteServer on its own REP thread; restartable on the same port."""
 
-    def __init__(self, handler, port, ttl=10.0):
+    def __init__(self, handler, port, ttl=10.0, **server_kw):
         self.handler = handler
+        self.server_kw = server_kw
         self.url = f"tcp://127.0.0.1:{port}"
         self.ttl = ttl
         self.server = None
@@ -68,6 +69,7 @@ class PoolNode:
             NixlTransport(POOL_AGENT, agent=FakeNixlAgent(POOL_AGENT)),
             pool_id="test",
             reservation_ttl_s=self.ttl,
+            **self.server_kw,
         )
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -91,6 +93,14 @@ class PoolNode:
 @pytest.fixture
 def pool(pool_handler, unused_port):
     node = PoolNode(pool_handler, unused_port)
+    node.start()
+    yield node
+    node.stop()
+
+
+@pytest.fixture
+def pool_no_evict(pool_handler, unused_port):
+    node = PoolNode(pool_handler, unused_port, evict=False)
     node.start()
     yield node
     node.stop()
@@ -499,7 +509,8 @@ def test_close_abandons_pages_of_ended_writes(pool):
     assert pool.stats()["quarantined"] == 0
 
 
-def test_a_full_pool_pauses_stores_but_not_loads(pool):
+def test_a_full_pool_pauses_stores_but_not_loads(pool_no_evict):
+    pool = pool_no_evict
     h = remote_handler(pool.url, staging=4 * PAGE)
     clock = FakeClock()
     h._storage._clock = clock
@@ -611,3 +622,21 @@ def test_has_local_does_not_wait_for_a_transfer_in_flight(pool):
         t.join()
     assert h.has_local("k")  # confirmed once the lock is free
     h.close()
+
+
+def test_stores_beyond_capacity_evict_the_least_recently_read(
+    pool_handler, unused_port
+):
+    node = PoolNode(pool_handler, unused_port, capacity_bytes=2 * PAGE)
+    node.start()
+    try:
+        h = remote_handler(node.url, staging=4 * PAGE)
+        assert _store(h, "old", b"1") and _store(h, "warm", b"2")
+        (lease,) = h.batch_retrieve(["warm"])  # read: now most recent
+        lease.release()
+        assert _store(h, "new", b"3") is True
+        assert h.batch_exists(["old", "warm", "new"]) == [False, True, True]
+        assert node.stats()["evicted"] == 1
+        h.close()
+    finally:
+        node.stop()

@@ -389,3 +389,75 @@ def test_a_pinned_stale_key_is_rejected_not_reported_stored(
     finally:
         srv2.close()
         fresh.close()
+
+
+def _capped_server(handler, pages, evict=True):
+    return RemoteServer(
+        handler,
+        NixlTransport("capped", agent=FakeNixlAgent("capped")),
+        pool_id="capped",
+        capacity_bytes=pages * PAGE,
+        evict=evict,
+    )
+
+
+def _fill(srv, *keys):
+    for key in keys:
+        (page,) = _reserve(srv, PAGE)
+        assert _publish(srv, (page["ticket"], key))["statuses"] == ["CREATED"]
+
+
+def test_a_full_pool_evicts_the_least_recently_read_key(handler):
+    srv = _capped_server(handler, 3)
+    try:
+        _fill(srv, "k1", "k2", "k3")
+        r = srv.handle(
+            {"op": "lookup", "keys": ["k1"], "ticket_id": "t", "protect": False}
+        )
+        assert r["entries"][0] is not None  # k1 is now the most recently read
+        _fill(srv, "k4")
+        assert handler.batch_exists(["k1", "k2", "k3", "k4"]) == [
+            True,
+            False,
+            True,
+            True,
+        ]
+        stats = srv.handle({"op": "stats"})
+        assert stats["evicted"] == 1 and stats["used_pages"] == 3
+    finally:
+        srv.close()
+
+
+def test_eviction_skips_pinned_keys(handler):
+    srv = _capped_server(handler, 2)
+    try:
+        _fill(srv, "a", "b")
+        assert handler.batch_pin(["a"]) == [True]  # a reader holds the oldest key
+        _fill(srv, "c")
+        assert handler.batch_exists(["a", "b", "c"]) == [True, False, True]
+        handler.batch_unpin(["a"])
+    finally:
+        srv.close()
+
+
+def test_a_full_pool_without_eviction_reports_pool_full(handler):
+    srv = _capped_server(handler, 1, evict=False)
+    try:
+        _fill(srv, "only")
+        r = srv.handle({"op": "reserve", "client_id": "w", "sizes": [PAGE]})
+        assert r["ok"] is False and r["code"] == "POOL_FULL"
+    finally:
+        srv.close()
+
+
+def test_a_pool_of_pinned_keys_reports_pool_full(handler):
+    srv = _capped_server(handler, 1)
+    try:
+        _fill(srv, "held")
+        assert handler.batch_pin(["held"]) == [True]
+        r = srv.handle({"op": "reserve", "client_id": "w", "sizes": [PAGE]})
+        assert r["ok"] is False and r["code"] == "POOL_FULL"
+        assert handler.exists("held")
+        handler.batch_unpin(["held"])
+    finally:
+        srv.close()
