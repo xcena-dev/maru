@@ -51,17 +51,16 @@ def test_remote_settings_require_the_remote_backend(backend):
 
 
 @pytest.mark.parametrize(
-    "knob",
-    [
-        "maru_async_load",
-        "maru_async_store",
-        "maru_overlap_load_with_compute",
-        "maru_use_layerwise",
-    ],
+    "knob", ["maru_overlap_load_with_compute", "maru_use_layerwise"]
 )
-def test_remote_rides_the_synchronous_chunkwise_lease_path(knob):
+def test_remote_stays_chunkwise_without_layer_overlap(knob):
     with pytest.raises(ValueError, match="Remote storage"):
         conn._validate_storage_config(remote_extra(**{knob: True}))
+
+
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
+def test_remote_accepts_async_loads_and_stores(knob):
+    assert conn._validate_storage_config(remote_extra(**{knob: True})) is True
 
 
 @pytest.mark.parametrize("name", ["maru_remote_timeout_s", "maru_remote_retry_s"])

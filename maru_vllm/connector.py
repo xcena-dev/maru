@@ -379,9 +379,12 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
 
     Returns:
         True for the lease-based backends (cpu, mixed, remote): reads come
-        back as leases, transfers are synchronous and chunkwise, and the
-        connector binds the cache namespace to the engine geometry. False
-        for the default CXL backend.
+        back as leases that are released after the GPU copy, stored keys are
+        re-checked in the store, and the connector binds the cache namespace
+        to the engine geometry. False for the default CXL backend. The cpu
+        and mixed backends also transfer synchronously only; the remote
+        backend uses the default transfer path, including asynchronous loads
+        and stores.
     """
     backend = extra.get("maru_storage_backend", "cxl")
     if backend not in {"cxl", "cpu", "mixed", "remote"}:
@@ -397,11 +400,10 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
     else:
         _validate_cpu_config(extra, backend)
     label = _lease_label(extra)
-    for knob in (
-        "maru_async_load",
-        "maru_async_store",
-        "maru_overlap_load_with_compute",
-    ):
+    knobs = ["maru_overlap_load_with_compute"]
+    if backend != "remote":
+        knobs[:0] = ["maru_async_load", "maru_async_store"]
+    for knob in knobs:
         if _get_knob(extra, knob):
             raise ValueError(f"{label} does not support {knob}")
     if extra.get("maru_use_layerwise", False):
@@ -468,15 +470,22 @@ def _bind_lease_namespace(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     reuse their own replicas (cpu/mixed); any geometry change splits them.
     """
     label = _lease_label(extra)
-    if extra.get("maru_storage_backend") == "remote" and getattr(
-        getattr(config, "scheduler_config", None), "async_scheduling", False
+    if (
+        extra.get("maru_storage_backend") == "remote"
+        and not _get_knob(extra, "maru_async_load")
+        and getattr(
+            getattr(config, "scheduler_config", None), "async_scheduling", False
+        )
     ):
         # Remote loads fail in normal operation (pool outage or restart). A
         # failed synchronous load is reported after the step's forward; with
         # async scheduling vLLM has already scheduled the next step for the
         # request, and recovering from the failure then crashes the engine.
+        # An asynchronous load reports its failure while the request is still
+        # parked, before any step for it is scheduled.
         raise ValueError(
-            f"{label} requires async scheduling off (--no-async-scheduling)"
+            f"{label} requires async scheduling off (--no-async-scheduling) "
+            "unless maru_async_load is enabled"
         )
     if (
         getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
@@ -1518,6 +1527,7 @@ class MaruWorkerConnector:
     """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
 
     _lease_mode = False
+    _sync_lease_transfers = False
 
     def __init__(
         self,
@@ -1532,6 +1542,12 @@ class MaruWorkerConnector:
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._lease_mode = _validate_storage_config(extra_config)
+        # cpu and mixed copy leased host buffers synchronously only; the
+        # remote backend's staging buffer is page-locked for CUDA, so it uses
+        # the default transfer path (kernels, async loads and stores).
+        self._sync_lease_transfers = (
+            self._lease_mode and extra_config.get("maru_storage_backend") != "remote"
+        )
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
@@ -1977,6 +1993,9 @@ class MaruWorkerConnector:
             ):
                 continue
 
+            if self._lease_mode:
+                self._load_leased_request(layers, req_meta, attn_metadata)
+                continue
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
@@ -1987,21 +2006,6 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
-            if self._lease_mode:
-                start, end = self._external_load_range(req_meta)
-                first_chunk = start // self._kv_chunk_tokens
-                last_chunk = (end + self._kv_chunk_tokens - 1) // self._kv_chunk_tokens
-                if last_chunk > num_chunks:
-                    self._fail_deferred_load(req_meta)
-                    continue
-                self._load_leased(
-                    layers,
-                    req_meta,
-                    chunk_keys[first_chunk:last_chunk],
-                    slot_mapping,
-                    attn_metadata,
-                )
-                continue
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
@@ -2150,6 +2154,15 @@ class MaruWorkerConnector:
         """
         try:
             handler = self._handler
+            if self._lease_mode:
+                # Leases are released batch by batch once each batch's copies
+                # have completed; the request unparks after the last batch.
+                if handler is None:
+                    self._fail_deferred_load(req_meta)
+                    return
+                torch.cuda.set_device(device)
+                self._load_leased_request(layers, req_meta, self._last_attn_metadata)
+                return
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
@@ -2819,6 +2832,40 @@ class MaruWorkerConnector:
             )
         return out
 
+    def _load_leased_request(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        req_meta: MaruReqMeta,
+        attn_metadata: Any,
+    ) -> None:
+        """Load a lease-backed request's external token range.
+
+        Runs on the engine thread for synchronous loads and on the loader
+        thread for asynchronous ones (``maru_async_load``).
+
+        Args:
+            layers: ``(name, kv_cache, layer index)`` per attention layer.
+            req_meta: The request, with its external token range.
+            attn_metadata: The step's attention metadata.
+        """
+        ct = self._kv_chunk_tokens
+        chunk_keys = _req_chunk_keys(req_meta, ct)
+        num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
+        start, end = self._external_load_range(req_meta)
+        first_chunk = start // ct
+        last_chunk = (end + ct - 1) // ct
+        if num_chunks == 0 or last_chunk > num_chunks:
+            self._fail_deferred_load(req_meta)
+            return
+        slot_mapping = self._build_slot_mapping(req_meta.block_ids, num_chunks * ct)
+        self._load_leased(
+            layers,
+            req_meta,
+            chunk_keys[first_chunk:last_chunk],
+            slot_mapping,
+            attn_metadata,
+        )
+
     def _load_leased(
         self,
         layers: list[tuple[str, torch.Tensor, int]],
@@ -2831,10 +2878,11 @@ class MaruWorkerConnector:
 
         Each batch is retrieved, copied to the GPU and released before the
         next one, so a backend whose read buffers are bounded (the remote
-        backend's staging slots) can load any number of chunks. The copies
-        are synchronous, so a lease is released only after its bytes are in
-        the paged cache. A batch that cannot be read fails the request from
-        that batch on; vLLM recomputes those tokens.
+        backend's staging slots) can load any number of chunks. Each batch's
+        copies have completed before its leases are released. A batch that
+        cannot be read fails the request from that batch on; vLLM recomputes
+        those tokens. A deferred request is reported finished only after its
+        last batch (or with its failure), never between batches.
 
         Args:
             layers: ``(name, kv_cache, layer index)`` per attention layer.
@@ -2887,20 +2935,25 @@ class MaruWorkerConnector:
                     )
                     self._fail_deferred_load(rest)
                     return
-                part = replace(req_meta, load_start_token=lo, load_end_token=hi)
+                part = replace(
+                    req_meta,
+                    load_start_token=lo,
+                    load_end_token=hi,
+                    deferred_load=False,
+                )
                 failed = self._load_packed(
                     layers, [(part, len(keys), slot_mapping, infos)], attn_metadata
                 )
             finally:
                 handler.release_retrieved(infos)
             if failed:
-                # This batch is already reported; vLLM recomputes from its
-                # first block, so the later batches are not worth reading.
-                if hi < end:
-                    self._fail_deferred_load(
-                        replace(req_meta, load_start_token=hi, load_end_token=end)
-                    )
+                # vLLM recomputes from this batch's first block, so the later
+                # batches are not worth reading.
+                self._fail_deferred_load(rest)
                 return
+        if req_meta.deferred_load:
+            with self._deferred_lock:
+                self._deferred_done.add(req_meta.req_id)
 
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
@@ -3238,7 +3291,7 @@ class MaruWorkerConnector:
         # the per-chunk launches pipelined instead of serializing on the compute
         # stream. Falls back to the current stream on CPU/non-CUDA.
         dev = layers[0][1].device
-        use_stream = not self._lease_mode and (
+        use_stream = (not self._lease_mode or kernel is not None) and (
             kernel is not None or (dev.type == "cuda" and torch.cuda.is_available())
         )
         if use_stream:
@@ -3276,12 +3329,17 @@ class MaruWorkerConnector:
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
                             2, num_layers, ct, -1
                         )
+                        whole_chunk = True
                         if self._lease_mode:
                             lo = max(start - chunk_index * ct, 0)
                             hi = min(end - chunk_index * ct, ct)
+                            whole_chunk = lo == 0 and hi == ct
                             chunk_slots = chunk_slots[lo:hi]
                             slab_host = slab_host[:, :, lo:hi]
-                        if kernel is not None:
+                        # The kernel reads a contiguous [2, L, tokens, h] slab;
+                        # a partial chunk's token slice is strided, so it takes
+                        # the per-layer path.
+                        if kernel is not None and whole_chunk:
                             ops, ptrs, pbs, block_size, head_size, fmt = kernel
                             ops.multi_layer_kv_transfer(
                                 slab_host,
@@ -3349,8 +3407,8 @@ class MaruWorkerConnector:
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration.
         """
-        if self._lease_mode:
-            return None  # Leased reads are host copies, not direct-access GPU memory.
+        if self._lease_mode and not self._lease_buffers_gpu_accessible():
+            return None  # Pageable leased buffers: host copies only.
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
@@ -3494,6 +3552,12 @@ class MaruWorkerConnector:
             self._active_load_refs = [
                 entry for entry in self._active_load_refs if not entry[0].query()
             ]
+
+    def _lease_buffers_gpu_accessible(self) -> bool:
+        """Whether leased buffers are page-locked for the GPU kernels."""
+        if self._sync_lease_transfers or self._handler is None:
+            return False
+        return self._handler.storage_gpu_accessible()
 
     def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
@@ -3825,6 +3889,12 @@ class MaruWorkerConnector:
             return self._store_kernel_ctx
         if not self._kv_caches or self._num_layers <= 0:
             return None  # not registered yet; resolve on a later call
+        if (
+            self._lease_mode
+            and not self._sync_lease_transfers
+            and self._handler is None
+        ):
+            return None  # remote buffers unknown until connected; decide later
         layers = [
             (name, kv_cache, self._get_layer_index(name))
             for name, kv_cache in self._kv_caches.items()

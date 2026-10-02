@@ -38,6 +38,42 @@ class StagingBuffer:
 
         self.address = buffer_address(self._view)
         self._free: deque[int] = deque(range(count))
+        self.cuda_registered = False
+
+    def cuda_register(self) -> bool:
+        """Page-lock the buffer for CUDA so GPU copies and kernels can read it.
+
+        Best effort, as for mapped CXL regions: on failure the buffer stays
+        pageable and callers use their pageable-copy path.
+
+        Returns:
+            Whether the buffer is now registered with CUDA.
+        """
+        if self.cuda_registered:
+            return True
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            from maru_handler.memory.mapper import _clear_cuda_sticky_error, _cuda_rc
+
+            rc = _cuda_rc(
+                torch.cuda.cudart().cudaHostRegister(self.address, self.nbytes, 0)
+            )
+            if rc != 0:
+                _clear_cuda_sticky_error()
+                logger.warning(
+                    "cudaHostRegister of the remote staging buffer failed: rc=%d", rc
+                )
+                return False
+        except (ImportError, RuntimeError, OSError) as exc:
+            logger.warning(
+                "cudaHostRegister of the remote staging buffer failed: %s", exc
+            )
+            return False
+        self.cuda_registered = True
+        return True
 
     def take(self, n: int = 1) -> list[int] | None:
         """Take ``n`` free slots, or None (and take nothing) if fewer remain."""
@@ -64,6 +100,22 @@ class StagingBuffer:
 
     def close(self) -> None:
         """Unmap the buffer unless a caller still holds an exported view."""
+        if self.cuda_registered:
+            try:
+                import torch
+
+                from maru_handler.memory.mapper import (
+                    _clear_cuda_sticky_error,
+                    _cuda_rc,
+                )
+
+                if _cuda_rc(torch.cuda.cudart().cudaHostUnregister(self.address)) != 0:
+                    _clear_cuda_sticky_error()
+            except (ImportError, RuntimeError, OSError) as exc:
+                logger.warning(
+                    "cudaHostUnregister of the remote staging buffer failed: %s", exc
+                )
+            self.cuda_registered = False
         try:
             self._view.release()
             self._mapping.close()
