@@ -425,6 +425,10 @@ def test_a_full_pool_evicts_the_least_recently_read_key(handler):
         stats = srv.handle({"op": "stats"})
         assert stats["evicted"] == 1 and stats["used_pages"] == 3
         assert srv.handle({"op": "ping"})["evictions"] == 1  # on every reply
+        r = srv.handle({"op": "evicted_since", "since": 0})
+        assert r["keys"] == ["k2"] and r["complete"] is True
+        r = srv.handle({"op": "evicted_since", "since": 1})
+        assert r["keys"] == [] and r["complete"] is True
     finally:
         srv.close()
 
@@ -460,5 +464,23 @@ def test_a_pool_of_pinned_keys_reports_pool_full(handler):
         assert r["ok"] is False and r["code"] == "POOL_FULL"
         assert handler.exists("held")
         handler.batch_unpin(["held"])
+    finally:
+        srv.close()
+
+
+def test_evicted_since_reports_a_truncated_log(handler):
+    srv = RemoteServer(
+        handler,
+        NixlTransport("srv", agent=FakeNixlAgent("srv")),
+        pool_id="p",
+        capacity_bytes=PAGE,
+        eviction_log_len=1,
+    )
+    try:
+        _fill(srv, "a", "b", "c")  # evicts a, then b; the log keeps only b
+        r = srv.handle({"op": "evicted_since", "since": 0})
+        assert r["keys"] == ["b"] and r["complete"] is False
+        assert srv.handle({"op": "evicted_since", "since": 1})["complete"] is True
+        assert srv.handle({"op": "evicted_since", "since": -1})["ok"] is False
     finally:
         srv.close()

@@ -100,7 +100,8 @@ class RemoteStorageClient:
         self._transport: Any = None
         self._staging: StagingBuffer | None = None
         # Keys this handler stored or read in the current server run. A hint
-        # for skipping stores: forgotten on a restart or a server eviction.
+        # for skipping stores: dropped when the server evicts them, all
+        # forgotten on a restart.
         self._stored: set[str] = set()
         self._evictions_seen = 0
         # Keys the server refused to publish, with the time to try them again.
@@ -243,18 +244,15 @@ class RemoteStorageClient:
 
         The remembered keys belong to one server run. If the server has not
         been heard from for a few seconds, a ping confirms the run first; a
-        restart clears the remembered keys so they are stored again. So does
-        an eviction the server reports: the evicted keys are not named, and
-        a store of a key that is still present skips the WRITE.
+        restart clears the remembered keys so they are stored again. Keys the
+        server evicts are dropped on the next load or store, which asks the
+        server for them; until then a remembered key may already be gone.
 
         Callers on the engine thread must not wait for another thread's
         transfer: while one holds the transfer lock the answer is False, so
         the caller stores again and the server reports the key present.
         """
-        if not self.connected:
-            return False
-        self._forget_if_evicted()
-        if key not in self._stored:
+        if not self.connected or key not in self._stored:
             return False
         if self._clock() - self._last_contact <= _STORED_KEYS_CHECK_S:
             return True
@@ -377,16 +375,29 @@ class RemoteStorageClient:
             self._fail(exc, "ping")
             self._ready()
 
-    def _forget_if_evicted(self) -> None:
-        """Forget the remembered keys once the server reports a new eviction.
+    def _sync_evictions(self) -> None:
+        """Drop remembered keys the server has evicted (I/O lock held).
 
-        Safe without the I/O lock: a key forgotten by a concurrent call is
-        only stored again, and that store finds it present.
+        Costs a control call only when the server reports new evictions. If
+        the server no longer lists all of them, every remembered key is
+        forgotten. A failed call leaves the keys for the next attempt.
         """
         evictions = getattr(self._client, "evictions", 0)
-        if evictions != self._evictions_seen:
-            self._evictions_seen = evictions
+        if evictions == self._evictions_seen:
+            return
+        try:
+            keys, complete = self._client.evicted_since(self._evictions_seen)
+        except Exception as exc:
+            self._fail(exc, "evicted_since")
+            return
+        if complete:
+            prefix = f"{self._namespace}/"
+            for key in keys:
+                if key.startswith(prefix):
+                    self._stored.discard(key[len(prefix) :])
+        else:
             self._stored.clear()
+        self._evictions_seen = evictions
 
     def stats(self) -> dict[str, Any]:
         """Local counters, staging occupancy and (if reachable) server counters."""
@@ -619,6 +630,7 @@ class RemoteStorageClient:
         if not self._ready():
             return [False] * len(keys)
         assert self._staging is not None
+        self._sync_evictions()
         now = self._clock()
         first: dict[str, int] = {}
         for i, key in enumerate(keys):
@@ -636,7 +648,6 @@ class RemoteStorageClient:
         except Exception as exc:
             self._fail(exc, "exists")
             return [False] * len(keys)
-        self._forget_if_evicted()
         ok_by_key: dict[str, bool] = {}
         for i, found in zip(order, present, strict=True):
             if found:
@@ -645,6 +656,10 @@ class RemoteStorageClient:
                 self._rejected.pop(keys[i], None)
         order = [i for i, found in zip(order, present, strict=True) if not found]
         self.counters["store_skipped_present"] += len(ok_by_key)
+        if ok_by_key:
+            logger.debug(
+                "remote store: %d keys already present, not written", len(ok_by_key)
+            )
         if not order:
             return [ok_by_key.get(k, False) for k in keys]
         sizes = [handles[i].size for i in order]
@@ -698,7 +713,6 @@ class RemoteStorageClient:
                 self._abandon_quietly(tickets)  # unknown tickets are skipped
             return [ok_by_key.get(k, False) for k in keys]
         t3 = time.perf_counter()
-        self._forget_if_evicted()
         for i, status in zip(order, statuses, strict=True):
             ok = status in (_CREATED, _ALREADY_PRESENT)
             ok_by_key[keys[i]] = ok
@@ -707,6 +721,7 @@ class RemoteStorageClient:
                 self._rejected.pop(keys[i], None)
             else:
                 self._rejected[keys[i]] = self._clock() + self.config.remote_retry_s
+        self._sync_evictions()  # this reservation may have evicted keys
         nbytes = sum(handles[i].size for i in order)
         self.counters["store_bytes"] += nbytes
         self.counters["write_seconds"] += t2 - t1
@@ -741,7 +756,7 @@ class RemoteStorageClient:
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote lookup failed: {exc}") from exc
         t1 = time.perf_counter()
-        self._forget_if_evicted()
+        self._sync_evictions()
         found = [i for i, e in enumerate(entries) if e is not None]
         for i, e in enumerate(entries):
             if e is None:
