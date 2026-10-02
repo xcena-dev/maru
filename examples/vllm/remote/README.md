@@ -141,7 +141,7 @@ config = MaruConfig(
     remote_url="tcp://pool-node:6600",
     remote_ucx_device="mlx5_0:1",
     cache_namespace="opaque-bytes-v1",
-    pool_size=64 * 1024 * 1024,      # staging buffer
+    pool_size=64 * 1024 * 1024,  # staging buffer
     chunk_size_bytes=4 * 1024 * 1024,
 )
 with MaruHandler(config) as handler:
