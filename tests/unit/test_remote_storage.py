@@ -279,6 +279,8 @@ def test_restart_is_detected_and_the_call_retried(pool):
 
 def test_write_timeout_isolates_slots_and_pages_until_it_ends(pool):
     h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
     client_agent = next(
         a
         for n, a in FakeNixlAgent.registry.items()
@@ -292,7 +294,8 @@ def test_write_timeout_isolates_slots_and_pages_until_it_ends(pool):
     assert server["quarantined"] == 1 and server["reservations"] == 0
     client_agent.stall = False
     client_agent.finish_stalled()  # the late WRITE lands in the quarantined page
-    h._storage.maintain()  # the server answers the probe: reconnect now
+    clock.advance(10.0)  # a failed transfer keeps calls stopped for the period
+    h._storage.maintain()  # then the server answers the probe: reconnect
     assert _store(h, "next", b"n" * 10) is True
     stats = h.get_stats()["remote_storage"]
     assert stats["quarantined_slots"] == 0 and stats["staging_free"] == 4
@@ -303,6 +306,8 @@ def test_write_timeout_isolates_slots_and_pages_until_it_ends(pool):
 
 def test_read_timeout_isolates_slots_and_releases_protection(pool):
     h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
     assert _store(h, "k", b"r" * 100)
     agent = next(
         a
@@ -316,7 +321,8 @@ def test_read_timeout_isolates_slots_and_releases_protection(pool):
     assert pool.stats()["tickets"] == 0  # a late READ only lands in the isolated slot
     agent.stall = False
     agent.finish_stalled()
-    h._storage.maintain()  # the server answers the probe: reconnect now
+    clock.advance(10.0)  # a failed transfer keeps calls stopped for the period
+    h._storage.maintain()  # then the server answers the probe: reconnect
     (lease,) = h.batch_retrieve(["k"])
     assert bytes(lease.view) == b"r" * 100
     lease.release()
@@ -919,4 +925,26 @@ def test_a_layout_error_waits_for_the_retry_period(pool, monkeypatch):
     clock.advance(10.0)  # past remote_retry_s
     h._storage.maintain()
     assert len(calls) == 2
+    h.close()
+
+
+def test_a_failed_transfer_keeps_calls_stopped_although_probes_answer(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
+    agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    agent.stall = True
+    assert _store(h, "slow", b"s" * PAGE) is False  # the WRITE times out
+    agent.stall = False
+    agent.finish_stalled()
+    h._storage.maintain()  # the control channel answers the probe
+    with pytest.raises(StorageUnavailableError):  # the data path is not trusted yet
+        h.alloc(1)
+    clock.advance(10.0)  # past the retry period
+    h._storage.maintain()
+    assert _store(h, "next", b"n") is True
     h.close()

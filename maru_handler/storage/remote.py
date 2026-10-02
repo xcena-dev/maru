@@ -131,6 +131,10 @@ class RemoteStorageClient:
         # The server answered but cannot serve this handler (layout changed):
         # reconnect only after the retry period, not on every probe.
         self._layout_error = False
+        # An RDMA transfer failed while the control channel may still answer:
+        # a successful probe proves nothing about the data path, so calls stay
+        # stopped for the whole retry period.
+        self._transfer_fault = False
         self.counters = {
             "stores": 0,
             "store_bytes": 0,
@@ -429,7 +433,9 @@ class RemoteStorageClient:
             logger.warning("remote probe failed: %s", exc)
             return
         self._probe_failures = 0
-        if self._layout_error and self._clock() < self._retry_at:
+        if (
+            self._layout_error or self._transfer_fault
+        ) and self._clock() < self._retry_at:
             return
         if self._reconnect or probe.generation != getattr(
             self._client, "generation", ""
@@ -655,6 +661,7 @@ class RemoteStorageClient:
             return False
         self._reconnect = False
         self._layout_error = False
+        self._transfer_fault = False
         if self._client.generation != old:
             logger.warning(
                 "remote server restarted (generation %s -> %s); forgetting stored keys",
@@ -696,6 +703,11 @@ class RemoteStorageClient:
             )
         self._retry_at = self._clock() + self.config.remote_retry_s
         self._reconnect = True
+
+    def _trip_transfer(self, exc: BaseException) -> None:
+        """Stop calls after a failed RDMA transfer for the full retry period."""
+        self._trip(exc)
+        self._transfer_fault = True
 
     def _fail(self, exc: BaseException, op: str) -> None:
         """Classify a failed control call."""
@@ -785,11 +797,11 @@ class RemoteStorageClient:
             )
         except TransferTimeout as exc:
             self._isolate(exc.pending, [handles[i].slot for i in order], tickets)
-            self._trip(exc)
+            self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
         except Exception as exc:  # the transfer ended in an error state
             self._abandon_quietly(tickets)
-            self._trip(exc)
+            self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
@@ -883,14 +895,14 @@ class RemoteStorageClient:
         except TransferTimeout as exc:
             self._release_quietly(ticket_id)  # a late READ only lands in isolated slots
             self._isolate(exc.pending, slots, [])
-            self._trip(exc)
+            self._trip_transfer(exc)
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError("remote READ timed out") from exc
         except Exception as exc:
             for s in slots:
                 self._staging.give(s)
             self._release_quietly(ticket_id)
-            self._trip(exc)
+            self._trip_transfer(exc)
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote READ failed: {exc}") from exc
         t2 = time.perf_counter()
