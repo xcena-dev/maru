@@ -420,10 +420,12 @@ class RemoteStorageClient:
             probe.connect()  # a ping: learns the generation and eviction count
         except (RemoteTimeout, RemoteUnreachable) as exc:
             self._probe_failures += 1
-            if self._reconnect or self._probe_failures >= _PROBE_FAILURES_TO_STOP:
-                self._trip(exc)
+            stopped = self._clock() < self._retry_at
+            if stopped or self._probe_failures >= _PROBE_FAILURES_TO_STOP:
+                self._trip(exc)  # keep stopped, or stop after failures in a row
             return
         except Exception as exc:  # the server answered with an error
+            self._probe_failures = 0
             logger.warning("remote probe failed: %s", exc)
             return
         self._probe_failures = 0
