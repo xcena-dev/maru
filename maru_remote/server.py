@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 CREATED = "CREATED"
 ALREADY_PRESENT = "ALREADY_PRESENT"
 REJECTED = "REJECTED"
+POOL_FULL = "POOL_FULL"
+
+
+class PoolFullError(ValueError):
+    """The pool cannot allocate the requested pages (reported as code POOL_FULL)."""
 
 
 def _require_str_list(value: Any, name: str) -> list[str]:
@@ -110,6 +115,7 @@ class RemoteServer:
         pool_id: str,
         reservation_ttl_s: float = 60.0,
         ticket_ttl_s: float = 120.0,
+        quarantine_ttl_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -120,6 +126,9 @@ class RemoteServer:
             pool_id: Name reported to clients in ``hello``.
             reservation_ttl_s: Lifetime of an unpublished page reservation.
             ticket_ttl_s: Lifetime of a read ticket (pinned keys).
+            quarantine_ttl_s: How long pages of a timed-out WRITE stay out of
+                circulation when their client never abandons them (it died).
+                Must exceed any time the NIC could still deliver that WRITE.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
@@ -128,6 +137,7 @@ class RemoteServer:
         self._generation = uuid.uuid4().hex
         self._reservation_ttl_s = reservation_ttl_s
         self._ticket_ttl_s = ticket_ttl_s
+        self._quarantine_ttl_s = quarantine_ttl_s
         self._clock = clock
         self._page_bytes = handler.get_chunk_size()
         self._regions: dict[int, _Region] = {}
@@ -150,6 +160,7 @@ class RemoteServer:
             "ping": self._op_ping,
         }
         self._sync_regions()
+        self._report_foreign_regions()
 
     @property
     def generation(self) -> str:
@@ -168,6 +179,15 @@ class RemoteServer:
         """
         name = msg.get("op")
         op = self._ops.get(name) if isinstance(name, str) else None
+        expected = msg.get("generation")
+        if expected is not None and expected != self._generation:
+            # The client still holds state (tickets, NIXL peer) of an earlier
+            # server run. Refuse before executing so its retry is safe.
+            return {
+                "ok": False,
+                "generation": self._generation,
+                "error": "client is connected to an earlier server run",
+            }
         if op is None:
             return {
                 "ok": False,
@@ -177,6 +197,13 @@ class RemoteServer:
         try:
             with self._lock:
                 return {"ok": True, "generation": self._generation, **op(msg)}
+        except PoolFullError as exc:
+            return {
+                "ok": False,
+                "generation": self._generation,
+                "code": POOL_FULL,
+                "error": f"pool full: {exc}",
+            }
         except (KeyError, TypeError, ValueError) as exc:
             return {
                 "ok": False,
@@ -192,14 +219,29 @@ class RemoteServer:
             }
 
     def sweep(self) -> None:
-        """Reclaim expired reservations and release expired read tickets.
+        """Reclaim expired reservations, quarantined pages and read tickets.
 
-        Quarantined pages are never reclaimed here. Never raises. An entry
-        whose free/unpin fails (e.g. a metadata-server timeout) is logged and
-        kept, so the next sweep retries it.
+        Quarantined pages return only after ``quarantine_ttl_s`` (their client
+        normally abandons them sooner). Never raises. An entry whose
+        free/unpin fails (e.g. a metadata-server timeout) is logged and kept,
+        so the next sweep retries it.
         """
         now = self._clock()
         with self._lock:
+            for ticket, res in list(self._quarantine.items()):
+                if res.deadline > now:
+                    continue
+                try:
+                    self._handler.free(res.handle)
+                except Exception:
+                    logger.exception(
+                        "sweep: freeing quarantined page %s failed", ticket
+                    )
+                    continue
+                logger.warning(
+                    "sweep: quarantined page %s was never abandoned; freed", ticket
+                )
+                del self._quarantine[ticket]
             for ticket, res in list(self._reservations.items()):
                 if res.deadline > now:
                     continue
@@ -320,9 +362,10 @@ class RemoteServer:
         pages: list[dict[str, Any]] = []
         try:
             for size in sizes:
-                handle = cast(
-                    AllocHandle, self._handler.alloc(size)
-                )  # may map a region
+                try:  # sizes are validated, so a failure here is exhaustion
+                    handle = cast(AllocHandle, self._handler.alloc(size))
+                except ValueError as exc:
+                    raise PoolFullError(str(exc)) from exc
                 allocated.append(handle)
                 addr = buffer_address(handle.buf)
                 region = self._region_for_address(addr)
@@ -385,22 +428,34 @@ class RemoteServer:
             for k, r, ok in zip(keys, registered, readable, strict=True)
             if r and not ok
         ]
+        stuck: set[str] = set()
         if stale:
             # Keys from an earlier server run whose regions this server never
-            # registered: nobody can read them remotely, so replace them.
+            # registered: nobody can read them remotely, so replace them. A
+            # key still pinned by that run cannot be deleted and stays unusable.
             logger.warning(
                 "replacing %d unreadable keys from an earlier run", len(stale)
             )
             for key in stale:
-                self._handler.delete(key)
+                if not self._handler.delete(key):
+                    stuck.add(key)
         for ticket in tickets:
             del self._reservations[ticket]
-        stored = self._handler.batch_store(keys, list(handles))  # takes ownership
+        keep = [i for i, k in enumerate(keys) if k not in stuck]
+        for i, k in enumerate(keys):
+            if k in stuck:
+                self._handler.free(handles[i])
+        stored_kept = self._handler.batch_store(
+            [keys[i] for i in keep], [handles[i] for i in keep]
+        )  # takes ownership
+        stored = dict(zip(keep, stored_kept, strict=True))
         statuses = []
-        for key, ok, was in zip(keys, stored, existed, strict=True):
-            if was:
+        for i, (key, was) in enumerate(zip(keys, existed, strict=True)):
+            if key in stuck:
+                statuses.append(REJECTED)
+            elif was:
                 statuses.append(ALREADY_PRESENT)
-            elif ok:
+            elif stored[i]:
                 statuses.append(CREATED)
             else:
                 # Another writer may have registered the key between the
@@ -444,11 +499,12 @@ class RemoteServer:
             ``quarantined``: number of reservations moved to quarantine.
         """
         moved = 0
+        deadline = self._clock() + self._quarantine_ttl_s
         for ticket in _require_str_list(msg["tickets"], "tickets"):
             res = self._reservations.pop(ticket, None)
             if res is None:
                 continue
-            self._quarantine[ticket] = res
+            self._quarantine[ticket] = _Reservation(res.handle, res.region_id, deadline)
             moved += 1
         return {"quarantined": moved}
 
@@ -603,6 +659,29 @@ class RemoteServer:
                 }
             )
         return entries
+
+    def _report_foreign_regions(self) -> None:
+        """Warn about pool regions held by other Maru clients or an earlier run.
+
+        Keys in those regions cannot be served over RDMA (only regions this
+        server owns are registered), so they hold device capacity until
+        their keys are replaced or MaruServer restarts.
+        """
+        try:
+            stats = self._handler.get_stats()
+            total = int(stats["allocation_manager"]["num_allocations"])
+        except Exception:  # informational only
+            logger.debug("could not read allocation stats", exc_info=True)
+            return
+        foreign = total - len(self._regions)
+        if foreign > 0:
+            logger.warning(
+                "%d pool regions belong to other Maru clients or an earlier "
+                "maru-remote-server run; their keys are not served remotely. Run "
+                "maru-server for maru-remote-server alone and restart both "
+                "together to reclaim them.",
+                foreign,
+            )
 
     def _region_list(self) -> list[dict[str, int]]:
         """Return the registered regions as wire dicts, ordered by region id."""

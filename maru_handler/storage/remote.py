@@ -12,30 +12,39 @@ regions. Callers see the CPU backend's contract:
   slots, unpins them, and returns read leases over the slots that the caller
   releases after its last copy.
 
-The staging buffer is anonymous memory registered with NIXL only. CUDA treats
-it as pageable, so a GPU copy has finished reading or writing it when the copy
-call returns; releasing a lease right after the copy is safe.
+The staging buffer is anonymous memory registered with NIXL. Callers must
+finish with a slot before handing it back: the vLLM connector's lease path
+copies with blocking ``copy_``/``.to(non_blocking=False)`` calls, so a lease
+released after those calls return is no longer read by the GPU.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
-import mmap
 import threading
 import time
 import uuid
-from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 from maru_common.storage_types import StorageError, StorageUnavailableError
+
+from .remote_buffers import (
+    QuarantinedTransfer,
+    RemoteAllocation,
+    RemoteReadLease,
+    StagingBuffer,
+    release_view,
+)
 
 logger = logging.getLogger(__name__)
 
 _CREATED = "CREATED"
 _ALREADY_PRESENT = "ALREADY_PRESENT"
+# How long the keys this handler remembers storing are trusted without
+# hearing from the server; after that has_local confirms the server run.
+_STORED_KEYS_CHECK_S = 5.0
 
 
 def _default_transport(agent_name: str, ucx_device: str) -> Any:
@@ -52,105 +61,6 @@ def _default_client(
     from maru_remote.client import RemoteClient
 
     return RemoteClient(url, transport, client_id=client_id, timeout_ms=timeout_ms)
-
-
-class _Staging:
-    """Fixed-size slots carved from one anonymous mapping."""
-
-    def __init__(self, capacity: int, slot_bytes: int):
-        count = capacity // slot_bytes
-        if count < 1:
-            raise ValueError("remote staging capacity must hold at least one slot")
-        self.slot_bytes = slot_bytes
-        self.count = count
-        self.nbytes = count * slot_bytes
-        self._mapping = mmap.mmap(-1, self.nbytes)
-        self._view = memoryview(self._mapping)
-        from maru_remote.transport import buffer_address
-
-        self.address = buffer_address(self._view)
-        self._free: deque[int] = deque(range(count))
-
-    def take(self, n: int = 1) -> list[int] | None:
-        """Take ``n`` free slots, or None (and take nothing) if fewer remain."""
-        if len(self._free) < n:
-            return None
-        return [self._free.popleft() for _ in range(n)]
-
-    def give(self, slot: int) -> None:
-        """Return one slot."""
-        self._free.append(slot)
-
-    def free_count(self) -> int:
-        """Number of free slots."""
-        return len(self._free)
-
-    def view(self, slot: int) -> memoryview:
-        """Writable view of one whole slot."""
-        start = slot * self.slot_bytes
-        return self._view[start : start + self.slot_bytes]
-
-    def addr(self, slot: int) -> int:
-        """Address of the first byte of a slot."""
-        return self.address + slot * self.slot_bytes
-
-    def close(self) -> None:
-        """Unmap the buffer unless a caller still holds an exported view."""
-        try:
-            self._view.release()
-            self._mapping.close()
-        except BufferError:
-            logger.warning("remote staging buffer still exported; leaving it mapped")
-
-
-@dataclass(eq=False)
-class RemoteAllocation:
-    """A staging slot handed out by ``alloc``; ``buf`` is written by the caller."""
-
-    buf: memoryview
-    slot: int
-    size: int
-    state: str = "writing"  # writing -> submitted (batch_store) -> freed
-
-
-@dataclass(eq=False)
-class RemoteReadLease:
-    """Staging bytes of one retrieved key, valid until :meth:`release`.
-
-    Release after the final read or copy (or use a context manager); GC is not
-    the synchronization mechanism.
-    """
-
-    view: memoryview
-    key: str
-    _release: Callable[[], None]
-    _released: bool = False
-
-    def release(self) -> None:
-        """Return the staging slot; idempotent."""
-        if self._released:
-            return
-        self._released = True
-        try:
-            self.view.release()
-        except BufferError:  # a caller-held tensor still aliases the view
-            logger.debug("remote lease view of %s still exported at release", self.key)
-        self._release()
-
-    def __enter__(self) -> RemoteReadLease:
-        return self
-
-    def __exit__(self, *_: Any) -> None:
-        self.release()
-
-
-@dataclass
-class _Quarantined:
-    """Buffers a timed-out transfer may still touch."""
-
-    pending: Any
-    slots: list[int]
-    tickets: list[str] = field(default_factory=list)  # WRITE pages to abandon
 
 
 class RemoteStorageClient:
@@ -183,11 +93,13 @@ class RemoteStorageClient:
         self._namespace = config.cache_namespace
         self._client: Any = None
         self._transport: Any = None
-        self._staging: _Staging | None = None
+        self._staging: StagingBuffer | None = None
         self._stored: set[str] = set()
         self._retry_at = 0.0
+        self._store_retry_at = 0.0
         self._reconnect = False
-        self._quarantine: list[_Quarantined] = []
+        self._last_contact = 0.0
+        self._quarantine: list[QuarantinedTransfer] = []
         self._quarantined_slots: set[int] = set()
         self._reads = 0
         self._closed = False
@@ -241,7 +153,8 @@ class RemoteStorageClient:
             self._closed = True
             self.connected = False
             for q in self._quarantine:
-                q.pending.poll()  # releases finished handles; closing drops the rest
+                if q.pending.poll() and q.tickets:
+                    self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
             self._quarantine.clear()
             if self._client is not None:
                 self._client.close()
@@ -283,9 +196,9 @@ class RemoteStorageClient:
             assert self._staging is not None
             if type(size) is not int or not 0 < size <= self._staging.slot_bytes:
                 raise ValueError("remote allocation must fit in one staging slot")
-            if self._clock() < self._retry_at:
+            if self._clock() < max(self._retry_at, self._store_retry_at):
                 raise StorageUnavailableError(
-                    "remote storage is unavailable; skipping store"
+                    "remote storage is unavailable or full; skipping store"
                 )
             slots = self._staging.take(1)
             if slots is None:
@@ -301,13 +214,23 @@ class RemoteStorageClient:
             if not isinstance(handle, RemoteAllocation) or handle.state != "writing":
                 return
             handle.state = "freed"
+            release_view(handle.buf)
             if self._staging is not None:
                 self._staging.give(handle.slot)
 
     def has_local(self, key: str) -> bool:
-        """Whether this handler stored (or found) ``key`` in the current server run."""
+        """Whether this handler stored (or found) ``key`` in the current server run.
+
+        The remembered keys belong to one server run. If the server has not
+        been heard from for a few seconds, a ping confirms the run first; a
+        restart clears the remembered keys so they are stored again.
+        """
         with self._lock:
-            return self.connected and key in self._stored
+            if not self.connected or key not in self._stored:
+                return False
+            if self._clock() - self._last_contact > _STORED_KEYS_CHECK_S:
+                self._confirm_run()
+            return key in self._stored
 
     def batch_store(
         self, keys: list[str], handles: list[RemoteAllocation]
@@ -346,10 +269,16 @@ class RemoteStorageClient:
                 assert self._staging is not None
                 for h in handles:
                     h.state = "freed"
+                    release_view(h.buf)
                     if h.slot not in self._quarantined_slots:
                         self._staging.give(h.slot)
             self.counters["stores" if all(results) else "stores_failed"] += 1
             return results
+
+    def retrieve_capacity(self) -> int:
+        """Free staging slots: the most objects one batch_retrieve can hold now."""
+        with self._lock:
+            return self._staging.free_count() if self._staging is not None else 0
 
     def batch_exists(self, keys: list[str]) -> list[bool]:
         """Report which keys are in the pool (all False while the server is down)."""
@@ -360,7 +289,8 @@ class RemoteStorageClient:
             if not self._ready():
                 return [False] * len(keys)
             try:
-                return list(self._client.exists([self._scope(k) for k in keys]))
+                scoped = [self._scope(k) for k in keys]
+                return list(self._after_restart(lambda: self._client.exists(scoped)))
             except Exception as exc:
                 self._fail(exc, "exists")
                 return [False] * len(keys)
@@ -391,10 +321,22 @@ class RemoteStorageClient:
                 return False
             try:
                 self._client.ping()
+                self._last_contact = self._clock()
                 return True
             except Exception as exc:
                 self._fail(exc, "ping")
                 return False
+
+    def _confirm_run(self) -> None:
+        """Ping the server; on a restart, reconnect (which forgets stored keys)."""
+        if not self._ready():
+            return
+        try:
+            self._client.ping()
+            self._last_contact = self._clock()
+        except Exception as exc:
+            self._fail(exc, "ping")
+            self._ready()
 
     def stats(self) -> dict[str, Any]:
         """Local counters, staging occupancy and (if reachable) server counters."""
@@ -451,8 +393,6 @@ class RemoteStorageClient:
         staging = None
         client = None
         try:
-            staging = _Staging(self.config.pool_size, self.config.chunk_size_bytes)
-            transport.register(staging.address, staging.nbytes, "maru-remote-staging")
             client = self._client_factory(
                 self.config.remote_url,
                 transport,
@@ -469,8 +409,15 @@ class RemoteStorageClient:
             raise StorageUnavailableError(
                 f"remote server {self.config.remote_url} is unreachable: {exc}"
             ) from exc
+        try:  # local resources only once the server is known to be usable
+            staging = StagingBuffer(self.config.pool_size, self.config.chunk_size_bytes)
+            transport.register(staging.address, staging.nbytes, "maru-remote-staging")
+        except Exception as exc:
+            self._discard(client, transport, staging)
+            raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
         self.connected = True
+        self._last_contact = self._clock()
         logger.info(
             "remote storage connected to %s (pool %s, page %d B, %d staging slots of %d B)",
             self.config.remote_url,
@@ -496,15 +443,20 @@ class RemoteStorageClient:
                 f"remote pool pages ({page} B) are smaller than one KV object "
                 f"({self.config.chunk_size_bytes} B); raise --page-bytes"
             )
-        ttl = float(hello.get("reservation_ttl_s", 0))
-        if ttl < 2 * self.config.remote_transfer_timeout_s:
-            raise StorageError(
-                f"remote reservation lifetime {ttl}s must be at least twice the "
-                f"transfer timeout {self.config.remote_transfer_timeout_s}s"
-            )
+        timeout = self.config.remote_transfer_timeout_s
+        for name, what in (
+            ("reservation_ttl_s", "reservation"),
+            ("ticket_ttl_s", "read protection"),
+        ):
+            ttl = float(hello.get(name, 0))
+            if ttl < 2 * timeout:
+                raise StorageError(
+                    f"remote {what} lifetime {ttl}s must be at least twice the "
+                    f"transfer timeout {timeout}s"
+                )
 
     @staticmethod
-    def _discard(client: Any, transport: Any, staging: _Staging | None) -> None:
+    def _discard(client: Any, transport: Any, staging: StagingBuffer | None) -> None:
         """Tear down a half-built connection."""
         for close in (
             client.close if client is not None else None,
@@ -546,6 +498,7 @@ class RemoteStorageClient:
             self._trip(exc)
             return False
         self._reconnect = False
+        self._last_contact = self._clock()
         if self._client.generation != old:
             logger.warning(
                 "remote server restarted (generation %s -> %s); forgetting stored keys",
@@ -556,6 +509,24 @@ class RemoteStorageClient:
         else:
             logger.info("remote server reachable again")
         return True
+
+    def _after_restart(self, call: Callable[[], Any]) -> Any:
+        """Run ``call``; if the server restarted, reconnect and run it once more.
+
+        Only for calls that start an operation (exists, reserve, lookup):
+        nothing from the earlier server run is carried into the retry.
+        """
+        from maru_remote.client import RemoteRestarted
+
+        try:
+            result = call()
+        except RemoteRestarted as exc:
+            self._fail(exc, "call")
+            if not self._ready():
+                raise
+            result = call()
+        self._last_contact = self._clock()
+        return result
 
     def _trip(self, exc: BaseException) -> None:
         """Stop calling the server for ``remote_retry_s`` after a failure."""
@@ -597,10 +568,19 @@ class RemoteStorageClient:
             first.setdefault(key, i)
         order = list(first.values())
         t0 = time.perf_counter()
+        sizes = [handles[i].size for i in order]
         try:
-            pages = self._client.reserve([handles[i].size for i in order])
+            pages = self._after_restart(lambda: self._client.reserve(sizes))
         except Exception as exc:
-            self._fail(exc, "reserve")
+            if getattr(exc, "code", None) == "POOL_FULL":
+                if self._clock() >= self._store_retry_at:
+                    logger.warning(
+                        "remote pool is full; skipping stores for %.0fs",
+                        self.config.remote_retry_s,
+                    )
+                self._store_retry_at = self._clock() + self.config.remote_retry_s
+            else:
+                self._fail(exc, "reserve")
             return [False] * len(keys)
         t1 = time.perf_counter()
         tickets = [p["ticket"] for p in pages]
@@ -631,8 +611,12 @@ class RemoteStorageClient:
             statuses = self._client.publish(
                 [(t, self._scope(keys[i])) for t, i in zip(tickets, order, strict=True)]
             )
-        except Exception as exc:  # unpublished pages expire on the server
+        except Exception as exc:
+            from maru_remote.client import RemoteTimeout, RemoteUnreachable
+
             self._fail(exc, "publish")
+            if not isinstance(exc, RemoteTimeout | RemoteUnreachable):
+                self._abandon_quietly(tickets)  # unknown tickets are skipped
             return [False] * len(keys)
         t3 = time.perf_counter()
         ok_by_key: dict[str, bool] = {}
@@ -659,12 +643,17 @@ class RemoteStorageClient:
         from maru_remote.transport import TransferTimeout
 
         assert self._staging is not None
-        ticket_id = f"{self._client_id()}-{uuid.uuid4().hex}"
         t0 = time.perf_counter()
+        scoped = [self._scope(k) for k in keys]
+        ticket_id = ""
+
+        def lookup() -> list[dict[str, Any] | None]:
+            nonlocal ticket_id
+            ticket_id = f"{self._client_id()}-{uuid.uuid4().hex}"  # fresh per attempt
+            return list(self._client.lookup(scoped, ticket_id, protect=True))
+
         try:
-            entries = self._client.lookup(
-                [self._scope(k) for k in keys], ticket_id, protect=True
-            )
+            entries = self._after_restart(lookup)
         except Exception as exc:
             self._fail(exc, "lookup")
             self.counters["loads_failed"] += 1
@@ -748,7 +737,9 @@ class RemoteStorageClient:
     def _isolate(self, pending: Any, slots: list[int], tickets: list[str]) -> None:
         """Keep the buffers of a timed-out transfer out of circulation."""
         self._quarantined_slots.update(slots)
-        self._quarantine.append(_Quarantined(pending, list(slots), list(tickets)))
+        self._quarantine.append(
+            QuarantinedTransfer(pending, list(slots), list(tickets))
+        )
         self.counters["quarantined_transfers"] += 1
         if tickets:
             try:
@@ -766,7 +757,7 @@ class RemoteStorageClient:
         """Return the buffers of quarantined transfers that have ended."""
         if not self._quarantine:
             return
-        keep: list[_Quarantined] = []
+        keep: list[QuarantinedTransfer] = []
         for q in self._quarantine:
             if not q.slots and not q.tickets:
                 continue
@@ -780,11 +771,18 @@ class RemoteStorageClient:
                         self._staging.give(s)
                 q.slots = []
             if q.tickets:
+                if self._clock() < self._retry_at:
+                    keep.append(q)  # the server is considered down: ask later
+                    continue
+                from maru_remote.client import RemoteRestarted
+
                 try:
                     self._client.abandon(q.tickets)
                     q.tickets = []
-                except Exception as exc:  # retried on the next reap
-                    logger.debug("remote abandon of quarantined pages failed: %s", exc)
+                except RemoteRestarted:
+                    q.tickets = []  # an earlier server run's pages are gone with it
+                except Exception as exc:  # retried after the cool-down
+                    self._fail(exc, "abandon")
                     keep.append(q)
         self._quarantine = keep
 

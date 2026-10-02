@@ -94,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--instance-id", default=None, help="Maru instance id")
     p.add_argument("--reservation-ttl", type=float, default=60.0, help="seconds")
     p.add_argument("--ticket-ttl", type=float, default=120.0, help="seconds")
+    p.add_argument(
+        "--quarantine-ttl",
+        type=float,
+        default=600.0,
+        help="seconds a timed-out WRITE's pages stay unused if never abandoned",
+    )
     p.add_argument("--log-level", default="INFO", help="logging level name")
     return p
 
@@ -136,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             pool_id=args.pool_id,
             reservation_ttl_s=args.reservation_ttl,
             ticket_ttl_s=args.ticket_ttl,
+            quarantine_ttl_s=args.quarantine_ttl,
         )
         try:
             _serve_until_signalled(server, args.ctrl_url)

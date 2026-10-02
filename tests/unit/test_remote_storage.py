@@ -238,13 +238,20 @@ def test_outage_skips_calls_until_retry_then_reconnects(pool):
     h.close()
 
 
-def test_restart_is_detected_on_the_next_reply(pool):
+def test_restart_is_detected_and_the_call_retried(pool):
     h = remote_handler(pool.url)
     assert _store(h, "k", b"1")
     pool.stop()
     pool.start()
-    assert h.batch_exists(["k"]) == [False]  # the reply's generation differs
-    assert h.batch_exists(["k"]) == [True]  # reconnected without a cool-down
+    # The reply's generation differs: reconnect and answer from the new run.
+    assert h.batch_exists(["k"]) == [True]
+    assert not h.has_local("k")  # what this handler knew belongs to the old run
+    (lease,) = h.batch_retrieve(["k"])
+    assert bytes(lease.view) == b"1"
+    lease.release()
+    pool.stop()
+    pool.start()
+    assert _store(h, "k2", b"2") is True  # reserve retried after the restart
     h.close()
 
 
@@ -426,3 +433,92 @@ def test_connector_store_on_one_worker_load_on_another(pool):
             w.shutdown()
         if scheduler._handler:
             scheduler._handler.close()
+
+
+def test_a_restart_refuses_old_run_requests_before_running_them(pool):
+    h = remote_handler(pool.url)
+    assert _store(h, "k", b"1")
+    pool.stop()
+    pool.start()
+    (lease,) = h.batch_retrieve(["k"])  # refused, reconnected, retried
+    assert bytes(lease.view) == b"1"
+    lease.release()
+    assert pool.stats()["tickets"] == 0  # the refused attempt pinned nothing
+    h.close()
+
+
+def test_remembered_keys_are_revalidated_after_silence(pool):
+    h = remote_handler(pool.url)
+    clock = FakeClock()
+    h._storage._clock = clock
+    h._storage._last_contact = clock()
+    assert _store(h, "k", b"1") and h.has_local("k")
+    pool.stop()
+    pool.start()  # a new run that this handler has not talked to yet
+    assert h.has_local("k")  # within the trust window: no call is made
+    clock.advance(6.0)
+    assert not h.has_local("k")  # the ping saw the new run and forgot the key
+    h.close()
+
+
+def test_cool_down_skips_abandon_of_isolated_pages(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    agent.stall = True
+    assert _store(h, "slow", b"s" * 10) is False  # isolates and trips the breaker
+    pool.stop()
+    agent.stall = False
+    agent.finish_stalled()
+    t0 = time.monotonic()
+    for _ in range(3):
+        with pytest.raises(StorageUnavailableError):
+            h.alloc(1)  # the slot returns locally; no abandon call while cooling down
+    assert time.monotonic() - t0 < 0.2
+    assert h.get_stats()["remote_storage"]["quarantined_slots"] == 0
+    pool.start()
+    h.close()
+
+
+def test_close_abandons_pages_of_ended_writes(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    agent = next(
+        a
+        for n, a in FakeNixlAgent.registry.items()
+        if n.startswith("maru-remote-client")
+    )
+    agent.stall = True
+    assert _store(h, "slow", b"s" * 10) is False
+    assert pool.stats()["quarantined"] == 1
+    agent.stall = False
+    agent.finish_stalled()
+    h.close()
+    assert pool.stats()["quarantined"] == 0
+
+
+def test_a_full_pool_pauses_stores_but_not_loads(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
+    assert _store(h, "kept", b"1")
+    with patch.object(pool.handler, "alloc", side_effect=ValueError("pool exhausted")):
+        assert _store(h, "more", b"2") is False  # reserve reports POOL_FULL
+    with pytest.raises(StorageUnavailableError, match="full"):
+        h.alloc(1)  # stores pause for the retry period
+    (lease,) = h.batch_retrieve(["kept"])  # loads still work
+    assert bytes(lease.view) == b"1"
+    lease.release()
+    clock.advance(6.0)
+    assert _store(h, "more", b"2") is True  # the pause has ended
+    h.close()
+
+
+def test_local_staging_errors_are_configuration_errors(pool):
+    with patch(
+        "maru_handler.storage.remote.StagingBuffer", side_effect=ValueError("bad size")
+    ):
+        with pytest.raises(StorageError, match="staging"):
+            remote_handler(pool.url)

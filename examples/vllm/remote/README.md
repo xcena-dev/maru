@@ -17,9 +17,11 @@ backend: `alloc` returns a writable staging slot, `batch_store` publishes it,
 and `batch_retrieve` returns read leases that the connector releases after its
 copy. The connector therefore uses the same synchronous chunkwise path as
 [CPU mode](../cpu/README.md), with the same limits: `TP=PP=DP=1`,
-`--enforce-eager`, unquantized KV, one KV cache group, and
-`kv_load_failure_policy="recompute"`. Async load/store, layerwise storage and the
-`maru_kv_ops` kernels are not used with this backend.
+`--enforce-eager`, `--no-async-scheduling`, unquantized KV, one KV cache group,
+and `kv_load_failure_policy="recompute"`. Async load/store, layerwise storage and
+the `maru_kv_ops` kernels are not used with this backend. A request's chunks are
+loaded in batches the staging buffer can hold, each copied to the GPU and
+released before the next.
 
 ## Requirements
 
@@ -50,7 +52,7 @@ The pool grows past `--pool-size` region by region as Maru's CXL pool does.
 Each worker node (replace the model, namespace, address and NIC):
 
 ```bash
-vllm serve <model> --enforce-eager \
+vllm serve <model> --enforce-eager --no-async-scheduling \
   --kv-transfer-config '{
     "kv_connector": "MaruKVConnector",
     "kv_connector_module_path": "maru_vllm",
@@ -68,14 +70,16 @@ vllm serve <model> --enforce-eager \
 
 `maru_cache_namespace` is the sharing scope. The connector combines it with the
 model configuration, dtype, block size and chunk size, so engines share KV only
-when all of these match. Use a namespace that identifies the exact weights.
-`maru_engine_id` is not needed.
+when all of these match; where a node keeps the weights and its transformers
+version do not count. Use a namespace that identifies the exact weights. Each
+engine logs the resulting value at start-up (`cache namespace <hash>`), so nodes
+can be compared. `maru_engine_id` is not needed.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `maru_remote_url` | required | Control endpoint of `maru-remote-server` |
 | `maru_remote_ucx_device` | UCX default | Local RDMA NIC for NIXL, e.g. `mlx5_0:1` |
-| `maru_remote_staging_size` | `1G` | Local staging buffer (RDMA source and target) |
+| `maru_remote_staging_size` | 64 KV objects, at least `1G` | Local staging buffer (RDMA source and target) |
 | `maru_remote_timeout_s` | `30` | Deadline of one RDMA batch |
 | `maru_remote_retry_s` | `30` | How long the worker stops calling the pool after a failure |
 
@@ -97,15 +101,23 @@ when all of these match. Use a namespace that identifies the exact weights.
 - **Outage.** After a failed or timed-out control request the worker stops
   calling the pool for `maru_remote_retry_s`: lookups miss, stores are skipped and
   requests compute normally. It then reconnects.
-- **Pool restart.** Every reply carries the server's start-up generation. On a
-  change the worker reloads the pool's NIXL metadata and forgets which keys it
-  stored. Keys written by an earlier `maru-remote-server` run stay in regions the
-  new run does not own and cannot expose over RDMA; the pool reports them missing
-  and the next store of the same key replaces them.
+- **Pool restart.** Every request and reply carries the server's start-up
+  generation; the server refuses requests addressed to an earlier run without
+  executing them. On a change the worker reloads the pool's NIXL metadata,
+  forgets which keys it stored and retries the call once. A worker that has not
+  talked to the pool for 5 s confirms the run before trusting what it stored.
+- **Keys of an earlier pool run.** They stay in regions the new run does not own
+  and cannot expose over RDMA; the pool reports them missing and the next store
+  of the same key replaces them. Their regions hold device capacity until then,
+  so run `maru-server` for `maru-remote-server` alone and restart the two
+  together; the server logs a warning when it finds regions it does not own.
+- **Full pool.** Without eviction, a full pool answers reservations with
+  `POOL_FULL`; the worker then skips stores (not loads) for `maru_remote_retry_s`.
 - **Timed-out transfers.** Memory a timed-out RDMA transfer may still reach is
   not reused: its staging slots stay isolated until NIXL reports the transfer
   ended, and the pool keeps the pages of a timed-out WRITE out of circulation
-  until the worker confirms the end.
+  until the worker confirms the end (or, if the worker died, for
+  `--quarantine-ttl`, 600 s by default).
 
 ## Trust model
 
