@@ -3637,7 +3637,10 @@ class MaruWorkerConnector:
                     slab = torch.frombuffer(
                         handle.buf[:slab_bytes], dtype=kv_contig.dtype
                     ).view(kv2, self._num_layers, ntok, hidden)
-                    slab[:, layer_idx].copy_(kv_contig)  # GPU->CXL
+                    # K and V planes are each contiguous in the slab; copying
+                    # them separately avoids a strided cross-device copy.
+                    for plane in range(kv2):
+                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->host
                     written.add(layer_idx)
                 except Exception as e:
                     logger.error("Maru packed save error: %s: %s", base_key, e)
