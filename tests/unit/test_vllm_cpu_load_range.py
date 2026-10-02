@@ -255,3 +255,36 @@ def test_a_missing_later_batch_fails_only_from_that_batch():
     )
     worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
     assert worker.take_failed_load_blocks() == {2, 3, 4, 5}  # chunk 1 onward
+
+
+def test_a_failed_batch_copy_stops_the_later_batches():
+    worker = make_worker(4, 8, remote_extra(), num_kv_heads=1, head_size=1)
+    cache = torch.full((12, 2, 4, 1, 1), -1.0)
+    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
+    worker._ensure_handler = lambda: None
+    worker._handler = Mock()
+    worker._handler.retrieve_capacity.return_value = 1
+    meta = MaruReqMeta(
+        "load",
+        list(range(24)),
+        list(range(6)),
+        False,
+        num_matched_chunks=3,
+        load_start_token=0,
+        load_end_token=24,
+    )
+    requested = []
+
+    def retrieve(keys):
+        requested.append(keys)
+        return [SimpleNamespace(view=bytearray(3))]  # too short to copy
+
+    worker._batch_retrieve_all = retrieve
+    context = SimpleNamespace(
+        attn_metadata=make_flash_attn_metadata(),
+        no_compile_layers={"layer": SimpleNamespace(kv_cache=cache)},
+    )
+    worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert len(requested) == 1  # the later batches are not read
+    assert worker._handler.release_retrieved.call_count == 1

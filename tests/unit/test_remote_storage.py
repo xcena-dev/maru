@@ -504,7 +504,13 @@ def test_a_full_pool_pauses_stores_but_not_loads(pool):
     clock = FakeClock()
     h._storage._clock = clock
     assert _store(h, "kept", b"1")
-    with patch.object(pool.handler, "alloc", side_effect=ValueError("pool exhausted")):
+    with patch.object(
+        pool.handler,
+        "alloc",
+        side_effect=ValueError(
+            "Cannot allocate page: pool exhausted after expansion attempt"
+        ),
+    ):
         assert _store(h, "more", b"2") is False  # reserve reports POOL_FULL
     with pytest.raises(StorageUnavailableError, match="full"):
         h.alloc(1)  # stores pause for the retry period
@@ -513,6 +519,30 @@ def test_a_full_pool_pauses_stores_but_not_loads(pool):
     lease.release()
     clock.advance(6.0)
     assert _store(h, "more", b"2") is True  # the pause has ended
+    h.close()
+
+
+def test_a_refused_key_is_not_written_again_until_the_retry_period(pool):
+    h = remote_handler(pool.url, staging=4 * PAGE)
+    clock = FakeClock()
+    h._storage._clock = clock
+
+    def refuse(keys, handles):
+        for handle in handles:
+            pool.handler.free(handle)
+        return [False] * len(keys)
+
+    with patch.object(pool.handler, "batch_store", side_effect=refuse):
+        assert _store(h, "stuck", b"1") is False  # the server answers REJECTED
+        written = h.get_stats()["remote_storage"]["counters"]["store_bytes"]
+        assert _store(h, "stuck", b"1") is False
+        assert (
+            h.get_stats()["remote_storage"]["counters"]["store_bytes"] == written
+        )  # no WRITE
+        assert _store(h, "other", b"2") is False  # other keys are still tried
+        assert h.get_stats()["remote_storage"]["counters"]["store_bytes"] > written
+    clock.advance(6.0)
+    assert _store(h, "stuck", b"1") is True  # tried again after the period
     h.close()
 
 

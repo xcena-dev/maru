@@ -331,9 +331,22 @@ def test_never_abandoned_quarantine_expires(server, handler, clock):
 
 
 def test_full_pool_is_reported_with_a_code(server, handler):
-    with patch.object(handler, "alloc", side_effect=ValueError("pool exhausted")):
+    with patch.object(
+        handler,
+        "alloc",
+        side_effect=ValueError(
+            "Cannot allocate page: pool exhausted after expansion attempt"
+        ),
+    ):
         r = server.handle({"op": "reserve", "client_id": "w", "sizes": [PAGE]})
     assert r["ok"] is False and r["code"] == "POOL_FULL"
+
+
+def test_other_allocation_faults_are_not_reported_as_full(server, handler):
+    fault = ValueError("Failed to get buffer view for region 7")
+    with patch.object(handler, "alloc", side_effect=fault):
+        r = server.handle({"op": "reserve", "client_id": "w", "sizes": [PAGE]})
+    assert r["ok"] is False and "code" not in r and "buffer view" in r["error"]
 
 
 def test_requests_from_an_earlier_run_are_refused_unexecuted(server):
