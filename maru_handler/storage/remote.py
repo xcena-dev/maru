@@ -433,13 +433,11 @@ class RemoteStorageClient:
             logger.warning("remote probe failed: %s", exc)
             return
         self._probe_failures = 0
-        if (
-            self._layout_error or self._transfer_fault
-        ) and self._clock() < self._retry_at:
-            return
-        if self._reconnect or probe.generation != getattr(
-            self._client, "generation", ""
-        ):
+        restarted = probe.generation != getattr(self._client, "generation", "")
+        held = self._layout_error or self._transfer_fault
+        if held and not restarted and self._clock() < self._retry_at:
+            return  # a new server run is worth a reconnect; the old one is not yet
+        if self._reconnect or restarted:
             with self._lock:
                 if self.connected and not self._closed:
                     self._reconnect = True
