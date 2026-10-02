@@ -222,6 +222,26 @@ eviction and SSD are later milestones. See the
 [mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
 for launch configuration, memory lifetime and validation instructions.
 
+### Remote CXL pool
+
+Set `maru_storage_backend="remote"` to keep KV in a CXL pool on another node and
+move it over RDMA ([NIXL](https://github.com/ai-dynamo/nixl), install with
+`pip install 'maru[remote]'`). The pool node runs MaruServer, the resource manager
+and `maru-remote-server`; workers need neither a DAX device nor a local
+MaruServer. Engines on different servers that use the same
+`maru_cache_namespace` and model geometry reuse each other's prefixes.
+
+Provide `maru_remote_url` (the pool node's control endpoint),
+`maru_remote_ucx_device` (the local RDMA NIC) and `maru_cache_namespace`.
+`maru_remote_staging_size` (default `1G`) sizes the worker's RDMA staging buffer.
+The remote backend uses the CPU mode's synchronous chunkwise path, so the same
+requirements apply: `--enforce-eager`, `TP=PP=DP=1`, unquantized KV and
+`kv_load_failure_policy="recompute"`. When the pool is unreachable, lookups miss
+and stores are skipped for `maru_remote_retry_s` (default 30 s) while requests
+compute normally. See the
+[remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
+for launch commands, failure behaviour and the trust model.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:
