@@ -255,7 +255,9 @@ def test_restart_is_detected_and_the_call_retried(pool):
     assert _store(h, "k", b"1")
     pool.stop()
     pool.start()
-    # The reply's generation differs: reconnect and answer from the new run.
+    # The scheduler path reports misses and leaves the reconnect to the
+    # maintenance thread, which answers from the new run.
+    h._storage.maintain()
     assert h.batch_exists(["k"]) == [True]
     assert not h.has_local("k")  # what this handler knew belongs to the old run
     (lease,) = h.batch_retrieve(["k"])
@@ -464,7 +466,7 @@ def test_a_restart_refuses_old_run_requests_before_running_them(pool):
     h.close()
 
 
-def test_remembered_keys_are_revalidated_after_silence(pool):
+def test_remembered_keys_are_revalidated_by_the_maintenance_thread(pool):
     h = remote_handler(pool.url)
     clock = FakeClock()
     h._storage._clock = clock
@@ -473,9 +475,6 @@ def test_remembered_keys_are_revalidated_after_silence(pool):
     pool.stop()
     pool.start()  # a new run that this handler has not talked to yet
     assert h.has_local("k")  # answered from memory: no call is made
-    h._storage.maintain()
-    assert h.has_local("k")  # within the trust window the run is not checked
-    clock.advance(6.0)
     h._storage.maintain()  # the maintenance thread's ping sees the new run
     assert not h.has_local("k")
     h.close()
@@ -752,3 +751,47 @@ def test_the_maintenance_thread_reconnects_after_an_outage(pool, monkeypatch):
         time.sleep(0.05)
     assert h.batch_exists(["k"]) == [True]  # reconnected off the caller's path
     h.close()
+
+
+def test_existence_checks_do_not_wait_for_a_maintenance_probe(pool, monkeypatch):
+    h = remote_handler(pool.url)
+    probe = h._storage._probe
+    started, release = threading.Event(), threading.Event()
+
+    def slow_connect():
+        started.set()
+        release.wait(5)  # a server that does not answer the probe
+        raise TimeoutError("probe timed out")
+
+    monkeypatch.setattr(probe, "connect", slow_connect)
+    t = threading.Thread(target=h._storage.maintain)
+    t.start()
+    started.wait(5)
+    try:
+        t0 = time.monotonic()
+        assert h.batch_exists(["k"]) == [False]
+        assert h.has_local("k") is False
+        assert time.monotonic() - t0 < 0.5  # neither waited for the probe
+    finally:
+        release.set()
+        t.join()
+    assert h.batch_exists(["k"]) == [False]  # the failed probe tripped the backend
+    h.close()
+
+
+def test_the_maintenance_thread_drops_keys_another_worker_evicted(
+    pool_handler, unused_port
+):
+    node = PoolNode(pool_handler, unused_port, capacity_bytes=1 * PAGE)
+    node.start()
+    try:
+        a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
+        assert _store(a, "k1", b"1")
+        assert _store(b, "k2", b"2")  # evicts k1
+        assert a.has_local("k1")
+        a._storage.maintain()  # an idle worker learns of the eviction by probe
+        assert not a.has_local("k1")
+        a.close()
+        b.close()
+    finally:
+        node.stop()
