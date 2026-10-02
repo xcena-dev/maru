@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -119,6 +119,7 @@ class RemoteServer:
         quarantine_ttl_s: float = 600.0,
         capacity_bytes: int | None = None,
         evict: bool = True,
+        eviction_log_len: int = 65536,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -138,6 +139,8 @@ class RemoteServer:
             evict: When a reservation finds the pool full, delete the least
                 recently read published keys (never pinned ones) to make
                 room. Otherwise the reservation fails with ``POOL_FULL``.
+            eviction_log_len: How many of the latest evicted keys to keep for
+                ``evicted_since``; a client further behind forgets everything.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
@@ -150,6 +153,8 @@ class RemoteServer:
         # Keys published through this server, least recently read first.
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._evicted = 0
+        # (eviction number, key) of the latest evictions, oldest first.
+        self._eviction_log: deque[tuple[int, str]] = deque(maxlen=eviction_log_len)
         self._transport = transport
         self._pool_id = pool_id
         self._generation = uuid.uuid4().hex
@@ -176,6 +181,7 @@ class RemoteServer:
             "release": self._op_release,
             "stats": self._op_stats,
             "ping": self._op_ping,
+            "evicted_since": self._op_evicted_since,
         }
         self._sync_regions()
         self._report_foreign_regions()
@@ -636,6 +642,27 @@ class RemoteServer:
             "evicted": self._evicted,
         }
 
+    def _op_evicted_since(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """List the keys evicted after eviction number ``since``.
+
+        Args:
+            msg: Request with ``since``, the ``evictions`` value the client
+                saw last (0 for a client that has seen none).
+
+        Returns:
+            ``keys`` evicted after ``since`` (oldest first) and ``complete``,
+            False when some of them are no longer in the log.
+        """
+        since = msg["since"]
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            raise ValueError("since must be a non-negative int")
+        log = self._eviction_log
+        oldest = log[0][0] if log else self._evicted + 1
+        return {
+            "keys": [k for n, k in log if n > since],
+            "complete": since >= oldest - 1,
+        }
+
     def _op_ping(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Answer a liveness probe.
 
@@ -715,9 +742,10 @@ class RemoteServer:
                 deleted = False
             if deleted:
                 freed += 1
+                self._evicted += 1
+                self._eviction_log.append((self._evicted, key))
             elif self._handler.exists(key):
                 self._lru[key] = None  # pinned: keep it, most recent end
-        self._evicted += freed
         if freed:
             logger.info("evicted %d least recently read keys", freed)
         return freed

@@ -683,12 +683,52 @@ def test_an_eviction_makes_the_writer_store_evicted_keys_again(
         (lease,) = h.batch_retrieve(["warm"])
         lease.release()
         assert _store(h, "new", b"3")  # evicts "old"
-        # Evicted keys are not named, so every remembered key is forgotten.
-        assert not h.has_local("old") and not h.has_local("warm")
-        assert _store(h, "warm", b"2")  # still present: no WRITE
-        assert h.get_stats()["remote_storage"]["counters"]["store_skipped_present"] == 1
-        assert _store(h, "old", b"1")  # written again (evicts "new" this time)
+        # Only the evicted key is forgotten; the others stay remembered.
+        assert not h.has_local("old")
+        assert h.has_local("warm") and h.has_local("new")
+        assert _store(h, "old", b"1")  # written again (evicts "warm" this time)
         assert h.batch_exists(["old"]) == [True]
+        assert not h.has_local("warm")
         h.close()
+    finally:
+        node.stop()
+
+
+def test_a_key_another_worker_evicted_is_dropped_on_the_next_call(
+    pool_handler, unused_port
+):
+    node = PoolNode(pool_handler, unused_port, capacity_bytes=1 * PAGE)
+    node.start()
+    try:
+        a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
+        assert _store(a, "k1", b"1")
+        assert _store(b, "k2", b"2")  # evicts k1
+        assert a.has_local("k1")  # a has not talked to the server since
+        (lease,) = a.batch_retrieve(["k2"])  # the reply reports an eviction
+        lease.release()
+        assert not a.has_local("k1") and a.has_local("k2")
+        a.close()
+        b.close()
+    finally:
+        node.stop()
+
+
+def test_a_truncated_eviction_log_forgets_every_remembered_key(
+    pool_handler, unused_port
+):
+    node = PoolNode(
+        pool_handler, unused_port, capacity_bytes=1 * PAGE, eviction_log_len=1
+    )
+    node.start()
+    try:
+        a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
+        assert _store(a, "mine", b"0")
+        assert _store(b, "k1", b"1") and _store(b, "k2", b"2")  # 2 evictions
+        (lease,) = a.batch_retrieve(["k2"])
+        lease.release()
+        assert not a.has_local("mine")  # the log lost an eviction
+        assert a.has_local("k2")  # read after the sync
+        a.close()
+        b.close()
     finally:
         node.stop()

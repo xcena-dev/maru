@@ -181,6 +181,21 @@ class RemoteClient:
         reply = self._call("quarantine", expect=("quarantined",), tickets=list(tickets))
         return int(reply["quarantined"])
 
+    def evicted_since(self, since: int) -> tuple[list[str], bool]:
+        """Keys the server evicted after eviction number ``since``.
+
+        Args:
+            since: The ``evictions`` value seen last.
+
+        Returns:
+            The evicted keys and whether the list is complete (False when
+            the server no longer remembers some of them).
+        """
+        reply = self._call(
+            "evicted_since", expect=("keys", "complete"), since=int(since)
+        )
+        return [str(k) for k in reply["keys"]], bool(reply["complete"])
+
     def exists(self, keys: list[str]) -> list[bool]:
         """Report which keys are stored.
 
