@@ -184,3 +184,13 @@ def test_unreachable_pool_retries_on_the_remote_retry_period():
     assert conn._handler_backoff_s(remote_extra()) == 30.0
     assert conn._handler_backoff_s(remote_extra(maru_remote_retry_s=7)) == 7.0
     assert conn._handler_backoff_s({"maru_storage_backend": "cpu"}) == 5.0
+
+
+def test_default_staging_holds_one_longest_prompt():
+    page = 32 * 1024**2
+    extra = remote_extra(maru_kv_chunk_tokens=256)
+    assert conn._remote_staging_bytes(extra, page) == 64 * page
+    extra[conn._MAX_MODEL_LEN_KEY] = 40960
+    assert conn._remote_staging_bytes(extra, page) == 160 * page
+    extra["maru_remote_staging_size"] = "2G"
+    assert conn._remote_staging_bytes(extra, page) == 2 * 1024**3
