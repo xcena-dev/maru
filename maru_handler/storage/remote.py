@@ -93,7 +93,11 @@ class RemoteStorageClient:
         """
         self.config = config
         self.connected = False
-        self._lock = threading.RLock()  # control requests and RDMA transfers
+        # Control requests and connection state. An RDMA transfer runs with it
+        # released (see _transfer), so a load and a store overlap on the wire.
+        self._lock = threading.RLock()
+        self._xfers = 0  # transfers running with _lock released
+        self._xfer_done = threading.Condition(self._lock)
         # Slot bookkeeping only. alloc, free and lease release take this lock
         # alone, so the engine thread never waits for a transfer or a control
         # request another thread is running under ``_lock``. Lock order:
@@ -191,6 +195,10 @@ class RemoteStorageClient:
                 if q.pending.poll() and q.tickets:
                     self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
             self._quarantine.clear()
+            # A transfer in flight still uses the agent and its slots.
+            deadline = time.monotonic() + self.config.remote_transfer_timeout_s + 1.0
+            while self._xfers and time.monotonic() < deadline:
+                self._xfer_done.wait(timeout=max(0.0, deadline - time.monotonic()))
             if self._client is not None:
                 self._client.close()
             if self._transport is not None:
@@ -803,11 +811,7 @@ class RemoteStorageClient:
             for i, p in zip(order, pages, strict=True)
         ]
         try:
-            self._transport.write(
-                self._client.peer,
-                pairs,
-                timeout_s=self.config.remote_transfer_timeout_s,
-            )
+            self._transfer("write", pairs)
         except TransferTimeout as exc:
             self._isolate(exc.pending, [handles[i].slot for i in order], tickets)
             self._trip_transfer(exc)
@@ -900,11 +904,7 @@ class RemoteStorageClient:
             for s, i, n in zip(slots, found, lengths, strict=True)
         ]
         try:
-            self._transport.read(
-                self._client.peer,
-                pairs,
-                timeout_s=self.config.remote_transfer_timeout_s,
-            )
+            self._transfer("read", pairs)
         except TransferTimeout as exc:
             self._release_quietly(ticket_id)  # a late READ only lands in isolated slots
             self._isolate(exc.pending, slots, [])
@@ -943,6 +943,27 @@ class RemoteStorageClient:
             (t3 - t2) * 1e3,
         )
         return leases
+
+    def _transfer(self, direction: str, pairs: list[tuple[int, int, int]]) -> None:
+        """Run one RDMA READ or WRITE with ``_lock`` released.
+
+        The caller holds ``_lock`` once and owns the slots and tickets in
+        ``pairs``. Releasing the lock lets the load thread's READ and the
+        store thread's WRITE run at the same time instead of one waiting for
+        the other; control requests stay serialized under the lock. close()
+        waits for these transfers before it closes the agent.
+        """
+        transport, peer = self._transport, self._client.peer
+        fn = transport.read if direction == "read" else transport.write
+        self._xfers += 1
+        state = self._lock._release_save()  # type: ignore[attr-defined]
+        try:
+            fn(peer, pairs, timeout_s=self.config.remote_transfer_timeout_s)
+        finally:
+            self._lock._acquire_restore(state)  # type: ignore[attr-defined]
+            self._xfers -= 1
+            if not self._xfers:
+                self._xfer_done.notify_all()
 
     def _end_read(self, slot: int) -> None:
         """Lease release: return its slot."""
