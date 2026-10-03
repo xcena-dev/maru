@@ -968,3 +968,35 @@ def test_a_restart_reconnects_although_a_transfer_failed(pool):
     h._storage.maintain()
     assert _store(h, "next", b"n") is True  # reconnected to the new run
     h.close()
+
+
+def test_scheduler_lookup_stages_and_worker_reads_move_the_window(
+    pool_handler, unused_port
+):
+    from maru_remote.stager import Stager
+
+    asked = []
+    node = PoolNode(
+        pool_handler,
+        unused_port,
+        stager=Stager(2, lambda addr, size: asked.append((addr, size)) or True),
+    )
+    node.start()
+    try:
+        worker = remote_handler(node.url)
+        keys = [f"k{i}" for i in range(4)]
+        for k in keys:
+            assert _store(worker, k, k.encode() * 10)
+        assert worker.batch_exists(keys) == [True] * 4  # store-side check: no staging
+        assert asked == []
+        sched = remote_handler(node.url, metadata_only=True)
+        assert sched.batch_exists(keys) == [True] * 4
+        assert len(asked) == 2  # the scheduler's lookup staged the first window
+        leases = worker.batch_retrieve(keys[:2])
+        assert len(asked) == 4  # reading k0 and k1 staged k2 and k3
+        for lease in leases:
+            lease.release()
+        sched.close()
+        worker.close()
+    finally:
+        node.stop()

@@ -196,16 +196,19 @@ class RemoteClient:
         )
         return [str(k) for k in reply["keys"]], bool(reply["complete"])
 
-    def exists(self, keys: list[str]) -> list[bool]:
+    def exists(self, keys: list[str], stage: bool = False) -> list[bool]:
         """Report which keys are stored.
 
         Args:
             keys: Keys to check.
+            stage: The keys are a request's prefix about to be read; a pool
+                with a stager starts loading them into the device DRAM.
 
         Returns:
             One bool per key.
         """
-        reply = self._call("exists", expect=("found",), keys=list(keys))
+        extra = {"stage": True} if stage else {}
+        reply = self._call("exists", expect=("found",), keys=list(keys), **extra)
         found = [bool(f) for f in reply["found"]]
         if len(found) != len(keys):
             raise RemoteError("exists: reply has the wrong number of results")

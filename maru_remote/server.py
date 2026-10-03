@@ -27,6 +27,7 @@ from maru_handler import MaruHandler
 from maru_handler.memory.types import AllocHandle, MemoryInfo
 
 from . import protocol
+from .stager import Stager
 from .transport import NixlTransport, buffer_address
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ class RemoteServer:
         capacity_bytes: int | None = None,
         evict: bool = True,
         eviction_log_len: int = 65536,
+        stager: Stager | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -141,6 +143,9 @@ class RemoteServer:
                 room. Otherwise the reservation fails with ``POOL_FULL``.
             eviction_log_len: How many of the latest evicted keys to keep for
                 ``evicted_since``; a client further behind forgets everything.
+            stager: Loads looked-up objects into the device DRAM ahead of
+                their reads (pools on an SSD-backed CXL device); None
+                disables staging.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
@@ -164,6 +169,8 @@ class RemoteServer:
         self._clock = clock
         self._page_bytes = handler.get_chunk_size()
         self._regions: dict[int, _Region] = {}
+        self._region_device_offset: dict[int, int] = {}
+        self._stager = stager
         self._md_version = 0
         self._reservations: dict[str, _Reservation] = {}
         self._quarantine: dict[str, _Reservation] = {}
@@ -559,14 +566,21 @@ class RemoteServer:
         A key registered in a region this server has not registered with NIXL
         (left by an earlier server run) is reported missing.
 
+        With ``stage`` (sent by the vLLM scheduler's lookup), the stager
+        starts loading the found keys into the device DRAM ahead of the
+        worker's reads.
+
         Args:
-            msg: Request with ``keys``: list of str.
+            msg: Request with ``keys``: list of str, optional bool ``stage``.
 
         Returns:
             ``found``: one bool per key.
         """
         keys = _require_str_list(msg["keys"], "keys")
-        return {"found": [e is not None for e in self._locate(keys)]}
+        entries = self._locate(keys)
+        if self._stager is not None and msg.get("stage") is True:
+            self._stager.on_lookup(keys, [self._device_range(e) for e in entries])
+        return {"found": [e is not None for e in entries]}
 
     def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Locate keys for remote READ, optionally pinning them under a ticket.
@@ -596,6 +610,8 @@ class RemoteServer:
         for key, entry in zip(keys, entries, strict=True):
             if entry is not None:
                 self._touch(key)
+        if self._stager is not None:
+            self._stager.on_read([k for k, e in zip(keys, entries, strict=True) if e])
         return {"entries": entries, "md_version": self._md_version}
 
     def _op_release(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -640,6 +656,7 @@ class RemoteServer:
             "capacity_pages": self._capacity_pages,
             "lru_keys": len(self._lru),
             "evicted": self._evicted,
+            "stager": self._stager.stats() if self._stager is not None else None,
         }
 
     def _op_evicted_since(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -780,6 +797,15 @@ class RemoteServer:
             )
         return entries
 
+    def _device_range(self, entry: dict[str, Any] | None) -> tuple[int, int] | None:
+        """Device (address, size) of a located key, or None."""
+        if entry is None:
+            return None
+        dev = self._region_device_offset.get(entry["region_id"])
+        if dev is None:
+            return None
+        return dev + entry["offset"], entry["length"]
+
     def _report_foreign_regions(self) -> None:
         """Warn about pool regions held by other Maru clients or an earlier run.
 
@@ -827,6 +853,9 @@ class RemoteServer:
             base = buffer_address(view)
             reg = self._transport.register(base, size, f"region-{region_id}")
             self._regions[region_id] = _Region(region_id, base, size, reg)
+            dev = self._handler.get_region_device_offset(region_id)
+            if dev is not None:
+                self._region_device_offset[region_id] = dev
             changed = True
         if changed:
             self._md_version += 1

@@ -25,6 +25,7 @@ from maru_common.config import MaruConfig
 from maru_handler import MaruHandler
 
 from .server import RemoteServer, serve_forever
+from .stager import Stager, device_prefetcher
 from .transport import NixlTransport
 
 logger = logging.getLogger("maru_remote")
@@ -112,6 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="lru",
         help="when full: delete least recently read keys, or refuse new stores",
     )
+    p.add_argument(
+        "--stage-window",
+        type=int,
+        default=0,
+        help="objects per request to load into the device DRAM ahead of the "
+        "worker's reads (InfiniteMemory pools); 0 disables staging",
+    )
+    p.add_argument(
+        "--stage-device",
+        type=int,
+        default=None,
+        help="pyxif device id of the pool's InfiniteMemory device "
+        "(required with --stage-window)",
+    )
     p.add_argument("--log-level", default="INFO", help="logging level name")
     return p
 
@@ -125,7 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Process exit code.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.stage_window < 0:
+        parser.error("--stage-window must be >= 0")
+    if args.stage_window and args.stage_device is None:
+        parser.error("--stage-window needs --stage-device")
     logging.basicConfig(
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -157,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
             quarantine_ttl_s=args.quarantine_ttl,
             capacity_bytes=args.capacity,
             evict=args.eviction == "lru",
+            stager=(
+                Stager(args.stage_window, device_prefetcher(args.stage_device))
+                if args.stage_window
+                else None
+            ),
         )
         try:
             _serve_until_signalled(server, args.ctrl_url)

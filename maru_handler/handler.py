@@ -224,6 +224,13 @@ class MaruHandler:
             self._mapper is not None and self._mapper.get_region(region_id) is not None
         )
 
+    def get_region_device_offset(self, region_id: int) -> int | None:
+        """Return a mapped region's byte offset within its DAX device, or None."""
+        if self._mapper is None:
+            return None
+        region = self._mapper.get_region(region_id)
+        return None if region is None else region.handle.offset
+
     def get_region_dax_path(self, region_id: int) -> str | None:
         """Return the DAX device path for a mapped region, or None. Stable plugin API."""
         if self._mapper is None:

@@ -345,7 +345,11 @@ class RemoteStorageClient:
                 return [False] * len(keys)
             try:
                 scoped = [self._scope(k) for k in keys]
-                found = list(self._client.exists(scoped))
+                # The scheduler's lookups (the metadata-only handler) name a
+                # request's prefix; the pool may stage it ahead of the reads.
+                found = list(
+                    self._client.exists(scoped, stage=self.config.metadata_only)
+                )
                 return found
             except Exception as exc:
                 self._fail(exc, "exists")
