@@ -98,8 +98,10 @@ class RemoteStorageClient:
         self._lock = threading.RLock()
         self._xfers = 0  # transfers running with _lock released
         self._xfer_done = threading.Condition(self._lock)
-        # Bumped on every reconnect; a transfer that resumes in a later epoch
-        # belongs to the old connection and must not publish or update hints.
+        # Bumped on every reconnect. A reconnect waits for transfers in flight
+        # (_drain_transfers), so a transfer normally resumes in its own epoch;
+        # the check is a guard in case a reconnect ever stops waiting: a
+        # transfer from an older epoch must not publish or update hints.
         self._epoch = 0
         self._closing = False  # close() is waiting for transfers in flight
         # Slot bookkeeping only. alloc, free and lease release take this lock
@@ -339,7 +341,10 @@ class RemoteStorageClient:
                 for h in handles:
                     h.state = "freed"
                     release_view(h.buf)
-                    if h.slot not in self._quarantined_slots and self._staging:
+                    if (
+                        h.slot not in self._quarantined_slots
+                        and self._staging is not None
+                    ):
                         self._staging.give(h.slot)
             self.counters["stores" if all(results) else "stores_failed"] += 1
             return results
@@ -846,7 +851,9 @@ class RemoteStorageClient:
             return [ok_by_key.get(k, False) for k in keys]
         if not current or not self._ready(connect=False):
             # Reconnected meanwhile (the tickets are the old server's) or the
-            # server is marked down: do not publish; the reservations expire.
+            # server is marked down: do not publish. The pages stay reserved
+            # until the reservation TTL; abandoning them now would block on a
+            # server that is down.
             return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
