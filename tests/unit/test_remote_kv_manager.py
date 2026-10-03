@@ -308,3 +308,14 @@ def test_reused_range_is_not_let_go_by_the_evicted_keys_request():
     ex.complete_all()
     kv.on_consumed(old)  # the evicted key's request finishes
     assert kv.ready(new, [rold[1]])  # the new key's pin is still held
+
+
+def test_key_stored_again_at_its_old_page_is_loaded_again():
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(2)
+    kv.on_lookup(keys, ranges)
+    ex.complete_all()
+    kv.forget_range(ranges[1])  # evicted, then stored again at the same page
+    assert not kv.ready(keys, ranges)
+    ex.complete_all()
+    assert kv.ready(keys, ranges)

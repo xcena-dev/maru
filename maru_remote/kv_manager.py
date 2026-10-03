@@ -263,6 +263,9 @@ class KVManager:
         found = [(k, r) for k, r in zip(keys[:n], ranges[:n], strict=True)]
         gid: _Gid = tuple(found)  # type: ignore[arg-type]
         req = self._reqs.get(gid)
+        if req is not None and _GONE in req.ranges:
+            self._drop(gid)  # a key was evicted and stored again: start afresh
+            req = None
         if req is not None:
             req.deadline = now + self._ttl
             if read:
