@@ -176,3 +176,16 @@ def test_close_lets_everything_go():
 def test_rejects_non_positive_settings(window, budget):
     with pytest.raises(ValueError):
         KVManager(window, FakeExecutor(), max_held_bytes=budget)
+
+
+def test_read_past_the_window_moves_the_window_there():
+    # The worker starts reading at chunk 10 when the GPU already holds the
+    # first chunks: the window must jump there, not wait at chunk 0.
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(20)
+    kv.on_lookup(keys, ranges)
+    assert not kv.ready(keys[10:12], ranges[10:12])
+    assert ranges[10] in ex.pinned and ranges[13] in ex.pinned
+    ex.complete_all()
+    assert sorted(ex.unpinned) == ranges[:4]  # skipped objects are let go
+    assert kv.ready(keys[10:12], ranges[10:12])

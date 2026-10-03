@@ -156,6 +156,7 @@ class KVManager:
                 for k, r in zip(keys, ranges, strict=True)
             ):
                 self._open(keys, ranges, now)
+            self._skip_to_reads(keys)
             self._pump()
             for r in ranges:
                 if r is None:
@@ -237,6 +238,28 @@ class KVManager:
         while len(self._reqs) > self._max_groups:
             self._drop(next(iter(self._reqs)))
             self.counters["dropped"] += 1
+
+    def _skip_to_reads(self, keys: list[str]) -> None:
+        """Move each request's window to the first key a worker now reads.
+
+        A worker that starts past the window (the GPU already held the first
+        chunks) will not read the objects before it: let them go and load
+        from where the read is.
+        """
+        first: dict[tuple[str, ...], int] = {}
+        for k in keys:
+            for gid in self._by_key.get(k, ()):
+                i = self._reqs[gid].index[k]
+                if i < first.get(gid, len(self._reqs[gid].keys)):
+                    first[gid] = i
+        for gid, i in first.items():
+            req = self._reqs[gid]
+            if i <= req.consumed_upto:
+                continue
+            for j in range(req.consumed_upto, min(i, req.held_upto)):
+                self._unref(req.ranges[j])
+            req.consumed_upto = i
+            req.held_upto = max(req.held_upto, i)
 
     def _pump(self) -> None:
         """Fill every request's window, oldest request first, within the budget."""
