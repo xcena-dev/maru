@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -594,12 +595,19 @@ def _handler_backoff_s(extra_config: dict[str, Any]) -> float:
 
 def _remote_staging_bytes(extra_config: dict[str, Any], page_bytes: int) -> int:
     """Staging buffer size: the setting, or the largest of 1 GiB, 64 KV objects
-    and one longest prompt's chunks (an async store stages a whole prompt)."""
+    and the room for one longest prompt's chunks.
+
+    An async store stages a whole prompt, and stores may only use the slots
+    outside the load reserve (``maru_remote_load_reserve``), so the prompt
+    term is scaled up by that reserve.
+    """
     if "maru_remote_staging_size" in extra_config:
         return _parse_size(extra_config["maru_remote_staging_size"])
     ct = int(extra_config.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS))
     prompt_chunks = -(-int(extra_config.get(_MAX_MODEL_LEN_KEY, 0)) // ct)
-    return max(DEFAULT_REMOTE_STAGING, 64 * page_bytes, prompt_chunks * page_bytes)
+    reserve = float(extra_config.get("maru_remote_load_reserve", 0.5))
+    store_slots = math.ceil(prompt_chunks / (1.0 - reserve))
+    return max(DEFAULT_REMOTE_STAGING, 64 * page_bytes, store_slots * page_bytes)
 
 
 def _remote_handler_settings(extra_config: dict[str, Any]) -> dict[str, Any]:
