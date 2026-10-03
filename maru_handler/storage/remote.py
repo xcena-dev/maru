@@ -98,6 +98,10 @@ class RemoteStorageClient:
         self._lock = threading.RLock()
         self._xfers = 0  # transfers running with _lock released
         self._xfer_done = threading.Condition(self._lock)
+        # Bumped on every reconnect; a transfer that resumes in a later epoch
+        # belongs to the old connection and must not publish or update hints.
+        self._epoch = 0
+        self._closing = False  # close() is waiting for transfers in flight
         # Slot bookkeeping only. alloc, free and lease release take this lock
         # alone, so the engine thread never waits for a transfer or a control
         # request another thread is running under ``_lock``. Lock order:
@@ -184,7 +188,12 @@ class RemoteStorageClient:
             RuntimeError: if read leases are still outstanding.
         """
         with self._lock:
+            # New calls are refused from here; transfers in flight finish first,
+            # since a load that finishes now hands out read leases.
+            self._closing = True
+            drained = self._drain_transfers()
             if self._reads:
+                self._closing = False
                 raise RuntimeError(
                     "Release remote read leases before closing the handler"
                 )
@@ -195,18 +204,23 @@ class RemoteStorageClient:
                 if q.pending.poll() and q.tickets:
                     self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
             self._quarantine.clear()
-            # A transfer in flight still uses the agent and its slots.
-            deadline = time.monotonic() + self.config.remote_transfer_timeout_s + 1.0
-            while self._xfers and time.monotonic() < deadline:
-                self._xfer_done.wait(timeout=max(0.0, deadline - time.monotonic()))
-            if self._client is not None:
-                self._client.close()
-            if self._transport is not None:
-                self._transport.close()
-            with self._slot_lock:
-                if self._staging is not None:
-                    self._staging.close()
-                self._client = self._transport = self._staging = None
+            if not drained:
+                # A transfer still uses the agent and its slots: leave them open
+                # rather than free memory the NIC may still write.
+                logger.warning(
+                    "closing with %d remote transfer(s) still in flight; "
+                    "the NIXL agent and staging buffer are left open",
+                    self._xfers,
+                )
+            else:
+                if self._client is not None:
+                    self._client.close()
+                if self._transport is not None:
+                    self._transport.close()
+                with self._slot_lock:
+                    if self._staging is not None:
+                        self._staging.close()
+                    self._client = self._transport = self._staging = None
             self._stored.clear()
             self._rejected.clear()
             maintainer, self._maintainer = self._maintainer, None
@@ -226,7 +240,7 @@ class RemoteStorageClient:
             StorageUnavailableError: if not connected.
             RuntimeError: if ``data`` is requested on a metadata-only handler.
         """
-        if not self.connected or self._closed:
+        if not self.connected or self._closed or self._closing:
             raise StorageUnavailableError("remote storage is not connected")
         if data and self._staging is None:
             raise RuntimeError("A metadata-only handler cannot access remote buffers")
@@ -322,11 +336,10 @@ class RemoteStorageClient:
             try:
                 results = self._store_locked(keys, handles)
             finally:
-                assert self._staging is not None
                 for h in handles:
                     h.state = "freed"
                     release_view(h.buf)
-                    if h.slot not in self._quarantined_slots:
+                    if h.slot not in self._quarantined_slots and self._staging:
                         self._staging.give(h.slot)
             self.counters["stores" if all(results) else "stores_failed"] += 1
             return results
@@ -667,7 +680,11 @@ class RemoteStorageClient:
             return True
         if not connect:
             return False
+        # Reconnecting replaces the NIXL peer; a transfer in flight still uses it.
+        if self._xfers and not self._drain_transfers():
+            return False
         old = getattr(self._client, "generation", "")
+        self._epoch += 1
         try:
             hello = self._client.connect()
             if not self.config.metadata_only:
@@ -810,15 +827,22 @@ class RemoteStorageClient:
             )
             for i, p in zip(order, pages, strict=True)
         ]
+        epoch = self._epoch
         try:
-            self._transfer("write", pairs)
+            current = self._transfer("write", pairs)
         except TransferTimeout as exc:
             self._isolate(exc.pending, [handles[i].slot for i in order], tickets)
-            self._trip_transfer(exc)
+            if self._epoch == epoch:  # a failure of the old connection is moot
+                self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
         except Exception as exc:  # the transfer ended in an error state
             self._abandon_quietly(tickets)
-            self._trip_transfer(exc)
+            if self._epoch == epoch:
+                self._trip_transfer(exc)
+            return [ok_by_key.get(k, False) for k in keys]
+        if not current or not self._ready(connect=False):
+            # Reconnected meanwhile (the tickets are the old server's) or the
+            # server is marked down: do not publish; the reservations expire.
             return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
@@ -903,19 +927,22 @@ class RemoteStorageClient:
             )
             for s, i, n in zip(slots, found, lengths, strict=True)
         ]
+        epoch = self._epoch
         try:
-            self._transfer("read", pairs)
+            current = self._transfer("read", pairs)
         except TransferTimeout as exc:
             self._release_quietly(ticket_id)  # a late READ only lands in isolated slots
             self._isolate(exc.pending, slots, [])
-            self._trip_transfer(exc)
+            if self._epoch == epoch:
+                self._trip_transfer(exc)
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError("remote READ timed out") from exc
         except Exception as exc:
             for s in slots:
                 self._staging.give(s)
             self._release_quietly(ticket_id)
-            self._trip_transfer(exc)
+            if self._epoch == epoch:
+                self._trip_transfer(exc)
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote READ failed: {exc}") from exc
         t2 = time.perf_counter()
@@ -923,7 +950,8 @@ class RemoteStorageClient:
         t3 = time.perf_counter()
         leases: list[RemoteReadLease | None] = [None] * len(keys)
         for s, i, n in zip(slots, found, lengths, strict=True):
-            self._stored.add(keys[i])  # present in this run: no need to store it
+            if current:  # present in this server run: no need to store it
+                self._stored.add(keys[i])
             leases[i] = RemoteReadLease(
                 self._staging.view(s)[:n], keys[i], functools.partial(self._end_read, s)
             )
@@ -944,26 +972,45 @@ class RemoteStorageClient:
         )
         return leases
 
-    def _transfer(self, direction: str, pairs: list[tuple[int, int, int]]) -> None:
+    def _drain_transfers(self) -> bool:
+        """Wait (``_lock`` held) for transfers in flight; True if none remain.
+
+        Bounded by the transfer deadline plus one second.
+        """
+        deadline = time.monotonic() + self.config.remote_transfer_timeout_s + 1.0
+        while self._xfers and time.monotonic() < deadline:
+            self._xfer_done.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return not self._xfers
+
+    def _transfer(self, direction: str, pairs: list[tuple[int, int, int]]) -> bool:
         """Run one RDMA READ or WRITE with ``_lock`` released.
 
         The caller holds ``_lock`` once and owns the slots and tickets in
         ``pairs``. Releasing the lock lets the load thread's READ and the
         store thread's WRITE run at the same time instead of one waiting for
         the other; control requests stay serialized under the lock. close()
-        waits for these transfers before it closes the agent.
+        and a reconnect wait for these transfers first.
+
+        Returns:
+            True if no reconnect happened meanwhile; False means the transfer
+            belongs to the previous connection, so the caller must not publish
+            or update its hints from it.
         """
         transport, peer = self._transport, self._client.peer
         fn = transport.read if direction == "read" else transport.write
+        epoch = self._epoch
         self._xfers += 1
-        state = self._lock._release_save()  # type: ignore[attr-defined]
         try:
-            fn(peer, pairs, timeout_s=self.config.remote_transfer_timeout_s)
+            state = self._lock._release_save()  # type: ignore[attr-defined]
+            try:
+                fn(peer, pairs, timeout_s=self.config.remote_transfer_timeout_s)
+            finally:
+                self._lock._acquire_restore(state)  # type: ignore[attr-defined]
         finally:
-            self._lock._acquire_restore(state)  # type: ignore[attr-defined]
             self._xfers -= 1
             if not self._xfers:
                 self._xfer_done.notify_all()
+        return epoch == self._epoch
 
     def _end_read(self, slot: int) -> None:
         """Lease release: return its slot."""
