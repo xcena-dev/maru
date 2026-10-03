@@ -106,6 +106,7 @@ class RemoteStorageClient:
         self._client: Any = None
         self._transport: Any = None
         self._staging: StagingBuffer | None = None
+        self._load_reserve = 0  # staging slots stores leave free for loads
         # Keys this handler stored or read in the current server run. A hint
         # for skipping stores: dropped when the server evicts them, all
         # forgotten on a restart.
@@ -249,10 +250,11 @@ class RemoteStorageClient:
                 raise StorageUnavailableError(
                     "remote storage is unavailable or full; skipping store"
                 )
-            slots = staging.take(1)
+            slots = staging.take(1, keep=self._load_reserve)
             if slots is None:
                 raise MemoryError(
-                    "remote staging buffer is full; skipping new cache admission"
+                    "remote staging buffer is full (the rest is kept for loads); "
+                    "skipping new cache admission"
                 )
             slot = slots[0]
             return RemoteAllocation(staging.view(slot)[:size], slot, size)
@@ -327,9 +329,16 @@ class RemoteStorageClient:
         return self._staging is not None and self._staging.cuda_registered
 
     def retrieve_capacity(self) -> int:
-        """Free staging slots: the most objects one batch_retrieve can hold now."""
+        """The most objects one batch_retrieve is sure to find slots for now.
+
+        Stores never take the slots reserved for loads, so up to that many
+        free slots stay free until a load takes them.
+        """
         with self._slot_lock:
-            return self._staging.free_count() if self._staging is not None else 0
+            if self._staging is None:
+                return 0
+            free = self._staging.free_count()
+            return min(free, self._load_reserve) if self._load_reserve else free
 
     def batch_exists(self, keys: list[str]) -> list[bool]:
         """Report which keys are in the pool (all False while the server is down).
@@ -567,6 +576,7 @@ class RemoteStorageClient:
             self._discard(client, transport, staging)
             raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
+        self._load_reserve = int(staging.count * self.config.remote_load_reserve)
         self.connected = True
         self._evictions_seen = getattr(client, "evictions", 0)
         self._start_maintainer()

@@ -77,10 +77,13 @@ class StagingBuffer:
         self.cuda_registered = True
         return True
 
-    def take(self, n: int = 1) -> list[int] | None:
-        """Take ``n`` free slots, or None (and take nothing) if fewer remain."""
+    def take(self, n: int = 1, keep: int = 0) -> list[int] | None:
+        """Take ``n`` free slots, leaving at least ``keep`` free.
+
+        Returns None (and takes nothing) if that is not possible.
+        """
         with self._free_lock:
-            if len(self._free) < n:
+            if len(self._free) - n < keep:
                 return None
             return [self._free.popleft() for _ in range(n)]
 
