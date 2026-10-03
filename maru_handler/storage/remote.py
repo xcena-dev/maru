@@ -160,6 +160,7 @@ class RemoteStorageClient:
             "quarantined_transfers": 0,
             "write_seconds": 0.0,
             "read_seconds": 0.0,
+            "stores_skipped_busy": 0,
             "stage_waits": 0,
             "stage_wait_seconds": 0.0,
             "stage_wait_timeouts": 0,
@@ -830,6 +831,9 @@ class RemoteStorageClient:
                         self.config.remote_retry_s,
                     )
                 self._store_retry_at = self._clock() + self.config.remote_retry_s
+            elif getattr(exc, "code", None) == "WRITE_BUSY":
+                # The pool has no page ready for a store; skip this one only.
+                self.counters["stores_skipped_busy"] += len(order)
             else:
                 self._fail(exc, "reserve")
             return [ok_by_key.get(k, False) for k in keys]

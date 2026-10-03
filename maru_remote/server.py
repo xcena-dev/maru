@@ -30,6 +30,7 @@ from . import protocol
 from .kv_manager import KVManager
 from .stager import Stager
 from .transport import NixlTransport, buffer_address
+from .write_buffer import WriteBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ CREATED = "CREATED"
 ALREADY_PRESENT = "ALREADY_PRESENT"
 REJECTED = "REJECTED"
 POOL_FULL = "POOL_FULL"
+WRITE_BUSY = "WRITE_BUSY"
 
 
 class PoolFullError(ValueError):
@@ -87,6 +89,10 @@ class _Region:
     registration: Any
 
 
+class WriteBusyError(Exception):
+    """No loaded page is free for a store (reported as code WRITE_BUSY)."""
+
+
 @dataclass
 class _Reservation:
     handle: AllocHandle
@@ -124,6 +130,8 @@ class RemoteServer:
         eviction_log_len: int = 65536,
         stager: Stager | None = None,
         kv_manager: KVManager | None = None,
+        write_buffer: WriteBuffer | None = None,
+        page_loader: Any = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -151,6 +159,11 @@ class RemoteServer:
             kv_manager: Holds each request's next objects in device DRAM
                 and lets a worker read them only once they are there (reads
                 that ask with ``wait_staged``); None disables it.
+            write_buffer: Free pages loaded into device DRAM ahead of stores;
+                a full-page store gets only such a page, or is refused with
+                ``WRITE_BUSY`` (the worker skips it). Needs ``page_loader``.
+            page_loader: Loads and holds a page in device DRAM: an object
+                with ``pin(address, size, done)`` and ``unpin(address, size)``.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
@@ -177,6 +190,12 @@ class RemoteServer:
         self._region_device_offset: dict[int, int] = {}
         self._stager = stager
         self._kv = kv_manager
+        if write_buffer is not None and page_loader is None:
+            raise ValueError("write_buffer needs page_loader")
+        self._wbuf = write_buffer
+        self._page_loader = page_loader
+        self._refill_stop = threading.Event()
+        self._refiller: threading.Thread | None = None
         self._warned_no_device_offset = False
         self._stage_failures = 0
         self._stage_warn_after = 0.0
@@ -201,6 +220,11 @@ class RemoteServer:
         }
         self._sync_regions()
         self._report_foreign_regions()
+        if self._wbuf is not None:
+            self._refiller = threading.Thread(
+                target=self._refill_loop, name="maru-remote-write-buffer", daemon=True
+            )
+            self._refiller.start()
 
     @property
     def generation(self) -> str:
@@ -239,12 +263,20 @@ class RemoteServer:
         try:
             with self._lock:
                 reply = op(msg)
+                self._refill_write_buffer()
                 return {
                     "ok": True,
                     "generation": self._generation,
                     "evictions": self._evicted,
                     **reply,
                 }
+        except WriteBusyError as exc:
+            return {
+                "ok": False,
+                "generation": self._generation,
+                "code": WRITE_BUSY,
+                "error": f"write busy: {exc}",
+            }
         except PoolFullError as exc:
             return {
                 "ok": False,
@@ -276,6 +308,7 @@ class RemoteServer:
         """
         now = self._clock()
         with self._lock:
+            self._refill_write_buffer()
             for ticket, res in list(self._quarantine.items()):
                 if res.deadline > now:
                     continue
@@ -335,6 +368,16 @@ class RemoteServer:
                 del self._tickets[ticket_id]
         if self._kv is not None:
             self._kv.close()
+        if self._wbuf is not None:
+            self._refill_stop.set()
+            self._wbuf.changed.set()
+            if self._refiller is not None:
+                self._refiller.join(timeout=5.0)
+            with self._lock:
+                for handle, rng in self._wbuf.close():
+                    if rng is not None:
+                        self._page_loader.unpin(*rng)
+                    self._free_quietly(handle)
         self._transport.close()
 
     # ---- ops (all called under self._lock) ----------------------------------
@@ -410,6 +453,14 @@ class RemoteServer:
                 f"sizes must be a non-empty list of ints in 1..{self._page_bytes}"
             )
         deadline = self._clock() + self._reservation_ttl_s
+        if self._wbuf is not None and all(n == self._page_bytes for n in sizes):
+            loaded = self._wbuf.take(len(sizes))
+            if loaded is None:
+                raise WriteBusyError("no loaded page is free; skip this store")
+            for _, rng in loaded:
+                if rng is not None:  # loaded and about to be written: let it go
+                    self._page_loader.unpin(*rng)
+            return self._reserve_pages([h for h, _ in loaded], sizes, deadline)
         allocated: list[AllocHandle] = []
         reserved: dict[str, _Reservation] = {}
         pages: list[dict[str, Any]] = []
@@ -699,6 +750,7 @@ class RemoteServer:
                 if self._stager is not None
                 else None
             ),
+            "write_buffer": self._wbuf.stats() if self._wbuf is not None else None,
             "kv_manager": (
                 {**self._kv.stats(), "failures": self._stage_failures}
                 if self._kv is not None
@@ -776,6 +828,83 @@ class RemoteServer:
         """Pages this server's handler holds in its own regions."""
         stats = self._handler.owned_region_manager.get_stats()
         return int(stats["total_allocated_pages"])
+
+    def _reserve_pages(
+        self, handles: list[AllocHandle], sizes: list[int], deadline: float
+    ) -> dict[str, Any]:
+        """Reserve already allocated pages for one store request."""
+        pages: list[dict[str, Any]] = []
+        for handle, size in zip(handles, sizes, strict=True):
+            addr = buffer_address(handle.buf)
+            region = self._region_for_address(addr)
+            ticket = uuid.uuid4().hex
+            self._reservations[ticket] = _Reservation(
+                handle, region.region_id, deadline
+            )
+            pages.append(
+                {
+                    "ticket": ticket,
+                    "region_id": region.region_id,
+                    "base": region.base,
+                    "offset": addr - region.base,
+                    "length": size,
+                }
+            )
+        return {"pages": pages, "md_version": self._md_version}
+
+    def _refill_loop(self) -> None:
+        """Keep the write buffer loaded: wake on each change, or every 50 ms."""
+        assert self._wbuf is not None
+        while not self._refill_stop.is_set():
+            self._wbuf.changed.wait(timeout=0.05)
+            self._wbuf.changed.clear()
+            if self._refill_stop.is_set():
+                return
+            with self._lock:
+                self._refill_write_buffer()
+
+    def _refill_write_buffer(self) -> None:
+        """Start loading free pages into device DRAM while no read is staged.
+
+        Never raises: a refill problem must not fail the request it follows.
+        """
+        if self._wbuf is None:
+            return
+        try:
+            self._refill_write_buffer_locked()
+        except Exception:
+            logger.exception("write-buffer refill failed")
+
+    def _refill_write_buffer_locked(self) -> None:
+        for handle, rng in self._wbuf.drain_orphans():
+            if rng is not None:
+                self._page_loader.unpin(*rng)
+            self._free_quietly(handle)
+        if self._kv is not None and self._kv.busy():
+            return  # reads first: their objects are being loaded
+        for _ in range(self._wbuf.want()):
+            if self._capacity_pages is not None and (
+                self._used_pages() >= self._capacity_pages and self._evict(1) < 1
+            ):
+                return
+            try:
+                handle = self._alloc_page(self._page_bytes)
+            except ValueError:
+                return  # pool full: stores are refused until reads free room
+            addr = buffer_address(handle.buf)
+            region = self._region_for_address(addr)
+            dev = self._region_device_offset.get(region.region_id)
+            if dev is None:  # not a device we can load: hand it out as is
+                self._wbuf.loading(handle, None)(True)
+                continue
+            rng = (dev + addr - region.base, self._page_bytes)
+            self._page_loader.pin(*rng, self._wbuf.loading(handle, rng))
+
+    def _free_quietly(self, handle: AllocHandle) -> None:
+        try:
+            self._handler.free(handle)
+        except Exception:
+            logger.exception("freeing a write-buffer page failed")
 
     def _alloc_page(self, size: int) -> AllocHandle:
         """Allocate one page, evicting one LRU key if the allocator is full."""

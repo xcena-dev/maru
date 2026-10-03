@@ -194,6 +194,11 @@ class KVManager:
                     self._drop(gid)
             self._pump()
 
+    def busy(self) -> bool:
+        """Whether an object is still being loaded for a read."""
+        with self._lock:
+            return any(o.state == "filling" for o in self._objs.values())
+
     def stats(self) -> dict[str, int]:
         """Counters plus live requests and bytes held."""
         with self._lock:
@@ -320,7 +325,11 @@ def _pin_worker(device_id: int, tasks: Any, results: Any) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the server decides when to stop
     import pyxif
 
-    calls = {"pin": pyxif.memory_pin, "unpin": pyxif.memory_unpin}
+    calls = {
+        "pin": pyxif.memory_pin,
+        "unpin": pyxif.memory_unpin,
+        "prefetch": pyxif.memory_prefetch_sync,
+    }
     while True:
         item = tasks.get()
         if item is None:
@@ -366,6 +375,7 @@ class ProcessPinExecutor:
         ]
         for proc in self._procs:
             proc.start()
+        self._closed = False
         self._lock = threading.Lock()
         self._callbacks: dict[int, Callable[[bool], None] | None] = {}
         self._next = itertools.count()
@@ -382,8 +392,18 @@ class ProcessPinExecutor:
         """Unpin in a worker process."""
         self._submit("unpin", address, size, None)
 
+    def prefetch(self, address: int, size: int, done: Callable[[bool], None]) -> None:
+        """Load a range into device DRAM without holding it; ``done(ok)`` after."""
+        self._submit("prefetch", address, size, done)
+
     def close(self, timeout_s: float = 5.0) -> None:
-        """Let queued calls finish for up to ``timeout_s``, then stop the processes."""
+        """Let queued calls finish for up to ``timeout_s``, then stop the processes.
+
+        Idempotent: the KV Manager and the server's owner may both close it.
+        """
+        if self._closed:
+            return
+        self._closed = True
         for _ in self._procs:
             self._tasks.put(None)
         deadline = time.monotonic() + timeout_s

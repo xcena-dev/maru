@@ -28,6 +28,7 @@ from .kv_manager import KVManager, ProcessPinExecutor
 from .server import RemoteServer, serve_forever
 from .stager import Stager, device_prefetcher
 from .transport import NixlTransport
+from .write_buffer import WriteBuffer
 
 logger = logging.getLogger("maru_remote")
 
@@ -149,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="bytes held at once for --prefetch-window; keep below the "
         "device's pin limit (half its DRAM)",
     )
+    p.add_argument(
+        "--write-buffer",
+        type=int,
+        default=0,
+        help="free pages kept loaded in the device DRAM for stores; a store "
+        "that finds none loaded is skipped (InfiniteMemory pools); 0 disables",
+    )
     p.add_argument("--log-level", default="INFO", help="logging level name")
     return p
 
@@ -172,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--prefetch-window must be >= 0")
     if args.prefetch_window and args.stage_device is None:
         parser.error("--prefetch-window needs --stage-device")
+    if args.write_buffer < 0:
+        parser.error("--write-buffer must be >= 0")
+    if args.write_buffer and args.stage_device is None:
+        parser.error("--write-buffer needs --stage-device")
     if args.prefetch_window and args.stage_window:
         parser.error("use --stage-window or --prefetch-window, not both")
     logging.basicConfig(
@@ -196,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
         transport = NixlTransport(
             f"maru-remote-{args.pool_id}", ucx_device=args.ucx_device
         )
+        device_calls = (
+            ProcessPinExecutor(args.stage_device, args.prefetch_workers)
+            if args.prefetch_window or args.write_buffer
+            else None
+        )
         server = RemoteServer(
             handler,
             transport,
@@ -213,18 +230,22 @@ def main(argv: list[str] | None = None) -> int:
             kv_manager=(
                 KVManager(
                     args.prefetch_window,
-                    ProcessPinExecutor(args.stage_device, args.prefetch_workers),
+                    device_calls,
                     max_held_bytes=args.prefetch_budget,
                     group_ttl_s=10.0,
                 )
                 if args.prefetch_window
                 else None
             ),
+            write_buffer=WriteBuffer(args.write_buffer) if args.write_buffer else None,
+            page_loader=device_calls,
         )
         try:
             _serve_until_signalled(server, args.ctrl_url)
         finally:
             server.close()
+            if device_calls is not None:
+                device_calls.close()
     finally:
         handler.close()
     return 0

@@ -1374,3 +1374,88 @@ def test_a_failed_segment_returns_the_slots_of_earlier_ones(pool_handler, unused
         worker.close()
     finally:
         node.stop()
+
+
+class ManualLoader:
+    """Write-buffer page loader whose loads complete when the test says so."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.waiting = []
+        self.unpinned = []
+
+    def pin(self, address, size, done):
+        with self.lock:
+            self.waiting.append(done)
+
+    def unpin(self, address, size):
+        with self.lock:
+            self.unpinned.append((address, size))
+
+    def complete_all(self):
+        with self.lock:
+            waiting, self.waiting = self.waiting, []
+        for done in waiting:
+            done(True)
+
+
+def test_stores_use_loaded_pages_and_skip_when_none_is_ready(pool_handler, unused_port):
+    from maru_remote.write_buffer import WriteBuffer
+
+    loader = ManualLoader()
+    node = PoolNode(
+        pool_handler,
+        unused_port,
+        write_buffer=WriteBuffer(pages=2, refill_batch=2),
+        page_loader=loader,
+    )
+    node.start()
+    try:
+        worker = remote_handler(node.url)
+        full = b"x" * PAGE
+        assert _store(worker, "a", full) is False  # nothing loaded yet: skipped
+        assert worker._storage.counters["stores_skipped_busy"] == 1
+        loader.complete_all()
+        assert _store(worker, "a", full) is True  # no back-off after a skip
+        assert len(loader.unpinned) == 1  # the page is let go once handed out
+        (lease,) = worker.batch_retrieve(["a"])
+        assert bytes(lease.view) == full
+        lease.release()
+        assert _store(worker, "small", b"s" * 10) is True  # partial pages bypass it
+        assert node.stats()["write_buffer"]["handed_out"] == 1
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_buffer_waits_while_reads_are_being_staged(pool_handler, unused_port):
+    from maru_remote.kv_manager import KVManager
+    from maru_remote.write_buffer import WriteBuffer
+
+    pins, loader = ManualPins(), ManualLoader()
+    node = PoolNode(
+        pool_handler,
+        unused_port,
+        kv_manager=KVManager(4, pins, max_held_bytes=64 * PAGE),
+        write_buffer=WriteBuffer(pages=2, refill_batch=2),
+        page_loader=loader,
+    )
+    node.start()
+    try:
+        worker = remote_handler(node.url, remote_load_reserve=0.0)
+        loader.complete_all()
+        assert _store(worker, "k0", b"v" * PAGE) is True
+        sched = remote_handler(node.url, metadata_only=True)
+        loader.complete_all()
+        before = len(loader.waiting)
+        assert sched.batch_exists(["k0"]) == [True]  # a read is being staged
+        assert _store(worker, "k1", b"w" * PAGE) is True  # takes a loaded page
+        assert worker._storage.ping()  # any request runs a refill attempt
+        assert len(loader.waiting) == before  # no page loads while reads stage
+        pins.complete_all()
+        assert worker._storage.ping()
+        assert len(loader.waiting) > before
+        sched.close()
+        worker.close()
+    finally:
+        node.stop()
