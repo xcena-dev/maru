@@ -1100,34 +1100,139 @@ def test_a_load_runs_while_a_store_transfer_is_in_flight(pool):
     h.close()
 
 
-def test_close_waits_for_a_transfer_in_flight(pool):
-    import threading as _threading
+def _slow(transport, name, started, release, seen=None):
+    """Make transport.<name> block until ``release``; record closed-agent use."""
+    real = getattr(transport, name)
 
-    h = remote_handler(pool.url, staging=8 * PAGE)
-    transport = h._storage._transport
-    real_write = transport.write
-    started, release = _threading.Event(), _threading.Event()
-    closed_agent = []
-
-    def slow_write(peer, pairs, timeout_s):
+    def slow(peer, pairs, timeout_s):
         started.set()
         release.wait(5)
-        assert not closed_agent  # the agent is still open while we use it
-        return real_write(peer, pairs, timeout_s=timeout_s)
+        if seen is not None and seen.get("closed"):
+            seen["used_after_close"] = True
+        return real(peer, pairs, timeout_s=timeout_s)
 
+    setattr(transport, name, slow)
+    return real
+
+
+def test_close_waits_for_a_transfer_in_flight(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, transfer_timeout=5.0)
+    transport = h._storage._transport
+    started, release = threading.Event(), threading.Event()
+    seen = {}
+    _slow(transport, "write", started, release, seen)
     real_close = transport.close
-    transport.write = slow_write
-    transport.close = lambda: (closed_agent.append(True), real_close())
+
+    def close_agent():
+        seen["closed"] = True
+        real_close()
+
+    transport.close = close_agent
     a = h.alloc(10)
     a.buf[:] = b"s" * 10
-    t = _threading.Thread(target=lambda: h.batch_store(["k"], [a]))
+    t = threading.Thread(target=lambda: h.batch_store(["k"], [a]))
     t.start()
     assert started.wait(5)
-    closer = _threading.Thread(target=h.close)
+    closer = threading.Thread(target=h.close)
     closer.start()
     closer.join(0.3)
-    assert closer.is_alive() and not closed_agent  # close waits for the WRITE
+    assert closer.is_alive() and not seen.get("closed")  # close waits for the WRITE
     release.set()
     t.join(5)
     closer.join(5)
-    assert closed_agent == [True]
+    assert seen.get("closed") and not seen.get("used_after_close")
+
+
+def test_close_leaves_the_agent_open_when_a_transfer_outlives_the_deadline(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, transfer_timeout=0.05)
+    transport = h._storage._transport
+    started, release = threading.Event(), threading.Event()
+    seen = {}
+    _slow(transport, "write", started, release, seen)
+    transport.close = lambda: seen.update(closed=True)
+    a = h.alloc(10)
+    a.buf[:] = b"s" * 10
+    errors = []
+
+    def store():
+        try:
+            h.batch_store(["k"], [a])
+        except Exception as e:  # noqa: BLE001 - recorded for the assertion
+            errors.append(e)
+
+    t = threading.Thread(target=store)
+    t.start()
+    assert started.wait(5)
+    h.close()  # waits about 1 s, then gives up on the WRITE
+    assert not seen.get("closed")  # the agent the WRITE uses stays open
+    release.set()
+    t.join(5)
+    assert errors == []  # the store finishes without touching freed state
+
+
+def test_close_refuses_when_a_load_in_flight_returns_leases(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, transfer_timeout=5.0)
+    assert _store(h, "k", b"v" * 10)
+    started, release = threading.Event(), threading.Event()
+    _slow(h._storage._transport, "read", started, release)
+    leases = []
+    t = threading.Thread(target=lambda: leases.extend(h.batch_retrieve(["k"])))
+    t.start()
+    assert started.wait(5)
+    outcome = []
+
+    def close():
+        try:
+            h.close()
+            outcome.append("closed")
+        except RuntimeError:
+            outcome.append("refused")
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    release.set()
+    t.join(5)
+    closer.join(5)
+    assert outcome == ["refused"]  # the load finished first and holds a lease
+    leases[0].release()
+    h.close()
+
+
+def test_reconnect_waits_for_a_transfer_in_flight(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, transfer_timeout=5.0)
+    s = h._storage
+    started, release = threading.Event(), threading.Event()
+    _slow(s._transport, "write", started, release)
+    order = []
+    real_connect = s._client.connect
+
+    def connect():
+        order.append("connect")
+        return real_connect()
+
+    s._client.connect = connect
+    a = h.alloc(10)
+    a.buf[:] = b"s" * 10
+
+    def store():
+        h.batch_store(["k"], [a])
+        order.append("store done")
+
+    t = threading.Thread(target=store)
+    t.start()
+    assert started.wait(5)
+
+    def reconnect():
+        with s._lock:
+            s._reconnect = True
+            s._ready()
+
+    r = threading.Thread(target=reconnect)
+    r.start()
+    r.join(0.3)
+    assert r.is_alive() and order == []  # the reconnect waits for the WRITE
+    release.set()
+    t.join(5)
+    r.join(5)
+    assert "connect" in order  # it ran once the WRITE had finished
+    h.close()
