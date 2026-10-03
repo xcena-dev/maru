@@ -45,6 +45,8 @@ _ALREADY_PRESENT = "ALREADY_PRESENT"
 # Period of the maintenance thread: one ping of its own probe client, then a
 # reconnect (server restarted or back) or an eviction sync when needed.
 _MAINTAIN_INTERVAL_S = 1.0
+# How long a load waiting for the pool to stage a batch sleeps between lookups.
+_STAGE_POLL_S = 0.0005
 # Reply deadline of a probe ping (capped by the control timeout); a ping
 # needs well under a millisecond, so a short deadline detects outages fast.
 _PROBE_TIMEOUT_MS = 500
@@ -117,6 +119,7 @@ class RemoteStorageClient:
         self._transport: Any = None
         self._staging: StagingBuffer | None = None
         self._load_reserve = 0  # staging slots stores leave free for loads
+        self._staged_reads = False  # the pool stages reads (hello "staged_reads")
         # Keys this handler stored or read in the current server run. A hint
         # for skipping stores: dropped when the server evicts them, all
         # forgotten on a restart.
@@ -157,6 +160,9 @@ class RemoteStorageClient:
             "quarantined_transfers": 0,
             "write_seconds": 0.0,
             "read_seconds": 0.0,
+            "stage_waits": 0,
+            "stage_wait_seconds": 0.0,
+            "stage_wait_timeouts": 0,
         }
 
     # ---- lifecycle ------------------------------------------------------------
@@ -610,6 +616,7 @@ class RemoteStorageClient:
             raise StorageError(f"remote staging buffer setup failed: {exc}") from exc
         self._client, self._transport, self._staging = client, transport, staging
         self._load_reserve = int(staging.count * self.config.remote_load_reserve)
+        self._staged_reads = bool(hello.get("staged_reads"))
         self.connected = True
         self._evictions_seen = getattr(client, "evictions", 0)
         self._start_maintainer()
@@ -891,26 +898,76 @@ class RemoteStorageClient:
         return [ok_by_key.get(k, False) for k in keys]
 
     def _retrieve_locked(self, keys: list[str]) -> list[RemoteReadLease | None]:
-        """Lookup with protection, READ into staging, unpin (lock held)."""
+        """Read ``keys`` into staging slots (lock held).
+
+        A pool that stages reads gets them in batches of
+        ``remote_read_segment`` objects, each read once the pool has it in
+        device DRAM: the pool loads the next batch while this one is read.
+        If a later batch fails, the slots of the earlier ones are returned.
+        """
+        seg = self.config.remote_read_segment
+        if not self._staged_reads:
+            return self._retrieve_batch_locked(keys, wait=False)
+        leases: list[RemoteReadLease | None] = []
+        try:
+            for i in range(0, len(keys), seg):
+                leases.extend(self._retrieve_batch_locked(keys[i : i + seg], wait=True))
+        except BaseException:
+            for lease in leases:
+                if lease is not None:
+                    lease.release()
+            raise
+        return leases
+
+    def _retrieve_batch_locked(
+        self, keys: list[str], *, wait: bool
+    ) -> list[RemoteReadLease | None]:
+        """Lookup with protection, READ into staging, unpin (lock held).
+
+        With ``wait``, the lookup is repeated with the I/O lock released until
+        the pool reports the keys staged, for at most ``remote_stage_wait_s``;
+        after that the keys are read as they are.
+        """
         from maru_remote.transport import TransferTimeout
 
         assert self._staging is not None
         t0 = time.perf_counter()
         scoped = [self._scope(k) for k in keys]
         ticket_id = ""
+        deadline = time.monotonic() + self.config.remote_stage_wait_s
 
-        def lookup() -> list[dict[str, Any] | None]:
+        def lookup() -> list[dict[str, Any] | None] | None:
             nonlocal ticket_id
             ticket_id = f"{self._client_id()}-{uuid.uuid4().hex}"  # fresh per attempt
-            return list(self._client.lookup(scoped, ticket_id, protect=True))
+            staged = wait and time.monotonic() < deadline
+            found = self._client.lookup(
+                scoped, ticket_id, protect=True, wait_staged=staged
+            )
+            if found is None and not staged:
+                raise StorageError("pool reported pending for a read that did not wait")
+            return None if found is None else list(found)
 
         try:
-            entries = self._after_restart(lookup)
+            while True:
+                entries = self._after_restart(lookup)
+                if entries is not None:
+                    break
+                self.counters["stage_waits"] += 1
+                if not self._pause(_STAGE_POLL_S):
+                    raise StorageUnavailableError(
+                        "remote storage reconnected or closed while a load waited"
+                    )
+        except StorageUnavailableError:
+            self.counters["loads_failed"] += 1
+            raise
         except Exception as exc:
             self._fail(exc, "lookup")
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote lookup failed: {exc}") from exc
+        if wait and time.monotonic() >= deadline:
+            self.counters["stage_wait_timeouts"] += 1
         t1 = time.perf_counter()
+        self.counters["stage_wait_seconds"] += t1 - t0
         self._sync_from_io()
         found = [i for i, e in enumerate(entries) if e is not None]
         for i, e in enumerate(entries):
@@ -1022,6 +1079,16 @@ class RemoteStorageClient:
             if not self._xfers:
                 self._xfer_done.notify_all()
         return epoch == self._epoch
+
+    def _pause(self, seconds: float) -> bool:
+        """Sleep with ``_lock`` released; True if no reconnect or close came meanwhile."""
+        epoch = self._epoch
+        state = self._lock._release_save()  # type: ignore[attr-defined]
+        try:
+            time.sleep(seconds)
+        finally:
+            self._lock._acquire_restore(state)  # type: ignore[attr-defined]
+        return epoch == self._epoch and self.connected and not self._closing
 
     def _end_read(self, slot: int) -> None:
         """Lease release: return its slot."""

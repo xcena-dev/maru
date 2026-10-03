@@ -27,6 +27,7 @@ from maru_handler import MaruHandler
 from maru_handler.memory.types import AllocHandle, MemoryInfo
 
 from . import protocol
+from .kv_manager import KVManager
 from .stager import Stager
 from .transport import NixlTransport, buffer_address
 
@@ -122,6 +123,7 @@ class RemoteServer:
         evict: bool = True,
         eviction_log_len: int = 65536,
         stager: Stager | None = None,
+        kv_manager: KVManager | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create the server and register the handler's mapped regions.
@@ -146,6 +148,9 @@ class RemoteServer:
             stager: Loads looked-up objects into the device DRAM ahead of
                 their reads (pools on an SSD-backed CXL device); None
                 disables staging.
+            kv_manager: Holds each request's next objects in device DRAM
+                and lets a worker read them only once they are there (reads
+                that ask with ``wait_staged``); None disables it.
             clock: Monotonic time source (tests inject a fake).
         """
         self._handler = handler
@@ -171,6 +176,7 @@ class RemoteServer:
         self._regions: dict[int, _Region] = {}
         self._region_device_offset: dict[int, int] = {}
         self._stager = stager
+        self._kv = kv_manager
         self._warned_no_device_offset = False
         self._stage_failures = 0
         self._stage_warn_after = 0.0
@@ -302,6 +308,8 @@ class RemoteServer:
                     logger.exception("sweep: unpinning ticket %s failed", ticket_id)
                     continue
                 del self._tickets[ticket_id]
+                if self._kv is not None:
+                    self._stage(self._kv.on_consumed, tk.keys)
 
     def close(self) -> None:
         """Release everything this server holds (not the handler itself).
@@ -325,6 +333,8 @@ class RemoteServer:
                     logger.exception("close: unpinning ticket %s failed", ticket_id)
                     continue
                 del self._tickets[ticket_id]
+        if self._kv is not None:
+            self._kv.close()
         self._transport.close()
 
     # ---- ops (all called under self._lock) ----------------------------------
@@ -346,6 +356,7 @@ class RemoteServer:
             "protocol": protocol.PROTOCOL_VERSION,
             "reservation_ttl_s": self._reservation_ttl_s,
             "ticket_ttl_s": self._ticket_ttl_s,
+            "staged_reads": self._kv is not None,
             **self._op_metadata(msg),
         }
 
@@ -581,9 +592,12 @@ class RemoteServer:
         """
         keys = _require_str_list(msg["keys"], "keys")
         entries = self._locate(keys)
-        if self._stager is not None and msg.get("stage") is True:
-            ranges = [self._device_range(e) for e in entries]
-            self._stage(self._stager.on_lookup, keys, ranges)
+        if msg.get("stage") is True:
+            hooks = [h.on_lookup for h in (self._stager, self._kv) if h is not None]
+            if hooks:
+                ranges = [self._device_range(e) for e in entries]
+                for hook in hooks:
+                    self._stage(hook, keys, ranges)
         return {"found": [e is not None for e in entries]}
 
     def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -592,11 +606,17 @@ class RemoteServer:
         With ``protect``, found keys are pinned until ``release`` or ticket
         expiry; a key that could not be pinned is reported as missing.
 
+        With ``wait_staged`` (and a KV Manager), the keys are located only
+        once every found key sits in device DRAM; until then the reply is
+        ``pending`` and nothing is pinned, so the worker asks again.
+
         Args:
-            msg: Request with ``keys``, ``ticket_id`` and bool ``protect``.
+            msg: Request with ``keys``, ``ticket_id``, bool ``protect`` and
+                optional bool ``wait_staged``.
 
         Returns:
-            ``entries`` (location or None per key) and ``md_version``.
+            ``entries`` (location or None per key) and ``md_version``, or
+            ``pending`` and ``md_version`` while staging is still running.
 
         Raises:
             ValueError: if fields are malformed or ``ticket_id`` is in use.
@@ -609,6 +629,15 @@ class RemoteServer:
         if protect and ticket_id in self._tickets:
             raise ValueError(f"ticket_id {ticket_id} is already in use")
         entries = self._locate(keys)
+        if self._kv is not None and msg.get("wait_staged") is True:
+            ranges = [self._device_range(e) for e in entries]
+            try:
+                ready = self._kv.ready(keys, ranges)
+            except Exception:  # staging must never fail the read itself
+                self._stage_failed()
+                ready = True
+            if not ready:
+                return {"pending": True, "md_version": self._md_version}
         if protect:
             self._protect(ticket_id, keys, entries)
         for key, entry in zip(keys, entries, strict=True):
@@ -640,6 +669,8 @@ class RemoteServer:
             return {"released": 0}
         self._handler.batch_unpin(tk.keys)
         del self._tickets[ticket_id]
+        if self._kv is not None:
+            self._stage(self._kv.on_consumed, tk.keys)
         return {"released": len(tk.keys)}
 
     def _op_stats(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -666,6 +697,11 @@ class RemoteServer:
             "stager": (
                 {**self._stager.stats(), "failures": self._stage_failures}
                 if self._stager is not None
+                else None
+            ),
+            "kv_manager": (
+                {**self._kv.stats(), "failures": self._stage_failures}
+                if self._kv is not None
                 else None
             ),
         }
@@ -813,16 +849,19 @@ class RemoteServer:
         try:
             fn(*args)
         except Exception:
-            self._stage_failures += 1
-            now = self._clock()
-            if now >= self._stage_warn_after:
-                self._stage_warn_after = now + 60.0
-                logger.warning(
-                    "staging hint failed (%d so far); further failures are not "
-                    "logged for 60 s",
-                    self._stage_failures,
-                    exc_info=True,
-                )
+            self._stage_failed()
+
+    def _stage_failed(self) -> None:
+        """Count a staging failure; log it at most once a minute."""
+        self._stage_failures += 1
+        now = self._clock()
+        if now >= self._stage_warn_after:
+            self._stage_warn_after = now + 60.0
+            logger.warning(
+                "staging failed (%d so far); further failures are not logged for 60 s",
+                self._stage_failures,
+                exc_info=True,
+            )
 
     def _device_range(self, entry: dict[str, Any] | None) -> tuple[int, int] | None:
         """Device (address, size) of a located key, or None."""

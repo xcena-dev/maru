@@ -1236,3 +1236,141 @@ def test_reconnect_waits_for_a_transfer_in_flight(pool):
     r.join(5)
     assert "connect" in order  # it ran once the WRITE had finished
     h.close()
+
+
+class ManualPins:
+    """KV Manager executor whose pins complete when the test says so."""
+
+    def __init__(self, auto=False):
+        self.auto = auto
+        self.lock = threading.Lock()
+        self.waiting = []
+        self.pinned = []
+        self.unpinned = []
+
+    def pin(self, address, size, done):
+        with self.lock:
+            self.pinned.append((address, size))
+            if not self.auto:
+                self.waiting.append(done)
+                return
+        threading.Timer(0, done, (True,)).start()  # off the caller's lock
+
+    def complete_all(self):
+        with self.lock:
+            waiting, self.waiting = self.waiting, []
+        for done in waiting:
+            done(True)
+
+    def unpin(self, address, size):
+        with self.lock:
+            self.unpinned.append((address, size))
+
+    def close(self):
+        pass
+
+
+def _staged_node(pool_handler, port, pins, window=4):
+    from maru_remote.kv_manager import KVManager
+
+    node = PoolNode(
+        pool_handler,
+        port,
+        kv_manager=KVManager(window, pins, max_held_bytes=64 * PAGE),
+    )
+    node.start()
+    return node
+
+
+def test_staged_read_waits_until_the_pool_holds_the_keys(pool_handler, unused_port):
+    pins = ManualPins()
+    node = _staged_node(pool_handler, unused_port, pins)
+    try:
+        worker = remote_handler(node.url, remote_stage_wait_s=5.0)
+        keys = ["k0", "k1"]
+        for k in keys:
+            assert _store(worker, k, k.encode() * 10)
+        result = {}
+        reader = threading.Thread(
+            target=lambda: result.setdefault("leases", worker.batch_retrieve(keys))
+        )
+        reader.start()
+        time.sleep(0.2)
+        assert reader.is_alive()  # waiting for the pool to stage k0 and k1
+        pins.complete_all()
+        reader.join(timeout=5)
+        leases = result["leases"]
+        assert [bytes(lease.view) for lease in leases] == [b"k0" * 10, b"k1" * 10]
+        for lease in leases:
+            lease.release()
+        assert sorted(pins.unpinned) == sorted(pins.pinned)  # released after the read
+        assert worker._storage.counters["stage_waits"] > 0
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_staged_reads_go_in_segments_and_move_the_window(pool_handler, unused_port):
+    pins = ManualPins(auto=True)
+    node = _staged_node(pool_handler, unused_port, pins, window=2)
+    try:
+        worker = remote_handler(node.url, remote_read_segment=2)
+        keys = [f"k{i}" for i in range(4)]
+        for k in keys:
+            assert _store(worker, k, k.encode() * 10)
+        sched = remote_handler(node.url, metadata_only=True)
+        assert sched.batch_exists(keys) == [True] * 4
+        leases = worker.batch_retrieve(keys)
+        assert [bytes(lease.view) for lease in leases] == [
+            k.encode() * 10 for k in keys
+        ]
+        for lease in leases:
+            lease.release()
+        assert len(pins.pinned) == 4 and len(pins.unpinned) == 4
+        assert node.stats()["kv_manager"]["live_requests"] == 0
+        sched.close()
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_staged_read_reads_anyway_after_the_wait_limit(pool_handler, unused_port):
+    pins = ManualPins()  # pins never complete
+    node = _staged_node(pool_handler, unused_port, pins)
+    try:
+        worker = remote_handler(node.url, remote_stage_wait_s=0.2)
+        assert _store(worker, "k0", b"v" * 10)
+        (lease,) = worker.batch_retrieve(["k0"])
+        assert bytes(lease.view) == b"v" * 10
+        lease.release()
+        assert worker._storage.counters["stage_wait_timeouts"] == 1
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_a_failed_segment_returns_the_slots_of_earlier_ones(pool_handler, unused_port):
+    pins = ManualPins(auto=True)
+    node = _staged_node(pool_handler, unused_port, pins)
+    try:
+        worker = remote_handler(node.url, staging=8 * PAGE, remote_read_segment=1)
+        for k in ("k0", "k1"):
+            assert _store(worker, k, b"v" * 10)
+        backend = worker._storage
+        real = backend._retrieve_batch_locked
+        calls = []
+
+        def second_fails(keys, *, wait):
+            calls.append(keys)
+            if len(calls) == 2:
+                raise StorageUnavailableError("injected")
+            return real(keys, wait=wait)
+
+        backend._retrieve_batch_locked = second_fails
+        free = backend._staging.free_count()
+        with pytest.raises(StorageUnavailableError):
+            worker.batch_retrieve(["k0", "k1"])
+        assert backend._staging.free_count() == free
+        worker.close()
+    finally:
+        node.stop()

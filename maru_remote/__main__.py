@@ -24,6 +24,7 @@ from types import FrameType
 from maru_common.config import MaruConfig
 from maru_handler import MaruHandler
 
+from .kv_manager import KVManager, ProcessPinExecutor
 from .server import RemoteServer, serve_forever
 from .stager import Stager, device_prefetcher
 from .transport import NixlTransport
@@ -125,7 +126,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="pyxif device id of the pool's InfiniteMemory device "
-        "(required with --stage-window)",
+        "(required with --stage-window or --prefetch-window)",
+    )
+    p.add_argument(
+        "--prefetch-window",
+        type=int,
+        default=0,
+        help="objects per request held in the device DRAM ahead of the "
+        "worker's reads; a worker reads them only once they are there "
+        "(InfiniteMemory pools); 0 disables it",
+    )
+    p.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=2,
+        help="processes that load and hold objects for --prefetch-window",
+    )
+    p.add_argument(
+        "--prefetch-budget",
+        type=parse_size,
+        default=parse_size("24G"),
+        help="bytes held at once for --prefetch-window; keep below the "
+        "device's pin limit (half its DRAM)",
     )
     p.add_argument("--log-level", default="INFO", help="logging level name")
     return p
@@ -146,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--stage-window must be >= 0")
     if args.stage_window and args.stage_device is None:
         parser.error("--stage-window needs --stage-device")
+    if args.prefetch_window < 0:
+        parser.error("--prefetch-window must be >= 0")
+    if args.prefetch_window and args.stage_device is None:
+        parser.error("--prefetch-window needs --stage-device")
+    if args.prefetch_window and args.stage_window:
+        parser.error("use --stage-window or --prefetch-window, not both")
     logging.basicConfig(
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -180,6 +208,16 @@ def main(argv: list[str] | None = None) -> int:
             stager=(
                 Stager(args.stage_window, device_prefetcher(args.stage_device))
                 if args.stage_window
+                else None
+            ),
+            kv_manager=(
+                KVManager(
+                    args.prefetch_window,
+                    ProcessPinExecutor(args.stage_device, args.prefetch_workers),
+                    max_held_bytes=args.prefetch_budget,
+                    group_ttl_s=10.0,
+                )
+                if args.prefetch_window
                 else None
             ),
         )

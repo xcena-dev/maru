@@ -215,26 +215,39 @@ class RemoteClient:
         return found
 
     def lookup(
-        self, keys: list[str], ticket_id: str, *, protect: bool = True
-    ) -> list[dict[str, Any] | None]:
+        self,
+        keys: list[str],
+        ticket_id: str,
+        *,
+        protect: bool = True,
+        wait_staged: bool = False,
+    ) -> list[dict[str, Any] | None] | None:
         """Locate keys for remote READ, pinning them under ``ticket_id``.
 
         Args:
             keys: Keys to locate.
             ticket_id: Read-ticket name; release it with :meth:`release`.
             protect: Pin the found keys until release or ticket expiry.
+            wait_staged: Ask the pool to answer only once the keys sit in
+                device DRAM (pools whose ``hello`` reports ``staged_reads``).
 
         Returns:
-            One entry (region_id, base, offset, length) or None per key.
+            One entry (region_id, base, offset, length) or None per key, or
+            None while the pool is still staging (nothing was pinned).
         """
         reply = self._call(
             "lookup",
-            expect=("entries", "md_version"),
+            expect=("md_version",),
             keys=list(keys),
             ticket_id=ticket_id,
             protect=protect,
+            wait_staged=wait_staged,
         )
         self._refresh_if_stale(int(reply["md_version"]))
+        if reply.get("pending") is True:
+            return None
+        if "entries" not in reply:
+            raise RemoteError("lookup: reply has no entries")
         entries: list[dict[str, Any] | None] = list(reply["entries"])
         if len(entries) != len(keys):
             raise RemoteError("lookup: reply has the wrong number of entries")

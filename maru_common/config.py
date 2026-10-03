@@ -56,6 +56,11 @@ class MaruConfig:
         remote_load_reserve: Share of the remote staging slots that stores
             leave free for loads (0 to 1). A store that would take one of
             them is skipped, so a slow pool makes stores, not loads, give way.
+        remote_read_segment: Objects one remote load reads per RDMA batch when
+            the pool stages reads (a pool on an SSD-backed CXL device). The
+            pool loads the next objects while the current batch is read.
+        remote_stage_wait_s: How long a remote load waits for the pool to
+            stage a batch before reading it as it is.
     """
 
     server_url: str = "tcp://localhost:5555"
@@ -85,6 +90,8 @@ class MaruConfig:
     remote_transfer_timeout_s: float = 30.0
     remote_retry_s: float = 30.0
     remote_load_reserve: float = 0.5
+    remote_read_segment: int = 4
+    remote_stage_wait_s: float = 10.0
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -175,7 +182,14 @@ class MaruConfig:
             )
         if self.cxl_pool_size is not None:
             raise ValueError("cxl_pool_size is only supported by mixed storage")
-        for name in ("remote_transfer_timeout_s", "remote_retry_s"):
+        segment = self.remote_read_segment
+        if isinstance(segment, bool) or not isinstance(segment, int) or segment <= 0:
+            raise ValueError("remote_read_segment must be a positive int")
+        for name in (
+            "remote_transfer_timeout_s",
+            "remote_retry_s",
+            "remote_stage_wait_s",
+        ):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
