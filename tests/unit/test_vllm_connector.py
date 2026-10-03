@@ -4353,6 +4353,10 @@ class TestDeferredAdmissionFitsCache:
         output.finished_req_ids = {req_id}
         return output
 
+    def test_budget_leaves_out_the_null_block(self, tmp_path):
+        engine = self._engine(tmp_path)  # 64 blocks, one kept aside by vLLM
+        assert engine.connector._scheduler._num_gpu_blocks == 63
+
     def test_no_limit_without_block_count(self):
         sched = self._sched(num_gpu_blocks=None)
         self._park(sched, self._request("big"))
