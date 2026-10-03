@@ -268,3 +268,43 @@ def test_evicted_range_is_let_go_at_once():
     assert ranges[1] in ex.unpinned
     kv.on_consumed(keys)
     assert ex.unpinned.count(ranges[1]) == 1  # not unpinned twice
+
+
+def test_window_of_a_finished_partial_read_gives_way():
+    kv, ex, clock = make(window=4, budget=8 * OBJ)
+    a, ra = keys_ranges(10, prefix="a")
+    b, rb = keys_ranges(10, base=100 * OBJ, prefix="b")
+    for keys, ranges in ((a, ra), (b, rb)):
+        kv.on_lookup(keys, ranges)
+        ex.complete_all()
+        assert kv.ready(keys[:2], ranges[:2])  # read only the first two
+        kv.on_consumed(keys[:2])
+        ex.complete_all()
+    clock.t = 2.0  # nobody has read a or b for a while
+    c, rc = keys_ranges(4, base=200 * OBJ, prefix="c")
+    assert not kv.ready(c, rc)
+    ex.complete_all()
+    assert kv.ready(c, rc)
+
+
+def test_two_reads_beyond_the_budget_both_go_ahead():
+    kv, ex, _ = make(window=4, budget=4 * OBJ)
+    a, ra = keys_ranges(4, prefix="a")
+    b, rb = keys_ranges(4, base=100 * OBJ, prefix="b")
+    assert not kv.ready(a, ra)
+    assert not kv.ready(b, rb)
+    ex.complete_all()
+    assert kv.ready(a, ra) and kv.ready(b, rb)
+
+
+def test_reused_range_is_not_let_go_by_the_evicted_keys_request():
+    kv, ex, _ = make(window=4)
+    old, rold = keys_ranges(2, prefix="old")
+    kv.on_lookup(old, rold)
+    ex.complete_all()
+    kv.forget_range(rold[1])  # old1 evicted; its page goes to a new key
+    new = ["new0"]
+    assert not kv.ready(new, [rold[1]])
+    ex.complete_all()
+    kv.on_consumed(old)  # the evicted key's request finishes
+    assert kv.ready(new, [rold[1]])  # the new key's pin is still held

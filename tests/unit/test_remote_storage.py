@@ -1425,6 +1425,7 @@ def test_stores_use_loaded_pages_and_skip_when_none_is_ready(pool_handler, unuse
         assert node.stats()["write_buffer"]["handed_out"] == 1
         worker.close()
     finally:
+        loader.complete_all()  # no page load left in flight at close
         node.stop()
 
 
@@ -1458,6 +1459,7 @@ def test_buffer_waits_while_reads_are_being_staged(pool_handler, unused_port):
         sched.close()
         worker.close()
     finally:
+        loader.complete_all()  # no page load left in flight at close
         node.stop()
 
 
@@ -1482,4 +1484,5 @@ def test_store_batch_larger_than_the_buffer_bypasses_it(pool_handler, unused_por
         assert worker.batch_store(["x", "y"], handles) == [True, True]
         worker.close()
     finally:
+        loader.complete_all()  # no page load left in flight at close
         node.stop()

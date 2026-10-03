@@ -373,8 +373,11 @@ class RemoteServer:
             self._wbuf.changed.set()
             if self._refiller is not None:
                 self._refiller.join(timeout=5.0)
+            deadline = self._clock() + 5.0  # let page loads in flight finish
+            while self._wbuf.stats()["loading"] and self._clock() < deadline:
+                time.sleep(0.01)
             with self._lock:
-                for handle, rng in self._wbuf.close():
+                for handle, rng in self._wbuf.close() + self._wbuf.drain_orphans():
                     if rng is not None:
                         self._page_loader.unpin(*rng)
                     self._free_quietly(handle)
