@@ -572,6 +572,18 @@ def _bind_lease_namespace(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     return bound
 
 
+def _usable_gpu_blocks(
+    kv_cache_config: KVCacheConfig | None, vllm_config: VllmConfig
+) -> int | None:
+    """GPU KV blocks requests can hold: vLLM keeps one block aside as its null block."""
+    total = (
+        kv_cache_config.num_blocks
+        if kv_cache_config is not None
+        else vllm_config.cache_config.num_gpu_blocks
+    )
+    return total - 1 if total else None
+
+
 def _unkeyed_request(request: Any) -> bool:
     """M1 does not key embeddings, adapter state, multimodal data or salts."""
     return (
@@ -923,11 +935,7 @@ class MaruKVConnector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
-                num_gpu_blocks=(
-                    kv_cache_config.num_blocks
-                    if kv_cache_config is not None
-                    else vllm_config.cache_config.num_gpu_blocks
-                ),
+                num_gpu_blocks=_usable_gpu_blocks(kv_cache_config, vllm_config),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
