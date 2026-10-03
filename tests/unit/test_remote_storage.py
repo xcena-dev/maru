@@ -1032,3 +1032,70 @@ def test_one_slot_staging_has_no_load_reserve(pool):
     h.free(a)
     assert h.retrieve_capacity() == 1
     h.close()
+
+
+def test_a_load_runs_while_a_store_transfer_is_in_flight(pool):
+    import threading as _threading
+
+    h = remote_handler(pool.url, staging=8 * PAGE, remote_load_reserve=0.5)
+    assert _store(h, "ready", b"r" * 100)
+    transport = h._storage._transport
+    real_write = transport.write
+    started, release = _threading.Event(), _threading.Event()
+
+    def slow_write(peer, pairs, timeout_s):
+        started.set()
+        release.wait(5)
+        return real_write(peer, pairs, timeout_s=timeout_s)
+
+    transport.write = slow_write
+    a = h.alloc(10)
+    a.buf[:] = b"s" * 10
+    result = {}
+    t = _threading.Thread(target=lambda: result.update(ok=h.batch_store(["slow"], [a])))
+    t.start()
+    assert started.wait(5)
+    try:
+        (lease,) = h.batch_retrieve(["ready"])  # not queued behind the WRITE
+        assert bytes(lease.view) == b"r" * 100
+        lease.release()
+        assert t.is_alive()  # the store is still in its WRITE
+    finally:
+        release.set()
+        t.join(5)
+    assert result["ok"] == [True]
+    transport.write = real_write
+    h.close()
+
+
+def test_close_waits_for_a_transfer_in_flight(pool):
+    import threading as _threading
+
+    h = remote_handler(pool.url, staging=8 * PAGE)
+    transport = h._storage._transport
+    real_write = transport.write
+    started, release = _threading.Event(), _threading.Event()
+    closed_agent = []
+
+    def slow_write(peer, pairs, timeout_s):
+        started.set()
+        release.wait(5)
+        assert not closed_agent  # the agent is still open while we use it
+        return real_write(peer, pairs, timeout_s=timeout_s)
+
+    real_close = transport.close
+    transport.write = slow_write
+    transport.close = lambda: (closed_agent.append(True), real_close())
+    a = h.alloc(10)
+    a.buf[:] = b"s" * 10
+    t = _threading.Thread(target=lambda: h.batch_store(["k"], [a]))
+    t.start()
+    assert started.wait(5)
+    closer = _threading.Thread(target=h.close)
+    closer.start()
+    closer.join(0.3)
+    assert closer.is_alive() and not closed_agent  # close waits for the WRITE
+    release.set()
+    t.join(5)
+    closer.join(5)
+    assert closed_agent == [True]
