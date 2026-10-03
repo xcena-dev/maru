@@ -912,10 +912,16 @@ class RemoteStorageClient:
         seg = self.config.remote_read_segment
         if not self._staged_reads:
             return self._retrieve_batch_locked(keys, wait=False)
+        # One waiting budget for the whole load, not one per batch.
+        deadline = time.monotonic() + self.config.remote_stage_wait_s
         leases: list[RemoteReadLease | None] = []
         try:
             for i in range(0, len(keys), seg):
-                leases.extend(self._retrieve_batch_locked(keys[i : i + seg], wait=True))
+                leases.extend(
+                    self._retrieve_batch_locked(
+                        keys[i : i + seg], wait=True, deadline=deadline
+                    )
+                )
         except BaseException:
             for lease in leases:
                 if lease is not None:
@@ -924,13 +930,13 @@ class RemoteStorageClient:
         return leases
 
     def _retrieve_batch_locked(
-        self, keys: list[str], *, wait: bool
+        self, keys: list[str], *, wait: bool, deadline: float = 0.0
     ) -> list[RemoteReadLease | None]:
         """Lookup with protection, READ into staging, unpin (lock held).
 
         With ``wait``, the lookup is repeated with the I/O lock released until
-        the pool reports the keys staged, for at most ``remote_stage_wait_s``;
-        after that the keys are read as they are.
+        the pool reports the keys staged, at most until ``deadline``
+        (monotonic); after that the keys are read as they are.
         """
         from maru_remote.transport import TransferTimeout
 
@@ -938,7 +944,6 @@ class RemoteStorageClient:
         t0 = time.perf_counter()
         scoped = [self._scope(k) for k in keys]
         ticket_id = ""
-        deadline = time.monotonic() + self.config.remote_stage_wait_s
 
         def lookup() -> list[dict[str, Any] | None] | None:
             nonlocal ticket_id

@@ -453,14 +453,24 @@ class RemoteServer:
                 f"sizes must be a non-empty list of ints in 1..{self._page_bytes}"
             )
         deadline = self._clock() + self._reservation_ttl_s
-        if self._wbuf is not None and all(n == self._page_bytes for n in sizes):
+        if (
+            self._wbuf is not None
+            and len(sizes) <= self._wbuf.capacity
+            and all(n == self._page_bytes for n in sizes)
+        ):
             loaded = self._wbuf.take(len(sizes))
             if loaded is None:
                 raise WriteBusyError("no loaded page is free; skip this store")
             for _, rng in loaded:
                 if rng is not None:  # loaded and about to be written: let it go
                     self._page_loader.unpin(*rng)
-            return self._reserve_pages([h for h, _ in loaded], sizes, deadline)
+            handles = [h for h, _ in loaded]
+            try:
+                return self._reserve_pages(handles, sizes, deadline)
+            except Exception:
+                for handle in handles:
+                    self._free_quietly(handle)
+                raise
         allocated: list[AllocHandle] = []
         reserved: dict[str, _Reservation] = {}
         pages: list[dict[str, Any]] = []
@@ -834,13 +844,12 @@ class RemoteServer:
     ) -> dict[str, Any]:
         """Reserve already allocated pages for one store request."""
         pages: list[dict[str, Any]] = []
+        reserved: dict[str, _Reservation] = {}
         for handle, size in zip(handles, sizes, strict=True):
             addr = buffer_address(handle.buf)
             region = self._region_for_address(addr)
             ticket = uuid.uuid4().hex
-            self._reservations[ticket] = _Reservation(
-                handle, region.region_id, deadline
-            )
+            reserved[ticket] = _Reservation(handle, region.region_id, deadline)
             pages.append(
                 {
                     "ticket": ticket,
@@ -850,6 +859,7 @@ class RemoteServer:
                     "length": size,
                 }
             )
+        self._reservations.update(reserved)  # all or nothing
         return {"pages": pages, "md_version": self._md_version}
 
     def _refill_loop(self) -> None:
@@ -928,12 +938,17 @@ class RemoteServer:
             if freed >= n:
                 break
             del self._lru[key]
+            rng = None
+            if self._kv is not None:
+                rng = self._device_range(self._locate([key])[0])
             try:
                 deleted = self._handler.delete(key)
             except Exception:  # keep serving; the key stays where it is
                 logger.warning("eviction of %s failed", key, exc_info=True)
                 deleted = False
             if deleted:
+                if rng is not None:  # the page may be reused: let its pin go now
+                    self._kv.forget_range(rng)  # type: ignore[union-attr]
                 freed += 1
                 self._evicted += 1
                 self._eviction_log.append((self._evicted, key))

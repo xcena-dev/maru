@@ -49,3 +49,12 @@ def test_close_returns_ready_pages_and_later_loads():
 def test_rejects_non_positive_settings(pages, batch):
     with pytest.raises(ValueError):
         WriteBuffer(pages, batch)
+
+
+def test_failed_load_pauses_refills_for_a_second():
+    now = [0.0]
+    wb = WriteBuffer(pages=4, clock=lambda: now[0])
+    wb.loading(object(), (0, 1))(False)
+    assert wb.want() == 0
+    now[0] = 1.1
+    assert wb.want() == 2

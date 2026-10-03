@@ -169,7 +169,7 @@ def test_close_lets_everything_go():
     ex.complete_all()
     kv.close()
     assert sorted(ex.unpinned) == ranges
-    assert ex.closed
+    assert not ex.closed  # the executor's owner closes it (it may be shared)
 
 
 @pytest.mark.parametrize("window, budget", [(0, OBJ), (1, 0)])
@@ -201,3 +201,70 @@ def test_key_published_after_the_first_ask_still_gets_loaded():
     assert ranges[1] in ex.pinned
     ex.complete_all()
     assert kv.ready(keys, ranges)
+
+
+def test_second_reader_of_a_consumed_prefix_gets_it_loaded_again():
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(10)
+    kv.on_lookup(keys, ranges)  # two requests with the same prefix
+    kv.on_lookup(keys, ranges)
+    ex.complete_all()
+    assert kv.ready(keys[:4], ranges[:4])  # the first reads 0..3 and is done
+    kv.on_consumed(keys[:4])
+    ex.complete_all()
+    assert not kv.ready(keys[:4], ranges[:4])  # unpinned; loaded again
+    ex.complete_all()
+    assert kv.ready(keys[:4], ranges[:4])
+
+
+def test_unread_windows_give_way_to_a_read():
+    kv, ex, _ = make(window=4, budget=8 * OBJ)
+    a, ra = keys_ranges(10, prefix="a")
+    b, rb = keys_ranges(10, base=100 * OBJ, prefix="b")
+    c, rc = keys_ranges(10, base=200 * OBJ, prefix="c")
+    kv.on_lookup(a, ra)
+    kv.on_lookup(b, rb)  # two hinted windows fill the budget
+    ex.complete_all()
+    kv.on_lookup(c, rc)
+    assert not kv.ready(c[:2], rc[:2])  # a worker reads c: room is made
+    ex.complete_all()
+    assert kv.ready(c[:2], rc[:2])
+    assert kv.stats()["held_bytes"] <= 8 * OBJ
+
+
+def test_key_stored_again_elsewhere_is_loaded_at_its_new_range():
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(2)
+    kv.on_lookup(keys, ranges)
+    ex.complete_all()
+    moved = [ranges[0], (500 * OBJ, OBJ)]  # k1 evicted and stored again
+    assert not kv.ready(keys, moved)
+    assert moved[1] in ex.pinned
+    ex.complete_all()
+    assert kv.ready(keys, moved)
+
+
+def test_same_read_again_does_not_count_objects_twice():
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(6)
+    assert not kv.ready(keys, ranges)  # a read nobody hinted: its own request
+    ex.complete_all()
+    assert kv.ready(keys, ranges)
+    kv.on_consumed(keys[:2])
+    assert not kv.ready(keys, ranges)  # the same six keys asked again
+    ex.complete_all()
+    assert kv.ready(keys, ranges)
+    kv.on_consumed(keys)
+    assert kv.stats()["held_bytes"] == 0
+    assert sorted(set(ex.pinned)) == sorted(set(ex.unpinned))
+
+
+def test_evicted_range_is_let_go_at_once():
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(2)
+    kv.on_lookup(keys, ranges)
+    ex.complete_all()
+    kv.forget_range(ranges[1])  # the server evicts k1; its page may be reused
+    assert ranges[1] in ex.unpinned
+    kv.on_consumed(keys)
+    assert ex.unpinned.count(ranges[1]) == 1  # not unpinned twice

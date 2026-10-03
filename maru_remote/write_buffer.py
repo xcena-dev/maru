@@ -15,6 +15,7 @@ add SSD reads to the read path.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -23,12 +24,18 @@ from typing import Any
 class WriteBuffer:
     """Bounded set of loaded free pages; the server allocates, this tracks."""
 
-    def __init__(self, pages: int, refill_batch: int = 2) -> None:
+    def __init__(
+        self,
+        pages: int,
+        refill_batch: int = 2,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         """Create a buffer of at most ``pages`` loaded pages.
 
         Args:
             pages: Loaded (or loading) free pages to keep.
             refill_batch: Pages started at once while refilling.
+            clock: Monotonic clock (tests pass a fake one).
 
         Raises:
             ValueError: if ``pages`` or ``refill_batch`` is not positive.
@@ -36,7 +43,10 @@ class WriteBuffer:
         if pages <= 0 or refill_batch <= 0:
             raise ValueError("pages and refill_batch must be positive")
         self._pages = pages
+        self.capacity = pages
         self._batch = refill_batch
+        self._clock = clock
+        self._quiet_until = 0.0  # no refills before this (after a failed load)
         self._lock = threading.Lock()
         self._ready: deque[Any] = deque()
         self._loading: set[int] = set()  # id() of handles being loaded
@@ -52,8 +62,14 @@ class WriteBuffer:
         }
 
     def want(self) -> int:
-        """Pages to start loading now (at most one refill batch)."""
+        """Pages to start loading now (at most one refill batch).
+
+        None for a second after a failed load: each refill may evict a cached
+        object to get a page, so a load that keeps failing must not spin.
+        """
         with self._lock:
+            if self._clock() < self._quiet_until:
+                return 0
             missing = self._pages - len(self._ready) - len(self._loading)
             return max(0, min(missing, self._batch - len(self._loading)))
 
@@ -73,6 +89,7 @@ class WriteBuffer:
                 else:
                     if not ok:
                         self.counters["load_failures"] += 1
+                        self._quiet_until = self._clock() + 1.0
                     # freed (and unpinned if it was loaded) by the server's thread
                     self._orphans.append((handle, rng if ok else None))
             self.changed.set()

@@ -56,18 +56,28 @@ class _Obj:
 
 @dataclass
 class _Req:
-    """The prefix objects of one request, in prefix order."""
+    """The prefix objects of one request (or one worker read), in order."""
 
     keys: list[str]
-    ranges: list[Range]
+    ranges: list[tuple[int, int]]
     deadline: float
+    read: bool = False  # opened for a worker read rather than a lookup hint
+    active: bool = False  # a worker is reading it
     consumed_upto: int = 0  # objects before this index were read and released
     held_upto: int = 0  # objects before this index are held (or skipped)
     index: dict[str, int] = field(default_factory=dict)
 
 
+_Gid = tuple[tuple[str, tuple[int, int]], ...]
+
+
 class KVManager:
-    """Hold each request's next objects in device DRAM ahead of its reads."""
+    """Hold each request's next objects in device DRAM ahead of its reads.
+
+    Requests come from the scheduler's lookups (hints) and from worker reads.
+    Requests a worker is reading are served first; when the budget is short,
+    hinted windows no worker reads yet are let go to make room.
+    """
 
     def __init__(
         self,
@@ -83,9 +93,9 @@ class KVManager:
 
         Args:
             window: Objects per request held ahead of its read position.
-            executor: Runs the device pin and unpin calls.
+            executor: Runs the device pin and unpin calls; its owner closes it.
             max_held_bytes: Upper bound on bytes held at once, below the
-                device's pin limit; requests beyond it wait for room.
+                device's pin limit.
             group_ttl_s: A request not looked up or read for this long is
                 dropped and its objects let go.
             max_groups: Requests tracked at most; the oldest is dropped first.
@@ -105,27 +115,30 @@ class KVManager:
         self._max_groups = max_groups
         self._clock = clock
         self._lock = threading.Lock()
-        self._reqs: dict[tuple[str, ...], _Req] = {}
-        self._by_key: dict[str, list[tuple[str, ...]]] = {}
+        self._reqs: dict[_Gid, _Req] = {}
+        self._by_key: dict[str, list[_Gid]] = {}
         self._objs: dict[tuple[int, int], _Obj] = {}
         self._held_bytes = 0
         # First time each still-unready read (by its keys) was asked about.
         self._waiting_since: dict[tuple[str, ...], float] = {}
         self.counters: dict[str, int] = {
             "requests": 0,
+            "read_requests": 0,
             "pinned": 0,
             "pinned_bytes": 0,
             "pin_failures": 0,
             "unpinned": 0,
             "expired": 0,
             "dropped": 0,
+            "yielded": 0,
+            "forgotten": 0,
             "waits": 0,
         }
 
     # ---- hooks called by the server --------------------------------------------
 
     def on_lookup(self, keys: list[str], ranges: list[Range]) -> None:
-        """Open (or refresh) the request whose prefix is ``keys``.
+        """Open (or refresh) the request whose prefix is ``keys`` (a hint).
 
         Args:
             keys: The request's prefix keys in order, as the scheduler asked.
@@ -134,14 +147,16 @@ class KVManager:
         with self._lock:
             now = self._clock()
             self._expire(now)
-            self._open(keys, ranges, now)
+            self._open(keys, ranges, now, read=False)
             self._pump()
 
     def ready(self, keys: list[str], ranges: list[Range]) -> bool:
         """Whether every found key of one worker read is staged.
 
-        Keys that no request holds open a request of their own, so a read
-        without a scheduler lookup is still loaded ahead.
+        The read's keys are held at their current ranges: requests that cover
+        them move their window to the read, and keys no request holds there
+        (never hinted, already read and let go by another reader, or stored
+        again elsewhere) get a request of their own.
 
         Args:
             keys: Keys of one worker read, in prefix order.
@@ -153,16 +168,13 @@ class KVManager:
         with self._lock:
             now = self._clock()
             self._expire(now)
-            if any(
-                r is not None and k not in self._by_key
-                for k, r in zip(keys, ranges, strict=True)
-            ):
-                self._open(keys, ranges, now)
-            self._skip_to_reads(keys)
+            found = [(k, r) for k, r in zip(keys, ranges, strict=True) if r is not None]
+            self._skip_to_reads(found, now)
             self._pump()
-            for r in ranges:
-                if r is None:
-                    continue
+            if any(r not in self._objs for _, r in found):
+                self._open([k for k, _ in found], [r for _, r in found], now, read=True)
+                self._pump()
+            for _, r in found:
                 obj = self._objs.get(r)
                 if obj is None or obj.state == "filling":
                     self.counters["waits"] += 1
@@ -179,7 +191,7 @@ class KVManager:
         """
         with self._lock:
             now = self._clock()
-            moved: dict[tuple[str, ...], int] = {}
+            moved: dict[_Gid, int] = {}
             for k in keys:
                 for gid in self._by_key.get(k, ()):
                     req = self._reqs.get(gid)
@@ -190,17 +202,31 @@ class KVManager:
                         moved[gid] = i
             for gid, upto in moved.items():
                 req = self._reqs[gid]
-                for i in range(req.consumed_upto, min(upto, req.held_upto)):
-                    self._unref(req.ranges[i])
-                req.consumed_upto = max(req.consumed_upto, upto)
-                req.held_upto = max(req.held_upto, req.consumed_upto)
+                self._consume(req, upto)
                 req.deadline = now + self._ttl
                 if req.consumed_upto >= len(req.keys):
                     self._drop(gid)
             self._pump()
 
+    def forget_range(self, rng: tuple[int, int]) -> None:
+        """Let a device range go now: its key is gone and the page may be reused.
+
+        Args:
+            rng: Device (address, size) of an evicted object.
+        """
+        with self._lock:
+            obj = self._objs.get(rng)
+            if obj is None:
+                return
+            self.counters["forgotten"] += 1
+            obj.refs = 0
+            if obj.state != "filling":
+                self._release(rng, obj)
+            else:
+                obj.state = "forgotten"  # unpinned when its pin completes
+
     def busy(self) -> bool:
-        """Whether an object is still being loaded for a read."""
+        """Whether an object is still being loaded for a read or a hint."""
         with self._lock:
             return any(o.state == "filling" for o in self._objs.values())
 
@@ -214,107 +240,117 @@ class KVManager:
             }
 
     def close(self) -> None:
-        """Let every object go and stop the executor."""
+        """Let every object go (the executor's owner then closes it)."""
         with self._lock:
             for gid in list(self._reqs):
                 self._drop(gid)
-        self._exec.close()
 
     # ---- internals (lock held) -------------------------------------------------
 
-    def _open(self, keys: list[str], ranges: list[Range], now: float) -> None:
+    def _open(
+        self, keys: list[str], ranges: list[Range], now: float, *, read: bool
+    ) -> None:
         n = 0  # only the leading run of found keys is a reusable prefix
         while n < len(ranges) and ranges[n] is not None:
             n += 1
         if n == 0:
             return
-        # Named by the keys found, not the keys asked for: a key published
-        # after a first ask then opens a request that includes it.
-        gid = tuple(keys[:n])
+        found = [(k, r) for k, r in zip(keys[:n], ranges[:n], strict=True)]
+        gid: _Gid = tuple(found)  # type: ignore[arg-type]
         req = self._reqs.get(gid)
         if req is not None:
             req.deadline = now + self._ttl
+            if read:
+                req.active = True
+                if req.consumed_upto:  # read again from the start (another reader)
+                    for j in range(req.consumed_upto, req.held_upto):
+                        self._unref(req.ranges[j])
+                    req.consumed_upto = req.held_upto = 0
             return
-        req = _Req(list(keys[:n]), list(ranges[:n]), now + self._ttl)
+        req = _Req(
+            [k for k, _ in found],
+            [r for _, r in found],  # type: ignore[misc]
+            now + self._ttl,
+            read=read,
+            active=read,
+        )
         req.index = {k: i for i, k in enumerate(req.keys)}
         self._reqs[gid] = req
         for k in req.keys:
             self._by_key.setdefault(k, []).append(gid)
-        self.counters["requests"] += 1
+        self.counters["read_requests" if read else "requests"] += 1
         while len(self._reqs) > self._max_groups:
             self._drop(next(iter(self._reqs)))
             self.counters["dropped"] += 1
 
-    def _note_wait(self, keys: list[str], ranges: list[Range], now: float) -> None:
-        """Log, once, the state behind a read that has waited over a second."""
-        tid = tuple(keys)
-        since = self._waiting_since.setdefault(tid, now)
-        if now - since < 1.0 or since < 0:
-            return
-        self._waiting_since[tid] = -1.0  # logged
-        parts = []
-        for k, r in zip(keys, ranges, strict=True):
-            obj = self._objs.get(r) if r is not None else None
-            reqs = [
-                (
-                    len(self._reqs[g].keys),
-                    self._reqs[g].index[k],
-                    self._reqs[g].consumed_upto,
-                    self._reqs[g].held_upto,
-                )
-                for g in self._by_key.get(k, ())
-            ]
-            parts.append(
-                f"{k[-12:]}: obj={None if obj is None else (obj.state, obj.refs)} "
-                f"requests(len,idx,consumed,held)={reqs}"
-            )
-        filling = sum(1 for o in self._objs.values() if o.state == "filling")
-        logger.warning(
-            "read of %d keys not staged after %.1f s; held %d/%d bytes, %d objects "
-            "filling, %d requests: %s",
-            len(keys),
-            now - since,
-            self._held_bytes,
-            self._max_held,
-            filling,
-            len(self._reqs),
-            "; ".join(parts),
-        )
-
-    def _skip_to_reads(self, keys: list[str]) -> None:
-        """Move each request's window to the first key a worker now reads.
+    def _skip_to_reads(
+        self, found: list[tuple[str, tuple[int, int]]], now: float
+    ) -> None:
+        """Mark requests that hold the read's keys active; move their windows there.
 
         A worker that starts past the window (the GPU already held the first
-        chunks) will not read the objects before it: let them go and load
-        from where the read is.
+        chunks) will not read the objects before it: let them go.
         """
-        first: dict[tuple[str, ...], int] = {}
-        for k in keys:
+        first: dict[_Gid, int] = {}
+        for k, r in found:
             for gid in self._by_key.get(k, ()):
-                i = self._reqs[gid].index[k]
-                if i < first.get(gid, len(self._reqs[gid].keys)):
+                req = self._reqs[gid]
+                i = req.index[k]
+                if req.ranges[i] != r or i < req.consumed_upto:
+                    continue  # stale range, or already read: another request serves it
+                if i < first.get(gid, len(req.keys)):
                     first[gid] = i
         for gid, i in first.items():
             req = self._reqs[gid]
-            if i <= req.consumed_upto:
-                continue
-            for j in range(req.consumed_upto, min(i, req.held_upto)):
-                self._unref(req.ranges[j])
-            req.consumed_upto = i
-            req.held_upto = max(req.held_upto, i)
+            req.active = True
+            req.deadline = now + self._ttl
+            self._consume(req, i)
+
+    def _consume(self, req: _Req, upto: int) -> None:
+        """Move ``req``'s read position to ``upto``, letting go of what it passes."""
+        if upto <= req.consumed_upto:
+            return
+        for j in range(req.consumed_upto, min(upto, req.held_upto)):
+            self._unref(req.ranges[j])
+        req.consumed_upto = upto
+        req.held_upto = max(req.held_upto, upto)
 
     def _pump(self) -> None:
-        """Fill every request's window, oldest request first, within the budget."""
-        for req in self._reqs.values():
-            target = min(len(req.keys), req.consumed_upto + self._window)
+        """Fill windows within the budget: reads first, then hints, oldest first.
+
+        A read that does not fit takes the room of hinted windows no worker
+        reads, newest hint first.
+        """
+        order = [g for g, r in self._reqs.items() if r.active] + [
+            g for g, r in self._reqs.items() if not r.active
+        ]
+        for gid in order:
+            req = self._reqs.get(gid)
+            if req is None:
+                continue
+            # A read's own request holds the whole read, however long it is.
+            span = len(req.keys) if req.read else self._window
+            target = min(len(req.keys), req.consumed_upto + span)
             while req.held_upto < target:
                 rng = req.ranges[req.held_upto]
-                assert rng is not None
-                obj = self._objs.get(rng)
-                if obj is None and self._held_bytes + rng[1] > self._max_held:
-                    return  # no room; later requests wait too (FIFO)
+                if rng not in self._objs and self._held_bytes + rng[1] > self._max_held:
+                    if not req.active or not self._yield_idle(rng[1]):
+                        return  # no room; later requests wait too (FIFO)
                 self._ref(rng)
                 req.held_upto += 1
+
+    def _yield_idle(self, need: int) -> bool:
+        """Let go of idle hinted windows (newest first) until ``need`` bytes fit."""
+        for gid in reversed([g for g, r in self._reqs.items() if not r.active]):
+            if self._held_bytes + need <= self._max_held:
+                break
+            req = self._reqs[gid]
+            if req.held_upto > req.consumed_upto:
+                for j in range(req.consumed_upto, req.held_upto):
+                    self._unref(req.ranges[j])
+                req.held_upto = req.consumed_upto
+                self.counters["yielded"] += 1
+        return self._held_bytes + need <= self._max_held
 
     def _ref(self, rng: tuple[int, int]) -> None:
         obj = self._objs.get(rng)
@@ -325,20 +361,19 @@ class KVManager:
             self._exec.pin(rng[0], rng[1], lambda ok, r=rng: self._on_pinned(r, ok))
         obj.refs += 1
 
-    def _unref(self, rng: Range) -> None:
-        if rng is None:
-            return
+    def _unref(self, rng: tuple[int, int]) -> None:
         obj = self._objs.get(rng)
         if obj is None:
             return
         obj.refs -= 1
-        if obj.refs > 0 or obj.state == "filling":
+        if obj.refs > 0 or obj.state in ("filling", "forgotten"):
             return  # a filling object is let go when its pin completes
         self._release(rng, obj)
 
     def _release(self, rng: tuple[int, int], obj: _Obj) -> None:
-        del self._objs[rng]
-        self._held_bytes -= obj.size
+        if self._objs.get(rng) is obj:
+            del self._objs[rng]
+            self._held_bytes -= obj.size
         if obj.state == "ready":
             self._exec.unpin(rng[0], rng[1])
             self.counters["unpinned"] += 1
@@ -350,22 +385,55 @@ class KVManager:
                 if ok:
                     self._exec.unpin(rng[0], rng[1])
                 return
+            forgotten = obj.state == "forgotten"
             obj.state = "ready" if ok else "failed"
             if ok:
                 self.counters["pinned"] += 1
                 self.counters["pinned_bytes"] += obj.size
             else:
                 self.counters["pin_failures"] += 1
-            if obj.refs == 0:
+            if obj.refs <= 0 or forgotten:
                 self._release(rng, obj)
                 self._pump()
+
+    def _note_wait(self, keys: list[str], ranges: list[Range], now: float) -> None:
+        """Log, once, the state behind a read that has waited over a second."""
+        tid = tuple(keys)
+        since = self._waiting_since.setdefault(tid, now)
+        if now - since < 1.0 or since < 0:
+            return
+        self._waiting_since[tid] = -now  # logged (negative: time of logging)
+        parts = []
+        for k, r in zip(keys, ranges, strict=True):
+            obj = self._objs.get(r) if r is not None else None
+            reqs = [
+                (len(q.keys), q.index[k], q.consumed_upto, q.held_upto, q.active)
+                for q in (self._reqs[g] for g in self._by_key.get(k, ()))
+            ]
+            parts.append(
+                f"{k[-12:]}: obj={None if obj is None else (obj.state, obj.refs)} "
+                f"requests(len,idx,consumed,held,active)={reqs}"
+            )
+        logger.warning(
+            "read of %d keys not staged after %.1f s; held %d/%d bytes, %d objects "
+            "filling, %d requests: %s",
+            len(keys),
+            now - since,
+            self._held_bytes,
+            self._max_held,
+            sum(1 for o in self._objs.values() if o.state == "filling"),
+            len(self._reqs),
+            "; ".join(parts),
+        )
 
     def _expire(self, now: float) -> None:
         for gid in [g for g, r in self._reqs.items() if r.deadline <= now]:
             self._drop(gid)
             self.counters["expired"] += 1
+        for tid in [t for t, s in self._waiting_since.items() if now - abs(s) > 60.0]:
+            del self._waiting_since[tid]
 
-    def _drop(self, gid: tuple[str, ...]) -> None:
+    def _drop(self, gid: _Gid) -> None:
         req = self._reqs.pop(gid, None)
         if req is None:
             return
@@ -464,14 +532,20 @@ class ProcessPinExecutor:
     def close(self, timeout_s: float = 5.0) -> None:
         """Let queued calls finish for up to ``timeout_s``, then stop the processes.
 
-        Idempotent: the KV Manager and the server's owner may both close it.
+        Calls submitted while waiting (unpins of pins that complete now) are
+        waited for too. Idempotent.
         """
         if self._closed:
             return
         self._closed = True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._callbacks:
+                    break
+            time.sleep(0.01)
         for _ in self._procs:
             self._tasks.put(None)
-        deadline = time.monotonic() + timeout_s
         for proc in self._procs:
             proc.join(timeout=max(0.0, deadline - time.monotonic()))
         for proc in self._procs:

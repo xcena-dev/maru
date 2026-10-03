@@ -1360,11 +1360,11 @@ def test_a_failed_segment_returns_the_slots_of_earlier_ones(pool_handler, unused
         real = backend._retrieve_batch_locked
         calls = []
 
-        def second_fails(keys, *, wait):
+        def second_fails(keys, *, wait, deadline=0.0):
             calls.append(keys)
             if len(calls) == 2:
                 raise StorageUnavailableError("injected")
-            return real(keys, wait=wait)
+            return real(keys, wait=wait, deadline=deadline)
 
         backend._retrieve_batch_locked = second_fails
         free = backend._staging.free_count()
@@ -1456,6 +1456,30 @@ def test_buffer_waits_while_reads_are_being_staged(pool_handler, unused_port):
         assert worker._storage.ping()
         assert len(loader.waiting) > before
         sched.close()
+        worker.close()
+    finally:
+        node.stop()
+
+
+def test_store_batch_larger_than_the_buffer_bypasses_it(pool_handler, unused_port):
+    from maru_remote.write_buffer import WriteBuffer
+
+    loader = ManualLoader()
+    node = PoolNode(
+        pool_handler,
+        unused_port,
+        write_buffer=WriteBuffer(pages=1, refill_batch=1),
+        page_loader=loader,
+    )
+    node.start()
+    try:
+        worker = remote_handler(node.url)
+        handles = []
+        for _ in range(2):
+            a = worker.alloc(PAGE)
+            a.buf[:] = b"z" * PAGE
+            handles.append(a)
+        assert worker.batch_store(["x", "y"], handles) == [True, True]
         worker.close()
     finally:
         node.stop()
