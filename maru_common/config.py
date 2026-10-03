@@ -53,6 +53,9 @@ class MaruConfig:
         remote_transfer_timeout_s: Deadline of one RDMA READ/WRITE batch.
         remote_retry_s: How long the remote backend stops calling the server
             after a failed or timed-out control request.
+        remote_load_reserve: Share of the remote staging slots that stores
+            leave free for loads (0 to 1). A store that would take one of
+            them is skipped, so a slow pool makes stores, not loads, give way.
     """
 
     server_url: str = "tcp://localhost:5555"
@@ -81,6 +84,7 @@ class MaruConfig:
     remote_ucx_device: str = ""
     remote_transfer_timeout_s: float = 30.0
     remote_retry_s: float = 30.0
+    remote_load_reserve: float = 0.5
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -179,3 +183,10 @@ class MaruConfig:
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive number")
+        reserve = self.remote_load_reserve
+        if (
+            isinstance(reserve, bool)
+            or not isinstance(reserve, int | float)
+            or not 0 <= reserve < 1
+        ):
+            raise ValueError("remote_load_reserve must be in [0, 1)")

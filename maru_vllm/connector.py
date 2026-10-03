@@ -358,6 +358,7 @@ _REMOTE_ONLY_SETTINGS = (
     "maru_remote_staging_size",
     "maru_remote_timeout_s",
     "maru_remote_retry_s",
+    "maru_remote_load_reserve",
 )
 
 
@@ -435,6 +436,10 @@ def _validate_remote_config(extra: dict[str, Any]) -> None:
     for name in ("maru_remote_timeout_s", "maru_remote_retry_s"):
         if name in extra and float(extra[name]) <= 0:
             raise ValueError(f"{name} must be positive")
+    if "maru_remote_load_reserve" in extra and not (
+        0 <= float(extra["maru_remote_load_reserve"]) < 1
+    ):
+        raise ValueError("maru_remote_load_reserve must be in [0, 1)")
 
 
 def _validate_cpu_config(extra: dict[str, Any], backend: str) -> None:
@@ -606,6 +611,7 @@ def _remote_handler_settings(extra_config: dict[str, Any]) -> dict[str, Any]:
             extra_config.get("maru_remote_timeout_s", 30.0)
         ),
         "remote_retry_s": float(extra_config.get("maru_remote_retry_s", 30.0)),
+        "remote_load_reserve": float(extra_config.get("maru_remote_load_reserve", 0.5)),
     }
 
 
