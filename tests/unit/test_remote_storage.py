@@ -331,7 +331,7 @@ def test_read_timeout_isolates_slots_and_releases_protection(pool):
 
 
 def test_full_staging_fails_fast_and_releases_protection(pool):
-    h = remote_handler(pool.url, staging=2 * PAGE)
+    h = remote_handler(pool.url, staging=2 * PAGE, remote_load_reserve=0)
     assert _store(h, "a", b"1") and _store(h, "b", b"2")
     held = h.alloc(1)
     with pytest.raises(MemoryError):
@@ -592,7 +592,7 @@ def test_alloc_and_lease_release_do_not_wait_for_a_transfer_in_flight(pool):
     import threading
     import time as _time
 
-    h = remote_handler(pool.url, staging=4 * PAGE)
+    h = remote_handler(pool.url, staging=4 * PAGE, remote_load_reserve=0)
     assert _store(h, "k", b"x")
     (lease,) = h.batch_retrieve(["k"])
     io_lock = h._storage._lock
@@ -1000,3 +1000,46 @@ def test_scheduler_lookup_stages_and_worker_reads_move_the_window(
         worker.close()
     finally:
         node.stop()
+
+
+def test_stores_leave_the_load_reserve_free(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, remote_load_reserve=0.5)
+    held = [h.alloc(1) for _ in range(4)]  # stores may take 8 - 4 slots
+    with pytest.raises(MemoryError, match="kept for loads"):
+        h.alloc(1)
+    assert h.retrieve_capacity() == 4
+    for a in held:
+        h.free(a)
+    h.close()
+
+
+def test_loads_get_the_reserve_while_stores_hold_the_rest(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, remote_load_reserve=0.5)
+    keys = [f"k{i}" for i in range(4)]
+    for k in keys:
+        assert _store(h, k, k.encode())
+    held = [h.alloc(1) for _ in range(4)]  # in-flight stores
+    leases = h.batch_retrieve(keys)  # the four reserved slots
+    assert [bytes(x.view) for x in leases] == [k.encode() for k in keys]
+    for x in leases:
+        x.release()
+    for a in held:
+        h.free(a)
+    h.close()
+
+
+def test_retrieve_capacity_is_bounded_by_the_reserve(pool):
+    h = remote_handler(pool.url, staging=8 * PAGE, remote_load_reserve=0.25)
+    assert h.retrieve_capacity() == 2  # loads are batched in reserve-sized steps
+    h.close()
+
+
+def test_load_reserve_must_be_a_share():
+    for bad in (-0.1, 1.0, True):
+        with pytest.raises(ValueError, match="remote_load_reserve"):
+            MaruConfig(
+                storage_backend="remote",
+                remote_url="tcp://x:1",
+                cache_namespace="ns",
+                remote_load_reserve=bad,
+            )
