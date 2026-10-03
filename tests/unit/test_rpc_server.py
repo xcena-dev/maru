@@ -53,7 +53,7 @@ class TestRpcServerHandlerDispatch:
         monkeypatch.setattr(
             server._allocation_manager,
             "allocate",
-            lambda instance_id, size, dax_path="": None,
+            lambda *args, **kwargs: None,
         )
 
         request = MockRequest(instance_id="instance1", size=4096, dax_path="")

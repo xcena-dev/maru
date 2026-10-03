@@ -293,14 +293,16 @@ class RpcAsyncClient(RpcClientBase):
     # Non-blocking Async API (*_async methods)
     # =========================================================================
 
-    def request_alloc_async(self, instance_id: str, size: int) -> Future:
+    def request_alloc_async(
+        self, instance_id: str, size: int, lease_id: str = ""
+    ) -> Future:
         """Non-blocking request_alloc. Returns Future[RequestAllocResponse]."""
+        data: dict = {"instance_id": instance_id, "size": size}
+        if lease_id:
+            data["lease_id"] = lease_id
 
         async def _coro():
-            response = await self._send_async(
-                MessageType.REQUEST_ALLOC,
-                {"instance_id": instance_id, "size": size},
-            )
+            response = await self._send_async(MessageType.REQUEST_ALLOC, data)
             return self._parse_request_alloc(response)
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)

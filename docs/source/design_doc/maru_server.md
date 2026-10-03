@@ -62,14 +62,14 @@ stateDiagram-v2
         Connected: kv_ref_count >= 0
     }
 
-    Active --> Deferred: release() / disconnect_client()
+    Active --> Deferred: release() / client lease expired
     state Deferred {
         [*] --> Waiting
         Waiting: owner_connected=False
         Waiting: kv_ref_count > 0
     }
 
-    Active --> Freed: release() + kv_ref_count==0
+    Active --> Freed: (release() / client lease expired) + kv_ref_count==0
     Deferred --> Freed: decrement_kv_ref() → kv_ref_count==0
 
     state Freed {
@@ -82,6 +82,15 @@ stateDiagram-v2
 ```
 
 When a client calls `return_alloc` or disconnects, the allocation's `owner_connected` flag is set to false. If the KV reference count is already zero, the region is freed immediately. Otherwise, it enters the deferred state and is freed later when the last KV entry referencing it is deleted.
+
+A client that exits without `close()` never calls `return_alloc`. The server detects it with a **client lease**:
+
+- On connect the handler starts a lease (a `HEARTBEAT` that names its instance and a per-connection lease id), allocates its regions under that lease, and renews it every quarter of the TTL on a dedicated connection. A clean `close()` returns the regions and then ends the lease.
+- When a lease goes `--client-lease-ttl` seconds (default 30) without renewal, the next lease renewal or allocation request marks the regions of that lease as owner-disconnected, so deferred freeing applies. Expiry is per lease, so a restarted client that reuses its instance id keeps its new regions.
+- Lease time counts only while the server is processing requests. Live clients renew every quarter of the TTL, so a gap of more than half the TTL with no lease activity means the server itself stalled (or no leased client was alive). The part of the gap beyond half the TTL is added to every deadline, so renewals that waited in the queue during a stall never expire a live lease, and a dead lease still expires within half the TTL once the server is active again.
+- The handler stops writing before the server can reclaim: once its last accepted renewal was sent three quarters of the TTL ago, `alloc()` raises and `store()`/`batch_store()` refuse and free the pages, until a renewal succeeds again. A late renewal of an expired lease is answered with `lease_expired`, after which the handler refuses writes for good, and the server refuses keys registered into a reclaimed region.
+- Clients that never start a lease, and servers started with `--client-lease-ttl 0`, keep the previous behaviour.
+- Limits: the handler checks its lease in `alloc()` and `store()`, not while the caller writes into a page, so a caller that holds an allocated page for more than a quarter of the TTL before writing it is not protected. A handler that cannot start a lease at connect (for example, the server does not answer) runs without one and logs a warning. After the server has been idle for longer than the TTL, the first allocation cannot yet reclaim a dead lease (its deadline is still up to half the TTL ahead), so on a full device a client restarted right after a crash may fail its first connect and succeed when it retries about half a TTL later.
 
 ---
 
@@ -128,7 +137,7 @@ The server exposes the following message types:
 | `BATCH_PIN_KV` | Batch check existence and pin multiple entries |
 | `BATCH_UNPIN_KV` | Batch unpin multiple entries |
 | `GET_STATS` | Retrieve server statistics |
-| `HEARTBEAT` | Connection health check |
+| `HEARTBEAT` | Connection health check; with `instance_id` and `lease_id` it starts, renews, or (`lease_release`) ends a client lease and replies `lease_ttl` and `lease_expired` |
 | `HANDSHAKE` | Reserved — initial client-server handshake |
 | `SHUTDOWN` | Reserved — graceful server shutdown |
 
