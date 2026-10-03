@@ -109,6 +109,8 @@ class KVManager:
         self._by_key: dict[str, list[tuple[str, ...]]] = {}
         self._objs: dict[tuple[int, int], _Obj] = {}
         self._held_bytes = 0
+        # First time each still-unready read (by its keys) was asked about.
+        self._waiting_since: dict[tuple[str, ...], float] = {}
         self.counters: dict[str, int] = {
             "requests": 0,
             "pinned": 0,
@@ -164,7 +166,9 @@ class KVManager:
                 obj = self._objs.get(r)
                 if obj is None or obj.state == "filling":
                     self.counters["waits"] += 1
+                    self._note_wait(keys, ranges, now)
                     return False
+            self._waiting_since.pop(tuple(keys), None)
             return True
 
     def on_consumed(self, keys: list[str]) -> None:
@@ -219,15 +223,17 @@ class KVManager:
     # ---- internals (lock held) -------------------------------------------------
 
     def _open(self, keys: list[str], ranges: list[Range], now: float) -> None:
-        gid = tuple(keys)
-        req = self._reqs.get(gid)
-        if req is not None:
-            req.deadline = now + self._ttl
-            return
         n = 0  # only the leading run of found keys is a reusable prefix
         while n < len(ranges) and ranges[n] is not None:
             n += 1
         if n == 0:
+            return
+        # Named by the keys found, not the keys asked for: a key published
+        # after a first ask then opens a request that includes it.
+        gid = tuple(keys[:n])
+        req = self._reqs.get(gid)
+        if req is not None:
+            req.deadline = now + self._ttl
             return
         req = _Req(list(keys[:n]), list(ranges[:n]), now + self._ttl)
         req.index = {k: i for i, k in enumerate(req.keys)}
@@ -238,6 +244,42 @@ class KVManager:
         while len(self._reqs) > self._max_groups:
             self._drop(next(iter(self._reqs)))
             self.counters["dropped"] += 1
+
+    def _note_wait(self, keys: list[str], ranges: list[Range], now: float) -> None:
+        """Log, once, the state behind a read that has waited over a second."""
+        tid = tuple(keys)
+        since = self._waiting_since.setdefault(tid, now)
+        if now - since < 1.0 or since < 0:
+            return
+        self._waiting_since[tid] = -1.0  # logged
+        parts = []
+        for k, r in zip(keys, ranges, strict=True):
+            obj = self._objs.get(r) if r is not None else None
+            reqs = [
+                (
+                    len(self._reqs[g].keys),
+                    self._reqs[g].index[k],
+                    self._reqs[g].consumed_upto,
+                    self._reqs[g].held_upto,
+                )
+                for g in self._by_key.get(k, ())
+            ]
+            parts.append(
+                f"{k[-12:]}: obj={None if obj is None else (obj.state, obj.refs)} "
+                f"requests(len,idx,consumed,held)={reqs}"
+            )
+        filling = sum(1 for o in self._objs.values() if o.state == "filling")
+        logger.warning(
+            "read of %d keys not staged after %.1f s; held %d/%d bytes, %d objects "
+            "filling, %d requests: %s",
+            len(keys),
+            now - since,
+            self._held_bytes,
+            self._max_held,
+            filling,
+            len(self._reqs),
+            "; ".join(parts),
+        )
 
     def _skip_to_reads(self, keys: list[str]) -> None:
         """Move each request's window to the first key a worker now reads.

@@ -189,3 +189,15 @@ def test_read_past_the_window_moves_the_window_there():
     ex.complete_all()
     assert sorted(ex.unpinned) == ranges[:4]  # skipped objects are let go
     assert kv.ready(keys[10:12], ranges[10:12])
+
+
+def test_key_published_after_the_first_ask_still_gets_loaded():
+    # First ask: the second key is not published yet. Second ask: it is.
+    kv, ex, _ = make(window=4)
+    keys, ranges = keys_ranges(2)
+    assert not kv.ready(keys, [ranges[0], None])
+    ex.complete_all()
+    assert not kv.ready(keys, ranges)
+    assert ranges[1] in ex.pinned
+    ex.complete_all()
+    assert kv.ready(keys, ranges)
