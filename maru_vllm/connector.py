@@ -742,6 +742,11 @@ class MaruKVConnector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
+                num_gpu_blocks=(
+                    kv_cache_config.num_blocks
+                    if kv_cache_config is not None
+                    else vllm_config.cache_config.num_gpu_blocks
+                ),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -907,11 +912,13 @@ class MaruSchedulerConnector:
         block_size: int,
         kv_chunk_tokens: int,
         extra_config: dict[str, Any],
+        num_gpu_blocks: int | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._cpu_mode = _validate_storage_config(extra_config)
+        self._num_gpu_blocks = num_gpu_blocks
         self._cpu_bypass_requests: set[str] = set()
 
         # Lazy-init MaruHandler for exists checks
@@ -957,6 +964,16 @@ class MaruSchedulerConnector:
         # views for per-layer transfer.
         self._deferred_layerwise_waiting: set[str] = set()
         self._deferred_layerwise_ready: set[str] = set()
+        # GPU blocks each parked request needs for its whole prompt, from
+        # parking until it resumes. A parked request holds blocks for its
+        # loaded prefix only and resumes only once the rest fits too, so the
+        # parked requests together must never need more than the cache holds:
+        # otherwise they can fill it with nothing running to free a block.
+        self._parked_blocks: dict[str, int] = {}
+        # Requests told to wait for room, oldest first, with the blocks they
+        # need. Their room is kept ahead of later requests so a long prompt
+        # is not passed over indefinitely.
+        self._admission_waiters: dict[str, int] = {}
 
         # Cached match results from get_num_new_matched_tokens,
         # consumed by update_state_after_alloc to avoid redundant RPC.
@@ -1083,6 +1100,66 @@ class MaruSchedulerConnector:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        """Report the cached prefix beyond ``num_computed_tokens``.
+
+        Returns:
+            ``(tokens, load_async)``. ``(None, False)`` asks vLLM to try the
+            request again on a later step: parking it now could leave the
+            parked requests needing more blocks than the cache has.
+        """
+        # vLLM asks only about a request that holds no parked blocks. One
+        # still on record had its load fail and its blocks freed.
+        self._parked_blocks.pop(request.request_id, None)
+        matched, load_async = self._match(request, num_computed_tokens)
+        if load_async and not self._admit_parked(request):
+            self._last_match_result.pop(request.request_id, None)
+            return None, False
+        self._admission_waiters.pop(request.request_id, None)
+        return matched, load_async
+
+    def _admit_parked(self, request: Request) -> bool:
+        """Whether ``request`` may park while its load runs.
+
+        It may when the blocks its whole prompt needs, added to what the
+        parked requests and the older waiters need, fit in the cache. A
+        request that is first in line is always admitted: vLLM sizes the
+        cache to hold one request of the maximum length.
+        """
+        if not self._num_gpu_blocks:
+            return True
+        req_id = request.request_id
+        need = self._prompt_blocks(request)
+        ahead = sum(n for r, n in self._parked_blocks.items() if r != req_id)
+        for waiter, blocks in self._admission_waiters.items():
+            if waiter == req_id:
+                break
+            ahead += blocks
+        if ahead == 0 or ahead + need <= self._num_gpu_blocks:
+            return True
+        if req_id not in self._admission_waiters:
+            self._admission_waiters[req_id] = need
+            logger.info(
+                "Maru: req %s waits to load (%d blocks needed, %d of %d "
+                "spoken for by earlier loads)",
+                req_id,
+                need,
+                ahead,
+                self._num_gpu_blocks,
+            )
+        return False
+
+    def _prompt_blocks(self, request: Request) -> int:
+        """GPU blocks that hold every token of ``request`` so far."""
+        tokens = getattr(request, "num_tokens", None)
+        if tokens is None:
+            tokens = len(request.prompt_token_ids or ())
+        return -(-int(tokens) // self._block_size)
+
+    def _match(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
         if self._cpu_mode and _cpu_bypass_request(request):
             self._cpu_bypass_requests.add(request.request_id)
@@ -1141,6 +1218,8 @@ class MaruSchedulerConnector:
     ):
         if num_external_tokens <= 0:
             self._load_starts.pop(request.request_id, None)
+            # The request was given its blocks to run: it is parked no longer.
+            self._parked_blocks.pop(request.request_id, None)
             # Second call after a deferred load completed (extra blocks for
             # the tail). Packed layerwise overlap uses it as the scheduler-side
             # handoff: the next scheduled forward must activate the CXL views
@@ -1158,6 +1237,7 @@ class MaruSchedulerConnector:
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
+            self._parked_blocks[request.request_id] = self._prompt_blocks(request)
             self._pending_deferred_loads[request.request_id] = (
                 request,
                 num_chunks,
@@ -1345,6 +1425,8 @@ class MaruSchedulerConnector:
             self._awaiting_deferred_recv.discard(rid)
             self._deferred_layerwise_waiting.discard(rid)
             self._deferred_layerwise_ready.discard(rid)
+            self._parked_blocks.pop(rid, None)
+            self._admission_waiters.pop(rid, None)
 
         self._requests_need_load.clear()
         self._load_ranges.clear()
