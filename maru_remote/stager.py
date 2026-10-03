@@ -76,7 +76,14 @@ class Stager:
         self._clock = clock
         self._groups: dict[tuple[str, ...], _Group] = {}
         self._by_key: dict[str, list[tuple[str, ...]]] = {}
-        self.counters = {"groups": 0, "asked": 0, "refused": 0, "asked_bytes": 0}
+        self.counters = {
+            "groups": 0,
+            "asked": 0,
+            "refused": 0,
+            "asked_bytes": 0,
+            "expired": 0,
+            "evicted": 0,
+        }
 
     def on_lookup(self, keys: list[str], ranges: list[Range]) -> None:
         """Start staging a request whose prefix keys the scheduler looked up.
@@ -110,6 +117,7 @@ class Stager:
         self._advance(group)
         while len(self._groups) > self._max_groups:
             self._drop(next(iter(self._groups)))
+            self.counters["evicted"] += 1
 
     def on_read(self, keys: list[str]) -> None:
         """Move the windows of the requests whose keys the worker now reads.
@@ -161,6 +169,7 @@ class Stager:
     def _expire(self, now: float) -> None:
         for gid in [g for g, grp in self._groups.items() if grp.deadline <= now]:
             self._drop(gid)
+            self.counters["expired"] += 1
 
     def _drop(self, gid: tuple[str, ...]) -> None:
         group = self._groups.pop(gid, None)

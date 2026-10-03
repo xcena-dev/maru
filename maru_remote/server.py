@@ -171,6 +171,7 @@ class RemoteServer:
         self._regions: dict[int, _Region] = {}
         self._region_device_offset: dict[int, int] = {}
         self._stager = stager
+        self._warned_no_device_offset = False
         self._md_version = 0
         self._reservations: dict[str, _Reservation] = {}
         self._quarantine: dict[str, _Reservation] = {}
@@ -579,7 +580,8 @@ class RemoteServer:
         keys = _require_str_list(msg["keys"], "keys")
         entries = self._locate(keys)
         if self._stager is not None and msg.get("stage") is True:
-            self._stager.on_lookup(keys, [self._device_range(e) for e in entries])
+            ranges = [self._device_range(e) for e in entries]
+            self._stage(self._stager.on_lookup, keys, ranges)
         return {"found": [e is not None for e in entries]}
 
     def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -611,7 +613,10 @@ class RemoteServer:
             if entry is not None:
                 self._touch(key)
         if self._stager is not None:
-            self._stager.on_read([k for k, e in zip(keys, entries, strict=True) if e])
+            self._stage(
+                self._stager.on_read,
+                [k for k, e in zip(keys, entries, strict=True) if e],
+            )
         return {"entries": entries, "md_version": self._md_version}
 
     def _op_release(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -797,12 +802,25 @@ class RemoteServer:
             )
         return entries
 
+    def _stage(self, fn: Callable[..., None], *args: Any) -> None:
+        """Run a stager hook; staging is a hint and never fails the request."""
+        try:
+            fn(*args)
+        except Exception:
+            logger.warning("staging hint failed", exc_info=True)
+
     def _device_range(self, entry: dict[str, Any] | None) -> tuple[int, int] | None:
         """Device (address, size) of a located key, or None."""
         if entry is None:
             return None
         dev = self._region_device_offset.get(entry["region_id"])
         if dev is None:
+            if not self._warned_no_device_offset:
+                self._warned_no_device_offset = True
+                logger.warning(
+                    "region %d has no device offset; its keys are not staged",
+                    entry["region_id"],
+                )
             return None
         return dev + entry["offset"], entry["length"]
 

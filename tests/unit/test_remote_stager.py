@@ -215,3 +215,27 @@ class TestServerStaging:
         assert r["found"] == [True]
         assert server.handle({"op": "stats"})["stager"] is None
         server.close()
+
+
+def test_a_failing_stager_never_fails_the_request(handler):
+    class Broken(Stager):
+        def on_lookup(self, keys, ranges):
+            raise KeyError("bookkeeping")
+
+        def on_read(self, keys):
+            raise KeyError("bookkeeping")
+
+    server = RemoteServer(
+        handler,
+        NixlTransport("pool", agent=FakeNixlAgent("pool")),
+        pool_id="test-pool",
+        stager=Broken(2, Device()),
+    )
+    _store(server, ["k0"])
+    assert server.handle({"op": "exists", "keys": ["k0"], "stage": True})["ok"]
+    r = server.handle(
+        {"op": "lookup", "keys": ["k0"], "ticket_id": "t1", "protect": True}
+    )
+    assert r["ok"] and r["entries"][0] is not None
+    assert server.handle({"op": "release", "ticket_id": "t1"})["released"] == 1
+    server.close()
