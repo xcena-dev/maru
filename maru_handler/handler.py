@@ -1425,9 +1425,10 @@ class MaruHandler:
         """How many objects one ``batch_retrieve`` can hold right now.
 
         Returns:
-            The free read buffers of a backend with bounded ones (the remote
-            backend's staging slots), or None when one call can return any
-            number of objects (cxl, cpu, mixed).
+            For a backend with bounded read buffers (the remote backend's
+            staging slots), the most objects the next call should ask for;
+            None when one call can return any number of objects (cxl, cpu,
+            mixed) or the remote backend has not connected yet.
         """
         fn = getattr(self._storage, "retrieve_capacity", None)
         return fn() if fn is not None else None

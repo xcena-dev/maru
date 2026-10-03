@@ -328,15 +328,18 @@ class RemoteStorageClient:
         """Whether GPU kernels and async copies may read and write the slots."""
         return self._staging is not None and self._staging.cuda_registered
 
-    def retrieve_capacity(self) -> int:
-        """The most objects one batch_retrieve is sure to find slots for now.
+    def retrieve_capacity(self) -> int | None:
+        """How many objects the next batch_retrieve should ask for at most.
 
-        Stores never take the slots reserved for loads, so up to that many
-        free slots stay free until a load takes them.
+        Stores never take the slots reserved for loads, so while loads run one
+        at a time (the async load thread) a batch of this size finds its
+        slots. Concurrent loads can still race for them; the loser fails like
+        any load that finds the buffer full. None before the backend has
+        connected: batch_retrieve connects and sizes the batch itself.
         """
         with self._slot_lock:
             if self._staging is None:
-                return 0
+                return None
             free = self._staging.free_count()
             return min(free, self._load_reserve) if self._load_reserve else free
 
@@ -585,12 +588,14 @@ class RemoteStorageClient:
         self._evictions_seen = getattr(client, "evictions", 0)
         self._start_maintainer()
         logger.info(
-            "remote storage connected to %s (pool %s, page %d B, %d staging slots of %d B)",
+            "remote storage connected to %s (pool %s, page %d B, %d staging slots "
+            "of %d B, %d kept for loads)",
             self.config.remote_url,
             hello.get("pool_id"),
             int(hello["page_bytes"]),
             staging.count,
             staging.slot_bytes,
+            self._load_reserve,
         )
         return True
 

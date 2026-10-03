@@ -186,11 +186,22 @@ def test_unreachable_pool_retries_on_the_remote_retry_period():
     assert conn._handler_backoff_s({"maru_storage_backend": "cpu"}) == 5.0
 
 
-def test_default_staging_holds_one_longest_prompt():
+def test_default_staging_holds_one_longest_prompt_outside_the_load_reserve():
     page = 32 * 1024**2
     extra = remote_extra(maru_kv_chunk_tokens=256)
     assert conn._remote_staging_bytes(extra, page) == 64 * page
-    extra[conn._MAX_MODEL_LEN_KEY] = 40960
+    extra[conn._MAX_MODEL_LEN_KEY] = 40960  # 160 chunks
+    assert conn._remote_staging_bytes(extra, page) == 320 * page  # half kept for loads
+    extra["maru_remote_load_reserve"] = 0
     assert conn._remote_staging_bytes(extra, page) == 160 * page
     extra["maru_remote_staging_size"] = "2G"
     assert conn._remote_staging_bytes(extra, page) == 2 * 1024**3
+
+
+def test_load_reserve_reaches_the_handler_and_is_validated():
+    assert conn._remote_handler_settings(remote_extra())["remote_load_reserve"] == 0.5
+    extra = remote_extra(maru_remote_load_reserve=0.25)
+    assert conn._remote_handler_settings(extra)["remote_load_reserve"] == 0.25
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError, match="maru_remote_load_reserve"):
+            conn._validate_remote_config(remote_extra(maru_remote_load_reserve=bad))

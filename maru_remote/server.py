@@ -172,6 +172,8 @@ class RemoteServer:
         self._region_device_offset: dict[int, int] = {}
         self._stager = stager
         self._warned_no_device_offset = False
+        self._stage_failures = 0
+        self._stage_warn_after = 0.0
         self._md_version = 0
         self._reservations: dict[str, _Reservation] = {}
         self._quarantine: dict[str, _Reservation] = {}
@@ -661,7 +663,11 @@ class RemoteServer:
             "capacity_pages": self._capacity_pages,
             "lru_keys": len(self._lru),
             "evicted": self._evicted,
-            "stager": self._stager.stats() if self._stager is not None else None,
+            "stager": (
+                {**self._stager.stats(), "failures": self._stage_failures}
+                if self._stager is not None
+                else None
+            ),
         }
 
     def _op_evicted_since(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -807,7 +813,16 @@ class RemoteServer:
         try:
             fn(*args)
         except Exception:
-            logger.warning("staging hint failed", exc_info=True)
+            self._stage_failures += 1
+            now = self._clock()
+            if now >= self._stage_warn_after:
+                self._stage_warn_after = now + 60.0
+                logger.warning(
+                    "staging hint failed (%d so far); further failures are not "
+                    "logged for 60 s",
+                    self._stage_failures,
+                    exc_info=True,
+                )
 
     def _device_range(self, entry: dict[str, Any] | None) -> tuple[int, int] | None:
         """Device (address, size) of a located key, or None."""

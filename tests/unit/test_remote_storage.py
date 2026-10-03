@@ -1043,3 +1043,24 @@ def test_load_reserve_must_be_a_share():
                 cache_namespace="ns",
                 remote_load_reserve=bad,
             )
+
+
+def test_retrieve_capacity_is_unbounded_before_connect(pool):
+    cfg = MaruConfig(
+        storage_backend="remote",
+        remote_url=pool.url,
+        cache_namespace="ns-a",
+        pool_size=8 * PAGE,
+        chunk_size_bytes=PAGE,
+        auto_connect=False,
+    )
+    h = MaruHandler(cfg)
+    assert h.retrieve_capacity() is None  # batch_retrieve connects and sizes itself
+
+
+def test_one_slot_staging_has_no_load_reserve(pool):
+    h = remote_handler(pool.url, staging=1 * PAGE, remote_load_reserve=0.5)
+    a = h.alloc(1)  # int(1 * 0.5) == 0: the only slot is usable by a store
+    h.free(a)
+    assert h.retrieve_capacity() == 1
+    h.close()
