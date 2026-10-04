@@ -233,9 +233,11 @@ MaruServer. Engines on different servers that use the same
 
 Provide `maru_remote_url` (the pool node's control endpoint),
 `maru_remote_ucx_device` (the local RDMA NIC) and `maru_cache_namespace`.
-`maru_remote_staging_size` (default: one `max_model_len` prompt, at least 64 KV
-objects and `1G`) sizes the worker's RDMA staging buffer, which is page-locked
-for CUDA. The remote backend follows CPU mode's lease rules (the pool is
+`maru_remote_staging_size` (default: one `max_model_len` prompt divided by
+`1 - maru_remote_load_reserve`, at least 64 KV objects and `1G`) sizes the
+worker's RDMA staging buffer, which is page-locked for CUDA. Stores leave the
+`maru_remote_load_reserve` share of it (default `0.5`) free for loads. The
+remote backend follows CPU mode's lease rules (the pool is
 re-checked for every request, only the external token range is loaded, leases
 are released after the copy) but uses the default transfer path: the
 `maru_kv_ops` kernels and `maru_async_load` / `maru_async_store`, which are

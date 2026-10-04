@@ -53,6 +53,7 @@ def main() -> int:
             cache_namespace=args.namespace,
             pool_size=staging,
             chunk_size_bytes=args.object_bytes,
+            remote_load_reserve=0.0,  # every object is stored before any is read
             auto_connect=False,
             timeout_ms=5000,
         )
