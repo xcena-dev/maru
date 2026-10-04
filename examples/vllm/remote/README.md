@@ -99,7 +99,8 @@ can be compared. `maru_engine_id` is not needed.
 |---|---|---|
 | `maru_remote_url` | required | Control endpoint of `maru-remote-server` |
 | `maru_remote_ucx_device` | UCX default | Local RDMA NIC for NIXL, e.g. `mlx5_0:1` |
-| `maru_remote_staging_size` | one `max_model_len` prompt, at least 64 KV objects and `1G` | Local staging buffer (RDMA source and target), page-locked for CUDA |
+| `maru_remote_staging_size` | one `max_model_len` prompt divided by `1 - maru_remote_load_reserve`, at least 64 KV objects and `1G` | Local staging buffer (RDMA source and target), page-locked for CUDA |
+| `maru_remote_load_reserve` | `0.5` | Share of the staging buffer that stores leave free for loads |
 | `maru_async_load`, `maru_async_store` | `false` | Load and store on background threads (recommended) |
 | `maru_remote_timeout_s` | `30` | Deadline of one RDMA batch |
 | `maru_remote_retry_s` | `30` | How long the worker stops calling the pool after a failure |
@@ -111,8 +112,10 @@ can be compared. `maru_engine_id` is not needed.
 - **Store.** A prompt's completed chunks are copied GPU → staging (with
   `maru_async_store`, after the forward), then one reserve, one RDMA WRITE batch
   and one publish. A key that already exists keeps its first value; the store
-  still counts as present. An async store stages a whole prompt, so a staging
-  buffer smaller than the longest prompt skips the excess chunks.
+  still counts as present. Stores use only the staging slots outside the load
+  reserve, so a slow pool makes stores, not loads, give way. An async store
+  stages a whole prompt, so if that share is smaller than the longest prompt
+  the excess chunks are skipped.
 - **Load.** The scheduler asks the pool which prefix chunks exist. The worker
   pins them, RDMA READs them into staging, unpins them, copies staging → GPU and
   releases the leases, in batches the staging buffer can hold. A missing chunk
