@@ -60,7 +60,7 @@ class OwnedRegionManager:
     # Lifecycle
     # =========================================================================
 
-    def add_region(self, handle: MaruHandle) -> OwnedRegion:
+    def add_region(self, handle: MaruHandle, prefault: bool = True) -> OwnedRegion:
         """Map a region via DaxMapper and create a PagedMemoryAllocator.
 
         Called by Handler during connect() and _expand_region().
@@ -68,6 +68,9 @@ class OwnedRegionManager:
 
         Args:
             handle: MaruHandle from server allocation
+            prefault: Pre-fault the mapping (see DaxMapper.map_region). The
+                prefault holds the GIL for the whole region, so a process
+                that must keep other threads running maps without it.
 
         Returns:
             The created OwnedRegion
@@ -76,7 +79,7 @@ class OwnedRegionManager:
             RuntimeError: If mmap fails
             ValueError: If allocator initialization fails
         """
-        self._mapper.map_region(handle)
+        self._mapper.map_region(handle, prefault=prefault)
 
         allocator = PagedMemoryAllocator(
             region_id=handle.region_id,

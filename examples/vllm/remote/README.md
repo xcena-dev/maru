@@ -6,8 +6,8 @@ can reach it, so engines on different servers reuse each other's prefixes.
 
 ```
 worker node                                 pool node
-vLLM + MaruKVConnector                      maru-server + resource manager
-  MaruHandler(storage_backend="remote")     maru-remote-server
+vLLM + MaruKVConnector                      resource manager
+  MaruHandler(storage_backend="remote")     maru-server (remote endpoint)
     staging buffer  <==== RDMA (NIXL) ====>   CXL regions (registered with NIXL)
     control client  ----- ZMQ ---------->     reserve / publish / lookup / release
 ```
@@ -35,8 +35,8 @@ forward, when async scheduling has already scheduled the request's next step.
 - An RDMA NIC on each node (RoCE or InfiniBand) and [NIXL](https://github.com/ai-dynamo/nixl)
   with its UCX backend: `pip install 'maru[remote]'`.
 - On the pool node: a CXL/DAX device, the resource manager and MaruServer, as in
-  a local CXL deployment.
-- Every worker must reach the pool node's control port and RDMA address.
+  a local CXL deployment. MaruServer serves the remote workers itself.
+- Every worker must reach the pool node's remote endpoint and RDMA address.
 
 ## Run
 
@@ -44,28 +44,29 @@ Pool node (replace the DAX path and NIC):
 
 ```bash
 install-maru-resource-manager           # once, as for local CXL
-maru-server --host 127.0.0.1 --port 5555 --dax-path /dev/dax1.0
-MARU_PLUGINS=none CUDA_VISIBLE_DEVICES= maru-remote-server \
-  --server-url tcp://127.0.0.1:5555 --pool-size 8G --page-bytes 4M \
-  --ctrl-url tcp://0.0.0.0:6600 --ucx-device mlx5_1:1 --pool-id pool-a \
-  --capacity 200G
+maru-server --host 127.0.0.1 --port 5555 --dax-path /dev/dax1.0 \
+  --remote-bind tcp://0.0.0.0:6600 --remote-pool-size 8G --remote-page-bytes 4M \
+  --remote-ucx-device mlx5_1:1 --remote-pool-id pool-a --remote-capacity 200G
 ```
 
-`--page-bytes` must hold one KV object: all layers of one
+`--remote-bind` turns remote access on: MaruServer maps remote regions,
+registers them with NIXL and answers remote workers on that endpoint from its
+own thread, while local clients keep using `--host`/`--port`. Remote keys go
+into the same ledger as local ones, so the two restart together.
+`--remote-page-bytes` must hold one KV object: all layers of one
 `maru_kv_chunk_tokens` chunk (3 MiB for Qwen2.5-0.5B with 256-token chunks).
-The pool grows past `--pool-size` region by region as Maru's CXL pool does,
-up to `--capacity` (or until the device is full). A reservation that would
-exceed it evicts the least recently read published keys; keys being read are
-pinned and never evicted. `--eviction none` instead refuses new stores when
-full. Workers skip storing keys they stored or read in the current server run.
+The remote pool grows past `--remote-pool-size` region by region, up to
+`--remote-capacity` (or until the device is full). A reservation that would
+exceed it evicts the least recently read remote keys; keys being read are
+pinned and never evicted. `--remote-eviction none` instead refuses new stores
+when full. Workers skip storing keys they stored or read in the current server run.
 Every reply carries the server's eviction count; when it changes, a worker's
 load, store or maintenance thread asks which keys were evicted and forgets
 only those, so evicted prefixes are stored again. The maintenance thread pings
 the server once a second without blocking the engine or the scheduler; it
-stops calls when the server stops answering and reconnects once it answers. A store also asks which keys are present
-first and writes only the missing ones.
-`MARU_PLUGINS=none` keeps device plugins out of the server process and the empty
-`CUDA_VISIBLE_DEVICES` keeps it from registering the pool with CUDA.
+stops calls when the server stops answering and reconnects once it answers.
+A store also asks which keys are present first and writes only the missing
+ones.
 
 Each worker node (replace the model, namespace, address and NIC):
 
@@ -97,7 +98,7 @@ can be compared. `maru_engine_id` is not needed.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `maru_remote_url` | required | Control endpoint of `maru-remote-server` |
+| `maru_remote_url` | required | Remote endpoint of the pool node's `maru-server` (`--remote-bind`) |
 | `maru_remote_ucx_device` | UCX default | Local RDMA NIC for NIXL, e.g. `mlx5_0:1` |
 | `maru_remote_staging_size` | one `max_model_len` prompt divided by `1 - maru_remote_load_reserve`, at least 64 KV objects and `1G` | Local staging buffer (RDMA source and target), page-locked for CUDA |
 | `maru_remote_load_reserve` | `0.5` | Share of the staging buffer that stores leave free for loads |
@@ -129,28 +130,30 @@ can be compared. `maru_engine_id` is not needed.
 - **Outage.** After a failed or timed-out control request the worker stops
   calling the pool for `maru_remote_retry_s`: lookups miss, stores are skipped and
   requests compute normally. It then reconnects.
-- **Pool restart.** Every request and reply carries the server's start-up
-  generation; the server refuses requests addressed to an earlier run without
-  executing them. On a change the worker reloads the pool's NIXL metadata,
-  forgets which keys it stored and retries the call once. A worker that has not
-  talked to the pool for 5 s confirms the run before trusting what it stored.
-- **Keys of an earlier pool run.** They stay in regions the new run does not own
-  and cannot expose over RDMA; the pool reports them missing and the next store
-  of the same key replaces them. Their regions hold device capacity until then,
-  so run `maru-server` for `maru-remote-server` alone and restart the two
-  together; the server logs a warning when it finds regions it does not own.
+- **Pool restart.** Restarting `maru-server` starts a new run: the ledger and
+  the remote state start empty together. Every request and reply carries the
+  run's start-up generation; the server refuses requests addressed to an
+  earlier run without executing them. On a change the worker reloads the
+  pool's NIXL metadata, forgets which keys it stored and retries the call once.
+  A worker that has not talked to the pool for 5 s confirms the run before
+  trusting what it stored.
+- **Local clients on the pool node.** Keys that local Maru clients keep in
+  their own regions are reported missing to remote workers, and a remote store
+  of the same key is refused. Local clients cannot delete remote keys or return
+  remote regions; remote regions are hidden from their region list. A local
+  client that looks up a remote key maps that whole region on first access.
 - **Full pool.** The pool evicts least recently read keys (see above). When
-  nothing can be evicted (every key pinned, or `--eviction none`) it answers
+  nothing can be evicted (every key pinned, or `--remote-eviction none`) it answers
   reservations with `POOL_FULL`; the worker then skips stores (not loads) for
   `maru_remote_retry_s`.
-- **Refused keys.** A key the pool refuses to publish (for example a key of an
-  earlier run that is still pinned) is not written again for
+- **Refused keys.** A key the pool refuses to publish (for example a key a
+  local client on the pool node already holds) is not written again for
   `maru_remote_retry_s`.
 - **Timed-out transfers.** Memory a timed-out RDMA transfer may still reach is
   not reused: its staging slots stay isolated until NIXL reports the transfer
   ended, and the pool keeps the pages of a timed-out WRITE out of circulation
   until the worker confirms the end (or, if the worker died, for
-  `--quarantine-ttl`, 600 s by default). If the pool restarts while such a
+  `--remote-quarantine-ttl`, 600 s by default). If the pool restarts while such a
   transfer is still pending, the worker drops the old pool's NIXL peer with
   the isolated transfer outstanding; that ordering has not been exercised on
   hardware.

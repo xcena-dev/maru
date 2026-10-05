@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remote CXL storage backend: KV bytes live in another node's CXL pool.
 
-The handler talks to the pool node's ``maru-remote-server`` over ZMQ and moves
-bytes with NIXL between a local staging buffer and the pool's registered
-regions. Callers see the CPU backend's contract:
+The handler talks to the remote endpoint of the pool node's maru-server over
+ZMQ and moves bytes with NIXL between a local staging buffer and the pool's
+registered regions. Callers see the CPU backend's contract:
 
 - ``alloc`` returns a writable staging slot;
 - ``batch_store`` takes ownership of the slots, reserves pool pages, RDMA

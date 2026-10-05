@@ -226,12 +226,13 @@ for launch configuration, memory lifetime and validation instructions.
 
 Set `maru_storage_backend="remote"` to keep KV in a CXL pool on another node and
 move it over RDMA ([NIXL](https://github.com/ai-dynamo/nixl), install with
-`pip install 'maru[remote]'`). The pool node runs MaruServer, the resource manager
-and `maru-remote-server`; workers need neither a DAX device nor a local
-MaruServer. Engines on different servers that use the same
+`pip install 'maru[remote]'`). The pool node runs the resource manager and
+MaruServer with remote access on (`--remote-bind`); MaruServer then serves
+remote workers on that endpoint from its own thread. Workers need neither a DAX
+device nor a local MaruServer. Engines on different servers that use the same
 `maru_cache_namespace` and model geometry reuse each other's prefixes.
 
-Provide `maru_remote_url` (the pool node's control endpoint),
+Provide `maru_remote_url` (the remote endpoint of the pool node's MaruServer),
 `maru_remote_ucx_device` (the local RDMA NIC) and `maru_cache_namespace`.
 `maru_remote_staging_size` (default: one `max_model_len` prompt divided by
 `1 - maru_remote_load_reserve`, at least 64 KV objects and `1G`) sizes the

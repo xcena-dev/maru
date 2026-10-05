@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gates G0/G1 for the remote storage backend, through the MaruHandler API.
 
-Opens ``MaruHandler(storage_backend="remote")`` against a pool node's
-maru-remote-server and, per round, stores N objects of random bytes, checks
+Opens ``MaruHandler(storage_backend="remote")`` against the remote endpoint of
+a pool node's maru-server and, per round, stores N objects of random bytes, checks
 that they exist, stores the same keys again with different bytes (the first
 value must win), retrieves them, compares SHA-256 digests and releases the
 leases. It reports RDMA bandwidth (bytes over the transfer time the backend
@@ -25,8 +25,8 @@ import time
 import uuid
 
 from maru_common.config import MaruConfig
+from maru_common.sizes import parse_size
 from maru_handler import MaruHandler
-from maru_remote.__main__ import parse_size
 
 
 def _payload(n: int, seed: int) -> bytes:

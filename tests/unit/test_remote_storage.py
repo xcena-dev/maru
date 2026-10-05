@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MaruHandler(storage_backend="remote") against an in-process pool node.
 
-The pool node is real code: a MaruServer, a CXL-backend MaruHandler on
-anonymous memory, and a RemoteServer on a ZMQ REP loop. Only NIXL is faked,
-by an agent that copies bytes between registered ranges.
+The pool node is real code: a MaruServer whose remote access maps anonymous
+memory (MockShmClient) and answers its endpoint on a ZMQ REP thread. Only
+NIXL is faked, by an agent that copies bytes between registered ranges.
 """
 
 import threading
@@ -15,8 +15,9 @@ import pytest
 from maru_common.config import MaruConfig
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_handler import MaruHandler
-from maru_remote.server import RemoteServer, serve_forever
 from maru_remote.transport import NixlTransport
+from maru_server.remote_access import RemoteAccess, serve_remote
+from maru_server.server import MaruServer
 from tests.unit.remote_fakes import FakeClock, FakeNixlAgent, reset_fake_agents
 
 PAGE = 64 * 1024
@@ -43,72 +44,65 @@ def _fake_nixl():
     reset_fake_agents()
 
 
-@pytest.fixture
-def pool_handler(server_thread, server_port):
-    h = MaruHandler(
-        MaruConfig(
-            server_url=f"tcp://127.0.0.1:{server_port}",
-            pool_size=32 * PAGE,
-            chunk_size_bytes=PAGE,
-            auto_connect=False,
-            use_async_rpc=False,
-        )
-    )
-    h.connect()
-    yield h
-    h.close()
-
-
 class PoolNode:
-    """A RemoteServer on its own REP thread; restartable on the same port."""
+    """A maru-server's remote access on its own endpoint thread.
 
-    def __init__(self, handler, port, ttl=10.0, **server_kw):
-        self.handler = handler
-        self.server_kw = server_kw
+    ``stop`` then ``start`` is a maru-server restart on the same port: a new
+    run with an empty ledger and a new generation.
+    """
+
+    def __init__(self, port, ttl=10.0, **access_kw):
+        self.access_kw = access_kw
         self.url = f"tcp://127.0.0.1:{port}"
         self.ttl = ttl
-        self.server = None
+        self.maru = None
+        self.access = None
         self._stop = None
         self._thread = None
 
     def start(self):
-        self.server = RemoteServer(
-            self.handler,
+        self.maru = MaruServer()
+        self.access = RemoteAccess(
+            self.maru,
             NixlTransport(POOL_AGENT, agent=FakeNixlAgent(POOL_AGENT)),
+            pool_size=32 * PAGE,
+            page_bytes=PAGE,
             pool_id="test",
             reservation_ttl_s=self.ttl,
-            **self.server_kw,
+            **self.access_kw,
         )
         self._stop = threading.Event()
+        ready = threading.Event()
         self._thread = threading.Thread(
-            target=serve_forever,
-            args=(self.server, self.url),
-            kwargs={"stop_event": self._stop, "sweep_interval_s": 0.05},
+            target=serve_remote,
+            args=(self.access, self.url),
+            kwargs={"stop_event": self._stop, "ready": ready, "sweep_interval_s": 0.05},
             daemon=True,
         )
         self._thread.start()
-        time.sleep(0.05)
+        assert ready.wait(5)
 
     def stop(self):
         self._stop.set()
         self._thread.join(timeout=5)
-        self.server.close()
+        self.access.close()
+        self.maru.close()
 
     def stats(self):
-        return self.server.handle({"op": "stats"})
+        return self.access.handle({"op": "stats"})
 
 
 @pytest.fixture
-def pool(pool_handler, unused_port):
-    node = PoolNode(pool_handler, unused_port)
+def pool(unused_port):
+    node = PoolNode(unused_port)
     node.start()
     yield node
     node.stop()
 
 
 @pytest.fixture
-def pool_no_evict(pool_handler, unused_port):
-    node = PoolNode(pool_handler, unused_port, evict=False)
+def pool_no_evict(unused_port):
+    node = PoolNode(unused_port, evict=False)
     node.start()
     yield node
     node.stop()
@@ -252,9 +246,11 @@ def test_outage_skips_calls_until_retry_then_reconnects(pool):
     clock.advance(6.0)
     assert h.batch_exists(["before"]) == [False]  # the scheduler path never reconnects
     h._storage.maintain()  # the maintenance thread's round reconnects
-    assert h.batch_exists(["before"]) == [True]  # keys live in the MaruServer
+    assert h._storage._client.generation == pool.access.generation
+    assert h.batch_exists(["before"]) == [False]  # the new run starts empty
     assert not h.has_local("before")  # the restart cleared what this handler knew
     assert _store(h, "after", b"2")
+    assert h.batch_exists(["after"]) == [True]
     h.close()
 
 
@@ -266,8 +262,10 @@ def test_restart_is_detected_and_the_call_retried(pool):
     # The scheduler path reports misses and leaves the reconnect to the
     # maintenance thread, which answers from the new run.
     h._storage.maintain()
-    assert h.batch_exists(["k"]) == [True]
+    assert h.batch_exists(["k"]) == [False]  # the new run starts empty
     assert not h.has_local("k")  # what this handler knew belongs to the old run
+    assert h.batch_retrieve(["k"]) == [None]
+    assert _store(h, "k", b"1") is True  # stored again in the new run
     (lease,) = h.batch_retrieve(["k"])
     assert bytes(lease.view) == b"1"
     lease.release()
@@ -473,9 +471,10 @@ def test_a_restart_refuses_old_run_requests_before_running_them(pool):
     assert _store(h, "k", b"1")
     pool.stop()
     pool.start()
-    (lease,) = h.batch_retrieve(["k"])  # refused, reconnected, retried
-    assert bytes(lease.view) == b"1"
-    lease.release()
+    old = h._storage._client.generation
+    # Refused by the new run, reconnected, retried there: the key is gone.
+    assert h.batch_retrieve(["k"]) == [None]
+    assert h._storage._client.generation == pool.access.generation != old
     assert pool.stats()["tickets"] == 0  # the refused attempt pinned nothing
     h.close()
 
@@ -538,12 +537,9 @@ def test_a_full_pool_pauses_stores_but_not_loads(pool_no_evict):
     clock = FakeClock()
     h._storage._clock = clock
     assert _store(h, "kept", b"1")
-    with patch.object(
-        pool.handler,
-        "alloc",
-        side_effect=ValueError(
-            "Cannot allocate page: pool exhausted after expansion attempt"
-        ),
+    with (
+        patch.object(pool.access._owned, "allocate", return_value=None),
+        patch.object(pool.maru, "request_alloc", return_value=None),
     ):
         assert _store(h, "more", b"2") is False  # reserve reports POOL_FULL
     with pytest.raises(StorageUnavailableError, match="full"):
@@ -561,12 +557,11 @@ def test_a_refused_key_is_not_written_again_until_the_retry_period(pool):
     clock = FakeClock()
     h._storage._clock = clock
 
-    def refuse(keys, handles):
-        for handle in handles:
-            pool.handler.free(handle)
-        return [False] * len(keys)
+    def refuse(entries):
+        # Every key is already held in a local client's region.
+        return [{"region_id": -1, "kv_offset": 0, "kv_length": 1} for _ in entries]
 
-    with patch.object(pool.handler, "batch_store", side_effect=refuse):
+    with patch.object(pool.maru, "batch_register_or_lookup", side_effect=refuse):
         assert _store(h, "stuck", b"1") is False  # the server answers REJECTED
         written = h.get_stats()["remote_storage"]["counters"]["store_bytes"]
         assert _store(h, "stuck", b"1") is False
@@ -646,10 +641,8 @@ def test_has_local_does_not_wait_for_a_transfer_in_flight(pool):
     h.close()
 
 
-def test_stores_beyond_capacity_evict_the_least_recently_read(
-    pool_handler, unused_port
-):
-    node = PoolNode(pool_handler, unused_port, capacity_bytes=2 * PAGE)
+def test_stores_beyond_capacity_evict_the_least_recently_read(unused_port):
+    node = PoolNode(unused_port, capacity_bytes=2 * PAGE)
     node.start()
     try:
         h = remote_handler(node.url, staging=4 * PAGE)
@@ -689,10 +682,8 @@ def test_a_store_of_a_present_key_skips_the_write(pool):
     other.close()
 
 
-def test_an_eviction_makes_the_writer_store_evicted_keys_again(
-    pool_handler, unused_port
-):
-    node = PoolNode(pool_handler, unused_port, capacity_bytes=2 * PAGE)
+def test_an_eviction_makes_the_writer_store_evicted_keys_again(unused_port):
+    node = PoolNode(unused_port, capacity_bytes=2 * PAGE)
     node.start()
     try:
         h = remote_handler(node.url, staging=4 * PAGE)
@@ -711,10 +702,8 @@ def test_an_eviction_makes_the_writer_store_evicted_keys_again(
         node.stop()
 
 
-def test_a_key_another_worker_evicted_is_dropped_on_the_next_call(
-    pool_handler, unused_port
-):
-    node = PoolNode(pool_handler, unused_port, capacity_bytes=1 * PAGE)
+def test_a_key_another_worker_evicted_is_dropped_on_the_next_call(unused_port):
+    node = PoolNode(unused_port, capacity_bytes=1 * PAGE)
     node.start()
     try:
         a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
@@ -730,12 +719,8 @@ def test_a_key_another_worker_evicted_is_dropped_on_the_next_call(
         node.stop()
 
 
-def test_a_truncated_eviction_log_forgets_every_remembered_key(
-    pool_handler, unused_port
-):
-    node = PoolNode(
-        pool_handler, unused_port, capacity_bytes=1 * PAGE, eviction_log_len=1
-    )
+def test_a_truncated_eviction_log_forgets_every_remembered_key(unused_port):
+    node = PoolNode(unused_port, capacity_bytes=1 * PAGE, eviction_log_len=1)
     node.start()
     try:
         a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
@@ -761,9 +746,14 @@ def test_the_maintenance_thread_reconnects_after_an_outage(pool, monkeypatch):
     assert h.batch_exists(["k"]) == [False]  # a control timeout trips the backend
     pool.start()
     deadline = time.monotonic() + 5.0
-    while h.batch_exists(["k"]) != [True] and time.monotonic() < deadline:
+    while (
+        h._storage._client.generation != pool.access.generation
+        and time.monotonic() < deadline
+    ):
         time.sleep(0.05)
-    assert h.batch_exists(["k"]) == [True]  # reconnected off the caller's path
+    # Reconnected off the caller's path to the new, empty run.
+    assert h._storage._client.generation == pool.access.generation
+    assert h.batch_exists(["k"]) == [False]
     h.close()
 
 
@@ -798,10 +788,8 @@ def test_existence_checks_do_not_wait_for_a_maintenance_probe(pool, monkeypatch)
     h.close()
 
 
-def test_the_maintenance_thread_drops_keys_another_worker_evicted(
-    pool_handler, unused_port
-):
-    node = PoolNode(pool_handler, unused_port, capacity_bytes=1 * PAGE)
+def test_the_maintenance_thread_drops_keys_another_worker_evicted(unused_port):
+    node = PoolNode(unused_port, capacity_bytes=1 * PAGE)
     node.start()
     try:
         a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
@@ -826,6 +814,8 @@ def test_a_server_that_returns_is_reconnected_before_the_retry_period_ends(pool)
     h._storage.maintain()  # still down: still stopped, no exception
     pool.start()
     h._storage.maintain()  # the server answers: reconnect at once
+    assert h._storage._client.generation == pool.access.generation
+    assert _store(h, "k", b"1") is True  # calls run again in the new run
     assert h.batch_exists(["k"]) == [True]
     h.close()
 
