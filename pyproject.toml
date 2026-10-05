@@ -49,7 +49,6 @@ docs = [
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
 marutop = "maru_tools.cli:main"
-maru-remote-server = "maru_remote.__main__:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"

@@ -46,7 +46,7 @@ class MaruConfig:
         storage_backend: Where KV bytes live: "cxl" (local DAX mapping, the
             default), "cpu" (worker DRAM), "mixed" (CPU and CXL) or "remote"
             (a CXL pool on another node, reached over RDMA).
-        remote_url: Control endpoint of the pool node's maru-remote-server
+        remote_url: Remote endpoint of the pool node's maru-server
             (remote backend only), e.g. "tcp://pool-node:6600".
         remote_ucx_device: UCX device of the local RDMA NIC, e.g.
             "mlx5_0:1"; empty for the UCX default.

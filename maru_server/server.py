@@ -4,14 +4,23 @@
 
 import argparse
 import logging
+import os
 import signal
+import sys
+import threading
+import time
+from collections.abc import Callable
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
 from .kv_manager import DeleteResult, KVManager
 from .stats_manager import StatsManager
+
+if TYPE_CHECKING:
+    from .remote_access import RemoteAccess
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +52,9 @@ class MaruServer:
         self._kv_manager = KVManager()
         self._stats_manager = StatsManager()
         self._lock = RLock()  # Coordinates cross-manager operations
+        # Owners whose regions a server component (remote access) manages:
+        # local RPC calls may not return those regions or delete their keys.
+        self._managed_owners: set[str] = set()
         self.replica_directory = ReplicaDirectory(
             cpu_capacity_limit,
             cpu_session_ttl,
@@ -99,15 +111,34 @@ class MaruServer:
     # Allocation Management
     # =========================================================================
 
+    def add_managed_owner(self, owner: str) -> None:
+        """Reserve ``owner`` for a server component.
+
+        Local RPC calls can then neither allocate nor return regions under
+        that owner, nor delete keys in its regions: the component tracks the
+        pages behind those keys itself.
+        """
+        with self._lock:
+            self._managed_owners.add(owner)
+
     def request_alloc(
-        self, instance_id: str, size: int, *, legacy_visible: bool = True
+        self,
+        instance_id: str,
+        size: int,
+        *,
+        legacy_visible: bool = True,
+        managed: bool = False,
     ) -> MaruHandle | None:
         """Handle allocation request from client.
 
         When ``--dax-path`` is configured, iterates over the server's
         dax_path list (fill-first fallback). Otherwise uses any available pool.
+        ``managed`` marks a call from the component that owns ``instance_id``.
         """
         if self._allocation_manager is None:
+            return None
+        if instance_id in self._managed_owners and not managed:
+            logger.warning("Refused allocation under managed owner %s", instance_id)
             return None
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
@@ -142,9 +173,17 @@ class MaruServer:
         logger.error("Failed to allocate %d bytes for %s", size, instance_id)
         return None
 
-    def return_alloc(self, instance_id: str, region_id: int) -> bool:
-        """Handle allocation return request from client."""
+    def return_alloc(
+        self, instance_id: str, region_id: int, *, managed: bool = False
+    ) -> bool:
+        """Handle allocation return request from client.
+
+        ``managed`` marks a call from the component that owns ``instance_id``.
+        """
         if self._allocation_manager is None:
+            return False
+        if instance_id in self._managed_owners and not managed:
+            logger.warning("Refused return of managed region %d", region_id)
             return False
         success = self._allocation_manager.release(instance_id, region_id)
         if success:
@@ -219,14 +258,88 @@ class MaruServer:
         return self._kv_manager.unpin(key)
 
     def delete_kv(self, key: str) -> bool:
-        """Delete a KV entry."""
+        """Delete a KV entry.
+
+        Keys in a managed region (see :meth:`add_managed_owner`) are refused:
+        their component deletes them with :meth:`delete_kv_at`.
+        """
         with self._lock:
+            entry = self._kv_manager.lookup(key)
+            if entry is not None and self._is_managed_region(entry.region_id):
+                logger.debug("Delete refused: key=%s is in a managed region", key)
+                return False
             result, region_to_deref = self._kv_manager.delete(key)
 
             if region_to_deref is not None:
                 self._allocation_manager.decrement_kv_ref(region_to_deref)
 
         return result == DeleteResult.DELETED
+
+    def delete_kv_at(self, key: str, region_id: int, kv_offset: int) -> DeleteResult:
+        """Delete ``key`` only if it still names this location.
+
+        For a component that owns the page behind its key.
+
+        Returns:
+            ``DELETED``, ``PINNED`` or ``NOT_FOUND`` (absent or elsewhere).
+        """
+        with self._lock:
+            result, region_to_deref = self._kv_manager.delete_at(
+                key, region_id, kv_offset
+            )
+            if region_to_deref is not None:
+                self._allocation_manager.decrement_kv_ref(region_to_deref)
+        return result
+
+    def batch_register_or_lookup(
+        self, entries: list[tuple[str, int, int, int]]
+    ) -> list[dict | None]:
+        """Register keys that are absent; report where the others already are.
+
+        One step under the server lock, so no other register or delete runs
+        between the check and the register.
+
+        Args:
+            entries: (key, region_id, kv_offset, kv_length) tuples.
+
+        Returns:
+            Per entry: None if it was registered now, else where the key
+            already is (``region_id``, ``kv_offset``, ``kv_length``).
+        """
+        if self._allocation_manager is None:
+            raise RuntimeError("CXL allocation is disabled")
+        with self._lock:
+            out: list[dict | None] = []
+            for key, region_id, kv_offset, kv_length in entries:
+                existing = self._kv_manager.lookup(key)
+                if existing is not None:
+                    out.append(self._entry_dict(existing))
+                    continue
+                _, alloc_to_ref = self._kv_manager.register(
+                    key, region_id, kv_offset, kv_length
+                )
+                if alloc_to_ref is not None:
+                    self._allocation_manager.increment_kv_ref(alloc_to_ref)
+                out.append(None)
+            return out
+
+    def batch_pin_lookup(
+        self, keys: list[str], region_ids: set[int]
+    ) -> list[dict | None]:
+        """Pin and locate the keys that live in ``region_ids``.
+
+        Each key is pinned and located in one step, on its own (no prefix
+        stop); keys elsewhere or absent are not pinned and come back as None.
+
+        Returns:
+            Per key: where a pinned entry is (``region_id``, ``kv_offset``,
+            ``kv_length``), or None.
+        """
+        with self._lock:
+            return [
+                None if e is None else self._entry_dict(e)
+                for e in self._kv_manager.batch_pin_in(keys, region_ids)
+            ]
 
     # =========================================================================
     # Batch KV Operations
@@ -308,6 +421,21 @@ class MaruServer:
             List of booleans indicating if each key exists
         """
         return self._kv_manager.batch_exists(keys)
+
+    def _is_managed_region(self, region_id: int) -> bool:
+        """Whether a server component manages ``region_id``."""
+        if not self._managed_owners or self._allocation_manager is None:
+            return False
+        return self._allocation_manager.get_owner(region_id) in self._managed_owners
+
+    @staticmethod
+    def _entry_dict(entry) -> dict:
+        """Where a KV entry is: region, offset and length."""
+        return {
+            "region_id": entry.region_id,
+            "kv_offset": entry.kv_offset,
+            "kv_length": entry.kv_length,
+        }
 
     _MAX_STATS_BATCH = 10000
 
@@ -454,6 +582,164 @@ def setup_logging(level: str) -> None:
         handler.setLevel(log_level)
 
 
+def _add_remote_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the options that serve this node's CXL pool to other nodes."""
+    from maru_common.sizes import parse_size
+
+    group = parser.add_argument_group(
+        "remote access",
+        "Serve part of this node's CXL pool to MaruHandler's remote backend on "
+        "other nodes (needs NIXL: pip install 'maru[remote]').",
+    )
+    group.add_argument(
+        "--remote-bind",
+        default=None,
+        help="ZMQ endpoint for remote workers, e.g. tcp://0.0.0.0:6600 "
+        "(remote access is off without it)",
+    )
+    group.add_argument(
+        "--remote-pool-size",
+        type=parse_size,
+        default=None,
+        help="bytes of each remote region, e.g. 8G (also the growth step)",
+    )
+    group.add_argument(
+        "--remote-page-bytes",
+        type=parse_size,
+        default=None,
+        help="remote page size; one page holds one KV object, e.g. 32M",
+    )
+    group.add_argument(
+        "--remote-pool-id", default="maru", help="pool name reported to clients"
+    )
+    group.add_argument(
+        "--remote-ucx-device", default="", help="UCX device, e.g. mlx5_1:1"
+    )
+    group.add_argument(
+        "--remote-capacity",
+        type=parse_size,
+        default=None,
+        help="most remote bytes to hold (default: grow until the device is full)",
+    )
+    group.add_argument(
+        "--remote-eviction",
+        choices=("lru", "none"),
+        default="lru",
+        help="when full: delete least recently read keys, or refuse new stores",
+    )
+    group.add_argument(
+        "--remote-reservation-ttl", type=float, default=60.0, help="seconds"
+    )
+    group.add_argument("--remote-ticket-ttl", type=float, default=120.0, help="seconds")
+    group.add_argument(
+        "--remote-quarantine-ttl",
+        type=float,
+        default=600.0,
+        help="seconds a timed-out WRITE's pages stay unused if never abandoned",
+    )
+
+
+class _RemoteEndpoint:
+    """Remote access and the thread that serves its endpoint.
+
+    The ledger and the remote state must start and end together, so if the
+    endpoint thread dies after it started serving, the whole server stops
+    (``failed`` is then True).
+    """
+
+    def __init__(self, access: "RemoteAccess", stop_event: threading.Event):
+        self.access = access
+        self.stop_event = stop_event
+        self.failed = False
+        self.thread: threading.Thread | None = None
+
+    def run(
+        self, bind_url: str, ready: threading.Event, on_failure: Callable[[], None]
+    ) -> None:
+        """Serve the endpoint; on an unexpected error, stop the whole server.
+
+        A failure before the endpoint is bound only sets ``failed``: the
+        caller of :func:`_start_remote` is still waiting and reports it.
+        """
+        from .remote_access import serve_remote
+
+        try:
+            serve_remote(self.access, bind_url, stop_event=self.stop_event, ready=ready)
+        except Exception:
+            logger.exception("Remote endpoint failed; stopping MaruServer")
+            self.failed = True
+            if ready.is_set():
+                on_failure()
+
+    def close(self) -> None:
+        """Stop the endpoint thread, then release the remote regions."""
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5.0)
+        self.access.close()
+
+
+def _start_remote(
+    server: MaruServer,
+    args: argparse.Namespace,
+    on_failure: Callable[[], None],
+) -> _RemoteEndpoint:
+    """Create remote access and serve its endpoint on a separate thread.
+
+    Args:
+        server: The server whose ledger remote access shares.
+        args: Parsed command line (the ``--remote-*`` options).
+        on_failure: Called from the endpoint thread if it dies after it
+            started serving; stops the server.
+
+    Returns:
+        The running endpoint.
+
+    Raises:
+        RuntimeError: if remote access cannot start or the endpoint does not
+            bind within 10 s (everything it set up is released first).
+    """
+    from maru_remote.transport import NixlTransport
+
+    from .remote_access import RemoteAccess
+
+    transport = NixlTransport(
+        f"maru-remote-{args.remote_pool_id}", ucx_device=args.remote_ucx_device
+    )
+    try:
+        access = RemoteAccess(
+            server,
+            transport,
+            pool_size=args.remote_pool_size,
+            page_bytes=args.remote_page_bytes,
+            pool_id=args.remote_pool_id,
+            reservation_ttl_s=args.remote_reservation_ttl,
+            ticket_ttl_s=args.remote_ticket_ttl,
+            quarantine_ttl_s=args.remote_quarantine_ttl,
+            capacity_bytes=args.remote_capacity,
+            evict=args.remote_eviction == "lru",
+        )
+    except Exception:
+        transport.close()
+        raise
+    endpoint = _RemoteEndpoint(access, threading.Event())
+    ready = threading.Event()
+    endpoint.thread = threading.Thread(
+        target=endpoint.run,
+        args=(args.remote_bind, ready, on_failure),
+        name="maru-remote",
+        daemon=True,
+    )
+    endpoint.thread.start()
+    deadline = time.monotonic() + 10.0
+    while not ready.wait(timeout=0.05):
+        if endpoint.failed or time.monotonic() > deadline:
+            endpoint.close()
+            raise RuntimeError(f"remote endpoint {args.remote_bind} did not start")
+    logger.info("Remote access listening on %s", args.remote_bind)
+    return endpoint
+
+
 def main() -> None:
     """Main entry point for the server."""
     # Import here to avoid circular import
@@ -509,9 +795,17 @@ def main() -> None:
         default=64 * 1024**3,
         help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
     )
+    _add_remote_arguments(parser)
     args = parser.parse_args()
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
+    if args.remote_bind:
+        if args.cpu_only:
+            parser.error("--remote-bind needs CXL; it cannot run with --cpu-only")
+        if not args.remote_pool_size or not args.remote_page_bytes:
+            parser.error(
+                "--remote-bind needs --remote-pool-size and --remote-page-bytes"
+            )
 
     setup_logging(args.log_level)
 
@@ -523,20 +817,37 @@ def main() -> None:
         cpu_capacity_limit=args.cpu_capacity_limit,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
+    remote: _RemoteEndpoint | None = None
+    stopping = threading.Event()
 
-    # Setup signal handlers
+    # Setup signal handlers (before remote access starts, so a remote
+    # endpoint that dies at any point stops the server cleanly)
     def signal_handler(signum, frame):
+        stopping.set()
+        if remote is not None:
+            remote.stop_event.set()
         rpc_server.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start server
-    logger.info("Starting MaruServer on %s:%d", args.host, args.port)
     try:
-        rpc_server.start()
+        if args.remote_bind:
+            remote = _start_remote(
+                server, args, lambda: os.kill(os.getpid(), signal.SIGTERM)
+            )
+        if not stopping.is_set():
+            logger.info("Starting MaruServer on %s:%d", args.host, args.port)
+            rpc_server.start()
     finally:
+        # Shutdown order: the remote endpoint first (no new remote requests),
+        # then remote access (NIXL deregistration, unmap, region return),
+        # then the server itself.
+        if remote is not None:
+            remote.close()
         server.close()
+    if remote is not None and remote.failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
