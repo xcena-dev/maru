@@ -106,10 +106,13 @@ chunk_tokens` (3 MiB for Qwen2.5-0.5B and 32 MiB for Llama-3.1-8B with
 256-token chunks). The remote pool grows past `--remote-pool-size` region by
 region, up to `--remote-capacity` (or until the device is full). Mapping and
 registering a region takes about 21 ms per GiB (1.35 s for 64 GiB, 2.7 s for
-128 GiB), and the remote endpoint serves nothing else meanwhile. Workers treat
-a pool that does not answer for about 2 s as down, so a region added while
-serving should stay well below 100 GiB. The example sets the capacity equal to
-the pool size, so the whole pool is registered at start-up. A reservation that would exceed the
+128 GiB), and the remote endpoint serves nothing else meanwhile. Workers'
+requests wait for it, so an engine's scheduler can pause until the region is
+added. If that takes longer than about 2 s, the waiting requests time out and
+workers stop calling the pool; they reconnect at the first answered ping,
+within about a second after the region is added. Meanwhile lookups miss,
+stores are skipped and requests compute normally. The example sets the
+capacity equal to the pool size, so the whole pool is registered at start-up. A reservation that would exceed the
 capacity evicts the least recently read remote keys; keys being read are
 pinned and never evicted. `--remote-eviction none` instead refuses new stores
 when full. Workers skip storing keys they stored or read in the current server
