@@ -634,7 +634,7 @@ class RemoteStorageClient:
         if page < self.config.chunk_size_bytes:
             raise StorageError(
                 f"remote pool pages ({page} B) are smaller than one KV object "
-                f"({self.config.chunk_size_bytes} B); raise --page-bytes"
+                f"({self.config.chunk_size_bytes} B); raise --remote-page-bytes"
             )
         timeout = self.config.remote_transfer_timeout_s
         for name, what in (
