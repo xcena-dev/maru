@@ -7,6 +7,8 @@ The `MaruHandler` is the client-side library that applications (e.g., LMCache/vL
 
 Data flows directly between the handler and CXL shared memory via memory-mapped regions — neither the MaruServer nor the resource manager is involved in the data path.
 
+Sections 1–4 describe the default storage backend, `cxl`. The other backends (`cpu`, `mixed`, `remote`) replace the region mapping with a storage client; section 5 covers them.
+
 ## 1. Component Hierarchy
 
 ```mermaid
@@ -222,6 +224,58 @@ sequenceDiagram
     end
     H-->>C: success
 ```
+
+## 5. Storage Backends
+
+`MaruConfig.storage_backend` selects where the handler keeps KV bytes. With `cxl` the handler owns CXL regions as described above. With the other backends it delegates storage to a storage client and hands out **read leases** instead of shared mappings.
+
+| Backend | Storage client | Where KV bytes live | Metadata |
+|---------|----------------|---------------------|----------|
+| `cxl` (default) | none (DaxMapper, OwnedRegionManager) | CXL regions owned by this handler | MaruServer RPC |
+| `cpu` | `CpuStorageClient` | This process's DRAM | MaruServer RPC (`--cpu-only` server) |
+| `mixed` | `CpuStorageClient` | This process's DRAM and CXL regions it owns | MaruServer RPC |
+| `remote` | `RemoteStorageClient` | A CXL pool on another node | The pool node's MaruServer, through its remote endpoint |
+
+The lease-based backends share one contract: `alloc` returns a writable buffer, `batch_store` takes ownership of the buffers and publishes their keys, and `batch_retrieve` returns read leases that the caller releases after its last copy. `pin`, `unpin` and `delete` are not supported with them.
+
+### Remote backend
+
+```mermaid
+graph TB
+    subgraph MaruHandler["MaruHandler (storage_backend=remote)"]
+        direction TB
+        subgraph RSC["RemoteStorageClient"]
+            RC["RemoteClient"]
+            NT["NixlTransport"]
+            SB["Staging buffer"]
+            MT["Maintenance thread"]
+        end
+    end
+    subgraph Pool["Pool node"]
+        EP["MaruServer remote endpoint"]
+        CXL["CXL regions"]
+    end
+
+    RC -.->|"reserve / publish / lookup / release"| EP
+    MT -.->|"ping every second"| EP
+    NT -->|"registers"| SB
+    SB <==>|"RDMA (NIXL)"| CXL
+
+    style RSC fill:#e3f2fd,stroke:#1565c0
+    style CXL fill:#fce4ec,stroke:#c62828
+```
+
+Dashed arrows are control requests over ZMQ, and the thick arrow is KV bytes over RDMA. The thin solid arrow shows NixlTransport registering the staging buffer with NIXL.
+
+**RemoteClient** sends control requests to the pool node's remote endpoint: reserve pool pages, publish keys, look up keys while pinning them, and release the pins. Every reply, and every request except the connection handshake and the maintenance thread's ping, carries the pool server's start-up generation, so the client notices a restarted pool and reconnects.
+
+**NixlTransport** registers the staging buffer with NIXL and issues one-sided RDMA READs and WRITEs between the staging buffer and the pool's registered regions.
+
+**Staging buffer** is local anonymous memory, divided into slots of one KV object each and page-locked for CUDA when CUDA is available. Stores leave a configurable share of the slots free for loads, so a slow pool makes stores, not loads, give way.
+
+**Maintenance thread** pings the pool once a second from its own client. It stops calls when the pool stops answering, reconnects when it answers again, and applies evictions the pool reports: the handler forgets the evicted keys, or every key it remembers when the pool's eviction log no longer covers the gap or the pool restarted.
+
+A store copies data into staging slots, reserves pages, writes them with RDMA WRITE and publishes the keys. A retrieve looks up and pins the keys, reads them with RDMA READ, releases the pins and returns leases over the staging slots. The pool node's MaruServer never copies KV bytes; see {ref}`Storage Backends <storage-backends>` in the architecture overview for the pool node side.
 
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),
