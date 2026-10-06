@@ -301,10 +301,14 @@ a node, also export `UCX_NET_DEVICES=<device>` before starting that node's
 process.
 
 The example sets the pool's capacity equal to one region, so `maru-server`
-maps and registers the whole pool at start-up. Registering a region takes
-about 21 ms per GiB, and the remote endpoint answers nothing else meanwhile;
-workers treat a pool that does not answer for about 2 s as down. Keep regions
-that are added while serving well below 100 GiB.
+maps and registers the whole pool at start-up. When a pool with a larger
+capacity grows while serving, registering the new region takes about 21 ms per
+GiB, and the remote endpoint answers nothing else meanwhile. Workers' requests
+wait for it, so an engine's scheduler can pause until the region is added. If
+that takes longer than about 2 s, the waiting requests time out and workers
+stop calling the pool; they reconnect at the first answered ping, within about
+a second after the region is added. Meanwhile lookups miss, stores are skipped
+and requests compute normally.
 
 ### Troubleshooting
 
