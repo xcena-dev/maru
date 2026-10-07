@@ -94,8 +94,10 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 
 ## Getting Started
 
+- {doc}`System Setup <source/getting_started/bios_setup>`
 - {doc}`Installation <source/getting_started/installation>`
-- {doc}`Quick Start <source/getting_started/quick_start>`
+- {doc}`Quick Start <source/getting_started/quick_start>` — Single-host and multi-host KV sharing
+- {doc}`Examples <source/getting_started/examples/index>`
 - {doc}`Architecture Overview <source/design_doc/architecture_overview>`
 
 ```{toctree}
@@ -103,9 +105,10 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 :caption: Getting Started
 :hidden:
 
+System Setup <source/getting_started/bios_setup>
 Installation <source/getting_started/installation>
-Quickstart <source/getting_started/quick_start>
-More Examples <source/getting_started/examples/index>
+Quick Start <source/getting_started/quick_start>
+Examples <source/getting_started/examples/index>
 ```
 
 ```{toctree}
@@ -127,6 +130,7 @@ CPU/CXL L1 and SSD L2 (Proposal) <source/design_doc/tiered_kv_cache>
 
 LMCache <source/integration/lmcache>
 vLLM <source/integration/vllm>
+NVIDIA Dynamo <source/integration/dynamo>
 SGLang HiCache <source/integration/sglang>
 ```
 

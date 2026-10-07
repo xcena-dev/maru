@@ -25,6 +25,8 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - CXL DAX device (`/dev/dax*`) or emulation environment
   - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
 
+See {doc}`bios_setup` for platform BIOS settings and DEV_DAX verification, and {doc}`../design_doc/consistency_and_safety` for the cache-visibility requirements of cross-host sharing.
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y python3 python3-venv python3-pip git \
@@ -139,6 +141,7 @@ pre-commit run --all-files
 
 <br/>
 
+(installation-verify)=
 ## 2. Verify Installation
 
 Verify that the Maru Python package is installed:
@@ -147,13 +150,22 @@ Verify that the Maru Python package is installed:
 python3 -c "import maru_shm; print('ok')"
 ```
 
+Verify the x86 cache-flush extension used by the {doc}`quick_start` producer and consumer. It is an optional build product, so the install succeeds without it when no C compiler is available:
+
+```bash
+python3 -c "from maru_shm._cxl_flush import HAVE_CLFLUSH; print(HAVE_CLFLUSH)"
+```
+
+`1` means the extension is available. An `ImportError` means it was not built: install a C compiler (`build-essential`) and the headers for your Python interpreter (`python3-dev` for the system Python), then rerun `install.sh`.
+
 If you installed with the Resource Manager, verify the binary:
 
 ```bash
 which maru-resource-manager
 ```
 
-Once installation is verified, proceed to the {doc}`quick_start` guide to start services and run your first store/retrieve.
+Once installation is verified, choose the single-host or multi-host setup in
+{doc}`quick_start` to start services and verify KV sharing.
 
 <br/>
 
@@ -176,6 +188,7 @@ In a multi-node deployment, the Resource Manager, Metadata Server, and MaruHandl
 
 > `maru-server` and `maru-resource-manager` do not need to run on the same node. The diagram above shows the simplest configuration; each can be deployed independently as long as MaruHandler can reach both over the network.
 
+(installation-multi-node-config)=
 ### Configuration
 
 Multi-node requires changing default bind addresses from `127.0.0.1` to a network-accessible address:
@@ -184,6 +197,23 @@ Multi-node requires changing default bind addresses from `127.0.0.1` to a networ
 - **Metadata Server**: change `--host` and set `--rm-address` to the Resource Manager's externally reachable address
 - **MaruHandler**: set `server_url` to the Metadata Server's address. The Resource Manager address is received automatically via handshake.
 
+To run the Resource Manager as the systemd service on a network address, override its command line:
+
+```bash
+sudo systemctl edit maru-resource-manager
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/maru-resource-manager --host <node-a-ip> --port 9850
+```
+
+```bash
+sudo systemctl restart maru-resource-manager
+```
+
 > **Security:** When binding to a non-loopback address, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
 
-> Multi-node end-to-end examples and deployment guide are coming soon.
+Follow the {ref}`multi-host quickstart <quickstart-multi-host>` to start the
+services and share data between a Python producer and consumer on two hosts.
