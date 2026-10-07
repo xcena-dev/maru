@@ -138,11 +138,21 @@ its allocated memory regions must be reclaimed to prevent leaks.
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
 | Resource Manager | Reaper polls process liveness every 1 second | Orphaned regions returned to free list; WAL records the free operation |
-| MaruServer | Deferred freeing state machine | Region freed only when both owner disconnected **and** KV reference count reaches zero |
+| MaruServer | Client lease: a handler renews it every quarter of `--client-lease-ttl` (default 30 s); a lease not renewed within the TTL expires | Regions allocated under the expired lease are marked owner-disconnected; deferred freeing then frees each one when its KV reference count reaches zero |
 
 The reaper defends against PID reuse by caching each client's process start
 time at allocation time. If the PID is recycled by the OS, the start-time
 mismatch triggers reclamation.
+
+The Resource Manager's reaper reclaims the regions of a Resource Manager
+client that disconnects, and for handler regions that client is MaruServer,
+which allocates them on the handler's behalf. A handler that dies therefore
+leaves its regions with MaruServer, and the client lease is what returns
+them. The handler stops writing to its regions once its last accepted
+renewal is three quarters of the TTL old, so a handler cut off from the
+server (for example by a network partition) stops before MaruServer can
+reclaim and reuse its memory. MaruServer also refuses to register keys into
+reclaimed regions. Details are in [MaruServer Architecture](maru_server.md).
 
 > **See also:** [MaruResourceManager Architecture](maru_resource_manager.md),
 > [MaruServer Architecture](maru_server.md)
@@ -153,7 +163,7 @@ mismatch triggers reclamation.
 
 | Failure | Impact | Recovery | Data Loss |
 |---------|--------|----------|-----------|
-| Client crash | Owned regions orphaned; keys become stale | Reaper + deferred freeing | None |
+| Client crash | Owned regions orphaned until the client lease expires | Client lease + deferred freeing | None |
 | Resource Manager crash | New region allocation blocked | WAL + checkpoint replay on restart | None |
 | Network partition (client-server) | Affected client cannot store/retrieve | Client reconnects when network recovers | None |
 | CXL device failure | All data on the device is lost | Not supported -- no cross-device replication | **Total** |

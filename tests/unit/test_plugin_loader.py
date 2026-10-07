@@ -289,3 +289,10 @@ class TestPluginApiContract:
             assert f in MaruHandle.__dataclass_fields__, (
                 f"MaruHandle.{f} removed — breaks plugins"
             )
+
+
+class TestInstalledPluginIsolation:
+    def test_handler_loads_no_installed_plugin_in_tests(self):
+        """The test suite never hands a real device to an installed plugin."""
+        handler = MaruHandler(MaruConfig(auto_connect=False))
+        assert handler._plugins == []
