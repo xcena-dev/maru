@@ -3,9 +3,6 @@
 Maru requires CXL memory exposed as **DEV_DAX** (`/dev/dax*`). Follow your
 server vendor's CXL setup instructions on each host.
 
-If you use **InfiniteMemory**, first follow its
-[BIOS configuration guide](https://xcena-dev.github.io/InfiniteMemory_docs/getting-started.html#bios-configuration).
-
 ## Intel (GNR)
 
 For multi-node KV sharing, apply this setting on each participating GNR host:
@@ -19,8 +16,7 @@ and BIOS version.
 
 ## AMD (Turin)
 
-Complete your platform's CXL setup, then verify DEV_DAX access below. For
-InfiniteMemory, use the BIOS configuration guide linked above.
+Complete your platform's CXL setup, then verify DEV_DAX access below.
 
 ## Verify after reboot
 
