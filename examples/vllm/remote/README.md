@@ -318,6 +318,6 @@ with MaruHandler(config) as handler:
 PYTHONPATH="$PWD" python -m pytest -q tests/unit/test_remote_*.py \
   tests/unit/test_vllm_remote_config.py tests/unit/test_vllm_cpu_load_range.py
 # On a worker node, against a running pool node:
-PYTHONPATH="$PWD" python tools/remote_storage_g0.py --remote-url tcp://pool-node:6600 \
+PYTHONPATH="$PWD" python tools/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
   --ucx-device mlx5_0:1 --objects 64 --object-bytes 4M --rounds 3
 ```
