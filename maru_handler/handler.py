@@ -1068,9 +1068,32 @@ class MaruHandler:
             One bool per key. True means the key is registered in the pool
             after this call: either this call registered it, or it already
             existed (in the local map, on the server, or registered by
-            another client while this call ran). A page this handler did
-            not register is returned to the allocator. False means the
-            register RPC failed, in which case every page is freed.
+            another client while this call ran). The page of a key that
+            already existed or lost the register race is freed. False
+            means the register RPC failed, in which case every page is
+            freed, or that the server's response had no result for the
+            key. The server may still have registered that key's page, so
+            the page is retained (allocated, untracked) until the handler
+            closes.
+
+        Raises:
+            RuntimeError: If the handler is metadata-only, not connected, or
+                closing.
+            ValueError: If keys and handles differ in length, or (CPU path)
+                a key or handle is invalid.
+            StorageUnavailableError: (CPU path) If the cache session is
+                unavailable.
+
+        Note:
+            Handle ownership passes to this call. On the CXL path every
+            exception above is raised before any handle is consumed, so the
+            caller still owns every handle and must free them. After a
+            normal return the caller must not free any handle: each page
+            was registered, freed, or retained here. On the CPU path a batch
+            larger than MAX_STORAGE_BATCH is committed in chunks, so a later
+            chunk can raise after earlier chunks were committed. Freeing
+            those earlier handles again either does nothing or raises
+            ValueError, and never releases committed data.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -1151,11 +1174,22 @@ class MaruHandler:
                 for i in range(len(keys)):
                     if i not in allocations:
                         continue
-                    is_new = (
-                        batch_resp.results[batch_idx]
-                        if batch_idx < len(batch_resp.results)
-                        else True
-                    )
+                    if batch_idx >= len(batch_resp.results):
+                        # No result for this entry: the server may or may not
+                        # have registered it. Report failure, but keep the
+                        # page allocated, since freeing it could hand out a
+                        # page the server's metadata still points to.
+                        rid, pidx = allocations.pop(i)
+                        results[i] = False
+                        logger.error(
+                            "batch_store: no register result for key=%s, "
+                            "keeping page untracked (region=%d, page=%d)",
+                            keys[i],
+                            rid,
+                            pidx,
+                        )
+                        continue
+                    is_new = batch_resp.results[batch_idx]
                     batch_idx += 1
                     if is_new:
                         continue
