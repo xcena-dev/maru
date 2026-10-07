@@ -11,8 +11,8 @@ pytest.importorskip("vllm")
 import torch
 
 from maru_vllm.connector import (
-    _cpu_bypass_request,
-    _cpu_engine_config,
+    _bind_lease_namespace,
+    _unkeyed_request,
     _validate_storage_config,
 )
 from tests.unit.vllm_connector_helpers import make_scheduler, make_worker
@@ -112,45 +112,45 @@ def test_multiple_workers_are_rejected(name):
     config = engine_config()
     setattr(config.parallel_config, name, 2)
     with pytest.raises(ValueError, match="TP=PP=DP"):
-        _cpu_engine_config(extra(), config)
+        _bind_lease_namespace(extra(), config)
 
 
 def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
-    a = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
-    assert a == _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    a = _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
+    assert a == _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
     config.model_config.revision = "other-commit"
-    assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    assert a != _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
     config = engine_config()
     config.cache_config.cache_dtype = "float32"
-    assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    assert a != _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
 
 
 def test_cpu_requires_recompute_instead_of_failing_a_cache_miss():
     config = engine_config()
     config.kv_transfer_config.kv_load_failure_policy = "fail"
     with pytest.raises(ValueError, match="recompute"):
-        _cpu_engine_config(extra(), config)
+        _bind_lease_namespace(extra(), config)
 
 
 def test_cpu_requires_eager_hooks_and_unquantized_kv():
     config = engine_config()
     config.model_config.enforce_eager = False
     with pytest.raises(ValueError, match="enforce_eager"):
-        _cpu_engine_config(extra(), config)
+        _bind_lease_namespace(extra(), config)
     config.model_config.enforce_eager = True
     config.cache_config.cache_dtype = "fp8"
     with pytest.raises(ValueError, match="quantized"):
-        _cpu_engine_config(extra(), config)
+        _bind_lease_namespace(extra(), config)
 
 
 def test_embeddings_are_bypassed_without_tensor_truth_conversion():
-    assert _cpu_bypass_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
-    assert _cpu_bypass_request(SimpleNamespace(cache_salt=""))
-    assert not _cpu_bypass_request(SimpleNamespace(mm_features=[]))
+    assert _unkeyed_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
+    assert _unkeyed_request(SimpleNamespace(cache_salt=""))
+    assert not _unkeyed_request(SimpleNamespace(mm_features=[]))
 
 
-def test_cpu_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():
+def test_lease_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():
     worker = make_worker(16, 16, extra())
     assert worker._packed_load_kernel_ctx([], None) is None
 
@@ -162,3 +162,28 @@ def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     assert scheduler._count_matched_chunks(list(range(8))) == 1
     scheduler._handler.batch_exists = lambda _: [False, False]
     assert scheduler._count_matched_chunks(list(range(8))) == 0
+
+
+def test_only_the_remote_backend_requires_async_scheduling_off():
+    config = engine_config()
+    config.scheduler_config = SimpleNamespace(async_scheduling=True)
+    assert _bind_lease_namespace(extra(), config)["maru_cache_namespace"]
+    remote = {
+        "maru_storage_backend": "remote",
+        "maru_remote_url": "tcp://pool:6600",
+        "maru_cache_namespace": "model-revision-1",
+    }
+    with pytest.raises(ValueError, match="--no-async-scheduling"):
+        _bind_lease_namespace(remote, config)
+    config.scheduler_config.async_scheduling = False
+    assert _bind_lease_namespace(remote, config)["maru_cache_namespace"]
+    # An asynchronous load reports its failure before the request is scheduled.
+    config.scheduler_config.async_scheduling = True
+    remote["maru_async_load"] = True
+    assert _bind_lease_namespace(remote, config)["maru_cache_namespace"]
+
+
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
+def test_cpu_mode_keeps_synchronous_transfers(knob):
+    with pytest.raises(ValueError, match="does not support"):
+        _validate_storage_config({**extra(), knob: True})

@@ -91,11 +91,17 @@ class MaruHandler:
                 timeout_ms=self._config.timeout_ms,
             )
         self._mapper: DaxMapper | None = None
-        self._cpu = None
+        # Lease-based storage backends (cpu, mixed, remote). None means the
+        # CXL backend: DAX mapping, allocator and key map below.
+        self._storage = None
         if self._config.storage_backend in {"cpu", "mixed"}:
             from .storage.client import CpuStorageClient
 
-            self._cpu = CpuStorageClient(self._config, self._rpc)
+            self._storage = CpuStorageClient(self._config, self._rpc)
+        elif self._config.storage_backend == "remote":
+            from .storage.remote import RemoteStorageClient
+
+            self._storage = RemoteStorageClient(self._config)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -274,8 +280,8 @@ class MaruHandler:
         Returns:
             True if successful
         """
-        if self._cpu is not None:
-            self._connected = self._cpu.connect()
+        if self._storage is not None:
+            self._connected = self._storage.connect()
             return self._connected
         if self._config.metadata_only:
             if not self._connected:
@@ -558,8 +564,8 @@ class MaruHandler:
         Sets ``_closing`` event to reject new operations, then acquires
         ``_write_lock`` to wait for in-flight writes before teardown.
         """
-        if self._cpu is not None:
-            self._cpu.close()
+        if self._storage is not None:
+            self._storage.close()
             self._connected = False
             return
         if self._config.metadata_only:
@@ -644,8 +650,8 @@ class MaruHandler:
             RuntimeError: If not connected or closing
             ValueError: If size exceeds chunk_size or allocation fails
         """
-        if self._cpu is not None:
-            return self._cpu.alloc(size)
+        if self._storage is not None:
+            return self._storage.alloc(size)
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
@@ -709,8 +715,9 @@ class MaruHandler:
         """Free a page previously obtained via alloc().
 
         Can be called before store() (discard) or after (eviction).
-        CPU M1 only frees unsubmitted writes: store transfers ownership to
-        the pool, including when its RPC outcome is unknown.
+        Lease-based backends (cpu, mixed, remote) only free unsubmitted
+        writes: store transfers ownership to the backend, including when its
+        RPC outcome is unknown.
 
         Args:
             handle: AllocHandle from alloc()
@@ -720,8 +727,8 @@ class MaruHandler:
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
-        if self._cpu is not None:
-            return self._cpu.free(handle)
+        if self._storage is not None:
+            return self._storage.free(handle)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -769,8 +776,8 @@ class MaruHandler:
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
-        if self._cpu is not None:
-            return self._cpu.batch_store([key], [handle])[0]
+        if self._storage is not None:
+            return self._storage.batch_store([key], [handle])[0]
         self._ensure_connected()
         t0 = time.monotonic()
         store_size = 0
@@ -846,8 +853,9 @@ class MaruHandler:
     def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
         """Retrieve a zero-copy MemoryInfo from the KV cache.
 
-        CPU storage returns a CpuReadLease instead. Explicitly release it
-        after the final read/copy, or use it as a context manager.
+        Lease-based backends (cpu, mixed, remote) return a read lease
+        instead. Explicitly release it after the final read/copy, or use it as
+        a context manager.
 
         Returns a MemoryInfo with a memoryview slice of the mmap region.
         Works for both owned (RW) and shared (RO) regions.
@@ -863,8 +871,8 @@ class MaruHandler:
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
-        if self._cpu is not None:
-            return self._cpu.batch_retrieve([key])[0]
+        if self._storage is not None:
+            return self._storage.batch_retrieve([key])[0]
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -924,8 +932,8 @@ class MaruHandler:
         Returns:
             True if exists
         """
-        if self._cpu is not None:
-            return self._cpu.batch_exists([key])[0]
+        if self._storage is not None:
+            return self._storage.batch_exists([key])[0]
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.exists_kv(key)
@@ -948,9 +956,10 @@ class MaruHandler:
         Returns:
             True if exists (and was pinned)
         """
-        if self._cpu is not None:
+        if self._storage is not None:
             raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
+                f"{self._config.storage_backend} storage uses read leases and does "
+                "not support eviction/pinning"
             )
         self._ensure_connected()
         t0 = time.monotonic()
@@ -969,9 +978,10 @@ class MaruHandler:
         Returns:
             True if unpinned successfully
         """
-        if self._cpu is not None:
+        if self._storage is not None:
             raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
+                f"{self._config.storage_backend} storage uses read leases and does "
+                "not support eviction/pinning"
             )
         self._ensure_connected()
         t0 = time.monotonic()
@@ -993,9 +1003,10 @@ class MaruHandler:
         Returns:
             True if deleted
         """
-        if self._cpu is not None:
+        if self._storage is not None:
             raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
+                f"{self._config.storage_backend} storage uses read leases and does "
+                "not support eviction/pinning"
             )
         self._ensure_connected()
         t0 = time.monotonic()
@@ -1034,6 +1045,8 @@ class MaruHandler:
         """
         if not self._connected or self._closing.is_set():
             return False
+        if self._config.storage_backend == "remote":
+            return self._storage.ping()
 
         try:
             return self._rpc.heartbeat()
@@ -1044,6 +1057,8 @@ class MaruHandler:
     def get_stats(self) -> dict:
         """Get server statistics."""
         self._ensure_connected()
+        if self._config.storage_backend == "remote":
+            return {"remote_storage": self._storage.stats()}
 
         stats = self._rpc.get_stats()
         result = {
@@ -1095,8 +1110,9 @@ class MaruHandler:
     def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | CpuReadLease | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
-        CPU results are CpuReadLease objects; release every non-None result
-        after the final read/copy (or call release_retrieved on the list).
+        Lease-based backends (cpu, mixed, remote) return read leases
+        (CpuReadLease / RemoteReadLease); release every non-None result after
+        the final read/copy (or call release_retrieved on the list).
 
         Uses a single batch RPC call for lookup, returns zero-copy
         memoryview slices for both owned (RW) and shared (RO) regions.
@@ -1115,8 +1131,8 @@ class MaruHandler:
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
-        if self._cpu is not None:
-            return self._cpu.batch_retrieve(keys)
+        if self._storage is not None:
+            return self._storage.batch_retrieve(keys)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1219,8 +1235,8 @@ class MaruHandler:
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
-        if self._cpu is not None:
-            return self._cpu.batch_store(keys, handles)
+        if self._storage is not None:
+            return self._storage.batch_store(keys, handles)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1334,8 +1350,8 @@ class MaruHandler:
         Returns:
             List of booleans indicating existence for each key
         """
-        if self._cpu is not None:
-            return self._cpu.batch_exists(keys)
+        if self._storage is not None:
+            return self._storage.batch_exists(keys)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1362,9 +1378,10 @@ class MaruHandler:
         Returns:
             List of booleans — True if key exists (and was pinned).
         """
-        if self._cpu is not None:
+        if self._storage is not None:
             raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
+                f"{self._config.storage_backend} storage uses read leases and does "
+                "not support eviction/pinning"
             )
         self._ensure_connected()
         t0 = time.monotonic()
@@ -1387,9 +1404,10 @@ class MaruHandler:
         Returns:
             List of booleans — True if successfully unpinned.
         """
-        if self._cpu is not None:
+        if self._storage is not None:
             raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
+                f"{self._config.storage_backend} storage uses read leases and does "
+                "not support eviction/pinning"
             )
         self._ensure_connected()
         t0 = time.monotonic()
@@ -1438,8 +1456,8 @@ class MaruHandler:
     @property
     def connected(self) -> bool:
         """Check if connected."""
-        if self._cpu is not None:
-            return self._cpu.connected
+        if self._storage is not None:
+            return self._storage.connected
         return self._connected
 
     # =========================================================================
@@ -1548,24 +1566,47 @@ class MaruHandler:
         )
 
     def has_local(self, key: str) -> bool:
-        """Whether this handler still owns a committed CPU replica."""
+        """Whether this handler still owns (cpu/mixed) or stored (remote) ``key``."""
         return (
-            self._cpu.has_local(key)
-            if self._cpu is not None
+            self._storage.has_local(key)
+            if self._storage is not None
             else key in self._key_to_location
         )
 
+    def retrieve_capacity(self) -> int | None:
+        """How many objects one ``batch_retrieve`` can hold right now.
+
+        Returns:
+            For a backend with bounded read buffers (the remote backend's
+            staging slots), the most objects the next call should ask for;
+            None when one call can return any number of objects (cxl, cpu,
+            mixed) or the remote backend has not connected yet.
+        """
+        fn = getattr(self._storage, "retrieve_capacity", None)
+        return fn() if fn is not None else None
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether the GPU can read and write stored buffers directly.
+
+        Returns:
+            True for mapped CXL regions and for a remote backend whose staging
+            buffer is page-locked for CUDA; False for the CPU and mixed pools.
+        """
+        if self._storage is None:
+            return True
+        return bool(getattr(self._storage, "gpu_accessible", False))
+
     def release_retrieved(self, infos: list) -> None:
-        """Release CPU read leases after the last read/GPU copy has completed."""
-        if self._cpu is not None:
+        """Release read leases after the last read/GPU copy has completed."""
+        if self._storage is not None:
             for info in infos:
                 if info is not None:
                     info.release()
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""
-        if self._cpu is not None:
-            self._cpu._ensure(data=False)
+        if self._storage is not None:
+            self._storage._ensure(data=False)
             return
         if self._closing.is_set():
             raise RuntimeError("Handler is closing")

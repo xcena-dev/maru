@@ -3340,15 +3340,14 @@ class TestPackedStorage:
         attn.__class__ = type("FlashMetadata", (), {})
         return attn
 
-    def test_mid_chunk_store_error_slab_reclaimed_at_next_step(self):
-        """A mid-chunk store error must not leak the re-created slab.
+    def test_mid_chunk_store_error_skips_the_chunk_for_the_step(self):
+        """A mid-chunk store error frees the slab and skips that chunk.
 
         Layer 0 fills the slab; layer 1 raises inside the slab write (its
         float64 extract inflates slab_bytes past the allocated buffer — a
-        stand-in for any transient copy error), discarding the original
-        slab; layer 2 re-creates the entry with ``written={2}``, which can
-        never reach ``_num_layers``. The next step boundary must reclaim it
-        instead of pinning the CXL page forever.
+        stand-in for any transient copy error), discarding the slab. Layer 2
+        must not re-create a slab that could never complete (it would hold a
+        page for the rest of the step); the next step may store the chunk.
         """
         from maru_vllm.connector import MaruConnectorMetadata
 
@@ -3366,12 +3365,14 @@ class TestPackedStorage:
             )
 
         worker.save_kv_layer(names[0], kv_layers[0], attn, _meta())
+        first_handle = next(iter(worker._pending_slabs.values()))[0]
         worker.save_kv_layer(names[1], kv_layers[1].double(), attn, _meta())
         worker.save_kv_layer(names[2], kv_layers[2], attn, _meta())
 
         assert store == {}
-        assert len(worker._pending_slabs) == 1  # re-created, unfinishable
-        stale_handle = next(iter(worker._pending_slabs.values()))[0]
+        assert worker._pending_slabs == {}  # nothing unfinishable left behind
+        worker._handler.free.assert_called_with(first_handle)
+        assert worker._handler.alloc.call_count == 1
 
         forward = SimpleNamespace(
             no_compile_layers={
@@ -3380,9 +3381,7 @@ class TestPackedStorage:
             attn_metadata=None,
         )
         worker.start_load_kv(forward, MaruConnectorMetadata())
-
-        assert worker._pending_slabs == {}
-        worker._handler.free.assert_called_with(stale_handle)
+        assert worker._skipped_slabs == set()  # the next step may store it
 
     def test_store_one_key_per_chunk_then_load_roundtrip(self):
         from maru_vllm.connector import (

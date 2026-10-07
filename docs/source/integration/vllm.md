@@ -222,6 +222,40 @@ eviction and SSD are later milestones. See the
 [mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
 for launch configuration, memory lifetime and validation instructions.
 
+### Remote CXL pool
+
+Set `maru_storage_backend="remote"` to keep KV in a CXL pool on another node and
+move it over RDMA ([NIXL](https://github.com/ai-dynamo/nixl), install with
+`pip install 'maru[remote]'`). The pool node runs the resource manager and
+MaruServer with remote access on (`--remote-bind`); MaruServer then serves
+remote workers on that endpoint from its own thread. Workers need neither a DAX
+device nor a local MaruServer. Engines on different servers that use the same
+`maru_cache_namespace` and model geometry reuse each other's prefixes.
+
+Provide `maru_remote_url` (the remote endpoint of the pool node's MaruServer),
+`maru_remote_ucx_device` (the local RDMA NIC) and `maru_cache_namespace`.
+`maru_remote_staging_size` (default: one `max_model_len` prompt divided by
+`1 - maru_remote_load_reserve`, at least 64 KV objects and `1G`) sizes the
+worker's RDMA staging buffer, which is page-locked for CUDA. Stores leave the
+`maru_remote_load_reserve` share of it (default `0.5`) free for loads. The
+remote backend follows CPU mode's lease rules (the pool is
+re-checked for every request, only the external token range is loaded, leases
+are released after the copy) but uses the default transfer path: the
+`maru_kv_ops` kernels and `maru_async_load` / `maru_async_store`, which are
+recommended. The requirements are `--enforce-eager`, `TP=PP=DP=1`, unquantized
+KV, chunkwise storage and `kv_load_failure_policy="recompute"`. Synchronous
+remote loads also require `--no-async-scheduling`: remote loads can fail while
+the pool is down or restarting, and a failed synchronous load cannot be
+recomputed safely under vLLM's async scheduling. With `maru_async_load` the
+failure is reported before the request is scheduled, so async scheduling can
+stay on. Loads are split into batches the staging buffer can hold. When the
+pool is unreachable, lookups miss and stores are skipped for
+`maru_remote_retry_s` (default 30 s) while requests compute normally. A full
+pool evicts its least recently read keys; a prefix that is already in the
+pool, including one another worker stored, is not written again. See the
+[remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
+for launch commands, failure behaviour and the trust model.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:

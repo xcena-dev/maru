@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -39,7 +40,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from maru_common.storage_types import StorageError
+from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
@@ -60,6 +61,10 @@ logger = init_logger(__name__)
 
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
+# Internal key the connector adds to the extra config for the remote backend.
+_MAX_MODEL_LEN_KEY = "_maru_max_model_len"
+# Staging buffer of the remote storage backend (local RDMA source/target).
+DEFAULT_REMOTE_STAGING = 1024**3
 
 # Knobs renamed to name the axis the deployer actually chooses, mapped to the
 # name each one replaced. The former names stay accepted for one release so
@@ -348,13 +353,98 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     return keys
 
 
+_REMOTE_ONLY_SETTINGS = (
+    "maru_remote_url",
+    "maru_remote_ucx_device",
+    "maru_remote_staging_size",
+    "maru_remote_timeout_s",
+    "maru_remote_retry_s",
+    "maru_remote_load_reserve",
+)
+
+
+# Config fields that name where or with which library version this node loaded
+# the weights. They differ between nodes serving the same model and must not
+# split the sharing namespace; the caller's maru_cache_namespace names the weights.
+_NODE_LOCAL_CONFIG_FIELDS = frozenset(
+    {"_name_or_path", "name_or_path", "transformers_version", "_commit_hash"}
+)
+
+
+def _lease_label(extra: dict[str, Any]) -> str:
+    """Name used in errors for the configured lease-based storage backend."""
+    if extra.get("maru_storage_backend") == "remote":
+        return "Remote storage"
+    return "CPU M1"
+
+
 def _validate_storage_config(extra: dict[str, Any]) -> bool:
-    """Validate M1's opt-in boundary before any cache data can be used."""
+    """Validate a lease-based backend's opt-in boundary before cache data is used.
+
+    Returns:
+        True for the lease-based backends (cpu, mixed, remote): reads come
+        back as leases that are released after the GPU copy, stored keys are
+        re-checked in the store, and the connector binds the cache namespace
+        to the engine geometry. False for the default CXL backend. The cpu
+        and mixed backends also transfer synchronously only; the remote
+        backend uses the default transfer path, including asynchronous loads
+        and stores.
+    """
     backend = extra.get("maru_storage_backend", "cxl")
-    if backend not in {"cxl", "cpu", "mixed"}:
-        raise ValueError("maru_storage_backend must be 'cxl', 'cpu' or 'mixed'")
+    if backend not in {"cxl", "cpu", "mixed", "remote"}:
+        raise ValueError(
+            "maru_storage_backend must be 'cxl', 'cpu', 'mixed' or 'remote'"
+        )
+    if backend != "remote" and any(name in extra for name in _REMOTE_ONLY_SETTINGS):
+        raise ValueError("maru_remote_* settings require maru_storage_backend='remote'")
     if backend == "cxl":
         return False
+    if backend == "remote":
+        _validate_remote_config(extra)
+    else:
+        _validate_cpu_config(extra, backend)
+    label = _lease_label(extra)
+    knobs = ["maru_overlap_load_with_compute"]
+    if backend != "remote":
+        knobs[:0] = ["maru_async_load", "maru_async_store"]
+    for knob in knobs:
+        if _get_knob(extra, knob):
+            raise ValueError(f"{label} does not support {knob}")
+    if extra.get("maru_use_layerwise", False):
+        raise ValueError(f"{label} supports sync chunkwise storage only")
+    return True
+
+
+def _validate_remote_config(extra: dict[str, Any]) -> None:
+    """Check the settings of ``maru_storage_backend='remote'``."""
+    for name in ("maru_remote_url", "maru_cache_namespace"):
+        if not extra.get(name):
+            raise ValueError(f"Remote storage requires {name}")
+    for name in (
+        "maru_pool_size",
+        "maru_cpu_pool_size",
+        "maru_cxl_pool_size",
+        "maru_write_order",
+        "maru_read_order",
+    ):
+        if name in extra:
+            raise ValueError(
+                f"{name} does not apply to remote storage; the staging buffer "
+                "is sized by maru_remote_staging_size"
+            )
+    if _parse_size(extra.get("maru_remote_staging_size", DEFAULT_REMOTE_STAGING)) <= 0:
+        raise ValueError("maru_remote_staging_size must be positive")
+    for name in ("maru_remote_timeout_s", "maru_remote_retry_s"):
+        if name in extra and float(extra[name]) <= 0:
+            raise ValueError(f"{name} must be positive")
+    if "maru_remote_load_reserve" in extra and not (
+        0 <= float(extra["maru_remote_load_reserve"]) < 1
+    ):
+        raise ValueError("maru_remote_load_reserve must be in [0, 1)")
+
+
+def _validate_cpu_config(extra: dict[str, Any], backend: str) -> None:
+    """Check the settings of ``maru_storage_backend`` 'cpu' or 'mixed'."""
     for name in ("maru_engine_id", "maru_cache_namespace", "maru_cpu_pool_size"):
         if not extra.get(name):
             raise ValueError(f"CPU storage requires {name}")
@@ -379,25 +469,37 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
         raise ValueError(
             "CXL capacity and placement order settings require mixed storage"
         )
-    for knob in (
-        "maru_async_load",
-        "maru_async_store",
-        "maru_overlap_load_with_compute",
+
+
+def _bind_lease_namespace(extra: dict[str, Any], config: Any) -> dict[str, Any]:
+    """Bind a caller-supplied model revision namespace to engine geometry.
+
+    Engines that compute the same digest share keys (remote storage) or may
+    reuse their own replicas (cpu/mixed); any geometry change splits them.
+    """
+    label = _lease_label(extra)
+    if (
+        extra.get("maru_storage_backend") == "remote"
+        and not _get_knob(extra, "maru_async_load")
+        and getattr(
+            getattr(config, "scheduler_config", None), "async_scheduling", False
+        )
     ):
-        if _get_knob(extra, knob):
-            raise ValueError(f"CPU M1 does not support {knob}")
-    if extra.get("maru_use_layerwise", False):
-        raise ValueError("CPU M1 supports sync chunkwise storage only")
-    return True
-
-
-def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
-    """Bind a caller-supplied model revision namespace to engine geometry."""
+        # Remote loads fail in normal operation (pool outage or restart). A
+        # failed synchronous load is reported after the step's forward; with
+        # async scheduling vLLM has already scheduled the next step for the
+        # request, and recovering from the failure then crashes the engine.
+        # An asynchronous load reports its failure while the request is still
+        # parked, before any step for it is scheduled.
+        raise ValueError(
+            f"{label} requires async scheduling off (--no-async-scheduling) "
+            "unless maru_async_load is enabled"
+        )
     if (
         getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
         != "recompute"
     ):
-        raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
+        raise ValueError(f"{label} requires kv_load_failure_policy='recompute'")
     parallel = config.parallel_config
     if any(
         getattr(parallel, name, 1) != 1
@@ -409,28 +511,32 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
             "prefill_context_parallel_size",
         )
     ):
-        raise ValueError("CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1")
+        raise ValueError(f"{label} requires TP=PP=DP=1 and context parallel sizes of 1")
     model = config.model_config
     if not getattr(model, "enforce_eager", False):
-        raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
+        raise ValueError(f"{label} requires enforce_eager=True (--enforce-eager)")
     if config.cache_config.cache_dtype not in {
         "auto",
         "float16",
         "bfloat16",
         "float32",
     }:
-        raise ValueError("CPU M1 does not support quantized KV caches")
+        raise ValueError(f"{label} does not support quantized KV caches")
     if (
         getattr(config, "lora_config", None) is not None
         or getattr(model, "is_multimodal_model", False)
         or getattr(model, "use_mla", False)
     ):
-        raise ValueError("CPU M1 supports text-only models without LoRA or MLA")
+        raise ValueError(f"{label} supports text-only models without LoRA or MLA")
+    model_config = {
+        k: v
+        for k, v in model.hf_config.to_dict().items()
+        if k not in _NODE_LOCAL_CONFIG_FIELDS
+    }
     identity = {
         "namespace": extra["maru_cache_namespace"],
-        "model": model.model,
         "revision": getattr(model, "revision", None),
-        "model_config": model.hf_config.to_dict(),
+        "model_config": model_config,
         "dtype": str(model.dtype),
         "kv_dtype": config.cache_config.cache_dtype,
         "block_size": config.cache_config.block_size,
@@ -440,7 +546,30 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode()
     ).hexdigest()
-    return {**extra, "maru_cache_namespace": digest}
+    logger.info(
+        "Maru %s cache namespace %s (from %r); engines share KV only with the same value",
+        label,
+        digest[:16],
+        extra["maru_cache_namespace"],
+    )
+    bound = {**extra, "maru_cache_namespace": digest}
+    if extra.get("maru_storage_backend") == "remote":
+        async_scheduling = bool(
+            getattr(
+                getattr(config, "scheduler_config", None), "async_scheduling", False
+            )
+        )
+        logger.info(
+            "Maru remote storage transfers: loads %s, stores %s, vLLM async "
+            "scheduling %s",
+            "async" if _get_knob(extra, "maru_async_load") else "sync",
+            "async" if _get_knob(extra, "maru_async_store") else "sync",
+            "on" if async_scheduling else "off",
+        )
+        max_len = getattr(getattr(config, "model_config", None), "max_model_len", None)
+        if isinstance(max_len, int) and max_len > 0:
+            bound[_MAX_MODEL_LEN_KEY] = max_len
+    return bound
 
 
 def _usable_gpu_blocks(
@@ -455,7 +584,7 @@ def _usable_gpu_blocks(
     return total - 1 if total else None
 
 
-def _cpu_bypass_request(request: Any) -> bool:
+def _unkeyed_request(request: Any) -> bool:
     """M1 does not key embeddings, adapter state, multimodal data or salts."""
     return (
         getattr(request, "prompt_embeds", None) is not None
@@ -463,6 +592,47 @@ def _cpu_bypass_request(request: Any) -> bool:
         or bool(getattr(request, "mm_features", None))
         or bool(getattr(request, "lora_request", None))
     )
+
+
+def _handler_backoff_s(extra_config: dict[str, Any]) -> float:
+    """Seconds before retrying a failed handler connection.
+
+    A remote pool that cannot be reached costs a control timeout per attempt,
+    so the remote backend waits ``maru_remote_retry_s`` like its own breaker.
+    """
+    if extra_config.get("maru_storage_backend") == "remote":
+        return float(extra_config.get("maru_remote_retry_s", 30.0))
+    return 5.0
+
+
+def _remote_staging_bytes(extra_config: dict[str, Any], page_bytes: int) -> int:
+    """Staging buffer size: the setting, or the largest of 1 GiB, 64 KV objects
+    and the room for one longest prompt's chunks.
+
+    An async store stages a whole prompt, and stores may only use the slots
+    outside the load reserve (``maru_remote_load_reserve``), so the prompt
+    term is scaled up by that reserve.
+    """
+    if "maru_remote_staging_size" in extra_config:
+        return _parse_size(extra_config["maru_remote_staging_size"])
+    ct = int(extra_config.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS))
+    prompt_chunks = -(-int(extra_config.get(_MAX_MODEL_LEN_KEY, 0)) // ct)
+    reserve = float(extra_config.get("maru_remote_load_reserve", 0.5))
+    store_slots = math.ceil(prompt_chunks / (1.0 - reserve))
+    return max(DEFAULT_REMOTE_STAGING, 64 * page_bytes, store_slots * page_bytes)
+
+
+def _remote_handler_settings(extra_config: dict[str, Any]) -> dict[str, Any]:
+    """MaruConfig fields of the remote backend from the connector settings."""
+    return {
+        "remote_url": extra_config["maru_remote_url"],
+        "remote_ucx_device": extra_config.get("maru_remote_ucx_device", ""),
+        "remote_transfer_timeout_s": float(
+            extra_config.get("maru_remote_timeout_s", 30.0)
+        ),
+        "remote_retry_s": float(extra_config.get("maru_remote_retry_s", 30.0)),
+        "remote_load_reserve": float(extra_config.get("maru_remote_load_reserve", 0.5)),
+    }
 
 
 def _create_maru_handler(
@@ -481,7 +651,8 @@ def _create_maru_handler(
     """
     from maru import MaruConfig, MaruHandler
 
-    cpu_mode = _validate_storage_config(extra_config)
+    lease_mode = _validate_storage_config(extra_config)
+    remote = extra_config.get("maru_storage_backend") == "remote"
     server_url = extra_config.get("maru_server_url", "tcp://localhost:5555")
     pool_size = (
         pool_size_override
@@ -491,7 +662,9 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
-    if cpu_mode:
+    if remote:
+        pool_size = _remote_staging_bytes(extra_config, chunk_size)
+    elif lease_mode:
         pool_size = _parse_size(extra_config["maru_cpu_pool_size"])
     if metadata_only:
         pool_size = 0
@@ -515,12 +688,20 @@ def _create_maru_handler(
         ),
         write_order=extra_config.get("maru_write_order", ("cpu", "cxl")),
         read_order=extra_config.get("maru_read_order", ("cpu", "cxl")),
+        **(_remote_handler_settings(extra_config) if remote else {}),
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
         logger.error("Failed to connect to MaruServer at %s", server_url)
         return None
-    logger.info("Connected to MaruServer at %s (pool=%d)", server_url, pool_size)
+    if remote:
+        logger.info(
+            "Connected to remote storage at %s (staging=%d)",
+            extra_config["maru_remote_url"],
+            pool_size,
+        )
+    else:
+        logger.info("Connected to MaruServer at %s (pool=%d)", server_url, pool_size)
     return handler
 
 
@@ -722,12 +903,12 @@ class MaruKVConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         extra = self._kv_transfer_config.kv_connector_extra_config
         if _validate_storage_config(extra):
-            extra = _cpu_engine_config(extra, vllm_config)
+            extra = _bind_lease_namespace(extra, vllm_config)
             if (
                 kv_cache_config is not None
                 and len(kv_cache_config.kv_cache_groups) != 1
             ):
-                raise ValueError("CPU M1 requires one KV cache group")
+                raise ValueError(f"{_lease_label(extra)} requires one KV cache group")
         self._kv_chunk_tokens = int(
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
@@ -913,7 +1094,7 @@ class MaruKVConnector(KVConnectorBase_V1):
 class MaruSchedulerConnector:
     """Scheduler-side: checks chunk-by-chunk which prefix is cached in Maru."""
 
-    _cpu_mode = False
+    _lease_mode = False
 
     def __init__(
         self,
@@ -925,9 +1106,9 @@ class MaruSchedulerConnector:
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
-        self._cpu_mode = _validate_storage_config(extra_config)
+        self._lease_mode = _validate_storage_config(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
-        self._cpu_bypass_requests: set[str] = set()
+        self._unkeyed_requests: set[str] = set()
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -988,6 +1169,11 @@ class MaruSchedulerConnector:
         self._last_match_result: dict[str, int] = {}
         self._load_starts: dict[str, int] = {}
         self._load_ranges: dict[str, tuple[int, int]] = {}
+        # Requests handed an asynchronous lease-backed load. vLLM asks again
+        # only when that load failed from its first block; the stored keys
+        # are still in the pool, so answering with the same hit would retry
+        # the failing load forever.
+        self._async_load_issued: set[str] = set()
 
         # Requests that need continued store across chunked prefill steps.
         # req_id -> (full prompt token_ids, block ids accumulated from the
@@ -1026,11 +1212,16 @@ class MaruSchedulerConnector:
         try:
             self._handler = _create_maru_handler(self._extra_config, metadata_only=True)
         except Exception as exc:
-            if self._cpu_mode and isinstance(exc, StorageError):
-                raise ValueError(f"CPU cache setup rejected: {exc}") from exc
-            self._handler_retry_after = time.monotonic() + 5.0
+            if self._lease_mode and isinstance(exc, StorageError):
+                raise ValueError(
+                    f"{_lease_label(self._extra_config)} setup rejected: {exc}"
+                ) from exc
+            backoff = _handler_backoff_s(self._extra_config)
+            self._handler_retry_after = time.monotonic() + backoff
             logger.warning(
-                "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
+                "Scheduler MaruHandler creation failed, backing off %.0fs: %s",
+                backoff,
+                exc,
             )
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
@@ -1045,7 +1236,7 @@ class MaruSchedulerConnector:
         if not keys:
             return 0
 
-        if self._cpu_mode:
+        if self._lease_mode:
             self._ensure_handler()
             if self._handler is None:
                 return 0
@@ -1169,8 +1360,14 @@ class MaruSchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
-        if self._cpu_mode and _cpu_bypass_request(request):
-            self._cpu_bypass_requests.add(request.request_id)
+        if self._lease_mode and _unkeyed_request(request):
+            self._unkeyed_requests.add(request.request_id)
+            return 0, False
+        if request.request_id in self._async_load_issued:
+            logger.warning(
+                "Maru: req %s returned after a failed load; recomputing it",
+                request.request_id,
+            )
             return 0, False
         token_ids = list(request.prompt_token_ids or [])
         if len(token_ids) < self._kv_chunk_tokens:
@@ -1213,7 +1410,7 @@ class MaruSchedulerConnector:
         # Cache the result so update_state_after_alloc can reuse it
         # without a redundant _count_matched_chunks call.
         self._last_match_result[request.request_id] = num_matched_chunks
-        if self._cpu_mode:
+        if self._lease_mode:
             self._load_starts[request.request_id] = num_computed_tokens
 
         return new_matched, self._deferred_loading
@@ -1239,9 +1436,11 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_ready.add(request.request_id)
             return
         num_chunks = self._last_match_result.pop(request.request_id, 0)
-        if self._cpu_mode:
+        if self._lease_mode:
             start = self._load_starts.pop(request.request_id, 0)
             self._load_ranges[request.request_id] = (start, start + num_external_tokens)
+            if self._deferred_loading:
+                self._async_load_issued.add(request.request_id)
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
@@ -1293,9 +1492,8 @@ class MaruSchedulerConnector:
         self._pending_deferred_loads.clear()
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if self._cpu_mode and (
-                new_req.req_id in self._cpu_bypass_requests
-                or _cpu_bypass_request(new_req)
+            if self._lease_mode and (
+                new_req.req_id in self._unkeyed_requests or _unkeyed_request(new_req)
             ):
                 continue
             token_ids = list(new_req.prompt_token_ids or [])
@@ -1425,7 +1623,7 @@ class MaruSchedulerConnector:
         for rid in stale_ids:
             self._load_starts.pop(rid, None)
             self._load_ranges.pop(rid, None)
-            self._cpu_bypass_requests.discard(rid)
+            self._unkeyed_requests.discard(rid)
             self._requests_need_store.pop(rid, None)
             self._requests_need_load.pop(rid, None)
             self._pending_deferred_loads.pop(rid, None)
@@ -1451,6 +1649,7 @@ class MaruSchedulerConnector:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Transfer block ownership to the worker for write-behind stores."""
+        self._async_load_issued.discard(request.request_id)
         if request.request_id in self._awaiting_deferred_recv:
             # vLLM already retains a parked request's blocks until its receive
             # completes. Claiming send ownership too produces a second free.
@@ -1467,7 +1666,8 @@ class MaruSchedulerConnector:
 class MaruWorkerConnector:
     """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
 
-    _cpu_mode = False
+    _lease_mode = False
+    _sync_lease_transfers = False
 
     def __init__(
         self,
@@ -1481,7 +1681,13 @@ class MaruWorkerConnector:
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
-        self._cpu_mode = _validate_storage_config(extra_config)
+        self._lease_mode = _validate_storage_config(extra_config)
+        # cpu and mixed copy leased host buffers synchronously only; the
+        # remote backend's staging buffer is page-locked for CUDA, so it uses
+        # the default transfer path (kernels, async loads and stores).
+        self._sync_lease_transfers = (
+            self._lease_mode and extra_config.get("maru_storage_backend") != "remote"
+        )
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
@@ -1615,6 +1821,11 @@ class MaruWorkerConnector:
         # handler was down. Retried by the next sweep; kept out of
         # _pending_slabs so no later layer resumes writing into them.
         self._orphan_slab_handles: list[Any] = []
+        # Chunks whose slab could not be allocated or filled in this step:
+        # the remaining layers skip them instead of re-allocating a slab that
+        # can never complete. Cleared at the step boundary.
+        self._skipped_slabs: set[str] = set()
+        self._last_skip_warning = 0.0
         # Coalesced packed store: multi_layer_kv_transfer ctx built from the
         # registered KV caches, cached because the pointer table is static.
         # None = unresolved, False = kernel unusable (per-layer fallback).
@@ -1679,18 +1890,23 @@ class MaruWorkerConnector:
             )
             self._handler = _create_maru_handler(extra_config)
         except Exception as exc:
-            if self._cpu_mode and isinstance(exc, StorageError):
-                raise ValueError(f"CPU cache setup rejected: {exc}") from exc
-            self._handler_retry_after = time.monotonic() + 5.0
+            if self._lease_mode and isinstance(exc, StorageError):
+                raise ValueError(
+                    f"{_lease_label(self._extra_config)} setup rejected: {exc}"
+                ) from exc
+            backoff = _handler_backoff_s(self._extra_config)
+            self._handler_retry_after = time.monotonic() + backoff
             logger.warning(
-                "Worker MaruHandler creation failed, backing off 5s: %s", exc
+                "Worker MaruHandler creation failed, backing off %.0fs: %s",
+                backoff,
+                exc,
             )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
         self._num_layers = len(kv_caches)
         self._kv_layout = self._resolve_kv_layout(kv_caches)
-        if self._cpu_mode:
+        if self._lease_mode:
             layout = self._kv_layout
             if (
                 layout is None
@@ -1699,18 +1915,22 @@ class MaruWorkerConnector:
                 != list(range(self._num_layers))
             ):
                 raise ValueError(
-                    "CPU M1 requires a recognized K/V layout and contiguous layer IDs"
+                    f"{_lease_label(self._extra_config)} requires a recognized K/V layout and contiguous layer IDs"
                 )
             sample = next(iter(kv_caches.values()))
             if sample.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
-                raise ValueError("CPU M1 requires an unquantized KV dtype")
+                raise ValueError(
+                    f"{_lease_label(self._extra_config)} requires an unquantized KV dtype"
+                )
             if any(
                 tuple(t.shape) != tuple(sample.shape)
                 or t.dtype != sample.dtype
                 or t.device != sample.device
                 for t in kv_caches.values()
             ):
-                raise ValueError("CPU M1 requires homogeneous KV cache layers")
+                raise ValueError(
+                    f"{_lease_label(self._extra_config)} requires homogeneous KV cache layers"
+                )
             schema = {
                 "format": "KV_2LTD-v1",
                 "layers": sorted(kv_caches),
@@ -1735,15 +1955,21 @@ class MaruWorkerConnector:
             self._page_size_bytes = per_layer * self._num_layers
         else:
             self._page_size_bytes = per_layer
-        if self._cpu_mode and self._page_size_bytes is not None:
+        if self._lease_mode and self._page_size_bytes is not None:
             configured_page = _parse_size(
                 self._extra_config.get("maru_chunk_size", self._page_size_bytes)
             )
             if configured_page < self._page_size_bytes:
-                raise ValueError(
-                    "maru_chunk_size cannot hold one CPU chunkwise KV object"
-                )
-            if _parse_size(self._extra_config["maru_cpu_pool_size"]) < configured_page:
+                raise ValueError("maru_chunk_size cannot hold one chunkwise KV object")
+            if self._extra_config.get("maru_storage_backend") == "remote":
+                staging = _remote_staging_bytes(self._extra_config, configured_page)
+                if staging < configured_page:
+                    raise ValueError(
+                        "maru_remote_staging_size cannot hold one KV object"
+                    )
+            elif (
+                _parse_size(self._extra_config["maru_cpu_pool_size"]) < configured_page
+            ):
                 raise ValueError("maru_cpu_pool_size cannot hold one CPU cache page")
             if (
                 self._extra_config.get("maru_storage_backend") == "mixed"
@@ -1907,6 +2133,9 @@ class MaruWorkerConnector:
             ):
                 continue
 
+            if self._lease_mode:
+                self._load_leased_request(layers, req_meta, attn_metadata)
+                continue
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
@@ -1917,15 +2146,6 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
-            if self._cpu_mode:
-                start, end = self._cpu_load_range(req_meta)
-                first_chunk = start // self._kv_chunk_tokens
-                last_chunk = (end + self._kv_chunk_tokens - 1) // self._kv_chunk_tokens
-                if last_chunk > num_chunks:
-                    self._fail_deferred_load(req_meta)
-                    continue
-                chunk_keys = chunk_keys[first_chunk:last_chunk]
-                num_chunks = len(chunk_keys)
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
@@ -1943,8 +2163,6 @@ class MaruWorkerConnector:
                 continue
 
             if len(infos) != len(keys):
-                if self._cpu_mode:
-                    self._handler.release_retrieved(infos)
                 # A truncated response would otherwise shift every later
                 # layer's objects by one position — silent wrong KV.
                 logger.error(
@@ -1962,8 +2180,6 @@ class MaruWorkerConnector:
             # inject a partially-populated (corrupt) KV cache — vLLM recomputes.
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
             if miss >= 0:
-                if self._cpu_mode:
-                    self._handler.release_retrieved(infos)
                 logger.warning(
                     "Maru load miss: %s — aborting load for req %s (recompute)",
                     keys[miss],
@@ -1985,12 +2201,7 @@ class MaruWorkerConnector:
         # per-(layer,chunk) copies. See design note "P6 v2 시도 2".
         if not self._use_layerwise:
             _t0 = time.monotonic()
-            try:
-                self._load_packed(layers, prepared_requests, attn_metadata)
-            finally:
-                if self._cpu_mode:
-                    for _, _, _, infos in prepared_requests:
-                        self._handler.release_retrieved(infos)
+            self._load_packed(layers, prepared_requests, attn_metadata)
             if self._timing:
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
@@ -2083,6 +2294,15 @@ class MaruWorkerConnector:
         """
         try:
             handler = self._handler
+            if self._lease_mode:
+                # Leases are released batch by batch once each batch's copies
+                # have completed; the request unparks after the last batch.
+                if handler is None:
+                    self._fail_deferred_load(req_meta)
+                    return
+                torch.cuda.set_device(device)
+                self._load_leased_request(layers, req_meta, self._last_attn_metadata)
+                return
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
@@ -2752,6 +2972,135 @@ class MaruWorkerConnector:
             )
         return out
 
+    def _load_leased_request(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        req_meta: MaruReqMeta,
+        attn_metadata: Any,
+    ) -> None:
+        """Load a lease-backed request's external token range.
+
+        Runs on the engine thread for synchronous loads and on the loader
+        thread for asynchronous ones (``maru_async_load``).
+
+        Args:
+            layers: ``(name, kv_cache, layer index)`` per attention layer.
+            req_meta: The request, with its external token range.
+            attn_metadata: The step's attention metadata.
+        """
+        ct = self._kv_chunk_tokens
+        chunk_keys = _req_chunk_keys(req_meta, ct)
+        num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
+        start, end = self._external_load_range(req_meta)
+        first_chunk = start // ct
+        last_chunk = (end + ct - 1) // ct
+        if num_chunks == 0 or last_chunk > num_chunks:
+            self._fail_deferred_load(req_meta)
+            return
+        slot_mapping = self._build_slot_mapping(req_meta.block_ids, num_chunks * ct)
+        self._load_leased(
+            layers,
+            req_meta,
+            chunk_keys[first_chunk:last_chunk],
+            slot_mapping,
+            attn_metadata,
+        )
+
+    def _load_leased(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        req_meta: MaruReqMeta,
+        chunk_keys: list[str],
+        slot_mapping: torch.Tensor,
+        attn_metadata: Any,
+    ) -> None:
+        """Load a lease-backed request's external range in bounded batches.
+
+        Each batch is retrieved, copied to the GPU and released before the
+        next one, so a backend whose read buffers are bounded (the remote
+        backend's staging slots) can load any number of chunks. Each batch's
+        copies have completed before its leases are released. A batch that
+        cannot be read fails the request from that batch on; vLLM recomputes
+        those tokens. A deferred request is reported finished only after its
+        last batch (or with its failure), never between batches.
+
+        Args:
+            layers: ``(name, kv_cache, layer index)`` per attention layer.
+            req_meta: The request, with its external token range.
+            chunk_keys: Keys of the chunks covering that range, in order.
+            slot_mapping: Slot of every token from token 0 of the request.
+            attn_metadata: The step's attention metadata.
+        """
+        handler = self._handler
+        assert handler is not None
+        ct = self._kv_chunk_tokens
+        start, end = self._external_load_range(req_meta)
+        first = start // ct
+        capacity = handler.retrieve_capacity()
+        step = len(chunk_keys) if capacity is None else capacity
+        if step <= 0:
+            logger.warning(
+                "Maru: no read buffer free for req %s (recompute)", req_meta.req_id
+            )
+            self._fail_deferred_load(req_meta)
+            return
+        for b in range(0, len(chunk_keys), step):
+            keys = chunk_keys[b : b + step]
+            lo = max(start, (first + b) * ct)
+            hi = min(end, (first + b + len(keys)) * ct)
+            rest = replace(req_meta, load_start_token=lo, load_end_token=end)
+            try:
+                _t0 = time.monotonic()
+                infos = self._batch_retrieve_all(keys)
+                if self._timing:
+                    _emit_timing(
+                        f"retrieve batch {len(keys)} keys = "
+                        f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
+                    )
+            except Exception as e:
+                logger.error(
+                    "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
+                )
+                self._fail_deferred_load(rest)
+                return
+            try:
+                if len(infos) != len(keys) or any(i is None for i in infos):
+                    # A miss (chunk gone since the scheduler's check) or a
+                    # truncated reply: never inject a partial batch.
+                    logger.warning(
+                        "Maru load miss for req %s (%d of %d chunks) — recompute",
+                        req_meta.req_id,
+                        sum(i is not None for i in infos),
+                        len(keys),
+                    )
+                    self._fail_deferred_load(rest)
+                    return
+                part = replace(
+                    req_meta,
+                    load_start_token=lo,
+                    load_end_token=hi,
+                    deferred_load=False,
+                )
+                failed = self._load_packed(
+                    layers, [(part, len(keys), slot_mapping, infos)], attn_metadata
+                )
+            finally:
+                handler.release_retrieved(infos)
+            if failed:
+                # vLLM recomputes from this batch's first block, so the later
+                # batches are not worth reading.
+                self._fail_deferred_load(rest)
+                return
+        if req_meta.deferred_load:
+            logger.info(
+                "Maru: deferred leased load of %d chunks in %d batches for req %s",
+                len(chunk_keys),
+                -(-len(chunk_keys) // step),
+                req_meta.req_id,
+            )
+            with self._deferred_lock:
+                self._deferred_done.add(req_meta.req_id)
+
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
         """Mark a deferred load as failed so the scheduler recomputes it.
 
@@ -2761,9 +3110,9 @@ class MaruWorkerConnector:
         unparks it from WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads
         also report errors, but only for their externally allocated blocks.
         """
-        if self._cpu_mode and not req_meta.is_store:
+        if self._lease_mode and not req_meta.is_store:
             self._fail_load(
-                req_meta, RuntimeError("CPU replica unavailable during load")
+                req_meta, RuntimeError("stored replica unavailable during load")
             )
             return
         if not req_meta.deferred_load:
@@ -2772,7 +3121,7 @@ class MaruWorkerConnector:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
 
-    def _cpu_load_range(self, req_meta: MaruReqMeta) -> tuple[int, int]:
+    def _external_load_range(self, req_meta: MaruReqMeta) -> tuple[int, int]:
         """Only externally allocated tokens may be copied or invalidated."""
         end = req_meta.load_end_token
         if end is None:
@@ -2796,8 +3145,8 @@ class MaruWorkerConnector:
         )
         with self._deferred_lock:
             blocks = req_meta.block_ids
-            if self._cpu_mode:
-                start, end = self._cpu_load_range(req_meta)
+            if self._lease_mode:
+                start, end = self._external_load_range(req_meta)
                 blocks = blocks[
                     start // self._block_size : (end + self._block_size - 1)
                     // self._block_size
@@ -3058,7 +3407,7 @@ class MaruWorkerConnector:
         layers: list[tuple[str, torch.Tensor, int]],
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
         attn_metadata: AttentionMetadata,
-    ) -> None:
+    ) -> set[str]:
         """Load per-chunk slabs with no GPU staging (P6 v2, packed).
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
@@ -3072,6 +3421,10 @@ class MaruWorkerConnector:
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
+
+        Returns:
+            Ids of the requests whose copy failed (already reported for
+            recompute through ``_fail_load``).
         """
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
         num_layers = len(layers)
@@ -3084,7 +3437,7 @@ class MaruWorkerConnector:
         # the per-chunk launches pipelined instead of serializing on the compute
         # stream. Falls back to the current stream on CPU/non-CUDA.
         dev = layers[0][1].device
-        use_stream = not self._cpu_mode and (
+        use_stream = (not self._lease_mode or kernel is not None) and (
             kernel is not None or (dev.type == "cuda" and torch.cuda.is_available())
         )
         if use_stream:
@@ -3099,6 +3452,7 @@ class MaruWorkerConnector:
             stream_ctx = contextlib.nullcontext()
 
         dtype = layers[0][1].dtype
+        failed: set[str] = set()
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3110,8 +3464,8 @@ class MaruWorkerConnector:
                     for ci in range(num_chunks):
                         slab_view = slab_infos[ci].view
                         chunk_index = ci
-                        if self._cpu_mode:
-                            start, end = self._cpu_load_range(req_meta)
+                        if self._lease_mode:
+                            start, end = self._external_load_range(req_meta)
                             chunk_index += start // ct
                         chunk_slots = slot_gpu[
                             chunk_index * ct : (chunk_index + 1) * ct
@@ -3121,12 +3475,17 @@ class MaruWorkerConnector:
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
                             2, num_layers, ct, -1
                         )
-                        if self._cpu_mode:
+                        whole_chunk = True
+                        if self._lease_mode:
                             lo = max(start - chunk_index * ct, 0)
                             hi = min(end - chunk_index * ct, ct)
+                            whole_chunk = lo == 0 and hi == ct
                             chunk_slots = chunk_slots[lo:hi]
                             slab_host = slab_host[:, :, lo:hi]
-                        if kernel is not None:
+                        # The kernel reads a contiguous [2, L, tokens, h] slab;
+                        # a partial chunk's token slice is strided, so it takes
+                        # the per-layer path.
+                        if kernel is not None and whole_chunk:
                             ops, ptrs, pbs, block_size, head_size, fmt = kernel
                             ops.multi_layer_kv_transfer(
                                 slab_host,
@@ -3153,6 +3512,7 @@ class MaruWorkerConnector:
                                 )
                 except Exception as e:
                     self._fail_load(req_meta, e)
+                    failed.add(req_meta.req_id)
                     continue
                 if req_meta.deferred_load:
                     with self._deferred_lock:
@@ -3177,6 +3537,7 @@ class MaruWorkerConnector:
                 _emit_timing(
                     f"packed-load {mode} {num_layers}L x {num_chunks}c (req {req_meta.req_id})"
                 )
+        return failed
 
     def _packed_load_kernel_ctx(
         self, layers: list[tuple[str, torch.Tensor, int]], attn_metadata: Any
@@ -3192,8 +3553,8 @@ class MaruWorkerConnector:
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration.
         """
-        if self._cpu_mode:
-            return None  # M1 CPU pools are pageable, not direct-access GPU memory.
+        if self._lease_mode and not self._lease_buffers_gpu_accessible():
+            return None  # Pageable leased buffers: host copies only.
         device = layers[0][1].device
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
@@ -3338,6 +3699,12 @@ class MaruWorkerConnector:
                 entry for entry in self._active_load_refs if not entry[0].query()
             ]
 
+    def _lease_buffers_gpu_accessible(self) -> bool:
+        """Whether leased buffers are page-locked for the GPU kernels."""
+        if self._sync_lease_transfers or self._handler is None:
+            return False
+        return self._handler.storage_gpu_accessible()
+
     def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
 
@@ -3347,7 +3714,7 @@ class MaruWorkerConnector:
         """
         handler = self._handler
         assert handler is not None
-        if self._cpu_mode or len(keys) <= batch_size:
+        if self._lease_mode or len(keys) <= batch_size:
             return list(handler.batch_retrieve(keys))
         out: list[Any] = []
         for i in range(0, len(keys), batch_size):
@@ -3467,8 +3834,9 @@ class MaruWorkerConnector:
                 continue
 
             # Phase 2: single batched register. batch_store takes ownership of
-            # every handle (it frees duplicates/failures internally); it only
-            # raises before consuming any, so the except path frees them all.
+            # every handle (it frees duplicates/failures internally). It raises
+            # before consuming any, or (lease backends) after returning them,
+            # where a later free is a no-op; so the except path frees them all.
             try:
                 results = self._handler.batch_store(pending_keys, pending_handles)
             except Exception as e:
@@ -3589,7 +3957,7 @@ class MaruWorkerConnector:
             ready_handles: list = []
             for ci in range(start_chunk, end_chunk):
                 base_key = chunk_keys[ci]
-                if self._is_stored(base_key):
+                if self._is_stored(base_key) or base_key in self._skipped_slabs:
                     continue
 
                 chunk_slots = slot_mapping[
@@ -3622,10 +3990,10 @@ class MaruWorkerConnector:
                     # K and V planes are each contiguous in the slab; copying
                     # them separately avoids a strided cross-device copy.
                     for plane in range(kv2):
-                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->slab
+                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->host
                     written.add(layer_idx)
                 except Exception as e:
-                    logger.error("Maru packed save error: %s: %s", base_key, e)
+                    self._note_store_skip(base_key, e)
                     self._discard_pending_slab(base_key)
                     continue
 
@@ -3668,6 +4036,12 @@ class MaruWorkerConnector:
             return self._store_kernel_ctx
         if not self._kv_caches or self._num_layers <= 0:
             return None  # not registered yet; resolve on a later call
+        if (
+            self._lease_mode
+            and not self._sync_lease_transfers
+            and self._handler is None
+        ):
+            return None  # remote buffers unknown until connected; decide later
         layers = [
             (name, kv_cache, self._get_layer_index(name))
             for name, kv_cache in self._kv_caches.items()
@@ -3803,8 +4177,9 @@ class MaruWorkerConnector:
             assert self._store_stream is not None
             self._store_stream.synchronize()
         # batch_store takes ownership of every handle (frees duplicates and
-        # failures internally); it only raises before consuming any, so the
-        # except path must free them all.
+        # failures internally). It raises before consuming any, or (lease
+        # backends) after returning them, where a later free is a no-op; so
+        # the except path must free them all.
         try:
             results = handler.batch_store(ready_keys, ready_handles)
         except Exception as e:
@@ -3957,7 +4332,12 @@ class MaruWorkerConnector:
                     # copy engine rather than keeping SMs busy for the D2H.
                     slab_host.copy_(self._store_staging, non_blocking=True)
                 except Exception as e:
-                    logger.error("Maru write-behind prepare error: %s: %s", base_key, e)
+                    if isinstance(e, MemoryError | StorageUnavailableError):
+                        self._note_store_skip(base_key, e)  # rate-limited
+                    else:
+                        logger.error(
+                            "Maru write-behind prepare error: %s: %s", base_key, e
+                        )
                     if handle is not None:
                         try:
                             handler.free(handle)
@@ -4050,6 +4430,24 @@ class MaruWorkerConnector:
                     if not pending:
                         del self._request_pending_store_keys[req_id]
 
+    def _note_store_skip(self, base_key: str, exc: Exception) -> None:
+        """Record a chunk whose store is skipped this step and log it.
+
+        A full staging buffer or an unavailable backend is expected while the
+        backend recovers, so it is logged at most once a minute.
+        """
+        self._skipped_slabs.add(base_key)
+        if isinstance(exc, MemoryError | StorageUnavailableError):
+            now = time.monotonic()
+            if now - self._last_skip_warning >= 60.0:
+                self._last_skip_warning = now
+                logger.warning(
+                    "Maru store skipped (%s); further skips are not logged for 60 s",
+                    exc,
+                )
+            return
+        logger.error("Maru packed save error: %s: %s", base_key, exc)
+
     def _discard_pending_slab(self, base_key: str) -> None:
         """Drop a half-filled slab entry after an error and free its handle.
 
@@ -4091,6 +4489,7 @@ class MaruWorkerConnector:
         Handles orphaned by an earlier sweep that ran without a handler are
         retried here first.
         """
+        self._skipped_slabs.clear()
         if self._orphan_slab_handles and self._handler is not None:
             orphans = self._orphan_slab_handles
             self._orphan_slab_handles = []
@@ -4110,9 +4509,10 @@ class MaruWorkerConnector:
         """Free alloc handles after a ``batch_store`` call raised.
 
         ``batch_store`` owns the handles once it runs (it frees duplicates and
-        failures internally); every exception it lets escape is raised before
-        any handle is consumed (connection/closing/length checks), so freeing
-        them here cannot double-free. Without this, a single RPC hiccup during
+        failures internally). The CXL path raises only before any handle is
+        consumed (connection/closing/length checks); a lease backend that
+        raises later has already returned its handles and ignores a free of
+        them. Either way freeing them here cannot double-free. Without this, a single RPC hiccup during
         a store step would leak every not-yet-registered CXL page.
         """
         handler = self._handler
@@ -4125,12 +4525,12 @@ class MaruWorkerConnector:
                 pass
 
     def _is_stored(self, key: str) -> bool:
-        if self._cpu_mode:
+        if self._lease_mode:
             return self._handler is not None and self._handler.has_local(key)
         return key in self._stored_keys
 
     def _record_stored(self, key: str) -> None:
-        if not self._cpu_mode:
+        if not self._lease_mode:
             self._stored_keys.add(key)
 
     def _write_done_marker(self, base_key: str) -> None:

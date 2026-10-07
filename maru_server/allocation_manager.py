@@ -84,6 +84,12 @@ class AllocationManager:
             info = self._allocations.get(region_id)
             return info.handle if info else None
 
+    def get_owner(self, region_id: int) -> str | None:
+        """Owner instance id of an allocation, or None if it is not tracked."""
+        with self._lock:
+            info = self._allocations.get(region_id)
+            return info.owner_instance_id if info else None
+
     def increment_kv_ref(self, region_id: int) -> bool:
         """Increment KV reference count."""
         with self._lock:

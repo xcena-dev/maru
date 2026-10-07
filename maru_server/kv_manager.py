@@ -147,6 +147,62 @@ class KVManager:
             logger.debug("Deleted KV: key=%s, region_id=%d", key, region_id)
             return (DeleteResult.DELETED, region_id)
 
+    def delete_at(
+        self, key: str, region_id: int, kv_offset: int
+    ) -> tuple[DeleteResult, int | None]:
+        """Delete ``key`` only if it still names this location.
+
+        Used by a component that owns the pages behind its keys: it must not
+        delete a same-named key that now lives somewhere else.
+
+        Args:
+            key: The chunk key string.
+            region_id: Region the caller recorded for the key.
+            kv_offset: Offset the caller recorded for the key.
+
+        Returns:
+            Like :meth:`delete`; ``NOT_FOUND`` when the key is absent or
+            names another location.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            if (
+                entry is None
+                or entry.region_id != region_id
+                or entry.kv_offset != kv_offset
+            ):
+                return (DeleteResult.NOT_FOUND, None)
+            if entry.pin_count > 0:
+                return (DeleteResult.PINNED, None)
+            del self._store[key]
+            return (DeleteResult.DELETED, region_id)
+
+    def batch_pin_in(
+        self, keys: list[str], region_ids: set[int]
+    ) -> list[KVEntry | None]:
+        """Pin and return the entries of ``keys`` that live in ``region_ids``.
+
+        Each key is decided on its own (no prefix stop): the caller records
+        exactly the keys it pinned and unpins them later.
+
+        Args:
+            keys: Chunk key strings.
+            region_ids: Regions whose entries may be pinned.
+
+        Returns:
+            One entry per key: the pinned entry, or None (absent or elsewhere).
+        """
+        with self._lock:
+            out: list[KVEntry | None] = []
+            for key in keys:
+                entry = self._store.get(key)
+                if entry is None or entry.region_id not in region_ids:
+                    out.append(None)
+                    continue
+                entry.pin_count += 1
+                out.append(entry)
+            return out
+
     def get_stats(self) -> dict:
         """Get KV statistics."""
         with self._lock:
