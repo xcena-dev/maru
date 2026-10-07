@@ -21,6 +21,7 @@ Example:
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 
 from maru_common import MaruConfig
@@ -114,6 +115,16 @@ class MaruHandler:
         self._stats_lock = threading.Lock()
         self._stats_rpc: RpcClient | None = None  # dedicated connection for flush
         self._stats_flusher: threading.Thread | None = None
+
+        # Client lease: renewed on a dedicated connection so the server can
+        # reclaim this handler's regions if the process exits without close().
+        self._lease_id = ""
+        self._lease_ttl = 0.0
+        self._lease_renewed_at = 0.0  # send time of the last accepted renewal
+        self._lease_rpc: RpcClient | None = None
+        self._lease_thread: threading.Thread | None = None
+        self._lease_stop = threading.Event()
+        self._lease_lost = threading.Event()
 
         # Connection state
         self._key_to_location: dict[str, tuple[int, int]] = {}
@@ -305,6 +316,10 @@ class MaruHandler:
                 rm_address = self._config.rm_address
             self._mapper = DaxMapper(rm_address=rm_address, device_table=device_table)
 
+            # 1c. Start a client lease (renewed in the background from now
+            #     on) before the first allocation
+            self._start_lease()
+
             # 2. Initialize managers
             self._owned = OwnedRegionManager(
                 mapper=self._mapper,
@@ -316,12 +331,14 @@ class MaruHandler:
                 response = self._rpc.request_alloc(
                     instance_id=self._config.instance_id,
                     size=self._config.pool_size,
+                    lease_id=self._lease_id,
                 )
             except Exception:
                 logger.error(
                     "RPC request_alloc failed during connect",
                     exc_info=True,
                 )
+                self._end_lease()
                 return False
 
             if not response.success or response.handle is None:
@@ -332,6 +349,7 @@ class MaruHandler:
                 if self._owned is not None:
                     self._owned.close()
                 self._owned = None
+                self._end_lease()
                 self._rpc.close()
                 return False
 
@@ -351,6 +369,7 @@ class MaruHandler:
                 if self._owned is not None:
                     self._owned.close()
                 self._owned = None
+                self._end_lease()
                 self._rpc.close()
                 return False
 
@@ -382,6 +401,8 @@ class MaruHandler:
 
         except Exception:
             logger.error("Failed to connect", exc_info=True)
+            if not self._connected:
+                self._end_lease()
             return False
 
     # =========================================================================
@@ -422,6 +443,120 @@ class MaruHandler:
         while self._connected and not self._closing.is_set():
             self._closing.wait(timeout=1.0)
             self._flush_stats()
+
+    # =========================================================================
+    # Client Lease
+    # =========================================================================
+
+    def _start_lease(self) -> None:
+        """Start a client lease and its renewal thread.
+
+        The server reclaims the regions allocated under the lease when it is
+        not renewed within the TTL. A server without lease support answers
+        with no TTL, and the handler then runs without a lease.
+        """
+        self._lease_id = uuid.uuid4().hex
+        self._lease_lost.clear()
+        self._lease_stop = threading.Event()
+        sent_at = time.monotonic()
+        try:
+            resp = self._rpc.renew_lease(self._config.instance_id, self._lease_id)
+        except Exception as e:
+            resp = {"error": str(e)}
+        if "error" in resp:
+            logger.warning(
+                "Could not start a client lease (%s); running without one, so "
+                "the server cannot reclaim this handler's regions if it dies",
+                resp["error"],
+            )
+        ttl = float(resp.get("lease_ttl") or 0.0)
+        if ttl <= 0:
+            self._lease_id = ""
+            self._lease_ttl = 0.0
+            return
+        self._lease_ttl = ttl
+        self._lease_renewed_at = sent_at
+        self._lease_rpc = RpcClient(
+            server_url=self._config.server_url,
+            timeout_ms=self._config.timeout_ms,
+        )
+        self._lease_rpc.connect()
+        self._lease_thread = threading.Thread(
+            target=self._lease_renewal_loop,
+            args=(ttl / 4,),
+            name="maru-lease",
+            daemon=True,
+        )
+        self._lease_thread.start()
+
+    def _lease_renewal_loop(self, interval: float) -> None:
+        """Renew the lease until it ends or the server reports it expired."""
+        while not self._lease_stop.wait(timeout=interval):
+            rpc = self._lease_rpc
+            if rpc is None:
+                return
+            sent_at = time.monotonic()
+            try:
+                resp = rpc.renew_lease(self._config.instance_id, self._lease_id)
+            except Exception as e:
+                resp = {"error": str(e)}
+            if "error" in resp or "lease_ttl" not in resp:
+                # The RPC client reports timeouts as an error reply. Retried
+                # next interval; writes stop if renewals keep failing.
+                logger.warning(
+                    "Client lease renewal failed: %s", resp.get("error", resp)
+                )
+                continue
+            if resp.get("lease_expired"):
+                logger.error(
+                    "Client lease %s expired and the server reclaimed this "
+                    "handler's regions; allocations and stores are refused "
+                    "until this handler is recreated",
+                    self._lease_id,
+                )
+                self._lease_lost.set()
+                return
+            self._lease_renewed_at = sent_at
+
+    def _lease_valid(self) -> bool:
+        """True when this handler may still write to its regions.
+
+        The server counts a lease from when it receives a renewal, which is
+        after the handler sent it. The handler stops writing once its last
+        accepted renewal was sent three quarters of the TTL ago, so it stops
+        before the server can reclaim the regions, and resumes when a renewal
+        succeeds again.
+        """
+        if not self._lease_ttl:
+            return True
+        if self._lease_lost.is_set():
+            return False
+        return time.monotonic() - self._lease_renewed_at < 0.75 * self._lease_ttl
+
+    def _end_lease(self, release: bool = False) -> None:
+        """Stop renewing the lease.
+
+        Args:
+            release: Also tell the server the lease ended. Only a close that
+                returned every region releases; otherwise the lease is left
+                to expire so the server reclaims whatever is still owned.
+        """
+        self._lease_stop.set()
+        if self._lease_rpc is not None:
+            self._lease_rpc.close()
+        if self._lease_thread is not None:
+            self._lease_thread.join(timeout=2.0)
+            self._lease_thread = None
+        self._lease_rpc = None
+        if release and self._lease_id and not self._lease_lost.is_set():
+            try:
+                self._rpc.renew_lease(
+                    self._config.instance_id, self._lease_id, release=True
+                )
+            except Exception:
+                logger.debug("Could not end the client lease", exc_info=True)
+        self._lease_id = ""
+        self._lease_ttl = 0.0
 
     def close(self) -> None:
         """Close the connection and return all allocations.
@@ -466,11 +601,17 @@ class MaruHandler:
                     owned_region_ids = self._owned.close()
 
                 # 2. Return allocations to server via RPC
+                all_returned = True
                 for rid in owned_region_ids:
                     try:
                         self._rpc.return_alloc(self._config.instance_id, rid)
                     except Exception:
+                        all_returned = False
                         logger.error("Failed to return region %d", rid, exc_info=True)
+
+                # 2b. End the lease once the regions are returned; if any
+                #     return failed, let it expire so the server reclaims it
+                self._end_lease(release=all_returned)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
                 if self._mapper is not None:
@@ -483,6 +624,8 @@ class MaruHandler:
             logger.error("Error during close", exc_info=True)
 
         finally:
+            if self._lease_id:
+                self._end_lease()  # close() failed; let the lease expire
             self._connected = False
             self._owned = None
             self._key_to_location.clear()
@@ -512,6 +655,8 @@ class MaruHandler:
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
+        if not self._lease_valid():
+            raise RuntimeError("Client lease expired or not renewed in time")
         t0 = time.monotonic()
 
         with self._write_lock:
@@ -641,6 +786,11 @@ class MaruHandler:
         with self._write_lock:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
+            if not self._lease_valid():
+                # The server may reclaim this page's region; never publish it.
+                self._owned.free(handle._region_id, handle._page_index)
+                logger.debug("store: key=%s refused, client lease not valid", key)
+                return False
 
             # Duplicate skip
             if key in self._key_to_location:
@@ -1096,6 +1246,14 @@ class MaruHandler:
         with self._write_lock:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
+            if not self._lease_valid():
+                # The server may reclaim these pages' regions; never publish.
+                for handle in handles:
+                    self._owned.free(handle._region_id, handle._page_index)
+                logger.debug(
+                    "batch_store: %d keys refused, client lease not valid", len(keys)
+                )
+                return [False] * len(keys)
 
             chunk_size = self._owned.get_chunk_size()
             results = [True] * len(keys)
@@ -1325,6 +1483,7 @@ class MaruHandler:
             response = self._rpc.request_alloc(
                 instance_id=self._config.instance_id,
                 size=self._expand_size,
+                lease_id=self._lease_id,
             )
         except Exception:
             logger.error("RPC request_alloc failed during expand", exc_info=True)

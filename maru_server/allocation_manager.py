@@ -20,6 +20,7 @@ class AllocationInfo:
     kv_ref_count: int = 0
     owner_connected: bool = True
     legacy_visible: bool = True
+    lease_id: str = ""  # client lease that owns the region ("" for none)
 
 
 class AllocationManager:
@@ -43,11 +44,14 @@ class AllocationManager:
         dax_path: str = "",
         *,
         legacy_visible: bool = True,
+        lease_id: str = "",
     ) -> MaruHandle | None:
         """Allocate memory via ShmClient and track ownership.
 
         ``legacy_visible=False`` reserves a typed storage pool that must not be
         returned by the legacy ``LIST_ALLOCATIONS`` discovery path.
+        ``lease_id`` ties the region to a client lease, so the region is
+        reclaimed when that lease expires (see ``disconnect_lease``).
         """
         try:
             handle = self._client.alloc(size, dax_path=dax_path)
@@ -70,6 +74,7 @@ class AllocationManager:
                 kv_ref_count=0,
                 owner_connected=True,
                 legacy_visible=legacy_visible,
+                lease_id=lease_id,
             )
         return handle
 
@@ -175,6 +180,38 @@ class AllocationManager:
                 )
                 self._client.free(info.handle)
                 del self._allocations[region_id]
+
+    def disconnect_lease(self, instance_id: str, lease_id: str) -> list[int]:
+        """Release the regions allocated under an expired client lease.
+
+        Same rule as ``disconnect_client``, limited to one lease: a region
+        without KV references is freed now, and a referenced region is freed
+        when its last KV entry is deleted.
+
+        Returns:
+            Region ids that the lease owned.
+        """
+        with self._lock:
+            owned = [
+                region_id
+                for region_id, info in self._allocations.items()
+                if info.owner_instance_id == instance_id and info.lease_id == lease_id
+            ]
+            for region_id in owned:
+                info = self._allocations[region_id]
+                info.owner_connected = False
+                if info.kv_ref_count > 0:
+                    continue
+                logger.info(
+                    "[FREE] region_id=%d, owner=%s, "
+                    "trigger=lease expired (kv_ref_count=%d)",
+                    region_id,
+                    instance_id,
+                    info.kv_ref_count,
+                )
+                self._client.free(info.handle)
+                del self._allocations[region_id]
+            return owned
 
     def list_allocations(
         self, exclude_instance_id: str | None = None

@@ -67,6 +67,7 @@ class RpcHandlerMixin:
         handle = self._server.request_alloc(
             instance_id=req.instance_id,
             size=req.size,
+            lease_id=getattr(req, "lease_id", ""),
         )
         if handle is None:
             logger.debug(
@@ -257,8 +258,12 @@ class RpcHandlerMixin:
         self._server.report_stats(req.entries)
         return {"success": True}
 
-    def _handle_heartbeat(self, _req: Any) -> dict:
-        return {}
+    def _handle_heartbeat(self, req: Any) -> dict:
+        return self._server.renew_lease(
+            getattr(req, "instance_id", ""),
+            getattr(req, "lease_id", ""),
+            release=getattr(req, "lease_release", False),
+        )
 
     def _handle_handshake(self, req: Any) -> dict:
         from maru_common.storage_types import (
