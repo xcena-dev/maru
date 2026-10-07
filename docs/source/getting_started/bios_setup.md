@@ -5,14 +5,15 @@ server vendor's CXL setup instructions on each host.
 
 ## Intel (GNR)
 
-For multi-node KV sharing, apply this setting on each participating GNR host:
+For multi-host KV sharing on Intel Granite Rapids (GNR), configure the BIOS as follows:
 
-| Setting | Value |
-|---------|-------|
-| `Allocating Write Flows` | `Non-Allocating` |
+- If a **DDIO** control is available, use it to **disable DDIO**.
+- Otherwise, set **`Allocating Write Flows`** to **`Non-Allocating`**.
 
-Save the settings and reboot. The menu location depends on your server vendor
-and BIOS version.
+Option names and menu locations vary by server vendor and BIOS version.
+If neither option is available, consult your server vendor's documentation.
+
+Apply the setting on every participating host, save the configuration, and reboot.
 
 ## AMD (Turin)
 
