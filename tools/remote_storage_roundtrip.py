@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gates G0/G1 for the remote storage backend, through the MaruHandler API.
+"""Round-trip check of the remote storage backend through the MaruHandler API.
 
 Opens ``MaruHandler(storage_backend="remote")`` against the remote endpoint of
 a pool node's maru-server and, per round, stores N objects of random bytes, checks
@@ -10,8 +10,8 @@ measured) and end-to-end call time, plus the server's reservation, quarantine
 and ticket counts after the run (all must be 0).
 
 Usage (on a worker node):
-  PYTHONPATH=. python tools/remote_storage_g0.py --remote-url tcp://pool-node:6600 \
-      --ucx-device mlx5_0:1 --objects 64 --object-bytes 4M --rounds 3 --out g0.json
+  PYTHONPATH=. python tools/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
+      --ucx-device mlx5_0:1 --objects 64 --object-bytes 4M --rounds 3 --out roundtrip.json
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ def main() -> int:
     ap.add_argument("--objects", type=int, default=64)
     ap.add_argument("--object-bytes", type=parse_size, default=parse_size("4M"))
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--namespace", default=f"g0-{uuid.uuid4().hex[:8]}")
-    ap.add_argument("--out", default="g0.json")
+    ap.add_argument("--namespace", default=f"roundtrip-{uuid.uuid4().hex[:8]}")
+    ap.add_argument("--out", default="roundtrip.json")
     args = ap.parse_args()
 
     staging = args.objects * args.object_bytes
