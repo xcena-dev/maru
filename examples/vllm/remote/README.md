@@ -268,20 +268,30 @@ starting that node's process.
   remote regions; remote regions are hidden from their region list. A local
   client that looks up a remote key maps that whole region on first access.
 - **Full pool.** The pool evicts least recently read keys (see above). When
-  nothing can be evicted (every key pinned, or `--remote-eviction none`) it answers
-  reservations with `POOL_FULL`; the worker then skips stores (not loads) for
-  `maru_remote_retry_s`.
+  a whole reservation cannot fit after eviction (including pinned or quarantined
+  pages, or `--remote-eviction none`), it answers `POOL_FULL` without evicting
+  existing keys. The worker then skips stores for `maru_remote_retry_s`.
 - **Refused keys.** A key the pool refuses to publish (for example a key a
   local client on the pool node already holds) is not written again for
   `maru_remote_retry_s`.
-- **Timed-out transfers.** Memory a timed-out RDMA transfer may still reach is
-  not reused: its staging slots stay isolated until NIXL reports the transfer
-  ended, and the pool keeps the pages of a timed-out WRITE out of circulation
-  until the worker confirms the end (or, if the worker died, for
-  `--remote-quarantine-ttl`, 600 s by default). If the pool restarts while such a
-  transfer is still pending, the worker drops the old pool's NIXL peer with
-  the isolated transfer outstanding; that ordering has not been exercised on
-  hardware.
+- **Unconfirmed transfers.** After a timeout, failed completion query, or failed
+  cancellation, staging slots stay isolated until NIXL releases the handle.
+  WRITE pages remain quarantined until the worker confirms completion or
+  cancellation. Reservation expiry also quarantines pages, so a lost control
+  request cannot cause a late WRITE to overwrite a newly stored key.
+  `--remote-quarantine-ttl` (default 600 s) controls when the pool logs a warning;
+  it does not reclaim pages. A lost worker can consume pool capacity until
+  successful pool shutdown deregisters the regions. Workers wait for pending
+  transfers to finish before removing the old peer or reconnecting. These
+  failure paths have unit coverage; real RDMA fault recovery still needs
+  hardware validation.
+- **Expired read protection.** The worker checks the pool's release reply after
+  READ completes. If the ticket already expired or its protection cannot be
+  confirmed, the worker discards the bytes and reports a load error for
+  recomputation.
+- **Shutdown.** Release all read leases before calling `close()`. Outstanding
+  transfers or failed NIXL cleanup raise an error and retain registered memory.
+  Retry `close()` after transfers finish or the cleanup failure is resolved.
 
 ## Trust model
 

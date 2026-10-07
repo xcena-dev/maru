@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A failed NIXL teardown must keep mappings alive even if its caller drops the
+# access object. A successful retry removes it; process exit is the last resort.
+_RETAINED_ACCESSES: set[RemoteAccess] = set()
+
 CREATED = "CREATED"
 ALREADY_PRESENT = "ALREADY_PRESENT"
 REJECTED = "REJECTED"
@@ -155,9 +159,8 @@ class RemoteAccess:
             pool_id: Name reported to clients in ``hello``.
             reservation_ttl_s: Lifetime of an unpublished page reservation.
             ticket_ttl_s: Lifetime of a read ticket (pinned keys).
-            quarantine_ttl_s: How long pages of a timed-out WRITE stay out of
-                circulation when their client never abandons them (it died).
-                Must exceed any time the NIC could still deliver that WRITE.
+            quarantine_ttl_s: Time before warning about an unconfirmed WRITE.
+                Never authorizes page reuse; only confirmed completion does.
             capacity_bytes: Most pool bytes to hold in pages (reserved,
                 published or quarantined); None grows the pool until the
                 device refuses a region.
@@ -198,6 +201,7 @@ class RemoteAccess:
         self._owned = OwnedRegionManager(self._mapper, page_bytes)
         server.add_managed_owner(self._owner)
         self._regions: dict[int, _Region] = {}
+        self._failed_regions: set[int] = set()
         self._md_version = 0
         # The page behind every key published through this access.
         self._pages: dict[str, _Page] = {}
@@ -281,29 +285,31 @@ class RemoteAccess:
             return self._error(f"{type(exc).__name__}: {exc}")
 
     def sweep(self) -> None:
-        """Reclaim expired reservations, quarantined pages and read tickets.
+        """Quarantine expired writes and reclaim expired read tickets.
 
-        Quarantined pages return only after ``quarantine_ttl_s`` (their client
-        normally abandons them sooner). Never raises; an entry whose unpin
-        fails is logged and kept for the next sweep.
+        A reservation timeout does not revoke the worker's RDMA descriptor.
+        Keep its page until the worker confirms completion with ``abandon``
+        or pool shutdown deregisters the memory. Warn once for old quarantine.
+        An entry whose unpin fails is kept for the next sweep.
         """
         now = self._clock()
         with self._lock:
             if self._closed:
                 return
-            for table, label in (
-                (self._quarantine, "quarantined page"),
-                (self._reservations, "reservation"),
-            ):
-                for ticket, res in list(table.items()):
-                    if res.deadline > now:
-                        continue
-                    if table is self._quarantine:
-                        logger.warning(
-                            "sweep: %s %s was never abandoned; freed", label, ticket
-                        )
-                    self._free_page(res.page)
-                    del table[ticket]
+            for ticket, res in list(self._reservations.items()):
+                if res.deadline <= now:
+                    self._quarantine[ticket] = _Reservation(
+                        res.page, res.size, now + self._quarantine_ttl_s
+                    )
+                    del self._reservations[ticket]
+            for ticket, res in self._quarantine.items():
+                if res.deadline <= now:
+                    logger.warning(
+                        "quarantined WRITE %s has no completion confirmation; "
+                        "page retained until abandon or pool shutdown",
+                        ticket,
+                    )
+                    res.deadline = float("inf")
             for ticket_id, tk in list(self._tickets.items()):
                 if tk.deadline > now:
                     continue
@@ -319,13 +325,15 @@ class RemoteAccess:
 
         Keys published here become unreadable once their regions are gone,
         so they leave the ledger first; only then are the regions returned.
-        Quarantined pages are released too: closing the NIXL agent ends any
-        WRITE that could still reach them.
+        NIXL deregistration must succeed before any mapping or region is
+        returned. A failure keeps this object alive and close can be retried.
         """
         with self._lock:
-            if self._closed:
+            if self._closed and not self._regions and not self._failed_regions:
                 return
             self._closed = True
+            _RETAINED_ACCESSES.add(self)
+            self._transport.close()
             for tk in self._tickets.values():
                 try:
                     self._server.batch_unpin(tk.keys)
@@ -346,22 +354,16 @@ class RemoteAccess:
             self._lru.clear()
             self._reservations.clear()
             self._quarantine.clear()
-            for region in self._regions.values():
-                try:
-                    self._transport.deregister(region.registration)
-                except Exception:
-                    logger.exception(
-                        "close: deregistering region %d failed", region.region_id
-                    )
             self._regions.clear()
-            region_ids = self._owned.close()
+            region_ids = set(self._owned.close()) | self._failed_regions
             self._mapper.close()
             for region_id in region_ids:
                 try:
                     self._server.return_alloc(self._owner, region_id, managed=True)
                 except Exception:
                     logger.exception("close: returning region %d failed", region_id)
-        self._transport.close()
+            self._failed_regions.clear()
+            _RETAINED_ACCESSES.discard(self)
 
     # ---- ops (all called under self._lock) ----------------------------------
 
@@ -434,20 +436,39 @@ class RemoteAccess:
             raise ValueError(
                 f"sizes must be a non-empty list of ints in 1..{self._page_bytes}"
             )
+        count = len(sizes)
         if self._capacity_pages is not None:
-            over = self._used_pages() + len(sizes) - self._capacity_pages
-            if over > 0 and self._evict(over) < over:
-                raise PoolFullError(
-                    f"capacity of {self._capacity_pages} pages reached and "
-                    "nothing more can be evicted"
-                )
+            if len(sizes) > self._capacity_pages:
+                raise PoolFullError("requested batch exceeds the entire pool capacity")
+        # Determine the whole batch's shortage before deleting any cached key.
+        # Grow only to the configured capacity; physical allocation can fail
+        # earlier, in which case existing pages are the only usable capacity.
+        while True:
+            stats = self._owned.get_stats()
+            free = int(stats["total_free_pages"])
+            used = int(stats["total_allocated_pages"])
+            capacity = free + used
+            if self._capacity_pages is not None:
+                capacity = min(capacity, self._capacity_pages)
+            if count <= capacity - used:
+                break
+            if self._capacity_pages is not None and free + used >= self._capacity_pages:
+                break
+            if not self._add_region():
+                break
+        shortage = count - (capacity - used)
+        if shortage > 0 and self._evict(shortage) < shortage:
+            raise PoolFullError("not enough free or evictable pages for the batch")
         deadline = self._clock() + self._reservation_ttl_s
         taken: list[_Page] = []
         reserved: dict[str, _Reservation] = {}
         pages: list[dict[str, Any]] = []
         try:
             for size in sizes:
-                page = self._alloc_page()
+                loc = self._owned.allocate()
+                if loc is None:
+                    raise PoolFullError("reserved capacity could not be allocated")
+                page = _Page(*loc)
                 taken.append(page)
                 region = self._regions[page.region_id]
                 ticket = uuid.uuid4().hex
@@ -499,7 +520,7 @@ class RemoteAccess:
         reservations: list[_Reservation] = []
         for ticket in tickets:
             res = self._reservations.get(ticket)
-            if res is None:
+            if res is None or res.deadline <= self._clock():
                 raise KeyError(f"unknown or expired ticket {ticket}")
             reservations.append(res)
         for ticket in tickets:
@@ -565,9 +586,9 @@ class RemoteAccess:
     def _op_quarantine(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Keep reserved pages out of circulation until the client abandons them.
 
-        A client sends this after a WRITE missed its deadline: the NIC may
-        still deliver bytes into these pages, so they must not be reused when
-        their reservation would otherwise expire.
+        A client sends this when WRITE completion is unconfirmed. The NIC may
+        still deliver bytes into these pages. Expiry also quarantines them;
+        this request makes the reservation unpublishable immediately.
 
         Args:
             msg: Request with ``tickets``: list of ticket strings.
@@ -769,23 +790,6 @@ class RemoteAccess:
         """Return one page to its region's allocator."""
         self._owned.free(page.region_id, page.index)
 
-    def _alloc_page(self) -> _Page:
-        """Take one free page: grow the pool, else evict one key, if needed.
-
-        Raises:
-            PoolFullError: if no page is free, the device refuses a new region
-                and nothing can be evicted.
-        """
-        for _ in range(2):
-            loc = self._owned.allocate()
-            if loc is not None:
-                return _Page(*loc)
-            if self._add_region():
-                continue
-            if self._evict(1) < 1:
-                break
-        raise PoolFullError("no free page, no new region and nothing to evict")
-
     def _add_region(self) -> bool:
         """Allocate, map and register one more remote region.
 
@@ -841,37 +845,33 @@ class RemoteAccess:
                 step()
             except Exception:
                 logger.exception("undoing region %d: %s failed", region_id, name)
+                # A failed deregistration must not be followed by unmapping.
+                self._failed_regions.add(region_id)
+                _RETAINED_ACCESSES.add(self)
+                break
 
     def _evict(self, n: int) -> int:
-        """Delete up to ``n`` least recently read published keys.
+        """Delete ``n`` least recently read unpinned keys, or change nothing.
 
-        Pinned keys (being read) stay. Returns the number of pages freed.
+        Selection and deletion share the ledger's pin lock, so local readers
+        cannot invalidate the capacity check. Returns n or zero.
         """
         if not self._evict_enabled or n <= 0:
             return 0
-        freed = 0
-        for key in list(self._lru):
-            if freed >= n:
-                break
-            del self._lru[key]
-            page = self._pages.get(key)
-            if page is None:
-                continue
-            try:
-                result = self._delete_at(key, page)
-            except Exception:  # keep serving; the key stays where it is
-                logger.warning("eviction of %s failed", key, exc_info=True)
-                self._lru[key] = None
-                continue
-            if result is DeleteResult.PINNED:
-                self._lru[key] = None  # being read: keep it, most recent end
-                continue
-            del self._pages[key]
+        locations = [
+            (key, self._pages[key].region_id, self._pages[key].index * self._page_bytes)
+            for key in self._lru
+            if key in self._pages
+        ]
+        reclaimed = self._server.evict_kv_at(locations, n)
+        for key, deleted in reclaimed:
+            self._lru.pop(key, None)
+            page = self._pages.pop(key)
             self._free_page(page)
-            freed += 1
-            if result is DeleteResult.DELETED:
+            if deleted:
                 self._evicted += 1
                 self._eviction_log.append((self._evicted, key))
+        freed = len(reclaimed)
         if freed:
             logger.info("evicted %d least recently read keys", freed)
         return freed

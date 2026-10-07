@@ -1,15 +1,10 @@
 # MaruHandler Architecture
 
-The `MaruHandler` is the client-side library that applications (e.g., LMCache/vLLM) use to interact with Maru. It serves two roles:
+MaruHandler allocates storage, publishes KV keys, and retrieves cached KV for serving adapters. The default `cxl` backend returns views into mapped shared memory. The `cpu`, `mixed`, and `remote` backends return read leases that callers release after their final copy.
 
-1. **KV cache client** — provides `store`/`retrieve`/`exists`/`delete` APIs.
-2. **Memory manager** — owns CXL memory regions, manages paged allocation within them, and auto-expands when space runs out.
+With `cxl`, the handler owns CXL regions, allocates pages within them, and expands its regions when space runs out. KV bytes pass directly between the handler and mapped shared memory; MaruServer and the resource manager handle metadata and allocation.
 
-Data flows directly between the handler and CXL shared memory via memory-mapped regions — neither the MaruServer nor the resource manager is involved in the data path.
-
-Sections 1–4 describe the default storage backend, `cxl`. The other backends (`cpu`, `mixed`, `remote`) replace the region mapping with a storage client; section 5 covers them.
-
-## 1. Component Hierarchy
+## 1. CXL Component Hierarchy
 
 ```mermaid
 graph TB
@@ -227,7 +222,7 @@ sequenceDiagram
 
 ## 5. Storage Backends
 
-`MaruConfig.storage_backend` selects where the handler keeps KV bytes. With `cxl` the handler owns CXL regions as described above. With the other backends it delegates storage to a storage client and hands out **read leases** instead of shared mappings.
+`MaruConfig.storage_backend` selects the handler's storage implementation:
 
 | Backend | Storage client | Where KV bytes live | Metadata |
 |---------|----------------|---------------------|----------|
@@ -275,7 +270,15 @@ Dashed arrows are control requests over ZMQ, and the thick arrow is KV bytes ove
 
 **Maintenance thread** pings the pool once a second from its own client. It stops calls when the pool stops answering, reconnects when it answers again, and applies evictions the pool reports: the handler forgets the evicted keys, or every key it remembers when the pool's eviction log no longer covers the gap or the pool restarted.
 
-A store copies data into staging slots, reserves pages, writes them with RDMA WRITE and publishes the keys. A retrieve looks up and pins the keys, reads them with RDMA READ, releases the pins and returns leases over the staging slots. The pool node's MaruServer never copies KV bytes; see {ref}`Storage Backends <storage-backends>` in the architecture overview for the pool node side.
+A store copies data into staging slots, reserves pages, writes them with RDMA WRITE and publishes the keys. A retrieve looks up and pins the keys, reads them with RDMA READ, and confirms the pins when releasing them before returning leases over the staging slots. If the read ticket expired or the release reply is unavailable, the load fails and its bytes are discarded. The pool node's MaruServer never copies KV bytes; see {ref}`Storage Backends <storage-backends>` for the pool node components.
+
+### Transfer lifetime and shutdown
+
+A timeout or a failed completion query does not prove that the NIC stopped accessing memory. Staging slots remain isolated until NIXL releases the transfer handle successfully. The pool retains the corresponding WRITE pages until the worker confirms completion or cancellation with `abandon`. Reservation expiry also quarantines pages, even when the worker's quarantine request never reaches the pool.
+
+The pool's `--remote-quarantine-ttl` sets the delay before logging a warning, not a page reclamation deadline. A lost worker can therefore leave pages allocated until pool shutdown successfully deregisters the regions. Automatic recovery from a dead writer requires a mechanism to revoke its memory access before reuse.
+
+`close()` refuses outstanding read leases or transfers. Failed peer removal or memory deregistration also raises and preserves the buffers; the caller can retry `close()` after resolving the failure. Reconnection waits for isolated transfers to finish before removing the old peer. A failed shutdown retains its resources in the process even if the caller drops the handler.
 
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),

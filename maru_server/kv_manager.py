@@ -177,6 +177,48 @@ class KVManager:
             del self._store[key]
             return (DeleteResult.DELETED, region_id)
 
+    def evict_at(
+        self, locations: list[tuple[str, int, int]], count: int
+    ) -> list[tuple[str, int | None]]:
+        """Reclaim count locations in priority order, or change nothing.
+
+        Missing or relocated keys also allow their old page to be reclaimed,
+        without deleting the current key. Pinned matching keys stay.
+
+        Args:
+            locations: Unique (key, region_id, offset) candidates in LRU order.
+            count: Number of pages needed.
+
+        Returns:
+            (key, deleted_region_id) for each reclaimed page; None as the
+            region means the old location was already absent. Empty if the
+            requested number is unavailable. Selection and deletion are
+            atomic with respect to pinning and key changes.
+        """
+        if count <= 0:
+            return []
+        with self._lock:
+            selected: dict[str, int | None] = {}
+            for key, region_id, offset in locations:
+                if key in selected:
+                    continue
+                entry = self._store.get(key)
+                matches = entry is not None and (entry.region_id, entry.kv_offset) == (
+                    region_id,
+                    offset,
+                )
+                if matches and entry is not None and entry.pin_count:
+                    continue
+                selected[key] = region_id if matches else None
+                if len(selected) == count:
+                    break
+            if len(selected) < count:
+                return []
+            for key, deleted_region_id in selected.items():
+                if deleted_region_id is not None:
+                    del self._store[key]
+            return list(selected.items())
+
     def batch_pin_in(
         self, keys: list[str], region_ids: set[int]
     ) -> list[KVEntry | None]:

@@ -5,10 +5,10 @@ The pool node registers its mapped CXL regions; a worker registers its host
 staging buffer. Metadata bytes travel over the control channel (ZMQ), not
 through NIXL's own side channels, so the transport never opens sockets.
 
-A transfer that misses its deadline is not released: the NIC may still be
-moving bytes into or out of the buffers it names. :class:`TransferTimeout`
-carries a :class:`PendingTransfer` so the caller can keep those buffers out of
-circulation until :meth:`PendingTransfer.poll` reports that the transfer ended.
+A timed-out transfer or failed cancellation can leave the NIC accessing its
+buffers. :class:`TransferTimeout` and :class:`TransferUncertainError` carry a
+:class:`PendingTransfer` so the caller can retain those buffers until
+:meth:`PendingTransfer.poll` confirms handle release.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _default_agent(agent_name: str, ucx_device: str) -> Any:
 
 
 class PendingTransfer:
-    """A transfer that missed its deadline and still owns its buffers."""
+    """A transfer whose handle and buffers have not been released."""
 
     def __init__(self, transport: NixlTransport, op: str, peer: str, handle: Any):
         """Wrap a NIXL transfer handle that was not released.
@@ -85,23 +85,31 @@ class PendingTransfer:
         """Check whether the transfer has ended; release the handle if so.
 
         Returns:
-            True once NIXL reports the transfer done or failed. Its buffers
-            may then be reused. False while it is still in progress.
+            True only after NIXL releases the handle, confirming completion
+            or cancellation. False while progress or cleanup is uncertain.
         """
         if self.finished:
             return True
         try:
             state = self._transport.check_state(self._handle)
-        except Exception as exc:  # a broken agent cannot touch buffers again
+        except Exception as exc:
             logger.warning(
                 "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
             )
-            state = "ERR"
+            state = None  # Try cancellation; a failed query proves nothing.
         if state == "PROC":
             return False
-        self._transport.release_handle(self.op, self.peer, self._handle)
-        self.finished = True
-        return True
+        self.finished = self._transport.release_handle(self.op, self.peer, self._handle)
+        return self.finished
+
+
+class TransferUncertainError(RuntimeError):
+    """A transfer failed without confirmed cancellation; keep its buffers."""
+
+    def __init__(self, message: str, pending: PendingTransfer):
+        """Keep the unreleased handle available for polling and cleanup."""
+        super().__init__(message)
+        self.pending = pending
 
 
 class TransferTimeout(TimeoutError):  # noqa: N818 (mirrors TimeoutError)
@@ -145,6 +153,7 @@ class NixlTransport:
         self._agent = agent
         self._registrations: list[Any] = []
         self._peers: set[str] = set()
+        self._pending: dict[int, PendingTransfer] = {}
         self._lock = threading.Lock()
 
     def register(self, addr: int, nbytes: int, tag: str = "") -> Any:
@@ -175,8 +184,8 @@ class NixlTransport:
             handle: Value returned by :meth:`register`.
         """
         with self._lock:
-            self._registrations.remove(handle)
             self._agent.deregister_memory(handle)
+            self._registrations.remove(handle)
 
     def metadata(self) -> bytes:
         """Return current agent metadata (connection info + registered regions)."""
@@ -205,8 +214,10 @@ class NixlTransport:
             name: Peer name returned by :meth:`add_peer`.
         """
         with self._lock:
-            self._peers.discard(name)
+            if any(p.peer == name for p in self._pending.values()):
+                raise RuntimeError(f"NIXL peer {name} still has unreleased transfers")
             self._agent.remove_remote_agent(name)
+            self._peers.discard(name)
 
     def read(
         self,
@@ -227,7 +238,9 @@ class NixlTransport:
 
         Raises:
             TransferTimeout: if the transfer does not finish in time; the
-                local and remote buffers stay owned by ``exc.pending``.
+                caller must retain buffers until ``exc.pending.poll()`` succeeds.
+            TransferUncertainError: if completion or cleanup fails and handle
+                release cannot be confirmed; retain buffers as for timeout.
             RuntimeError: if the transfer ends in an error state.
         """
         return self._xfer("READ", peer, pairs, timeout_s)
@@ -251,7 +264,9 @@ class NixlTransport:
 
         Raises:
             TransferTimeout: if the transfer does not finish in time; the
-                local and remote buffers stay owned by ``exc.pending``.
+                caller must retain buffers until ``exc.pending.poll()`` succeeds.
+            TransferUncertainError: if completion or cleanup fails and handle
+                release cannot be confirmed; retain buffers as for timeout.
             RuntimeError: if the transfer ends in an error state.
         """
         return self._xfer("WRITE", peer, pairs, timeout_s)
@@ -268,35 +283,42 @@ class NixlTransport:
         with self._lock:
             return str(self._agent.check_xfer_state(handle))
 
-    def release_handle(self, op: str, peer: str, handle: Any) -> None:
-        """Release a transfer handle, logging a failure instead of raising.
+    def release_handle(self, op: str, peer: str, handle: Any) -> bool:
+        """Release a transfer handle; False keeps its buffers owned.
 
         Args:
             op: ``"READ"`` or ``"WRITE"``.
             peer: Peer name.
             handle: Handle from ``initialize_xfer``.
+
+        Returns:
+            True if NIXL confirmed release, False if cleanup must be retried.
         """
         try:
             with self._lock:
                 self._agent.release_xfer_handle(handle)
-        except Exception as exc:  # the caller's own outcome matters more
+                self._pending.pop(id(handle), None)
+            return True
+        except Exception as exc:
             logger.warning("releasing NIXL %s handle to %s failed: %s", op, peer, exc)
+            return False
 
     def close(self) -> None:
-        """Remove peers and deregister everything."""
+        """Remove peers and deregister memory after all handles are released.
+
+        Raises:
+            RuntimeError: if transfers still own buffers.
+            Exception: if NIXL cleanup fails. Keep the buffers alive and retry.
+        """
         with self._lock:  # snapshot only; each call below takes the lock itself
+            if self._pending:
+                raise RuntimeError("NIXL transfers still own registered memory")
             peers = list(self._peers)
             registrations = list(self._registrations)
         for name in peers:
-            try:
-                self.remove_peer(name)
-            except Exception as exc:  # keep tearing down the rest
-                logger.warning("removing NIXL peer %s failed: %s", name, exc)
+            self.remove_peer(name)
         for reg in registrations:
-            try:
-                self.deregister(reg)
-            except Exception as exc:
-                logger.warning("deregistering NIXL memory failed: %s", exc)
+            self.deregister(reg)
 
     def _xfer(
         self,
@@ -330,25 +352,36 @@ class NixlTransport:
                 [(ra, n, 0) for _la, ra, n in pairs], "DRAM"
             )
             handle = self._agent.initialize_xfer(op, local, remote, peer)
+            pending = PendingTransfer(self, op, peer, handle)
+            self._pending[id(handle)] = pending
         t0 = time.perf_counter()
-        release = True
         try:
             with self._lock:
                 state = self._agent.transfer(handle)
             deadline = t0 + timeout_s
             while state == "PROC":
                 if time.perf_counter() > deadline:
-                    release = False  # the NIC may still touch these buffers
                     raise TransferTimeout(
                         f"NIXL {op} to {peer} exceeded {timeout_s}s",
-                        PendingTransfer(self, op, peer, handle),
+                        pending,
                     )
                 time.sleep(_POLL_SLEEP_S)  # lock released: other threads may post
                 with self._lock:
                     state = self._agent.check_xfer_state(handle)
             if state != "DONE":
                 raise RuntimeError(f"NIXL {op} to {peer} ended in state {state}")
-            return time.perf_counter() - t0
-        finally:
-            if release:
-                self.release_handle(op, peer, handle)
+        except TransferTimeout:
+            raise
+        except Exception as exc:
+            if not self.release_handle(op, peer, handle):
+                raise TransferUncertainError(
+                    f"NIXL {op} to {peer} failed without confirmed cancellation",
+                    pending,
+                ) from exc
+            raise
+        if not self.release_handle(op, peer, handle):
+            raise TransferUncertainError(
+                f"NIXL {op} to {peer} completed but its handle is unreleased", pending
+            )
+        pending.finished = True
+        return time.perf_counter() - t0

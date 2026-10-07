@@ -1,10 +1,10 @@
 # Architecture Overview
 
-Maru manages KV cache data in CXL shared memory, enabling cross-instance sharing across multiple nodes without data transfer. This page describes nodes attached to the CXL device, which is what the default storage backend (`cxl`) uses. Nodes without CXL reach a pool node's CXL memory over RDMA through the remote CXL pool, the storage backend `remote` (see {ref}`Storage Backends <storage-backends>` below); it is unrelated to the control plane's Remote mode below.
+Maru stores reusable KV cache data in CXL shared memory, worker DRAM, or a remote CXL pool. With the default `cxl` backend, clients on CXL-attached nodes access mapped shared regions directly. With `remote`, workers transfer KV bytes between local staging buffers and a pool node's CXL memory over RDMA.
 
 ---
 
-## System Architecture
+## CXL System Architecture
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -81,7 +81,7 @@ The system has three layers:
 
 ## Key Design Properties
 
-**Zero-copy data path.** Clients access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead. The remote CXL pool keeps the separation across nodes: workers move KV bytes with one-sided RDMA between their staging buffer and the pool, so no server process copies them either.
+**Direct CXL access.** Clients using `cxl` read and write mapped shared memory without sending KV bytes through MaruServer. The control plane carries metadata and allocation requests. With `remote`, workers move KV bytes between staging buffers and the pool through one-sided RDMA; MaruServer still handles only metadata and allocation.
 
 **Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
 
@@ -129,7 +129,9 @@ flowchart LR
 (storage-backends)=
 ## Storage Backends
 
-`MaruConfig.storage_backend` decides where a handler keeps KV bytes. Everything above describes the default, `cxl`. The other backends keep the same `store`/`retrieve` API but hand out read leases instead of shared mappings: a read returns a view that the caller releases after copying it.
+`MaruConfig.storage_backend` selects where a handler keeps KV bytes. The `cxl` backend returns views into mapped shared memory. The `cpu`, `mixed`, and `remote` backends return read leases that the caller releases after its final copy.
+
+Storage backend and control-plane mode are separate settings. The control plane's **Remote mode** uses MaruServer and the resource manager over RPC; **Shared Filesystem mode** uses MaruFs. The `remote` storage backend requires a pool node running MaruServer.
 
 | Backend | Where KV bytes live | Who can read them | Data path |
 |---------|---------------------|-------------------|-----------|
@@ -139,8 +141,6 @@ flowchart LR
 | `remote` | A CXL pool on another node (the pool node) | Every engine that reaches the pool node over RDMA and uses the same cache namespace and model | One-sided RDMA (NIXL) between a local staging buffer and the pool |
 
 ### Remote CXL pool
-
-The name is unrelated to the **Remote mode** of the control plane above. Remote mode says how the control plane is built (MaruServer and the resource manager over RPC, as opposed to Shared Filesystem mode); the remote CXL pool is a storage backend, and its pool node runs a Remote mode MaruServer.
 
 The `remote` backend lets nodes without CXL share one node's CXL memory. Only the pool node has the CXL device. Its MaruServer opens a remote endpoint (`--remote-bind`) next to its usual RPC endpoint, and a component inside it, RemoteAccess, allocates remote regions from the resource manager, maps them and registers them with the node's RDMA NIC. A worker keeps the vLLM connector (`MaruKVConnector`) and its MaruHandler, configured with `storage_backend="remote"`; it opens no DAX device and runs no MaruServer of its own. The SGLang and LMCache adapters use the `cxl` backend only.
 
@@ -216,13 +216,15 @@ sequenceDiagram
     C->>H: release the leases (slots are reused)
 ```
 
-As on a CXL-attached node, data is written before its key is published, so other engines never observe a partial write. A pinned key is not evicted while a worker reads it. RemoteAccess records remote keys in MaruServer's own KV ledger, so remote state and the ledger start and end together with the MaruServer process. When the pool fills up, RemoteAccess evicts the least recently read remote keys; keys that local clients on the pool node store in their own regions are never evicted by it.
+Data is written before its key is published. A read ticket pins the key until release or expiry; after READ completes, the worker confirms that the ticket still held its pins before returning the bytes. An expired reservation or an unconfirmed WRITE keeps its page quarantined until the worker confirms completion or cancellation, or the pool successfully deregisters the region at shutdown. Elapsed time alone cannot make an RDMA destination safe to reuse.
+
+RemoteAccess records remote keys in MaruServer's own KV ledger, so remote state and the ledger start and end together with the MaruServer process. When the pool fills up, RemoteAccess evicts the least recently read remote keys only if enough unpinned pages can satisfy the whole reservation. Keys that local clients store in their own regions are never evicted by it.
 
 The pool's control channel is not authenticated, and its RDMA metadata exposes the registered regions, so run it only inside a trusted cluster network. For configuration and a runnable example, see [vLLM](../integration/vllm.md) and the [vLLM examples](../getting_started/examples/vllm/index.md).
 
 ---
 
-## Data Flow
+## CXL Data Flow
 
 ### Store
 
@@ -260,7 +262,7 @@ sequenceDiagram
     H-->>C: data
 ```
 
-These flows are those of the `cxl` backend; the remote CXL pool's flows are shown above. Every retrieve requires one metadata lookup via the control plane. Once a region is mapped, the mapping is cached for subsequent accesses to the same region — only the first access to a given region incurs the mmap cost.
+Each retrieve uses a metadata lookup through the control plane. The handler caches region mappings, so only the first access to a region incurs the mmap cost.
 
 ---
 

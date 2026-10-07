@@ -456,6 +456,27 @@ class MaruServer:
                 self._allocation_manager.decrement_kv_ref(region_to_deref)
         return result
 
+    def evict_kv_at(
+        self, locations: list[tuple[str, int, int]], count: int
+    ) -> list[tuple[str, bool]]:
+        """Reclaim count LRU locations atomically, or leave every key intact.
+
+        Args:
+            locations: (key, region_id, offset) candidates, oldest first.
+            count: Number of reclaimable pages required.
+
+        Returns:
+            (key, deleted) per reclaimed location. False means that key was
+            already absent or relocated. Empty when too few are unpinned.
+        """
+        with self._lock:
+            assert self._allocation_manager is not None
+            reclaimed = self._kv_manager.evict_at(locations, count)
+            for _, region_id in reclaimed:
+                if region_id is not None:
+                    self._allocation_manager.decrement_kv_ref(region_id)
+            return [(key, rid is not None) for key, rid in reclaimed]
+
     def batch_register_or_lookup(
         self, entries: list[tuple[str, int, int, int]]
     ) -> list[dict | None]:
@@ -808,7 +829,8 @@ def _add_remote_arguments(parser: argparse.ArgumentParser) -> None:
         "--remote-quarantine-ttl",
         type=float,
         default=600.0,
-        help="seconds a timed-out WRITE's pages stay unused if never abandoned",
+        help="seconds before warning about unconfirmed WRITE pages "
+        "(pages are retained until completion or pool shutdown, never TTL-freed)",
     )
 
 

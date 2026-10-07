@@ -278,10 +278,7 @@ class RemoteClient:
     def _forget_peer(self) -> None:
         """Drop the peer of a previous server generation (md lock held)."""
         assert self.transport is not None
-        try:
-            self.transport.remove_peer(self.peer)
-        except Exception as exc:  # a stale peer must not block the reconnect
-            logger.warning("removing stale NIXL peer %s failed: %s", self.peer, exc)
+        self.transport.remove_peer(self.peer)
         self.peer = ""
         self.md_version = -1
 

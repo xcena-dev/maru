@@ -40,6 +40,11 @@ from .remote_buffers import (
 
 logger = logging.getLogger(__name__)
 
+# Keep native memory owners alive if cleanup fails, including when callers
+# discard a handler after close raises. A successful close retry removes it.
+_RETAINED_BACKENDS: set[RemoteStorageClient] = set()
+_RETAINED_CONNECTIONS: list[tuple[Any, Any, Any]] = []
+
 _CREATED = "CREATED"
 _ALREADY_PRESENT = "ALREADY_PRESENT"
 # Period of the maintenance thread: one ping of its own probe client, then a
@@ -187,9 +192,13 @@ class RemoteStorageClient:
         """Release the staging buffer, the NIXL agent and the control socket.
 
         Raises:
-            RuntimeError: if read leases are still outstanding.
+            RuntimeError: if leases or transfers are outstanding. Retry close
+                after they finish; new operations are refused during shutdown.
+            Exception: if NIXL cleanup fails. Registered buffers stay alive.
         """
         with self._lock:
+            if self._closed:
+                return
             # New calls are refused from here; transfers in flight finish first,
             # since a load that finishes now hands out read leases.
             self._closing = True
@@ -199,30 +208,31 @@ class RemoteStorageClient:
                 raise RuntimeError(
                     "Release remote read leases before closing the handler"
                 )
+            _RETAINED_BACKENDS.add(self)
+            if not drained:
+                raise RuntimeError("Remote transfers still in flight; retry close")
+            self._reap_slots()
+            if any(q.slots for q in self._quarantine):
+                raise RuntimeError(
+                    "Quarantined remote transfers still in flight; retry close"
+                )
+            for q in self._quarantine:
+                if q.tickets:
+                    self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
+                    q.tickets = []
+            if self._transport is not None:
+                self._transport.close()  # failure must prevent staging teardown
+            with self._slot_lock:
+                if self._staging is not None:
+                    self._staging.close()
+            if self._client is not None:
+                self._client.close()
+            self._client = self._transport = self._staging = None
+            self._quarantine.clear()
             self._closed = True
             self.connected = False
             self._stop_maintainer.set()
-            for q in self._quarantine:
-                if q.pending.poll() and q.tickets:
-                    self._abandon_quietly(q.tickets)  # the WRITE ended: free its pages
-            self._quarantine.clear()
-            if not drained:
-                # A transfer still uses the agent and its slots: leave them open
-                # rather than free memory the NIC may still write.
-                logger.warning(
-                    "closing with %d remote transfer(s) still in flight; "
-                    "the NIXL agent and staging buffer are left open",
-                    self._xfers,
-                )
-            else:
-                if self._client is not None:
-                    self._client.close()
-                if self._transport is not None:
-                    self._transport.close()
-                with self._slot_lock:
-                    if self._staging is not None:
-                        self._staging.close()
-                    self._client = self._transport = self._staging = None
+            _RETAINED_BACKENDS.discard(self)
             self._stored.clear()
             self._rejected.clear()
             maintainer, self._maintainer = self._maintainer, None
@@ -456,7 +466,7 @@ class RemoteStorageClient:
         from maru_remote.client import RemoteTimeout, RemoteUnreachable
 
         probe = self._probe
-        if probe is None or not self.connected or self._closed:
+        if probe is None or not self.connected or self._closed or self._closing:
             return
         try:
             probe.connect()  # a ping: learns the generation and eviction count
@@ -477,11 +487,16 @@ class RemoteStorageClient:
             return  # a new server run is worth a reconnect; the old one is not yet
         if self._reconnect or restarted:
             with self._lock:
-                if self.connected and not self._closed:
+                if self.connected and not self._closed and not self._closing:
                     self._reconnect = True
                     self._retry_at = 0.0  # the server answered just now
-                    self._ready()
+                    if self._ready():
+                        self._reap()
             return
+        if self._quarantine:
+            with self._lock:
+                if not self._closed and not self._closing:
+                    self._reap()  # reclaim completed WRITEs even on an idle worker
         if self._staging is not None:
             with self._evict_lock:
                 self._sync_evictions(probe)
@@ -651,17 +666,16 @@ class RemoteStorageClient:
     @staticmethod
     def _discard(client: Any, transport: Any, staging: StagingBuffer | None) -> None:
         """Tear down a half-built connection."""
-        for close in (
-            client.close if client is not None else None,
-            transport.close if transport is not None else None,
-            staging.close if staging is not None else None,
-        ):
-            if close is None:
-                continue
-            try:
-                close()
-            except Exception as exc:
-                logger.warning("remote connect cleanup failed: %s", exc)
+        try:
+            if transport is not None:
+                transport.close()
+            if staging is not None:
+                staging.close()
+            if client is not None:
+                client.close()
+        except Exception as exc:
+            _RETAINED_CONNECTIONS.append((client, transport, staging))
+            logger.warning("remote connect cleanup failed; resources retained: %s", exc)
 
     def _client_id(self) -> str:
         return f"maru-{self.config.instance_id}"
@@ -679,7 +693,7 @@ class RemoteStorageClient:
             connect: Reconnect here when one is due; False reports the server
                 unavailable instead (for callers that must not wait).
         """
-        if self._clock() < self._retry_at:
+        if self._closed or self._closing or self._clock() < self._retry_at:
             return False
         if not self._reconnect:
             return True
@@ -688,6 +702,9 @@ class RemoteStorageClient:
         # Reconnecting replaces the NIXL peer; a transfer in flight still uses it.
         if self._xfers and not self._drain_transfers():
             return False
+        self._reap_slots()
+        if any(q.slots for q in self._quarantine):
+            return False  # the old peer still owns these transfers
         old = getattr(self._client, "generation", "")
         self._epoch += 1
         try:
@@ -770,7 +787,7 @@ class RemoteStorageClient:
         self, keys: list[str], handles: list[RemoteAllocation]
     ) -> list[bool]:
         """Reserve, WRITE and publish (lock held; slots are returned by the caller)."""
-        from maru_remote.transport import TransferTimeout
+        from maru_remote.transport import TransferTimeout, TransferUncertainError
 
         self._reap()
         if not self._ready(connect=False):
@@ -835,7 +852,7 @@ class RemoteStorageClient:
         epoch = self._epoch
         try:
             current = self._transfer("write", pairs)
-        except TransferTimeout as exc:
+        except (TransferTimeout, TransferUncertainError) as exc:
             self._isolate(exc.pending, [handles[i].slot for i in order], tickets)
             if self._epoch == epoch:  # a failure of the old connection is moot
                 self._trip_transfer(exc)
@@ -888,7 +905,7 @@ class RemoteStorageClient:
 
     def _retrieve_locked(self, keys: list[str]) -> list[RemoteReadLease | None]:
         """Lookup with protection, READ into staging, unpin (lock held)."""
-        from maru_remote.transport import TransferTimeout
+        from maru_remote.transport import TransferTimeout, TransferUncertainError
 
         assert self._staging is not None
         t0 = time.perf_counter()
@@ -937,13 +954,13 @@ class RemoteStorageClient:
         epoch = self._epoch
         try:
             current = self._transfer("read", pairs)
-        except TransferTimeout as exc:
+        except (TransferTimeout, TransferUncertainError) as exc:
             self._release_quietly(ticket_id)  # a late READ only lands in isolated slots
             self._isolate(exc.pending, slots, [])
             if self._epoch == epoch:
                 self._trip_transfer(exc)
             self.counters["loads_failed"] += 1
-            raise StorageUnavailableError("remote READ timed out") from exc
+            raise StorageUnavailableError("remote READ completion unconfirmed") from exc
         except Exception as exc:
             for s in slots:
                 self._staging.give(s)
@@ -953,7 +970,19 @@ class RemoteStorageClient:
             self.counters["loads_failed"] += 1
             raise StorageUnavailableError(f"remote READ failed: {exc}") from exc
         t2 = time.perf_counter()
-        self._release_quietly(ticket_id)  # the bytes are local now
+        try:
+            # A worker can pause longer than the read ticket's lifetime before
+            # posting READ. Reject bytes if the server already removed its pin.
+            if self._client.release(ticket_id) != len(found):
+                raise StorageUnavailableError("remote read protection expired")
+        except Exception as exc:
+            for s in slots:
+                self._staging.give(s)
+            self._fail(exc, "release")
+            self.counters["loads_failed"] += 1
+            raise StorageUnavailableError(
+                f"remote read protection could not be confirmed: {exc}"
+            ) from exc
         t3 = time.perf_counter()
         leases: list[RemoteReadLease | None] = [None] * len(keys)
         for s, i, n in zip(slots, found, lengths, strict=True):
@@ -1038,10 +1067,10 @@ class RemoteStorageClient:
         if tickets:
             try:
                 self._client.quarantine(tickets)
-            except Exception as exc:  # the pages stay reserved until their TTL
+            except Exception as exc:  # expiry also quarantines; never TTL-freed
                 logger.warning("remote quarantine request failed: %s", exc)
         logger.warning(
-            "remote %s timed out; isolating %d staging slots and %d pool pages",
+            "remote %s completion unconfirmed; isolating %d staging slots and %d pool pages",
             pending.op,
             len(slots),
             len(tickets),
@@ -1091,7 +1120,7 @@ class RemoteStorageClient:
     def _abandon_quietly(self, tickets: list[str]) -> None:
         try:
             self._client.abandon(tickets)
-        except Exception as exc:  # the reservations expire on the server
+        except Exception as exc:  # the server keeps them quarantined
             logger.debug("remote abandon failed: %s", exc)
 
     def _release_quietly(self, ticket_id: str) -> None:

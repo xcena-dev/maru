@@ -256,6 +256,14 @@ pool, including one another worker stored, is not written again. See the
 [remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
 for launch commands, failure behaviour and the trust model.
 
+An unconfirmed WRITE keeps both its staging slots and pool pages out of reuse
+until completion or cancellation is confirmed. Reservation expiry quarantines
+pages; `--remote-quarantine-ttl` sets a warning delay and does not reclaim them.
+A lost worker can retain pool capacity until successful pool shutdown.
+Reads whose protection expired are discarded and recomputed. Shutdown raises
+if transfers or failed NIXL cleanup still require registered memory to remain
+mapped; retry `close()` after resolving the failure.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:

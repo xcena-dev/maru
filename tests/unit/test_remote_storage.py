@@ -1107,7 +1107,13 @@ def test_close_leaves_the_agent_open_when_a_transfer_outlives_the_deadline(pool)
     started, release = threading.Event(), threading.Event()
     seen = {}
     _slow(transport, "write", started, release, seen)
-    transport.close = lambda: seen.update(closed=True)
+    real_close = transport.close
+
+    def close_agent():
+        seen["closed"] = True
+        real_close()
+
+    transport.close = close_agent
     a = h.alloc(10)
     a.buf[:] = b"s" * 10
     errors = []
@@ -1121,11 +1127,108 @@ def test_close_leaves_the_agent_open_when_a_transfer_outlives_the_deadline(pool)
     t = threading.Thread(target=store)
     t.start()
     assert started.wait(5)
-    h.close()  # waits about 1 s, then gives up on the WRITE
-    assert not seen.get("closed")  # the agent the WRITE uses stays open
-    release.set()
-    t.join(5)
+    try:
+        with pytest.raises(RuntimeError, match="in flight"):
+            h.close()  # waits about 1 s, then refuses to free the WRITE's buffers
+        assert not seen.get("closed")
+    finally:
+        release.set()
+        t.join(5)
     assert errors == []  # the store finishes without touching freed state
+    h.close()
+    assert seen.get("closed")
+
+
+def test_close_retains_staging_until_quarantined_transfer_finishes(pool):
+    h = remote_handler(pool.url)
+    storage = h._storage
+    staging, transport = storage._staging, storage._transport
+    agent = transport._agent
+    agent.stall = True
+    assert not _store(h, "slow", b"A" * 16)
+    assert storage._xfers == 0  # timed out, but NIXL still owns the memory
+    with patch.object(staging, "close") as unmap:
+        with pytest.raises(RuntimeError, match="Quarantined"):
+            h.close()
+        unmap.assert_not_called()
+        assert storage._staging is staging and agent.registered
+    assert agent.finish_stalled() == 1
+    h.close()
+    assert storage._staging is None and not agent.registered
+    assert pool.stats()["used_pages"] == 0
+
+
+def test_close_preserves_staging_after_failed_deregistration(pool):
+    h = remote_handler(pool.url)
+    storage = h._storage
+    staging, agent = storage._staging, storage._transport._agent
+    with (
+        patch.object(agent, "deregister_memory", side_effect=RuntimeError("busy")),
+        patch.object(staging, "close") as unmap,
+    ):
+        with pytest.raises(RuntimeError, match="busy"):
+            h.close()
+        unmap.assert_not_called()
+        assert storage._staging is staging and agent.registered
+    h.close()
+    assert storage._staging is None and not agent.registered
+
+
+def test_failed_query_and_cancel_isolate_slots_and_delay_reconnect(pool):
+    h = remote_handler(pool.url)
+    storage = h._storage
+    clock = FakeClock()
+    storage._clock = clock
+    agent = storage._transport._agent
+    agent.stall = True
+    with (
+        patch.object(agent, "check_xfer_state", side_effect=RuntimeError("query")),
+        patch.object(agent, "release_xfer_handle", side_effect=RuntimeError("cancel")),
+    ):
+        assert not _store(h, "uncertain", b"A" * 16)
+        assert h.get_stats()["remote_storage"]["quarantined_slots"] == 1
+        clock.advance(10)
+        with patch.object(agent, "remove_remote_agent") as remove:
+            assert not storage._ready()
+            remove.assert_not_called()
+    assert agent.finish_stalled() == 1
+    agent.stall = False
+    storage.maintain()
+    assert h.get_stats()["remote_storage"]["quarantined_slots"] == 0
+    assert pool.stats()["used_pages"] == 0
+    assert _store(h, "recovered", b"B" * 16)
+    (lease,) = h.batch_retrieve(["recovered"])
+    assert bytes(lease.view) == b"B" * 16
+    lease.release()
+    h.close()
+
+
+def test_expired_read_protection_rejects_reused_page_bytes(unused_port):
+    clock = FakeClock()
+    node = PoolNode(unused_port, capacity_bytes=PAGE, clock=clock)
+    node.start()
+    reader = remote_handler(node.url)
+    writer = remote_handler(node.url)
+    try:
+        assert _store(writer, "old", b"A" * 16)
+        real_read = reader._storage._transport.read
+        slots_before = reader._storage._staging.free_count()
+
+        def paused_read(peer, pairs, **kw):
+            clock.advance(121)
+            node.access.sweep()
+            assert _store(writer, "new", b"B" * 16)
+            return real_read(peer, pairs, **kw)
+
+        with patch.object(reader._storage._transport, "read", side_effect=paused_read):
+            with pytest.raises(StorageUnavailableError, match="protection"):
+                reader.batch_retrieve(["old"])
+        assert reader._storage._staging.free_count() == slots_before
+        assert reader._storage._reads == 0
+    finally:
+        reader.close()
+        writer.close()
+        node.stop()
 
 
 def test_close_refuses_when_a_load_in_flight_returns_leases(pool):

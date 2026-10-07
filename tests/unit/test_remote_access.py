@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from maru_remote.transport import NixlTransport, buffer_address
+from maru_remote.transport import NixlTransport, TransferTimeout, buffer_address
 from maru_server.kv_manager import DeleteResult
 from maru_server.remote_access import RemoteAccess
 from maru_server.server import MaruServer
@@ -183,14 +183,20 @@ def test_abandon_frees_reserved_pages(access):
     assert _used(access) == 1
 
 
-def test_expired_reservation_is_reclaimed_by_sweep(access, clock):
-    _reserve(access, PAGE)
+def test_expired_reservation_is_quarantined_by_sweep(access, clock):
+    pages = _reserve(access, PAGE)
     clock.advance(9.0)
     access.sweep()
     assert access.handle({"op": "stats"})["reservations"] == 1
     clock.advance(2.0)
     access.sweep()
     assert access.handle({"op": "stats"})["reservations"] == 0
+    assert access.handle({"op": "stats"})["quarantined"] == 1
+    assert _used(access) == 1
+    clock.advance(10000.0)
+    access.sweep()
+    assert _used(access) == 1
+    access.handle({"op": "abandon", "tickets": [pages[0]["ticket"]]})
     assert _used(access) == 0
 
 
@@ -209,13 +215,115 @@ def test_quarantined_pages_survive_expiry_until_abandoned(access, clock):
     assert _used(access) == 0
 
 
-def test_never_abandoned_quarantine_expires(access, clock):
+def test_never_abandoned_quarantine_stays_allocated(access, clock):
     pages = _reserve(access, PAGE)
     access.handle({"op": "quarantine", "tickets": [pages[0]["ticket"]]})
     clock.advance(601.0)
     access.sweep()
-    assert access.handle({"op": "stats"})["quarantined"] == 0
-    assert _used(access) == 0
+    assert access.handle({"op": "stats"})["quarantined"] == 1
+    assert _used(access) == 1
+
+
+@pytest.mark.parametrize("quarantine_delivered", [False, True])
+@pytest.mark.parametrize("posted", [False, True])
+def test_expiry_cannot_reuse_a_late_writers_page(
+    maru, worker, clock, quarantine_delivered, posted
+):
+    acc = _access(maru, pool_size=PAGE, capacity_bytes=PAGE, clock=clock)
+    peer = worker.add_peer(acc.handle({"op": "hello", "client_id": "w"})["nixl_md"])
+    (old,) = _reserve(acc, 16)
+    src = bytearray(b"A" * 16)
+    worker.register(buffer_address(src), len(src))
+    pairs = [(buffer_address(src), old["base"] + old["offset"], len(src))]
+    agent = FakeNixlAgent.registry["worker"]
+    pending = None
+    if posted:
+        agent.stall = True
+        with pytest.raises(TransferTimeout) as info:
+            worker.write(peer, pairs, timeout_s=0.001)
+        pending = info.value.pending
+    if quarantine_delivered:
+        acc.handle({"op": "quarantine", "tickets": [old["ticket"]]})
+    # Lost quarantine RPC, or delivered quarantine: neither timeout revokes MR.
+    for _ in range(2):
+        clock.advance(10000)
+        acc.sweep()
+        reply = acc.handle({"op": "reserve", "client_id": "w2", "sizes": [16]})
+        assert reply["code"] == "POOL_FULL"
+        assert _used(acc) == 1
+    if posted:
+        assert agent.finish_stalled() == 1
+        assert pending.poll()
+        agent.stall = False
+    else:
+        worker.write(peer, pairs)  # resumes with a still-valid old descriptor
+    assert not _publish(acc, (old["ticket"], "expired"))["ok"]
+    acc.handle({"op": "abandon", "tickets": [old["ticket"]]})
+    (new,) = _reserve(acc, 16)
+    assert (new["base"], new["offset"]) == (old["base"], old["offset"])
+    _write_remote(worker, peer, new, b"B" * 16)
+    assert _publish(acc, (new["ticket"], "new-key"))["ok"]
+    entry = acc.handle(
+        {"op": "lookup", "keys": ["new-key"], "ticket_id": "r", "protect": False}
+    )["entries"][0]
+    assert _read_remote(worker, peer, entry) == b"B" * 16
+    worker.close()
+    acc.close()
+
+
+@pytest.mark.parametrize("limit", ["logical", "pinned", "physical"])
+def test_failed_batch_reservation_preserves_cached_keys(maru, limit):
+    acc = _access(
+        maru,
+        pool_size=2 * PAGE,
+        capacity_bytes=2 * PAGE if limit != "physical" else None,
+    )
+    _fill(acc, "a", "b")
+    if limit == "pinned":
+        acc.handle({"op": "lookup", "keys": ["b"], "ticket_id": "r", "protect": True})
+    with patch.object(maru, "request_alloc", return_value=None):
+        reply = acc.handle(
+            {
+                "op": "reserve",
+                "client_id": "w",
+                "sizes": [16] * (2 if limit == "pinned" else 3),
+            }
+        )
+    assert reply["code"] == "POOL_FULL"
+    assert acc.handle({"op": "exists", "keys": ["a", "b"]})["found"] == [True, True]
+    assert acc.handle({"op": "stats"})["evicted"] == 0
+    acc.close()
+
+
+def test_pool_deregistration_failure_preserves_mappings(access, maru):
+    agent = FakeNixlAgent.registry["pool"]
+    with (
+        patch.object(agent, "deregister_memory", side_effect=RuntimeError("busy")),
+        patch.object(access._mapper, "close") as unmap,
+    ):
+        with pytest.raises(RuntimeError, match="busy"):
+            access.close()
+        unmap.assert_not_called()
+        assert maru.get_stats()["allocation_manager"]["num_allocations"] == 1
+    access.close()
+    assert not agent.registered
+    assert maru.get_stats()["allocation_manager"]["num_allocations"] == 0
+
+
+def test_failed_region_setup_does_not_unmap_registered_memory(access, maru):
+    agent = FakeNixlAgent.registry["pool"]
+    with (
+        patch.object(access._owned, "add_region", side_effect=RuntimeError("setup")),
+        patch.object(agent, "deregister_memory", side_effect=RuntimeError("busy")),
+        patch.object(access._mapper, "unmap_region") as unmap,
+    ):
+        with pytest.raises(RuntimeError, match="setup"):
+            access._add_region()
+        unmap.assert_not_called()
+        assert maru.get_stats()["allocation_manager"]["num_allocations"] == 2
+    access.close()
+    assert not agent.registered
+    assert maru.get_stats()["allocation_manager"]["num_allocations"] == 0
 
 
 def test_protected_key_refuses_delete_until_release(access, maru):

@@ -3,7 +3,12 @@
 
 import pytest
 
-from maru_remote.transport import NixlTransport, TransferTimeout, buffer_address
+from maru_remote.transport import (
+    NixlTransport,
+    TransferTimeout,
+    TransferUncertainError,
+    buffer_address,
+)
 from tests.unit.remote_fakes import FakeNixlAgent, reset_fake_agents
 
 
@@ -100,3 +105,67 @@ def test_close_removes_peers_and_registrations(pair):
     a.close()
     fake = FakeNixlAgent.registry["a"]
     assert fake.registered == [] and fake.peers == set()
+
+
+@pytest.mark.parametrize(
+    "failure", ["transfer", "check_xfer_state", "release_xfer_handle"]
+)
+def test_unconfirmed_failure_retains_handle_and_blocks_cleanup(
+    pair, monkeypatch, failure
+):
+    a, b, peer = pair
+    src, src_addr = _buf(16, 3)
+    remote, remote_addr = _buf(16)
+    a.register(src_addr, 16)
+    b.register(remote_addr, 16)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = failure != "release_xfer_handle"
+    original_post = fake.transfer
+
+    def post_then_raise(handle):
+        original_post(handle)
+        raise RuntimeError("post result unavailable")
+
+    def fail(*args):
+        raise RuntimeError("completion/cancellation unavailable")
+
+    with monkeypatch.context() as m:
+        if failure == "transfer":
+            m.setattr(fake, failure, post_then_raise)
+        elif failure == "check_xfer_state":
+            m.setattr(fake, failure, fail)
+        m.setattr(fake, "release_xfer_handle", fail)
+        with pytest.raises(TransferUncertainError) as info:
+            a.write(peer, [(src_addr, remote_addr, 16)])
+        pending = info.value.pending
+        # Even a failed query followed by failed cancellation proves nothing.
+        m.setattr(fake, "check_xfer_state", fail)
+        assert pending.poll() is False and not pending.finished
+        with pytest.raises(RuntimeError, match="transfers"):
+            a.close()
+        with pytest.raises(RuntimeError, match="transfers"):
+            a.remove_peer(peer)
+        assert fake.registered and peer in fake.peers
+    fake.finish_stalled()
+    assert remote == src
+    assert pending.poll()
+    a.close()
+    assert fake.registered == []
+
+
+def test_deregistration_failure_is_retryable(pair, monkeypatch):
+    a, b, peer = pair
+    src, src_addr = _buf(16)
+    a.register(src_addr, len(src))
+    fake = FakeNixlAgent.registry["a"]
+
+    def fail(reg):
+        raise RuntimeError("deregistration failed")
+
+    with monkeypatch.context() as m:
+        m.setattr(fake, "deregister_memory", fail)
+        with pytest.raises(RuntimeError, match="deregistration"):
+            a.close()
+        assert fake.registered
+    a.close()
+    assert fake.registered == []
