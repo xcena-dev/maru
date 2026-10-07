@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -23,6 +24,13 @@ if TYPE_CHECKING:
     from .remote_access import RemoteAccess
 
 logger = logging.getLogger(__name__)
+
+#: Default client lease TTL in seconds. Clients renew every quarter of it.
+DEFAULT_CLIENT_LEASE_TTL = 30.0
+
+#: Ended (expired or released) lease ids remembered, so a late renewal is
+#: told the lease is over instead of starting it again.
+_MAX_ENDED_LEASES = 4096
 
 
 class MaruServer:
@@ -41,7 +49,11 @@ class MaruServer:
         enable_cxl: bool = True,
         cpu_capacity_limit: int = 64 * 1024**3,
         cpu_session_ttl: float = 30,
+        client_lease_ttl: float = DEFAULT_CLIENT_LEASE_TTL,
+        clock: Callable[[], float] = time.monotonic,
     ):
+        if client_lease_ttl < 0:
+            raise ValueError("client_lease_ttl must be >= 0 (0 disables leases)")
         self._rm_address = rm_address or "127.0.0.1:9850"
         self._dax_paths = dax_paths
         from .replica_directory import ReplicaDirectory
@@ -55,6 +67,17 @@ class MaruServer:
         # Owners whose regions a server component (remote access) manages:
         # local RPC calls may not return those regions or delete their keys.
         self._managed_owners: set[str] = set()
+        # Client leases: a client that renews a lease gets the regions it
+        # allocates under that lease reclaimed when it stops renewing (for
+        # example, a process killed before close()). Clients that never
+        # renew a lease keep the previous behaviour.
+        self._client_lease_ttl = client_lease_ttl
+        self._clock = clock
+        self._leases: dict[str, tuple[str, float]] = {}  # lease -> (owner, deadline)
+        self._ended_leases: OrderedDict[str, None] = OrderedDict()
+        self._last_lease_activity = clock()
+        # Regions of expired leases; registrations into them are refused.
+        self._reaped_regions: set[int] = set()
         self.replica_directory = ReplicaDirectory(
             cpu_capacity_limit,
             cpu_session_ttl,
@@ -128,24 +151,37 @@ class MaruServer:
         *,
         legacy_visible: bool = True,
         managed: bool = False,
+        lease_id: str = "",
     ) -> MaruHandle | None:
         """Handle allocation request from client.
 
         When ``--dax-path`` is configured, iterates over the server's
         dax_path list (fill-first fallback). Otherwise uses any available pool.
         ``managed`` marks a call from the component that owns ``instance_id``.
+        Expired client leases are reclaimed first so their space is usable,
+        and a request under an expired lease is refused.
         """
         if self._allocation_manager is None:
             return None
         if instance_id in self._managed_owners and not managed:
             logger.warning("Refused allocation under managed owner %s", instance_id)
             return None
+        self.reap_expired_leases()
+        if lease_id:
+            with self._lock:
+                if lease_id in self._ended_leases:
+                    logger.warning(
+                        "Refused allocation for %s: lease %s expired",
+                        instance_id,
+                        lease_id,
+                    )
+                    return None
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
             if legacy_visible:
                 handle = self._allocation_manager.allocate(
-                    instance_id, size, dax_path=path
+                    instance_id, size, dax_path=path, lease_id=lease_id
                 )
             else:
                 handle = self._allocation_manager.allocate(
@@ -162,6 +198,9 @@ class MaruServer:
                     path or "(any)",
                     handle.region_id,
                 )
+                with self._lock:
+                    # The resource manager may reuse a reclaimed region id.
+                    self._reaped_regions.discard(handle.region_id)
                 return handle
             logger.debug(
                 "Pool %s refused allocation for %s (%d bytes)",
@@ -198,6 +237,125 @@ class MaruServer:
             return []
         return self._allocation_manager.list_allocations(exclude_instance_id)
 
+    # =========================================================================
+    # Client Leases
+    # =========================================================================
+
+    @property
+    def client_lease_ttl(self) -> float:
+        """Client lease TTL in seconds (0 when leases are disabled)."""
+        return self._client_lease_ttl
+
+    def renew_lease(
+        self, instance_id: str, lease_id: str, release: bool = False
+    ) -> dict:
+        """Renew a client lease, starting it on first use.
+
+        Args:
+            instance_id: Client instance identifier that owns the lease.
+            lease_id: Lease identifier, unique per client connection.
+            release: End the lease instead; sent by a clean ``close()`` after
+                it returned its regions.
+
+        Returns:
+            ``lease_ttl`` and ``lease_expired`` (True when the lease already
+            expired and its regions were reclaimed). An empty dict, the plain
+            heartbeat reply, when leases are disabled or no lease is named.
+        """
+        if not self._client_lease_ttl or not instance_id or not lease_id:
+            return {}
+        with self._lock:
+            now = self._observe_lease_time()
+            if lease_id in self._ended_leases:
+                return {"lease_ttl": self._client_lease_ttl, "lease_expired": True}
+            if release:
+                if self._leases.pop(lease_id, None) is not None:
+                    logger.info("Client %s ended lease %s", instance_id, lease_id)
+                # A renewal that arrives after the release must not reopen it.
+                self._remember_ended_lease(lease_id)
+                return {"lease_ttl": self._client_lease_ttl, "lease_expired": False}
+            if lease_id not in self._leases:
+                logger.info("Client %s started lease %s", instance_id, lease_id)
+            # Credit this renewal before reaping, so a renewal that waited in
+            # the server's queue never expires its own lease.
+            self._leases[lease_id] = (instance_id, now + self._client_lease_ttl)
+            self._reap_expired_leases(now)
+        return {"lease_ttl": self._client_lease_ttl, "lease_expired": False}
+
+    def reap_expired_leases(self) -> None:
+        """Reclaim the regions of client leases that were not renewed in time.
+
+        Runs on lease renewals and allocation requests, so space held by a
+        client that exited without ``close()`` is reclaimed before another
+        client needs it.
+        """
+        if not self._client_lease_ttl or self._allocation_manager is None:
+            return
+        with self._lock:
+            self._reap_expired_leases(self._observe_lease_time())
+
+    def _observe_lease_time(self) -> float:
+        """Return now, first extending every lease across a server stall.
+
+        Live clients renew every quarter of the TTL, so while any client is
+        alive the server sees lease activity at least that often. A gap over
+        half the TTL means the server itself was not processing requests (a
+        long request holding the lock, a paused process), or no leased
+        client was alive. Renewals may have queued during the gap, so the
+        part of it beyond half the TTL does not count as lease time.
+
+        This keeps a live lease: its last renewal was processed at most a
+        quarter TTL before the gap began, so after the shift its deadline is
+        still at least a quarter TTL ahead. Dead leases still advance by
+        half the TTL per gap, so they expire at most half a TTL after the
+        server becomes active again. Caller holds ``_lock``.
+        """
+        now = self._clock()
+        gap = now - self._last_lease_activity
+        stalled = gap - self._client_lease_ttl / 2
+        if self._leases and stalled > 0:
+            self._leases = {
+                lease_id: (owner, deadline + stalled)
+                for lease_id, (owner, deadline) in self._leases.items()
+            }
+            logger.info(
+                "No lease activity for %.1f s; extended %d lease(s) by %.1f s",
+                gap,
+                len(self._leases),
+                stalled,
+            )
+        self._last_lease_activity = now
+        return now
+
+    def _reap_expired_leases(self, now: float) -> None:
+        """Expire leases whose deadline passed. Caller holds ``_lock``."""
+        if self._allocation_manager is None:
+            return
+        expired = [
+            (lease_id, owner)
+            for lease_id, (owner, deadline) in self._leases.items()
+            if deadline <= now
+        ]
+        for lease_id, owner in expired:
+            del self._leases[lease_id]
+            self._remember_ended_lease(lease_id)
+            regions = self._allocation_manager.disconnect_lease(owner, lease_id)
+            self._reaped_regions.update(regions)
+            logger.warning(
+                "Client %s lease %s expired (no renewal for %.0f s); "
+                "reclaimed %d region(s)",
+                owner,
+                lease_id,
+                self._client_lease_ttl,
+                len(regions),
+            )
+
+    def _remember_ended_lease(self, lease_id: str) -> None:
+        """Remember an expired or released lease. Caller holds ``_lock``."""
+        self._ended_leases[lease_id] = None
+        while len(self._ended_leases) > _MAX_ENDED_LEASES:
+            self._ended_leases.popitem(last=False)
+
     def client_disconnected(self, instance_id: str) -> None:
         """Handle client disconnection."""
         if self._allocation_manager is None:
@@ -216,6 +374,13 @@ class MaruServer:
         if self._allocation_manager is None:
             return False
         with self._lock:
+            if region_id in self._reaped_regions:
+                logger.warning(
+                    "Refused KV %s: region %d belongs to an expired lease",
+                    key,
+                    region_id,
+                )
+                return False
             is_new, alloc_to_ref = self._kv_manager.register(
                 key, region_id, kv_offset, kv_length
             )
@@ -360,6 +525,14 @@ class MaruServer:
         with self._lock:
             results = []
             for key, region_id, kv_offset, kv_length in entries:
+                if region_id in self._reaped_regions:
+                    logger.warning(
+                        "Refused KV %s: region %d belongs to an expired lease",
+                        key,
+                        region_id,
+                    )
+                    results.append(False)
+                    continue
                 is_new, alloc_to_ref = self._kv_manager.register(
                     key, region_id, kv_offset, kv_length
                 )
@@ -795,8 +968,20 @@ def main() -> None:
         default=64 * 1024**3,
         help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
     )
+    parser.add_argument(
+        "--client-lease-ttl",
+        type=float,
+        default=DEFAULT_CLIENT_LEASE_TTL,
+        help=(
+            "Seconds a client may go without renewing its lease before the "
+            "regions it allocated are reclaimed; 0 disables leases "
+            f"(default: {DEFAULT_CLIENT_LEASE_TTL:g})"
+        ),
+    )
     _add_remote_arguments(parser)
     args = parser.parse_args()
+    if args.client_lease_ttl < 0:
+        parser.error("--client-lease-ttl must be >= 0")
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
     if args.remote_bind:
@@ -815,6 +1000,7 @@ def main() -> None:
         dax_paths=args.dax_paths,
         enable_cxl=not args.cpu_only,
         cpu_capacity_limit=args.cpu_capacity_limit,
+        client_lease_ttl=args.client_lease_ttl,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
     remote: _RemoteEndpoint | None = None

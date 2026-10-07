@@ -153,7 +153,7 @@ Maru must handle the following failure and cleanup scenarios.
 | Concern | Strategy |
 |---------|----------|
 | **Normal shutdown** | Client calls `close()`: returns all owned regions via RPC, server decrements ref counts, immediate or deferred free |
-| **Client crash** | Resource Manager's reaper thread polls process liveness every 1 s; reclaims leaked allocations. Server's `disconnect_client()` marks regions as owner-disconnected |
+| **Client crash** | MaruServer allocates handler regions from the Resource Manager, so the Resource Manager's reaper (below) covers MaruServer, not the handler. The handler's client lease stops being renewed; after `--client-lease-ttl` (default 30 s) the server marks the regions allocated under that lease as owner-disconnected, and deferred freeing returns them |
 | **Stale metadata** | Server holds KV entries pointing to deferred regions until last ref is removed; then region is freed |
 | **PID reuse defense** | Reaper caches process start time; detects recycled PIDs by comparing current vs cached start time |
 | **Crash recovery** | Resource Manager replays write-ahead log on restart to reconstruct allocation state |

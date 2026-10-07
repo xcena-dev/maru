@@ -167,6 +167,8 @@ class RequestAllocRequest:
 
     instance_id: str
     size: int
+    # Lease that owns the region; empty for clients without a lease.
+    lease_id: str = ""
 
 
 @dataclass
@@ -499,16 +501,26 @@ class GetUsageResponse:
 
 @dataclass
 class HeartbeatRequest:
-    """HEARTBEAT (0xF1) - Connection keepalive."""
+    """HEARTBEAT (0xF1) - Connection keepalive and client lease renewal.
 
-    pass
+    A request that names a lease renews it. Regions allocated under a lease
+    are reclaimed when the lease is not renewed within the server's TTL.
+    """
+
+    instance_id: str = ""
+    lease_id: str = ""
+    # End the lease (clean close, after the client returned its regions).
+    lease_release: bool = False
 
 
 @dataclass
 class HeartbeatResponse:
     """Response for HEARTBEAT."""
 
-    pass
+    # Lease TTL in seconds; 0 when the server does not keep client leases.
+    lease_ttl: float = 0.0
+    # True when the named lease already expired and its regions were reclaimed.
+    lease_expired: bool = False
 
 
 @dataclass

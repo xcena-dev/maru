@@ -105,20 +105,23 @@ class RpcClientBase(abc.ABC):
     # Allocation Management
     # =========================================================================
 
-    def request_alloc(self, instance_id: str, size: int) -> RequestAllocResponse:
+    def request_alloc(
+        self, instance_id: str, size: int, lease_id: str = ""
+    ) -> RequestAllocResponse:
         """Request a new memory allocation.
 
         Args:
             instance_id: Client instance identifier
             size: Requested size in bytes
+            lease_id: Client lease that owns the region ("" for none)
 
         Returns:
             RequestAllocResponse with handle on success
         """
-        response = self._send_request(
-            MessageType.REQUEST_ALLOC,
-            {"instance_id": instance_id, "size": size},
-        )
+        data: dict[str, Any] = {"instance_id": instance_id, "size": size}
+        if lease_id:
+            data["lease_id"] = lease_id
+        response = self._send_request(MessageType.REQUEST_ALLOC, data)
         return self._parse_request_alloc(response)
 
     def list_allocations(
@@ -386,6 +389,26 @@ class RpcClientBase(abc.ABC):
         """
         response = self._send_request(MessageType.HEARTBEAT, {})
         return "error" not in response
+
+    def renew_lease(
+        self, instance_id: str, lease_id: str, release: bool = False
+    ) -> dict:
+        """Renew this client's lease on the server.
+
+        Args:
+            instance_id: Client instance identifier
+            lease_id: Lease identifier, unique per connection
+            release: End the lease instead (clean close)
+
+        Returns:
+            Server response: ``lease_ttl`` (0 when the server keeps no leases)
+            and ``lease_expired``. A server without lease support returns an
+            empty dict.
+        """
+        data: dict[str, Any] = {"instance_id": instance_id, "lease_id": lease_id}
+        if release:
+            data["lease_release"] = True
+        return self._send_request(MessageType.HEARTBEAT, data)
 
     def handshake(self) -> dict:
         """Perform handshake with server. Returns server config (rm_address, etc.)."""
