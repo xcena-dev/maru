@@ -988,6 +988,64 @@ class TestMaruHandlerCoverage:
 
         handler.close()
 
+    def test_batch_store_lost_register_race_frees_page(self):
+        """A key another client registers between the existence check and the
+        register RPC comes back False from the server. batch_store must release
+        that page and report the key as stored, exactly as store() does."""
+        handler = _make_mock_handler()
+
+        batch_exists_resp = MagicMock()
+        batch_exists_resp.results = [False, False]
+        handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
+
+        batch_resp = MagicMock()
+        batch_resp.success = True
+        batch_resp.results = [False, True]  # key 1 lost the race, key 2 is new
+        handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
+
+        h1 = handler.alloc(size=2)
+        h1.buf[:2] = b"d1"
+        h2 = handler.alloc(size=2)
+        h2.buf[:2] = b"d2"
+        results = handler.batch_store(keys=["1", "2"], handles=[h1, h2])
+
+        assert results == [True, True]
+        assert "1" not in handler._key_to_location
+        assert "2" in handler._key_to_location
+        # Key 1's page went back to the pool; only key 2's page stays allocated.
+        assert handler._owned.get_stats()["total_allocated_pages"] == 1
+
+        handler.close()
+
+    def test_batch_store_missing_register_result_keeps_page(self):
+        """A key with no entry in the register response may or may not be
+        registered on the server. batch_store must report it as failed without
+        tracking it, and must keep its page, which the server may reference."""
+        handler = _make_mock_handler()
+
+        batch_exists_resp = MagicMock()
+        batch_exists_resp.results = [False, False]
+        handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
+
+        batch_resp = MagicMock()
+        batch_resp.success = True
+        batch_resp.results = [True]  # no result for key 2
+        handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
+
+        h1 = handler.alloc(size=2)
+        h1.buf[:2] = b"d1"
+        h2 = handler.alloc(size=2)
+        h2.buf[:2] = b"d2"
+        results = handler.batch_store(keys=["1", "2"], handles=[h1, h2])
+
+        assert results == [True, False]
+        assert "1" in handler._key_to_location
+        assert "2" not in handler._key_to_location
+        # Neither page went back to the pool.
+        assert handler._owned.get_stats()["total_allocated_pages"] == 2
+
+        handler.close()
+
     # =================================================================
     # batch_exists() happy path
     # =================================================================
@@ -1264,6 +1322,12 @@ class TestMaruHandlerDuplicateSkip:
         batch_exists_resp.results = [True, False]
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
 
+        # Only key 2 reaches the register RPC
+        batch_resp = MagicMock()
+        batch_resp.success = True
+        batch_resp.results = [True]
+        handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
+
         h1 = handler.alloc(size=5)
         h1.buf[:5] = b"data1"
         h2 = handler.alloc(size=5)
@@ -1282,6 +1346,11 @@ class TestMaruHandlerDuplicateSkip:
         handler = _make_mock_handler()
 
         handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
+
+        batch_resp = MagicMock()
+        batch_resp.success = True
+        batch_resp.results = [True]
+        handler._rpc.batch_register_kv = MagicMock(return_value=batch_resp)
 
         h = handler.alloc(size=4)
         h.buf[:4] = b"data"
