@@ -4348,6 +4348,39 @@ class TestDeferredAdmissionFitsCache:
         assert sched.get_num_new_matched_tokens(big, 0)[0] is None  # mid first
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
 
+    def test_waiter_is_not_looked_up_again_until_it_fits(self):
+        sched = self._sched()
+        chunks = dict(self.PROMPTS.values())
+        lookups = []
+
+        def count(ids):
+            lookups.append(len(ids))
+            return chunks[len(ids)]
+
+        sched._count_matched_chunks = count
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        lookups.clear()
+        for _ in range(3):  # vLLM asks again every step
+            assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
+        assert lookups == []
+        sched.build_connector_meta(self._finished("big"))
+        assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
+        assert lookups == [100]
+
+    def test_waiter_whose_prefix_is_gone_computes_once_it_fits(self):
+        sched = self._sched()
+        big, mid = self._request("big"), self._request("mid")
+        self._park(sched, big)
+        assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
+        sched._count_matched_chunks = lambda ids: 0  # evicted while it waited
+        # The budget still has no room: mid keeps waiting without a lookup.
+        assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
+        sched.build_connector_meta(self._finished("big"))
+        assert sched.get_num_new_matched_tokens(mid, 0) == (0, False)
+        assert "mid" not in sched._admission_waiters
+
     @staticmethod
     def _finished(req_id):
         output = fake_scheduler_output()
