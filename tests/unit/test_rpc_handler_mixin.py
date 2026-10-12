@@ -62,7 +62,7 @@ class TestRpcHandlerMixin:
         monkeypatch.setattr(
             server._allocation_manager,
             "allocate",
-            lambda *args, **kwargs: None,
+            lambda instance_id, size, dax_path="": None,
         )
         req = MockRequest(instance_id="inst1", size=4096, dax_path="")
         resp = handler._handle_request_alloc(req)
