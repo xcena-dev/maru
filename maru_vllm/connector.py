@@ -836,7 +836,10 @@ class MaruKVConnector(KVConnectorBase_V1):
             nor the copy ever blocks the engine's forward passes — the
             in-process analog of the MP server's separate-process retrieve.
             This is what vLLM itself calls an async load
-            (get_num_new_matched_tokens returns async_load=True).
+            (get_num_new_matched_tokens returns async_load=True). A request
+            parks only while the whole prompts of all parked requests fit in
+            the GPU KV cache (the first in line always parks); otherwise it
+            waits in WAITING for its turn.
             (default: false; was maru_enable_deferred_loading)
         maru_async_store: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
@@ -1313,6 +1316,12 @@ class MaruSchedulerConnector:
         # vLLM asks only about a request that holds no parked blocks. One
         # still on record had its load fail and its blocks freed.
         self._parked_blocks.pop(request.request_id, None)
+        # vLLM asks a waiting request again every step. Until the budget has
+        # room for it, answer from the budget alone: no lookup, no hit log.
+        if request.request_id in self._admission_waiters and not self._admit_parked(
+            request
+        ):
+            return None, False
         matched, load_async = self._match(request, num_computed_tokens)
         if load_async and not self._admit_parked(request):
             self._last_match_result.pop(request.request_id, None)

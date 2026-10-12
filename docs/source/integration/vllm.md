@@ -330,6 +330,14 @@ through a CUDA event. The forward pass no longer waits on the retrieve RPC.
 This is the mechanism vLLM itself calls an asynchronous load: the request
 waits in `WAITING_FOR_REMOTE_KVS`.
 
+A parked request holds GPU blocks for its loaded prefix and runs once its
+whole prompt fits, so Maru parks a request only while the whole prompts of
+all parked requests fit in the GPU KV cache (the first request in line is
+always parked). A request that does not fit
+stays in `WAITING`, keeps its place ahead of later requests, and is parked
+once earlier loads finish. This budget counts GPU blocks;
+`maru_load_admission_window` below counts loads in flight.
+
 `maru_async_store` lets the store finish after the forward pass returns, so
 the first token of the current step is not delayed by the GPU→CXL copy and
 the metadata registration.
