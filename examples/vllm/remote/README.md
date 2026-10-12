@@ -119,9 +119,11 @@ when full. Workers skip storing keys they stored or read in the current server
 run. Every reply carries the server's eviction count; when it changes, a
 worker's load, store or maintenance thread asks which keys were evicted and
 forgets only those, so evicted prefixes are stored again. The maintenance
-thread pings the server once a second without blocking the engine or the
-scheduler; it stops calls when the server stops answering and reconnects once
-it answers. A store also asks which keys are present first and writes only the
+thread runs off the engine and scheduler paths. While calls succeed it sends
+no pings, because every reply already carries the server's run and eviction
+count; after a failed call it pings the server once a second and reconnects
+once it answers. A worker that skipped stores on keys it remembers, with no
+reply since, asks the server once in the next round. A store also asks which keys are present first and writes only the
 missing ones.
 
 ### 2. Worker nodes
@@ -259,9 +261,9 @@ starting that node's process.
   start-up generation;
   the server refuses requests addressed to an earlier run without executing
   them. On a change the worker reloads the pool's NIXL metadata, forgets which
-  keys it stored and retries the call once. The maintenance thread's ping
-  every second also reports the run, so an idle worker notices a restart
-  within about a second.
+  keys it stored and retries the call once. An idle worker notices a restart
+  at its next call, or within about a second if it skipped a store on keys it
+  remembers.
 - **Local clients on the pool node.** Keys that local Maru clients keep in
   their own regions are reported missing to remote workers, and a remote store
   of the same key is refused. Local clients cannot delete remote keys or return

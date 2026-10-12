@@ -48,13 +48,15 @@ class PoolNode:
     """A maru-server's remote access on its own endpoint thread.
 
     ``stop`` then ``start`` is a maru-server restart on the same port: a new
-    run with an empty ledger and a new generation.
+    run with an empty ledger and a new generation. ``ops`` lists the
+    operations the endpoint served, across restarts.
     """
 
     def __init__(self, port, ttl=10.0, **access_kw):
         self.access_kw = access_kw
         self.url = f"tcp://127.0.0.1:{port}"
         self.ttl = ttl
+        self.ops = []
         self.maru = None
         self.access = None
         self._stop = None
@@ -71,6 +73,13 @@ class PoolNode:
             reservation_ttl_s=self.ttl,
             **self.access_kw,
         )
+        handle = self.access.handle
+
+        def recorded(msg):
+            self.ops.append(msg.get("op"))
+            return handle(msg)
+
+        self.access.handle = recorded
         self._stop = threading.Event()
         ready = threading.Event()
         self._thread = threading.Thread(
@@ -259,11 +268,12 @@ def test_restart_is_detected_and_the_call_retried(pool):
     assert _store(h, "k", b"1")
     pool.stop()
     pool.start()
-    # The scheduler path reports misses and leaves the reconnect to the
-    # maintenance thread, which answers from the new run.
+    # The new run refuses the scheduler path's existence check, which reports
+    # misses and leaves the reconnect to the maintenance thread.
+    assert h.batch_exists(["k"]) == [False]
     h._storage.maintain()
-    assert h.batch_exists(["k"]) == [False]  # the new run starts empty
     assert not h.has_local("k")  # what this handler knew belongs to the old run
+    assert h.batch_exists(["k"]) == [False]  # the new run starts empty
     assert h.batch_retrieve(["k"]) == [None]
     assert _store(h, "k", b"1") is True  # stored again in the new run
     (lease,) = h.batch_retrieve(["k"])
@@ -479,17 +489,45 @@ def test_a_restart_refuses_old_run_requests_before_running_them(pool):
     h.close()
 
 
-def test_remembered_keys_are_revalidated_by_the_maintenance_thread(pool):
+def test_remembered_keys_are_forgotten_after_the_first_reply_from_a_new_run(pool):
     h = remote_handler(pool.url)
-    clock = FakeClock()
-    h._storage._clock = clock
-    h._storage._last_contact = clock()
     assert _store(h, "k", b"1") and h.has_local("k")
     pool.stop()
     pool.start()  # a new run that this handler has not talked to yet
     assert h.has_local("k")  # answered from memory: no call is made
-    h._storage.maintain()  # the maintenance thread's ping sees the new run
+    h._storage.maintain()  # a healthy round sends nothing, so the run is unknown
+    assert h.has_local("k") and "ping" not in pool.ops
+    assert h.batch_exists(["other"]) == [False]  # the new run refuses the call
+    h._storage.maintain()  # the reconnect is due: ping, reconnect, forget
     assert not h.has_local("k")
+    h.close()
+
+
+def test_a_healthy_backend_pings_only_while_calls_are_stopped(pool, monkeypatch):
+    import maru_handler.storage.remote as remote_mod
+
+    monkeypatch.setattr(remote_mod, "_MAINTAIN_INTERVAL_S", 0.02)
+    h = remote_handler(pool.url, retry_s=0.2)
+    assert _store(h, "k", b"1")
+    assert h.batch_exists(["k"]) == [True]
+    time.sleep(0.3)  # about 15 maintenance rounds while calls succeed
+    assert "ping" not in pool.ops
+    pool.stop()
+    assert h.batch_exists(["k"]) == [False]  # a control timeout stops calls
+    time.sleep(0.2)  # the maintenance thread pings the server that is down
+    pool.start()
+    deadline = time.monotonic() + 5.0
+    while (
+        h._storage._client.generation != pool.access.generation
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+    assert h._storage._client.generation == pool.access.generation
+    assert "ping" in pool.ops  # the reconnect followed an answered ping
+    assert _store(h, "k2", b"2")
+    pings = pool.ops.count("ping")
+    time.sleep(0.3)  # healthy again: no further pings
+    assert pool.ops.count("ping") == pings
     h.close()
 
 
@@ -759,6 +797,7 @@ def test_the_maintenance_thread_reconnects_after_an_outage(pool, monkeypatch):
 
 def test_existence_checks_do_not_wait_for_a_maintenance_probe(pool, monkeypatch):
     h = remote_handler(pool.url)
+    h._storage._reconnect = True  # a reconnect is due: the round pings
     probe = h._storage._probe
     started, release = threading.Event(), threading.Event()
 
@@ -796,21 +835,109 @@ def test_the_maintenance_thread_drops_keys_another_worker_evicted(unused_port):
         assert _store(a, "k1", b"1")
         assert _store(b, "k2", b"2")  # evicts k1
         assert a.has_local("k1")
-        a._storage.maintain()  # an idle worker learns of the eviction by probe
+        a._storage.maintain()  # nothing reported it yet: no call
+        assert a.has_local("k1")
+        # The existence check's reply reports the eviction; the scheduler
+        # path does not sync, the maintenance thread does.
+        assert a.batch_exists(["k2"]) == [True]
+        assert a.has_local("k1")
+        a._storage.maintain()
         assert not a.has_local("k1")
+        assert "ping" in node.ops  # the probe confirmed the run once
+        pings = node.ops.count("ping")
+        assert _store(b, "k3", b"3")  # evicts k2
+        assert a.batch_exists(["k3"]) == [True]
+        a._storage.maintain()  # the probe already asks this run: no ping
+        assert node.ops.count("ping") == pings
         a.close()
         b.close()
     finally:
         node.stop()
 
 
+def _evicting_pair(node):
+    """Two workers on a one-page pool: b's store of k2 evicts a's k1."""
+    a, b = (remote_handler(node.url, staging=4 * PAGE) for _ in range(2))
+    assert _store(a, "k1", b"1")
+    assert _store(b, "k2", b"2")  # evicts k1
+    assert a.batch_exists(["k2"]) == [True]  # the reply reports the eviction
+    return a, b
+
+
+@pytest.mark.parametrize("probe_knows_the_run", [False, True])
+def test_a_new_run_met_by_an_eviction_sync_reconnects_at_once(
+    unused_port, probe_knows_the_run
+):
+    node = PoolNode(unused_port, capacity_bytes=1 * PAGE)
+    node.start()
+    try:
+        a, b = _evicting_pair(node)
+        if probe_knows_the_run:  # its eviction query is refused by the new run
+            a._storage._probe.connect()
+        node.stop()
+        node.start()
+        a._storage.maintain()
+        assert a._storage._client.generation == node.access.generation
+        assert not a.has_local("k1")
+        pings = node.ops.count("ping")
+        for _ in range(3):
+            a._storage.maintain()  # reconnected: nothing more to ask
+        assert node.ops.count("ping") == pings
+        a.close()
+        b.close()
+    finally:
+        node.stop()
+
+
+def test_eviction_sync_timeouts_in_a_row_stop_calls(unused_port, monkeypatch):
+    from maru_remote.client import RemoteTimeout
+
+    node = PoolNode(unused_port, capacity_bytes=1 * PAGE)
+    node.start()
+    try:
+        a, b = _evicting_pair(node)
+
+        def timeout(since):
+            raise RemoteTimeout("t")
+
+        monkeypatch.setattr(a._storage._probe, "evicted_since", timeout)
+        a._storage.maintain()  # one slow reply is not an outage
+        assert a._storage._retry_at == 0.0
+        a._storage.maintain()  # the second in a row stops calls
+        assert a._storage._retry_at > 0.0
+        assert a.has_local("k1")  # the eviction is still to be applied
+        a.close()
+        b.close()
+    finally:
+        node.stop()
+
+
+def test_stores_skipped_on_remembered_keys_confirm_the_run_once(pool):
+    h = remote_handler(pool.url)
+    assert _store(h, "k", b"1")
+    h._storage.maintain()  # the store's replies confirmed the run
+    assert h.has_local("k")  # a store skipped on memory, then a reply
+    assert h.batch_exists(["x"]) == [False]
+    h._storage.maintain()  # confirmed by that reply: no ping
+    assert "ping" not in pool.ops
+    pool.stop()
+    pool.start()
+    assert h.has_local("k")  # skipped on memory, and the server stays silent
+    h._storage.maintain()  # asks once, meets the new run and reconnects
+    assert pool.ops.count("ping") == 1
+    assert h._storage._client.generation == pool.access.generation
+    assert not h.has_local("k")
+    h._storage.maintain()  # nothing used since: no further ping
+    assert pool.ops.count("ping") == 1
+    h.close()
+
+
 def test_a_server_that_returns_is_reconnected_before_the_retry_period_ends(pool):
     h = remote_handler(pool.url, retry_s=600.0)
     assert _store(h, "k", b"1")
     pool.stop()
-    h._storage.maintain()  # one failed probe: a slow server is not an outage
-    h._storage.maintain()  # the second in a row stops calls for the retry period
-    assert h.batch_exists(["k"]) == [False]
+    h._storage.maintain()  # calls succeeded so far: no probe
+    assert h.batch_exists(["k"]) == [False]  # a timeout stops calls for 600 s
     h._storage.maintain()  # still down: still stopped, no exception
     pool.start()
     h._storage.maintain()  # the server answers: reconnect at once
@@ -826,8 +953,7 @@ def test_loads_and_stores_leave_the_reconnect_to_the_maintenance_thread(pool):
     h._storage._clock = clock
     assert _store(h, "k", b"1")
     pool.stop()
-    h._storage.maintain()
-    h._storage.maintain()  # two failed probes in a row: calls stop
+    assert h.batch_exists(["k"]) == [False]  # a control timeout stops calls
     clock.advance(10.0)  # the retry period is over, the server still down
     t0 = time.monotonic()
     assert _store(h, "k2", b"2") is False
@@ -845,13 +971,19 @@ def test_an_error_reply_to_a_probe_does_not_stop_calls(pool, monkeypatch):
 
     h = remote_handler(pool.url)
     assert _store(h, "k", b"1")
+    h._storage._reconnect = True  # a reconnect is due: the rounds ping
+    probe = h._storage._probe
+    connect = probe.connect
 
     def error_reply():
         raise RemoteError("remote ping: busy")
 
-    monkeypatch.setattr(h._storage._probe, "connect", error_reply)
+    monkeypatch.setattr(probe, "connect", error_reply)
     for _ in range(3):
         h._storage.maintain()
+    assert h._storage._retry_at == 0.0  # an answering server is not an outage
+    monkeypatch.setattr(probe, "connect", connect)
+    h._storage.maintain()  # the next answer reconnects
     assert h.batch_exists(["k"]) == [True]
     h.close()
 
@@ -860,6 +992,7 @@ def test_only_timeouts_in_a_row_stop_calls(pool, monkeypatch):
     from maru_remote.client import RemoteError, RemoteTimeout
 
     h = remote_handler(pool.url)
+    h._storage._reconnect = True  # a reconnect is due: the rounds ping
     outcomes = iter(
         [
             RemoteTimeout("t"),

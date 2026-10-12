@@ -47,8 +47,12 @@ _RETAINED_CONNECTIONS: list[tuple[Any, Any, Any]] = []
 
 _CREATED = "CREATED"
 _ALREADY_PRESENT = "ALREADY_PRESENT"
-# Period of the maintenance thread: one ping of its own probe client, then a
-# reconnect (server restarted or back) or an eviction sync when needed.
+# Period of the maintenance thread. While calls are stopped or a reconnect is
+# due, a round pings the server with the probe client and reconnects once it
+# answers. Otherwise a round calls the server only to apply evictions a reply
+# reported, to confirm the server run when stores were skipped on remembered
+# keys with no reply since the last round, or to return the pages of ended
+# quarantined WRITEs.
 _MAINTAIN_INTERVAL_S = 1.0
 # Reply deadline of a probe ping (capped by the control timeout); a ping
 # needs well under a millisecond, so a short deadline detects outages fast.
@@ -127,6 +131,11 @@ class RemoteStorageClient:
         # forgotten on a restart.
         self._stored: set[str] = set()
         self._evictions_seen = 0
+        # True answers of has_local (engine thread only) and the main client's
+        # reply count, as of the last maintenance round.
+        self._hint_uses = 0
+        self._hint_uses_seen = 0
+        self._replies_seen = 0
         # Keys the server refused to publish, with the time to try them again.
         self._rejected: dict[str, float] = {}
         self._retry_at = 0.0
@@ -308,11 +317,17 @@ class RemoteStorageClient:
 
         Answers from memory and never calls the server, so the engine thread
         never waits on the network. The remembered keys belong to one server
-        run: the maintenance thread checks the run every round and forgets
-        them on a restart, and it or the next load or store drops the keys
-        the server evicted. Until then a remembered key may already be gone.
+        run: the first reply from a new run leads to a reconnect that forgets
+        them, and the next load or store, or the maintenance thread after
+        any reply, drops the keys the server reported evicted. A True answer
+        that no reply confirms before the next maintenance round makes that
+        round ask the server once. Until then a remembered key may already
+        be gone.
         """
-        return self.connected and key in self._stored
+        found = self.connected and key in self._stored
+        if found:
+            self._hint_uses += 1
+        return found
 
     def batch_store(
         self, keys: list[str], handles: list[RemoteAllocation]
@@ -457,24 +472,36 @@ class RemoteStorageClient:
         """One round of background upkeep, off the engine and scheduler paths.
 
         The only place that reconnects after an outage or a restart. Pings
-        the server with the probe client without holding the I/O lock, also
-        while calls are stopped: a failed ping keeps calls stopped, and the
-        first answer after an outage (or a changed server run) reconnects
-        right away under the I/O lock. Otherwise drops remembered keys the
-        server reported evicted.
+        the server only while calls are stopped or a reconnect is due: while
+        calls succeed, their replies carry the server run and the eviction
+        count, so a healthy round sends no ping. The ping runs on the probe
+        client without holding the I/O lock: a failed ping keeps calls
+        stopped, and the first answer after an outage (or from a changed
+        server run) reconnects right away under the I/O lock. A healthy
+        round returns the pages of ended quarantined WRITEs and keeps the
+        remembered keys true to the server (see :meth:`_update_hints`).
         """
         from maru_remote.client import RemoteTimeout, RemoteUnreachable
 
         probe = self._probe
         if probe is None or not self.connected or self._closed or self._closing:
             return
+        if not self._reconnect and self._clock() >= self._retry_at:
+            if self._quarantine:
+                with self._lock:
+                    if not self._closed and not self._closing:
+                        self._reap()  # reclaim completed WRITEs even on an idle worker
+            uses = self._hint_uses
+            replies = getattr(self._client, "replies", 0)
+            unconfirmed = uses != self._hint_uses_seen and replies == self._replies_seen
+            self._hint_uses_seen, self._replies_seen = uses, replies
+            if self._staging is not None:
+                self._update_hints(probe, ping=unconfirmed)
+            return
         try:
-            probe.connect()  # a ping: learns the generation and eviction count
+            probe.connect()  # a ping: learns the server run
         except (RemoteTimeout, RemoteUnreachable) as exc:
-            self._probe_failures += 1
-            stopped = self._clock() < self._retry_at
-            if stopped or self._probe_failures >= _PROBE_FAILURES_TO_STOP:
-                self._trip(exc)  # keep stopped, or stop after failures in a row
+            self._probe_timed_out(exc)
             return
         except Exception as exc:  # the server answered with an error
             self._probe_failures = 0
@@ -486,20 +513,62 @@ class RemoteStorageClient:
         if held and not restarted and self._clock() < self._retry_at:
             return  # a new server run is worth a reconnect; the old one is not yet
         if self._reconnect or restarted:
-            with self._lock:
-                if self.connected and not self._closed and not self._closing:
-                    self._reconnect = True
-                    self._retry_at = 0.0  # the server answered just now
-                    if self._ready():
-                        self._reap()
+            self._reconnect_now()
+
+    def _update_hints(self, probe: Any, ping: bool) -> None:
+        """Keep the remembered keys true to the server, on the probe client.
+
+        Calls the server only when needed: when a reply reported evictions
+        not applied yet (an existence check on the scheduler path does not
+        apply them itself), or with ``ping`` when stores were skipped on
+        remembered keys and no reply has confirmed the server run since the
+        last round. A probe that meets a new server run reconnects at once;
+        a timeout counts like a failed ping. Never holds the I/O lock, and
+        holds the eviction lock (which a reconnect waits for) only for the
+        eviction query.
+        """
+        from maru_remote.client import RemoteRestarted, RemoteTimeout, RemoteUnreachable
+
+        main = self._client
+        if not ping and getattr(main, "evictions", 0) == self._evictions_seen:
+            self._probe_failures = 0  # nothing to ask: a later failure counts afresh
             return
-        if self._quarantine:
-            with self._lock:
-                if not self._closed and not self._closing:
-                    self._reap()  # reclaim completed WRITEs even on an idle worker
-        if self._staging is not None:
+        try:
+            if ping or probe.generation != getattr(main, "generation", ""):
+                probe.connect()  # a ping: learns the run and its eviction count
             with self._evict_lock:
-                self._sync_evictions(probe)
+                same_run = probe.generation == getattr(main, "generation", "")
+                if same_run:
+                    evictions = max(getattr(main, "evictions", 0), probe.evictions)
+                    self._sync_evictions(probe, evictions)
+        except RemoteRestarted:
+            same_run = False  # the eviction query met a new server run
+        except (RemoteTimeout, RemoteUnreachable) as exc:
+            self._probe_timed_out(exc)
+            return
+        except Exception as exc:  # the server answered with an error
+            self._probe_failures = 0
+            logger.warning("remote eviction sync failed: %s", exc)
+            return
+        self._probe_failures = 0
+        if not same_run:
+            self._reconnect_now()  # forgets the remembered keys of the old run
+
+    def _probe_timed_out(self, exc: BaseException) -> None:
+        """Count a probe timeout; enough in a row, or one while stopped, stops calls."""
+        self._probe_failures += 1
+        stopped = self._clock() < self._retry_at
+        if stopped or self._probe_failures >= _PROBE_FAILURES_TO_STOP:
+            self._trip(exc)
+
+    def _reconnect_now(self) -> None:
+        """Reconnect under the I/O lock: the server answered just now."""
+        with self._lock:
+            if self.connected and not self._closed and not self._closing:
+                self._reconnect = True
+                self._retry_at = 0.0
+                if self._ready():
+                    self._reap()
 
     def _sync_from_io(self) -> None:
         """Eviction sync from a load or store (I/O lock held); never waits.
@@ -508,27 +577,26 @@ class RemoteStorageClient:
         """
         if self._evict_lock.acquire(blocking=False):
             try:
-                self._sync_evictions(self._client)
+                self._sync_evictions(
+                    self._client, getattr(self._client, "evictions", 0)
+                )
+            except Exception as exc:
+                self._fail(exc, "evicted_since")
             finally:
                 self._evict_lock.release()
 
-    def _sync_evictions(self, client: Any) -> None:
+    def _sync_evictions(self, client: Any, evictions: int) -> None:
         """Drop remembered keys the server has evicted (eviction lock held).
 
-        Costs a control call only when ``client``'s last reply reported new
-        evictions. If the server no longer lists all of them, every
-        remembered key is forgotten. A failed call leaves the keys for the
-        next attempt.
+        Costs a control call on ``client`` only when ``evictions``, the
+        count a reply reported, differs from the one already applied. If
+        the server no longer lists all of them, every remembered key is
+        forgotten. A failed call raises and leaves the keys for the next
+        attempt.
         """
-        evictions = getattr(client, "evictions", 0)
         if evictions == self._evictions_seen:
             return
-        try:
-            keys, complete = client.evicted_since(self._evictions_seen)
-        except Exception as exc:
-            if client is self._client:
-                self._fail(exc, "evicted_since")
-            return
+        keys, complete = client.evicted_since(self._evictions_seen)
         if complete:
             prefix = f"{self._namespace}/"
             for key in keys:
@@ -722,6 +790,7 @@ class RemoteStorageClient:
         self._reconnect = False
         self._layout_error = False
         self._transfer_fault = False
+        self._probe_failures = 0  # a later outage counts its failures afresh
         if self._client.generation != old:
             logger.warning(
                 "remote server restarted (generation %s -> %s); forgetting stored keys",
