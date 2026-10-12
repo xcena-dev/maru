@@ -471,7 +471,8 @@ class RemoteStorageClient:
     def maintain(self) -> None:
         """One round of background upkeep, off the engine and scheduler paths.
 
-        The only place that reconnects after an outage or a restart. Pings
+        Reconnects after an outage, and after a restart that no load or
+        store has met yet (one that meets it reconnects in place). Pings
         the server only while calls are stopped or a reconnect is due: while
         calls succeed, their replies carry the server run and the eviction
         count, so a healthy round sends no ping. The ping runs on the probe
@@ -823,13 +824,14 @@ class RemoteStorageClient:
         return result
 
     def _trip(self, exc: BaseException) -> None:
-        """Stop calling the server for ``remote_retry_s`` after a failure."""
+        """Stop calling the server after a failure until a reconnect.
+
+        The maintenance thread reconnects at the first answered ping; after
+        a transfer fault (``_trip_transfer``) it waits ``remote_retry_s``
+        unless the server restarted.
+        """
         if self._clock() >= self._retry_at and not self._reconnect:
-            logger.warning(
-                "remote storage unavailable for %.0fs: %s",
-                self.config.remote_retry_s,
-                exc,
-            )
+            logger.warning("remote storage unavailable: %s", exc)
         self._retry_at = self._clock() + self.config.remote_retry_s
         self._reconnect = True
 

@@ -51,8 +51,10 @@ class MaruConfig:
         remote_ucx_device: UCX device of the local RDMA NIC, e.g.
             "mlx5_0:1"; empty for the UCX default.
         remote_transfer_timeout_s: Deadline of one RDMA READ/WRITE batch.
-        remote_retry_s: How long the remote backend stops calling the server
-            after a failed or timed-out control request.
+        remote_retry_s: How long the remote backend waits before calling the
+            server again after a failed RDMA transfer, a full pool or a
+            refused key. After a failed or timed-out control request it calls
+            again as soon as the server answers a ping.
         remote_load_reserve: Share of the remote staging slots that stores
             leave free for loads (0 to 1). A store that would take one of
             them is skipped, so a slow pool makes stores, not loads, give way.

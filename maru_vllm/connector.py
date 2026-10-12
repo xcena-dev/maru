@@ -585,7 +585,11 @@ def _usable_gpu_blocks(
 
 
 def _unkeyed_request(request: Any) -> bool:
-    """M1 does not key embeddings, adapter state, multimodal data or salts."""
+    """Whether the request carries inputs the chunk keys do not cover.
+
+    Keys hash token ids only, so prompt embeddings, cache salts, multimodal
+    data and LoRA adapters bypass the lease-based backends.
+    """
     return (
         getattr(request, "prompt_embeds", None) is not None
         or getattr(request, "cache_salt", None) is not None
@@ -3990,7 +3994,7 @@ class MaruWorkerConnector:
                     # K and V planes are each contiguous in the slab; copying
                     # them separately avoids a strided cross-device copy.
                     for plane in range(kv2):
-                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->host
+                        slab[plane, layer_idx].copy_(kv_contig[plane])  # GPU->slab
                     written.add(layer_idx)
                 except Exception as e:
                     self._note_store_skip(base_key, e)

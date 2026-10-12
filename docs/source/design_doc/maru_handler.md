@@ -252,7 +252,7 @@ graph TB
     end
 
     RC -.->|"reserve / publish / lookup / release"| EP
-    MT -.->|"ping while stopped"| EP
+    MT -.->|"ping / eviction query"| EP
     NT -->|"registers"| SB
     SB <==>|"RDMA (NIXL)"| CXL
 
@@ -268,7 +268,7 @@ Dashed arrows are control requests over ZMQ, and the thick arrow is KV bytes ove
 
 **Staging buffer** is local anonymous memory, divided into slots of one KV object each and page-locked for CUDA when CUDA is available. Stores leave a configurable share of the slots free for loads, so a slow pool makes stores, not loads, give way.
 
-**Maintenance thread** runs off the engine and scheduler paths. While calls succeed it sends no pings, because every reply already carries the pool's run and eviction count. After a call fails, or when a reply comes from a new pool run, it pings the pool once a second from its own client, keeps calls stopped while the pool stays silent, and reconnects at the first answer. When the handler skipped stores on keys it remembers and no reply has come since the previous round, it asks the pool once to confirm the run. It also applies the evictions any reply reports: the handler forgets the evicted keys, or every key it remembers when the pool's eviction log no longer covers the gap or the pool restarted.
+**Maintenance thread** runs off the engine and scheduler paths. While calls succeed it sends no pings, because every reply already carries the pool's run and eviction count. After a call fails, or when a reply comes from a new pool run, it pings the pool once a second from its own client, keeps calls stopped while the pool stays silent, and reconnects at the first answer. After a failed RDMA transfer it reconnects only once `MaruConfig.remote_retry_s` (`maru_remote_retry_s` in vLLM) has passed or the pool has restarted. When the handler skipped stores on keys it remembers and no reply has come since the previous round, it asks the pool once to confirm the run. It also applies the evictions any reply reports: the handler forgets the evicted keys, or every key it remembers when the pool's eviction log no longer covers the gap or the pool restarted.
 
 A store copies data into staging slots, reserves pages, writes them with RDMA WRITE and publishes the keys. A retrieve looks up and pins the keys, reads them with RDMA READ, and confirms the pins when releasing them before returning leases over the staging slots. If the read ticket expired or the release reply is unavailable, the load fails and its bytes are discarded. The pool node's MaruServer never copies KV bytes; see {ref}`Storage Backends <storage-backends>` for the pool node components.
 

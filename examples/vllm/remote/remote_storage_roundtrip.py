@@ -10,7 +10,7 @@ measured) and end-to-end call time, plus the server's reservation, quarantine
 and ticket counts after the run (all must be 0).
 
 Usage (on a worker node):
-  PYTHONPATH=. python tools/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
+  PYTHONPATH=. python examples/vllm/remote/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
       --ucx-device mlx5_0:1 --objects 64 --object-bytes 4M --rounds 3 --out roundtrip.json
 """
 
@@ -31,6 +31,15 @@ from maru_handler import MaruHandler
 
 def _payload(n: int, seed: int) -> bytes:
     return hashlib.shake_256(seed.to_bytes(8, "little")).digest(n)
+
+
+def _counter(h: MaruHandler, name: str) -> float:
+    """Read one of the remote backend's local counters.
+
+    ``get_stats`` also asks the pool for its counters, so read this outside
+    the timed calls.
+    """
+    return float(h.get_stats()["remote_storage"]["counters"][name])
 
 
 def main() -> int:
@@ -59,7 +68,6 @@ def main() -> int:
         )
     )
     h.connect()
-    backend = h._storage  # the tool reads the backend's transfer counters
     rounds = []
     ok_all = True
     try:
@@ -74,22 +82,22 @@ def main() -> int:
                 a = h.alloc(len(blob))
                 a.buf[:] = blob
                 handles.append(a)
-            w0 = backend.counters["write_seconds"]
+            w0 = _counter(h, "write_seconds")
             t0 = time.perf_counter()
             stored = h.batch_store(keys, handles)
             t1 = time.perf_counter()
-            write_s = backend.counters["write_seconds"] - w0
+            write_s = _counter(h, "write_seconds") - w0
             exists = h.batch_exists(keys)
             dup = []
             for key in keys[:4]:  # a second writer of the same keys
                 a = h.alloc(16)
                 a.buf[:] = b"\xff" * 16
                 dup.append(h.batch_store([key], [a])[0])
-            r0 = backend.counters["read_seconds"]
+            r0 = _counter(h, "read_seconds")
             t2 = time.perf_counter()
             leases = h.batch_retrieve(keys)
             t3 = time.perf_counter()
-            read_s = backend.counters["read_seconds"] - r0
+            read_s = _counter(h, "read_seconds") - r0
             match = [
                 lease is not None
                 and hashlib.sha256(lease.view).digest() == hashlib.sha256(blob).digest()

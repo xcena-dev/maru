@@ -492,19 +492,26 @@ def test_growing_the_pool_does_not_hold_up_ledger_calls(maru):
         acc.close()
 
 
-def test_remote_regions_are_mapped_without_prefault(maru):
+def test_remote_regions_are_mapped_without_prefault(maru, monkeypatch):
+    import maru_handler.memory.mapper as mapper_mod
+
+    monkeypatch.setattr(mapper_mod, "_PREFAULT_ENABLED", True)
     acc = _access(maru)
     calls = []
     real = acc._mapper.map_region
 
     def record(handle, prefault=True):
-        calls.append(prefault)
+        calls.append(handle.region_id)
         return real(handle, prefault=prefault)
 
     try:
-        with patch.object(acc._mapper, "map_region", side_effect=record):
+        with (
+            patch.object(acc._mapper, "map_region", side_effect=record),
+            patch.object(mapper_mod.DaxMapper, "_prefault_region") as prefault,
+        ):
             _reserve(acc, *([PAGE] * 20))  # grows the pool by one region
-        assert calls and not any(calls)
+        assert calls  # the new region was mapped
+        prefault.assert_not_called()
     finally:
         acc.close()
 

@@ -214,6 +214,7 @@ All example settings are in `env.sh`. Override them with environment variables:
 | `remote_example.sh` | One-host run of all of the above plus the test |
 | `run_simple_query.sh` | One prompt on each engine, with its cached tokens |
 | `run_benchmark.sh`, `run_benchmark.py` | TTFT and tokens found in the pool |
+| `remote_storage_roundtrip.py` | Store/load round trip through `MaruHandler` without vLLM: byte check and RDMA bandwidth |
 
 The `*_UCX_DEVICE` settings are passed to NIXL. If UCX still uses other NICs of
 a node, also export `UCX_NET_DEVICES=<device>` (for example `mlx5_0:1`) before
@@ -229,7 +230,7 @@ starting that node's process.
 | `maru_remote_load_reserve` | `0.5` | Share of the staging buffer that stores leave free for loads |
 | `maru_async_load`, `maru_async_store` | `false` | Load and store on background threads (recommended) |
 | `maru_remote_timeout_s` | `30` | Deadline of one RDMA batch |
-| `maru_remote_retry_s` | `30` | How long the worker stops calling the pool after a failure |
+| `maru_remote_retry_s` | `30` | Wait before calling the pool again after a failed RDMA transfer, a full pool, a refused key or a failed start-up connection |
 
 `maru_pool_size`, `maru_cpu_pool_size` and the mixed-mode settings do not apply.
 
@@ -253,8 +254,11 @@ starting that node's process.
   or whose reservation or read-protection lifetime is shorter than twice
   `maru_remote_timeout_s`, is rejected at start.
 - **Outage.** After a failed or timed-out control request the worker stops
-  calling the pool for `maru_remote_retry_s`: lookups miss, stores are skipped and
-  requests compute normally. It then reconnects.
+  calling the pool: lookups miss, stores are skipped and requests compute
+  normally. Its maintenance thread pings the pool once a second and reconnects
+  at the first answer. After a failed RDMA transfer the worker instead waits
+  `maru_remote_retry_s` before reconnecting, unless the pool restarted
+  meanwhile.
 - **Pool restart.** Restarting `maru-server` starts a new run: the ledger and
   the remote state start empty together. Every reply, and every request except
   the connection handshake and the maintenance thread's ping, carries the run's
@@ -284,9 +288,7 @@ starting that node's process.
   `--remote-quarantine-ttl` (default 600 s) controls when the pool logs a warning;
   it does not reclaim pages. A lost worker can consume pool capacity until
   successful pool shutdown deregisters the regions. Workers wait for pending
-  transfers to finish before removing the old peer or reconnecting. These
-  failure paths have unit coverage; real RDMA fault recovery still needs
-  hardware validation.
+  transfers to finish before removing the old peer or reconnecting.
 - **Expired read protection.** The worker checks the pool's release reply after
   READ completes. If the ticket already expired or its protection cannot be
   confirmed, the worker discards the bytes and reports a load error for
@@ -330,6 +332,6 @@ with MaruHandler(config) as handler:
 PYTHONPATH="$PWD" python -m pytest -q tests/unit/test_remote_*.py \
   tests/unit/test_vllm_remote_config.py tests/unit/test_vllm_cpu_load_range.py
 # On a worker node, against a running pool node:
-PYTHONPATH="$PWD" python tools/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
+PYTHONPATH="$PWD" python examples/vllm/remote/remote_storage_roundtrip.py --remote-url tcp://pool-node:6600 \
   --ucx-device mlx5_0:1 --objects 64 --object-bytes 4M --rounds 3
 ```

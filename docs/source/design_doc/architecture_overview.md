@@ -262,7 +262,7 @@ sequenceDiagram
     H-->>C: data
 ```
 
-Each retrieve uses a metadata lookup through the control plane. The handler caches region mappings, so only the first access to a region incurs the mmap cost.
+Every retrieve requires one metadata lookup via the control plane. Once a region is mapped, the mapping is cached for subsequent accesses to the same region — only the first access to a given region incurs the mmap cost.
 
 ---
 

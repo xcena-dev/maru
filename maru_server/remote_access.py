@@ -813,7 +813,7 @@ class RemoteAccess:
                 raise RuntimeError(f"region {rid} is not mapped")
             base = buffer_address(view)
             registration = self._transport.register(base, length, f"region-{rid}")
-            self._owned.add_region(handle, prefault=False)  # already mapped
+            self._owned.add_region(handle)  # already mapped: reused, no prefault
         except Exception:
             logger.exception("adding remote region %d failed", rid)
             self._undo_region(rid, registration)

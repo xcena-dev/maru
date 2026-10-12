@@ -130,8 +130,9 @@ class DaxMapper:
 
         If already mapped, returns the existing MappedRegion.
         Thread-safe: protected by internal lock (idempotent).
-        Always maps with PROT_READ | PROT_WRITE and registers with
-        cudaHostRegister for GPU DMA.
+        Always maps with PROT_READ | PROT_WRITE. Registers the mapping with
+        cudaHostRegister for GPU DMA unless the mapper was created with
+        ``cuda_register=False``.
 
         Args:
             handle: MaruHandle from server allocation or lookup
