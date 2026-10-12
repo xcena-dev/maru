@@ -284,6 +284,7 @@ class MaruServer:
             ``DELETED``, ``PINNED`` or ``NOT_FOUND`` (absent or elsewhere).
         """
         with self._lock:
+            assert self._allocation_manager is not None
             result, region_to_deref = self._kv_manager.delete_at(
                 key, region_id, kv_offset
             )
