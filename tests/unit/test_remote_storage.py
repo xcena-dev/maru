@@ -569,6 +569,101 @@ def test_close_abandons_pages_of_ended_writes(pool):
     assert pool.stats()["quarantined"] == 0
 
 
+def test_pages_of_an_ended_write_left_unpublished_are_returned(unused_port):
+    # The WRITE ended, but another thread stopped calls meanwhile (say a load's
+    # lookup timed out), so the store does not publish. Its pages must go back
+    # once the server answers, not stay quarantined until pool shutdown.
+    node = PoolNode(unused_port, ttl=0.3)
+    node.start()
+    try:
+        h = remote_handler(node.url, retry_s=0.2)
+        s = h._storage
+        real_write = s._transport.write
+
+        def write_then_stop_calls(peer, pairs, timeout_s):
+            real_write(peer, pairs, timeout_s=timeout_s)
+            s._trip(RuntimeError("another thread's call timed out"))
+
+        s._transport.write = write_then_stop_calls
+        assert _store(h, "k", b"x" * 100) is False
+        s._transport.write = real_write
+        time.sleep(0.6)  # the reservation expires
+        node.access.sweep()
+        assert node.stats()["quarantined"] == 1  # kept until abandon
+        for _ in range(3):
+            s.maintain()  # reconnects once the retry period ends, then reaps
+        stats = node.stats()
+        assert stats["reservations"] == 0 and stats["quarantined"] == 0
+        assert _store(h, "k2", b"y" * 100) is True
+        h.close()
+    finally:
+        node.stop()
+
+
+def test_pages_of_a_publish_that_timed_out_are_returned(unused_port):
+    # The publish request timed out: the pool may or may not have run it. The
+    # pages go back once the server answers; a published ticket is skipped.
+    from maru_remote.client import RemoteTimeout
+
+    node = PoolNode(unused_port, ttl=0.3)
+    node.start()
+    try:
+        h = remote_handler(node.url, retry_s=0.2)
+        s = h._storage
+        real_publish = s._client.publish
+
+        def lost_publish(items):
+            raise RemoteTimeout("publish timed out")
+
+        s._client.publish = lost_publish
+        assert _store(h, "k", b"x" * 100) is False
+        s._client.publish = real_publish
+        time.sleep(0.6)  # the reservation expires
+        node.access.sweep()
+        assert node.stats()["quarantined"] == 1  # kept until abandon
+        for _ in range(3):
+            s.maintain()
+        stats = node.stats()
+        assert stats["reservations"] == 0 and stats["quarantined"] == 0
+        assert _store(h, "k", b"x" * 100) is True
+        h.close()
+    finally:
+        node.stop()
+
+
+def test_abandon_after_a_publish_that_ran_keeps_the_key(unused_port):
+    # The publish ran but its reply was lost: abandoning its tickets later
+    # must not free the published page.
+    from maru_remote.client import RemoteTimeout
+
+    node = PoolNode(unused_port, ttl=0.3)
+    node.start()
+    try:
+        h = remote_handler(node.url, retry_s=0.2)
+        s = h._storage
+        real_publish = s._client.publish
+
+        def reply_lost(items):
+            real_publish(items)
+            raise RemoteTimeout("publish reply lost")
+
+        s._client.publish = reply_lost
+        assert _store(h, "k", b"x" * 100) is False
+        s._client.publish = real_publish
+        time.sleep(0.6)
+        node.access.sweep()
+        for _ in range(3):
+            s.maintain()
+        assert s._quarantine == []  # the abandon was sent and answered
+        stats = node.stats()
+        assert stats["reservations"] == 0 and stats["quarantined"] == 0
+        assert stats["lru_keys"] == 1
+        assert h.batch_exists(["k"]) == [True]
+        h.close()
+    finally:
+        node.stop()
+
+
 def test_a_full_pool_pauses_stores_but_not_loads(pool_no_evict):
     pool = pool_no_evict
     h = remote_handler(pool.url, staging=4 * PAGE)

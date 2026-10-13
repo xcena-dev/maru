@@ -934,10 +934,13 @@ class RemoteStorageClient:
                 self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
         if not current or not self._ready(connect=False):
-            # Reconnected meanwhile (the tickets are the old server's) or the
-            # server is marked down: do not publish. The pages stay reserved
-            # until the reservation TTL; abandoning them now would block on a
-            # server that is down.
+            # Reconnected meanwhile or the server is marked down: do not
+            # publish. The WRITE has ended, so its pages only wait to be
+            # returned: the quarantine keeps the tickets and abandons them
+            # once the server answers (an earlier server run's pages are gone
+            # with it). Abandoning them now would block on a server that is
+            # down, and the pool keeps an expired reservation until abandon.
+            self._quarantine.append(QuarantinedTransfer(None, [], list(tickets)))
             return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
@@ -948,7 +951,11 @@ class RemoteStorageClient:
             from maru_remote.client import RemoteTimeout, RemoteUnreachable
 
             self._fail(exc, "publish")
-            if not isinstance(exc, RemoteTimeout | RemoteUnreachable):
+            if isinstance(exc, RemoteTimeout | RemoteUnreachable):
+                # Unknown whether the publish ran: abandon once the server
+                # answers. The pool skips tickets it already published.
+                self._quarantine.append(QuarantinedTransfer(None, [], list(tickets)))
+            else:
                 self._abandon_quietly(tickets)  # unknown tickets are skipped
             return [ok_by_key.get(k, False) for k in keys]
         t3 = time.perf_counter()
