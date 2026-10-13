@@ -112,10 +112,10 @@ added. If that takes longer than about 2 s, the waiting requests time out and
 workers stop calling the pool; they reconnect at the first answered ping,
 within about a second after the region is added. Meanwhile lookups miss,
 stores are skipped and requests compute normally. The example sets the
-capacity equal to the pool size, so the whole pool is registered at start-up. A reservation that would exceed the
-capacity evicts the least recently read remote keys; keys being read are
-pinned and never evicted. `--remote-eviction none` instead refuses new stores
-when full. Workers skip storing keys they stored or read in the current server
+capacity equal to the pool size, so the whole pool is registered at start-up.
+A reservation that would exceed the capacity evicts the least recently used
+remote keys (stored or read); keys being read are pinned and never evicted.
+`--remote-eviction none` instead refuses new stores when full. Workers skip storing keys they stored or read in the current server
 run. Every reply carries the server's eviction count; when it changes, a
 worker's load, store or maintenance thread asks which keys were evicted and
 forgets only those, so evicted prefixes are stored again. The maintenance
@@ -273,7 +273,7 @@ starting that node's process.
   of the same key is refused. Local clients cannot delete remote keys or return
   remote regions; remote regions are hidden from their region list. A local
   client that looks up a remote key maps that whole region on first access.
-- **Full pool.** The pool evicts least recently read keys (see above). When
+- **Full pool.** The pool evicts least recently used keys (see above). When
   a whole reservation cannot fit after eviction (including pinned or quarantined
   pages, or `--remote-eviction none`), it answers `POOL_FULL` without evicting
   existing keys. The worker then skips stores for `maru_remote_retry_s`.

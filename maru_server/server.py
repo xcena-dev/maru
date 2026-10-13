@@ -647,7 +647,7 @@ def _add_remote_arguments(parser: argparse.ArgumentParser) -> None:
         "--remote-eviction",
         choices=("lru", "none"),
         default="lru",
-        help="when full: delete least recently read keys, or refuse new stores",
+        help="when full: delete least recently used keys, or refuse new stores",
     )
     group.add_argument(
         "--remote-reservation-ttl", type=float, default=60.0, help="seconds"

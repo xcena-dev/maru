@@ -254,7 +254,7 @@ pool stops answering, lookups miss and stores are skipped while requests
 compute normally; the worker pings the pool once a second and reconnects at
 its first answer. After a failed RDMA transfer it waits `maru_remote_retry_s`
 (default 30 s) before calling the pool again. A full
-pool evicts its least recently read keys; a prefix that is already in the
+pool evicts its least recently used keys (stored or read); a prefix that is already in the
 pool, including one another worker stored, is not written again. See the
 [remote example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote/README.md)
 for launch commands, failure behaviour and the trust model.

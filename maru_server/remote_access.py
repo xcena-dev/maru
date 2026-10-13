@@ -164,9 +164,9 @@ class RemoteAccess:
             capacity_bytes: Most pool bytes to hold in pages (reserved,
                 published or quarantined); None grows the pool until the
                 device refuses a region.
-            evict: When the pool is full, delete the least recently read
-                published keys (never pinned ones) to make room. Otherwise a
-                reservation fails with ``POOL_FULL``.
+            evict: When the pool is full, delete the least recently used
+                published keys (stored or read; never pinned ones) to make
+                room. Otherwise a reservation fails with ``POOL_FULL``.
             eviction_log_len: How many of the latest evicted keys to keep for
                 ``evicted_since``; a client further behind forgets everything.
             clock: Monotonic time source (tests inject a fake).
@@ -205,7 +205,7 @@ class RemoteAccess:
         self._md_version = 0
         # The page behind every key published through this access.
         self._pages: dict[str, _Page] = {}
-        # Published keys, least recently read first.
+        # Published keys, least recently used (stored or read) first.
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._evicted = 0
         # (eviction number, key) of the latest evictions, oldest first.
@@ -851,7 +851,7 @@ class RemoteAccess:
                 break
 
     def _evict(self, n: int) -> int:
-        """Delete ``n`` least recently read unpinned keys, or change nothing.
+        """Delete ``n`` least recently used unpinned keys, or change nothing.
 
         Selection and deletion share the ledger's pin lock, so local readers
         cannot invalidate the capacity check. Returns n or zero.
@@ -873,7 +873,7 @@ class RemoteAccess:
                 self._eviction_log.append((self._evicted, key))
         freed = len(reclaimed)
         if freed:
-            logger.info("evicted %d least recently read keys", freed)
+            logger.info("evicted %d least recently used keys", freed)
         return freed
 
     def _locate(self, keys: list[str]) -> list[dict[str, Any] | None]:

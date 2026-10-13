@@ -218,7 +218,7 @@ sequenceDiagram
 
 Data is written before its key is published. A read ticket pins the key until release or expiry; after READ completes, the worker confirms that the ticket still held its pins before returning the bytes. An expired reservation or an unconfirmed WRITE keeps its page quarantined until the worker confirms completion or cancellation, or the pool successfully deregisters the region at shutdown. Elapsed time alone cannot make an RDMA destination safe to reuse.
 
-RemoteAccess records remote keys in MaruServer's own KV ledger, so remote state and the ledger start and end together with the MaruServer process. When the pool fills up, RemoteAccess evicts the least recently read remote keys only if enough unpinned pages can satisfy the whole reservation. Keys that local clients store in their own regions are never evicted by it.
+RemoteAccess records remote keys in MaruServer's own KV ledger, so remote state and the ledger start and end together with the MaruServer process. When the pool fills up, RemoteAccess evicts the least recently used remote keys (stored or read) only if enough unpinned pages can satisfy the whole reservation. Keys that local clients store in their own regions are never evicted by it.
 
 The pool's control channel is not authenticated, and its RDMA metadata exposes the registered regions, so run it only inside a trusted cluster network. For configuration and a runnable example, see [vLLM](../integration/vllm.md) and the [vLLM examples](../getting_started/examples/vllm/index.md).
 
