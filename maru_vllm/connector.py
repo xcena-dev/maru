@@ -983,7 +983,8 @@ class MaruSchedulerConnector:
         self._parked_blocks: dict[str, int] = {}
         # Requests told to wait for room, oldest first, with the blocks they
         # need. Their room is kept ahead of later requests so a long prompt
-        # is not passed over indefinitely.
+        # is not passed over indefinitely. A request leaves once vLLM gives it
+        # blocks, once it has nothing to load, or once it finishes.
         self._admission_waiters: dict[str, int] = {}
 
         # Cached match results from get_num_new_matched_tokens,
@@ -1131,7 +1132,12 @@ class MaruSchedulerConnector:
         if load_async and not self._admit_parked(request):
             self._last_match_result.pop(request.request_id, None)
             return None, False
-        self._admission_waiters.pop(request.request_id, None)
+        if not load_async:
+            # Nothing to load: the request no longer waits for the budget.
+            self._admission_waiters.pop(request.request_id, None)
+        # A request let through keeps its place until vLLM gives it blocks
+        # (update_state_after_alloc): with running requests holding blocks,
+        # vLLM can still refuse it this step and ask again next step.
         return matched, load_async
 
     def _admit_parked(self, request: Request) -> bool:
@@ -1233,6 +1239,8 @@ class MaruSchedulerConnector:
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ):
+        # vLLM gave the request its blocks: it holds its place no longer.
+        self._admission_waiters.pop(request.request_id, None)
         if num_external_tokens <= 0:
             self._load_starts.pop(request.request_id, None)
             # The request was given its blocks to run: it is parked no longer.

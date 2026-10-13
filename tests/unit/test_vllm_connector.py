@@ -4271,6 +4271,38 @@ class TestDeferredAdmissionFitsCache:
         output = engine.schedule()
         assert output.num_scheduled_tokens.get("big", 0) > 0
 
+    def test_request_refused_blocks_keeps_its_place(self, tmp_path):
+        # A request can fit the budget yet get no blocks from vLLM while
+        # running requests hold them. It must stay ahead of later requests.
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = self._engine(tmp_path)
+        chunks = dict(self.PROMPTS.values())
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks.get(
+            len(ids), 0
+        )
+        running = Request(
+            "running", list(range(64)), SamplingParams(max_tokens=1), None
+        )
+        engine.add_request(running)  # 16 blocks, nothing in Maru
+        engine.schedule()
+        self._add(engine, "mid")
+        engine.schedule()  # mid parks
+        big, small = self._add(engine, "big"), self._add(engine, "small")
+        engine.schedule()  # both wait for the budget, big first
+        self._finish_loads(engine, ["mid"])
+        for _ in range(3):
+            # mid runs; big fits the budget but only 22 blocks are free
+            # (63 usable: running holds 16, mid 25; big needs 50).
+            engine.schedule()
+            assert big.status == RequestStatus.WAITING
+            assert small.status == RequestStatus.WAITING
+        engine.finish_requests(["running", "mid"], RequestStatus.FINISHED_STOPPED)
+        engine.schedule()
+        assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert small.status == RequestStatus.WAITING  # big 50 + small 15 > 63
+
     def test_requests_parked_alone_still_resume(self, tmp_path):
         from vllm.v1.request import RequestStatus
 
@@ -4319,6 +4351,21 @@ class TestDeferredAdmissionFitsCache:
         sched.update_state_after_alloc(big, MagicMock(), 0)  # big resumed
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
         assert sched.get_num_new_matched_tokens(small, 0)[1] is True
+
+    def test_let_through_request_waits_until_it_gets_blocks(self):
+        sched = self._sched()
+        big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
+        self._park(sched, mid)
+        assert sched.get_num_new_matched_tokens(big, 0)[0] is None
+        assert sched.get_num_new_matched_tokens(small, 0)[0] is None
+        sched.update_state_after_alloc(mid, MagicMock(), 0)  # mid resumed
+        # big fits the budget, but vLLM has no blocks for it yet.
+        assert sched.get_num_new_matched_tokens(big, 0)[1] is True
+        assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
+        assert sched.get_num_new_matched_tokens(big, 0)[1] is True  # asked again
+        assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
+        self._park(sched, big)  # vLLM gave big its blocks
+        assert "big" not in sched._admission_waiters
 
     def test_finished_requests_release_their_room(self):
         sched = self._sched()
