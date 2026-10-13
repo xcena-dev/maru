@@ -621,7 +621,7 @@ def test_pages_of_a_publish_that_timed_out_are_returned(unused_port):
         time.sleep(0.6)  # the reservation expires
         node.access.sweep()
         assert node.stats()["quarantined"] == 1  # kept until abandon
-        for _ in range(3):
+        for _ in range(3):  # the sleep also outlasted the 0.2 s retry period
             s.maintain()
         stats = node.stats()
         assert stats["reservations"] == 0 and stats["quarantined"] == 0
@@ -629,6 +629,69 @@ def test_pages_of_a_publish_that_timed_out_are_returned(unused_port):
         h.close()
     finally:
         node.stop()
+
+
+def test_pages_of_a_failed_write_are_returned_when_abandon_fails(unused_port):
+    # The WRITE ended in an error state and the immediate abandon got no answer:
+    # the pages go back once the server answers again.
+    from maru_remote.client import RemoteUnreachable
+
+    node = PoolNode(unused_port, ttl=0.3)
+    node.start()
+    try:
+        h = remote_handler(node.url, retry_s=0.2)
+        s = h._storage
+        real_write, real_abandon = s._transport.write, s._client.abandon
+
+        def failed_write(peer, pairs, timeout_s):
+            raise RuntimeError("transfer ended in an error state")
+
+        def no_answer(tickets):
+            raise RemoteUnreachable("pool did not answer")
+
+        s._transport.write, s._client.abandon = failed_write, no_answer
+        assert _store(h, "k", b"x" * 100) is False
+        s._transport.write, s._client.abandon = real_write, real_abandon
+        time.sleep(0.6)  # the reservation expires
+        node.access.sweep()
+        assert node.stats()["quarantined"] == 1  # kept until abandon
+        for _ in range(3):  # the sleep also outlasted the 0.2 s retry period
+            s.maintain()
+        stats = node.stats()
+        assert stats["reservations"] == 0 and stats["quarantined"] == 0
+        assert _store(h, "k", b"x" * 100) is True
+        h.close()
+    finally:
+        node.stop()
+
+
+def test_a_refused_abandon_is_not_retried(pool):
+    # A server that refuses an abandon with an error reply will refuse it
+    # again: the tickets are dropped instead of being retried forever.
+    from maru_remote.client import RemoteError
+
+    h = remote_handler(pool.url, retry_s=0.2)
+    s = h._storage
+    real_write, real_abandon = s._transport.write, s._client.abandon
+    calls = []
+
+    def failed_write(peer, pairs, timeout_s):
+        raise RuntimeError("transfer ended in an error state")
+
+    def refused(tickets):
+        calls.append(list(tickets))
+        raise RemoteError("abandon refused")
+
+    s._transport.write, s._client.abandon = failed_write, refused
+    assert _store(h, "k", b"x" * 100) is False
+    assert s._quarantine == [] and len(calls) == 1
+    s._keep_for_reap(["t-unknown"])  # as if kept after a timeout
+    time.sleep(0.3)
+    for _ in range(3):
+        s.maintain()
+    assert s._quarantine == [] and len(calls) == 2
+    s._transport.write, s._client.abandon = real_write, real_abandon
+    h.close()
 
 
 def test_abandon_after_a_publish_that_ran_keeps_the_key(unused_port):

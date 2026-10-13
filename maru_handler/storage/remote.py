@@ -929,7 +929,7 @@ class RemoteStorageClient:
                 self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
         except Exception as exc:  # the transfer ended in an error state
-            self._abandon_quietly(tickets)
+            self._abandon_or_keep(tickets)
             if self._epoch == epoch:
                 self._trip_transfer(exc)
             return [ok_by_key.get(k, False) for k in keys]
@@ -940,7 +940,7 @@ class RemoteStorageClient:
             # once the server answers (an earlier server run's pages are gone
             # with it). Abandoning them now would block on a server that is
             # down, and the pool keeps an expired reservation until abandon.
-            self._quarantine.append(QuarantinedTransfer(None, [], list(tickets)))
+            self._keep_for_reap(tickets)
             return [ok_by_key.get(k, False) for k in keys]
         t2 = time.perf_counter()
         try:
@@ -954,9 +954,9 @@ class RemoteStorageClient:
             if isinstance(exc, RemoteTimeout | RemoteUnreachable):
                 # Unknown whether the publish ran: abandon once the server
                 # answers. The pool skips tickets it already published.
-                self._quarantine.append(QuarantinedTransfer(None, [], list(tickets)))
+                self._keep_for_reap(tickets)
             else:
-                self._abandon_quietly(tickets)  # unknown tickets are skipped
+                self._abandon_or_keep(tickets)  # unknown tickets are skipped
             return [ok_by_key.get(k, False) for k in keys]
         t3 = time.perf_counter()
         for i, status in zip(order, statuses, strict=True):
@@ -1183,17 +1183,53 @@ class RemoteStorageClient:
                 if self._clock() < self._retry_at:
                     keep.append(q)  # the server is considered down: ask later
                     continue
-                from maru_remote.client import RemoteRestarted
+                from maru_remote.client import (
+                    RemoteRestarted,
+                    RemoteTimeout,
+                    RemoteUnreachable,
+                )
 
                 try:
                     self._client.abandon(q.tickets)
                     q.tickets = []
                 except RemoteRestarted:
                     q.tickets = []  # an earlier server run's pages are gone with it
-                except Exception as exc:  # retried after the cool-down
+                except (RemoteTimeout, RemoteUnreachable) as exc:
                     self._fail(exc, "abandon")
-                    keep.append(q)
+                    keep.append(q)  # retried after the cool-down
+                except Exception as exc:  # the server refused: retrying cannot help
+                    logger.warning(
+                        "remote abandon refused; pages stay until pool shutdown: %s",
+                        exc,
+                    )
+                    q.tickets = []
         self._quarantine = keep
+
+    def _keep_for_reap(self, tickets: list[str]) -> None:
+        """Keep the tickets of an ended WRITE; ``_reap`` abandons them later."""
+        self._quarantine.append(QuarantinedTransfer(None, [], list(tickets)))
+
+    def _abandon_or_keep(self, tickets: list[str]) -> None:
+        """Return the pages of an ended WRITE now, or keep their tickets.
+
+        A timeout or a failed socket keeps the tickets for ``_reap``, which
+        abandons them once the server answers. A new server run's reply drops
+        them (the earlier run's pages are gone with it), and so does a refusal,
+        which a retry cannot change.
+        """
+        from maru_remote.client import RemoteRestarted, RemoteTimeout, RemoteUnreachable
+
+        try:
+            self._client.abandon(tickets)
+        except (RemoteTimeout, RemoteUnreachable) as exc:
+            self._fail(exc, "abandon")
+            self._keep_for_reap(tickets)
+        except RemoteRestarted as exc:
+            self._fail(exc, "abandon")
+        except Exception as exc:
+            logger.warning(
+                "remote abandon refused; pages stay until pool shutdown: %s", exc
+            )
 
     def _abandon_quietly(self, tickets: list[str]) -> None:
         try:
