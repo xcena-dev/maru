@@ -37,6 +37,7 @@ from tests.unit.vllm_connector_helpers import (
     make_vllm_scheduler,
     make_worker,
     store_metadata,
+    store_req_meta,
 )
 
 # =============================================================================
@@ -4333,6 +4334,271 @@ def test_deferred_loading_accepts_supported_vllm(monkeypatch, factory, version):
 
     monkeypatch.setattr(vllm, "__version__", version)
     factory(4, 8, {"maru_async_load": True})
+
+
+# =============================================================================
+# A partial hit loaded synchronously must still store the chunks it computes
+# =============================================================================
+
+
+class TestSyncPartialHitStoresComputedChunks:
+    """A request that finds only its leading chunks in Maru computes the rest.
+
+    Those computed chunks belong in Maru as much as a cold request's do: a
+    second instance reading the same prompt (prefix sharing, or a decode
+    instance in prefill/decode disaggregation) otherwise finds only the shared
+    prefix and recomputes everything after it. The deferred path already
+    stores them when the parked request resumes; the synchronous path used to
+    emit only the load.
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _scheduler_with_load(self, num_tokens, cached_chunks, num_computed=0):
+        sched = make_scheduler(
+            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+        )
+        sched._handler = MagicMock()
+        total_chunks = num_tokens // self.CHUNK
+        sched._handler.batch_exists.return_value = [True] * cached_chunks + [False] * (
+            total_chunks - cached_chunks
+        )
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(num_tokens)),
+            all_token_ids=list(range(num_tokens)),
+        )
+        matched, load_async = sched.get_num_new_matched_tokens(request, num_computed)
+        assert load_async is False
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (list(range(num_tokens // self.BLOCK)),)
+        sched.update_state_after_alloc(request, blocks, matched)
+        return sched, num_computed + matched
+
+    def _new_req(self, num_tokens, num_computed):
+        return fake_new_request_data(
+            prompt_token_ids=list(range(num_tokens)),
+            block_ids=list(range(-(-num_tokens // self.BLOCK))),
+            num_computed_tokens=num_computed,
+        )
+
+    def test_computed_chunks_after_the_loaded_prefix_are_stored(self):
+        # 44 tokens = 5 full chunks + 4; Maru holds the first 2 chunks.
+        sched, computed = self._scheduler_with_load(44, cached_chunks=2)
+        assert computed == 16
+        meta = sched.build_connector_meta(
+            fake_scheduler_output(
+                [self._new_req(44, computed)], None, {"r1": 44 - computed}
+            )
+        )
+        loads = [r for r in meta.requests if not r.is_store]
+        stores = [r for r in meta.requests if r.is_store]
+        assert len(loads) == 1 and loads[0].num_matched_chunks == 2
+        assert len(stores) == 1
+        store = stores[0]
+        ct = self.CHUNK
+        start = store.num_computed_tokens // ct
+        end = (store.num_computed_tokens + store.num_scheduled_tokens) // ct
+        assert (start, end) == (2, 5), "store chunks 2..4, never the loaded 0..1"
+        assert "r1" not in sched._requests_need_store
+
+    def test_chunked_prefill_continues_storing_after_the_load_step(self):
+        sched, computed = self._scheduler_with_load(44, cached_chunks=2)
+        # First step computes only 8 of the remaining 28 tokens.
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([self._new_req(44, computed)], None, {"r1": 8})
+        )
+        store = next(r for r in meta.requests if r.is_store)
+        ct = self.CHUNK
+        assert store.num_computed_tokens // ct == 2
+        assert (store.num_computed_tokens + store.num_scheduled_tokens) // ct == 3
+        assert "r1" in sched._requests_need_store
+
+        meta2 = sched.build_connector_meta(
+            fake_scheduler_output(
+                [], fake_cached_reqs(["r1"], [None], [24]), {"r1": 20}
+            )
+        )
+        cont = meta2.requests[0]
+        assert cont.is_store and cont.num_computed_tokens == 24
+        assert "r1" not in sched._requests_need_store
+
+    def test_full_hit_held_back_block_stores_nothing(self):
+        # 40 tokens = exactly 5 chunks, all cached: one block is held back for
+        # the engine to compute. Every chunk already exists, so no store.
+        sched, computed = self._scheduler_with_load(40, cached_chunks=5)
+        assert computed == 36
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([self._new_req(40, computed)], None, {"r1": 4})
+        )
+        assert [r.is_store for r in meta.requests] == [False]
+
+    def _store_range(self, meta):
+        store = next(r for r in meta.requests if r.is_store)
+        ct = self.CHUNK
+        start = store.num_computed_tokens // ct
+        return start, (store.num_computed_tokens + store.num_scheduled_tokens) // ct
+
+    def test_local_prefix_hit_stores_from_the_end_of_the_load(self):
+        # vLLM's own prefix cache covers the first 4 tokens; Maru supplies the
+        # rest of the first 2 chunks, so the request counts 16 tokens computed.
+        sched, computed = self._scheduler_with_load(44, cached_chunks=2, num_computed=4)
+        assert computed == 16
+        meta = sched.build_connector_meta(
+            fake_scheduler_output(
+                [self._new_req(44, computed)], None, {"r1": 44 - computed}
+            )
+        )
+        assert self._store_range(meta) == (2, 5)
+
+    def test_request_resumed_after_preemption_stores_computed_chunks(self):
+        sched, computed = self._scheduler_with_load(44, cached_chunks=2)
+        # Preemption drops the store tracking; the resumed request is a cached
+        # one carrying all of its blocks again.
+        meta = sched.build_connector_meta(
+            fake_scheduler_output(
+                [],
+                fake_cached_reqs(["r1"], [(list(range(11)),)], [computed], ["r1"]),
+                {"r1": 44 - computed},
+            )
+        )
+        loads = [r for r in meta.requests if not r.is_store]
+        assert len(loads) == 1 and loads[0].num_matched_chunks == 2
+        assert self._store_range(meta) == (2, 5)
+        assert "r1" not in sched._requests_need_store
+
+
+class TestFailedSyncLoadSkipsSameStepStore:
+    """A request whose synchronous load fails must not store in that step.
+
+    The synchronous path loads and computes a request in one step, so a failed
+    load leaves the step computing on top of KV that was never loaded. The
+    chunks it would store are wrong, and once stored, a reader of the same
+    prompt would load them. The failure is reported so vLLM recomputes the
+    request; the steps that recompute it store as usual.
+    """
+
+    BLOCK = 4
+    CHUNK = 8
+    LAYER = "model.layers.0.self_attn"
+
+    @staticmethod
+    def _raise(keys):
+        raise RuntimeError("rpc down")
+
+    FAILURES = {
+        "retrieve_error": _raise,
+        "short_response": lambda keys: [None] * (len(keys) - 1),
+        "miss": lambda keys: [None] * len(keys),
+    }
+
+    def _worker(self, failure):
+        worker = make_worker(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_use_layerwise": True},
+        )
+        stored = attach_capturing_handler(
+            worker, capture=capture_float32, min_alloc_bytes=4
+        )
+
+        def _store(key, handle=None):
+            stored[key] = "DONE"
+            return True
+
+        worker._handler.store.side_effect = _store
+        worker._handler.batch_retrieve.side_effect = self.FAILURES[failure]
+        worker._num_layers = 1
+        return worker, stored
+
+    def _step(self, worker, kv, requests):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        metadata = MaruConnectorMetadata(requests=requests)
+        attn = make_flash_attn_metadata()
+        fwd = SimpleNamespace(
+            no_compile_layers={self.LAYER: SimpleNamespace(kv_cache=kv)},
+            attn_metadata=attn,
+        )
+        worker.start_load_kv(fwd, metadata)
+        worker.save_kv_layer(self.LAYER, kv, attn, metadata)
+
+    @pytest.mark.parametrize("failure", sorted(FAILURES))
+    def test_failed_load_is_reported_and_drops_only_that_store(self, failure):
+        worker, stored = self._worker(failure)
+        kv = torch.randn(2, 16, self.BLOCK, 1)
+        hit_tokens = list(range(100, 164))
+        cold_tokens = list(range(64))
+        # Maru held the first 2 chunks; this step computes 2 more of the 8.
+        self._step(
+            worker,
+            kv,
+            [
+                deferred_req_meta(
+                    token_ids=hit_tokens,
+                    block_ids=list(range(16)),
+                    num_matched_chunks=2,
+                    req_id="hit",
+                    deferred_load=False,
+                ),
+                store_req_meta(
+                    token_ids=hit_tokens,
+                    block_ids=list(range(16)),
+                    num_scheduled_tokens=16,
+                    num_computed_tokens=16,
+                    req_id="hit",
+                ),
+                store_req_meta(
+                    token_ids=cold_tokens,
+                    block_ids=list(range(16)),
+                    num_scheduled_tokens=64,
+                    req_id="cold",
+                ),
+            ],
+        )
+        hit_keys = _chunk_keys(hit_tokens, self.CHUNK)
+        cold_keys = _chunk_keys(cold_tokens, self.CHUNK)
+        assert worker.take_failed_load_blocks() == set(range(16))
+        assert all(f"{key}_L0" in stored for key in cold_keys)
+        assert not any(key.startswith(tuple(hit_keys)) for key in stored)
+
+        # Every block of the request is reported, so vLLM recomputes it from
+        # its first block;
+        # the continuation step that does so stores what it computes.
+        self._step(
+            worker,
+            kv,
+            [
+                store_req_meta(
+                    token_ids=hit_tokens,
+                    block_ids=list(range(16)),
+                    num_scheduled_tokens=64,
+                    num_computed_tokens=0,
+                    req_id="hit",
+                )
+            ],
+        )
+        assert all(f"{key}_L0" in stored for key in hit_keys)
+
+    def test_store_filter_drops_only_the_failed_request(self):
+        # The layerwise loop is exercised above; the packed and write-behind
+        # store loops read their entries through this same filter.
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker, _ = self._worker("miss")
+        hit = store_req_meta(
+            token_ids=list(range(8)), block_ids=[0, 1], num_scheduled_tokens=8
+        )
+        other = store_req_meta(
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            num_scheduled_tokens=8,
+            req_id="r2",
+        )
+        worker._load_failed_req_ids.add("r1")
+        metadata = MaruConnectorMetadata(requests=[hit, other])
+        assert worker._store_requests(metadata) == [other]
 
 
 # =============================================================================

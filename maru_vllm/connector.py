@@ -1312,6 +1312,19 @@ class MaruSchedulerConnector:
                         load_end_token=load_end,
                     )
                 )
+                # The chunks computed after the loaded prefix are stored in the
+                # same step, as the deferred path does when a parked request
+                # resumes; otherwise a later reader of this prompt finds only
+                # the shared prefix.
+                self._store_after_load(
+                    meta,
+                    new_req.req_id,
+                    token_ids,
+                    new_req.block_ids[0],
+                    getattr(new_req, "num_computed_tokens", 0) or 0,
+                    scheduler_output.num_scheduled_tokens.get(new_req.req_id, 0),
+                    num_chunks,
+                )
             else:
                 # Store new prompt chunks to maru. num_computed_tokens is
                 # non-zero when a prefix was already covered externally (a
@@ -1376,6 +1389,17 @@ class MaruSchedulerConnector:
                         load_start_token=self._load_ranges.get(req_id, (0, None))[0],
                         load_end_token=self._load_ranges.get(req_id, (0, None))[1],
                     )
+                )
+                # Preemption dropped the request's store tracking; like a new
+                # request, it stores what it computes after the loaded prefix.
+                self._store_after_load(
+                    meta,
+                    req_id,
+                    list(request.prompt_token_ids or []),
+                    new_block_ids[0],
+                    num_computed,
+                    num_new,
+                    num_chunks,
                 )
             elif req_id in self._requests_need_store:
                 # Chunked-prefill continuation (normal progression OR
@@ -1445,6 +1469,53 @@ class MaruSchedulerConnector:
             return False, None
         return self._write_behind, None
 
+    def _store_after_load(
+        self,
+        meta: MaruConnectorMetadata,
+        req_id: str,
+        token_ids: list[int],
+        block_ids: list[int],
+        num_computed: int,
+        num_scheduled: int,
+        num_loaded_chunks: int,
+    ) -> None:
+        """Emit the store for chunks a synchronously loaded request computes.
+
+        Args:
+            meta: Metadata of the step being built; a store entry is appended.
+            req_id: The request that also carries a load in this step.
+            token_ids: The request's prompt token ids.
+            block_ids: The request's blocks, covering it from token 0.
+            num_computed: Tokens vLLM counts as computed before this step,
+                including the ones this step loads.
+            num_scheduled: Tokens this step computes.
+            num_loaded_chunks: Leading chunks loaded from Maru in this step.
+
+        The store starts at the end of the loaded chunks. vLLM's computed
+        count already reaches that point unless a fully cached prompt holds
+        one block back, and then no chunk is left to store; starting from the
+        larger of the two keeps a loaded chunk from being written again. A
+        step that does not finish the prompt's chunks leaves the request in
+        ``_requests_need_store`` for the chunked-prefill continuation.
+        """
+        ct = self._kv_chunk_tokens
+        prompt_chunks = len(token_ids) // ct
+        computed_after_step = num_computed + num_scheduled
+        store_from = max(num_computed, num_loaded_chunks * ct)
+        if min(computed_after_step // ct, prompt_chunks) > store_from // ct:
+            meta.requests.append(
+                MaruReqMeta(
+                    req_id=req_id,
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    is_store=True,
+                    num_scheduled_tokens=computed_after_step - store_from,
+                    num_computed_tokens=store_from,
+                )
+            )
+        if computed_after_step // ct < prompt_chunks:
+            self._requests_need_store[req_id] = (token_ids, list(block_ids))
+
 
 # ============================================================================
 # Worker-side implementation
@@ -1513,6 +1584,11 @@ class MaruWorkerConnector:
         self._deferred_done: set[str] = set()
         self._recv_only_finished_req_ids: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        # Requests whose synchronous load failed in the current step. The step
+        # still computes them on top of the unloaded prefix, so their stores in
+        # this step are dropped; the failure report makes vLLM recompute them
+        # in later steps. Reset at every start_load_kv.
+        self._load_failed_req_ids: set[str] = set()
         # Loads the background thread has taken but not yet accounted for, and
         # those among them whose request was abandoned meanwhile. A request
         # aborted while parked keeps its blocks until this connector reports
@@ -1810,6 +1886,7 @@ class MaruWorkerConnector:
         # valid); an incomplete fallback slab can never complete once the step
         # that allocated it ended.
         self._store_layers_seen.clear()
+        self._load_failed_req_ids.clear()
         self._reclaim_stale_pending_slabs()
 
         self._ensure_handler()
@@ -1923,10 +2000,7 @@ class MaruWorkerConnector:
                         f"{(time.monotonic() - _t0) * 1000:.2f} ms (req {req_meta.req_id})"
                     )
             except Exception as e:
-                logger.error(
-                    "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
-                )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(req_meta, RuntimeError(f"batch_retrieve failed: {e}"))
                 continue
 
             if len(infos) != len(keys):
@@ -1934,14 +2008,12 @@ class MaruWorkerConnector:
                     self._handler.release_retrieved(infos)
                 # A truncated response would otherwise shift every later
                 # layer's objects by one position — silent wrong KV.
-                logger.error(
-                    "Maru retrieve returned %d infos for %d keys — "
-                    "recompute for req %s",
-                    len(infos),
-                    len(keys),
-                    req_meta.req_id,
+                self._fail_load(
+                    req_meta,
+                    RuntimeError(
+                        f"retrieve returned {len(infos)} infos for {len(keys)} keys"
+                    ),
                 )
-                self._fail_deferred_load(req_meta)
                 continue
 
             # All-or-nothing: a miss (chunk evicted between the scheduler's
@@ -1951,12 +2023,9 @@ class MaruWorkerConnector:
             if miss >= 0:
                 if self._cpu_mode:
                     self._handler.release_retrieved(infos)
-                logger.warning(
-                    "Maru load miss: %s — aborting load for req %s (recompute)",
-                    keys[miss],
-                    req_meta.req_id,
+                self._fail_load(
+                    req_meta, RuntimeError(f"load miss: {keys[miss]} is gone")
                 )
-                self._fail_deferred_load(req_meta)
                 continue
 
             # Packed (default): keep the per-chunk slab infos whole (num_chunks
@@ -2781,6 +2850,7 @@ class MaruWorkerConnector:
         logger.error(
             "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
         )
+        self._note_sync_load_failure(req_meta)
         with self._deferred_lock:
             blocks = req_meta.block_ids
             if self._cpu_mode:
@@ -2792,6 +2862,30 @@ class MaruWorkerConnector:
             self._failed_load_blocks.update(blocks)
             if req_meta.deferred_load:
                 self._deferred_done.add(req_meta.req_id)
+
+    def _note_sync_load_failure(self, req_meta: MaruReqMeta) -> None:
+        """Keep this step from storing a request whose synchronous load failed.
+
+        The step computes the request on top of KV that was never loaded, so
+        the chunks it would store are wrong. A deferred load fails before its
+        request resumes and stores nothing in the failing step.
+        """
+        if req_meta.is_store or req_meta.deferred_load:
+            return
+        if req_meta.req_id not in self._load_failed_req_ids:
+            logger.warning(
+                "Maru: not storing req %s this step; its load failed",
+                req_meta.req_id,
+            )
+        self._load_failed_req_ids.add(req_meta.req_id)
+
+    def _store_requests(self, metadata: MaruConnectorMetadata) -> list[MaruReqMeta]:
+        """Return this step's store entries, minus requests whose load failed."""
+        return [
+            req_meta
+            for req_meta in metadata.requests
+            if req_meta.is_store and req_meta.req_id not in self._load_failed_req_ids
+        ]
 
     def _abort_deferred_loads(self, metadata: MaruConnectorMetadata) -> None:
         """Degrade every deferred load in ``metadata`` to recompute.
@@ -3361,10 +3455,7 @@ class MaruWorkerConnector:
 
         layer_idx = self._get_layer_index(layer_name)
 
-        for req_meta in metadata.requests:
-            if not req_meta.is_store:
-                continue
-
+        for req_meta in self._store_requests(metadata):
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             if not chunk_keys:
                 continue
@@ -3540,9 +3631,7 @@ class MaruWorkerConnector:
                     self._store_packed_slabs(kernel, metadata)
             return
 
-        for req_meta in metadata.requests:
-            if not req_meta.is_store:
-                continue
+        for req_meta in self._store_requests(metadata):
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
             if not chunk_keys:
                 continue
@@ -3714,9 +3803,7 @@ class MaruWorkerConnector:
         # the per-request fallback's eager _stored_keys updates did.
         seen_keys: set[str] = set()
         with stream_ctx:
-            for req_meta in metadata.requests:
-                if not req_meta.is_store:
-                    continue
+            for req_meta in self._store_requests(metadata):
                 chunk_keys = _req_chunk_keys(req_meta, ct)
                 if not chunk_keys:
                     continue
@@ -3833,9 +3920,7 @@ class MaruWorkerConnector:
         # First collect request-to-key ownership on CPU. Shared-prefix keys
         # retain every request ID even though only one physical copy is queued.
         key_entries: dict[str, tuple[torch.Tensor, set[str]]] = {}
-        for req_meta in metadata.requests:
-            if not req_meta.is_store:
-                continue
+        for req_meta in self._store_requests(metadata):
             chunk_keys = _req_chunk_keys(req_meta, ct)
             if not chunk_keys:
                 continue

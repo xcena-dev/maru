@@ -370,13 +370,17 @@ def fake_new_request_data(
     prompt_token_ids: list[int],
     block_ids: list[int],
     req_id: str = "r1",
+    num_computed_tokens: int = 0,
 ) -> SimpleNamespace:
     """Stand-in for a SchedulerOutput.scheduled_new_reqs entry.
 
     ``block_ids`` is wrapped in the single-KV-group tuple vLLM passes.
+    ``num_computed_tokens`` counts tokens already covered before this step,
+    including an external hit the connector loads in it.
     """
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=prompt_token_ids,
         block_ids=(list(block_ids),),
+        num_computed_tokens=num_computed_tokens,
     )
