@@ -335,7 +335,9 @@ whole prompt fits, so Maru parks a request only while the whole prompts of
 all parked requests fit in the GPU KV cache (the first request in line is
 always parked). A request that does not fit
 stays in `WAITING`, keeps its place ahead of later requests, and is parked
-once earlier loads finish. This budget counts GPU blocks;
+once earlier loads finish. It keeps that place until vLLM gives it blocks, so
+a request that fits the budget while running requests still hold the blocks it
+needs is not passed over either. This budget counts GPU blocks;
 `maru_load_admission_window` below counts loads in flight.
 
 `maru_async_store` lets the store finish after the forward pass returns, so
