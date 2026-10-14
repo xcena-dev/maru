@@ -112,6 +112,8 @@ The CXL mmap region is pinned via `cudaHostRegister` by MaruHandler's DaxMapper,
 so `.to(device)` triggers a direct DMA transfer from CXL to GPU memory without
 any intermediate CPU copy.
 
+If CUDA registration fails for a region, the packed connector checks each slab's actual pin status before passing a host pointer to the placement kernel. Inline loads copy an unpinned slab to the GPU and run the placement kernel on that copy, as deferred loads already do for every slab. Stores gather into one reusable GPU slab and copy it to CXL before publishing the keys. Pinned slabs keep the direct kernel path, including in batches that also contain unpinned slabs. This preserves caching when pinning fails, at reduced transfer performance.
+
 ### Chunk-Based Storage
 
 Tokens are divided into fixed-size chunks (default 256 tokens) for storage:
