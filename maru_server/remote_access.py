@@ -947,15 +947,18 @@ def serve_remote(
         ready: Set once the socket is bound.
         sweep_interval_s: Poll timeout and sweep period in seconds.
     """
-    ctx = zmq.Context.instance()
+    # Socket.close() only schedules libzmq's cleanup. Own this context so
+    # termination waits for the listening port to be released before a
+    # same-process restart, without terminating other endpoints or clients.
+    ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
-    sock.bind(bind_url)
-    if ready is not None:
-        ready.set()
-    poller = zmq.Poller()
-    poller.register(sock, zmq.POLLIN)
-    last_sweep = time.monotonic()
     try:
+        sock.bind(bind_url)
+        if ready is not None:
+            ready.set()
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        last_sweep = time.monotonic()
         while not stop_event.is_set():
             if poller.poll(timeout=int(sweep_interval_s * 1000)):
                 raw = sock.recv()
@@ -986,3 +989,4 @@ def serve_remote(
                 last_sweep = time.monotonic()
     finally:
         sock.close(linger=0)
+        ctx.term()

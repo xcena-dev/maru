@@ -737,6 +737,26 @@ def test_a_dying_remote_endpoint_stops_the_server(maru):
     assert maru.get_stats()["allocation_manager"]["num_allocations"] == 0
 
 
+def test_stopped_remote_endpoint_releases_its_port(access):
+    import socket
+
+    from maru_server.remote_access import serve_remote
+
+    port = _free_port()
+    stop = threading.Event()
+    stop.set()
+    # An already requested stop still binds and then closes the endpoint.
+    # Returning must mean the port is reusable, not just cleanup queued on
+    # a shared context's background reaper.
+    for _ in range(10):
+        ready = threading.Event()
+        serve_remote(access, f"tcp://127.0.0.1:{port}", stop_event=stop, ready=ready)
+        assert ready.is_set()
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+
+
 def test_an_endpoint_that_cannot_bind_fails_start_and_releases_everything(maru):
     import zmq
 
@@ -752,6 +772,7 @@ def test_an_endpoint_that_cannot_bind_fails_start_and_releases_everything(maru):
             pytest.raises(RuntimeError, match="did not start"),
         ):
             _start_remote(maru, _remote_args(remote_bind=url), lambda: called.append(1))
+        assert holder.getsockopt(zmq.TYPE) == zmq.REP
     finally:
         holder.close(linger=0)
     assert called == []  # no signal: start reports the failure itself
