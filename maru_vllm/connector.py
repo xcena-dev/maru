@@ -882,7 +882,9 @@ class MaruKVConnector(KVConnectorBase_V1):
             the multi_layer_kv_transfer kernel directly on the pinned
             CXL slab (no staging) when available — load scatters a whole slab
             into the paged cache per chunk, store gathers one D2H per chunk —
-            falling back to per-layer copies otherwise. See design note P6.
+            falling back to per-layer copies otherwise. A slab whose region
+            failed CUDA registration is staged through one chunk of GPU
+            memory and still placed by the kernel. See design note P6.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_load_admission_window: int - With maru_async_load, cap how many
@@ -3429,16 +3431,18 @@ class MaruWorkerConnector:
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
         attn_metadata: AttentionMetadata,
     ) -> set[str]:
-        """Load per-chunk slabs with no GPU staging (P6 v2, packed).
+        """Load packed slabs directly when pinned, or through a device copy.
 
         The KV_2LTD slab (``[2, num_layers, chunk_tokens, hidden]``) is handed
         whole to ``multi_layer_kv_transfer``, which reads the pinned
         CXL host memory directly (UVA) and scatters all layers into the paged
         GPU cache in one kernel per chunk — the same no-staging path LMCache's
         ``VLLMPagedMemGPUConnectorV2.to_gpu`` uses. This avoids both v1's
-        per-(layer, chunk) copies and the reverted GPU-staging OOM. Non-Flash
-        layouts, CPU, or an unbuilt ``maru_kv_ops`` fall back to a per-layer
-        inject that reads the same slab slices.
+        per-(layer, chunk) copies and the reverted GPU-staging OOM. A slab
+        whose region failed CUDA registration is first copied to the device,
+        one chunk at a time, and then placed by the same kernel. Non-Flash
+        layouts, CPU, or an unbuilt ``maru_kv_ops`` fall back to copying one
+        slab at a time and injecting its per-layer slices.
 
         Deferred (between-step) requests are marked finished immediately (the
         transfer completes on the current stream before this returns).
@@ -3474,6 +3478,7 @@ class MaruWorkerConnector:
 
         dtype = layers[0][1].dtype
         failed: set[str] = set()
+        staged_chunks: dict[str, int] = {}
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3491,7 +3496,7 @@ class MaruWorkerConnector:
                         chunk_slots = slot_gpu[
                             chunk_index * ct : (chunk_index + 1) * ct
                         ]
-                        # KV_2LTD host tensor aliasing pinned CXL:
+                        # KV_2LTD host tensor aliasing CXL:
                         # [2, L, tokens, h]
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
                             2, num_layers, ct, -1
@@ -3508,8 +3513,19 @@ class MaruWorkerConnector:
                         # the per-layer path.
                         if kernel is not None and whole_chunk:
                             ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                            # Registration can fail independently for each
+                            # region; kernel availability alone does not make
+                            # a host slab accessible to the GPU. Stage such a
+                            # slab like the deferred path does, keeping one
+                            # placement launch per chunk.
+                            slab_src = slab_host
+                            if not slab_host.is_pinned():
+                                slab_src = slab_host.to(dev, non_blocking=True)
+                                staged_chunks[req_meta.req_id] = (
+                                    staged_chunks.get(req_meta.req_id, 0) + 1
+                                )
                             ops.multi_layer_kv_transfer(
-                                slab_host,
+                                slab_src,
                                 ptrs,
                                 chunk_slots,
                                 dev,
@@ -3545,7 +3561,13 @@ class MaruWorkerConnector:
             self._load_stream.synchronize()
 
         for req_meta, num_chunks, _, _ in prepared_requests:
-            mode = "kernel" if kernel is not None else "fallback"
+            staged = staged_chunks.get(req_meta.req_id, 0)
+            if kernel is None:
+                mode = "fallback"
+            elif staged:
+                mode = f"kernel, {staged} unpinned chunks staged"
+            else:
+                mode = "kernel"
             logger.info(
                 "Maru: packed-loaded %d layers x %d chunks (%d tokens) for req %s (%s)",
                 num_layers,
@@ -4084,7 +4106,7 @@ class MaruWorkerConnector:
     def _store_packed_slabs(
         self, kernel: tuple, metadata: MaruConnectorMetadata
     ) -> None:
-        """Write each chunk completed this step with one kernel D2H transfer.
+        """Gather completed chunks directly to pinned CXL or stage a copy.
 
         Runs once per step, from the last layer's ``save_kv_layer`` call —
         every layer's KV for the step is in the paged buffers by then. Each
@@ -4092,8 +4114,9 @@ class MaruWorkerConnector:
         ``multi_layer_kv_transfer(D2H)`` reading the paged GPU cache directly
         into the pinned CXL slab (no staging), queued on a dedicated stream
         that first waits on the compute stream so the step's KV writes are
-        visible. One synchronize gates ``batch_store`` so a key is never
-        registered before its slab bytes are fully in CXL.
+        visible. Unpinned slabs use one reusable device buffer followed by a
+        blocking copy to CXL. One stream synchronize gates ``batch_store`` so
+        a key is never registered before its slab bytes are fully in CXL.
         """
         ops, ptrs, pbs, block_size, head_size, fmt = kernel
         handler = self._handler
@@ -4121,6 +4144,8 @@ class MaruWorkerConnector:
 
         ready_keys: list[str] = []
         ready_handles: list = []
+        staging: torch.Tensor | None = None
+        staged_chunks = 0
         # Requests sharing a prefix can yield the same base_key within one
         # step; the single deferred batch_store no longer dedupes them the way
         # the per-request fallback's eager _stored_keys updates did.
@@ -4170,8 +4195,16 @@ class MaruWorkerConnector:
                         slab_host = torch.frombuffer(
                             handle.buf[:slab_bytes], dtype=dtype
                         ).view(2, self._num_layers, ct, -1)
+                        target = slab_host
+                        if not slab_host.is_pinned():
+                            # Bound staging to one chunk even when a whole
+                            # region failed CUDA registration. Copy before
+                            # reusing it for the next chunk on this stream.
+                            if staging is None:
+                                staging = torch.empty_like(slab_host, device=dev)
+                            target = staging
                         ops.multi_layer_kv_transfer(
-                            slab_host,
+                            target,
                             ptrs,
                             slot_dev[ci * ct : (ci + 1) * ct],
                             dev,
@@ -4181,6 +4214,9 @@ class MaruWorkerConnector:
                             block_size=block_size,
                             head_size=head_size,
                         )
+                        if target is not slab_host:
+                            slab_host.copy_(target)
+                            staged_chunks += 1
                     except Exception as e:
                         logger.error("Maru packed save error: %s: %s", base_key, e)
                         if handle is not None:
@@ -4213,8 +4249,11 @@ class MaruWorkerConnector:
             else:
                 logger.warning("Maru packed store failed: %s", base_key)
         if self._timing:
+            mode = "kernel"
+            if staged_chunks:
+                mode += f", {staged_chunks} unpinned chunks staged"
             _emit_timing(
-                f"packed-store kernel {self._num_layers}L x {len(ready_keys)}c"
+                f"packed-store {mode} {self._num_layers}L x {len(ready_keys)}c"
             )
 
     def _store_packed_slabs_write_behind(

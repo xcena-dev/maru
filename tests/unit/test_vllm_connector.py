@@ -1414,22 +1414,22 @@ class TestPackedStoreLoadRoundtrip:
 # =============================================================================
 
 
-class _PageLockedPool:
-    """Handler stand-in backed by page-locked host memory.
+class _HostPool:
+    """Handler stand-in with a repeating pattern of pinned/pageable pages.
 
-    ``multi_layer_kv_transfer`` reaches a host destination through
-    ``cudaHostGetDevicePointer``, so the pool must hand out memory the driver
-    knows about, the way a CUDA-registered CXL mapping does in production. A
+    Pageable pages model a CXL region whose CUDA registration failed. A
     stored key keeps the same bytes for the reader rather than copying them,
     which is also what the shared pool does.
     """
 
-    def __init__(self):
+    def __init__(self, pinning=(True,)):
         self.objects: dict = {}
         self._live: list = []
+        self._pinning = pinning
 
     def alloc(self, nbytes: int):
-        backing = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+        pinned = self._pinning[len(self._live) % len(self._pinning)]
+        backing = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pinned)
         self._live.append(backing)
         return SimpleNamespace(buf=memoryview(backing.numpy()), backing=backing)
 
@@ -1473,6 +1473,13 @@ class TestPackedKernelRoundtripGPU:
     NUM_BLOCKS = PROMPT // BLOCK
     HIDDEN = HEADS * HEAD_SIZE
 
+    @pytest.fixture(autouse=True)
+    def _require_kv_ops(self):
+        import maru_kv_ops
+
+        if not maru_kv_ops.is_available():
+            pytest.skip(f"fused kernel unavailable: {maru_kv_ops.import_error()}")
+
     def _layer_names(self):
         return [f"model.layers.{i}.self_attn" for i in range(self.LAYERS)]
 
@@ -1502,9 +1509,9 @@ class TestPackedKernelRoundtripGPU:
         assert worker._kv_layout.format_name is not None, "kernel format required"
         return worker
 
-    def _store(self, caches, *, write_behind: bool):
+    def _store(self, caches, *, write_behind: bool, pinning=(True,)):
         """Run one store step; return the pool and the prompt's token ids."""
-        pool = _PageLockedPool()
+        pool = _HostPool(pinning)
         worker = self._make_worker(
             caches, extra_config={"maru_async_store": True} if write_behind else None
         )
@@ -1521,15 +1528,20 @@ class TestPackedKernelRoundtripGPU:
 
         expected = self.PROMPT // self.CHUNK
         deadline = time.monotonic() + 30.0
-        while len(pool.objects) < expected and time.monotonic() < deadline:
+        while (
+            write_behind
+            and len(pool.objects) < expected
+            and time.monotonic() < deadline
+        ):
             worker.get_finished_saving(set())
             time.sleep(0.01)
         assert len(pool.objects) == expected, (
             f"{len(pool.objects)} of {expected} chunks registered"
         )
+        worker.shutdown()
         return pool, token_ids
 
-    def _load(self, pool, token_ids, num_chunks):
+    def _load(self, pool, token_ids, num_chunks, *, deferred=True):
         """Read the pool back into zeroed caches; return them."""
         src = self._source_caches()
         dst = {name: torch.zeros_like(tensor) for name, tensor in src.items()}
@@ -1548,37 +1560,47 @@ class TestPackedKernelRoundtripGPU:
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=num_chunks,
+                deferred_load=deferred,
             ),
         )
-        # On CUDA a deferred packed load always goes to the background loader
-        # thread, so the request is reported on a later call, not this one.
-        deadline = time.monotonic() + 30.0
-        finished = None
-        while finished is None and time.monotonic() < deadline:
-            finished = reader.get_finished_loading()
-            if finished is None:
-                time.sleep(0.01)
-        assert finished == {"r1"}
+        if deferred:
+            # On CUDA a deferred packed load always goes to the background
+            # loader thread, so the request is reported on a later call.
+            deadline = time.monotonic() + 30.0
+            finished = None
+            while finished is None and time.monotonic() < deadline:
+                finished = reader.get_finished_loading()
+                if finished is None:
+                    time.sleep(0.01)
+            assert finished == {"r1"}
         assert reader.take_failed_load_blocks() == set()
+        reader.shutdown()
         return dst
 
     def _slab_bytes(self, pool, token_ids):
         keys = _chunk_keys(token_ids, self.CHUNK)
         return [bytes(pool.objects[key].buf) for key in keys]
 
+    @pytest.mark.parametrize(
+        "pinning",
+        [(True,), (False,), (True, False)],
+        ids=["pinned", "pageable", "mixed"],
+    )
     @pytest.mark.parametrize("write_behind", [False, True], ids=["direct", "staging"])
-    def test_roundtrip_restores_every_layer(self, write_behind):
-        """Either store variant round-trips every layer of every chunk exactly."""
-        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
+    def test_roundtrip_restores_every_layer(self, write_behind, pinning):
+        """Either store variant round-trips every layer of every chunk exactly.
+
+        The deferred load reads back slabs whose region may have failed CUDA
+        registration, so every pin state must survive it too.
+        """
         src = self._source_caches()
-        pool, token_ids = self._store(src, write_behind=write_behind)
+        pool, token_ids = self._store(src, write_behind=write_behind, pinning=pinning)
         dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK)
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name])
 
     def test_staging_and_direct_stores_agree_byte_for_byte(self):
         """GPU staging must not change the stored object's arrangement."""
-        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
         caches = self._source_caches()
         direct, token_ids = self._store(caches, write_behind=False)
         staged, _ = self._store(caches, write_behind=True)
@@ -1588,7 +1610,6 @@ class TestPackedKernelRoundtripGPU:
 
     def test_slab_bytes_are_kv_2ltd(self):
         """The stored object holds K/V, layer and token on the declared axes."""
-        pytest.importorskip("lmcache.c_ops", reason="fused kernel path needs c_ops")
         caches = self._source_caches()
         pool, token_ids = self._store(caches, write_behind=False)
 
@@ -1606,6 +1627,99 @@ class TestPackedKernelRoundtripGPU:
                             slab[kv, layer_idx, ti],
                             host[name][block, kv, offset].reshape(self.HIDDEN),
                         )
+
+    @pytest.mark.parametrize(
+        "pinning",
+        [(True,), (False,), (True, False)],
+        ids=["pinned", "pageable", "mixed"],
+    )
+    def test_inline_roundtrip_with_pin_states(self, pinning, monkeypatch):
+        """Failed pinning must preserve KV bytes without staging pinned pages."""
+        import maru_kv_ops
+
+        transfer = maru_kv_ops.multi_layer_kv_transfer
+        calls = []
+
+        def record_transfer(slab, ptrs, slots, device, pbs, direction, *args, **kwargs):
+            calls.append((direction, slab.device.type, slab.data_ptr()))
+            return transfer(slab, ptrs, slots, device, pbs, direction, *args, **kwargs)
+
+        monkeypatch.setattr(maru_kv_ops, "multi_layer_kv_transfer", record_transfer)
+        src = self._source_caches()
+        pool, token_ids = self._store(src, write_behind=False, pinning=pinning)
+        dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, deferred=False)
+        for name in self._layer_names():
+            torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
+
+        # Pinned pages still go straight to/from the kernel. Pageable pages
+        # reach it through a device copy, one launch per chunk either way.
+        # Pageable stores share one device slab, so staging does not grow
+        # with the request.
+        store_calls = [c for c in calls if c[0] == maru_kv_ops.TransferDirection.D2H]
+        load_calls = [c for c in calls if c[0] == maru_kv_ops.TransferDirection.H2D]
+        staging_ptrs = set()
+        keys = _chunk_keys(token_ids, self.CHUNK)
+        assert len(store_calls) == len(load_calls) == len(keys)
+        for key, store, load in zip(keys, store_calls, load_calls, strict=True):
+            backing = pool.objects[key].backing
+            if backing.is_pinned():
+                assert store[1:] == ("cpu", backing.data_ptr())
+                assert load[1:] == ("cpu", backing.data_ptr())
+            else:
+                assert store[1] == "cuda" and load[1] == "cuda"
+                staging_ptrs.add(store[2])
+        assert len(staging_ptrs) <= 1
+
+    def test_inline_load_from_pageable_write_behind_store(self):
+        """Exercise inline load independently of the direct store fallback."""
+        import maru_kv_ops
+
+        src = self._source_caches()
+        pool, token_ids = self._store(src, write_behind=True, pinning=(False,))
+        with patch.object(
+            maru_kv_ops,
+            "multi_layer_kv_transfer",
+            wraps=maru_kv_ops.multi_layer_kv_transfer,
+        ) as transfer:
+            dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, deferred=False)
+        for name in self._layer_names():
+            torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
+        # Some GPUs can access pageable DRAM directly; even there, verify the
+        # dispatch contract needed on GPUs/mappings that require registration.
+        assert transfer.call_count == self.PROMPT // self.CHUNK
+        for call in transfer.call_args_list:
+            assert call.args[0].is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA registration")
+def test_registered_mapping_reports_pinned():
+    """``is_pinned()`` must see a mapping registered the way DaxMapper does it.
+
+    Packed transfers pick the direct kernel path from ``is_pinned()`` on a
+    tensor aliasing the CXL mapping. The pools above are cudaHostAlloc memory,
+    but production maps are registered with ``cudaHostRegister``. If torch
+    stopped reporting those as pinned, every slab would silently take the
+    staged path.
+    """
+    import ctypes
+    import mmap
+
+    from maru_handler.memory.mapper import _cuda_rc
+
+    torch.cuda.init()
+    nbytes = 1 << 20
+    view = memoryview(mmap.mmap(-1, nbytes))
+    slab = torch.frombuffer(view[4096 : 2 * 4096], dtype=torch.uint8)
+    assert not slab.is_pinned()
+
+    cudart = torch.cuda.cudart()
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(view))
+    assert _cuda_rc(cudart.cudaHostRegister(addr, nbytes, 0)) == 0
+    try:
+        assert slab.is_pinned()
+    finally:
+        assert _cuda_rc(cudart.cudaHostUnregister(addr)) == 0
+    assert not slab.is_pinned()
 
 
 # =============================================================================
