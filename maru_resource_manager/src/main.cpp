@@ -48,7 +48,9 @@ int main(int argc, char **argv) {
     maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec);
     int rc = pm.loadPools();
     if (rc != 0) {
-        maru::logf(maru::LogLevel::Error, "loadPools failed (rc=%d)", rc);
+        maru::logf(maru::LogLevel::Error,
+                   "loadPools failed (rc=%d); refusing to serve or checkpoint invalid state", rc);
+        return 1;
     }
     // loadPools returns 0 even when no devices found (scanDevices succeeds
     // with empty list). Report this, but keep rescanning even with live pools:
@@ -110,7 +112,12 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "shutting down...");
     reaper.stop();
     server.stop();
-    pm.checkpoint();
+    rc = pm.checkpoint();
+    if (rc != 0) {
+        maru::logf(maru::LogLevel::Warn,
+                   "shutdown checkpoint not written (rc=%d); WAL retained", rc);
+        return 1;
+    }
     maru::logf(maru::LogLevel::Info, "shutdown complete");
     return 0;
 }

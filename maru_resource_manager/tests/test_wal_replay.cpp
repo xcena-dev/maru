@@ -16,6 +16,10 @@ PoolState pool(uint32_t id) {
     PoolState p{};
     p.poolId = id;
     p.totalSize = 16384;
+    p.dataBegin = 0;
+    p.dataEnd = p.totalSize;
+    p.alignBytes = 4096;
+    p.type = DaxType::FS_DAX;
     p.freeSize = p.totalSize;
     p.freeList.push_back({0, p.totalSize});
     return p;
