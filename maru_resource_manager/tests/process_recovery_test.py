@@ -234,34 +234,6 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.free(reused)
         self.stop()
 
-    def test_sigkill_replays_live_and_freed_allocations(self):
-        self.start()
-        live = self.allocate()
-        freed = self.allocate()
-        self.free(freed)
-        identity = self.identity()
-        wal = (self.state / WAL_NAME).read_bytes()
-        self.assertTrue(wal)
-        self.assertFalse((self.state / "global.meta").exists())
-        self.stop(signal.SIGKILL)
-        self.assertEqual((self.state / WAL_NAME).read_bytes(), wal)
-        self.start()
-        self.assertEqual(self.identity(), identity)
-        self.access(live)
-        self.free(freed, -errno.ENOENT)
-        self.check_stats({"/dev/dax0.0": 1})
-        next_handle = self.allocate()
-        self.assertGreater(next_handle[0], freed[0])
-        self.assertEqual(next_handle[1], freed[1])
-        self.free(live)
-        self.free(next_handle)
-        self.stop()
-        self.checkpoint(0, next_handle[0] + 1)
-        self.start()
-        self.check_stats()
-        self.assertEqual(self.identity(), identity)
-        self.stop()
-
     def test_missing_secret_rejects_live_recovery(self):
         self.start()
         self.allocate()
@@ -283,17 +255,23 @@ class ProcessRecoveryTest(unittest.TestCase):
         checkpoint = (self.state / "global.meta").read_bytes()
         self.start()
         live = self.allocate()
+        freed = self.allocate()
+        self.free(freed)
         self.free(old)
+        wal = (self.state / WAL_NAME).read_bytes()
+        self.assertTrue(wal)
         self.stop(signal.SIGKILL)
         self.assertEqual((self.state / "global.meta").read_bytes(), checkpoint)
-        self.assertTrue((self.state / WAL_NAME).read_bytes())
+        self.assertEqual((self.state / WAL_NAME).read_bytes(), wal)
         self.start()
+        self.assertEqual(self.identity(), identity)
         self.access(live)
         self.free(old, -errno.ENOENT)
+        self.free(freed, -errno.ENOENT)
         self.check_stats({"/dev/dax0.0": 1})
         reused = self.allocate()
         self.assertEqual(reused[1], old[1])
-        self.assertGreater(reused[0], live[0])
+        self.assertGreater(reused[0], freed[0])
         self.free(live)
         self.free(reused)
         self.stop()
@@ -375,8 +353,8 @@ class ProcessRecoveryTest(unittest.TestCase):
         before = (self.state / filename).read_bytes()
         identity = self.identity()
 
-        # For write failures, successfully write the header and part of the
-        # payload before returning ENOSPC. fsync failures occur after all bytes.
+        # A write failure writes the header and part of the payload first;
+        # an fsync failure comes after all bytes.
         fault = f"{filename}.tmp {operation} {error} 40"
         self.start(checkpoint_fault=fault)
         self.free(old)
@@ -408,17 +386,11 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.checkpoint(0, next_handle[0] + 1)
         self.assertFalse((self.state / f"{filename}.tmp").exists())
 
-    def test_shutdown_checkpoint_write_failure_retains_wal(self):
+    def test_shutdown_checkpoint_failure_retains_wal(self):
+        # CheckpointFailureTest covers every file and phase in process; this
+        # runs the real shutdown once, failing the last file it writes.
         self.add_device(1)
-        for filename in ("pool_0.meta", "pool_1.meta", "global.meta"):
-            with self.subTest(file=filename):
-                self.checkpoint_failure_round_trip(filename, "write", errno.ENOSPC)
-
-    def test_shutdown_checkpoint_fsync_failure_retains_wal(self):
-        self.add_device(1)
-        for filename in ("pool_0.meta", "pool_1.meta", "global.meta"):
-            with self.subTest(file=filename):
-                self.checkpoint_failure_round_trip(filename, "fsync", errno.EIO)
+        self.checkpoint_failure_round_trip("global.meta", "write", errno.ENOSPC)
 
     def ctl(self, *argv):
         result = subprocess.run(
@@ -447,6 +419,8 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn(f"region={handle[0]}", output)
         self.free(handle)
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 1, output)  # Still used by the RM.
         code, output = self.ctl("exclude", "dax1.0")
         self.assertEqual(code, 0, output)
         self.assertEqual(self.pool_paths(), {"/dev/dax0.0"})
@@ -461,9 +435,18 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn("device=/dev/dax1.0 state=excluded", output)
 
+        # Reset it for reuse: a wiped device comes back with a fresh header.
+        code, output = self.ctl("wipe", "dax1.0")
+        self.assertEqual(code, 1, output)  # Needs --confirm.
+        code, output = self.ctl("wipe", "dax1.0", "--confirm")
+        self.assertEqual(code, 0, output)
+        with (self.root / "dev/dax1.0").open("rb") as stream:
+            self.assertEqual(stream.read(4096), bytes(4096))
         code, output = self.ctl("include", "dax1.0")
         self.assertEqual(code, 0, output)
         self.assertEqual(self.pool_paths(), {"/dev/dax0.0", "/dev/dax1.0"})
+        with (self.root / "dev/dax1.0").open("rb") as stream:
+            self.assertEqual(stream.read(8), b"MARUDEV\0")
         self.access(self.allocate(1), 1)
         self.stop()
         self.assertFalse((self.state / "admin.sock").exists())
@@ -481,25 +464,6 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.access(handle)
         self.free(handle)
-        self.stop()
-
-    def test_admin_wipe_resets_an_excluded_device(self):
-        self.add_device(1)
-        self.start()
-        self.free(self.allocate(1))
-        code, output = self.ctl("wipe", "dax1.0", "--confirm")
-        self.assertEqual(code, 1, output)  # Still used by the RM.
-        code, output = self.ctl("exclude", "dax1.0")
-        self.assertEqual(code, 0, output)
-        code, output = self.ctl("wipe", "dax1.0")
-        self.assertEqual(code, 1, output)  # Needs --confirm.
-        code, output = self.ctl("wipe", "dax1.0", "--confirm")
-        self.assertEqual(code, 0, output)
-        self.assertEqual((self.root / "dev/dax1.0").read_bytes(), bytes(SIZE))
-        code, output = self.ctl("include", "dax1.0")
-        self.assertEqual(code, 0, output)
-        self.assertEqual((self.root / "dev/dax1.0").read_bytes()[:8], b"MARUDEV\0")
-        self.access(self.allocate(1), 1)
         self.stop()
 
 

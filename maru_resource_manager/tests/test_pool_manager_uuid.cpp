@@ -35,16 +35,10 @@ protected:
     }
 };
 
-// ── getDeviceUuidForRegion ──────────────────────────────────────────────────
+// ── getDeviceUuidForRegion / getStats ───────────────────────────────────────
 
-TEST_F(PoolManagerUuidTest, GetUuidForNonexistentRegionReturnsEmpty) {
-    std::string uuid = pm_->getDeviceUuidForRegion(9999);
-    EXPECT_EQ(uuid, "");
-}
-
-// ── getStats ────────────────────────────────────────────────────────────────
-
-TEST_F(PoolManagerUuidTest, GetStatsEmptyPools) {
+TEST_F(PoolManagerUuidTest, EmptyManagerHasNoUuidOrPools) {
+    EXPECT_EQ(pm_->getDeviceUuidForRegion(9999), "");
     std::vector<PoolState> stats;
     pm_->getStats(stats);
     EXPECT_TRUE(stats.empty());

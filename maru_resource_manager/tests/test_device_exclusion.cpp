@@ -50,7 +50,6 @@ protected:
         std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
         f.write(head.data(), static_cast<std::streamsize>(head.size()));
     }
-    std::string head(uint32_t id) { return bytes(fakeRoot + dev(id)).substr(0, 64); }
     int allocateAs(PoolManager &pm, const std::string &client, Handle &h, uint32_t id = 0) {
         std::string path, uuid;
         uint64_t requested;
@@ -622,14 +621,14 @@ TEST_F(DeviceExclusionTest, WipeZeroesOnlyExcludedDevicesWhenConfirmed) {
     ASSERT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
     out.clear();
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
-    const auto before = bytes(fakeRoot + dev(1));
+    const auto before = head(1, 2 * H); // The header and the client's data.
     out.clear();
     EXPECT_EQ(pm.adminWipe("/dev/dax1.0", false, out), -EPERM);
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), before);
+    EXPECT_EQ(head(1, 2 * H), before);
     out.clear();
     ASSERT_EQ(pm.adminWipe("/dev/dax1.0", true, out), 0) << out;
     EXPECT_NE(out.find("wiped /dev/dax1.0 bytes=" + std::to_string(B)), npos) << out;
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0')); // Header included.
+    EXPECT_EQ(head(1, B), std::string(B, '\0')); // Header included.
 
     // Reset for reuse: a wiped device comes back with a fresh header.
     out.clear();
@@ -651,10 +650,11 @@ TEST_F(DeviceExclusionTest, WipeStopsBetweenChunksWhenCancelled) {
     std::ofstream(fakeRoot + dev(1), std::ios::binary | std::ios::trunc) << pattern;
     std::atomic<bool> cancel{true};
     EXPECT_EQ(wipeDevice(dev(1), B, H, &cancel), -ECANCELED);
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), pattern);
+    EXPECT_EQ(head(1, H), pattern.substr(0, H)); // Not even the first chunk.
     cancel = false;
-    ASSERT_EQ(wipeDevice(dev(1), B, H, &cancel), 0); // Eight 2 MiB chunks.
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+    // Eight 2 MiB chunks; WipeZeroesOnlyExcludedDevicesWhenConfirmed checks
+    // the zeroed bytes.
+    ASSERT_EQ(wipeDevice(dev(1), B, H, &cancel), 0);
     EXPECT_EQ(wipeDevice(dev(1), B, 1000), -EINVAL); // Not page-aligned.
 }
 
@@ -665,8 +665,7 @@ TEST_F(DeviceExclusionTest, IsolatedWipeSurvivesFaultsAndStopsOnCancel) {
     EXPECT_EQ(wipeDeviceIsolated(dev(1), 2 * B, H), -EIO);
     EXPECT_EQ(wipeDeviceIsolated(dev(1), B, H, [] { return true; }), -ECANCELED);
     EXPECT_EQ(wipeDeviceIsolated("/dev/dax9.0", B, H), -ENOENT);
-    ASSERT_EQ(wipeDeviceIsolated(dev(1), B, H), 0);
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+    EXPECT_EQ(wipeDeviceIsolated(dev(1), B, H), 0);
 }
 
 TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {

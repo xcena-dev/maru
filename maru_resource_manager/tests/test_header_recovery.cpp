@@ -1,42 +1,10 @@
 // Exercise production discovery/recovery using a private fake /dev and sysfs.
-// This target's linker wraps filesystem calls; it never opens real DAX devices.
+// This target links fake_dax_fs.cpp; it never opens real DAX devices.
 #include "recovery_fixture.h"
 
-std::string fakeRoot;
 std::vector<std::string> openedPaths;
 
-namespace {
-std::string redirected(const char *path) {
-    std::string p(path);
-    if (p.rfind("/dev/", 0) == 0 || p.rfind("/sys/", 0) == 0) {
-        if (fakeRoot.empty()) std::abort();
-        return fakeRoot + p;
-    }
-    return p;
-}
-} // namespace
-
-extern "C" int __real_stat(const char *, struct stat *);
-extern "C" int __real_open(const char *, int, ...);
-extern "C" DIR *__real_opendir(const char *);
-extern "C" ssize_t __real_readlink(const char *, char *, size_t);
-
-extern "C" int __wrap_stat(const char *path, struct stat *st) {
-    const int rc = __real_stat(redirected(path).c_str(), st);
-    if (rc == 0 && std::string(path).rfind("/dev/dax", 0) == 0) {
-        st->st_mode = (st->st_mode & ~S_IFMT) | S_IFCHR;
-        st->st_rdev = makedev(240, 0);
-    }
-    return rc;
-}
-extern "C" int __wrap_open(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, unsigned int);
-        va_end(args);
-    }
+int recordOpen(const char *path) {
     openedPaths.emplace_back(path);
     // Holds a caller in open(), e.g. a wipe child (test_device_exclusion.cpp).
     if (std::string(path) == "/dev/dax-hang") {
@@ -44,13 +12,7 @@ extern "C" int __wrap_open(const char *path, int flags, ...) {
         errno = EIO;
         return -1;
     }
-    return __real_open(redirected(path).c_str(), flags, mode);
-}
-extern "C" DIR *__wrap_opendir(const char *path) {
-    return __real_opendir(redirected(path).c_str());
-}
-extern "C" ssize_t __wrap_readlink(const char *path, char *buf, size_t size) {
-    return __real_readlink(redirected(path).c_str(), buf, size);
+    return 0;
 }
 
 TEST_F(HeaderRecoveryTest, FreshPoolInitializesHeaderAfterValidation) {
@@ -127,7 +89,7 @@ TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
         EXPECT_EQ(pm.loadPools(), -EUCLEAN);
         EXPECT_EQ(pm.checkpoint(), -EAGAIN);
         EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
-        EXPECT_EQ(bytes(fakeRoot + dev(0)), std::string(B, '\0'));
+        EXPECT_EQ(head(0, B), std::string(B, '\0'));
     }
 }
 
@@ -225,7 +187,7 @@ TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
         PoolManager pm(state);
         EXPECT_EQ(pm.loadPools(), -EUCLEAN);
         EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-        EXPECT_EQ(bytes(fakeRoot + dev(0)), std::string(B, '\0'));
+        EXPECT_EQ(head(0, B), std::string(B, '\0'));
     }
     // Only in the WAL, for a device that appears at a rescan: startup could
     // not apply the record.
@@ -235,7 +197,7 @@ TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
     ASSERT_EQ(pm.loadPools(), 0); // dax0.0 has no history now.
     addDevice(1, false);
     EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+    EXPECT_EQ(head(1, B), std::string(B, '\0'));
     EXPECT_EQ(pm.checkpoint(), -EAGAIN);
 }
 
@@ -258,15 +220,6 @@ TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
     EXPECT_EQ(pm.loadPools(), -EUCLEAN);
     EXPECT_EQ(pm.checkpoint(), -EAGAIN);
     EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), before);
-}
-
-TEST_F(HeaderRecoveryTest, TruncatedWalDoesNotInitializeAnyDevice) {
-    addDevice(0, false);
-    std::ofstream(state + "/maru-resource-manager.wal") << "torn";
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EPROTO);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
 }
 
 TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
@@ -363,7 +316,9 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         EXPECT_EQ(restarted.allocationCount(), 2u);
     }
     // Not a prefix of the final record: zero fill, a header prefix with an
-    // unknown type, or a torn record followed by another. WAL left untouched.
+    // unknown type, or a torn record followed by another. WAL left untouched,
+    // and no fresh device gets a header.
+    addDevice(1, false);
     fs::remove(walPath);
     ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
     const auto one = bytes(walPath);
@@ -374,6 +329,8 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         PoolManager pm(state);
         EXPECT_EQ(pm.loadPools(), -EPROTO);
         EXPECT_EQ(bytes(walPath), corrupt);
+        DeviceHeader header{};
+        EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
     }
 }
 
@@ -672,26 +629,6 @@ TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
     EXPECT_EQ(reaper.allocationCount(), 1u);
 }
 
-TEST_F(HeaderRecoveryTest, FsDaxStillAllowsFileOffsetZero) {
-    auto p = pool();
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
-    PoolManager pm(state);
-    PoolManagerTestPeer::inject(pm, p, {});
-    Handle h{};
-    std::string path, uuid;
-    uint64_t size;
-    ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
-    EXPECT_EQ(h.offset, 0u);
-    EXPECT_TRUE(fs::exists(path));
-    EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
-    EXPECT_FALSE(fs::exists(path));
-}
-
 TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
     auto p = pool();
     p.type = DaxType::FS_DAX;
@@ -715,7 +652,10 @@ TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
     EXPECT_EQ(stats[0].freeSize, B);
     ASSERT_EQ(pm.alloc(H, "offline-test-owner", h, path, uuid, p.devPath, size), 0);
     EXPECT_EQ(h.regionId, 2u);
+    EXPECT_EQ(h.offset, 0u); // FS_DAX keeps file offset zero; it has no header.
+    EXPECT_TRUE(fs::exists(path));
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+    EXPECT_FALSE(fs::exists(path));
 }
 
 TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
@@ -834,10 +774,11 @@ void PrintTo(const CheckpointFaultCase &fault, std::ostream *os) {
 }
 
 std::vector<CheckpointFaultCase> checkpointFaultCases() {
+    // The checkpoint returns any errno as is, so one per phase is enough.
     std::vector<CheckpointFaultCase> cases;
     for (const auto *file : {"pool_0.meta", "pool_1.meta", "global.meta"})
         for (const auto *phase : {"HeaderWrite", "PartialPayloadWrite", "Fsync"})
-            for (int error : {ENOSPC, EIO}) cases.push_back({file, phase, error});
+            cases.push_back({file, phase, std::string(phase) == "Fsync" ? EIO : ENOSPC});
     return cases;
 }
 } // namespace
@@ -926,6 +867,5 @@ INSTANTIATE_TEST_SUITE_P(CheckpointIo, CheckpointFailureTest,
     [](const ::testing::TestParamInfo<CheckpointFaultCase> &info) {
         auto file = info.param.file;
         std::replace(file.begin(), file.end(), '.', '_');
-        return file + "_" + info.param.phase + "_" +
-               (info.param.error == ENOSPC ? "ENOSPC" : "EIO");
+        return file + "_" + info.param.phase;
     });
