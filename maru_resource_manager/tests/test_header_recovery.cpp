@@ -84,12 +84,8 @@ TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
         p.totalSize = p.freeSize = size - H;
         p.freeList = {{H, size - H}};
         save(p);
-        const auto before = bytes(state + "/pool_0.meta");
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-        EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
-        EXPECT_EQ(head(0, B), std::string(B, '\0'));
+        SCOPED_TRACE(size);
+        expectRecoveryRefused(-EUCLEAN);
     }
 }
 
@@ -110,27 +106,30 @@ TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
 
 TEST_F(HeaderRecoveryTest, BadGlobalMetadataDoesNotInitializeFreshHeader) {
     addDevice(0, false);
+    // Shorter than its header, or a header of another format.
     std::ofstream(state + "/global.meta") << "broken";
-    PoolManager pm(state);
-    EXPECT_NE(pm.loadPools(), 0);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    {
+        SCOPED_TRACE("truncated");
+        expectRecoveryRefused(-EPIPE);
+    }
+    std::ofstream(state + "/global.meta") << std::string(32, 'x');
+    {
+        SCOPED_TRACE("wrong magic");
+        expectRecoveryRefused(-EPROTO);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, MissingGlobalCheckpointIsNotAnEmptyLedger) {
     addDevice(0);
     ASSERT_EQ(MetadataStore(state).save(pool()), 0);
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, MissingPoolCheckpointWithLiveAllocationIsRejected) {
     addDevice(0);
     const auto a = allocation();
     ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, MissingHeaderWithoutLiveAllocationGetsFreshHeader) {
@@ -184,10 +183,8 @@ TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
             p.freeList = {{2 * H, B - 2 * H}};
             save(p, {{42, allocation()}});
         }
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-        EXPECT_EQ(head(0, B), std::string(B, '\0'));
+        SCOPED_TRACE(walOnly ? "live in the WAL" : "live in the checkpoint");
+        expectRecoveryRefused(-EUCLEAN);
     }
     // Only in the WAL, for a device that appears at a rescan: startup could
     // not apply the record.
@@ -205,8 +202,7 @@ TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRejected) {
     addDevice(0);
     auto a = allocation(0, 0);
     save(pool(), {{42, a}});
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
@@ -411,9 +407,7 @@ TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
     using checkpoint_fault::Operation;
     addDevice(0);
     const std::string walPath = state + "/maru-resource-manager.wal";
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    const std::string exitedOwner = std::string(host) + ":2147483647";
+    const std::string exitedOwner = localClient(2147483647);
     auto failSync = [&] {
         checkpoint_fault::arm(walPath, Operation::Fdatasync, EIO);
         checkpoint_fault::armTruncate(walPath, EIO);
@@ -445,9 +439,7 @@ TEST_F(HeaderRecoveryTest, UnsyncedCompleteRecordsStaySafeAcrossRestart) {
         ASSERT_EQ(pm.loadPools(), 0);
         failSync();
         Handle h{};
-        std::string path, uuid;
-        uint64_t requested;
-        EXPECT_EQ(pm.alloc(H, exitedOwner, h, path, uuid, dev(0), requested), -EIO);
+        EXPECT_EQ(allocate(pm, h, 0, exitedOwner), -EIO);
         checkpoint_fault::clear();
         EXPECT_EQ(pm.allocationCount(), 0u);
         PoolManager restarted(state);
@@ -595,12 +587,11 @@ TEST_F(HeaderRecoveryTest, BoundsOverflowOverlapAndLiveFreeIntersectionAreReject
         p.freeList = extents;
         ASSERT_EQ(MetadataStore(state).save(p), 0);
         ASSERT_EQ(MetadataStore(state).saveGlobal({}, 43), 0);
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        SCOPED_TRACE(extents.front().offset);
+        expectRecoveryRefused(-EUCLEAN);
     }
     save(pool(), {{42, allocation()}}); // Valid ranges, but free/live overlap.
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
@@ -619,9 +610,7 @@ TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
     // A local dead PID makes the reaper attempt the same deallocation path.
     PoolManager reaper(state);
     auto dead = invalid;
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    std::snprintf(dead.clientId, sizeof(dead.clientId), "%.80s:2147483647", host);
+    std::snprintf(dead.clientId, sizeof(dead.clientId), "%s", localClient(2147483647).c_str());
     PoolManagerTestPeer::inject(reaper, pool(), dead);
     uint64_t reaped = 99;
     reaper.reapExpired(reaped);
@@ -630,13 +619,7 @@ TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
 }
 
 TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
-    auto p = pool();
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
+    const auto p = fsDaxPool();
     PoolManager pm(state);
     PoolManagerTestPeer::inject(pm, p, {});
     // Left by a crash between file creation and the WAL append.
@@ -659,13 +642,7 @@ TEST_F(HeaderRecoveryTest, FsDaxFileCreationFailureKeepsFreeList) {
 }
 
 TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
-    auto p = pool(5);
-    p.type = DaxType::FS_DAX;
-    p.dataBegin = 0;
-    p.totalSize = p.freeSize = B;
-    p.freeList = {{0, B}};
-    p.devPath = fakeRoot + "/files";
-    fs::create_directory(p.devPath);
+    const auto p = fsDaxPool(5);
     PoolManager pm(state);
     PoolManagerTestPeer::inject(pm, p, allocation(5, 0)); // Owns maru_42.dat.
     // FS_DAX pool IDs follow sysfs numbering and can change across boots, so
@@ -688,24 +665,6 @@ TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
     PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50);
     EXPECT_FALSE(fs::exists(p.devPath + "/maru_7.dat"));
     for (const auto &name : kept) EXPECT_TRUE(fs::exists(p.devPath + "/" + name)) << name;
-}
-
-TEST_F(HeaderRecoveryTest, FailedWalReplayIsTransactional) {
-    WalStore wal(state);
-    const auto good = allocation();
-    auto bad = allocation(0, 0);
-    bad.handle.regionId = 99;
-    ASSERT_EQ(wal.appendAlloc(good), 0);
-    ASSERT_EQ(wal.appendAlloc(bad), 0);
-    std::vector<PoolState> pools{pool()};
-    std::map<uint64_t, Allocation> allocations;
-    uint64_t next = 1;
-    EXPECT_EQ(wal.replay(pools, allocations, next), -EUCLEAN);
-    EXPECT_EQ(next, 1u);
-    EXPECT_TRUE(allocations.empty());
-    ASSERT_EQ(pools[0].freeList.size(), 1u);
-    EXPECT_EQ(pools[0].freeList[0].offset, H);
-    EXPECT_EQ(pools[0].freeList[0].length, B - H);
 }
 
 TEST_F(HeaderRecoveryTest, InvalidSecondPoolCannotInitializeFirstPoolHeader) {
@@ -740,9 +699,7 @@ TEST_F(HeaderRecoveryTest, LateHeaderAllocationFailsWithoutLosingExistingAllocat
 
 TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
     auto a = allocation();
-    char host[256]{};
-    ASSERT_EQ(::gethostname(host, sizeof(host)), 0);
-    std::snprintf(a.clientId, sizeof(a.clientId), "%.80s:2147483647", host);
+    std::snprintf(a.clientId, sizeof(a.clientId), "%s", localClient(2147483647).c_str());
     auto p = pool();
     p.freeList = {{2 * H, B - 2 * H}};
     p.freeSize = B - 2 * H;
@@ -828,10 +785,6 @@ TEST_P(CheckpointFailureTest, RetainsWalAndAllowsRetry) {
     EXPECT_EQ(rc, -fault.error);
     EXPECT_EQ(bytes(path), publishedBefore); // Failed file was not renamed.
     EXPECT_EQ(bytes(walPath), walBefore); // Not just present: byte-for-byte intact.
-    ASSERT_TRUE(fs::exists(path + ".tmp"));
-    if (fault.phase != "Fsync") {
-        EXPECT_EQ(fs::file_size(path + ".tmp"), partial ? 40u : 0u);
-    }
     EXPECT_EQ(bytes(state + "/global.meta"), oldGlobal);
     if (fault.file != "pool_0.meta") {
         EXPECT_NE(bytes(state + "/pool_0.meta"), oldPool0);

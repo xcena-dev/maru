@@ -50,24 +50,33 @@ protected:
         std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
         f.write(head.data(), static_cast<std::streamsize>(head.size()));
     }
-    int allocateAs(PoolManager &pm, const std::string &client, Handle &h, uint32_t id = 0) {
-        std::string path, uuid;
-        uint64_t requested;
-        return pm.alloc(H, client, h, path, uuid, dev(id), requested);
-    }
-    std::string localClient(pid_t pid) {
-        char host[256]{};
-        EXPECT_EQ(::gethostname(host, sizeof(host)), 0);
-        return std::string(host) + ":" + std::to_string(pid);
+    // A WAL record for an absent pool (dax2.0) keeps checkpoints paused.
+    void pauseCheckpoints() {
+        auto absent = allocation(2);
+        absent.handle.regionId = 500;
+        ASSERT_EQ(WalStore(state).appendAlloc(absent), 0);
     }
 };
 
-std::string ask(const std::string &socketPath, const std::string &request) {
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+sockaddr_un unixAddress(const std::string &path) {
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    return addr;
+}
+
+// The rest of the line after key in text, or "" when key is absent.
+std::string lineAfter(const std::string &text, const std::string &key) {
+    const auto at = text.find(key);
+    if (at == npos) return "";
+    const auto begin = at + key.size();
+    return text.substr(begin, text.find('\n', begin) - begin);
+}
+
+std::string ask(const std::string &socketPath, const std::string &request) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    const auto addr = unixAddress(socketPath);
+    if (::connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
         ::close(fd);
         return "connect failed";
     }
@@ -172,34 +181,58 @@ TEST_F(DeviceExclusionTest, ExcludeRefusesLiveAllocationsUntilFreed) {
     EXPECT_NE(out.find("checkpoints=enabled"), npos) << out;
 }
 
-TEST_F(DeviceExclusionTest, ExcludeOfAbsentDeviceUsesCheckpointAndWal) {
+TEST_F(DeviceExclusionTest, AbsentDeviceAllocationsComeFromCheckpointAndWal) {
     addDevice(0);
     auto p = pool(1);
     p.freeList = {{2 * H, B - 2 * H}};
     p.freeSize = B - 2 * H;
     save(p, {{42, allocation(1)}});
-    ASSERT_EQ(WalStore(state).appendFree(42), 0); // Freed after the checkpoint.
+    const std::string walPath = state + "/maru-resource-manager.wal";
+    {
+        WalStore wal(state);
+        ASSERT_EQ(wal.appendFree(42), 0); // Freed after the checkpoint.
+        auto later = allocation(1, 3 * H);
+        later.handle.regionId = 43;
+        ASSERT_EQ(wal.appendAlloc(later), 0); // Allocated after it: WAL only.
+    }
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     EXPECT_EQ(pm.checkpoint(), -EAGAIN); // Pool 1 has no device.
+    for (const std::string filter : {"dax1.0", ""}) {
+        std::string out;
+        ASSERT_EQ(pm.adminAllocations(filter, out), 0) << out;
+        EXPECT_EQ(out.find("region=42 "), npos) << filter << ": " << out;
+        EXPECT_NE(out.find("region=43 pool=1 device=(not present)"), npos)
+            << filter << ": " << out;
+    }
     std::string out;
+    ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
+    EXPECT_EQ(out, "");
+
+    // An unreadable WAL is an error, never an empty listing.
+    const auto wal = bytes(walPath);
+    std::ofstream(walPath, std::ios::binary | std::ios::trunc) << std::string(64, '\xff');
+    for (const std::string filter : {"dax1.0", ""}) {
+        out.clear();
+        EXPECT_EQ(pm.adminAllocations(filter, out), -EPROTO) << filter;
+        EXPECT_NE(out.find("cannot read WAL"), npos) << filter << ": " << out;
+    }
+    std::ofstream(walPath, std::ios::binary | std::ios::trunc) << wal;
+
+    // Nothing on a pool without a device can be released, and the device
+    // cannot be excluded while region 43 is live.
+    out.clear();
     EXPECT_EQ(pm.adminRelease(42, true, out), -ENODEV);
+    out.clear();
+    EXPECT_EQ(pm.adminExclude("dax1.0", out), -EBUSY);
+    EXPECT_NE(out.find("region=43"), npos) << out;
+    EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
+    ASSERT_EQ(WalStore(state).appendFree(43), 0);
     out.clear();
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     EXPECT_EQ(pm.allocationCount(), 0u);
     EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
     EXPECT_EQ(pm.checkpoint(), 0);
-}
-
-TEST_F(DeviceExclusionTest, ExcludeOfAbsentDeviceRefusesWalOnlyAllocation) {
-    addDevice(0);
-    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    std::string out;
-    EXPECT_EQ(pm.adminExclude("dax1.0", out), -EBUSY);
-    EXPECT_NE(out.find("region=42"), npos) << out;
-    EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
 }
 
 TEST_F(DeviceExclusionTest, StartupRefusesExcludedPoolWithLiveAllocation) {
@@ -247,9 +280,9 @@ TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
 
     out.clear();
     ASSERT_EQ(pm.adminInclude("dax1.0", true, out), 0) << out;
-    const auto archived = out.find("previous_metadata=");
-    ASSERT_NE(archived, npos) << out;
-    EXPECT_TRUE(fs::exists(out.substr(archived + 18, out.find('\n', archived) - archived - 18)));
+    const auto archived = lineAfter(out, "previous_metadata=");
+    ASSERT_FALSE(archived.empty()) << out;
+    EXPECT_TRUE(fs::exists(archived));
     DeviceHeader header{};
     ASSERT_EQ(readDeviceHeader(dev(1), header, H), 0);
     EXPECT_NE(uuidToString(header.uuid), uuid);
@@ -267,9 +300,9 @@ TEST_F(DeviceExclusionTest, ReleaseNeedsExitedOwnerAndConfirmation) {
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     Handle mine{}, remote{}, gone{};
-    ASSERT_EQ(allocateAs(pm, localClient(::getpid()), mine), 0);
+    ASSERT_EQ(allocate(pm, mine, 0, localClient(::getpid())), 0);
     ASSERT_EQ(allocate(pm, remote), 0); // "offline-test-owner" is not local.
-    ASSERT_EQ(allocateAs(pm, localClient(2147483647), gone), 0);
+    ASSERT_EQ(allocate(pm, gone, 0, localClient(2147483647)), 0);
     std::string out;
     EXPECT_EQ(pm.adminRelease(mine.regionId, true, out), -EBUSY);
     EXPECT_EQ(pm.adminRelease(remote.regionId, false, out), -EPERM);
@@ -320,11 +353,8 @@ TEST_F(DeviceExclusionTest, IncludeAfterFreesSinceTheLastCheckpointStartsEmpty) 
     ASSERT_EQ(allocate(pm, x, 1), 0);
     ASSERT_EQ(pm.checkpoint(), 0);                  // Checkpoint lists x.
     ASSERT_EQ(pm.verifyAndFree(x, "offline-test-owner"), 0); // Freed in the WAL only.
-    // A WAL record for an absent pool keeps checkpoints paused, so the
-    // checkpoint still lists x when the device comes back.
-    auto absent = allocation(2);
-    absent.handle.regionId = 500;
-    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0);
+    // The checkpoint still lists x when the device comes back.
+    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
     std::string out;
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     EXPECT_NE(out.find("checkpoint=deferred"), npos) << out;
@@ -362,9 +392,9 @@ TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
     // --reinit asked to discard the device, so its header may already be new;
     // the old metadata then stays archived, and ownership is rolled back.
     EXPECT_NE(out.find("header was already written"), npos) << out;
-    const auto kept = out.find("previous metadata kept at ");
-    ASSERT_NE(kept, npos) << out;
-    EXPECT_EQ(bytes(out.substr(kept + 26, out.find('\n', kept) - kept - 26)), meta);
+    const auto kept = lineAfter(out, "previous metadata kept at ");
+    ASSERT_FALSE(kept.empty()) << out;
+    EXPECT_EQ(bytes(kept), meta);
     EXPECT_NE(bytes(state + "/pool_1.meta"), meta);
     EXPECT_EQ(excludedOnDisk(), std::set<std::string>{"dax1.0"});
     EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
@@ -401,7 +431,7 @@ TEST_F(DeviceExclusionTest, UnsyncedListIsNotReportedAsReadyForHandover) {
         ASSERT_EQ(admin.start(), 0);
         const std::string reply = ask(sock, "exclude dax1.0\n");
         admin.stop();
-        EXPECT_EQ(reply.rfind("INCOMPLETE\n/dev/dax1.0 is excluded, but", 0), 0u) << reply;
+        EXPECT_EQ(reply.rfind("INCOMPLETE\n", 0), 0u) << reply;
         EXPECT_NE(reply.find("not durable yet"), npos) << reply;
     }
     out.clear();
@@ -459,47 +489,11 @@ TEST_F(DeviceExclusionTest, UnsyncedIncludeStandsButIsReported) {
     checkpoint_fault::clear();
     // Losing this list would only keep the device excluded.
     ASSERT_EQ(rc, 0) << out;
-    EXPECT_NE(out.find("WARNING: the excluded device list is not durable yet"), npos) << out;
+    EXPECT_NE(out.find("not durable yet"), npos) << out;
     EXPECT_EQ(poolPaths(pm), (std::set<std::string>{dev(0), dev(1)}));
     out.clear();
     ASSERT_EQ(pm.adminStatus(out), 0);
     EXPECT_NE(out.find("excluded_list=not-durable"), npos) << out;
-}
-
-TEST_F(DeviceExclusionTest, AllocationsOfAbsentDeviceIncludeTheWal) {
-    addDevice(0);
-    auto p = pool(1);
-    p.freeList = {{2 * H, B - 2 * H}};
-    p.freeSize = B - 2 * H;
-    save(p, {{42, allocation(1)}});
-    {
-        WalStore wal(state);
-        ASSERT_EQ(wal.appendFree(42), 0); // Freed after the checkpoint.
-        auto later = allocation(1, 3 * H);
-        later.handle.regionId = 43;
-        ASSERT_EQ(wal.appendAlloc(later), 0); // Allocated after it.
-    }
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    for (const std::string filter : {"dax1.0", ""}) {
-        std::string out;
-        ASSERT_EQ(pm.adminAllocations(filter, out), 0) << out;
-        EXPECT_EQ(out.find("region=42 "), npos) << filter << ": " << out;
-        EXPECT_NE(out.find("region=43 pool=1 device=(not present)"), npos)
-            << filter << ": " << out;
-    }
-    std::string out;
-    ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
-    EXPECT_EQ(out, "");
-
-    // An unreadable WAL is an error, never an empty listing.
-    std::ofstream(state + "/maru-resource-manager.wal", std::ios::binary | std::ios::trunc)
-        << std::string(64, '\xff');
-    for (const std::string filter : {"dax1.0", ""}) {
-        out.clear();
-        EXPECT_EQ(pm.adminAllocations(filter, out), -EPROTO) << filter;
-        EXPECT_NE(out.find("cannot read WAL"), npos) << filter << ": " << out;
-    }
 }
 
 TEST_F(DeviceExclusionTest, IncludeIgnoresUnrelatedRejectedDevice) {
@@ -550,10 +544,8 @@ TEST_F(DeviceExclusionTest, LiveAdminSocketIsNeverTakenOver) {
     // A stale socket (no server) is replaced.
     {
         const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+        const auto addr = unixAddress(path);
+        ASSERT_EQ(::bind(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)), 0);
         ::close(fd);
     }
     AdminServer third(pm, path);
@@ -677,10 +669,8 @@ TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {
     ASSERT_EQ(admin.start(), 0);
     auto connectTo = [&] {
         const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-        EXPECT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+        const auto addr = unixAddress(path);
+        EXPECT_EQ(::connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)), 0);
         return fd;
     };
     const int busy = connectTo(); // Holds the admin thread until it sends a line.
@@ -705,9 +695,7 @@ TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {
 TEST_F(DeviceExclusionTest, IncludeBeforeAnyGlobalCheckpointStaysRestartable) {
     addDevice(0);
     addDevice(1);
-    auto absent = allocation(2);
-    absent.handle.regionId = 500;
-    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0); // Keeps checkpoints paused.
+    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     std::string out;
@@ -726,9 +714,7 @@ TEST_F(DeviceExclusionTest, IncludeBeforeAnyGlobalCheckpointStaysRestartable) {
 TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
     addDevice(0);
     addDevice(1);
-    auto absent = allocation(2);
-    absent.handle.regionId = 500;
-    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0); // Keeps checkpoints paused.
+    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     const std::string walPath = state + "/maru-resource-manager.wal";

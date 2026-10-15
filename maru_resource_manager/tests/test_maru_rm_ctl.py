@@ -24,15 +24,23 @@ class FakeAdminSocket:
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(str(path))
         self.server.listen(1)
-        self.thread = threading.Thread(target=self._serve)
+        # Never hold the test run if the ctl fails before connecting.
+        self.server.settimeout(5)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
     def _serve(self):
-        conn, _ = self.server.accept()
+        try:
+            conn, _ = self.server.accept()
+        except OSError:  # Timed out, or closed by close().
+            return
         with conn:
             data = b""
             while b"\n" not in data:
-                data += conn.recv(1024)
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
             self.request = data.decode()
             conn.sendall(self.reply.encode())
 

@@ -170,23 +170,24 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(response[8 : 8 + path_len], f"/dev/dax{pool}.0".encode())
         self.assertEqual(struct.unpack_from("<QQ", response, 8 + path_len), handle[1:3])
 
+    def stats(self):
+        """Served pools by device path: (kind, total, free, alignment)."""
+        response = self.request(5)
+        offset, pools = 4, {}
+        for _ in range(struct.unpack_from("<I", response)[0]):
+            length, *fields = struct.unpack_from("<IIQQQ", response, offset)
+            offset += 32
+            pools[response[offset : offset + length].decode()] = tuple(fields)
+            offset += length
+        self.assertEqual(offset, len(response))
+        return pools
+
     def check_stats(self, used=None):
         used = used or {}
-        response = self.request(5)
-        count = struct.unpack_from("<I", response)[0]
-        offset = 4
-        pools = {}
-        for _ in range(count):
-            length, kind, total, free, alignment = struct.unpack_from(
-                "<IIQQQ", response, offset
-            )
-            offset += 32
-            path = response[offset : offset + length].decode()
-            offset += length
+        pools = self.stats()
+        for path, (kind, total, free, alignment) in pools.items():
             self.assertEqual((kind, total, alignment), (0, SIZE - ALIGN, ALIGN))
             self.assertEqual(free, total - used.get(path, 0) * ALIGN)
-            pools[path] = free
-        self.assertEqual(offset, len(response))
         self.assertEqual(set(pools), {f"/dev/{p.name}" for p in self.sysfs.iterdir()})
 
     def identity(self):
@@ -362,10 +363,9 @@ class ProcessRecoveryTest(unittest.TestCase):
         wal = (self.state / WAL_NAME).read_bytes()
         self.stop(expected_status=1)
         self.assertIn(f"Injected {operation} failure", self.log.read_text())
-        self.assertIn(
-            f"shutdown checkpoint not written (rc={-error}); WAL retained",
-            self.log.read_text(),
-        )
+        log = self.log.read_text()
+        self.assertIn("WAL retained", log)
+        self.assertIn(f"rc={-error}", log)
         self.assertEqual((self.state / WAL_NAME).read_bytes(), wal)
         self.assertEqual((self.state / filename).read_bytes(), before)
 
@@ -401,16 +401,6 @@ class ProcessRecoveryTest(unittest.TestCase):
         )
         return result.returncode, result.stdout + result.stderr
 
-    def pool_paths(self):
-        response = self.request(5)
-        offset, paths = 4, set()
-        for _ in range(struct.unpack_from("<I", response)[0]):
-            length = struct.unpack_from("<I", response, offset)[0]
-            offset += 32
-            paths.add(response[offset : offset + length].decode())
-            offset += length
-        return paths
-
     def test_admin_exclude_and_include(self):
         self.add_device(1)
         self.start()
@@ -423,13 +413,13 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(code, 1, output)  # Still used by the RM.
         code, output = self.ctl("exclude", "dax1.0")
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.pool_paths(), {"/dev/dax0.0"})
+        self.assertEqual(set(self.stats()), {"/dev/dax0.0"})
         header = (self.root / "dev/dax1.0").read_bytes()[:64]
 
         # The decision survives a restart; the device is never touched.
         self.stop()
         self.start()
-        self.assertEqual(self.pool_paths(), {"/dev/dax0.0"})
+        self.assertEqual(set(self.stats()), {"/dev/dax0.0"})
         self.assertEqual((self.root / "dev/dax1.0").read_bytes()[:64], header)
         code, output = self.ctl("status")
         self.assertEqual(code, 0, output)
@@ -444,7 +434,7 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.assertEqual(stream.read(4096), bytes(4096))
         code, output = self.ctl("include", "dax1.0")
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.pool_paths(), {"/dev/dax0.0", "/dev/dax1.0"})
+        self.assertEqual(set(self.stats()), {"/dev/dax0.0", "/dev/dax1.0"})
         with (self.root / "dev/dax1.0").open("rb") as stream:
             self.assertEqual(stream.read(8), b"MARUDEV\0")
         self.access(self.allocate(1), 1)

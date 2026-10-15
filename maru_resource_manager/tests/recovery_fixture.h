@@ -11,7 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <limits>
+#include <map>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -105,20 +105,72 @@ protected:
         ASSERT_EQ(m.save(p), 0);
         ASSERT_EQ(m.saveGlobal(a, 43), 0);
     }
+    // A whole file, read in one call (fast even for a device); "" if missing.
     std::string bytes(const std::string &path) {
-        std::ifstream in(path, std::ios::binary);
-        return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in) return {};
+        std::string data(static_cast<size_t>(in.tellg()), '\0');
+        in.seekg(0).read(data.data(), static_cast<std::streamsize>(data.size()));
+        return data;
     }
-    // The first n bytes of a device, read in one call (fast even for all of it).
+    // The first n bytes of a device.
     std::string head(uint32_t id, size_t n = 64) {
         std::string data(n, '\0');
         std::ifstream(fakeRoot + dev(id), std::ios::binary)
             .read(data.data(), static_cast<std::streamsize>(n));
         return data;
     }
-    int allocate(PoolManager &pm, Handle &h, uint32_t id = 0) {
+    int allocate(PoolManager &pm, Handle &h, uint32_t id = 0,
+                 const std::string &client = "offline-test-owner") {
         std::string path, uuid;
         uint64_t requested;
-        return pm.alloc(H, "offline-test-owner", h, path, uuid, dev(id), requested);
+        return pm.alloc(H, client, h, path, uuid, dev(id), requested);
+    }
+    // The client ID of a process on this host; the host name is cut so the
+    // pid still fits Allocation::clientId.
+    std::string localClient(pid_t pid) {
+        char host[256]{};
+        EXPECT_EQ(::gethostname(host, sizeof(host)), 0);
+        return std::string(host).substr(0, 80) + ":" + std::to_string(pid);
+    }
+    // An FS_DAX pool over the directory fakeRoot/files: no header, so its data
+    // starts at offset zero.
+    PoolState fsDaxPool(uint32_t id = 0) {
+        auto p = pool(id);
+        p.type = DaxType::FS_DAX;
+        p.dataBegin = 0;
+        p.totalSize = p.freeSize = B;
+        p.freeList = {{0, B}};
+        p.devPath = fakeRoot + "/files";
+        fs::create_directory(p.devPath);
+        return p;
+    }
+    // Recovery refuses with rc and changes nothing: no pool is served, no
+    // checkpoint is written, and every state file and device keeps its bytes.
+    void expectRecoveryRefused(int rc) {
+        const auto before = snapshot();
+        {
+            PoolManager pm(state);
+            EXPECT_EQ(pm.loadPools(), rc);
+            EXPECT_FALSE(pm.hasPools());
+            EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+        }
+        const auto after = snapshot();
+        for (const auto &[path, data] : before) {
+            const auto it = after.find(path);
+            EXPECT_TRUE(it != after.end()) << path << " removed";
+            EXPECT_TRUE(it == after.end() || it->second == data) << path << " changed";
+        }
+        for (const auto &[path, data] : after)
+            EXPECT_TRUE(before.count(path)) << path << " created";
+    }
+    // Every regular file in the state directory and the fake /dev.
+    std::map<std::string, std::string> snapshot() {
+        std::map<std::string, std::string> files;
+        for (const auto *dir : {"/state", "/dev"})
+            for (const auto &entry : fs::directory_iterator(fakeRoot + dir))
+                if (entry.is_regular_file())
+                    files[entry.path().string()] = bytes(entry.path().string());
+        return files;
     }
 };
