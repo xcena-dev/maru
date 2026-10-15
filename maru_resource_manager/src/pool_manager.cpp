@@ -601,6 +601,19 @@ int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
     rc = metadata_->load(poolId, loaded);
     if (rc == 0)
     {
+        // The data range comes from the device. RMs before recovery validation
+        // (#99) replaced the saved total with the device size on load but kept
+        // the saved free list, so a checkpoint can hold a total that does not
+        // match its own extents. The extents and allocations are still checked
+        // against the device range below and after WAL replay.
+        if (loaded.totalSize != pool.totalSize)
+        {
+            logf(LogLevel::Warn,
+                 "%s: ignoring checkpoint total size %llu; the device data size is %llu",
+                 path.c_str(), static_cast<unsigned long long>(loaded.totalSize),
+                 static_cast<unsigned long long>(pool.totalSize));
+            loaded.totalSize = pool.totalSize;
+        }
         loaded.hasCheckpoint = true;
         pool = loaded;
     }

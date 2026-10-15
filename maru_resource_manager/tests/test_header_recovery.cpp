@@ -90,6 +90,60 @@ TEST_F(HeaderRecoveryTest, LegacyAndRewrittenTotalAreRejectedWithoutDeviceWrites
     }
 }
 
+TEST_F(HeaderRecoveryTest, StaleCheckpointTotalUsesDeviceRange) {
+    addDevice(0);
+    // A pre-validation RM saved the device size it saw at load but kept the
+    // old free list; the extents and the allocation cover this device exactly.
+    for (uint64_t total : {4 * (B - H), (B - H) / 2}) {
+        auto p = pool();
+        p.totalSize = total;
+        p.freeSize = B - 2 * H;
+        p.freeList = {{2 * H, B - 2 * H}};
+        save(p, {{42, allocation()}});
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        std::vector<PoolState> stats;
+        pm.getStats(stats);
+        ASSERT_EQ(stats.size(), 1u);
+        EXPECT_EQ(stats[0].totalSize, B - H);
+        EXPECT_EQ(stats[0].freeSize, B - 2 * H);
+        EXPECT_EQ(pm.checkpoint(), 0);
+        PoolState saved = pool();
+        ASSERT_EQ(MetadataStore(state).load(0, saved), 0);
+        EXPECT_EQ(saved.totalSize, B - H);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
+    addDevice(0);
+    // Consistent checkpoints of a device half and twice this size.
+    for (uint64_t size : {B / 2, 2 * B}) {
+        auto p = pool();
+        p.totalSize = p.freeSize = size - H;
+        p.freeList = {{H, size - H}};
+        save(p);
+        const auto before = bytes(state + "/pool_0.meta");
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        EXPECT_FALSE(pm.hasPools());
+        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
+    }
+}
+
+TEST_F(HeaderRecoveryTest, ResizedClearedDeviceIsRejectedWithoutDeviceWrites) {
+    addDevice(0, false);
+    for (uint64_t size : {B / 2, 2 * B}) {
+        auto p = pool();
+        p.totalSize = p.freeSize = size - H;
+        p.freeList = {{H, size - H}};
+        save(p);
+        PoolManager pm(state);
+        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
+        EXPECT_EQ(bytes(fakeRoot + dev(0)), std::string(B, '\0'));
+    }
+}
+
 TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
     addDevice(0);
     save(pool());
