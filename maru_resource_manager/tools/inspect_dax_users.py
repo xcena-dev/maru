@@ -11,8 +11,11 @@ import os
 import platform
 import stat
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+# System python3 may be 3.9; datetime.UTC needs 3.11.
+UTC = timezone.utc  # noqa: UP017
 
 
 def inspect(devices: list[str], proc: Path = Path("/proc")) -> dict:
