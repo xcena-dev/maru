@@ -341,6 +341,34 @@ TEST_F(DeviceExclusionTest, IncludeAfterFreesSinceTheLastCheckpointStartsEmpty) 
     EXPECT_EQ(restarted.verifyAndFree(y, "offline-test-owner"), 0);
 }
 
+TEST_F(DeviceExclusionTest, WipedDeviceWithWalHistoryIsIncludedWithFreshHeader) {
+    addDevice(0);
+    addDevice(1);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    const auto uuid = uuidOf(pm, 1);
+    Handle x{};
+    ASSERT_EQ(allocate(pm, x, 1), 0);
+    ASSERT_EQ(pm.verifyAndFree(x, "offline-test-owner"), 0); // ALLOC and FREE in the WAL.
+    // A WAL record for an absent pool keeps checkpoints paused, so the WAL
+    // still references pool 1 when it is included again.
+    auto absent = allocation(2);
+    absent.handle.regionId = 500;
+    ASSERT_EQ(WalStore(state).appendAlloc(absent), 0);
+    std::string out;
+    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+    EXPECT_NE(out.find("checkpoint=deferred"), npos) << out;
+    out.clear();
+    ASSERT_EQ(pm.adminWipe("dax1.0", true, out), 0) << out;
+    out.clear();
+    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    EXPECT_NE(uuidOf(pm, 1), uuid);
+    DeviceHeader header{};
+    EXPECT_EQ(readDeviceHeader(dev(1), header, H), 0);
+    ASSERT_EQ(allocate(pm, x, 1), 0);
+    EXPECT_EQ(x.offset, H);
+}
+
 TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
     addDevice(0);
     addDevice(1);
