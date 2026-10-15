@@ -115,7 +115,7 @@ TEST_F(HeaderRecoveryTest, StaleCheckpointTotalUsesDeviceRange) {
 }
 
 TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
-    addDevice(0);
+    addDevice(0, false);
     // Consistent checkpoints of a device half and twice this size.
     for (uint64_t size : {B / 2, 2 * B}) {
         auto p = pool();
@@ -125,21 +125,8 @@ TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
         const auto before = bytes(state + "/pool_0.meta");
         PoolManager pm(state);
         EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_FALSE(pm.hasPools());
         EXPECT_EQ(pm.checkpoint(), -EAGAIN);
         EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
-    }
-}
-
-TEST_F(HeaderRecoveryTest, ResizedClearedDeviceIsRejectedWithoutDeviceWrites) {
-    addDevice(0, false);
-    for (uint64_t size : {B / 2, 2 * B}) {
-        auto p = pool();
-        p.totalSize = p.freeSize = size - H;
-        p.freeList = {{H, size - H}};
-        save(p);
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
         EXPECT_EQ(bytes(fakeRoot + dev(0)), std::string(B, '\0'));
     }
 }
@@ -184,29 +171,12 @@ TEST_F(HeaderRecoveryTest, MissingPoolCheckpointWithLiveAllocationIsRejected) {
     EXPECT_EQ(pm.loadPools(), -EUCLEAN);
 }
 
-TEST_F(HeaderRecoveryTest, MissingHeaderWithHistoryIsNotReinitialized) {
+TEST_F(HeaderRecoveryTest, MissingHeaderWithoutLiveAllocationGetsFreshHeader) {
     addDevice(0, false);
-    save(pool());
-    // Not a cleared device: something else wrote into the header area.
-    for (uint64_t at : {uint64_t(0), H / 2}) {
-        fs::resize_file(fakeRoot + dev(0), 0);
-        fs::resize_file(fakeRoot + dev(0), B);
-        {
-            std::fstream out(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary);
-            out.seekp(at);
-            out << "foreign";
-        }
-        const auto before = bytes(fakeRoot + dev(0));
-        PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_EQ(bytes(fakeRoot + dev(0)), before);
-    }
-}
-
-TEST_F(HeaderRecoveryTest, ClearedDeviceWithoutLiveAllocationGetsFreshHeader) {
-    addDevice(0, false);
-    // A power cycle zeroed the device after a run that freed every region: a
-    // stale checkpoint total, a checkpoint entry freed in the WAL, WAL pairs.
+    // A power cycle took the header; the memory came back with any content.
+    std::fstream(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary) << "garbage";
+    // The last run freed every region: a stale checkpoint total, a checkpoint
+    // entry freed in the WAL, WAL pairs.
     auto p = pool();
     p.totalSize = 4 * (B - H);
     p.freeSize = B - 2 * H;
@@ -233,12 +203,16 @@ TEST_F(HeaderRecoveryTest, ClearedDeviceWithoutLiveAllocationGetsFreshHeader) {
     EXPECT_EQ(pm.checkpoint(), 0);
 }
 
-TEST_F(HeaderRecoveryTest, ClearedDeviceWithLiveAllocationIsRejected) {
+TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
     addDevice(0, false);
-    for (bool walOnly : {false, true}) {
+    auto restart = [&] {
         fs::remove_all(state);
         fs::create_directories(state);
         ASSERT_EQ(initSecret(state, false), 0);
+    };
+    // Live in the checkpoint, or only in the WAL.
+    for (bool walOnly : {false, true}) {
+        restart();
         if (walOnly) {
             save(pool());
             ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
@@ -253,6 +227,16 @@ TEST_F(HeaderRecoveryTest, ClearedDeviceWithLiveAllocationIsRejected) {
         EXPECT_EQ(pm.checkpoint(), -EAGAIN);
         EXPECT_EQ(bytes(fakeRoot + dev(0)), std::string(B, '\0'));
     }
+    // Only in the WAL, for a device that appears at a rescan: startup could
+    // not apply the record.
+    restart();
+    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0); // dax0.0 has no history now.
+    addDevice(1, false);
+    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
+    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
 }
 
 TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRejected) {
@@ -338,39 +322,6 @@ TEST_F(HeaderRecoveryTest, MissingDeviceKeepsWalUntilLateDiscovery) {
     EXPECT_EQ(pm.allocationCount(), 1u);
     EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
     EXPECT_EQ(pm.checkpoint(), 0);
-}
-
-TEST_F(HeaderRecoveryTest, ClearedDeviceAtRescanWithoutLiveAllocationIsAdded) {
-    addDevice(0);
-    // Pool 1's checkpoint entry was freed in the WAL before its device went
-    // away; it comes back cleared.
-    auto p = pool(1);
-    p.freeSize = B - 2 * H;
-    p.freeList = {{2 * H, B - 2 * H}};
-    save(p, {{42, allocation(1)}});
-    ASSERT_EQ(WalStore(state).appendFree(42), 0);
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    EXPECT_EQ(pm.allocationCount(), 1u);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-    addDevice(1, false);
-    ASSERT_EQ(pm.rescanDevices(), 0);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(1), header, H), 0);
-    EXPECT_EQ(pm.allocationCount(), 0u);
-    EXPECT_EQ(pm.checkpoint(), 0);
-}
-
-TEST_F(HeaderRecoveryTest, ClearedDeviceAtRescanWithLiveAllocationIsRejected) {
-    addDevice(0);
-    // Only the WAL knows this allocation; startup could not apply it.
-    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    addDevice(1, false);
-    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
-    EXPECT_EQ(bytes(fakeRoot + dev(1)), std::string(B, '\0'));
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
 }
 
 TEST_F(HeaderRecoveryTest, RescanWithoutNewDevicesDoesNotReadWal) {

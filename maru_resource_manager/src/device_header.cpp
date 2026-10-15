@@ -1,7 +1,6 @@
 // Copyright 2026 XCENA Inc.
 #include "device_header.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -69,33 +68,6 @@ int readDeviceHeader(const std::string &devPath, DeviceHeader &out,
     if (std::memcmp(out.magic, kDeviceHeaderMagic, sizeof(out.magic)) != 0)
         return -ENODATA;
 
-    return 0;
-}
-
-int readHeaderAreaZeroed(const std::string &devPath, uint64_t mapSize,
-                         bool &zeroed) {
-    int fd = ::open(devPath.c_str(), O_RDONLY);
-    if (fd < 0)
-        return -errno;
-
-    void *ptr = ::mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
-    int err = errno;
-    ::close(fd);
-    if (ptr == MAP_FAILED)
-        return -err;
-
-    // As in readDeviceHeader: read the device, not lines cached here earlier.
-    // In chunks, so the first non-zero byte ends the scan.
-    constexpr uint64_t kChunk = 64 * 1024;
-    const auto *bytes = static_cast<const unsigned char *>(ptr);
-    zeroed = true;
-    for (uint64_t off = 0; zeroed && off < mapSize; off += kChunk) {
-        const uint64_t len = std::min(kChunk, mapSize - off);
-        flushCacheRange(bytes + off, len);
-        zeroed = std::all_of(bytes + off, bytes + off + len,
-                             [](unsigned char b) { return b == 0; });
-    }
-    ::munmap(ptr, mapSize);
     return 0;
 }
 

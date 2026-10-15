@@ -29,12 +29,6 @@ static_assert(sizeof(DeviceHeader) == kDeviceHeaderSize,
 int readDeviceHeader(const std::string &devPath, DeviceHeader &out,
                      uint64_t mapSize);
 
-/// Set `zeroed` to whether the first mapSize bytes (the area reserved for the
-/// header on DEV_DAX) are all zero, as on a cleared device, e.g. volatile
-/// memory after a power cycle. Returns 0, or -errno on I/O error.
-int readHeaderAreaZeroed(const std::string &devPath, uint64_t mapSize,
-                         bool &zeroed);
-
 /// Write header to a DEV_DAX device via mmap.
 /// mapSize must be >= device alignment (typically 2MB for DEV_DAX).
 /// Returns 0 on success, -errno on error.
