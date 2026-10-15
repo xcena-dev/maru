@@ -149,11 +149,15 @@ int WalStore::appendRecord(WalRecordType type, const void *payload, uint32_t len
     rc = -errno;
     if (written) *written = true;
     appendError_ = rc;
-    // A caller that rejects the operation drops the record (best effort: it
-    // may already be durable, which callers must tolerate).
-    if (!keepUnsynced) (void)::ftruncate(walFd_, st.st_size);
     logf(LogLevel::Error, "WAL sync failed: %s; appends disabled until checkpoint",
          std::strerror(-rc));
+    // A caller that rejects the operation drops the record (best effort: it
+    // may already be durable, which callers must tolerate).
+    if (!keepUnsynced && ::ftruncate(walFd_, st.st_size) != 0)
+      logf(LogLevel::Warn,
+           "cannot remove rejected WAL record: %s; a restart before the next checkpoint "
+           "may replay it as a leaked allocation",
+           std::strerror(errno));
     return rc;
   }
   return 0;
