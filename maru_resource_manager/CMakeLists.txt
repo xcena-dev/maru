@@ -124,17 +124,32 @@ if(MARU_BUILD_TESTS)
     target_link_options(maru_rm_process_test_daemon PRIVATE
         -Wl,--wrap=main -Wl,--wrap=bind ${TEST_SYSCALL_WRAPS})
     target_link_libraries(maru_rm_process_test_daemon PRIVATE pthread OpenSSL::Crypto)
-    foreach(scenario IN ITEMS
-        sigterm_preserves_live_handle
-        sigkill_replays_checkpoint_and_wal
-        missing_secret_rejects_live_recovery
-        prepared_legacy_checkpoint_round_trip
-        shutdown_checkpoint_failure_retains_wal
-        admin_exclude_and_include
-        second_instance_is_refused)
+    # One entry per test_* method, read at configure time; a method whose name
+    # cannot be read stops the configure instead of being skipped.
+    set(PROCESS_TEST ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PROCESS_TEST})
+    file(STRINGS ${PROCESS_TEST} process_scenarios ENCODING UTF-8 REGEX "^    def test_")
+    list(TRANSFORM process_scenarios REPLACE "^    def test_([A-Za-z0-9_]+)\\(.*$" "\\1")
+    set(unread_scenarios ${process_scenarios})
+    list(FILTER unread_scenarios INCLUDE REGEX "^    def ")
+    if(unread_scenarios)
+        message(FATAL_ERROR "Cannot read test names in ${PROCESS_TEST}: ${unread_scenarios}")
+    endif()
+    foreach(scenario IN LISTS process_scenarios)
         add_test(NAME ProcessRecovery.${scenario}
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_recovery_test.py
+            COMMAND ${Python3_EXECUTABLE} ${PROCESS_TEST}
                 $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)
         set_tests_properties(ProcessRecovery.${scenario} PROPERTIES TIMEOUT 60)
+    endforeach()
+
+    # Tests of the repair, inspection and maru-rm-ctl tools (Python only).
+    file(GLOB tool_tests RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_*.py)
+    foreach(tool_test IN LISTS tool_tests)
+        get_filename_component(module ${tool_test} NAME_WE)
+        add_test(NAME RmTools.${module}
+            COMMAND ${Python3_EXECUTABLE} -m unittest -v ${module}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        set_tests_properties(RmTools.${module} PROPERTIES TIMEOUT 60)
     endforeach()
 endif()

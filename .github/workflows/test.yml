@@ -141,11 +141,8 @@ jobs:
             -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
           cmake --build build/resource-manager --parallel 4
 
-      - name: Run C++ and process recovery tests
+      - name: Run C++, process recovery and tool tests
         run: ctest --test-dir build/resource-manager --output-on-failure --parallel 2
-
-      - name: Run repair and inspection tool tests
-        run: python -m unittest discover -s maru_resource_manager/tests -p 'test_*.py' -v
 
       - name: Upload CTest diagnostics
         if: always()
