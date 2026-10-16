@@ -17,6 +17,15 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
+# One region mapper per node: the service's lock lives under /run/maru, which
+# this script cannot use, so check for the service directly.
+if command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet maru-region-mapper 2>/dev/null; then
+    echo "maru-region-mapper.service already serves this node;" \
+        "stop it first (sudo systemctl stop maru-region-mapper)." >&2
+    exit 1
+fi
+
 ARGS=(
     --rm-address "$MARU_RM_ADDRESS"
     --host "$MARU_MEMORY_NODE_HOST"
