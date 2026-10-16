@@ -29,6 +29,8 @@ class StagingBuffer:
         self._free: deque[int] = deque(range(count))
         self._free_lock = threading.Lock()  # engine, loader and store threads
         self.cuda_registered = False
+        # Slots that stores leave free so that a concurrent load finds room
+        self.load_reserve = 0
 
     def cuda_register(self) -> bool:
         """Page-lock the buffer for CUDA so GPU copies and kernels can read it.
@@ -84,6 +86,13 @@ class StagingBuffer:
         """Number of free slots."""
         with self._free_lock:
             return len(self._free)
+
+    def load_capacity(self) -> int:
+        """Slots the next load batch may take: the free slots, at most the
+        load reserve when there is one."""
+        with self._free_lock:
+            free = len(self._free)
+        return min(free, self.load_reserve) if self.load_reserve else free
 
     def view(self, slot: int) -> memoryview:
         """Writable view of one whole slot."""

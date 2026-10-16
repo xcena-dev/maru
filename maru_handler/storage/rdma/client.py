@@ -319,9 +319,12 @@ class RdmaStorageClient(RegionLifecycle):
         """
         with self._lock:
             self._ensure()
-            slots = self._staging.take(1)
+            staging = self._staging
+            if staging is None:
+                raise StorageUnavailableError("RDMA staging buffer is not set up")
+            slots = staging.take(1, keep=staging.load_reserve)
             if slots is None:
-                raise MemoryError("RDMA staging buffer is full")
+                raise MemoryError("RDMA staging buffer has no slot for stores")
             try:
                 region, location = self._take_page(size)
             except BaseException:
@@ -373,6 +376,21 @@ class RdmaStorageClient(RegionLifecycle):
             pass
         if self._staging is not None:
             self._staging.give(handle.slot)
+
+    def retrieve_capacity(self) -> int | None:
+        """How many keys the next :meth:`batch_retrieve` should ask for at most.
+
+        Stores leave the load reserve free, so a batch of this size finds its
+        slots while loads run one at a time. None before the staging buffer
+        exists.
+        """
+        staging = self._staging
+        return None if staging is None else staging.load_capacity()
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether the staging buffer is page-locked for GPU copy kernels."""
+        staging = self._staging
+        return staging is not None and staging.cuda_registered
 
     def has_local(self, key: str) -> bool:
         """Whether this session committed ``key`` and still holds it."""

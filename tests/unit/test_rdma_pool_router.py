@@ -199,6 +199,24 @@ def test_pools_share_one_staging_buffer_and_one_nixl_agent(pools):
         r.close()
 
 
+def test_the_pools_share_one_load_reserve(pools):
+    # 16 staging slots, half kept for loads: the stores of both pools
+    # together get 8.
+    r = router(pools, pages=16, rdma_load_reserve=0.5)
+    try:
+        first, second = route_keys_per_pool(r)
+        handles = [r.alloc(1, route_key=k) for k in [first, second] * 4]
+        with pytest.raises(MemoryError):
+            r.alloc(1, route_key=first)
+        assert r.retrieve_capacity() == 8
+        r.data.staging.cuda_registered = True
+        assert r.storage_gpu_accessible() is True
+        for handle in handles:
+            r.free(handle)
+    finally:
+        r.close()
+
+
 def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
     r = router(pools, rdma_timeout_s=0.01)
     agent = FakeNixlAgent.registry[

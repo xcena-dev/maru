@@ -70,12 +70,57 @@ def test_a_retryable_open_refusal_backs_off_like_a_cxl_handler(monkeypatch):
     assert worker._handler is None and worker._handler_retry_after > 0
 
 
-@pytest.mark.parametrize(
-    "knob", ["maru_async_load", "maru_async_store", "maru_overlap_load_with_compute"]
-)
-def test_rdma_keeps_the_sync_chunkwise_contract(knob):
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
+def test_rdma_takes_asynchronous_loads_and_stores(knob):
+    # The staging buffer is page-locked for CUDA (design note 3.11).
+    assert _validate_storage_config(extra(**{knob: True})) is True
+
+
+def test_rdma_has_no_load_compute_overlap():
+    with pytest.raises(ValueError, match="maru_overlap_load_with_compute"):
+        _validate_storage_config(
+            extra(maru_async_load=True, maru_overlap_load_with_compute=True)
+        )
+
+
+def test_rdma_stores_chunkwise_only():
+    with pytest.raises(ValueError, match="chunkwise"):
+        _validate_storage_config(extra(maru_use_layerwise=True))
+
+
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
+def test_cpu_storage_still_rejects_asynchronous_transfers(knob):
+    from tests.unit.test_vllm_cpu_config import extra as cpu_extra
+
     with pytest.raises(ValueError, match=knob):
-        _validate_storage_config(extra(**{knob: True}))
+        _validate_storage_config({**cpu_extra(), knob: True})
+
+
+def _engine(async_scheduling):
+    from types import SimpleNamespace
+
+    from tests.unit.test_vllm_cpu_config import engine_config
+
+    config = engine_config()
+    config.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+    return config
+
+
+def test_sync_rdma_loads_need_vllm_async_scheduling_off():
+    from maru_vllm.connector import _cpu_engine_config
+
+    with pytest.raises(ValueError, match="--no-async-scheduling"):
+        _cpu_engine_config(extra(), _engine(True))
+    assert _cpu_engine_config(extra(), _engine(False))["maru_cache_namespace"]
+    # An asynchronous load reports its failure while the request is parked.
+    assert _cpu_engine_config(extra(maru_async_load=True), _engine(True))
+
+
+def test_cpu_storage_keeps_its_async_scheduling_behavior():
+    from maru_vllm.connector import _cpu_engine_config
+    from tests.unit.test_vllm_cpu_config import extra as cpu_extra
+
+    assert _cpu_engine_config(cpu_extra(), _engine(True))
 
 
 @pytest.mark.parametrize("backend", ["cxl", "cpu"])
@@ -128,6 +173,43 @@ def test_default_staging_fits_one_longest_load_and_store():
     )
     assert _rdma_staging_size({"_maru_request_chunks": 4}, MIB) == 1024 * MIB
     assert _rdma_staging_size({}, MIB) is None
+
+
+def test_async_staging_holds_a_request_for_loads_and_one_for_stores():
+    config = {
+        "maru_storage_backend": "rdma",
+        "maru_async_load": True,
+        "_maru_request_chunks": 40,
+        "maru_rdma_staging_size": "3G",
+    }
+    with pytest.raises(ValueError, match="one for loads, one for stores"):
+        _rdma_staging_size(config, 64 * MIB)
+    config["maru_rdma_staging_size"] = "5G"
+    assert _rdma_staging_size(config, 64 * MIB) == 5 * 1024 * MIB
+    # The default already gives each half one longest request.
+    del config["maru_rdma_staging_size"]
+    assert _rdma_staging_size(config, 64 * MIB) == 2 * 40 * 64 * MIB
+
+
+@pytest.mark.parametrize(
+    "knobs,reserve",
+    [({}, 0.0), ({"maru_async_load": True}, 0.5), ({"maru_async_store": True}, 0.5)],
+)
+def test_async_transfers_keep_half_the_staging_for_loads(monkeypatch, knobs, reserve):
+    seen = {}
+
+    class FakeHandler:
+        def __init__(self, cfg):
+            seen["cfg"] = cfg
+
+        def connect(self):
+            return True
+
+    monkeypatch.setattr(maru, "MaruHandler", FakeHandler)
+    _create_maru_handler(extra(maru_chunk_size="1M", **knobs))
+    assert seen["cfg"].rdma_load_reserve == reserve
+    _create_maru_handler(extra(maru_chunk_size="1M", **knobs), metadata_only=True)
+    assert seen["cfg"].rdma_load_reserve == 0.0
 
 
 def test_explicit_staging_must_hold_one_longest_request():

@@ -162,6 +162,17 @@ class PoolRouter:
                 return
         self.clients[0].free(handle)
 
+    def retrieve_capacity(self) -> int | None:
+        """How many keys the next batch_retrieve should ask for at most (the
+        pools share one staging buffer)."""
+        staging = self.data.staging
+        return None if staging is None else staging.load_capacity()
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether the shared staging buffer is page-locked for GPU kernels."""
+        staging = self.data.staging
+        return staging is not None and staging.cuda_registered
+
     def has_local(self, key: str) -> bool:
         """Whether a connected pool committed ``key`` for this worker."""
         return any(c.has_local(key) for c in self.clients if c.connected)

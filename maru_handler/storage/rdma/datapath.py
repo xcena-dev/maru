@@ -90,6 +90,7 @@ class RdmaDataPath:
         staging = transport = None
         try:
             staging = StagingBuffer(size, page)
+            staging.load_reserve = int(staging.count * self.config.rdma_load_reserve)
             staging.cuda_register()
             name = f"maru-worker-{self.config.engine_id}-{uuid.uuid4().hex[:8]}"
             transport = self._transport_factory(name)

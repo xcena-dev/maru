@@ -1465,6 +1465,26 @@ class MaruHandler:
             len(response.allocations),
         )
 
+    def retrieve_capacity(self) -> int | None:
+        """How many keys the next ``batch_retrieve`` should ask for at most.
+
+        Returns:
+            The read buffer slots a load may use now (rdma backend), or None
+            when retrieves are not bounded by a read buffer.
+        """
+        capacity = getattr(self._cpu, "retrieve_capacity", None)
+        return capacity() if capacity is not None else None
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether retrieved and allocated buffers are page-locked for the GPU.
+
+        Returns:
+            True when GPU copy kernels may read and write those buffers
+            directly (the rdma backend's staging buffer registered with CUDA).
+        """
+        accessible = getattr(self._cpu, "storage_gpu_accessible", None)
+        return bool(accessible()) if accessible is not None else False
+
     def has_local(self, key: str) -> bool:
         """Whether this handler still owns a committed CPU replica."""
         return (

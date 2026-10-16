@@ -215,6 +215,41 @@ def test_reads_beyond_free_staging_slots_are_misses(world):
     assert read(a, ["k1"]) == [b"1"]
 
 
+def test_stores_leave_the_load_reserve_free(world):
+    # Asynchronous transfers: stores leave half of the staging slots to loads.
+    a = world.client("a", pages=8, staging_pages=4, rdma_load_reserve=0.5)
+    held = [a.alloc(1), a.alloc(1)]
+    with pytest.raises(MemoryError, match="no slot for stores"):
+        a.alloc(1)
+    assert a.retrieve_capacity() == 2
+    for handle in held:
+        a.free(handle)
+    put(a, "k1", b"1")
+    put(a, "k2", b"2")
+    leases = a.batch_retrieve(["k1", "k2"])  # loads may take the reserve
+    assert [bytes(lease.view) for lease in leases] == [b"1", b"2"]
+    assert a.retrieve_capacity() == 2  # the two other slots are free
+    for lease in leases:
+        lease.release()
+
+
+def test_without_a_reserve_loads_and_stores_share_every_slot(world):
+    a = world.client("a", pages=8, staging_pages=2)
+    held = [a.alloc(1), a.alloc(1)]
+    assert a.retrieve_capacity() == 0
+    for handle in held:
+        a.free(handle)
+    assert a.retrieve_capacity() == 2
+
+
+def test_gpu_access_follows_the_staging_registration(world, monkeypatch):
+    a = world.client("a")
+    a._staging.cuda_registered = False
+    assert a.storage_gpu_accessible() is False
+    a._staging.cuda_registered = True
+    assert a.storage_gpu_accessible() is True
+
+
 # -------------------------------------------------------------- regions, eviction
 
 

@@ -12,6 +12,7 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
 from tests.unit.test_vllm_cpu_config import extra, mixed_extra
+from tests.unit.test_vllm_rdma_config import extra as rdma_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -19,7 +20,7 @@ from tests.unit.vllm_connector_helpers import (
 )
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), rdma_extra()])
 @pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
 @pytest.mark.parametrize(
     "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]
@@ -30,6 +31,9 @@ def test_load_only_external_tokens(config, start, end, failure):
     worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
     worker._ensure_handler = lambda: None
     worker._handler = Mock() if failure != "handler" else None
+    if worker._handler is not None:
+        worker._handler.retrieve_capacity.return_value = None
+        worker._handler.storage_gpu_accessible.return_value = False
     meta = MaruReqMeta(
         "load",
         list(range(16)),

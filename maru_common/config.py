@@ -70,6 +70,9 @@ class MaruConfig:
     rdma_device: str = ""  # RDMA NIC for NIXL/UCX, e.g. "mlx5_0:1"; empty = default
     rdma_staging_size: int | None = None  # Host staging buffer; None = derived
     rdma_timeout_s: float = 30.0  # Deadline of one RDMA batch
+    # Share of staging slots that stores leave free for loads; set when loads
+    # and stores run on separate threads (asynchronous transfers)
+    rdma_load_reserve: float = 0.0
 
     @property
     def server_urls(self) -> list[str]:
@@ -137,12 +140,18 @@ class MaruConfig:
         if self.storage_backend == "rdma":
             if self.rdma_timeout_s <= 0:
                 raise ValueError("rdma_timeout_s must be positive")
+            if not 0 <= self.rdma_load_reserve < 1:
+                raise ValueError("rdma_load_reserve must be in [0, 1)")
             if (
                 self.rdma_staging_size is not None
                 and self.rdma_staging_size < self.chunk_size_bytes
             ):
                 raise ValueError("rdma_staging_size must hold at least one page")
-        elif self.rdma_staging_size is not None or self.rdma_device:
+        elif (
+            self.rdma_staging_size is not None
+            or self.rdma_device
+            or self.rdma_load_reserve
+        ):
             raise ValueError("RDMA settings require the rdma storage backend")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
