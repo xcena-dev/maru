@@ -225,8 +225,9 @@ def main(argv: list[str] | None = None) -> int:
         argv: Command-line arguments (default: ``sys.argv[1:]``).
 
     Returns:
-        0 after a signal; 1 if another region mapper holds this node or UCX
-        may use a transport that does not check remote keys.
+        0 after a signal; 1 if the resource manager address is empty,
+        another region mapper holds this node, or UCX may use a transport
+        that does not check remote keys.
     """
     args = build_parser().parse_args(argv)
     level = getattr(logging, args.log_level)
@@ -235,6 +236,13 @@ def main(argv: list[str] | None = None) -> int:
         package_logger.setLevel(level)
         for handler in package_logger.handlers:
             handler.setLevel(level)
+
+    if not args.rm_address.strip():
+        logger.error(
+            "no resource manager address: set MARU_RM_ADDRESS or --rm-address "
+            "to the pool's resource manager (host:port)"
+        )
+        return 1
 
     try:
         transports = require_checked_transport(

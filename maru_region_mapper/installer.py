@@ -46,6 +46,24 @@ MARU_REGION_MAPPER_PORT=9860
 MARU_REGION_MAPPER_UCX_DEVICE=
 """
 
+STANDALONE_ENV = """\
+# Settings of the Maru region mapper service (maru-region-mapper.service).
+# This node runs no resource manager, so the service starts at boot on its own.
+# Restart after a change: sudo systemctl restart maru-region-mapper
+
+# Resource manager of the pool, on another memory node (required), e.g.
+# 10.0.0.2:9850. It must listen on a network address.
+MARU_RM_ADDRESS=
+
+# Address and port the workers of other nodes connect to. Give maru-server
+# this node's address on the RDMA network with this port (--region-mapper).
+MARU_REGION_MAPPER_HOST=0.0.0.0
+MARU_REGION_MAPPER_PORT=9860
+
+# RDMA NIC to register regions with, e.g. mlx5_1:1. Empty: the UCX default.
+MARU_REGION_MAPPER_UCX_DEVICE=
+"""
+
 
 def render_unit(python: str, standalone: bool = False) -> str:
     """The systemd unit of the region mapper.
@@ -78,7 +96,10 @@ def render_unit(python: str, standalone: bool = False) -> str:
     return f"""\
 [Unit]
 Description=Maru region mapper - maps CXL regions and registers them with the NIC for remote workers
-{order}
+{order}# Stops retrying after 5 failed starts in a minute (e.g. no RDMA NIC).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 EnvironmentFile=-{ENV_FILE}
@@ -146,7 +167,7 @@ def install(
     print(f"  Installed systemd service: {unit}", file=sys.stderr)
     if not env_file.exists():
         env_file.parent.mkdir(parents=True, exist_ok=True)
-        env_file.write_text(DEFAULT_ENV)
+        env_file.write_text(STANDALONE_ENV if standalone else DEFAULT_ENV)
         print(f"  Wrote settings: {env_file}", file=sys.stderr)
     else:
         print(f"  Kept settings: {env_file}", file=sys.stderr)

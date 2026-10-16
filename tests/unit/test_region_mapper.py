@@ -354,6 +354,14 @@ def test_main_refuses_an_unchecked_transport_before_starting(monkeypatch, tmp_pa
     assert not (tmp_path / "lock").exists()  # stopped before the node lock
 
 
+def test_main_refuses_an_empty_resource_manager_address(monkeypatch, tmp_path):
+    # A standalone service's settings leave the address for the operator.
+    monkeypatch.setenv("UCX_TLS", "rc")
+    monkeypatch.setenv("MARU_RM_ADDRESS", "")
+    assert cli.main(["--lock-file", str(tmp_path / "lock")]) == 1
+    assert not (tmp_path / "lock").exists()
+
+
 def test_one_region_mapper_per_node(monkeypatch, tmp_path):
     path = str(tmp_path / "run" / "lock")
     fd = cli.hold_node_lock(path)

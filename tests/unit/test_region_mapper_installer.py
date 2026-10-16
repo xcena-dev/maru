@@ -33,6 +33,9 @@ def test_the_service_starts_and_stops_with_the_resource_manager():
     # NIC registration pins memory; the node lock lives in /run/maru.
     assert "LimitMEMLOCK=infinity" in unit
     assert "RuntimeDirectory=maru" in unit
+    # A node without an RDMA NIC fails every start: stop retrying.
+    assert "StartLimitIntervalSec=60" in unit
+    assert "StartLimitBurst=5" in unit
 
 
 def test_a_standalone_service_starts_at_boot_without_a_resource_manager():
@@ -58,6 +61,11 @@ def test_install_standalone_writes_the_standalone_unit(tmp_path, monkeypatch):
     )
     unit = (systemd / installer.SERVICE_NAME).read_text()
     assert unit == installer.render_unit("/opt/venv/bin/python", standalone=True)
+    # This node runs no resource manager: the operator names the pool's.
+    settings = (tmp_path / "region-mapper.env").read_text()
+    assert settings == installer.STANDALONE_ENV
+    assert "\nMARU_RM_ADDRESS=\n" in settings
+    assert "starts and stops with maru-resource-manager" not in settings
 
 
 def test_install_writes_the_unit_and_settings_and_enables_it(tmp_path, monkeypatch):
