@@ -233,16 +233,25 @@ and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
 size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
 and, optionally, `maru_rdma_device` (the worker's RDMA NIC, e.g. `mlx5_0:1`).
 
-![Components of the rdma backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/rdma_sw_structure.png)
+![The cxl backend and the rdma backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the rdma backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/rdma_concept.png)
 
 Resources flow as for the cxl backend: the resource manager gives regions to
 maru-server and maru-server gives them to the worker, one region when its
-storage session opens and one more each time its regions are full. Each memory
+storage session opens and one more each time its regions are full. Only the
+step that maps a region moves, from the Handler to the memory node.
+
+![Components of the rdma backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/rdma_sw_structure.png)
+
+Each memory
 node runs a region mapper (`maru-region-mapper`), a service shared by every app:
 it maps the regions Handlers ask for and registers them with the node's NIC.
 With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
 which starts and stops with the resource manager; its settings (bind address,
 port 9860, NIC) are in `/etc/maru/region-mapper.env`.
+A memory node of a shared pool that runs no resource manager installs the
+service alone (`install-maru-region-mapper`) and sets `MARU_RM_ADDRESS` to the
+node that does; the resource manager then listens on a network address, as in
+the {ref}`multi-node configuration <installation-multi-node-config>`.
 maru-server takes the pool's region mappers with `--region-mapper host:port`
 (one per memory node) and hands them to the workers. Engines read each other's
 keys under a server lease; before a worker gives a region back, its region

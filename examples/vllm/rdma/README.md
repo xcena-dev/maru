@@ -115,10 +115,26 @@ sudo systemctl start maru-resource-manager    # also starts the region mapper
 systemctl status maru-region-mapper
 ```
 
-On a memory node that does not run the resource manager of the pool, set
-`MARU_RM_ADDRESS` in that file to the node that does. On a host without the
-service (a test host, or Maru installed without NIXL), `./region_mapper.sh`
-runs a region mapper in the foreground instead:
+When maru-server or another memory node reaches the resource manager over the
+network, the resource manager listens on a network address, as in Maru's
+[multi-node configuration](../../../docs/source/getting_started/installation.md#configuration).
+
+A memory node of a shared pool that does not run the resource manager installs
+the region mapper service alone and points it at the node that does. There the
+service starts by hand, since the resource manager that starts it runs on
+another node:
+
+```bash
+./install.sh --no-rm                          # Maru with NIXL, no resource manager
+sudo "$(which install-maru-region-mapper)"
+sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
+sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
+  /etc/maru/region-mapper.env
+sudo systemctl start maru-region-mapper
+```
+
+On a host without the service (a test host, or Maru installed without NIXL),
+`./region_mapper.sh` runs a region mapper in the foreground instead:
 
 ```bash
 MARU_MEMORY_NODE_HOST=10.0.0.2 MARU_MAPPER_UCX_DEVICE=mlx5_1:1 ./region_mapper.sh
