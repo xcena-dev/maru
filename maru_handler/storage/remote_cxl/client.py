@@ -554,7 +554,27 @@ class RemoteCxlStorageClient(RegionLifecycle):
         except Exception as exc:
             logger.warning("RDMA WRITE failed: %s", exc)
             self._data.disconnect({access.peer})
-            self._give_back(group)
+            # The memory node's NIC still accepts the region's key, and a
+            # WRITE that ended in an error at this end may still be in the
+            # network. Its pages stay out of use while this worker owns the
+            # region; the release before the region goes back ends any late
+            # WRITE. The slots are safe: this end's connection is torn down.
+            for h in group:
+                region.untrack(h)
+                region.quarantine(h.location)
+                self._give_slot(h)
+                h.state = "freed"
+            # A node that cannot be reached any more has the region set aside
+            # now, so its keys stop being reported as hits.
+            try:
+                self._map_own(region)
+            except StorageUnavailableError as map_exc:
+                logger.warning(
+                    "Remote CXL region %d cannot be mapped: %s",
+                    region.region_id,
+                    map_exc,
+                )
+                self._set_aside(region)
             return False
         return True
 

@@ -395,9 +395,28 @@ def test_a_failed_write_reconnects_and_maps_the_region_again(world):
     agent.broken.add(peer)  # a remote access error left the connection broken
     ok, handle = put(a, "k", b"x")
     assert not ok and handle.state == "freed"
-    assert peer not in agent.peers  # the broken connection was dropped
+    # The broken connection was dropped and the region mapped again at once.
+    assert peer in agent.peers and peer not in agent.broken
+    assert only_region(a).reachable
     ok, _ = put(a, "k", b"y")
     assert ok and read(a, ["k"]) == [b"y"]
+
+
+def test_the_page_of_a_failed_write_is_not_used_again(world):
+    # The WRITE may still be in the network, and the memory node's NIC still
+    # accepts the region's key: its page must not get another key's bytes.
+    a = world.client("a", pages=2)
+    agent = worker_agent("a")
+    agent.fail_next = True
+    ok, failed = put(a, "k1", b"x")
+    assert not ok
+    region = only_region(a)
+    assert region.usage()["quarantined_bytes"] == PAGE
+    ok, stored = put(a, "k2", b"y")
+    assert ok and stored.location.offset != failed.location.offset
+    # The staging slot came back: the failed WRITE's end of the connection
+    # is gone.
+    assert a._staging.free_count() == a._staging.count
 
 
 def test_a_lost_expand_reply_gets_the_same_region_on_the_next_try(world):
@@ -756,13 +775,13 @@ def test_a_new_region_on_a_down_node_goes_back_at_once(world, monkeypatch):
     put(a, "k", b"v")
     world.node.stop()
     # The new region cannot be mapped and goes back; "k" is evicted for room
-    # and the WRITE to the stopped node fails.
+    # and the WRITE to the stopped node fails, which sets the region aside.
     assert put(a, "k2", b"w")[0] is False
     assert len(a.regions) == 1 and world.cxl.released == [2]
-    assert put(a, "k3", b"x")[0] is False  # now the region itself is set aside
+    assert not only_region(a).reachable
     # Every mapper of the pool is down: no more regions are asked for.
     with pytest.raises(MemoryError):
-        put(a, "k4", b"y")
+        put(a, "k3", b"x")
     assert world.cxl.released == [2] and len(world.cxl.regions) == 1
 
 

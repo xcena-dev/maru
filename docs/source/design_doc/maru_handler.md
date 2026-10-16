@@ -249,7 +249,10 @@ reaches the region with one-sided RDMA.
 the Connector copies the KV into the slot, and the Handler WRITEs it to the
 page. It commits the key only after the WRITE completed. A WRITE whose end is
 not confirmed keeps its page and slot out of use until NIXL releases the
-transfer, so a late WRITE never lands on reused memory.
+transfer, and the page of a WRITE that ended in an error stays out of use
+while the Handler owns the region (that WRITE may still be in the network,
+and the memory node's NIC still accepts the region's key), so a late WRITE
+never lands on reused memory.
 
 **Retrieve.** The Handler takes a server lease on the keys (`acquire`), which
 returns each key's location and, for another worker's region, a *read handle*.
