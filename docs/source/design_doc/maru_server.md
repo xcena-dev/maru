@@ -170,8 +170,12 @@ worker (`--region-mapper-key-file`).
 
 **Handles.** MaruServer gives a region's handle, with the Resource Manager's
 auth token, only to the session that owns the region. Other sessions get a
-read handle with `acquire`; a region mapper maps a read handle only for a
-region it has mapped, and only the region's handle releases a region.
+read handle with `acquire`: the region's number, offset and length with a read
+token derived from the auth token. A region mapper maps a read handle only for
+a region it has mapped, and only the region's handle releases a region, so a
+reader cannot take a region away from its owner.
+
+![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; B's release of R is refused at the region mapper, and A's writes keep going](../image/remote_cxl_read_handle.png)
 
 | Action | Operation |
 |--------|-----------|

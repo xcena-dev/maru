@@ -194,6 +194,8 @@ How the properties above carry over:
   and every connection proves the region mapper key, a file that only the
   users running workers and maru-server can read. A reader gets a read handle,
   which maps a region but cannot release it.
+
+  ![Who can map a region. (a) cxl backend: a process on a host attached to the CXL device whose user may open the DAX device file maps R; a process of another user is refused, and a host off the device has no device. (b) remote_cxl backend: a process on a host of the RDMA network that can read the key file proves the key to the region mapper and maps R, then reads and writes it by RDMA; a process without the key is refused, and a host off the RDMA network cannot reach the region mapper](../image/remote_cxl_who_maps.png)
 - **Region lifetime.** A region goes back to the Resource Manager only after
   its region mapper deregistered it from the NIC, so an RDMA WRITE of the old
   owner that is still in flight fails at the NIC instead of landing in the
