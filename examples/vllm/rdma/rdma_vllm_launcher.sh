@@ -87,7 +87,14 @@ echo "========================="
 # The rdma backend stores chunkwise and needs --enforce-eager and
 # kv_load_failure_policy "recompute". Synchronous loads also need
 # --no-async-scheduling; the example keeps it off in both modes.
-CUDA_VISIBLE_DEVICES=$DEVICE exec "${NUMA[@]}" vllm serve "$MODEL" \
+#
+# The engine gives its regions back when vLLM shuts it down, which happens
+# when the API server alone gets the signal. Ctrl-C reaches every process of
+# the terminal's foreground group, and an engine process that gets the
+# signal itself can end before its regions go back; maru-server then keeps
+# them until it restarts. So vLLM runs in its own session and this script
+# passes Ctrl-C and TERM on to the API server only.
+CUDA_VISIBLE_DEVICES=$DEVICE setsid "${NUMA[@]}" vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \
     --no-async-scheduling \
@@ -110,4 +117,14 @@ CUDA_VISIBLE_DEVICES=$DEVICE exec "${NUMA[@]}" vllm serve "$MODEL" \
             \"maru_cache_namespace\": \"${MARU_CACHE_NAMESPACE}\",
             \"maru_kv_chunk_tokens\": ${MARU_KV_CHUNK_TOKENS}
         }
-    }"
+    }" &
+VLLM_PID=$!
+trap 'kill -TERM "$VLLM_PID" 2>/dev/null' INT TERM
+# wait returns early when a trapped signal arrives; wait until vLLM exits.
+wait "$VLLM_PID"
+status=$?
+while kill -0 "$VLLM_PID" 2>/dev/null; do
+    wait "$VLLM_PID"
+    status=$?
+done
+exit "$status"

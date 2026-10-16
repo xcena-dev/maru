@@ -42,13 +42,20 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     local pids=() p
-    # Engines first: they give their regions back through maru-server and
-    # the region mapper on the way out.
+    # Engines first: they give their regions back through the region mapper
+    # and maru-server on the way out. Only the launcher gets TERM; it passes
+    # it on to the API server, which shuts the engine down. A TERM that
+    # reaches the engine process itself can end it before its regions go
+    # back.
     for p in "${INST1_PID:-}" "${INST2_PID:-}" "${SERVER_PID:-}" "${MAPPER_PID:-}"; do
         [[ -z "$p" ]] && continue
         local tree=( $(descendants "$p") )
-        kill -TERM "${tree[@]}" 2>/dev/null || true
-        for _ in $(seq 1 15); do  # graceful window, then force-kill survivors
+        if [[ "$p" == "${INST1_PID:-}" || "$p" == "${INST2_PID:-}" ]]; then
+            kill -TERM "$p" 2>/dev/null || true
+        else
+            kill -TERM "${tree[@]}" 2>/dev/null || true
+        fi
+        for _ in $(seq 1 30); do  # graceful window, then force-kill survivors
             local alive=0
             for q in "${tree[@]}"; do
                 if kill -0 "$q" 2>/dev/null; then alive=1; fi

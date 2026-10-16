@@ -226,6 +226,12 @@ All example settings are in `env.sh`. Override them with environment variables:
 - **Engines start but never hit**: check that both engines use the same
   `maru_cache_namespace` and `maru_server_url`, and that the prompt is longer
   than one chunk.
+- **maru-server keeps a stopped engine's regions** (the pool stays used after
+  the engines are gone): an engine process that gets the stop signal itself,
+  for example from a `kill` of its whole process group, can end before its
+  regions go back. Stop an engine with Ctrl-C in the launcher's terminal or
+  `kill -TERM` on the launcher; the launcher passes the signal on to vLLM's
+  API server only. maru-server frees the regions it keeps when it stops.
 - **Engines on another node cannot connect**: maru-server and the region
   mapper listen on `127.0.0.1` by default. Set `MARU_SERVER_BIND_HOST` and
   `MARU_MEMORY_NODE_HOST` to addresses the workers reach.
