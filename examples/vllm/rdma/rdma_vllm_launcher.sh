@@ -119,12 +119,14 @@ CUDA_VISIBLE_DEVICES=$DEVICE setsid "${NUMA[@]}" vllm serve "$MODEL" \
         }
     }" &
 VLLM_PID=$!
-trap 'kill -TERM "$VLLM_PID" 2>/dev/null' INT TERM
-# wait returns early when a trapped signal arrives; wait until vLLM exits.
-wait "$VLLM_PID"
-status=$?
+trap 'kill -TERM "$VLLM_PID" 2>/dev/null' INT TERM HUP
+# wait returns early (with status > 128) when a trapped signal arrives; keep
+# waiting until vLLM has exited, so a caller that stops maru-server next does
+# so after the engine gave its regions back.
+status=0
+wait "$VLLM_PID" || status=$?
 while kill -0 "$VLLM_PID" 2>/dev/null; do
-    wait "$VLLM_PID"
-    status=$?
+    status=0
+    wait "$VLLM_PID" || status=$?
 done
 exit "$status"
