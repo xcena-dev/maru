@@ -150,7 +150,7 @@ class CpuStorageClient:
                 # not proof of a lost session, nor permission to free memory.
                 logger.warning("CPU cache heartbeat failed", exc_info=True)
 
-    def alloc(self, size: int) -> CpuAllocation:
+    def alloc(self, size: int, route_key: str | None = None) -> CpuAllocation:
         with self._lock:
             self._ensure()
             return self.pool.alloc(size)
@@ -241,7 +241,7 @@ class CpuStorageClient:
                 result = self._call("commit", op_id=op_id, entries=entries)
                 self._finish_commit(op_id, result.get("statuses", []))
 
-    def batch_exists(self, keys: list[str]) -> list[bool]:
+    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
         self._ensure(data=False)
         out = []
         for i in range(0, len(keys), MAX_STORAGE_BATCH):
@@ -261,7 +261,9 @@ class CpuStorageClient:
                 out.extend([False] * len(batch))
         return out
 
-    def batch_retrieve(self, keys: list[str]) -> list[CpuReadLease | None]:
+    def batch_retrieve(
+        self, keys: list[str], route_key: str | None = None
+    ) -> list[CpuReadLease | None]:
         if len(keys) > MAX_STORAGE_BATCH:
             out = []
             try:
