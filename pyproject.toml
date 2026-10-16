@@ -49,6 +49,7 @@ docs = [
 [project.scripts]
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
+install-maru-region-mapper = "maru_region_mapper.installer:main"
 marutop = "maru_tools.cli:main"
 maru-region-mapper = "maru_region_mapper.cli:main"
 

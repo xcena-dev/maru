@@ -158,28 +158,41 @@ def build_parser() -> argparse.ArgumentParser:
         description="Maru region mapper - maps resource-manager regions and "
         "registers them with this node's NIC for remote Handlers",
     )
+    # Each default can also come from the environment, so the system service
+    # takes its settings from an environment file (see installer.py).
+    env = os.environ
     parser.add_argument(
-        "--rm-address", required=True, help="Resource manager address (host:port)"
+        "--rm-address",
+        default=env.get("MARU_RM_ADDRESS", "127.0.0.1:9850"),
+        help="Resource manager address (host:port; env MARU_RM_ADDRESS; "
+        "default: 127.0.0.1:9850)",
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)"
+        "--host",
+        default=env.get("MARU_REGION_MAPPER_HOST", "127.0.0.1"),
+        help="Bind address (env MARU_REGION_MAPPER_HOST; default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--port", type=int, default=9860, help="Bind port (default: 9860)"
+        "--port",
+        type=int,
+        default=int(env.get("MARU_REGION_MAPPER_PORT", "9860")),
+        help="Bind port (env MARU_REGION_MAPPER_PORT; default: 9860)",
     )
     parser.add_argument(
         "--node-id", default=socket.gethostname(), help="Node name (default: hostname)"
     )
     parser.add_argument(
         "--ucx-device",
-        default="",
-        help="UCX device, e.g. mlx5_0:1 (default: the UCX default)",
+        default=env.get("MARU_REGION_MAPPER_UCX_DEVICE", ""),
+        help="UCX device, e.g. mlx5_0:1 (env MARU_REGION_MAPPER_UCX_DEVICE; "
+        "default: the UCX default)",
     )
     parser.add_argument(
         "--lock-file",
-        default=None,
+        default=env.get("MARU_REGION_MAPPER_LOCK_FILE") or None,
         help="Lock held for the life of the process, so one region mapper runs "
-        "per node (default: /run/maru/region-mapper-<node-id>.lock)",
+        "per node (env MARU_REGION_MAPPER_LOCK_FILE; default: "
+        "/run/maru/region-mapper-<node-id>.lock)",
     )
     parser.add_argument(
         "--allow-unchecked-transport",

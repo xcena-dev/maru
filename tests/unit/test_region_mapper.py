@@ -368,13 +368,47 @@ def test_boot_id_is_read_from_the_kernel(tmp_path):
     assert cli.read_boot_id(str(tmp_path / "missing")) == ""
 
 
-def test_the_command_line_defaults():
-    args = cli.build_parser().parse_args(["--rm-address", "mem1:9850"])
-    assert (args.host, args.port, args.allow_unchecked_transport) == (
-        "127.0.0.1",
-        9860,
-        False,
-    )
+_ENV_SETTINGS = (
+    "MARU_RM_ADDRESS",
+    "MARU_REGION_MAPPER_HOST",
+    "MARU_REGION_MAPPER_PORT",
+    "MARU_REGION_MAPPER_UCX_DEVICE",
+    "MARU_REGION_MAPPER_LOCK_FILE",
+)
+
+
+def test_the_command_line_defaults(monkeypatch):
+    for name in _ENV_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    args = cli.build_parser().parse_args([])
+    assert (
+        args.rm_address,
+        args.host,
+        args.port,
+        args.ucx_device,
+        args.lock_file,
+        args.allow_unchecked_transport,
+    ) == ("127.0.0.1:9850", "127.0.0.1", 9860, "", None, False)
+
+
+def test_the_service_settings_come_from_the_environment(monkeypatch):
+    # The system service passes its settings file as the environment.
+    for name, value in zip(
+        _ENV_SETTINGS,
+        ["mem1:9850", "0.0.0.0", "9870", "mlx5_1:1", "/run/maru/x.lock"],
+        strict=True,
+    ):
+        monkeypatch.setenv(name, value)
+    args = cli.build_parser().parse_args([])
+    assert (
+        args.rm_address,
+        args.host,
+        args.port,
+        args.ucx_device,
+        args.lock_file,
+    ) == ("mem1:9850", "0.0.0.0", 9870, "mlx5_1:1", "/run/maru/x.lock")
+    # A command-line option still wins.
+    assert cli.build_parser().parse_args(["--port", "9861"]).port == 9861
 
 
 # ------------------------------------------------------------ device mapper
