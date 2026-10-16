@@ -311,14 +311,19 @@ def test_a_release_to_a_restarted_mapper_succeeds():
 
 
 @pytest.mark.parametrize(
-    "value", ["rc", "rc,dc", "rc_x,ud_x:aux", "ib", "dc_mlx5,self"]
+    "value", ["rc", "rc,dc", "rc_x,ud_x:aux", "rc_verbs,ud_verbs:aux", "dc_mlx5,self"]
 )
 def test_transports_that_check_remote_keys_are_accepted(value):
     env = {"UCX_TLS": value}
     assert cli.require_checked_transport(env) == value
 
 
-@pytest.mark.parametrize("value", ["tcp", "rc,tcp", "sm", "all", "^tcp", "cma"])
+# UD has no one-sided RDMA; UCX would carry RDMA over it in software, so it
+# passes only as rc's connection-setup helper (":aux"). "ib" enables UD fully.
+@pytest.mark.parametrize(
+    "value",
+    ["tcp", "rc,tcp", "sm", "all", "^tcp", "cma", "ib", "ud", "rc,ud_x", "ud_mlx5"],
+)
 def test_transports_that_do_not_check_remote_keys_are_refused(value):
     with pytest.raises(cli.UncheckedTransportError):
         cli.require_checked_transport({"UCX_TLS": value})

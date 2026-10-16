@@ -39,11 +39,15 @@ logger = logging.getLogger("maru_region_mapper.cli")
 # deregistered range refuses late writes ("self" never leaves the process).
 CHECKED_UCX_TRANSPORTS = frozenset(
     {
-        "ib", "rc", "rc_v", "rc_x", "rc_verbs", "rc_mlx5",
-        "dc", "dc_x", "dc_mlx5", "ud", "ud_v", "ud_x", "ud_verbs", "ud_mlx5",
+        "rc", "rc_v", "rc_x", "rc_verbs", "rc_mlx5",
+        "dc", "dc_x", "dc_mlx5",
         "self",
     }
 )  # fmt: skip
+# UD has no one-sided RDMA, so UCX would carry RDMA over it in software. It
+# passes only as an auxiliary transport (":aux"), which UCX uses to set up rc
+# connections; "ib" is left out because it enables UD for RDMA too.
+AUX_ONLY_UCX_TRANSPORTS = frozenset({"ud", "ud_v", "ud_x", "ud_verbs", "ud_mlx5"})
 DEFAULT_UCX_TRANSPORTS = "rc,dc"
 # UCX's registration cache keeps a registration alive after NIXL releases it.
 # Only spellings known to turn it off pass; anything else must be set to n.
@@ -91,12 +95,8 @@ def require_checked_transport(
     if not value:
         environ["UCX_TLS"] = DEFAULT_UCX_TRANSPORTS
         return DEFAULT_UCX_TRANSPORTS
-    names = [item.strip().split(":")[0] for item in value.split(",") if item.strip()]
-    unchecked = [
-        name
-        for name in names
-        if name.startswith("^") or name not in CHECKED_UCX_TRANSPORTS
-    ]
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    unchecked = [item for item in items if not _checked_transport(item)]
     if unchecked and not allow_unchecked:
         raise UncheckedTransportError(
             f"UCX_TLS={value!r} allows {', '.join(unchecked)}, where a released "
@@ -104,6 +104,14 @@ def require_checked_transport(
             f"(e.g. {DEFAULT_UCX_TRANSPORTS}) or --allow-unchecked-transport"
         )
     return value
+
+
+def _checked_transport(item: str) -> bool:
+    """Whether one ``UCX_TLS`` entry keeps RDMA on key-checking transports."""
+    name, _, flag = item.partition(":")
+    if name in CHECKED_UCX_TRANSPORTS:
+        return True
+    return name in AUX_ONLY_UCX_TRANSPORTS and flag == "aux"
 
 
 def default_lock_file(node_id: str) -> str:
