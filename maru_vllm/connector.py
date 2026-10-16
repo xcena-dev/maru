@@ -517,11 +517,12 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
 def _rdma_staging_size(extra: dict[str, Any], page_size: int) -> int | None:
     """Bytes of RDMA staging for this worker, or None for the handler default.
 
-    A load holds one staging slot per chunk until its copy to the GPU ends,
-    so a buffer smaller than one max_model_len request can never load that
-    request. With asynchronous loads or stores, stores leave half of the
-    slots to loads, so the buffer must hold one such request in each half.
-    The default fits one such load and one such store.
+    A store puts every chunk a step completes into staging before it writes
+    them, so a buffer smaller than one max_model_len request leaves the rest
+    of such a request out of the pool. Loads go in batches of the free slots.
+    With asynchronous loads or stores, stores leave half of the slots to
+    loads, so the buffer must hold one such request in each half. The
+    default fits one such load and one such store.
 
     Raises:
         ValueError: If an explicit size cannot hold one max_model_len
