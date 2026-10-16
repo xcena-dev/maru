@@ -76,9 +76,14 @@ This will:
    pool, then the same prompt to instance 2, which loads the KV from the pool
 5. Clean up all processes
 
-Expected output: instance 2 reports most of the prompt as cached tokens,
-`Pool hit: Yes` and `Same answer: Yes`. Only whole chunks are stored, so the
-cached tokens stop at the last full `maru_kv_chunk_tokens` chunk. Instance 2
+Expected output: instance 2 reports most of the prompt as cached tokens and
+`Pool hit: Yes`. Only whole chunks are stored, so the cached tokens stop at the
+last full `maru_kv_chunk_tokens` chunk. `Same answer` compares instance 1's
+answer, computed from the whole prompt, with instance 2's, which reuses the
+stored KV and computes only the rest. vLLM itself can answer differently when it
+recomputes part of a prompt instead of reusing it, so `Same answer: No` after
+some tokens is not a load failure; the KV from the pool is checked against
+vLLM's own prefix cache at the same reused length, which gives the same answer. Instance 2
 never saw the prompt, so those tokens were found in the pool. vLLM counts them
 when it schedules the request; if the RDMA read then fails, the connector logs
 `Maru load failed for req ...; recomputing` after a line with the cause (such
