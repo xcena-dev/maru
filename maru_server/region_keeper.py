@@ -47,6 +47,10 @@ CONNECT_TIMEOUT_S = 3.0
 # region with the NIC, which takes well under a second; one slow node must
 # not hold up the others for long, since the keeper is one thread.
 REPLY_TIMEOUT_S = 10.0
+# A kept region whose region mapper does not answer this long stops being
+# found, as a live owner removes the keys of a region it cannot reach: its
+# keys would keep being hits that fail to read.
+UNREACHABLE_S = 30.0
 
 
 class RegionKeeper:
@@ -83,6 +87,8 @@ class RegionKeeper:
         # pool_id -> (address, connection generation, boot) of the hold
         self._held: dict[str, tuple[str, int, str]] = {}
         self._down: dict[str, float] = {}
+        # Kept region -> when its region mapper first failed to answer
+        self._unreachable: dict[str, float] = {}
         self._next_check = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -114,8 +120,11 @@ class RegionKeeper:
         """Do what the departed regions need now."""
         self._directory.make_room()
         work = self._directory.departed()
-        for pool_id in set(self._held) - {item[0] for item in work}:
+        current = {item[0] for item in work}
+        for pool_id in set(self._held) - current:
             del self._held[pool_id]
+        for pool_id in set(self._unreachable) - current:
+            del self._unreachable[pool_id]
         now = self._clock()
         check = now >= self._next_check
         if check:
@@ -123,6 +132,8 @@ class RegionKeeper:
         for pool_id, handle, fate, boot in work:
             address = pick_mapper(self._mappers, int(handle["region_id"]))
             if self._is_down(address):
+                if fate == "keep":
+                    self._note_unreachable(pool_id, now)
                 continue
             if fate == "return":
                 self._release(pool_id, handle, address)
@@ -159,6 +170,7 @@ class RegionKeeper:
         except RegionMapUnavailable as exc:
             self._held.pop(pool_id, None)
             self._mark_down(address, exc)
+            self._note_unreachable(pool_id, self._clock())
             return
         except RegionMapError as exc:
             self._held.pop(pool_id, None)
@@ -170,12 +182,23 @@ class RegionKeeper:
             else:
                 logger.warning("holding region %s failed: %s", handle["region_id"], exc)
             return
+        self._unreachable.pop(pool_id, None)
         known = boot or (held[2] if held is not None else "")
         if known and now_boot and now_boot != known:
             # The memory node rebooted: bytes its CPU cache held are gone.
             self._directory.give_back(pool_id, "its memory node rebooted")
             return
         self._held[pool_id] = (address, client.generation, known or now_boot)
+
+    def _note_unreachable(self, pool_id: str, now: float) -> None:
+        """Give a kept region back once its region mapper is gone too long."""
+        since = self._unreachable.setdefault(pool_id, now)
+        if now - since >= UNREACHABLE_S:
+            del self._unreachable[pool_id]
+            self._held.pop(pool_id, None)
+            self._directory.give_back(
+                pool_id, f"its region mapper did not answer for {UNREACHABLE_S:.0f} s"
+            )
 
     def _release(self, pool_id: str, handle: dict, address: str) -> None:
         """Release a region at its region mapper, then free it."""

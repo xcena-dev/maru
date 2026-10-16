@@ -159,7 +159,10 @@ back when:
   ago goes, one at a time);
 - its memory node rebooted (the boot id differs from the one its owner
   reported), since bytes in the node's CPU cache may be lost;
-- its region mapper refuses its handle (someone released it).
+- its region mapper refuses its handle (someone released it);
+- its region mapper does not answer for 30 seconds, as a live owner removes
+  the keys of a region it cannot reach (the region goes back once the region
+  mapper answers again).
 
 The keeper talks to the region mappers on its own thread, so a memory node
 that does not answer delays no request. It proves the region mapper key like a

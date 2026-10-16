@@ -280,3 +280,47 @@ def test_every_check_maps_a_held_region_again(env):
     keeper.run_once()
     assert client.calls.count(("map", region_id)) == 2
     assert ("hello",) not in client.calls
+
+
+def test_a_kept_region_whose_mapper_stays_away_stops_being_found(env):
+    # Its keys would keep being hits that fail to read, as a live owner's
+    # keys would until it removes them.
+    from maru_server.region_keeper import UNREACHABLE_S
+
+    directory, rm, clock, keeper, _, _ = env
+    pool, region_id = leave(directory, "a", key="k")
+
+    def found():
+        reply = call(directory, "probe", engine_id="x", namespace="ns", keys=["k"])
+        return reply["results"] == [True]
+
+    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    for _ in range(2):
+        client.fail["map"] = RegionMapUnavailable("down")
+        keeper.run_once()
+        assert found()
+        clock.advance(UNREACHABLE_S / 2)
+    client.fail["map"] = RegionMapUnavailable("down")
+    keeper.run_once()
+    assert not found()
+    keeper.run_once()
+    assert rm.released == []  # it goes back once its mapper answers again
+    clock.advance(DOWN_S + 0.1)
+    keeper.run_once()
+    assert rm.released == [region_id]
+
+
+def test_a_short_outage_keeps_the_kept_region(env):
+    from maru_server.region_keeper import UNREACHABLE_S
+
+    directory, rm, clock, keeper, _, _ = env
+    pool, region_id = leave(directory, "a", key="k")
+    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    client.fail["map"] = RegionMapUnavailable("down")
+    keeper.run_once()
+    clock.advance(DOWN_S + 0.1)
+    keeper.run_once()  # answers again
+    clock.advance(UNREACHABLE_S)
+    keeper.run_once()
+    assert [p for p, *_ in directory.departed()] == [pool]
+    assert rm.released == []
