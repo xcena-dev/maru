@@ -17,14 +17,18 @@ from maru_common.storage_types import (
     StorageUnavailableError,
 )
 from maru_handler.storage.remote_cxl import RemoteCxlStorageClient, pick_mapper
+from maru_remote.region_map import RegionMapError, read_handle
 from maru_remote.transport import NixlTransport
+from maru_server.region_keeper import RegionKeeper
 from maru_server.replica_directory import ReplicaDirectory
 from tests.unit.remote_fakes import (
     FakeClock,
     FakeCxl,
     FakeMemoryNode,
     FakeNixlAgent,
+    key_file,
     reset_fake_agents,
+    shared_key,
 )
 
 PAGE = 4096  # a region must start on a page for mmap
@@ -75,6 +79,14 @@ class World:
         )
         self.nodes = [FakeMemoryNode(self.cxl, f"mem{i + 1}") for i in range(nodes)]
         self.clients: list[RemoteCxlStorageClient] = []
+        # MaruServer's side of the regions whose owner left; tests run it
+        # one pass at a time.
+        self.keeper = RegionKeeper(
+            self.directory,
+            [n.address for n in self.nodes],
+            shared_key(),
+            clock=self.clock,
+        )
 
     @property
     def node(self) -> FakeMemoryNode:
@@ -91,6 +103,7 @@ class World:
                 "chunk_size_bytes": PAGE,
                 "rdma_staging_size": staging_pages * PAGE,
                 "metadata_only": metadata_only,
+                "region_mapper_key_file": key_file(),
                 **kwargs,
             },
         )
@@ -112,6 +125,7 @@ class World:
                     c.close()
                 except RuntimeError:
                     pass
+        self.keeper.stop()
         for node in self.nodes:
             node.stop()
         reset_fake_agents()
@@ -193,6 +207,33 @@ def test_the_region_mapper_checks_a_region_once_and_shares_its_registration(worl
     assert len(holders[region.region_id]) == 2
     scheduler = world.client("b-sched", metadata_only=True)
     assert scheduler.batch_exists(["k"]) == [True]
+
+
+def test_a_reader_gets_a_read_handle_and_cannot_take_the_region_away(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"shared")
+    region = only_region(a)
+    leases = {}
+    for c in (a, b):
+        reply = world.directory.execute("acquire", {**c._credentials, "keys": ["k"]})
+        leases[c] = reply["result"]
+    # The owner gets its region's handle; a reader only a read handle.
+    assert leases[a]["regions"][region.pool_id] == region.handle
+    assert leases[b]["regions"][region.pool_id] == read_handle(region.handle)
+    for c, lease in leases.items():
+        world.directory.execute(
+            "release", {**c._credentials, "lease_id": lease["lease_id"]}
+        )
+    assert read(b, ["k"]) == [b"shared"]
+    # A reader that tries to release the owner's region is refused, and the
+    # owner keeps writing to it.
+    with pytest.raises(RegionMapError) as info:
+        b._data._client(world.node.address).release(
+            leases[b]["regions"][region.pool_id]
+        )
+    assert info.value.code == "denied"
+    assert put(a, "k2", b"more")[0]
+    assert read(b, ["k2"]) == [b"more"]
 
 
 def test_a_key_another_worker_committed_first_returns_the_page(world):
@@ -406,29 +447,70 @@ def test_heartbeat_renews_while_a_transfer_holds_the_client_lock(world):
 # ------------------------------------------------------------ return rule (5.3)
 
 
-def test_close_releases_each_region_before_returning_it(world):
+def test_after_its_owner_closes_a_region_with_keys_stays_readable(world):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"v")
     region = only_region(a)
     assert read(b, ["k"]) == [b"v"]  # b maps a's region to read it
+    a.close()
+    world.keeper.run_once()
+    # As a cxl Handler's region stays while keys refer to it: MaruServer
+    # holds the registration instead of the owner.
+    assert world.cxl.released == []
+    assert len(world.node.service.holders()[region.region_id]) == 2  # b, keeper
+    assert read(b, ["k"]) == [b"v"]
+    c = world.client("c")  # a worker that starts later reads it too
+    assert read(c, ["k"]) == [b"v"]
+    a2 = world.client("a")  # so does the restarted worker
+    assert read(a2, ["k"]) == [b"v"]
+
+
+def test_a_kept_region_goes_back_only_after_its_release(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    region = only_region(a)
+    assert read(b, ["k"]) == [b"v"]
+    a.close()
+    world.keeper.run_once()
     seen = []
     release = world.node.service.release
 
     def record(handle):
-        # At the release the region is still a's: not yet back at the RM.
+        # At the release the region is still allocated: not yet at the RM.
         seen.append(handle["region_id"] in world.cxl.regions)
         return release(handle)
 
     world.node.service.release = record
-    a.close()
+    world.directory.give_back(region.pool_id, "test")
+    assert read(b, ["k"]) == [None]  # its keys stop being found at once
+    world.keeper.run_once()
     assert seen == [True]
     assert world.cxl.released == [region.region_id]
     # Released whoever else held it, and b cannot map it again.
     assert region.region_id not in world.node.service.holders()
     b._data.forget(region.pool_id)
     with pytest.raises(StorageUnavailableError, match="released"):
-        b._data.region(region.pool_id, region.handle, b.region_mappers)
+        b._data.region(region.pool_id, read_handle(region.handle), b.region_mappers)
+
+
+def test_a_full_rm_gives_back_the_kept_region_read_longest_ago(world):
+    world.cxl.size = 4 * PAGE  # room for two regions of two pages
+    a = world.client("a", pages=2)
+    put(a, "k", b"v")
+    region = only_region(a)
+    a.close()
+    world.keeper.run_once()
+    b = world.client("b", pages=2)
+    put(b, "b1", b"1")
+    put(b, "b2", b"2")
+    # b's region is full and the RM has no room: b evicts its own key now,
+    # and the keeper gives a's kept region back for b's next request.
+    assert put(b, "b3", b"3")[0]
+    world.keeper.run_once()
+    world.keeper.run_once()
+    assert world.cxl.released == [region.region_id]
     assert read(b, ["k"]) == [None]
+    assert put(b, "b4", b"4")[0] and len(b.regions) == 2
 
 
 def test_a_write_still_in_flight_at_close_cannot_land_on_the_next_owner(world):
@@ -438,6 +520,8 @@ def test_a_write_still_in_flight_at_close_cannot_land_on_the_next_owner(world):
     assert put(a, "k", b"late")[0] is False
     old = only_region(a)
     a.close()
+    # The region holds no key: the keeper releases it, then frees it.
+    world.keeper.run_once()
     assert world.cxl.released == [old.region_id]
     # The same bytes of CXL go to the next owner under a new region id.
     c = world.client("c")
@@ -454,11 +538,15 @@ def test_a_write_still_in_flight_at_close_cannot_land_on_the_next_owner(world):
 def test_an_unreachable_region_mapper_keeps_the_regions(world):
     a = world.client("a")
     put(a, "k", b"v")
+    region = only_region(a)
     world.node.stop()
     a.close()
-    # No release, so no drained close: MaruServer keeps the region.
+    world.directory.give_back(region.pool_id, "test")
+    world.keeper.run_once()
+    # No release, so the region stays allocated.
     assert world.cxl.released == []
-    assert world.directory.get_usage("remote_cxl")["pools"][0]["active"] is True
+    (usage,) = world.directory.get_usage("remote_cxl")["pools"]
+    assert usage["pool_id"] == region.pool_id
 
 
 def test_a_failed_deregistration_keeps_the_regions(world):
@@ -477,12 +565,44 @@ def test_a_restarted_region_mapper_confirms_the_release(world):
     a = world.client("a")
     put(a, "k", b"v")
     region = only_region(a)
-    world.node.restart()  # every registration went with the old process
     a.close()
+    world.keeper.run_once()
+    world.node.restart()  # every registration went with the old process
+    world.directory.give_back(region.pool_id, "test")
+    world.keeper.run_once()
     assert world.cxl.released == [region.region_id]
 
 
-def test_an_expired_session_disables_the_cache_and_returns_the_regions(world):
+def test_the_keeper_maps_a_kept_region_again_after_its_mapper_restarts(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    region = only_region(a)
+    a.close()
+    world.keeper.run_once()
+    world.node.restart()
+    world.clock.advance(11)  # the keeper's next check of its holds
+    world.keeper.run_once()
+    assert region.region_id in world.node.service.holders()
+    assert read(b, ["k"]) == [b"v"]
+
+
+def test_a_kept_region_on_a_rebooted_node_goes_back(world):
+    a = world.client("a")
+    put(a, "k", b"v")
+    region = only_region(a)
+    a._heartbeat()  # reports the boot of the region's memory node
+    a.close()
+    world.keeper.run_once()
+    world.node.restart(reboot=True)  # bytes in its CPU cache may be gone
+    world.clock.advance(11)
+    world.keeper.run_once()
+    world.keeper.run_once()
+    assert world.cxl.released == [region.region_id]
+    b = world.client("b")
+    assert read(b, ["k"]) == [None]
+
+
+def test_an_expired_owner_leaves_and_its_keys_stay_readable(world):
     a = world.client("a")
     put(a, "k", b"v")
     region = only_region(a)
@@ -491,20 +611,40 @@ def test_an_expired_session_disables_the_cache_and_returns_the_regions(world):
         a._heartbeat()
     a._disable("session expired")
     assert not a.connected
-    assert world.cxl.released == [region.region_id]
     with pytest.raises(StorageUnavailableError):
         a.alloc(1)
+    world.keeper.run_once()
+    assert world.cxl.released == []
+    b = world.client("b")
+    assert read(b, ["k"]) == [b"v"]
+    assert region.region_id in world.node.service.holders()
     a.close()
 
 
-def test_a_reader_finishing_after_a_close_keeps_its_bytes(world):
+def test_a_crashed_owners_keys_stay_readable(world):
+    a = world.client("a")
+    put(a, "k", b"v")
+    a._data.close()  # the process is gone: its connections close
+    a._stop.set()
+    world.clock.advance(31)
+    world.keeper.run_once()  # the session expired: MaruServer maps the region
+    b = world.client("b")
+    assert read(b, ["k"]) == [b"v"]
+    assert world.cxl.released == []
+    world.clients.remove(a)
+
+
+def test_a_reader_finishing_after_a_give_back_keeps_its_bytes(world):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"v")
     region = only_region(a)
     leases = b.batch_retrieve(["k"])
     a.close()
-    # b released its server lease right after the READ, so the region went
-    # back at once; the bytes b read are in its own staging buffer.
+    world.keeper.run_once()
+    world.directory.give_back(region.pool_id, "test")
+    world.keeper.run_once()
+    # b released its server lease right after the READ; the bytes b read
+    # are in its own staging buffer.
     assert world.cxl.released == [region.region_id]
     assert bytes(leases[0].view) == b"v"
     leases[0].release()
@@ -579,7 +719,10 @@ def test_a_down_node_keeps_only_its_regions_from_going_back(shared):
     }
     down.stop()
     a.close()
-    # Regions on the live node went back one by one; MaruServer keeps the rest.
+    for pool_id, *_ in shared.directory.departed():
+        shared.directory.give_back(pool_id, "test")
+    shared.keeper.run_once()
+    # Regions on the live node went back; the down node's stay allocated.
     assert set(shared.cxl.regions) == kept
 
 
@@ -680,6 +823,9 @@ def test_a_failed_release_does_not_stop_the_other_regions_of_its_mapper(world):
 
     world.node.service.release = fail_first
     a.close()
+    for pool_id, *_ in world.directory.departed():
+        world.directory.give_back(pool_id, "test")
+    world.keeper.run_once()
     assert world.cxl.released == [second.region_id]
     assert first.region_id in world.cxl.regions
 
@@ -938,7 +1084,9 @@ def test_an_open_whose_reply_was_lost_is_closed(world):
     )
     with pytest.raises(StorageUnavailableError, match="reply lost"):
         c.connect()
-    # MaruServer had granted a region; the close gave it back.
+    # MaruServer had granted a region; the close handed it over and the
+    # keeper gave it back (it holds no key).
+    world.keeper.run_once()
     assert world.cxl.released and not world.cxl.regions
 
 

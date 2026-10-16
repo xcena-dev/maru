@@ -26,6 +26,13 @@ export MARU_MAPPER_PORT=${MARU_MAPPER_PORT:-$((10500 + $(id -u)))}
 export MARU_MAPPER_UCX_DEVICE=${MARU_MAPPER_UCX_DEVICE:-}
 # One region mapper runs per node; this lock file enforces it.
 export MARU_MAPPER_LOCK_FILE=${MARU_MAPPER_LOCK_FILE:-/tmp/maru-region-mapper.lock}
+# Key the region mappers require from workers and maru-server. The region
+# mapper service keeps it in /etc/maru/region-mapper.key (root only); give
+# every user that runs a worker or maru-server its own copy:
+#   sudo install -D -m 0600 -o "$USER" /etc/maru/region-mapper.key \
+#       ~/.maru/region-mapper.key
+# region_mapper.sh creates this file when it runs the region mapper itself.
+export MARU_REGION_MAPPER_KEY_FILE=${MARU_REGION_MAPPER_KEY_FILE:-$HOME/.maru/region-mapper.key}
 
 # ── Metadata node (maru-server, one per app and pool) ─────────────────
 export MARU_SERVER_BIND_HOST=${MARU_SERVER_BIND_HOST:-127.0.0.1}

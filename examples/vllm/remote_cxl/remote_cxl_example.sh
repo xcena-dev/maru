@@ -94,10 +94,21 @@ if systemctl is-active --quiet maru-region-mapper 2>/dev/null; then
             tail -1 | cut -d= -f2-
     }
     host=$(setting MARU_REGION_MAPPER_HOST)
-    [[ -z "$host" || "$host" == "0.0.0.0" ]] && host=127.0.0.1
+    if [[ -z "$host" ]]; then
+        # The service listens on its RDMA NIC's address.
+        host=$(python -c "import sys; from maru_region_mapper.cli import rdma_address; print(rdma_address(sys.argv[1]))" \
+            "$(setting MARU_REGION_MAPPER_UCX_DEVICE)")
+    elif [[ "$host" == "0.0.0.0" ]]; then
+        host=127.0.0.1
+    fi
     port=$(setting MARU_REGION_MAPPER_PORT)
     MAPPER_SERVICE="$host:${port:-9860}"
     export MARU_REGION_MAPPERS=$MAPPER_SERVICE
+    if [[ ! -r "$MARU_REGION_MAPPER_KEY_FILE" ]]; then
+        echo "ERROR: no readable copy of the region mapper key at $MARU_REGION_MAPPER_KEY_FILE." >&2
+        echo "  sudo install -D -m 0600 -o \"\$USER\" /etc/maru/region-mapper.key $MARU_REGION_MAPPER_KEY_FILE" >&2
+        exit 1
+    fi
 fi
 
 echo "================================================"

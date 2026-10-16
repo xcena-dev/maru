@@ -11,10 +11,11 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-from maru_common.storage_types import StorageUnavailableError
+from maru_common.storage_types import StorageError, StorageUnavailableError
+from maru_remote.region_map import pick_mapper
 
 from ..staging import StagingBuffer
-from .region import RegionAccess, pick_mapper
+from .region import RegionAccess
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,10 @@ class RdmaDataPath:
         """
         self.config = config
         self._transport_factory = transport_factory or _default_transport(config)
-        self._mapper_factory = mapper_factory or _default_mapper(config)
+        self._mapper_factory = mapper_factory or self._default_mapper
+        # Region mapper key, read by start() for the default mapper factory
+        self._key: bytes | None = None
+        self._needs_key = mapper_factory is None
         self.staging: StagingBuffer | None = None
         self.transport: Any = None
         self._registration: Any = None
@@ -80,11 +84,19 @@ class RdmaDataPath:
         """Map the staging buffer and register it with this node's NIC.
 
         Raises:
+            StorageError: if the region mapper key cannot be read.
             Exception: if the buffer, the NIXL agent or the registration
                 fails; nothing is left set up.
         """
         if self.transport is not None:
             return
+        if self._needs_key and self._key is None:
+            from maru_remote.region_map import KeyFileError, load_key
+
+            try:
+                self._key = load_key(self.config.region_mapper_key_file)
+            except KeyFileError as exc:
+                raise StorageError(str(exc)) from exc
         page = self.config.chunk_size_bytes
         size = self.config.rdma_staging_size or max(64 * page, DEFAULT_STAGING)
         staging = transport = None
@@ -295,6 +307,33 @@ class RdmaDataPath:
         self._not_mapped(pool_id)
         return Release.DONE
 
+    def unmap(self, pool_id: str, handle: dict, mappers: list[str]) -> None:
+        """Drop this worker's hold on a region at its region mapper.
+
+        The region stays registered while someone else holds it. A broken
+        connection already dropped the hold.
+
+        Args:
+            pool_id: The region's pool id at MaruServer.
+            handle: The region's handle or read handle.
+            mappers: Region mapper addresses of the region's pool.
+        """
+        from maru_remote.region_map import RegionMapError
+
+        self.forget(pool_id)
+        self._not_mapped(pool_id)
+        if not mappers:
+            return
+        address = pick_mapper(mappers, int(handle["region_id"]))
+        with self._lock:
+            client = self._mappers.get(address)
+        if client is None:
+            return
+        try:
+            client.unmap(int(handle["region_id"]))
+        except RegionMapError as exc:
+            logger.warning("unmap of region %s failed: %s", handle["region_id"], exc)
+
     def disconnect(self, peers: set[str]) -> bool:
         """Close the NIXL connections to these peers; True if all are closed.
 
@@ -330,6 +369,16 @@ class RdmaDataPath:
             self.staging.close()
             self.staging = None
 
+    def _default_mapper(self, address: str) -> Any:
+        from maru_remote.region_map import RegionMapClient
+
+        return RegionMapClient(
+            address,
+            timeout_s=self.config.rdma_timeout_s,
+            connect_timeout_s=CONNECT_TIMEOUT_S,
+            key=self._key,
+        )
+
     def _client(self, address: str) -> Any:
         with self._lock:
             client = self._mappers.get(address)
@@ -354,18 +403,5 @@ def _default_transport(config: Any) -> Callable[[str], Any]:
         from maru_remote.transport import NixlTransport
 
         return NixlTransport(name, ucx_device=config.rdma_device)
-
-    return make
-
-
-def _default_mapper(config: Any) -> Callable[[str], Any]:
-    def make(address: str) -> Any:
-        from maru_remote.region_map import RegionMapClient
-
-        return RegionMapClient(
-            address,
-            timeout_s=config.rdma_timeout_s,
-            connect_timeout_s=CONNECT_TIMEOUT_S,
-        )
 
     return make

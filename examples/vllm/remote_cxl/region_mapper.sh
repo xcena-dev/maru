@@ -26,11 +26,21 @@ if command -v systemctl >/dev/null 2>&1 \
     exit 1
 fi
 
+# Workers and maru-server prove this key on every connection; copy it to
+# them (the same file serves every memory node of the pool).
+if [[ ! -e "$MARU_REGION_MAPPER_KEY_FILE" ]]; then
+    mkdir -p "$(dirname "$MARU_REGION_MAPPER_KEY_FILE")"
+    python -c "import sys; from maru_remote.region_map import write_key; write_key(sys.argv[1])" \
+        "$MARU_REGION_MAPPER_KEY_FILE"
+    echo "Created the region mapper key $MARU_REGION_MAPPER_KEY_FILE"
+fi
+
 ARGS=(
     --rm-address "$MARU_RM_ADDRESS"
     --host "$MARU_MEMORY_NODE_HOST"
     --port "$MARU_MAPPER_PORT"
     --lock-file "$MARU_MAPPER_LOCK_FILE"
+    --key-file "$MARU_REGION_MAPPER_KEY_FILE"
 )
 if [[ -n "$MARU_MAPPER_UCX_DEVICE" ]]; then
     ARGS+=(--ucx-device "$MARU_MAPPER_UCX_DEVICE")
@@ -42,6 +52,7 @@ echo "=== Maru region mapper (memory node) ==="
 echo "  Listening on:     $MARU_MEMORY_NODE_HOST:$MARU_MAPPER_PORT"
 echo "  Resource manager: $MARU_RM_ADDRESS"
 echo "  UCX device:       ${MARU_MAPPER_UCX_DEVICE:-(UCX default)}"
+echo "  Key:              $MARU_REGION_MAPPER_KEY_FILE"
 echo "========================================"
 echo "Give maru-server this region mapper: --region-mapper ${MARU_MEMORY_NODE_HOST}:${MARU_MAPPER_PORT}"
 echo ""

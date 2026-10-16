@@ -231,7 +231,9 @@ stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
 size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
-and, optionally, `maru_rdma_device` (the worker's RDMA NIC, e.g. `mlx5_0:1`).
+`maru_region_mapper_key_file` (a copy of the memory nodes' region mapper key,
+default `/etc/maru/region-mapper.key`) and, optionally, `maru_rdma_device` (the
+worker's RDMA NIC, e.g. `mlx5_0:1`).
 
 ![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
 
@@ -246,17 +248,27 @@ Each memory
 node runs a region mapper (`maru-region-mapper`), a service shared by every app:
 it maps the regions Handlers ask for and registers them with the node's NIC.
 With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
-which starts and stops with the resource manager; its settings (bind address,
-port 9860, NIC) are in `/etc/maru/region-mapper.env`.
+which starts and stops with the resource manager; its settings (NIC, port 9860,
+key file) are in `/etc/maru/region-mapper.env`. It listens on the NIC's address
+on the RDMA network, and every worker and maru-server proves the region mapper
+key (`/etc/maru/region-mapper.key`, created by the installer) on each
+connection, so only processes that can read a copy of the key map regions, as
+only users that can open the DAX device map them on a CXL-attached node. The
+protocol itself is not encrypted, like the resource manager's, so keep the
+RDMA network to the hosts of the deployment.
 A memory node of a shared pool that runs no resource manager installs the
 service alone (`install-maru-region-mapper --standalone`, which starts it at
 boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
 the {ref}`multi-node configuration <installation-multi-node-config>`.
 maru-server takes the pool's region mappers with `--region-mapper host:port`
-(one per memory node) and hands them to the workers. Engines read each other's
-keys under a server lease; before a worker gives a region back, its region
-mapper deregisters it, so a late RDMA WRITE fails at the NIC instead of landing
-in the next owner's KV.
+(one per memory node) and `--region-mapper-key-file`, and hands the list to
+the workers. Engines read each other's keys under a server lease; a reader
+gets a read handle, which maps a region but cannot release it. When a worker
+stops, maru-server keeps its regions that hold keys and holds their mapping,
+so the keys stay readable as a stopped cxl Handler's keys do; it gives a kept
+region back when the resource manager is full. A region goes back only after
+its region mapper deregistered it, so a late RDMA WRITE fails at the NIC
+instead of landing in the next owner's KV.
 
 The backend stores KV chunkwise and needs `--enforce-eager`,
 `kv_load_failure_policy="recompute"` and one worker per engine. Loads and

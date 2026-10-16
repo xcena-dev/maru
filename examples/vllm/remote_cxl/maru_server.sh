@@ -3,7 +3,9 @@
 #
 # Runs in the foreground, on the metadata node (it may be a memory node). It
 # allocates the workers' regions from the pool's resource manager, as for
-# local CXL, and tells the workers which region mappers serve the pool.
+# local CXL, and tells the workers which region mappers serve the pool. Once
+# a worker leaves, maru-server keeps its regions that still have keys and
+# talks to their region mapper itself, so it needs the region mapper key.
 #
 # Usage:
 #   ./maru_server.sh
@@ -21,6 +23,7 @@ ARGS=(
     --port "$MARU_SERVER_PORT"
     --rm-address "$MARU_RM_ADDRESS"
     --region-mapper "$MARU_REGION_MAPPERS"
+    --region-mapper-key-file "$MARU_REGION_MAPPER_KEY_FILE"
 )
 if [[ -n "$MARU_DAX_PATH" ]]; then
     ARGS+=(--dax-path "$MARU_DAX_PATH")

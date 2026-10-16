@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 import uuid
 from collections import deque
@@ -13,25 +12,6 @@ from typing import Any
 from maru_common.storage_types import StorageLocation, StorageUnavailableError
 
 REMOTE_CXL = "remote_cxl"
-
-
-def pick_mapper(mappers: list[str], region_id: int) -> str:
-    """The region mapper that serves a region (rendezvous hash).
-
-    Every Handler with the same list picks the same node for a region, so
-    the owner and the readers of a region use one memory node's NIC.
-
-    Args:
-        mappers: Region mapper addresses of the pool.
-        region_id: Region number.
-
-    Returns:
-        One address of ``mappers``.
-    """
-    return max(
-        mappers,
-        key=lambda address: hashlib.sha256(f"{address}|{region_id}".encode()).digest(),
-    )
 
 
 @dataclass(eq=False)

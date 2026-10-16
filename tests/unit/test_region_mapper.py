@@ -11,9 +11,18 @@ import pytest
 
 from maru_region_mapper import cli
 from maru_region_mapper.mapper import DaxRegionMapper
-from maru_region_mapper.server import handle_request
-from maru_region_mapper.service import MapDenied, RegionMapService
-from maru_remote.region_map import RegionMapClient, RegionMapError
+from maru_region_mapper.server import ConnectionAuth, handle_request
+from maru_region_mapper.service import MapDenied, NotMapped, RegionMapService
+from maru_remote.region_map import (
+    KeyFileError,
+    RegionMapClient,
+    RegionMapError,
+    RegionMapUnavailable,
+    load_key,
+    prove,
+    read_handle,
+    write_key,
+)
 from maru_remote.transport import NixlTransport
 from maru_shm.types import MaruHandle
 from tests.unit.remote_fakes import (
@@ -21,7 +30,9 @@ from tests.unit.remote_fakes import (
     FakeDeviceMapper,
     FakeMemoryNode,
     FakeNixlAgent,
+    key_file,
     reset_fake_agents,
+    shared_key,
 )
 
 
@@ -260,7 +271,7 @@ def test_a_handler_connection_that_closes_drops_its_holds():
     cxl = FakeCxl()
     mem = FakeMemoryNode(cxl)
     try:
-        client = RegionMapClient(mem.address, timeout_s=5)
+        client = RegionMapClient(mem.address, timeout_s=5, key=shared_key())
         handle = cxl.reserve("owner", 4096).to_dict()
         reply = client.map(handle)
         assert reply.epoch == "mem1-e0" and reply.boot == "mem1-boot0"
@@ -275,7 +286,7 @@ def test_the_client_reconnects_after_a_restart_and_counts_it():
     cxl = FakeCxl()
     mem = FakeMemoryNode(cxl)
     try:
-        client = RegionMapClient(mem.address, timeout_s=5)
+        client = RegionMapClient(mem.address, timeout_s=5, key=shared_key())
         handle = cxl.reserve("owner", 4096).to_dict()
         client.map(handle)
         assert client.generation == 1
@@ -297,7 +308,7 @@ def test_a_release_to_a_restarted_mapper_succeeds():
     cxl = FakeCxl()
     mem = FakeMemoryNode(cxl)
     try:
-        client = RegionMapClient(mem.address, timeout_s=5)
+        client = RegionMapClient(mem.address, timeout_s=5, key=shared_key())
         handle = cxl.reserve("owner", 4096).to_dict()
         client.map(handle)
         mem.restart()
@@ -305,6 +316,265 @@ def test_a_release_to_a_restarted_mapper_succeeds():
         client.close()
     finally:
         mem.stop()
+
+
+# --------------------------------------------------------- read handles
+
+
+def test_a_read_handle_shares_a_mapped_region(node):
+    handle = node.region()
+    owner = node.service.map(1, handle)
+    reader = node.service.map(2, read_handle(handle))
+    assert reader == owner
+    assert node.service.holders() == {handle["region_id"]: {1, 2}}
+
+
+def test_a_read_handle_cannot_map_a_region_the_first_time(node):
+    # Only the region's handle checks it with the resource manager; the
+    # owner (or MaruServer) maps it again.
+    handle = node.region()
+    with pytest.raises(NotMapped):
+        node.service.map(2, read_handle(handle))
+    assert node.cxl.accesses == []
+    reply = handle_request(
+        node.service, 2, {"op": "map", "handle": read_handle(handle)}
+    )
+    assert reply["code"] == "unavailable"
+
+
+def test_a_read_handle_cannot_release_a_region(node):
+    # A reader cannot take a region away from its owner.
+    handle = node.region()
+    node.service.map(1, handle)
+    node.service.map(2, read_handle(handle))
+    with pytest.raises(MapDenied, match="read handle cannot release"):
+        node.service.release(read_handle(handle))
+    reply = handle_request(
+        node.service, 2, {"op": "release", "handle": read_handle(handle)}
+    )
+    assert reply["code"] == "denied"
+    assert node.service.holders() == {handle["region_id"]: {1, 2}}
+    assert node.agent.registered  # still registered for the owner
+
+
+def test_a_wrong_read_token_is_denied(node):
+    handle = node.region()
+    node.service.map(1, handle)
+    forged = {**read_handle(handle), "read_token": "0" * 32}
+    with pytest.raises(MapDenied, match="read token"):
+        node.service.map(2, forged)
+    other = node.region()
+    with pytest.raises(MapDenied):
+        node.service.map(2, {**read_handle(other), "region_id": handle["region_id"]})
+
+
+def test_a_read_handle_of_a_released_region_is_denied(node):
+    handle = node.region()
+    node.service.map(1, handle)
+    node.service.release(handle)
+    with pytest.raises(MapDenied, match="released"):
+        node.service.map(2, read_handle(handle))
+
+
+def test_a_read_handle_does_not_reveal_the_auth_token():
+    handle = MaruHandle(region_id=7, offset=0, length=4096, auth_token=123).to_dict()
+    reader = read_handle(handle)
+    assert set(reader) == {"region_id", "offset", "length", "read_token"}
+    assert (
+        reader["read_token"] != read_handle({**handle, "auth_token": 124})["read_token"]
+    )
+
+
+# ------------------------------------------------------------------- key
+
+
+def _raw(mem):
+    """A connection that speaks the protocol by hand."""
+    import socket
+
+    from maru_remote.region_map import recv_frame, send_frame
+
+    sock = socket.create_connection(("127.0.0.1", int(mem.address.split(":")[1])))
+
+    def ask(message):
+        send_frame(sock, message)
+        return recv_frame(sock)
+
+    return sock, ask
+
+
+def test_a_connection_does_nothing_before_it_proves_the_key():
+    cxl = FakeCxl()
+    mem = FakeMemoryNode(cxl)
+    sock, ask = _raw(mem)
+    try:
+        handle = cxl.reserve("owner", 4096).to_dict()
+        hello = ask({"op": "hello"})
+        assert hello["ok"] and len(hello["nonce"]) == 16
+        for message in (
+            {"op": "map", "handle": handle},
+            {"op": "release", "handle": handle},
+            {"op": "unmap", "region_id": handle["region_id"]},
+        ):
+            assert ask(message)["code"] == "denied"
+        wrong = ask(
+            {
+                "op": "auth",
+                "proof": prove(b"x" * 32, "handler", hello["nonce"]),
+                "nonce": b"n" * 16,
+            }
+        )
+        assert wrong["code"] == "denied"
+        assert ask({"op": "map", "handle": handle})["code"] == "denied"
+        assert cxl.accesses == []
+        right = ask(
+            {
+                "op": "auth",
+                "proof": prove(shared_key(), "handler", hello["nonce"]),
+                "nonce": b"n" * 16,
+            }
+        )
+        assert right["proof"] == prove(shared_key(), "mapper", b"n" * 16)
+        assert ask({"op": "map", "handle": handle})["ok"]
+    finally:
+        sock.close()
+        mem.stop()
+
+
+def test_a_client_with_another_key_cannot_map():
+    cxl = FakeCxl()
+    mem = FakeMemoryNode(cxl)
+    try:
+        client = RegionMapClient(mem.address, timeout_s=5, key=b"y" * 32)
+        with pytest.raises(RegionMapUnavailable, match="key check failed"):
+            client.map(cxl.reserve("owner", 4096).to_dict())
+        no_key = RegionMapClient(mem.address, timeout_s=5)
+        with pytest.raises(
+            RegionMapUnavailable, match="requires the region mapper key"
+        ):
+            no_key.hello()
+        assert cxl.accesses == []
+    finally:
+        mem.stop()
+
+
+def test_the_client_checks_that_the_region_mapper_holds_the_key():
+    # A process that poses as the region mapper cannot hand out addresses.
+    cxl = FakeCxl()
+    impostor = FakeMemoryNode(cxl, key=b"z" * 32)
+    keyless = FakeMemoryNode(cxl, name="mem2", key=None)
+    try:
+        for mem in (impostor, keyless):
+            client = RegionMapClient(mem.address, timeout_s=5, key=shared_key())
+            with pytest.raises(RegionMapUnavailable, match="key check failed"):
+                client.hello()
+    finally:
+        impostor.stop()
+        keyless.stop()
+
+
+def test_an_auth_reply_with_another_proof_is_refused():
+    auth = ConnectionAuth(b"k" * 32)
+    reply = auth.check(
+        {
+            "op": "auth",
+            "proof": prove(b"k" * 32, "handler", auth.nonce),
+            "nonce": b"c" * 16,
+        }
+    )
+    assert reply["ok"] and auth.proved
+    assert reply["proof"] != prove(b"other" * 7, "mapper", b"c" * 16)
+
+
+def test_the_key_file_must_hold_a_key_and_stay_private(tmp_path):
+    path = tmp_path / "key"
+    write_key(str(path))
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert len(load_key(str(path))) == 32
+    with pytest.raises(FileExistsError):
+        write_key(str(path))  # an existing key is never replaced
+    path.chmod(0o644)
+    with pytest.raises(KeyFileError, match="readable by every user"):
+        load_key(str(path))
+    path.chmod(0o640)
+    assert len(load_key(str(path))) == 32
+    bad = tmp_path / "bad"
+    bad.write_text("not hex\n")
+    bad.chmod(0o600)
+    with pytest.raises(KeyFileError, match="does not hold"):
+        load_key(str(bad))
+    with pytest.raises(KeyFileError, match="cannot read"):
+        load_key(str(tmp_path / "missing"))
+
+
+def test_writing_a_key_leaves_no_temporary_file(tmp_path):
+    write_key(str(tmp_path / "key"))
+    assert [p.name for p in tmp_path.iterdir()] == ["key"]
+
+
+def test_a_proof_that_is_not_bytes_is_refused():
+    import socket
+
+    from maru_remote.region_map import recv_frame, send_frame
+
+    ours, theirs = socket.socketpair()
+
+    def serve():
+        recv_frame(theirs)
+        send_frame(
+            theirs,
+            {"ok": True, "node": "n", "epoch": "e", "boot": "", "nonce": b"n" * 16},
+        )
+        recv_frame(theirs)
+        send_frame(theirs, {"ok": True, "proof": 12345})
+
+    threading.Thread(target=serve, daemon=True).start()
+    client = RegionMapClient(
+        "mem1:9860", timeout_s=5, connect=lambda addr, timeout: ours, key=b"k" * 32
+    )
+    with pytest.raises(RegionMapUnavailable, match="another key"):
+        client.hello()
+    theirs.close()
+
+
+def test_main_refuses_to_start_without_the_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("UCX_TLS", "rc")
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    assert cli.main([*argv, "--key-file", str(tmp_path / "missing")]) == 1
+    assert not (tmp_path / "lock").exists()
+
+
+# ------------------------------------------------------------ bind address
+
+
+def _sysfs(tmp_path, device, interfaces):
+    for name in interfaces:
+        (tmp_path / device / "device" / "net" / name).mkdir(parents=True)
+    return str(tmp_path)
+
+
+def test_the_bind_address_is_the_rdma_nics_network_address(tmp_path):
+    sysfs = _sysfs(tmp_path, "mlx5_1", ["ens1f1np1"])
+    addresses = {"ens1f1np1": "10.0.0.7"}
+    assert cli.rdma_address("mlx5_1:1", sysfs, addresses.get) == "10.0.0.7"
+
+
+def test_no_bind_address_without_a_device_or_an_address(tmp_path):
+    with pytest.raises(ValueError, match="MARU_REGION_MAPPER_HOST"):
+        cli.rdma_address("", str(tmp_path), lambda name: None)
+    sysfs = _sysfs(tmp_path, "mlx5_0", ["ens1f0np0"])
+    with pytest.raises(ValueError, match="no network interface with an IPv4"):
+        cli.rdma_address("mlx5_0:1", sysfs, lambda name: None)
+    with pytest.raises(ValueError, match="no network interface"):
+        cli.rdma_address("mlx5_9:1", sysfs, lambda name: "10.0.0.1")
+
+
+def test_main_refuses_to_start_without_a_bind_address(monkeypatch, tmp_path):
+    monkeypatch.setenv("UCX_TLS", "rc")
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    argv += ["--key-file", key_file(), "--host", "", "--ucx-device", ""]
+    assert cli.main(argv) == 1
+    assert not (tmp_path / "lock").exists()
 
 
 # ------------------------------------------------------------- command line
@@ -369,7 +639,8 @@ def test_one_region_mapper_per_node(monkeypatch, tmp_path):
         with pytest.raises(cli.NodeLockedError):
             cli.hold_node_lock(path)
         monkeypatch.setenv("UCX_TLS", "rc")
-        assert cli.main(["--rm-address", "mem1:9850", "--lock-file", path]) == 1
+        argv = ["--rm-address", "mem1:9850", "--lock-file", path]
+        assert cli.main([*argv, "--key-file", key_file()]) == 1
     finally:
         os.close(fd)
 
@@ -387,6 +658,7 @@ _ENV_SETTINGS = (
     "MARU_REGION_MAPPER_PORT",
     "MARU_REGION_MAPPER_UCX_DEVICE",
     "MARU_REGION_MAPPER_LOCK_FILE",
+    "MARU_REGION_MAPPER_KEY_FILE",
 )
 
 
@@ -400,15 +672,24 @@ def test_the_command_line_defaults(monkeypatch):
         args.port,
         args.ucx_device,
         args.lock_file,
+        args.key_file,
         args.allow_unchecked_transport,
-    ) == ("127.0.0.1:9850", "127.0.0.1", 9860, "", None, False)
+    ) == (
+        "127.0.0.1:9850",
+        "127.0.0.1",
+        9860,
+        "",
+        None,
+        "/etc/maru/region-mapper.key",
+        False,
+    )
 
 
 def test_the_service_settings_come_from_the_environment(monkeypatch):
     # The system service passes its settings file as the environment.
     for name, value in zip(
         _ENV_SETTINGS,
-        ["mem1:9850", "0.0.0.0", "9870", "mlx5_1:1", "/run/maru/x.lock"],
+        ["mem1:9850", "", "9870", "mlx5_1:1", "/run/maru/x.lock", "/etc/k"],
         strict=True,
     ):
         monkeypatch.setenv(name, value)
@@ -419,7 +700,8 @@ def test_the_service_settings_come_from_the_environment(monkeypatch):
         args.port,
         args.ucx_device,
         args.lock_file,
-    ) == ("mem1:9850", "0.0.0.0", 9870, "mlx5_1:1", "/run/maru/x.lock")
+        args.key_file,
+    ) == ("mem1:9850", "", 9870, "mlx5_1:1", "/run/maru/x.lock", "/etc/k")
     # A command-line option still wins.
     assert cli.build_parser().parse_args(["--port", "9861"]).port == 9861
 

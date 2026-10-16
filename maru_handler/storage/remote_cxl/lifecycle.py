@@ -23,9 +23,10 @@ from maru_common.storage_types import (
     StorageLocation,
     StorageUnavailableError,
 )
+from maru_remote.region_map import pick_mapper
 
 from .datapath import RdmaDataPath, Release
-from .region import IsolatedTransfer, RegionAccess, RemoteCxlRegion, pick_mapper
+from .region import IsolatedTransfer, RegionAccess, RemoteCxlRegion
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,9 @@ class RegionLifecycle:
     def _return_regions(self) -> None:
         """Give every region back in the order that keeps late WRITEs out.
 
+        Used when MaruServer cannot take the regions over: it restarted (a
+        new epoch) or never granted the session.
+
         1. Wait (bounded) for the WRITEs sent to the regions; this only
            spares them an error.
         2. Have each region's mapper deregister it (``release``). From the
@@ -207,9 +211,55 @@ class RegionLifecycle:
                     self._call_retrying("return_region", pool_id=pool_id)
         self.regions.clear()
 
-    def _close_session_quietly(self) -> None:
+    def _leave(self) -> None:
+        """Hand the regions over to MaruServer: the worker is done with them.
+
+        A cxl Handler's regions stay while keys refer to them after it
+        closes, and other Handlers keep reading those keys. Here MaruServer
+        takes the regions over the same way: it keeps the ones with keys,
+        holding their registration for readers, and releases the others
+        before it frees them. So the owner releases nothing:
+
+        1. Wait (bounded) for the WRITEs sent to the regions. A WRITE that
+           is never confirmed lands, if at all, on a page no key refers to.
+        2. Give back at once the regions no region mapper ever mapped for
+           it: no RDMA was ever sent to them, so they need no release.
+        3. Close the session drained.
+        4. Drop this worker's own holds at the region mappers.
+
+        If MaruServer does not confirm the close, it takes the regions over
+        when the session expires.
+        """
+        if not self.regions:
+            return
+        for region in self.regions.values():
+            region.retire()
+        if not self._settle_writes(self.config.rdma_timeout_s):
+            logger.warning("RDMA WRITEs are still unconfirmed; their pages hold no key")
+        for pool_id, region in list(self.regions.items()):
+            if not region.mapped and not self._data.map_attempted(pool_id):
+                if self._call_retrying("return_region", pool_id=pool_id):
+                    del self.regions[pool_id]
+        if not self._close_session_quietly():
+            logger.warning(
+                "MaruServer did not confirm the close; it takes the regions over "
+                "when the session expires"
+            )
+        for pool_id, region in self.regions.items():
+            self._data.unmap(pool_id, region.handle, self._mappers)
+        self.regions.clear()
+
+    def _close_session_quietly(self) -> bool:
         if self._credentials and not self.config.metadata_only:
-            self._call_retrying("close", drained=True)
+            # The boot of each region's memory node goes along, so MaruServer
+            # can tell a reboot after it takes a region over.
+            boots = [
+                {"pool_id": region.pool_id, "boot": region.boot}
+                for region in self.regions.values()
+                if region.boot
+            ]
+            return self._call_retrying("close", drained=True, pools=boots)
+        return True
 
     def _call_retrying(self, action: str, **payload: Any) -> bool:
         """Send an idempotent request a few times; True once it succeeded."""

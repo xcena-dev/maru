@@ -317,17 +317,46 @@ class FakeDeviceMapper:
         self.discarded.append(addr - self.base)
 
 
+_KEY_FILE: str | None = None
+
+
+def key_file() -> str:
+    """A region mapper key file shared by the fake memory nodes and workers."""
+    global _KEY_FILE
+    if _KEY_FILE is None:
+        import os
+        import tempfile
+
+        from maru_remote.region_map import write_key
+
+        path = os.path.join(tempfile.mkdtemp(prefix="maru-test-key-"), "key")
+        write_key(path)
+        _KEY_FILE = path
+    return _KEY_FILE
+
+
+def shared_key() -> bytes:
+    """The key in :func:`key_file`."""
+    from maru_remote.region_map import load_key
+
+    return load_key(key_file())
+
+
 class FakeMemoryNode:
     """A memory node's region mapper served on loopback TCP.
 
     The service, server, client and device mapper are the real ones; only the
-    resource manager, the device (a file) and NIXL are fakes.
+    resource manager, the device (a file) and NIXL are fakes. The server
+    requires the key in :func:`key_file` unless ``key`` says otherwise.
     """
 
-    def __init__(self, cxl: FakeCxl, name: str = "mem1", port: int = 0) -> None:
+    def __init__(
+        self, cxl: FakeCxl, name: str = "mem1", port: int = 0, key: object = "test"
+    ) -> None:
         self.cxl = cxl
         self.name = name
         self._port = port
+        self.key = shared_key() if key == "test" else key
         self.restarts = 0
         self.boots = 0
         self._start()
@@ -352,7 +381,7 @@ class FakeMemoryNode:
             epoch=epoch,
             boot_id=f"{self.name}-boot{self.boots}",
         )
-        self.server = RegionMapServer(self.service, "127.0.0.1", self._port)
+        self.server = RegionMapServer(self.service, "127.0.0.1", self._port, self.key)
         self._port = self.server.address[1]
         self.address = f"127.0.0.1:{self._port}"
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)

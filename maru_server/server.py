@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_remote.region_map import DEFAULT_KEY_FILE, KeyFileError, load_key
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -33,10 +34,12 @@ class MaruServer:
         cpu_capacity_limit: int = 64 * 1024**3,
         cpu_session_ttl: float = 30,
         region_mappers: list[str] | None = None,
+        region_mapper_key: bytes | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
         # Region mappers of the pool's memory nodes, handed to remote CXL workers in
-        # the handshake as the RM address is; MaruServer never calls them.
+        # the handshake as the RM address is. MaruServer calls them itself only
+        # for regions whose owner left (region_keeper.py).
         self._region_mappers = list(region_mappers or [])
         self._dax_paths = dax_paths
         from .replica_directory import ReplicaDirectory
@@ -53,6 +56,14 @@ class MaruServer:
             reserve_cxl=self._reserve_storage_region if enable_cxl else None,
             release_cxl=self._release_storage_region if enable_cxl else None,
         )
+        self._region_keeper = None
+        if enable_cxl and self._region_mappers:
+            from .region_keeper import RegionKeeper
+
+            self._region_keeper = RegionKeeper(
+                self.replica_directory, self._region_mappers, region_mapper_key
+            )
+            self._region_keeper.start()
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
@@ -443,6 +454,8 @@ class MaruServer:
 
     def close(self) -> None:
         """Shutdown the server and release resources."""
+        if self._region_keeper is not None:
+            self._region_keeper.stop()
         self._stats_manager.close()
         if self._allocation_manager is not None:
             self._allocation_manager.close()
@@ -529,6 +542,14 @@ def main() -> None:
             "node of a shared pool."
         ),
     )
+    parser.add_argument(
+        "--region-mapper-key-file",
+        default=DEFAULT_KEY_FILE,
+        help=(
+            "Key the region mappers require (a copy of a memory node's "
+            f"{DEFAULT_KEY_FILE}); used with --region-mapper"
+        ),
+    )
     args = parser.parse_args()
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
@@ -540,6 +561,12 @@ def main() -> None:
     ]
     if args.cpu_only and region_mappers:
         parser.error("--cpu-only cannot be combined with --region-mapper")
+    region_mapper_key = None
+    if region_mappers:
+        try:
+            region_mapper_key = load_key(args.region_mapper_key_file)
+        except KeyFileError as exc:
+            parser.error(str(exc))
 
     setup_logging(args.log_level)
 
@@ -550,6 +577,7 @@ def main() -> None:
         enable_cxl=not args.cpu_only,
         cpu_capacity_limit=args.cpu_capacity_limit,
         region_mappers=region_mappers,
+        region_mapper_key=region_mapper_key,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 

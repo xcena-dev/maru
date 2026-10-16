@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """ReplicaDirectory rules for remote CXL regions: expand, sharing, leases, eviction,
-expiry and the return of regions after a drained close."""
+expiry, and what MaruServer does with the regions of an owner that left."""
 
 import uuid
 
@@ -49,6 +49,17 @@ def env():
         reserve_cxl=rm.reserve, release_cxl=rm.release, clock=clock, session_ttl=30
     )
     return directory, rm, clock
+
+
+def released_by_keeper(directory):
+    """What the region keeper does when every release succeeds."""
+    for pool_id, _handle, fate, _boot in directory.departed():
+        if fate == "return":
+            directory.given_back(pool_id)
+
+
+def fates(directory):
+    return {pool_id: fate for pool_id, _h, fate, _b in directory.departed()}
 
 
 def call(directory, action, **payload):
@@ -326,7 +337,7 @@ def test_a_retried_remove_learns_the_page_is_free(env):
 # ---------------------------------------------------------- expiry and return
 
 
-def test_an_expired_owner_hides_its_keys_and_keeps_its_regions(env):
+def test_an_expired_owners_keys_stay_found_and_maruserver_keeps_its_region(env):
     directory, rm, clock = env
     a, pool_a = open_session(directory, "a")
     commit(directory, a, pool_a, "k", 0)
@@ -334,8 +345,11 @@ def test_an_expired_owner_hides_its_keys_and_keeps_its_regions(env):
     with pytest.raises(ValueError, match="expired"):
         commit(directory, a, pool_a, "z", 1)
     c, _ = open_session(directory, "c")
-    assert call(directory, "acquire", **c, keys=["k"])["entries"] == [None]
-    # A timeout does not prove the owner stopped writing: the region is held.
+    # The owner wrote "k" before it went; nothing writes the page again.
+    entries = call(directory, "acquire", **c, keys=["k"])["entries"]
+    assert entries[0]["pool_id"] == pool_a
+    assert fates(directory) == {pool_a: "keep"}
+    released_by_keeper(directory)
     assert rm.released == [] and 1 in rm.regions
     with pytest.raises(ValueError, match="expired"):
         call(
@@ -346,37 +360,108 @@ def test_an_expired_owner_hides_its_keys_and_keeps_its_regions(env):
         )
 
 
-def test_a_drained_close_of_an_expired_session_returns_its_regions(env):
+def test_regions_without_keys_go_back_after_the_keeper_releases_them(env):
     directory, rm, clock = env
     a, _ = open_session(directory, "a")
     expand(directory, a)
     clock.advance(31)
     call(directory, "close", **a, drained=True)
+    assert rm.released == []  # not before their region mapper released them
+    assert set(fates(directory).values()) == {"return"}
+    released_by_keeper(directory)
     assert sorted(rm.released) == [1, 2]
+    assert directory.departed() == []
 
 
-def test_a_drained_close_returns_regions_nobody_reads(env):
-    directory, rm, _ = env
-    a, pool_a = open_session(directory, "a")
-    b, _ = open_session(directory, "b")
-    commit(directory, a, pool_a, "k", 0)
-    call(directory, "close", **a, drained=True)
-    assert rm.released == [1]
-    assert call(directory, "acquire", **b, keys=["k"])["entries"] == [None]
-
-
-def test_a_closed_region_returns_at_once_and_its_readers_lose_their_lease(env):
+def test_a_drained_close_keeps_the_regions_with_keys(env):
     directory, rm, _ = env
     a, pool_a = open_session(directory, "a")
     b, _ = open_session(directory, "b")
     commit(directory, a, pool_a, "k", 0)
     lease = call(directory, "acquire", **b, keys=["k"])["lease_id"]
-    # The owner closes only after its region mapper released the region, so
-    # no READ can reach it any more: it goes back without waiting for b.
     call(directory, "close", **a, drained=True)
-    assert rm.released == [1]
+    released_by_keeper(directory)
+    # As a cxl Handler's region stays while keys refer to it.
+    assert rm.released == []
+    assert call(directory, "release", **b, lease_id=lease) == {"held": True}
+    entries = call(directory, "acquire", **b, keys=["k"])["entries"]
+    assert entries[0]["pool_id"] == pool_a
+    # A new worker of the same engine reads it too.
+    a2, _ = open_session(directory, "a", token="a2")
+    assert call(directory, "acquire", **a2, keys=["k"])["entries"][0] is not None
+
+
+def test_a_kept_region_given_back_loses_its_keys_and_its_readers_leases(env):
+    directory, rm, _ = env
+    a, pool_a = open_session(directory, "a")
+    b, _ = open_session(directory, "b")
+    commit(directory, a, pool_a, "k", 0)
+    call(directory, "close", **a, drained=True)
+    lease = call(directory, "acquire", **b, keys=["k"])["lease_id"]
+    directory.give_back(pool_a, "test")
+    # Keys stop being found at once; the region goes back after the release.
     assert call(directory, "acquire", **b, keys=["k"])["entries"] == [None]
     assert call(directory, "release", **b, lease_id=lease) == {"held": False}
+    assert rm.released == []
+    released_by_keeper(directory)
+    assert rm.released == [1]
+
+
+def test_a_refused_region_request_gives_back_the_kept_region_read_longest_ago(env):
+    directory, rm, clock = env
+    rm.limit = 4 * 2 * PAGE  # four regions of two pages
+    owners = []
+    for name in ("a", "b"):
+        creds, pool = open_session(directory, name)
+        commit(directory, creds, pool, f"{name}-k", 0)
+        owners.append((creds, pool))
+    c, _ = open_session(directory, "c")
+    clock.advance(1)
+    call(directory, "probe", engine_id="c", namespace="ns", keys=["a-k"])
+    for creds, _pool in owners:
+        call(directory, "close", **creds, drained=True)
+    d, _ = open_session(directory, "d")
+    with pytest.raises(ValueError, match="reservation failed"):
+        expand(directory, d)
+    assert directory.make_room() == 1
+    # "b-k" was read longest ago (never): its region goes first.
+    assert fates(directory) == {owners[0][1]: "keep", owners[1][1]: "return"}
+    released_by_keeper(directory)
+    assert rm.released == [2]
+    expand(directory, d)
+    assert directory.make_room() == 0
+
+
+def test_a_kept_region_shows_in_the_usage_without_an_owner(env):
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    call(directory, "close", **a, drained=True)
+    (usage,) = directory.get_usage("remote_cxl")["pools"]
+    assert usage["pool_id"] == pool_a and usage["replicas"] == 1
+    assert usage["engine_id"] == "" and usage["active"] is False
+
+
+def test_the_owner_reports_the_boot_of_its_regions_memory_node(env):
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    call(
+        directory,
+        "heartbeat",
+        **a,
+        sequence=1,
+        pools=[
+            {
+                "pool_id": pool_a,
+                "allocated_bytes": PAGE,
+                "quarantined_bytes": 0,
+                "boot": "boot-1",
+            }
+        ],
+    )
+    call(directory, "close", **a, drained=True)
+    assert [boot for *_, boot in directory.departed()] == ["boot-1"]
 
 
 def test_return_region_gives_back_one_region_and_keeps_the_others(env):
@@ -397,7 +482,7 @@ def test_return_region_gives_back_one_region_and_keeps_the_others(env):
     with pytest.raises(ValueError, match="Not a region"):
         call(directory, "return_region", **b, pool_id=second)
     call(directory, "close", **a, drained=True)
-    assert rm.released == [1, 2]
+    assert fates(directory) == {second: "keep"}  # k2 is still there
 
 
 def test_a_heartbeat_may_still_report_a_region_just_given_back(env):
@@ -412,11 +497,14 @@ def test_a_heartbeat_may_still_report_a_region_just_given_back(env):
     call(directory, "heartbeat", **a, sequence=1, pools=reports)
 
 
-def test_an_expired_session_can_return_a_region(env):
+def test_an_expired_owners_return_of_a_region_maruserver_took_succeeds(env):
     directory, rm, clock = env
     a, first = open_session(directory, "a")
     clock.advance(31)
     call(directory, "return_region", **a, pool_id=first)
+    # MaruServer took it over at the expiry; its keeper gives it back.
+    assert fates(directory) == {first: "return"}
+    released_by_keeper(directory)
     assert rm.released == [1]
 
 
@@ -426,6 +514,7 @@ def test_an_unconfirmed_release_is_retried(env):
     b, _ = open_session(directory, "b")
     rm.fail_release = True
     call(directory, "close", **a, drained=True)
+    released_by_keeper(directory)
     assert rm.released == []
     rm.fail_release = False
     heartbeat(directory, b)
@@ -487,3 +576,67 @@ def test_cpu_release_still_succeeds_without_a_session(env):
         lease_id="x",
     )
     assert reply == {"held": False}
+
+
+def test_reopening_an_expired_session_is_refused(env):
+    directory, _, clock = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    clock.advance(31)
+    with pytest.raises(ValueError, match="Session token reused"):
+        open_session(directory, "a")
+
+
+def test_refusals_give_back_one_kept_region_at_a_time(env):
+    directory, rm, _ = env
+    for name in ("a", "b", "c"):
+        creds, pool = open_session(directory, name)
+        commit(directory, creds, pool, f"{name}-k", 0)
+        call(directory, "close", **creds, drained=True)
+    rm.limit = rm.used  # full
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            open_session(directory, "d")
+    assert directory.make_room() == 1
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            open_session(directory, "d")
+    # The first one has not reached the RM yet: no other goes.
+    assert directory.make_room() == 0
+    assert list(fates(directory).values()).count("return") == 1
+    released_by_keeper(directory)
+    open_session(directory, "d")  # takes the space that came back
+    with pytest.raises(ValueError):
+        open_session(directory, "e")
+    assert directory.make_room() == 1
+    assert list(fates(directory).values()).count("return") == 1
+
+
+def test_a_region_stuck_on_its_way_back_does_not_block_room_for_ever(env):
+    directory, rm, clock = env
+    for name in ("a", "b"):
+        creds, pool = open_session(directory, name)
+        commit(directory, creds, pool, f"{name}-k", 0)
+        call(directory, "close", **creds, drained=True)
+    rm.limit = rm.used
+    with pytest.raises(ValueError):
+        open_session(directory, "d")
+    assert directory.make_room() == 1
+    with pytest.raises(ValueError):
+        open_session(directory, "d")
+    clock.advance(31)  # its region mapper never answered
+    assert directory.make_room() == 1
+
+
+def test_the_drained_close_carries_the_boot_of_each_region(env):
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    call(
+        directory,
+        "close",
+        **a,
+        drained=True,
+        pools=[{"pool_id": pool_a, "boot": "b-7"}],
+    )
+    assert [boot for *_, boot in directory.departed()] == ["b-7"]

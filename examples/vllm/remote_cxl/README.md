@@ -14,18 +14,37 @@ worker node (any number)          metadata node              memory node (each n
 vLLM + MaruKVConnector            maru-server                region mapper
   MaruHandler                     storage sessions,          maps a region, registers it
   (storage_backend="remote_cxl")    regions, keys    <--alloc-- with the NIC   resource manager
-    session RPC  ---------------->                              ^       (one per pool)
+    session RPC  ---------------->    |                         ^       (one per pool)
     map / release  ---------------------------------------------+
+                                      +-- hold / release -------+  (regions of workers that left)
     staging  <======= one-sided RDMA (NIXL) =======>  NIC ==> CXL memory
 ```
 
 A worker opens a storage session with maru-server and gets one region of
 `maru_pool_size`; when its regions are full it gets one more, as `auto_expand`
 does for the cxl backend. Other engines read its keys under a server lease,
-mapping the region through the same region mapper. Before a worker gives a
-region back, its region mapper deregisters the region from the NIC, so a WRITE
-still in flight from the old owner fails at the NIC instead of landing in the
-next owner's KV.
+mapping the region through the same region mapper.
+
+When a worker stops, its keys stay, as a cxl Handler's keys stay after it
+closes: maru-server keeps the worker's regions that hold keys and holds their
+mapping at the region mapper, so other engines, and the worker when it starts
+again, keep reading them. maru-server gives a kept region back when the
+resource manager is full (the one read longest ago first). Every region goes
+back to the resource manager only after its region mapper deregistered it
+from the NIC, so a WRITE still in flight from the old owner fails at the NIC
+instead of landing in the next owner's KV.
+
+Who may map a region is bound as on a CXL-attached node, where a process
+needs the CXL device and permission to open its DAX file. The region mapper
+listens on the memory node's RDMA network address, and every worker and
+maru-server proves the region mapper key on each connection. Readers get a
+read handle, which maps a region but cannot release it, so only a region's
+owner and maru-server can take a region away.
+
+> **Security:** the key proves who connects, but the region map protocol, like
+> the resource manager's, is not encrypted: a host that can watch the traffic
+> sees region handles and remote keys. Keep the RDMA network to the hosts of
+> the deployment, as the CXL fabric is.
 
 The backend stores KV chunkwise and needs `TP=PP=DP=1`, `--enforce-eager`,
 unquantized KV and `kv_load_failure_policy="recompute"`. Loads and stores
@@ -49,7 +68,11 @@ moves it, as for the cxl backend.
   the region mapper as a system service that starts and stops with the
   resource manager, so a memory node runs it without a separate step.
 - Every worker must reach maru-server and each memory node's region mapper and
-  NIC.
+  NIC, and so must maru-server reach the region mappers.
+- A copy of the region mapper key (`/etc/maru/region-mapper.key` on the memory
+  nodes, created by the installer) on every worker node and the maru-server
+  node, readable only by the user that runs them. The memory nodes of a shared
+  pool use the same key.
 - The region mapper runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
   its registration cache off (`UCX_RCACHE_ENABLE=n`). It sets both itself and
   refuses to start if they are set otherwise: with the TCP transport or the
@@ -106,14 +129,23 @@ resource manager: one per memory node, shared by every app that uses the pool.
 With Maru installed with NIXL, `./install.sh` installs it as
 `maru-region-mapper.service`, which starts and stops with the resource
 manager. Set the node's RDMA NIC in `/etc/maru/region-mapper.env`; the defaults
-listen on all addresses at port 9860 and use the resource manager on the same
-node:
+listen on that NIC's address at port 9860 and use the resource manager on the
+same node:
 
 ```bash
 sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
   /etc/maru/region-mapper.env
 sudo systemctl start maru-resource-manager    # also starts the region mapper
 systemctl status maru-region-mapper
+```
+
+The installer also created the region mapper key, `/etc/maru/region-mapper.key`.
+Copy it to every worker node and to the maru-server node, owned by the user
+that runs them (the example scripts read `~/.maru/region-mapper.key`):
+
+```bash
+sudo install -D -m 0600 -o "$USER" /etc/maru/region-mapper.key ~/.maru/region-mapper.key
+scp ~/.maru/region-mapper.key worker1:.maru/region-mapper.key   # keep it 0600
 ```
 
 When maru-server or another memory node reaches the resource manager over the
@@ -130,6 +162,7 @@ sudo "$(which install-maru-region-mapper)" --standalone
 sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
 sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
   /etc/maru/region-mapper.env
+sudo install -m 0600 ./region-mapper.key /etc/maru/region-mapper.key   # the pool's key
 sudo systemctl start maru-region-mapper
 ```
 
@@ -154,11 +187,14 @@ which runs
 
 ```bash
 maru-server --host 10.0.0.2 --port $MARU_SERVER_PORT --rm-address 127.0.0.1:9850 \
-  --region-mapper 10.0.0.2:9860 --dax-path /dev/dax1.0
+  --region-mapper 10.0.0.2:9860 --region-mapper-key-file ~/.maru/region-mapper.key \
+  --dax-path /dev/dax1.0
 ```
 
 maru-server allocates each worker's regions from the resource manager, as for
-local CXL, and hands the region mapper list to the workers. A shared pool lists
+local CXL, and hands the region mapper list to the workers. It also talks to
+the region mappers itself for the regions of workers that left, so it needs
+the key. A shared pool lists
 every memory node, `--region-mapper host1:port,host2:port`; each region is then
 served by one of them, picked from the region number, so every worker reaches
 a region through the same node. maru-server runs once per app and pool.
@@ -187,6 +223,7 @@ vllm serve <model> --enforce-eager --no-async-scheduling --enable-prompt-tokens-
     "kv_connector_extra_config": {
       "maru_server_url": "tcp://10.0.0.2:<maru-server port>",
       "maru_storage_backend": "remote_cxl",
+      "maru_region_mapper_key_file": "/home/<user>/.maru/region-mapper.key",
       "maru_rdma_device": "mlx5_0:1",
       "maru_pool_size": "4G",
       "maru_engine_id": "<unique per engine>",
@@ -229,6 +266,7 @@ All example settings are in `env.sh`. Override them with environment variables:
 | `MARU_MAPPER_PORT` | `10500 + uid` | `region_mapper.sh`: region mapper port |
 | `MARU_MAPPER_UCX_DEVICE` | UCX default | `region_mapper.sh`: RDMA NIC the region mapper registers regions with, e.g. `mlx5_1:1` |
 | `MARU_MAPPER_LOCK_FILE` | `/tmp/maru-region-mapper.lock` | `region_mapper.sh`: keeps one region mapper per node |
+| `MARU_REGION_MAPPER_KEY_FILE` | `~/.maru/region-mapper.key` | Region mapper key; `region_mapper.sh` creates it if missing, maru-server and the workers read it |
 | `MARU_SERVER_BIND_HOST` | `127.0.0.1` | Interface maru-server listens on |
 | `MARU_SERVER_PORT` | `10000 + uid` | maru-server port |
 | `MARU_DAX_PATH` | any pool | DAX device of the pool |
@@ -257,12 +295,15 @@ All example settings are in `env.sh`. Override them with environment variables:
 - **Engines start but never hit**: check that both engines use the same
   `maru_cache_namespace` and `maru_server_url`, and that the prompt is longer
   than one chunk.
-- **maru-server keeps a stopped engine's regions** (the pool stays used after
-  the engines are gone): an engine process that gets the stop signal itself,
-  for example from a `kill` of its whole process group, can end before its
-  regions go back. Stop an engine with Ctrl-C in the launcher's terminal or
-  `kill -TERM` on the launcher; the launcher passes the signal on to vLLM's
-  API server only. maru-server frees the regions it keeps when it stops.
-- **Engines on another node cannot connect**: maru-server and the region
-  mapper listen on `127.0.0.1` by default. Set `MARU_SERVER_BIND_HOST` and
+- **The pool stays used after the engines stop**: maru-server keeps the
+  regions of stopped engines that still hold keys, so other engines and
+  restarted ones read them. It gives them back when the resource manager is
+  full; `maru-server` logs `giving back remote CXL region`.
+- **`key check failed`** (in the engine or maru-server log): the process has
+  no copy of the region mapper key, or another one. Copy the memory nodes'
+  `/etc/maru/region-mapper.key` (0600, owned by the process's user) and point
+  `maru_region_mapper_key_file` or `--region-mapper-key-file` at it.
+- **Engines on another node cannot connect**: maru-server listens on
+  `127.0.0.1` by default, and so does `region_mapper.sh`; the region mapper
+  service listens on its RDMA NIC's address. Set `MARU_SERVER_BIND_HOST` and
   `MARU_MEMORY_NODE_HOST` to addresses the workers reach.

@@ -17,6 +17,7 @@ def _install(tmp_path, monkeypatch, nixl=True):
         systemd_dir=systemd,
         env_file=env,
         systemctl=lambda *a: calls.append(a),
+        key_file=tmp_path / "etc" / "maru" / "region-mapper.key",
     )
     return ok, systemd / installer.SERVICE_NAME, env, calls
 
@@ -58,6 +59,7 @@ def test_install_standalone_writes_the_standalone_unit(tmp_path, monkeypatch):
         env_file=tmp_path / "region-mapper.env",
         systemctl=lambda *a: None,
         standalone=True,
+        key_file=tmp_path / "region-mapper.key",
     )
     unit = (systemd / installer.SERVICE_NAME).read_text()
     assert unit == installer.render_unit("/opt/venv/bin/python", standalone=True)
@@ -82,18 +84,33 @@ def test_install_writes_the_unit_and_settings_and_enables_it(tmp_path, monkeypat
     ]
 
 
-def test_default_settings_accept_workers_of_other_nodes():
+def test_default_settings_listen_on_the_rdma_network_and_require_the_key():
     settings = dict(
         line.split("=", 1)
         for line in installer.DEFAULT_ENV.splitlines()
         if line and not line.startswith("#")
     )
+    # An empty host means the address of the RDMA NIC's interface, so only
+    # hosts on the RDMA network reach the region mapper.
     assert settings == {
         "MARU_RM_ADDRESS": "127.0.0.1:9850",
-        "MARU_REGION_MAPPER_HOST": "0.0.0.0",
-        "MARU_REGION_MAPPER_PORT": "9860",
         "MARU_REGION_MAPPER_UCX_DEVICE": "",
+        "MARU_REGION_MAPPER_HOST": "",
+        "MARU_REGION_MAPPER_PORT": "9860",
+        "MARU_REGION_MAPPER_KEY_FILE": "/etc/maru/region-mapper.key",
     }
+
+
+def test_install_creates_the_key_once_readable_by_root_only(tmp_path, monkeypatch):
+    from maru_remote.region_map import load_key
+
+    _install(tmp_path, monkeypatch)
+    key_file = tmp_path / "etc" / "maru" / "region-mapper.key"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    key = load_key(str(key_file))
+    assert len(key) == 32
+    _install(tmp_path, monkeypatch)  # a reinstall keeps the key
+    assert load_key(str(key_file)) == key
 
 
 def test_a_reinstall_keeps_the_settings(tmp_path, monkeypatch):

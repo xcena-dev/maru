@@ -14,11 +14,15 @@ Rules that keep a late RDMA from landing on someone else's data:
   and a staging slot only after its transfer completed or NIXL released it.
 * A transfer whose completion is not confirmed isolates its pages and slots
   until NIXL releases its handle.
-* A region goes back to MaruServer only after its region mapper deregistered
-  it (``release``). A WRITE still in the NIC's send queue or in the network
-  then fails at the memory node's NIC instead of landing on the region's
-  next owner. A region whose release cannot be confirmed stays with the
-  session; MaruServer never reuses it without being given it back.
+* A region goes back to the resource manager only after its region mapper
+  deregistered it (``release``). A WRITE still in the NIC's send queue or in
+  the network then fails at the memory node's NIC instead of landing on the
+  region's next owner. The owner releases a region it gives back while it
+  runs; when the owner leaves (close or session expiry), MaruServer takes its
+  regions over, keeps the ones with keys readable and releases each before it
+  frees it.
+* A reader gets a read handle, which maps a region that is mapped already but
+  cannot release it, so only the owner and MaruServer can take a region away.
 
 A region whose region mapper cannot map it is set aside: its keys are removed
 from MaruServer (so probes stop reporting hits that cannot be read) and new
@@ -32,6 +36,8 @@ Modules:
     router: several pools behind one worker.
 """
 
+from maru_remote.region_map import pick_mapper
+
 from .client import RemoteCxlStorageClient
 from .datapath import RdmaDataPath
 from .region import (
@@ -39,7 +45,6 @@ from .region import (
     RegionAccess,
     RemoteCxlAllocation,
     RemoteCxlRegion,
-    pick_mapper,
 )
 from .router import PoolRouter
 

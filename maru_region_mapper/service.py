@@ -14,10 +14,17 @@ CXL-attached node. For each region a Handler asks for:
 3. The registration lives while some connected Handler holds the region.
    When the last holder unmaps it, or its connection closes, the region is
    deregistered and unmapped.
-4. The region's owner releases it before giving it back to MaruServer: the
-   region is deregistered and unmapped whoever else holds it, and later
-   requests to map that handle are refused. After the reply, an RDMA that
-   names the old registration fails at the NIC.
+4. Whoever gives the region back (its owner, or MaruServer once the owner
+   left) releases it first: the region is deregistered and unmapped whoever
+   else holds it, and later requests to map that handle are refused. After
+   the reply, an RDMA that names the old registration fails at the NIC.
+
+Two kinds of handle name a region. The handle itself carries the resource
+manager's auth token; MaruServer gives it to the region's owner only. A
+reader gets a read handle, whose read token is derived from the auth token
+(``maru_remote.region_map.read_handle``). A read handle maps a region that is
+mapped here already and never releases one, so a reader cannot take a region
+away from its owner.
 
 A map reply carries the NIXL metadata of that region's registration only,
 so a Handler learns the remote key of the regions it asked for and no other.
@@ -28,12 +35,14 @@ wait for the first one to finish mapping it.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from maru_remote.region_map import read_token
 from maru_shm.types import MaruHandle
 
 logger = logging.getLogger(__name__)
@@ -48,6 +57,31 @@ class MapDenied(PermissionError):  # noqa: N818 (a PermissionError)
     """A handle does not match the region it names, or was released."""
 
 
+class NotMapped(LookupError):  # noqa: N818 (a LookupError)
+    """A read handle names a region that is not mapped here now.
+
+    Only a handle with the auth token can map a region the first time; the
+    region's owner or MaruServer maps it again.
+    """
+
+
+@dataclass(frozen=True)
+class ReadHandle:
+    """A reader's name for a region: where it is and its read token."""
+
+    region_id: int
+    offset: int
+    length: int
+    read_token: str
+
+    def matches(self, handle: MaruHandle) -> bool:
+        """Whether this read handle was derived from ``handle``."""
+        return (
+            (self.region_id, self.offset, self.length)
+            == (handle.region_id, handle.offset, handle.length)
+        ) and hmac.compare_digest(self.read_token, read_token(handle.to_dict()))
+
+
 @dataclass
 class _Mapping:
     handle: MaruHandle
@@ -59,29 +93,37 @@ class _Mapping:
     holders: set[int] = field(default_factory=set)
 
 
-def parse_handle(value: Any) -> MaruHandle:
-    """Validate a handle received over the wire.
+def parse_handle(value: Any) -> MaruHandle | ReadHandle:
+    """Validate a handle or read handle received over the wire.
 
     Args:
-        value: ``MaruHandle.to_dict()``-shaped map.
+        value: ``MaruHandle.to_dict()`` or ``read_handle()``-shaped map.
 
     Returns:
-        The handle.
+        The handle, or the read handle if the map has ``read_token``.
 
     Raises:
-        ValueError: if a field is missing or not a nonnegative integer.
+        ValueError: if a field is missing or malformed.
     """
     if not isinstance(value, dict):
         raise ValueError("handle must be a map")
     fields = {}
-    for name in ("region_id", "offset", "length", "auth_token"):
+    names = ("region_id", "offset", "length")
+    if "read_token" not in value:
+        names += ("auth_token",)
+    for name in names:
         item = value.get(name)
         if type(item) is not int or item < 0:
             raise ValueError(f"handle.{name} must be a nonnegative integer")
         fields[name] = item
     if fields["length"] == 0:
         raise ValueError("handle.length must be positive")
-    return MaruHandle(**fields)
+    if "auth_token" in fields:
+        return MaruHandle(**fields)
+    token = value["read_token"]
+    if not isinstance(token, str) or not token:
+        raise ValueError("handle.read_token must be a string")
+    return ReadHandle(read_token=token, **fields)
 
 
 class RegionMapService:
@@ -143,7 +185,8 @@ class RegionMapService:
 
         Args:
             conn: Connection id of the requesting Handler.
-            handle: ``MaruHandle.to_dict()`` of the region.
+            handle: ``MaruHandle.to_dict()`` of the region, or its read
+                handle (``maru_remote.region_map.read_handle``).
 
         Returns:
             ``{"region_id", "addr", "length", "metadata"}``; ``metadata``
@@ -151,11 +194,14 @@ class RegionMapService:
 
         Raises:
             ValueError: if the handle is malformed.
-            MapDenied: if the handle does not match a mapped region or its
-                owner released it.
+            MapDenied: if the handle does not match a mapped region or the
+                region was released.
+            NotMapped: if a read handle names a region not mapped here.
             Exception: if the resource manager, the device or NIXL fails.
         """
         h = parse_handle(handle)
+        if isinstance(h, ReadHandle):
+            return self._map_for_reader(conn, h)
         while True:
             with self._lock:
                 if self._released.get(h.region_id) == h:
@@ -178,6 +224,25 @@ class RegionMapService:
                 return self._establish(m, conn)
             self._wait(m)
 
+    def _map_for_reader(self, conn: int, h: ReadHandle) -> dict:
+        """Share the mapping of a region with a reader."""
+        while True:
+            with self._lock:
+                released = self._released.get(h.region_id)
+                if released is not None and h.matches(released):
+                    raise MapDenied(f"region {h.region_id} was released by its owner")
+                m = self._maps.get(h.region_id)
+                if m is None:
+                    raise NotMapped(f"region {h.region_id} is not mapped here")
+                if m.ready.is_set():
+                    if not h.matches(m.handle):
+                        raise MapDenied(
+                            f"read token does not match region {h.region_id}"
+                        )
+                    m.holders.add(conn)
+                    return self._reply(m)
+            self._wait(m)
+
     def unmap(self, conn: int, region_id: int) -> None:
         """Drop a connection's hold on a region; release it if none is left.
 
@@ -194,23 +259,29 @@ class RegionMapService:
                 self._release_locked(region_id, m)
 
     def release(self, handle: Any) -> None:
-        """Deregister and unmap a region for its owner, whoever holds it.
+        """Deregister and unmap a region, whoever holds it.
 
-        The owner calls this before it gives the region back. Once it
-        returns, the NIC refuses RDMA to the region's old registration and
-        the handle cannot be mapped again. Releasing a region that is not
-        mapped (never was, or this process restarted) succeeds.
+        Whoever gives the region back calls this first: its owner, or
+        MaruServer for a region whose owner left. Once it returns, the NIC
+        refuses RDMA to the region's old registration and the handle cannot
+        be mapped again. Releasing a region that is not mapped (never was,
+        or this process restarted) succeeds.
 
         Args:
             handle: ``MaruHandle.to_dict()`` of the region.
 
         Raises:
             ValueError: if the handle is malformed.
-            MapDenied: if a mapped region with this id has another handle.
+            MapDenied: if the handle is a read handle, or a mapped region
+                with this id has another handle.
             RuntimeError: if NIXL refused to deregister; the region stays
                 registered and must not be given back.
         """
         h = parse_handle(handle)
+        if isinstance(h, ReadHandle):
+            raise MapDenied(
+                f"region {h.region_id}: a read handle cannot release a region"
+            )
         while True:
             with self._lock:
                 m = self._maps.get(h.region_id)

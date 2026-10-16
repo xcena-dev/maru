@@ -7,26 +7,42 @@ time it asks (``expand``), as a cxl Handler does with ``request_alloc``. Any
 session of the same namespace can lease and read their keys; the owner evicts
 its own keys in the order of last use across all sessions.
 
-A region stays with its session until the owner gives it back, one region
-at a time (``return_region``) or all of them with a drained close. Expiry
-only hides its keys: a timeout does not prove that the owner stopped writing.
-The owner gives a region back only after the region mapper deregistered it,
-so no RDMA reaches it any more; the region goes back to the resource manager
-at once, and leases other sessions still hold on its keys are reported lost
-on release.
+A region stays with its session while the owner uses it. The owner gives
+one back alone (``return_region``) only after the region mapper deregistered
+it, so no RDMA reaches it any more; the region goes back to the resource
+manager at once, and leases other sessions still hold on its keys are
+reported lost on release.
+
+When the owner leaves (a drained close, or its session expires), MaruServer
+takes its regions over, as it keeps a cxl Handler's regions while keys refer
+to them. A region with keys is kept: its keys are still found and the region
+keeper (``region_keeper.py``) holds its mapping at the region mapper so
+readers keep reading. A region without keys goes back. The owner never wrote
+a page that a found key refers to, so a late write from it, or from an
+owner that only seemed gone, lands on no key's bytes. A taken-over region
+goes back to the resource manager only after the keeper released it at its
+region mapper: when the resource manager is full (the kept region read
+longest ago first), or when its keys cannot be read any more.
 """
 
+import logging
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from threading import RLock
+from threading import Event, RLock
 
 from maru_common.storage_policy import FixedOrderPolicy, validate_order
 from maru_common.storage_types import MAX_STORAGE_BATCH, StorageLocation
+from maru_remote.region_map import read_handle
+
+logger = logging.getLogger(__name__)
 
 REMOTE_CXL = "remote_cxl"
 MAX_REGIONS_PER_SESSION = 4096
 RELEASE_RETRY_S = 1.0
+# A kept region given back to make room is waited for this long before
+# another one goes for the same reason.
+ROOM_WAIT_S = 30.0
 
 
 def _bound(items: dict, limit: int) -> None:
@@ -57,6 +73,11 @@ class StoragePool:
     visible: bool = True
     last_use: dict[str, float] = field(default_factory=dict)
     leased: dict[str, int] = field(default_factory=dict)
+    # Remote CXL regions only: the boot of the memory node the owner last
+    # reported for the region, and what MaruServer does with a region whose
+    # owner left ("keep": keys stay found; "return": release, then free).
+    boot: str = ""
+    fate: str = ""
 
 
 @dataclass
@@ -113,6 +134,14 @@ class ReplicaDirectory:
         self._remote_cxl_index: dict[tuple[str, str], StoragePool] = {}
         # Regions whose release the RM has not confirmed yet
         self._releasing: dict[str, StoragePool] = {}
+        # Remote CXL regions whose owner left, taken over by MaruServer
+        self._departed: dict[str, StoragePool] = {}
+        # Region requests the RM refused since the keeper last looked
+        self._refused_reservations = 0
+        # Kept regions given back to make room, not at the RM yet -> when
+        self._room_pending: dict[str, float] = {}
+        # Set when there is work for the region keeper
+        self.keeper_wakeup = Event()
         self._next_release_retry = 0.0
         self._lock = RLock()
 
@@ -143,12 +172,12 @@ class ReplicaDirectory:
                 session.active = False
                 if self._engines.get(session.engine_id) == session.token:
                     del self._engines[session.engine_id]
-                # Timeout is not proof of unmapping: pools and regions stay
-                # charged until a drained close. Remote CXL keys stop being found,
-                # and the leases this session held as a reader end with it.
+                # Timeout is not proof of unmapping: pools stay charged until a
+                # drained close. Remote CXL regions are taken over (their keys
+                # stay found), and the leases this session held as a reader end
+                # with it.
                 self._drop_reader_leases(session)
-                for region in session.regions.values():
-                    self._hide(region)
+                self._take_over(session)
         self._retry_releases()
 
     def _session(self, payload: dict) -> StorageSession:
@@ -225,7 +254,11 @@ class ReplicaDirectory:
         write_order = validate_order(p.get("write_order", ["cpu", "cxl"]))
         previous = self._sessions.get(token)
         if previous is not None:
-            first = next(iter(self._all_pools(previous)))
+            if not previous.active:
+                # An expired remote CXL session has no regions left: MaruServer
+                # took them over.
+                raise ValueError("Session token reused with a different registration")
+            first = next(iter(self._all_pools(previous)), None)
             expected = (
                 engine,
                 namespace,
@@ -244,13 +277,13 @@ class ReplicaDirectory:
                 previous.node_id,
                 previous.schema,
                 previous.pools["cpu"].capacity if "cpu" in previous.pools else 0,
-                first.page_size,
+                first.page_size if first is not None else page_size,
                 previous.pools["cxl"].capacity if "cxl" in previous.pools else 0,
                 previous.region_size,
                 previous.read_order,
                 previous.write_order,
             )
-            if not previous.active or actual != expected:
+            if actual != expected:
                 raise ValueError("Session token reused with a different registration")
             return self._grant(previous)
         if engine in self._engines:
@@ -317,6 +350,9 @@ class ReplicaDirectory:
         owner_id = "remote_cxl:" + uuid.uuid4().hex
         handle = self._reserve_cxl(owner_id, size)
         if handle is None:
+            # The keeper gives a kept region back to make room for the next try.
+            self._refused_reservations += 1
+            self.keeper_wakeup.set()
             raise ValueError("Remote CXL region reservation failed")
         return StoragePool(
             uuid.uuid4().hex,
@@ -403,12 +439,17 @@ class ReplicaDirectory:
             )
             if allocated > pool.capacity or quarantined > allocated:
                 raise ValueError("Invalid pool usage")
-            parsed.append((pool, allocated, quarantined))
+            boot = report.get("boot")
+            parsed.append(
+                (pool, allocated, quarantined, boot if isinstance(boot, str) else "")
+            )
         if seq > session.report_sequence:
             session.report_sequence = seq
-            for pool, allocated, quarantined in parsed:
+            for pool, allocated, quarantined, boot in parsed:
                 pool.allocated_bytes = allocated
                 pool.quarantined_bytes = quarantined
+                if boot:
+                    pool.boot = boot
         session.deadline = self._clock() + self.session_ttl
         return {}
 
@@ -566,7 +607,7 @@ class ReplicaDirectory:
                     pool.last_use[key] = now
                     pool.acquired_objects += 1
                     remote_cxl_held.append((pool, key))
-                    regions[pool.pool_id] = pool.handle.to_dict()
+                    regions[pool.pool_id] = self._region_handle(session, pool)
             else:
                 session.pools[loc.medium].acquired_objects += 1
             entries.append(loc)
@@ -582,6 +623,18 @@ class ReplicaDirectory:
             "lease_id": lease_id,
             "regions": regions,
         }
+
+    @staticmethod
+    def _region_handle(session: StorageSession, pool: StoragePool) -> dict:
+        """The handle of an own region; a read handle of anyone else's.
+
+        Only the region's handle (with the resource manager's auth token) can
+        release a region at its region mapper, so it goes to the owner alone.
+        """
+        handle = pool.handle.to_dict()
+        if session.regions.get(pool.pool_id) is pool:
+            return handle
+        return read_handle(handle)
 
     @staticmethod
     def _drop_remote_cxl_lease(held: list[tuple[StoragePool, str]]) -> None:
@@ -762,9 +815,8 @@ class ReplicaDirectory:
             if self._engines.get(session.engine_id) == token:
                 del self._engines[session.engine_id]
             self._drop_reader_leases(session)
-            for region in session.regions.values():
-                self._return_region(region)
-            session.regions.clear()
+            self._note_boots(session, p.get("pools"))
+            self._take_over(session)
             cxl = session.pools.get("cxl")
             if cxl and not self._release_cxl(cxl.owner_id, cxl.handle.region_id):
                 raise ValueError("CXL pool release unconfirmed; retry drained close")
@@ -772,6 +824,112 @@ class ReplicaDirectory:
         return {}
 
     # ------------------------------------------------------------------ usage
+
+    # ------------------------------------------------------------ take over
+
+    def _take_over(self, session: StorageSession) -> None:
+        """MaruServer takes the regions of a session whose owner left.
+
+        A region with keys is kept and its keys stay found; one without keys
+        goes back. Either way the region keeper deals with its region mapper
+        first. A resent ``return_region`` of a taken region succeeds.
+        """
+        for region in session.regions.values():
+            if region.replicas:
+                region.fate = "keep"
+            else:
+                region.fate = "return"
+                self._hide(region)
+                self._void_leases(region)
+            self._departed[region.pool_id] = region
+            session.returned[region.pool_id] = None
+        _bound(session.returned, MAX_REGIONS_PER_SESSION)
+        if session.regions:
+            self.keeper_wakeup.set()
+        session.regions.clear()
+
+    @staticmethod
+    def _note_boots(session: StorageSession, reports: object) -> None:
+        """Record the boot ids an owner sent with its drained close."""
+        if not isinstance(reports, list):
+            return
+        for report in reports:
+            if not isinstance(report, dict):
+                continue
+            region = session.regions.get(report.get("pool_id"))
+            boot = report.get("boot")
+            if region is not None and isinstance(boot, str) and boot:
+                region.boot = boot
+
+    def departed(self) -> list[tuple[str, dict, str, str]]:
+        """Regions whose owner left: ``(pool_id, handle, fate, boot)``.
+
+        ``fate`` is ``"keep"`` (hold the mapping) or ``"return"`` (release,
+        then :meth:`given_back`); ``boot`` is the boot the owner last
+        reported for the region's memory node ("" if none).
+        """
+        with self._lock:
+            self._expire()
+            return [
+                (pool.pool_id, pool.handle.to_dict(), pool.fate, pool.boot)
+                for pool in self._departed.values()
+            ]
+
+    def give_back(self, pool_id: str, reason: str) -> None:
+        """Stop finding a kept region's keys; the keeper then releases it.
+
+        Args:
+            pool_id: The region.
+            reason: Why (logged).
+        """
+        with self._lock:
+            region = self._departed.get(pool_id)
+            if region is None or region.fate == "return":
+                return
+            logger.info(
+                "giving back remote CXL region %d: %s", region.handle.region_id, reason
+            )
+            region.fate = "return"
+            self._hide(region)
+            self._void_leases(region)
+            self.keeper_wakeup.set()
+
+    def given_back(self, pool_id: str) -> None:
+        """Its region mapper released a region: free it at the RM.
+
+        Args:
+            pool_id: The region.
+        """
+        with self._lock:
+            region = self._departed.pop(pool_id, None)
+            if region is not None:
+                self._return_region(region)
+
+    def make_room(self) -> int:
+        """Give back a kept region when the RM refused a region request.
+
+        The kept region read longest ago goes. One goes at a time: while it
+        is on its way to the RM, further refusals give back no other, since
+        the space it frees may be what the next request needs.
+
+        Returns:
+            How many kept regions are given back now (0 or 1).
+        """
+        with self._lock:
+            wanted, self._refused_reservations = self._refused_reservations, 0
+            now = self._clock()
+            for pool_id, since in list(self._room_pending.items()):
+                if pool_id not in self._departed or now - since > ROOM_WAIT_S:
+                    del self._room_pending[pool_id]
+            if not wanted or self._room_pending:
+                return 0
+            kept = [r for r in self._departed.values() if r.fate == "keep"]
+            if not kept:
+                return 0
+            oldest = min(kept, key=lambda r: max(r.last_use.values(), default=0.0))
+            self._room_pending[oldest.pool_id] = now
+        self.give_back(oldest.pool_id, "the resource manager is full")
+        return 1
 
     def _pool_usage(self, s: StorageSession | None, pool: StoragePool) -> dict:
         leases = s.leases.values() if s is not None else ()
@@ -810,7 +968,7 @@ class ReplicaDirectory:
     def _usage(self, medium=None) -> dict:
         pools = [
             (s, pool) for s in self._sessions.values() for pool in self._all_pools(s)
-        ]
+        ] + [(None, pool) for pool in self._departed.values()]
         return {
             "server_epoch": self.server_epoch,
             "host_capacity_limit": self.capacity_limit,

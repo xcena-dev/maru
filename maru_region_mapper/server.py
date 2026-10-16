@@ -6,18 +6,24 @@ One thread per Handler connection. A request runs the service call and gets
 one reply; when the connection ends (the Handler closed it, its process died,
 or TCP keepalive found the peer gone), the service drops the connection's
 hold on every region.
+
+With a key, a connection must prove it (``auth``) before it may map, unmap
+or release; ``hello`` gives the connection's nonce, and the ``auth`` reply
+proves the key back to the client.
 """
 
 from __future__ import annotations
 
+import hmac
 import itertools
 import logging
+import secrets
 import socket
 import threading
 
-from maru_remote.region_map import recv_frame, send_frame
+from maru_remote.region_map import NONCE_BYTES, prove, recv_frame, send_frame
 
-from .service import MapDenied, RegionMapService
+from .service import MapDenied, NotMapped, RegionMapService
 
 logger = logging.getLogger(__name__)
 
@@ -38,21 +44,70 @@ def _set_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
-def handle_request(service: RegionMapService, conn: int, message: dict) -> dict:
+class ConnectionAuth:
+    """Whether one connection proved the region mapper key."""
+
+    def __init__(self, key: bytes | None) -> None:
+        """Start a connection.
+
+        Args:
+            key: Region mapper key; None runs without one (every request is
+                accepted).
+        """
+        self.key = key
+        self.nonce = secrets.token_bytes(NONCE_BYTES) if key is not None else b""
+        self.proved = key is None
+
+    def check(self, message: dict) -> dict:
+        """Check an ``auth`` request and build its reply."""
+        if self.key is None:
+            return {
+                "ok": False,
+                "error": "this region mapper runs without a key",
+                "code": "invalid",
+            }
+        proof, nonce = message.get("proof"), message.get("nonce")
+        if (
+            not isinstance(proof, bytes)
+            or not isinstance(nonce, bytes)
+            or not (hmac.compare_digest(proof, prove(self.key, "handler", self.nonce)))
+        ):
+            return {"ok": False, "error": "wrong region mapper key", "code": "denied"}
+        self.proved = True
+        return {"ok": True, "proof": prove(self.key, "mapper", nonce)}
+
+
+def handle_request(
+    service: RegionMapService,
+    conn: int,
+    message: dict,
+    auth: ConnectionAuth | None = None,
+) -> dict:
     """Run one request and build its reply.
 
     Args:
         service: The region map service.
         conn: Connection id.
         message: Decoded request.
+        auth: Key state of the connection; None accepts every request.
 
     Returns:
         The reply map (``ok`` and the result, or ``error`` and ``code``).
     """
+    auth = auth or ConnectionAuth(None)
     op = message.get("op")
     try:
         if op == "hello":
-            return {"ok": True, **service.hello()}
+            nonce = {"nonce": auth.nonce} if auth.key is not None else {}
+            return {"ok": True, **service.hello(), **nonce}
+        if op == "auth":
+            return auth.check(message)
+        if not auth.proved:
+            return {
+                "ok": False,
+                "error": "prove the region mapper key first (auth)",
+                "code": "denied",
+            }
         if op == "map":
             return {"ok": True, **service.map(conn, message.get("handle"))}
         if op == "unmap":
@@ -67,6 +122,8 @@ def handle_request(service: RegionMapService, conn: int, message: dict) -> dict:
         return {"ok": False, "error": f"unknown op {op!r}", "code": "invalid"}
     except MapDenied as exc:
         return {"ok": False, "error": str(exc), "code": "denied"}
+    except NotMapped as exc:
+        return {"ok": False, "error": str(exc), "code": "unavailable"}
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "code": "invalid"}
     except Exception as exc:
@@ -74,20 +131,27 @@ def handle_request(service: RegionMapService, conn: int, message: dict) -> dict:
         return {"ok": False, "error": str(exc)[:1024], "code": "unavailable"}
 
 
-def serve_connection(service: RegionMapService, conn: int, sock: socket.socket) -> None:
+def serve_connection(
+    service: RegionMapService,
+    conn: int,
+    sock: socket.socket,
+    key: bytes | None = None,
+) -> None:
     """Serve one Handler connection until it ends, then drop its holds.
 
     Args:
         service: The region map service.
         conn: Connection id.
         sock: Connected socket.
+        key: Region mapper key the connection must prove; None for none.
     """
+    auth = ConnectionAuth(key)
     try:
         while True:
             message = recv_frame(sock)
             if message is None:
                 break
-            send_frame(sock, handle_request(service, conn, message))
+            send_frame(sock, handle_request(service, conn, message, auth))
     except (OSError, ValueError) as exc:
         logger.info("connection %d ended: %s", conn, exc)
     finally:
@@ -101,15 +165,24 @@ def serve_connection(service: RegionMapService, conn: int, sock: socket.socket) 
 class RegionMapServer:
     """Accepts Handler connections for a :class:`RegionMapService`."""
 
-    def __init__(self, service: RegionMapService, host: str, port: int) -> None:
+    def __init__(
+        self,
+        service: RegionMapService,
+        host: str,
+        port: int,
+        key: bytes | None = None,
+    ) -> None:
         """Bind the listening socket.
 
         Args:
             service: The region map service.
             host: Bind address.
             port: Bind port (0 picks a free port).
+            key: Region mapper key every connection must prove; None accepts
+                every connection (tests).
         """
         self.service = service
+        self._key = key
         self._sock = socket.create_server((host, port), reuse_port=False)
         self.address = self._sock.getsockname()[:2]
         self._stop = threading.Event()
@@ -147,7 +220,7 @@ class RegionMapServer:
 
     def _serve(self, conn: int, client: socket.socket) -> None:
         try:
-            serve_connection(self.service, conn, client)
+            serve_connection(self.service, conn, client, self._key)
         finally:
             with self._clients_lock:
                 self._clients.pop(conn, None)

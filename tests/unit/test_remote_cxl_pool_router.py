@@ -14,6 +14,7 @@ from tests.unit.remote_fakes import (
     FakeCxl,
     FakeMemoryNode,
     FakeNixlAgent,
+    key_file,
     reset_fake_agents,
 )
 from tests.unit.test_remote_cxl_storage import PAGE, Rpc
@@ -64,6 +65,7 @@ def router(pools, engine="w", metadata_only=False, pages=8, rpcs=None, **kwargs)
         chunk_size_bytes=PAGE,
         rdma_staging_size=16 * PAGE,
         metadata_only=metadata_only,
+        region_mapper_key_file=key_file(),
         **kwargs,
     )
     r = PoolRouter(

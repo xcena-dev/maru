@@ -10,18 +10,28 @@ RDMA.
 One TCP connection per Handler and region mapper; each message is a 4-byte
 big-endian length followed by a MessagePack map. Requests carry ``op``:
 
-- ``hello``: returns ``{"node", "epoch", "boot"}``; the epoch is new on
-  every start of the region mapper process, ``boot`` on every boot of the
-  memory node.
-- ``map`` with ``handle`` (``MaruHandle.to_dict()``): returns
-  ``{"region_id", "addr", "length", "metadata"}``. ``addr`` is the region
-  mapper's virtual address of the region (VA_R); a Handler uses it only as
-  the remote address of RDMA requests. ``metadata`` is NIXL metadata naming
-  this region's registration only, with connection info.
+- ``hello``: returns ``{"node", "epoch", "boot", "nonce"}``; the epoch is
+  new on every start of the region mapper process, ``boot`` on every boot of
+  the memory node, ``nonce`` on every connection.
+- ``auth`` with ``proof`` and ``nonce``: the client proves it holds the
+  region mapper key (:func:`prove` over the connection's nonce) and the reply
+  proves the same over the client's nonce. A connection does nothing else
+  until it has proved the key, so only processes that can read the key file
+  map regions, as only users who can open the DAX device map them on a
+  CXL-attached node.
+- ``map`` with ``handle``: returns ``{"region_id", "addr", "length",
+  "metadata"}``. ``addr`` is the region mapper's virtual address of the
+  region (VA_R); a Handler uses it only as the remote address of RDMA
+  requests. ``metadata`` is NIXL metadata naming this region's registration
+  only, with connection info. The handle is either the region's handle
+  (``MaruHandle.to_dict()``, which only the region's owner and MaruServer
+  hold) or its read handle (:func:`read_handle`, which MaruServer gives to
+  readers); a read handle maps only a region that is mapped already.
 - ``unmap`` with ``region_id``: the connection no longer needs the region.
-- ``release`` with ``handle``: the region's owner is giving it back; the
+- ``release`` with the region's handle: the region is being given back; the
   region mapper deregisters and unmaps it whoever else holds it, and refuses
   later maps of the handle. Releasing a region that is not mapped succeeds.
+  A read handle cannot release.
 
 Replies carry ``ok``; a failure has ``error`` and ``code``. The region mapper
 treats a closed connection as an unmap of every region the connection mapped.
@@ -29,9 +39,14 @@ treats a closed connection as an unmap of every region the connection mapped.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import os
+import secrets
 import socket
 import struct
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +58,150 @@ logger = logging.getLogger(__name__)
 
 MAX_FRAME = 16 * 1024 * 1024
 _LEN = struct.Struct("!I")
+# Shared by the region mappers of a deployment, its workers and its
+# MaruServers; readable only by the users that run them.
+DEFAULT_KEY_FILE = "/etc/maru/region-mapper.key"
+NONCE_BYTES = 16
+
+
+def pick_mapper(mappers: list[str], region_id: int) -> str:
+    """The region mapper that serves a region (rendezvous hash).
+
+    Every Handler with the same list, and MaruServer, pick the same node for
+    a region, so the owner and the readers of a region use one memory node's
+    NIC.
+
+    Args:
+        mappers: Region mapper addresses of the pool.
+        region_id: Region number.
+
+    Returns:
+        One address of ``mappers``.
+    """
+    return max(
+        mappers,
+        key=lambda address: hashlib.sha256(f"{address}|{region_id}".encode()).digest(),
+    )
+
+
+def read_token(handle: dict) -> str:
+    """The read capability of a region, derived from its handle.
+
+    Whoever knows the handle's auth token can compute it; nobody can go back
+    from it to the auth token. A region mapper that mapped the region checks
+    a read token against the handle the resource manager confirmed.
+
+    Args:
+        handle: ``MaruHandle.to_dict()`` of the region.
+
+    Returns:
+        32 hex digits.
+    """
+    key = int(handle["auth_token"]).to_bytes(8, "little")
+    message = b"maru-region-read|%d|%d|%d" % (
+        int(handle["region_id"]),
+        int(handle["offset"]),
+        int(handle["length"]),
+    )
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:32]
+
+
+def read_handle(handle: dict) -> dict:
+    """What a reader gets of a region: where it is and its read token.
+
+    Args:
+        handle: ``MaruHandle.to_dict()`` of the region.
+
+    Returns:
+        ``{"region_id", "offset", "length", "read_token"}``.
+    """
+    return {
+        "region_id": int(handle["region_id"]),
+        "offset": int(handle["offset"]),
+        "length": int(handle["length"]),
+        "read_token": read_token(handle),
+    }
+
+
+class KeyFileError(ValueError):
+    """The region mapper key file is missing, malformed or open to everyone."""
+
+
+def new_key() -> str:
+    """A new region mapper key: 32 random bytes as hex."""
+    return secrets.token_hex(32)
+
+
+def load_key(path: str) -> bytes:
+    """Read the region mapper key.
+
+    Args:
+        path: Key file; one line of hex digits (at least 32).
+
+    Returns:
+        The key bytes.
+
+    Raises:
+        KeyFileError: if the file cannot be read, is readable by every user,
+            or does not hold a key.
+    """
+    try:
+        with open(path) as f:
+            mode = os.fstat(f.fileno()).st_mode
+            text = f.read().strip()
+    except OSError as exc:
+        raise KeyFileError(f"cannot read the region mapper key {path}: {exc}") from exc
+    if mode & 0o004:
+        raise KeyFileError(
+            f"the region mapper key {path} is readable by every user; chmod o-r {path}"
+        )
+    try:
+        key = bytes.fromhex(text)
+    except ValueError:
+        key = b""
+    if len(key) < 16:
+        raise KeyFileError(
+            f"{path} does not hold a region mapper key (at least 32 hex digits)"
+        )
+    return key
+
+
+def write_key(path: str) -> None:
+    """Create a key file readable by its owner only; an existing one stays.
+
+    The key is written to a temporary file that is then linked into place,
+    so an interrupted write never leaves an empty key behind.
+
+    Args:
+        path: Key file to create.
+
+    Raises:
+        FileExistsError: if the file exists.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".region-mapper-key-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_key() + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)
+
+
+def prove(key: bytes, role: str, nonce: bytes) -> bytes:
+    """Proof that ``role`` holds ``key``, bound to the peer's ``nonce``.
+
+    Args:
+        key: Region mapper key.
+        role: ``"handler"`` for a client, ``"mapper"`` for the region mapper.
+        nonce: The nonce the other side chose for this connection.
+
+    Returns:
+        HMAC-SHA256 digest.
+    """
+    return hmac.new(key, role.encode() + b"|" + bytes(nonce), hashlib.sha256).digest()
 
 
 class RegionMapError(RuntimeError):
@@ -174,6 +333,7 @@ class RegionMapClient:
         timeout_s: float = 30.0,
         connect_timeout_s: float | None = None,
         connect: Callable[[tuple[str, int], float], Any] | None = None,
+        key: bytes | None = None,
     ) -> None:
         """Create the client.
 
@@ -184,8 +344,12 @@ class RegionMapClient:
             connect_timeout_s: Timeout for connecting; ``timeout_s`` if None.
             connect: Socket factory ``(address, timeout) -> socket``
                 (tests inject an in-process pair).
+            key: Region mapper key (:func:`load_key`). Each connection
+                proves it and checks that the region mapper proves it too;
+                None only for a region mapper that runs without a key.
         """
         self.address = address
+        self._key = key
         self._endpoint = parse_address(address)
         self._timeout_s = timeout_s
         self._connect_timeout_s = (
@@ -306,9 +470,47 @@ class RegionMapClient:
         self._sock = sock
         self.generation += 1
         reply = self._request({"op": "hello"})
+        try:
+            self._authenticate(reply.get("nonce"))
+        except (RegionMapError, RegionMapUnavailable) as exc:
+            self._drop()
+            raise RegionMapUnavailable(
+                f"region mapper {self.address}: key check failed: {exc}"
+            ) from exc
         self.epoch = str(reply["epoch"])
         self.node = str(reply["node"])
         self.boot = str(reply.get("boot", ""))
+
+    def _authenticate(self, nonce: Any) -> None:
+        """Prove the key to the region mapper and check its proof.
+
+        Raises:
+            RegionMapError: if the region mapper refused the proof.
+            RegionMapUnavailable: if the two sides disagree on using a key
+                or the region mapper proved another key.
+        """
+        if self._key is None:
+            if nonce is not None:
+                raise RegionMapUnavailable(
+                    "it requires the region mapper key; set the key file "
+                    f"(default {DEFAULT_KEY_FILE})"
+                )
+            return
+        if nonce is None:
+            raise RegionMapUnavailable("it runs without a key and cannot prove one")
+        mine = secrets.token_bytes(NONCE_BYTES)
+        ack = self._request(
+            {
+                "op": "auth",
+                "proof": prove(self._key, "handler", bytes(nonce)),
+                "nonce": mine,
+            }
+        )
+        proof = ack.get("proof")
+        if not isinstance(proof, bytes) or not hmac.compare_digest(
+            proof, prove(self._key, "mapper", mine)
+        ):
+            raise RegionMapUnavailable("it proved another key")
 
     def _request(self, message: dict) -> dict:
         try:

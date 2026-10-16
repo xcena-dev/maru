@@ -237,11 +237,15 @@ class RemoteCxlStorageClient(RegionLifecycle):
         while not self._stop.wait(interval):
             try:
                 self._heartbeat()
-            except StorageError:
+            except StorageError as exc:
                 # A new epoch or an expired session cannot be resumed with the
                 # old regions: fail closed until the worker restarts.
+                restarted = "epoch changed" in str(exc)
                 self._disable(
-                    "Remote CXL cache session expired or MaruServer restarted"
+                    "MaruServer restarted"
+                    if restarted
+                    else "Remote CXL cache session expired",
+                    server_restarted=restarted,
                 )
                 return
             except Exception:
@@ -288,20 +292,31 @@ class RemoteCxlStorageClient(RegionLifecycle):
         with self._sequence_lock:
             self._sequence += 1
             sequence = self._sequence
+        # The boot of each region's memory node goes along, so MaruServer
+        # can tell a reboot after it takes a region over.
         reports = [
-            {"pool_id": region.pool_id, **region.usage()}
+            {"pool_id": region.pool_id, **region.usage(), "boot": region.boot}
             for region in list(self.regions.values())
         ]
         self._call("heartbeat", sequence=sequence, pools=reports)
 
-    def _disable(self, reason: str) -> None:
-        """Stop using the cache and give the regions back."""
+    def _disable(self, reason: str, server_restarted: bool = False) -> None:
+        """Stop using the cache and leave the regions.
+
+        After an expiry MaruServer has taken the regions over, so the worker
+        only leaves them. A restarted MaruServer knows nothing of them; the
+        worker then releases them itself before the resource manager
+        reclaims them.
+        """
         with self._lock:
             if not self.connected:
                 return
             logger.warning("%s; restart the worker to re-enable the cache", reason)
             self.connected = False
-            self._return_regions()
+            if server_restarted:
+                self._return_regions()
+            else:
+                self._leave()
 
     # ------------------------------------------------------------ allocation
 
@@ -722,10 +737,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
         by_peer: dict[str, list[tuple[int, int, int]]] = {}
         try:
             for (_, location), slot in zip(hits, slots, strict=False):
-                handle = regions.get(location.pool_id)
+                # An own region is mapped with its handle; another session's
+                # with the read handle MaruServer gave with the lease.
                 own = self.regions.get(location.pool_id)
-                if handle is None and own is not None:
-                    handle = own.handle
+                handle = (
+                    own.handle if own is not None else regions.get(location.pool_id)
+                )
                 if handle is None:
                     raise StorageUnavailableError("No region for a leased location")
                 access = self._region(location.pool_id, handle)
@@ -789,7 +806,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
     # ----------------------------------------------------------------- close
 
     def close(self) -> None:
-        """Give the regions back (release first) and close the session.
+        """Hand the regions over to MaruServer and close the session.
 
         Raises:
             RuntimeError: if a read lease given to the connector is still
@@ -805,7 +822,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             thread.join()
         self._threads = []
         with self._lock:
-            self._return_regions()
+            self._leave()
             if not self._isolated:
                 self._stop_data_path()
             else:
