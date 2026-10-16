@@ -224,6 +224,63 @@ eviction and SSD are later milestones. See the
 [mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
 for launch configuration, memory lifetime and validation instructions.
 
+### CXL on memory nodes over RDMA
+
+Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The KV
+stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
+and writes it with one-sided RDMA, and only control messages go to maru-server
+and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
+size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
+`maru_region_mapper_key_file` (a copy of the memory nodes' region mapper key,
+default `/etc/maru/region-mapper.key`) and, optionally, `maru_rdma_device` (the
+worker's RDMA NIC, e.g. `mlx5_0:1`).
+
+![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
+
+Resources flow as for the cxl backend: the resource manager gives regions to
+maru-server and maru-server gives them to the worker, one region when its
+storage session opens and one more each time its regions are full. Only the
+step that maps a region moves, from the Handler to the memory node.
+
+![Components of the remote_cxl backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/remote_cxl_sw_structure.png)
+
+Each memory
+node runs a region mapper (`maru-region-mapper`), a service shared by every app:
+it maps the regions Handlers ask for and registers them with the node's NIC.
+With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
+which starts and stops with the resource manager; its settings (NIC, port 9860,
+key file) are in `/etc/maru/region-mapper.env`. It listens on the NIC's address
+on the RDMA network, and every worker and maru-server proves the region mapper
+key (`/etc/maru/region-mapper.key`, created by the installer) on each
+connection, so only processes that can read a copy of the key map regions, as
+only users that can open the DAX device map them on a CXL-attached node. The
+protocol itself is not encrypted, like the resource manager's, so keep the
+RDMA network to the hosts of the deployment.
+A memory node of a shared pool that runs no resource manager installs the
+service alone (`install-maru-region-mapper --standalone`, which starts it at
+boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
+the {ref}`multi-node configuration <installation-multi-node-config>`.
+maru-server takes the pool's region mappers with `--region-mapper host:port`
+(one per memory node) and `--region-mapper-key-file`, and hands the list to
+the workers. Engines read each other's keys under a server lease; a reader
+gets a read handle, which maps a region but cannot release it. When a worker
+stops, maru-server keeps its regions that hold keys and holds their mapping,
+so the keys stay readable as a stopped cxl Handler's keys do; it gives a kept
+region back when the resource manager is full. A region goes back only after
+its region mapper deregistered it, so a late RDMA WRITE fails at the NIC
+instead of landing in the next owner's KV.
+
+The backend stores KV chunkwise and needs `--enforce-eager`,
+`kv_load_failure_policy="recompute"` and one worker per engine. Loads and
+stores run on the engine thread unless `maru_async_load` and
+`maru_async_store` move them off it; synchronous loads also need
+`--no-async-scheduling`, while asynchronous loads run with vLLM's asynchronous
+scheduling on. The worker's staging buffer is registered with CUDA,
+so the copy kernel moves KV between the GPU and the staging buffer as it does
+for mapped CXL memory. NIXL is required (`pip install 'maru[rdma]'`).
+See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
+for one-host and multi-node launch steps.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:

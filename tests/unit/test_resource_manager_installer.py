@@ -25,6 +25,23 @@ from maru_common.resource_manager_installer import (
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _no_region_mapper_service(monkeypatch):
+    """Keep the region mapper installer away from the real /etc/systemd."""
+    from maru_region_mapper import installer as region_mapper_installer
+
+    calls = []
+    monkeypatch.setattr(
+        region_mapper_installer, "install", lambda *a, **k: calls.append("install")
+    )
+    monkeypatch.setattr(
+        region_mapper_installer,
+        "uninstall",
+        lambda *a, **k: calls.append("uninstall") or False,
+    )
+    return calls
+
+
 class TestFprintf:
     """Tests for fprintf helper."""
 
@@ -357,6 +374,53 @@ class TestDoInstall:
 # =============================================================================
 # main tests
 # =============================================================================
+
+
+class TestRegionMapperService:
+    """The RM installer also installs the region mapper service."""
+
+    def _install(self, tmp_path, **extra):
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        build_dir = src_dir / "build"
+        args = argparse.Namespace(
+            prefix=str(tmp_path / "install"), clean=False, **extra
+        )
+
+        def build(*a, **kw):
+            build_dir.mkdir(exist_ok=True)
+            (build_dir / "maru-resource-manager").write_text("fake binary")
+            return subprocess.CompletedProcess(args=a, returncode=0)
+
+        with (
+            patch(
+                "maru_common.resource_manager_installer.shutil.which",
+                return_value="/usr/bin/cmake",
+            ),
+            patch(
+                "maru_common.resource_manager_installer._find_resource_manager_source",
+                return_value=src_dir,
+            ),
+            patch("maru_common.resource_manager_installer._run", side_effect=build),
+        ):
+            return _do_install(args)
+
+    def test_installed_with_the_resource_manager(
+        self, tmp_path, _no_region_mapper_service
+    ):
+        assert self._install(tmp_path, no_region_mapper=False) == 0
+        assert _no_region_mapper_service == ["install"]
+
+    def test_left_out_on_request(self, tmp_path, _no_region_mapper_service):
+        assert self._install(tmp_path, no_region_mapper=True) == 0
+        assert _no_region_mapper_service == []
+
+    def test_removed_with_the_resource_manager(
+        self, tmp_path, _no_region_mapper_service
+    ):
+        with patch("maru_common.resource_manager_installer.subprocess.run"):
+            _do_uninstall(str(tmp_path))
+        assert _no_region_mapper_service == ["uninstall"]
 
 
 class TestMain:

@@ -12,6 +12,7 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
 from tests.unit.test_vllm_cpu_config import extra, mixed_extra
+from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -19,7 +20,7 @@ from tests.unit.vllm_connector_helpers import (
 )
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_cxl_extra()])
 @pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
 @pytest.mark.parametrize(
     "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]
@@ -30,6 +31,9 @@ def test_load_only_external_tokens(config, start, end, failure):
     worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
     worker._ensure_handler = lambda: None
     worker._handler = Mock() if failure != "handler" else None
+    if worker._handler is not None:
+        worker._handler.retrieve_capacity.return_value = None
+        worker._handler.storage_gpu_accessible.return_value = False
     meta = MaruReqMeta(
         "load",
         list(range(16)),
@@ -45,8 +49,10 @@ def test_load_only_external_tokens(config, start, end, failure):
         for i in range(2)
     ]
 
-    def retrieve(requested):
+    def retrieve(requested, route_key=None):
         assert requested == keys[start // 8 : 2]
+        # A load that starts mid-request still routes by the request's first key.
+        assert route_key == keys[0]
         if failure == "retrieve":
             raise RuntimeError("lost replica")
         if failure == "truncated":

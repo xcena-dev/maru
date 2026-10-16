@@ -273,6 +273,23 @@ class MaruShmClient:
             self._close_region_locked(handle.region_id)
         logger.debug("free(region_id=%d)", handle.region_id)
 
+    def get_access(self, handle: MaruHandle) -> GetAccessResp:
+        """Check a handle with the resource manager and get its device.
+
+        Always asks the resource manager (``GET_ACCESS``), unlike :meth:`mmap`,
+        which reuses a device path it saw before for the same region.
+
+        Args:
+            handle: Handle of the region.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            RuntimeError: if the resource manager refuses the handle.
+        """
+        return self._request_access(handle)
+
     def _request_access(self, handle: MaruHandle) -> GetAccessResp:
         """Request access info from the resource manager via GET_ACCESS_REQ."""
         req = GetAccessReq(handle=handle, client_id=self._client_id)

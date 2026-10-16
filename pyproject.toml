@@ -34,6 +34,10 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
+# NIXL for the remote_cxl storage backend and the region mapper (maru-region-mapper)
+rdma = [
+    "nixl",
+]
 docs = [
     "sphinx>=7.0",
     "shibuya",
@@ -45,7 +49,9 @@ docs = [
 [project.scripts]
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
+install-maru-region-mapper = "maru_region_mapper.installer:main"
 marutop = "maru_tools.cli:main"
+maru-region-mapper = "maru_region_mapper.cli:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"

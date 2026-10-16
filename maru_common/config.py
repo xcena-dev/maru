@@ -65,6 +65,22 @@ class MaruConfig:
     cxl_pool_size: int | None = None  # Fixed CXL budget in mixed mode
     write_order: tuple[str, ...] = ("cpu", "cxl")
     read_order: tuple[str, ...] = ("cpu", "cxl")
+    # Remote CXL storage: pool_size is the size of one region in a memory node's CXL;
+    # the session gets one more region whenever all of its regions are full
+    rdma_device: str = ""  # RDMA NIC for NIXL/UCX, e.g. "mlx5_0:1"; empty = default
+    rdma_staging_size: int | None = None  # Host staging buffer; None = derived
+    rdma_timeout_s: float = 30.0  # Deadline of one RDMA batch
+    # Share of staging slots that stores leave free for loads; set when loads
+    # and stores run on separate threads (asynchronous transfers)
+    rdma_load_reserve: float = 0.0
+    # Key the region mappers of the pool require (a copy of the memory node's
+    # /etc/maru/region-mapper.key, readable by the worker's user only)
+    region_mapper_key_file: str = "/etc/maru/region-mapper.key"
+
+    @property
+    def server_urls(self) -> list[str]:
+        """MaruServer URLs; the remote_cxl backend uses one pool per URL."""
+        return [url.strip() for url in self.server_url.split(",") if url.strip()]
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -86,8 +102,10 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
-        if self.storage_backend not in {"cpu", "cxl", "mixed"}:
-            raise ValueError("storage_backend must be 'cpu', 'cxl' or 'mixed'")
+        if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
+            raise ValueError(
+                "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
+            )
         if self.storage_backend == "mixed":
             if (
                 type(self.cxl_pool_size) is not int
@@ -106,16 +124,40 @@ class MaruConfig:
                 setattr(self, name, validate_order(getattr(self, name)))
         elif self.cxl_pool_size is not None:
             raise ValueError("cxl_pool_size is only supported by mixed storage")
-        if self.storage_backend in {"cpu", "mixed"}:
+        if self.storage_backend in {"cpu", "mixed", "remote_cxl"}:
             if not self.engine_id or not self.cache_namespace:
-                raise ValueError("CPU storage requires engine_id and cache_namespace")
+                raise ValueError(
+                    "Storage sessions require engine_id and cache_namespace"
+                )
             if self.expand_size is not None:
-                raise ValueError("CPU M1 uses a fixed pool; expand_size is unsupported")
+                raise ValueError(
+                    "Remote CXL regions grow by pool_size; expand_size is unsupported"
+                    if self.storage_backend == "remote_cxl"
+                    else "CPU M1 uses a fixed pool; expand_size is unsupported"
+                )
             if (
                 not self.metadata_only
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if "," in self.server_url and self.storage_backend != "remote_cxl":
+            raise ValueError("Several MaruServer URLs require the remote_cxl backend")
+        if self.storage_backend == "remote_cxl":
+            if self.rdma_timeout_s <= 0:
+                raise ValueError("rdma_timeout_s must be positive")
+            if not 0 <= self.rdma_load_reserve < 1:
+                raise ValueError("rdma_load_reserve must be in [0, 1)")
+            if (
+                self.rdma_staging_size is not None
+                and self.rdma_staging_size < self.chunk_size_bytes
+            ):
+                raise ValueError("rdma_staging_size must hold at least one page")
+        elif (
+            self.rdma_staging_size is not None
+            or self.rdma_device
+            or self.rdma_load_reserve
+        ):
+            raise ValueError("RDMA settings require the remote_cxl storage backend")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
         if not self.metadata_only and self.pool_size < self.chunk_size_bytes:

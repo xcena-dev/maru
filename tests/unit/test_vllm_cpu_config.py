@@ -158,7 +158,7 @@ def test_cpu_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():
 def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     scheduler = make_scheduler(4, 4, extra())
     scheduler._known_keys = {"any-old-key"}
-    scheduler._handler = SimpleNamespace(batch_exists=lambda _: [True, False])
+    scheduler._handler = SimpleNamespace(batch_exists=lambda _, **route: [True, False])
     assert scheduler._count_matched_chunks(list(range(8))) == 1
-    scheduler._handler.batch_exists = lambda _: [False, False]
+    scheduler._handler.batch_exists = lambda _, **route: [False, False]
     assert scheduler._count_matched_chunks(list(range(8))) == 0

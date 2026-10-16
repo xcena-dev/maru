@@ -76,25 +76,22 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        if self._config.use_async_rpc:
-            from .rpc_async_client import RpcAsyncClient
-
-            self._rpc = RpcAsyncClient(
-                self._config.server_url,
-                timeout_ms=self._config.timeout_ms,
-                max_inflight=self._config.max_inflight,
-            )
-        else:
-            self._rpc = RpcClient(
-                self._config.server_url,
-                timeout_ms=self._config.timeout_ms,
-            )
+        self._rpc = self._make_rpc(self._config.server_urls[0])
         self._mapper: DaxMapper | None = None
         self._cpu = None
         if self._config.storage_backend in {"cpu", "mixed"}:
             from .storage.client import CpuStorageClient
 
             self._cpu = CpuStorageClient(self._config, self._rpc)
+        elif self._config.storage_backend == "remote_cxl":
+            from .storage.remote_cxl import PoolRouter, RemoteCxlStorageClient
+
+            urls = self._config.server_urls
+            if len(urls) == 1:
+                self._cpu = RemoteCxlStorageClient(self._config, self._rpc)
+            else:
+                rpcs = [self._rpc] + [self._make_rpc(url) for url in urls[1:]]
+                self._cpu = PoolRouter(self._config, rpcs, urls)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -128,6 +125,18 @@ class MaruHandler:
         logger.debug("Created MaruHandler with config: %s", self._config)
 
         self._dispatch_plugins("on_init", self)
+
+    def _make_rpc(self, url: str):
+        """RPC client for one MaruServer URL."""
+        if self._config.use_async_rpc:
+            from .rpc_async_client import RpcAsyncClient
+
+            return RpcAsyncClient(
+                url,
+                timeout_ms=self._config.timeout_ms,
+                max_inflight=self._config.max_inflight,
+            )
+        return RpcClient(url, timeout_ms=self._config.timeout_ms)
 
     def _dispatch_plugins(self, hook: str, *args) -> None:
         """Invoke ``hook`` on every loaded plugin, isolating failures.
@@ -485,7 +494,9 @@ class MaruHandler:
     # KV Operations
     # =========================================================================
 
-    def alloc(self, size: int) -> AllocHandle | CpuAllocation:
+    def alloc(
+        self, size: int, route_key: str | None = None
+    ) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
         The caller writes directly to ``handle.buf``, then passes the handle
@@ -493,6 +504,8 @@ class MaruHandler:
 
         Args:
             size: Required bytes (must be <= chunk_size)
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             AllocHandle with writable memoryview and allocation metadata
@@ -502,7 +515,7 @@ class MaruHandler:
             ValueError: If size exceeds chunk_size or allocation fails
         """
         if self._cpu is not None:
-            return self._cpu.alloc(size)
+            return self._cpu.alloc(size, route_key=route_key)
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
@@ -942,7 +955,9 @@ class MaruHandler:
     # Batch Operations
     # =========================================================================
 
-    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | CpuReadLease | None]:
+    def batch_retrieve(
+        self, keys: list[str], route_key: str | None = None
+    ) -> list[MemoryInfo | CpuReadLease | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
         CPU results are CpuReadLease objects; release every non-None result
@@ -959,6 +974,8 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             List of MemoryInfo (None for keys not found)
@@ -966,7 +983,7 @@ class MaruHandler:
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
         if self._cpu is not None:
-            return self._cpu.batch_retrieve(keys)
+            return self._cpu.batch_retrieve(keys, route_key=route_key)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1223,19 +1240,21 @@ class MaruHandler:
         self._record_stats("batch_store", total_bytes, (time.monotonic() - t0) * 1e6)
         return results
 
-    def batch_exists(self, keys: list[str]) -> list[bool]:
+    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
         """Check if multiple keys exist.
 
         Uses a single batch RPC call instead of N individual calls.
 
         Args:
             keys: List of chunk key strings
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             List of booleans indicating existence for each key
         """
         if self._cpu is not None:
-            return self._cpu.batch_exists(keys)
+            return self._cpu.batch_exists(keys, route_key=route_key)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1445,6 +1464,26 @@ class MaruHandler:
             mapped_count,
             len(response.allocations),
         )
+
+    def retrieve_capacity(self) -> int | None:
+        """How many keys the next ``batch_retrieve`` should ask for at most.
+
+        Returns:
+            The read buffer slots a load may use now (remote_cxl backend), or None
+            when retrieves are not bounded by a read buffer.
+        """
+        capacity = getattr(self._cpu, "retrieve_capacity", None)
+        return capacity() if capacity is not None else None
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether retrieved and allocated buffers are page-locked for the GPU.
+
+        Returns:
+            True when GPU copy kernels may read and write those buffers
+            directly (the remote_cxl backend's staging buffer registered with CUDA).
+        """
+        accessible = getattr(self._cpu, "storage_gpu_accessible", None)
+        return bool(accessible()) if accessible is not None else False
 
     def has_local(self, key: str) -> bool:
         """Whether this handler still owns a committed CPU replica."""

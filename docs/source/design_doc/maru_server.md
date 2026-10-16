@@ -133,3 +133,59 @@ The server exposes the following message types:
 | `SHUTDOWN` | Reserved — graceful server shutdown |
 
 Batch operations allow clients to reduce RPC round-trips when operating on multiple keys.
+
+---
+
+(maru-server-remote-cxl)=
+## 6. Remote CXL Regions
+
+For `remote_cxl` workers, MaruServer keeps storage sessions (`ReplicaDirectory`).
+A session gets regions from the Resource Manager as a cxl Handler does
+(`open`, then `expand`), and MaruServer indexes every session's keys, so any
+session of the same namespace can lease and read them. MaruServer hands the
+pool's region mapper list to the workers in the handshake.
+
+![MaruServer keeps the regions of a worker that left. (a) A leaves: MaruServer holds R's mapping at the region mapper, and B still reads k. (b) When the Resource Manager is full, MaruServer stops finding R's keys, releases R at the region mapper and only then frees it](../image/remote_cxl_kept_region.png)
+
+**Regions of a worker that left.** When a session closes drained or expires,
+MaruServer takes its regions over. A region that holds keys is *kept*: its
+keys are still found, and the `RegionKeeper` thread holds its mapping at the
+region mapper so readers keep reading. A region without keys goes back. The
+keeper releases a region at its region mapper before MaruServer frees it at
+the Resource Manager, so a late RDMA WRITE fails at the NIC. A kept region goes
+back when:
+
+- the Resource Manager refuses a region request (the kept region read longest
+  ago goes, one at a time);
+- its memory node rebooted (the boot id differs from the one its owner
+  reported), since bytes in the node's CPU cache may be lost;
+- its region mapper refuses its handle (someone released it);
+- its region mapper does not answer for 30 seconds, as a live owner removes
+  the keys of a region it cannot reach (the region goes back once the region
+  mapper answers again).
+
+When maru-server stops, the keeper releases the regions it took over at their
+region mappers and frees them before it exits, so a reader's open connection
+does not keep one registered after the Resource Manager hands it out again.
+The keeper talks to the region mappers on its own thread, so a memory node
+that does not answer delays no request. It proves the region mapper key like a
+worker (`--region-mapper-key-file`).
+
+**Handles.** MaruServer gives a region's handle, with the Resource Manager's
+auth token, only to the session that owns the region. Other sessions get a
+read handle with `acquire`: the region's number, offset and length with a read
+token derived from the auth token. A region mapper maps a read handle only for
+a region it has mapped, and only the region's handle releases a region, so a
+reader cannot take a region away from its owner.
+
+![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; B's release of R is refused at the region mapper, and A's writes keep going](../image/remote_cxl_read_handle.png)
+
+| Action | Operation |
+|--------|-----------|
+| `open` / `close` | Open a session (with its first region) / close it drained |
+| `expand` | One more region for the session |
+| `heartbeat` | Renew the session; reports usage and each region's boot id |
+| `commit` / `probe` / `acquire` / `release` | Register keys / check them / lease them for a read / end the lease |
+| `victims` / `remove` | Least recently used unleased keys of own regions / remove them |
+| `return_region` | Give one region back after its region mapper released it |
+

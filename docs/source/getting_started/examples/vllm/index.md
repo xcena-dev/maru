@@ -1,6 +1,6 @@
 # vLLM Examples
 
-Two runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
+Runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
 which moves KV cache through CXL shared memory without LMCache in the serving
 path. Both live under `examples/vllm/`:
 
@@ -8,6 +8,7 @@ path. Both live under `examples/vllm/`:
 |---------|-----------|---------------|
 | Single-instance verification | `examples/vllm/single/` | One instance stores KV and reuses it on a repeat request — the cheapest connector check |
 | P2P KV cache sharing | `examples/vllm/p2p_sharing/` | Two instances share KV cache, so the second skips prefill |
+| CXL on memory nodes over RDMA | `examples/vllm/remote_cxl/` | Engines on nodes without CXL share KV in a memory node's CXL pool over RDMA |
 
 Start with the single-instance example: it needs one GPU and isolates the
 store and load paths before any cross-instance behavior is involved.
@@ -163,6 +164,23 @@ CXL retrieve overhead can exceed the prefill it saves.
 
 **Garbage output on Instance 2.** KV cache corruption — confirm the load is
 using per-chunk injection rather than a concatenated 1D load.
+
+## CXL on memory nodes over RDMA
+
+Engines on nodes without CXL keep KV in the CXL pool of memory nodes and move
+it over RDMA (`maru_storage_backend="remote_cxl"`). Each memory node runs a region
+mapper that maps and registers regions for the workers; maru-server allocates
+the regions as for local CXL.
+
+```bash
+cd examples/vllm/remote_cxl
+MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
+MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh     # one host, 2 GPUs, an RDMA NIC
+```
+
+`Pool hit: Yes` and `Same answer: Yes` confirm that the second instance loaded
+the first one's KV from the pool. See `examples/vllm/remote_cxl/README.md` for
+running the memory node, maru-server and workers on separate nodes.
 
 ## Further reading
 
