@@ -224,6 +224,33 @@ eviction and SSD are later milestones. See the
 [mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
 for launch configuration, memory lifetime and validation instructions.
 
+### CXL on memory nodes over RDMA
+
+Set `maru_storage_backend="rdma"` to run engines on nodes without CXL. The KV
+stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
+and writes it with one-sided RDMA, and only control messages go to maru-server
+and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
+size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
+and, optionally, `maru_rdma_device` (the worker's RDMA NIC, e.g. `mlx5_0:1`).
+
+Resources flow as for the cxl backend: the resource manager gives regions to
+maru-server and maru-server gives them to the worker, one region when its
+storage session opens and one more each time its regions are full. Each memory
+node runs a region mapper (`maru-region-mapper`), a service shared by every app:
+it maps the regions Handlers ask for and registers them with the node's NIC.
+maru-server takes the pool's region mappers with `--region-mapper host:port`
+(one per memory node) and hands them to the workers. Engines read each other's
+keys under a server lease; before a worker gives a region back, its region
+mapper deregisters it, so a late RDMA WRITE fails at the NIC instead of landing
+in the next owner's KV.
+
+The backend follows the storage session contract of the CPU mode:
+`--enforce-eager`, `--no-async-scheduling`, `kv_load_failure_policy="recompute"`,
+synchronous chunkwise transfers and one worker per engine. Asynchronous loads
+and stores are not supported yet. NIXL is required (`pip install 'maru[rdma]'`).
+See the [RDMA example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/rdma/README.md)
+for one-host and multi-node launch steps.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:
