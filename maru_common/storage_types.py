@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 STORAGE_CAPABILITY = "cpu_storage_v1"
 MIXED_STORAGE_CAPABILITY = "mixed_storage_v1"
+RDMA_STORAGE_CAPABILITY = "rdma_storage_v1"
 MAX_STORAGE_BATCH = 1024
 
 

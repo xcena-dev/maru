@@ -32,8 +32,12 @@ class MaruServer:
         enable_cxl: bool = True,
         cpu_capacity_limit: int = 64 * 1024**3,
         cpu_session_ttl: float = 30,
+        region_mappers: list[str] | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
+        # Region mappers of the pool's memory nodes, handed to RDMA workers in
+        # the handshake as the RM address is; MaruServer never calls them.
+        self._region_mappers = list(region_mappers or [])
         self._dax_paths = dax_paths
         from .replica_directory import ReplicaDirectory
 
@@ -84,6 +88,11 @@ class MaruServer:
     def rm_address(self) -> str:
         """Resource manager address used by this server."""
         return self._rm_address
+
+    @property
+    def region_mappers(self) -> list[str]:
+        """Region mapper addresses of the pool's memory nodes."""
+        return list(self._region_mappers)
 
     def _reserve_storage_region(self, owner: str, size: int) -> MaruHandle | None:
         """Reserve a typed pool without exposing it to legacy clients."""
@@ -509,9 +518,28 @@ def main() -> None:
         default=64 * 1024**3,
         help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
     )
+    parser.add_argument(
+        "--region-mapper",
+        action="append",
+        default=None,
+        dest="region_mappers",
+        help=(
+            "Region mapper address (host:port) of a memory node of this pool, "
+            "for RDMA workers. Repeat or separate with commas for every memory "
+            "node of a shared pool."
+        ),
+    )
     args = parser.parse_args()
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
+    region_mappers = [
+        address.strip()
+        for item in args.region_mappers or []
+        for address in item.split(",")
+        if address.strip()
+    ]
+    if args.cpu_only and region_mappers:
+        parser.error("--cpu-only cannot be combined with --region-mapper")
 
     setup_logging(args.log_level)
 
@@ -521,6 +549,7 @@ def main() -> None:
         dax_paths=args.dax_paths,
         enable_cxl=not args.cpu_only,
         cpu_capacity_limit=args.cpu_capacity_limit,
+        region_mappers=region_mappers,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 
