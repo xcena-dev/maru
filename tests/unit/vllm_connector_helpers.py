@@ -16,7 +16,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
@@ -120,6 +120,9 @@ def make_vllm_scheduler(
     extra_config: dict[str, Any] | None = None,
     num_blocks: int = 64,
     enable_prefix_caching: bool = False,
+    speculative_method: Literal["draft_model", "eagle", "ngram"] | None = None,
+    num_speculative_tokens: int = 16,
+    max_model_len: int = 512,
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -134,6 +137,9 @@ def make_vllm_scheduler(
         extra_config: Extra ``kv_connector_extra_config`` entries.
         num_blocks: GPU KV blocks the scheduler may allocate.
         enable_prefix_caching: Exercise sharing of computed GPU blocks.
+        speculative_method: Optional draft-model, EAGLE or ngram configuration.
+        num_speculative_tokens: Draft tokens when speculation is enabled.
+        max_model_len: Token limit used by the model and scheduler.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -144,7 +150,9 @@ def make_vllm_scheduler(
         CacheConfig,
         KVTransferConfig,
         ModelConfig,
+        ParallelConfig,
         SchedulerConfig,
+        SpeculativeConfig,
         VllmConfig,
     )
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -162,7 +170,19 @@ def make_vllm_scheduler(
         seed=0,
         skip_tokenizer_init=True,
         enforce_eager=True,
+        max_model_len=max_model_len,
     )
+    speculative_config = None
+    if speculative_method is not None:
+        speculative_config = SpeculativeConfig(
+            model="ngram" if speculative_method == "ngram" else str(model_dir),
+            method=speculative_method,
+            num_speculative_tokens=num_speculative_tokens,
+            prompt_lookup_min=1,
+            prompt_lookup_max=3,
+            target_model_config=model_config,
+            target_parallel_config=ParallelConfig(),
+        )
     cache_config = CacheConfig(
         block_size=block_size,
         cache_dtype="auto",
@@ -170,10 +190,11 @@ def make_vllm_scheduler(
     )
     vllm_config = VllmConfig(
         model_config=model_config,
+        speculative_config=speculative_config,
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=512,
-            max_model_len=512,
+            max_model_len=max_model_len,
             is_encoder_decoder=False,
             async_scheduling=False,
         ),

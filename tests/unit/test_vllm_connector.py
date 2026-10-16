@@ -4427,6 +4427,131 @@ class TestDeferredAdmissionFitsCache:
         self._finish_loads(engine, ["big"])
         assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
 
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    @pytest.mark.parametrize("prompt_tokens", [200, 201])
+    @pytest.mark.parametrize("small_chunks", [4, 5])
+    def test_speculative_requests_resume(
+        self, tmp_path, method, prompt_tokens, small_chunks
+    ):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path, 4, 8, {"maru_async_load": True}, speculative_method=method
+        )
+        # Prompt-only reservations fit in 63 blocks (50+13 or 51+12),
+        # but the oldest needs four more blocks for its draft tokens.
+        small_tokens = 52 if prompt_tokens == 200 else 48
+        chunks = {prompt_tokens: 12, small_tokens: small_chunks}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = []
+        for name, count in (("big", prompt_tokens), ("small", small_tokens)):
+            request = Request(
+                name, list(range(count)), SamplingParams(max_tokens=1), None
+            )
+            engine.add_request(request)
+            requests.append(request)
+        engine.schedule()
+        parked = [
+            r.request_id
+            for r in requests
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        assert "big" in parked
+        self._finish_loads(engine, parked)
+        assert any(
+            engine.schedule().num_scheduled_tokens.get("big", 0) > 0 for _ in range(4)
+        )
+
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    def test_single_speculative_request_at_model_limit(self, tmp_path, method):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {"maru_async_load": True},
+            speculative_method=method,
+            max_model_len=252,
+        )
+        engine.connector._scheduler._count_matched_chunks = lambda ids: 12
+        request = Request("big", list(range(251)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        self._finish_loads(engine, ["big"])
+        assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
+
+    def test_ngram_does_not_reserve_draft_model_slots(self, tmp_path):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path, 4, 8, {"maru_async_load": True}, speculative_method="ngram"
+        )
+        chunks = {200: 12, 52: 6}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = [
+            Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
+            for name, count in (("big", 200), ("small", 52))
+        ]
+        for request in requests:
+            engine.add_request(request)
+        engine.schedule()
+        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
+
+    @pytest.mark.parametrize("method", ["draft_model", "eagle"])
+    def test_model_limit_does_not_overreserve_speculative_loads(self, tmp_path, method):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {"maru_async_load": True},
+            num_blocks=68,
+            speculative_method=method,
+            max_model_len=200,
+        )
+        chunks = {199: 12, 52: 4}
+        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        requests = [
+            Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
+            for name, count in (("big", 199), ("small", 52))
+        ]
+        for request in requests:
+            engine.add_request(request)
+        engine.schedule()
+        # The model's 200-token limit caps big at 50 blocks. With small's
+        # 17 blocks including lookahead, both fit the 67 usable blocks.
+        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
+        self._finish_loads(engine, [r.request_id for r in requests])
+        assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
+
+    def test_upstream_reservation_allows_overlapping_loads(self, tmp_path):
+        import vllm
+        from packaging.version import Version
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        if Version(vllm.__version__) < Version("0.23.0"):
+            pytest.skip("upstream async-load reservation requires vLLM >= 0.23")
+        engine = self._engine(tmp_path)
+        engine.connector._scheduler._count_matched_chunks = lambda ids: {
+            200: 12,
+            60: 6,
+        }[len(ids)]
+        big = self._add(engine, "big")
+        engine.schedule()
+        request = Request("next", list(range(60)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
     def _sched(self, num_gpu_blocks=64):
         sched = make_scheduler(4, 8, {"maru_async_load": True})
         sched._num_gpu_blocks = num_gpu_blocks
@@ -4571,9 +4696,41 @@ class TestDeferredAdmissionFitsCache:
         output.finished_req_ids = {req_id}
         return output
 
-    def test_budget_leaves_out_the_null_block(self, tmp_path):
+    def test_budget_uses_installed_vllm_version(self, tmp_path):
+        import vllm
+        from packaging.version import Version
+
         engine = self._engine(tmp_path)  # 64 blocks, one kept aside by vLLM
-        assert engine.connector._scheduler._num_gpu_blocks == 63
+        expected = 63 if Version(vllm.__version__) < Version("0.23.0") else None
+        assert engine.connector._scheduler._num_gpu_blocks == expected
+
+    @pytest.mark.parametrize(
+        "version,lookahead,expected",
+        [
+            ("0.22.1", 0, 63),
+            ("0.23.0rc1", 0, 63),
+            ("0.23.0.dev1", 0, 63),
+            ("0.23.0", 0, None),
+            ("0.23.0+local", 0, None),
+            ("0.23.0.post1", 0, None),
+            ("0.28.0", 0, None),
+            ("0.23.0", 16, 63),
+            ("0.28.0", 16, 63),
+            ("unknown", 0, 63),
+        ],
+    )
+    def test_budget_version_boundary(self, monkeypatch, version, lookahead, expected):
+        import vllm
+
+        from maru_vllm.connector import _async_load_budget
+
+        monkeypatch.setattr(vllm, "__version__", version)
+        config = SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks=64))
+        assert _async_load_budget(None, config, lookahead) == expected
+        assert (
+            _async_load_budget(SimpleNamespace(num_blocks=64), config, lookahead)
+            == expected
+        )
 
     def test_no_limit_without_block_count(self):
         sched = self._sched(num_gpu_blocks=None)

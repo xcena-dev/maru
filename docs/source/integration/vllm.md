@@ -287,15 +287,24 @@ through a CUDA event. The forward pass no longer waits on the retrieve RPC.
 This is the mechanism vLLM itself calls an asynchronous load: the request
 waits in `WAITING_FOR_REMOTE_KVS`.
 
-A parked request holds GPU blocks for its loaded prefix and runs once its
-whole prompt fits, so Maru parks a request only while the whole prompts of
-all parked requests fit in the GPU KV cache (the first request in line is
-always parked). A request that does not fit
-stays in `WAITING`, keeps its place ahead of later requests, and is parked
-once earlier loads finish. It keeps that place until vLLM gives it blocks, so
-a request that fits the budget while running requests still hold the blocks it
-needs is not passed over either. This budget counts GPU blocks;
-`maru_load_admission_window` below counts loads in flight.
+A parked request initially holds blocks for its loaded prefix. It needs room
+for the rest of its prompt and any speculative lookahead before it can run.
+On vLLM < 0.23, Maru budgets this full requirement for parked requests and
+earlier waiters, capped at the model's maximum length. A request that does not
+fit stays in `WAITING` and keeps its place until vLLM gives it blocks. The
+first request in line is admitted on its own; vLLM sizes the cache to fit one
+maximum-length request.
+
+On vLLM 0.23+ without speculative lookahead, Maru uses vLLM's reservation for
+in-flight prefills without adding its own block budget. This allows loads to
+overlap when their initial allocations fit, even if their complete prompts
+would not all fit at once. With speculative lookahead (for example, draft-model
+or EAGLE decoding), Maru retains its budget: the upstream reservation counts
+prompt tails but can leave too little room for the oldest request's lookahead.
+Methods without lookahead slots, such as ngram, use the ordinary version rule.
+
+This budget counts GPU blocks; `maru_load_admission_window` below counts loads
+in flight.
 
 `maru_async_store` lets the store finish after the forward pass returns, so
 the first token of the current step is not delayed by the GPU→CXL copy and

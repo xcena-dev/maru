@@ -443,16 +443,47 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     return {**extra, "maru_cache_namespace": digest}
 
 
-def _usable_gpu_blocks(
-    kv_cache_config: KVCacheConfig | None, vllm_config: VllmConfig
+def _vllm_version_at_least(minimum: str) -> bool:
+    import vllm
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(getattr(vllm, "__version__", "unknown")) >= Version(minimum)
+    except InvalidVersion:
+        return False
+
+
+def _scheduler_lookahead_tokens(vllm_config: VllmConfig) -> int:
+    """Read vLLM's slot margin, with the pre-property scheduler rules as fallback."""
+    lookahead = getattr(vllm_config, "num_lookahead_tokens", None)
+    if lookahead is not None:
+        return int(lookahead)
+    spec = vllm_config.speculative_config
+    if spec is None or not (spec.use_eagle() or spec.uses_draft_model()):
+        return 0
+    # vLLM 0.23 added DFlash's extra anchor slot to the scheduler margin.
+    anchor = spec.method == "dflash" and _vllm_version_at_least("0.23.0")
+    return int(spec.num_speculative_tokens) + int(anchor)
+
+
+def _async_load_budget(
+    kv_cache_config: KVCacheConfig | None,
+    vllm_config: VllmConfig,
+    num_lookahead_tokens: int,
 ) -> int | None:
-    """GPU KV blocks requests can hold: vLLM keeps one block aside as its null block."""
+    """Reserve resume space where upstream admission does not cover it.
+
+    vLLM 0.23+ reserves in-flight prompt tails, but not speculative lookahead.
+    Without lookahead, let its allocation-aware reservation admit loads.
+    """
+    if not num_lookahead_tokens and _vllm_version_at_least("0.23.0"):
+        return None
     total = (
         kv_cache_config.num_blocks
         if kv_cache_config is not None
         else vllm_config.cache_config.num_gpu_blocks
     )
-    return total - 1 if total else None
+    return total - 1 if total else None  # vLLM sets one null block aside.
 
 
 def _cpu_bypass_request(request: Any) -> bool:
@@ -579,14 +610,9 @@ def _validate_deferred_loading(enabled: bool) -> None:
     if not enabled:
         return
     import vllm
-    from packaging.version import InvalidVersion, Version
 
     version = getattr(vllm, "__version__", "unknown")
-    try:
-        supported = Version(version) >= Version("0.16.0")
-    except InvalidVersion:
-        supported = False
-    if not supported:
+    if not _vllm_version_at_least("0.16.0"):
         raise ValueError(
             f"maru_async_load requires vLLM >= 0.16.0 (found {version}); "
             "upgrade vLLM or disable maru_async_load / "
@@ -651,10 +677,11 @@ class MaruKVConnector(KVConnectorBase_V1):
             nor the copy ever blocks the engine's forward passes — the
             in-process analog of the MP server's separate-process retrieve.
             This is what vLLM itself calls an async load
-            (get_num_new_matched_tokens returns async_load=True). A request
-            parks only while the whole prompts of all parked requests fit in
-            the GPU KV cache (the first in line always parks); otherwise it
-            waits in WAITING for its turn.
+            (get_num_new_matched_tokens returns async_load=True). On vLLM
+            < 0.23, or with speculative lookahead, Maru budgets the parked
+            requests' prompts plus resume lookahead; excess loads wait their
+            turn. On vLLM 0.23+ without lookahead, admission uses vLLM's own
+            reservation without an additional Maru block budget.
             (default: false; was maru_enable_deferred_loading)
         maru_async_store: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
@@ -755,11 +782,16 @@ class MaruKVConnector(KVConnectorBase_V1):
         self._scheduler: MaruSchedulerConnector | None
         self._worker: MaruWorkerConnector | None
         if role == KVConnectorRole.SCHEDULER:
+            lookahead = _scheduler_lookahead_tokens(vllm_config)
             self._scheduler = MaruSchedulerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
                 extra_config=extra,
-                num_gpu_blocks=_usable_gpu_blocks(kv_cache_config, vllm_config),
+                num_gpu_blocks=_async_load_budget(
+                    kv_cache_config, vllm_config, lookahead
+                ),
+                num_lookahead_tokens=lookahead,
+                max_model_len=vllm_config.model_config.max_model_len,
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -926,12 +958,16 @@ class MaruSchedulerConnector:
         kv_chunk_tokens: int,
         extra_config: dict[str, Any],
         num_gpu_blocks: int | None = None,
+        num_lookahead_tokens: int = 0,
+        max_model_len: int | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._cpu_mode = _validate_storage_config(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
+        self._num_lookahead_tokens = num_lookahead_tokens
+        self._max_model_len = max_model_len
         self._cpu_bypass_requests: set[str] = set()
 
         # Lazy-init MaruHandler for exists checks
@@ -977,7 +1013,7 @@ class MaruSchedulerConnector:
         # views for per-layer transfer.
         self._deferred_layerwise_waiting: set[str] = set()
         self._deferred_layerwise_ready: set[str] = set()
-        # GPU blocks each parked request needs for its whole prompt, from
+        # GPU blocks each parked request needs for its prompt and lookahead, from
         # parking until it resumes. A parked request holds blocks for its
         # loaded prefix only and resumes only once the rest fits too, so the
         # parked requests together must never need more than the cache holds:
@@ -1145,7 +1181,7 @@ class MaruSchedulerConnector:
     def _admit_parked(self, request: Request) -> bool:
         """Whether ``request`` may park while its load runs.
 
-        It may when the blocks its whole prompt needs, added to what the
+        It may when the blocks its prompt and lookahead need, added to what the
         parked requests and the older waiters need, fit in the cache. A
         request that is first in line is always admitted: vLLM sizes the
         cache to hold one request of the maximum length.
@@ -1153,7 +1189,7 @@ class MaruSchedulerConnector:
         if not self._num_gpu_blocks:
             return True
         req_id = request.request_id
-        need = self._prompt_blocks(request)
+        need = self._resume_blocks(request)
         ahead = sum(n for r, n in self._parked_blocks.items() if r != req_id)
         for waiter, blocks in self._admission_waiters.items():
             if waiter == req_id:
@@ -1173,12 +1209,15 @@ class MaruSchedulerConnector:
             )
         return False
 
-    def _prompt_blocks(self, request: Request) -> int:
-        """GPU blocks that hold every token of ``request`` so far."""
+    def _resume_blocks(self, request: Request) -> int:
+        """Prompt plus resume lookahead, capped as in vLLM's slot allocation."""
         tokens = getattr(request, "num_tokens", None)
         if tokens is None:
             tokens = len(request.prompt_token_ids or ())
-        return -(-int(tokens) // self._block_size)
+        tokens = int(tokens) + self._num_lookahead_tokens
+        if self._max_model_len is not None:
+            tokens = min(tokens, self._max_model_len)
+        return -(-tokens // self._block_size)
 
     def _match(
         self,
@@ -1264,7 +1303,8 @@ class MaruSchedulerConnector:
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
-            self._parked_blocks[request.request_id] = self._prompt_blocks(request)
+            if self._num_gpu_blocks is not None:
+                self._parked_blocks[request.request_id] = self._resume_blocks(request)
             self._pending_deferred_loads[request.request_id] = (
                 request,
                 num_chunks,
