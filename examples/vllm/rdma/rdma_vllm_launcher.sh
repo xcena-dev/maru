@@ -56,6 +56,16 @@ if [[ -n "${MARU_LOG_TIMING:-}" ]]; then
     TIMING_ENTRY="\"maru_log_timing\": true,"
 fi
 
+# MARU_ASYNC=1 loads cache hits between steps (maru_async_load) and stores
+# after the forward (maru_async_store); stores then leave half of the staging
+# buffer to loads.
+ASYNC_ENTRY=""
+ASYNC_MODE="off"
+if [[ -n "${MARU_ASYNC:-}" ]]; then
+    ASYNC_ENTRY="\"maru_async_load\": true, \"maru_async_store\": true,"
+    ASYNC_MODE="load and store"
+fi
+
 NUMA=()
 if [[ -n "$MARU_NUMA_NODE" ]]; then
     NUMA=(numactl --cpunodebind="$MARU_NUMA_NODE" --membind="$MARU_NUMA_NODE")
@@ -71,11 +81,12 @@ echo "  UCX device:   ${MARU_WORKER_UCX_DEVICE:-(UCX default)}"
 echo "  Region size:  $MARU_POOL_SIZE"
 echo "  Namespace:    $MARU_CACHE_NAMESPACE"
 echo "  Chunk Tokens: $MARU_KV_CHUNK_TOKENS"
+echo "  Async:        $ASYNC_MODE"
 echo "========================="
 
-# The rdma backend uses the storage session contract of the cpu backend:
-# synchronous chunkwise loads and stores, --enforce-eager,
-# --no-async-scheduling and kv_load_failure_policy "recompute".
+# The rdma backend stores chunkwise and needs --enforce-eager and
+# kv_load_failure_policy "recompute". Synchronous loads also need
+# --no-async-scheduling; the example keeps it off in both modes.
 CUDA_VISIBLE_DEVICES=$DEVICE exec "${NUMA[@]}" vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \
@@ -93,6 +104,7 @@ CUDA_VISIBLE_DEVICES=$DEVICE exec "${NUMA[@]}" vllm serve "$MODEL" \
             \"maru_storage_backend\": \"rdma\",
             ${UCX_ENTRY}
             ${TIMING_ENTRY}
+            ${ASYNC_ENTRY}
             \"maru_pool_size\": \"${MARU_POOL_SIZE}\",
             \"maru_engine_id\": \"${ENGINE_ID}\",
             \"maru_cache_namespace\": \"${MARU_CACHE_NAMESPACE}\",

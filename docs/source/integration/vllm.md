@@ -244,10 +244,13 @@ keys under a server lease; before a worker gives a region back, its region
 mapper deregisters it, so a late RDMA WRITE fails at the NIC instead of landing
 in the next owner's KV.
 
-The backend follows the storage session contract of the CPU mode:
-`--enforce-eager`, `--no-async-scheduling`, `kv_load_failure_policy="recompute"`,
-synchronous chunkwise transfers and one worker per engine. Asynchronous loads
-and stores are not supported yet. NIXL is required (`pip install 'maru[rdma]'`).
+The backend stores KV chunkwise and needs `--enforce-eager`,
+`kv_load_failure_policy="recompute"` and one worker per engine. Loads and
+stores run on the engine thread unless `maru_async_load` and
+`maru_async_store` move them off it; synchronous loads also need
+`--no-async-scheduling`. The worker's staging buffer is registered with CUDA,
+so the copy kernel moves KV between the GPU and the staging buffer as it does
+for mapped CXL memory. NIXL is required (`pip install 'maru[rdma]'`).
 See the [RDMA example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/rdma/README.md)
 for one-host and multi-node launch steps.
 

@@ -27,12 +27,15 @@ region back, its region mapper deregisters the region from the NIC, so a WRITE
 still in flight from the old owner fails at the NIC instead of landing in the
 next owner's KV.
 
-The backend uses the storage session contract of the cpu backend:
-synchronous chunkwise loads and stores, `TP=PP=DP=1`, `--enforce-eager`,
-`--no-async-scheduling`, unquantized KV and
-`kv_load_failure_policy="recompute"`. Asynchronous loads and stores
-(`maru_async_load`, `maru_async_store`) are not supported yet, and the
-connector copies between the GPU and the staging buffer one layer at a time.
+The backend stores KV chunkwise and needs `TP=PP=DP=1`, `--enforce-eager`,
+unquantized KV and `kv_load_failure_policy="recompute"`. Loads and stores
+run on the engine thread by default; `maru_async_load` loads cache hits
+between steps and `maru_async_store` stores after the forward
+(`MARU_ASYNC=1` on the launcher sets both). Synchronous loads need
+`--no-async-scheduling`, which the launcher always passes. The KV moves
+between the GPU and the worker's staging buffer, host memory registered with
+the NIC and with CUDA; with `maru_kv_ops` built, one copy kernel per chunk
+moves it, as for the cxl backend.
 
 ## Requirements
 
@@ -208,6 +211,7 @@ All example settings are in `env.sh`. Override them with environment variables:
 | `MARU_INST1_GPU` / `MARU_INST2_GPU` | `0` / `1` | GPU of each engine |
 | `MARU_NUMA_NODE` | none | NUMA node to bind each engine to |
 | `MARU_LOG_TIMING` | off | Log the connector's load and store timings |
+| `MARU_ASYNC` | off | Load cache hits between steps and store after the forward |
 | `GPU_MEM_UTIL` | `0.1` | vLLM GPU memory utilization |
 
 ## Troubleshooting
