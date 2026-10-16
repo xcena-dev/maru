@@ -35,6 +35,31 @@ def test_the_service_starts_and_stops_with_the_resource_manager():
     assert "RuntimeDirectory=maru" in unit
 
 
+def test_a_standalone_service_starts_at_boot_without_a_resource_manager():
+    # A memory node of a shared pool that runs no resource manager.
+    unit = installer.render_unit("/opt/venv/bin/python", standalone=True)
+    assert "WantedBy=multi-user.target" in unit
+    assert "maru-resource-manager.service" not in unit
+    assert "After=network-online.target\n" in unit
+    assert "ExecStart=/opt/venv/bin/python -m maru_region_mapper.cli" in unit
+    assert "LimitMEMLOCK=infinity" in unit
+
+
+def test_install_standalone_writes_the_standalone_unit(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer, "nixl_available", lambda: True)
+    systemd = tmp_path / "systemd"
+    systemd.mkdir()
+    assert installer.install(
+        python="/opt/venv/bin/python",
+        systemd_dir=systemd,
+        env_file=tmp_path / "region-mapper.env",
+        systemctl=lambda *a: None,
+        standalone=True,
+    )
+    unit = (systemd / installer.SERVICE_NAME).read_text()
+    assert unit == installer.render_unit("/opt/venv/bin/python", standalone=True)
+
+
 def test_install_writes_the_unit_and_settings_and_enables_it(tmp_path, monkeypatch):
     ok, unit, env, calls = _install(tmp_path, monkeypatch)
     assert ok
@@ -101,12 +126,21 @@ def test_install_needs_root(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "argv,called", [([], "install"), (["--uninstall"], "uninstall")]
+    "argv,called",
+    [
+        ([], ("install", False)),
+        (["--standalone"], ("install", True)),
+        (["--uninstall"], ("uninstall",)),
+    ],
 )
 def test_main_installs_or_removes(monkeypatch, argv, called):
     calls = []
     monkeypatch.setattr(installer.os, "getuid", lambda: 0)
-    monkeypatch.setattr(installer, "install", lambda: calls.append("install") or True)
-    monkeypatch.setattr(installer, "uninstall", lambda: calls.append("uninstall"))
+    monkeypatch.setattr(
+        installer,
+        "install",
+        lambda standalone=False: calls.append(("install", standalone)) or True,
+    )
+    monkeypatch.setattr(installer, "uninstall", lambda: calls.append(("uninstall",)))
     assert installer.main(argv) == 0
     assert calls == [called]

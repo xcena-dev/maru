@@ -249,8 +249,8 @@ With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
 which starts and stops with the resource manager; its settings (bind address,
 port 9860, NIC) are in `/etc/maru/region-mapper.env`.
 A memory node of a shared pool that runs no resource manager installs the
-service alone (`install-maru-region-mapper`) and sets `MARU_RM_ADDRESS` to the
-node that does; the resource manager then listens on a network address, as in
+service alone (`install-maru-region-mapper --standalone`, which starts it at
+boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
 the {ref}`multi-node configuration <installation-multi-node-config>`.
 maru-server takes the pool's region mappers with `--region-mapper host:port`
 (one per memory node) and hands them to the workers. Engines read each other's

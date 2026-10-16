@@ -120,13 +120,12 @@ network, the resource manager listens on a network address, as in Maru's
 [multi-node configuration](../../../docs/source/getting_started/installation.md#configuration).
 
 A memory node of a shared pool that does not run the resource manager installs
-the region mapper service alone and points it at the node that does. There the
-service starts by hand, since the resource manager that starts it runs on
-another node:
+the region mapper service alone (`--standalone`: it starts at boot on its own)
+and points it at the node that does:
 
 ```bash
 ./install.sh --no-rm                          # Maru with NIXL, no resource manager
-sudo "$(which install-maru-region-mapper)"
+sudo "$(which install-maru-region-mapper)" --standalone
 sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
 sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
   /etc/maru/region-mapper.env

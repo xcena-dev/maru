@@ -7,7 +7,9 @@ memory node, shared by every app. ``install-maru-resource-manager`` calls
 :func:`install` after it installs the resource manager, so a memory node runs
 both with ``systemctl start maru-resource-manager``. The service is wanted by
 the resource manager's unit and stops and restarts with it; the resource
-manager's own unit is left unchanged.
+manager's own unit is left unchanged. A memory node of a shared pool that runs
+no resource manager installs it standalone (``--standalone``), so it starts at
+boot on its own.
 
 Settings come from an environment file (:data:`ENV_FILE`) that is written
 once and kept across reinstalls.
@@ -45,23 +47,38 @@ MARU_REGION_MAPPER_UCX_DEVICE=
 """
 
 
-def render_unit(python: str) -> str:
+def render_unit(python: str, standalone: bool = False) -> str:
     """The systemd unit of the region mapper.
 
     Args:
         python: Interpreter that has Maru and NIXL installed.
+        standalone: For a memory node that runs no resource manager: start at
+            boot on its own instead of with the resource manager.
 
     Returns:
         The unit file text.
     """
+    if standalone:
+        order = "After=network-online.target\nWants=network-online.target\n"
+        install = (
+            "# Started at boot: this node runs no resource manager.\n"
+            "WantedBy=multi-user.target"
+        )
+    else:
+        order = (
+            f"After=network-online.target {RM_SERVICE_NAME}\n"
+            "Wants=network-online.target\n"
+            "# Stops and restarts with the resource manager.\n"
+            f"PartOf={RM_SERVICE_NAME}\n"
+        )
+        install = (
+            "# Started whenever the resource manager starts.\n"
+            f"WantedBy={RM_SERVICE_NAME}"
+        )
     return f"""\
 [Unit]
 Description=Maru region mapper - maps CXL regions and registers them with the NIC for remote workers
-After=network-online.target {RM_SERVICE_NAME}
-Wants=network-online.target
-# Stops and restarts with the resource manager.
-PartOf={RM_SERVICE_NAME}
-
+{order}
 [Service]
 Type=simple
 EnvironmentFile=-{ENV_FILE}
@@ -80,8 +97,7 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 
 [Install]
-# Started whenever the resource manager starts.
-WantedBy={RM_SERVICE_NAME}
+{install}
 """
 
 
@@ -99,6 +115,7 @@ def install(
     systemd_dir: Path = SYSTEMD_DIR,
     env_file: Path = ENV_FILE,
     systemctl=_systemctl,
+    standalone: bool = False,
 ) -> bool:
     """Install the unit and, if missing, the environment file; enable it.
 
@@ -107,6 +124,8 @@ def install(
         systemd_dir: Directory of system units.
         env_file: Environment file of the service; an existing one is kept.
         systemctl: Runs a systemctl command.
+        standalone: Start at boot on its own (a node without a resource
+            manager) instead of with the resource manager.
 
     Returns:
         True if installed; False if NIXL is not installed or there is no
@@ -123,7 +142,7 @@ def install(
         print("Skipping the region mapper service: no systemd.", file=sys.stderr)
         return False
     unit = systemd_dir / SERVICE_NAME
-    unit.write_text(render_unit(python))
+    unit.write_text(render_unit(python, standalone))
     print(f"  Installed systemd service: {unit}", file=sys.stderr)
     if not env_file.exists():
         env_file.parent.mkdir(parents=True, exist_ok=True)
@@ -133,11 +152,18 @@ def install(
         print(f"  Kept settings: {env_file}", file=sys.stderr)
     systemctl("daemon-reload")
     systemctl("enable", SERVICE_NAME)
-    print(
-        "  The region mapper starts with the resource manager:\n"
-        "    sudo systemctl start maru-resource-manager",
-        file=sys.stderr,
-    )
+    if standalone:
+        print(
+            f"  Set MARU_RM_ADDRESS in {env_file} to the pool's resource "
+            "manager, then:\n    sudo systemctl start maru-region-mapper",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "  The region mapper starts with the resource manager:\n"
+            "    sudo systemctl start maru-resource-manager",
+            file=sys.stderr,
+        )
     return True
 
 
@@ -167,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         epilog="Requires root. In a venv: sudo $(which install-maru-region-mapper)",
     )
     parser.add_argument("--uninstall", action="store_true", help="remove the service")
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="for a memory node that runs no resource manager: start the "
+        "service at boot on its own",
+    )
     args = parser.parse_args(argv)
     if os.getuid() != 0:
         print(
@@ -178,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.uninstall:
         uninstall()
         return 0
-    return 0 if install() else 1
+    return 0 if install(standalone=args.standalone) else 1
 
 
 if __name__ == "__main__":
