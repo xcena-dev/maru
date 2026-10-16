@@ -238,6 +238,9 @@ maru-server and maru-server gives them to the worker, one region when its
 storage session opens and one more each time its regions are full. Each memory
 node runs a region mapper (`maru-region-mapper`), a service shared by every app:
 it maps the regions Handlers ask for and registers them with the node's NIC.
+With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
+which starts and stops with the resource manager; its settings (bind address,
+port 9860, NIC) are in `/etc/maru/region-mapper.env`.
 maru-server takes the pool's region mappers with `--region-mapper host:port`
 (one per memory node) and hands them to the workers. Engines read each other's
 keys under a server lease; before a worker gives a region back, its region

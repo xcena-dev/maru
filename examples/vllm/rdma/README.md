@@ -43,7 +43,10 @@ moves it, as for the cxl backend.
   with its UCX backend: `pip install 'maru[rdma]'`.
 - On the memory nodes: the CXL/DAX device of the pool, visible on every memory
   node of the pool, and the resource manager on one of them, as for a local CXL
-  deployment (`./install.sh` installs it). Use a devdax device.
+  deployment. Use a devdax device. Install Maru with NIXL
+  (`pip install 'maru[rdma]'`, then `./install.sh`): the installer also sets up
+  the region mapper as a system service that starts and stops with the
+  resource manager, so a memory node runs it without a separate step.
 - Every worker must reach maru-server and each memory node's region mapper and
   NIC.
 - The region mapper runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
@@ -53,8 +56,9 @@ moves it, as for the cxl backend.
 
 ## Quick start (one host)
 
-`rdma_example.sh` runs the memory node's region mapper, maru-server and two
-workers on one host. The workers still go through the region mapper's NIC
+`rdma_example.sh` runs maru-server and two workers on one host, and uses the
+region mapper service when it runs there (otherwise it starts a region mapper
+itself). The workers still go through the region mapper's NIC
 registration and one-sided RDMA, so the example needs 2 GPUs, an RDMA NIC and
 a CXL/DAX device on that host.
 
@@ -65,7 +69,7 @@ MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./rdma_example.sh [model]
 ```
 
 This will:
-1. Start the region mapper (`region_mapper.sh`)
+1. Use the region mapper service, or start a region mapper (`region_mapper.sh`)
 2. Start maru-server with that region mapper (`maru_server.sh`)
 3. Launch two vLLM engines with `storage_backend: "rdma"` (`rdma_vllm_launcher.sh`)
 4. Send a new prompt to instance 1, which computes it and stores its KV in the
@@ -91,24 +95,29 @@ workers on another node. Replace the addresses, NICs and DAX device.
 
 ### 1. Memory nodes
 
-On every memory node of the pool, start its region mapper on the address the
-workers reach over the RDMA network:
+Each memory node of the pool runs a region mapper, a platform service like the
+resource manager: one per memory node, shared by every app that uses the pool.
+With Maru installed with NIXL, `./install.sh` installs it as
+`maru-region-mapper.service`, which starts and stops with the resource
+manager. Set the node's RDMA NIC in `/etc/maru/region-mapper.env`; the defaults
+listen on all addresses at port 9860 and use the resource manager on the same
+node:
+
+```bash
+sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
+  /etc/maru/region-mapper.env
+sudo systemctl start maru-resource-manager    # also starts the region mapper
+systemctl status maru-region-mapper
+```
+
+On a memory node that does not run the resource manager of the pool, set
+`MARU_RM_ADDRESS` in that file to the node that does. On a host without the
+service (a test host, or Maru installed without NIXL), `./region_mapper.sh`
+runs a region mapper in the foreground instead:
 
 ```bash
 MARU_MEMORY_NODE_HOST=10.0.0.2 MARU_MAPPER_UCX_DEVICE=mlx5_1:1 ./region_mapper.sh
 ```
-
-which runs
-
-```bash
-maru-region-mapper --rm-address 127.0.0.1:9850 --host 10.0.0.2 \
-  --port $MARU_MAPPER_PORT --ucx-device mlx5_1:1 --lock-file /tmp/maru-region-mapper.lock
-```
-
-The region mapper is a platform service: one per memory node, shared by every
-app that uses the pool. The lock file keeps it to one per node. On a memory
-node that does not run the resource manager, set `MARU_RM_ADDRESS` to the node
-that does.
 
 ### 2. Metadata node
 
@@ -117,14 +126,14 @@ an address the workers reach:
 
 ```bash
 MARU_SERVER_BIND_HOST=10.0.0.2 MARU_DAX_PATH=/dev/dax1.0 \
-MARU_REGION_MAPPERS=10.0.0.2:$MARU_MAPPER_PORT ./maru_server.sh
+MARU_REGION_MAPPERS=10.0.0.2:9860 ./maru_server.sh
 ```
 
 which runs
 
 ```bash
 maru-server --host 10.0.0.2 --port $MARU_SERVER_PORT --rm-address 127.0.0.1:9850 \
-  --region-mapper 10.0.0.2:$MARU_MAPPER_PORT --dax-path /dev/dax1.0
+  --region-mapper 10.0.0.2:9860 --dax-path /dev/dax1.0
 ```
 
 maru-server allocates each worker's regions from the resource manager, as for
@@ -195,14 +204,14 @@ All example settings are in `env.sh`. Override them with environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `MARU_RM_ADDRESS` | `127.0.0.1:9850` | Resource manager of the pool |
-| `MARU_MEMORY_NODE_HOST` | `127.0.0.1` | Memory node's address on the RDMA network; its region mapper listens there |
-| `MARU_MAPPER_PORT` | `10500 + uid` | Region mapper port |
-| `MARU_MAPPER_UCX_DEVICE` | UCX default | RDMA NIC the region mapper registers regions with, e.g. `mlx5_1:1` |
-| `MARU_MAPPER_LOCK_FILE` | `/tmp/maru-region-mapper.lock` | Keeps one region mapper per node |
+| `MARU_MEMORY_NODE_HOST` | `127.0.0.1` | `region_mapper.sh`: memory node's address on the RDMA network; the region mapper listens there |
+| `MARU_MAPPER_PORT` | `10500 + uid` | `region_mapper.sh`: region mapper port |
+| `MARU_MAPPER_UCX_DEVICE` | UCX default | `region_mapper.sh`: RDMA NIC the region mapper registers regions with, e.g. `mlx5_1:1` |
+| `MARU_MAPPER_LOCK_FILE` | `/tmp/maru-region-mapper.lock` | `region_mapper.sh`: keeps one region mapper per node |
 | `MARU_SERVER_BIND_HOST` | `127.0.0.1` | Interface maru-server listens on |
 | `MARU_SERVER_PORT` | `10000 + uid` | maru-server port |
 | `MARU_DAX_PATH` | any pool | DAX device of the pool |
-| `MARU_REGION_MAPPERS` | this node's region mapper | Region mappers of the pool, `host:port`, comma separated |
+| `MARU_REGION_MAPPERS` | this node's region mapper (the service's, if it runs) | Region mappers of the pool, `host:port`, comma separated |
 | `MARU_SERVER_URL` | `tcp://$MARU_SERVER_HOST:$MARU_SERVER_PORT` | maru-server as workers see it; set it on worker nodes |
 | `MARU_POOL_SIZE` | `4G` | Region size; a worker gets one more region each time its regions are full |
 | `MARU_WORKER_UCX_DEVICE` | UCX default | RDMA NIC on each worker, e.g. `mlx5_0:1` |
@@ -221,8 +230,9 @@ All example settings are in `env.sh`. Override them with environment variables:
   `UCX_RCACHE_ENABLE=n`. Only for a test on a host without an RDMA NIC,
   `--allow-unchecked-transport` lets it run on other transports; a late RDMA
   WRITE can then land in a region after its owner gave it back.
-- **`cannot take the node lock`**: another region mapper runs on this node.
-  One region mapper serves every app on the node.
+- **`cannot take the node lock`**: another region mapper runs on this node,
+  usually the service. One region mapper serves every app on the node; give
+  maru-server its address instead of starting another one.
 - **Engines start but never hit**: check that both engines use the same
   `maru_cache_namespace` and `maru_server_url`, and that the prompt is longer
   than one chunk.

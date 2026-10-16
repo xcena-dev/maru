@@ -84,11 +84,31 @@ wait_for_log() {  # <log> <pattern> <pid> <name>
     done
 }
 
+# A memory node where Maru was installed with NIXL runs the region mapper as a
+# system service that starts with the resource manager. Use it then: one
+# region mapper serves the node.
+MAPPER_SERVICE=""
+if systemctl is-active --quiet maru-region-mapper 2>/dev/null; then
+    setting() {
+        (grep -E "^$1=" /etc/maru/region-mapper.env 2>/dev/null || true) |
+            tail -1 | cut -d= -f2-
+    }
+    host=$(setting MARU_REGION_MAPPER_HOST)
+    [[ -z "$host" || "$host" == "0.0.0.0" ]] && host=127.0.0.1
+    port=$(setting MARU_REGION_MAPPER_PORT)
+    MAPPER_SERVICE="$host:${port:-9860}"
+    export MARU_REGION_MAPPERS=$MAPPER_SERVICE
+fi
+
 echo "================================================"
 echo "  Maru-vLLM RDMA KV Example (one host)"
 echo "================================================"
 echo "  Model:          $MODEL"
-echo "  Region mapper:  $MARU_MEMORY_NODE_HOST:$MARU_MAPPER_PORT"
+if [[ -n "$MAPPER_SERVICE" ]]; then
+    echo "  Region mapper:  $MAPPER_SERVICE (system service)"
+else
+    echo "  Region mapper:  $MARU_MEMORY_NODE_HOST:$MARU_MAPPER_PORT"
+fi
 echo "  maru-server:    $MARU_SERVER_URL (DAX ${MARU_DAX_PATH:-any})"
 echo "  Instance 1:     port $MARU_INST1_PORT (GPU $MARU_INST1_GPU)"
 echo "  Instance 2:     port $MARU_INST2_PORT (GPU $MARU_INST2_GPU)"
@@ -98,11 +118,15 @@ echo "================================================"
 echo ""
 
 # Step 1: the memory node's region mapper
-echo "[Step 1] Starting the region mapper on port $MARU_MAPPER_PORT..."
-: > "$LOG_DIR/region_mapper.log"   # the readiness wait must not see an old run
-bash "$SCRIPT_DIR/region_mapper.sh" > "$LOG_DIR/region_mapper.log" 2>&1 &
-MAPPER_PID=$!
-wait_for_log "$LOG_DIR/region_mapper.log" "region mapper for node" "$MAPPER_PID" "region mapper"
+if [[ -n "$MAPPER_SERVICE" ]]; then
+    echo "[Step 1] Using the region mapper service at $MAPPER_SERVICE"
+else
+    echo "[Step 1] Starting the region mapper on port $MARU_MAPPER_PORT..."
+    : > "$LOG_DIR/region_mapper.log"   # the readiness wait must not see an old run
+    bash "$SCRIPT_DIR/region_mapper.sh" > "$LOG_DIR/region_mapper.log" 2>&1 &
+    MAPPER_PID=$!
+    wait_for_log "$LOG_DIR/region_mapper.log" "region mapper for node" "$MAPPER_PID" "region mapper"
+fi
 
 # Step 2: maru-server, which hands the region mapper's address to the workers
 echo "[Step 2] Starting maru-server on port $MARU_SERVER_PORT..."
