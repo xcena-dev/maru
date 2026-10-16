@@ -4498,6 +4498,29 @@ class TestDeferredAdmissionFitsCache:
         sched.build_connector_meta(self._finished("mid"))
         assert sched.get_num_new_matched_tokens(small, 0)[1] is True
 
+    def test_abort_after_match_before_allocation_clears_lookup(self, tmp_path):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = self._engine(tmp_path)
+        chunks = dict(self.PROMPTS.values())
+        sched = engine.connector._scheduler
+        sched._count_matched_chunks = lambda ids: chunks.get(len(ids), 0)
+        engine.add_request(
+            Request("running", list(range(64)), SamplingParams(max_tokens=1), None)
+        )
+        engine.schedule()  # 16 of the 63 usable blocks are occupied.
+        big = self._add(engine, "big")
+        engine.schedule()  # lookup succeeds, but its 50 blocks do not fit.
+        assert big.status == RequestStatus.WAITING
+        assert "big" in sched._last_match_result
+
+        engine.finish_requests(["big"], RequestStatus.FINISHED_ABORTED)
+        engine.schedule()
+        assert "big" not in sched._last_match_result
+        assert "big" not in sched._admission_waiters
+        assert "big" not in sched._parked_blocks
+
     def test_failed_load_asked_again_drops_its_old_room(self):
         # A failed load that invalidates the first block sends the request
         # back to WAITING with its blocks freed, and vLLM asks again. Its old

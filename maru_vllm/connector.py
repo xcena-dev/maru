@@ -1454,6 +1454,7 @@ class MaruSchedulerConnector:
             self._deferred_layerwise_ready.discard(rid)
             self._parked_blocks.pop(rid, None)
             self._admission_waiters.pop(rid, None)
+            self._last_match_result.pop(rid, None)
 
         self._requests_need_load.clear()
         self._load_ranges.clear()
