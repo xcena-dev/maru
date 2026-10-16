@@ -32,7 +32,8 @@ unquantized KV and `kv_load_failure_policy="recompute"`. Loads and stores
 run on the engine thread by default; `maru_async_load` loads cache hits
 between steps and `maru_async_store` stores after the forward
 (`MARU_ASYNC=1` on the launcher sets both). Synchronous loads need
-`--no-async-scheduling`, which the launcher always passes. The KV moves
+`--no-async-scheduling`, which the launcher passes unless `MARU_ASYNC=1`;
+asynchronous loads run with vLLM's asynchronous scheduling on. The KV moves
 between the GPU and the worker's staging buffer, host memory registered with
 the NIC and with CUDA; with `maru_kv_ops` built, one copy kernel per chunk
 moves it, as for the cxl backend.

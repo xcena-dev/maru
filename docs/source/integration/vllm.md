@@ -262,7 +262,8 @@ The backend stores KV chunkwise and needs `--enforce-eager`,
 `kv_load_failure_policy="recompute"` and one worker per engine. Loads and
 stores run on the engine thread unless `maru_async_load` and
 `maru_async_store` move them off it; synchronous loads also need
-`--no-async-scheduling`. The worker's staging buffer is registered with CUDA,
+`--no-async-scheduling`, while asynchronous loads run with vLLM's asynchronous
+scheduling on. The worker's staging buffer is registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
 for mapped CXL memory. NIXL is required (`pip install 'maru[rdma]'`).
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)

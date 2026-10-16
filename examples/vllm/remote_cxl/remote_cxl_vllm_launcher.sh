@@ -59,11 +59,15 @@ fi
 # MARU_ASYNC=1 loads cache hits between steps (maru_async_load) and stores
 # after the forward (maru_async_store); stores then leave half of the staging
 # buffer to loads.
+# Synchronous loads need vLLM's asynchronous scheduling off; asynchronous
+# loads run with it on, vLLM's default.
 ASYNC_ENTRY=""
 ASYNC_MODE="off"
+SCHEDULING=(--no-async-scheduling)
 if [[ -n "${MARU_ASYNC:-}" ]]; then
     ASYNC_ENTRY="\"maru_async_load\": true, \"maru_async_store\": true,"
     ASYNC_MODE="load and store"
+    SCHEDULING=()
 fi
 
 NUMA=()
@@ -85,8 +89,7 @@ echo "  Async:        $ASYNC_MODE"
 echo "========================="
 
 # The remote_cxl backend stores chunkwise and needs --enforce-eager and
-# kv_load_failure_policy "recompute". Synchronous loads also need
-# --no-async-scheduling; the example keeps it off in both modes.
+# kv_load_failure_policy "recompute".
 #
 # The engine gives its regions back when vLLM shuts it down, which happens
 # when the API server alone gets the signal. Ctrl-C reaches every process of
@@ -97,7 +100,7 @@ echo "========================="
 CUDA_VISIBLE_DEVICES=$DEVICE setsid "${NUMA[@]}" vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \
-    --no-async-scheduling \
+    "${SCHEDULING[@]}" \
     --enable-prompt-tokens-details \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
