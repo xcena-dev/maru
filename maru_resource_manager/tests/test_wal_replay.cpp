@@ -16,6 +16,10 @@ PoolState pool(uint32_t id) {
     PoolState p{};
     p.poolId = id;
     p.totalSize = 16384;
+    p.dataBegin = 0;
+    p.dataEnd = p.totalSize;
+    p.alignBytes = 4096;
+    p.type = DaxType::FS_DAX;
     p.freeSize = p.totalSize;
     p.freeList.push_back({0, p.totalSize});
     return p;
@@ -123,5 +127,22 @@ TEST_F(WalReplayTest, SamePoolReplayAndFreeStillWork) {
     uint64_t freeBytes = 0;
     for (const auto &extent : pools[0].freeList) freeBytes += extent.length;
     EXPECT_EQ(freeBytes, pools[0].totalSize);
+}
+
+TEST_F(WalReplayTest, FailedReplayIsTransactional) {
+    const auto good = allocation(0, 42, 11);
+    auto bad = allocation(0, 99, 12);
+    bad.realOffset = 16384; // Past the end of the pool.
+    ASSERT_EQ(wal->appendAlloc(good), 0);
+    ASSERT_EQ(wal->appendAlloc(bad), 0);
+    std::vector<PoolState> pools{pool(0)};
+    std::map<uint64_t, Allocation> allocations;
+    uint64_t next = 1;
+    EXPECT_EQ(wal->replay(pools, allocations, next), -EUCLEAN);
+    EXPECT_EQ(next, 1u);
+    EXPECT_TRUE(allocations.empty());
+    ASSERT_EQ(pools[0].freeList.size(), 1u);
+    EXPECT_EQ(pools[0].freeList[0].offset, 0u);
+    EXPECT_EQ(pools[0].freeList[0].length, 16384u);
 }
 } // namespace

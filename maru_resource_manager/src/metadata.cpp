@@ -6,8 +6,10 @@
 
 #include <cerrno>
 #include <cstring>
+#include <limits>
 
 #include "util.h"
+#include "pool_validation.h"
 
 namespace maru {
 
@@ -25,6 +27,27 @@ struct MetaHeader {
   uint64_t totalSize;
   uint64_t freeCount;
 };
+
+// Check file size before allocating from on-disk counts. Reject truncation,
+// trailing bytes and multiplication overflow without changing caller state.
+static int readPayload(int fd, size_t headerSize, uint64_t count,
+                       size_t recordSize, uint32_t expectedCrc,
+                       std::vector<uint8_t> &payload) {
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) return -errno;
+  if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) < headerSize)
+    return -EPROTO;
+  const uint64_t bytes = static_cast<uint64_t>(st.st_size) - headerSize;
+  if (bytes % recordSize != 0 || count != bytes / recordSize ||
+      bytes > std::numeric_limits<size_t>::max()) return -EPROTO;
+  payload.resize(static_cast<size_t>(bytes));
+  if (!payload.empty()) {
+    const int rc = readFull(fd, payload.data(), payload.size());
+    if (rc != 0) return rc;
+  }
+  const uint32_t actual = payload.empty() ? 0 : crc32(payload.data(), payload.size());
+  return actual == expectedCrc ? 0 : -EILSEQ;
+}
 
 MetadataStore::MetadataStore(const std::string &stateDir)
     : stateDir_(stateDir) {}
@@ -56,35 +79,26 @@ int MetadataStore::load(uint32_t poolId, PoolState &pool) {
     return -EPROTO;
   }
 
-  pool.poolId = hdr.poolId;
-  pool.totalSize = hdr.totalSize;
-  pool.freeList.clear();
-  pool.freeSize = 0;
-
-  // Read all extents into a contiguous buffer for CRC32 verification
-  size_t payloadSize = hdr.freeCount * sizeof(Extent);
-  std::vector<uint8_t> payload(payloadSize);
-  if (payloadSize > 0) {
-    rc = readFull(fd, payload.data(), payloadSize);
-    if (rc != 0) {
-      ::close(fd);
-      return rc;
-    }
-    uint32_t computed = crc32(payload.data(), payloadSize);
-    if (computed != hdr.crc32) {
-      ::close(fd);
-      return -EILSEQ; // CRC32 mismatch
-    }
-  }
+  std::vector<uint8_t> payload;
+  rc = readPayload(fd, sizeof(hdr), hdr.freeCount, sizeof(Extent), hdr.crc32, payload);
+  ::close(fd);
+  if (rc != 0) return rc;
+  PoolState loaded = pool;
+  loaded.poolId = hdr.poolId;
+  loaded.totalSize = hdr.totalSize;
+  loaded.freeList.clear();
+  loaded.freeSize = 0;
 
   for (uint64_t i = 0; i < hdr.freeCount; ++i) {
     Extent ex{};
     std::memcpy(&ex, payload.data() + i * sizeof(Extent), sizeof(Extent));
-    pool.freeList.push_back(ex);
-    pool.freeSize += ex.length;
+    if (ex.length == 0 || ex.offset > UINT64_MAX - ex.length ||
+        loaded.freeSize > UINT64_MAX - ex.length) return -EUCLEAN;
+    loaded.freeList.push_back(ex);
+    loaded.freeSize += ex.length;
   }
 
-  ::close(fd);
+  pool = std::move(loaded);
   return 0;
 }
 
@@ -128,7 +142,11 @@ int MetadataStore::save(const PoolState &pool) {
     }
   }
 
-  ::fsync(fd);
+  if (::fsync(fd) != 0) {
+    rc = -errno;
+    ::close(fd);
+    return rc;
+  }
   ::close(fd);
 
   if (::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -166,32 +184,23 @@ int MetadataStore::loadGlobal(std::map<uint64_t, Allocation> &allocations,
     return -EPROTO;
   }
 
-  nextRegionId = hdr.nextRegionId;
-  allocations.clear();
-
-  size_t payloadSize = hdr.allocCount * sizeof(Allocation);
-  std::vector<uint8_t> payload(payloadSize);
-  if (payloadSize > 0) {
-    rc = readFull(fd, payload.data(), payloadSize);
-    if (rc != 0) {
-      ::close(fd);
-      return rc;
-    }
-    uint32_t computed = crc32(payload.data(), payloadSize);
-    if (computed != hdr.crc32) {
-      ::close(fd);
-      return -EILSEQ;
-    }
-  }
+  std::vector<uint8_t> payload;
+  rc = readPayload(fd, sizeof(hdr), hdr.allocCount, sizeof(Allocation), hdr.crc32, payload);
+  ::close(fd);
+  if (rc != 0) return rc;
+  if (hdr.nextRegionId == 0) return -EUCLEAN;
+  std::map<uint64_t, Allocation> loaded;
 
   for (uint64_t i = 0; i < hdr.allocCount; ++i) {
     Allocation al{};
     std::memcpy(&al, payload.data() + i * sizeof(Allocation),
                 sizeof(Allocation));
-    allocations.emplace(al.handle.regionId, al);
+    if (!validAllocationRecord(al) || al.handle.regionId >= hdr.nextRegionId ||
+        !loaded.emplace(al.handle.regionId, al).second) return -EUCLEAN;
   }
 
-  ::close(fd);
+  allocations = std::move(loaded);
+  nextRegionId = hdr.nextRegionId;
   return 0;
 }
 
@@ -237,7 +246,11 @@ int MetadataStore::saveGlobal(const std::map<uint64_t, Allocation> &allocations,
     }
   }
 
-  ::fsync(fd);
+  if (::fsync(fd) != 0) {
+    rc = -errno;
+    ::close(fd);
+    return rc;
+  }
   ::close(fd);
 
   if (::rename(tmp.c_str(), path.c_str()) != 0) {

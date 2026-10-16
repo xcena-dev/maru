@@ -1,11 +1,15 @@
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
+#include "admin_server.h"
 #include "log.h"
 #include "pool_manager.h"
 #include "reaper.h"
@@ -25,6 +29,19 @@ int main(int argc, char **argv) {
 
     // Ensure state directory exists
     maru::ensureDirExists(cfg.stateDir);
+
+    // One RM per state directory: a second one would replay, truncate and
+    // checkpoint the WAL, and take over the admin socket, under the first.
+    // The lock is held until the process exits.
+    const std::string lockPath = cfg.stateDir + "/maru-resource-manager.lock";
+    const int lockFd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (lockFd < 0 || ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        maru::logf(maru::LogLevel::Error,
+                   "cannot lock %s: %s (is another maru-resource-manager using this state "
+                   "directory?)",
+                   lockPath.c_str(), std::strerror(errno));
+        return 1;
+    }
 
     // Persist config for reference
     maru::writeConfigFile(cfg);
@@ -48,7 +65,9 @@ int main(int argc, char **argv) {
     maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec);
     int rc = pm.loadPools();
     if (rc != 0) {
-        maru::logf(maru::LogLevel::Error, "loadPools failed (rc=%d)", rc);
+        maru::logf(maru::LogLevel::Error,
+                   "loadPools failed (rc=%d); refusing to serve or checkpoint invalid state", rc);
+        return 1;
     }
     // loadPools returns 0 even when no devices found (scanDevices succeeds
     // with empty list). Report this, but keep rescanning even with live pools:
@@ -56,6 +75,15 @@ int main(int argc, char **argv) {
     if (!pm.hasPools()) {
         maru::logf(maru::LogLevel::Warn,
                     "no CXL/DAX devices found — starting with empty pool");
+    }
+
+    // maru-rm-ctl endpoint. Started while this is the only thread (see start()).
+    maru::AdminServer admin(pm, cfg.stateDir + "/admin.sock");
+    rc = admin.start();
+    if (rc != 0) {
+        maru::logf(maru::LogLevel::Error, "cannot create admin socket %s/admin.sock: %s",
+                   cfg.stateDir.c_str(), std::strerror(-rc));
+        return 1;
     }
 
     maru::TcpServer server(pm, cfg.host, cfg.port, cfg.numWorkers, cfg.maxClients);
@@ -110,7 +138,13 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "shutting down...");
     reaper.stop();
     server.stop();
-    pm.checkpoint();
+    admin.stop();
+    rc = pm.checkpoint();
+    if (rc != 0) {
+        maru::logf(maru::LogLevel::Warn,
+                   "shutdown checkpoint not written (rc=%d); WAL retained", rc);
+        return 1;
+    }
     maru::logf(maru::LogLevel::Info, "shutdown complete");
     return 0;
 }

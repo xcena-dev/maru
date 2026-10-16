@@ -10,6 +10,9 @@ namespace maru {
 
 int writeFull(int fd, const void *buf, size_t len);
 int readFull(int fd, void *buf, size_t len);
+/// fsync a directory so entries created, renamed or removed in it survive a
+/// power loss; syncing a file covers its contents only. Returns 0 or -errno.
+int syncDirectory(const std::string &path);
 
 uint64_t nowSec();
 

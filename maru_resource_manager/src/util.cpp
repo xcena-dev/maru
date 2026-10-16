@@ -53,6 +53,14 @@ int readFull(int fd, void *buf, size_t len) {
   return 0;
 }
 
+int syncDirectory(const std::string &path) {
+  const int dir = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir < 0) return -errno;
+  const int rc = ::fsync(dir) == 0 ? 0 : -errno;
+  ::close(dir);
+  return rc;
+}
+
 uint64_t nowSec() {
   using namespace std::chrono;
   return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
@@ -97,8 +105,12 @@ static bool saveSecretToFile(const std::string &stateDir,
     return false;
   }
   ssize_t written = ::write(fd, g_hmacSecret.data(), g_hmacSecret.size());
+  // Allocations checkpointed after this point need the secret to survive a
+  // power loss, along with its directory entry.
+  const bool synced = ::fsync(fd) == 0;
   ::close(fd);
-  return written == static_cast<ssize_t>(g_hmacSecret.size());
+  return written == static_cast<ssize_t>(g_hmacSecret.size()) && synced &&
+         syncDirectory(stateDir) == 0;
 }
 
 int initSecret(const std::string &stateDir, bool hasExistingAllocations) {

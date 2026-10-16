@@ -100,14 +100,68 @@ jobs:
             coverage.xml
             pytest.xml
 
-  # Keep the required status-check context stable while the matrix expands.
+  resource-manager:
+    name: resource-manager
+    runs-on: [self-hosted, maru_action]
+    timeout-minutes: 15
+    container:
+      image: ubuntu:22.04
+      volumes:
+        - /home/sw-devops/cache/maru/uv:/root/.cache/uv
+        - /home/sw-devops/cache/maru/python:/root/.local/share/uv/python
+    env:
+      NEXUS_URL: http://192.168.97.60:8081
+    steps:
+      - name: Install C++ test dependencies
+        run: |
+          for suite in jammy jammy-updates jammy-security; do
+            echo "deb ${NEXUS_URL}/repository/ubuntu-proxy/ $suite main restricted universe multiverse"
+          done > /etc/apt/sources.list
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates build-essential cmake libssl-dev libgtest-dev
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: Create the test interpreter environment
+        run: |
+          uv venv --python 3.12
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build Resource Manager and isolated test daemon
+        run: |
+          cmake -S maru_resource_manager -B build/resource-manager \
+            -DMARU_BUILD_TESTS=ON -DMARU_BUILD_TOOLS=OFF \
+            -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+          cmake --build build/resource-manager --parallel 4
+
+      - name: Run C++, process recovery and tool tests
+        run: ctest --test-dir build/resource-manager --output-on-failure --parallel 2
+
+      - name: Upload CTest diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-manager-test-logs
+          path: build/resource-manager/Testing/Temporary/
+
+  # Keep the required context stable and include the RM tests in its gate.
   unit-test:
     name: unit-test
     if: ${{ always() }}
-    needs: unit-test-matrix
+    needs: [unit-test-matrix, resource-manager]
     runs-on: [self-hosted, maru_action]
     steps:
-      - name: Require every Python version to pass
+      - name: Require Python matrix and Resource Manager tests to pass
         env:
           MATRIX_RESULT: ${{ needs.unit-test-matrix.result }}
-        run: test "$MATRIX_RESULT" = success
+          RM_RESULT: ${{ needs.resource-manager.result }}
+        run: |
+          test "$MATRIX_RESULT" = success
+          test "$RM_RESULT" = success
