@@ -1,10 +1,10 @@
 # Architecture Overview
 
-Maru manages KV cache data in CXL shared memory, enabling cross-instance sharing across multiple nodes without data transfer.
+Maru stores reusable KV cache data in CXL shared memory, worker DRAM, or a remote CXL pool. With the default `cxl` backend, clients on CXL-attached nodes access mapped shared regions directly. With `remote`, workers transfer KV bytes between local staging buffers and a pool node's CXL memory over RDMA.
 
 ---
 
-## System Architecture
+## CXL System Architecture
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -67,7 +67,7 @@ flowchart TB
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. With the default `cxl` storage backend, the data path is identical regardless of control plane mode.
 
 The system has three layers:
 
@@ -81,7 +81,7 @@ The system has three layers:
 
 ## Key Design Properties
 
-**Zero-copy data path.** Clients access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead.
+**Direct CXL access.** Clients using `cxl` read and write mapped shared memory without sending KV bytes through MaruServer. The control plane carries metadata and allocation requests. With `remote`, workers move KV bytes between staging buffers and the pool through one-sided RDMA; MaruServer still handles only metadata and allocation.
 
 **Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
 
@@ -126,7 +126,105 @@ flowchart LR
 
 ---
 
-## Data Flow
+(storage-backends)=
+## Storage Backends
+
+`MaruConfig.storage_backend` selects where a handler keeps KV bytes. The `cxl` backend returns views into mapped shared memory. The `cpu`, `mixed`, and `remote` backends return read leases that the caller releases after its final copy.
+
+Storage backend and control-plane mode are separate settings. The control plane's **Remote mode** uses MaruServer and the resource manager over RPC; **Shared Filesystem mode** uses MaruFs. The `remote` storage backend requires a pool node running MaruServer.
+
+| Backend | Where KV bytes live | Who can read them | Data path |
+|---------|---------------------|-------------------|-----------|
+| `cxl` (default) | CXL shared memory attached to the node | Every instance that uses the same MaruServer, on nodes attached to the CXL device | Direct load/store on mapped regions, zero-copy |
+| `cpu` | The worker's own DRAM | Only the engine that stored them | Host copies; MaruServer (`--cpu-only`) tracks locations and capacity |
+| `mixed` | The worker's DRAM and CXL regions it owns | Only the engine that stored them | Host copies to either pool, in a configured write and read order |
+| `remote` | A CXL pool on another node (the pool node) | Every engine that reaches the pool node over RDMA and uses the same cache namespace and model | One-sided RDMA (NIXL) between a local staging buffer and the pool |
+
+### Remote CXL pool
+
+The `remote` backend lets nodes without CXL share one node's CXL memory. Only the pool node has the CXL device. Its MaruServer opens a remote endpoint (`--remote-bind`) next to its usual RPC endpoint, and a component inside it, RemoteAccess, allocates remote regions from the resource manager, maps them and registers them with the node's RDMA NIC. A worker keeps the vLLM connector (`MaruKVConnector`) and its MaruHandler, configured with `storage_backend="remote"`; it opens no DAX device and runs no MaruServer of its own. The SGLang and LMCache adapters use the `cxl` backend only.
+
+```mermaid
+%%{ init: { "flowchart": { "curve": "linear" } } }%%
+flowchart LR
+    subgraph WA["Worker node A (no CXL)"]
+        direction TB
+        IA(["LLM Instance"])
+        HA{{"MaruHandler (remote)"}}
+        SA["Staging buffer"]
+        IA --- HA --- SA
+    end
+    subgraph WB["Worker node B (no CXL)"]
+        direction TB
+        IB(["LLM Instance"])
+        HB{{"MaruHandler (remote)"}}
+        SB["Staging buffer"]
+        IB --- HB --- SB
+    end
+    subgraph PN["Pool node"]
+        direction TB
+        subgraph MSP["MaruServer"]
+            direction TB
+            EP["Remote endpoint"]:::maru
+            RA["RemoteAccess"]:::maru
+            LED["KV ledger"]:::maru
+            EP --- RA --- LED
+        end
+        RMP["MaruResourceManager"]:::maru
+        subgraph CXLP["CXL Shared Memory"]
+            RR["Remote regions"]
+        end
+    end
+
+    HA & HB -.->|"reserve / publish / lookup / release"| EP
+    SA & SB <==>|"RDMA read / write"| RR
+    RA -.->|"allocate regions"| RMP
+    RMP -.-> CXLP
+
+    classDef maru fill:#f8cecc,stroke:#b85450,font-weight:bold
+```
+
+> **Control** (dashed arrows) — small requests from each worker to the pool node's remote endpoint, and region allocation on the pool node.
+>
+> **Data** (thick arrows) — KV bytes, moved by the worker's NIC directly between its staging buffer and the pool's registered regions. Neither MaruServer nor the resource manager copies them. Thin solid lines only connect the parts of one process.
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant H as MaruHandler (remote)
+    participant S as Staging buffer
+    participant EP as Pool node: remote endpoint
+    participant P as Pool node: CXL region
+
+    Note over C,P: Store
+    C->>H: alloc()
+    H-->>C: staging slot
+    C->>S: write KV into the slot
+    C->>H: batch_store(keys, slots)
+    H->>EP: reserve pages
+    EP-->>H: page addresses
+    S->>P: RDMA WRITE (issued by the worker)
+    H->>EP: publish keys
+    Note over C,P: Retrieve
+    C->>H: batch_retrieve(keys)
+    H->>EP: look up keys and pin them
+    EP-->>H: page addresses
+    P->>S: RDMA READ (issued by the worker)
+    H->>EP: release the pins
+    H-->>C: read leases over the slots
+    C->>S: copy the KV out
+    C->>H: release the leases (slots are reused)
+```
+
+Data is written before its key is published. A read ticket pins the key until release or expiry; after READ completes, the worker confirms that the ticket still held its pins before returning the bytes. An expired reservation or an unconfirmed WRITE keeps its page quarantined until the worker confirms completion or cancellation, or the pool successfully deregisters the region at shutdown. Elapsed time alone cannot make an RDMA destination safe to reuse.
+
+RemoteAccess records remote keys in MaruServer's own KV ledger, so remote state and the ledger start and end together with the MaruServer process. When the pool fills up, RemoteAccess evicts the least recently used remote keys (stored or read) only if enough unpinned pages can satisfy the whole reservation. Keys that local clients store in their own regions are never evicted by it.
+
+The pool's control channel is not authenticated, and its RDMA metadata exposes the registered regions, so run it only inside a trusted cluster network. For configuration and a runnable example, see [vLLM](../integration/vllm.md) and the [vLLM examples](../getting_started/examples/vllm/index.md).
+
+---
+
+## CXL Data Flow
 
 ### Store
 
@@ -174,14 +272,16 @@ MaruHandler is **framework-independent**. Its interface operates on string keys 
 
 ```mermaid
 graph LR
-    A[LMCache] -->|MaruConnector| D[MaruHandler]
+    V[vLLM] -->|MaruKVConnector| D[MaruHandler]
+    A[LMCache] -->|MaruConnector| D
     B[SGLang] -->|MaruStorage| D
     C[Other Framework] -->|Custom Adapter| D
     D --> E[MaruServer]
     D --> F[CXL Shared Memory]
 ```
 
-> **See also:** [LMCache](../integration/lmcache.md),
+> **See also:** [vLLM](../integration/vllm.md),
+> [LMCache](../integration/lmcache.md),
 > [SGLang HiCache](../integration/sglang.md),
 > [MaruHandler Design](maru_handler.md)
 

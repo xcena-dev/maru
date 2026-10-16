@@ -101,8 +101,19 @@ class DaxMapper:
         self,
         rm_address: str | None = None,
         device_table: dict[str, str] | None = None,
+        cuda_register: bool = True,
     ):
+        """Create a mapper.
+
+        Args:
+            rm_address: Resource manager address; None uses the default.
+            device_table: Optional DAX path overrides per device.
+            cuda_register: Register mapped regions with CUDA (cudaHostRegister)
+                when a GPU is available. Processes that never copy to or from
+                a GPU (maru-server's remote access) turn it off.
+        """
         self._client = MaruShmClient(address=rm_address, device_table=device_table)
+        self._cuda_register = cuda_register
         self._lock = threading.Lock()
         self._regions: dict[int, MappedRegion] = {}
 
@@ -119,8 +130,9 @@ class DaxMapper:
 
         If already mapped, returns the existing MappedRegion.
         Thread-safe: protected by internal lock (idempotent).
-        Always maps with PROT_READ | PROT_WRITE and registers with
-        cudaHostRegister for GPU DMA.
+        Always maps with PROT_READ | PROT_WRITE. Registers the mapping with
+        cudaHostRegister for GPU DMA unless the mapper was created with
+        ``cuda_register=False``.
 
         Args:
             handle: MaruHandle from server allocation or lookup
@@ -175,7 +187,7 @@ class DaxMapper:
             prefault_ms = (time.monotonic() - t0) * 1000
 
         # Outside lock: CUDA pin is idempotent
-        if region._buffer_view is not None:
+        if self._cuda_register and region._buffer_view is not None:
             try:
                 import torch
 
