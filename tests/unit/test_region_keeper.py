@@ -324,3 +324,27 @@ def test_a_short_outage_keeps_the_kept_region(env):
     keeper.run_once()
     assert [p for p, *_ in directory.departed()] == [pool]
     assert rm.released == []
+
+
+def test_stopping_releases_the_kept_regions_before_maruserver_goes(env):
+    # The resource manager reclaims a stopped MaruServer's regions; a kept
+    # region is released at its region mapper first.
+    directory, rm, _, keeper, clients, _ = env
+    pool, region_id = leave(directory, "a", key="k")
+    keeper.run_once()
+    keeper.stop()
+    address = pick_mapper(MAPPERS, region_id)
+    assert ("release", region_id) in clients[address].calls
+    assert rm.released == [region_id]
+    assert directory.departed() == []
+
+
+def test_stopping_leaves_a_region_whose_mapper_is_down_to_the_rm(env):
+    directory, rm, _, keeper, _, _ = env
+    pool, region_id = leave(directory, "a", key="k")
+    keeper._client(pick_mapper(MAPPERS, region_id)).fail["map"] = RegionMapUnavailable(
+        "down"
+    )
+    keeper.run_once()
+    keeper.stop()
+    assert rm.released == []

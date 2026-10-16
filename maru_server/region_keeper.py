@@ -102,19 +102,36 @@ class RegionKeeper:
             self._thread.start()
 
     def stop(self) -> None:
-        """Stop the thread and close the region mapper connections.
+        """Give back the regions MaruServer took over, then stop.
 
-        Closing a connection drops MaruServer's holds; the resource manager
-        reclaims the regions of a MaruServer that went away.
+        The resource manager reclaims every region of a MaruServer that goes
+        away. A region this keeper holds is released at its region mapper
+        first, so a reader's hold does not keep it registered after the
+        resource manager hands it out again. A region whose region mapper
+        does not answer is left to the resource manager, as when MaruServer
+        dies.
         """
         self._stop.set()
         self._directory.keeper_wakeup.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
+        try:
+            self._give_back_all()
+        except Exception:
+            logger.warning("giving back the kept regions failed", exc_info=True)
         for client in self._clients.values():
             client.close()
         self._clients.clear()
+
+    def _give_back_all(self) -> None:
+        for pool_id, _handle, fate, _boot in self._directory.departed():
+            if fate == "keep":
+                self._directory.give_back(pool_id, "maru-server is stopping")
+        for pool_id, handle, _fate, _boot in self._directory.departed():
+            address = pick_mapper(self._mappers, int(handle["region_id"]))
+            if not self._is_down(address):
+                self._release(pool_id, handle, address)
 
     def run_once(self) -> None:
         """Do what the departed regions need now."""

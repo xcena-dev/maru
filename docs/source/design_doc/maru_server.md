@@ -164,6 +164,9 @@ back when:
   the keys of a region it cannot reach (the region goes back once the region
   mapper answers again).
 
+When maru-server stops, the keeper releases the regions it took over at their
+region mappers and frees them before it exits, so a reader's open connection
+does not keep one registered after the Resource Manager hands it out again.
 The keeper talks to the region mappers on its own thread, so a memory node
 that does not answer delays no request. It proves the region mapper key like a
 worker (`--region-mapper-key-file`).
