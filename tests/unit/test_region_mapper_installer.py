@@ -73,7 +73,13 @@ def test_install_writes_the_unit_and_settings_and_enables_it(tmp_path, monkeypat
     assert ok
     assert unit.read_text() == installer.render_unit("/opt/venv/bin/python")
     assert env.read_text() == installer.DEFAULT_ENV
-    assert calls == [("daemon-reload",), ("enable", installer.SERVICE_NAME)]
+    # disable first: a reinstall in the other form must not keep the old
+    # form's links (e.g. multi-user.target.wants after a standalone install).
+    assert calls == [
+        ("daemon-reload",),
+        ("disable", installer.SERVICE_NAME),
+        ("enable", installer.SERVICE_NAME),
+    ]
 
 
 def test_default_settings_accept_workers_of_other_nodes():

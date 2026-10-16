@@ -172,6 +172,8 @@ def install(
     else:
         print(f"  Kept settings: {env_file}", file=sys.stderr)
     systemctl("daemon-reload")
+    # Drop the links of an earlier install in the other form first.
+    systemctl("disable", SERVICE_NAME)
     systemctl("enable", SERVICE_NAME)
     if standalone:
         print(
