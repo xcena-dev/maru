@@ -313,6 +313,18 @@ def _load_keys(
     return [chunk_keys[ci] for ci in range(num_chunks)]
 
 
+def _session_route(cpu_mode: bool, chunk_keys: list[str]) -> dict[str, str]:
+    """Routing kwargs for a storage-session call made for one request.
+
+    Every chunk of a request goes to the pool chosen by its first chunk key,
+    so a request's prefix is stored and found in one pool. The shared-memory
+    paths take no route key.
+    """
+    if cpu_mode and chunk_keys and chunk_keys[0]:
+        return {"route_key": chunk_keys[0]}
+    return {}
+
+
 def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     """Generate maru keys for each chunk of the token prefix.
 
@@ -348,20 +360,41 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     return keys
 
 
+_RDMA_KNOBS = ("maru_rdma_device", "maru_rdma_staging_size", "maru_rdma_timeout_s")
+# Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.rdma.
+_MIN_RDMA_STAGING = 1024**3
+
+
+def _session_pool_key(extra: dict[str, Any]) -> str:
+    """The extra_config key that sizes a storage-session backend's space.
+
+    RDMA storage takes regions as the cxl backend does: ``maru_pool_size`` is
+    the size of one region, and a full worker gets another one.
+    """
+    if extra.get("maru_storage_backend") == "rdma":
+        return "maru_pool_size"
+    return "maru_cpu_pool_size"
+
+
 def _validate_storage_config(extra: dict[str, Any]) -> bool:
     """Validate M1's opt-in boundary before any cache data can be used."""
     backend = extra.get("maru_storage_backend", "cxl")
-    if backend not in {"cxl", "cpu", "mixed"}:
-        raise ValueError("maru_storage_backend must be 'cxl', 'cpu' or 'mixed'")
+    if backend not in {"cxl", "cpu", "mixed", "rdma"}:
+        raise ValueError("maru_storage_backend must be 'cxl', 'cpu', 'mixed' or 'rdma'")
+    if backend != "rdma" and any(name in extra for name in _RDMA_KNOBS):
+        raise ValueError("RDMA settings require maru_storage_backend='rdma'")
     if backend == "cxl":
         return False
-    for name in ("maru_engine_id", "maru_cache_namespace", "maru_cpu_pool_size"):
+    pool_key = _session_pool_key(extra)
+    for name in ("maru_engine_id", "maru_cache_namespace", pool_key):
         if not extra.get(name):
-            raise ValueError(f"CPU storage requires {name}")
-    if "maru_pool_size" in extra:
-        raise ValueError("Use maru_cpu_pool_size for CPU storage, not maru_pool_size")
-    if _parse_size(extra["maru_cpu_pool_size"]) <= 0:
-        raise ValueError("maru_cpu_pool_size must be positive")
+            raise ValueError(f"{backend.upper()} storage requires {name}")
+    if backend != "rdma" and "maru_pool_size" in extra:
+        raise ValueError(f"Use {pool_key} for {backend} storage, not maru_pool_size")
+    if backend == "rdma" and "maru_cpu_pool_size" in extra:
+        raise ValueError("RDMA storage takes its region size from maru_pool_size")
+    if _parse_size(extra[pool_key]) <= 0:
+        raise ValueError(f"{pool_key} must be positive")
     if backend == "mixed":
         from maru_common.storage_policy import validate_order
 
@@ -440,7 +473,38 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode()
     ).hexdigest()
-    return {**extra, "maru_cache_namespace": digest}
+    out = {**extra, "maru_cache_namespace": digest}
+    max_model_len = getattr(model, "max_model_len", None)
+    if isinstance(max_model_len, int) and max_model_len > 0:
+        out["_maru_max_model_len"] = max_model_len
+    return out
+
+
+def _rdma_staging_size(extra: dict[str, Any], page_size: int) -> int | None:
+    """Bytes of RDMA staging for this worker, or None for the handler default.
+
+    A load holds one staging slot per chunk until its copy to the GPU ends,
+    so a buffer smaller than one max_model_len request can never load that
+    request. The default fits one such load and one such store.
+
+    Raises:
+        ValueError: If an explicit size holds fewer chunks than one
+            max_model_len request.
+    """
+    chunks = extra.get("_maru_request_chunks")
+    need = chunks * page_size if chunks else None
+    if "maru_rdma_staging_size" in extra:
+        size = _parse_size(extra["maru_rdma_staging_size"])
+        if need is not None and size < need:
+            raise ValueError(
+                f"maru_rdma_staging_size ({size} bytes) holds fewer chunks than "
+                f"one max_model_len request ({chunks} chunks of {page_size} "
+                f"bytes = {need} bytes)"
+            )
+        return size
+    if need is None:
+        return None
+    return max(_MIN_RDMA_STAGING, 2 * need)
 
 
 def _vllm_version_at_least(minimum: str) -> bool:
@@ -523,7 +587,7 @@ def _create_maru_handler(
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
     if cpu_mode:
-        pool_size = _parse_size(extra_config["maru_cpu_pool_size"])
+        pool_size = _parse_size(extra_config[_session_pool_key(extra_config)])
     if metadata_only:
         pool_size = 0
     cfg = MaruConfig(
@@ -546,6 +610,13 @@ def _create_maru_handler(
         ),
         write_order=extra_config.get("maru_write_order", ("cpu", "cxl")),
         read_order=extra_config.get("maru_read_order", ("cpu", "cxl")),
+        rdma_device=extra_config.get("maru_rdma_device", ""),
+        rdma_staging_size=(
+            _rdma_staging_size(extra_config, chunk_size)
+            if extra_config.get("maru_storage_backend") == "rdma" and not metadata_only
+            else None
+        ),
+        rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30.0)),
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
@@ -1092,7 +1163,9 @@ class MaruSchedulerConnector:
             if self._handler is None:
                 return 0
             try:
-                results = self._handler.batch_exists(keys)
+                results = self._handler.batch_exists(
+                    keys, **_session_route(self._cpu_mode, keys)
+                )
             except Exception:
                 return 0
             # Re-probe each time: CPU residency is tied to a live worker session.
@@ -1737,10 +1810,18 @@ class MaruWorkerConnector:
             self._effective_page_size_bytes = _parse_size(
                 extra_config.get("maru_chunk_size", 4 * 1024 * 1024)
             )
+            max_model_len = extra_config.get("_maru_max_model_len")
+            if self._cpu_mode and max_model_len:
+                extra_config = {
+                    **extra_config,
+                    "_maru_request_chunks": -(-max_model_len // self._kv_chunk_tokens),
+                }
             self._handler = _create_maru_handler(extra_config)
         except Exception as exc:
             if self._cpu_mode and isinstance(exc, StorageError):
                 raise ValueError(f"CPU cache setup rejected: {exc}") from exc
+            if self._cpu_mode and isinstance(exc, ValueError):
+                raise  # a configuration error does not heal on retry
             self._handler_retry_after = time.monotonic() + 5.0
             logger.warning(
                 "Worker MaruHandler creation failed, backing off 5s: %s", exc
@@ -1803,8 +1884,9 @@ class MaruWorkerConnector:
                 raise ValueError(
                     "maru_chunk_size cannot hold one CPU chunkwise KV object"
                 )
-            if _parse_size(self._extra_config["maru_cpu_pool_size"]) < configured_page:
-                raise ValueError("maru_cpu_pool_size cannot hold one CPU cache page")
+            pool_key = _session_pool_key(self._extra_config)
+            if _parse_size(self._extra_config[pool_key]) < configured_page:
+                raise ValueError(f"{pool_key} cannot hold one cache page")
             if (
                 self._extra_config.get("maru_storage_backend") == "mixed"
                 and _parse_size(self._extra_config["maru_cxl_pool_size"])
@@ -1977,6 +2059,7 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
+            route = _session_route(self._cpu_mode, chunk_keys)
             if self._cpu_mode:
                 start, end = self._cpu_load_range(req_meta)
                 first_chunk = start // self._kv_chunk_tokens
@@ -1989,7 +2072,7 @@ class MaruWorkerConnector:
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
-                infos = self._batch_retrieve_all(keys)
+                infos = self._batch_retrieve_all(keys, **route)
                 if self._timing:
                     _emit_timing(
                         f"retrieve batch {len(keys)} keys = "
@@ -2170,7 +2253,9 @@ class MaruWorkerConnector:
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
 
             _t0 = time.monotonic()
-            infos = self._batch_retrieve_all(keys)
+            infos = self._batch_retrieve_all(
+                keys, **_session_route(self._cpu_mode, chunk_keys)
+            )
             if self._timing:
                 _emit_timing(
                     f"deferred retrieve batch {len(keys)} keys = "
@@ -3418,7 +3503,9 @@ class MaruWorkerConnector:
                 entry for entry in self._active_load_refs if not entry[0].query()
             ]
 
-    def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
+    def _batch_retrieve_all(
+        self, keys: list[str], batch_size: int = 1024, route_key: str | None = None
+    ) -> list:
         """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
 
         A single request can produce num_layers x num_chunks keys (thousands),
@@ -3428,7 +3515,8 @@ class MaruWorkerConnector:
         handler = self._handler
         assert handler is not None
         if self._cpu_mode or len(keys) <= batch_size:
-            return list(handler.batch_retrieve(keys))
+            route = {"route_key": route_key} if route_key else {}
+            return list(handler.batch_retrieve(keys, **route))
         out: list[Any] = []
         for i in range(0, len(keys), batch_size):
             out.extend(handler.batch_retrieve(keys[i : i + batch_size]))
@@ -3525,7 +3613,9 @@ class MaruWorkerConnector:
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
 
                     # Zero-copy path: alloc CXL page, GPU→CXL direct copy
-                    handle = self._handler.alloc(nbytes)
+                    handle = self._handler.alloc(
+                        nbytes, **_session_route(self._cpu_mode, chunk_keys)
+                    )
                     dst = torch.frombuffer(
                         handle.buf[:nbytes], dtype=kv_contig.dtype
                     ).reshape(kv_contig.shape)
@@ -3687,7 +3777,10 @@ class MaruWorkerConnector:
 
                     pending = self._pending_slabs.get(base_key)
                     if pending is None:
-                        handle = handler.alloc(layer_bytes * self._num_layers)
+                        handle = handler.alloc(
+                            layer_bytes * self._num_layers,
+                            **_session_route(self._cpu_mode, chunk_keys),
+                        )
                         written: set[int] = set()
                         self._pending_slabs[base_key] = (handle, written)
                     else:
@@ -3854,7 +3947,9 @@ class MaruWorkerConnector:
                     seen_keys.add(base_key)
                     handle = None
                     try:
-                        handle = handler.alloc(slab_bytes)
+                        handle = handler.alloc(
+                            slab_bytes, **_session_route(self._cpu_mode, chunk_keys)
+                        )
                         slab_host = torch.frombuffer(
                             handle.buf[:slab_bytes], dtype=dtype
                         ).view(2, self._num_layers, ct, -1)

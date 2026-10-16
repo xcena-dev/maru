@@ -45,8 +45,10 @@ def test_load_only_external_tokens(config, start, end, failure):
         for i in range(2)
     ]
 
-    def retrieve(requested):
+    def retrieve(requested, route_key=None):
         assert requested == keys[start // 8 : 2]
+        # A load that starts mid-request still routes by the request's first key.
+        assert route_key == keys[0]
         if failure == "retrieve":
             raise RuntimeError("lost replica")
         if failure == "truncated":
