@@ -233,6 +233,8 @@ and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
 size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
 and, optionally, `maru_rdma_device` (the worker's RDMA NIC, e.g. `mlx5_0:1`).
 
+![Components of the rdma backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/rdma_sw_structure.png)
+
 Resources flow as for the cxl backend: the resource manager gives regions to
 maru-server and maru-server gives them to the worker, one region when its
 storage session opens and one more each time its regions are full. Each memory
