@@ -34,7 +34,7 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
-# NIXL for the rdma storage backend and the region mapper (maru-region-mapper)
+# NIXL for the remote_cxl storage backend and the region mapper (maru-region-mapper)
 rdma = [
     "nixl",
 ]

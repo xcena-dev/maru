@@ -1,14 +1,14 @@
 #!/bin/bash
 # Launch a vLLM engine whose KV store is the CXL pool of the memory nodes,
-# reached over RDMA (storage_backend "rdma").
+# reached over RDMA (storage_backend "remote_cxl").
 #
 # Usage:
-#   ./rdma_vllm_launcher.sh <inst1|inst2> [model]
+#   ./remote_cxl_vllm_launcher.sh <inst1|inst2> [model]
 #
 # Examples:
-#   ./rdma_vllm_launcher.sh inst1                          # GPU 0, default model
+#   ./remote_cxl_vllm_launcher.sh inst1                          # GPU 0, default model
 #   MARU_SERVER_URL=tcp://<metadata node>:<port> MARU_WORKER_UCX_DEVICE=mlx5_0:1 \
-#       MARU_INST2_GPU=0 ./rdma_vllm_launcher.sh inst2       # worker on another node
+#       MARU_INST2_GPU=0 ./remote_cxl_vllm_launcher.sh inst2       # worker on another node
 #
 # The port is the one maru_server.sh prints on the metadata node.
 
@@ -71,7 +71,7 @@ if [[ -n "$MARU_NUMA_NODE" ]]; then
     NUMA=(numactl --cpunodebind="$MARU_NUMA_NODE" --membind="$MARU_NUMA_NODE")
 fi
 
-echo "=== Maru-vLLM RDMA KV ==="
+echo "=== Maru-vLLM remote CXL KV ==="
 echo "  Instance:     $1 (engine id $ENGINE_ID)"
 echo "  Model:        $MODEL"
 echo "  GPU Device:   $DEVICE"
@@ -84,7 +84,7 @@ echo "  Chunk Tokens: $MARU_KV_CHUNK_TOKENS"
 echo "  Async:        $ASYNC_MODE"
 echo "========================="
 
-# The rdma backend stores chunkwise and needs --enforce-eager and
+# The remote_cxl backend stores chunkwise and needs --enforce-eager and
 # kv_load_failure_policy "recompute". Synchronous loads also need
 # --no-async-scheduling; the example keeps it off in both modes.
 #
@@ -108,7 +108,7 @@ CUDA_VISIBLE_DEVICES=$DEVICE setsid "${NUMA[@]}" vllm serve "$MODEL" \
         \"kv_load_failure_policy\": \"recompute\",
         \"kv_connector_extra_config\": {
             \"maru_server_url\": \"${MARU_SERVER_URL}\",
-            \"maru_storage_backend\": \"rdma\",
+            \"maru_storage_backend\": \"remote_cxl\",
             ${UCX_ENTRY}
             ${TIMING_ENTRY}
             ${ASYNC_ENTRY}

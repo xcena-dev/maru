@@ -1,7 +1,7 @@
 #!/bin/bash
-# Environment variables for the RDMA KV example: vLLM engines on nodes without
+# Environment variables for the remote CXL KV example: vLLM engines on nodes without
 # CXL keep KV in the CXL pool of memory nodes and move it over RDMA
-# (MaruHandler storage_backend="rdma").
+# (MaruHandler storage_backend="remote_cxl").
 
 export VLLM_LOG_LEVEL=${VLLM_LOG_LEVEL:-INFO}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.1}
@@ -46,7 +46,7 @@ export MARU_KV_CHUNK_TOKENS=${MARU_KV_CHUNK_TOKENS:-256}
 # RDMA NIC each worker uses, e.g. mlx5_0:1 (empty: UCX default).
 export MARU_WORKER_UCX_DEVICE=${MARU_WORKER_UCX_DEVICE:-}
 # Engines share KV only when this name (plus model shape) matches.
-export MARU_CACHE_NAMESPACE=${MARU_CACHE_NAMESPACE:-maru-rdma-example}
+export MARU_CACHE_NAMESPACE=${MARU_CACHE_NAMESPACE:-maru-remote-cxl-example}
 export MARU_INST1_GPU=${MARU_INST1_GPU:-0}
 export MARU_INST2_GPU=${MARU_INST2_GPU:-1}
 # NUMA node to run each engine on (empty: no binding), e.g. the GPU's socket.

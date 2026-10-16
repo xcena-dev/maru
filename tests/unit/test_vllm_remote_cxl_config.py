@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RDMA storage opt-in at the vLLM connector boundary."""
+"""Remote CXL storage opt-in at the vLLM connector boundary."""
 
 import pytest
 
@@ -16,7 +16,7 @@ from maru_vllm.connector import (
 
 def extra(**kwargs):
     return {
-        "maru_storage_backend": "rdma",
+        "maru_storage_backend": "remote_cxl",
         "maru_pool_size": "16M",
         "maru_engine_id": "worker-0",
         "maru_cache_namespace": "model-revision-1",
@@ -24,7 +24,7 @@ def extra(**kwargs):
     }
 
 
-def test_rdma_is_a_storage_session_backend():
+def test_remote_cxl_is_a_storage_session_backend():
     assert _validate_storage_config(extra()) is True
 
 
@@ -38,7 +38,7 @@ def test_required_rdma_settings(key):
         _validate_storage_config(config)
 
 
-def test_rdma_takes_its_region_size_from_maru_pool_size():
+def test_remote_cxl_takes_its_region_size_from_maru_pool_size():
     # The region size, as for the cxl backend; a full worker gets one more.
     with pytest.raises(ValueError, match="maru_pool_size"):
         _validate_storage_config(extra(maru_cpu_pool_size="1G"))
@@ -62,7 +62,7 @@ def test_a_retryable_open_refusal_backs_off_like_a_cxl_handler(monkeypatch):
     from tests.unit.vllm_connector_helpers import make_worker
 
     def refuse(config):
-        raise StorageUnavailableError("RDMA region reservation failed")
+        raise StorageUnavailableError("Remote CXL region reservation failed")
 
     monkeypatch.setattr(connector, "_create_maru_handler", refuse)
     worker = make_worker(16, 256, extra())
@@ -71,19 +71,19 @@ def test_a_retryable_open_refusal_backs_off_like_a_cxl_handler(monkeypatch):
 
 
 @pytest.mark.parametrize("knob", ["maru_async_load", "maru_async_store"])
-def test_rdma_takes_asynchronous_loads_and_stores(knob):
+def test_remote_cxl_takes_asynchronous_loads_and_stores(knob):
     # The staging buffer is page-locked for CUDA (design note 3.11).
     assert _validate_storage_config(extra(**{knob: True})) is True
 
 
-def test_rdma_has_no_load_compute_overlap():
+def test_remote_cxl_has_no_load_compute_overlap():
     with pytest.raises(ValueError, match="maru_overlap_load_with_compute"):
         _validate_storage_config(
             extra(maru_async_load=True, maru_overlap_load_with_compute=True)
         )
 
 
-def test_rdma_stores_chunkwise_only():
+def test_remote_cxl_stores_chunkwise_only():
     with pytest.raises(ValueError, match="chunkwise"):
         _validate_storage_config(extra(maru_use_layerwise=True))
 
@@ -106,7 +106,7 @@ def _engine(async_scheduling):
     return config
 
 
-def test_sync_rdma_loads_need_vllm_async_scheduling_off():
+def test_sync_remote_cxl_loads_need_vllm_async_scheduling_off():
     from maru_vllm.connector import _cpu_engine_config
 
     with pytest.raises(ValueError, match="--no-async-scheduling"):
@@ -124,7 +124,7 @@ def test_cpu_storage_keeps_its_async_scheduling_behavior():
 
 
 @pytest.mark.parametrize("backend", ["cxl", "cpu"])
-def test_rdma_settings_need_the_rdma_backend(backend):
+def test_rdma_settings_need_the_remote_cxl_backend(backend):
     config = {
         "maru_storage_backend": backend,
         "maru_cpu_pool_size": "1M",
@@ -136,7 +136,7 @@ def test_rdma_settings_need_the_rdma_backend(backend):
         _validate_storage_config(config)
 
 
-def test_handler_gets_the_rdma_pool_and_transfer_settings(monkeypatch):
+def test_handler_gets_the_remote_cxl_pool_and_transfer_settings(monkeypatch):
     seen = {}
 
     class FakeHandler:
@@ -156,7 +156,7 @@ def test_handler_gets_the_rdma_pool_and_transfer_settings(monkeypatch):
         )
     )
     cfg = seen["cfg"]
-    assert cfg.storage_backend == "rdma"
+    assert cfg.storage_backend == "remote_cxl"
     assert cfg.pool_size == 16 * 1024**2
     assert cfg.rdma_device == "mlx5_0:1"
     assert cfg.rdma_staging_size == 8 * 1024**2
@@ -177,7 +177,7 @@ def test_default_staging_fits_one_longest_load_and_store():
 
 def test_async_staging_holds_a_request_for_loads_and_one_for_stores():
     config = {
-        "maru_storage_backend": "rdma",
+        "maru_storage_backend": "remote_cxl",
         "maru_async_load": True,
         "_maru_request_chunks": 40,
         "maru_rdma_staging_size": "3G",

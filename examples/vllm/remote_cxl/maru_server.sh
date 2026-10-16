@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start maru-server for RDMA workers.
+# Start maru-server for remote CXL workers.
 #
 # Runs in the foreground, on the metadata node (it may be a memory node). It
 # allocates the workers' regions from the pool's resource manager, as for

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regions of an RDMA storage session and the pages a worker allocates in them."""
+"""Regions of a remote CXL storage session and the pages a worker allocates in them."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 
 from maru_common.storage_types import StorageLocation, StorageUnavailableError
 
-RDMA = "rdma"
+REMOTE_CXL = "remote_cxl"
 
 
 def pick_mapper(mappers: list[str], region_id: int) -> str:
@@ -35,13 +35,13 @@ def pick_mapper(mappers: list[str], region_id: int) -> str:
 
 
 @dataclass(eq=False)
-class RdmaAllocation:
+class RemoteCxlAllocation:
     """A remote page being written through one staging slot."""
 
     buf: memoryview
     location: StorageLocation
     slot: int
-    region: RdmaRegion
+    region: RemoteCxlRegion
     state: str = "writing"
 
     @property
@@ -50,7 +50,7 @@ class RdmaAllocation:
         return self.location.length
 
 
-class RdmaRegion:
+class RemoteCxlRegion:
     """Pages of one region; the worker is their only allocator."""
 
     def __init__(self, pool_id: str, capacity: int, page_size: int, handle: dict):
@@ -67,7 +67,7 @@ class RdmaRegion:
         """
         if capacity < page_size or page_size <= 0 or capacity % page_size:
             raise ValueError(
-                "RDMA region capacity must be a positive multiple of page size"
+                "Remote CXL region capacity must be a positive multiple of page size"
             )
         self.pool_id = pool_id
         self.capacity = capacity
@@ -76,7 +76,7 @@ class RdmaRegion:
         self.region_id = int(handle["region_id"])
         self._free = deque(range(capacity // page_size))
         self._generation = 0
-        self._writing: dict[str, RdmaAllocation] = {}
+        self._writing: dict[str, RemoteCxlAllocation] = {}
         self._quarantined: set[int] = set()
         self._lock = threading.RLock()
         self.retired = False
@@ -103,11 +103,13 @@ class RdmaRegion:
         """
         with self._lock:
             if self.retired:
-                raise StorageUnavailableError("RDMA region belongs to a closed session")
+                raise StorageUnavailableError(
+                    "Remote CXL region belongs to a closed session"
+                )
             if type(size) is not int or not 0 < size <= self.page_size:
-                raise ValueError("RDMA allocation must fit in one page")
+                raise ValueError("Remote CXL allocation must fit in one page")
             if not self._free:
-                raise MemoryError("RDMA region is full")
+                raise MemoryError("Remote CXL region is full")
             page = self._free.popleft()
             self._generation += 1
             return StorageLocation(
@@ -116,27 +118,27 @@ class RdmaRegion:
                 self._generation,
                 page * self.page_size,
                 size,
-                RDMA,
+                REMOTE_CXL,
             )
 
-    def track(self, handle: RdmaAllocation) -> None:
+    def track(self, handle: RemoteCxlAllocation) -> None:
         """Remember an allocation being written."""
         with self._lock:
             self._writing[handle.location.allocation_id] = handle
 
-    def validate(self, handle: RdmaAllocation) -> None:
+    def validate(self, handle: RemoteCxlAllocation) -> None:
         """Check that an allocation is one of this region's writes.
 
         Raises:
             ValueError: if it is not.
         """
         if (
-            not isinstance(handle, RdmaAllocation)
+            not isinstance(handle, RemoteCxlAllocation)
             or self._writing.get(handle.location.allocation_id) is not handle
         ):
-            raise ValueError("Allocation does not belong to this RDMA region")
+            raise ValueError("Allocation does not belong to this remote CXL region")
 
-    def untrack(self, handle: RdmaAllocation) -> None:
+    def untrack(self, handle: RemoteCxlAllocation) -> None:
         """Forget an allocation that was committed, freed or isolated."""
         with self._lock:
             self._writing.pop(handle.location.allocation_id, None)
@@ -195,6 +197,6 @@ class IsolatedTransfer:
     pending: Any  # maru_remote.transport.PendingTransfer
     op: str
     peer: str
-    region: RdmaRegion | None
+    region: RemoteCxlRegion | None
     locations: list[StorageLocation] = field(default_factory=list)
     slots: list[int] = field(default_factory=list)

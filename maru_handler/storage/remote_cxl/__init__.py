@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RDMA storage: a storage session whose regions live in a memory node's CXL.
+"""Remote CXL storage: a storage session whose regions live in a memory node's CXL.
 
 The Handler gets regions the way a cxl Handler does: one when the session
 opens and one more (``expand``) whenever all of them are full. The region
@@ -32,18 +32,24 @@ Modules:
     router: several pools behind one worker.
 """
 
-from .client import RdmaStorageClient
+from .client import RemoteCxlStorageClient
 from .datapath import RdmaDataPath
-from .region import RDMA, RdmaAllocation, RdmaRegion, RegionAccess, pick_mapper
+from .region import (
+    REMOTE_CXL,
+    RegionAccess,
+    RemoteCxlAllocation,
+    RemoteCxlRegion,
+    pick_mapper,
+)
 from .router import PoolRouter
 
 __all__ = [
-    "RDMA",
+    "REMOTE_CXL",
     "PoolRouter",
-    "RdmaAllocation",
+    "RemoteCxlAllocation",
     "RdmaDataPath",
-    "RdmaRegion",
-    "RdmaStorageClient",
+    "RemoteCxlRegion",
+    "RemoteCxlStorageClient",
     "RegionAccess",
     "pick_mapper",
 ]

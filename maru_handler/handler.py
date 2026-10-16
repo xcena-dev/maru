@@ -83,12 +83,12 @@ class MaruHandler:
             from .storage.client import CpuStorageClient
 
             self._cpu = CpuStorageClient(self._config, self._rpc)
-        elif self._config.storage_backend == "rdma":
-            from .storage.rdma import PoolRouter, RdmaStorageClient
+        elif self._config.storage_backend == "remote_cxl":
+            from .storage.remote_cxl import PoolRouter, RemoteCxlStorageClient
 
             urls = self._config.server_urls
             if len(urls) == 1:
-                self._cpu = RdmaStorageClient(self._config, self._rpc)
+                self._cpu = RemoteCxlStorageClient(self._config, self._rpc)
             else:
                 rpcs = [self._rpc] + [self._make_rpc(url) for url in urls[1:]]
                 self._cpu = PoolRouter(self._config, rpcs, urls)
@@ -504,7 +504,7 @@ class MaruHandler:
 
         Args:
             size: Required bytes (must be <= chunk_size)
-            route_key: The request's first chunk key. With several rdma
+            route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
 
         Returns:
@@ -974,7 +974,7 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
-            route_key: The request's first chunk key. With several rdma
+            route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
 
         Returns:
@@ -1247,7 +1247,7 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
-            route_key: The request's first chunk key. With several rdma
+            route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
 
         Returns:
@@ -1469,7 +1469,7 @@ class MaruHandler:
         """How many keys the next ``batch_retrieve`` should ask for at most.
 
         Returns:
-            The read buffer slots a load may use now (rdma backend), or None
+            The read buffer slots a load may use now (remote_cxl backend), or None
             when retrieves are not bounded by a read buffer.
         """
         capacity = getattr(self._cpu, "retrieve_capacity", None)
@@ -1480,7 +1480,7 @@ class MaruHandler:
 
         Returns:
             True when GPU copy kernels may read and write those buffers
-            directly (the rdma backend's staging buffer registered with CUDA).
+            directly (the remote_cxl backend's staging buffer registered with CUDA).
         """
         accessible = getattr(self._cpu, "storage_gpu_accessible", None)
         return bool(accessible()) if accessible is not None else False

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owner-scoped CPU/CXL L1 pools, and RDMA regions read across sessions.
+"""Owner-scoped CPU/CXL L1 pools, and remote CXL regions read across sessions.
 
-CPU and mixed pools keep access within the owning worker. RDMA regions live in
+CPU and mixed pools keep access within the owning worker. Remote CXL regions live in
 a memory node's CXL; a session gets one region when it opens and one more each
 time it asks (``expand``), as a cxl Handler does with ``request_alloc``. Any
 session of the same namespace can lease and read their keys; the owner evicts
@@ -24,7 +24,7 @@ from threading import RLock
 from maru_common.storage_policy import FixedOrderPolicy, validate_order
 from maru_common.storage_types import MAX_STORAGE_BATCH, StorageLocation
 
-RDMA = "rdma"
+REMOTE_CXL = "remote_cxl"
 MAX_REGIONS_PER_SESSION = 4096
 RELEASE_RETRY_S = 1.0
 
@@ -49,7 +49,7 @@ class StoragePool:
     allocated_bytes: int = 0
     quarantined_bytes: int = 0
     acquired_objects: int = 0
-    # RDMA regions only: the namespace they serve, whether their keys can be
+    # Remote CXL regions only: the namespace they serve, whether their keys can be
     # found (False once the owner expired or closed), the last use of each
     # key and the read leases on each key.
     namespace: str = ""
@@ -74,11 +74,13 @@ class StorageSession:
     leases: dict[str, list[StorageLocation]] = field(default_factory=dict)
     operations: dict[str, tuple[list[dict], list[str]]] = field(default_factory=dict)
     report_sequence: int = -1
-    # RDMA regions owned by this session (pool_id -> region) and their size
+    # Remote CXL regions owned by this session (pool_id -> region) and their size
     regions: dict[str, StoragePool] = field(default_factory=dict)
     region_size: int = 0
-    # lease_id -> (region, key) for leases on RDMA regions, possibly of others
-    rdma_leases: dict[str, list[tuple[StoragePool, str]]] = field(default_factory=dict)
+    # lease_id -> (region, key) for leases on remote CXL regions, possibly of others
+    remote_cxl_leases: dict[str, list[tuple[StoragePool, str]]] = field(
+        default_factory=dict
+    )
     # expand op_id -> pool_id of the region it gave, so a resent expand whose
     # reply was lost gets the same region instead of a second one
     expansions: dict[str, str] = field(default_factory=dict)
@@ -107,8 +109,8 @@ class ReplicaDirectory:
         self._sessions: dict[str, StorageSession] = {}
         self._engines: dict[str, str] = {}
         self._closed_tokens: set[str] = set()
-        # (namespace, key) -> RDMA region holding the key
-        self._rdma_index: dict[tuple[str, str], StoragePool] = {}
+        # (namespace, key) -> remote CXL region holding the key
+        self._remote_cxl_index: dict[tuple[str, str], StoragePool] = {}
         # Regions whose release the RM has not confirmed yet
         self._releasing: dict[str, StoragePool] = {}
         self._next_release_retry = 0.0
@@ -118,7 +120,7 @@ class ReplicaDirectory:
     def supports_mixed(self):
         return self._reserve_cxl is not None and self._release_cxl is not None
 
-    supports_rdma = supports_mixed
+    supports_remote_cxl = supports_mixed
 
     @staticmethod
     def _text(value, name: str) -> str:
@@ -142,7 +144,7 @@ class ReplicaDirectory:
                 if self._engines.get(session.engine_id) == session.token:
                     del self._engines[session.engine_id]
                 # Timeout is not proof of unmapping: pools and regions stay
-                # charged until a drained close. RDMA keys stop being found,
+                # charged until a drained close. Remote CXL keys stop being found,
                 # and the leases this session held as a reader end with it.
                 self._drop_reader_leases(session)
                 for region in session.regions.values():
@@ -198,7 +200,9 @@ class ReplicaDirectory:
         namespace = self._text(p.get("namespace"), "namespace")
         node = self._text(p.get("node_id"), "node_id")
         schema = self._text(p.get("schema"), "schema")
-        region_size = self._integer(p.get("rdma_region_size", 0), "rdma_region_size")
+        region_size = self._integer(
+            p.get("remote_cxl_region_size", 0), "remote_cxl_region_size"
+        )
         capacity = self._integer(p.get("capacity"), "capacity", 0 if region_size else 1)
         page_size = self._integer(p.get("page_size"), "page_size", 1)
         cxl_capacity = self._integer(p.get("cxl_capacity", 0), "cxl_capacity")
@@ -213,10 +217,10 @@ class ReplicaDirectory:
             raise ValueError(
                 "CXL storage is unavailable; mixed mode requires a CXL-enabled server"
             )
-        if region_size and not self.supports_rdma:
-            raise ValueError("RDMA storage requires a CXL-enabled server")
+        if region_size and not self.supports_remote_cxl:
+            raise ValueError("Remote CXL storage requires a CXL-enabled server")
         if region_size and (capacity or cxl_capacity):
-            raise ValueError("An RDMA session cannot also hold CPU or CXL pools")
+            raise ValueError("A remote CXL session cannot also hold CPU or CXL pools")
         read_order = validate_order(p.get("read_order", ["cpu", "cxl"]))
         write_order = validate_order(p.get("write_order", ["cpu", "cxl"]))
         previous = self._sessions.get(token)
@@ -254,7 +258,7 @@ class ReplicaDirectory:
         if len(self._sessions) >= 1024:
             raise ValueError("Storage session limit reached")
         if region_size:
-            self._check_rdma_peers(namespace, schema, page_size)
+            self._check_remote_cxl_peers(namespace, schema, page_size)
         granted = sum(
             s.pools["cpu"].capacity
             for s in self._sessions.values()
@@ -296,7 +300,7 @@ class ReplicaDirectory:
         self._engines[engine] = token
         return self._grant(session)
 
-    def _check_rdma_peers(self, namespace: str, schema: str, page_size: int):
+    def _check_remote_cxl_peers(self, namespace: str, schema: str, page_size: int):
         """Readers of another session's region must agree on the KV layout."""
         for session in self._sessions.values():
             if not session.active or session.namespace != namespace:
@@ -304,19 +308,19 @@ class ReplicaDirectory:
             for region in session.regions.values():
                 if region.schema != schema or region.page_size != page_size:
                     raise ValueError(
-                        "RDMA regions of this namespace use another schema or page size"
+                        "Remote CXL regions of this namespace use another schema or page size"
                     )
 
     def _reserve_region(
         self, namespace: str, schema: str, size: int, page_size: int
     ) -> StoragePool:
-        owner_id = "rdma:" + uuid.uuid4().hex
+        owner_id = "remote_cxl:" + uuid.uuid4().hex
         handle = self._reserve_cxl(owner_id, size)
         if handle is None:
-            raise ValueError("RDMA region reservation failed")
+            raise ValueError("Remote CXL region reservation failed")
         return StoragePool(
             uuid.uuid4().hex,
-            RDMA,
+            REMOTE_CXL,
             size,
             page_size,
             handle,
@@ -350,17 +354,17 @@ class ReplicaDirectory:
         }
 
     def _expand(self, p: dict) -> dict:
-        """One more RDMA region for the session, as ``request_alloc`` gives a
+        """One more remote CXL region for the session, as ``request_alloc`` gives a
         cxl Handler one more region."""
         session = self._session(p)
         op_id = self._text(p.get("op_id"), "op_id")
         if not session.regions:
-            raise ValueError("The session has no RDMA regions")
+            raise ValueError("The session has no remote CXL regions")
         given = session.expansions.get(op_id)
         if given is not None and given in session.regions:
             return {"pool": self._pool_info(session.regions[given])}
         if len(session.regions) >= MAX_REGIONS_PER_SESSION:
-            raise ValueError("RDMA region limit of the session reached")
+            raise ValueError("Remote CXL region limit of the session reached")
         first = next(iter(session.regions.values()))
         region = self._reserve_region(
             session.namespace, session.schema, session.region_size, first.page_size
@@ -380,7 +384,7 @@ class ReplicaDirectory:
             first = session.pools.get("cpu") or next(iter(self._all_pools(session)))
             reports = [{"pool_id": first.pool_id, **p}]
         by_id = {pool.pool_id: pool for pool in self._all_pools(session)}
-        # An RDMA session may report a subset: a region can be granted while
+        # A remote CXL session may report a subset: a region can be granted while
         # the report is on its way.
         exact = not session.regions
         if not isinstance(reports, list) or (exact and len(reports) != len(by_id)):
@@ -427,7 +431,7 @@ class ReplicaDirectory:
 
     @staticmethod
     def _owned_pool(session: StorageSession, loc: StorageLocation):
-        if loc.medium == RDMA:
+        if loc.medium == REMOTE_CXL:
             return session.regions.get(loc.pool_id)
         pool = session.pools.get(loc.medium)
         return pool if pool is not None and pool.pool_id == loc.pool_id else None
@@ -464,11 +468,11 @@ class ReplicaDirectory:
         now = self._clock()
         statuses = []
         for key, loc, pool in parsed:
-            rdma = pool.medium == RDMA
+            remote_cxl = pool.medium == REMOTE_CXL
             if key in pool.replicas or (
-                rdma and (session.namespace, key) in self._rdma_index
+                remote_cxl and (session.namespace, key) in self._remote_cxl_index
             ):
-                # The first commit of a key wins, also across RDMA sessions.
+                # The first commit of a key wins, also across remote CXL sessions.
                 status = "ALREADY_PRESENT"
             elif loc.allocation_id in pool.allocations or loc.offset in pool.pages:
                 status = "REJECTED"
@@ -476,8 +480,8 @@ class ReplicaDirectory:
                 pool.replicas[key] = loc
                 pool.allocations[loc.allocation_id] = key
                 pool.pages.add(loc.offset)
-                if rdma:
-                    self._rdma_index[(session.namespace, key)] = pool
+                if remote_cxl:
+                    self._remote_cxl_index[(session.namespace, key)] = pool
                     pool.last_use[key] = now
                 status = "CREATED"
             statuses.append(status)
@@ -502,8 +506,8 @@ class ReplicaDirectory:
                 return loc
         return None
 
-    def _rdma_lookup(self, namespace: str, key: str) -> StoragePool | None:
-        pool = self._rdma_index.get((namespace, key))
+    def _remote_cxl_lookup(self, namespace: str, key: str) -> StoragePool | None:
+        pool = self._remote_cxl_index.get((namespace, key))
         if pool is None or not pool.visible or key not in pool.replicas:
             return None
         return pool
@@ -522,8 +526,8 @@ class ReplicaDirectory:
         for key in keys:
             hit = bool(valid and self._select(session, key))
             if not hit and isinstance(namespace, str):
-                # RDMA residency does not depend on the prober's session.
-                pool = self._rdma_lookup(namespace, key)
+                # Remote CXL residency does not depend on the prober's session.
+                pool = self._remote_cxl_lookup(namespace, key)
                 if pool is not None:
                     pool.last_use[key] = now
                     hit = True
@@ -539,40 +543,40 @@ class ReplicaDirectory:
     def _acquire(self, p: dict) -> dict:
         session = self._session(p)
         keys = self._keys(p)
-        if len(session.leases) + len(session.rdma_leases) >= 4096:
+        if len(session.leases) + len(session.remote_cxl_leases) >= 4096:
             raise ValueError("Storage read lease limit reached")
         # A reader may name its lease, so it can release a lease whose reply
         # it never received.
         requested = p.get("lease_id")
         if requested is not None:
             requested = self._text(requested, "lease_id")
-            if requested in session.leases or requested in session.rdma_leases:
+            if requested in session.leases or requested in session.remote_cxl_leases:
                 raise ValueError("lease_id is already in use")
         now = self._clock()
         entries = []
-        rdma_held: list[tuple[StoragePool, str]] = []
+        remote_cxl_held: list[tuple[StoragePool, str]] = []
         regions = {}
         for key in keys:
             loc = self._select(session, key)
             if loc is None:
-                pool = self._rdma_lookup(session.namespace, key)
+                pool = self._remote_cxl_lookup(session.namespace, key)
                 if pool is not None:
                     loc = pool.replicas[key]
                     pool.leased[key] = pool.leased.get(key, 0) + 1
                     pool.last_use[key] = now
                     pool.acquired_objects += 1
-                    rdma_held.append((pool, key))
+                    remote_cxl_held.append((pool, key))
                     regions[pool.pool_id] = pool.handle.to_dict()
             else:
                 session.pools[loc.medium].acquired_objects += 1
             entries.append(loc)
         lease_id = (requested or uuid.uuid4().hex) if any(entries) else None
         if lease_id is not None:
-            local = [loc for loc in entries if loc and loc.medium != RDMA]
+            local = [loc for loc in entries if loc and loc.medium != REMOTE_CXL]
             if local:
                 session.leases[lease_id] = local
-            if rdma_held:
-                session.rdma_leases[lease_id] = rdma_held
+            if remote_cxl_held:
+                session.remote_cxl_leases[lease_id] = remote_cxl_held
         return {
             "entries": [asdict(loc) if loc else None for loc in entries],
             "lease_id": lease_id,
@@ -580,7 +584,7 @@ class ReplicaDirectory:
         }
 
     @staticmethod
-    def _drop_rdma_lease(held: list[tuple[StoragePool, str]]) -> None:
+    def _drop_remote_cxl_lease(held: list[tuple[StoragePool, str]]) -> None:
         for pool, key in held:
             count = pool.leased.get(key, 0) - 1
             if count > 0:
@@ -589,9 +593,9 @@ class ReplicaDirectory:
                 pool.leased.pop(key, None)
 
     def _drop_reader_leases(self, session: StorageSession) -> None:
-        for held in session.rdma_leases.values():
-            self._drop_rdma_lease(held)
-        session.rdma_leases.clear()
+        for held in session.remote_cxl_leases.values():
+            self._drop_remote_cxl_lease(held)
+        session.remote_cxl_leases.clear()
 
     def _release(self, p: dict) -> dict:
         if p.get("server_epoch") != self.server_epoch:
@@ -601,12 +605,12 @@ class ReplicaDirectory:
         held = False
         if session is not None:
             held = session.active and (
-                lease_id in session.leases or lease_id in session.rdma_leases
+                lease_id in session.leases or lease_id in session.remote_cxl_leases
             )
             session.leases.pop(lease_id, None)
-            rdma = session.rdma_leases.pop(lease_id, None)
-            if rdma:
-                self._drop_rdma_lease(rdma)
+            remote_lease = session.remote_cxl_leases.pop(lease_id, None)
+            if remote_lease:
+                self._drop_remote_cxl_lease(remote_lease)
         # held=False tells a reader its bytes may have been evicted or the
         # region returned mid-read, so the bytes must not be used.
         return {"held": held}
@@ -615,7 +619,7 @@ class ReplicaDirectory:
 
     def _owned_regions(self, session: StorageSession) -> dict[str, StoragePool]:
         if not session.regions:
-            raise ValueError("The session has no RDMA regions")
+            raise ValueError("The session has no remote CXL regions")
         return session.regions
 
     def _victims(self, p: dict) -> dict:
@@ -668,8 +672,8 @@ class ReplicaDirectory:
         pool.allocations.pop(loc.allocation_id, None)
         pool.pages.discard(loc.offset)
         pool.last_use.pop(key, None)
-        if self._rdma_index.get((pool.namespace, key)) is pool:
-            del self._rdma_index[(pool.namespace, key)]
+        if self._remote_cxl_index.get((pool.namespace, key)) is pool:
+            del self._remote_cxl_index[(pool.namespace, key)]
 
     # ------------------------------------------------------------ return
 
@@ -677,8 +681,8 @@ class ReplicaDirectory:
         """Stop finding a region's keys; its bytes and leases stay."""
         region.visible = False
         for key in region.replicas:
-            if self._rdma_index.get((region.namespace, key)) is region:
-                del self._rdma_index[(region.namespace, key)]
+            if self._remote_cxl_index.get((region.namespace, key)) is region:
+                del self._remote_cxl_index[(region.namespace, key)]
 
     def _return_region(self, region: StoragePool) -> None:
         """The owner gave the region back after its region mapper released it.
@@ -720,10 +724,10 @@ class ReplicaDirectory:
     def _void_leases(self, region: StoragePool) -> None:
         """End every lease on a region; their releases report held=False."""
         for session in self._sessions.values():
-            for lease_id, held in list(session.rdma_leases.items()):
+            for lease_id, held in list(session.remote_cxl_leases.items()):
                 if any(pool is region for pool, _ in held):
-                    del session.rdma_leases[lease_id]
-                    self._drop_rdma_lease(
+                    del session.remote_cxl_leases[lease_id]
+                    self._drop_remote_cxl_lease(
                         [(pool, key) for pool, key in held if pool is not region]
                     )
         region.leased.clear()
@@ -777,7 +781,7 @@ class ReplicaDirectory:
             "node_id": s.node_id if s is not None else "",
             "medium": pool.medium,
             "tier": "L1",
-            "scope": "namespace" if pool.medium == RDMA else "process",
+            "scope": "namespace" if pool.medium == REMOTE_CXL else "process",
             "active": s.active if s is not None else False,
             "owner_instance_id": pool.owner_id,
             "capacity_bytes": pool.capacity,
@@ -792,7 +796,7 @@ class ReplicaDirectory:
             "replicas": len(pool.replicas),
             "read_leases": (
                 sum(pool.leased.values())
-                if pool.medium == RDMA
+                if pool.medium == REMOTE_CXL
                 else sum(
                     any(loc.pool_id == pool.pool_id for loc in lease)
                     for lease in leases

@@ -361,7 +361,7 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
 
 
 _RDMA_KNOBS = ("maru_rdma_device", "maru_rdma_staging_size", "maru_rdma_timeout_s")
-# Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.rdma.
+# Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
 _MIN_RDMA_STAGING = 1024**3
 # Share of the RDMA staging slots that stores leave free for loads when loads
 # and stores run on separate threads.
@@ -370,9 +370,9 @@ _RDMA_ASYNC_LOAD_RESERVE = 0.5
 _LEASED_SLOT_WAIT_S = 1.0
 
 
-def _rdma_async(extra: dict[str, Any]) -> bool:
-    """Whether loads or stores of the rdma backend run off the engine thread."""
-    return extra.get("maru_storage_backend") == "rdma" and any(
+def _remote_cxl_async(extra: dict[str, Any]) -> bool:
+    """Whether loads or stores of the remote_cxl backend run off the engine thread."""
+    return extra.get("maru_storage_backend") == "remote_cxl" and any(
         _get_knob(extra, knob) for knob in ("maru_async_load", "maru_async_store")
     )
 
@@ -380,10 +380,10 @@ def _rdma_async(extra: dict[str, Any]) -> bool:
 def _session_pool_key(extra: dict[str, Any]) -> str:
     """The extra_config key that sizes a storage-session backend's space.
 
-    RDMA storage takes regions as the cxl backend does: ``maru_pool_size`` is
+    Remote CXL storage takes regions as the cxl backend does: ``maru_pool_size`` is
     the size of one region, and a full worker gets another one.
     """
-    if extra.get("maru_storage_backend") == "rdma":
+    if extra.get("maru_storage_backend") == "remote_cxl":
         return "maru_pool_size"
     return "maru_cpu_pool_size"
 
@@ -391,20 +391,22 @@ def _session_pool_key(extra: dict[str, Any]) -> str:
 def _validate_storage_config(extra: dict[str, Any]) -> bool:
     """Validate M1's opt-in boundary before any cache data can be used."""
     backend = extra.get("maru_storage_backend", "cxl")
-    if backend not in {"cxl", "cpu", "mixed", "rdma"}:
-        raise ValueError("maru_storage_backend must be 'cxl', 'cpu', 'mixed' or 'rdma'")
-    if backend != "rdma" and any(name in extra for name in _RDMA_KNOBS):
-        raise ValueError("RDMA settings require maru_storage_backend='rdma'")
+    if backend not in {"cxl", "cpu", "mixed", "remote_cxl"}:
+        raise ValueError(
+            "maru_storage_backend must be 'cxl', 'cpu', 'mixed' or 'remote_cxl'"
+        )
+    if backend != "remote_cxl" and any(name in extra for name in _RDMA_KNOBS):
+        raise ValueError("RDMA settings require maru_storage_backend='remote_cxl'")
     if backend == "cxl":
         return False
     pool_key = _session_pool_key(extra)
     for name in ("maru_engine_id", "maru_cache_namespace", pool_key):
         if not extra.get(name):
             raise ValueError(f"{backend.upper()} storage requires {name}")
-    if backend != "rdma" and "maru_pool_size" in extra:
+    if backend != "remote_cxl" and "maru_pool_size" in extra:
         raise ValueError(f"Use {pool_key} for {backend} storage, not maru_pool_size")
-    if backend == "rdma" and "maru_cpu_pool_size" in extra:
-        raise ValueError("RDMA storage takes its region size from maru_pool_size")
+    if backend == "remote_cxl" and "maru_cpu_pool_size" in extra:
+        raise ValueError("Remote CXL storage takes its region size from maru_pool_size")
     if _parse_size(extra[pool_key]) <= 0:
         raise ValueError(f"{pool_key} must be positive")
     if backend == "mixed":
@@ -424,19 +426,19 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
         raise ValueError(
             "CXL capacity and placement order settings require mixed storage"
         )
-    # The rdma staging buffer is page-locked for CUDA, so the rdma backend
+    # The remote_cxl staging buffer is page-locked for CUDA, so the remote_cxl backend
     # also takes asynchronous loads and stores (design note 3.11).
-    label = "RDMA storage" if backend == "rdma" else "CPU M1"
+    label = "remote CXL storage" if backend == "remote_cxl" else "CPU M1"
     knobs = ["maru_overlap_load_with_compute"]
-    if backend != "rdma":
+    if backend != "remote_cxl":
         knobs[:0] = ["maru_async_load", "maru_async_store"]
     for knob in knobs:
         if _get_knob(extra, knob):
             raise ValueError(f"{label} does not support {knob}")
     if extra.get("maru_use_layerwise", False):
         raise ValueError(
-            "RDMA storage supports chunkwise storage only"
-            if backend == "rdma"
+            "Remote CXL storage supports chunkwise storage only"
+            if backend == "remote_cxl"
             else "CPU M1 supports sync chunkwise storage only"
         )
     return True
@@ -445,7 +447,7 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry."""
     if (
-        extra.get("maru_storage_backend") == "rdma"
+        extra.get("maru_storage_backend") == "remote_cxl"
         and not _get_knob(extra, "maru_async_load")
         and getattr(
             getattr(config, "scheduler_config", None), "async_scheduling", False
@@ -455,9 +457,9 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
         # async scheduling vLLM has already scheduled the request's next step
         # by then. An asynchronous load reports its failure while the request
         # is still parked. Remote loads fail in normal operation (a memory
-        # node or maru-server going away), so the rdma backend checks this.
+        # node or maru-server going away), so the remote_cxl backend checks this.
         raise ValueError(
-            "RDMA storage requires vLLM async scheduling off "
+            "Remote CXL storage requires vLLM async scheduling off "
             "(--no-async-scheduling) unless maru_async_load is enabled"
         )
     if (
@@ -533,7 +535,7 @@ def _rdma_staging_size(extra: dict[str, Any], page_size: int) -> int | None:
     need = chunks * page_size if chunks else None
     if "maru_rdma_staging_size" in extra:
         size = _parse_size(extra["maru_rdma_staging_size"])
-        split = _rdma_async(extra)
+        split = _remote_cxl_async(extra)
         need_total = (2 if split else 1) * need if need else None
         if need_total is not None and size < need_total:
             what = (
@@ -658,13 +660,14 @@ def _create_maru_handler(
         rdma_device=extra_config.get("maru_rdma_device", ""),
         rdma_staging_size=(
             _rdma_staging_size(extra_config, chunk_size)
-            if extra_config.get("maru_storage_backend") == "rdma" and not metadata_only
+            if extra_config.get("maru_storage_backend") == "remote_cxl"
+            and not metadata_only
             else None
         ),
         rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30.0)),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE
-            if _rdma_async(extra_config) and not metadata_only
+            if _remote_cxl_async(extra_config) and not metadata_only
             else 0.0
         ),
     )
@@ -1674,7 +1677,7 @@ class MaruWorkerConnector:
     """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
 
     _cpu_mode = False
-    _rdma_mode = False
+    _remote_cxl_mode = False
 
     def __init__(
         self,
@@ -1689,11 +1692,11 @@ class MaruWorkerConnector:
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._cpu_mode = _validate_storage_config(extra_config)
-        # The rdma staging buffer is page-locked for CUDA: rdma loads and
+        # The remote_cxl staging buffer is page-locked for CUDA: remote_cxl loads and
         # stores take the copy kernel, may run asynchronously, and load in
         # batches that fit the staging buffer (design note 3.11).
-        self._rdma_mode = (
-            self._cpu_mode and extra_config.get("maru_storage_backend") == "rdma"
+        self._remote_cxl_mode = (
+            self._cpu_mode and extra_config.get("maru_storage_backend") == "remote_cxl"
         )
         # Layout cross-checks. Optional; without them detection still verifies
         # block_size, but cannot separate the two rank-4 fused orders.
@@ -1828,7 +1831,7 @@ class MaruWorkerConnector:
         # handler was down. Retried by the next sweep; kept out of
         # _pending_slabs so no later layer resumes writing into them.
         self._orphan_slab_handles: list[Any] = []
-        # rdma: chunks whose slab could not be allocated or filled in this
+        # remote_cxl: chunks whose slab could not be allocated or filled in this
         # step (staging full); the remaining layers skip them instead of
         # allocating a slab that can never complete. Cleared every step.
         self._skipped_slabs: set[str] = set()
@@ -2133,7 +2136,7 @@ class MaruWorkerConnector:
                 and self._try_submit_deferred_load(req_meta)
             ):
                 continue
-            if self._rdma_mode:
+            if self._remote_cxl_mode:
                 self._load_leased_request(layers, req_meta, attn_metadata)
                 continue
 
@@ -2314,7 +2317,7 @@ class MaruWorkerConnector:
         """
         try:
             handler = self._handler
-            if self._rdma_mode:
+            if self._remote_cxl_mode:
                 # Batches of leased staging slots: each batch is released once
                 # its copies are done; the request unparks after the last one.
                 if handler is None:
@@ -3014,7 +3017,7 @@ class MaruWorkerConnector:
         attn_metadata: Any,
         stream: Any = None,
     ) -> None:
-        """Load an rdma request's externally allocated token range.
+        """Load a remote_cxl request's externally allocated token range.
 
         Runs on the engine thread for synchronous loads and on the loader
         thread for asynchronous ones (``maru_async_load``).
@@ -3056,7 +3059,7 @@ class MaruWorkerConnector:
         route: dict[str, str],
         stream: Any = None,
     ) -> None:
-        """Load an rdma request's external range in staging-sized batches.
+        """Load a remote_cxl request's external range in staging-sized batches.
 
         Each batch is retrieved, copied to the GPU and released before the
         next one is retrieved, so the staging buffer bounds a batch, not a
@@ -3674,7 +3677,7 @@ class MaruWorkerConnector:
         engine KV format both come from the layout resolved at registration.
         """
         if self._cpu_mode and not self._lease_buffers_gpu_accessible():
-            # CPU pools are pageable; the rdma staging buffer is page-locked
+            # CPU pools are pageable; the remote_cxl staging buffer is page-locked
             # unless its CUDA registration failed.
             return None
         device = layers[0][1].device
@@ -3823,7 +3826,7 @@ class MaruWorkerConnector:
 
     def _lease_buffers_gpu_accessible(self) -> bool:
         """Whether storage-session buffers are page-locked for GPU kernels."""
-        if not self._rdma_mode or self._handler is None:
+        if not self._remote_cxl_mode or self._handler is None:
             return False
         return bool(self._handler.storage_gpu_accessible())
 
@@ -4165,7 +4168,7 @@ class MaruWorkerConnector:
             return self._store_kernel_ctx
         if not self._kv_caches or self._num_layers <= 0:
             return None  # not registered yet; resolve on a later call
-        if self._rdma_mode and self._handler is None:
+        if self._remote_cxl_mode and self._handler is None:
             return None  # staging unknown until connected; resolve later
         layers = [
             (name, kv_cache, self._get_layer_index(name))
@@ -4478,7 +4481,7 @@ class MaruWorkerConnector:
                     # copy engine rather than keeping SMs busy for the D2H.
                     slab_host.copy_(self._store_staging, non_blocking=True)
                 except Exception as e:
-                    if self._rdma_mode and isinstance(
+                    if self._remote_cxl_mode and isinstance(
                         e, MemoryError | StorageUnavailableError
                     ):
                         self._note_store_skip(base_key, e)  # rate-limited
@@ -4581,12 +4584,14 @@ class MaruWorkerConnector:
     def _note_store_skip(self, base_key: str, exc: Exception) -> None:
         """Report a chunk whose store fails in this step.
 
-        On the rdma backend a full staging buffer or an unavailable pool is
+        On the remote_cxl backend a full staging buffer or an unavailable pool is
         expected while loads hold the slots or the pool recovers: the chunk
         is skipped for the rest of the step and logged at most once a
         minute. Other errors, and other backends, log every chunk.
         """
-        if self._rdma_mode and isinstance(exc, MemoryError | StorageUnavailableError):
+        if self._remote_cxl_mode and isinstance(
+            exc, MemoryError | StorageUnavailableError
+        ):
             self._skipped_slabs.add(base_key)
             now = time.monotonic()
             if now - self._last_skip_warning >= 60.0:

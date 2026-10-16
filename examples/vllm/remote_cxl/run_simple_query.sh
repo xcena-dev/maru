@@ -1,12 +1,12 @@
 #!/bin/bash
-# Simple query test for the RDMA KV path (vLLM direct).
+# Simple query test for the remote CXL KV path (vLLM direct).
 # Flow: inst1 computes a prompt and stores its KV in the CXL pool over RDMA ->
 #       inst2 answers the same prompt with KV read from the pool over RDMA.
 #
 # Prerequisites:
 #   1. Every memory node runs region_mapper.sh, and the metadata node runs
 #      maru_server.sh
-#   2. Two engines run rdma_vllm_launcher.sh (inst1, inst2), on any nodes
+#   2. Two engines run remote_cxl_vllm_launcher.sh (inst1, inst2), on any nodes
 #
 # Usage:
 #   ./run_simple_query.sh [model]

@@ -1,11 +1,11 @@
 #!/bin/bash
-# Run the RDMA KV sharing test between two vLLM engines.
+# Run the remote CXL KV sharing test between two vLLM engines.
 # Instance 1 stores a prompt's KV in the pool; Instance 2 loads it.
 #
 # Prerequisites:
 #   1. Every memory node runs region_mapper.sh, and the metadata node runs
 #      maru_server.sh
-#   2. Two engines run rdma_vllm_launcher.sh (inst1, inst2), on any nodes
+#   2. Two engines run remote_cxl_vllm_launcher.sh (inst1, inst2), on any nodes
 #
 # Usage:
 #   ./run_benchmark.sh [--model MODEL] [--prompt-repeat N] [--max-tokens N]

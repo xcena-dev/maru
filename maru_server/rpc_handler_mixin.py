@@ -263,7 +263,7 @@ class RpcHandlerMixin:
     def _handle_handshake(self, req: Any) -> dict:
         from maru_common.storage_types import (
             MIXED_STORAGE_CAPABILITY,
-            RDMA_STORAGE_CAPABILITY,
+            REMOTE_CXL_STORAGE_CAPABILITY,
             STORAGE_CAPABILITY,
         )
 
@@ -275,7 +275,7 @@ class RpcHandlerMixin:
             "region_mappers": region_mappers,
             "capabilities": [STORAGE_CAPABILITY]
             + ([MIXED_STORAGE_CAPABILITY] if cxl else [])
-            + ([RDMA_STORAGE_CAPABILITY] if cxl and region_mappers else []),
+            + ([REMOTE_CXL_STORAGE_CAPABILITY] if cxl and region_mappers else []),
             "server_epoch": self._server.replica_directory.server_epoch,
         }
 

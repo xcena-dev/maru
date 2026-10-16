@@ -226,21 +226,21 @@ for launch configuration, memory lifetime and validation instructions.
 
 ### CXL on memory nodes over RDMA
 
-Set `maru_storage_backend="rdma"` to run engines on nodes without CXL. The KV
+Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The KV
 stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
 size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
 and, optionally, `maru_rdma_device` (the worker's RDMA NIC, e.g. `mlx5_0:1`).
 
-![The cxl backend and the rdma backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the rdma backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/rdma_concept.png)
+![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
 
 Resources flow as for the cxl backend: the resource manager gives regions to
 maru-server and maru-server gives them to the worker, one region when its
 storage session opens and one more each time its regions are full. Only the
 step that maps a region moves, from the Handler to the memory node.
 
-![Components of the rdma backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/rdma_sw_structure.png)
+![Components of the remote_cxl backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/remote_cxl_sw_structure.png)
 
 Each memory
 node runs a region mapper (`maru-region-mapper`), a service shared by every app:
@@ -265,7 +265,7 @@ stores run on the engine thread unless `maru_async_load` and
 `--no-async-scheduling`. The worker's staging buffer is registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
 for mapped CXL memory. NIXL is required (`pip install 'maru[rdma]'`).
-See the [RDMA example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/rdma/README.md)
+See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 for one-host and multi-node launch steps.
 
 ### Connector settings

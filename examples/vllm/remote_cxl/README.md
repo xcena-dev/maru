@@ -1,6 +1,6 @@
 # vLLM with CXL on memory nodes over RDMA
 
-The `rdma` storage backend lets vLLM engines on nodes without CXL keep their
+The `remote_cxl` storage backend lets vLLM engines on nodes without CXL keep their
 KV cache in the CXL memory of other nodes, the memory nodes, and move it over
 RDMA. Resources flow as for local CXL: the resource manager gives regions to
 maru-server, and maru-server gives them to each worker's MaruHandler. What
@@ -12,8 +12,8 @@ through any Maru process.
 ```
 worker node (any number)          metadata node              memory node (each node of the pool)
 vLLM + MaruKVConnector            maru-server                region mapper
-  MaruHandler(storage_backend       storage sessions,          maps a region, registers it
-             ="rdma")               regions, keys    <--alloc-- with the NIC   resource manager
+  MaruHandler                     storage sessions,          maps a region, registers it
+  (storage_backend="remote_cxl")    regions, keys    <--alloc-- with the NIC   resource manager
     session RPC  ---------------->                              ^       (one per pool)
     map / release  ---------------------------------------------+
     staging  <======= one-sided RDMA (NIXL) =======>  NIC ==> CXL memory
@@ -56,7 +56,7 @@ moves it, as for the cxl backend.
 
 ## Quick start (one host)
 
-`rdma_example.sh` runs maru-server and two workers on one host, and uses the
+`remote_cxl_example.sh` runs maru-server and two workers on one host, and uses the
 region mapper service when it runs there (otherwise it starts a region mapper
 itself). The workers still go through the region mapper's NIC
 registration and one-sided RDMA, so the example needs 2 GPUs, an RDMA NIC and
@@ -65,13 +65,13 @@ a CXL/DAX device on that host.
 ```bash
 sudo systemctl start maru-resource-manager    # installed by ./install.sh
 MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
-MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./rdma_example.sh [model]
+MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh [model]
 ```
 
 This will:
 1. Use the region mapper service, or start a region mapper (`region_mapper.sh`)
 2. Start maru-server with that region mapper (`maru_server.sh`)
-3. Launch two vLLM engines with `storage_backend: "rdma"` (`rdma_vllm_launcher.sh`)
+3. Launch two vLLM engines with `storage_backend: "remote_cxl"` (`remote_cxl_vllm_launcher.sh`)
 4. Send a new prompt to instance 1, which computes it and stores its KV in the
    pool, then the same prompt to instance 2, which loads the KV from the pool
 5. Clean up all processes
@@ -168,8 +168,8 @@ On each worker node, point the engines at maru-server:
 
 ```bash
 export MARU_SERVER_URL=tcp://10.0.0.2:<maru-server port> MARU_WORKER_UCX_DEVICE=mlx5_0:1
-MARU_INST1_GPU=0 ./rdma_vllm_launcher.sh inst1 [model]
-MARU_INST2_GPU=1 ./rdma_vllm_launcher.sh inst2 [model]
+MARU_INST1_GPU=0 ./remote_cxl_vllm_launcher.sh inst1 [model]
+MARU_INST2_GPU=1 ./remote_cxl_vllm_launcher.sh inst2 [model]
 ```
 
 The example's default ports derive from the user ID, which can differ between
@@ -185,7 +185,7 @@ vllm serve <model> --enforce-eager --no-async-scheduling --enable-prompt-tokens-
     "kv_load_failure_policy": "recompute",
     "kv_connector_extra_config": {
       "maru_server_url": "tcp://10.0.0.2:<maru-server port>",
-      "maru_storage_backend": "rdma",
+      "maru_storage_backend": "remote_cxl",
       "maru_rdma_device": "mlx5_0:1",
       "maru_pool_size": "4G",
       "maru_engine_id": "<unique per engine>",
@@ -235,7 +235,7 @@ All example settings are in `env.sh`. Override them with environment variables:
 | `MARU_SERVER_URL` | `tcp://$MARU_SERVER_HOST:$MARU_SERVER_PORT` | maru-server as workers see it; set it on worker nodes |
 | `MARU_POOL_SIZE` | `4G` | Region size; a worker gets one more region each time its regions are full |
 | `MARU_WORKER_UCX_DEVICE` | UCX default | RDMA NIC on each worker, e.g. `mlx5_0:1` |
-| `MARU_CACHE_NAMESPACE` | `maru-rdma-example` | Sharing scope of the engines |
+| `MARU_CACHE_NAMESPACE` | `maru-remote-cxl-example` | Sharing scope of the engines |
 | `MARU_KV_CHUNK_TOKENS` | `256` | Tokens per KV chunk |
 | `MARU_INST1_GPU` / `MARU_INST2_GPU` | `0` / `1` | GPU of each engine |
 | `MARU_NUMA_NODE` | none | NUMA node to bind each engine to |

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The RDMA storage client: a storage session whose regions live in a memory
+"""The remote CXL storage client: a storage session whose regions live in a memory
 node's CXL, written and read with one-sided RDMA through a staging buffer."""
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any
 
 from maru_common.storage_types import (
     MAX_STORAGE_BATCH,
-    RDMA_STORAGE_CAPABILITY,
+    REMOTE_CXL_STORAGE_CAPABILITY,
     STORAGE_CAPABILITY,
     StorageError,
     StorageLocation,
@@ -25,7 +25,7 @@ from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
 from .datapath import RdmaDataPath
 from .lifecycle import RegionLifecycle
-from .region import RDMA, IsolatedTransfer, RdmaAllocation, RdmaRegion
+from .region import REMOTE_CXL, IsolatedTransfer, RemoteCxlAllocation, RemoteCxlRegion
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ TRANSIENT_OPEN_REFUSALS = (
 )
 
 
-class RdmaStorageClient(RegionLifecycle):
+class RemoteCxlStorageClient(RegionLifecycle):
     """Storage-session client whose regions are reached over RDMA."""
 
     def __init__(
@@ -52,7 +52,7 @@ class RdmaStorageClient(RegionLifecycle):
         """Create a client; :meth:`connect` opens the session.
 
         Args:
-            config: ``MaruConfig`` of the worker (``storage_backend="rdma"``).
+            config: ``MaruConfig`` of the worker (``storage_backend="remote_cxl"``).
             rpc: MaruServer RPC client.
             data: Data path shared with other pools (``PoolRouter``); a new
                 one is made and owned when omitted.
@@ -65,7 +65,7 @@ class RdmaStorageClient(RegionLifecycle):
         # True once connected: a client that lost its session afterwards keeps
         # the cache off until the worker restarts, as storage sessions do.
         self.ever_connected = False
-        self.regions: dict[str, RdmaRegion] = {}
+        self.regions: dict[str, RemoteCxlRegion] = {}
         self._owns_data = data is None
         self._data = data or RdmaDataPath(config, transport_factory, mapper_factory)
         self._credentials: dict = {}
@@ -78,7 +78,7 @@ class RdmaStorageClient(RegionLifecycle):
         self._sequence = 0
         self._sequence_lock = threading.Lock()
         self._keys: dict[str, StorageLocation] = {}
-        self._pending: dict[str, tuple[list[str], list[RdmaAllocation]]] = {}
+        self._pending: dict[str, tuple[list[str], list[RemoteCxlAllocation]]] = {}
         # Victims whose remove reply was lost: their pages wait for a retry.
         self._removing: list[dict] = []
         # op_id of an expand whose reply was lost, resent by the next attempt
@@ -109,7 +109,7 @@ class RdmaStorageClient(RegionLifecycle):
         """
         with self._lock:
             if self._stop.is_set():
-                raise RuntimeError("Create a fresh RDMA handler after close")
+                raise RuntimeError("Create a fresh remote CXL handler after close")
             if self.connected:
                 return True
             self.rpc.connect()
@@ -128,7 +128,7 @@ class RdmaStorageClient(RegionLifecycle):
                         raise
                     self._data.start()
                     for info in grant["pools"]:
-                        if info["medium"] == RDMA:
+                        if info["medium"] == REMOTE_CXL:
                             self._add_region(info)
                     interval = self._session_ttl / 3
                     self._threads = [
@@ -136,13 +136,13 @@ class RdmaStorageClient(RegionLifecycle):
                             target=self._heartbeat_loop,
                             args=(interval,),
                             daemon=True,
-                            name="maru-rdma-heartbeat",
+                            name="maru-remote-cxl-heartbeat",
                         ),
                         threading.Thread(
                             target=self._remap_loop,
                             args=(interval,),
                             daemon=True,
-                            name="maru-rdma-remap",
+                            name="maru-remote-cxl-remap",
                         ),
                     ]
                 self.connected = True
@@ -170,9 +170,9 @@ class RdmaStorageClient(RegionLifecycle):
             raise StorageError("MaruServer does not support cpu_storage_v1")
         mappers = [str(m) for m in handshake.get("region_mappers") or []]
         if not self.config.metadata_only:
-            if RDMA_STORAGE_CAPABILITY not in capabilities or not mappers:
+            if REMOTE_CXL_STORAGE_CAPABILITY not in capabilities or not mappers:
                 raise StorageError(
-                    "RDMA storage requires rdma_storage_v1 and --region-mapper "
+                    "Remote CXL storage requires remote_cxl_storage_v1 and --region-mapper "
                     "on MaruServer"
                 )
         self._mappers = mappers
@@ -211,7 +211,7 @@ class RdmaStorageClient(RegionLifecycle):
             schema=self.config.storage_schema,
             node_id=self.config.node_id or socket.gethostname(),
             capacity=0,
-            rdma_region_size=size,
+            remote_cxl_region_size=size,
             page_size=page,
         )
         self._session_ttl = grant["session_ttl"]
@@ -222,7 +222,7 @@ class RdmaStorageClient(RegionLifecycle):
 
     def _ensure(self, data: bool = True) -> None:
         if not self.connected or self._stop.is_set():
-            raise StorageUnavailableError("RDMA cache session is unavailable")
+            raise StorageUnavailableError("Remote CXL cache session is unavailable")
         if data and not self.regions:
             raise RuntimeError("A metadata-only client cannot access RDMA buffers")
 
@@ -240,12 +240,14 @@ class RdmaStorageClient(RegionLifecycle):
             except StorageError:
                 # A new epoch or an expired session cannot be resumed with the
                 # old regions: fail closed until the worker restarts.
-                self._disable("RDMA cache session expired or MaruServer restarted")
+                self._disable(
+                    "Remote CXL cache session expired or MaruServer restarted"
+                )
                 return
             except Exception:
                 # A timeout is neither proof of a lost session nor permission
                 # to reuse memory; acquire revalidates everything.
-                logger.warning("RDMA cache heartbeat failed", exc_info=True)
+                logger.warning("Remote CXL cache heartbeat failed", exc_info=True)
             # Housekeeping waits for a free moment; a transfer in progress
             # only delays it to the next beat.
             if self._lock.acquire(blocking=False):
@@ -255,7 +257,9 @@ class RdmaStorageClient(RegionLifecycle):
                     self._retry_drops()
                     self._reap_isolated()
                 except Exception:
-                    logger.warning("RDMA cache housekeeping failed", exc_info=True)
+                    logger.warning(
+                        "Remote CXL cache housekeeping failed", exc_info=True
+                    )
                 finally:
                     self._lock.release()
 
@@ -272,7 +276,7 @@ class RdmaStorageClient(RegionLifecycle):
                 self._retry_unreachable()
                 self._check_boots()
             except Exception:
-                logger.warning("RDMA region remap failed", exc_info=True)
+                logger.warning("Remote CXL region remap failed", exc_info=True)
 
     def _heartbeat(self) -> None:
         """Renew the session without the client lock.
@@ -301,7 +305,7 @@ class RdmaStorageClient(RegionLifecycle):
 
     # ------------------------------------------------------------ allocation
 
-    def alloc(self, size: int, route_key: str | None = None) -> RdmaAllocation:
+    def alloc(self, size: int, route_key: str | None = None) -> RemoteCxlAllocation:
         """A staging slot and a remote page for ``size`` bytes.
 
         Args:
@@ -330,13 +334,13 @@ class RdmaStorageClient(RegionLifecycle):
             except BaseException:
                 self._staging.give(slots[0])
                 raise
-            handle = RdmaAllocation(
+            handle = RemoteCxlAllocation(
                 self._staging.view(slots[0])[:size], location, slots[0], region
             )
             region.track(handle)
             return handle
 
-    def _take_page(self, size: int) -> tuple[RdmaRegion, StorageLocation]:
+    def _take_page(self, size: int) -> tuple[RemoteCxlRegion, StorageLocation]:
         """A free page: from a region with room, a new region, or eviction."""
         for attempt in ("free", "expand", "evict"):
             if attempt == "expand" and not (self._may_expand() and self._expand()):
@@ -346,9 +350,9 @@ class RdmaStorageClient(RegionLifecycle):
             for region in self.regions.values():
                 if region.has_free():
                     return region, region.take_page(size)
-        raise MemoryError("RDMA regions are full; skipping new cache admission")
+        raise MemoryError("Remote CXL regions are full; skipping new cache admission")
 
-    def free(self, handle: RdmaAllocation) -> None:
+    def free(self, handle: RemoteCxlAllocation) -> None:
         """Give back an allocation that was not stored.
 
         A committed allocation or one a transfer may still touch is left
@@ -369,7 +373,7 @@ class RdmaStorageClient(RegionLifecycle):
             self._give_slot(handle)
             handle.state = "freed"
 
-    def _give_slot(self, handle: RdmaAllocation) -> None:
+    def _give_slot(self, handle: RemoteCxlAllocation) -> None:
         try:
             handle.buf.release()
         except BufferError:
@@ -399,7 +403,9 @@ class RdmaStorageClient(RegionLifecycle):
 
     # ----------------------------------------------------------------- store
 
-    def batch_store(self, keys: list[str], handles: list[RdmaAllocation]) -> list[bool]:
+    def batch_store(
+        self, keys: list[str], handles: list[RemoteCxlAllocation]
+    ) -> list[bool]:
         """Write the staged bytes to their remote pages, then commit the keys.
 
         Args:
@@ -426,18 +432,20 @@ class RdmaStorageClient(RegionLifecycle):
         with self._lock:
             self._ensure()
             if len({id(h) for h in handles}) != len(handles):
-                raise ValueError("An RDMA allocation can only be committed once")
+                raise ValueError("A remote CXL allocation can only be committed once")
             for key, handle in zip(keys, handles, strict=True):
                 if not isinstance(key, str) or not key or len(key) > 4096:
-                    raise ValueError("Invalid RDMA key")
+                    raise ValueError("Invalid remote CXL key")
                 handle.region.validate(handle)
                 if handle.state != "writing":
-                    raise ValueError("RDMA allocation was already submitted")
+                    raise ValueError("Remote CXL allocation was already submitted")
             if not self._write(handles):
                 return [False] * len(keys)
             return self._commit(keys, handles)
 
-    def _commit(self, keys: list[str], handles: list[RdmaAllocation]) -> list[bool]:
+    def _commit(
+        self, keys: list[str], handles: list[RemoteCxlAllocation]
+    ) -> list[bool]:
         op_id = uuid.uuid4().hex
         self._pending[op_id] = (keys[:], handles[:])
         for handle in handles:
@@ -456,17 +464,17 @@ class RdmaStorageClient(RegionLifecycle):
             return [False] * len(keys)
         return self._finish_commit(op_id, result.get("statuses", []))
 
-    def _write(self, handles: list[RdmaAllocation]) -> bool:
+    def _write(self, handles: list[RemoteCxlAllocation]) -> bool:
         """Move staged bytes to their remote pages; False if not confirmed.
 
         Pages are written region by region. If any region fails, nothing is
         committed: written pages and their slots go back, unconfirmed ones
         are isolated.
         """
-        groups: dict[str, list[RdmaAllocation]] = {}
+        groups: dict[str, list[RemoteCxlAllocation]] = {}
         for h in handles:
             groups.setdefault(h.region.pool_id, []).append(h)
-        written: list[RdmaAllocation] = []
+        written: list[RemoteCxlAllocation] = []
         ok = True
         for group in groups.values():
             if ok and self._write_group(group):
@@ -483,7 +491,7 @@ class RdmaStorageClient(RegionLifecycle):
             self._give_slot(h)
         return True
 
-    def _write_group(self, group: list[RdmaAllocation]) -> bool:
+    def _write_group(self, group: list[RemoteCxlAllocation]) -> bool:
         """WRITE the pages of one region; on failure they are given back or
         isolated, and False is returned."""
         from maru_remote.transport import TransferTimeout, TransferUncertainError
@@ -492,7 +500,9 @@ class RdmaStorageClient(RegionLifecycle):
         try:
             access = self._map_own(region)
         except StorageUnavailableError as exc:
-            logger.warning("RDMA region %d cannot be mapped: %s", region.region_id, exc)
+            logger.warning(
+                "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
+            )
             self._give_back(group)
             self._set_aside(region)
             return False
@@ -533,7 +543,7 @@ class RdmaStorageClient(RegionLifecycle):
             return False
         return True
 
-    def _give_back(self, handles: list[RdmaAllocation]) -> None:
+    def _give_back(self, handles: list[RemoteCxlAllocation]) -> None:
         """Pages written but not committed (or never written) return."""
         for h in handles:
             h.region.untrack(h)
@@ -647,7 +657,7 @@ class RdmaStorageClient(RegionLifecycle):
             if len(entries) != len(keys):
                 if lease_id:
                     self._release_lease(lease_id)
-                raise StorageUnavailableError("Malformed RDMA acquire response")
+                raise StorageUnavailableError("Malformed remote CXL acquire response")
             hits = [
                 (i, StorageLocation(**entry))
                 for i, entry in enumerate(entries)

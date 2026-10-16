@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ReplicaDirectory rules for RDMA regions: expand, sharing, leases, eviction,
+"""ReplicaDirectory rules for remote CXL regions: expand, sharing, leases, eviction,
 expiry and the return of regions after a drained close."""
 
 import uuid
@@ -69,11 +69,11 @@ def open_session(directory, engine, pages=2, namespace="ns", page=PAGE, token=No
         node_id="node",
         schema="opaque-bytes-v1",
         capacity=0,
-        rdma_region_size=pages * page,
+        remote_cxl_region_size=pages * page,
         page_size=page,
     )
     pool = grant["pools"][0]
-    assert pool["medium"] == "rdma" and "handle" in pool
+    assert pool["medium"] == "remote_cxl" and "handle" in pool
     return creds, pool["pool_id"]
 
 
@@ -84,7 +84,7 @@ def location(pool_id, page, allocation=None, length=8):
         "generation": page + 1,
         "offset": page * PAGE,
         "length": length,
-        "medium": "rdma",
+        "medium": "remote_cxl",
     }
 
 
@@ -113,7 +113,7 @@ def test_expand_gives_the_session_one_more_region(env):
     directory, rm, _ = env
     a, first = open_session(directory, "a")
     region = expand(directory, a)["pool"]
-    assert region["medium"] == "rdma" and region["pool_id"] != first
+    assert region["medium"] == "remote_cxl" and region["pool_id"] != first
     assert region["capacity"] == 2 * PAGE and region["handle"]["region_id"] == 2
     assert commit(directory, a, region["pool_id"], "k", 1) == "CREATED"
     assert sorted(rm.regions) == [1, 2]
@@ -151,7 +151,7 @@ def test_a_session_cannot_commit_into_another_sessions_region(env):
         commit(directory, b, pool_a, "k", 0)
 
 
-def test_heartbeat_of_an_rdma_session_may_report_some_regions(env):
+def test_heartbeat_of_a_remote_cxl_session_may_report_some_regions(env):
     directory, _, _ = env
     a, first = open_session(directory, "a")
     expand(directory, a)
@@ -175,7 +175,7 @@ def test_reopening_with_the_same_token_returns_every_region(env):
         node_id="node",
         schema="opaque-bytes-v1",
         capacity=0,
-        rdma_region_size=2 * PAGE,
+        remote_cxl_region_size=2 * PAGE,
         page_size=PAGE,
     )
     assert [p["pool_id"] for p in again["pools"]] == [first, second]
@@ -435,7 +435,7 @@ def test_an_unconfirmed_release_is_retried(env):
 # ----------------------------------------------------------------- open rules
 
 
-def test_rdma_sessions_hold_no_cpu_or_cxl_pool(env):
+def test_remote_cxl_sessions_hold_no_cpu_or_cxl_pool(env):
     directory, _, _ = env
     with pytest.raises(ValueError, match="cannot also hold"):
         call(
@@ -448,12 +448,12 @@ def test_rdma_sessions_hold_no_cpu_or_cxl_pool(env):
             node_id="node",
             schema="s",
             capacity=PAGE,
-            rdma_region_size=PAGE,
+            remote_cxl_region_size=PAGE,
             page_size=PAGE,
         )
 
 
-def test_rdma_needs_a_cxl_enabled_server():
+def test_remote_cxl_needs_a_cxl_enabled_server():
     directory = ReplicaDirectory()
     with pytest.raises(ValueError, match="CXL-enabled"):
         open_session(directory, "a")
@@ -473,7 +473,7 @@ def test_cpu_sessions_cannot_expand(env):
         capacity=PAGE,
         page_size=PAGE,
     )
-    with pytest.raises(ValueError, match="no RDMA regions"):
+    with pytest.raises(ValueError, match="no remote CXL regions"):
         expand(directory, creds)
 
 

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Several RDMA pools behind one worker: routing, grouping and shared staging."""
+"""Several remote CXL pools behind one worker: routing, grouping and shared staging."""
 
 import pytest
 
-import maru_handler.storage.rdma.router as router_module
+import maru_handler.storage.remote_cxl.router as router_module
 from maru_common.config import MaruConfig
 from maru_common.storage_types import StorageUnavailableError
-from maru_handler.storage.rdma import PoolRouter
+from maru_handler.storage.remote_cxl import PoolRouter
 from maru_remote.transport import NixlTransport
 from maru_server.replica_directory import ReplicaDirectory
 from tests.unit.remote_fakes import (
@@ -16,7 +16,7 @@ from tests.unit.remote_fakes import (
     FakeNixlAgent,
     reset_fake_agents,
 )
-from tests.unit.test_rdma_storage import PAGE, Rpc
+from tests.unit.test_remote_cxl_storage import PAGE, Rpc
 
 URLS = ["tcp://meta-a:5555", "tcp://meta-b:5555"]
 
@@ -55,7 +55,7 @@ def pools():
 
 def router(pools, engine="w", metadata_only=False, pages=8, rpcs=None, **kwargs):
     config = MaruConfig(
-        storage_backend="rdma",
+        storage_backend="remote_cxl",
         server_url=",".join(URLS),
         engine_id=engine,
         cache_namespace="ns",
@@ -234,7 +234,7 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
 
 def test_router_rejects_mismatched_rpcs_and_urls(pools):
     config = MaruConfig(
-        storage_backend="rdma",
+        storage_backend="remote_cxl",
         server_url=",".join(URLS),
         engine_id="e",
         cache_namespace="ns",

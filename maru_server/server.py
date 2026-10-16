@@ -35,7 +35,7 @@ class MaruServer:
         region_mappers: list[str] | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
-        # Region mappers of the pool's memory nodes, handed to RDMA workers in
+        # Region mappers of the pool's memory nodes, handed to remote CXL workers in
         # the handshake as the RM address is; MaruServer never calls them.
         self._region_mappers = list(region_mappers or [])
         self._dax_paths = dax_paths
@@ -525,7 +525,7 @@ def main() -> None:
         dest="region_mappers",
         help=(
             "Region mapper address (host:port) of a memory node of this pool, "
-            "for RDMA workers. Repeat or separate with commas for every memory "
+            "for remote CXL workers. Repeat or separate with commas for every memory "
             "node of a shared pool."
         ),
     )

@@ -1,12 +1,12 @@
 #!/bin/bash
-# RDMA KV example on one host: the memory node's region mapper, maru-server and
+# Remote CXL KV example on one host: the memory node's region mapper, maru-server and
 # both workers run here. The workers still read and write the CXL pool through
 # the region mapper's NIC registration and one-sided RDMA, as across nodes.
 #
 # This script:
 #   1. Starts the region mapper (the memory node's service)
 #   2. Starts maru-server with that region mapper
-#   3. Launches two vLLM engines with storage_backend "rdma"
+#   3. Launches two vLLM engines with storage_backend "remote_cxl"
 #   4. Runs the sharing test (inst1 stores, inst2 loads from the pool)
 #   5. Cleans up all processes
 #
@@ -14,12 +14,12 @@
 # Maru resource manager with a CXL/DAX device, and NIXL.
 #
 # Usage:
-#   ./rdma_example.sh [model]
+#   ./remote_cxl_example.sh [model]
 #
 # Examples:
 #   MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
-#       MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./rdma_example.sh
-#   MARU_POOL_SIZE=4G GPU_MEM_UTIL=0.5 ./rdma_example.sh meta-llama/Llama-3.1-8B-Instruct
+#       MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh
+#   MARU_POOL_SIZE=4G GPU_MEM_UTIL=0.5 ./remote_cxl_example.sh meta-llama/Llama-3.1-8B-Instruct
 
 set -euo pipefail
 
@@ -101,7 +101,7 @@ if systemctl is-active --quiet maru-region-mapper 2>/dev/null; then
 fi
 
 echo "================================================"
-echo "  Maru-vLLM RDMA KV Example (one host)"
+echo "  Maru-vLLM remote CXL KV Example (one host)"
 echo "================================================"
 echo "  Model:          $MODEL"
 if [[ -n "$MAPPER_SERVICE" ]]; then
@@ -137,10 +137,10 @@ wait_for_log "$LOG_DIR/maru_server.log" "RPC Server started" "$SERVER_PID" "maru
 
 # Step 3: the two engines
 echo "[Step 3] Starting vLLM instance 1 (GPU $MARU_INST1_GPU, port $MARU_INST1_PORT)..."
-bash "$SCRIPT_DIR/rdma_vllm_launcher.sh" inst1 "$MODEL" > "$LOG_DIR/inst1.log" 2>&1 &
+bash "$SCRIPT_DIR/remote_cxl_vllm_launcher.sh" inst1 "$MODEL" > "$LOG_DIR/inst1.log" 2>&1 &
 INST1_PID=$!
 echo "[Step 3] Starting vLLM instance 2 (GPU $MARU_INST2_GPU, port $MARU_INST2_PORT)..."
-bash "$SCRIPT_DIR/rdma_vllm_launcher.sh" inst2 "$MODEL" > "$LOG_DIR/inst2.log" 2>&1 &
+bash "$SCRIPT_DIR/remote_cxl_vllm_launcher.sh" inst2 "$MODEL" > "$LOG_DIR/inst2.log" 2>&1 &
 INST2_PID=$!
 
 echo ""
@@ -161,7 +161,7 @@ done
 echo ""
 
 # Step 4: the sharing test
-echo "[Step 4] Running the RDMA KV sharing test..."
+echo "[Step 4] Running the remote CXL KV sharing test..."
 RC=0
 python "$SCRIPT_DIR/run_benchmark.py" \
     --model "$MODEL" \

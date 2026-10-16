@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""rdma loads in staging-sized batches, asynchronous loads and stores, and the
+"""remote_cxl loads in staging-sized batches, asynchronous loads and stores, and the
 copy kernel over the staging buffer (design note 3.11)."""
 
 import contextlib
@@ -13,7 +13,7 @@ pytest.importorskip("vllm")
 import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
-from tests.unit.test_vllm_rdma_config import extra as rdma_extra
+from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -30,7 +30,7 @@ def _view(slab):
 
 
 def _worker(capacity):
-    worker = make_worker(4, 8, rdma_extra(), num_kv_heads=1, head_size=1)
+    worker = make_worker(4, 8, remote_cxl_extra(), num_kv_heads=1, head_size=1)
     cache = torch.full((12, 2, 4, 1, 1), -1.0)
     worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
     worker._ensure_handler = lambda: None
@@ -192,7 +192,7 @@ class _FakeStream:
 
 
 def _kernel_worker(monkeypatch, log, start=0, stream_fails=False):
-    """An rdma worker whose copy kernel and CUDA streams run on the CPU."""
+    """A remote_cxl worker whose copy kernel and CUDA streams run on the CPU."""
     worker, cache = _worker(3)
     worker._handler.storage_gpu_accessible.return_value = True
     worker._handler.release_retrieved.side_effect = lambda infos: log.append(
@@ -291,7 +291,7 @@ def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
 
 
 def test_a_failed_async_load_is_recomputed_instead_of_retried():
-    scheduler = make_scheduler(4, 8, rdma_extra(maru_async_load=True))
+    scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
     scheduler._count_matched_chunks = lambda tokens: 2
     request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)
@@ -316,7 +316,7 @@ def _empty_output(preempted=()):
 
 
 def test_a_preempted_request_gets_its_hit_again():
-    scheduler = make_scheduler(4, 8, rdma_extra(maru_async_load=True))
+    scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
     scheduler._count_matched_chunks = lambda tokens: 2
     request = SimpleNamespace(request_id="r", prompt_token_ids=list(range(16)))
     scheduler.get_num_new_matched_tokens(request, 0)
@@ -330,7 +330,7 @@ def test_a_preempted_request_gets_its_hit_again():
 def test_an_async_load_carries_its_external_token_range():
     """Blocks before the range are vLLM's own prefix cache: a deferred load
     must leave them alone, as an inline load does."""
-    scheduler = make_scheduler(4, 8, rdma_extra(maru_async_load=True))
+    scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
     scheduler._count_matched_chunks = lambda tokens: 2
     request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 4) == (8, True)
@@ -398,7 +398,7 @@ def _store_worker(monkeypatch, url_count):
     worker = make_worker(
         4,
         8,
-        rdma_extra(maru_async_store=True, maru_server_url=urls),
+        remote_cxl_extra(maru_async_store=True, maru_server_url=urls),
         num_kv_heads=1,
         head_size=1,
     )

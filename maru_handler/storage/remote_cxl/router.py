@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Several RDMA pools behind one worker, one MaruServer each."""
+"""Several remote CXL pools behind one worker, one MaruServer each."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from typing import Any
 from maru_common.storage_types import StorageError, StorageUnavailableError
 
 from ..cpu import CpuReadLease
-from .client import RdmaStorageClient
+from .client import RemoteCxlStorageClient
 from .datapath import RdmaDataPath
-from .region import RdmaAllocation
+from .region import RemoteCxlAllocation
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def _route_score(pool: str, route_key: str) -> bytes:
 
 
 class PoolRouter:
-    """Several RDMA pools, one MaruServer each; a request stays in one pool.
+    """Several remote CXL pools, one MaruServer each; a request stays in one pool.
 
     The connector only uses chunks that hit contiguously from the start of a
     prompt, so every chunk of a request is routed by one key (the request's
@@ -64,7 +64,9 @@ class PoolRouter:
         self.config = config
         self.urls = urls
         self.data = RdmaDataPath(config, transport_factory, mapper_factory)
-        self.clients = [RdmaStorageClient(config, rpc, data=self.data) for rpc in rpcs]
+        self.clients = [
+            RemoteCxlStorageClient(config, rpc, data=self.data) for rpc in rpcs
+        ]
         self._stop = threading.Event()
         self._retry: threading.Thread | None = None
         self._connect_lock = threading.Lock()
@@ -94,14 +96,14 @@ class PoolRouter:
             except Exception as exc:
                 failures.append(exc)
                 logger.warning(
-                    "RDMA pool %s is unavailable: %s", c.config.server_url, exc
+                    "Remote CXL pool %s is unavailable: %s", c.config.server_url, exc
                 )
         if len(failures) == len(self.clients):
             self.data.close()
             raise failures[0]
         if failures:
             self._retry = threading.Thread(
-                target=self._retry_loop, daemon=True, name="maru-rdma-pool-retry"
+                target=self._retry_loop, daemon=True, name="maru-remote-cxl-pool-retry"
             )
             self._retry.start()
         return True
@@ -109,7 +111,7 @@ class PoolRouter:
     def _ensure(self, data: bool = False) -> None:
         """Raise unless some pool is connected (``MaruHandler`` calls this)."""
         if not self.connected:
-            raise StorageUnavailableError("No RDMA pool is available")
+            raise StorageUnavailableError("No remote CXL pool is available")
 
     def _retry_loop(self) -> None:
         """Connect the pools that never connected until each one answers."""
@@ -123,25 +125,27 @@ class PoolRouter:
                         return
                     try:
                         c.connect()
-                        logger.info("RDMA pool %s is available", c.config.server_url)
+                        logger.info(
+                            "Remote CXL pool %s is available", c.config.server_url
+                        )
                     except Exception as exc:
-                        logger.debug("RDMA pool still unavailable: %s", exc)
+                        logger.debug("Remote CXL pool still unavailable: %s", exc)
 
-    def _pick(self, route_key: str | None) -> RdmaStorageClient:
+    def _pick(self, route_key: str | None) -> RemoteCxlStorageClient:
         if not route_key:
-            raise ValueError("Several RDMA pools need a route key per request")
+            raise ValueError("Several remote CXL pools need a route key per request")
         best = max(
             range(len(self.urls)), key=lambda i: _route_score(self.urls[i], route_key)
         )
         return self.clients[best]
 
-    def _owner(self, handle: RdmaAllocation) -> RdmaStorageClient:
+    def _owner(self, handle: RemoteCxlAllocation) -> RemoteCxlStorageClient:
         for c in self.clients:
             if c.regions.get(handle.region.pool_id) is handle.region:
                 return c
-        raise ValueError("Allocation does not belong to a current RDMA region")
+        raise ValueError("Allocation does not belong to a current remote CXL region")
 
-    def alloc(self, size: int, route_key: str | None = None) -> RdmaAllocation:
+    def alloc(self, size: int, route_key: str | None = None) -> RemoteCxlAllocation:
         """Allocate in the pool the route key picks.
 
         Raises:
@@ -149,10 +153,10 @@ class PoolRouter:
         """
         c = self._pick(route_key)
         if not c.connected:
-            raise MemoryError("RDMA pool of this prefix is unavailable")
+            raise MemoryError("Remote CXL pool of this prefix is unavailable")
         return c.alloc(size)
 
-    def free(self, handle: RdmaAllocation) -> None:
+    def free(self, handle: RemoteCxlAllocation) -> None:
         """Give back an allocation that was not stored."""
         # A handle of a closed session only gives back its slot in the shared
         # staging buffer, which any client can do.
@@ -177,7 +181,9 @@ class PoolRouter:
         """Whether a connected pool committed ``key`` for this worker."""
         return any(c.has_local(key) for c in self.clients if c.connected)
 
-    def batch_store(self, keys: list[str], handles: list[RdmaAllocation]) -> list[bool]:
+    def batch_store(
+        self, keys: list[str], handles: list[RemoteCxlAllocation]
+    ) -> list[bool]:
         """Store each allocation in the pool it was allocated from."""
         if len(keys) != len(handles):
             raise ValueError("keys and handles must have the same length")

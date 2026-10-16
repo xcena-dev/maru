@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""RDMA KV sharing test: one engine stores a prompt's KV in the CXL pool of a
+"""Remote CXL KV sharing test: one engine stores a prompt's KV in the CXL pool of a
 memory node over RDMA, another engine reads it back the same way.
 
 Sends the same prompt to Instance 1 (computes it and stores its KV in the pool)
@@ -149,7 +149,7 @@ def summarize(store: dict, load: dict, chunk_tokens: int, wait: float) -> dict:
     speedup = round(t1 / t2, 2) if (t1 and t2) else None
 
     print(f"\n{_B}{'=' * 60}{_NC}", file=sys.stderr)
-    print(f"{_B}  Maru-vLLM RDMA KV sharing{_NC}", file=sys.stderr)
+    print(f"{_B}  Maru-vLLM remote CXL KV sharing{_NC}", file=sys.stderr)
     print(f"{_B}{'=' * 60}{_NC}", file=sys.stderr)
     print(f"  {_G}Instance 1 (store){_NC}: TTFT = {_ms(t1)}", file=sys.stderr)
     print(
@@ -176,7 +176,7 @@ def summarize(store: dict, load: dict, chunk_tokens: int, wait: float) -> dict:
 
 
 async def main() -> None:
-    p = argparse.ArgumentParser(description="Maru-vLLM RDMA KV sharing test")
+    p = argparse.ArgumentParser(description="Maru-vLLM remote CXL KV sharing test")
     p.add_argument("--model", default=os.environ.get("MODEL", DEFAULT_MODEL))
     p.add_argument(
         "--url1", default=os.environ.get("MARU_INST1_URL", "http://localhost:8000")

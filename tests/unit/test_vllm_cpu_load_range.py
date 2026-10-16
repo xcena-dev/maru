@@ -12,7 +12,7 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
 from tests.unit.test_vllm_cpu_config import extra, mixed_extra
-from tests.unit.test_vllm_rdma_config import extra as rdma_extra
+from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -20,7 +20,7 @@ from tests.unit.vllm_connector_helpers import (
 )
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra(), rdma_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_cxl_extra()])
 @pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
 @pytest.mark.parametrize(
     "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]

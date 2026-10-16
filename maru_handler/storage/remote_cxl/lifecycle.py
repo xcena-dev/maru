@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Region lifecycle of an RDMA storage session: getting, mapping, setting
+"""Region lifecycle of a remote CXL storage session: getting, mapping, setting
 aside and giving back regions, evicting keys, and ending stray transfers.
 
 :class:`RegionLifecycle` is the half of
-:class:`~maru_handler.storage.rdma.client.RdmaStorageClient` that manages
+:class:`~maru_handler.storage.remote_cxl.client.RemoteCxlStorageClient` that manages
 regions; the client's stores and loads use it. Methods that change regions
 or keys expect the client lock to be held unless they say otherwise.
 """
@@ -25,7 +25,7 @@ from maru_common.storage_types import (
 )
 
 from .datapath import RdmaDataPath, Release
-from .region import IsolatedTransfer, RdmaRegion, RegionAccess, pick_mapper
+from .region import IsolatedTransfer, RegionAccess, RemoteCxlRegion, pick_mapper
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +35,10 @@ CALL_ATTEMPTS = 3
 
 
 class RegionLifecycle:
-    """Regions of one storage session; mixed into the RDMA storage client."""
+    """Regions of one storage session; mixed into the remote CXL storage client."""
 
     config: Any
-    regions: dict[str, RdmaRegion]
+    regions: dict[str, RemoteCxlRegion]
     connected: bool
     _data: RdmaDataPath
     _mappers: list[str]
@@ -55,13 +55,13 @@ class RegionLifecycle:
 
     # ------------------------------------------------------------ mapping
 
-    def _add_region(self, info: dict) -> RdmaRegion:
+    def _add_region(self, info: dict) -> RemoteCxlRegion:
         """Track a region the session got and map it now.
 
         A region whose mapper cannot map it is kept aside; new pages then
         come from another region, a new one if needed.
         """
-        region = RdmaRegion(
+        region = RemoteCxlRegion(
             info["pool_id"],
             info["capacity"],
             self.config.chunk_size_bytes,
@@ -72,19 +72,21 @@ class RegionLifecycle:
             self._map_own(region)
         except StorageUnavailableError as exc:
             region.reachable = False
-            logger.warning("RDMA region %d is not reachable: %s", region.region_id, exc)
+            logger.warning(
+                "Remote CXL region %d is not reachable: %s", region.region_id, exc
+            )
         return region
 
     def _region(self, pool_id: str, handle: dict, own: bool = False) -> RegionAccess:
         return self._data.region(pool_id, handle, self._mappers, own=own)
 
-    def _map_own(self, region: RdmaRegion) -> RegionAccess:
+    def _map_own(self, region: RemoteCxlRegion) -> RegionAccess:
         """Access to a region of this session, mapping it if needed."""
         access = self._region(region.pool_id, region.handle, own=True)
         self._adopt(region, access)
         return access
 
-    def _adopt(self, region: RdmaRegion, access: RegionAccess) -> None:
+    def _adopt(self, region: RemoteCxlRegion, access: RegionAccess) -> None:
         """Note a map of an own region; a rebooted memory node voids its keys.
 
         A WRITE the memory node's NIC completed may have sat in that node's
@@ -93,7 +95,7 @@ class RegionLifecycle:
         """
         if region.boot and access.boot != region.boot:
             logger.warning(
-                "memory node of RDMA region %d rebooted; removing its keys",
+                "memory node of remote CXL region %d rebooted; removing its keys",
                 region.region_id,
             )
             self._drop_keys(region)
@@ -123,7 +125,7 @@ class RegionLifecycle:
                     continue
                 self._adopt(region, access)
                 region.reachable = True
-            logger.info("RDMA region %d is reachable again", region.region_id)
+            logger.info("Remote CXL region %d is reachable again", region.region_id)
 
     def _check_boots(self) -> None:
         """Remove the keys of own regions whose memory node rebooted.
@@ -132,7 +134,7 @@ class RegionLifecycle:
         reboot is noticed even for a region this worker no longer writes.
         Runs without the client lock until there is something to change.
         """
-        owned: dict[str, list[RdmaRegion]] = {}
+        owned: dict[str, list[RemoteCxlRegion]] = {}
         for region in list(self.regions.values()):
             if region.boot and not region.retired:
                 owned.setdefault(
@@ -147,7 +149,7 @@ class RegionLifecycle:
                     if region.retired or not boot or boot == region.boot:
                         continue
                     logger.warning(
-                        "memory node of RDMA region %d rebooted; removing its keys",
+                        "memory node of remote CXL region %d rebooted; removing its keys",
                         region.region_id,
                     )
                     self._drop_keys(region)
@@ -196,7 +198,7 @@ class RegionLifecycle:
             self._close_session_quietly()
         else:
             logger.error(
-                "%d RDMA region(s) could not be released at their region mapper; "
+                "%d remote CXL region(s) could not be released at their region mapper; "
                 "MaruServer keeps them",
                 list(released.values()).count(False),
             )
@@ -216,11 +218,11 @@ class RegionLifecycle:
                 self._call(action, **payload)
                 return True
             except StorageError as exc:
-                logger.warning("RDMA %s refused: %s", action, exc)
+                logger.warning("Remote CXL %s refused: %s", action, exc)
                 return False
             except Exception:
                 continue
-        logger.warning("RDMA %s could not be confirmed", action)
+        logger.warning("Remote CXL %s could not be confirmed", action)
         return False
 
     # --------------------------------------------------------- more space
@@ -241,11 +243,11 @@ class RegionLifecycle:
             result = self._call("expand", op_id=op_id)
         except StorageError as exc:
             self._expand_op = None
-            logger.info("RDMA expand refused (%s); evicting instead", exc)
+            logger.info("Remote CXL expand refused (%s); evicting instead", exc)
             return False
         except Exception:
             logger.warning(
-                "RDMA expand outcome unknown; resending it later", exc_info=True
+                "Remote CXL expand outcome unknown; resending it later", exc_info=True
             )
             return False
         self._expand_op = None
@@ -257,7 +259,7 @@ class RegionLifecycle:
             return False
         return True
 
-    def _give_up(self, region: RdmaRegion) -> None:
+    def _give_up(self, region: RemoteCxlRegion) -> None:
         """Give back at once a new region whose mapper cannot map it.
 
         No RDMA was ever sent to it. It still needs a release first if a map
@@ -284,7 +286,7 @@ class RegionLifecycle:
         try:
             victims = self._call("victims", count=count)["entries"]
         except Exception:
-            logger.warning("RDMA eviction failed", exc_info=True)
+            logger.warning("Remote CXL eviction failed", exc_info=True)
             return False
         if not victims:
             return False
@@ -295,7 +297,7 @@ class RegionLifecycle:
         except Exception:
             # The server may have removed them already; a retry tells.
             self._removing.extend(victims)
-            logger.warning("RDMA eviction outcome unknown; retrying later")
+            logger.warning("Remote CXL eviction outcome unknown; retrying later")
             return False
         return self._reclaim(victims, statuses)
 
@@ -319,14 +321,14 @@ class RegionLifecycle:
         try:
             statuses = self._call("remove", entries=entries)["statuses"]
         except Exception:
-            logger.warning("RDMA eviction retry failed", exc_info=True)
+            logger.warning("Remote CXL eviction retry failed", exc_info=True)
             return False
         del self._removing[: len(entries)]
         return self._reclaim(entries, statuses)
 
     # ------------------------------------------------------ keys that go
 
-    def _set_aside(self, region: RdmaRegion) -> None:
+    def _set_aside(self, region: RemoteCxlRegion) -> None:
         """Stop using a region its mapper cannot map, and remove its keys.
 
         Without the removal, probes keep reporting the keys as hits and every
@@ -336,7 +338,7 @@ class RegionLifecycle:
         region.reachable = False
         self._drop_keys(region)
 
-    def _drop_keys(self, region: RdmaRegion) -> None:
+    def _drop_keys(self, region: RemoteCxlRegion) -> None:
         """Remove every key of a region from MaruServer.
 
         A key a reader holds under a lease is kept by MaruServer; it is
@@ -361,7 +363,7 @@ class RegionLifecycle:
                 statuses = self._call("remove", entries=batch)["statuses"]
             except Exception:
                 self._dropping.extend(batch)
-                logger.warning("removing keys of an RDMA region failed; retrying")
+                logger.warning("removing keys of a remote CXL region failed; retrying")
                 continue
             self._reclaim(batch, statuses)
             for entry, status in zip(batch, statuses, strict=True):

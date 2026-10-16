@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RDMA storage client against the real directory and a real region mapper
+"""Remote CXL storage client against the real directory and a real region mapper
 served on loopback TCP; the CXL device, the resource manager and NIXL are
 fakes."""
 
@@ -8,15 +8,15 @@ import time
 
 import pytest
 
-import maru_handler.storage.rdma.datapath as datapath
+import maru_handler.storage.remote_cxl.datapath as datapath
 from maru_common.config import MaruConfig
 from maru_common.storage_types import (
-    RDMA_STORAGE_CAPABILITY,
+    REMOTE_CXL_STORAGE_CAPABILITY,
     STORAGE_CAPABILITY,
     StorageError,
     StorageUnavailableError,
 )
-from maru_handler.storage.rdma import RdmaStorageClient, pick_mapper
+from maru_handler.storage.remote_cxl import RemoteCxlStorageClient, pick_mapper
 from maru_remote.transport import NixlTransport
 from maru_server.replica_directory import ReplicaDirectory
 from tests.unit.remote_fakes import (
@@ -45,7 +45,7 @@ class Rpc:
 
     def handshake(self):
         return {
-            "capabilities": [STORAGE_CAPABILITY, RDMA_STORAGE_CAPABILITY],
+            "capabilities": [STORAGE_CAPABILITY, REMOTE_CXL_STORAGE_CAPABILITY],
             "server_epoch": self.directory.server_epoch,
             "rm_address": "mem1:9850",
             "region_mappers": list(self.mappers),
@@ -74,7 +74,7 @@ class World:
             session_ttl=30,
         )
         self.nodes = [FakeMemoryNode(self.cxl, f"mem{i + 1}") for i in range(nodes)]
-        self.clients: list[RdmaStorageClient] = []
+        self.clients: list[RemoteCxlStorageClient] = []
 
     @property
     def node(self) -> FakeMemoryNode:
@@ -82,7 +82,7 @@ class World:
 
     def client(self, engine, pages=4, staging_pages=8, metadata_only=False, **kwargs):
         config = MaruConfig(
-            storage_backend="rdma",
+            storage_backend="remote_cxl",
             engine_id=engine,
             cache_namespace="ns",
             node_id="worker",
@@ -94,7 +94,7 @@ class World:
                 **kwargs,
             },
         )
-        c = RdmaStorageClient(
+        c = RemoteCxlStorageClient(
             config,
             Rpc(self.directory, [n.address for n in self.nodes]),
             transport_factory=lambda name: NixlTransport(
@@ -458,7 +458,7 @@ def test_an_unreachable_region_mapper_keeps_the_regions(world):
     a.close()
     # No release, so no drained close: MaruServer keeps the region.
     assert world.cxl.released == []
-    assert world.directory.get_usage("rdma")["pools"][0]["active"] is True
+    assert world.directory.get_usage("remote_cxl")["pools"][0]["active"] is True
 
 
 def test_a_failed_deregistration_keeps_the_regions(world):
@@ -862,7 +862,7 @@ def test_regions_spread_over_the_region_mappers():
 # -------------------------------------------------------------------- setup
 
 
-def test_a_server_without_rdma_or_region_mappers_is_rejected(world):
+def test_a_server_without_remote_cxl_or_region_mappers_is_rejected(world):
     class OldRpc(Rpc):
         def handshake(self):
             return {**super().handshake(), "capabilities": [STORAGE_CAPABILITY]}
@@ -872,14 +872,14 @@ def test_a_server_without_rdma_or_region_mappers_is_rejected(world):
             return {**super().handshake(), "region_mappers": []}
 
     config = MaruConfig(
-        storage_backend="rdma",
+        storage_backend="remote_cxl",
         engine_id="a",
         cache_namespace="ns",
         pool_size=PAGE,
         chunk_size_bytes=PAGE,
     )
     for rpc_class in (OldRpc, NoMapperRpc):
-        c = RdmaStorageClient(
+        c = RemoteCxlStorageClient(
             config,
             rpc_class(world.directory, [world.node.address]),
             transport_factory=lambda name: NixlTransport(
@@ -924,14 +924,14 @@ def test_an_open_whose_reply_was_lost_is_closed(world):
     rpc = Rpc(world.directory, [world.node.address])
     rpc.lost_replies.add("open")
     config = MaruConfig(
-        storage_backend="rdma",
+        storage_backend="remote_cxl",
         engine_id="a",
         cache_namespace="ns",
         pool_size=PAGE,
         chunk_size_bytes=PAGE,
         rdma_staging_size=4 * PAGE,
     )
-    c = RdmaStorageClient(
+    c = RemoteCxlStorageClient(
         config,
         rpc,
         transport_factory=lambda name: NixlTransport(name, agent=FakeNixlAgent(name)),
@@ -942,8 +942,8 @@ def test_an_open_whose_reply_was_lost_is_closed(world):
     assert world.cxl.released and not world.cxl.regions
 
 
-def test_config_requires_session_identity_and_rdma_backend_for_rdma_settings():
+def test_config_requires_session_identity_and_remote_cxl_backend_for_rdma_settings():
     with pytest.raises(ValueError, match="engine_id and cache_namespace"):
-        MaruConfig(storage_backend="rdma", pool_size=PAGE, chunk_size_bytes=PAGE)
-    with pytest.raises(ValueError, match="require the rdma storage backend"):
+        MaruConfig(storage_backend="remote_cxl", pool_size=PAGE, chunk_size_bytes=PAGE)
+    with pytest.raises(ValueError, match="require the remote_cxl storage backend"):
         MaruConfig(rdma_device="mlx5_0:1")
