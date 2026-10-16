@@ -552,13 +552,19 @@ def test_an_unreachable_region_mapper_keeps_the_regions(world):
 def test_a_failed_deregistration_keeps_the_regions(world):
     a = world.client("a")
     put(a, "k", b"v")
+    region = only_region(a)
+    a.close()
+    world.keeper.run_once()
 
     def refuse(registration):
         raise RuntimeError("NIC busy")
 
     world.node.transport.deregister = refuse
-    a.close()
+    world.directory.give_back(region.pool_id, "test")
+    world.keeper.run_once()
+    # Still registered, so it must not reach the RM; the keeper tries again.
     assert world.cxl.released == []
+    assert [pool_id for pool_id, *_ in world.directory.departed()] == [region.pool_id]
 
 
 def test_a_restarted_region_mapper_confirms_the_release(world):

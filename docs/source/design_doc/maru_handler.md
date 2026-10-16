@@ -223,6 +223,66 @@ sequenceDiagram
     H-->>C: success
 ```
 
+---
+
+(maru-handler-remote-cxl)=
+## 5. Remote CXL Backend
+
+With `storage_backend="remote_cxl"` the Handler keeps its KV in the CXL memory
+of memory nodes and moves it over RDMA. It gets regions the way a cxl Handler
+does, but through a storage session: one region when the session opens and one
+more (`expand`) whenever all of them are full. The region mapper on a region's
+memory node maps the region and registers it with that node's NIC; the Handler
+reaches the region with one-sided RDMA.
+
+![Components of the remote_cxl backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/remote_cxl_sw_structure.png)
+
+| Component | Role |
+|-----------|------|
+| `RemoteCxlStorageClient` | The storage session: regions, pages, stores, loads, eviction |
+| `RdmaDataPath` | The worker's staging buffer, its NIXL agent and its connections to the region mappers |
+| `RegionMapClient` | One connection to a region mapper: proves the region mapper key, then `map`, `unmap`, `release` |
+| `StagingBuffer` | Host memory registered with the NIC and with CUDA; KV moves GPU ↔ staging by copy, staging ↔ region by RDMA |
+| `PoolRouter` | Several pools (one MaruServer each): routes a request to one pool by its first chunk key |
+
+**Store.** The Handler takes a staging slot and a free page of an own region,
+the Connector copies the KV into the slot, and the Handler WRITEs it to the
+page. It commits the key only after the WRITE completed. A WRITE whose end is
+not confirmed keeps its page and slot out of use until NIXL releases the
+transfer, so a late WRITE never lands on reused memory.
+
+**Retrieve.** The Handler takes a server lease on the keys (`acquire`), which
+returns each key's location and, for another worker's region, a *read handle*.
+It maps that region at its region mapper on first use, READs the pages into
+staging slots, and ends the lease (`release`). It uses the bytes only if the
+lease was held to the end.
+
+**Eviction.** When its regions are full and the Resource Manager has no room,
+the Handler asks MaruServer for its least recently used unleased keys
+(`victims`) and removes them. A page is reused only after MaruServer
+confirmed that no key refers to it.
+
+**Giving regions back.** A region goes back to the Resource Manager only after
+its region mapper deregistered it from the NIC (`release`):
+
+![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so the region mapper deregisters the region first and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
+
+- A region the Handler gives back while it runs (for example a new region
+  whose memory node it cannot reach) is released first, then returned with
+  `return_region`.
+- When the Handler leaves (it closes, or its session expired), it waits for
+  its WRITEs, closes the session drained and drops its holds at the region
+  mappers. MaruServer takes its regions over: it keeps those that hold keys,
+  so other workers and the restarted worker keep reading them, and releases
+  the others before it frees them.
+- If MaruServer restarted, nobody takes the regions over, so the Handler
+  releases them itself.
+
+**Staging slots.** Loads and stores share the staging buffer. With
+asynchronous transfers, stores leave a share of the slots free for loads:
+
+![Staging slots: half of the slots are kept free for loads; stores take the rest](../image/remote_cxl_staging_slots.png)
+
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),
 > [KV Cache Management](kv_cache_management.md),

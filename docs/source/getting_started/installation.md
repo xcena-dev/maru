@@ -11,6 +11,7 @@ Maru consists of two server components and a client library:
 | **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
+| **Region Mapper** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-region-mapper` (`maru[rdma]`) |
 
 In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler, which connects to both the Resource Manager and Metadata Server over the network.
 
@@ -75,6 +76,16 @@ To install **without the Resource Manager** (e.g., on nodes that only run LLM in
 ```
 
 > **Note:** Client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager.
+
+With NIXL installed (`pip install 'maru[rdma]'` before `./install.sh`), the
+installer also sets up the region mapper as `maru-region-mapper.service`, which
+starts and stops with the Resource Manager, and creates the region mapper key
+`/etc/maru/region-mapper.key`. Set the node's RDMA NIC in
+`/etc/maru/region-mapper.env` (`MARU_REGION_MAPPER_UCX_DEVICE`): the service
+listens on that NIC's address. Workers and maru-server need a copy of the key,
+readable only by the users that run them. The
+[remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
+walks through a deployment.
 
 <br/>
 
