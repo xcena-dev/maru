@@ -896,7 +896,72 @@ def test_a_peer_is_connected_anew_after_its_mapper_connection_broke(world):
         assert client.generation == before + 1
     assert put(a, "k2", b"w")[0] is True
     assert read(b, ["k", "k2"]) == [b"v", b"w"]
-    assert peer in worker_agent("a").peers and peer in worker_agent("b").peers
+    for engine in ("a", "b"):
+        agent = worker_agent(engine)
+        assert peer in agent.peers and peer not in agent.failed
+
+
+def test_a_failed_peer_is_connected_anew_while_its_mapper_connection_holds(world):
+    """UCX failed a reader's connection, and no request broke the connection
+    to the region mapper; mapping another region of that node loads its
+    metadata into a new connection."""
+    a, b = world.client("a", pages=1), world.client("b")
+    put(a, "k1", b"1")
+    assert read(b, ["k1"]) == [b"1"]
+    peer = world.node.agent.name
+    worker_agent("b").fail_endpoint(peer)
+    generation = b._data._client(world.node.address).generation
+    assert put(a, "k2", b"2")[0] is True  # a second region of a, on the same node
+    assert read(b, ["k2"]) == [b"2"]  # its first map by b
+    assert b._data._client(world.node.address).generation == generation
+    assert peer not in worker_agent("b").failed
+    assert read(b, ["k1"]) == [b"1"]  # the first region maps again
+
+
+def test_the_region_mapper_drops_the_connection_checks(world):
+    a = world.client("a", pages=1)
+    put(a, "k1", b"1")
+    put(a, "k2", b"2")  # a second region: its map checks the loaded peer
+    assert world.node.agent.notifs
+    a._data.boots([world.node.address])
+    assert world.node.agent.notifs == []
+
+
+def test_a_restarted_region_mappers_old_peer_is_dropped(world):
+    a = world.client("a")
+    put(a, "k", b"1")
+    old = world.node.agent.name
+    world.node.restart()
+    results = [put(a, "k2", b"2")[0] for _ in range(3)]
+    assert results[-1] is True
+    assert old not in worker_agent("a").peers
+    assert world.node.agent.name in worker_agent("a").peers
+
+
+def test_a_peer_nixl_keeps_is_not_loaded_into(world, monkeypatch):
+    a = world.client("a")
+    put(a, "k", b"1")
+    client = a._data._client(world.node.address)
+    client._drop()
+    a._data.boots([world.node.address])  # a new connection to the mapper
+    monkeypatch.setattr(a._data.transport, "disconnect", lambda name: False)
+    assert put(a, "k2", b"2")[0] is False
+    assert only_region(a).pool_id in a._data._map_failed  # tried again later
+    monkeypatch.undo()
+    time.sleep(0.1)
+    assert put(a, "k3", b"3")[0] is True
+
+
+def test_a_map_reply_from_an_ended_connection_is_not_loaded(world):
+    a = world.client("a")
+    put(a, "k", b"1")
+    region = only_region(a)
+    peer, generation = a._data._loaded[world.node.address]
+    with pytest.raises(StorageUnavailableError, match="earlier connection"):
+        a._data._load_peer(
+            world.node.address, generation - 1, b"", region.pool_id, region.region_id
+        )
+    assert a._data._loaded[world.node.address] == (peer, generation)
 
 
 def test_expanding_resumes_once_the_back_off_ends(world):

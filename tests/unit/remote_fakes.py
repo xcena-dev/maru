@@ -43,8 +43,10 @@ class FakeNixlAgent:
 
     :meth:`fail_endpoint` is what UCX does when a peer stops answering: the
     connection fails without any transfer seeing it. Transfers to the peer
-    then end in ``ERR``, and loading its metadata again before removing it
-    raises :class:`LoadIntoFailedEndpoint`, as NIXL crashes there.
+    then end in ``ERR``, notifications to it are refused, and loading its
+    metadata again before removing it raises :class:`LoadIntoFailedEndpoint`,
+    as NIXL crashes there. Notifications sent to an agent stay in its
+    ``notifs`` until it calls ``get_new_notifs``.
     """
 
     registry: dict[str, FakeNixlAgent] = {}
@@ -58,6 +60,7 @@ class FakeNixlAgent:
         self.known: dict[str, set[tuple[int, int, int]] | None] = {}
         self.broken: set[str] = set()
         self.failed: set[str] = set()  # peers whose endpoint UCX closed
+        self.notifs: list[tuple[str, bytes]] = []  # (sender, message) received
         self.backends: list[tuple[str, dict]] = []
         self.stall = False
         self.fail_next = False
@@ -128,6 +131,23 @@ class FakeNixlAgent:
         self.known.pop(name, None)
         self.broken.discard(name)
         self.failed.discard(name)
+
+    def send_notif(self, remote_agent_name, notif_msg, backend=None) -> None:
+        name = remote_agent_name
+        if isinstance(name, bytes):
+            name = name.decode()
+        if name not in self.peers:
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
+        if name in self.failed:
+            raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+        FakeNixlAgent.registry[name].notifs.append((self.name, bytes(notif_msg)))
+
+    def get_new_notifs(self, backends=()) -> dict[str, list[bytes]]:
+        out: dict[str, list[bytes]] = {}
+        for sender, msg in self.notifs:
+            out.setdefault(sender, []).append(msg)
+        self.notifs.clear()
+        return out
 
     def fail_endpoint(self, name: str) -> None:
         """Fail the connection to a known peer, as UCX does on its own."""

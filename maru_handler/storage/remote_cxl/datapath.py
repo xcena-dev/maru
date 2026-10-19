@@ -79,7 +79,8 @@ class RdmaDataPath:
         # that connection until it is released or the connection ends.
         self._attempted: dict[str, tuple[str, int]] = {}
         # Region mapper -> (NIXL peer, connection generation) when the peer's
-        # metadata was last loaded through that mapper's connection
+        # metadata was last loaded through that mapper's connection. A peer
+        # dropped after a transfer error stays listed; has_peer() tells.
         self._loaded: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
         # Held from the check of a peer to the load of its metadata
@@ -193,7 +194,9 @@ class RdmaDataPath:
                 self._attempted[pool_id] = (address, client.generation)
         # The reply names this region's registration only; loading it into a
         # peer this agent already knows adds the region to it.
-        peer = self._load_peer(address, client.generation, reply.metadata, region_id)
+        peer = self._load_peer(
+            address, client.generation, reply.metadata, pool_id, region_id
+        )
         access = RegionAccess(
             peer, reply.addr, reply.length, address, client.generation, reply.boot
         )
@@ -204,30 +207,47 @@ class RdmaDataPath:
         return access
 
     def _load_peer(
-        self, address: str, generation: int, metadata: bytes, region_id: object
+        self,
+        address: str,
+        generation: int,
+        metadata: bytes,
+        pool_id: str,
+        region_id: object,
     ) -> str:
         """Load a map reply's metadata into the region mapper's NIXL peer.
 
-        A peer loaded under an earlier connection to the mapper is dropped
-        first and connected anew. The connection broke because the mapper
-        stopped answering for a while (or restarted), and UCX may have failed
-        its connection to the peer meanwhile without any transfer seeing it.
-        NIXL closes a failed connection but keeps using it when metadata is
-        loaded into the same peer again, which crashes the process.
+        UCX fails a connection on its own when the peer stops answering (a
+        stopped process, a network outage), and NIXL closes it but keeps it
+        in the peer: loading metadata into that peer again crashes the
+        process. So the loaded peer is dropped and connected anew when its
+        connection failed, and also when the connection to the mapper broke
+        since it was loaded (the mapper stopped answering or restarted; a
+        restarted mapper's old peer is then dropped too).
 
         Raises:
-            StorageUnavailableError: if NIXL refused to drop the old peer or
-                to load the metadata.
+            StorageUnavailableError: if the reply came over a connection that
+                has ended since another map loaded the peer, or NIXL refused
+                to drop the old peer or to load the metadata.
         """
         with self._load_lock:
             with self._lock:
                 loaded = self._loaded.get(address)
+            if loaded is not None and generation < loaded[1]:
+                # The mapper released what that connection held.
+                raise StorageUnavailableError(
+                    f"region {region_id} could not be mapped: the reply came "
+                    "over an earlier connection"
+                )
             if (
                 loaded is not None
-                and loaded[1] != generation
                 and self.transport.has_peer(loaded[0])
+                and (
+                    generation > loaded[1] or not self.transport.peer_usable(loaded[0])
+                )
                 and not self.disconnect({loaded[0]})
             ):
+                with self._lock:
+                    self._map_failed[pool_id] = time.monotonic() + DOWN_BACKOFF_S
                 raise StorageUnavailableError(
                     f"region {region_id} could not be mapped: NIXL kept the "
                     f"connection to {loaded[0]}"

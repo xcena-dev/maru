@@ -169,6 +169,7 @@ class RegionMapService:
 
     def hello(self) -> dict:
         """Identity of this region mapper process and of the node's boot."""
+        self._discard_notifs()
         return {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
 
     def holders(self) -> dict[int, set[int]]:
@@ -199,6 +200,7 @@ class RegionMapService:
             NotMapped: if a read handle names a region not mapped here.
             Exception: if the resource manager, the device or NIXL fails.
         """
+        self._discard_notifs()
         h = parse_handle(handle)
         if isinstance(h, ReadHandle):
             return self._map_for_reader(conn, h)
@@ -313,6 +315,13 @@ class RegionMapService:
                 m.holders.discard(conn)
                 if not m.holders:
                     self._release_locked(rid, m)
+
+    def _discard_notifs(self) -> None:
+        """Drop the notifications workers send to check their connection here."""
+        try:
+            self._transport.discard_notifs()
+        except Exception:
+            logger.debug("dropping NIXL notifications failed", exc_info=True)
 
     def close(self) -> None:
         """Release every region (the process is ending)."""

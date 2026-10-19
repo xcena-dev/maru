@@ -265,6 +265,33 @@ class NixlTransport:
         with self._lock:
             return name in self._peers
 
+    def peer_usable(self, name: str) -> bool:
+        """Whether NIXL's connection to a loaded peer has not failed.
+
+        UCX fails a connection on its own when the peer stops answering, and
+        NIXL then closes it but keeps it in the peer; loading the peer's
+        metadata again crashes the process. An empty notification tells the
+        two states apart without touching a closed connection: NIXL refuses
+        to send it then. The peer drops these with :meth:`discard_notifs`.
+
+        Args:
+            name: Peer name returned by :meth:`add_peer`.
+
+        Returns:
+            False if NIXL refused to send to the peer.
+        """
+        with self._lock:
+            try:
+                self._agent.send_notif(name, b"")
+            except Exception:
+                return False
+        return True
+
+    def discard_notifs(self) -> None:
+        """Drop the notifications peers sent (their :meth:`peer_usable` checks)."""
+        with self._lock:
+            self._agent.get_new_notifs()
+
     def pending_peers(self) -> set[str]:
         """Peers that still have a transfer whose handle is not released."""
         with self._lock:
