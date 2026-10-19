@@ -101,17 +101,18 @@ This will:
 2. Start maru-server with that remote CXL agent (`maru_server.sh`)
 3. Launch two vLLM engines with `storage_backend: "remote_cxl"` (`remote_cxl_vllm_launcher.sh`)
 4. Send a new prompt to instance 1, which computes it and stores its KV in the
-   pool, then the same prompt to instance 2, which loads the KV from the pool
+   pool, then the same prompt to instance 2, which loads the KV from the pool,
+   and once more to instance 1, which answers from vLLM's own prefix cache
 5. Clean up all processes
 
 Expected output: instance 2 reports most of the prompt as cached tokens and
 `Pool hit: Yes`. Only whole chunks are stored, so the cached tokens stop at the
-last full `maru_kv_chunk_tokens` chunk. `Same answer` compares instance 1's
-answer, computed from the whole prompt, with instance 2's, which reuses the
-stored KV and computes only the rest. vLLM itself can answer differently when it
-recomputes part of a prompt instead of reusing it, so `Same answer: No` after
-some tokens is not a load failure; the KV from the pool is checked against
-vLLM's own prefix cache at the same reused length, which gives the same answer. Instance 2
+last full `maru_kv_chunk_tokens` chunk. `Same answer` compares instance 2's
+answer, which reuses the KV from the pool, with instance 1's answer to the same
+prompt from vLLM's own prefix cache; both reuse a prefix of the same length, so
+they should match. Instance 1's first answer, computed from the whole prompt,
+can differ from both after some tokens: vLLM itself answers differently when it
+reuses a prefix instead of computing it. Instance 2
 never saw the prompt, so those tokens were found in the pool. vLLM counts them
 when it schedules the request; if the RDMA read then fails, the connector logs
 `Maru load failed for req ...; recomputing` after a line with the cause (such

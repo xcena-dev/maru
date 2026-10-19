@@ -6,7 +6,10 @@ memory node over RDMA, another engine reads it back the same way.
 
 Sends the same prompt to Instance 1 (computes it and stores its KV in the pool)
 and then to Instance 2 (loads the KV from the pool). Instance 2 has never seen
-the prompt, so every cached token it reports was found in the pool.
+the prompt, so every cached token it reports was found in the pool. Instance 1
+then answers the prompt again from vLLM's own prefix cache; Instance 2's answer
+from the pool should be the same. (An answer computed from the whole prompt can
+differ: vLLM itself answers differently when it reuses a prefix.)
 vLLM counts them when it schedules the request. A load that then fails is
 recomputed and logged by the connector ("Maru load failed for req ...;
 recomputing", preceded by its cause such as "Maru batch_retrieve failed"); if
@@ -135,7 +138,9 @@ def report(label: str, result: dict) -> None:
         print(f"  [{label}] answer: {result['text']!r}", file=sys.stderr)
 
 
-def summarize(store: dict, load: dict, chunk_tokens: int, wait: float) -> dict:
+def summarize(
+    store: dict, load: dict, own: dict, chunk_tokens: int, wait: float
+) -> dict:
     """Decide whether Instance 2 found Instance 1's KV in the pool; print a summary.
 
     vLLM reports a prompt's cached tokens when it schedules the request, so a
@@ -159,9 +164,15 @@ def summarize(store: dict, load: dict, chunk_tokens: int, wait: float) -> dict:
     )
     if speedup:
         print(f"  {_C}TTFT ratio{_NC}:         {speedup:.2f}x", file=sys.stderr)
-    same = store["text"] == load["text"]
+    same = (
+        load["status"] == "ok" and own["status"] == "ok" and load["text"] == own["text"]
+    )
     print(f"  {_C}Pool hit{_NC}:           {'Yes' if hit else 'No'}", file=sys.stderr)
-    print(f"  {_C}Same answer{_NC}:        {'Yes' if same else 'No'}", file=sys.stderr)
+    print(
+        f"  {_C}Same answer{_NC}:        {'Yes' if same else 'No'} "
+        "(Instance 2 from the pool vs Instance 1 from vLLM's prefix cache)",
+        file=sys.stderr,
+    )
     print(f"{_B}{'=' * 60}{_NC}\n", file=sys.stderr)
     return {
         "store_ttft_ms": t1,
@@ -218,7 +229,14 @@ async def main() -> None:
     load = await stream_completion(args.url2, args.model, prompt, args.max_tokens)
     report("load", load)
 
-    summary = summarize(store, load, args.chunk_tokens, args.wait_time)
+    print(
+        "\n[3] Instance 1 answers again from vLLM's own prefix cache",
+        file=sys.stderr,
+    )
+    own = await stream_completion(args.url1, args.model, prompt, args.max_tokens)
+    report("prefix cache", own)
+
+    summary = summarize(store, load, own, args.chunk_tokens, args.wait_time)
     print(json.dumps(summary))
     sys.exit(0 if summary["pool_hit"] else 1)
 
