@@ -267,16 +267,20 @@ confirmed that no key refers to it.
 
 **A memory node that stops answering.** A region whose region mapper cannot
 map it is set aside: its keys are removed, so probes stop reporting hits that
-would fail to read, and a background retry maps it again. Stores pass over
-regions whose region mapper failed a moment ago, and while every region
-mapper of the pool is down the Handler evicts nothing and skips the store,
-since no WRITE could reach the freed pages. When the memory node answers
-again, the Handler maps its regions anew; before it loads a map reply into a
-NIXL peer it already knows, it checks that NIXL's connection to the peer has
-not failed (UCX fails an unanswered connection on its own, even an idle one)
-and otherwise drops the peer and connects anew. NIXL 1.2.0 keeps a failed
-connection's closed endpoint in the peer, and loading into it crashes the
-process.
+would fail to read, and a background retry maps it again. A region mapper
+that left a request unanswered stays so until a later request to it (a map,
+or the heartbeat's boot check every 10 seconds) is answered. Until then
+stores take no pages in its regions and eviction picks no keys there; with no
+other region the store is skipped, since no WRITE could reach the freed
+pages. When the memory node answers again, the Handler maps its regions anew.
+Before it loads a map reply into a NIXL peer (NIXL's record of a remote agent:
+its metadata and its UCX connection) that it already knows, it checks that
+the connection has not failed and otherwise drops the peer and connects anew.
+UCX fails an unanswered connection on its own, even an idle one, and NIXL
+1.2.0 keeps the closed connection in the peer, so loading into it would crash
+the process:
+
+![A worker maps region R2 after its region mapper stopped answering and answers again. (a) Without the check, R2's metadata is loaded into the peer that still holds the closed connection, and the worker process crashes. (b) The Handler checks the peer first; the check is refused, so it drops the peer, connects anew and loads R2's metadata, and RDMA of R2 works](../image/remote_cxl_failed_peer.png)
 
 **Giving regions back.** A region goes back to the Resource Manager only after
 its region mapper deregistered it from the NIC (`release`):
