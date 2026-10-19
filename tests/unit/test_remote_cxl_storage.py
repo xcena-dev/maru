@@ -1040,6 +1040,7 @@ def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     )
     down.stop()
     a._data.boots([down.address])  # the heartbeat finds it down
+    time.sleep(0.1)  # the back-off ends; the node still does not answer
     a.config.auto_expand = False
     assert put(a, "k8", b"8")[0] is True
     on_down = [
@@ -1049,6 +1050,12 @@ def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     ]
     assert "k0" in on_down
     assert all(a.batch_exists(on_down))
+    # The node answers again: its regions take pages again.
+    down._start()
+    time.sleep(0.1)
+    a._data.boots([down.address])
+    assert a._data.answering(down.address)
+    assert all(a._writable(r) for r in by_node[down.address])
 
 
 def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):

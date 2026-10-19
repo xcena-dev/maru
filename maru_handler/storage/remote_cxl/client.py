@@ -359,8 +359,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
         """A free page: from a region with room, a new region, or eviction.
 
         Only regions a WRITE can reach now are used: a WRITE to a region
-        whose region mapper failed a moment ago would fail after the
-        transport's timeout and leave the page quarantined. Eviction likewise
+        whose region mapper has not answered since it last failed would fail
+        after the transport's timeout and leave the page quarantined. Eviction likewise
         frees pages only in those regions (``_evict``).
         """
         for attempt in ("free", "expand", "evict"):

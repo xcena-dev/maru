@@ -76,6 +76,9 @@ class RdmaDataPath:
         self._access: dict[str, RegionAccess] = {}
         # Region mapper -> time until which it counts as down
         self._down: dict[str, float] = {}
+        # Region mappers whose last request got no reply; one stays here
+        # until a later request is answered (the back-off above ends sooner)
+        self._unanswered: set[str] = set()
         # Region -> time until which a map the mapper failed is not retried
         self._map_failed: dict[str, float] = {}
         # Own region -> (mapper, connection generation) of a map reply that
@@ -225,6 +228,7 @@ class RdmaDataPath:
         with self._lock:
             self._access[pool_id] = access
             self._down.pop(address, None)
+            self._unanswered.discard(address)
             self._map_failed.pop(pool_id, None)
         return access
 
@@ -295,6 +299,16 @@ class RdmaDataPath:
             until = self._down.get(address)
         return until is not None and time.monotonic() < until
 
+    def answering(self, address: str) -> bool:
+        """Whether a region mapper answered since its last unanswered request.
+
+        A region mapper that stopped answering stays out of this until a
+        later request to it (a map, or the heartbeat's boot check) gets a
+        reply, however long that takes.
+        """
+        with self._lock:
+            return address not in self._unanswered
+
     def all_down(self, mappers: list[str]) -> bool:
         """Whether every one of these region mappers is down right now."""
         return bool(mappers) and all(self.is_down(m) for m in mappers)
@@ -350,8 +364,11 @@ class RdmaDataPath:
                 out[address] = str(client.hello().get("boot", ""))
             except RegionMapUnavailable:
                 self._mark_down(address)
+                continue
             except RegionMapError:
                 continue
+            with self._lock:
+                self._unanswered.discard(address)
         return out
 
     def release(self, pool_id: str, handle: dict, mappers: list[str]) -> Release:
@@ -390,6 +407,8 @@ class RdmaDataPath:
                 "release of region %s not confirmed: %s", handle["region_id"], exc
             )
             return Release.NO_REPLY
+        with self._lock:
+            self._unanswered.discard(address)
         self._not_mapped(pool_id)
         return Release.DONE
 
@@ -479,6 +498,7 @@ class RdmaDataPath:
     def _mark_down(self, address: str) -> None:
         with self._lock:
             self._down[address] = time.monotonic() + DOWN_BACKOFF_S
+            self._unanswered.add(address)
 
     def _not_mapped(self, pool_id: str) -> None:
         with self._lock:

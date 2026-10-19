@@ -329,11 +329,11 @@ class RegionLifecycle:
 
     def _writable(self, region: RemoteCxlRegion) -> bool:
         """Whether a WRITE can reach a region now: it is in use and its
-        region mapper did not fail a moment ago."""
+        region mapper answered since its last unanswered request."""
         return (
             region.reachable
             and not region.retired
-            and not self._data.is_down(pick_mapper(self._mappers, region.region_id))
+            and self._data.answering(pick_mapper(self._mappers, region.region_id))
         )
 
     def _evict(self) -> bool:
