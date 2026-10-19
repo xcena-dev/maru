@@ -757,8 +757,9 @@ def test_a_region_no_mapper_ever_mapped_goes_back_without_a_release(world):
     first = only_region(a)
     world.node.stop()
     a.rpc.unreachable.add("return_region")  # keep the new region until close
-    # The full region asks for a new one it cannot map, then evicts "k".
-    assert put(a, "k2", b"w")[0] is False
+    # The full region asks for a new one it cannot map; the store is skipped.
+    with pytest.raises(MemoryError):
+        put(a, "k2", b"w")
     (never,) = [r for r in a.regions.values() if r is not first]
     assert not never.mapped
     a.rpc.unreachable.clear()
@@ -774,12 +775,13 @@ def test_a_new_region_on_a_down_node_goes_back_at_once(world, monkeypatch):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     world.node.stop()
-    # The new region cannot be mapped and goes back; "k" is evicted for room
-    # and the WRITE to the stopped node fails, which sets the region aside.
-    assert put(a, "k2", b"w")[0] is False
+    # The new region cannot be mapped and goes back. Every mapper of the pool
+    # is down now, so "k" is not evicted for a page no WRITE could reach.
+    with pytest.raises(MemoryError):
+        put(a, "k2", b"w")
     assert len(a.regions) == 1 and world.cxl.released == [2]
-    assert not only_region(a).reachable
-    # Every mapper of the pool is down: no more regions are asked for.
+    assert a.batch_exists(["k"]) == [True]
+    # No more regions are asked for.
     with pytest.raises(MemoryError):
         put(a, "k3", b"x")
     assert world.cxl.released == [2] and len(world.cxl.regions) == 1
@@ -964,12 +966,25 @@ def test_a_map_reply_from_an_ended_connection_is_not_loaded(world):
     assert a._data._loaded[world.node.address] == (peer, generation)
 
 
+def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):
+    """The freed page could not be written, so the keys stay."""
+    a = world.client("a", pages=1)
+    put(a, "k", b"v")
+    world.node.restart()
+    world.node.stop()
+    with pytest.raises(MemoryError):  # the connector skips this store
+        put(a, "k2", b"w")
+    world.node._start()
+    assert a.batch_exists(["k"]) == [True]
+
+
 def test_expanding_resumes_once_the_back_off_ends(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     world.node.restart()  # same address; the first map after it fails over
     world.node.stop()
-    assert put(a, "k2", b"w")[0] is False
+    with pytest.raises(MemoryError):
+        put(a, "k2", b"w")
     assert not a._may_expand()  # the only region mapper is down
     world.node._start()
     time.sleep(0.1)
