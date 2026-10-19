@@ -258,7 +258,10 @@ never lands on reused memory.
 returns each key's location and, for another worker's region, a *read handle*.
 It maps that region at its region mapper on first use, READs the pages into
 staging slots, and ends the lease (`release`). It uses the bytes only if the
-lease was held to the end.
+lease was held to the end. A location longer than a staging slot, or past the
+end of its region, loads as a miss without a READ. A `release` whose reply is
+lost is sent again by the heartbeat thread, so the lease does not keep the
+owner from evicting the key.
 
 **Eviction.** When its regions are full and the Resource Manager has no room,
 the Handler asks MaruServer for its least recently used unleased keys
@@ -292,6 +295,11 @@ its region mapper deregistered it from the NIC (`release`):
 - A region the Handler gives back while it runs (for example a new region
   whose memory node it cannot reach) is released first, then returned with
   `return_region`.
+- A region whose memory node rebooted (its region mapper reports a new boot
+  id) goes back the same way at once, since bytes that sat in the node's CPU
+  cache may be lost. MaruServer then stops finding its keys and ends the
+  leases on them, so a reader holding one drops what it read; the next store
+  gets a new region.
 - When the Handler leaves (it closes, or its session expired), it waits for
   its WRITEs, closes the session drained and drops its holds at the region
   mappers. MaruServer takes its regions over: it keeps those that hold keys,

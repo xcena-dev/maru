@@ -142,8 +142,12 @@ Batch operations allow clients to reduce RPC round-trips when operating on multi
 For `remote_cxl` workers, MaruServer keeps storage sessions (`ReplicaDirectory`).
 A session gets regions from the Resource Manager as a cxl Handler does
 (`open`, then `expand`), and MaruServer indexes every session's keys, so any
-session of the same namespace can lease and read them. MaruServer hands the
-pool's region mapper list to the workers in the handshake.
+session of the same namespace can lease and read them. A session opens only if
+its schema and page size match those of the namespace's other sessions and of
+the regions kept for workers that left, since it may read their keys. A session
+may hold no region for a while (its only region went back) and asks for one
+with `expand`. MaruServer hands the pool's region mapper list to the workers in
+the handshake.
 
 ![MaruServer keeps the regions of a worker that left. (a) A leaves: MaruServer holds R's mapping at the region mapper, and B still reads k. (b) When the Resource Manager is full, MaruServer stops finding R's keys, releases R at the region mapper and only then frees it](../image/remote_cxl_kept_region.png)
 
