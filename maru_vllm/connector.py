@@ -60,6 +60,13 @@ logger = init_logger(__name__)
 
 # Default number of tokens per chunk for KV cache storage
 DEFAULT_KV_CHUNK_TOKENS = 256
+# Model config fields that name where a node keeps the weights or which
+# library wrote the config. They differ between nodes serving the same model
+# and must not split the sharing namespace; maru_cache_namespace names the
+# weights.
+_NODE_LOCAL_CONFIG_FIELDS = frozenset(
+    {"_name_or_path", "name_or_path", "transformers_version", "_commit_hash"}
+)
 
 # Knobs renamed to name the axis the deployer actually chooses, mapped to the
 # name each one replaced. The former names stay accepted for one release so
@@ -450,7 +457,14 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
 
 
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
-    """Bind a caller-supplied model revision namespace to engine geometry."""
+    """Bind a caller-supplied model revision namespace to engine geometry.
+
+    Engines that compute the same digest share keys (remote_cxl) or reuse
+    their own replicas (cpu, mixed); any geometry change splits them. Where a
+    node keeps the weights does not enter the digest, so engines on nodes that
+    load the same model from different paths share; the caller's
+    ``maru_cache_namespace`` tells different weights apart.
+    """
     if (
         extra.get("maru_storage_backend") == "remote_cxl"
         and not _get_knob(extra, "maru_async_load")
@@ -500,11 +514,15 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
         or getattr(model, "use_mla", False)
     ):
         raise ValueError("CPU M1 supports text-only models without LoRA or MLA")
+    model_config = {
+        k: v
+        for k, v in model.hf_config.to_dict().items()
+        if k not in _NODE_LOCAL_CONFIG_FIELDS
+    }
     identity = {
         "namespace": extra["maru_cache_namespace"],
-        "model": model.model,
         "revision": getattr(model, "revision", None),
-        "model_config": model.hf_config.to_dict(),
+        "model_config": model_config,
         "dtype": str(model.dtype),
         "kv_dtype": config.cache_config.cache_dtype,
         "block_size": config.cache_config.block_size,
@@ -514,6 +532,11 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode()
     ).hexdigest()
+    logger.info(
+        "Maru cache namespace %s (from %r); engines share KV only with the same value",
+        digest[:16],
+        extra["maru_cache_namespace"],
+    )
     out = {**extra, "maru_cache_namespace": digest}
     max_model_len = getattr(model, "max_model_len", None)
     if isinstance(max_model_len, int) and max_model_len > 0:

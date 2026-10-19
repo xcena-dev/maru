@@ -126,6 +126,37 @@ def test_engine_namespace_tracks_revision_and_geometry():
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
 
 
+def test_engine_namespace_ignores_where_a_node_keeps_the_weights():
+    """Nodes that load the same weights from different paths, with another
+    transformers release, share; another maru_cache_namespace does not."""
+
+    def node(path, transformers_version):
+        config = engine_config()
+        config.model_config.model = path
+        config.model_config.hf_config = SimpleNamespace(
+            to_dict=lambda: {
+                "heads": 4,
+                "_name_or_path": path,
+                "transformers_version": transformers_version,
+                "_commit_hash": None,
+            }
+        )
+        return config
+
+    a = _cpu_engine_config(extra(), node("org/model", "5.11.0"))["maru_cache_namespace"]
+    b = _cpu_engine_config(extra(), node("/models/model", "5.12.0"))[
+        "maru_cache_namespace"
+    ]
+    assert a == b
+    other = {**extra(), "maru_cache_namespace": "other-weights"}
+    assert (
+        a
+        != _cpu_engine_config(other, node("org/model", "5.11.0"))[
+            "maru_cache_namespace"
+        ]
+    )
+
+
 def test_cpu_requires_recompute_instead_of_failing_a_cache_miss():
     config = engine_config()
     config.kv_transfer_config.kv_load_failure_policy = "fail"
