@@ -266,13 +266,15 @@ the Handler asks MaruServer for its least recently used unleased keys
 confirmed that no key refers to it.
 
 **A memory node that stops answering.** A region whose region mapper cannot
-map it is set aside: its keys are removed, so probes stop reporting hits that
-would fail to read, and a background retry maps it again. A region mapper
-that left a request unanswered stays so until a later request to it (a map,
-or the heartbeat's boot check every 10 seconds) is answered. Until then
-stores take no pages in its regions and eviction picks no keys there; with no
-other region the store is skipped, since no WRITE could reach the freed
-pages. When the memory node answers again, the Handler maps its regions anew.
+map it is set aside, and a background retry maps it again. If the retry
+succeeds within 30 seconds (a region mapper restart), the region is used
+again with its keys; otherwise its keys are removed, so probes stop reporting
+hits that would fail to read, as MaruServer does for a region it took over.
+A region mapper that left a request unanswered stays so until a later request
+to it (a map, or the heartbeat's boot check every 10 seconds) is answered.
+Until then stores take no pages in its regions, eviction picks no keys there
+and no new region is asked for; with no other region the store is skipped,
+since no WRITE could reach the freed pages. When the memory node answers again, the Handler maps its regions anew.
 Before it loads a map reply into a NIXL peer (NIXL's record of a remote agent:
 its metadata and its UCX connection) that it already knows, it checks that
 the connection has not failed and otherwise drops the peer and connects anew.
