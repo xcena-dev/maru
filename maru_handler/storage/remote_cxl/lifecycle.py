@@ -23,7 +23,7 @@ from maru_common.storage_types import (
     StorageLocation,
     StorageUnavailableError,
 )
-from maru_remote.region_map import pick_mapper
+from maru_remote.region_map import pick_agent
 
 from .datapath import RdmaDataPath, Release
 from .region import IsolatedTransfer, RegionAccess, RemoteCxlRegion
@@ -34,7 +34,7 @@ EVICT_BATCH = 32
 SETTLE_POLL_S = 0.01
 CALL_ATTEMPTS = 3
 # A region set aside keeps its keys this long, as MaruServer keeps those of a
-# region it took over: a region mapper that restarts maps it again in time.
+# region it took over: a remote CXL agent that restarts maps it again in time.
 UNREACHABLE_KEYS_S = 30.0
 
 
@@ -62,7 +62,7 @@ class RegionLifecycle:
     def _add_region(self, info: dict) -> RemoteCxlRegion:
         """Track a region the session got and map it now.
 
-        A region whose mapper cannot map it is kept aside; new pages then
+        A region whose agent cannot map it is kept aside; new pages then
         come from another region, a new one if needed.
         """
         region = RemoteCxlRegion(
@@ -82,7 +82,7 @@ class RegionLifecycle:
         return region
 
     def _region(self, pool_id: str, handle: dict, own: bool = False) -> RegionAccess:
-        return self._data.region(pool_id, handle, self._mappers, own=own)
+        return self._data.region(pool_id, handle, self._agents, own=own)
 
     def _map_own(self, region: RemoteCxlRegion) -> RegionAccess:
         """Access to a region of this session, mapping it if needed."""
@@ -120,7 +120,7 @@ class RegionLifecycle:
         )
         entries = self._forget_keys(region)
         region.retire()
-        outcome = self._data.release(region.pool_id, region.handle, self._mappers)
+        outcome = self._data.release(region.pool_id, region.handle, self._agents)
         if outcome is Release.DONE and self._call_retrying(
             "return_region", pool_id=region.pool_id
         ):
@@ -136,7 +136,7 @@ class RegionLifecycle:
         for region in pending:
             if self.regions.get(region.pool_id) is not region:
                 continue  # gone with the close
-            outcome = self._data.release(region.pool_id, region.handle, self._mappers)
+            outcome = self._data.release(region.pool_id, region.handle, self._agents)
             if outcome is Release.DONE and self._call_retrying(
                 "return_region", pool_id=region.pool_id
             ):
@@ -181,7 +181,7 @@ class RegionLifecycle:
                     # registration. If that fails, whoever gives the region
                     # back sees it mapped and releases it first.
                     region.mapped = True
-                    self._data.release(region.pool_id, region.handle, self._mappers)
+                    self._data.release(region.pool_id, region.handle, self._agents)
                     continue
                 self._adopt(region, access)
                 region.reachable = True
@@ -191,16 +191,16 @@ class RegionLifecycle:
     def _check_boots(self) -> None:
         """Give back own regions whose memory node rebooted.
 
-        Asks every region mapper of a mapped own region for its boot id, so a
+        Asks every remote CXL agent of a mapped own region for its boot id, so a
         reboot is noticed even for a region this worker no longer writes.
         Runs without the client lock until there is something to change.
         """
         owned: dict[str, list[RemoteCxlRegion]] = {}
         for region in list(self.regions.values()):
             if region.boot and not region.retired:
-                owned.setdefault(
-                    pick_mapper(self._mappers, region.region_id), []
-                ).append(region)
+                owned.setdefault(pick_agent(self._agents, region.region_id), []).append(
+                    region
+                )
         if not owned:
             return
         boots = self._data.boots(list(owned))
@@ -221,10 +221,10 @@ class RegionLifecycle:
 
         1. Wait (bounded) for the WRITEs sent to the regions; this only
            spares them an error.
-        2. Have each region's mapper deregister it (``release``). From the
+        2. Have each region's agent deregister it (``release``). From the
            reply on, an RDMA to the region fails at the memory node's NIC.
-           A region for which no map request ever reached a mapper needs no
-           release: no RDMA was ever sent to it. After a region mapper does
+           A region for which no map request ever reached a agent needs no
+           release: no RDMA was ever sent to it. After a remote CXL agent does
            not reply, its other regions are not tried again.
         3. Only then give the regions back. If all are released the session
            closes drained; otherwise each released region goes back alone
@@ -244,11 +244,11 @@ class RegionLifecycle:
             if not region.mapped and not self._data.map_attempted(pool_id):
                 released[pool_id] = True
                 continue
-            address = pick_mapper(self._mappers, region.region_id)
+            address = pick_agent(self._agents, region.region_id)
             if address in silent:
                 released[pool_id] = False
                 continue
-            outcome = self._data.release(pool_id, region.handle, self._mappers)
+            outcome = self._data.release(pool_id, region.handle, self._agents)
             if outcome is Release.NO_REPLY:
                 silent.add(address)
             released[pool_id] = outcome is Release.DONE
@@ -256,7 +256,7 @@ class RegionLifecycle:
             self._close_session_quietly()
         else:
             logger.error(
-                "%d remote CXL region(s) could not be released at their region mapper; "
+                "%d remote CXL region(s) could not be released at their remote CXL agent; "
                 "MaruServer keeps them",
                 list(released.values()).count(False),
             )
@@ -276,10 +276,10 @@ class RegionLifecycle:
 
         1. Wait (bounded) for the WRITEs sent to the regions. A WRITE that
            is never confirmed lands, if at all, on a page no key refers to.
-        2. Give back at once the regions no region mapper ever mapped for
+        2. Give back at once the regions no remote CXL agent ever mapped for
            it: no RDMA was ever sent to them, so they need no release.
         3. Close the session drained.
-        4. Drop this worker's own holds at the region mappers.
+        4. Drop this worker's own holds at the remote CXL agents.
 
         If MaruServer does not confirm the close, it takes the regions over
         when the session expires. A session that holds no region (its
@@ -299,7 +299,7 @@ class RegionLifecycle:
                 "when the session expires"
             )
         for pool_id, region in self.regions.items():
-            self._data.unmap(pool_id, region.handle, self._mappers)
+            self._data.unmap(pool_id, region.handle, self._agents)
         self.regions.clear()
 
     def _close_session_quietly(self) -> bool:
@@ -331,14 +331,14 @@ class RegionLifecycle:
     # --------------------------------------------------------- more space
 
     def _may_expand(self) -> bool:
-        """Whether to ask for one more region: not while no region mapper of
+        """Whether to ask for one more region: not while no remote CXL agent of
         the pool answers, since no new region could be mapped and a store
         would wait for the map's timeout. The heartbeat's boot check and the
         retry of set-aside regions notice when one answers again."""
         return (
             (self.config.auto_expand or not self.regions)
-            and any(self._data.answering(m) for m in self._mappers)
-            and not self._data.all_down(self._mappers)
+            and any(self._data.answering(m) for m in self._agents)
+            and not self._data.all_down(self._agents)
         )
 
     def _expand(self) -> bool:
@@ -369,10 +369,10 @@ class RegionLifecycle:
         return True
 
     def _give_up(self, region: RemoteCxlRegion) -> None:
-        """Give back at once a new region whose mapper cannot map it.
+        """Give back at once a new region whose agent cannot map it.
 
         No RDMA was ever sent to it. It still needs a release first if a map
-        request may have reached its mapper (no reply came, or the
+        request may have reached its agent (no reply came, or the
         background retry mapped it meanwhile). The next expand gets a new
         region number, which may fall on another memory node. A region that
         cannot go back now stays until the close.
@@ -380,7 +380,7 @@ class RegionLifecycle:
         region.retire()
         if region.mapped or self._data.map_attempted(region.pool_id):
             region.mapped = True
-            outcome = self._data.release(region.pool_id, region.handle, self._mappers)
+            outcome = self._data.release(region.pool_id, region.handle, self._agents)
             if outcome is not Release.DONE:
                 return
         if self._call_retrying("return_region", pool_id=region.pool_id):
@@ -388,11 +388,11 @@ class RegionLifecycle:
 
     def _writable(self, region: RemoteCxlRegion) -> bool:
         """Whether a WRITE can reach a region now: it is in use and its
-        region mapper answered since its last unanswered request."""
+        remote CXL agent answered since its last unanswered request."""
         return (
             region.reachable
             and not region.retired
-            and self._data.answering(pick_mapper(self._mappers, region.region_id))
+            and self._data.answering(pick_agent(self._agents, region.region_id))
         )
 
     def _evict(self) -> bool:
@@ -455,11 +455,11 @@ class RegionLifecycle:
     # ------------------------------------------------------ keys that go
 
     def _set_aside(self, region: RemoteCxlRegion) -> None:
-        """Stop using a region its mapper cannot map.
+        """Stop using a region its agent cannot map.
 
         A background retry maps it again (:meth:`_retry_unreachable`); one
         that maps within :data:`UNREACHABLE_KEYS_S` keeps its keys, as after a
-        region mapper restart. Later the keys are removed: otherwise probes
+        remote CXL agent restart. Later the keys are removed: otherwise probes
         keep reporting them as hits and every request with that prefix reads,
         fails and recomputes.
         """

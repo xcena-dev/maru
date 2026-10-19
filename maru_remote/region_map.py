@@ -1,26 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Region map protocol between a worker's Handler and a region mapper.
+"""Region map protocol between a worker's Handler and a remote CXL agent.
 
-A region mapper runs on every memory node. It does for a remote Handler what
+A remote CXL agent runs on every memory node. It does for a remote Handler what
 ``DaxMapper`` does inside a Handler on a CXL-attached node: check a region's
 handle with the resource manager (``GET_ACCESS``) and mmap the region, and
 then register the mapping with the node's NIC so the Handler can reach it by
 RDMA.
 
-One TCP connection per Handler and region mapper; each message is a 4-byte
+One TCP connection per Handler and remote CXL agent; each message is a 4-byte
 big-endian length followed by a MessagePack map. Requests carry ``op``:
 
 - ``hello``: returns ``{"node", "epoch", "boot", "nonce"}``; the epoch is
-  new on every start of the region mapper process, ``boot`` on every boot of
+  new on every start of the remote CXL agent process, ``boot`` on every boot of
   the memory node, ``nonce`` on every connection.
 - ``auth`` with ``proof`` and ``nonce``: the client proves it holds the
-  region mapper key (:func:`prove` over the connection's nonce) and the reply
+  remote CXL agent key (:func:`prove` over the connection's nonce) and the reply
   proves the same over the client's nonce. A connection does nothing else
   until it has proved the key, so only processes that can read the key file
   map regions, as only users who can open the DAX device map them on a
   CXL-attached node.
 - ``map`` with ``handle``: returns ``{"region_id", "addr", "length",
-  "metadata"}``. ``addr`` is the region mapper's virtual address of the
+  "metadata"}``. ``addr`` is the remote CXL agent's virtual address of the
   region (VA_R); a Handler uses it only as the remote address of RDMA
   requests. ``metadata`` is NIXL metadata naming this region's registration
   only, with connection info. The handle is either the region's handle
@@ -29,11 +29,11 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   readers); a read handle maps only a region that is mapped already.
 - ``unmap`` with ``region_id``: the connection no longer needs the region.
 - ``release`` with the region's handle: the region is being given back; the
-  region mapper deregisters and unmaps it whoever else holds it, and refuses
+  remote CXL agent deregisters and unmaps it whoever else holds it, and refuses
   later maps of the handle. Releasing a region that is not mapped succeeds.
   A read handle cannot release.
 
-Replies carry ``ok``; a failure has ``error`` and ``code``. The region mapper
+Replies carry ``ok``; a failure has ``error`` and ``code``. The remote CXL agent
 treats a closed connection as an unmap of every region the connection mapped.
 """
 
@@ -58,28 +58,28 @@ logger = logging.getLogger(__name__)
 
 MAX_FRAME = 16 * 1024 * 1024
 _LEN = struct.Struct("!I")
-# Shared by the region mappers of a deployment, its workers and its
+# Shared by the remote CXL agents of a deployment, its workers and its
 # MaruServers; readable only by the users that run them.
-DEFAULT_KEY_FILE = "/etc/maru/region-mapper.key"
+DEFAULT_KEY_FILE = "/etc/maru/remote-cxl-agent.key"
 NONCE_BYTES = 16
 
 
-def pick_mapper(mappers: list[str], region_id: int) -> str:
-    """The region mapper that serves a region (rendezvous hash).
+def pick_agent(agents: list[str], region_id: int) -> str:
+    """The remote CXL agent that serves a region (rendezvous hash).
 
     Every Handler with the same list, and MaruServer, pick the same node for
     a region, so the owner and the readers of a region use one memory node's
     NIC.
 
     Args:
-        mappers: Region mapper addresses of the pool.
+        agents: Remote CXL agent addresses of the pool.
         region_id: Region number.
 
     Returns:
-        One address of ``mappers``.
+        One address of ``agents``.
     """
     return max(
-        mappers,
+        agents,
         key=lambda address: hashlib.sha256(f"{address}|{region_id}".encode()).digest(),
     )
 
@@ -88,7 +88,7 @@ def read_token(handle: dict) -> str:
     """The read capability of a region, derived from its handle.
 
     Whoever knows the handle's auth token can compute it; nobody can go back
-    from it to the auth token. A region mapper that mapped the region checks
+    from it to the auth token. A remote CXL agent that mapped the region checks
     a read token against the handle the resource manager confirmed.
 
     Args:
@@ -124,16 +124,16 @@ def read_handle(handle: dict) -> dict:
 
 
 class KeyFileError(ValueError):
-    """The region mapper key file is missing, malformed or open to everyone."""
+    """The remote CXL agent key file is missing, malformed or open to everyone."""
 
 
 def new_key() -> str:
-    """A new region mapper key: 32 random bytes as hex."""
+    """A new remote CXL agent key: 32 random bytes as hex."""
     return secrets.token_hex(32)
 
 
 def load_key(path: str) -> bytes:
-    """Read the region mapper key.
+    """Read the remote CXL agent key.
 
     Args:
         path: Key file; one line of hex digits (at least 32).
@@ -150,10 +150,12 @@ def load_key(path: str) -> bytes:
             mode = os.fstat(f.fileno()).st_mode
             text = f.read().strip()
     except OSError as exc:
-        raise KeyFileError(f"cannot read the region mapper key {path}: {exc}") from exc
+        raise KeyFileError(
+            f"cannot read the remote CXL agent key {path}: {exc}"
+        ) from exc
     if mode & 0o004:
         raise KeyFileError(
-            f"the region mapper key {path} is readable by every user; chmod o-r {path}"
+            f"the remote CXL agent key {path} is readable by every user; chmod o-r {path}"
         )
     try:
         key = bytes.fromhex(text)
@@ -161,7 +163,7 @@ def load_key(path: str) -> bytes:
         key = b""
     if len(key) < 16:
         raise KeyFileError(
-            f"{path} does not hold a region mapper key (at least 32 hex digits)"
+            f"{path} does not hold a remote CXL agent key (at least 32 hex digits)"
         )
     return key
 
@@ -179,7 +181,7 @@ def write_key(path: str) -> None:
         FileExistsError: if the file exists.
     """
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(prefix=".region-mapper-key-", dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=".remote-cxl-agent-key-", dir=directory)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(new_key() + "\n")
@@ -194,8 +196,8 @@ def prove(key: bytes, role: str, nonce: bytes) -> bytes:
     """Proof that ``role`` holds ``key``, bound to the peer's ``nonce``.
 
     Args:
-        key: Region mapper key.
-        role: ``"handler"`` for a client, ``"mapper"`` for the region mapper.
+        key: Remote CXL agent key.
+        role: ``"handler"`` for a client, ``"agent"`` for the remote CXL agent.
         nonce: The nonce the other side chose for this connection.
 
     Returns:
@@ -205,7 +207,7 @@ def prove(key: bytes, role: str, nonce: bytes) -> bytes:
 
 
 class RegionMapError(RuntimeError):
-    """The region mapper refused a request.
+    """The remote CXL agent refused a request.
 
     Attributes:
         code: Short reason (``"denied"``, ``"unavailable"``, ``"invalid"``...).
@@ -217,7 +219,7 @@ class RegionMapError(RuntimeError):
 
 
 class RegionMapUnavailable(ConnectionError):  # noqa: N818 (a ConnectionError)
-    """The region mapper could not be reached or the connection broke."""
+    """The remote CXL agent could not be reached or the connection broke."""
 
 
 def send_frame(sock: socket.socket, message: dict) -> None:
@@ -282,14 +284,14 @@ class MapReply:
 
     Attributes:
         region_id: Region number from the handle.
-        addr: The region mapper's virtual address of the region (VA_R).
+        addr: The remote CXL agent's virtual address of the region (VA_R).
         length: Region length in bytes.
-        metadata: NIXL metadata of the region mapper's agent naming this
+        metadata: NIXL metadata of the remote CXL agent's agent naming this
             region's registration (its remote key) and the connection info.
-        epoch: The region mapper process this mapping belongs to.
+        epoch: The remote CXL agent process this mapping belongs to.
         boot: The boot of the memory node at the time of the mapping.
         generation: The client's connection the reply came over; the
-            region mapper drops the mapping when that connection ends.
+            remote CXL agent drops the mapping when that connection ends.
     """
 
     region_id: int
@@ -305,7 +307,7 @@ def parse_address(address: str) -> tuple[str, int]:
     """Split ``host:port``.
 
     Args:
-        address: Region mapper address.
+        address: Remote CXL agent address.
 
     Returns:
         ``(host, port)``.
@@ -315,15 +317,15 @@ def parse_address(address: str) -> tuple[str, int]:
     """
     host, sep, port = address.rpartition(":")
     if not sep or not host or not port.isdigit():
-        raise ValueError(f"region mapper address must be host:port, got {address!r}")
+        raise ValueError(f"remote CXL agent address must be host:port, got {address!r}")
     return host, int(port)
 
 
 class RegionMapClient:
-    """A Handler's connection to one region mapper.
+    """A Handler's connection to one remote CXL agent.
 
     The connection is opened on first use. If it breaks, every mapping the
-    region mapper held for this connection is gone with it, so the caller
+    remote CXL agent held for this connection is gone with it, so the caller
     must forget the addresses it got and map again; :attr:`generation`
     counts reconnections so the caller can tell. A request that finds the
     connection broken opens it once more and is sent again.
@@ -341,15 +343,15 @@ class RegionMapClient:
         """Create the client.
 
         Args:
-            address: ``host:port`` of the region mapper.
+            address: ``host:port`` of the remote CXL agent.
             timeout_s: Socket timeout for each reply (a first map registers
                 a whole region with the NIC).
             connect_timeout_s: Timeout for connecting; ``timeout_s`` if None.
             connect: Socket factory ``(address, timeout) -> socket``
                 (tests inject an in-process pair).
-            key: Region mapper key (:func:`load_key`). Each connection
-                proves it and checks that the region mapper proves it too;
-                None only for a region mapper that runs without a key.
+            key: Remote CXL agent key (:func:`load_key`). Each connection
+                proves it and checks that the remote CXL agent proves it too;
+                None only for a remote CXL agent that runs without a key.
         """
         self.address = address
         self._key = key
@@ -367,19 +369,19 @@ class RegionMapClient:
         self.generation = 0
 
     def hello(self) -> dict:
-        """Connect if needed and return the region mapper's identity.
+        """Connect if needed and return the remote CXL agent's identity.
 
         Returns:
             ``{"node", "epoch", "boot"}``.
 
         Raises:
-            RegionMapUnavailable: if the region mapper cannot be reached.
+            RegionMapUnavailable: if the remote CXL agent cannot be reached.
         """
         with self._lock:
             return self._send({"op": "hello"})
 
     def map(self, handle: dict) -> MapReply:
-        """Ask the region mapper to map and register a region.
+        """Ask the remote CXL agent to map and register a region.
 
         Args:
             handle: ``MaruHandle.to_dict()`` of the region.
@@ -388,8 +390,8 @@ class RegionMapClient:
             Where the region is reachable.
 
         Raises:
-            RegionMapError: if the region mapper refused (e.g. a wrong handle).
-            RegionMapUnavailable: if the region mapper cannot be reached.
+            RegionMapError: if the remote CXL agent refused (e.g. a wrong handle).
+            RegionMapUnavailable: if the remote CXL agent cannot be reached.
         """
         with self._lock:
             reply = self._send({"op": "map", "handle": dict(handle)})
@@ -404,7 +406,7 @@ class RegionMapClient:
             )
 
     def unmap(self, region_id: int) -> None:
-        """Tell the region mapper this Handler no longer needs a region.
+        """Tell the remote CXL agent this Handler no longer needs a region.
 
         A broken connection already released the region, so it is ignored.
 
@@ -412,7 +414,7 @@ class RegionMapClient:
             region_id: Region number.
 
         Raises:
-            RegionMapError: if the region mapper refused.
+            RegionMapError: if the remote CXL agent refused.
         """
         with self._lock:
             if self._sock is None:
@@ -423,16 +425,16 @@ class RegionMapClient:
                 pass
 
     def release(self, handle: dict) -> None:
-        """Have the region mapper deregister a region this Handler owns.
+        """Have the remote CXL agent deregister a region this Handler owns.
 
-        Sent before the region goes back to MaruServer. A region mapper that
+        Sent before the region goes back to MaruServer. A remote CXL agent that
         restarted holds no registration and answers that it is released.
 
         Args:
             handle: ``MaruHandle.to_dict()`` of the region.
 
         Raises:
-            RegionMapError: if the region mapper refused (``"denied"``: it
+            RegionMapError: if the remote CXL agent refused (``"denied"``: it
                 maps another region under this id; ``"unavailable"``: the
                 deregistration failed and the region is still registered).
             RegionMapUnavailable: if no connection got a reply.
@@ -464,7 +466,7 @@ class RegionMapClient:
             sock = self._connect(self._endpoint, self._connect_timeout_s)
         except OSError as exc:
             raise RegionMapUnavailable(
-                f"region mapper {self.address} is unreachable: {exc}"
+                f"remote CXL agent {self.address} is unreachable: {exc}"
             ) from exc
         try:
             sock.settimeout(self._timeout_s)
@@ -479,24 +481,24 @@ class RegionMapClient:
         except (RegionMapError, RegionMapUnavailable) as exc:
             self._drop()
             raise RegionMapUnavailable(
-                f"region mapper {self.address}: key check failed: {exc}"
+                f"remote CXL agent {self.address}: key check failed: {exc}"
             ) from exc
         self.epoch = str(reply["epoch"])
         self.node = str(reply["node"])
         self.boot = str(reply.get("boot", ""))
 
     def _authenticate(self, nonce: Any) -> None:
-        """Prove the key to the region mapper and check its proof.
+        """Prove the key to the remote CXL agent and check its proof.
 
         Raises:
-            RegionMapError: if the region mapper refused the proof.
+            RegionMapError: if the remote CXL agent refused the proof.
             RegionMapUnavailable: if the two sides disagree on using a key
-                or the region mapper proved another key.
+                or the remote CXL agent proved another key.
         """
         if self._key is None:
             if nonce is not None:
                 raise RegionMapUnavailable(
-                    "it requires the region mapper key; set the key file "
+                    "it requires the remote CXL agent key; set the key file "
                     f"(default {DEFAULT_KEY_FILE})"
                 )
             return
@@ -512,7 +514,7 @@ class RegionMapClient:
         )
         proof = ack.get("proof")
         if not isinstance(proof, bytes) or not hmac.compare_digest(
-            proof, prove(self._key, "mapper", mine)
+            proof, prove(self._key, "agent", mine)
         ):
             raise RegionMapUnavailable("it proved another key")
 
@@ -523,14 +525,14 @@ class RegionMapClient:
         except (OSError, ValueError) as exc:
             self._drop()
             raise RegionMapUnavailable(
-                f"region mapper {self.address} connection failed: {exc}"
+                f"remote CXL agent {self.address} connection failed: {exc}"
             ) from exc
         if reply is None:
             self._drop()
-            raise RegionMapUnavailable(f"region mapper {self.address} closed")
+            raise RegionMapUnavailable(f"remote CXL agent {self.address} closed")
         if not reply.get("ok"):
             raise RegionMapError(
-                str(reply.get("error", "region mapper refused")),
+                str(reply.get("error", "remote CXL agent refused")),
                 str(reply.get("code", "error")),
             )
         return reply

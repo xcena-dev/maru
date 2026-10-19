@@ -8,7 +8,7 @@ session of the same namespace can lease and read their keys; the owner evicts
 its own keys in the order of last use across all sessions.
 
 A region stays with its session while the owner uses it. The owner gives
-one back alone (``return_region``) only after the region mapper deregistered
+one back alone (``return_region``) only after the remote CXL agent deregistered
 it, so no RDMA reaches it any more; the region goes back to the resource
 manager at once, and leases other sessions still hold on its keys are
 reported lost on release.
@@ -16,12 +16,12 @@ reported lost on release.
 When the owner leaves (a drained close, or its session expires), MaruServer
 takes its regions over, as it keeps a cxl Handler's regions while keys refer
 to them. A region with keys is kept: its keys are still found and the region
-keeper (``region_keeper.py``) holds its mapping at the region mapper so
+keeper (``region_keeper.py``) holds its mapping at the remote CXL agent so
 readers keep reading. A region without keys goes back. The owner never wrote
 a page that a found key refers to, so a late write from it, or from an
 owner that only seemed gone, lands on no key's bytes. A taken-over region
 goes back to the resource manager only after the keeper released it at its
-region mapper: when the resource manager is full (the kept region read
+remote CXL agent: when the resource manager is full (the kept region read
 longest ago first), or when its keys cannot be read any more.
 """
 
@@ -685,7 +685,7 @@ class ReplicaDirectory:
         """The handle of an own region; a read handle of anyone else's.
 
         Only the region's handle (with the resource manager's auth token) can
-        release a region at its region mapper, so it goes to the owner alone.
+        release a region at its remote CXL agent, so it goes to the owner alone.
         """
         handle = pool.handle.to_dict()
         if session.regions.get(pool.pool_id) is pool:
@@ -805,7 +805,7 @@ class ReplicaDirectory:
                 del self._remote_cxl_index[(region.namespace, key)]
 
     def _return_region(self, region: StoragePool) -> None:
-        """The owner gave the region back after its region mapper released it.
+        """The owner gave the region back after its remote CXL agent released it.
 
         No RDMA reaches the region any more, so it goes back to the resource
         manager at once. Readers that still hold a lease on its keys learn
@@ -823,7 +823,7 @@ class ReplicaDirectory:
         """Give one region back, as a cxl Handler's ``return_alloc``.
 
         Accepted from an expired session too, like a drained close: the
-        owner sends it only after the region mapper released the region.
+        owner sends it only after the remote CXL agent released the region.
         """
         if p.get("server_epoch") != self.server_epoch:
             raise ValueError("Server epoch changed")
@@ -898,7 +898,7 @@ class ReplicaDirectory:
         """MaruServer takes the regions of a session whose owner left.
 
         A region with keys is kept and its keys stay found; one without keys
-        goes back. Either way the region keeper deals with its region mapper
+        goes back. Either way the region keeper deals with its remote CXL agent
         first. A resent ``return_region`` of a taken region succeeds.
         """
         for region in session.regions.values():
@@ -962,7 +962,7 @@ class ReplicaDirectory:
             self.keeper_wakeup.set()
 
     def given_back(self, pool_id: str) -> None:
-        """Its region mapper released a region: free it at the RM.
+        """Its remote CXL agent released a region: free it at the RM.
 
         Args:
             pool_id: The region.

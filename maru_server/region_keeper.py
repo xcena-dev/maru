@@ -4,19 +4,19 @@
 On a CXL-attached node, MaruServer keeps a cxl Handler's region while keys
 refer to it after the Handler closed, and other Handlers keep reading it
 through their own mmap. A remote CXL region is read through one
-registration at its region mapper instead, which someone must hold while
+registration at its remote CXL agent instead, which someone must hold while
 readers read and remove before the region's memory is reused. Once the
 owner left, MaruServer is the one that decides when the region goes back,
 so it does both, from this thread:
 
-* A kept region (its keys are still found) is mapped at its region mapper
+* A kept region (its keys are still found) is mapped at its remote CXL agent
   with the region's handle, so the registration stays while readers read.
-  A region mapper that restarted is asked again; one whose memory node
+  A remote CXL agent that restarted is asked again; one whose memory node
   rebooted, or that refuses the handle, has the region given back.
-* A region to give back is released at its region mapper (the NIC refuses
+* A region to give back is released at its remote CXL agent (the NIC refuses
   RDMA to it from then on) and only then freed at the resource manager.
 
-The region mapper calls run here, never in the request thread, so a memory
+The remote CXL agent calls run here, never in the request thread, so a memory
 node that does not answer delays no heartbeat.
 """
 
@@ -32,7 +32,7 @@ from maru_remote.region_map import (
     RegionMapClient,
     RegionMapError,
     RegionMapUnavailable,
-    pick_mapper,
+    pick_agent,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,14 +40,14 @@ logger = logging.getLogger(__name__)
 INTERVAL_S = 1.0
 # How often held regions' memory nodes are asked for their boot
 CHECK_S = 10.0
-# A region mapper that did not answer is not asked again for this long
+# A remote CXL agent that did not answer is not asked again for this long
 DOWN_S = 5.0
 CONNECT_TIMEOUT_S = 3.0
 # A reply that takes longer counts as no answer. Mapping registers a whole
 # region with the NIC, which takes well under a second; one slow node must
 # not hold up the others for long, since the keeper is one thread.
 REPLY_TIMEOUT_S = 10.0
-# A kept region whose region mapper does not answer this long stops being
+# A kept region whose remote CXL agent does not answer this long stops being
 # found, as a live owner removes the keys of a region it cannot reach: its
 # keys would keep being hits that fail to read.
 UNREACHABLE_S = 30.0
@@ -56,14 +56,14 @@ UNREACHABLE_S = 30.0
 class RegionKeeper:
     """Holds the kept regions' mappings and releases the regions to give back.
 
-    The directory, the region mapper list and the client factory are passed
+    The directory, the remote CXL agent list and the client factory are passed
     in so tests can use fakes.
     """
 
     def __init__(
         self,
         directory: Any,
-        mappers: list[str],
+        agents: list[str],
         key: bytes | None,
         *,
         client_factory: Callable[[str], Any] | None = None,
@@ -73,13 +73,13 @@ class RegionKeeper:
 
         Args:
             directory: The ``ReplicaDirectory`` of this MaruServer.
-            mappers: Region mapper addresses of the pool, as handed to workers.
-            key: Region mapper key.
+            agents: Remote CXL agent addresses of the pool, as handed to workers.
+            key: Remote CXL agent key.
             client_factory: ``address -> RegionMapClient``.
             clock: Monotonic clock.
         """
         self._directory = directory
-        self._mappers = list(mappers)
+        self._agents = list(agents)
         self._key = key
         self._factory = client_factory or self._default_client
         self._clock = clock
@@ -87,7 +87,7 @@ class RegionKeeper:
         # pool_id -> (address, connection generation, boot) of the hold
         self._held: dict[str, tuple[str, int, str]] = {}
         self._down: dict[str, float] = {}
-        # Kept region -> when its region mapper first failed to answer
+        # Kept region -> when its remote CXL agent first failed to answer
         self._unreachable: dict[str, float] = {}
         self._next_check = 0.0
         self._stop = threading.Event()
@@ -105,9 +105,9 @@ class RegionKeeper:
         """Give back the regions MaruServer took over, then stop.
 
         The resource manager reclaims every region of a MaruServer that goes
-        away. A region this keeper holds is released at its region mapper
+        away. A region this keeper holds is released at its remote CXL agent
         first, so a reader's hold does not keep it registered after the
-        resource manager hands it out again. A region whose region mapper
+        resource manager hands it out again. A region whose remote CXL agent
         does not answer is left to the resource manager, as when MaruServer
         dies.
         """
@@ -129,7 +129,7 @@ class RegionKeeper:
             if fate == "keep":
                 self._directory.give_back(pool_id, "maru-server is stopping")
         for pool_id, handle, _fate, _boot in self._directory.departed():
-            address = pick_mapper(self._mappers, int(handle["region_id"]))
+            address = pick_agent(self._agents, int(handle["region_id"]))
             if not self._is_down(address):
                 self._release(pool_id, handle, address)
 
@@ -147,7 +147,7 @@ class RegionKeeper:
         if check:
             self._next_check = now + CHECK_S
         for pool_id, handle, fate, boot in work:
-            address = pick_mapper(self._mappers, int(handle["region_id"]))
+            address = pick_agent(self._agents, int(handle["region_id"]))
             if self._is_down(address):
                 if fate == "keep":
                     self._note_unreachable(pool_id, now)
@@ -175,7 +175,7 @@ class RegionKeeper:
 
         A held region is mapped again at every check: the map shares the
         registration if it is still there, maps the region again after the
-        region mapper restarted (the connection opens anew), and is refused
+        remote CXL agent restarted (the connection opens anew), and is refused
         if someone released the region meanwhile.
         """
         client = self._client(address)
@@ -193,9 +193,11 @@ class RegionKeeper:
             self._held.pop(pool_id, None)
             if exc.code == "denied":
                 # Released meanwhile (by an owner that only seemed gone), or
-                # the mapper has another region under this id: the keys
+                # the agent has another region under this id: the keys
                 # cannot be read any more.
-                self._directory.give_back(pool_id, f"its region mapper refused: {exc}")
+                self._directory.give_back(
+                    pool_id, f"its remote CXL agent refused: {exc}"
+                )
             else:
                 logger.warning("holding region %s failed: %s", handle["region_id"], exc)
             return
@@ -208,17 +210,18 @@ class RegionKeeper:
         self._held[pool_id] = (address, client.generation, known or now_boot)
 
     def _note_unreachable(self, pool_id: str, now: float) -> None:
-        """Give a kept region back once its region mapper is gone too long."""
+        """Give a kept region back once its remote CXL agent is gone too long."""
         since = self._unreachable.setdefault(pool_id, now)
         if now - since >= UNREACHABLE_S:
             del self._unreachable[pool_id]
             self._held.pop(pool_id, None)
             self._directory.give_back(
-                pool_id, f"its region mapper did not answer for {UNREACHABLE_S:.0f} s"
+                pool_id,
+                f"its remote CXL agent did not answer for {UNREACHABLE_S:.0f} s",
             )
 
     def _release(self, pool_id: str, handle: dict, address: str) -> None:
-        """Release a region at its region mapper, then free it."""
+        """Release a region at its remote CXL agent, then free it."""
         try:
             self._client(address).release(handle)
         except RegionMapUnavailable as exc:
@@ -231,7 +234,7 @@ class RegionKeeper:
                     "releasing region %s failed: %s", handle["region_id"], exc
                 )
                 return
-            # denied: the mapper maps another region under this id, so this
+            # denied: the agent maps another region under this id, so this
             # one is not registered there.
         self._held.pop(pool_id, None)
         self._directory.given_back(pool_id)
@@ -255,5 +258,5 @@ class RegionKeeper:
         return until is not None and self._clock() < until
 
     def _mark_down(self, address: str, exc: Exception) -> None:
-        logger.warning("region mapper %s did not answer: %s", address, exc)
+        logger.warning("remote CXL agent %s did not answer: %s", address, exc)
         self._down[address] = self._clock() + DOWN_S

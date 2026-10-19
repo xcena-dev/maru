@@ -17,30 +17,30 @@ export MARU_INST2_PORT=${MARU_INST2_PORT:-$((MARU_PORT_BASE + 21))}
 # ── Memory node (each node attached to the pool's CXL memory) ─────────
 # The resource manager of the pool (one per pool, as for local CXL).
 export MARU_RM_ADDRESS=${MARU_RM_ADDRESS:-127.0.0.1:9850}
-# This memory node's address on the RDMA network. Workers reach its region
-# mapper there, so do not use 127.0.0.1 when workers run on other nodes.
+# This memory node's address on the RDMA network. Workers reach its remote CXL
+# agent there, so do not use 127.0.0.1 when workers run on other nodes.
 export MARU_MEMORY_NODE_HOST=${MARU_MEMORY_NODE_HOST:-127.0.0.1}
-export MARU_MAPPER_PORT=${MARU_MAPPER_PORT:-$((10500 + $(id -u)))}
-# RDMA NIC the region mapper registers regions with, e.g. mlx5_1:1
+export MARU_AGENT_PORT=${MARU_AGENT_PORT:-$((10500 + $(id -u)))}
+# RDMA NIC the remote CXL agent registers regions with, e.g. mlx5_1:1
 # (empty: UCX default).
-export MARU_MAPPER_UCX_DEVICE=${MARU_MAPPER_UCX_DEVICE:-}
-# One region mapper runs per node; this lock file enforces it.
-export MARU_MAPPER_LOCK_FILE=${MARU_MAPPER_LOCK_FILE:-/tmp/maru-region-mapper.lock}
-# Key the region mappers require from workers and maru-server. The region
-# mapper service keeps it in /etc/maru/region-mapper.key (root only); give
+export MARU_AGENT_UCX_DEVICE=${MARU_AGENT_UCX_DEVICE:-}
+# One remote CXL agent runs per node; this lock file enforces it.
+export MARU_AGENT_LOCK_FILE=${MARU_AGENT_LOCK_FILE:-/tmp/maru-remote-cxl-agent.lock}
+# Key the remote CXL agents require from workers and maru-server. The remote CXL
+# agent service keeps it in /etc/maru/remote-cxl-agent.key (root only); give
 # every user that runs a worker or maru-server its own copy:
-#   sudo install -D -m 0600 -o "$USER" /etc/maru/region-mapper.key \
-#       ~/.maru/region-mapper.key
-# region_mapper.sh creates this file when it runs the region mapper itself.
-export MARU_REGION_MAPPER_KEY_FILE=${MARU_REGION_MAPPER_KEY_FILE:-$HOME/.maru/region-mapper.key}
+#   sudo install -D -m 0600 -o "$USER" /etc/maru/remote-cxl-agent.key \
+#       ~/.maru/remote-cxl-agent.key
+# remote_cxl_agent.sh creates this file when it runs the remote CXL agent itself.
+export MARU_REMOTE_CXL_AGENT_KEY_FILE=${MARU_REMOTE_CXL_AGENT_KEY_FILE:-$HOME/.maru/remote-cxl-agent.key}
 
 # ── Metadata node (maru-server, one per app and pool) ─────────────────
 export MARU_SERVER_BIND_HOST=${MARU_SERVER_BIND_HOST:-127.0.0.1}
 export MARU_SERVER_PORT=${MARU_SERVER_PORT:-$((10000 + $(id -u)))}
 # DAX device of the pool (empty: any pool the resource manager offers).
 export MARU_DAX_PATH=${MARU_DAX_PATH:-}
-# Region mappers of the pool, host:port, comma separated: one per memory node.
-export MARU_REGION_MAPPERS=${MARU_REGION_MAPPERS:-${MARU_MEMORY_NODE_HOST}:${MARU_MAPPER_PORT}}
+# Remote CXL agents of the pool, host:port, comma separated: one per memory node.
+export MARU_REMOTE_CXL_AGENTS=${MARU_REMOTE_CXL_AGENTS:-${MARU_MEMORY_NODE_HOST}:${MARU_AGENT_PORT}}
 # maru-server as the workers see it. Set it directly on worker nodes.
 export MARU_SERVER_HOST=${MARU_SERVER_HOST:-127.0.0.1}
 export MARU_SERVER_URL=${MARU_SERVER_URL:-tcp://${MARU_SERVER_HOST}:${MARU_SERVER_PORT}}

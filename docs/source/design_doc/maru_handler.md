@@ -231,7 +231,7 @@ sequenceDiagram
 With `storage_backend="remote_cxl"` the Handler keeps its KV in the CXL memory
 of memory nodes and moves it over RDMA. It gets regions the way a cxl Handler
 does, but through a storage session: one region when the session opens and one
-more (`expand`) whenever all of them are full. The region mapper on a region's
+more (`expand`) whenever all of them are full. The remote CXL agent on a region's
 memory node maps the region and registers it with that node's NIC; the Handler
 reaches the region with one-sided RDMA.
 
@@ -240,8 +240,8 @@ reaches the region with one-sided RDMA.
 | Component | Role |
 |-----------|------|
 | `RemoteCxlStorageClient` | The storage session: regions, pages, stores, loads, eviction |
-| `RdmaDataPath` | The worker's staging buffer, its NIXL agent and its connections to the region mappers |
-| `RegionMapClient` | One connection to a region mapper: proves the region mapper key, then `map`, `unmap`, `release` |
+| `RdmaDataPath` | The worker's staging buffer, its NIXL agent and its connections to the remote CXL agents |
+| `RegionMapClient` | One connection to a remote CXL agent: proves the remote CXL agent key, then `map`, `unmap`, `release` |
 | `StagingBuffer` | Host memory registered with the NIC and with CUDA; KV moves GPU ↔ staging by copy, staging ↔ region by RDMA |
 | `PoolRouter` | Several pools (one MaruServer each): routes a request to one pool by its first chunk key |
 
@@ -256,7 +256,7 @@ never lands on reused memory.
 
 **Retrieve.** The Handler takes a server lease on the keys (`acquire`), which
 returns each key's location and, for another worker's region, a *read handle*.
-It maps that region at its region mapper on first use, READs the pages into
+It maps that region at its remote CXL agent on first use, READs the pages into
 staging slots, and ends the lease (`release`). It uses the bytes only if the
 lease was held to the end. A location longer than a staging slot, or past the
 end of its region, loads as a miss without a READ. A `release` whose reply is
@@ -268,12 +268,12 @@ or another worker is waiting for its first region, the Handler asks MaruServer f
 (`victims`) and removes them. A page is reused only after MaruServer
 confirmed that no key refers to it.
 
-**A memory node that stops answering.** A region whose region mapper cannot
+**A memory node that stops answering.** A region whose remote CXL agent cannot
 map it is set aside, and a background retry maps it again. If the retry
-succeeds within 30 seconds (a region mapper restart), the region is used
+succeeds within 30 seconds (a remote CXL agent restart), the region is used
 again with its keys; otherwise its keys are removed, so probes stop reporting
 hits that would fail to read, as MaruServer does for a region it took over.
-A region mapper that left a request unanswered stays so until a later request
+A remote CXL agent that left a request unanswered stays so until a later request
 to it (a map, or the heartbeat's boot check every 10 seconds) is answered.
 Until then stores take no pages in its regions, eviction picks no keys there
 and no new region is asked for; with no other region the store is skipped,
@@ -285,24 +285,24 @@ UCX fails an unanswered connection on its own, even an idle one, and NIXL
 1.2.0 keeps the closed connection in the peer, so loading into it would crash
 the process:
 
-![A worker maps region R2 after its region mapper stopped answering and answers again. (a) Without the check, R2's metadata is loaded into the peer that still holds the closed connection, and the worker process crashes. (b) The Handler checks the peer first; the check is refused, so it drops the peer, connects anew and loads R2's metadata, and RDMA of R2 works](../image/remote_cxl_failed_peer.png)
+![A worker maps region R2 after its remote CXL agent stopped answering and answers again. (a) Without the check, R2's metadata is loaded into the peer that still holds the closed connection, and the worker process crashes. (b) The Handler checks the peer first; the check is refused, so it drops the peer, connects anew and loads R2's metadata, and RDMA of R2 works](../image/remote_cxl_failed_peer.png)
 
 **Giving regions back.** A region goes back to the Resource Manager only after
-its region mapper deregistered it from the NIC (`release`):
+its remote CXL agent deregistered it from the NIC (`release`):
 
-![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so the region mapper deregisters the region first and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
+![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so the remote CXL agent deregisters the region first and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
 
 - A region the Handler gives back while it runs (for example a new region
   whose memory node it cannot reach) is released first, then returned with
   `return_region`.
-- A region whose memory node rebooted (its region mapper reports a new boot
+- A region whose memory node rebooted (its remote CXL agent reports a new boot
   id) goes back the same way at once, since bytes that sat in the node's CPU
   cache may be lost. MaruServer then stops finding its keys and ends the
   leases on them, so a reader holding one drops what it read; the next store
   gets a new region.
 - When the Handler leaves (it closes, or its session expired), it waits for
-  its WRITEs, closes the session drained and drops its holds at the region
-  mappers. MaruServer takes its regions over: it keeps those that hold keys,
+  its WRITEs, closes the session drained and drops its holds at the remote CXL
+  agents. MaruServer takes its regions over: it keeps those that hold keys,
   so other workers and the restarted worker keep reading them, and releases
   the others before it frees them.
 - If MaruServer restarted, nobody takes the regions over, so the Handler

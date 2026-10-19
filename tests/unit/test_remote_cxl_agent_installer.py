@@ -1,30 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The region mapper's system service: unit, settings file and install."""
+"""The remote CXL agent's system service: unit, settings file and install."""
 
 import pytest
 
-from maru_region_mapper import installer
+from maru_remote_cxl_agent import installer
 
 
 def _install(tmp_path, monkeypatch, nixl=True):
     monkeypatch.setattr(installer, "nixl_available", lambda: nixl)
     systemd = tmp_path / "systemd"
     systemd.mkdir(exist_ok=True)
-    env = tmp_path / "etc" / "maru" / "region-mapper.env"
+    env = tmp_path / "etc" / "maru" / "remote-cxl-agent.env"
     calls = []
     ok = installer.install(
         python="/opt/venv/bin/python",
         systemd_dir=systemd,
         env_file=env,
         systemctl=lambda *a: calls.append(a),
-        key_file=tmp_path / "etc" / "maru" / "region-mapper.key",
+        key_file=tmp_path / "etc" / "maru" / "remote-cxl-agent.key",
     )
     return ok, systemd / installer.SERVICE_NAME, env, calls
 
 
 def test_the_service_starts_and_stops_with_the_resource_manager():
     unit = installer.render_unit("/opt/venv/bin/python")
-    assert "ExecStart=/opt/venv/bin/python -m maru_region_mapper.cli" in unit
+    assert "ExecStart=/opt/venv/bin/python -m maru_remote_cxl_agent.cli" in unit
     # Started by the RM's start, stopped and restarted with it; the RM's own
     # unit needs no change.
     assert "WantedBy=maru-resource-manager.service" in unit
@@ -45,7 +45,7 @@ def test_a_standalone_service_starts_at_boot_without_a_resource_manager():
     assert "WantedBy=multi-user.target" in unit
     assert "maru-resource-manager.service" not in unit
     assert "After=network-online.target\n" in unit
-    assert "ExecStart=/opt/venv/bin/python -m maru_region_mapper.cli" in unit
+    assert "ExecStart=/opt/venv/bin/python -m maru_remote_cxl_agent.cli" in unit
     assert "LimitMEMLOCK=infinity" in unit
 
 
@@ -56,15 +56,15 @@ def test_install_standalone_writes_the_standalone_unit(tmp_path, monkeypatch):
     assert installer.install(
         python="/opt/venv/bin/python",
         systemd_dir=systemd,
-        env_file=tmp_path / "region-mapper.env",
+        env_file=tmp_path / "remote-cxl-agent.env",
         systemctl=lambda *a: None,
         standalone=True,
-        key_file=tmp_path / "region-mapper.key",
+        key_file=tmp_path / "remote-cxl-agent.key",
     )
     unit = (systemd / installer.SERVICE_NAME).read_text()
     assert unit == installer.render_unit("/opt/venv/bin/python", standalone=True)
     # This node runs no resource manager: the operator names the pool's.
-    settings = (tmp_path / "region-mapper.env").read_text()
+    settings = (tmp_path / "remote-cxl-agent.env").read_text()
     assert settings == installer.STANDALONE_ENV
     assert "\nMARU_RM_ADDRESS=\n" in settings
     assert "starts and stops with maru-resource-manager" not in settings
@@ -91,13 +91,13 @@ def test_default_settings_listen_on_the_rdma_network_and_require_the_key():
         if line and not line.startswith("#")
     )
     # An empty host means the address of the RDMA NIC's interface, so only
-    # hosts on the RDMA network reach the region mapper.
+    # hosts on the RDMA network reach the remote CXL agent.
     assert settings == {
         "MARU_RM_ADDRESS": "127.0.0.1:9850",
-        "MARU_REGION_MAPPER_UCX_DEVICE": "",
-        "MARU_REGION_MAPPER_HOST": "",
-        "MARU_REGION_MAPPER_PORT": "9860",
-        "MARU_REGION_MAPPER_KEY_FILE": "/etc/maru/region-mapper.key",
+        "MARU_REMOTE_CXL_AGENT_UCX_DEVICE": "",
+        "MARU_REMOTE_CXL_AGENT_HOST": "",
+        "MARU_REMOTE_CXL_AGENT_PORT": "9860",
+        "MARU_REMOTE_CXL_AGENT_KEY_FILE": "/etc/maru/remote-cxl-agent.key",
     }
 
 
@@ -105,7 +105,7 @@ def test_install_creates_the_key_once_readable_by_root_only(tmp_path, monkeypatc
     from maru_remote.region_map import load_key
 
     _install(tmp_path, monkeypatch)
-    key_file = tmp_path / "etc" / "maru" / "region-mapper.key"
+    key_file = tmp_path / "etc" / "maru" / "remote-cxl-agent.key"
     assert key_file.stat().st_mode & 0o777 == 0o600
     key = load_key(str(key_file))
     assert len(key) == 32
@@ -115,10 +115,10 @@ def test_install_creates_the_key_once_readable_by_root_only(tmp_path, monkeypatc
 
 def test_a_reinstall_keeps_the_settings(tmp_path, monkeypatch):
     _, _, env, _ = _install(tmp_path, monkeypatch)
-    env.write_text("MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1\n")
+    env.write_text("MARU_REMOTE_CXL_AGENT_UCX_DEVICE=mlx5_1:1\n")
     ok, unit, env, _ = _install(tmp_path, monkeypatch)
     assert ok and unit.exists()
-    assert env.read_text() == "MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1\n"
+    assert env.read_text() == "MARU_REMOTE_CXL_AGENT_UCX_DEVICE=mlx5_1:1\n"
 
 
 def test_no_service_without_nixl(tmp_path, monkeypatch):

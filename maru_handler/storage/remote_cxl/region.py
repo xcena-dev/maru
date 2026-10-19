@@ -60,11 +60,11 @@ class RemoteCxlRegion:
         self._quarantined: set[int] = set()
         self._lock = threading.RLock()
         self.retired = False
-        # False while its region mapper cannot map it (node down)
+        # False while its remote CXL agent cannot map it (node down)
         self.reachable = True
         # When it was set aside, until its keys are removed or it maps again
         self.unreachable_since: float | None = None
-        # Whether a region mapper ever answered a map of it: until then no
+        # Whether a remote CXL agent ever answered a map of it: until then no
         # RDMA can have been sent to it, so it goes back without a release.
         self.mapped = False
         # Boot of the memory node at the last map
@@ -160,14 +160,14 @@ class RemoteCxlRegion:
 
 @dataclass(frozen=True)
 class RegionAccess:
-    """Where a region is reachable: the NIXL peer of its region mapper, the
-    region mapper's address of the region (VA_R), which connection mapped it
+    """Where a region is reachable: the NIXL peer of its remote CXL agent, the
+    remote CXL agent's address of the region (VA_R), which connection mapped it
     and the boot of the memory node then."""
 
     peer: str
     base_addr: int
     length: int
-    mapper: str
+    agent: str
     generation: int
     boot: str = ""
 

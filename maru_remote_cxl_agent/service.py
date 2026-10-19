@@ -169,7 +169,7 @@ class RegionMapService:
         self._lock = threading.Lock()
 
     def hello(self) -> dict:
-        """Identity of this region mapper process and of the node's boot."""
+        """Identity of this remote CXL agent process and of the node's boot."""
         self._discard_notifs()
         return {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
 

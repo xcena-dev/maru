@@ -232,11 +232,11 @@ stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
 size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`,
-`maru_region_mapper_key_file` (a copy of the memory nodes' region mapper key,
-default `/etc/maru/region-mapper.key`) and, optionally, `maru_rdma_device` (the
+`maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
+default `/etc/maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
 worker's RDMA NIC, e.g. `mlx5_0:1`).
 
-![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the region mapper on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
+![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
 
 Resources flow as for the cxl backend: the resource manager gives regions to
 maru-server and maru-server gives them to the worker, one region when its
@@ -246,29 +246,29 @@ step that maps a region moves, from the Handler to the memory node.
 ![Components of the remote_cxl backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/remote_cxl_sw_structure.png)
 
 Each memory
-node runs a region mapper (`maru-region-mapper`), a service shared by every app:
+node runs a remote CXL agent (`maru-remote-cxl-agent`), a service shared by every app:
 it maps the regions Handlers ask for and registers them with the node's NIC.
-With NIXL installed, `./install.sh` sets it up as `maru-region-mapper.service`,
+With NIXL installed, `./install.sh` sets it up as `maru-remote-cxl-agent.service`,
 which starts and stops with the resource manager; its settings (NIC, port 9860,
-key file) are in `/etc/maru/region-mapper.env`. It listens on the NIC's address
-on the RDMA network, and every worker and maru-server proves the region mapper
-key (`/etc/maru/region-mapper.key`, created by the installer) on each
+key file) are in `/etc/maru/remote-cxl-agent.env`. It listens on the NIC's address
+on the RDMA network, and every worker and maru-server proves the remote CXL agent
+key (`/etc/maru/remote-cxl-agent.key`, created by the installer) on each
 connection, so only processes that can read a copy of the key map regions, as
 only users that can open the DAX device map them on a CXL-attached node. The
 protocol itself is not encrypted, like the resource manager's, so keep the
 RDMA network to the hosts of the deployment.
 A memory node of a shared pool that runs no resource manager installs the
-service alone (`install-maru-region-mapper --standalone`, which starts it at
+service alone (`install-maru-remote-cxl-agent --standalone`, which starts it at
 boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
 the {ref}`multi-node configuration <installation-multi-node-config>`.
-maru-server takes the pool's region mappers with `--region-mapper host:port`
-(one per memory node) and `--region-mapper-key-file`, and hands the list to
+maru-server takes the pool's remote CXL agents with `--remote-cxl-agent host:port`
+(one per memory node) and `--remote-cxl-agent-key-file`, and hands the list to
 the workers. Engines read each other's keys under a server lease; a reader
 gets a read handle, which maps a region but cannot release it. When a worker
 stops, maru-server keeps its regions that hold keys and holds their mapping,
 so the keys stay readable as a stopped cxl Handler's keys do; it gives a kept
 region back when the resource manager is full. A region goes back only after
-its region mapper deregistered it, so a late RDMA WRITE fails at the NIC
+its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
 instead of landing in the next owner's KV.
 
 The backend stores KV chunkwise and needs `--enforce-eager`,
@@ -285,15 +285,15 @@ for one-host and multi-node launch steps.
 #### Several memory nodes and pools
 
 **Shared pool.** Several memory nodes can share one CXL memory, as hosts on a
-CXL switch do. Each of them runs a region mapper; maru-server takes all of
-them, with `--region-mapper` repeated or comma separated, and hands the list to
+CXL switch do. Each of them runs a remote CXL agent; maru-server takes all of
+them, with `--remote-cxl-agent` repeated or comma separated, and hands the list to
 the workers. Each region is served by one memory node, picked by a hash of the
 region number over that list, so the region's owner and its readers map it at
 the same node and move its KV through that node's NIC. The memory nodes use the
-same region mapper key and the multi-host settings of
+same remote CXL agent key and the multi-host settings of
 {doc}`System Setup <../getting_started/bios_setup>`.
 
-![A shared pool of two memory nodes, each running a region mapper. Each region is mapped by one node, the region mapper m with the largest hash of m and the region number: node 1 maps R1 and R3, node 2 maps R2. The worker node of R2's owner maps R2 at memory node 2 and writes it by RDMA through that node; the worker node of a reader maps R2 at the same node and reads it by RDMA](../image/remote_cxl_shared_pool.png)
+![A shared pool of two memory nodes, each running a remote CXL agent. Each region is mapped by one node, the remote CXL agent m with the largest hash of m and the region number: node 1 maps R1 and R3, node 2 maps R2. The worker node of R2's owner maps R2 at memory node 2 and writes it by RDMA through that node; the worker node of a reader maps R2 at the same node and reads it by RDMA](../image/remote_cxl_shared_pool.png)
 
 **Several pools.** Each pool has its own maru-server. List them in
 `maru_server_url`, comma separated (`"tcp://10.0.0.2:5555,tcp://10.0.0.3:5555"`):

@@ -73,9 +73,9 @@ class MaruConfig:
     # Share of staging slots that stores leave free for loads; set when loads
     # and stores run on separate threads (asynchronous transfers)
     rdma_load_reserve: float = 0.0
-    # Key the region mappers of the pool require (a copy of the memory node's
-    # /etc/maru/region-mapper.key, readable by the worker's user only)
-    region_mapper_key_file: str = "/etc/maru/region-mapper.key"
+    # Key the remote CXL agents of the pool require (a copy of the memory node's
+    # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
+    remote_cxl_agent_key_file: str = "/etc/maru/remote-cxl-agent.key"
 
     @property
     def server_urls(self) -> list[str]:

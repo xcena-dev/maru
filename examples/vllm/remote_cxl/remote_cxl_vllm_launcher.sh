@@ -112,7 +112,7 @@ CUDA_VISIBLE_DEVICES=$DEVICE setsid "${NUMA[@]}" vllm serve "$MODEL" \
         \"kv_connector_extra_config\": {
             \"maru_server_url\": \"${MARU_SERVER_URL}\",
             \"maru_storage_backend\": \"remote_cxl\",
-            \"maru_region_mapper_key_file\": \"${MARU_REGION_MAPPER_KEY_FILE}\",
+            \"maru_remote_cxl_agent_key_file\": \"${MARU_REMOTE_CXL_AGENT_KEY_FILE}\",
             ${UCX_ENTRY}
             ${TIMING_ENTRY}
             ${ASYNC_ENTRY}

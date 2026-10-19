@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Thin NIXL wrapper: register host memory, exchange metadata, batch READ/WRITE.
 
-A memory node's region mapper registers mapped CXL regions; a worker registers
-its host staging buffer. Metadata bytes travel in region mapper replies, not
+A memory node's remote CXL agent registers mapped CXL regions; a worker registers
+its host staging buffer. Metadata bytes travel in remote CXL agent replies, not
 through NIXL's own side channels, so the transport never opens sockets.
 
 A timed-out transfer or failed cancellation can leave the NIC accessing its

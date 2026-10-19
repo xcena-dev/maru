@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A worker's staging buffer, NIXL agent and region mapper connections."""
+"""A worker's staging buffer, NIXL agent and remote CXL agent connections."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from maru_common.storage_types import StorageError, StorageUnavailableError
-from maru_remote.region_map import pick_mapper
+from maru_remote.region_map import pick_agent
 
 from ..staging import StagingBuffer
 from .region import RegionAccess
@@ -20,31 +20,31 @@ from .region import RegionAccess
 logger = logging.getLogger(__name__)
 
 DEFAULT_STAGING = 1024**3
-# A region mapper whose map failed is not asked again for this long, so loads
+# A remote CXL agent whose map failed is not asked again for this long, so loads
 # and stores on its regions miss at once instead of waiting for a connect.
 DOWN_BACKOFF_S = 5.0
-# Connecting to a region mapper; replies may take longer (a first map
+# Connecting to a remote CXL agent; replies may take longer (a first map
 # registers a whole region with the NIC).
 CONNECT_TIMEOUT_S = 3.0
 
 
 class _StaleReplyError(StorageUnavailableError):
-    """A map reply came over a connection to the region mapper that ended."""
+    """A map reply came over a connection to the remote CXL agent that ended."""
 
 
 class Release(enum.Enum):
-    """Outcome of asking a region mapper to deregister a region."""
+    """Outcome of asking a remote CXL agent to deregister a region."""
 
-    DONE = "done"  # the region is not registered at its mapper
-    FAILED = "failed"  # the mapper answered; the region stays registered
-    NO_REPLY = "no_reply"  # the mapper did not answer
+    DONE = "done"  # the region is not registered at its agent
+    FAILED = "failed"  # the agent answered; the region stays registered
+    NO_REPLY = "no_reply"  # the agent did not answer
 
 
 class RdmaDataPath:
-    """Staging buffer, NIXL agent and region mapper connections of a worker.
+    """Staging buffer, NIXL agent and remote CXL agent connections of a worker.
 
     One worker keeps one staging buffer and one NIXL agent however many
-    pools it uses. Region access is cached per region; a region mapper
+    pools it uses. Region access is cached per region; a remote CXL agent
     connection that breaks loses every mapping it held, so its cached
     accesses are dropped and the regions are mapped again on next use.
     """
@@ -53,7 +53,7 @@ class RdmaDataPath:
         self,
         config: Any,
         transport_factory: Callable[[str], Any] | None = None,
-        mapper_factory: Callable[[str], Any] | None = None,
+        agent_factory: Callable[[str], Any] | None = None,
     ) -> None:
         """Create an idle data path; :meth:`start` sets it up.
 
@@ -61,32 +61,32 @@ class RdmaDataPath:
             config: ``MaruConfig`` of the worker.
             transport_factory: ``agent name -> NixlTransport`` (tests inject
                 fakes).
-            mapper_factory: ``address -> RegionMapClient``.
+            agent_factory: ``address -> RegionMapClient``.
         """
         self.config = config
         self._transport_factory = transport_factory or _default_transport(config)
-        self._mapper_factory = mapper_factory or self._default_mapper
-        # Region mapper key, read by start() for the default mapper factory
+        self._agent_factory = agent_factory or self._default_agent
+        # Remote CXL agent key, read by start() for the default agent factory
         self._key: bytes | None = None
-        self._needs_key = mapper_factory is None
+        self._needs_key = agent_factory is None
         self.staging: StagingBuffer | None = None
         self.transport: Any = None
         self._registration: Any = None
-        self._mappers: dict[str, Any] = {}
+        self._agents: dict[str, Any] = {}
         self._access: dict[str, RegionAccess] = {}
-        # Region mapper -> time until which it counts as down
+        # Remote CXL agent -> time until which it counts as down
         self._down: dict[str, float] = {}
-        # Region mappers whose last request got no reply; one stays here
+        # Remote CXL agents whose last request got no reply; one stays here
         # until a later request is answered (the back-off above ends sooner)
         self._unanswered: set[str] = set()
-        # Region -> time until which a map the mapper failed is not retried
+        # Region -> time until which a map the agent failed is not retried
         self._map_failed: dict[str, float] = {}
-        # Own region -> (mapper, connection generation) of a map reply that
-        # was not turned into an access; the mapper holds the region for
+        # Own region -> (agent, connection generation) of a map reply that
+        # was not turned into an access; the agent holds the region for
         # that connection until it is released or the connection ends.
         self._attempted: dict[str, tuple[str, int]] = {}
-        # Region mapper -> (NIXL peer, connection generation) when the peer's
-        # metadata was last loaded through that mapper's connection. A peer
+        # Remote CXL agent -> (NIXL peer, connection generation) when the peer's
+        # metadata was last loaded through that agent's connection. A peer
         # dropped after a transfer error stays listed; has_peer() tells.
         self._loaded: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
@@ -98,7 +98,7 @@ class RdmaDataPath:
         """Map the staging buffer and register it with this node's NIC.
 
         Raises:
-            StorageError: if the region mapper key cannot be read.
+            StorageError: if the remote CXL agent key cannot be read.
             Exception: if the buffer, the NIXL agent or the registration
                 fails; nothing is left set up.
         """
@@ -108,7 +108,7 @@ class RdmaDataPath:
             from maru_remote.region_map import KeyFileError, load_key
 
             try:
-                self._key = load_key(self.config.region_mapper_key_file)
+                self._key = load_key(self.config.remote_cxl_agent_key_file)
             except KeyFileError as exc:
                 raise StorageError(str(exc)) from exc
         page = self.config.chunk_size_bytes
@@ -139,14 +139,14 @@ class RdmaDataPath:
         )
 
     def region(
-        self, pool_id: str, handle: dict, mappers: list[str], own: bool = False
+        self, pool_id: str, handle: dict, agents: list[str], own: bool = False
     ) -> RegionAccess:
-        """Access to a region, asking its region mapper to map it on first use.
+        """Access to a region, asking its remote CXL agent to map it on first use.
 
         Args:
             pool_id: The region's pool id at MaruServer.
             handle: ``MaruHandle.to_dict()`` of the region.
-            mappers: Region mapper addresses of the region's pool.
+            agents: Remote CXL agent addresses of the region's pool.
             own: Whether the region belongs to this worker's session; a map
                 reply is then remembered even if no access results from it
                 (see :meth:`map_attempted`).
@@ -156,42 +156,42 @@ class RdmaDataPath:
 
         Raises:
             StorageUnavailableError: if the region cannot be mapped now (its
-                region mapper is down or refused, or NIXL refused its
+                remote CXL agent is down or refused, or NIXL refused its
                 metadata).
         """
         from maru_remote.region_map import RegionMapError, RegionMapUnavailable
 
         with self._lock:
             access = self._access.get(pool_id)
-            client = self._mappers.get(access.mapper) if access else None
+            client = self._agents.get(access.agent) if access else None
             retry_at = self._map_failed.get(pool_id)
         if access is not None and client is not None:
             if client.generation == access.generation:
                 return access
-        if not mappers:
-            raise StorageUnavailableError("MaruServer named no region mapper")
+        if not agents:
+            raise StorageUnavailableError("MaruServer named no remote CXL agent")
         region_id = handle.get("region_id")
         if retry_at is not None and time.monotonic() < retry_at:
             raise StorageUnavailableError(
                 f"region {region_id} failed to map a moment ago"
             )
-        address = pick_mapper(mappers, int(handle["region_id"]))
+        address = pick_agent(agents, int(handle["region_id"]))
         if self.is_down(address):
-            raise StorageUnavailableError(f"region mapper {address} is down")
+            raise StorageUnavailableError(f"remote CXL agent {address} is down")
         client = self._client(address)
         for attempt in range(2):
             try:
                 reply = client.map(handle)
             except RegionMapUnavailable as exc:
                 # The client closed the connection: whatever the request
-                # mapped is released by the mapper when it sees the
+                # mapped is released by the agent when it sees the
                 # connection end.
                 self._mark_down(address)
                 raise StorageUnavailableError(
                     f"region {region_id} could not be mapped: {exc}"
                 ) from exc
             except RegionMapError as exc:
-                # The mapper refused and holds no mapping of this region.
+                # The agent refused and holds no mapping of this region.
                 self._not_mapped(pool_id)
                 if exc.code == "unavailable":
                     with self._lock:
@@ -203,12 +203,12 @@ class RdmaDataPath:
                 with self._lock:
                     self._attempted[pool_id] = (address, reply.generation)
             if reply.generation != client.generation:
-                # The connection the reply came over ended since; the mapper
+                # The connection the reply came over ended since; the agent
                 # released what it held.
                 if attempt:
                     raise _StaleReplyError(
                         f"region {region_id} could not be mapped: its "
-                        "connection to the region mapper keeps breaking"
+                        "connection to the remote CXL agent keeps breaking"
                     )
                 continue
             # The reply names this region's registration only; loading it
@@ -240,7 +240,7 @@ class RdmaDataPath:
         pool_id: str,
         region_id: object,
     ) -> str:
-        """Load a map reply's metadata into the region mapper's NIXL peer.
+        """Load a map reply's metadata into the remote CXL agent's NIXL peer.
 
         UCX fails a connection on its own when the peer stops answering (a
         stopped process, a network outage), and NIXL closes it but keeps it
@@ -248,14 +248,14 @@ class RdmaDataPath:
         process. So the loaded peer is dropped and connected anew when
         :meth:`NixlTransport.peer_usable` says no (a transfer to it failed,
         or NIXL refuses to send to it), and also when the connection to the
-        mapper broke since it was loaded (the mapper stopped answering or
-        restarted; a restarted mapper's old peer is then dropped too). The
+        agent broke since it was loaded (the agent stopped answering or
+        restarted; a restarted agent's old peer is then dropped too). The
         check holds for its moment: UCX can still fail the connection in the
         moment between the check and the load.
 
         Raises:
             _StaleReplyError: if the reply came over a connection that has ended
-                since another map loaded the peer; the mapper released what
+                since another map loaded the peer; the agent released what
                 that connection held.
             StorageUnavailableError: if NIXL refused to drop the old peer or
                 to load the metadata.
@@ -294,24 +294,24 @@ class RdmaDataPath:
         return peer
 
     def is_down(self, address: str) -> bool:
-        """Whether a map through this region mapper failed a moment ago."""
+        """Whether a map through this remote CXL agent failed a moment ago."""
         with self._lock:
             until = self._down.get(address)
         return until is not None and time.monotonic() < until
 
     def answering(self, address: str) -> bool:
-        """Whether a region mapper answered since its last unanswered request.
+        """Whether a remote CXL agent answered since its last unanswered request.
 
-        A region mapper that stopped answering stays out of this until a
+        A remote CXL agent that stopped answering stays out of this until a
         later request to it (a map, or the heartbeat's boot check) gets a
         reply, however long that takes.
         """
         with self._lock:
             return address not in self._unanswered
 
-    def all_down(self, mappers: list[str]) -> bool:
-        """Whether every one of these region mappers is down right now."""
-        return bool(mappers) and all(self.is_down(m) for m in mappers)
+    def all_down(self, agents: list[str]) -> bool:
+        """Whether every one of these remote CXL agents is down right now."""
+        return bool(agents) and all(self.is_down(m) for m in agents)
 
     def has_access(self, pool_id: str) -> bool:
         """Whether a region is mapped for this worker (an access is cached)."""
@@ -319,20 +319,20 @@ class RdmaDataPath:
             return pool_id in self._access
 
     def map_attempted(self, pool_id: str) -> bool:
-        """Whether a region is mapped at its mapper for this worker.
+        """Whether a region is mapped at its agent for this worker.
 
         True while an access is cached, and also after a map reply for an
         own region that gave no access (NIXL refused its metadata) as long
-        as that reply's connection is open: the mapper then still holds the
+        as that reply's connection is open: the agent then still holds the
         region, so it needs a release before it goes back. A map that got
-        no reply needs none; its connection is closed, and the mapper
+        no reply needs none; its connection is closed, and the agent
         releases what a closed connection held.
         """
         with self._lock:
             if pool_id in self._access:
                 return True
             held = self._attempted.get(pool_id)
-            client = self._mappers.get(held[0]) if held else None
+            client = self._agents.get(held[0]) if held else None
         return client is not None and client.generation == held[1]
 
     def forget(self, pool_id: str) -> None:
@@ -341,23 +341,23 @@ class RdmaDataPath:
             self._access.pop(pool_id, None)
 
     def boots(self, addresses: list[str]) -> dict[str, str]:
-        """Ask region mappers this worker talks to for their node's boot id.
+        """Ask remote CXL agents this worker talks to for their node's boot id.
 
         A connection found broken is opened again, which also tells the
-        caller's cached accesses through that mapper to map again.
+        caller's cached accesses through that agent to map again.
 
         Args:
-            addresses: Region mapper addresses.
+            addresses: Remote CXL agent addresses.
 
         Returns:
-            ``address -> boot id`` for the region mappers that answered.
+            ``address -> boot id`` for the remote CXL agents that answered.
         """
         from maru_remote.region_map import RegionMapError, RegionMapUnavailable
 
         out = {}
         for address in addresses:
             with self._lock:
-                client = self._mappers.get(address)
+                client = self._agents.get(address)
             if client is None or self.is_down(address):
                 continue
             try:
@@ -371,27 +371,27 @@ class RdmaDataPath:
                 self._unanswered.discard(address)
         return out
 
-    def release(self, pool_id: str, handle: dict, mappers: list[str]) -> Release:
-        """Have the region's mapper deregister a region this worker owns.
+    def release(self, pool_id: str, handle: dict, agents: list[str]) -> Release:
+        """Have the region's agent deregister a region this worker owns.
 
         Args:
             pool_id: The region's pool id at MaruServer.
             handle: ``MaruHandle.to_dict()`` of the region.
-            mappers: Region mapper addresses of the region's pool.
+            agents: Remote CXL agent addresses of the region's pool.
 
         Returns:
-            ``Release.DONE`` once the region is not registered at its mapper:
-            released now, never mapped there, or that mapper maps another
-            region under this id. ``Release.FAILED`` if the mapper answered
+            ``Release.DONE`` once the region is not registered at its agent:
+            released now, never mapped there, or that agent maps another
+            region under this id. ``Release.FAILED`` if the agent answered
             that it could not deregister the region. ``Release.NO_REPLY`` if
-            the mapper did not answer; it then counts as down.
+            the agent did not answer; it then counts as down.
         """
         from maru_remote.region_map import RegionMapError, RegionMapUnavailable
 
         self.forget(pool_id)
-        if not mappers:
+        if not agents:
             return Release.FAILED
-        address = pick_mapper(mappers, int(handle["region_id"]))
+        address = pick_agent(agents, int(handle["region_id"]))
         try:
             self._client(address).release(handle)
         except RegionMapError as exc:
@@ -400,7 +400,7 @@ class RdmaDataPath:
                     "release of region %s failed: %s", handle["region_id"], exc
                 )
                 return Release.FAILED
-            # denied: the mapper's region under this id is not ours
+            # denied: the agent's region under this id is not ours
         except RegionMapUnavailable as exc:
             self._mark_down(address)
             logger.error(
@@ -412,8 +412,8 @@ class RdmaDataPath:
         self._not_mapped(pool_id)
         return Release.DONE
 
-    def unmap(self, pool_id: str, handle: dict, mappers: list[str]) -> None:
-        """Drop this worker's hold on a region at its region mapper.
+    def unmap(self, pool_id: str, handle: dict, agents: list[str]) -> None:
+        """Drop this worker's hold on a region at its remote CXL agent.
 
         The region stays registered while someone else holds it. A broken
         connection already dropped the hold.
@@ -421,17 +421,17 @@ class RdmaDataPath:
         Args:
             pool_id: The region's pool id at MaruServer.
             handle: The region's handle or read handle.
-            mappers: Region mapper addresses of the region's pool.
+            agents: Remote CXL agent addresses of the region's pool.
         """
         from maru_remote.region_map import RegionMapError
 
         self.forget(pool_id)
         self._not_mapped(pool_id)
-        if not mappers:
+        if not agents:
             return
-        address = pick_mapper(mappers, int(handle["region_id"]))
+        address = pick_agent(agents, int(handle["region_id"]))
         with self._lock:
-            client = self._mappers.get(address)
+            client = self._agents.get(address)
         if client is None:
             return
         try:
@@ -460,10 +460,10 @@ class RdmaDataPath:
         return ok
 
     def close(self) -> None:
-        """Close region mapper connections, the NIXL agent and the staging."""
+        """Close remote CXL agent connections, the NIXL agent and the staging."""
         with self._lock:
-            clients = list(self._mappers.values())
-            self._mappers.clear()
+            clients = list(self._agents.values())
+            self._agents.clear()
             self._access.clear()
             self._loaded.clear()
         for client in clients:
@@ -478,7 +478,7 @@ class RdmaDataPath:
             self.staging.close()
             self.staging = None
 
-    def _default_mapper(self, address: str) -> Any:
+    def _default_agent(self, address: str) -> Any:
         from maru_remote.region_map import RegionMapClient
 
         return RegionMapClient(
@@ -490,9 +490,9 @@ class RdmaDataPath:
 
     def _client(self, address: str) -> Any:
         with self._lock:
-            client = self._mappers.get(address)
+            client = self._agents.get(address)
             if client is None:
-                client = self._mappers[address] = self._mapper_factory(address)
+                client = self._agents[address] = self._agent_factory(address)
             return client
 
     def _mark_down(self, address: str) -> None:

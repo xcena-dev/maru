@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """Map resource-manager regions read/write for NIC registration.
 
-The region mapper maps a region with libc ``mmap`` so it gets a plain address
+The remote CXL agent maps a region with libc ``mmap`` so it gets a plain address
 to register with the NIC, without CUDA registration or prefaulting: a memory
 node has no GPU, and NIC registration pins every page of the range anyway.
 

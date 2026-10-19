@@ -371,7 +371,7 @@ _RDMA_KNOBS = (
     "maru_rdma_device",
     "maru_rdma_staging_size",
     "maru_rdma_timeout_s",
-    "maru_region_mapper_key_file",
+    "maru_remote_cxl_agent_key_file",
 )
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
 _MIN_RDMA_STAGING = 1024**3
@@ -693,8 +693,8 @@ def _create_maru_handler(
             else None
         ),
         rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30.0)),
-        region_mapper_key_file=extra_config.get(
-            "maru_region_mapper_key_file", "/etc/maru/region-mapper.key"
+        remote_cxl_agent_key_file=extra_config.get(
+            "maru_remote_cxl_agent_key_file", "/etc/maru/remote-cxl-agent.key"
         ),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE

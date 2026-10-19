@@ -7,17 +7,17 @@ from maru_remote.region_map import (
     MapReply,
     RegionMapError,
     RegionMapUnavailable,
-    pick_mapper,
+    pick_agent,
 )
 from maru_server.region_keeper import CHECK_S, DOWN_S, RegionKeeper
 from maru_server.replica_directory import ReplicaDirectory
 from tests.unit.remote_fakes import FakeClock
 from tests.unit.test_remote_cxl_directory import FakeRm, call, commit, open_session
 
-MAPPERS = ["mem1:9860", "mem2:9860"]
+AGENTS = ["mem1:9860", "mem2:9860"]
 
 
-class FakeMapperClient:
+class FakeAgentClient:
     """Records calls; ``fail`` makes the next call of an op raise."""
 
     def __init__(self, address, boots):
@@ -59,15 +59,15 @@ def env():
     directory = ReplicaDirectory(
         reserve_cxl=rm.reserve, release_cxl=rm.release, clock=clock, session_ttl=30
     )
-    boots = dict.fromkeys(MAPPERS, "boot-1")
+    boots = dict.fromkeys(AGENTS, "boot-1")
     clients = {}
 
     def factory(address):
-        clients[address] = FakeMapperClient(address, boots)
+        clients[address] = FakeAgentClient(address, boots)
         return clients[address]
 
     keeper = RegionKeeper(
-        directory, MAPPERS, b"k" * 32, client_factory=factory, clock=clock
+        directory, AGENTS, b"k" * 32, client_factory=factory, clock=clock
     )
     return directory, rm, clock, keeper, clients, boots
 
@@ -100,7 +100,7 @@ def test_a_kept_region_is_held_and_one_without_keys_is_released_then_freed(env):
 def test_the_region_is_freed_only_after_its_release_succeeds(env):
     directory, rm, clock, keeper, clients, _ = env
     pool, region_id = leave(directory, "a")
-    address = pick_mapper(MAPPERS, region_id)
+    address = pick_agent(AGENTS, region_id)
     keeper._client(address).fail["release"] = RegionMapError("busy", "unavailable")
     keeper.run_once()
     assert rm.released == []  # the deregistration failed: still registered
@@ -108,10 +108,10 @@ def test_the_region_is_freed_only_after_its_release_succeeds(env):
     assert rm.released == [region_id]
 
 
-def test_a_region_mapper_that_does_not_answer_is_left_alone_for_a_while(env):
+def test_a_remote_cxl_agent_that_does_not_answer_is_left_alone_for_a_while(env):
     directory, rm, clock, keeper, clients, _ = env
     pool, region_id = leave(directory, "a")
-    address = pick_mapper(MAPPERS, region_id)
+    address = pick_agent(AGENTS, region_id)
     client = keeper._client(address)
     client.fail["release"] = RegionMapUnavailable("down")
     keeper.run_once()
@@ -126,7 +126,7 @@ def test_a_refused_hold_gives_the_region_back(env):
     # Its owner released it meanwhile, so its keys cannot be read any more.
     directory, rm, _, keeper, _, _ = env
     pool, region_id = leave(directory, "a", key="k")
-    address = pick_mapper(MAPPERS, region_id)
+    address = pick_agent(AGENTS, region_id)
     keeper._client(address).fail["map"] = RegionMapError("released", "denied")
     keeper.run_once()
     b, _ = open_session(directory, "b")
@@ -155,7 +155,7 @@ def test_a_reboot_after_the_owners_report_gives_the_region_back(env):
     )
     call(directory, "close", **creds, drained=True)
     region_id = rm.next_id - 1
-    boots[pick_mapper(MAPPERS, region_id)] = "boot-2"
+    boots[pick_agent(AGENTS, region_id)] = "boot-2"
     keeper.run_once()
     keeper.run_once()
     assert rm.released == [region_id]
@@ -165,7 +165,7 @@ def test_a_reboot_while_held_gives_the_region_back(env):
     directory, rm, clock, keeper, _, boots = env
     pool, region_id = leave(directory, "a", key="k")
     keeper.run_once()
-    boots[pick_mapper(MAPPERS, region_id)] = "boot-2"
+    boots[pick_agent(AGENTS, region_id)] = "boot-2"
     keeper.run_once()
     assert rm.released == []  # not checked yet
     clock.advance(CHECK_S)
@@ -197,7 +197,7 @@ def test_expiry_is_noticed_without_requests(env):
     clock.advance(31)
     keeper.run_once()
     region_id = rm.next_id - 1
-    assert ("map", region_id) in clients[pick_mapper(MAPPERS, region_id)].calls
+    assert ("map", region_id) in clients[pick_agent(AGENTS, region_id)].calls
 
 
 def test_the_thread_wakes_on_work_and_stops(env):
@@ -216,7 +216,7 @@ def test_the_thread_wakes_on_work_and_stops(env):
     assert all(("close",) in c.calls for c in clients.values())
 
 
-def test_maruserver_runs_a_keeper_only_with_region_mappers():
+def test_maruserver_runs_a_keeper_only_with_remote_cxl_agents():
     from maru_server.server import MaruServer
 
     server = MaruServer(enable_cxl=False)
@@ -224,7 +224,7 @@ def test_maruserver_runs_a_keeper_only_with_region_mappers():
     server.close()
 
 
-def test_maru_server_refuses_region_mappers_without_the_key(
+def test_maru_server_refuses_remote_cxl_agents_without_the_key(
     monkeypatch, tmp_path, capsys
 ):
     from maru_server import server
@@ -233,16 +233,16 @@ def test_maru_server_refuses_region_mappers_without_the_key(
         "sys.argv",
         [
             "maru-server",
-            "--region-mapper",
+            "--remote-cxl-agent",
             "mem1:9860",
-            "--region-mapper-key-file",
+            "--remote-cxl-agent-key-file",
             str(tmp_path / "missing"),
         ],
     )
     with pytest.raises(SystemExit) as info:
         server.main()
     assert info.value.code == 2
-    assert "region mapper key" in capsys.readouterr().err
+    assert "remote CXL agent key" in capsys.readouterr().err
 
 
 def test_a_kept_region_its_owner_released_meanwhile_is_given_back(env):
@@ -252,7 +252,7 @@ def test_a_kept_region_its_owner_released_meanwhile_is_given_back(env):
     directory, rm, clock, keeper, clients, _ = env
     pool, region_id = leave(directory, "a", key="k")
     keeper.run_once()
-    address = pick_mapper(MAPPERS, region_id)
+    address = pick_agent(AGENTS, region_id)
     keeper._client(address).fail["map"] = RegionMapError("released", "denied")
     clock.advance(CHECK_S)
     keeper.run_once()
@@ -260,11 +260,11 @@ def test_a_kept_region_its_owner_released_meanwhile_is_given_back(env):
     assert rm.released == [region_id]
 
 
-def test_a_reconnected_mapper_gets_the_kept_region_mapped_again(env):
+def test_a_reconnected_agent_gets_the_kept_region_mapped_again(env):
     directory, rm, clock, keeper, clients, _ = env
     pool, region_id = leave(directory, "a", key="k")
     keeper.run_once()
-    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    client = keeper._client(pick_agent(AGENTS, region_id))
     client.generation += 1  # the connection was opened again
     keeper.run_once()
     assert client.calls.count(("map", region_id)) == 2
@@ -275,14 +275,14 @@ def test_every_check_maps_a_held_region_again(env):
     directory, _, clock, keeper, clients, _ = env
     pool, region_id = leave(directory, "a", key="k")
     keeper.run_once()
-    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    client = keeper._client(pick_agent(AGENTS, region_id))
     clock.advance(CHECK_S)
     keeper.run_once()
     assert client.calls.count(("map", region_id)) == 2
     assert ("hello",) not in client.calls
 
 
-def test_a_kept_region_whose_mapper_stays_away_stops_being_found(env):
+def test_a_kept_region_whose_agent_stays_away_stops_being_found(env):
     # Its keys would keep being hits that fail to read, as a live owner's
     # keys would until it removes them.
     from maru_server.region_keeper import UNREACHABLE_S
@@ -294,7 +294,7 @@ def test_a_kept_region_whose_mapper_stays_away_stops_being_found(env):
         reply = call(directory, "probe", engine_id="x", namespace="ns", keys=["k"])
         return reply["results"] == [True]
 
-    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    client = keeper._client(pick_agent(AGENTS, region_id))
     for _ in range(2):
         client.fail["map"] = RegionMapUnavailable("down")
         keeper.run_once()
@@ -304,7 +304,7 @@ def test_a_kept_region_whose_mapper_stays_away_stops_being_found(env):
     keeper.run_once()
     assert not found()
     keeper.run_once()
-    assert rm.released == []  # it goes back once its mapper answers again
+    assert rm.released == []  # it goes back once its agent answers again
     clock.advance(DOWN_S + 0.1)
     keeper.run_once()
     assert rm.released == [region_id]
@@ -315,7 +315,7 @@ def test_a_short_outage_keeps_the_kept_region(env):
 
     directory, rm, clock, keeper, _, _ = env
     pool, region_id = leave(directory, "a", key="k")
-    client = keeper._client(pick_mapper(MAPPERS, region_id))
+    client = keeper._client(pick_agent(AGENTS, region_id))
     client.fail["map"] = RegionMapUnavailable("down")
     keeper.run_once()
     clock.advance(DOWN_S + 0.1)
@@ -328,21 +328,21 @@ def test_a_short_outage_keeps_the_kept_region(env):
 
 def test_stopping_releases_the_kept_regions_before_maruserver_goes(env):
     # The resource manager reclaims a stopped MaruServer's regions; a kept
-    # region is released at its region mapper first.
+    # region is released at its remote CXL agent first.
     directory, rm, _, keeper, clients, _ = env
     pool, region_id = leave(directory, "a", key="k")
     keeper.run_once()
     keeper.stop()
-    address = pick_mapper(MAPPERS, region_id)
+    address = pick_agent(AGENTS, region_id)
     assert ("release", region_id) in clients[address].calls
     assert rm.released == [region_id]
     assert directory.departed() == []
 
 
-def test_stopping_leaves_a_region_whose_mapper_is_down_to_the_rm(env):
+def test_stopping_leaves_a_region_whose_agent_is_down_to_the_rm(env):
     directory, rm, _, keeper, _, _ = env
     pool, region_id = leave(directory, "a", key="k")
-    keeper._client(pick_mapper(MAPPERS, region_id)).fail["map"] = RegionMapUnavailable(
+    keeper._client(pick_agent(AGENTS, region_id)).fail["map"] = RegionMapUnavailable(
         "down"
     )
     keeper.run_once()

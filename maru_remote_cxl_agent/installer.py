@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Install the region mapper as a system service started with the RM.
+"""Install the remote CXL agent as a system service started with the RM.
 
-The region mapper is a platform service like the resource manager: one per
+The remote CXL agent is a platform service like the resource manager: one per
 memory node, shared by every app. ``install-maru-resource-manager`` calls
 :func:`install` after it installs the resource manager, so a memory node runs
 both with ``systemctl start maru-resource-manager``. The service is wanted by
@@ -12,7 +12,7 @@ no resource manager installs it standalone (``--standalone``), so it starts at
 boot on its own.
 
 Settings come from an environment file (:data:`ENV_FILE`) that is written
-once and kept across reinstalls. The region mapper key (:data:`KEY_FILE`) is
+once and kept across reinstalls. The remote CXL agent key (:data:`KEY_FILE`) is
 created once as well; workers and MaruServer need a copy of it.
 """
 
@@ -27,60 +27,60 @@ from pathlib import Path
 
 from maru_remote.region_map import DEFAULT_KEY_FILE, write_key
 
-SERVICE_NAME = "maru-region-mapper.service"
+SERVICE_NAME = "maru-remote-cxl-agent.service"
 RM_SERVICE_NAME = "maru-resource-manager.service"
 SYSTEMD_DIR = Path("/etc/systemd/system")
-ENV_FILE = Path("/etc/maru/region-mapper.env")
+ENV_FILE = Path("/etc/maru/remote-cxl-agent.env")
 KEY_FILE = Path(DEFAULT_KEY_FILE)
 
 DEFAULT_ENV = """\
-# Settings of the Maru region mapper service (maru-region-mapper.service).
+# Settings of the Maru remote CXL agent service (maru-remote-cxl-agent.service).
 # The service starts and stops with maru-resource-manager.service.
-# Restart after a change: sudo systemctl restart maru-region-mapper
+# Restart after a change: sudo systemctl restart maru-remote-cxl-agent
 
 # Resource manager of the pool, as this node reaches it.
 MARU_RM_ADDRESS=127.0.0.1:9850
 
 # RDMA NIC to register regions with, e.g. mlx5_1:1. Empty: the UCX default.
-MARU_REGION_MAPPER_UCX_DEVICE=
+MARU_REMOTE_CXL_AGENT_UCX_DEVICE=
 
 # Address and port the workers of other nodes connect to. Give maru-server
-# this address with this port (--region-mapper). Empty: the address of the
+# this address with this port (--remote-cxl-agent). Empty: the address of the
 # NIC above on the RDMA network (the NIC must then be set).
-MARU_REGION_MAPPER_HOST=
-MARU_REGION_MAPPER_PORT=9860
+MARU_REMOTE_CXL_AGENT_HOST=
+MARU_REMOTE_CXL_AGENT_PORT=9860
 
 # Key that workers and maru-server prove on every connection. Copy this file
 # to them, readable only by the users that run them.
-MARU_REGION_MAPPER_KEY_FILE=/etc/maru/region-mapper.key
+MARU_REMOTE_CXL_AGENT_KEY_FILE=/etc/maru/remote-cxl-agent.key
 """
 
 STANDALONE_ENV = """\
-# Settings of the Maru region mapper service (maru-region-mapper.service).
+# Settings of the Maru remote CXL agent service (maru-remote-cxl-agent.service).
 # This node runs no resource manager, so the service starts at boot on its own.
-# Restart after a change: sudo systemctl restart maru-region-mapper
+# Restart after a change: sudo systemctl restart maru-remote-cxl-agent
 
 # Resource manager of the pool, on another memory node (required), e.g.
 # 10.0.0.2:9850. It must listen on a network address.
 MARU_RM_ADDRESS=
 
 # RDMA NIC to register regions with, e.g. mlx5_1:1. Empty: the UCX default.
-MARU_REGION_MAPPER_UCX_DEVICE=
+MARU_REMOTE_CXL_AGENT_UCX_DEVICE=
 
 # Address and port the workers of other nodes connect to. Give maru-server
-# this address with this port (--region-mapper). Empty: the address of the
+# this address with this port (--remote-cxl-agent). Empty: the address of the
 # NIC above on the RDMA network (the NIC must then be set).
-MARU_REGION_MAPPER_HOST=
-MARU_REGION_MAPPER_PORT=9860
+MARU_REMOTE_CXL_AGENT_HOST=
+MARU_REMOTE_CXL_AGENT_PORT=9860
 
 # Key that workers and maru-server prove on every connection. Copy this file
 # to them, readable only by the users that run them.
-MARU_REGION_MAPPER_KEY_FILE=/etc/maru/region-mapper.key
+MARU_REMOTE_CXL_AGENT_KEY_FILE=/etc/maru/remote-cxl-agent.key
 """
 
 
 def render_unit(python: str, standalone: bool = False) -> str:
-    """The systemd unit of the region mapper.
+    """The systemd unit of the remote CXL agent.
 
     Args:
         python: Interpreter that has Maru and NIXL installed.
@@ -109,7 +109,7 @@ def render_unit(python: str, standalone: bool = False) -> str:
         )
     return f"""\
 [Unit]
-Description=Maru region mapper - maps CXL regions and registers them with the NIC for remote workers
+Description=Maru remote CXL agent - maps CXL regions and registers them with the NIC for remote workers
 {order}# Stops retrying after 5 failed starts in a minute (e.g. no RDMA NIC).
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -117,7 +117,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=-{ENV_FILE}
-ExecStart={python} -m maru_region_mapper.cli
+ExecStart={python} -m maru_remote_cxl_agent.cli
 Restart=on-failure
 RestartSec=3
 # Registering a region with the NIC pins its memory.
@@ -163,21 +163,21 @@ def install(
         systemctl: Runs a systemctl command.
         standalone: Start at boot on its own (a node without a resource
             manager) instead of with the resource manager.
-        key_file: Region mapper key; an existing one is kept.
+        key_file: Remote CXL agent key; an existing one is kept.
 
     Returns:
         True if installed; False if NIXL is not installed or there is no
-        systemd, so a region mapper could not run here.
+        systemd, so a remote CXL agent could not run here.
     """
     if not nixl_available():
         print(
-            "Skipping the region mapper service: NIXL is not installed "
+            "Skipping the remote CXL agent service: NIXL is not installed "
             "(uv pip install nixl, or pip install nixl, to serve remote workers).",
             file=sys.stderr,
         )
         return False
     if not systemd_dir.is_dir():
-        print("Skipping the region mapper service: no systemd.", file=sys.stderr)
+        print("Skipping the remote CXL agent service: no systemd.", file=sys.stderr)
         return False
     unit = systemd_dir / SERVICE_NAME
     unit.write_text(render_unit(python, standalone))
@@ -187,7 +187,7 @@ def install(
         env_file.write_text(STANDALONE_ENV if standalone else DEFAULT_ENV)
         print(f"  Wrote settings: {env_file}", file=sys.stderr)
         print(
-            f"  Set MARU_REGION_MAPPER_UCX_DEVICE in {env_file} to this node's "
+            f"  Set MARU_REMOTE_CXL_AGENT_UCX_DEVICE in {env_file} to this node's "
             "RDMA NIC (e.g. mlx5_1:1): the service listens on that NIC's address "
             "and does not start without it.",
             file=sys.stderr,
@@ -197,9 +197,9 @@ def install(
     if not key_file.exists():
         key_file.parent.mkdir(parents=True, exist_ok=True)
         write_key(str(key_file))
-        print(f"  Wrote the region mapper key: {key_file}", file=sys.stderr)
+        print(f"  Wrote the remote CXL agent key: {key_file}", file=sys.stderr)
     else:
-        print(f"  Kept the region mapper key: {key_file}", file=sys.stderr)
+        print(f"  Kept the remote CXL agent key: {key_file}", file=sys.stderr)
     print(
         f"  Copy {key_file} to the worker nodes and the maru-server node of this "
         "pool, readable only by the users that run them; a shared pool's memory "
@@ -213,12 +213,12 @@ def install(
     if standalone:
         print(
             f"  Set MARU_RM_ADDRESS in {env_file} to the pool's resource "
-            "manager, then:\n    sudo systemctl start maru-region-mapper",
+            "manager, then:\n    sudo systemctl start maru-remote-cxl-agent",
             file=sys.stderr,
         )
     else:
         print(
-            "  The region mapper starts with the resource manager:\n"
+            "  The remote CXL agent starts with the resource manager:\n"
             "    sudo systemctl start maru-resource-manager",
             file=sys.stderr,
         )
@@ -243,12 +243,12 @@ def uninstall(systemd_dir: Path = SYSTEMD_DIR, systemctl=_systemctl) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``install-maru-region-mapper``: install or remove the service only."""
+    """``install-maru-remote-cxl-agent``: install or remove the service only."""
     parser = argparse.ArgumentParser(
-        prog="install-maru-region-mapper",
-        description="Install the Maru region mapper as a system service that "
+        prog="install-maru-remote-cxl-agent",
+        description="Install the Maru remote CXL agent as a system service that "
         "starts with maru-resource-manager.",
-        epilog="Requires root. In a venv: sudo $(which install-maru-region-mapper)",
+        epilog="Requires root. In a venv: sudo $(which install-maru-remote-cxl-agent)",
     )
     parser.add_argument("--uninstall", action="store_true", help="remove the service")
     parser.add_argument(
@@ -261,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     if os.getuid() != 0:
         print(
             "Error: root privileges required.\n"
-            "Hint: sudo $(which install-maru-region-mapper)",
+            "Hint: sudo $(which install-maru-remote-cxl-agent)",
             file=sys.stderr,
         )
         return 1

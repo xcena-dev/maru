@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""``maru-region-mapper``: the region mapper of a memory node.
+"""``maru-remote-cxl-agent``: the remote CXL agent of a memory node.
 
 Run one per memory node (e.g. as a systemd service next to the resource
 manager). Handlers on worker nodes connect to it to have regions mapped and
@@ -15,8 +15,8 @@ NIC registration in place and late writes still land).
 
 Who may map a region is bound as on a CXL-attached node. There, a process
 needs the CXL device and permission to open its DAX file. Here, it needs to
-reach the region mapper, which listens on this node's RDMA network address
-by default, and to read the region mapper key, which every connection proves.
+reach the remote CXL agent, which listens on this node's RDMA network address
+by default, and to read the remote CXL agent key, which every connection proves.
 """
 
 import argparse
@@ -40,7 +40,7 @@ from .service import RegionMapService
 
 # Named, not __name__: under `python -m` the module is __main__, outside the
 # package logger that main() configures.
-logger = logging.getLogger("maru_region_mapper.cli")
+logger = logging.getLogger("maru_remote_cxl_agent.cli")
 
 
 # UCX transports where the NIC checks the remote key of each RDMA, so a
@@ -63,7 +63,7 @@ RCACHE_OFF = ("n", "no", "0")
 
 
 class NodeLockedError(RuntimeError):
-    """Another region mapper of this node holds the node lock."""
+    """Another remote CXL agent of this node holds the node lock."""
 
 
 class UncheckedTransportError(RuntimeError):
@@ -92,7 +92,7 @@ def rdma_address(
 ) -> str:
     """The IPv4 address of the network interface of an RDMA device.
 
-    Workers reach the region mapper over the same network their RDMA uses,
+    Workers reach the remote CXL agent over the same network their RDMA uses,
     so this is the address it listens on when none is given.
 
     Args:
@@ -110,8 +110,8 @@ def rdma_address(
     device = ucx_device.partition(":")[0].strip()
     if not device:
         raise ValueError(
-            "no bind address: set MARU_REGION_MAPPER_HOST (--host) or "
-            "MARU_REGION_MAPPER_UCX_DEVICE (--ucx-device)"
+            "no bind address: set MARU_REMOTE_CXL_AGENT_HOST (--host) or "
+            "MARU_REMOTE_CXL_AGENT_UCX_DEVICE (--ucx-device)"
         )
     net = Path(sysfs) / device / "device" / "net"
     names = sorted(p.name for p in net.iterdir()) if net.is_dir() else []
@@ -121,7 +121,7 @@ def rdma_address(
             return address
     raise ValueError(
         f"RDMA device {device} has no network interface with an IPv4 address; "
-        "set MARU_REGION_MAPPER_HOST (--host)"
+        "set MARU_REMOTE_CXL_AGENT_HOST (--host)"
     )
 
 
@@ -179,13 +179,13 @@ def _checked_transport(item: str) -> bool:
 
 def default_lock_file(node_id: str) -> str:
     """Return the default per-node lock file path."""
-    return f"/run/maru/region-mapper-{node_id.replace(os.sep, '_')}.lock"
+    return f"/run/maru/remote-cxl-agent-{node_id.replace(os.sep, '_')}.lock"
 
 
 def hold_node_lock(path: str) -> int:
-    """Take the node's region mapper lock for the life of the process.
+    """Take the node's remote CXL agent lock for the life of the process.
 
-    Two region mappers on one node would register the same region twice and
+    Two remote CXL agents on one node would register the same region twice and
     hand out different keys for it.
 
     Args:
@@ -205,7 +205,7 @@ def hold_node_lock(path: str) -> int:
     except BlockingIOError:
         os.close(fd)
         raise NodeLockedError(
-            f"{path} is held by another maru-region-mapper of this node"
+            f"{path} is held by another maru-remote-cxl-agent of this node"
         ) from None
     except OSError:
         os.close(fd)
@@ -223,10 +223,10 @@ def read_boot_id(path: str = "/proc/sys/kernel/random/boot_id") -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Command-line options of ``maru-region-mapper``."""
+    """Command-line options of ``maru-remote-cxl-agent``."""
     parser = argparse.ArgumentParser(
-        prog="maru-region-mapper",
-        description="Maru region mapper - maps resource-manager regions and "
+        prog="maru-remote-cxl-agent",
+        description="Maru remote CXL agent - maps resource-manager regions and "
         "registers them with this node's NIC for remote Handlers",
     )
     # Each default can also come from the environment, so the system service
@@ -240,38 +240,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default=env.get("MARU_REGION_MAPPER_HOST", "127.0.0.1"),
-        help="Bind address (env MARU_REGION_MAPPER_HOST; default: 127.0.0.1). "
+        default=env.get("MARU_REMOTE_CXL_AGENT_HOST", "127.0.0.1"),
+        help="Bind address (env MARU_REMOTE_CXL_AGENT_HOST; default: 127.0.0.1). "
         "Empty: the address of the --ucx-device network interface",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(env.get("MARU_REGION_MAPPER_PORT", "9860")),
-        help="Bind port (env MARU_REGION_MAPPER_PORT; default: 9860)",
+        default=int(env.get("MARU_REMOTE_CXL_AGENT_PORT", "9860")),
+        help="Bind port (env MARU_REMOTE_CXL_AGENT_PORT; default: 9860)",
     )
     parser.add_argument(
         "--node-id", default=socket.gethostname(), help="Node name (default: hostname)"
     )
     parser.add_argument(
         "--ucx-device",
-        default=env.get("MARU_REGION_MAPPER_UCX_DEVICE", ""),
-        help="UCX device, e.g. mlx5_0:1 (env MARU_REGION_MAPPER_UCX_DEVICE; "
+        default=env.get("MARU_REMOTE_CXL_AGENT_UCX_DEVICE", ""),
+        help="UCX device, e.g. mlx5_0:1 (env MARU_REMOTE_CXL_AGENT_UCX_DEVICE; "
         "default: the UCX default)",
     )
     parser.add_argument(
         "--key-file",
-        default=env.get("MARU_REGION_MAPPER_KEY_FILE") or DEFAULT_KEY_FILE,
-        help="Region mapper key that every Handler and MaruServer connection "
-        "must prove (env MARU_REGION_MAPPER_KEY_FILE; default: "
+        default=env.get("MARU_REMOTE_CXL_AGENT_KEY_FILE") or DEFAULT_KEY_FILE,
+        help="Remote CXL agent key that every Handler and MaruServer connection "
+        "must prove (env MARU_REMOTE_CXL_AGENT_KEY_FILE; default: "
         f"{DEFAULT_KEY_FILE})",
     )
     parser.add_argument(
         "--lock-file",
-        default=env.get("MARU_REGION_MAPPER_LOCK_FILE") or None,
-        help="Lock held for the life of the process, so one region mapper runs "
-        "per node (env MARU_REGION_MAPPER_LOCK_FILE; default: "
-        "/run/maru/region-mapper-<node-id>.lock)",
+        default=env.get("MARU_REMOTE_CXL_AGENT_LOCK_FILE") or None,
+        help="Lock held for the life of the process, so one remote CXL agent runs "
+        "per node (env MARU_REMOTE_CXL_AGENT_LOCK_FILE; default: "
+        "/run/maru/remote-cxl-agent-<node-id>.lock)",
     )
     parser.add_argument(
         "--allow-unchecked-transport",
@@ -290,19 +290,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the region mapper until SIGINT or SIGTERM.
+    """Run the remote CXL agent until SIGINT or SIGTERM.
 
     Args:
         argv: Command-line arguments (default: ``sys.argv[1:]``).
 
     Returns:
         0 after a signal; 1 if the resource manager address is empty, there
-        is no bind address or key, another region mapper holds this node, or
+        is no bind address or key, another remote CXL agent holds this node, or
         UCX may use a transport that does not check remote keys.
     """
     args = build_parser().parse_args(argv)
     level = getattr(logging, args.log_level)
-    for package in ("maru_region_mapper", "maru_remote", "maru_shm"):
+    for package in ("maru_remote_cxl_agent", "maru_remote", "maru_shm"):
         package_logger = setup_package_logging(package)
         package_logger.setLevel(level)
         for handler in package_logger.handlers:
@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     epoch = uuid.uuid4().hex
     transport = NixlTransport(
-        f"maru-region-mapper-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
+        f"maru-remote-cxl-agent-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
     )
     rm = MaruShmClient(address=args.rm_address)
     service = RegionMapService(
@@ -358,11 +358,11 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     if host == "0.0.0.0":
         logger.warning(
-            "Binding to 0.0.0.0: every network of this node reaches the region "
-            "mapper; the key still decides who maps a region"
+            "Binding to 0.0.0.0: every network of this node reaches the remote CXL "
+            "agent; the key still decides who maps a region"
         )
     logger.info(
-        "region mapper for node %s (epoch %s) on %s:%d, resource manager %s, "
+        "remote CXL agent for node %s (epoch %s) on %s:%d, resource manager %s, "
         "key %s, UCX_TLS=%s, UCX_RCACHE_ENABLE=%s",
         args.node_id,
         epoch,

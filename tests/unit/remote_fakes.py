@@ -265,11 +265,11 @@ def reset_fake_agents() -> None:
 class FakeCxl:
     """One CXL device and its resource manager.
 
-    The device is a temporary file that region mappers map with the real
+    The device is a temporary file that remote CXL agents map with the real
     ``DaxRegionMapper``. Regions are reserved first fit, so a released range
     is handed out again under a new region id, as the real resource manager
     does. ``get_access`` checks a handle the way ``GET_ACCESS`` does. Every
-    region mapper of the pool maps the same bytes.
+    remote CXL agent of the pool maps the same bytes.
     """
 
     def __init__(self, size: int = 1 << 20) -> None:
@@ -366,7 +366,7 @@ _KEY_FILE: str | None = None
 
 
 def key_file() -> str:
-    """A region mapper key file shared by the fake memory nodes and workers."""
+    """A remote CXL agent key file shared by the fake memory nodes and workers."""
     global _KEY_FILE
     if _KEY_FILE is None:
         import os
@@ -388,7 +388,7 @@ def shared_key() -> bytes:
 
 
 class FakeMemoryNode:
-    """A memory node's region mapper served on loopback TCP.
+    """A memory node's remote CXL agent served on loopback TCP.
 
     The service, server, client and device mapper are the real ones; only the
     resource manager, the device (a file) and NIXL are fakes. The server
@@ -409,13 +409,13 @@ class FakeMemoryNode:
     def _start(self) -> None:
         import threading
 
-        from maru_region_mapper.mapper import DaxRegionMapper
-        from maru_region_mapper.server import RegionMapServer
-        from maru_region_mapper.service import RegionMapService
         from maru_remote.transport import NixlTransport
+        from maru_remote_cxl_agent.mapper import DaxRegionMapper
+        from maru_remote_cxl_agent.server import RegionMapServer
+        from maru_remote_cxl_agent.service import RegionMapService
 
         epoch = f"{self.name}-e{self.restarts}"
-        self.agent = FakeNixlAgent(f"maru-region-mapper-{epoch}")
+        self.agent = FakeNixlAgent(f"maru-remote-cxl-agent-{epoch}")
         self.transport = NixlTransport(self.agent.name, agent=self.agent)
         self.mapper = DaxRegionMapper({})
         self.service = RegionMapService(

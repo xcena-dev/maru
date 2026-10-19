@@ -31,7 +31,7 @@ Node A stores the KV it computes in a shared KV cache, and nodes B and C load it
 
 - **Lower System Energy** — On nodes attached to CXL, eliminating bulk data transfer cuts NIC and CPU power draw, and shorter data paths reduce GPU idle time per request.
 
-- **GPU Nodes without CXL** — With the `remote_cxl` storage backend, vLLM workers on GPU nodes without CXL keep their KV in the CXL memory of memory nodes. A region mapper on each memory node maps regions and registers them with the node's NIC, and workers read and write them with one-sided RDMA. Several memory nodes can share one CXL pool, and a worker can use several pools. See the [remote CXL example](examples/vllm/remote_cxl/README.md).
+- **GPU Nodes without CXL** — With the `remote_cxl` storage backend, vLLM workers on GPU nodes without CXL keep their KV in the CXL memory of memory nodes. A remote CXL agent on each memory node maps regions and registers them with the node's NIC, and workers read and write them with one-sided RDMA. Several memory nodes can share one CXL pool, and a worker can use several pools. See the [remote CXL example](examples/vllm/remote_cxl/README.md).
 
 ## Overview
 ```mermaid
@@ -70,20 +70,20 @@ flowchart TB
 >
 > **Data Plane** (solid arrows) — on nodes attached to CXL, direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
 
-GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in the CXL memory of memory nodes: a region mapper on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). Only control messages go to maru-server and the region mapper. See [Remote CXL](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html#remote-cxl-cxl-memory-of-other-nodes-over-rdma) in the architecture overview.
+GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in the CXL memory of memory nodes: a remote CXL agent on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). Only control messages go to maru-server and the remote CXL agent. See [Remote CXL](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html#remote-cxl-cxl-memory-of-other-nodes-over-rdma) in the architecture overview.
 
 ## Quick Start
 
 ### System Components
 
-Maru consists of two server components and a client library. A deployment with GPU nodes without CXL adds a region mapper on each memory node:
+Maru consists of two server components and a client library. A deployment with GPU nodes without CXL adds a remote CXL agent on each memory node:
 
 | Component | Role | Package |
 |-----------|------|---------|
 | **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
-| **Region Mapper** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-region-mapper` (needs NIXL) |
+| **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |
 
 All components run on the same machine in a single-node setup. For multi-node deployment, see the [installation guide](https://xcena-dev.github.io/maru/source/getting_started/installation.html#multi-node-configuration).
 
@@ -96,7 +96,7 @@ All components run on the same machine in a single-node setup. For multi-node de
 - [uv](https://docs.astral.sh/uv/) (recommended; `install.sh` falls back to pip)
 - CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
 - For the `remote_cxl` backend:
-  - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node; the maru-server node must reach the region mappers on the memory nodes' RDMA network addresses
+  - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node; the maru-server node must reach the remote CXL agents on the memory nodes' RDMA network addresses
   - NIXL in the same environment, before `./install.sh`: `uv pip install nixl` (`pip install nixl` without uv)
 
 ```bash

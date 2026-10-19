@@ -15,12 +15,12 @@ usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""
     echo "Build and install Maru (Python package + maru-resource-manager)."
-    echo "With NIXL installed (uv pip install nixl), the region mapper is"
+    echo "With NIXL installed (uv pip install nixl), the remote CXL agent is"
     echo "also installed as a service that starts with maru-resource-manager."
     echo ""
     echo "Options:"
     echo "  --no-rm      Skip building/installing maru-resource-manager and the"
-    echo "               region mapper service"
+    echo "               remote CXL agent service"
     echo "  -h, --help   Show this help message"
 }
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Region mapper: the map / unmap / release service, its TCP front end, the
+"""Remote CXL agent: the map / unmap / release service, its TCP front end, the
 Handler-side client, the command line and the device mapper."""
 
 import ctypes
@@ -9,10 +9,6 @@ import time
 
 import pytest
 
-from maru_region_mapper import cli
-from maru_region_mapper.mapper import DaxRegionMapper
-from maru_region_mapper.server import ConnectionAuth, handle_request
-from maru_region_mapper.service import MapDenied, NotMapped, RegionMapService
 from maru_remote.region_map import (
     KeyFileError,
     RegionMapClient,
@@ -24,6 +20,10 @@ from maru_remote.region_map import (
     write_key,
 )
 from maru_remote.transport import NixlTransport
+from maru_remote_cxl_agent import cli
+from maru_remote_cxl_agent.mapper import DaxRegionMapper
+from maru_remote_cxl_agent.server import ConnectionAuth, handle_request
+from maru_remote_cxl_agent.service import MapDenied, NotMapped, RegionMapService
 from maru_shm.types import MaruHandle
 from tests.unit.remote_fakes import (
     FakeCxl,
@@ -304,7 +304,7 @@ def test_the_client_reconnects_after_a_restart_and_counts_it():
         mem.stop()
 
 
-def test_a_release_to_a_restarted_mapper_succeeds():
+def test_a_release_to_a_restarted_agent_succeeds():
     cxl = FakeCxl()
     mem = FakeMemoryNode(cxl)
     try:
@@ -434,7 +434,7 @@ def test_a_connection_does_nothing_before_it_proves_the_key():
                 "nonce": b"n" * 16,
             }
         )
-        assert right["proof"] == prove(shared_key(), "mapper", b"n" * 16)
+        assert right["proof"] == prove(shared_key(), "agent", b"n" * 16)
         assert ask({"op": "map", "handle": handle})["ok"]
     finally:
         sock.close()
@@ -450,7 +450,7 @@ def test_a_client_with_another_key_cannot_map():
             client.map(cxl.reserve("owner", 4096).to_dict())
         no_key = RegionMapClient(mem.address, timeout_s=5)
         with pytest.raises(
-            RegionMapUnavailable, match="requires the region mapper key"
+            RegionMapUnavailable, match="requires the remote CXL agent key"
         ):
             no_key.hello()
         assert cxl.accesses == []
@@ -458,8 +458,8 @@ def test_a_client_with_another_key_cannot_map():
         mem.stop()
 
 
-def test_the_client_checks_that_the_region_mapper_holds_the_key():
-    # A process that poses as the region mapper cannot hand out addresses.
+def test_the_client_checks_that_the_remote_cxl_agent_holds_the_key():
+    # A process that poses as the remote CXL agent cannot hand out addresses.
     cxl = FakeCxl()
     impostor = FakeMemoryNode(cxl, key=b"z" * 32)
     keyless = FakeMemoryNode(cxl, name="mem2", key=None)
@@ -483,7 +483,7 @@ def test_an_auth_reply_with_another_proof_is_refused():
         }
     )
     assert reply["ok"] and auth.proved
-    assert reply["proof"] != prove(b"other" * 7, "mapper", b"c" * 16)
+    assert reply["proof"] != prove(b"other" * 7, "agent", b"c" * 16)
 
 
 def test_the_key_file_must_hold_a_key_and_stay_private(tmp_path):
@@ -560,7 +560,7 @@ def test_the_bind_address_is_the_rdma_nics_network_address(tmp_path):
 
 
 def test_no_bind_address_without_a_device_or_an_address(tmp_path):
-    with pytest.raises(ValueError, match="MARU_REGION_MAPPER_HOST"):
+    with pytest.raises(ValueError, match="MARU_REMOTE_CXL_AGENT_HOST"):
         cli.rdma_address("", str(tmp_path), lambda name: None)
     sysfs = _sysfs(tmp_path, "mlx5_0", ["ens1f0np0"])
     with pytest.raises(ValueError, match="no network interface with an IPv4"):
@@ -632,7 +632,7 @@ def test_main_refuses_an_empty_resource_manager_address(monkeypatch, tmp_path):
     assert not (tmp_path / "lock").exists()
 
 
-def test_one_region_mapper_per_node(monkeypatch, tmp_path):
+def test_one_remote_cxl_agent_per_node(monkeypatch, tmp_path):
     path = str(tmp_path / "run" / "lock")
     fd = cli.hold_node_lock(path)
     try:
@@ -654,11 +654,11 @@ def test_boot_id_is_read_from_the_kernel(tmp_path):
 
 _ENV_SETTINGS = (
     "MARU_RM_ADDRESS",
-    "MARU_REGION_MAPPER_HOST",
-    "MARU_REGION_MAPPER_PORT",
-    "MARU_REGION_MAPPER_UCX_DEVICE",
-    "MARU_REGION_MAPPER_LOCK_FILE",
-    "MARU_REGION_MAPPER_KEY_FILE",
+    "MARU_REMOTE_CXL_AGENT_HOST",
+    "MARU_REMOTE_CXL_AGENT_PORT",
+    "MARU_REMOTE_CXL_AGENT_UCX_DEVICE",
+    "MARU_REMOTE_CXL_AGENT_LOCK_FILE",
+    "MARU_REMOTE_CXL_AGENT_KEY_FILE",
 )
 
 
@@ -680,7 +680,7 @@ def test_the_command_line_defaults(monkeypatch):
         9860,
         "",
         None,
-        "/etc/maru/region-mapper.key",
+        "/etc/maru/remote-cxl-agent.key",
         False,
     )
 
@@ -722,7 +722,7 @@ def test_the_device_mapper_maps_the_region_of_the_local_device(tmp_path):
 
 
 def test_an_unmapped_range_is_not_given_to_the_next_mapping(tmp_path):
-    from maru_region_mapper import mapper as mapper_module
+    from maru_remote_cxl_agent import mapper as mapper_module
 
     device = tmp_path / "dax-local"
     device.write_bytes(bytes(1 << 20))

@@ -410,7 +410,7 @@ def test_regions_without_keys_go_back_after_the_keeper_releases_them(env):
     expand(directory, a)
     clock.advance(31)
     call(directory, "close", **a, drained=True)
-    assert rm.released == []  # not before their region mapper released them
+    assert rm.released == []  # not before their remote CXL agent released them
     assert set(fates(directory).values()) == {"return"}
     released_by_keeper(directory)
     assert sorted(rm.released) == [1, 2]
@@ -703,7 +703,7 @@ def test_a_region_stuck_on_its_way_back_does_not_block_room_for_ever(env):
     assert directory.make_room() == 1
     with pytest.raises(ValueError):
         open_session(directory, "d")
-    clock.advance(31)  # its region mapper never answered
+    clock.advance(31)  # its remote CXL agent never answered
     assert directory.make_room() == 1
 
 

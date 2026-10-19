@@ -33,14 +33,14 @@ class MaruServer:
         enable_cxl: bool = True,
         cpu_capacity_limit: int = 64 * 1024**3,
         cpu_session_ttl: float = 30,
-        region_mappers: list[str] | None = None,
-        region_mapper_key: bytes | None = None,
+        remote_cxl_agents: list[str] | None = None,
+        remote_cxl_agent_key: bytes | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
-        # Region mappers of the pool's memory nodes, handed to remote CXL workers in
+        # Remote CXL agents of the pool's memory nodes, handed to remote CXL workers in
         # the handshake as the RM address is. MaruServer calls them itself only
         # for regions whose owner left (region_keeper.py).
-        self._region_mappers = list(region_mappers or [])
+        self._remote_cxl_agents = list(remote_cxl_agents or [])
         self._dax_paths = dax_paths
         from .replica_directory import ReplicaDirectory
 
@@ -57,11 +57,11 @@ class MaruServer:
             release_cxl=self._release_storage_region if enable_cxl else None,
         )
         self._region_keeper = None
-        if enable_cxl and self._region_mappers:
+        if enable_cxl and self._remote_cxl_agents:
             from .region_keeper import RegionKeeper
 
             self._region_keeper = RegionKeeper(
-                self.replica_directory, self._region_mappers, region_mapper_key
+                self.replica_directory, self._remote_cxl_agents, remote_cxl_agent_key
             )
             self._region_keeper.start()
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
@@ -101,9 +101,9 @@ class MaruServer:
         return self._rm_address
 
     @property
-    def region_mappers(self) -> list[str]:
-        """Region mapper addresses of the pool's memory nodes."""
-        return list(self._region_mappers)
+    def remote_cxl_agents(self) -> list[str]:
+        """Remote CXL agent addresses of the pool's memory nodes."""
+        return list(self._remote_cxl_agents)
 
     def _reserve_storage_region(self, owner: str, size: int) -> MaruHandle | None:
         """Reserve a typed pool without exposing it to legacy clients."""
@@ -532,39 +532,39 @@ def main() -> None:
         help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
     )
     parser.add_argument(
-        "--region-mapper",
+        "--remote-cxl-agent",
         action="append",
         default=None,
-        dest="region_mappers",
+        dest="remote_cxl_agents",
         help=(
-            "Region mapper address (host:port) of a memory node of this pool, "
+            "Remote CXL agent address (host:port) of a memory node of this pool, "
             "for remote CXL workers. Repeat or separate with commas for every memory "
             "node of a shared pool."
         ),
     )
     parser.add_argument(
-        "--region-mapper-key-file",
+        "--remote-cxl-agent-key-file",
         default=DEFAULT_KEY_FILE,
         help=(
-            "Key the region mappers require (a copy of a memory node's "
-            f"{DEFAULT_KEY_FILE}); used with --region-mapper"
+            "Key the remote CXL agents require (a copy of a memory node's "
+            f"{DEFAULT_KEY_FILE}); used with --remote-cxl-agent"
         ),
     )
     args = parser.parse_args()
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
-    region_mappers = [
+    remote_cxl_agents = [
         address.strip()
-        for item in args.region_mappers or []
+        for item in args.remote_cxl_agents or []
         for address in item.split(",")
         if address.strip()
     ]
-    if args.cpu_only and region_mappers:
-        parser.error("--cpu-only cannot be combined with --region-mapper")
-    region_mapper_key = None
-    if region_mappers:
+    if args.cpu_only and remote_cxl_agents:
+        parser.error("--cpu-only cannot be combined with --remote-cxl-agent")
+    remote_cxl_agent_key = None
+    if remote_cxl_agents:
         try:
-            region_mapper_key = load_key(args.region_mapper_key_file)
+            remote_cxl_agent_key = load_key(args.remote_cxl_agent_key_file)
         except KeyFileError as exc:
             parser.error(str(exc))
 
@@ -576,8 +576,8 @@ def main() -> None:
         dax_paths=args.dax_paths,
         enable_cxl=not args.cpu_only,
         cpu_capacity_limit=args.cpu_capacity_limit,
-        region_mappers=region_mappers,
-        region_mapper_key=region_mapper_key,
+        remote_cxl_agents=remote_cxl_agents,
+        remote_cxl_agent_key=remote_cxl_agent_key,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 

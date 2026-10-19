@@ -4,7 +4,7 @@
 #       inst2 answers the same prompt with KV read from the pool over RDMA.
 #
 # Prerequisites:
-#   1. Every memory node runs region_mapper.sh, and the metadata node runs
+#   1. Every memory node runs remote_cxl_agent.sh, and the metadata node runs
 #      maru_server.sh
 #   2. Two engines run remote_cxl_vllm_launcher.sh (inst1, inst2), on any nodes
 #

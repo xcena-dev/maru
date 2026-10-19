@@ -268,14 +268,14 @@ class RpcHandlerMixin:
         )
 
         cxl = self._server.replica_directory.supports_mixed
-        region_mappers = list(getattr(self._server, "region_mappers", []))
+        remote_cxl_agents = list(getattr(self._server, "remote_cxl_agents", []))
         return {
             "success": True,
             "rm_address": self._server.rm_address,
-            "region_mappers": region_mappers,
+            "remote_cxl_agents": remote_cxl_agents,
             "capabilities": [STORAGE_CAPABILITY]
             + ([MIXED_STORAGE_CAPABILITY] if cxl else [])
-            + ([REMOTE_CXL_STORAGE_CAPABILITY] if cxl and region_mappers else []),
+            + ([REMOTE_CXL_STORAGE_CAPABILITY] if cxl and remote_cxl_agents else []),
             "server_epoch": self._server.replica_directory.server_epoch,
         }
 

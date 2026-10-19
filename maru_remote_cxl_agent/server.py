@@ -45,13 +45,13 @@ def _set_keepalive(sock: socket.socket) -> None:
 
 
 class ConnectionAuth:
-    """Whether one connection proved the region mapper key."""
+    """Whether one connection proved the remote CXL agent key."""
 
     def __init__(self, key: bytes | None) -> None:
         """Start a connection.
 
         Args:
-            key: Region mapper key; None runs without one (every request is
+            key: Remote CXL agent key; None runs without one (every request is
                 accepted).
         """
         self.key = key
@@ -63,7 +63,7 @@ class ConnectionAuth:
         if self.key is None:
             return {
                 "ok": False,
-                "error": "this region mapper runs without a key",
+                "error": "this remote CXL agent runs without a key",
                 "code": "invalid",
             }
         proof, nonce = message.get("proof"), message.get("nonce")
@@ -72,9 +72,13 @@ class ConnectionAuth:
             or not isinstance(nonce, bytes)
             or not (hmac.compare_digest(proof, prove(self.key, "handler", self.nonce)))
         ):
-            return {"ok": False, "error": "wrong region mapper key", "code": "denied"}
+            return {
+                "ok": False,
+                "error": "wrong remote CXL agent key",
+                "code": "denied",
+            }
         self.proved = True
-        return {"ok": True, "proof": prove(self.key, "mapper", nonce)}
+        return {"ok": True, "proof": prove(self.key, "agent", nonce)}
 
 
 def handle_request(
@@ -105,7 +109,7 @@ def handle_request(
         if not auth.proved:
             return {
                 "ok": False,
-                "error": "prove the region mapper key first (auth)",
+                "error": "prove the remote CXL agent key first (auth)",
                 "code": "denied",
             }
         if op == "map":
@@ -143,7 +147,7 @@ def serve_connection(
         service: The region map service.
         conn: Connection id.
         sock: Connected socket.
-        key: Region mapper key the connection must prove; None for none.
+        key: Remote CXL agent key the connection must prove; None for none.
     """
     auth = ConnectionAuth(key)
     try:
@@ -178,7 +182,7 @@ class RegionMapServer:
             service: The region map service.
             host: Bind address.
             port: Bind port (0 picks a free port).
-            key: Region mapper key every connection must prove; None accepts
+            key: Remote CXL agent key every connection must prove; None accepts
                 every connection (tests).
         """
         self.service = service

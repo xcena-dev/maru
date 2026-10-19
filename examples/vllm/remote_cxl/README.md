@@ -4,14 +4,14 @@ The `remote_cxl` storage backend lets vLLM engines on nodes without CXL keep the
 KV cache in the CXL memory of other nodes, the memory nodes, and move it over
 RDMA. Resources flow as for local CXL: the resource manager gives regions to
 maru-server, and maru-server gives them to each worker's MaruHandler. What
-moves to the memory node is the mapping: a region mapper on every memory node
+moves to the memory node is the mapping: a remote CXL agent on every memory node
 maps the regions Handlers ask for and registers them with that node's NIC. The
 worker then reads and writes them with one-sided RDMA; the bytes do not pass
 through any Maru process.
 
 ```
 worker node (any number)          metadata node              memory node (each node of the pool)
-vLLM + MaruKVConnector            maru-server                region mapper
+vLLM + MaruKVConnector            maru-server                remote CXL agent
   MaruHandler                     storage sessions,          maps a region, registers it
   (storage_backend="remote_cxl")    regions, keys    <--alloc-- with the NIC   resource manager
     session RPC  ---------------->    |                         ^       (one per pool)
@@ -23,21 +23,21 @@ vLLM + MaruKVConnector            maru-server                region mapper
 A worker opens a storage session with maru-server and gets one region of
 `maru_pool_size`; when its regions are full it gets one more, as `auto_expand`
 does for the cxl backend. Other engines read its keys under a server lease,
-mapping the region through the same region mapper.
+mapping the region through the same remote CXL agent.
 
 When a worker stops, its keys stay, as a cxl Handler's keys stay after it
 closes: maru-server keeps the worker's regions that hold keys and holds their
-mapping at the region mapper, so other engines, and the worker when it starts
+mapping at the remote CXL agent, so other engines, and the worker when it starts
 again, keep reading them. maru-server gives a kept region back when the
 resource manager is full (the one read longest ago first). Every region goes
-back to the resource manager only after its region mapper deregistered it
+back to the resource manager only after its remote CXL agent deregistered it
 from the NIC, so a WRITE still in flight from the old owner fails at the NIC
 instead of landing in the next owner's KV.
 
 Who may map a region is bound as on a CXL-attached node, where a process
-needs the CXL device and permission to open its DAX file. The region mapper
+needs the CXL device and permission to open its DAX file. The remote CXL agent
 listens on the memory node's RDMA network address, and every worker and
-maru-server proves the region mapper key on each connection. Readers get a
+maru-server proves the remote CXL agent key on each connection. Readers get a
 read handle, which maps a region but cannot release it, so only a region's
 owner and maru-server can take a region away.
 
@@ -66,18 +66,18 @@ moves it, as for the cxl backend.
   node of the pool, and the resource manager on one of them, as for a local CXL
   deployment. Use a devdax device. Install Maru with NIXL (NIXL first,
   then `./install.sh` from the Maru source tree): the installer also
-  sets up the region mapper as a system service that starts and stops with the
+  sets up the remote CXL agent as a system service that starts and stops with the
   resource manager, so a memory node runs it without a separate step.
-- Every worker must reach maru-server and each memory node's region mapper and
-  NIC, and so must maru-server reach the region mappers.
+- Every worker must reach maru-server and each memory node's remote CXL agent and
+  NIC, and so must maru-server reach the remote CXL agents.
 - A pool that several memory nodes share: apply the multi-host settings of
   Maru's [System Setup](../../../docs/source/getting_started/bios_setup.md) on
   each of those memory nodes, as on hosts that share CXL memory.
-- A copy of the region mapper key (`/etc/maru/region-mapper.key` on the memory
+- A copy of the remote CXL agent key (`/etc/maru/remote-cxl-agent.key` on the memory
   nodes, created by the installer) on every worker node and the maru-server
   node, readable only by the user that runs them. The memory nodes of a shared
   pool use the same key.
-- The region mapper runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
+- The remote CXL agent runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
   its registration cache off (`UCX_RCACHE_ENABLE=n`). It sets both itself and
   refuses to start if they are set otherwise: with the TCP transport or the
   registration cache, a deregistered region can still be written.
@@ -85,20 +85,20 @@ moves it, as for the cxl backend.
 ## Quick start (one host)
 
 `remote_cxl_example.sh` runs maru-server and two workers on one host, and uses the
-region mapper service when it runs there (otherwise it starts a region mapper
-itself). The workers still go through the region mapper's NIC
+remote CXL agent service when it runs there (otherwise it starts a remote CXL agent
+itself). The workers still go through the remote CXL agent's NIC
 registration and one-sided RDMA, so the example needs 2 GPUs, an RDMA NIC and
 a CXL/DAX device on that host.
 
 ```bash
 sudo systemctl start maru-resource-manager    # installed by ./install.sh
-MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
+MARU_DAX_PATH=/dev/dax0.0 MARU_AGENT_UCX_DEVICE=mlx5_0:1 \
 MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh [model]
 ```
 
 This will:
-1. Use the region mapper service, or start a region mapper (`region_mapper.sh`)
-2. Start maru-server with that region mapper (`maru_server.sh`)
+1. Use the remote CXL agent service, or start a remote CXL agent (`remote_cxl_agent.sh`)
+2. Start maru-server with that remote CXL agent (`maru_server.sh`)
 3. Launch two vLLM engines with `storage_backend: "remote_cxl"` (`remote_cxl_vllm_launcher.sh`)
 4. Send a new prompt to instance 1, which computes it and stores its KV in the
    pool, then the same prompt to instance 2, which loads the KV from the pool
@@ -124,46 +124,46 @@ engine to the socket of its GPU and NIC.
 ## Several nodes (step by step)
 
 Three roles start the processes, in this order: the platform operator runs
-the resource manager on each memory node, which starts the region mapper with
+the resource manager on each memory node, which starts the remote CXL agent with
 it (step 1); the app launcher starts maru-server (step 2) and then vLLM on each
 worker node (step 3); the app's users send requests (step 4). A prompt stored
 by one worker is then loaded by any other worker of the app.
 
-![One app on one pool. 1, the operator runs the resource manager on the memory node, and systemd starts the region mapper with it. 2, the app launcher starts maru-server on the metadata node; it gets regions from the resource manager as workers ask for them. 3, the app launcher starts vLLM on each worker node; each MaruHandler opens a storage session with maru-server and maps its region at the region mapper. 4, request 1 with prompt P goes to worker 1, which stores P's KV in its region R1 by RDMA; request 2 with the same prompt goes to worker 2, which maps R1 at the region mapper and loads P's KV from R1 by RDMA](../../../docs/source/image/remote_cxl_user_flow.png)
+![One app on one pool. 1, the operator runs the resource manager on the memory node, and systemd starts the remote CXL agent with it. 2, the app launcher starts maru-server on the metadata node; it gets regions from the resource manager as workers ask for them. 3, the app launcher starts vLLM on each worker node; each MaruHandler opens a storage session with maru-server and maps its region at the remote CXL agent. 4, request 1 with prompt P goes to worker 1, which stores P's KV in its region R1 by RDMA; request 2 with the same prompt goes to worker 2, which maps R1 at the remote CXL agent and loads P's KV from R1 by RDMA](../../../docs/source/image/remote_cxl_user_flow.png)
 
 The example below uses one memory node that also runs maru-server, and two
 workers on another node. Replace the addresses, NICs and DAX device.
 
 ### 1. Memory nodes
 
-Each memory node of the pool runs a region mapper, a platform service like the
+Each memory node of the pool runs a remote CXL agent, a platform service like the
 resource manager: one per memory node, shared by every app that uses the pool.
 With Maru installed with NIXL, `./install.sh` installs it as
-`maru-region-mapper.service`, which starts and stops with the resource
-manager. Set the node's RDMA NIC in `/etc/maru/region-mapper.env`; the defaults
+`maru-remote-cxl-agent.service`, which starts and stops with the resource
+manager. Set the node's RDMA NIC in `/etc/maru/remote-cxl-agent.env`; the defaults
 listen on that NIC's address at port 9860 and use the resource manager on the
 same node:
 
 ```bash
-sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
-  /etc/maru/region-mapper.env
-sudo systemctl start maru-resource-manager    # also starts the region mapper
-systemctl status maru-region-mapper
+sudo sed -i 's/^MARU_REMOTE_CXL_AGENT_UCX_DEVICE=.*/MARU_REMOTE_CXL_AGENT_UCX_DEVICE=mlx5_1:1/' \
+  /etc/maru/remote-cxl-agent.env
+sudo systemctl start maru-resource-manager    # also starts the remote CXL agent
+systemctl status maru-remote-cxl-agent
 ```
 
-The installer also created the region mapper key, `/etc/maru/region-mapper.key`.
+The installer also created the remote CXL agent key, `/etc/maru/remote-cxl-agent.key`.
 Copy it to every worker node and to the maru-server node, owned by the user
-that runs them (the example scripts read `~/.maru/region-mapper.key`):
+that runs them (the example scripts read `~/.maru/remote-cxl-agent.key`):
 
 ```bash
-sudo install -D -m 0600 -o "$USER" /etc/maru/region-mapper.key ~/.maru/region-mapper.key
-scp ~/.maru/region-mapper.key worker1:.maru/region-mapper.key   # keep it 0600
+sudo install -D -m 0600 -o "$USER" /etc/maru/remote-cxl-agent.key ~/.maru/remote-cxl-agent.key
+scp ~/.maru/remote-cxl-agent.key worker1:.maru/remote-cxl-agent.key   # keep it 0600
 ```
 
 When maru-server or another memory node reaches the resource manager over the
 network, the resource manager listens on a network address, as in Maru's
 [multi-node configuration](../../../docs/source/getting_started/installation.md#configuration).
-It then answers only on that address, so the region mapper is pointed at it
+It then answers only on that address, so the remote CXL agent is pointed at it
 too:
 
 ```bash
@@ -171,62 +171,62 @@ sudo systemctl edit maru-resource-manager
 #   [Service]
 #   ExecStart=
 #   ExecStart=/usr/local/bin/maru-resource-manager --host 10.0.0.2 --port 9850
-sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
-sudo systemctl restart maru-resource-manager   # restarts the region mapper with it
+sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/remote-cxl-agent.env
+sudo systemctl restart maru-resource-manager   # restarts the remote CXL agent with it
 ```
 
 A memory node of a shared pool that does not run the resource manager installs
-the region mapper service alone (`--standalone`: it starts at boot on its own)
+the remote CXL agent service alone (`--standalone`: it starts at boot on its own)
 and points it at the node that does:
 
 ```bash
 ./install.sh --no-rm                          # Maru with NIXL, no resource manager
-sudo "$(which install-maru-region-mapper)" --standalone
-sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
-sudo sed -i 's/^MARU_REGION_MAPPER_UCX_DEVICE=.*/MARU_REGION_MAPPER_UCX_DEVICE=mlx5_1:1/' \
-  /etc/maru/region-mapper.env
-sudo install -m 0600 ./region-mapper.key /etc/maru/region-mapper.key   # the pool's key
-sudo systemctl start maru-region-mapper
+sudo "$(which install-maru-remote-cxl-agent)" --standalone
+sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/remote-cxl-agent.env
+sudo sed -i 's/^MARU_REMOTE_CXL_AGENT_UCX_DEVICE=.*/MARU_REMOTE_CXL_AGENT_UCX_DEVICE=mlx5_1:1/' \
+  /etc/maru/remote-cxl-agent.env
+sudo install -m 0600 ./remote-cxl-agent.key /etc/maru/remote-cxl-agent.key   # the pool's key
+sudo systemctl start maru-remote-cxl-agent
 ```
 
 On a host without the service (a test host, or Maru installed without NIXL),
-`./region_mapper.sh` runs a region mapper in the foreground instead:
+`./remote_cxl_agent.sh` runs a remote CXL agent in the foreground instead:
 
 ```bash
-MARU_MEMORY_NODE_HOST=10.0.0.2 MARU_MAPPER_UCX_DEVICE=mlx5_1:1 ./region_mapper.sh
+MARU_MEMORY_NODE_HOST=10.0.0.2 MARU_AGENT_UCX_DEVICE=mlx5_1:1 ./remote_cxl_agent.sh
 ```
 
 ### 2. Metadata node
 
-Start maru-server with the region mappers of all memory nodes of the pool, on
+Start maru-server with the remote CXL agents of all memory nodes of the pool, on
 an address the workers reach:
 
 ```bash
 MARU_SERVER_BIND_HOST=10.0.0.2 MARU_DAX_PATH=/dev/dax1.0 \
-MARU_REGION_MAPPERS=10.0.0.2:9860 ./maru_server.sh
+MARU_REMOTE_CXL_AGENTS=10.0.0.2:9860 ./maru_server.sh
 ```
 
 which runs
 
 ```bash
 maru-server --host 10.0.0.2 --port $MARU_SERVER_PORT --rm-address 127.0.0.1:9850 \
-  --region-mapper 10.0.0.2:9860 --region-mapper-key-file ~/.maru/region-mapper.key \
+  --remote-cxl-agent 10.0.0.2:9860 --remote-cxl-agent-key-file ~/.maru/remote-cxl-agent.key \
   --dax-path /dev/dax1.0
 ```
 
 With the resource manager on a network address (step 1), also give
 `MARU_RM_ADDRESS=10.0.0.2:9850`; maru-server can then run on any node that
 reaches it. maru-server allocates each worker's regions from the resource
-manager, as for local CXL, and hands the region mapper list to the workers.
-It also talks to the region mappers itself for the regions of workers that
+manager, as for local CXL, and hands the remote CXL agent list to the workers.
+It also talks to the remote CXL agents itself for the regions of workers that
 left, so it needs the key. A shared pool lists
-every memory node, `--region-mapper host1:port,host2:port`; each region is then
+every memory node, `--remote-cxl-agent host1:port,host2:port`; each region is then
 served by one of them, picked by a hash of the region number over that list, so
 every worker reaches a region through the same node. maru-server runs once per
 app and pool.
 
 To use several pools, run one maru-server per pool, each with that pool's
-resource manager and region mappers, and list them all in the workers'
+resource manager and remote CXL agents, and list them all in the workers'
 `maru_server_url`, comma separated
 (`MARU_SERVER_URL=tcp://10.0.0.2:<port>,tcp://10.0.0.3:<port>`). A worker opens
 a storage session with each maru-server and sends each request to one pool,
@@ -256,7 +256,7 @@ vllm serve <model> --enforce-eager --no-async-scheduling --enable-prompt-tokens-
     "kv_connector_extra_config": {
       "maru_server_url": "tcp://10.0.0.2:<maru-server port>",
       "maru_storage_backend": "remote_cxl",
-      "maru_region_mapper_key_file": "/home/<user>/.maru/region-mapper.key",
+      "maru_remote_cxl_agent_key_file": "/home/<user>/.maru/remote-cxl-agent.key",
       "maru_rdma_device": "mlx5_0:1",
       "maru_pool_size": "4G",
       "maru_engine_id": "<unique per engine>",
@@ -296,15 +296,15 @@ All example settings are in `env.sh`. Override them with environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `MARU_RM_ADDRESS` | `127.0.0.1:9850` | Resource manager of the pool |
-| `MARU_MEMORY_NODE_HOST` | `127.0.0.1` | `region_mapper.sh`: memory node's address on the RDMA network; the region mapper listens there |
-| `MARU_MAPPER_PORT` | `10500 + uid` | `region_mapper.sh`: region mapper port |
-| `MARU_MAPPER_UCX_DEVICE` | UCX default | `region_mapper.sh`: RDMA NIC the region mapper registers regions with, e.g. `mlx5_1:1` |
-| `MARU_MAPPER_LOCK_FILE` | `/tmp/maru-region-mapper.lock` | `region_mapper.sh`: keeps one region mapper per node |
-| `MARU_REGION_MAPPER_KEY_FILE` | `~/.maru/region-mapper.key` | Region mapper key; `region_mapper.sh` creates it if missing, maru-server and the workers read it |
+| `MARU_MEMORY_NODE_HOST` | `127.0.0.1` | `remote_cxl_agent.sh`: memory node's address on the RDMA network; the remote CXL agent listens there |
+| `MARU_AGENT_PORT` | `10500 + uid` | `remote_cxl_agent.sh`: remote CXL agent port |
+| `MARU_AGENT_UCX_DEVICE` | UCX default | `remote_cxl_agent.sh`: RDMA NIC the remote CXL agent registers regions with, e.g. `mlx5_1:1` |
+| `MARU_AGENT_LOCK_FILE` | `/tmp/maru-remote-cxl-agent.lock` | `remote_cxl_agent.sh`: keeps one remote CXL agent per node |
+| `MARU_REMOTE_CXL_AGENT_KEY_FILE` | `~/.maru/remote-cxl-agent.key` | Remote CXL agent key; `remote_cxl_agent.sh` creates it if missing, maru-server and the workers read it |
 | `MARU_SERVER_BIND_HOST` | `127.0.0.1` | Interface maru-server listens on |
 | `MARU_SERVER_PORT` | `10000 + uid` | maru-server port |
 | `MARU_DAX_PATH` | any pool | DAX device of the pool |
-| `MARU_REGION_MAPPERS` | this node's region mapper (the service's, if it runs) | Region mappers of the pool, `host:port`, comma separated |
+| `MARU_REMOTE_CXL_AGENTS` | this node's remote CXL agent (the service's, if it runs) | Remote CXL agents of the pool, `host:port`, comma separated |
 | `MARU_SERVER_URL` | `tcp://$MARU_SERVER_HOST:$MARU_SERVER_PORT` | maru-server as workers see it; set it on worker nodes |
 | `MARU_POOL_SIZE` | `4G` | Region size; a worker gets one more region each time its regions are full |
 | `MARU_WORKER_UCX_DEVICE` | UCX default | RDMA NIC on each worker, e.g. `mlx5_0:1` |
@@ -318,13 +318,13 @@ All example settings are in `env.sh`. Override them with environment variables:
 
 ## Troubleshooting
 
-- **The region mapper refuses to start with `UCX_TLS` or `UCX_RCACHE_ENABLE`**:
+- **The remote CXL agent refuses to start with `UCX_TLS` or `UCX_RCACHE_ENABLE`**:
   unset them, or set `UCX_TLS` to RDMA transports (`rc`, `dc`) and
   `UCX_RCACHE_ENABLE=n`. Only for a test on a host without an RDMA NIC,
   `--allow-unchecked-transport` lets it run on other transports; a late RDMA
   WRITE can then land in a region after its owner gave it back.
-- **`cannot take the node lock`**: another region mapper runs on this node,
-  usually the service. One region mapper serves every app on the node; give
+- **`cannot take the node lock`**: another remote CXL agent runs on this node,
+  usually the service. One remote CXL agent serves every app on the node; give
   maru-server its address instead of starting another one.
 - **Engines start but never hit**: check that both engines use the same
   `maru_cache_namespace` and `maru_server_url`, and that the prompt is longer
@@ -334,10 +334,10 @@ All example settings are in `env.sh`. Override them with environment variables:
   restarted ones read them. It gives them back when the resource manager is
   full; `maru-server` logs `giving back remote CXL region`.
 - **`key check failed`** (in the engine or maru-server log): the process has
-  no copy of the region mapper key, or another one. Copy the memory nodes'
-  `/etc/maru/region-mapper.key` (0600, owned by the process's user) and point
-  `maru_region_mapper_key_file` or `--region-mapper-key-file` at it.
+  no copy of the remote CXL agent key, or another one. Copy the memory nodes'
+  `/etc/maru/remote-cxl-agent.key` (0600, owned by the process's user) and point
+  `maru_remote_cxl_agent_key_file` or `--remote-cxl-agent-key-file` at it.
 - **Engines on another node cannot connect**: maru-server listens on
-  `127.0.0.1` by default, and so does `region_mapper.sh`; the region mapper
+  `127.0.0.1` by default, and so does `remote_cxl_agent.sh`; the remote CXL agent
   service listens on its RDMA NIC's address. Set `MARU_SERVER_BIND_HOST` and
   `MARU_MEMORY_NODE_HOST` to addresses the workers reach.

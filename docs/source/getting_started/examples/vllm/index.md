@@ -168,15 +168,15 @@ using per-chunk injection rather than a concatenated 1D load.
 ## CXL on memory nodes over RDMA
 
 Engines on nodes without CXL keep KV in the CXL pool of memory nodes and move
-it over RDMA (`maru_storage_backend="remote_cxl"`). Each memory node runs a region
-mapper that maps and registers regions for the workers; maru-server allocates
+it over RDMA (`maru_storage_backend="remote_cxl"`). Each memory node runs a remote CXL
+agent that maps and registers regions for the workers; maru-server allocates
 the regions as for local CXL.
 
 ```bash
 cd examples/vllm/remote_cxl
 # One host with 2 GPUs, an RDMA NIC, a CXL/DAX device, the resource manager
 # running (sudo systemctl start maru-resource-manager) and NIXL (uv pip install nixl)
-MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
+MARU_DAX_PATH=/dev/dax0.0 MARU_AGENT_UCX_DEVICE=mlx5_0:1 \
 MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh
 ```
 

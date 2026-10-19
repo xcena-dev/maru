@@ -146,16 +146,16 @@ session of the same namespace can lease and read them. A session opens only if
 its schema and page size match those of the namespace's other sessions and of
 the regions kept for workers that left, since it may read their keys. A session
 may hold no region for a while (its only region went back) and asks for one
-with `expand`. MaruServer hands the pool's region mapper list to the workers in
+with `expand`. MaruServer hands the pool's remote CXL agent list to the workers in
 the handshake.
 
-![MaruServer keeps the regions of a worker that left. (a) A leaves: MaruServer holds R's mapping at the region mapper, and B still reads k. (b) When the Resource Manager is full, MaruServer stops finding R's keys, releases R at the region mapper and only then frees it](../image/remote_cxl_kept_region.png)
+![MaruServer keeps the regions of a worker that left. (a) A leaves: MaruServer holds R's mapping at the remote CXL agent, and B still reads k. (b) When the Resource Manager is full, MaruServer stops finding R's keys, releases R at the remote CXL agent and only then frees it](../image/remote_cxl_kept_region.png)
 
 **Regions of a worker that left.** When a session closes drained or expires,
 MaruServer takes its regions over. A region that holds keys is *kept*: its
 keys are still found, and the `RegionKeeper` thread holds its mapping at the
-region mapper so readers keep reading. A region without keys goes back. The
-keeper releases a region at its region mapper before MaruServer frees it at
+remote CXL agent so readers keep reading. A region without keys goes back. The
+keeper releases a region at its remote CXL agent before MaruServer frees it at
 the Resource Manager, so a late RDMA WRITE fails at the NIC. A kept region goes
 back when:
 
@@ -165,29 +165,29 @@ back when:
   holds a region is refused more and evicts its own keys instead;
 - its memory node rebooted (the boot id differs from the one its owner
   reported), since bytes in the node's CPU cache may be lost;
-- its region mapper refuses its handle (someone released it);
-- its region mapper has not answered for 30 seconds, as a live owner removes
+- its remote CXL agent refuses its handle (someone released it);
+- its remote CXL agent has not answered for 30 seconds, as a live owner removes
   the keys of a region it cannot reach. The keeper notices at its next check
   (every 10 seconds) once its request times out (10 seconds), so the keys stop
-  being found somewhat later than 30 seconds after the region mapper stopped
-  answering. The region is released and freed once the region mapper answers
+  being found somewhat later than 30 seconds after the remote CXL agent stopped
+  answering. The region is released and freed once the remote CXL agent answers
   again.
 
 When maru-server stops, the keeper releases the regions it took over at their
-region mappers and frees them before it exits, so a reader's open connection
+remote CXL agents and frees them before it exits, so a reader's open connection
 does not keep one registered after the Resource Manager hands it out again.
-The keeper talks to the region mappers on its own thread, so a memory node
-that does not answer delays no request. It proves the region mapper key like a
-worker (`--region-mapper-key-file`).
+The keeper talks to the remote CXL agents on its own thread, so a memory node
+that does not answer delays no request. It proves the remote CXL agent key like a
+worker (`--remote-cxl-agent-key-file`).
 
 **Handles.** MaruServer gives a region's handle, with the Resource Manager's
 auth token, only to the session that owns the region. Other sessions get a
 read handle with `acquire`: the region's number, offset and length with a read
-token derived from the auth token. A region mapper maps a read handle only for
+token derived from the auth token. A remote CXL agent maps a read handle only for
 a region it has mapped, and only the region's handle releases a region, so a
 reader cannot take a region away from its owner.
 
-![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; B's release of R is refused at the region mapper, and A's writes keep going](../image/remote_cxl_read_handle.png)
+![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; B's release of R is refused at the remote CXL agent, and A's writes keep going](../image/remote_cxl_read_handle.png)
 
 | Action | Operation |
 |--------|-----------|
@@ -196,5 +196,5 @@ reader cannot take a region away from its owner.
 | `heartbeat` | Renew the session; reports usage and each region's boot id |
 | `commit` / `probe` / `acquire` / `release` | Register keys / check them / lease them for a read / end the lease |
 | `victims` / `remove` | Least recently used unleased keys of own regions / remove them |
-| `return_region` | Give one region back after its region mapper released it |
+| `return_region` | Give one region back after its remote CXL agent released it |
 

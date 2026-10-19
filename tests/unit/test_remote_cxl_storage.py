@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Remote CXL storage client against the real directory and a real region mapper
+"""Remote CXL storage client against the real directory and a real remote CXL agent
 served on loopback TCP; the CXL device, the resource manager and NIXL are
 fakes."""
 
@@ -18,7 +18,7 @@ from maru_common.storage_types import (
     StorageError,
     StorageUnavailableError,
 )
-from maru_handler.storage.remote_cxl import RemoteCxlStorageClient, pick_mapper
+from maru_handler.storage.remote_cxl import RemoteCxlStorageClient, pick_agent
 from maru_remote.region_map import RegionMapError, read_handle
 from maru_remote.transport import NixlTransport
 from maru_server.region_keeper import RegionKeeper
@@ -37,9 +37,9 @@ PAGE = 4096  # a region must start on a page for mmap
 
 
 class Rpc:
-    def __init__(self, directory, mappers):
+    def __init__(self, directory, agents):
         self.directory = directory
-        self.mappers = mappers
+        self.agents = agents
         self.lost_replies: set[str] = set()  # actions that run but never reply
         self.unreachable: set[str] = set()  # actions that never reach the server
 
@@ -54,7 +54,7 @@ class Rpc:
             "capabilities": [STORAGE_CAPABILITY, REMOTE_CXL_STORAGE_CAPABILITY],
             "server_epoch": self.directory.server_epoch,
             "rm_address": "mem1:9850",
-            "region_mappers": list(self.mappers),
+            "remote_cxl_agents": list(self.agents),
         }
 
     def storage(self, action, payload):
@@ -105,7 +105,7 @@ class World:
                 "chunk_size_bytes": PAGE,
                 "rdma_staging_size": staging_pages * PAGE,
                 "metadata_only": metadata_only,
-                "region_mapper_key_file": key_file(),
+                "remote_cxl_agent_key_file": key_file(),
                 **kwargs,
             },
         )
@@ -135,7 +135,7 @@ class World:
 
 @pytest.fixture(autouse=True)
 def _short_backoff(monkeypatch):
-    """A region mapper that failed is tried again after 50 ms, not 5 s."""
+    """A remote CXL agent that failed is tried again after 50 ms, not 5 s."""
     monkeypatch.setattr(datapath, "DOWN_BACKOFF_S", 0.05)
 
 
@@ -198,7 +198,7 @@ def test_bytes_go_to_the_remote_page_and_come_back(world):
     assert read(a, ["k", "x"]) == [b"hello", None]
 
 
-def test_the_region_mapper_checks_a_region_once_and_shares_its_registration(world):
+def test_the_remote_cxl_agent_checks_a_region_once_and_shares_its_registration(world):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"shared")
     region = only_region(a)
@@ -543,7 +543,7 @@ def test_a_kept_region_goes_back_only_after_its_release(world):
     assert region.region_id not in world.node.service.holders()
     b._data.forget(region.pool_id)
     with pytest.raises(StorageUnavailableError, match="released"):
-        b._data.region(region.pool_id, read_handle(region.handle), b.region_mappers)
+        b._data.region(region.pool_id, read_handle(region.handle), b.remote_cxl_agents)
 
 
 def test_a_full_rm_gives_back_the_kept_region_read_longest_ago(world):
@@ -608,7 +608,7 @@ def test_a_write_still_in_flight_at_close_cannot_land_on_the_next_owner(world):
     assert read(c, ["mine"]) == [b"mine"]
 
 
-def test_an_unreachable_region_mapper_keeps_the_regions(world):
+def test_an_unreachable_remote_cxl_agent_keeps_the_regions(world):
     a = world.client("a")
     put(a, "k", b"v")
     region = only_region(a)
@@ -640,7 +640,7 @@ def test_a_failed_deregistration_keeps_the_regions(world):
     assert [pool_id for pool_id, *_ in world.directory.departed()] == [region.pool_id]
 
 
-def test_a_restarted_region_mapper_confirms_the_release(world):
+def test_a_restarted_remote_cxl_agent_confirms_the_release(world):
     a = world.client("a")
     put(a, "k", b"v")
     region = only_region(a)
@@ -652,7 +652,7 @@ def test_a_restarted_region_mapper_confirms_the_release(world):
     assert world.cxl.released == [region.region_id]
 
 
-def test_the_keeper_maps_a_kept_region_again_after_its_mapper_restarts(world):
+def test_the_keeper_maps_a_kept_region_again_after_its_agent_restarts(world):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"v")
     region = only_region(a)
@@ -729,10 +729,10 @@ def test_a_reader_finishing_after_a_give_back_keeps_its_bytes(world):
     leases[0].release()
 
 
-# ---------------------------------------------------------- region mapper failures
+# ---------------------------------------------------------- remote CXL agent failures
 
 
-def test_a_region_mapper_restart_maps_the_regions_again(world):
+def test_a_remote_cxl_agent_restart_maps_the_regions_again(world):
     a, b = world.client("a"), world.client("b")
     put(a, "before", b"1")
     world.node.restart()
@@ -755,7 +755,7 @@ def test_an_unreachable_region_is_set_aside_and_its_keys_removed(shared, monkeyp
     down = next(
         n
         for n in shared.nodes
-        if n.address == pick_mapper(a.region_mappers, first.region_id)
+        if n.address == pick_agent(a.remote_cxl_agents, first.region_id)
     )
     down.stop()
     ok = False
@@ -778,7 +778,7 @@ def test_an_unreachable_region_is_set_aside_and_its_keys_removed(shared, monkeyp
     assert a.batch_exists(["k1", "k2"]) == [False, True]
     assert handle.location.pool_id != first.pool_id
     down_regions = [r for r in a.regions.values() if not r.reachable]
-    assert len(down_regions) <= len(a.region_mappers)
+    assert len(down_regions) <= len(a.remote_cxl_agents)
     # The node comes back on the same address: the region is used again.
     down._start()
     time.sleep(0.1)  # the back-off after the failed map ends
@@ -790,16 +790,16 @@ def test_a_down_node_keeps_only_its_regions_from_going_back(shared):
     a = shared.client("a", pages=1)
     put(a, "k1", b"1")
     while (
-        len({pick_mapper(a.region_mappers, r.region_id) for r in a.regions.values()})
+        len({pick_agent(a.remote_cxl_agents, r.region_id) for r in a.regions.values()})
         < 2
     ):
         put(a, f"k{len(a.regions) + 1}", b"x")  # a region on each node
-    down_address = pick_mapper(a.region_mappers, only_region_on(a, 0).region_id)
+    down_address = pick_agent(a.remote_cxl_agents, only_region_on(a, 0).region_id)
     down = next(n for n in shared.nodes if n.address == down_address)
     kept = {
         r.region_id
         for r in a.regions.values()
-        if pick_mapper(a.region_mappers, r.region_id) == down_address
+        if pick_agent(a.remote_cxl_agents, r.region_id) == down_address
     }
     down.stop()
     a.close()
@@ -810,7 +810,7 @@ def test_a_down_node_keeps_only_its_regions_from_going_back(shared):
     assert set(shared.cxl.regions) == kept
 
 
-def test_a_region_no_mapper_ever_mapped_goes_back_without_a_release(world):
+def test_a_region_no_agent_ever_mapped_goes_back_without_a_release(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     first = only_region(a)
@@ -873,7 +873,7 @@ def test_a_region_mapped_without_an_access_is_released_before_it_goes_back(world
     assert held_at_return == [{first.region_id}]
 
 
-def test_a_region_the_mapper_failed_to_map_is_not_asked_again_at_once(
+def test_a_region_the_agent_failed_to_map_is_not_asked_again_at_once(
     world, monkeypatch
 ):
     monkeypatch.setattr(datapath, "DOWN_BACKOFF_S", 60.0)
@@ -927,7 +927,7 @@ def test_a_rebooted_memory_node_voids_the_keys_of_its_regions(world):
     assert b.batch_exists(["k", "k2"]) == [False, True]
 
 
-def test_a_restarted_region_mapper_keeps_the_keys(world):
+def test_a_restarted_remote_cxl_agent_keeps_the_keys(world):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"v")
     world.node.restart()  # the process only: the node's caches stay
@@ -936,8 +936,8 @@ def test_a_restarted_region_mapper_keeps_the_keys(world):
     assert b.batch_exists(["k"]) == [True]
 
 
-def test_a_peer_is_connected_anew_after_its_mapper_connection_broke(world):
-    """A region mapper that stopped answering for a while comes back.
+def test_a_peer_is_connected_anew_after_its_agent_connection_broke(world):
+    """A remote CXL agent that stopped answering for a while comes back.
 
     The workers' requests to it timed out, so their connections broke, and
     UCX failed their connections to its NIXL agent on its own. The agent is
@@ -962,9 +962,9 @@ def test_a_peer_is_connected_anew_after_its_mapper_connection_broke(world):
         assert peer in agent.peers and peer not in agent.failed
 
 
-def test_a_failed_peer_is_connected_anew_while_its_mapper_connection_holds(world):
+def test_a_failed_peer_is_connected_anew_while_its_agent_connection_holds(world):
     """UCX failed a reader's connection, and no request broke the connection
-    to the region mapper; mapping another region of that node loads its
+    to the remote CXL agent; mapping another region of that node loads its
     metadata into a new connection."""
     a, b = world.client("a", pages=1), world.client("b")
     put(a, "k1", b"1")
@@ -979,7 +979,7 @@ def test_a_failed_peer_is_connected_anew_while_its_mapper_connection_holds(world
     assert read(b, ["k1"]) == [b"1"]  # the first region maps again
 
 
-def test_the_region_mapper_drops_the_connection_checks(world):
+def test_the_remote_cxl_agent_drops_the_connection_checks(world):
     a = world.client("a", pages=1)
     put(a, "k1", b"1")
     put(a, "k2", b"2")  # a second region: its map checks the loaded peer
@@ -988,7 +988,7 @@ def test_the_region_mapper_drops_the_connection_checks(world):
     assert world.node.agent.notifs == []
 
 
-def test_a_restarted_region_mappers_old_peer_is_dropped(world):
+def test_a_restarted_remote_cxl_agents_old_peer_is_dropped(world):
     a = world.client("a")
     put(a, "k", b"1")
     old = world.node.agent.name
@@ -1079,22 +1079,22 @@ def test_a_reply_from_an_ended_connection_is_not_used_before_any_newer_load(
 
 
 def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
-    """One of two region mappers of the pool is down: eviction frees pages
+    """One of two remote CXL agents of the pool is down: eviction frees pages
     only in regions on the node that answers."""
     a = shared.client("a", pages=1)
     for i in range(8):  # one page per region: one region per key
         put(a, f"k{i}", bytes([i]))
     by_node = {}
     for region in a.regions.values():
-        by_node.setdefault(pick_mapper(a.region_mappers, region.region_id), []).append(
-            region
-        )
+        by_node.setdefault(
+            pick_agent(a.remote_cxl_agents, region.region_id), []
+        ).append(region)
     assert len(by_node) == 2
     first = a._keys["k0"].pool_id  # the least recently used key
     down = next(
         n
         for n in shared.nodes
-        if n.address == pick_mapper(a.region_mappers, a.regions[first].region_id)
+        if n.address == pick_agent(a.remote_cxl_agents, a.regions[first].region_id)
     )
     down.stop()
     a._data.boots([down.address])  # the heartbeat finds it down
@@ -1116,7 +1116,7 @@ def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     assert all(a._writable(r) for r in by_node[down.address])
 
 
-def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):
+def test_a_store_does_not_evict_while_its_remote_cxl_agent_is_down(world):
     """The freed page could not be written, so the keys stay."""
     a = world.client("a", pages=1)
     put(a, "k", b"v")
@@ -1128,14 +1128,14 @@ def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):
     assert a.batch_exists(["k"]) == [True]
 
 
-def test_expanding_resumes_once_the_region_mapper_answers(world):
+def test_expanding_resumes_once_the_remote_cxl_agent_answers(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     world.node.restart()  # same address; the first map after it fails over
     world.node.stop()
     with pytest.raises(MemoryError):
         put(a, "k2", b"w")
-    assert not a._may_expand()  # the only region mapper is down
+    assert not a._may_expand()  # the only remote CXL agent is down
     time.sleep(0.1)  # the back-off ends; no store waits on the node meanwhile
     assert not a._may_expand()
     world.node._start()
@@ -1145,8 +1145,8 @@ def test_expanding_resumes_once_the_region_mapper_answers(world):
     assert put(a, "k3", b"x")[0] is True
 
 
-def test_a_region_whose_mapper_restarts_in_time_keeps_its_keys(world):
-    """The owner's map of its region fails while the region mapper restarts:
+def test_a_region_whose_agent_restarts_in_time_keeps_its_keys(world):
+    """The owner's map of its region fails while the remote CXL agent restarts:
     the region is set aside, and the retry maps it again within the grace,
     so its keys stay and another worker reads them."""
     a, b = world.client("a", pages=2), world.client("b")
@@ -1175,7 +1175,7 @@ def test_reads_of_a_down_node_miss_without_waiting_for_it(world, monkeypatch):
     client = b._data._client(world.node.address)
 
     def no_connect(handle):
-        raise AssertionError("a down region mapper was asked again")
+        raise AssertionError("a down remote CXL agent was asked again")
 
     client.map = no_connect
     free = b._staging.free_count()
@@ -1384,13 +1384,13 @@ def test_a_reboot_is_noticed_without_writing_to_the_region(world):
     assert b.batch_exists(["k"]) == [False]
 
 
-def test_a_wrong_handle_is_refused_by_the_region_mapper(world):
+def test_a_wrong_handle_is_refused_by_the_remote_cxl_agent(world):
     a = world.client("a")
     region = only_region(a)
     a._data.forget(region.pool_id)
     forged = {**region.handle, "auth_token": 1}
     with pytest.raises(StorageUnavailableError, match="could not be mapped"):
-        a._data.region("forged", forged, a.region_mappers)
+        a._data.region("forged", forged, a.remote_cxl_agents)
 
 
 # ----------------------------------------------------------------- shared pool
@@ -1404,7 +1404,7 @@ def test_a_shared_pool_spreads_regions_and_readers_follow_the_owner(shared):
     assert read(reader, [f"k{i}" for i in range(4)]) == [bytes([i]) for i in range(4)]
     for c in owners:
         region = only_region(c)
-        node = pick_mapper(c.region_mappers, region.region_id)
+        node = pick_agent(c.remote_cxl_agents, region.region_id)
         # The owner and the reader map the region through the same node.
         holder = next(n for n in shared.nodes if n.address == node)
         assert len(holder.service.holders()[region.region_id]) == 2
@@ -1412,25 +1412,25 @@ def test_a_shared_pool_spreads_regions_and_readers_follow_the_owner(shared):
         assert region.region_id not in other.service.holders()
 
 
-def test_regions_spread_over_the_region_mappers():
-    mappers = ["mem2:9860", "mem3:9860"]
-    picks = [pick_mapper(mappers, region_id) for region_id in range(1, 201)]
+def test_regions_spread_over_the_remote_cxl_agents():
+    agents = ["mem2:9860", "mem3:9860"]
+    picks = [pick_agent(agents, region_id) for region_id in range(1, 201)]
     assert 70 <= picks.count("mem2:9860") <= 130
     # Every Handler with the same list picks the same node for a region.
-    assert picks == [pick_mapper(list(reversed(mappers)), r) for r in range(1, 201)]
+    assert picks == [pick_agent(list(reversed(agents)), r) for r in range(1, 201)]
 
 
 # -------------------------------------------------------------------- setup
 
 
-def test_a_server_without_remote_cxl_or_region_mappers_is_rejected(world):
+def test_a_server_without_remote_cxl_or_remote_cxl_agents_is_rejected(world):
     class OldRpc(Rpc):
         def handshake(self):
             return {**super().handshake(), "capabilities": [STORAGE_CAPABILITY]}
 
-    class NoMapperRpc(Rpc):
+    class NoAgentRpc(Rpc):
         def handshake(self):
-            return {**super().handshake(), "region_mappers": []}
+            return {**super().handshake(), "remote_cxl_agents": []}
 
     config = MaruConfig(
         storage_backend="remote_cxl",
@@ -1439,7 +1439,7 @@ def test_a_server_without_remote_cxl_or_region_mappers_is_rejected(world):
         pool_size=PAGE,
         chunk_size_bytes=PAGE,
     )
-    for rpc_class in (OldRpc, NoMapperRpc):
+    for rpc_class in (OldRpc, NoAgentRpc):
         c = RemoteCxlStorageClient(
             config,
             rpc_class(world.directory, [world.node.address]),
@@ -1447,7 +1447,7 @@ def test_a_server_without_remote_cxl_or_region_mappers_is_rejected(world):
                 name, agent=FakeNixlAgent(name)
             ),
         )
-        with pytest.raises(StorageError, match="region-mapper"):
+        with pytest.raises(StorageError, match="remote-cxl-agent"):
             c.connect()
 
 

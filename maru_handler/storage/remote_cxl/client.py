@@ -47,7 +47,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         *,
         data: RdmaDataPath | None = None,
         transport_factory: Callable[[str], Any] | None = None,
-        mapper_factory: Callable[[str], Any] | None = None,
+        agent_factory: Callable[[str], Any] | None = None,
     ) -> None:
         """Create a client; :meth:`connect` opens the session.
 
@@ -57,7 +57,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             data: Data path shared with other pools (``PoolRouter``); a new
                 one is made and owned when omitted.
             transport_factory: NIXL transport factory for a new data path.
-            mapper_factory: Region mapper client factory for a new data path.
+            agent_factory: Remote CXL agent client factory for a new data path.
         """
         self.config = config
         self.rpc = rpc
@@ -67,9 +67,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
         self.ever_connected = False
         self.regions: dict[str, RemoteCxlRegion] = {}
         self._owns_data = data is None
-        self._data = data or RdmaDataPath(config, transport_factory, mapper_factory)
+        self._data = data or RdmaDataPath(config, transport_factory, agent_factory)
         self._credentials: dict = {}
-        self._mappers: list[str] = []
+        self._agents: list[str] = []
         self._session_ttl = 30.0
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -97,9 +97,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
     # ------------------------------------------------------------------ setup
 
     @property
-    def region_mappers(self) -> list[str]:
-        """Region mapper addresses MaruServer gave in the handshake."""
-        return list(self._mappers)
+    def remote_cxl_agents(self) -> list[str]:
+        """Remote CXL agent addresses MaruServer gave in the handshake."""
+        return list(self._agents)
 
     def connect(self) -> bool:
         """Handshake, open the session, map its first region, start renewing.
@@ -173,14 +173,14 @@ class RemoteCxlStorageClient(RegionLifecycle):
         capabilities = handshake.get("capabilities", [])
         if STORAGE_CAPABILITY not in capabilities:
             raise StorageError("MaruServer does not support cpu_storage_v1")
-        mappers = [str(m) for m in handshake.get("region_mappers") or []]
+        agents = [str(m) for m in handshake.get("remote_cxl_agents") or []]
         if not self.config.metadata_only:
-            if REMOTE_CXL_STORAGE_CAPABILITY not in capabilities or not mappers:
+            if REMOTE_CXL_STORAGE_CAPABILITY not in capabilities or not agents:
                 raise StorageError(
-                    "Remote CXL storage requires remote_cxl_storage_v1 and --region-mapper "
+                    "Remote CXL storage requires remote_cxl_storage_v1 and --remote-cxl-agent "
                     "on MaruServer"
                 )
-        self._mappers = mappers
+        self._agents = agents
         self._credentials = {
             "server_epoch": handshake["server_epoch"],
             "session_token": uuid.uuid4().hex,
@@ -368,7 +368,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         """A free page: from a region with room, a new region, or eviction.
 
         Only regions a WRITE can reach now are used: a WRITE to a region
-        whose region mapper has not answered since it last failed would fail
+        whose remote CXL agent has not answered since it last failed would fail
         after the transport's timeout and leave the page quarantined. Eviction likewise
         frees pages only in those regions (``_evict``).
         """

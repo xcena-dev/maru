@@ -45,7 +45,7 @@ class PoolRouter:
         urls: list[str],
         *,
         transport_factory: Callable[[str], Any] | None = None,
-        mapper_factory: Callable[[str], Any] | None = None,
+        agent_factory: Callable[[str], Any] | None = None,
     ) -> None:
         """Create one client per pool sharing one data path.
 
@@ -54,7 +54,7 @@ class PoolRouter:
             rpcs: One MaruServer RPC client per pool.
             urls: The pools' MaruServer URLs (the routing identities).
             transport_factory: NIXL transport factory.
-            mapper_factory: Region mapper client factory.
+            agent_factory: Remote CXL agent client factory.
 
         Raises:
             ValueError: if ``rpcs`` and ``urls`` do not pair up one to one.
@@ -63,7 +63,7 @@ class PoolRouter:
             raise ValueError("One RPC client per distinct MaruServer URL is required")
         self.config = config
         self.urls = urls
-        self.data = RdmaDataPath(config, transport_factory, mapper_factory)
+        self.data = RdmaDataPath(config, transport_factory, agent_factory)
         self.clients = [
             RemoteCxlStorageClient(config, rpc, data=self.data) for rpc in rpcs
         ]
