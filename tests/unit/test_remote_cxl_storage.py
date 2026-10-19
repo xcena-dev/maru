@@ -875,6 +875,30 @@ def test_a_restarted_region_mapper_keeps_the_keys(world):
     assert b.batch_exists(["k"]) == [True]
 
 
+def test_a_peer_is_connected_anew_after_its_mapper_connection_broke(world):
+    """A region mapper that stopped answering for a while comes back.
+
+    The workers' requests to it timed out, so their connections broke, and
+    UCX failed their connections to its NIXL agent on its own. The agent is
+    the same process's, so mapping a region again must not load its metadata
+    into the failed peer (NIXL crashes there); the peer is connected anew.
+    """
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    assert read(b, ["k"]) == [b"v"]
+    peer = world.node.agent.name
+    for c, engine in ((a, "a"), (b, "b")):
+        worker_agent(engine).fail_endpoint(peer)
+        client = c._data._client(world.node.address)
+        before = client.generation
+        client._drop()  # a request timed out
+        assert c._data.boots([world.node.address])  # the heartbeat reconnects
+        assert client.generation == before + 1
+    assert put(a, "k2", b"w")[0] is True
+    assert read(b, ["k", "k2"]) == [b"v", b"w"]
+    assert peer in worker_agent("a").peers and peer in worker_agent("b").peers
+
+
 def test_expanding_resumes_once_the_back_off_ends(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")

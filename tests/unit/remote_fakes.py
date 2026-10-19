@@ -6,6 +6,16 @@ from __future__ import annotations
 import ctypes
 
 
+class LoadIntoFailedEndpoint(BaseException):
+    """Metadata was loaded into a peer whose UCX endpoint had failed.
+
+    NIXL 1.2.0 closes a failed endpoint in its error callback but keeps the
+    pointer, and loading metadata into the same peer again unpacks the keys
+    with it: the process crashes (seen as a segfault in
+    ``ucp_ep_rkey_unpack``). A BaseException, so no handler swallows it.
+    """
+
+
 class FakeNixlAgent:
     """Stands in for ``nixl._api.nixl_agent``.
 
@@ -30,6 +40,11 @@ class FakeNixlAgent:
     ``stall`` keeps every new transfer in progress (no bytes move) until
     :meth:`finish_stalled` completes them, which is how a test reproduces a
     transfer that misses its deadline and lands later.
+
+    :meth:`fail_endpoint` is what UCX does when a peer stops answering: the
+    connection fails without any transfer seeing it. Transfers to the peer
+    then end in ``ERR``, and loading its metadata again before removing it
+    raises :class:`LoadIntoFailedEndpoint`, as NIXL crashes there.
     """
 
     registry: dict[str, FakeNixlAgent] = {}
@@ -42,6 +57,7 @@ class FakeNixlAgent:
         # None = every current registration (full metadata)
         self.known: dict[str, set[tuple[int, int, int]] | None] = {}
         self.broken: set[str] = set()
+        self.failed: set[str] = set()  # peers whose endpoint UCX closed
         self.backends: list[tuple[str, dict]] = []
         self.stall = False
         self.fail_next = False
@@ -93,6 +109,8 @@ class FakeNixlAgent:
         assert name in FakeNixlAgent.registry, name
         if conn != "1" and name not in self.peers:
             raise RuntimeError(f"no connection info for new agent {name}")
+        if name in self.failed:
+            raise LoadIntoFailedEndpoint(name)
         self.peers.add(name)
         if ranges == "*":
             self.known[name] = None
@@ -109,6 +127,13 @@ class FakeNixlAgent:
         self.peers.discard(name)
         self.known.pop(name, None)
         self.broken.discard(name)
+        self.failed.discard(name)
+
+    def fail_endpoint(self, name: str) -> None:
+        """Fail the connection to a known peer, as UCX does on its own."""
+        assert name in self.peers, name
+        self.failed.add(name)
+        self.broken.add(name)
 
     @staticmethod
     def _covered(agent: FakeNixlAgent, addr: int, size: int) -> bool:

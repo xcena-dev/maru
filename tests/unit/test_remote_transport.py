@@ -95,8 +95,11 @@ def test_a_write_after_deregistration_fails_and_breaks_the_connection():
     assert r1 == bytearray(16)  # nothing landed
     with pytest.raises(RuntimeError, match="ERR"):
         a.write(peer, [(src_addr, r2_addr, 16)])  # the connection is broken
+    assert a.has_peer(peer)
     assert a.disconnect(peer)
+    assert not a.has_peer(peer)
     a.add_peer(b.partial_metadata(reg2))
+    assert a.has_peer(peer)
     a.write(peer, [(src_addr, r2_addr, 16)])
     assert r2 == src
 

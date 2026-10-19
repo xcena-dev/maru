@@ -260,6 +260,11 @@ class NixlTransport:
             self._agent.remove_remote_agent(name)
             self._peers.discard(name)
 
+    def has_peer(self, name: str) -> bool:
+        """Whether a peer is loaded (added by :meth:`add_peer`, not removed)."""
+        with self._lock:
+            return name in self._peers
+
     def pending_peers(self) -> set[str]:
         """Peers that still have a transfer whose handle is not released."""
         with self._lock:

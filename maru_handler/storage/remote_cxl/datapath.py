@@ -78,7 +78,12 @@ class RdmaDataPath:
         # was not turned into an access; the mapper holds the region for
         # that connection until it is released or the connection ends.
         self._attempted: dict[str, tuple[str, int]] = {}
+        # Region mapper -> (NIXL peer, connection generation) when the peer's
+        # metadata was last loaded through that mapper's connection
+        self._loaded: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
+        # Held from the check of a peer to the load of its metadata
+        self._load_lock = threading.Lock()
 
     def start(self) -> None:
         """Map the staging buffer and register it with this node's NIC.
@@ -188,12 +193,7 @@ class RdmaDataPath:
                 self._attempted[pool_id] = (address, client.generation)
         # The reply names this region's registration only; loading it into a
         # peer this agent already knows adds the region to it.
-        try:
-            peer = self.transport.add_peer(reply.metadata)
-        except Exception as exc:
-            raise StorageUnavailableError(
-                f"NIXL refused the metadata of region {region_id}: {exc}"
-            ) from exc
+        peer = self._load_peer(address, client.generation, reply.metadata, region_id)
         access = RegionAccess(
             peer, reply.addr, reply.length, address, client.generation, reply.boot
         )
@@ -202,6 +202,45 @@ class RdmaDataPath:
             self._down.pop(address, None)
             self._map_failed.pop(pool_id, None)
         return access
+
+    def _load_peer(
+        self, address: str, generation: int, metadata: bytes, region_id: object
+    ) -> str:
+        """Load a map reply's metadata into the region mapper's NIXL peer.
+
+        A peer loaded under an earlier connection to the mapper is dropped
+        first and connected anew. The connection broke because the mapper
+        stopped answering for a while (or restarted), and UCX may have failed
+        its connection to the peer meanwhile without any transfer seeing it.
+        NIXL closes a failed connection but keeps using it when metadata is
+        loaded into the same peer again, which crashes the process.
+
+        Raises:
+            StorageUnavailableError: if NIXL refused to drop the old peer or
+                to load the metadata.
+        """
+        with self._load_lock:
+            with self._lock:
+                loaded = self._loaded.get(address)
+            if (
+                loaded is not None
+                and loaded[1] != generation
+                and self.transport.has_peer(loaded[0])
+                and not self.disconnect({loaded[0]})
+            ):
+                raise StorageUnavailableError(
+                    f"region {region_id} could not be mapped: NIXL kept the "
+                    f"connection to {loaded[0]}"
+                )
+            try:
+                peer = self.transport.add_peer(metadata)
+            except Exception as exc:
+                raise StorageUnavailableError(
+                    f"NIXL refused the metadata of region {region_id}: {exc}"
+                ) from exc
+            with self._lock:
+                self._loaded[address] = (peer, generation)
+        return peer
 
     def is_down(self, address: str) -> bool:
         """Whether a map through this region mapper failed a moment ago."""
@@ -357,6 +396,7 @@ class RdmaDataPath:
             clients = list(self._mappers.values())
             self._mappers.clear()
             self._access.clear()
+            self._loaded.clear()
         for client in clients:
             client.close()  # releases every mapping the connection held
         if self.transport is not None:
