@@ -25,7 +25,7 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - [uv](https://docs.astral.sh/uv/) — recommended Python package installer
 - CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
   - **Multi-node:** All nodes that share the pool over CXL must be connected to the shared CXL memory pool (e.g., via CXL switch). GPU nodes without CXL reach it over RDMA instead (`remote_cxl` backend).
-- For the `remote_cxl` backend: an RDMA NIC (RoCE or InfiniBand) on every worker and memory node, and NIXL in the same environment, installed before `./install.sh` (`uv pip install nixl`, or `pip install nixl` without uv)
+- For the `remote_cxl` backend: an RDMA NIC (RoCE or InfiniBand) on every worker and memory node, a route from the maru-server node to the region mappers on the memory nodes' RDMA network addresses, and NIXL in the same environment, installed before `./install.sh` (`uv pip install nixl`, or `pip install nixl` without uv)
 
 See {doc}`bios_setup` for platform BIOS settings and DEV_DAX verification, and {doc}`../design_doc/consistency_and_safety` for the cache-visibility requirements of cross-host sharing.
 

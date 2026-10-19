@@ -3,6 +3,8 @@
 Maru requires CXL memory exposed as **DEV_DAX** (`/dev/dax*`) on every host
 attached to the CXL memory; with the `remote_cxl` backend, these are the memory
 nodes. Follow your server vendor's CXL setup instructions on each of these hosts.
+Worker nodes without CXL, which use the `remote_cxl` backend, need none of the
+settings on this page.
 
 ## Intel (GNR)
 
@@ -18,8 +20,7 @@ Apply the setting on every participating host, save the configuration, and reboo
 
 A `remote_cxl` pool that several memory nodes share is multi-host sharing too:
 those memory nodes are the hosts that share the CXL memory, so apply the same
-setting on each of them. Worker nodes without CXL need none of the settings on
-this page.
+setting on each of them.
 
 ## AMD (Turin)
 

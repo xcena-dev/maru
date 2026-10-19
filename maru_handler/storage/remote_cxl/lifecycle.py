@@ -189,7 +189,7 @@ class RegionLifecycle:
             logger.info("Remote CXL region %d is reachable again", region.region_id)
 
     def _check_boots(self) -> None:
-        """Remove the keys of own regions whose memory node rebooted.
+        """Give back own regions whose memory node rebooted.
 
         Asks every region mapper of a mapped own region for its boot id, so a
         reboot is noticed even for a region this worker no longer writes.

@@ -39,7 +39,7 @@ flowchart LR
 
 By removing the LMCache middleware layer, the direct connector achieves:
 
-- **Fewer dependencies** — only vLLM + Maru
+- **Fewer dependencies** — only vLLM + Maru (the `remote_cxl` backend also needs NIXL)
 - **Zero-copy save path** (default `cxl` backend) — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
 - **Zero-copy load path** (default `cxl` backend) — CXL mmap (CUDA pinned) → GPU via DMA
 - **No serialization overhead** — raw tensor bytes, no `MemoryObj` conversion
@@ -534,8 +534,8 @@ Example (Llama 7B, fp16):
 | Prefix matching | LMCache CacheEngineKey hashing | vLLM token prefix hashing |
 | Configuration | LMCACHE_CONFIG_FILE YAML | kv_connector_extra_config JSON |
 | Storage backends | `cxl` | `cxl`, `cpu`, `mixed`, `remote_cxl` |
-| Save path | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
-| Load path | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
+| Save path (`cxl` backend) | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
+| Load path (`cxl` backend) | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
 
 ## Troubleshooting
 

@@ -2,9 +2,9 @@
 
 **Maru** is a high-performance **KV cache storage engine built on CXL shared memory**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency.
 
-Transfer-based sharing copies the KV across the network to every node that reuses it, byte by byte. As models get larger and contexts get longer, those copies become a structural bottleneck. On nodes attached to CXL, Maru takes the opposite approach: **don't move data, share the memory.** Instances on those nodes read and write KV cache data directly in CXL shared memory, and only lightweight metadata (tens of bytes) travels between components. GPU nodes without CXL reach the CXL memory of memory nodes with one-sided RDMA: the NICs move the bytes, and no Maru process is on that path.
+Transfer-based sharing copies the KV across the network to every node that reuses it, byte by byte. As models get larger and contexts get longer, those copies become a structural bottleneck. On nodes attached to CXL, Maru takes the opposite approach: **don't move data, share the memory.** Instances on those nodes read and write KV cache data directly in CXL shared memory, and only lightweight metadata (tens of bytes) travels between components. GPU nodes without CXL reach the CXL memory of memory nodes with one-sided RDMA: the NICs move the bytes, and no process on the memory node handles them.
 
-Node A stores the KV it computes in one shared KV cache, and nodes B and C load it instead of recomputing. Nodes reach the cache through a CXL switch or an RDMA network; the nodes that use one pool share its KV.
+Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. Nodes attached to CXL share a CXL memory pool through a CXL switch; GPU nodes without CXL share the CXL memory of memory nodes over an RDMA network with the `remote_cxl` backend. A node shares KV with the other nodes that use the same pool and backend.
 
 :::{image} source/image/maru_shared_kv_cache.png
 :alt: Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network
@@ -13,7 +13,7 @@ Node A stores the KV it computes in one shared KV cache, and nodes B and C load 
 
 ## Key Features
 
-- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. On nodes attached to CXL, Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization. Nodes that reach the pool over RDMA add one copy, between the GPU and a host staging buffer.
+- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. On nodes attached to CXL, Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization. Nodes that reach the pool over RDMA move KV through a host staging buffer: the GPU copies it to and from the buffer, and the NIC moves it to and from the CXL memory with one-sided RDMA.
 
 - **Scales with Context Length and Concurrency** — Network-based sharing degrades as contexts grow and more consumers hit the same KV. On nodes attached to CXL, Maru never fans out KV payloads — scaling is bounded by shared-memory bandwidth, not network transfer.
 

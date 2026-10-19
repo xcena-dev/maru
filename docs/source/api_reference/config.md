@@ -20,6 +20,14 @@ class MaruConfig:
     use_async_rpc: bool = True
     max_inflight: int = 64
     eager_map: bool = True
+    storage_backend: str = "cxl"  # "cpu", "cxl", "mixed" or "remote_cxl"
+    engine_id: str | None = None
+    cache_namespace: str | None = None
+    rdma_device: str = ""
+    rdma_staging_size: int | None = None
+    rdma_timeout_s: float = 30.0
+    rdma_load_reserve: float = 0.0
+    region_mapper_key_file: str = "/etc/maru/region-mapper.key"
 ```
 
 ### Parameters
@@ -35,6 +43,9 @@ class MaruConfig:
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
 | `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
+| `storage_backend` | `str` | `"cxl"` | Where KV lives: `"cxl"` (CXL shared memory mapped on this node), `"cpu"`, `"mixed"`, or `"remote_cxl"` (CXL memory of memory nodes over RDMA) |
+| `engine_id` | `str \| None` | `None` | Engine identity of a storage session; required for `cpu`, `mixed` and `remote_cxl` |
+| `cache_namespace` | `str \| None` | `None` | Namespace whose keys a storage session shares; required for `cpu`, `mixed` and `remote_cxl` |
 | `rdma_device` | `str` | `""` (UCX default) | `remote_cxl` only: RDMA NIC for NIXL/UCX, e.g. `"mlx5_0:1"` |
 | `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` only: host staging buffer registered with the NIC and CUDA (bytes); `None` uses the larger of 64 pages and 1 GiB |
 | `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
