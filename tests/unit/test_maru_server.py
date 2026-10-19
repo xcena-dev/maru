@@ -3,6 +3,7 @@
 """Unit tests for MaruServer orchestration logic."""
 
 from maru_server.server import MaruServer
+from tests.unit.test_remote_cxl_directory import PAGE, commit, open_session
 
 
 class TestMaruBasic:
@@ -267,6 +268,17 @@ class TestGetUsage:
         assert "gone" in by_id
         assert by_id["gone"]["regions"] == 1
         assert by_id["gone"]["used"] == 128
+
+    def test_get_usage_counts_the_kv_of_remote_cxl_regions(self):
+        """A remote_cxl region's stored KV bytes count as its owner's used bytes."""
+        server = MaruServer()
+        creds, pool_id = open_session(server.replica_directory, "w1")
+        assert commit(server.replica_directory, creds, pool_id, "k", 0) == "CREATED"
+        (pool,) = server.replica_directory.get_usage("remote_cxl")["pools"]
+
+        by_id = {i["instance_id"]: i for i in server.get_usage()["instances"]}
+        assert by_id[pool["owner_instance_id"]]["allocated"] == 2 * PAGE
+        assert by_id[pool["owner_instance_id"]]["used"] == 8
 
     def test_get_usage_orphan_kv_region_ignored(self):
         """A KV entry referencing a region with no allocation entry (orphan) is

@@ -394,7 +394,7 @@ class MaruServer:
 
         l1_usage = self.replica_directory.get_usage()
         for pool in l1_usage["pools"]:
-            if pool["medium"] == "cxl":
+            if pool["medium"] in ("cxl", "remote_cxl"):
                 owner = pool["owner_instance_id"]
                 used_by_instance[owner] = (
                     used_by_instance.get(owner, 0) + pool["ready_bytes"]
