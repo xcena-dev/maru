@@ -11,7 +11,7 @@ Maru consists of two server components and a client library:
 | **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
-| **Region Mapper** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-region-mapper` (`maru[rdma]`) |
+| **Region Mapper** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-region-mapper` (needs NIXL) |
 
 In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler, which connects to both the Resource Manager and Metadata Server over the network.
 
@@ -77,7 +77,7 @@ To install **without the Resource Manager** (e.g., on nodes that only run LLM in
 
 > **Note:** Client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager.
 
-With NIXL installed (`pip install 'maru[rdma]'` before `./install.sh`), the
+With NIXL installed (`pip install nixl` before `./install.sh`), the
 installer also sets up the region mapper as `maru-region-mapper.service`, which
 starts and stops with the Resource Manager, and creates the region mapper key
 `/etc/maru/region-mapper.key`. Set the node's RDMA NIC in
@@ -207,6 +207,7 @@ Multi-node requires changing default bind addresses from `127.0.0.1` to a networ
 - **Resource Manager**: change `--host` to accept remote connections
 - **Metadata Server**: change `--host` and set `--rm-address` to the Resource Manager's externally reachable address
 - **MaruHandler**: set `server_url` to the Metadata Server's address. The Resource Manager address is received automatically via handshake.
+- **Region Mapper** (`remote_cxl` backend): set `MARU_RM_ADDRESS` in `/etc/maru/region-mapper.env` to the address the Resource Manager listens on; a Resource Manager bound to a network address answers only there.
 
 To run the Resource Manager as the systemd service on a network address, override its command line:
 

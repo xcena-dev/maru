@@ -277,7 +277,7 @@ stores run on the engine thread unless `maru_async_load` and
 `--no-async-scheduling`, while asynchronous loads run with vLLM's asynchronous
 scheduling on. The worker's staging buffer is registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
-for mapped CXL memory. NIXL is required (`pip install 'maru[rdma]'`).
+for mapped CXL memory. NIXL is required (`pip install nixl`).
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 for one-host and multi-node launch steps.
 

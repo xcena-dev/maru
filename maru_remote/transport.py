@@ -53,7 +53,7 @@ def _default_agent(agent_name: str, ucx_device: str) -> Any:
         A ``nixl_agent`` instance.
 
     Raises:
-        ImportError: if NIXL is not installed (``pip install 'maru[rdma]'``).
+        ImportError: if NIXL is not installed (``pip install nixl``).
     """
     from nixl._api import nixl_agent, nixl_agent_config
 

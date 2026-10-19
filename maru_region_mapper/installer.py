@@ -172,7 +172,7 @@ def install(
     if not nixl_available():
         print(
             "Skipping the region mapper service: NIXL is not installed "
-            "(pip install 'maru[rdma]' to serve remote workers).",
+            "(pip install nixl to serve remote workers).",
             file=sys.stderr,
         )
         return False

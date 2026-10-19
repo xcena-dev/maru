@@ -60,12 +60,12 @@ moves it, as for the cxl backend.
 ## Requirements
 
 - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node, and NIXL
-  with its UCX backend: `pip install 'maru[rdma]'`.
+  with its UCX backend: `pip install nixl`.
 - On the memory nodes: the CXL/DAX device of the pool, visible on every memory
   node of the pool, and the resource manager on one of them, as for a local CXL
-  deployment. Use a devdax device. Install Maru with NIXL
-  (`pip install 'maru[rdma]'`, then `./install.sh`): the installer also sets up
-  the region mapper as a system service that starts and stops with the
+  deployment. Use a devdax device. Install Maru with NIXL (`pip install
+  nixl`, then `./install.sh` from the Maru source tree): the installer also
+  sets up the region mapper as a system service that starts and stops with the
   resource manager, so a memory node runs it without a separate step.
 - Every worker must reach maru-server and each memory node's region mapper and
   NIC, and so must maru-server reach the region mappers.
@@ -159,6 +159,17 @@ scp ~/.maru/region-mapper.key worker1:.maru/region-mapper.key   # keep it 0600
 When maru-server or another memory node reaches the resource manager over the
 network, the resource manager listens on a network address, as in Maru's
 [multi-node configuration](../../../docs/source/getting_started/installation.md#configuration).
+It then answers only on that address, so the region mapper is pointed at it
+too:
+
+```bash
+sudo systemctl edit maru-resource-manager
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/maru-resource-manager --host 10.0.0.2 --port 9850
+sudo sed -i 's/^MARU_RM_ADDRESS=.*/MARU_RM_ADDRESS=10.0.0.2:9850/' /etc/maru/region-mapper.env
+sudo systemctl restart maru-resource-manager   # restarts the region mapper with it
+```
 
 A memory node of a shared pool that does not run the resource manager installs
 the region mapper service alone (`--standalone`: it starts at boot on its own)
@@ -199,10 +210,12 @@ maru-server --host 10.0.0.2 --port $MARU_SERVER_PORT --rm-address 127.0.0.1:9850
   --dax-path /dev/dax1.0
 ```
 
-maru-server allocates each worker's regions from the resource manager, as for
-local CXL, and hands the region mapper list to the workers. It also talks to
-the region mappers itself for the regions of workers that left, so it needs
-the key. A shared pool lists
+With the resource manager on a network address (step 1), also give
+`MARU_RM_ADDRESS=10.0.0.2:9850`; maru-server can then run on any node that
+reaches it. maru-server allocates each worker's regions from the resource
+manager, as for local CXL, and hands the region mapper list to the workers.
+It also talks to the region mappers itself for the regions of workers that
+left, so it needs the key. A shared pool lists
 every memory node, `--region-mapper host1:port,host2:port`; each region is then
 served by one of them, picked from the region number, so every worker reaches
 a region through the same node. maru-server runs once per app and pool.
