@@ -29,7 +29,6 @@ WAL_NAME = "maru-resource-manager.wal"
 CTL = Path(__file__).resolve().parents[1] / "tools/maru_rm_ctl.py"
 
 
-
 class ProcessRecoveryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="maru-rm-process-")
@@ -295,7 +294,8 @@ class ProcessRecoveryTest(unittest.TestCase):
         small = SIZE // 4
         payload = EXTENT.pack(ALIGN, small - ALIGN)
         (self.state / "pool_2.meta").write_bytes(
-            META_HEADER.pack(0x4D455441, 6, 2, zlib.crc32(payload), small - ALIGN, 1) + payload
+            META_HEADER.pack(0x4D455441, 6, 2, zlib.crc32(payload), small - ALIGN, 1)
+            + payload
         )
         (self.state / "global.meta").write_bytes(
             META_HEADER.pack(0x474C4F42, 2, 0, 0, next_id, 0)

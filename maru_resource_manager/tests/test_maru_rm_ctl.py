@@ -146,10 +146,15 @@ class MaruRmCtlTest(unittest.TestCase):
         self.assertIn("may still complete", err.getvalue())
 
     def test_bad_arguments_never_reach_the_rm(self):
-        for argv in (["exclude", "sda"], ["release", "-1"], ["include"], ["wipe"],
-                     ["discard", "dax2.0", "--force"],
-                     ["release", "42", "--force"],
-                     ["include", "dax2.0", "--adopt", "--reinit"]):
+        for argv in (
+            ["exclude", "sda"],
+            ["release", "-1"],
+            ["include"],
+            ["wipe"],
+            ["discard", "dax2.0", "--force"],
+            ["release", "42", "--force"],
+            ["include", "dax2.0", "--adopt", "--reinit"],
+        ):
             with (
                 self.assertRaises(SystemExit),
                 contextlib.redirect_stderr(io.StringIO()),

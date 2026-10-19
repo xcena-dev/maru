@@ -850,9 +850,7 @@ class TestShmClientDeviceTable:
 
             # (b) Not scannable, but the RM path carries this UUID.
             monkeypatch.setattr("maru_shm.client.scan_dax_devices", lambda: [])
-            monkeypatch.setattr(
-                "maru_shm.client.read_device_uuid", lambda p: test_uuid
-            )
+            monkeypatch.setattr("maru_shm.client.read_device_uuid", lambda p: test_uuid)
             client = MaruShmClient(address="127.0.0.1:1", device_table={})
             assert client._resolve_device_path(rm_path, test_uuid) == rm_path
 

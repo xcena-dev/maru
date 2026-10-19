@@ -125,7 +125,9 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("device", nargs="?", type=device_name)
     exclude = commands.add_parser("exclude", help="stop using a device")
     exclude.add_argument("device", type=device_name)
-    include = commands.add_parser("include", help="judge an excluded or refused device again")
+    include = commands.add_parser(
+        "include", help="judge an excluded or refused device again"
+    )
     include.add_argument("device", type=device_name)
     mode = include.add_mutually_exclusive_group()
     mode.add_argument(
@@ -136,8 +138,7 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--adopt",
         action="store_true",
-        help="accept the Maru header on an excluded device that has no "
-        "identity record",
+        help="accept the Maru header on an excluded device that has no identity record",
     )
     mode.add_argument(
         "--restore-header",
