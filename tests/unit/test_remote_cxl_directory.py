@@ -656,6 +656,41 @@ def test_refusals_give_back_one_kept_region_at_a_time(env):
     assert list(fates(directory).values()).count("return") == 1
 
 
+def test_room_goes_to_a_worker_without_a_region_before_one_that_wants_more(env):
+    """The room a refused first region made is not taken by another's expand."""
+    directory, rm, _ = env
+    a, pool = open_session(directory, "a")
+    commit(directory, a, pool, "a-k", 0)
+    call(directory, "close", **a, drained=True)  # its region is kept
+    b, _ = open_session(directory, "b")
+    rm.limit = rm.used  # full
+    with pytest.raises(ValueError, match="reservation failed"):
+        open_session(directory, "c")  # c has no region yet
+    assert directory.make_room() == 1
+    released_by_keeper(directory)  # a's region is back at the RM
+    with pytest.raises(ValueError, match="without a region"):
+        expand(directory, b)  # b evicts its own keys instead
+    open_session(directory, "c")  # c gets the room
+    with pytest.raises(ValueError, match="reservation failed"):
+        expand(directory, b)
+    assert directory.make_room() == 0  # nothing kept is left
+
+
+def test_a_worker_that_stopped_asking_for_a_region_holds_no_room(env):
+    directory, rm, clock = env
+    b, _ = open_session(directory, "b")
+    rm.limit = rm.used
+    with pytest.raises(ValueError, match="reservation failed"):
+        open_session(directory, "c")
+    rm.limit = rm.used + 2 * PAGE
+    with pytest.raises(ValueError, match="without a region"):
+        expand(directory, b)
+    clock.advance(20)
+    heartbeat(directory, b)
+    clock.advance(11)  # c has not asked again for 31 s
+    expand(directory, b)
+
+
 def test_a_region_stuck_on_its_way_back_does_not_block_room_for_ever(env):
     directory, rm, clock = env
     for name in ("a", "b"):

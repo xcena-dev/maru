@@ -566,6 +566,26 @@ def test_a_full_rm_gives_back_the_kept_region_read_longest_ago(world):
     assert put(b, "b4", b"4")[0] and len(b.regions) == 2
 
 
+def test_the_room_a_kept_region_makes_goes_to_a_worker_without_one(world):
+    """A worker that could not open its session gets the room before another
+    worker that already has a region grows into it."""
+    world.cxl.size = 4 * PAGE  # room for two regions of two pages
+    a = world.client("a", pages=2)
+    put(a, "k", b"v")
+    a.close()
+    world.keeper.run_once()  # a's region is kept
+    b = world.client("b", pages=2)
+    with pytest.raises(StorageUnavailableError, match="reservation failed"):
+        world.client("c", pages=2)  # its engine retries a few seconds later
+    world.keeper.run_once()
+    world.keeper.run_once()  # a's region is back at the RM
+    put(b, "b1", b"1")
+    put(b, "b2", b"2")
+    assert put(b, "b3", b"3")[0] and len(b.regions) == 1  # b evicted instead
+    c = world.client("c", pages=2)
+    assert put(c, "c1", b"1")[0] is True
+
+
 def test_a_write_still_in_flight_at_close_cannot_land_on_the_next_owner(world):
     a = world.client("a", rdma_timeout_s=0.01)
     agent = worker_agent("a")

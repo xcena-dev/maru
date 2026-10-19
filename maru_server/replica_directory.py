@@ -43,6 +43,9 @@ RELEASE_RETRY_S = 1.0
 # A kept region given back to make room is waited for this long before
 # another one goes for the same reason.
 ROOM_WAIT_S = 30.0
+# A worker refused its first region is waited for this long: meanwhile no
+# session that already holds a region gets another one.
+FIRST_REGION_WAIT_S = 30.0
 
 
 def _bound(items: dict, limit: int) -> None:
@@ -143,6 +146,8 @@ class ReplicaDirectory:
         self._refused_reservations = 0
         # Kept regions given back to make room, not at the RM yet -> when
         self._room_pending: dict[str, float] = {}
+        # Engines refused their first remote CXL region -> when last refused
+        self._first_region_waits: dict[str, float] = {}
         # Set when there is work for the region keeper
         self.keeper_wakeup = Event()
         self._next_release_retry = 0.0
@@ -316,7 +321,9 @@ class ReplicaDirectory:
             )
         regions = {}
         if region_size:
-            region = self._reserve_region(namespace, schema, region_size, page_size)
+            region = self._reserve_first_region(
+                engine, namespace, schema, region_size, page_size
+            )
             regions[region.pool_id] = region
         session = StorageSession(
             token,
@@ -356,6 +363,26 @@ class ReplicaDirectory:
             raise ValueError(
                 "Remote CXL regions of this namespace use another schema or page size"
             )
+
+    def _reserve_first_region(
+        self, engine: str, namespace: str, schema: str, size: int, page_size: int
+    ) -> StoragePool:
+        """A session's first region; a refusal makes the engine wait first in line."""
+        try:
+            region = self._reserve_region(namespace, schema, size, page_size)
+        except ValueError:
+            self._first_region_waits[engine] = self._clock()
+            raise
+        self._first_region_waits.pop(engine, None)
+        return region
+
+    def _waiting_for_first_region(self, engine: str) -> bool:
+        """Whether another engine was refused its first region lately."""
+        now = self._clock()
+        for waiter, since in list(self._first_region_waits.items()):
+            if now - since > FIRST_REGION_WAIT_S:
+                del self._first_region_waits[waiter]
+        return any(waiter != engine for waiter in self._first_region_waits)
 
     def _reserve_region(
         self, namespace: str, schema: str, size: int, page_size: int
@@ -415,9 +442,25 @@ class ReplicaDirectory:
             return {"pool": self._pool_info(session.regions[given])}
         if len(session.regions) >= MAX_REGIONS_PER_SESSION:
             raise ValueError("Remote CXL region limit of the session reached")
-        region = self._reserve_region(
-            session.namespace, session.schema, session.region_size, session.page_size
-        )
+        if not session.regions:
+            region = self._reserve_first_region(
+                session.engine_id,
+                session.namespace,
+                session.schema,
+                session.region_size,
+                session.page_size,
+            )
+        elif self._waiting_for_first_region(session.engine_id):
+            # The space that comes free goes to the worker without a region;
+            # this session evicts its own keys instead.
+            raise ValueError("Remote CXL space is held for a worker without a region")
+        else:
+            region = self._reserve_region(
+                session.namespace,
+                session.schema,
+                session.region_size,
+                session.page_size,
+            )
         session.regions[region.pool_id] = region
         session.expansions[op_id] = region.pool_id
         _bound(session.expansions, MAX_REGIONS_PER_SESSION)
