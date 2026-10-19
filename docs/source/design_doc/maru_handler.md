@@ -265,6 +265,19 @@ the Handler asks MaruServer for its least recently used unleased keys
 (`victims`) and removes them. A page is reused only after MaruServer
 confirmed that no key refers to it.
 
+**A memory node that stops answering.** A region whose region mapper cannot
+map it is set aside: its keys are removed, so probes stop reporting hits that
+would fail to read, and a background retry maps it again. Stores pass over
+regions whose region mapper failed a moment ago, and while every region
+mapper of the pool is down the Handler evicts nothing and skips the store,
+since no WRITE could reach the freed pages. When the memory node answers
+again, the Handler maps its regions anew; before it loads a map reply into a
+NIXL peer it already knows, it checks that NIXL's connection to the peer has
+not failed (UCX fails an unanswered connection on its own, even an idle one)
+and otherwise drops the peer and connects anew. NIXL 1.2.0 keeps a failed
+connection's closed endpoint in the peer, and loading into it crashes the
+process.
+
 **Giving regions back.** A region goes back to the Resource Manager only after
 its region mapper deregistered it from the NIC (`release`):
 
