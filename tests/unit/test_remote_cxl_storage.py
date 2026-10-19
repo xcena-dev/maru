@@ -895,7 +895,7 @@ def test_a_region_the_agent_failed_to_map_is_not_asked_again_at_once(
     assert not a._data.is_down(world.node.address)
 
 
-def test_a_failed_release_does_not_stop_the_other_regions_of_its_mapper(world):
+def test_a_failed_release_does_not_stop_the_other_regions_of_its_agent(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     put(a, "k2", b"w")  # the full region gets a second one
