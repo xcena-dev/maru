@@ -86,6 +86,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # Keys that must leave MaruServer (region unreachable or its memory
         # node rebooted), retried while a reader's lease keeps them
         self._dropping: list[dict] = []
+        # Regions whose memory node rebooted and that could not go back yet
+        self._unreturned: list[RemoteCxlRegion] = []
+        # Read leases whose release was not confirmed: MaruServer keeps a
+        # lease while the session lives, and a leased key cannot be evicted
+        self._unreleased: list[str] = []
         self._isolated: list[IsolatedTransfer] = []
         self._staging_warned = False
 
@@ -223,7 +228,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def _ensure(self, data: bool = True) -> None:
         if not self.connected or self._stop.is_set():
             raise StorageUnavailableError("Remote CXL cache session is unavailable")
-        if data and not self.regions:
+        if data and self.config.metadata_only:
+            # A data client may hold no region for a while (its only region
+            # went back after a reboot); its next store asks for one.
             raise RuntimeError("A metadata-only client cannot access RDMA buffers")
 
     def _stop_data_path(self) -> None:
@@ -259,6 +266,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     self._resolve_pending()
                     self._retry_removes()
                     self._retry_drops()
+                    self._retry_returns()
+                    self._retry_lease_releases()
                     self._reap_isolated()
                 except Exception:
                     logger.warning(
@@ -522,6 +531,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
         from maru_remote.transport import TransferTimeout, TransferUncertainError
 
         region = group[0].region
+        if region.retired:
+            # It went back after the pages were taken (memory node rebooted).
+            self._give_back(group)
+            return False
         try:
             access = self._map_own(region)
         except StorageUnavailableError as exc:
@@ -530,6 +543,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
             )
             self._give_back(group)
             self._set_aside(region)
+            return False
+        if region.retired:
+            # Its memory node rebooted and the region went back.
+            self._give_back(group)
             return False
         pairs = [
             (
@@ -604,7 +621,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
             return [False] * len(keys)  # retain uncertain ownership
         for key, handle, status in zip(keys, handles, statuses, strict=True):
             handle.region.untrack(handle)
-            if status == "CREATED":
+            if status == "CREATED" and handle.region.retired:
+                # Its region went back (memory node rebooted): MaruServer
+                # dropped the key with it.
+                handle.state = "freed"
+            elif status == "CREATED":
                 handle.state = "ready"
                 self._keys[key] = handle.location
             else:
@@ -775,7 +796,17 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 )
                 if handle is None:
                     raise StorageUnavailableError("No region for a leased location")
+                if not 0 < location.length <= self._staging.slot_bytes:
+                    # A READ longer than its slot would land in the next one.
+                    raise StorageUnavailableError(
+                        f"A leased location of {location.length} bytes does not "
+                        f"fit a {self._staging.slot_bytes}-byte staging slot"
+                    )
                 access = self._region(location.pool_id, handle)
+                if location.offset + location.length > access.length:
+                    raise StorageUnavailableError(
+                        "A leased location ends past its region"
+                    )
                 by_peer.setdefault(access.peer, []).append(
                     (
                         self._staging.addr(slot),
@@ -817,12 +848,34 @@ class RemoteCxlStorageClient(RegionLifecycle):
         return True
 
     def _release_lease(self, lease_id: str) -> bool:
-        """Release a server lease; True only if it held for the whole read."""
+        """Release a server lease; True only if it held for the whole read.
+
+        A release that cannot be confirmed is sent again by the housekeeping
+        (:meth:`_retry_lease_releases`); MaruServer answers a release of a
+        lease it no longer has.
+        """
         try:
             return bool(self._call("release", lease_id=lease_id).get("held"))
         except Exception:
             logger.warning("RDMA read lease release could not be confirmed")
+            self._unreleased.append(lease_id)
+            # MaruServer refuses leases past 4096 per session anyway.
+            del self._unreleased[:-4096]
             return False
+
+    def _retry_lease_releases(self) -> None:
+        """Send the unconfirmed lease releases again until one is answered."""
+        pending, self._unreleased = self._unreleased, []
+        for i, lease_id in enumerate(pending):
+            try:
+                self._call("release", lease_id=lease_id)
+            except StorageError:
+                # Refused: the session is gone (MaruServer restarted), and
+                # with it the lease.
+                continue
+            except Exception:
+                self._unreleased.extend(pending[i:])
+                return
 
     def _end_read(self, slot: int) -> Callable[[], None]:
         def release() -> None:

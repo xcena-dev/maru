@@ -80,6 +80,10 @@ class PendingTransfer:
         self._transport = transport
         self.handle = handle
         self.finished = False
+        # True once NIXL reported DONE: every byte moved. A transfer released
+        # in any other state (an error, or a state that could not be read)
+        # may still have bytes in the network.
+        self.completed = False
         # The posting thread polls the transfer itself until it hands the
         # handle over (a timeout or an unconfirmed failure); until then
         # poll() leaves the handle alone so it is never released under it.
@@ -120,6 +124,12 @@ class PendingTransfer:
                 state = None  # Try cancellation; a failed query proves nothing.
             if state == "PROC":
                 return False
+            if state == "DONE":
+                self.completed = True
+            else:
+                # As for a transfer that fails while its thread waits: the
+                # connection is suspect, and the peer is connected anew.
+                self._transport.mark_failed(self.peer)
             self.finished = self._transport.release_handle(
                 self.op, self.peer, self.handle
             )
@@ -402,6 +412,15 @@ class NixlTransport:
         with self._lock:
             return str(self._agent.check_xfer_state(handle))
 
+    def mark_failed(self, peer: str) -> None:
+        """Note that a transfer to ``peer`` ended in an error.
+
+        Args:
+            peer: Peer name.
+        """
+        with self._lock:
+            self._tainted.add(peer)
+
     def release_handle(self, op: str, peer: str, handle: Any) -> bool:
         """Release a transfer handle; False keeps its buffers owned.
 
@@ -489,6 +508,7 @@ class NixlTransport:
                     state = self._agent.check_xfer_state(handle)
             if state != "DONE":
                 raise RuntimeError(f"NIXL {op} to {peer} ended in state {state}")
+            pending.completed = True
         except TransferTimeout:
             pending.hand_over()
             raise

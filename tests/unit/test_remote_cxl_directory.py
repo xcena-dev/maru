@@ -226,6 +226,36 @@ def test_sessions_of_a_namespace_agree_on_page_size_and_schema(env):
     open_session(directory, "c", namespace="other", page=2 * PAGE)
 
 
+def test_a_kept_region_binds_the_layout_of_its_namespace(env):
+    """Keys of an owner that left stay found, so their layout still binds."""
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    call(directory, "close", **a, drained=True)
+    assert fates(directory) == {pool_a: "keep"}
+    with pytest.raises(ValueError, match="another schema or page size"):
+        open_session(directory, "b", page=2 * PAGE)
+    open_session(directory, "c")
+
+
+def test_a_session_whose_regions_all_went_back_gets_a_new_one(env):
+    directory, rm, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    call(directory, "return_region", **a, pool_id=pool_a)
+    assert call(directory, "probe", **a, namespace="ns", keys=["k"])["results"] == [
+        False
+    ]
+    call(directory, "heartbeat", **a, sequence=1, pools=[])
+    assert call(directory, "victims", **a, count=1)["entries"] == []
+    pool = call(directory, "expand", **a, op_id="x")["pool"]
+    assert pool["pool_id"] != pool_a and pool["capacity"] == 2 * PAGE
+    assert commit(directory, a, pool["pool_id"], "k2", 0) == "CREATED"
+    # The layout stays bound while the session holds no region.
+    with pytest.raises(ValueError, match="another schema or page size"):
+        open_session(directory, "b", page=2 * PAGE)
+
+
 def test_a_named_lease_can_be_released_without_its_reply(env):
     directory, _, _ = env
     a, pool_a = open_session(directory, "a")

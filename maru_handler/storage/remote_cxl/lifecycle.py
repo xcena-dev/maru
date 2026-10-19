@@ -91,20 +91,63 @@ class RegionLifecycle:
         return access
 
     def _adopt(self, region: RemoteCxlRegion, access: RegionAccess) -> None:
-        """Note a map of an own region; a rebooted memory node voids its keys.
+        """Note a map of an own region; one on a rebooted memory node goes back.
+
+        The caller checks ``region.retired`` before it writes to the region.
+        """
+        region.mapped = True
+        if region.boot and access.boot != region.boot:
+            self._give_back_rebooted(region)
+            return
+        region.boot = access.boot
+
+    def _give_back_rebooted(self, region: RemoteCxlRegion) -> None:
+        """Give back an own region whose memory node rebooted.
 
         A WRITE the memory node's NIC completed may have sat in that node's
-        CPU cache; a reboot lost it while the key stayed committed. The keys
-        of the region are removed before it is used again.
+        CPU cache; a reboot lost it while the key stayed committed. Giving
+        the region back (released first) makes MaruServer stop finding its
+        keys at once and end the leases on them, so a reader holding one
+        drops what it read; removing the keys one by one would leave a
+        leased key found. The next store gets a new region. A region that
+        cannot go back now has its keys removed meanwhile and goes back at
+        the close; it keeps the boot it was written under, so MaruServer
+        also sees the reboot if it takes the region over.
         """
-        if region.boot and access.boot != region.boot:
-            logger.warning(
-                "memory node of remote CXL region %d rebooted; removing its keys",
-                region.region_id,
-            )
-            self._drop_keys(region)
-        region.boot = access.boot
-        region.mapped = True
+        logger.warning(
+            "memory node of remote CXL region %d rebooted; giving the region back",
+            region.region_id,
+        )
+        entries = self._forget_keys(region)
+        region.retire()
+        outcome = self._data.release(region.pool_id, region.handle, self._mappers)
+        if outcome is Release.DONE and self._call_retrying(
+            "return_region", pool_id=region.pool_id
+        ):
+            self.regions.pop(region.pool_id, None)
+            return
+        self._unreturned.append(region)
+        self._dropping.extend(entries)
+        self._retry_drops()
+
+    def _retry_returns(self) -> None:
+        """Give back again the rebooted regions that could not go back."""
+        pending, self._unreturned = self._unreturned, []
+        for region in pending:
+            if self.regions.get(region.pool_id) is not region:
+                continue  # gone with the close
+            outcome = self._data.release(region.pool_id, region.handle, self._mappers)
+            if outcome is Release.DONE and self._call_retrying(
+                "return_region", pool_id=region.pool_id
+            ):
+                self.regions.pop(region.pool_id, None)
+                self._dropping = [
+                    e
+                    for e in self._dropping
+                    if e["location"]["pool_id"] != region.pool_id
+                ]
+            else:
+                self._unreturned.append(region)
 
     def _retry_unreachable(self) -> None:
         """Map regions set aside earlier; one that maps is used again.
@@ -166,13 +209,7 @@ class RegionLifecycle:
                 for region in owned[address]:
                     if region.retired or not boot or boot == region.boot:
                         continue
-                    logger.warning(
-                        "memory node of remote CXL region %d rebooted; removing its keys",
-                        region.region_id,
-                    )
-                    self._drop_keys(region)
-                    self._data.forget(region.pool_id)
-                    region.boot = boot
+                    self._give_back_rebooted(region)
 
     # ---------------------------------------------------------- give back
 
@@ -245,13 +282,12 @@ class RegionLifecycle:
         4. Drop this worker's own holds at the region mappers.
 
         If MaruServer does not confirm the close, it takes the regions over
-        when the session expires.
+        when the session expires. A session that holds no region (its
+        only region went back) still closes.
         """
-        if not self.regions:
-            return
         for region in self.regions.values():
             region.retire()
-        if not self._settle_writes(self.config.rdma_timeout_s):
+        if self.regions and not self._settle_writes(self.config.rdma_timeout_s):
             logger.warning("RDMA WRITEs are still unconfirmed; their pages hold no key")
         for pool_id, region in list(self.regions.items()):
             if not region.mapped and not self._data.map_attempted(pool_id):
@@ -300,7 +336,7 @@ class RegionLifecycle:
         would wait for the map's timeout. The heartbeat's boot check and the
         retry of set-aside regions notice when one answers again."""
         return (
-            self.config.auto_expand
+            (self.config.auto_expand or not self.regions)
             and any(self._data.answering(m) for m in self._mappers)
             and not self._data.all_down(self._mappers)
         )
@@ -437,6 +473,11 @@ class RegionLifecycle:
         A key a reader holds under a lease is kept by MaruServer; it is
         removed by a later retry (:meth:`_retry_drops`).
         """
+        self._dropping.extend(self._forget_keys(region))
+        self._retry_drops()
+
+    def _forget_keys(self, region: RemoteCxlRegion) -> list[dict]:
+        """Stop tracking a region's keys; returns them as remove entries."""
         entries = [
             {"key": key, "location": asdict(location)}
             for key, location in self._keys.items()
@@ -444,8 +485,7 @@ class RegionLifecycle:
         ]
         for entry in entries:
             self._keys.pop(entry["key"], None)
-        self._dropping.extend(entries)
-        self._retry_drops()
+        return entries
 
     def _retry_drops(self) -> None:
         """Resend removes of keys that must go until MaruServer drops them."""
@@ -467,13 +507,19 @@ class RegionLifecycle:
     # ---------------------------------------------- unconfirmed transfers
 
     def _reap_isolated(self) -> None:
-        """Give back the pages and slots of transfers NIXL has released."""
+        """Give back the pages and slots of transfers NIXL has released.
+
+        The slots go back once NIXL released the transfer. A WRITE's remote
+        pages go back only if it completed: one released after an error may
+        still be in the network, so its pages stay out of use while this
+        worker owns the region, as after a WRITE that fails at once.
+        """
         kept = []
         for entry in self._isolated:
             if entry.pending.finished or entry.pending.poll():
                 # Pages go back to the region they came from; a retired
                 # region ignores them.
-                if entry.region is not None:
+                if entry.region is not None and entry.pending.completed:
                     for location in entry.locations:
                         entry.region.unquarantine(location)
                         entry.region.give_page(location)

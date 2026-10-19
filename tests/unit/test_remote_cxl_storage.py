@@ -390,6 +390,38 @@ def test_unconfirmed_write_keeps_pages_and_slots_until_released(world):
     assert a._staging.free_count() == free_slots + 1
 
 
+def test_a_write_that_ends_in_an_error_after_its_deadline_keeps_its_page(world):
+    """Released after an error, a WRITE may still be in the network."""
+    a = world.client("a", pages=2, rdma_timeout_s=0.01)
+    agent = worker_agent("a")
+    agent.stall = True
+    handle = a.alloc(4)
+    handle.buf[:4] = b"late"
+    assert a.batch_store(["k"], [handle]) == [False]
+    region = only_region(a)
+    free_slots = a._staging.free_count()
+    agent.stall = False
+    agent.broken.add(world.node.agent.name)  # the WRITE ends in ERR
+    assert agent.finish_stalled() == 0
+    a._reap_isolated()
+    assert a._isolated == []
+    assert a._staging.free_count() == free_slots + 1  # NIXL let the slot go
+    assert region.usage() == {"allocated_bytes": PAGE, "quarantined_bytes": PAGE}
+    assert not a._transport.peer_usable(world.node.agent.name)
+
+
+def test_a_read_longer_than_a_staging_slot_is_a_miss(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"hello")
+    slot_bytes = b._staging.slot_bytes
+    b._staging.slot_bytes = 4  # a location this long would spill into the next slot
+    try:
+        assert read(b, ["k"]) == [None]
+    finally:
+        b._staging.slot_bytes = slot_bytes
+    assert read(b, ["k"]) == [b"hello"]
+
+
 def test_a_failed_write_reconnects_and_maps_the_region_again(world):
     a = world.client("a")
     agent = worker_agent("a")
@@ -1206,6 +1238,100 @@ def test_an_interrupt_during_a_read_keeps_its_slot_taken(world, monkeypatch):
     # The READ may still run: its slot is not handed out again.
     assert b._staging.free_count() == free - 1
     # No lease of b pins "k": its owner can still evict it.
+    victims = world.directory.execute("victims", {**a._credentials, "count": 1})
+    assert [v["key"] for v in victims["result"]["entries"]] == ["k"]
+
+
+def test_a_reboot_ends_the_leases_on_the_keys_of_its_regions(world):
+    """A reader holding a lease learns the bytes may be lost; nobody finds them."""
+    a, b, c = world.client("a"), world.client("b"), world.client("c")
+    put(a, "k", b"v")
+    region = only_region(a)
+    lease = world.directory.execute("acquire", {**b._credentials, "keys": ["k"]})
+    lease_id = lease["result"]["lease_id"]
+    world.node.restart(reboot=True)
+    a._check_boots()
+    assert c.batch_exists(["k"]) == [False]
+    released = world.directory.execute(
+        "release", {**b._credentials, "lease_id": lease_id}
+    )
+    assert released["result"] == {"held": False}
+    assert region.region_id in world.cxl.released
+    assert a.regions == {}
+    assert put(a, "k2", b"w")[0] is True  # a new region
+    assert read(c, ["k2"]) == [b"w"]
+
+
+def test_a_worker_whose_only_region_went_back_closes_its_session(world):
+    a = world.client("a")
+    put(a, "k", b"v")
+    world.node.restart(reboot=True)
+    a._check_boots()
+    assert a.regions == {}
+    a.close()
+    assert "a" not in world.directory._engines
+    again = world.client("a")  # the engine id is free at once
+    assert put(again, "k2", b"w")[0] is True
+
+
+def test_a_rebooted_region_is_replaced_without_auto_expand(world):
+    a = world.client("a", auto_expand=False)
+    put(a, "k", b"v")
+    world.node.restart(reboot=True)
+    a._check_boots()
+    assert put(a, "k2", b"w")[0] is True
+    assert len(a.regions) == 1
+
+
+def test_a_rebooted_region_that_could_not_go_back_is_given_back_later(world):
+    a, c = world.client("a"), world.client("c")
+    put(a, "k", b"v")
+    region = only_region(a)
+    a.rpc.unreachable.add("return_region")
+    world.node.restart(reboot=True)
+    a._check_boots()
+    assert region.retired and a.regions == {region.pool_id: region}
+    assert c.batch_exists(["k"]) == [False]  # its unleased keys were removed
+    a.rpc.unreachable.clear()
+    a._retry_returns()
+    assert a.regions == {} and a._unreturned == []
+    assert region.region_id in world.cxl.released
+
+
+def test_a_commit_confirmed_after_its_region_went_back_records_no_key(world):
+    a, c = world.client("a"), world.client("c")
+    a.rpc.lost_replies.add("commit")
+    assert put(a, "k", b"v")[0] is False  # outcome unknown: kept pending
+    a.rpc.lost_replies.clear()
+    world.node.restart(reboot=True)
+    a._check_boots()
+    a._resolve_pending()
+    assert a._pending == {} and "k" not in a._keys
+    assert c.batch_exists(["k"]) == [False]
+
+
+def test_an_unconfirmed_lease_release_is_sent_again(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    b.rpc.lost_replies.add("release")
+    assert read(b, ["k"]) == [None]  # the lease's end was not confirmed
+    b.rpc.lost_replies.clear()
+    assert b._unreleased
+    b._retry_lease_releases()
+    assert b._unreleased == []
+    victims = world.directory.execute("victims", {**a._credentials, "count": 1})
+    assert [v["key"] for v in victims["result"]["entries"]] == ["k"]
+
+
+def test_a_lease_release_that_never_arrived_is_sent_again(world):
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    b.rpc.unreachable.add("release")
+    assert read(b, ["k"]) == [None]
+    victims = world.directory.execute("victims", {**a._credentials, "count": 1})
+    assert victims["result"]["entries"] == []  # the lease still pins the key
+    b.rpc.unreachable.clear()
+    b._retry_lease_releases()
     victims = world.directory.execute("victims", {**a._credentials, "count": 1})
     assert [v["key"] for v in victims["result"]["entries"]] == ["k"]
 

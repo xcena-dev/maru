@@ -95,9 +95,12 @@ class StorageSession:
     leases: dict[str, list[StorageLocation]] = field(default_factory=dict)
     operations: dict[str, tuple[list[dict], list[str]]] = field(default_factory=dict)
     report_sequence: int = -1
-    # Remote CXL regions owned by this session (pool_id -> region) and their size
+    # Remote CXL regions owned by this session (pool_id -> region) and their size;
+    # a remote CXL session is one with a region size, and it may hold no
+    # region for a while (its only region went back after a reboot)
     regions: dict[str, StoragePool] = field(default_factory=dict)
     region_size: int = 0
+    page_size: int = 0
     # lease_id -> (region, key) for leases on remote CXL regions, possibly of others
     remote_cxl_leases: dict[str, list[tuple[StoragePool, str]]] = field(
         default_factory=dict
@@ -258,7 +261,6 @@ class ReplicaDirectory:
                 # An expired remote CXL session has no regions left: MaruServer
                 # took them over.
                 raise ValueError("Session token reused with a different registration")
-            first = next(iter(self._all_pools(previous)), None)
             expected = (
                 engine,
                 namespace,
@@ -277,7 +279,7 @@ class ReplicaDirectory:
                 previous.node_id,
                 previous.schema,
                 previous.pools["cpu"].capacity if "cpu" in previous.pools else 0,
-                first.page_size if first is not None else page_size,
+                previous.page_size,
                 previous.pools["cxl"].capacity if "cxl" in previous.pools else 0,
                 previous.region_size,
                 previous.read_order,
@@ -328,21 +330,32 @@ class ReplicaDirectory:
             self._clock() + self.session_ttl,
             regions=regions,
             region_size=region_size,
+            page_size=page_size,
         )
         self._sessions[token] = session
         self._engines[engine] = token
         return self._grant(session)
 
     def _check_remote_cxl_peers(self, namespace: str, schema: str, page_size: int):
-        """Readers of another session's region must agree on the KV layout."""
-        for session in self._sessions.values():
-            if not session.active or session.namespace != namespace:
-                continue
-            for region in session.regions.values():
-                if region.schema != schema or region.page_size != page_size:
-                    raise ValueError(
-                        "Remote CXL regions of this namespace use another schema or page size"
-                    )
+        """Readers of another session's region must agree on the KV layout.
+
+        The keys a new session can find are in the regions of the active
+        remote CXL sessions of its namespace (present and future ones) and in
+        the kept regions of owners that left.
+        """
+        layouts = [
+            (session.schema, session.page_size)
+            for session in self._sessions.values()
+            if session.active and session.region_size and session.namespace == namespace
+        ] + [
+            (region.schema, region.page_size)
+            for region in self._departed.values()
+            if region.fate == "keep" and region.namespace == namespace
+        ]
+        if any(layout != (schema, page_size) for layout in layouts):
+            raise ValueError(
+                "Remote CXL regions of this namespace use another schema or page size"
+            )
 
     def _reserve_region(
         self, namespace: str, schema: str, size: int, page_size: int
@@ -380,12 +393,13 @@ class ReplicaDirectory:
         yield from session.regions.values()
 
     def _grant(self, session):
-        first = session.pools.get("cpu") or next(iter(self._all_pools(session)))
+        # A remote CXL session may hold no region for a while.
+        first = session.pools.get("cpu") or next(iter(self._all_pools(session)), None)
         return {
-            "pool_id": first.pool_id,
+            "pool_id": first.pool_id if first is not None else None,
             "server_epoch": self.server_epoch,
             "session_ttl": self.session_ttl,
-            "capacity": first.capacity,
+            "capacity": first.capacity if first is not None else 0,
             "pools": [self._pool_info(pool) for pool in self._all_pools(session)],
         }
 
@@ -394,16 +408,15 @@ class ReplicaDirectory:
         cxl Handler one more region."""
         session = self._session(p)
         op_id = self._text(p.get("op_id"), "op_id")
-        if not session.regions:
+        if not session.region_size:
             raise ValueError("The session has no remote CXL regions")
         given = session.expansions.get(op_id)
         if given is not None and given in session.regions:
             return {"pool": self._pool_info(session.regions[given])}
         if len(session.regions) >= MAX_REGIONS_PER_SESSION:
             raise ValueError("Remote CXL region limit of the session reached")
-        first = next(iter(session.regions.values()))
         region = self._reserve_region(
-            session.namespace, session.schema, session.region_size, first.page_size
+            session.namespace, session.schema, session.region_size, session.page_size
         )
         session.regions[region.pool_id] = region
         session.expansions[op_id] = region.pool_id
@@ -422,7 +435,7 @@ class ReplicaDirectory:
         by_id = {pool.pool_id: pool for pool in self._all_pools(session)}
         # A remote CXL session may report a subset: a region can be granted while
         # the report is on its way.
-        exact = not session.regions
+        exact = not session.region_size
         if not isinstance(reports, list) or (exact and len(reports) != len(by_id)):
             raise ValueError("Invalid pool usage report")
         parsed = []
@@ -671,7 +684,7 @@ class ReplicaDirectory:
     # ---------------------------------------------------------------- evict
 
     def _owned_regions(self, session: StorageSession) -> dict[str, StoragePool]:
-        if not session.regions:
+        if not session.region_size:
             raise ValueError("The session has no remote CXL regions")
         return session.regions
 
