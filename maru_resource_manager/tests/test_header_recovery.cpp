@@ -214,7 +214,7 @@ TEST_F(HeaderRecoveryTest, ResizedDeviceIsResetUnlessItsAllocationsMayBeInUse) {
     EXPECT_NE(expectDeviceRefused(0).find("identity tags"), std::string::npos);
 }
 
-TEST_F(HeaderRecoveryTest, DamagedRecordIsResetOrRefused) {
+TEST_F(HeaderRecoveryTest, DamagedRecordOrIdentityMismatchIsResetOrRefused) {
     addDevice(0);
     { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Records version 7.
     auto original = bytes(state + "/pool_0.meta");
@@ -242,6 +242,45 @@ TEST_F(HeaderRecoveryTest, DamagedRecordIsResetOrRefused) {
     newer[4] = 8;
     std::ofstream(state + "/pool_0.meta", std::ios::binary) << newer;
     EXPECT_NE(expectDeviceRefused(0).find("newer"), std::string::npos);
+
+    // A device identity that does not match the records is refused, and
+    // neither device is written.
+    {
+        resetState();
+        resetDevice(0, true);
+        addDevice(1);
+        { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Both recorded.
+        // The header and identity tags of each device.
+        const auto area0 = head(0, H), area1 = head(1, H);
+        auto put = [&](uint32_t id, const std::string &area) {
+            std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
+            f.write(area.data(), static_cast<std::streamsize>(area.size()));
+        };
+        auto expectBothRefused = [&](const char *what) {
+            SCOPED_TRACE(what);
+            const auto other = head(1, H);
+            EXPECT_FALSE(expectDeviceRefused(0).empty());
+            EXPECT_EQ(head(1, H), other);
+            PoolManager pm(state);
+            ASSERT_EQ(pm.loadPools(), 0);
+            EXPECT_FALSE(pm.hasPools());
+        };
+        put(0, area1); // The dax numbers swapped.
+        put(1, area0);
+        expectBothRefused("swapped");
+        put(0, area0); // Two devices with one UUID.
+        put(1, area0);
+        expectBothRefused("duplicate UUID");
+        put(0, area1); // dax1.0's identity is on dax0.0 and dax1.0 has none.
+        put(1, std::string(H, '\0'));
+        expectBothRefused("header lost, its UUID elsewhere");
+        put(0, area0); // A Maru header of a version this RM does not know.
+        put(1, area1);
+        auto newer = area0;
+        newer[8] = 2;
+        put(0, newer);
+        EXPECT_NE(expectDeviceRefused(0).find("version"), std::string::npos);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, BadGlobalMetadataDoesNotInitializeFreshHeader) {
@@ -447,6 +486,50 @@ TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_EQ(restarted.allocationCount(), 1u);
     EXPECT_EQ(restarted.verifyAndFree(next, "offline-test-owner"), 0);
+
+    // A restart keeps a local owner's allocation within one boot; one
+    // recorded in an earlier boot (boot_id= line of rm.conf) is released.
+    {
+        resetState();
+        const std::string bootFile = fakeRoot + "/boot_id";
+        auto boot = [&](const std::string &id) { std::ofstream(bootFile) << id << "\n"; };
+        const std::string b1 = "11111111-1111-4111-8111-111111111111";
+        const std::string b2 = "22222222-2222-4222-8222-222222222222";
+        // A local owner whose PID runs: this process.
+        const std::string me = localClient(::getpid());
+        auto run = [&](const std::function<void(PoolManager &)> &body) {
+            PoolManager rm(state);
+            PoolManagerTestPeer::setBootIdPath(rm, bootFile);
+            ASSERT_EQ(rm.loadPools(), 0);
+            body(rm);
+        };
+        boot(b1);
+        run([&](PoolManager &rm) {
+            Handle h{};
+            ASSERT_EQ(allocate(rm, h, 0, me), 0);
+        });
+        EXPECT_EQ(readBootMarker(state), b1);
+        run([&](PoolManager &rm) { EXPECT_EQ(rm.allocationCount(), 1u); }); // Same boot.
+        boot(b2); // After a reboot the PID belongs to some other process.
+        run([&](PoolManager &rm) { EXPECT_EQ(rm.allocationCount(), 0u); });
+        EXPECT_EQ(readBootMarker(state), b2);
+        run([&](PoolManager &rm) {
+            Handle h{};
+            ASSERT_EQ(allocate(rm, h, 0, me), 0);
+        });
+        // An earlier RM started since: it rewrote rm.conf without the line.
+        std::ofstream(state + "/rm.conf") << "host=0.0.0.0\nport=9850\nlog_level=info\n";
+        boot(b1);
+        run([&](PoolManager &rm) { EXPECT_EQ(rm.allocationCount(), 1u); });
+        EXPECT_EQ(readBootMarker(state), b1);
+        std::ofstream(state + "/rm.conf") << "boot_id=not-a-boot-id\n"; // Ignored.
+        boot(b2);
+        run([&](PoolManager &rm) { EXPECT_EQ(rm.allocationCount(), 1u); });
+        // An unreadable boot ID removes the line, so no later start guesses.
+        fs::remove(bootFile);
+        run([&](PoolManager &rm) { EXPECT_EQ(rm.allocationCount(), 1u); });
+        EXPECT_EQ(readBootMarker(state), "");
+    }
 }
 
 TEST_F(HeaderRecoveryTest, CheckpointPlusWalFreeDoesNotResurrectAllocation) {
@@ -966,84 +1049,6 @@ TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
     ASSERT_EQ(stats[0].freeList.size(), 1u);
     EXPECT_EQ(stats[0].freeList[0].offset, H);
     EXPECT_EQ(stats[0].freeList[0].length, B - H);
-}
-
-TEST_F(HeaderRecoveryTest, IdentityMismatchIsRefusedWithoutWrites) {
-    addDevice(0);
-    addDevice(1);
-    { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Both recorded.
-    // The header and identity tags of each device.
-    const auto area0 = head(0, H), area1 = head(1, H);
-    auto put = [&](uint32_t id, const std::string &area) {
-        std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
-        f.write(area.data(), static_cast<std::streamsize>(area.size()));
-    };
-    auto expectBothRefused = [&](const char *what) {
-        SCOPED_TRACE(what);
-        const auto other = head(1, H);
-        EXPECT_FALSE(expectDeviceRefused(0).empty());
-        EXPECT_EQ(head(1, H), other);
-        PoolManager pm(state);
-        ASSERT_EQ(pm.loadPools(), 0);
-        EXPECT_FALSE(pm.hasPools());
-    };
-    put(0, area1); // The dax numbers swapped.
-    put(1, area0);
-    expectBothRefused("swapped");
-    put(0, area0); // Two devices with one UUID.
-    put(1, area0);
-    expectBothRefused("duplicate UUID");
-    put(0, area1); // dax1.0's identity is on dax0.0 and dax1.0 has none.
-    put(1, std::string(H, '\0'));
-    expectBothRefused("header lost, its UUID elsewhere");
-    put(0, area0); // A Maru header of a version this RM does not know.
-    put(1, area1);
-    auto newer = area0;
-    newer[8] = 2;
-    put(0, newer);
-    EXPECT_NE(expectDeviceRefused(0).find("version"), std::string::npos);
-}
-
-TEST_F(HeaderRecoveryTest, BootMarkerReleasesOnlyPreviousBootLocalOwners) {
-    addDevice(0);
-    const std::string bootFile = fakeRoot + "/boot_id";
-    auto boot = [&](const std::string &id) { std::ofstream(bootFile) << id << "\n"; };
-    const std::string b1 = "11111111-1111-4111-8111-111111111111";
-    const std::string b2 = "22222222-2222-4222-8222-222222222222";
-    // A local owner whose PID runs: this process.
-    const std::string me = localClient(::getpid());
-    auto run = [&](const std::function<void(PoolManager &)> &body) {
-        PoolManager pm(state);
-        PoolManagerTestPeer::setBootIdPath(pm, bootFile);
-        ASSERT_EQ(pm.loadPools(), 0);
-        body(pm);
-    };
-    boot(b1);
-    run([&](PoolManager &pm) {
-        Handle h{};
-        ASSERT_EQ(allocate(pm, h, 0, me), 0);
-    });
-    EXPECT_EQ(readBootMarker(state), b1);
-    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); }); // Same boot.
-    boot(b2); // After a reboot the PID belongs to some other process.
-    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 0u); });
-    EXPECT_EQ(readBootMarker(state), b2);
-    run([&](PoolManager &pm) {
-        Handle h{};
-        ASSERT_EQ(allocate(pm, h, 0, me), 0);
-    });
-    // An earlier RM started since: it rewrote rm.conf without the line.
-    std::ofstream(state + "/rm.conf") << "host=0.0.0.0\nport=9850\nlog_level=info\n";
-    boot(b1);
-    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
-    EXPECT_EQ(readBootMarker(state), b1);
-    std::ofstream(state + "/rm.conf") << "boot_id=not-a-boot-id\n"; // Ignored.
-    boot(b2);
-    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
-    // An unreadable boot ID removes the line, so no later start guesses.
-    fs::remove(bootFile);
-    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
-    EXPECT_EQ(readBootMarker(state), "");
 }
 
 TEST_F(HeaderRecoveryTest, UnresponsiveDeviceDoesNotBlockOtherPools) {
