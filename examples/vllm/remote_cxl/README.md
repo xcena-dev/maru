@@ -125,7 +125,7 @@ it (step 1); the app launcher starts maru-server (step 2) and then vLLM on each
 worker node (step 3); the app's users send requests (step 4). A prompt stored
 by one worker is then loaded by any other worker of the app.
 
-![One app on one pool. 1, the operator runs the resource manager on the memory node, and systemd starts the region mapper with it. 2, the app launcher starts maru-server on the metadata node, which gets regions from the resource manager. 3, the app launcher starts vLLM on each worker node; each MaruHandler opens a storage session with maru-server. 4, request 1 with prompt P goes to worker 1, which stores P's KV in its region R1 by RDMA; request 2 with the same prompt goes to worker 2, which loads P's KV from R1 by RDMA](../../../docs/source/image/remote_cxl_user_flow.png)
+![One app on one pool. 1, the operator runs the resource manager on the memory node, and systemd starts the region mapper with it. 2, the app launcher starts maru-server on the metadata node; it gets regions from the resource manager as workers ask for them. 3, the app launcher starts vLLM on each worker node; each MaruHandler opens a storage session with maru-server and maps its region at the region mapper. 4, request 1 with prompt P goes to worker 1, which stores P's KV in its region R1 by RDMA; request 2 with the same prompt goes to worker 2, which maps R1 at the region mapper and loads P's KV from R1 by RDMA](../../../docs/source/image/remote_cxl_user_flow.png)
 
 The example below uses one memory node that also runs maru-server, and two
 workers on another node. Replace the addresses, NICs and DAX device.
