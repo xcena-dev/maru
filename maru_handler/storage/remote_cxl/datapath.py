@@ -199,6 +199,15 @@ class RdmaDataPath:
             if own:
                 with self._lock:
                     self._attempted[pool_id] = (address, reply.generation)
+            if reply.generation != client.generation:
+                # The connection the reply came over ended since; the mapper
+                # released what it held.
+                if attempt:
+                    raise _StaleReplyError(
+                        f"region {region_id} could not be mapped: its "
+                        "connection to the region mapper keeps breaking"
+                    )
+                continue
             # The reply names this region's registration only; loading it
             # into a peer this agent already knows adds the region to it.
             try:
@@ -413,6 +422,8 @@ class RdmaDataPath:
 
     def disconnect(self, peers: set[str]) -> bool:
         """Close the NIXL connections to these peers; True if all are closed.
+
+        A load of metadata into a peer in progress finishes first.
 
         A transfer that ends in an error leaves a reliable connection in the
         error state, so later transfers to the same memory node fail too.

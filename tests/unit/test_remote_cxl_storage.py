@@ -989,6 +989,37 @@ def test_a_map_reply_from_an_ended_connection_is_mapped_again(world, monkeypatch
     assert read(world.client("b"), ["k1", "k2"]) == [b"1", b"2"]
 
 
+def test_a_reply_from_an_ended_connection_is_not_used_before_any_newer_load(
+    world, monkeypatch
+):
+    a = world.client("a", pages=1)
+    put(a, "k1", b"1")
+    a._data._loaded.clear()  # no load over a newer connection yet
+    client = a._data._client(world.node.address)
+    real_map = client.map
+    generations = []
+
+    def map_first_reply_stale(handle):
+        reply = real_map(handle)
+        generations.append(reply.generation)
+        if len(generations) == 1:
+            return dataclasses.replace(reply, generation=reply.generation - 1)
+        return reply
+
+    monkeypatch.setattr(client, "map", map_first_reply_stale)
+    real_load = a._data._load_peer
+    loaded = []
+
+    def record_load(address, generation, *args):
+        loaded.append(generation)
+        return real_load(address, generation, *args)
+
+    monkeypatch.setattr(a._data, "_load_peer", record_load)
+    assert put(a, "k2", b"2")[0] is True
+    assert len(generations) == 2  # the stale reply was mapped again
+    assert loaded == [client.generation]  # and never loaded
+
+
 def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     """One of two region mappers of the pool is down: eviction frees pages
     only in regions on the node that answers."""

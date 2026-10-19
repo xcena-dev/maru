@@ -176,7 +176,8 @@ class NixlTransport:
         self._agent = agent
         self._registrations: list[Any] = []
         self._peers: set[str] = set()
-        # Peers a transfer to failed, timed out or ended uncertain
+        # Peers a transfer to ended in an error (their connection is in
+        # the error state); a timeout is left to the isolation of its pages
         self._tainted: set[str] = set()
         self._pending: dict[int, PendingTransfer] = {}
         self._lock = threading.Lock()
@@ -273,8 +274,8 @@ class NixlTransport:
 
         UCX fails a connection on its own when the peer stops answering, and
         NIXL then closes it but keeps it in the peer; loading the peer's
-        metadata again crashes the process. A peer a transfer to failed is
-        unusable. Otherwise an empty notification tells the two states apart
+        metadata again crashes the process. A peer a transfer to ended in an
+        error is unusable. Otherwise an empty notification tells the two states apart
         without touching a closed connection: NIXL refuses to send it then.
         The answer holds for the moment of the check; UCX may fail the
         connection right after it. The peer drops the notifications with
@@ -284,8 +285,8 @@ class NixlTransport:
             name: Peer name returned by :meth:`add_peer`.
 
         Returns:
-            False if a transfer to the peer failed or NIXL refused to send to
-            it.
+            False if a transfer to the peer ended in an error or NIXL refused
+            to send to it.
         """
         with self._lock:
             if name in self._tainted:
@@ -469,11 +470,7 @@ class NixlTransport:
             remote = self._agent.get_xfer_descs(
                 [(ra, n, 0) for _la, ra, n in pairs], "DRAM"
             )
-            try:
-                handle = self._agent.initialize_xfer(op, local, remote, peer)
-            except Exception:
-                self._tainted.add(peer)
-                raise
+            handle = self._agent.initialize_xfer(op, local, remote, peer)
             pending = PendingTransfer(self, op, peer, handle)
             self._pending[id(handle)] = pending
         t0 = time.perf_counter()
@@ -493,8 +490,6 @@ class NixlTransport:
             if state != "DONE":
                 raise RuntimeError(f"NIXL {op} to {peer} ended in state {state}")
         except TransferTimeout:
-            with self._lock:
-                self._tainted.add(peer)
             pending.hand_over()
             raise
         except Exception as exc:

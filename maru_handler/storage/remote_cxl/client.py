@@ -371,7 +371,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for region in self.regions.values():
                 if region.has_free() and self._writable(region):
                     return region, region.take_page(size)
-        if not any(self._writable(r) for r in self.regions.values()):
+        if self.regions and not any(self._writable(r) for r in self.regions.values()):
             raise MemoryError(
                 "No remote CXL region is reachable now; skipping new cache admission"
             )

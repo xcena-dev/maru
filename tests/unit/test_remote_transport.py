@@ -204,6 +204,7 @@ def test_timeout_keeps_the_handle_until_the_transfer_ends(pair):
         a.write(peer, [(src_addr, remote_addr, 16)], timeout_s=0.01)
     pending = info.value.pending
     assert fake.released == []  # the NIC may still touch the buffers
+    assert a.peer_usable(peer)  # a slow connection is not a failed one
     assert pending.poll() is False
     assert fake.finish_stalled() == 1
     assert list(remote) == [3] * 16  # the late transfer landed

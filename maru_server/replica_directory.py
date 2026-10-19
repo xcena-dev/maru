@@ -678,8 +678,9 @@ class ReplicaDirectory:
     def _victims(self, p: dict) -> dict:
         """Least recently used, unleased keys of the caller's own regions.
 
-        ``pools``, if given, limits them to those regions: a worker evicts
-        only where it can write the freed pages.
+        ``pools``, if given, limits them to those regions (ids the caller
+        does not own are ignored): a worker evicts only where it can write
+        the freed pages.
         """
         session = self._session(p)
         count = self._integer(p.get("count"), "count", 1)

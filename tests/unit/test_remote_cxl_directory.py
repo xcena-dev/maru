@@ -282,6 +282,20 @@ def test_victims_are_least_recently_used_across_regions_and_skip_leases(env):
     assert [v["key"] for v in victims] == ["mid"]
 
 
+def test_victims_can_be_limited_to_some_regions(env):
+    directory, _, clock = env
+    a, first = open_session(directory, "a")
+    second = expand(directory, a)["pool"]["pool_id"]
+    commit(directory, a, first, "old", 0)
+    clock.advance(1)
+    commit(directory, a, second, "new", 0)
+    victims = call(directory, "victims", **a, count=2, pools=[second, "other"])
+    assert [v["key"] for v in victims["entries"]] == ["new"]
+    assert call(directory, "victims", **a, count=2, pools=[])["entries"] == []
+    with pytest.raises(ValueError, match="pools"):
+        call(directory, "victims", **a, count=1, pools=second)
+
+
 def test_remove_needs_the_same_location_and_no_lease(env):
     directory, _, _ = env
     a, pool_a = open_session(directory, "a")
