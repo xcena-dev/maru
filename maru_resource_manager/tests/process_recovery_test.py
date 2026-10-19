@@ -5,10 +5,7 @@ The daemon must be the CMake test-only target, never an installed/live RM.
 """
 
 import errno
-import importlib.util
-import json
 import os
-import shutil
 import signal
 import socket
 import struct
@@ -31,11 +28,6 @@ EXTENT = struct.Struct("<QQ")
 WAL_NAME = "maru-resource-manager.wal"
 CTL = Path(__file__).resolve().parents[1] / "tools/maru_rm_ctl.py"
 
-spec = importlib.util.spec_from_file_location(
-    "repair", Path(__file__).resolve().parents[1] / "tools/prepare_empty_pool_repair.py"
-)
-repair = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(repair)
 
 
 class ProcessRecoveryTest(unittest.TestCase):
@@ -241,11 +233,12 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.stop(signal.SIGKILL)
         (self.state / "secret").unlink()
         wal = (self.state / WAL_NAME).read_bytes()
+        global_meta = (self.state / "global.meta").read_bytes()
         self.start(expected_failure=True)
         self.assertIn("loadPools failed", self.log.read_text())
         self.assertEqual((self.state / WAL_NAME).read_bytes(), wal)
         self.assertFalse((self.state / "secret").exists())
-        self.assertFalse((self.state / "global.meta").exists())
+        self.assertEqual((self.state / "global.meta").read_bytes(), global_meta)
 
     def test_sigkill_replays_checkpoint_and_wal(self):
         self.start()
@@ -279,12 +272,12 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.checkpoint(0, reused[0] + 1)
         self.assertEqual(self.identity(), identity)
 
-    def test_prepared_legacy_checkpoint_round_trip(self):
+    def test_legacy_and_resized_checkpoints_start_without_repair(self):
         next_id = 335380
         self.add_device(1)
         self.add_device(2)
         headers = {}
-        for pool in range(3):
+        for pool in range(2):
             path = self.root / f"dev/dax{pool}.0"
             header = struct.pack("<8sI16sI", b"MARUDEV\0", 1, uuid.uuid4().bytes, 0)
             with path.open("r+b") as stream:
@@ -297,37 +290,32 @@ class ProcessRecoveryTest(unittest.TestCase):
                 META_HEADER.pack(0x4D455441, 6, pool, zlib.crc32(payload), total, 1)
                 + payload
             )
+        # dax2.0 was re-provisioned to four times its size and lost its
+        # header; its checkpoint still describes the old device.
+        small = SIZE // 4
+        payload = EXTENT.pack(ALIGN, small - ALIGN)
+        (self.state / "pool_2.meta").write_bytes(
+            META_HEADER.pack(0x4D455441, 6, 2, zlib.crc32(payload), small - ALIGN, 1) + payload
+        )
         (self.state / "global.meta").write_bytes(
             META_HEADER.pack(0x474C4F42, 2, 0, 0, next_id, 0)
         )
         (self.state / "secret").write_bytes(os.urandom(32))
-        before = {p.name: p.read_bytes() for p in self.state.iterdir()}
-        self.start(expected_failure=True)
-        self.assertIn("offline repair required", self.log.read_text())
-
-        backup = self.root / "backup"
-        shutil.copytree(self.state, backup)
-        output = self.root / "prepared"
-        manifest = repair.prepare(
-            backup, output, [f"/dev/dax{i}.0" for i in range(3)], self.sysfs
-        )
-        self.assertEqual(json.loads((output / "manifest.json").read_text()), manifest)
-        self.assertEqual(manifest["next_region_id"], next_id)
-        for name, data in before.items():
-            self.assertEqual((backup / name).read_bytes(), data)
-            self.assertEqual((self.state / name).read_bytes(), data)
-        for pool in range(3):
-            shutil.copyfile(
-                output / f"pool_{pool}.meta", self.state / f"pool_{pool}.meta"
-            )
+        secret = (self.state / "secret").read_bytes()
 
         self.start()
         self.check_stats()
+        self.assertIn("started over", self.log.read_text())
+        with (self.root / "dev/dax2.0").open("rb") as stream:
+            self.assertEqual(stream.read(8), b"MARUDEV\0")
         handles = [self.allocate(pool) for pool in range(3)]
         for pool, handle in enumerate(handles):
             self.assertEqual(handle[:3], (next_id + pool, ALIGN, ALIGN))
         self.stop()
         self.checkpoint(3, next_id + 3)
+        for pool in range(3):  # Recorded as version 7 before being served.
+            meta = (self.state / f"pool_{pool}.meta").read_bytes()
+            self.assertEqual(struct.unpack_from("<II", meta), (0x4D455441, 7))
         self.start()
         self.check_stats({f"/dev/dax{i}.0": 1 for i in range(3)})
         for pool, handle in enumerate(handles):
@@ -344,7 +332,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         for pool, header in headers.items():
             with (self.root / f"dev/dax{pool}.0").open("rb") as stream:
                 self.assertEqual(stream.read(len(header)), header)
-        self.assertEqual((self.state / "secret").read_bytes(), before["secret"])
+        self.assertEqual((self.state / "secret").read_bytes(), secret)
 
     def checkpoint_failure_round_trip(self, filename, operation, error):
         self.start()
@@ -440,6 +428,27 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.access(self.allocate(1), 1)
         self.stop()
         self.assertFalse((self.state / "admin.sock").exists())
+
+        # dax1.0 loses its header (its memory was power-cycled) while this
+        # process, a local owner, still holds an allocation on it: refused,
+        # dax0.0 is served, and discard settles it.
+        with (self.root / "dev/dax1.0").open("r+b") as stream:
+            stream.write(bytes(32))
+        self.start()
+        self.assertEqual(set(self.stats()), {"/dev/dax0.0"})
+        code, output = self.ctl("status")
+        self.assertEqual(code, 0, output)
+        self.assertIn("device=/dev/dax1.0 pool=1 state=refused", output)
+        code, output = self.ctl("discard", "dax1.0", "--confirm")
+        self.assertNotEqual(code, 0, output)  # The owner is running.
+        code, output = self.ctl("discard", "dax1.0", "--confirm", "--force")
+        self.assertEqual(code, 0, output)
+        self.process.send_signal(signal.SIGHUP)  # Rescan now.
+        deadline = time.monotonic() + 10
+        while set(self.stats()) != {"/dev/dax0.0", "/dev/dax1.0"}:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        self.stop()
 
     def test_second_instance_is_refused(self):
         self.start()

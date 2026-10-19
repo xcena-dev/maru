@@ -2,12 +2,22 @@
 
 #include <string>
 #include <set>
+#include <utility>
+#include <vector>
 
 #include "pool_manager.h"
 
 namespace maru {
 
 enum class WalRecordType : uint32_t { ALLOC = 1, FREE = 2 };
+
+/// Every live allocation, independent of device layout.
+struct Ledger {
+  std::map<uint64_t, Allocation> live;
+  uint64_t nextRegionId{1};
+};
+
+class MetadataStore;
 
 class WalStore {
 public:
@@ -26,24 +36,27 @@ public:
   // sets `written`: the caller must complete the free, because recovery may
   // apply it. Losing it instead only brings the allocation back (a leak).
   int appendFree(uint64_t regionId, bool *written = nullptr);
+  // FREE records for every ID in one write and one sync, with appendFree's
+  // outcome rules.
+  int appendFrees(const std::vector<uint64_t> &regionIds, bool *written = nullptr);
   // An append's outcome on disk is unknown; a checkpoint must replace the log.
   bool appendsDisabled() const { return appendError_ != 0; }
-  // Read/validate the log without opening any device or changing recovery state.
-  int referencedPools(std::set<uint32_t> &pools) const;
-  // Keep only `pools` in `live` (seeded from the global checkpoint) and apply
-  // the log's ALLOC/FREE records for them, without opening any device.
-  int liveAllocations(const std::set<uint32_t> &pools,
-                      std::map<uint64_t, Allocation> &live) const;
 
-  int replay(std::vector<PoolState> &pools,
-             std::map<uint64_t, Allocation> &allocations,
-             uint64_t &nextRegionId);
+  /// Apply the log to the global checkpoint's allocations (see Ledger).
+  /// Reads only the log; never opens a device. -EEXIST if two different
+  /// records claim one region ID (only RMs before #91 reused IDs).
+  int buildLedger(const std::map<uint64_t, Allocation> &global,
+                  uint64_t globalNextRegionId, Ledger &out) const;
+  /// True if the log's first record allocates region 1: the log then reaches
+  /// back to an empty state, so no lost global checkpoint held allocations.
+  bool startsAtFirstRegion() const;
+
   // Truncate an incomplete final record so appends do not follow it. Call
   // only after recovery has validated every complete record.
   int discardTornTail();
 
-  int checkpoint(const std::vector<PoolState> &pools,
-                 class MetadataStore &metadata,
+  /// Write the global checkpoint, then remove the log.
+  int checkpoint(MetadataStore &metadata,
                  const std::map<uint64_t, Allocation> &allocations,
                  uint64_t nextRegionId);
 
@@ -59,8 +72,7 @@ private:
 
   std::string walPath() const;
   int ensureOpen();
-  int appendRecord(WalRecordType type, const void *payload, uint32_t len,
-                   bool keepUnsynced, bool *written);
+  int appendBuffer(const std::vector<uint8_t> &buf, bool keepUnsynced, bool *written);
 };
 
 } // namespace maru

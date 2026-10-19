@@ -11,10 +11,24 @@ own user only):
                                Hand the device over only once this exits 0:
                                until the list is synced to disk it exits 4,
                                and running it again retries the sync
-  include daxN.M [--reinit]    use an excluded device again; --reinit archives
-                               its pool metadata and writes a fresh header,
-                               discarding whatever the device holds
-  release REGION --confirm     return one allocation whose owner has exited
+  discard daxN.M [--confirm [--force]]
+                               release every allocation the RM records for the
+                               device's pool without opening the device;
+                               refuses while a local owner process is running
+                               unless --force
+  include daxN.M [--reinit | --adopt | --restore-header]
+                               judge an excluded or refused device again;
+                               --reinit archives its pool metadata and writes
+                               a fresh header, discarding whatever the device
+                               holds; --adopt accepts the Maru header of a
+                               device that has no identity record;
+                               --restore-header writes the recorded UUID back
+                               to a device whose header was cleared, when the
+                               identity tags still match
+  release REGION --confirm [--force]
+                               return one allocation whose owner has exited;
+                               --force releases even if a local process with
+                               the owner's PID is running (e.g. a reused PID)
   wipe daxN.M --confirm        zero all of an excluded device, header included
                                (e.g. before handing it over, or to reset it for
                                tests); waits until done, which can take minutes
@@ -58,10 +72,22 @@ def request_line(args: argparse.Namespace) -> str:
     if args.command == "exclude":
         return f"exclude {args.device}"
     if args.command == "include":
-        return f"include {args.device}" + (" --reinit" if args.reinit else "")
+        mode = "reinit" if args.reinit else "adopt" if args.adopt else None
+        mode = "restore-header" if args.restore_header else mode
+        return f"include {args.device}" + (f" --{mode}" if mode else "")
+    if args.command == "discard":
+        return (
+            f"discard {args.device}"
+            + (" --confirm" if args.confirm else "")
+            + (" --force" if args.force else "")
+        )
     if args.command == "wipe":
         return f"wipe {args.device}" + (" --confirm" if args.confirm else "")
-    return f"release {args.region}" + (" --confirm" if args.confirm else "")
+    return (
+        f"release {args.region}"
+        + (" --confirm" if args.confirm else "")
+        + (" --force" if args.force else "")
+    )
 
 
 class NoReplyError(Exception):
@@ -99,12 +125,43 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("device", nargs="?", type=device_name)
     exclude = commands.add_parser("exclude", help="stop using a device")
     exclude.add_argument("device", type=device_name)
-    include = commands.add_parser("include", help="use an excluded device again")
+    include = commands.add_parser("include", help="judge an excluded or refused device again")
     include.add_argument("device", type=device_name)
-    include.add_argument(
+    mode = include.add_mutually_exclusive_group()
+    mode.add_argument(
         "--reinit",
         action="store_true",
         help="discard the device's contents and pool metadata (e.g. after ROOF)",
+    )
+    mode.add_argument(
+        "--adopt",
+        action="store_true",
+        help="accept the Maru header on an excluded device that has no "
+        "identity record",
+    )
+    mode.add_argument(
+        "--restore-header",
+        action="store_true",
+        help="write the recorded UUID back to a device whose header was "
+        "cleared, when the identity tags still match",
+    )
+    discard = commands.add_parser(
+        "discard",
+        help="release a device's allocations without opening it",
+        description="Release every allocation the RM records for the device's "
+        "pool without opening the device; refuses while a local owner process "
+        "is running unless --force.",
+    )
+    discard.add_argument("device", type=device_name)
+    discard.add_argument(
+        "--confirm",
+        action="store_true",
+        help="no host maps the device's regions any more",
+    )
+    discard.add_argument(
+        "--force",
+        action="store_true",
+        help="discard even if a local owner process is running (needs --confirm)",
     )
     release = commands.add_parser("release", help="return one allocation")
     release.add_argument("region", type=region_id)
@@ -112,6 +169,12 @@ def parser() -> argparse.ArgumentParser:
         "--confirm",
         action="store_true",
         help="the owner has exited and unmapped the region",
+    )
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help="release even if a local process with the owner's PID is running "
+        "(e.g. a PID reused after a reboot); needs --confirm",
     )
     wipe = commands.add_parser("wipe", help="zero all of an excluded device")
     wipe.add_argument("device", type=device_name)
@@ -124,7 +187,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    args = parser().parse_args(argv)
+    cli = parser()
+    args = cli.parse_args(argv)
+    if getattr(args, "force", False) and not args.confirm:
+        cli.error("--force is only valid together with --confirm")
     path = Path(args.socket) if args.socket else Path(args.state_dir) / "admin.sock"
     try:
         # A wipe of a large device takes minutes; wait for it.

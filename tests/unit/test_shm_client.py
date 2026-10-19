@@ -832,3 +832,42 @@ class TestShmClientDeviceTable:
                     os.unlink(p)
                 except OSError:
                     pass
+
+    def test_unknown_uuid_is_rescanned_then_header_checked(self, monkeypatch):
+        """Missing UUIDs follow rescan -> RM header match -> error, never a blind RM path."""
+        rm_path = _make_temp_file(size=4096, fill=b"\xbb")
+        local_path = _make_temp_file(size=4096, fill=b"\xaa")
+        test_uuid = "550e8400-e29b-41d4-a716-446655440000"
+        try:
+            # (a) The rescan finds the device and is merged into the table.
+            monkeypatch.setattr(
+                "maru_shm.client.scan_dax_devices", lambda: [(test_uuid, local_path)]
+            )
+            for table in ({}, {"other-uuid": rm_path}):
+                client = MaruShmClient(address="127.0.0.1:1", device_table=table)
+                assert client._resolve_device_path(rm_path, test_uuid) == local_path
+                assert client._device_table == {**table, test_uuid: local_path}
+
+            # (b) Not scannable, but the RM path carries this UUID.
+            monkeypatch.setattr("maru_shm.client.scan_dax_devices", lambda: [])
+            monkeypatch.setattr(
+                "maru_shm.client.read_device_uuid", lambda p: test_uuid
+            )
+            client = MaruShmClient(address="127.0.0.1:1", device_table={})
+            assert client._resolve_device_path(rm_path, test_uuid) == rm_path
+
+            # (c) The RM path holds another (or no) UUID: refuse to map it.
+            for found in ("other-uuid", None):
+                monkeypatch.setattr(
+                    "maru_shm.client.read_device_uuid", lambda p, f=found: f
+                )
+                client = MaruShmClient(address="127.0.0.1:1", device_table={})
+                with pytest.raises(RuntimeError, match=test_uuid):
+                    client._resolve_device_path(rm_path, test_uuid)
+
+            # No table at all keeps the RM path without any lookup.
+            client = MaruShmClient(address="127.0.0.1:1")
+            assert client._resolve_device_path(rm_path, test_uuid) == rm_path
+        finally:
+            os.unlink(rm_path)
+            os.unlink(local_path)

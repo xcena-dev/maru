@@ -145,6 +145,62 @@ protected:
         fs::create_directory(p.devPath);
         return p;
     }
+    // Rewrite a device as `size` zero bytes, optionally with a fresh header.
+    void resetDevice(uint32_t id, bool header, uint64_t size = B) {
+        const auto name = "dax" + std::to_string(id) + ".0";
+        std::ofstream(fakeRoot + "/sys/class/dax/" + name + "/size") << size;
+        fs::remove(fakeRoot + dev(id));
+        int fd = ::open(dev(id).c_str(), O_CREAT | O_RDWR, 0600);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::ftruncate(fd, static_cast<off_t>(size)), 0);
+        ::close(fd);
+        if (header) {
+            DeviceHeader hdr{};
+            initDeviceHeader(hdr);
+            ASSERT_EQ(writeDeviceHeader(dev(id), hdr, H), 0);
+        }
+    }
+    void resetState() {
+        fs::remove_all(state);
+        fs::create_directories(state);
+        ASSERT_EQ(initSecret(state, false), 0);
+    }
+    PoolRecord record(uint32_t id = 0) {
+        PoolRecord r;
+        MetadataStore(state).loadRecord(id, r);
+        return r;
+    }
+    std::vector<std::string> archives(uint32_t id = 0) {
+        std::vector<std::string> found;
+        const auto prefix = "pool_" + std::to_string(id) + ".meta.reset-";
+        for (const auto &entry : fs::directory_iterator(state))
+            if (entry.path().filename().string().rfind(prefix, 0) == 0)
+                found.push_back(entry.path().string());
+        return found;
+    }
+    // The client ID of a local process that does not exist.
+    std::string exitedLocalClient() { return localClient(2147483647); }
+    // Startup leaves the device unserved and refused, and changes neither
+    // the device, its pool record nor the WAL. Returns the reason.
+    std::string expectDeviceRefused(uint32_t id) {
+        const auto device = bytes(fakeRoot + dev(id));
+        const auto meta = bytes(state + "/pool_" + std::to_string(id) + ".meta");
+        const auto wal = bytes(state + "/maru-resource-manager.wal");
+        std::string why;
+        {
+            PoolManager pm(state);
+            EXPECT_EQ(pm.loadPools(), 0);
+            std::vector<PoolState> stats;
+            pm.getStats(stats);
+            for (const auto &p : stats) EXPECT_NE(p.devPath, dev(id));
+            why = PoolManagerTestPeer::unserved(pm, dev(id));
+            EXPECT_EQ(why.rfind("refused", 0), 0u) << why;
+        }
+        EXPECT_TRUE(bytes(fakeRoot + dev(id)) == device) << dev(id) << " changed";
+        EXPECT_EQ(bytes(state + "/pool_" + std::to_string(id) + ".meta"), meta);
+        EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), wal);
+        return why;
+    }
     // Recovery refuses with rc and changes nothing: no pool is served, no
     // checkpoint is written, and every state file and device keeps its bytes.
     void expectRecoveryRefused(int rc) {

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <unordered_set>
 
@@ -26,7 +27,9 @@
 #include "device_header.h"
 #include "device_wipe.h"
 #include "metadata.h"
+#include "pool_recovery.h"
 #include "pool_validation.h"
+#include "server_config.h"
 #include "util.h"
 #include "wal.h"
 
@@ -360,7 +363,8 @@ static bool getRegionIndexForPmem(const std::string &blockName,
 }
 
 PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
-    : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec)
+    : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec),
+      slots_(std::make_shared<DeviceSlots>())
 {
     metadata_ = std::make_unique<MetadataStore>(stateDir);
     wal_ = std::make_unique<WalStore>(stateDir);
@@ -496,7 +500,41 @@ int PoolManager::scanDevices(std::vector<DeviceInfo> &outDevices)
     return 0;
 }
 
+static int deviceSize(const std::string &path, uint64_t &sizeOut);
+
 int PoolManager::getDeviceSize(const std::string &path, uint64_t &sizeOut)
+{
+    return deviceSize(path, sizeOut);
+}
+
+int PoolManager::poolBuildFailed(const std::string &path, const char *stage, int error)
+{
+    auto failure = std::make_pair(std::string(stage), error);
+    auto previous = failedDevices_.find(path);
+    if (previous == failedDevices_.end() || previous->second != failure)
+    {
+        logf(LogLevel::Warn, "failed to load pool from %s (%s): %d (%s)",
+             path.c_str(), stage, error, std::strerror(-error));
+        failedDevices_[path] = std::move(failure);
+    }
+    return error;
+}
+
+// sysfs integer attribute: 0, or -errno (-ENOENT when it does not exist).
+static int readSysfsU64(const std::string &path, uint64_t &out)
+{
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return -errno;
+    char buf[64] = {0};
+    const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    const int err = errno;
+    ::close(fd);
+    if (n < 0) return -err;
+    out = std::strtoull(buf, nullptr, 10);
+    return n > 0 && out > 0 ? 0 : -EINVAL;
+}
+
+static int deviceSize(const std::string &path, uint64_t &sizeOut)
 {
     struct stat st
     {
@@ -536,143 +574,107 @@ int PoolManager::getDeviceSize(const std::string &path, uint64_t &sizeOut)
     return -ENOTSUP;
 }
 
-int PoolManager::poolBuildFailed(const std::string &path, const char *stage, int error)
+DeviceProbe probeDeviceIo(uint32_t poolId, const std::string &devPath, DaxType type,
+                          uint64_t defaultAlign)
 {
-    auto failure = std::make_pair(std::string(stage), error);
-    auto previous = failedDevices_.find(path);
-    if (previous == failedDevices_.end() || previous->second != failure)
+    DeviceProbe p;
+    p.poolId = poolId;
+    p.devPath = devPath;
+    p.type = type;
+    int rc = deviceSize(devPath, p.size);
+    if (rc != 0 || p.size == 0)
     {
-        logf(LogLevel::Warn, "failed to load pool from %s (%s): %d (%s)",
-             path.c_str(), stage, error, std::strerror(-error));
-        failedDevices_[path] = std::move(failure);
+        p.rc = rc != 0 ? rc : -EINVAL;
+        p.stage = "device size";
+        return p;
     }
-    return error;
-}
-
-int PoolManager::buildPoolFromDevice(uint32_t poolId, const std::string &path,
-                                      DaxType type, PoolState &out)
-{
-    if (isExcluded(path)) return -EPERM;
-    uint64_t size = 0;
-    int rc = getDeviceSize(path, size);
-    if (rc != 0 || size == 0)
-    {
-        return poolBuildFailed(path, "device size", rc != 0 ? rc : -EINVAL);
-    }
-
-    // Read device alignment first (needed for mmap-based header access)
-    uint64_t devAlign = alignBytes_;
-    if (type == DaxType::DEV_DAX)
-    {
-        uint64_t da = 0;
-        if (readDaxAlignBytes(baseName(path), da))
-        {
-            devAlign = da;
-        }
-    }
-
-    const uint64_t dataOffset = type == DaxType::DEV_DAX ? devAlign : 0;
-    if (devAlign == 0 || size <= dataOffset)
-        return poolBuildFailed(path, "device layout", -EUCLEAN);
-
-    PoolState pool{};
-    pool.poolId = poolId;
-    pool.devPath = path;
-    pool.dataBegin = dataOffset;
-    pool.dataEnd = size;
-    pool.totalSize = size - dataOffset;
-    pool.freeSize = size - dataOffset;
-    pool.type = type;
     if (type == DaxType::FS_DAX)
     {
-        uint64_t blksz = 0;
-        if (getBlockLogicalBlockSize(path, blksz) && blksz > 0)
-        {
-            if (blksz > devAlign)
-            {
-                devAlign = blksz;
-            }
-        }
+        // Files are allocated by the filesystem; the block size only rounds
+        // allocations up, so an unreadable one keeps the default.
+        uint64_t align = defaultAlign, blksz = 0;
+        if (getBlockLogicalBlockSize(devPath, blksz) && blksz > align) align = blksz;
+        p.align = align;
+        p.dataBegin = 0;
+        p.dataEnd = p.size;
+        return p;
     }
-    pool.alignBytes = devAlign;
-    pool.freeList.push_back(Extent{dataOffset, size - dataOffset});
+    // Kernels without the per-device attribute expose the region's.
+    const std::string sys = std::string(kSysBusDaxDevices) + "/" + baseName(devPath);
+    uint64_t align = 0;
+    rc = readSysfsU64(sys + kAlignAttr, align);
+    if (rc == -ENOENT) rc = readSysfsU64(sys + "/../dax_region" + kAlignAttr, align);
+    if (rc == -ENOENT)
+    {
+        align = defaultAlign;
+        rc = 0;
+    }
+    if (rc != 0)
+    {
+        p.rc = rc;
+        p.stage = "device alignment";
+        return p;
+    }
+    p.align = align;
+    p.dataBegin = align;
+    p.dataEnd = p.size;
+    if (p.size <= align) return p; // Refused by decide(); nothing to map.
+    DeviceIdentity id;
+    rc = readDeviceIdentity(devPath, align, id);
+    if (rc != 0)
+    {
+        p.rc = rc;
+        p.stage = "read device header";
+        return p;
+    }
+    uint32_t magic = 0;
+    std::memcpy(&magic, id.header.magic, sizeof(magic));
+    if (id.headerRc == 0)
+    {
+        p.header = id.header.version == kDeviceHeaderVersion ? DeviceProbe::Header::Ours
+                                                             : DeviceProbe::Header::BadVersion;
+        std::memcpy(p.headerUuid.data(), id.header.uuid, p.headerUuid.size());
+    }
+    else
+    {
+        p.header = magic == kRoofSuperblockMagic ? DeviceProbe::Header::Roof
+                                                 : DeviceProbe::Header::None;
+    }
+    p.tags = id.tags;
+    std::memcpy(p.tagUuid.data(), id.tagUuid, p.tagUuid.size());
+    return p;
+}
 
-    PoolState loaded = pool;
-    rc = metadata_->load(poolId, loaded);
-    if (rc == 0)
-    {
-        // The data range comes from the device. RMs before recovery validation
-        // (#99) replaced the saved total with the device size on load but kept
-        // the saved free list, so a checkpoint can hold a total that does not
-        // match its own extents. The extents and allocations are still checked
-        // against the device range below and after WAL replay.
-        if (loaded.totalSize != pool.totalSize)
-        {
-            logf(LogLevel::Warn,
-                 "%s: ignoring checkpoint total size %llu; the device data size is %llu",
-                 path.c_str(), static_cast<unsigned long long>(loaded.totalSize),
-                 static_cast<unsigned long long>(pool.totalSize));
-            loaded.totalSize = pool.totalSize;
-        }
-        loaded.hasCheckpoint = true;
-        pool = loaded;
-    }
-    else if (rc != -ENOENT)
-    {
-        poolBuildFailed(path, "checkpoint read", rc);
-        return -EUCLEAN;
-    }
-    if (validateFreeList(pool) != 0)
-        return poolBuildFailed(path, "checkpoint data range (offline repair required)", -EUCLEAN);
+int PoolManager::probeDevice(const DeviceInfo &dev, DeviceProbe &out)
+{
+    out = probeDeviceIo(dev.poolId, dev.devPath, dev.type, alignBytes_);
+    return reportProbe(out);
+}
 
-    if (type == DaxType::DEV_DAX)
-    {
-        DeviceHeader hdr{};
-        const int hrc = readDeviceHeader(path, hdr, devAlign);
-        uint32_t magic = 0;
-        std::memcpy(&magic, hdr.magic, sizeof(magic));
-        if (reinit_.count(baseName(path)) && (hrc == 0 || hrc == -ENODATA))
-        {
-            pool.needsHeaderInit = true; // include --reinit: fresh header and pool
-        }
-        else if (hrc == -ENODATA && magic == kRoofSuperblockMagic)
-        {
-            return poolBuildFailed(path, "ROOF filesystem on device, not registering it", -EBUSY);
-        }
-        else if (hrc == -ENODATA)
-        {
-            pool.needsHeaderInit = true;
-        }
-        else if (hrc != 0)
-        {
-            return poolBuildFailed(path, "read device header", hrc);
-        }
-        else
-        {
-            if (hdr.version != kDeviceHeaderVersion)
-                return poolBuildFailed(path, "device header version", -EUCLEAN);
-            pool.deviceUuid = uuidToString(hdr.uuid);
-        }
-    }
-
-    out = std::move(pool);
-    if (failedDevices_.erase(path))
-    {
-        logf(LogLevel::Info, "device recovered: %s", path.c_str());
-    }
+int PoolManager::reportProbe(const DeviceProbe &probe)
+{
+    if (probe.rc != 0) return poolBuildFailed(probe.devPath, probe.stage.c_str(), probe.rc);
+    if (failedDevices_.erase(probe.devPath))
+        logf(LogLevel::Info, "device recovered: %s", probe.devPath.c_str());
     return 0;
 }
 
-int PoolManager::loadPools()
+bool isLocalClientId(const char *clientId) { return isLocalClient(clientId); }
+
+std::string baseNameOf(const std::string &path) { return baseName(path); }
+
+bool PoolManager::ownerGone(const Allocation &a) const
 {
-    std::lock_guard<std::mutex> lock(mu_);
-    return loadPoolsLocked();
+    if (!isLocalClient(a.clientId)) return false;
+    if (previousBoot_) return true;
+    const pid_t pid = pidFromClientId(a.clientId);
+    return pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH;
 }
 
-int PoolManager::rescanDevices()
+void PoolManager::recountClients()
 {
-    std::lock_guard<std::mutex> lock(mu_);
-    return rescanDevicesLocked();
+    clientAllocCounts_.clear();
+    for (const auto &[id, a] : allocations_) ++clientAllocCounts_[a.clientId];
 }
 
 bool PoolManager::hasPools() const
@@ -681,183 +683,19 @@ bool PoolManager::hasPools() const
     return !pools_.empty();
 }
 
-static std::string describeAllocations(const std::map<uint64_t, Allocation> &live)
-{
-    std::string text;
-    for (const auto &[id, a] : live)
-        text += "region=" + std::to_string(id) + " pool=" + std::to_string(a.poolId) +
-                " size=" + std::to_string(a.allocLength) + " client=" + a.clientId + "\n";
-    return text;
-}
-
-int PoolManager::recoverPools(std::vector<PoolState> &pools,
-                              std::map<uint64_t, Allocation> &allocations,
-                              uint64_t &nextRegionId, std::string &unavailablePools)
-{
-    std::set<uint32_t> referenced;
-    int rc = wal_->referencedPools(referenced);
-    if (rc != 0 && rc != -ENOENT) return rc;
-
-    // Validate saved allocations before replay, even if a later FREE could
-    // hide them.
-    std::set<uint32_t> headerLost;
-    for (const auto &pool : pools)
-    {
-        bool hasAllocations = false;
-        for (const auto &[id, a] : allocations)
-        {
-            if (a.poolId != pool.poolId) continue;
-            hasAllocations = true;
-            if (id != a.handle.regionId || !validAllocation(pool, a))
-                return poolBuildFailed(pool.devPath, "checkpoint allocation range", -EUCLEAN);
-        }
-        if (!pool.hasCheckpoint && hasAllocations)
-            return poolBuildFailed(pool.devPath, "missing pool checkpoint", -EUCLEAN);
-        if (pool.needsHeaderInit && !reinit_.count(baseName(pool.devPath)) &&
-            (pool.hasCheckpoint || hasAllocations || referenced.count(pool.poolId)))
-            headerLost.insert(pool.poolId);
-    }
-
-    rc = wal_->replay(pools, allocations, nextRegionId);
-    if (rc != 0 && rc != -ENOENT) return rc;
-    // A device that lost its header (volatile CXL memory comes back cleared
-    // after a power cycle) lost what its allocations held. Its history is
-    // replayed and validated like any other, and it starts over with a fresh
-    // header only if none of its allocations is live.
-    for (const auto &pool : pools)
-    {
-        if (!headerLost.count(pool.poolId)) continue;
-        std::map<uint64_t, Allocation> live;
-        for (const auto &[id, a] : allocations)
-            if (a.poolId == pool.poolId) live.emplace(id, a);
-        if (live.empty()) continue;
-        logf(LogLevel::Error, "%s lost its device header but holds live allocations:\n%s",
-             pool.devPath.c_str(), describeAllocations(live).c_str());
-        return poolBuildFailed(pool.devPath, "missing header with live allocations", -EUCLEAN);
-    }
-    for (auto &pool : pools)
-    {
-        coalesceFreeList(pool);
-        recomputeFreeSize(pool);
-        if (validatePoolState(pool, allocations) != 0)
-            return poolBuildFailed(pool.devPath, "recovered allocation/free-list consistency", -EUCLEAN);
-    }
-
-    // No device writes until every staged pool and the entire WAL pass.
-    for (auto &pool : pools)
-    {
-        if (!pool.needsHeaderInit) continue;
-        DeviceHeader hdr{};
-        initDeviceHeader(hdr);
-        rc = writeDeviceHeader(pool.devPath, hdr, pool.alignBytes);
-        if (rc != 0) return poolBuildFailed(pool.devPath, "write device header", rc);
-        pool.deviceUuid = uuidToString(hdr.uuid);
-        pool.needsHeaderInit = false;
-        if (headerLost.count(pool.poolId))
-            logf(LogLevel::Warn,
-                 "%s lost its device header with no live allocations; wrote a fresh one: "
-                 "UUID=%s",
-                 pool.devPath.c_str(), pool.deviceUuid.c_str());
-        else
-            logf(LogLevel::Info, "Auto-initialized device header on %s: UUID=%s",
-                 pool.devPath.c_str(), pool.deviceUuid.c_str());
-    }
-
-    unavailablePools = describeUnavailable(referenced, allocations, pools);
-    return 0;
-}
-
-// Missing devices must retain their WAL, including records not imported into
-// allocations yet. Excluded pools hold no live allocations (checked when they
-// are excluded and at startup), so their history does not block checkpoints.
-std::string PoolManager::describeUnavailable(
-    const std::set<uint32_t> &referenced,
-    const std::map<uint64_t, Allocation> &allocations,
-    const std::vector<PoolState> &staged) const
-{
-    std::set<uint32_t> available = excludedPoolIds();
-    for (const auto &p : pools_) available.insert(p.poolId);
-    for (const auto &p : staged) available.insert(p.poolId);
-    std::set<uint32_t> missing;
-    for (uint32_t id : referenced)
-        if (!available.count(id)) missing.insert(id);
-    for (const auto &[id, a] : allocations)
-        if (!available.count(a.poolId)) missing.insert(a.poolId);
-    std::string ids;
-    for (uint32_t id : missing) ids += (ids.empty() ? "" : ",") + std::to_string(id);
-    return ids.empty() ? "" : "no device for pool(s) " + ids + " referenced by WAL/checkpoint";
-}
-
-void PoolManager::refreshUnavailableLocked()
-{
-    std::set<uint32_t> referenced;
-    const int rc = wal_->referencedPools(referenced);
-    if (rc != 0 && rc != -ENOENT)
-    {
-        setCheckpointBlock("cannot read WAL (rc=" + std::to_string(rc) + ")");
-        return;
-    }
-    unavailablePools_ = describeUnavailable(referenced, allocations_, {});
-    setCheckpointBlock(unavailablePools_);
-}
-
 bool PoolManager::isExcluded(const std::string &devPath) const
 {
     return devPath.rfind("/dev/", 0) == 0 && excluded_.count(devPath.substr(5));
 }
 
-std::set<uint32_t> PoolManager::excludedPoolIds() const
-{
-    std::set<uint32_t> ids;
-    for (const auto &name : excluded_)
-    {
-        uint32_t id = 0;
-        if (parseRegionIndexFromDaxName(name, id)) ids.insert(id);
-    }
-    return ids;
-}
-
-// Drop checkpoint entries of excluded pools that the WAL freed, so they do
-// not look like missing-pool allocations. Live ones mean the list was edited
-// by hand or the device was never drained: refuse rather than guess.
-int PoolManager::dropExcludedLedger(std::map<uint64_t, Allocation> &allocations,
-                                    std::string &why)
-{
-    const auto pools = excludedPoolIds();
-    if (pools.empty()) return 0;
-    std::map<uint64_t, Allocation> live = allocations;
-    const int rc = wal_->liveAllocations(pools, live);
-    if (rc != 0)
-    {
-        why = "cannot read WAL for excluded devices (rc=" + std::to_string(rc) + ")";
-        return rc;
-    }
-    if (!live.empty())
-    {
-        why = "excluded device(s) still hold live allocations; include them or release:\n" +
-              describeAllocations(live);
-        return -EBUSY;
-    }
-    for (auto it = allocations.begin(); it != allocations.end();)
-        it = pools.count(it->second.poolId) ? allocations.erase(it) : std::next(it);
-    return 0;
-}
-
 // Remove backing files of freed regions: a crash between logging a FREE and
-// the unlink leaves one behind. Only this RM creates maru_<id>.dat in the
-// mount. An FS_DAX pool ID comes from sysfs numbering, not from the mount, so
-// a file is kept if any pool owns its region ID.
+// the unlink leaves one behind, and a released allocation of a pool that was
+// not served leaves its file. Only this RM creates maru_<id>.dat in the mount.
+// An FS_DAX pool ID comes from sysfs numbering, not from the mount, so a file
+// is kept if any pool owns its region ID in the ledger.
 void PoolManager::removeOrphanFsDaxFiles(const PoolState &pool)
 {
     if (pool.type != DaxType::FS_DAX) return;
-    // A missing pool may own files here, including WAL-only allocations that
-    // replay did not import.
-    if (!unavailablePools_.empty())
-    {
-        logf(LogLevel::Info, "keeping unowned files in %s: %s",
-             pool.devPath.c_str(), unavailablePools_.c_str());
-        return;
-    }
     DIR *dir = ::opendir(pool.devPath.c_str());
     if (!dir)
     {
@@ -907,212 +745,6 @@ void PoolManager::setCheckpointBlock(std::string reason)
     checkpointBlock_ = std::move(reason);
 }
 
-int PoolManager::loadPoolsLocked()
-{
-    setCheckpointBlock("recovery has not completed");
-    // Before any device is opened: an unreadable list must not mean "none".
-    const int excludeRc = loadExcludedDevices(stateDir_, excluded_);
-    if (excludeRc != 0)
-    {
-        logf(LogLevel::Error, "cannot read excluded device list in %s: %d (%s)",
-             stateDir_.c_str(), excludeRc, std::strerror(-excludeRc));
-        return excludeRc;
-    }
-    for (const auto &name : excluded_)
-        logf(LogLevel::Info, "device /dev/%s is excluded (maru-rm-ctl include to use it)",
-             name.c_str());
-    // A previous RM may have renamed the list into place without syncing it,
-    // and that state lived only in its memory. Confirm it again so no
-    // excluded device is handed over while a power loss could still undo it.
-    excludedSyncRc_ = excluded_.empty() ? 0 : syncExcludedDevices(stateDir_);
-    if (excludedSyncRc_ != 0)
-        logf(LogLevel::Warn, "the excluded device list in %s is not durable yet: %s",
-             stateDir_.c_str(), std::strerror(-excludedSyncRc_));
-    std::map<uint64_t, Allocation> stagedAllocations;
-    uint64_t stagedNextRegionId = 1;
-    const int globalRc = metadata_->loadGlobal(stagedAllocations, stagedNextRegionId);
-    hasGlobalCheckpoint_ = globalRc == 0;
-    if (globalRc != 0 && globalRc != -ENOENT)
-    {
-        logf(LogLevel::Error, "cannot restore global metadata: %d", globalRc);
-        return globalRc;
-    }
-
-    std::vector<DeviceInfo> devices;
-    int rc = scanDevices(devices);
-    if (rc != 0) return rc;
-    std::vector<PoolState> stagedPools;
-    for (const auto &dev : devices)
-    {
-        if (isExcluded(dev.devPath)) continue;
-        PoolState pool;
-        rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
-        if (rc == -EUCLEAN) return rc;
-        if (rc != 0) continue; // Transient device errors remain retryable.
-        if (pool.hasCheckpoint && globalRc == -ENOENT)
-            return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
-        stagedPools.push_back(std::move(pool));
-    }
-    std::string why;
-    rc = dropExcludedLedger(stagedAllocations, why);
-    if (rc != 0)
-    {
-        logf(LogLevel::Error, "%s", why.c_str());
-        return rc;
-    }
-    std::string unavailable;
-    rc = recoverPools(stagedPools, stagedAllocations, stagedNextRegionId, unavailable);
-    if (rc != 0) return rc;
-    // Every complete record passed; never append after an incomplete one.
-    rc = wal_->discardTornTail();
-    if (rc != 0)
-    {
-        logf(LogLevel::Error, "cannot discard incomplete WAL tail: %d", rc);
-        return rc;
-    }
-
-    // Initialize the persisted secret before recomputing restored tokens.
-    rc = initSecret(stateDir_, !stagedAllocations.empty());
-    if (rc != 0) return rc;
-    clientAllocCounts_.clear();
-    for (auto &[regionId, alloc] : stagedAllocations)
-    {
-        alloc.handle.authToken = computeAuthToken(
-            alloc.handle, alloc.nonce, std::string(alloc.clientId));
-        ++clientAllocCounts_[alloc.clientId];
-    }
-    pools_ = std::move(stagedPools);
-    allocations_ = std::move(stagedAllocations);
-    nextRegionId_ = stagedNextRegionId;
-    unavailablePools_ = std::move(unavailable);
-    for (const auto &pool : pools_) removeOrphanFsDaxFiles(pool);
-    setCheckpointBlock(unavailablePools_);
-    return 0;
-}
-
-int PoolManager::rescanDevicesLocked()
-{
-    std::vector<DeviceInfo> devices;
-    int rc = scanDevices(devices);
-    if (rc != 0)
-    {
-        setCheckpointBlock("device rescan failed (rc=" + std::to_string(rc) + ")");
-        return rc;
-    }
-
-    std::vector<PoolState> stagedPools;
-    for (const auto &dev : devices)
-    {
-        bool exists = false;
-        for (const auto &pool : pools_)
-            if (pool.poolId == dev.poolId || pool.devPath == dev.devPath) exists = true;
-        if (exists || isExcluded(dev.devPath)) continue;
-        PoolState pool;
-        rc = buildPoolFromDevice(dev.poolId, dev.devPath, dev.type, pool);
-        if (rc == -EUCLEAN)
-        {
-            setCheckpointBlock("device " + dev.devPath + " failed recovery validation");
-            return rc;
-        }
-        if (rc != 0) continue;
-        if (pool.hasCheckpoint && !hasGlobalCheckpoint_)
-        {
-            setCheckpointBlock("device " + dev.devPath + " has no global checkpoint");
-            return poolBuildFailed(pool.devPath, "missing global checkpoint", -EUCLEAN);
-        }
-        stagedPools.push_back(std::move(pool));
-    }
-
-    // Without a new pool there is nothing to import from the WAL or ledger.
-    if (stagedPools.empty())
-    {
-        setCheckpointBlock(unavailablePools_);
-        return 0;
-    }
-
-    rc = addPoolsLocked(stagedPools);
-    if (rc != 0)
-        setCheckpointBlock("rescan recovery failed (rc=" + std::to_string(rc) + ")");
-    return rc;
-}
-
-// Recover `staged` against the live ledger and publish them; on failure
-// nothing in memory changes.
-int PoolManager::addPoolsLocked(std::vector<PoolState> &staged)
-{
-    StagedRecovery recovery;
-    recovery.pools = std::move(staged);
-    const int rc = stagePoolsLocked(recovery);
-    if (rc == 0) publishPoolsLocked(recovery);
-    return rc;
-}
-
-// Validate pools against a copy of the ledger and write headers for new
-// devices. Only device headers are written; nothing in memory changes.
-int PoolManager::stagePoolsLocked(StagedRecovery &recovery)
-{
-    recovery.allocations = allocations_;
-    recovery.nextRegionId = nextRegionId_;
-    return recoverPools(recovery.pools, recovery.allocations, recovery.nextRegionId,
-                        recovery.unavailable);
-}
-
-void PoolManager::publishPoolsLocked(StagedRecovery &recovery)
-{
-    const size_t firstNew = pools_.size();
-    for (auto &pool : recovery.pools) pools_.push_back(std::move(pool));
-    allocations_ = std::move(recovery.allocations);
-    nextRegionId_ = recovery.nextRegionId;
-    clientAllocCounts_.clear();
-    for (auto &[id, a] : allocations_)
-    {
-        a.handle.authToken = computeAuthToken(a.handle, a.nonce, std::string(a.clientId));
-        ++clientAllocCounts_[a.clientId];
-    }
-    unavailablePools_ = std::move(recovery.unavailable);
-    for (size_t i = firstNew; i < pools_.size(); ++i) removeOrphanFsDaxFiles(pools_[i]);
-    setCheckpointBlock(unavailablePools_);
-}
-
-void PoolManager::recomputeFreeSize(PoolState &pool)
-{
-    pool.freeSize = 0;
-    for (const auto &ex : pool.freeList)
-    {
-        pool.freeSize += ex.length;
-    }
-}
-
-void PoolManager::coalesceFreeList(PoolState &pool)
-{
-    std::sort(
-        pool.freeList.begin(),
-        pool.freeList.end(),
-        [](const Extent &a, const Extent &b)
-        {
-            return a.offset < b.offset;
-        });
-    std::vector<Extent> merged;
-    for (const auto &ex : pool.freeList)
-    {
-        if (merged.empty())
-        {
-            merged.push_back(ex);
-            continue;
-        }
-        Extent &last = merged.back();
-        if (last.offset + last.length >= ex.offset)
-        {
-            uint64_t end = std::max(last.offset + last.length, ex.offset + ex.length);
-            last.length = end - last.offset;
-        }
-        else
-        {
-            merged.push_back(ex);
-        }
-    }
-    pool.freeList.swap(merged);
-}
 
 void PoolManager::insertExtentSorted(PoolState &pool, uint64_t offset,
                                      uint64_t length)
@@ -1501,11 +1133,18 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
             continue;
         }
 
-        // Check if this client's grace period has expired (works for both local and remote)
+        // Grace expiry frees allocations of served pools only. A pool that is
+        // not served may be refused because its device lost its contents; a
+        // remote owner cut off by the network can still be running, and
+        // releasing its allocations would let that pool start over under it.
         if (expiredClients.count(cid))
         {
-            toFree.push_back(kv.first);
-            continue;
+            if (findPoolById(kv.second.poolId))
+            {
+                toFree.push_back(kv.first);
+                continue;
+            }
+            reapRetries_.insert(cid); // Reaped once its pool is served again.
         }
 
         // For local clients, also check PID liveness
@@ -1579,9 +1218,17 @@ int PoolManager::checkpointLocked()
         }
         return -EAGAIN;
     }
-    const int rc = wal_->checkpoint(pools_, *metadata_, allocations_, nextRegionId_);
-    if (rc == 0) hasGlobalCheckpoint_ = true;
-    else logf(LogLevel::Error, "checkpoint failed; keeping WAL: %d", rc);
+    for (const auto &pool : pools_)
+    {
+        if (validatePoolState(pool, allocations_) != 0)
+        {
+            logf(LogLevel::Error, "pool %u free list does not match its allocations; "
+                 "checkpoint refused, WAL retained", pool.poolId);
+            return -EUCLEAN;
+        }
+    }
+    const int rc = wal_->checkpoint(*metadata_, allocations_, nextRegionId_);
+    if (rc != 0) logf(LogLevel::Error, "checkpoint failed; keeping WAL: %d", rc);
     return rc;
 }
 
@@ -1661,18 +1308,18 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
 
     const Allocation &alloc = globalIt->second;
 
+    // A pool that is not served is released in the ledger only; its device
+    // and free list are rebuilt when it is served again.
     PoolState *targetPool = findPoolById(alloc.poolId);
-    if (!targetPool)
+    if (targetPool)
     {
-        return -ENOENT;
+        if (!validAllocation(*targetPool, alloc) || validateFreeList(*targetPool) != 0 ||
+            alloc.allocLength > targetPool->totalSize - targetPool->freeSize)
+            return -EUCLEAN;
+        for (const auto &e : targetPool->freeList)
+            if (alloc.realOffset < e.offset + e.length &&
+                e.offset < alloc.realOffset + alloc.allocLength) return -EUCLEAN;
     }
-
-    if (!validAllocation(*targetPool, alloc) || validateFreeList(*targetPool) != 0 ||
-        alloc.allocLength > targetPool->totalSize - targetPool->freeSize)
-        return -EUCLEAN;
-    for (const auto &e : targetPool->freeList)
-        if (alloc.realOffset < e.offset + e.length &&
-            e.offset < alloc.realOffset + alloc.allocLength) return -EUCLEAN;
 
     // Log the free before releasing anything: a failed append leaves the
     // allocation intact so the caller (or the reaper) can retry.
@@ -1697,13 +1344,15 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
              static_cast<unsigned long long>(regionId), walRc);
     }
 
-    if (targetPool->type == DaxType::FS_DAX)
+    if (targetPool)
     {
-        deleteFsDaxFile(targetPool->devPath, regionId);
+        if (targetPool->type == DaxType::FS_DAX)
+        {
+            deleteFsDaxFile(targetPool->devPath, regionId);
+        }
+        insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
+        targetPool->freeSize += alloc.allocLength;
     }
-
-    insertExtentSorted(*targetPool, alloc.realOffset, alloc.allocLength);
-    targetPool->freeSize += alloc.allocLength;
 
     // Update client refcount
     if (alloc.clientId[0] != '\0')
@@ -1794,6 +1443,22 @@ static const char *ownerState(const char *clientId)
     return localOwnerAlive(clientId) ? "running" : "exited";
 }
 
+static const char *unservedStateName(int state)
+{
+    return state == 0 ? "refused" : state == 1 ? "skipped" : "busy";
+}
+
+// PID, command line and start time of a local owner, for the operator.
+static std::string ownerProcessInfo(const char *clientId)
+{
+    const pid_t pid = pidFromClientId(clientId);
+    std::string cmd;
+    std::ifstream in("/proc/" + std::to_string(pid) + "/cmdline");
+    std::getline(in, cmd, '\0');
+    return "pid=" + std::to_string(pid) + " cmd=" + (cmd.empty() ? "?" : cmd) +
+           " start_ticks=" + std::to_string(getPidStartTime(pid));
+}
+
 int PoolManager::adminStatus(std::string &out)
 {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1803,8 +1468,18 @@ int PoolManager::adminStatus(std::string &out)
         appendf(out, "pool=%u device=%s state=active total=%llu free=%llu allocations=%zu\n",
                 p.poolId, p.devPath.c_str(), static_cast<unsigned long long>(p.totalSize),
                 static_cast<unsigned long long>(p.freeSize), counts[p.poolId]);
+    for (const auto &[path, u] : unserved_)
+        out += "device=" + path + " pool=" + std::to_string(u.poolId) + " state=" +
+               unservedStateName(static_cast<int>(u.state)) + " live=" + std::to_string(u.live) +
+               " owners_alive=" + std::to_string(u.ownersAlive) + " reason=" + u.reason + "\n";
     for (const auto &name : excluded_)
-        appendf(out, "device=/dev/%s state=excluded\n", name.c_str());
+    {
+        // An include whose device write timed out: the write may still land.
+        const std::string path = "/dev/" + name;
+        const bool pending = slots_->isHeld(path) && !slots_->heldByTimedOutRead(path);
+        appendf(out, "device=%s state=excluded%s\n", path.c_str(),
+                pending ? " write_pending=yes" : "");
+    }
     if (excludedSyncRc_ != 0)
         out += "excluded_list=not-durable reason=" + std::string(std::strerror(-excludedSyncRc_)) +
                "\n";
@@ -1826,50 +1501,21 @@ int PoolManager::adminAllocations(const std::string &device, std::string &out)
         return -EINVAL;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    // A loaded pool's allocations are current. A pool without a device only
-    // has its checkpoint entries here and the WAL holds the rest, so list it
-    // from both, as adminExclude does.
-    std::set<uint32_t> absent;
-    if (device.empty())
-    {
-        const int rc = wal_->referencedPools(absent);
-        if (rc != 0 && rc != -ENOENT)
-        {
-            out = "cannot read WAL: " + std::string(std::strerror(-rc)) + "\n";
-            return rc;
-        }
-        for (const auto &[id, a] : allocations_) absent.insert(a.poolId);
-    }
-    else
-    {
-        absent.insert(poolFilter);
-    }
-    for (const auto &p : pools_) absent.erase(p.poolId);
-    std::map<uint64_t, Allocation> live;
+    // The ledger holds every pool's allocations, served or not.
+    auto deviceOf = [&](uint32_t poolId) -> std::string {
+        if (const PoolState *pool = findPoolById(poolId)) return pool->devPath;
+        for (const auto &[path, u] : unserved_)
+            if (u.poolId == poolId)
+                return path + " (" + unservedStateName(static_cast<int>(u.state)) + ")";
+        return "(not present)";
+    };
     for (const auto &[id, a] : allocations_)
-        if (absent.count(a.poolId)) live.emplace(id, a);
-    if (!absent.empty())
-    {
-        const int rc = wal_->liveAllocations(absent, live);
-        if (rc != 0)
-        {
-            out = "cannot read WAL: " + std::string(std::strerror(-rc)) + "\n";
-            return rc;
-        }
-    }
-    for (const auto &[id, a] : allocations_)
-        if (!absent.count(a.poolId) && (device.empty() || a.poolId == poolFilter))
-            live.emplace(id, a);
-    for (const auto &[id, a] : live)
-    {
-        const PoolState *pool = findPoolById(a.poolId);
-        appendf(out, "region=%llu pool=%u device=%s size=%llu offset=%llu client=%s owner=%s\n",
-                static_cast<unsigned long long>(id), a.poolId,
-                pool ? pool->devPath.c_str() : "(not present)",
-                static_cast<unsigned long long>(a.allocLength),
-                static_cast<unsigned long long>(a.realOffset), a.clientId,
-                ownerState(a.clientId));
-    }
+        if (device.empty() || a.poolId == poolFilter)
+            out += "region=" + std::to_string(a.handle.regionId) +
+                   " pool=" + std::to_string(a.poolId) + " device=" + deviceOf(a.poolId) +
+                   " size=" + std::to_string(a.allocLength) +
+                   " offset=" + std::to_string(a.realOffset) + " client=" + a.clientId +
+                   " owner=" + ownerState(a.clientId) + "\n";
     return 0;
 }
 
@@ -1917,6 +1563,14 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
     const std::string path = "/dev/" + name;
     const int fileRc = checkExcludedFileLocked(out);
     if (fileRc != 0) return fileRc;
+    // A device read that timed out holds the slot but never writes; any
+    // other operation on the device, such as an include whose device write
+    // timed out, must finish first, even if the device is excluded again.
+    if (slots_->isHeld(path) && !slots_->heldByTimedOutRead(path))
+    {
+        out = "an operation on " + path + " is in progress; retry\n";
+        return -EBUSY;
+    }
     if (excluded_.count(name))
     {
         // An earlier save may have renamed the list into place without
@@ -1955,27 +1609,15 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
                 return -EINVAL;
             }
 
-    // A loaded pool's allocations are current. A pool without a device only
-    // has its checkpoint entries here; the WAL holds the rest.
-    std::map<uint64_t, Allocation> live;
-    for (const auto &[id, a] : allocations_)
-        if (a.poolId == poolId) live.emplace(id, a);
-    if (loaded == pools_.end())
-    {
-        const int rc = wal_->liveAllocations({poolId}, live);
-        if (rc != 0)
-        {
-            out = "cannot read WAL: " + std::string(std::strerror(-rc)) + "\n";
-            return rc;
-        }
-    }
+    // The ledger holds this pool's allocations whether or not it is served.
+    const auto live = poolAllocations(poolId);
     if (!live.empty())
     {
         out = path + " still holds " + std::to_string(live.size()) +
               " allocation(s); stop their owners (or release them) and retry:\n";
-        for (const auto &[id, a] : live)
+        for (const auto &a : live)
             appendf(out, "region=%llu size=%llu client=%s owner=%s\n",
-                    static_cast<unsigned long long>(id),
+                    static_cast<unsigned long long>(a.handle.regionId),
                     static_cast<unsigned long long>(a.allocLength), a.clientId,
                     ownerState(a.clientId));
         return -EBUSY;
@@ -1995,22 +1637,9 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
     excludedSyncRc_ = syncRc;
     excluded_ = std::move(next);
     if (loaded != pools_.end()) pools_.erase(loaded);
-    // Checkpoint entries the WAL already freed would otherwise look like
-    // allocations of a missing pool.
-    bool dropped = false;
-    for (auto it = allocations_.begin(); it != allocations_.end();)
-    {
-        if (it->second.poolId != poolId) { ++it; continue; }
-        it = allocations_.erase(it);
-        dropped = true;
-    }
-    if (dropped)
-    {
-        clientAllocCounts_.clear();
-        for (const auto &[id, a] : allocations_) ++clientAllocCounts_[a.clientId];
-    }
+    unserved_.erase(path);
+    retryAfter_.erase(path);
     failedDevices_.erase(path);
-    refreshUnavailableLocked();
     logf(LogLevel::Warn, "admin: excluded %s (pool %u); it is no longer used", path.c_str(),
          poolId);
 
@@ -2028,7 +1657,7 @@ int PoolManager::adminExclude(const std::string &device, std::string &out)
     return 0;
 }
 
-int PoolManager::adminInclude(const std::string &device, bool reinit, std::string &out)
+int PoolManager::adminInclude(const std::string &device, IncludeMode mode, std::string &out)
 {
     std::string name;
     uint32_t poolId = 0;
@@ -2037,7 +1666,7 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
         out = "invalid device name: " + device + "\n";
         return -EINVAL;
     }
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
     const std::string path = "/dev/" + name;
     for (const auto &p : pools_)
         if (p.devPath == path || p.poolId == poolId)
@@ -2062,123 +1691,76 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
         out = path + " was not found; is it bound to device_dax?\n";
         return -ENODEV;
     }
-
-    // An excluded pool holds no allocations (checked by exclude and at
-    // startup), so it comes back as an empty pool. Its metadata predates the
-    // exclusion and would no longer match: keep it aside and write a fresh one
-    // before the list says the device is in use, so a restart at any point
-    // finds consistent files.
-    const bool wasExcluded = excluded_.count(name) != 0;
-    const std::string meta = stateDir_ + "/pool_" + std::to_string(poolId) + ".meta";
-    std::string archived;
-    if (wasExcluded || reinit)
+    if (slots_->isHeld(path))
     {
-        // Never replace an earlier archive (the state dir lock makes this
-        // check race-free).
-        const std::string base = meta + (reinit ? ".reinit-" : ".include-") +
-                                 std::to_string(static_cast<long long>(std::time(nullptr)));
-        struct stat st{};
-        archived = base;
-        for (int n = 1; ::lstat(archived.c_str(), &st) == 0; ++n)
-            archived = base + "." + std::to_string(n);
-        if (::rename(meta.c_str(), archived.c_str()) != 0)
-        {
-            if (errno != ENOENT)
-            {
-                rc = -errno;
-                out = "cannot archive " + meta + ": " + std::strerror(-rc) + "\n";
-                return rc;
-            }
-            archived.clear();
-        }
+        out = "an operation on " + path + " is in progress; retry\n";
+        return -EBUSY;
     }
-    bool metaWritten = false, listSaved = false, headerWritten = false;
+
+    // The device stays excluded on disk until it is served: a crash at any
+    // point leaves either an excluded device or a complete pool.
+    const bool wasExcluded = excluded_.erase(name) != 0;
+    retryAfter_.erase(path);
+    failedDevices_.erase(path); // Report only this attempt's failure.
+    auto plans = probeAndDecide(lock, devices, mode, wasExcluded, false, path);
     auto rollback = [&](int error, const std::string &why) {
-        reinit_.erase(name);
-        out = path + ": " + why + " (" + std::strerror(-error) + ")\n";
         if (wasExcluded)
         {
             excluded_.insert(name);
-            int syncRc = 0;
-            const int saveRc =
-                listSaved ? saveExcludedDevices(stateDir_, excluded_, syncRc) : 0;
-            if (saveRc != 0)
-                out += "WARNING: could not record the exclusion again (" +
-                       std::string(std::strerror(-saveRc)) +
-                       "); the RM may register this device when it restarts\n";
-            else if (listSaved)
-            {
-                excludedSyncRc_ = syncRc;
-                if (syncRc != 0) out += unsyncedExclusionNote(stateDir_, syncRc, name);
-            }
+            unserved_.erase(path);
         }
-        if (headerWritten)
-        {
-            // The old metadata described the device before its new header;
-            // never put it back under that header.
-            out += "a new device header was already written";
-            out += archived.empty() ? "\n" : "; previous metadata kept at " + archived + "\n";
-        }
-        else if (!archived.empty())
-            ::rename(archived.c_str(), meta.c_str());
-        else if (metaWritten)
-            ::unlink(meta.c_str());
-        refreshUnavailableLocked();
+        out = path + ": " + why + "\n";
+        if (mode == IncludeMode::Judge)
+            out += "see maru-rm-ctl include --reinit, --adopt or --restore-header, or discard\n";
         return error;
     };
-
-    excluded_.erase(name);
-    if (reinit) reinit_.insert(name);
-    failedDevices_.erase(path); // Report only this attempt's failure.
-    PoolState pool;
-    rc = buildPoolFromDevice(info->poolId, info->devPath, info->type, pool);
-    if (rc != 0)
+    if (plans.empty()) return rollback(-EBUSY, "an operation on the device is in progress");
+    DevicePlan &plan = plans.front();
+    if (plan.action == DevicePlan::Action::Refuse || plan.action == DevicePlan::Action::Skip)
     {
-        auto failure = failedDevices_.find(path);
-        rollback(rc, failure != failedDevices_.end() ? failure->second.first : "cannot read device");
-        if (!reinit) out += "use --reinit to discard its contents and start an empty pool\n";
-        return rc;
+        if (!plan.timedOut) slots_->release(path);
+        if (!wasExcluded) markUnserved(plan);
+        return rollback(plan.timedOut ? -EAGAIN
+                        : plan.action == DevicePlan::Action::Skip ? -EBUSY
+                                                                  : -EUCLEAN,
+                        plan.reason);
     }
-    // Header first: until the list is saved the device stays excluded, so a
-    // crash at any point below leaves either an excluded device or a complete
-    // one, never a listed device without a header.
-    const bool writesHeader = pool.needsHeaderInit;
-    StagedRecovery recovery;
-    recovery.pools.push_back(std::move(pool));
-    if ((rc = stagePoolsLocked(recovery)) != 0)
-    {
-        auto failure = failedDevices_.find(path);
-        rollback(rc, failure != failedDevices_.end() ? failure->second.first : "recovery failed");
-        if (!reinit) out += "use --reinit to discard its contents and start an empty pool\n";
-        return rc;
-    }
-    headerWritten = writesHeader;
-    // Fresh metadata reconciles a global checkpoint that may still list
-    // regions the WAL freed. Without one there is nothing to reconcile, and
-    // pool metadata without a global checkpoint would make startup refuse.
-    if ((wasExcluded || reinit) && hasGlobalCheckpoint_)
-    {
-        if ((rc = metadata_->save(recovery.pools.front())) != 0)
-            return rollback(rc, "cannot write pool metadata");
-        metaWritten = true;
-    }
+    executePlans(lock, plans);
+    PoolState *added = findPoolByPath(path);
+    if (!added) return rollback(-EIO, plan.reason);
     if (wasExcluded)
     {
         int syncRc = 0;
-        if ((rc = saveExcludedDevices(stateDir_, excluded_, syncRc)) != 0)
-            return rollback(rc, "cannot save excluded device list");
-        listSaved = true;
+        rc = saveExcludedDevices(stateDir_, excluded_, syncRc);
+        if (rc != 0)
+        {
+            // Not in use yet: nothing was allocated while the lock was held.
+            for (auto it = pools_.begin(); it != pools_.end(); ++it)
+                if (it->devPath == path)
+                {
+                    pools_.erase(it);
+                    break;
+                }
+            excluded_.insert(name);
+            out = path + ": cannot save excluded device list (" + std::strerror(-rc) +
+                  "); it stays excluded\n";
+            if (plan.writeHeader || plan.writeRecord)
+                out += "its new identity was already written" +
+                       (plan.archived.empty() ? std::string()
+                                              : "; previous metadata kept at " + plan.archived) +
+                       "\n";
+            return rc;
+        }
         excludedSyncRc_ = syncRc;
     }
-    publishPoolsLocked(recovery);
-    reinit_.erase(name);
-
-    const PoolState *added = findPoolById(poolId);
-    logf(LogLevel::Warn, "admin: included %s (pool %u)%s", path.c_str(), poolId,
-         reinit ? " with a fresh header" : "");
+    added = findPoolByPath(path);
+    logf(LogLevel::Warn, "admin: included %s (pool %u): %s", path.c_str(), poolId,
+         plan.reason.c_str());
     appendf(out, "included %s (pool %u) uuid=%s\n", path.c_str(), poolId,
             added ? added->deviceUuid.c_str() : "");
-    if (!archived.empty()) out += "previous_metadata=" + archived + "\n";
+    out += "action=" + std::string(plan.action == DevicePlan::Action::Reset ? "reset" : "serve") +
+           " reason=" + plan.reason + "\n";
+    if (!plan.archived.empty()) out += "previous_metadata=" + plan.archived + "\n";
     if (checkpointBlock_.empty() && checkpointLocked() == 0)
         out += "checkpoint=written\n";
     else
@@ -2193,7 +1775,7 @@ int PoolManager::adminInclude(const std::string &device, bool reinit, std::strin
     return 0;
 }
 
-int PoolManager::adminRelease(uint64_t regionId, bool confirmed, std::string &out)
+int PoolManager::adminRelease(uint64_t regionId, bool confirmed, bool force, std::string &out)
 {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = allocations_.find(regionId);
@@ -2203,15 +1785,11 @@ int PoolManager::adminRelease(uint64_t regionId, bool confirmed, std::string &ou
         return -ENOENT;
     }
     const Allocation a = it->second;
-    if (!findPoolById(a.poolId))
+    if (isLocalClient(a.clientId) && localOwnerAlive(a.clientId) && !force)
     {
-        out = "pool " + std::to_string(a.poolId) +
-              " has no device; its allocations cannot be released here\n";
-        return -ENODEV;
-    }
-    if (isLocalClient(a.clientId) && localOwnerAlive(a.clientId))
-    {
-        out = std::string("owner ") + a.clientId + " is still running\n";
+        out = std::string("owner ") + a.clientId + " is still running (" +
+              ownerProcessInfo(a.clientId) +
+              "); pass --force if that process is not the owner (a PID reused after a reboot)\n";
         return -EBUSY;
     }
     if (!confirmed)
@@ -2226,12 +1804,86 @@ int PoolManager::adminRelease(uint64_t regionId, bool confirmed, std::string &ou
         out = "release failed: " + std::string(std::strerror(-rc)) + "\n";
         return rc;
     }
-    logf(LogLevel::Warn, "admin: released region %llu (%llu bytes, pool %u) owned by %s",
+    logf(LogLevel::Warn, "admin: released region %llu (%llu bytes, pool %u) owned by %s%s",
          static_cast<unsigned long long>(regionId),
-         static_cast<unsigned long long>(a.allocLength), a.poolId, a.clientId);
+         static_cast<unsigned long long>(a.allocLength), a.poolId, a.clientId,
+         force ? " (forced)" : "");
     appendf(out, "released region=%llu size=%llu client=%s\n",
             static_cast<unsigned long long>(regionId),
             static_cast<unsigned long long>(a.allocLength), a.clientId);
+    return 0;
+}
+
+int PoolManager::adminDiscard(const std::string &device, bool confirmed, bool force,
+                              std::string &out)
+{
+    std::string name;
+    uint32_t poolId = 0;
+    if (!normalizeDaxName(device, name) || !parseRegionIndexFromDaxName(name, poolId))
+    {
+        out = "invalid device name: " + device + "\n";
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    const std::string path = "/dev/" + name;
+    const auto live = poolAllocations(poolId);
+    if (live.empty())
+    {
+        out = "pool " + std::to_string(poolId) + " has no recorded allocation\n";
+        return 0;
+    }
+    std::string list;
+    std::string running;
+    for (const auto &a : live)
+    {
+        appendf(list, "region=%llu size=%llu client=%s owner=%s\n",
+                static_cast<unsigned long long>(a.handle.regionId),
+                static_cast<unsigned long long>(a.allocLength), a.clientId,
+                ownerState(a.clientId));
+        if (isLocalClient(a.clientId) && localOwnerAlive(a.clientId))
+            running += std::string(a.clientId) + " " + ownerProcessInfo(a.clientId) + "\n";
+    }
+    if (!confirmed)
+    {
+        out = list + "this releases every allocation above without opening " + path +
+              ". Stop every MaruServer and handler that maps it on every host, then pass "
+              "--confirm\n";
+        return -EPERM;
+    }
+    if (!running.empty() && !force)
+    {
+        out = "local owner process(es) still running:\n" + running +
+              "stop them, or pass --force if they are not the owners (PIDs reused after a "
+              "reboot)\n";
+        return -EBUSY;
+    }
+    if (wal_->appendsDisabled()) checkpointLocked();
+    std::vector<uint64_t> frees;
+    for (const auto &a : live) frees.push_back(a.handle.regionId);
+    bool written = false;
+    const int rc = wal_->appendFrees(frees, &written);
+    if (rc != 0 && !written)
+    {
+        out = "cannot log the release: " + std::string(std::strerror(-rc)) + "\n";
+        return rc;
+    }
+    PoolState *pool = findPoolById(poolId);
+    for (const auto &a : live)
+    {
+        if (pool && pool->type == DaxType::FS_DAX) deleteFsDaxFile(pool->devPath, a.handle.regionId);
+        allocations_.erase(a.handle.regionId);
+    }
+    if (pool) rebuildFreeList(*pool);
+    recountClients();
+    for (auto &[devPath, u] : unserved_)
+        if (u.poolId == poolId) retryAfter_.erase(devPath);
+    logf(LogLevel::Warn, "admin: discarded %zu allocation(s) of pool %u%s", live.size(), poolId,
+         force ? " (forced)" : "");
+    out = list + "discarded pool=" + std::to_string(poolId) + " allocations=" +
+          std::to_string(live.size()) + "\n";
+    if (rc != 0)
+        out += "WARNING: the records reached the WAL but syncing it failed; appends are paused "
+               "until a checkpoint\n";
     return 0;
 }
 
@@ -2264,6 +1916,12 @@ int PoolManager::adminWipe(const std::string &device, bool confirmed, std::strin
             out = path + " is excluded, but " +
                   unsyncedExclusionNote(stateDir_, excludedSyncRc_, name);
             return excludedSyncRc_;
+        }
+        // A device write that timed out may still land; wait for it.
+        if (slots_->isHeld(path) && !slots_->heldByTimedOutRead(path))
+        {
+            out = "an operation on " + path + " is in progress; retry\n";
+            return -EBUSY;
         }
         if (!confirmed)
         {

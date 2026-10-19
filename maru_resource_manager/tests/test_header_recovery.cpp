@@ -1,16 +1,63 @@
 // Exercise production discovery/recovery using a private fake /dev and sysfs.
 // This target links fake_dax_fs.cpp; it never opens real DAX devices.
 #include "recovery_fixture.h"
+#include "server_config.h"
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <condition_variable>
 
 std::vector<std::string> openedPaths;
+static std::mutex openedMutex;
+
+// One open() of a chosen path (the nth) either stalls until released, as an
+// unresponsive device does, or runs an action instead (UnresponsiveDevice*).
+static std::mutex hangMutex;
+static std::condition_variable hangCv;
+static std::string hangPath;
+static int hangOpen = -1;
+static int hangOpensSeen = 0;
+static bool hangReleased = true;
+static std::function<void()> hangAction;
+
+static void armHang(const std::string &path, int nthOpen, std::function<void()> action = {}) {
+    std::lock_guard<std::mutex> lock(hangMutex);
+    hangPath = path;
+    hangOpen = nthOpen;
+    hangOpensSeen = 0;
+    hangReleased = false;
+    hangAction = std::move(action);
+}
+
+static void releaseHang() {
+    {
+        std::lock_guard<std::mutex> lock(hangMutex);
+        hangReleased = true;
+        hangPath.clear();
+    }
+    hangCv.notify_all();
+}
 
 int recordOpen(const char *path) {
-    openedPaths.emplace_back(path);
+    {
+        std::lock_guard<std::mutex> lock(openedMutex);
+        openedPaths.emplace_back(path);
+    }
     // Holds a caller in open(), e.g. a wipe child (test_device_exclusion.cpp).
     if (std::string(path) == "/dev/dax-hang") {
         ::sleep(30);
         errno = EIO;
         return -1;
+    }
+    std::unique_lock<std::mutex> lock(hangMutex);
+    if (!hangPath.empty() && path == hangPath && hangOpensSeen++ == hangOpen) {
+        if (hangAction) {
+            auto action = hangAction;
+            lock.unlock();
+            action();
+            return 0;
+        }
+        hangCv.wait_for(lock, std::chrono::seconds(30), [] { return hangReleased; });
     }
     return 0;
 }
@@ -31,37 +78,56 @@ TEST_F(HeaderRecoveryTest, FreshPoolInitializesHeaderAfterValidation) {
     ASSERT_EQ(restarted.loadPools(), 0);
     ASSERT_EQ(allocate(restarted, h), 0);
     EXPECT_EQ(h.offset, H);
+    // Kernels without the per-device align attribute: the region's, else
+    // 2 MiB, never a skipped device.
+    fs::remove(fakeRoot + "/sys/bus/dax/devices/dax0.0/align");
+    PoolManager older(state);
+    ASSERT_EQ(older.loadPools(), 0);
+    EXPECT_TRUE(older.hasPools());
 }
 
-TEST_F(HeaderRecoveryTest, LegacyAndRewrittenTotalAreRejectedWithoutDeviceWrites) {
+TEST_F(HeaderRecoveryTest, LegacyRecordIsReplaced) {
     addDevice(0, false);
-    for (bool rewritten : {false, true}) {
+    // A version 6 record of an earlier RM, whatever its free list and total
+    // say (here the header range that RMs before #40 kept).
+    for (bool header : {true, false}) {
+        SCOPED_TRACE(header ? "header" : "no header");
+        resetState();
+        resetDevice(0, header);
+        const auto before = head(0, 32);
         auto p = pool();
-        p.totalSize = rewritten ? B - H : B;
-        p.freeSize = B;
+        p.totalSize = p.freeSize = B;
         p.freeList = {{0, B}};
         save(p);
-        const auto before = bytes(state + "/pool_0.meta");
         PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_FALSE(pm.hasPools());
-        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-        EXPECT_EQ(bytes(state + "/pool_0.meta"), before);
-        DeviceHeader header{};
-        EXPECT_EQ(readDeviceHeader(dev(0), header, H), -ENODATA);
+        ASSERT_EQ(pm.loadPools(), 0);
+        std::vector<PoolState> stats;
+        pm.getStats(stats);
+        ASSERT_EQ(stats.size(), 1u);
+        EXPECT_EQ(stats[0].freeSize, B - H);
+        EXPECT_EQ(record().kind, PoolRecord::Kind::V7);
+        DeviceHeader hdr{};
+        EXPECT_EQ(readDeviceHeader(dev(0), hdr, H), 0);
+        // With its header the device keeps its UUID; without one it started
+        // over and the old record was kept aside.
+        EXPECT_EQ(head(0, 32) == before, header);
+        EXPECT_EQ(archives().size(), header ? 0u : 1u);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0);
+        EXPECT_EQ(h.offset, H);
     }
 }
 
-TEST_F(HeaderRecoveryTest, StaleCheckpointTotalUsesDeviceRange) {
+TEST_F(HeaderRecoveryTest, LegacyPoolWithLiveAllocationIsServed) {
     addDevice(0);
-    // A pre-validation RM saved the device size it saw at load but kept the
-    // old free list; the extents and the allocation cover this device exactly.
-    for (uint64_t total : {4 * (B - H), (B - H) / 2}) {
-        auto p = pool();
-        p.totalSize = total;
-        p.freeSize = B - 2 * H;
-        p.freeList = {{2 * H, B - 2 * H}};
-        save(p, {{42, allocation()}});
+    // The ledger carries over; the version 6 record's free list and total
+    // are not read.
+    auto p = pool();
+    p.totalSize = 4 * (B - H);
+    p.freeSize = B - 2 * H;
+    p.freeList = {{2 * H, B - 2 * H}};
+    save(p, {{42, allocation()}});
+    {
         PoolManager pm(state);
         ASSERT_EQ(pm.loadPools(), 0);
         std::vector<PoolState> stats;
@@ -69,39 +135,113 @@ TEST_F(HeaderRecoveryTest, StaleCheckpointTotalUsesDeviceRange) {
         ASSERT_EQ(stats.size(), 1u);
         EXPECT_EQ(stats[0].totalSize, B - H);
         EXPECT_EQ(stats[0].freeSize, B - 2 * H);
+        // Recorded as version 7 with the device's layout.
+        const auto saved = record();
+        ASSERT_EQ(saved.kind, PoolRecord::Kind::V7);
+        EXPECT_EQ(saved.dataBegin, H);
+        EXPECT_EQ(saved.dataEnd, B);
         EXPECT_EQ(pm.checkpoint(), 0);
-        PoolState saved = pool();
-        ASSERT_EQ(MetadataStore(state).load(0, saved), 0);
-        EXPECT_EQ(saved.totalSize, B - H);
     }
+    PoolManager restarted(state); // The version 7 path.
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 1u);
 }
 
-TEST_F(HeaderRecoveryTest, ResizedDeviceCheckpointIsStillRejected) {
+TEST_F(HeaderRecoveryTest, ResizedDeviceIsResetUnlessItsAllocationsMayBeInUse) {
     addDevice(0, false);
-    // Consistent checkpoints of a device half and twice this size.
+    addDevice(1);
+    // A device re-provisioned to another size lost its header; its
+    // checkpoint is consistent for the old size and holds no allocation.
     for (uint64_t size : {B / 2, 2 * B}) {
+        SCOPED_TRACE(size);
+        resetState();
+        resetDevice(0, false);
         auto p = pool();
         p.totalSize = p.freeSize = size - H;
         p.freeList = {{H, size - H}};
         save(p);
-        SCOPED_TRACE(size);
-        expectRecoveryRefused(-EUCLEAN);
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        std::vector<PoolState> stats;
+        pm.getStats(stats);
+        ASSERT_EQ(stats.size(), 2u);
+        EXPECT_EQ(record().kind, PoolRecord::Kind::V7);
+        EXPECT_EQ(record().dataEnd, B);
+        DeviceHeader hdr{};
+        EXPECT_EQ(readDeviceHeader(dev(0), hdr, H), 0);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0);
+        EXPECT_EQ(h.offset, H);
+        EXPECT_GE(h.regionId, 43u); // IDs of the history are not reused.
     }
+
+    // With its header the pool starts over under the same UUID; so does a
+    // device whose size is unchanged but whose identity tags no longer
+    // match (an interleave member changed).
+    resetState();
+    resetDevice(0, true);
+    { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Records version 7.
+    const auto header = head(0, 32);
+    resetDevice(0, false, 2 * B);
+    std::ofstream(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary)
+        << header; // The header survived, the rest of the mapping changed.
+    { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); }
+    EXPECT_EQ(head(0, 32), header);
+    EXPECT_EQ(record().dataEnd, 2 * B);
+    {
+        std::fstream f(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(3 * kDeviceTagStride);
+        f << std::string(32, 'x');
+    }
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(0)), "");
+    }
+    EXPECT_EQ(head(0, 32), header);
+    EXPECT_EQ(archives().size(), 2u); // Both started over.
+    EXPECT_EQ(head(0, 3 * kDeviceTagStride + 7).substr(3 * kDeviceTagStride), "MARUTAG");
+
+    // A recorded allocation whose owner may still run keeps the device
+    // refused, and the other device is served.
+    {
+        std::fstream f(fakeRoot + dev(0), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(3 * kDeviceTagStride);
+        f << std::string(32, 'x');
+    }
+    auto a = allocation();
+    ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
+    EXPECT_NE(expectDeviceRefused(0).find("identity tags"), std::string::npos);
 }
 
-TEST_F(HeaderRecoveryTest, CrcAndOversizedCountsFailWithoutReplacingMetadata) {
+TEST_F(HeaderRecoveryTest, DamagedRecordIsResetOrRefused) {
     addDevice(0);
-    save(pool());
+    { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Records version 7.
     auto original = bytes(state + "/pool_0.meta");
+    // A damaged CRC or UUID: nothing recorded on the pool, so it starts over
+    // and keeps the damaged file aside.
     for (size_t field : {size_t(12), size_t(24)}) {
         auto corrupt = original;
         corrupt[field] ^= 0x7f;
+        for (const auto &old : archives()) fs::remove(old);
         std::ofstream(state + "/pool_0.meta", std::ios::binary) << corrupt;
         PoolManager pm(state);
-        EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-        EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-        EXPECT_EQ(bytes(state + "/pool_0.meta"), corrupt);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(record().kind, PoolRecord::Kind::V7);
+        ASSERT_EQ(archives().size(), 1u);
+        EXPECT_EQ(bytes(archives().front()), corrupt);
     }
+    // With an allocation whose owner may run, nothing is replaced.
+    auto corrupt = original;
+    corrupt[12] ^= 0x7f;
+    std::ofstream(state + "/pool_0.meta", std::ios::binary) << corrupt;
+    ASSERT_EQ(MetadataStore(state).saveGlobal({{42, allocation()}}, 43), 0);
+    EXPECT_NE(expectDeviceRefused(0).find("damaged"), std::string::npos);
+    // A record from a newer RM is never replaced either.
+    std::string newer = original;
+    newer[4] = 8;
+    std::ofstream(state + "/pool_0.meta", std::ios::binary) << newer;
+    EXPECT_NE(expectDeviceRefused(0).find("newer"), std::string::npos);
 }
 
 TEST_F(HeaderRecoveryTest, BadGlobalMetadataDoesNotInitializeFreshHeader) {
@@ -123,13 +263,59 @@ TEST_F(HeaderRecoveryTest, MissingGlobalCheckpointIsNotAnEmptyLedger) {
     addDevice(0);
     ASSERT_EQ(MetadataStore(state).save(pool()), 0);
     expectRecoveryRefused(-EUCLEAN);
+    // Unless the WAL reaches back to region 1: the first checkpoint was cut
+    // short, and the WAL holds every allocation there ever was.
+    auto first = allocation();
+    first.handle.regionId = 1;
+    ASSERT_EQ(WalStore(state).appendAlloc(first), 0);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_TRUE(fs::exists(state + "/global.meta"));
+    }
+
+    // global.meta is created empty and the WAL kept, so a restart before the
+    // first checkpoint replays the same history: region 42, freed and then
+    // used by another pool (as RMs before #91 could), stays pool 0's.
+    resetState();
+    auto reused = allocation(1);
+    auto reuse = allocation(0);
+    reuse.nonce = 99;
+    {
+        WalStore wal(state);
+        ASSERT_EQ(wal.appendAlloc(reused), 0);
+        ASSERT_EQ(wal.appendFree(42), 0);
+        ASSERT_EQ(wal.appendAlloc(reuse), 0);
+    }
+    for (int start = 0; start < 2; ++start) {
+        SCOPED_TRACE(start);
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_TRUE(pm.hasPools());
+        EXPECT_EQ(pm.allocationCount(), 1u);
+    }
+    // Two pools claiming one ID at once cannot be resolved.
+    auto rival = allocation(2);
+    rival.nonce = 7;
+    ASSERT_EQ(WalStore(state).appendAlloc(rival), 0);
+    expectRecoveryRefused(-EEXIST);
 }
 
-TEST_F(HeaderRecoveryTest, MissingPoolCheckpointWithLiveAllocationIsRejected) {
+TEST_F(HeaderRecoveryTest, MissingPoolRecordKeepsAllocationsThatFit) {
     addDevice(0);
     const auto a = allocation();
     ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
-    expectRecoveryRefused(-EUCLEAN);
+    {
+        PoolManager pm(state); // The header is adopted, the allocation fits.
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
+    }
+    resetState();
+    resetDevice(0, false); // Without the header the allocation's data is gone.
+    ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
+    EXPECT_NE(expectDeviceRefused(0).find("header lost"), std::string::npos);
 }
 
 TEST_F(HeaderRecoveryTest, MissingHeaderWithoutLiveAllocationGetsFreshHeader) {
@@ -164,16 +350,11 @@ TEST_F(HeaderRecoveryTest, MissingHeaderWithoutLiveAllocationGetsFreshHeader) {
     EXPECT_EQ(pm.checkpoint(), 0);
 }
 
-TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
+TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRefused) {
     addDevice(0, false);
-    auto restart = [&] {
-        fs::remove_all(state);
-        fs::create_directories(state);
-        ASSERT_EQ(initSecret(state, false), 0);
-    };
     // Live in the checkpoint, or only in the WAL.
     for (bool walOnly : {false, true}) {
-        restart();
+        resetState();
         if (walOnly) {
             save(pool());
             ASSERT_EQ(WalStore(state).appendAlloc(allocation()), 0);
@@ -184,38 +365,68 @@ TEST_F(HeaderRecoveryTest, MissingHeaderWithLiveAllocationIsRejected) {
             save(p, {{42, allocation()}});
         }
         SCOPED_TRACE(walOnly ? "live in the WAL" : "live in the checkpoint");
-        expectRecoveryRefused(-EUCLEAN);
+        EXPECT_NE(expectDeviceRefused(0).find("header lost"), std::string::npos);
     }
-    // Only in the WAL, for a device that appears at a rescan: startup could
-    // not apply the record.
-    restart();
+    // The owner is a local process that exited: its allocation is released
+    // and the pool starts over.
+    resetState();
+    auto exited = allocation();
+    std::snprintf(exited.clientId, sizeof(exited.clientId), "%s", exitedLocalClient().c_str());
+    exited.handle.authToken = computeAuthToken(exited.handle, exited.nonce, exited.clientId);
+    auto p = pool();
+    p.freeSize = B - 2 * H;
+    p.freeList = {{2 * H, B - 2 * H}};
+    save(p, {{42, exited}});
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 0u);
+        EXPECT_TRUE(pm.hasPools());
+    }
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 0u);
+    // Only in the WAL, for a device that appears at a rescan: it is refused
+    // and the served pool and checkpoints carry on.
+    resetState();
+    resetDevice(0, true);
     ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
     PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0); // dax0.0 has no history now.
+    ASSERT_EQ(pm.loadPools(), 0);
     addDevice(1, false);
-    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    EXPECT_EQ(pm.rescanDevices(), 0);
     EXPECT_EQ(head(1, B), std::string(B, '\0'));
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("refused", 0), 0u);
+    EXPECT_EQ(pm.checkpoint(), 0);
+    EXPECT_EQ(pm.allocationCount(), 1u);
 }
 
-TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRejected) {
+TEST_F(HeaderRecoveryTest, HeaderAllocationInCheckpointIsRefusedWhileItsOwnerMayRun) {
     addDevice(0);
     auto a = allocation(0, 0);
     save(pool(), {{42, a}});
-    expectRecoveryRefused(-EUCLEAN);
+    EXPECT_NE(expectDeviceRefused(0).find("may still be in use"), std::string::npos);
+    std::snprintf(a.clientId, sizeof(a.clientId), "%s", exitedLocalClient().c_str());
+    save(pool(), {{42, a}});
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_TRUE(pm.hasPools());
+    EXPECT_EQ(pm.allocationCount(), 0u);
 }
 
-TEST_F(HeaderRecoveryTest, HeaderAllocFreeInWalIsRejectedAndRetained) {
+TEST_F(HeaderRecoveryTest, FreedHeaderAllocationInWalStartsThePoolOver) {
     addDevice(0);
     save(pool());
     WalStore wal(state);
     ASSERT_EQ(wal.appendAlloc(allocation(0, 0)), 0);
     ASSERT_EQ(wal.appendFree(42), 0);
-    const auto before = bytes(state + "/maru-resource-manager.wal");
+    const auto header = head(0, 32);
     PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-    EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), before);
+    ASSERT_EQ(pm.loadPools(), 0); // Nothing is live.
+    EXPECT_TRUE(pm.hasPools());
+    EXPECT_EQ(head(0, 32), header);
+    EXPECT_EQ(record().kind, PoolRecord::Kind::V7);
+    EXPECT_EQ(pm.checkpoint(), 0);
 }
 
 TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
@@ -225,6 +436,7 @@ TEST_F(HeaderRecoveryTest, WalOnlyCrashRecoveryRetainsLiveAllocationAndToken) {
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_TRUE(fs::exists(state + "/global.meta")); // Created before any pool record.
     Handle next{};
     ASSERT_EQ(allocate(pm, next), 0);
     EXPECT_EQ(next.regionId, 43u);
@@ -254,23 +466,33 @@ TEST_F(HeaderRecoveryTest, CheckpointPlusWalFreeDoesNotResurrectAllocation) {
     EXPECT_GE(h.regionId, 43u);
 }
 
-TEST_F(HeaderRecoveryTest, MissingDeviceKeepsWalUntilLateDiscovery) {
+TEST_F(HeaderRecoveryTest, MissingDeviceKeepsItsAllocationsUntilLateDiscovery) {
     addDevice(0);
     const auto a = allocation(1);
-    ASSERT_EQ(WalStore(state).appendAlloc(a), 0);
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-    EXPECT_NE(PoolManagerTestPeer::checkpointBlock(pm).find("pool(s) 1 "), std::string::npos);
-    EXPECT_TRUE(fs::exists(state + "/maru-resource-manager.wal"));
-    ASSERT_EQ(pm.rescanDevices(), 0); // No new device: still paused.
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-    addDevice(1);
-    ASSERT_EQ(pm.rescanDevices(), 0);
-    EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
-    EXPECT_EQ(pm.allocationCount(), 1u);
-    EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
-    EXPECT_EQ(pm.checkpoint(), 0);
+    // With or without a version 6 record of its pool: the ledger keeps the
+    // allocation, and the checkpoint writes it into global.meta.
+    for (bool legacy : {false, true}) {
+        SCOPED_TRACE(legacy ? "version 6 record" : "no record");
+        resetState();
+        fs::remove_all(fakeRoot + "/sys/bus/dax/devices/dax1.0");
+        if (legacy) {
+            auto p = pool(1);
+            p.freeSize = B - 2 * H;
+            p.freeList = {{2 * H, B - 2 * H}};
+            save(p);
+        }
+        ASSERT_EQ(WalStore(state).appendAlloc(a), 0);
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.checkpoint(), 0);
+        EXPECT_FALSE(fs::exists(state + "/maru-resource-manager.wal"));
+        addDevice(1);
+        ASSERT_EQ(pm.rescanDevices(), 0);
+        EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)), "");
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(pm.verifyAndFree(a.handle, a.clientId), 0);
+        EXPECT_EQ(pm.checkpoint(), 0);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, RescanWithoutNewDevicesDoesNotReadWal) {
@@ -328,6 +550,28 @@ TEST_F(HeaderRecoveryTest, TornFinalWalRecordIsDiscardedBeforeAppend) {
         DeviceHeader header{};
         EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
     }
+    // dax1.0 starts over and logs the release of an exited owner's
+    // allocation, after the torn tail is cut, so a restart reads it.
+    fs::remove(walPath);
+    auto exited = allocation(1);
+    exited.handle.regionId = 50;
+    std::snprintf(exited.clientId, sizeof(exited.clientId), "%s", exitedLocalClient().c_str());
+    ASSERT_EQ(WalStore(state).appendAlloc(exited), 0);
+    const auto complete = bytes(walPath);
+    ASSERT_EQ(WalStore(state).appendAlloc(second), 0);
+    fs::resize_file(walPath, complete.size() + 10);
+    std::string out;
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        ASSERT_EQ(pm.adminAllocations("dax1.0", out), 0);
+        EXPECT_EQ(out, "");
+        EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)), "");
+    }
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    ASSERT_EQ(restarted.adminAllocations("dax1.0", out), 0);
+    EXPECT_EQ(out, "");
 }
 
 TEST_F(HeaderRecoveryTest, LegacyWalReplaysButItsTornTailIsRejected) {
@@ -507,6 +751,10 @@ TEST_F(HeaderRecoveryTest, NewWalEntryIsSyncedBeforeItsFirstRecordIsAcknowledged
 
 TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) {
     addDevice(0);
+    // A refused pool with a live allocation does not stop the checkpoint
+    // that replaces the log.
+    addDevice(1, false);
+    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     Handle kept{};
@@ -527,7 +775,7 @@ TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) 
     {
         PoolManager restarted(crashed);
         ASSERT_EQ(restarted.loadPools(), 0);
-        EXPECT_EQ(restarted.allocationCount(), 1u);
+        EXPECT_EQ(restarted.allocationCount(), 2u);
         EXPECT_EQ(bytes(crashed + "/maru-resource-manager.wal"), walBefore);
     }
 
@@ -535,7 +783,7 @@ TEST_F(HeaderRecoveryTest, UnremovableFailedAppendBlocksAppendsUntilCheckpoint) 
     ASSERT_EQ(allocate(pm, h), 0);
     PoolManager restarted(state);
     ASSERT_EQ(restarted.loadPools(), 0);
-    EXPECT_EQ(restarted.allocationCount(), 2u);
+    EXPECT_EQ(restarted.allocationCount(), 3u);
 }
 
 TEST_F(HeaderRecoveryTest, ReaperRetriesFreeAfterWalFailure) {
@@ -555,43 +803,38 @@ TEST_F(HeaderRecoveryTest, ReaperRetriesFreeAfterWalFailure) {
     pm.reapExpired(reaped);
     EXPECT_EQ(reaped, 1u);
     EXPECT_EQ(pm.allocationCount(), 0u);
+    // A pool that is not served: an exited local owner's allocation leaves
+    // the ledger, a remote owner past its grace period does not (it may
+    // still run behind a network break).
+    auto exited = allocation(9);
+    exited.handle.regionId = 90;
+    std::snprintf(exited.clientId, sizeof(exited.clientId), "%s", exitedLocalClient().c_str());
+    auto remote = allocation(9);
+    remote.handle.regionId = 91;
+    PoolManagerTestPeer::addAllocation(pm, exited);
+    PoolManagerTestPeer::addAllocation(pm, remote);
+    pm.clientDisconnected("offline-test-owner");
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 1u);
+    EXPECT_EQ(pm.allocationCount(), 1u);
 }
 
-TEST_F(HeaderRecoveryTest, FailedRescanPreservesLivePoolAndWal) {
+TEST_F(HeaderRecoveryTest, RefusedRescanPreservesLivePool) {
     addDevice(0);
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     Handle h{};
     ASSERT_EQ(allocate(pm, h), 0);
-    addDevice(1, false);
-    auto p = pool(1);
-    p.freeList = {{0, B}};
-    p.freeSize = B;
-    ASSERT_EQ(MetadataStore(state).save(p), 0);
-    const auto walBefore = bytes(state + "/maru-resource-manager.wal");
-    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    addDevice(1); // Holds the UUID dax0.0 has: refused, never written.
+    const auto header0 = head(0, 32);
+    std::ofstream(fakeRoot + dev(1), std::ios::in | std::ios::out | std::ios::binary)
+        << header0;
+    EXPECT_EQ(pm.rescanDevices(), 0);
+    EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("refused", 0), 0u);
+    EXPECT_EQ(head(1, 32), header0);
     EXPECT_EQ(pm.allocationCount(), 1u);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
-    EXPECT_NE(PoolManagerTestPeer::checkpointBlock(pm).find(dev(1)), std::string::npos);
-    EXPECT_EQ(bytes(state + "/maru-resource-manager.wal"), walBefore);
-    DeviceHeader header{};
-    EXPECT_EQ(readDeviceHeader(dev(1), header, H), -ENODATA);
+    EXPECT_EQ(pm.checkpoint(), 0);
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
-}
-
-TEST_F(HeaderRecoveryTest, BoundsOverflowOverlapAndLiveFreeIntersectionAreRejected) {
-    addDevice(0);
-    for (auto extents : std::vector<std::vector<Extent>>{
-             {{H, B}}, {{UINT64_MAX - H + 1, H}}, {{H, H}, {H, H}}}) {
-        auto p = pool();
-        p.freeList = extents;
-        ASSERT_EQ(MetadataStore(state).save(p), 0);
-        ASSERT_EQ(MetadataStore(state).saveGlobal({}, 43), 0);
-        SCOPED_TRACE(extents.front().offset);
-        expectRecoveryRefused(-EUCLEAN);
-    }
-    save(pool(), {{42, allocation()}}); // Valid ranges, but free/live overlap.
-    expectRecoveryRefused(-EUCLEAN);
 }
 
 TEST_F(HeaderRecoveryTest, RuntimeAllocationAndReaperCannotExposeHeader) {
@@ -659,26 +902,32 @@ TEST_F(HeaderRecoveryTest, OrphanFsDaxFilesAreRemoved) {
     // Fresh (or wrong) state issued no IDs, so it owns nothing to remove.
     PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 1);
     EXPECT_TRUE(fs::exists(p.devPath + "/maru_7.dat"));
-    // A missing pool may own it through a WAL-only allocation.
-    PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50, "no device for pool(s) 9");
+    // A pool that is not served still owns its files through the ledger.
+    auto absent = allocation(9);
+    absent.handle.regionId = 7;
+    PoolManagerTestPeer::addAllocation(pm, absent);
+    PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50);
     EXPECT_TRUE(fs::exists(p.devPath + "/maru_7.dat"));
+    PoolManagerTestPeer::removeAllocation(pm, 7);
     PoolManagerTestPeer::removeOrphanFsDaxFiles(pm, 50);
     EXPECT_FALSE(fs::exists(p.devPath + "/maru_7.dat"));
     for (const auto &name : kept) EXPECT_TRUE(fs::exists(p.devPath + "/" + name)) << name;
 }
 
-TEST_F(HeaderRecoveryTest, InvalidSecondPoolCannotInitializeFirstPoolHeader) {
+TEST_F(HeaderRecoveryTest, EachDeviceIsJudgedOnItsOwn) {
     addDevice(0, false);
     addDevice(1, false);
-    auto bad = pool(1);
-    bad.freeList = {{0, B}};
-    bad.freeSize = B;
-    save(bad);
+    // dax1.0 lost its header while an allocation on it may be in use: it is
+    // refused untouched, and dax0.0, a new device, is served.
+    save(pool(1), {{42, allocation(1)}});
     PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EUCLEAN);
-    DeviceHeader h{};
-    EXPECT_EQ(readDeviceHeader(dev(0), h, H), -ENODATA);
-    EXPECT_EQ(readDeviceHeader(dev(1), h, H), -ENODATA);
+    ASSERT_EQ(pm.loadPools(), 0);
+    std::vector<PoolState> stats;
+    pm.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].devPath, dev(0));
+    EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("refused", 0), 0u);
+    EXPECT_EQ(head(1, B), std::string(B, '\0'));
 }
 
 TEST_F(HeaderRecoveryTest, LateHeaderAllocationFailsWithoutLosingExistingAllocations) {
@@ -690,10 +939,11 @@ TEST_F(HeaderRecoveryTest, LateHeaderAllocationFailsWithoutLosingExistingAllocat
     Handle h{};
     ASSERT_EQ(allocate(pm, h), 0);
     EXPECT_EQ(h.regionId, 43u);
-    addDevice(1);
-    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
-    EXPECT_EQ(pm.allocationCount(), 1u);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN);
+    addDevice(1); // Its recorded allocation covers the header: refused.
+    EXPECT_EQ(pm.rescanDevices(), 0);
+    EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("refused", 0), 0u);
+    EXPECT_EQ(pm.allocationCount(), 2u);
+    EXPECT_EQ(pm.checkpoint(), 0);
     EXPECT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
 }
 
@@ -718,6 +968,170 @@ TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
     EXPECT_EQ(stats[0].freeList[0].length, B - H);
 }
 
+TEST_F(HeaderRecoveryTest, IdentityMismatchIsRefusedWithoutWrites) {
+    addDevice(0);
+    addDevice(1);
+    { PoolManager pm(state); ASSERT_EQ(pm.loadPools(), 0); } // Both recorded.
+    // The header and identity tags of each device.
+    const auto area0 = head(0, H), area1 = head(1, H);
+    auto put = [&](uint32_t id, const std::string &area) {
+        std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
+        f.write(area.data(), static_cast<std::streamsize>(area.size()));
+    };
+    auto expectBothRefused = [&](const char *what) {
+        SCOPED_TRACE(what);
+        const auto other = head(1, H);
+        EXPECT_FALSE(expectDeviceRefused(0).empty());
+        EXPECT_EQ(head(1, H), other);
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_FALSE(pm.hasPools());
+    };
+    put(0, area1); // The dax numbers swapped.
+    put(1, area0);
+    expectBothRefused("swapped");
+    put(0, area0); // Two devices with one UUID.
+    put(1, area0);
+    expectBothRefused("duplicate UUID");
+    put(0, area1); // dax1.0's identity is on dax0.0 and dax1.0 has none.
+    put(1, std::string(H, '\0'));
+    expectBothRefused("header lost, its UUID elsewhere");
+    put(0, area0); // A Maru header of a version this RM does not know.
+    put(1, area1);
+    auto newer = area0;
+    newer[8] = 2;
+    put(0, newer);
+    EXPECT_NE(expectDeviceRefused(0).find("version"), std::string::npos);
+}
+
+TEST_F(HeaderRecoveryTest, BootMarkerReleasesOnlyPreviousBootLocalOwners) {
+    addDevice(0);
+    const std::string bootFile = fakeRoot + "/boot_id";
+    auto boot = [&](const std::string &id) { std::ofstream(bootFile) << id << "\n"; };
+    const std::string b1 = "11111111-1111-4111-8111-111111111111";
+    const std::string b2 = "22222222-2222-4222-8222-222222222222";
+    // A local owner whose PID runs: this process.
+    const std::string me = localClient(::getpid());
+    auto run = [&](const std::function<void(PoolManager &)> &body) {
+        PoolManager pm(state);
+        PoolManagerTestPeer::setBootIdPath(pm, bootFile);
+        ASSERT_EQ(pm.loadPools(), 0);
+        body(pm);
+    };
+    boot(b1);
+    run([&](PoolManager &pm) {
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h, 0, me), 0);
+    });
+    EXPECT_EQ(readBootMarker(state), b1);
+    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); }); // Same boot.
+    boot(b2); // After a reboot the PID belongs to some other process.
+    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 0u); });
+    EXPECT_EQ(readBootMarker(state), b2);
+    run([&](PoolManager &pm) {
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h, 0, me), 0);
+    });
+    // An earlier RM started since: it rewrote rm.conf without the line.
+    std::ofstream(state + "/rm.conf") << "host=0.0.0.0\nport=9850\nlog_level=info\n";
+    boot(b1);
+    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
+    EXPECT_EQ(readBootMarker(state), b1);
+    std::ofstream(state + "/rm.conf") << "boot_id=not-a-boot-id\n"; // Ignored.
+    boot(b2);
+    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
+    // An unreadable boot ID removes the line, so no later start guesses.
+    fs::remove(bootFile);
+    run([&](PoolManager &pm) { EXPECT_EQ(pm.allocationCount(), 1u); });
+    EXPECT_EQ(readBootMarker(state), "");
+}
+
+TEST_F(HeaderRecoveryTest, UnresponsiveDeviceDoesNotBlockOtherPools) {
+    addDevice(0);
+    PoolManager pm(state);
+    PoolManagerTestPeer::setDeviceIoTimeout(pm, 200);
+    ASSERT_EQ(pm.loadPools(), 0);
+    auto waitIdle = [&] {
+        for (int i = 0; i < 500 && PoolManagerTestPeer::slotHeld(pm, dev(1)); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ASSERT_FALSE(PoolManagerTestPeer::slotHeld(pm, dev(1)));
+    };
+    // The device stops answering at its first read, at the read just before
+    // the write, or at the write itself.
+    for (int nth : {0, 1, 2}) {
+        SCOPED_TRACE(nth);
+        fs::remove_all(fakeRoot + "/sys/bus/dax/devices/dax1.0");
+        fs::remove_all(fakeRoot + "/sys/class/dax/dax1.0");
+        addDevice(1, false);
+        resetDevice(1, false); // A new device each round.
+        armHang(dev(1), nth);
+        const auto started = std::chrono::steady_clock::now();
+        EXPECT_EQ(pm.rescanDevices(), 0);
+        EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(5));
+        EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("busy", 0), 0u);
+        Handle h{};
+        ASSERT_EQ(allocate(pm, h), 0); // Other pools carry on meanwhile.
+        ASSERT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
+        std::string out;
+        EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -EBUSY);
+        if (nth == 2) { // The write can still land: not handed over meanwhile.
+            EXPECT_EQ(pm.adminExclude("dax1.0", out), -EBUSY);
+        }
+        releaseHang();
+        waitIdle();
+        ASSERT_EQ(pm.rescanDevices(), 0); // Judged again once it answers.
+        EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)), "");
+        out.clear();
+        ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+        out.clear();
+        fs::remove(state + "/excluded_devices");
+        PoolManagerTestPeer::reloadExcluded(pm);
+    }
+    // Changed by someone else between the read and the write: not written.
+    fs::remove_all(fakeRoot + "/sys/bus/dax/devices/dax1.0");
+    fs::remove_all(fakeRoot + "/sys/class/dax/dax1.0");
+    addDevice(1, false);
+    resetDevice(1, false);
+    DeviceHeader theirs{};
+    initDeviceHeader(theirs);
+    armHang(dev(1), 1, [&] { writeDeviceHeader(dev(1), theirs, H); });
+    EXPECT_EQ(pm.rescanDevices(), 0);
+    releaseHang();
+    EXPECT_EQ(head(1, 32), std::string(reinterpret_cast<const char *>(&theirs), 32));
+    EXPECT_NE(PoolManagerTestPeer::unserved(pm, dev(1)).find("changed"), std::string::npos);
+    // A device that hangs at startup is skipped; the others are served, and
+    // the device can be excluded while only its timed-out read holds it.
+    armHang(dev(1), 0);
+    PoolManager restarted(state);
+    PoolManagerTestPeer::setDeviceIoTimeout(restarted, 200);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_TRUE(restarted.hasPools());
+    EXPECT_EQ(PoolManagerTestPeer::unserved(restarted, dev(1)).rfind("busy", 0), 0u);
+    std::string out;
+    EXPECT_EQ(restarted.adminExclude("dax1.0", out), 0) << out;
+    releaseHang();
+    auto waitRestartedIdle = [&] {
+        for (int i = 0; i < 500 && PoolManagerTestPeer::slotHeld(restarted, dev(1)); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ASSERT_FALSE(PoolManagerTestPeer::slotHeld(restarted, dev(1)));
+    };
+    waitRestartedIdle();
+    // An include whose device write times out leaves the device excluded,
+    // but not ready to hand over until the write returns.
+    armHang(dev(1), 2);
+    out.clear();
+    EXPECT_NE(restarted.adminInclude("dax1.0", PoolManager::IncludeMode::Reinit, out), 0);
+    out.clear();
+    EXPECT_EQ(restarted.adminExclude("dax1.0", out), -EBUSY) << out;
+    out.clear();
+    ASSERT_EQ(restarted.adminStatus(out), 0);
+    EXPECT_NE(out.find("state=excluded write_pending=yes"), std::string::npos) << out;
+    releaseHang();
+    waitRestartedIdle();
+    out.clear();
+    EXPECT_EQ(restarted.adminExclude("dax1.0", out), 0) << out;
+}
+
 namespace {
 struct CheckpointFaultCase {
     std::string file;
@@ -731,11 +1145,11 @@ void PrintTo(const CheckpointFaultCase &fault, std::ostream *os) {
 }
 
 std::vector<CheckpointFaultCase> checkpointFaultCases() {
-    // The checkpoint returns any errno as is, so one per phase is enough.
+    // A checkpoint writes only global.meta and returns any errno as is, so
+    // one case per phase is enough.
     std::vector<CheckpointFaultCase> cases;
-    for (const auto *file : {"pool_0.meta", "pool_1.meta", "global.meta"})
-        for (const auto *phase : {"HeaderWrite", "PartialPayloadWrite", "Fsync"})
-            cases.push_back({file, phase, std::string(phase) == "Fsync" ? EIO : ENOSPC});
+    for (const auto *phase : {"HeaderWrite", "PartialPayloadWrite", "Fsync"})
+        cases.push_back({"global.meta", phase, std::string(phase) == "Fsync" ? EIO : ENOSPC});
     return cases;
 }
 } // namespace
@@ -751,68 +1165,82 @@ class CheckpointFailureTest : public HeaderRecoveryTest,
 TEST_P(CheckpointFailureTest, RetainsWalAndAllowsRetry) {
     addDevice(0);
     addDevice(1);
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    Handle old{};
-    ASSERT_EQ(allocate(pm, old), 0);
-    ASSERT_EQ(pm.checkpoint(), 0);
-    const auto oldPool0 = bytes(state + "/pool_0.meta");
-    const auto oldPool1 = bytes(state + "/pool_1.meta");
-    const auto oldGlobal = bytes(state + "/global.meta");
-
-    // Both pool checkpoints and the global ledger now differ from the baseline.
-    ASSERT_EQ(pm.verifyAndFree(old, "offline-test-owner"), 0);
-    Handle a{}, b{}, c{};
-    ASSERT_EQ(allocate(pm, a), 0);
-    ASSERT_EQ(allocate(pm, b), 0);
-    ASSERT_EQ(allocate(pm, c, 1), 0);
     const std::string walPath = state + "/maru-resource-manager.wal";
-    const auto walBefore = bytes(walPath);
-    ASSERT_FALSE(walBefore.empty());
+    const std::string globalPath = state + "/global.meta";
+    Handle old{}, a{}, b{}, c{}, later{};
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        const auto record0 = bytes(state + "/pool_0.meta");
+        const auto record1 = bytes(state + "/pool_1.meta");
+        ASSERT_EQ(allocate(pm, old), 0);
+        ASSERT_EQ(pm.checkpoint(), 0);
+        const auto oldGlobal = bytes(globalPath);
+        ASSERT_EQ(pm.verifyAndFree(old, "offline-test-owner"), 0);
+        ASSERT_EQ(allocate(pm, a), 0);
+        ASSERT_EQ(allocate(pm, b), 0);
+        ASSERT_EQ(allocate(pm, c, 1), 0);
+        const auto walBefore = bytes(walPath);
+        ASSERT_FALSE(walBefore.empty());
 
-    const auto &fault = GetParam();
-    const auto path = state + "/" + fault.file;
-    const auto publishedBefore = bytes(path);
-    const bool partial = fault.phase == "PartialPayloadWrite";
-    checkpoint_fault::arm(path + ".tmp",
-        fault.phase == "Fsync" ? checkpoint_fault::Operation::Fsync
-                               : checkpoint_fault::Operation::Write,
-        fault.error, partial ? 40 : 0); // 32-byte header + 8 payload bytes.
-    const int rc = pm.checkpoint();
-    checkpoint_fault::clear();
-    ASSERT_EQ(checkpoint_fault::failures(), 1u); // Prove the failpoint was reached.
-    EXPECT_EQ(checkpoint_fault::shortWrites(), partial ? 1u : 0u);
-    EXPECT_EQ(rc, -fault.error);
-    EXPECT_EQ(bytes(path), publishedBefore); // Failed file was not renamed.
-    EXPECT_EQ(bytes(walPath), walBefore); // Not just present: byte-for-byte intact.
-    EXPECT_EQ(bytes(state + "/global.meta"), oldGlobal);
-    if (fault.file != "pool_0.meta") {
-        EXPECT_NE(bytes(state + "/pool_0.meta"), oldPool0);
-    }
-    if (fault.file == "global.meta") {
-        EXPECT_NE(bytes(state + "/pool_1.meta"), oldPool1);
-    }
-    EXPECT_EQ(pm.allocationCount(), 3u);
+        const auto &fault = GetParam();
+        const bool partial = fault.phase == "PartialPayloadWrite";
+        checkpoint_fault::arm(globalPath + ".tmp",
+            fault.phase == "Fsync" ? checkpoint_fault::Operation::Fsync
+                                   : checkpoint_fault::Operation::Write,
+            fault.error, partial ? 40 : 0); // 32-byte header + 8 payload bytes.
+        const int rc = pm.checkpoint();
+        checkpoint_fault::clear();
+        ASSERT_EQ(checkpoint_fault::failures(), 1u); // Prove the failpoint was reached.
+        EXPECT_EQ(checkpoint_fault::shortWrites(), partial ? 1u : 0u);
+        EXPECT_EQ(rc, -fault.error);
+        EXPECT_EQ(bytes(globalPath), oldGlobal);
+        EXPECT_EQ(bytes(walPath), walBefore); // Not just present: byte-for-byte intact.
+        EXPECT_FALSE(fs::exists(globalPath + ".tmp"));
+        // Checkpoints never write pool records.
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), record0);
+        EXPECT_EQ(bytes(state + "/pool_1.meta"), record1);
+        EXPECT_EQ(pm.allocationCount(), 3u);
 
-    // A failed checkpoint must also leave the appendable WAL connected to its
-    // pathname. Continue allocating, then retry with the fault removed.
-    Handle later{};
-    ASSERT_EQ(allocate(pm, later, 1), 0);
-    const auto extendedWal = bytes(walPath);
-    EXPECT_GT(extendedWal.size(), walBefore.size());
-    EXPECT_EQ(extendedWal.substr(0, walBefore.size()), walBefore);
-    ASSERT_EQ(pm.checkpoint(), 0);
-    EXPECT_FALSE(fs::exists(walPath));
-    EXPECT_FALSE(fs::exists(path + ".tmp"));
-
-    PoolManager restarted(state);
-    ASSERT_EQ(restarted.loadPools(), 0);
-    EXPECT_EQ(restarted.allocationCount(), 4u);
-    EXPECT_EQ(restarted.verifyAndFree(old, "offline-test-owner"), -ENOENT);
-    for (const auto &handle : {a, b, c, later}) {
-        EXPECT_EQ(restarted.verifyAndFree(handle, "offline-test-owner"), 0);
+        // A failed checkpoint must also leave the appendable WAL connected to
+        // its pathname. Continue allocating, then retry with the fault removed.
+        ASSERT_EQ(allocate(pm, later, 1), 0);
+        const auto extendedWal = bytes(walPath);
+        EXPECT_GT(extendedWal.size(), walBefore.size());
+        EXPECT_EQ(extendedWal.substr(0, walBefore.size()), walBefore);
+        ASSERT_EQ(pm.checkpoint(), 0);
+        EXPECT_FALSE(fs::exists(walPath));
     }
-    EXPECT_EQ(restarted.checkpoint(), 0);
+    {
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 4u);
+        EXPECT_EQ(restarted.verifyAndFree(old, "offline-test-owner"), -ENOENT);
+        ASSERT_EQ(restarted.verifyAndFree(a, "offline-test-owner"), 0);
+    }
+
+    // Stopped after global.meta was replaced, before the WAL was removed: the
+    // log is replayed onto the checkpoint that already holds it, with the
+    // same result.
+    Handle d{};
+    std::string covered;
+    {
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        ASSERT_EQ(allocate(restarted, d), 0);
+        covered = bytes(walPath); // a's FREE and d's ALLOC
+        ASSERT_EQ(restarted.checkpoint(), 0);
+    }
+    std::ofstream(walPath, std::ios::binary) << covered;
+    {
+        PoolManager restarted(state);
+        ASSERT_EQ(restarted.loadPools(), 0);
+        EXPECT_EQ(restarted.allocationCount(), 4u);
+        EXPECT_EQ(restarted.verifyAndFree(a, "offline-test-owner"), -ENOENT);
+        for (const auto &handle : {b, c, later, d})
+            EXPECT_EQ(restarted.verifyAndFree(handle, "offline-test-owner"), 0);
+        EXPECT_EQ(restarted.checkpoint(), 0);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(CheckpointIo, CheckpointFailureTest,

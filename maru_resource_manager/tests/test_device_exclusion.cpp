@@ -50,11 +50,10 @@ protected:
         std::fstream f(fakeRoot + dev(id), std::ios::in | std::ios::out | std::ios::binary);
         f.write(head.data(), static_cast<std::streamsize>(head.size()));
     }
-    // A WAL record for an absent pool (dax2.0) keeps checkpoints paused.
-    void pauseCheckpoints() {
-        auto absent = allocation(2);
-        absent.handle.regionId = 500;
-        ASSERT_EQ(WalStore(state).appendAlloc(absent), 0);
+    // Every checkpoint fails until checkpoint_fault::clear().
+    void failCheckpoints() {
+        checkpoint_fault::arm(state + "/global.meta.tmp", checkpoint_fault::Operation::Write,
+                              ENOSPC);
     }
 };
 
@@ -187,65 +186,61 @@ TEST_F(DeviceExclusionTest, AbsentDeviceAllocationsComeFromCheckpointAndWal) {
     p.freeList = {{2 * H, B - 2 * H}};
     p.freeSize = B - 2 * H;
     save(p, {{42, allocation(1)}});
-    const std::string walPath = state + "/maru-resource-manager.wal";
+    auto later = allocation(1, 3 * H);
+    later.handle.regionId = 43;
     {
         WalStore wal(state);
         ASSERT_EQ(wal.appendFree(42), 0); // Freed after the checkpoint.
-        auto later = allocation(1, 3 * H);
-        later.handle.regionId = 43;
         ASSERT_EQ(wal.appendAlloc(later), 0); // Allocated after it: WAL only.
     }
-    PoolManager pm(state);
-    ASSERT_EQ(pm.loadPools(), 0);
-    EXPECT_EQ(pm.checkpoint(), -EAGAIN); // Pool 1 has no device.
-    for (const std::string filter : {"dax1.0", ""}) {
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.checkpoint(), 0); // global.meta holds pool 1's allocations too.
+        for (const std::string filter : {"dax1.0", ""}) {
+            std::string out;
+            ASSERT_EQ(pm.adminAllocations(filter, out), 0) << out;
+            EXPECT_EQ(out.find("region=42 "), npos) << filter << ": " << out;
+            EXPECT_NE(out.find("region=43 pool=1 device=(not present)"), npos)
+                << filter << ": " << out;
+        }
         std::string out;
-        ASSERT_EQ(pm.adminAllocations(filter, out), 0) << out;
-        EXPECT_EQ(out.find("region=42 "), npos) << filter << ": " << out;
-        EXPECT_NE(out.find("region=43 pool=1 device=(not present)"), npos)
-            << filter << ": " << out;
-    }
-    std::string out;
-    ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
-    EXPECT_EQ(out, "");
+        ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
+        EXPECT_EQ(out, "");
 
-    // An unreadable WAL is an error, never an empty listing.
-    const auto wal = bytes(walPath);
-    std::ofstream(walPath, std::ios::binary | std::ios::trunc) << std::string(64, '\xff');
-    for (const std::string filter : {"dax1.0", ""}) {
+        // A pool without a device cannot be excluded while region 43 is
+        // live; its allocations are released in the ledger.
+        EXPECT_EQ(pm.adminRelease(42, true, false, out), -ENOENT);
         out.clear();
-        EXPECT_EQ(pm.adminAllocations(filter, out), -EPROTO) << filter;
-        EXPECT_NE(out.find("cannot read WAL"), npos) << filter << ": " << out;
+        EXPECT_EQ(pm.adminExclude("dax1.0", out), -EBUSY);
+        EXPECT_NE(out.find("region=43"), npos) << out;
+        EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
+        out.clear();
+        ASSERT_EQ(pm.adminRelease(43, true, false, out), 0) << out;
+        out.clear();
+        ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
+        EXPECT_EQ(pm.allocationCount(), 0u);
+        EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
+        EXPECT_EQ(pm.checkpoint(), 0);
     }
-    std::ofstream(walPath, std::ios::binary | std::ios::trunc) << wal;
-
-    // Nothing on a pool without a device can be released, and the device
-    // cannot be excluded while region 43 is live.
-    out.clear();
-    EXPECT_EQ(pm.adminRelease(42, true, out), -ENODEV);
-    out.clear();
-    EXPECT_EQ(pm.adminExclude("dax1.0", out), -EBUSY);
-    EXPECT_NE(out.find("region=43"), npos) << out;
-    EXPECT_FALSE(fs::exists(state + "/excluded_devices"));
-    ASSERT_EQ(WalStore(state).appendFree(43), 0);
-    out.clear();
-    ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
-    EXPECT_EQ(pm.allocationCount(), 0u);
-    EXPECT_EQ(PoolManagerTestPeer::checkpointBlock(pm), "");
-    EXPECT_EQ(pm.checkpoint(), 0);
 }
 
-TEST_F(DeviceExclusionTest, StartupRefusesExcludedPoolWithLiveAllocation) {
+TEST_F(DeviceExclusionTest, ExcludedPoolWithLiveAllocationKeepsItsRecords) {
     addDevice(0);
+    addDevice(1);
     ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
     writeExcluded("dax1.0\n"); // Edited by hand without draining.
-    PoolManager pm(state);
-    EXPECT_EQ(pm.loadPools(), -EBUSY);
-    // Allocation history alone is fine.
-    ASSERT_EQ(WalStore(state).appendFree(42), 0);
-    PoolManager drained(state);
-    ASSERT_EQ(drained.loadPools(), 0);
-    EXPECT_EQ(drained.checkpoint(), 0);
+    openedPaths.clear();
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(std::count(openedPaths.begin(), openedPaths.end(), dev(1)), 0);
+        EXPECT_EQ(pm.checkpoint(), 0); // The allocation moves into global.meta.
+    }
+    PoolManager restarted(state);
+    ASSERT_EQ(restarted.loadPools(), 0);
+    EXPECT_EQ(restarted.allocationCount(), 1u);
 }
 
 TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
@@ -255,15 +250,15 @@ TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
     ASSERT_EQ(pm.loadPools(), 0);
     const auto uuid = uuidOf(pm, 1);
     std::string out;
-    EXPECT_EQ(pm.adminInclude("dax1.0", false, out), -EINVAL); // Not excluded.
+    EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -EINVAL); // Not excluded.
     out.clear();
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     EXPECT_EQ(poolPaths(pm).size(), 2u);
     EXPECT_EQ(uuidOf(pm, 1), uuid);
     EXPECT_TRUE(excludedOnDisk().empty());
-    ASSERT_EQ(pm.checkpoint(), 0); // pool_1.meta now exists.
+    ASSERT_EQ(pm.checkpoint(), 0);
 
     // Hand it to ROOF, then try to take it back.
     out.clear();
@@ -271,7 +266,7 @@ TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
     writeRoofSuperblock(1);
     const auto roof = head(1);
     out.clear();
-    EXPECT_EQ(pm.adminInclude("dax1.0", false, out), -EBUSY);
+    EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -EBUSY);
     EXPECT_NE(out.find("ROOF"), npos) << out;
     EXPECT_NE(out.find("--reinit"), npos) << out;
     EXPECT_EQ(head(1), roof);
@@ -279,7 +274,7 @@ TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
     EXPECT_EQ(poolPaths(pm).size(), 1u);
 
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", true, out), 0) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Reinit, out), 0) << out;
     const auto archived = lineAfter(out, "previous_metadata=");
     ASSERT_FALSE(archived.empty()) << out;
     EXPECT_TRUE(fs::exists(archived));
@@ -293,6 +288,36 @@ TEST_F(DeviceExclusionTest, IncludeRestoresPoolButRoofDeviceNeedsReinit) {
     PoolManager restarted(state);
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_EQ(poolPaths(restarted).size(), 2u);
+
+    // Judged against its record: while excluded, dax1.0 got another Maru
+    // header (another cluster's); include refuses and it stays excluded.
+    out.clear();
+    ASSERT_EQ(restarted.adminExclude("dax1.0", out), 0) << out;
+    const auto ours = head(1, 32);
+    DeviceHeader theirs{};
+    initDeviceHeader(theirs);
+    ASSERT_EQ(writeDeviceHeader(dev(1), theirs, H), 0);
+    out.clear();
+    EXPECT_EQ(restarted.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -EUCLEAN);
+    EXPECT_NE(out.find("differs from recorded"), npos) << out;
+    EXPECT_EQ(excludedOnDisk(), std::set<std::string>{"dax1.0"});
+    // The header alone changed (the identity tags still match the record):
+    // --restore-header writes the recorded UUID back.
+    out.clear();
+    ASSERT_EQ(restarted.adminInclude("dax1.0", PoolManager::IncludeMode::RestoreHeader, out), 0)
+        << out;
+    EXPECT_EQ(head(1, 32), ours);
+    // A device excluded by an earlier RM has no record: its Maru header is
+    // accepted only with --adopt.
+    out.clear();
+    ASSERT_EQ(restarted.adminExclude("dax1.0", out), 0) << out;
+    fs::remove(state + "/pool_1.meta");
+    out.clear();
+    EXPECT_EQ(restarted.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -EUCLEAN);
+    EXPECT_NE(out.find("--adopt"), npos) << out;
+    out.clear();
+    ASSERT_EQ(restarted.adminInclude("dax1.0", PoolManager::IncludeMode::Adopt, out), 0) << out;
+    EXPECT_EQ(head(1, 32), ours);
 }
 
 TEST_F(DeviceExclusionTest, ReleaseNeedsExitedOwnerAndConfirmation) {
@@ -304,19 +329,49 @@ TEST_F(DeviceExclusionTest, ReleaseNeedsExitedOwnerAndConfirmation) {
     ASSERT_EQ(allocate(pm, remote), 0); // "offline-test-owner" is not local.
     ASSERT_EQ(allocate(pm, gone, 0, localClient(2147483647)), 0);
     std::string out;
-    EXPECT_EQ(pm.adminRelease(mine.regionId, true, out), -EBUSY);
-    EXPECT_EQ(pm.adminRelease(remote.regionId, false, out), -EPERM);
-    EXPECT_EQ(pm.adminRelease(gone.regionId, false, out), -EPERM);
+    EXPECT_EQ(pm.adminRelease(mine.regionId, true, false, out), -EBUSY);
+    EXPECT_EQ(pm.adminRelease(remote.regionId, false, false, out), -EPERM);
+    EXPECT_EQ(pm.adminRelease(gone.regionId, false, false, out), -EPERM);
     out.clear();
-    ASSERT_EQ(pm.adminRelease(remote.regionId, true, out), 0) << out;
-    ASSERT_EQ(pm.adminRelease(gone.regionId, true, out), 0) << out;
-    EXPECT_EQ(pm.adminRelease(gone.regionId, true, out), -ENOENT);
+    ASSERT_EQ(pm.adminRelease(remote.regionId, true, false, out), 0) << out;
+    ASSERT_EQ(pm.adminRelease(gone.regionId, true, false, out), 0) << out;
+    EXPECT_EQ(pm.adminRelease(gone.regionId, true, false, out), -ENOENT);
     out.clear();
     ASSERT_EQ(pm.adminAllocations("dax0.0", out), 0);
     EXPECT_NE(out.find("owner=running"), npos) << out;
     PoolManager restarted(state); // Releases went through the WAL.
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_EQ(restarted.allocationCount(), 1u);
+
+    // --force passes a running local owner (a PID reused after a reboot).
+    out.clear();
+    ASSERT_EQ(restarted.adminRelease(mine.regionId, true, true, out), 0) << out;
+    // discard returns every allocation of the pool: refused while a local
+    // owner runs unless forced, and a served pool gets its ranges back.
+    Handle a{}, b{};
+    ASSERT_EQ(allocate(restarted, a, 0, localClient(::getpid())), 0);
+    ASSERT_EQ(allocate(restarted, b), 0);
+    out.clear();
+    EXPECT_EQ(restarted.adminDiscard("dax0.0", false, false, out), -EPERM);
+    EXPECT_EQ(restarted.adminDiscard("dax0.0", true, false, out), -EBUSY);
+    out.clear();
+    ASSERT_EQ(restarted.adminDiscard("dax0.0", true, true, out), 0) << out;
+    EXPECT_EQ(restarted.allocationCount(), 0u);
+    std::vector<PoolState> stats;
+    restarted.getStats(stats);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_EQ(stats[0].freeSize, stats[0].totalSize);
+    // An excluded device is never opened by discard.
+    addDevice(1);
+    ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);
+    writeExcluded("dax1.0\n");
+    PoolManager excluded(state);
+    ASSERT_EQ(excluded.loadPools(), 0);
+    openedPaths.clear();
+    out.clear();
+    ASSERT_EQ(excluded.adminDiscard("dax1.0", true, false, out), 0) << out;
+    EXPECT_EQ(excluded.allocationCount(), 0u);
+    EXPECT_EQ(std::count(openedPaths.begin(), openedPaths.end(), dev(1)), 0);
 }
 
 TEST_F(DeviceExclusionTest, AdminSocketIsPrivateAndParsesStrictly) {
@@ -347,22 +402,26 @@ TEST_F(DeviceExclusionTest, AdminSocketIsPrivateAndParsesStrictly) {
 TEST_F(DeviceExclusionTest, IncludeAfterFreesSinceTheLastCheckpointStartsEmpty) {
     addDevice(0);
     addDevice(1);
+    Handle x{};
+    {
+        PoolManager first(state);
+        ASSERT_EQ(first.loadPools(), 0);
+        ASSERT_EQ(allocate(first, x, 1), 0);
+        ASSERT_EQ(first.checkpoint(), 0);                  // Checkpoint lists x.
+        ASSERT_EQ(first.verifyAndFree(x, "offline-test-owner"), 0); // Freed in the WAL only.
+    }
+    // The checkpoint still lists x when the device comes back.
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
-    Handle x{};
-    ASSERT_EQ(allocate(pm, x, 1), 0);
-    ASSERT_EQ(pm.checkpoint(), 0);                  // Checkpoint lists x.
-    ASSERT_EQ(pm.verifyAndFree(x, "offline-test-owner"), 0); // Freed in the WAL only.
-    // The checkpoint still lists x when the device comes back.
-    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
+    failCheckpoints();
     std::string out;
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     EXPECT_NE(out.find("checkpoint=deferred"), npos) << out;
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
-    EXPECT_NE(out.find("previous_metadata="), npos) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     Handle y{};
     ASSERT_EQ(allocate(pm, y, 1), 0);
+    checkpoint_fault::clear();
     EXPECT_EQ(y.offset, x.offset);
     // Crash before any checkpoint: the files on disk must still recover.
     PoolManager restarted(state);
@@ -377,7 +436,7 @@ TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
     ASSERT_EQ(pm.loadPools(), 0);
     Handle h{};
     ASSERT_EQ(allocate(pm, h, 1), 0);
-    ASSERT_EQ(pm.checkpoint(), 0); // pool_1.meta has a hole for h.
+    ASSERT_EQ(pm.checkpoint(), 0); // global.meta lists h.
     ASSERT_EQ(pm.verifyAndFree(h, "offline-test-owner"), 0);
     std::string out;
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
@@ -386,12 +445,12 @@ TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
     checkpoint_fault::arm(state + "/excluded_devices.tmp", checkpoint_fault::Operation::Write,
                           ENOSPC);
     out.clear();
-    EXPECT_EQ(pm.adminInclude("dax1.0", true, out), -ENOSPC);
+    EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Reinit, out), -ENOSPC);
     checkpoint_fault::clear();
     EXPECT_EQ(checkpoint_fault::failures(), 1u);
-    // --reinit asked to discard the device, so its header may already be new;
-    // the old metadata then stays archived, and ownership is rolled back.
-    EXPECT_NE(out.find("header was already written"), npos) << out;
+    // --reinit asked to discard the device, so its identity may already be
+    // new; the old metadata then stays archived, and ownership is rolled back.
+    EXPECT_NE(out.find("identity was already written"), npos) << out;
     const auto kept = lineAfter(out, "previous metadata kept at ");
     ASSERT_FALSE(kept.empty()) << out;
     EXPECT_EQ(bytes(kept), meta);
@@ -404,7 +463,7 @@ TEST_F(DeviceExclusionTest, FailedListSaveKeepsTheDeviceExcluded) {
         EXPECT_EQ(poolPaths(restarted), std::set<std::string>{dev(0)});
     }
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", true, out), 0) << out; // Retry works.
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Reinit, out), 0) << out; // Retry works.
 }
 
 TEST_F(DeviceExclusionTest, UnsyncedListIsNotReportedAsReadyForHandover) {
@@ -485,7 +544,7 @@ TEST_F(DeviceExclusionTest, UnsyncedIncludeStandsButIsReported) {
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
     out.clear();
-    const int rc = pm.adminInclude("dax1.0", false, out);
+    const int rc = pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out);
     checkpoint_fault::clear();
     // Losing this list would only keep the device excluded.
     ASSERT_EQ(rc, 0) << out;
@@ -503,15 +562,14 @@ TEST_F(DeviceExclusionTest, IncludeIgnoresUnrelatedRejectedDevice) {
     ASSERT_EQ(pm.loadPools(), 0);
     std::string out;
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
-    addDevice(2);
-    auto bad = pool(2);
-    bad.freeList = {{0, B}}; // Covers the header: rejected on every rescan.
-    bad.freeSize = B;
-    ASSERT_EQ(MetadataStore(state).save(bad), 0);
-    EXPECT_EQ(pm.rescanDevices(), -EUCLEAN);
+    addDevice(2); // Carries dax0.0's UUID: refused on every rescan.
+    std::ofstream(fakeRoot + dev(2), std::ios::in | std::ios::out | std::ios::binary)
+        << head(0, 32);
+    EXPECT_EQ(pm.rescanDevices(), 0);
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     EXPECT_EQ(poolPaths(pm), (std::set<std::string>{dev(0), dev(1)}));
+    EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(2)).rfind("refused", 0), 0u);
 }
 
 TEST_F(DeviceExclusionTest, HandEditedListIsNeverOverwritten) {
@@ -524,7 +582,7 @@ TEST_F(DeviceExclusionTest, HandEditedListIsNeverOverwritten) {
     writeExcluded("dax1.0\ndax3.0\n");
     out.clear();
     EXPECT_EQ(pm.adminExclude("dax0.0", out), -ESTALE);
-    EXPECT_EQ(pm.adminInclude("dax1.0", false, out), -ESTALE);
+    EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -ESTALE);
     EXPECT_EQ(excludedOnDisk(), (std::set<std::string>{"dax1.0", "dax3.0"}));
     EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
 }
@@ -561,9 +619,9 @@ TEST_F(DeviceExclusionTest, HeaderIsWrittenBeforeTheListReleasesTheDevice) {
     checkpoint_fault::arm(state + "/excluded_devices.tmp", checkpoint_fault::Operation::Write,
                           ENOSPC);
     std::string out;
-    EXPECT_EQ(pm.adminInclude("dax1.0", false, out), -ENOSPC);
+    EXPECT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), -ENOSPC);
     checkpoint_fault::clear();
-    EXPECT_NE(out.find("header was already written"), npos) << out;
+    EXPECT_NE(out.find("identity was already written"), npos) << out;
     DeviceHeader header{};
     EXPECT_EQ(readDeviceHeader(dev(1), header, H), 0);
     EXPECT_EQ(excludedOnDisk(), std::set<std::string>{"dax1.0"});
@@ -573,7 +631,7 @@ TEST_F(DeviceExclusionTest, HeaderIsWrittenBeforeTheListReleasesTheDevice) {
         EXPECT_EQ(poolPaths(restarted), std::set<std::string>{dev(0)});
     }
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     PoolManager restarted(state);
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_EQ(poolPaths(restarted), (std::set<std::string>{dev(0), dev(1)}));
@@ -586,13 +644,12 @@ TEST_F(DeviceExclusionTest, ArchivesAreNeverOverwritten) {
     ASSERT_EQ(pm.loadPools(), 0);
     std::string out;
     for (int round = 0; round < 3; ++round) {
-        ASSERT_EQ(pm.checkpoint(), 0);
         ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
-        ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+        ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Reinit, out), 0) << out;
     }
     size_t archives = 0;
     for (const auto &entry : fs::directory_iterator(state))
-        archives += entry.path().filename().string().rfind("pool_1.meta.include-", 0) == 0;
+        archives += entry.path().filename().string().rfind("pool_1.meta.reset-", 0) == 0;
     EXPECT_EQ(archives, 3u);
 }
 
@@ -624,7 +681,7 @@ TEST_F(DeviceExclusionTest, WipeZeroesOnlyExcludedDevicesWhenConfirmed) {
 
     // Reset for reuse: a wiped device comes back with a fresh header.
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     DeviceHeader header{};
     EXPECT_EQ(readDeviceHeader(dev(1), header, H), 0);
     ASSERT_EQ(allocate(pm, h, 1), 0);
@@ -692,18 +749,19 @@ TEST_F(DeviceExclusionTest, RequestOfADepartedClientIsNotRun) {
     EXPECT_EQ(poolPaths(pm), std::set<std::string>{dev(0)});
 }
 
-TEST_F(DeviceExclusionTest, IncludeBeforeAnyGlobalCheckpointStaysRestartable) {
+TEST_F(DeviceExclusionTest, IncludeBeforeAnyCheckpointStaysRestartable) {
     addDevice(0);
     addDevice(1);
-    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
+    // Startup creates global.meta before any pool record, so a record never
+    // exists without it.
+    EXPECT_TRUE(fs::exists(state + "/global.meta"));
+    EXPECT_TRUE(fs::exists(state + "/pool_1.meta"));
     std::string out;
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     out.clear();
-    ASSERT_EQ(pm.adminInclude("dax1.0", false, out), 0) << out;
-    EXPECT_FALSE(fs::exists(state + "/global.meta"));
-    EXPECT_FALSE(fs::exists(state + "/pool_1.meta")); // No pool metadata without it.
+    ASSERT_EQ(pm.adminInclude("dax1.0", PoolManager::IncludeMode::Judge, out), 0) << out;
     Handle h{};
     ASSERT_EQ(allocate(pm, h, 1), 0);
     PoolManager restarted(state);
@@ -714,7 +772,6 @@ TEST_F(DeviceExclusionTest, IncludeBeforeAnyGlobalCheckpointStaysRestartable) {
 TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
     addDevice(0);
     addDevice(1);
-    ASSERT_NO_FATAL_FAILURE(pauseCheckpoints());
     PoolManager pm(state);
     ASSERT_EQ(pm.loadPools(), 0);
     const std::string walPath = state + "/maru-resource-manager.wal";
@@ -723,6 +780,7 @@ TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
     Handle h{};
     EXPECT_EQ(allocate(pm, h, 1), -EIO); // Rejected, but its ALLOC stays in the WAL.
     checkpoint_fault::clear();
+    failCheckpoints();
     std::string out;
     EXPECT_EQ(pm.adminExclude("dax1.0", out), -EAGAIN);
     EXPECT_NE(out.find("outcome is unknown"), npos) << out;
@@ -731,9 +789,8 @@ TEST_F(DeviceExclusionTest, ExcludeWaitsForAnUncertainWalRecordToBeReplaced) {
         PoolManager restarted(state); // Nothing was excluded: still restartable.
         EXPECT_EQ(restarted.loadPools(), 0);
     }
-    // Once a checkpoint is possible it replaces the log, and exclude proceeds.
-    addDevice(2);
-    ASSERT_EQ(pm.rescanDevices(), 0);
+    // Once a checkpoint succeeds it replaces the log, and exclude proceeds.
+    checkpoint_fault::clear();
     out.clear();
     ASSERT_EQ(pm.adminExclude("dax1.0", out), 0) << out;
     PoolManager restarted(state);

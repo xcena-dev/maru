@@ -21,7 +21,9 @@ namespace maru {
 static constexpr size_t kMaxRequestBytes = 4096;
 static constexpr const char *kUsage =
     "usage: status | allocations [daxN.M] | exclude daxN.M | "
-    "include daxN.M [--reinit] | release REGION [--confirm] | wipe daxN.M [--confirm]\n";
+    "include daxN.M [--reinit|--adopt|--restore-header] | "
+    "release REGION [--confirm [--force]] | discard daxN.M [--confirm [--force]] | "
+    "wipe daxN.M [--confirm]\n";
 
 AdminServer::AdminServer(PoolManager &pm, std::string socketPath)
     : pm_(pm), path_(std::move(socketPath)) {}
@@ -190,13 +192,27 @@ std::string AdminServer::handleLine(PoolManager &pm, const std::string &line,
         rc = pm.adminAllocations(args.size() == 2 ? args[1] : "", out);
     } else if (command == "exclude" && args.size() == 2) {
         rc = pm.adminExclude(args[1], out);
-    } else if (command == "include" &&
-               (args.size() == 2 || (args.size() == 3 && args[2] == "--reinit"))) {
-        rc = pm.adminInclude(args[1], args.size() == 3, out);
-    } else if (command == "release" &&
-               (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm")) &&
-               parseRegion(args[1], region)) {
-        rc = pm.adminRelease(region, args.size() == 3, out);
+    } else if (command == "include" && (args.size() == 2 || args.size() == 3)) {
+        using Mode = PoolManager::IncludeMode;
+        Mode mode = Mode::Judge;
+        bool valid = true;
+        if (args.size() == 3) {
+            if (args[2] == "--reinit") mode = Mode::Reinit;
+            else if (args[2] == "--adopt") mode = Mode::Adopt;
+            else if (args[2] == "--restore-header") mode = Mode::RestoreHeader;
+            else valid = false;
+        }
+        if (valid) rc = pm.adminInclude(args[1], mode, out);
+        else out = kUsage;
+    } else if (command == "release" && args.size() >= 2 && args.size() <= 4 &&
+               parseRegion(args[1], region) &&
+               (args.size() < 3 || args[2] == "--confirm") &&
+               (args.size() < 4 || args[3] == "--force")) {
+        rc = pm.adminRelease(region, args.size() >= 3, args.size() == 4, out);
+    } else if (command == "discard" && args.size() >= 2 && args.size() <= 4 &&
+               (args.size() < 3 || args[2] == "--confirm") &&
+               (args.size() < 4 || args[3] == "--force")) {
+        rc = pm.adminDiscard(args[1], args.size() >= 3, args.size() == 4, out);
     } else if (command == "wipe" &&
                (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm"))) {
         rc = pm.adminWipe(args[1], args.size() == 3, out, cancelled);

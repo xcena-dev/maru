@@ -74,7 +74,8 @@ int main(int argc, char **argv) {
     // other devices may appear later during boot or after hot-add.
     if (!pm.hasPools()) {
         maru::logf(maru::LogLevel::Warn,
-                    "no CXL/DAX devices found — starting with empty pool");
+                    "no pool is served yet (no CXL/DAX device, or every device was refused "
+                    "or skipped; see maru-rm-ctl status)");
     }
 
     // maru-rm-ctl endpoint. Started while this is the only thread (see start()).

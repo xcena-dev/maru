@@ -18,6 +18,7 @@ add_executable(maru_resource_manager
     src/server_config.cpp
     src/log.cpp
     src/pool_manager.cpp
+    src/pool_recovery.cpp
     src/pool_validation.cpp
     src/metadata.cpp
     src/wal.cpp
@@ -70,6 +71,7 @@ if(MARU_BUILD_TESTS)
         src/server_config.cpp
         src/log.cpp
         src/pool_manager.cpp
+        src/pool_recovery.cpp
         src/pool_validation.cpp
         src/metadata.cpp
         src/wal.cpp
