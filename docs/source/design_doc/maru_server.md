@@ -160,7 +160,9 @@ the Resource Manager, so a late RDMA WRITE fails at the NIC. A kept region goes
 back when:
 
 - the Resource Manager refuses a region request (the kept region read longest
-  ago goes, one at a time);
+  ago goes, one at a time). The room it makes goes to a worker that was refused
+  its first region: for 30 seconds after such a refusal, a session that already
+  holds a region is refused more and evicts its own keys instead;
 - its memory node rebooted (the boot id differs from the one its owner
   reported), since bytes in the node's CPU cache may be lost;
 - its region mapper refuses its handle (someone released it);

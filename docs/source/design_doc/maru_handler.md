@@ -264,7 +264,7 @@ lost is sent again by the heartbeat thread, so the lease does not keep the
 owner from evicting the key.
 
 **Eviction.** When its regions are full and the Resource Manager has no room,
-the Handler asks MaruServer for its least recently used unleased keys
+or another worker is waiting for its first region, the Handler asks MaruServer for its least recently used unleased keys
 (`victims`) and removes them. A page is reused only after MaruServer
 confirmed that no key refers to it.
 
