@@ -146,7 +146,7 @@ apply to that backend only:
 | --- | --- | --- | --- |
 | `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
 | `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
-| `maru_cache_namespace` | `str` | required | Sharing scope: engines share KV only within one namespace and model shape |
+| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
 | `maru_pool_size` | `str \| int` | `1G` | Region size; the engine gets one more region whenever its regions are full |
 | `maru_region_mapper_key_file` | `str` | `/etc/maru/region-mapper.key` | Copy of the memory nodes' region mapper key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
