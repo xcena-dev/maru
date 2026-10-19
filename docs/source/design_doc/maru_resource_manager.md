@@ -120,7 +120,7 @@ Each pool also has a record, `pool_N.meta` (version 7), holding the device's UUI
 | Lost its header, or its layout changed (e.g. re-provisioned to another size), and no allocation on it may still be in use | Starts over (reset): the pool is rebuilt from the device; the previous record is kept as `pool_N.meta.reset-<time>` |
 | As above, but an allocation's owner may still be running (a remote owner, or a local process that is alive) | Refused: not served, nothing written; the rest of the resource manager keeps running |
 | Holds another pool's UUID, an unknown header version, a record from a newer resource manager, or a UUID another device also holds | Refused |
-| Formatted by ROOF, excluded, or not answering | Skipped (excluded devices are never opened) |
+| Formatted by ROOF, excluded, or not answering, or the pool records cannot be listed | Skipped (excluded devices are never opened) |
 
 An owner counts as gone only when it is a local process whose PID no longer exists, or one recorded in an earlier boot (the `boot_id=` line of `rm.conf`). Remote owners are never assumed gone by recovery. Startup exits only when the ledger itself cannot be trusted or the state directory cannot be written: an unreadable `global.meta`, WAL or excluded device list; pool records without `global.meta` (unless the WAL reaches back to region 1); one region ID claimed by two different records (possible only in a WAL in which a resource manager before #91 reused region IDs; stop every client, move the WAL aside and restart); a missing secret with live allocations. Devices are rejudged at every rescan (every 10 s and on SIGHUP), so a refused device whose last local owner exits starts over automatically.
 

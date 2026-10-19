@@ -675,6 +675,13 @@ void PoolManager::recountClients()
 {
     clientAllocCounts_.clear();
     for (const auto &[id, a] : allocations_) ++clientAllocCounts_[a.clientId];
+    // A PID that owns nothing now may be reused: its next owner must not be
+    // compared with the old start time (the reaper would take it for reuse).
+    std::set<pid_t> owners;
+    for (const auto &[clientId, count] : clientAllocCounts_)
+        if (isLocalClient(clientId)) owners.insert(pidFromClientId(clientId));
+    for (auto it = pidStartTimes_.begin(); it != pidStartTimes_.end();)
+        it = owners.count(it->first) ? std::next(it) : pidStartTimes_.erase(it);
 }
 
 bool PoolManager::hasPools() const
@@ -1703,6 +1710,17 @@ int PoolManager::adminInclude(const std::string &device, IncludeMode mode, std::
     retryAfter_.erase(path);
     failedDevices_.erase(path); // Report only this attempt's failure.
     auto plans = probeAndDecide(lock, devices, mode, wasExcluded, false, path);
+    // The other devices were read only to judge this one (duplicate UUIDs).
+    for (auto it = plans.begin(); it != plans.end();)
+    {
+        if (it->probe.devPath == path)
+        {
+            ++it;
+            continue;
+        }
+        if (!it->timedOut) slots_->release(it->probe.devPath);
+        it = plans.erase(it);
+    }
     auto rollback = [&](int error, const std::string &why) {
         if (wasExcluded)
         {

@@ -108,6 +108,8 @@ bool DeviceProbe::sameIdentity(const DeviceProbe &o) const
 
 struct PoolManager::DecideContext
 {
+    // include: the device the mode applies to (the others are judged too).
+    std::string target;
     IncludeMode mode{IncludeMode::Judge};
     bool wasExcluded{false};
     bool startup{false};
@@ -133,6 +135,9 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
 {
     plan = DevicePlan{};
     plan.probe = probe;
+    const bool target = probe.devPath == ctx.target;
+    const IncludeMode mode = target ? ctx.mode : IncludeMode::Judge;
+    const bool wasExcluded = target && ctx.wasExcluded;
     auto refuse = [&](std::string why) {
         plan.action = DevicePlan::Action::Refuse;
         plan.reason = std::move(why);
@@ -182,7 +187,7 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
         return static_cast<int64_t>(it->second);
     };
 
-    if (ctx.mode == IncludeMode::Reinit)
+    if (mode == IncludeMode::Reinit)
     {
         // A header recorded for pool M means this device holds M's data.
         if (dev && probe.header == DeviceProbe::Header::Ours)
@@ -214,7 +219,7 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
 
     auto header = probe.header;
     Uuid headerUuid = probe.headerUuid;
-    if (ctx.mode == IncludeMode::RestoreHeader)
+    if (mode == IncludeMode::RestoreHeader)
     {
         if (!dev || record.kind != PoolRecord::Kind::V7)
             return refuse("--restore-header needs a version 7 pool record");
@@ -271,7 +276,7 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
             if (m >= 0)
                 return refuse("header UUID " + uuidText(headerUuid) + " belongs to pool " +
                               std::to_string(m) + " (dax numbering changed?)");
-            if (ctx.wasExcluded && ctx.mode != IncludeMode::Adopt)
+            if (wasExcluded && mode != IncludeMode::Adopt)
                 return refuse("the excluded device has a Maru header but no identity record; "
                               "include it with --adopt to accept the header, or --reinit");
         }
@@ -365,9 +370,10 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
 std::vector<DevicePlan> PoolManager::probeAndDecide(std::unique_lock<std::mutex> &lock,
                                                     const std::vector<DeviceInfo> &devices,
                                                     IncludeMode mode, bool wasExcluded,
-                                                    bool startup, const std::string &only)
+                                                    bool startup, const std::string &target)
 {
     DecideContext ctx;
+    ctx.target = target;
     ctx.mode = mode;
     ctx.wasExcluded = wasExcluded;
     ctx.startup = startup;
@@ -377,14 +383,17 @@ std::vector<DevicePlan> PoolManager::probeAndDecide(std::unique_lock<std::mutex>
     {
         if (isExcluded(dev.devPath)) continue;
         ++ctx.poolIdDevices[dev.poolId];
-        if (!only.empty() && dev.devPath != only) continue;
         if (findPoolByPath(dev.devPath)) continue;
+        // include reads every device, so that it sees the duplicates a scan
+        // would, but its caller acts only on the target. A rescan leaves a
+        // device alone while it waits to retry a write.
+        const bool other = !target.empty() && dev.devPath != target;
         auto retry = retryAfter_.find(dev.devPath);
-        if (mode == IncludeMode::Judge && retry != retryAfter_.end() &&
-            now < retry->second.first)
+        if (target.empty() && retry != retryAfter_.end() && now < retry->second.first)
             continue;
         if (!slots_->tryAcquire(dev.devPath))
         {
+            if (other) continue;
             auto &u = unserved_[dev.devPath];
             if (u.state != DeviceState::Busy)
                 logf(LogLevel::Warn, "%s is busy (an operation on it has not finished)",
@@ -419,8 +428,10 @@ std::vector<DevicePlan> PoolManager::probeAndDecide(std::unique_lock<std::mutex>
     std::vector<DeviceProbe> probes(candidates.size());
     std::vector<bool> answered(candidates.size(), false);
     for (size_t i = 0; i < candidates.size(); ++i) answered[i] = reads[i]->wait(deadline, probes[i]);
+    std::vector<uint32_t> ids;
+    const int listRc = metadata_->listRecordIds(ids);
     std::map<uint32_t, PoolRecord> records;
-    for (uint32_t id : metadata_->listRecordIds()) metadata_->loadRecord(id, records[id]);
+    for (uint32_t id : ids) metadata_->loadRecord(id, records[id]);
     lock.lock();
 
     for (const auto &[id, rec] : records)
@@ -444,6 +455,15 @@ std::vector<DevicePlan> PoolManager::probeAndDecide(std::unique_lock<std::mutex>
             continue;
         }
         reportProbe(probes[i]);
+        if (listRc != 0)
+        {
+            // Records that cannot be listed are unknown, not absent.
+            plan.probe = probes[i];
+            plan.action = DevicePlan::Action::Skip;
+            plan.reason = "cannot list pool records in " + stateDir_ + ": " +
+                          std::strerror(-listRc);
+            continue;
+        }
         PoolRecord none;
         auto rec = records.find(candidates[i].poolId);
         decide(probes[i], rec != records.end() ? rec->second : none, ctx, plan);
@@ -779,7 +799,15 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
         // Pool records without global.meta: accept only a log that reaches
         // back to region 1 (a crash in the first checkpoint). Otherwise
         // global.meta may have been deleted with allocations in it.
-        if (!metadata_->listRecordIds().empty() && !wal_->startsAtFirstRegion())
+        std::vector<uint32_t> ids;
+        const int listRc = metadata_->listRecordIds(ids);
+        if (listRc != 0)
+        {
+            logf(LogLevel::Error, "cannot list pool records in %s: %s", stateDir_.c_str(),
+                 std::strerror(-listRc));
+            return listRc;
+        }
+        if (!ids.empty() && !wal_->startsAtFirstRegion())
         {
             logf(LogLevel::Error,
                  "%s has pool records but no global.meta, and the WAL does not reach back to "

@@ -42,7 +42,9 @@ public:
   /// an earlier copy. archived is empty if there was no record.
   int archiveRecord(uint32_t poolId, const std::string &tag, std::string &archived);
   /// Pool IDs of every pool_N.meta (exact names; no .tmp or archive copies).
-  std::vector<uint32_t> listRecordIds() const;
+  /// -errno if the state directory cannot be read: an unread record must
+  /// never look like a missing one.
+  int listRecordIds(std::vector<uint32_t> &ids) const;
 
   // Global state management
   int loadGlobal(std::map<uint64_t, Allocation> &allocations,

@@ -17,7 +17,7 @@ Devices are named `daxN.M` or `/dev/daxN.M`. The RM serves device `daxN.M` as po
 | `status` | Served pools, devices that are not served and why, excluded devices, checkpoint state |
 | `allocations [daxN.M]` | Allocations of every pool, served or not, and whether each owner is still running |
 | `exclude daxN.M` | Stop using a device for good, e.g. to hand it to another owner. Refused while any allocation on it is live |
-| `include daxN.M` | Judge an excluded or refused device again and serve it if it passes |
+| `include daxN.M` | Judge an excluded or refused device again, against every other device as at startup, and serve it if it passes |
 | `include daxN.M --reinit` | Start the device over with a new UUID, discarding whatever it holds (also over a ROOF filesystem or another header). Refused while an allocation on it may still be in use |
 | `include daxN.M --adopt` | Accept the Maru header of an excluded device that has no identity record yet (excluded by an older RM) |
 | `include daxN.M --restore-header` | Write the recorded UUID back to a device whose header alone was cleared, when the rest of its identity still matches |
@@ -51,7 +51,7 @@ checkpoints=enabled
 |---|---|
 | `state=active` | Served |
 | `state=refused` | Not served and not written. `live` allocations are recorded on its pool, and `owners_alive` of them may still be in use. The RM judges the device again every 10 s and on `SIGHUP` |
-| `state=skipped` | Not served: formatted by ROOF, or it could not be read |
+| `state=skipped` | Not served: formatted by ROOF, it could not be read, or the pool records in the state directory could not be listed |
 | `state=busy` | An operation on the device has not finished, e.g. a read or write that timed out |
 | `state=excluded` | Excluded with `exclude`; never opened. `write_pending=yes` means an earlier write to it timed out and may still land: do not hand it over yet |
 | `excluded_list=not-durable` | The excluded list is not on disk yet; `exclude` and `wipe` refuse until it is |

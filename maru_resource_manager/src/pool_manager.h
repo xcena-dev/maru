@@ -175,13 +175,13 @@ private:
     bool ownerGone(const Allocation &a) const;
     std::vector<Allocation> poolAllocations(uint32_t poolId) const;
     // Probe devices that are neither served nor excluded and decide what to
-    // do with each; with `only`, just that device (every device in `devices`
-    // still counts for pool ID collisions). Device and state-file reads run
-    // with `lock` released.
+    // do with each. With a `target` (include), `mode` and `wasExcluded` apply
+    // to it alone, and the caller acts only on its plan. Device and
+    // state-file reads run with `lock` released.
     std::vector<DevicePlan> probeAndDecide(std::unique_lock<std::mutex> &lock,
                                            const std::vector<DeviceInfo> &devices,
                                            IncludeMode mode, bool wasExcluded, bool startup,
-                                           const std::string &only = "");
+                                           const std::string &target = "");
     // Carry out plans: ledger, record and device writes, then publish. Device
     // writes run with `lock` released. Returns the first write error.
     int executePlans(std::unique_lock<std::mutex> &lock, std::vector<DevicePlan> &plans);

@@ -45,6 +45,10 @@ public:
         static const char *names[] = {"refused", "skipped", "busy"};
         return std::string(names[static_cast<int>(it->second.state)]) + ": " + it->second.reason;
     }
+    // The start time the RM recorded for a local owner's PID.
+    static void setPidStartTime(PoolManager &pm, pid_t pid, uint64_t start) {
+        pm.pidStartTimes_[pid] = start;
+    }
     static bool slotHeld(PoolManager &pm, const std::string &path) {
         return pm.slots_->isHeld(path);
     }

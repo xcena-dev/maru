@@ -212,6 +212,27 @@ TEST_F(HeaderRecoveryTest, ResizedDeviceIsResetUnlessItsAllocationsMayBeInUse) {
     auto a = allocation();
     ASSERT_EQ(MetadataStore(state).saveGlobal({{42, a}}, 43), 0);
     EXPECT_NE(expectDeviceRefused(0).find("identity tags"), std::string::npos);
+
+    // Records that cannot be listed (search and write permission only) are
+    // unknown, not missing: no device is judged and nothing is written.
+    if (::geteuid() != 0) {
+        const auto record0 = bytes(state + "/pool_0.meta");
+        ASSERT_EQ(::chmod(state.c_str(), 0300), 0);
+        std::string why;
+        bool served = true;
+        {
+            PoolManager pm(state);
+            const int rc = pm.loadPools();
+            ASSERT_EQ(::chmod(state.c_str(), 0700), 0);
+            ASSERT_EQ(rc, 0);
+            served = pm.hasPools();
+            why = PoolManagerTestPeer::unserved(pm, dev(0));
+        }
+        EXPECT_FALSE(served);
+        EXPECT_NE(why.find("cannot list pool records"), std::string::npos) << why;
+        EXPECT_EQ(bytes(state + "/pool_0.meta"), record0);
+        EXPECT_NE(expectDeviceRefused(0).find("identity tags"), std::string::npos);
+    }
 }
 
 TEST_F(HeaderRecoveryTest, DamagedRecordOrIdentityMismatchIsResetOrRefused) {
@@ -263,6 +284,11 @@ TEST_F(HeaderRecoveryTest, DamagedRecordOrIdentityMismatchIsResetOrRefused) {
             EXPECT_EQ(head(1, H), other);
             PoolManager pm(state);
             ASSERT_EQ(pm.loadPools(), 0);
+            EXPECT_FALSE(pm.hasPools());
+            // include judges the device against the other devices too.
+            std::string out;
+            EXPECT_EQ(pm.adminInclude("dax0.0", PoolManager::IncludeMode::Judge, out), -EUCLEAN)
+                << out;
             EXPECT_FALSE(pm.hasPools());
         };
         put(0, area1); // The dax numbers swapped.

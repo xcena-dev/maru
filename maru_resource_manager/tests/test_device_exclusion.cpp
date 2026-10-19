@@ -354,6 +354,9 @@ TEST_F(DeviceExclusionTest, ReleaseNeedsExitedOwnerAndConfirmation) {
     out.clear();
     EXPECT_EQ(restarted.adminDiscard("dax0.0", false, false, out), -EPERM);
     EXPECT_EQ(restarted.adminDiscard("dax0.0", true, false, out), -EBUSY);
+    // The running process reused the owner's PID: the RM recorded the old
+    // owner's start time.
+    PoolManagerTestPeer::setPidStartTime(restarted, ::getpid(), getPidStartTime(::getpid()) - 1);
     out.clear();
     ASSERT_EQ(restarted.adminDiscard("dax0.0", true, true, out), 0) << out;
     EXPECT_EQ(restarted.allocationCount(), 0u);
@@ -361,6 +364,13 @@ TEST_F(DeviceExclusionTest, ReleaseNeedsExitedOwnerAndConfirmation) {
     restarted.getStats(stats);
     ASSERT_EQ(stats.size(), 1u);
     EXPECT_EQ(stats[0].freeSize, stats[0].totalSize);
+    // The PID's next owner is not taken for the old one by the reaper.
+    Handle next{};
+    ASSERT_EQ(allocate(restarted, next, 0, localClient(::getpid())), 0);
+    uint64_t reaped = 0;
+    restarted.reapExpired(reaped);
+    EXPECT_EQ(reaped, 0u);
+    ASSERT_EQ(restarted.verifyAndFree(next, localClient(::getpid())), 0);
     // An excluded device is never opened by discard.
     addDevice(1);
     ASSERT_EQ(WalStore(state).appendAlloc(allocation(1)), 0);

@@ -321,10 +321,11 @@ int MetadataStore::archiveRecord(uint32_t poolId, const std::string &tag,
   return syncDirectory(stateDir_);
 }
 
-std::vector<uint32_t> MetadataStore::listRecordIds() const {
-  std::vector<uint32_t> ids;
+int MetadataStore::listRecordIds(std::vector<uint32_t> &ids) const {
+  ids.clear();
   DIR *dir = ::opendir(stateDir_.c_str());
-  if (!dir) return ids;
+  if (!dir) return -errno;
+  errno = 0;
   while (const struct dirent *ent = ::readdir(dir)) {
     const std::string name = ent->d_name;
     static const std::string prefix = "pool_", suffix = ".meta";
@@ -338,10 +339,16 @@ std::vector<uint32_t> MetadataStore::listRecordIds() const {
       continue;
     const unsigned long long id = std::stoull(digits);
     if (id <= UINT32_MAX) ids.push_back(static_cast<uint32_t>(id));
+    errno = 0;
   }
+  const int rc = errno != 0 ? -errno : 0;
   ::closedir(dir);
+  if (rc != 0) {
+    ids.clear();
+    return rc;
+  }
   std::sort(ids.begin(), ids.end());
-  return ids;
+  return 0;
 }
 
 struct GlobalMetaHeader {
