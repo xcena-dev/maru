@@ -1262,6 +1262,26 @@ def test_a_reboot_ends_the_leases_on_the_keys_of_its_regions(world):
     assert read(c, ["k2"]) == [b"w"]
 
 
+def test_a_reboot_a_store_notices_ends_the_leases_on_the_keys_of_its_regions(world):
+    """The store's map of its region sees the new boot, as the heartbeat does."""
+    a, b, c = world.client("a"), world.client("b"), world.client("c")
+    put(a, "k", b"v")
+    region = only_region(a)
+    lease = world.directory.execute("acquire", {**b._credentials, "keys": ["k"]})
+    lease_id = lease["result"]["lease_id"]
+    world.node.restart(reboot=True)
+    a._check_boots = lambda: pytest.fail("the store must notice the reboot")
+    assert put(a, "k2", b"w")[0] is False  # the old registration is gone
+    assert put(a, "k2", b"w")[0] is True  # a new region on the new boot
+    assert c.batch_exists(["k", "k2"]) == [False, True]
+    released = world.directory.execute(
+        "release", {**b._credentials, "lease_id": lease_id}
+    )
+    assert released["result"] == {"held": False}
+    assert region.region_id in world.cxl.released
+    assert region.pool_id not in a.regions
+
+
 def test_a_worker_whose_only_region_went_back_closes_its_session(world):
     a = world.client("a")
     put(a, "k", b"v")
