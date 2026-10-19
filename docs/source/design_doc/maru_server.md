@@ -187,7 +187,7 @@ token derived from the auth token. A remote CXL agent maps a read handle only fo
 a region it has mapped, and only the region's handle releases a region, so a
 reader cannot take a region away from its owner.
 
-![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; B's release of R is refused at the remote CXL agent, and A's writes keep going](../image/remote_cxl_read_handle.png)
+![The owner A gets R's handle with the auth token; reader B gets R's read handle with its lease. B maps R with the read handle and reads it; if B sent a release of R, the remote CXL agent would refuse it, and A's writes keep going](../image/remote_cxl_read_handle.png)
 
 | Action | Operation |
 |--------|-----------|

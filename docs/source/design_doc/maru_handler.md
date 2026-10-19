@@ -290,7 +290,7 @@ the process:
 **Giving regions back.** A region goes back to the Resource Manager only after
 its remote CXL agent deregistered it from the NIC (`release`):
 
-![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so the remote CXL agent deregisters the region first and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
+![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so whoever gives the region back (its owner, or MaruServer once the owner has left) has the remote CXL agent deregister it first, and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
 
 - A region the Handler gives back while it runs (for example a new region
   whose memory node it cannot reach) is released first, then returned with
@@ -311,7 +311,7 @@ its remote CXL agent deregistered it from the NIC (`release`):
 **Staging slots.** Loads and stores share the staging buffer. With
 asynchronous transfers, stores leave a share of the slots free for loads:
 
-![Staging slots: half of the slots are kept free for loads; stores take the rest](../image/remote_cxl_staging_slots.png)
+![Staging slots with asynchronous transfers: stores leave half of the slots, by count, free for loads. A load batch fills the free load slots by RDMA READ from the region that holds its keys and goes back after its GPU copy; a store copies from the GPU and WRITEs to the worker's own region](../image/remote_cxl_staging_slots.png)
 
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),
