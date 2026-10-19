@@ -130,17 +130,7 @@ An owner counts as gone only when it is a local process whose PID no longer exis
 
 **Checkpoint.** A checkpoint writes `global.meta` (tmp, fsync, rename), syncs the directory and then removes the WAL. If a crash loses the removal, the WAL is applied again onto the checkpoint that already holds it, with the same result: this resource manager never reuses a region ID, an ALLOC already in `global.meta` is skipped, and a FREE of a region not in it does nothing. The exception is a WAL in which a resource manager before #91 reused a region ID; startup then exits as above. When `global.meta` is missing at startup, an empty one is created and the WAL is kept.
 
-**Operator commands** (`maru-rm-ctl`, over `<state>/admin.sock`):
-
-| Command | Use |
-|---|---|
-| `status`, `allocations [daxN.M]` | Served, refused, skipped and busy devices with reasons; allocations of every pool, served or not |
-| `include daxN.M` | Judge an excluded or refused device again |
-| `include daxN.M --reinit` | Start a device over with a new UUID, even over ROOF or a foreign header; refused while allocations on it may be in use |
-| `include daxN.M --adopt` | Accept the Maru header of a device excluded by an earlier resource manager (no identity record) |
-| `include daxN.M --restore-header` | Write the recorded UUID back when only the header was cleared and the identity tags still match |
-| `discard daxN.M --confirm [--force]` | Release every allocation of the device's pool without opening the device; `--force` passes a local PID that is running but is not the owner |
-| `release REGION --confirm [--force]` | Release one allocation, also on a pool that is not served |
+**Operator commands**: [`maru-rm-ctl`](../api_reference/maru_rm_ctl.md) shows why a device is not served and resolves it (`include` with `--reinit`, `--adopt` or `--restore-header`; `discard`; `release`).
 
 **Downgrade** is forward-only: an earlier resource manager exits on a version 7 record, and cannot serve a pool with allocations without a version 6 free list. To go back, stop all clients, check that `maru-rm-ctl allocations` is empty, stop the resource manager, move `pool_*.meta` aside, and start the earlier version.
 

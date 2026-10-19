@@ -164,6 +164,8 @@ If you installed with the Resource Manager, verify the binary:
 which maru-resource-manager
 ```
 
+Once the Resource Manager runs, `sudo maru-rm-ctl status` shows the devices it serves and why any other device is not served. See [`maru-rm-ctl`](../api_reference/maru_rm_ctl.md).
+
 Once installation is verified, choose the single-host or multi-host setup in
 {doc}`quick_start` to start services and verify KV sharing.
 
