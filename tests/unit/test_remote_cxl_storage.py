@@ -10,6 +10,7 @@ import time
 import pytest
 
 import maru_handler.storage.remote_cxl.datapath as datapath
+import maru_handler.storage.remote_cxl.lifecycle as lifecycle
 from maru_common.config import MaruConfig
 from maru_common.storage_types import (
     REMOTE_CXL_STORAGE_CAPABILITY,
@@ -694,7 +695,8 @@ def test_a_region_mapper_restart_maps_the_regions_again(world):
     assert got == [b"1"]
 
 
-def test_an_unreachable_region_is_set_aside_and_its_keys_removed(shared):
+def test_an_unreachable_region_is_set_aside_and_its_keys_removed(shared, monkeypatch):
+    monkeypatch.setattr(lifecycle, "UNREACHABLE_KEYS_S", 0.05)
     a = shared.client("a", pages=2)
     put(a, "k1", b"1")
     first = only_region(a)
@@ -716,7 +718,11 @@ def test_an_unreachable_region_is_set_aside_and_its_keys_removed(shared):
     assert not first.reachable
     # Regions nobody could map went back: only the first and the used one stay.
     assert len(shared.cxl.regions) == 2
-    # Its key no longer reports a hit that cannot be read.
+    # Its key stays for a while, then no longer reports a hit that cannot
+    # be read.
+    assert a.batch_exists(["k1", "k2"]) == [True, True]
+    time.sleep(0.1)
+    a._retry_unreachable()
     assert a.batch_exists(["k1", "k2"]) == [False, True]
     assert handle.location.pool_id != first.pool_id
     down_regions = [r for r in a.regions.values() if not r.reachable]
@@ -1070,7 +1076,7 @@ def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):
     assert a.batch_exists(["k"]) == [True]
 
 
-def test_expanding_resumes_once_the_back_off_ends(world):
+def test_expanding_resumes_once_the_region_mapper_answers(world):
     a = world.client("a", pages=1)
     put(a, "k", b"v")
     world.node.restart()  # same address; the first map after it fails over
@@ -1078,10 +1084,32 @@ def test_expanding_resumes_once_the_back_off_ends(world):
     with pytest.raises(MemoryError):
         put(a, "k2", b"w")
     assert not a._may_expand()  # the only region mapper is down
+    time.sleep(0.1)  # the back-off ends; no store waits on the node meanwhile
+    assert not a._may_expand()
     world.node._start()
     time.sleep(0.1)
+    a._check_boots()  # the heartbeat's boot check gets an answer
     assert a._may_expand()
     assert put(a, "k3", b"x")[0] is True
+
+
+def test_a_region_whose_mapper_restarts_in_time_keeps_its_keys(world):
+    """The owner's map of its region fails while the region mapper restarts:
+    the region is set aside, and the retry maps it again within the grace,
+    so its keys stay and another worker reads them."""
+    a, b = world.client("a", pages=2), world.client("b")
+    put(a, "k1", b"1")
+    first = only_region(a)
+    world.node.restart()  # a's access to the region is stale now
+    world.node.stop()
+    assert put(a, "k2", b"2")[0] is False  # the map fails: set aside
+    assert not first.reachable
+    assert a.batch_exists(["k1"]) == [True]  # kept during the grace
+    world.node._start()
+    time.sleep(0.1)
+    a._retry_unreachable()
+    assert first.reachable
+    assert read(b, ["k1"]) == [b"1"]
 
 
 def test_reads_of_a_down_node_miss_without_waiting_for_it(world, monkeypatch):

@@ -62,6 +62,8 @@ class RemoteCxlRegion:
         self.retired = False
         # False while its region mapper cannot map it (node down)
         self.reachable = True
+        # When it was set aside, until its keys are removed or it maps again
+        self.unreachable_since: float | None = None
         # Whether a region mapper ever answered a map of it: until then no
         # RDMA can have been sent to it, so it goes back without a release.
         self.mapped = False

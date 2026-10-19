@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 EVICT_BATCH = 32
 SETTLE_POLL_S = 0.01
 CALL_ATTEMPTS = 3
+# A region set aside keeps its keys this long, as MaruServer keeps those of a
+# region it took over: a region mapper that restarts maps it again in time.
+UNREACHABLE_KEYS_S = 30.0
 
 
 class RegionLifecycle:
@@ -106,8 +109,10 @@ class RegionLifecycle:
     def _retry_unreachable(self) -> None:
         """Map regions set aside earlier; one that maps is used again.
 
-        Runs without the client lock: reaching a node that is down can take
-        the connect timeout, and stores must not wait for it.
+        A region that still cannot be mapped :data:`UNREACHABLE_KEYS_S` after
+        it was set aside has its keys removed. Runs without the client lock:
+        reaching a node that is down can take the connect timeout, and stores
+        must not wait for it.
         """
         for region in list(self.regions.values()):
             if region.reachable or region.retired:
@@ -115,6 +120,17 @@ class RegionLifecycle:
             try:
                 access = self._region(region.pool_id, region.handle, own=True)
             except StorageUnavailableError:
+                since = region.unreachable_since
+                if since is not None and time.monotonic() - since >= UNREACHABLE_KEYS_S:
+                    with self._lock:
+                        if not region.reachable and not region.retired:
+                            region.unreachable_since = None
+                            logger.warning(
+                                "Remote CXL region %d stayed unreachable; removing "
+                                "its keys",
+                                region.region_id,
+                            )
+                            self._drop_keys(region)
                 continue
             with self._lock:
                 if region.retired:
@@ -126,6 +142,7 @@ class RegionLifecycle:
                     continue
                 self._adopt(region, access)
                 region.reachable = True
+                region.unreachable_since = None
             logger.info("Remote CXL region %d is reachable again", region.region_id)
 
     def _check_boots(self) -> None:
@@ -278,9 +295,15 @@ class RegionLifecycle:
     # --------------------------------------------------------- more space
 
     def _may_expand(self) -> bool:
-        """Whether to ask for one more region: not while every region mapper
-        of the pool is down, since no new region could be mapped."""
-        return self.config.auto_expand and not self._data.all_down(self._mappers)
+        """Whether to ask for one more region: not while no region mapper of
+        the pool answers, since no new region could be mapped and a store
+        would wait for the map's timeout. The heartbeat's boot check and the
+        retry of set-aside regions notice when one answers again."""
+        return (
+            self.config.auto_expand
+            and any(self._data.answering(m) for m in self._mappers)
+            and not self._data.all_down(self._mappers)
+        )
 
     def _expand(self) -> bool:
         """One more region from MaruServer, as a cxl Handler's auto_expand.
@@ -396,14 +419,17 @@ class RegionLifecycle:
     # ------------------------------------------------------ keys that go
 
     def _set_aside(self, region: RemoteCxlRegion) -> None:
-        """Stop using a region its mapper cannot map, and remove its keys.
+        """Stop using a region its mapper cannot map.
 
-        Without the removal, probes keep reporting the keys as hits and every
-        request with that prefix reads, fails and recomputes. A background
-        retry maps the region again later (:meth:`_retry_unreachable`).
+        A background retry maps it again (:meth:`_retry_unreachable`); one
+        that maps within :data:`UNREACHABLE_KEYS_S` keeps its keys, as after a
+        region mapper restart. Later the keys are removed: otherwise probes
+        keep reporting them as hits and every request with that prefix reads,
+        fails and recomputes.
         """
         region.reachable = False
-        self._drop_keys(region)
+        if region.unreachable_since is None:
+            region.unreachable_since = time.monotonic()
 
     def _drop_keys(self, region: RemoteCxlRegion) -> None:
         """Remove every key of a region from MaruServer.

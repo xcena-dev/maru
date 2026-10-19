@@ -575,7 +575,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 self._give_slot(h)
                 h.state = "freed"
             # A node that cannot be reached any more has the region set aside
-            # now, so its keys stop being reported as hits.
+            # now; its keys stop being reported as hits if it stays so.
             try:
                 self._map_own(region)
             except StorageUnavailableError as map_exc:
