@@ -28,6 +28,10 @@ DOWN_BACKOFF_S = 5.0
 CONNECT_TIMEOUT_S = 3.0
 
 
+class _StaleReplyError(StorageUnavailableError):
+    """A map reply came over a connection to the region mapper that ended."""
+
+
 class Release(enum.Enum):
     """Outcome of asking a region mapper to deregister a region."""
 
@@ -83,8 +87,9 @@ class RdmaDataPath:
         # dropped after a transfer error stays listed; has_peer() tells.
         self._loaded: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
-        # Held from the check of a peer to the load of its metadata
-        self._load_lock = threading.Lock()
+        # Held from the check of a peer to the load of its metadata, and
+        # while a peer is dropped
+        self._load_lock = threading.RLock()
 
     def start(self) -> None:
         """Map the staging buffer and register it with this node's NIC.
@@ -171,34 +176,42 @@ class RdmaDataPath:
         if self.is_down(address):
             raise StorageUnavailableError(f"region mapper {address} is down")
         client = self._client(address)
-        try:
-            reply = client.map(handle)
-        except RegionMapUnavailable as exc:
-            # The client closed the connection: whatever the request mapped
-            # is released by the mapper when it sees the connection end.
-            self._mark_down(address)
-            raise StorageUnavailableError(
-                f"region {region_id} could not be mapped: {exc}"
-            ) from exc
-        except RegionMapError as exc:
-            # The mapper refused and holds no mapping of this region for us.
-            self._not_mapped(pool_id)
-            if exc.code == "unavailable":
+        for attempt in range(2):
+            try:
+                reply = client.map(handle)
+            except RegionMapUnavailable as exc:
+                # The client closed the connection: whatever the request
+                # mapped is released by the mapper when it sees the
+                # connection end.
+                self._mark_down(address)
+                raise StorageUnavailableError(
+                    f"region {region_id} could not be mapped: {exc}"
+                ) from exc
+            except RegionMapError as exc:
+                # The mapper refused and holds no mapping of this region.
+                self._not_mapped(pool_id)
+                if exc.code == "unavailable":
+                    with self._lock:
+                        self._map_failed[pool_id] = time.monotonic() + DOWN_BACKOFF_S
+                raise StorageUnavailableError(
+                    f"region {region_id} could not be mapped: {exc}"
+                ) from exc
+            if own:
                 with self._lock:
-                    self._map_failed[pool_id] = time.monotonic() + DOWN_BACKOFF_S
-            raise StorageUnavailableError(
-                f"region {region_id} could not be mapped: {exc}"
-            ) from exc
-        if own:
-            with self._lock:
-                self._attempted[pool_id] = (address, client.generation)
-        # The reply names this region's registration only; loading it into a
-        # peer this agent already knows adds the region to it.
-        peer = self._load_peer(
-            address, client.generation, reply.metadata, pool_id, region_id
-        )
+                    self._attempted[pool_id] = (address, reply.generation)
+            # The reply names this region's registration only; loading it
+            # into a peer this agent already knows adds the region to it.
+            try:
+                peer = self._load_peer(
+                    address, reply.generation, reply.metadata, pool_id, region_id
+                )
+            except _StaleReplyError:
+                if attempt:
+                    raise
+                continue  # map again over the current connection
+            break
         access = RegionAccess(
-            peer, reply.addr, reply.length, address, client.generation, reply.boot
+            peer, reply.addr, reply.length, address, reply.generation, reply.boot
         )
         with self._lock:
             self._access[pool_id] = access
@@ -219,22 +232,26 @@ class RdmaDataPath:
         UCX fails a connection on its own when the peer stops answering (a
         stopped process, a network outage), and NIXL closes it but keeps it
         in the peer: loading metadata into that peer again crashes the
-        process. So the loaded peer is dropped and connected anew when its
-        connection failed, and also when the connection to the mapper broke
-        since it was loaded (the mapper stopped answering or restarted; a
-        restarted mapper's old peer is then dropped too).
+        process. So the loaded peer is dropped and connected anew when
+        :meth:`NixlTransport.peer_usable` says no (a transfer to it failed,
+        or NIXL refuses to send to it), and also when the connection to the
+        mapper broke since it was loaded (the mapper stopped answering or
+        restarted; a restarted mapper's old peer is then dropped too). The
+        check holds for its moment: UCX can still fail the connection in the
+        moment between the check and the load.
 
         Raises:
-            StorageUnavailableError: if the reply came over a connection that
-                has ended since another map loaded the peer, or NIXL refused
-                to drop the old peer or to load the metadata.
+            _StaleReplyError: if the reply came over a connection that has ended
+                since another map loaded the peer; the mapper released what
+                that connection held.
+            StorageUnavailableError: if NIXL refused to drop the old peer or
+                to load the metadata.
         """
         with self._load_lock:
             with self._lock:
                 loaded = self._loaded.get(address)
             if loaded is not None and generation < loaded[1]:
-                # The mapper released what that connection held.
-                raise StorageUnavailableError(
+                raise _StaleReplyError(
                     f"region {region_id} could not be mapped: the reply came "
                     "over an earlier connection"
                 )
@@ -245,6 +262,7 @@ class RdmaDataPath:
                     generation > loaded[1] or not self.transport.peer_usable(loaded[0])
                 )
                 and not self.disconnect({loaded[0]})
+                and self.transport.has_peer(loaded[0])
             ):
                 with self._lock:
                     self._map_failed[pool_id] = time.monotonic() + DOWN_BACKOFF_S
@@ -402,12 +420,13 @@ class RdmaDataPath:
         the node maps it again and loads the peer's metadata anew.
         """
         ok = True
-        for peer in peers:
-            ok = self.transport.disconnect(peer) and ok
-        with self._lock:
-            for pool_id, access in list(self._access.items()):
-                if access.peer in peers:
-                    del self._access[pool_id]
+        with self._load_lock:
+            for peer in peers:
+                ok = self.transport.disconnect(peer) and ok
+            with self._lock:
+                for pool_id, access in list(self._access.items()):
+                    if access.peer in peers:
+                        del self._access[pool_id]
         return ok
 
     def close(self) -> None:

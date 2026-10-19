@@ -676,12 +676,22 @@ class ReplicaDirectory:
         return session.regions
 
     def _victims(self, p: dict) -> dict:
-        """Least recently used, unleased keys of the caller's own regions."""
+        """Least recently used, unleased keys of the caller's own regions.
+
+        ``pools``, if given, limits them to those regions: a worker evicts
+        only where it can write the freed pages.
+        """
         session = self._session(p)
         count = self._integer(p.get("count"), "count", 1)
+        pools = p.get("pools")
+        if pools is not None and (
+            not isinstance(pools, list) or not all(isinstance(x, str) for x in pools)
+        ):
+            raise ValueError("pools must be a list of pool ids")
         candidates = [
             (pool, key)
-            for pool in self._owned_regions(session).values()
+            for pool_id, pool in self._owned_regions(session).items()
+            if pools is None or pool_id in pools
             for key in pool.replicas
             if not pool.leased.get(key)
         ]

@@ -3,6 +3,7 @@
 served on loopback TCP; the CXL device, the resource manager and NIXL are
 fakes."""
 
+import dataclasses
 import threading
 import time
 
@@ -964,6 +965,59 @@ def test_a_map_reply_from_an_ended_connection_is_not_loaded(world):
             world.node.address, generation - 1, b"", region.pool_id, region.region_id
         )
     assert a._data._loaded[world.node.address] == (peer, generation)
+
+
+def test_a_map_reply_from_an_ended_connection_is_mapped_again(world, monkeypatch):
+    """Another thread loaded the peer over a newer connection after this
+    reply came: the mapping it names went with the old connection."""
+    a = world.client("a", pages=1)
+    put(a, "k1", b"1")
+    client = a._data._client(world.node.address)
+    real_map = client.map
+    generations = []
+
+    def map_first_reply_stale(handle):
+        reply = real_map(handle)
+        generations.append(reply.generation)
+        if len(generations) == 1:
+            return dataclasses.replace(reply, generation=reply.generation - 1)
+        return reply
+
+    monkeypatch.setattr(client, "map", map_first_reply_stale)
+    assert put(a, "k2", b"2")[0] is True  # a new region: mapped twice
+    assert generations == [client.generation] * 2
+    assert read(world.client("b"), ["k1", "k2"]) == [b"1", b"2"]
+
+
+def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
+    """One of two region mappers of the pool is down: eviction frees pages
+    only in regions on the node that answers."""
+    a = shared.client("a", pages=1)
+    for i in range(8):  # one page per region: one region per key
+        put(a, f"k{i}", bytes([i]))
+    by_node = {}
+    for region in a.regions.values():
+        by_node.setdefault(pick_mapper(a.region_mappers, region.region_id), []).append(
+            region
+        )
+    assert len(by_node) == 2
+    first = a._keys["k0"].pool_id  # the least recently used key
+    down = next(
+        n
+        for n in shared.nodes
+        if n.address == pick_mapper(a.region_mappers, a.regions[first].region_id)
+    )
+    down.stop()
+    a._data.boots([down.address])  # the heartbeat finds it down
+    a.config.auto_expand = False
+    assert put(a, "k8", b"8")[0] is True
+    on_down = [
+        k
+        for k, loc in a._keys.items()
+        if loc.pool_id in {r.pool_id for r in by_node[down.address]}
+    ]
+    assert "k0" in on_down
+    assert all(a.batch_exists(on_down))
 
 
 def test_a_store_does_not_evict_while_its_region_mapper_is_down(world):

@@ -20,7 +20,6 @@ from maru_common.storage_types import (
     StorageLocation,
     StorageUnavailableError,
 )
-from maru_remote.region_map import pick_mapper
 
 from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
@@ -359,23 +358,23 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def _take_page(self, size: int) -> tuple[RemoteCxlRegion, StorageLocation]:
         """A free page: from a region with room, a new region, or eviction.
 
-        Regions whose region mapper failed a moment ago are passed over: a
-        WRITE there would fail after the transport's timeout and leave the
-        page quarantined. When every region mapper of the pool is down,
-        nothing is evicted, since the freed pages could not be written.
+        Only regions a WRITE can reach now are used: a WRITE to a region
+        whose region mapper failed a moment ago would fail after the
+        transport's timeout and leave the page quarantined. Eviction likewise
+        frees pages only in those regions (``_evict``).
         """
         for attempt in ("free", "expand", "evict"):
             if attempt == "expand" and not (self._may_expand() and self._expand()):
                 continue
-            if attempt == "evict" and (
-                self._data.all_down(self._mappers) or not self._evict()
-            ):
+            if attempt == "evict" and not self._evict():
                 continue
             for region in self.regions.values():
-                if region.has_free() and not self._data.is_down(
-                    pick_mapper(self._mappers, region.region_id)
-                ):
+                if region.has_free() and self._writable(region):
                     return region, region.take_page(size)
+        if not any(self._writable(r) for r in self.regions.values()):
+            raise MemoryError(
+                "No remote CXL region is reachable now; skipping new cache admission"
+            )
         raise MemoryError("Remote CXL regions are full; skipping new cache admission")
 
     def free(self, handle: RemoteCxlAllocation) -> None:

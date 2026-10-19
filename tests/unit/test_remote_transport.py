@@ -96,10 +96,11 @@ def test_a_write_after_deregistration_fails_and_breaks_the_connection():
     with pytest.raises(RuntimeError, match="ERR"):
         a.write(peer, [(src_addr, r2_addr, 16)])  # the connection is broken
     assert a.has_peer(peer)
+    assert not a.peer_usable(peer)  # a transfer to it failed
     assert a.disconnect(peer)
     assert not a.has_peer(peer)
     a.add_peer(b.partial_metadata(reg2))
-    assert a.has_peer(peer)
+    assert a.has_peer(peer) and a.peer_usable(peer)
     a.write(peer, [(src_addr, r2_addr, 16)])
     assert r2 == src
 
@@ -300,3 +301,14 @@ def test_deregistration_failure_is_retryable(pair, monkeypatch):
         assert fake.registered
     a.close()
     assert fake.registered == []
+
+
+def test_peer_usable_tells_a_failed_connection_and_the_peer_drops_the_checks(pair):
+    a, b, peer = pair
+    assert a.peer_usable(peer)
+    assert b._agent.notifs  # the check reached the peer
+    b.discard_notifs()
+    assert not b._agent.notifs
+    a._agent.fail_endpoint(peer)  # UCX failed the connection on its own
+    assert not a.peer_usable(peer)
+    assert not b._agent.notifs  # nothing was sent on the failed connection

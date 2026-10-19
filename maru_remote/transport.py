@@ -176,6 +176,8 @@ class NixlTransport:
         self._agent = agent
         self._registrations: list[Any] = []
         self._peers: set[str] = set()
+        # Peers a transfer to failed, timed out or ended uncertain
+        self._tainted: set[str] = set()
         self._pending: dict[int, PendingTransfer] = {}
         self._lock = threading.Lock()
 
@@ -259,6 +261,7 @@ class NixlTransport:
                 raise RuntimeError(f"NIXL peer {name} still has unreleased transfers")
             self._agent.remove_remote_agent(name)
             self._peers.discard(name)
+            self._tainted.discard(name)
 
     def has_peer(self, name: str) -> bool:
         """Whether a peer is loaded (added by :meth:`add_peer`, not removed)."""
@@ -270,17 +273,23 @@ class NixlTransport:
 
         UCX fails a connection on its own when the peer stops answering, and
         NIXL then closes it but keeps it in the peer; loading the peer's
-        metadata again crashes the process. An empty notification tells the
-        two states apart without touching a closed connection: NIXL refuses
-        to send it then. The peer drops these with :meth:`discard_notifs`.
+        metadata again crashes the process. A peer a transfer to failed is
+        unusable. Otherwise an empty notification tells the two states apart
+        without touching a closed connection: NIXL refuses to send it then.
+        The answer holds for the moment of the check; UCX may fail the
+        connection right after it. The peer drops the notifications with
+        :meth:`discard_notifs`.
 
         Args:
             name: Peer name returned by :meth:`add_peer`.
 
         Returns:
-            False if NIXL refused to send to the peer.
+            False if a transfer to the peer failed or NIXL refused to send to
+            it.
         """
         with self._lock:
+            if name in self._tainted:
+                return False
             try:
                 self._agent.send_notif(name, b"")
             except Exception:
@@ -322,6 +331,7 @@ class NixlTransport:
             with self._lock:
                 self._agent.remove_remote_agent(name)
                 self._peers.discard(name)
+                self._tainted.discard(name)
         except Exception as exc:
             logger.error("closing the NIXL connection to %s failed: %s", name, exc)
             return False
@@ -459,7 +469,11 @@ class NixlTransport:
             remote = self._agent.get_xfer_descs(
                 [(ra, n, 0) for _la, ra, n in pairs], "DRAM"
             )
-            handle = self._agent.initialize_xfer(op, local, remote, peer)
+            try:
+                handle = self._agent.initialize_xfer(op, local, remote, peer)
+            except Exception:
+                self._tainted.add(peer)
+                raise
             pending = PendingTransfer(self, op, peer, handle)
             self._pending[id(handle)] = pending
         t0 = time.perf_counter()
@@ -479,9 +493,13 @@ class NixlTransport:
             if state != "DONE":
                 raise RuntimeError(f"NIXL {op} to {peer} ended in state {state}")
         except TransferTimeout:
+            with self._lock:
+                self._tainted.add(peer)
             pending.hand_over()
             raise
         except Exception as exc:
+            with self._lock:
+                self._tainted.add(peer)
             released = self.release_handle(op, peer, handle)
             pending.hand_over(finished=released)
             if not released:

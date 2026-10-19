@@ -288,6 +288,8 @@ class MapReply:
             region's registration (its remote key) and the connection info.
         epoch: The region mapper process this mapping belongs to.
         boot: The boot of the memory node at the time of the mapping.
+        generation: The client's connection the reply came over; the
+            region mapper drops the mapping when that connection ends.
     """
 
     region_id: int
@@ -296,6 +298,7 @@ class MapReply:
     metadata: bytes
     epoch: str
     boot: str = ""
+    generation: int = 0
 
 
 def parse_address(address: str) -> tuple[str, int]:
@@ -397,6 +400,7 @@ class RegionMapClient:
                 bytes(reply["metadata"]),
                 self.epoch,
                 self.boot,
+                self.generation,
             )
 
     def unmap(self, region_id: int) -> None:

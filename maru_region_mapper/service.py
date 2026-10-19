@@ -165,6 +165,7 @@ class RegionMapService:
         self.boot_id = boot_id
         self._maps: dict[int, _Mapping] = {}
         self._released: OrderedDict[int, MaruHandle] = OrderedDict()
+        self._drain_failed = False
         self._lock = threading.Lock()
 
     def hello(self) -> dict:
@@ -321,7 +322,12 @@ class RegionMapService:
         try:
             self._transport.discard_notifs()
         except Exception:
-            logger.debug("dropping NIXL notifications failed", exc_info=True)
+            # They pile up while this fails; say so once.
+            if not self._drain_failed:
+                logger.warning("dropping NIXL notifications failed", exc_info=True)
+            self._drain_failed = True
+        else:
+            self._drain_failed = False
 
     def close(self) -> None:
         """Release every region (the process is ending)."""

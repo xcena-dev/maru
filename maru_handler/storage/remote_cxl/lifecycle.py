@@ -327,14 +327,31 @@ class RegionLifecycle:
         if self._call_retrying("return_region", pool_id=region.pool_id):
             self.regions.pop(region.pool_id, None)
 
+    def _writable(self, region: RemoteCxlRegion) -> bool:
+        """Whether a WRITE can reach a region now: it is in use and its
+        region mapper did not fail a moment ago."""
+        return (
+            region.reachable
+            and not region.retired
+            and not self._data.is_down(pick_mapper(self._mappers, region.region_id))
+        )
+
     def _evict(self) -> bool:
-        """Remove this session's least recently used, unleased keys."""
+        """Remove this session's least recently used, unleased keys.
+
+        Only keys in regions a WRITE can reach now go: a page freed in a
+        region whose memory node does not answer could not be written, and
+        the key's bytes there stay readable once the node answers again.
+        """
         if self._retry_removes():
             return True
+        usable = [r.pool_id for r in self.regions.values() if self._writable(r)]
+        if not usable:
+            return False
         pages = sum(r.capacity // r.page_size for r in self.regions.values())
         count = max(1, min(EVICT_BATCH, pages // 16))
         try:
-            victims = self._call("victims", count=count)["entries"]
+            victims = self._call("victims", count=count, pools=usable)["entries"]
         except Exception:
             logger.warning("Remote CXL eviction failed", exc_info=True)
             return False
