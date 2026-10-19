@@ -26,7 +26,7 @@ class MaruConfig:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `server_url` | `str` | `"tcp://localhost:5555"` | ZeroMQ endpoint of MaruServer |
+| `server_url` | `str` | `"tcp://localhost:5555"` | ZeroMQ endpoint of MaruServer. With `storage_backend="remote_cxl"`, a comma-separated list of endpoints, one maru-server per pool |
 | `instance_id` | `str \| None` | `None` (auto-generated UUID) | Unique client identifier |
 | `pool_size` | `int` | `104_857_600` (100MB) | Initial memory pool size to request (bytes) |
 | `chunk_size_bytes` | `int` | `1_048_576` (1MB) | Page size for paged allocation (bytes) |
@@ -35,6 +35,11 @@ class MaruConfig:
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
 | `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
+| `rdma_device` | `str` | `""` (UCX default) | `remote_cxl` only: RDMA NIC for NIXL/UCX, e.g. `"mlx5_0:1"` |
+| `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` only: host staging buffer registered with the NIC and CUDA (bytes); `None` uses the larger of 64 pages and 1 GiB |
+| `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
+| `rdma_load_reserve` | `float` | `0.0` | `remote_cxl` only: share of staging slots, in `[0, 1)`, that stores leave free for loads; set when loads and stores run on separate threads |
+| `region_mapper_key_file` | `str` | `"/etc/maru/region-mapper.key"` | `remote_cxl` only: copy of the memory nodes' region mapper key, readable by the worker's user only |
 
 ### Examples
 
@@ -127,8 +132,8 @@ vllm serve <model> --kv-transfer-config '{
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address |
-| `maru_pool_size` | `str \| int` | `1G` | CXL memory pool size (`4G`, `500M`, or integer bytes) |
+| `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
+| `maru_pool_size` | `str \| int` | `1G` | CXL memory pool size (`4G`, `500M`, or integer bytes). With `remote_cxl`, required: the size of one region; the engine gets one more region whenever its regions are full |
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
@@ -155,9 +160,9 @@ apply to that backend only:
 
 ### Region mapper (`maru-region-mapper`)
 
-One per memory node, installed as `maru-region-mapper.service` with NIXL. Each
-option also comes from the environment variable in parentheses, which the
-service reads from `/etc/maru/region-mapper.env`.
+One per memory node, installed as `maru-region-mapper.service` with NIXL. An
+option with an environment variable in parentheses also takes its value from
+it, and the service reads these variables from `/etc/maru/region-mapper.env`.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -166,8 +171,10 @@ service reads from `/etc/maru/region-mapper.env`.
 | `--host` (`MARU_REGION_MAPPER_HOST`) | `127.0.0.1`; the service: empty | Bind address; empty means the address of the `--ucx-device` interface |
 | `--port` (`MARU_REGION_MAPPER_PORT`) | `9860` | Bind port |
 | `--key-file` (`MARU_REGION_MAPPER_KEY_FILE`) | `/etc/maru/region-mapper.key` | Key every connection must prove; the installer creates it |
+| `--node-id` | hostname | Name of the memory node; names the default lock file |
 | `--lock-file` (`MARU_REGION_MAPPER_LOCK_FILE`) | `/run/maru/region-mapper-<node>.lock` | Keeps one region mapper per node |
 | `--allow-unchecked-transport` | off | Accept UCX transports that do not check remote keys (tests on one host only) |
+| `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
 ---
 

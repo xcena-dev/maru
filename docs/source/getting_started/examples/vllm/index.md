@@ -2,7 +2,7 @@
 
 Runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
 which moves KV cache through CXL shared memory without LMCache in the serving
-path. Both live under `examples/vllm/`:
+path. They live under `examples/vllm/`:
 
 | Example | Directory | What it shows |
 |---------|-----------|---------------|
@@ -174,8 +174,10 @@ the regions as for local CXL.
 
 ```bash
 cd examples/vllm/remote_cxl
+# One host with 2 GPUs, an RDMA NIC, a CXL/DAX device, the resource manager
+# running (sudo systemctl start maru-resource-manager) and NIXL (uv pip install nixl)
 MARU_DAX_PATH=/dev/dax0.0 MARU_MAPPER_UCX_DEVICE=mlx5_0:1 \
-MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh     # one host, 2 GPUs, an RDMA NIC
+MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh
 ```
 
 `Pool hit: Yes` and `Same answer: Yes` confirm that the second instance loaded

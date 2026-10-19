@@ -16,7 +16,8 @@ for GPU-specific options.
 ## Integration Architecture
 
 MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing
-between vLLM instances through CXL shared memory — **without any middleware**.
+between vLLM instances — **without any middleware**. With the default `cxl`
+backend, the KV moves through CXL shared memory.
 
 ```mermaid
 flowchart LR
@@ -39,8 +40,8 @@ flowchart LR
 By removing the LMCache middleware layer, the direct connector achieves:
 
 - **Fewer dependencies** — only vLLM + Maru
-- **Zero-copy save path** — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
-- **Zero-copy load path** — CXL mmap (CUDA pinned) → GPU via DMA
+- **Zero-copy save path** (default `cxl` backend) — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
+- **Zero-copy load path** (default `cxl` backend) — CXL mmap (CUDA pinned) → GPU via DMA
 - **No serialization overhead** — raw tensor bytes, no `MemoryObj` conversion
 
 ### Component Roles
@@ -230,7 +231,7 @@ Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The
 stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
-size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`
+size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`,
 `maru_region_mapper_key_file` (a copy of the memory nodes' region mapper key,
 default `/etc/maru/region-mapper.key`) and, optionally, `maru_rdma_device` (the
 worker's RDMA NIC, e.g. `mlx5_0:1`).
@@ -277,9 +278,30 @@ stores run on the engine thread unless `maru_async_load` and
 `--no-async-scheduling`, while asynchronous loads run with vLLM's asynchronous
 scheduling on. The worker's staging buffer is registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
-for mapped CXL memory. NIXL is required (`pip install nixl`).
+for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install nixl` without uv).
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 for one-host and multi-node launch steps.
+
+#### Several memory nodes and pools
+
+**Shared pool.** Several memory nodes can share one CXL memory, as hosts on a
+CXL switch do. Each of them runs a region mapper; maru-server takes all of
+them, with `--region-mapper` repeated or comma separated, and hands the list to
+the workers. Each region is served by one memory node, picked by a hash of the
+region number over that list, so the region's owner and its readers map it at
+the same node and move its KV through that node's NIC. The memory nodes use the
+same region mapper key and the multi-host settings of
+{doc}`System Setup <../getting_started/bios_setup>`.
+
+![A shared pool of two memory nodes, each running a region mapper. Each region is mapped by one node, the region mapper m with the largest hash of m and the region number: node 1 maps R1 and R3, node 2 maps R2. The worker node of R2's owner maps R2 at memory node 2 and writes it by RDMA through that node; the worker node of a reader maps R2 at the same node and reads it by RDMA](../image/remote_cxl_shared_pool.png)
+
+**Several pools.** Each pool has its own maru-server. List them in
+`maru_server_url`, comma separated (`"tcp://10.0.0.2:5555,tcp://10.0.0.3:5555"`):
+the worker opens a storage session with each, and sends each request to one
+pool, picked by a hash of the request's first chunk key, so all chunks of a
+request stay in one pool. A pool whose maru-server does not answer when the
+worker starts only makes its prefixes miss; the worker connects to it once it
+answers.
 
 ### Connector settings
 
@@ -287,8 +309,8 @@ Settings in `kv_connector_extra_config`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address |
-| `maru_pool_size` | str/int | `1G` | CXL memory pool size (`4G`, `500M`, etc.) |
+| `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
+| `maru_pool_size` | str/int | `1G` | CXL memory pool size (`4G`, `500M`, etc.); with `remote_cxl`, required: the size of one region, and the worker gets one more region whenever its regions are full |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | str | auto | Unique instance ID (default: auto-generated UUID) |
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
@@ -489,7 +511,9 @@ Controls how many tokens per chunk when storing KV cache:
 
 ### maru_pool_size
 
-CXL memory allocated per instance. Capacity estimation:
+CXL memory allocated per instance. With the `remote_cxl` backend, it is the size
+of one region: when the worker's regions are full, it gets one more region of
+this size. Capacity estimation:
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -509,6 +533,7 @@ Example (Llama 7B, fp16):
 | Serialization | LMCache MemoryObj conversion | torch tensor ↔ bytes direct |
 | Prefix matching | LMCache CacheEngineKey hashing | vLLM token prefix hashing |
 | Configuration | LMCACHE_CONFIG_FILE YAML | kv_connector_extra_config JSON |
+| Storage backends | `cxl` | `cxl`, `cpu`, `mixed`, `remote_cxl` |
 | Save path | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
 | Load path | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
 

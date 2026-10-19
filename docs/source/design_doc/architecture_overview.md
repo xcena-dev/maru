@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Maru manages KV cache data in CXL shared memory, enabling cross-instance sharing across multiple nodes without data transfer.
+Maru manages KV cache data in CXL shared memory, enabling cross-instance sharing across multiple nodes. Nodes attached to the CXL memory share it without data transfer; nodes without CXL reach it over RDMA (see Remote CXL below).
 
 ---
 
@@ -67,13 +67,13 @@ flowchart TB
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+> **Data Plane** (solid arrows) — on nodes attached to CXL, direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode. Nodes without CXL move KV over RDMA, as Remote CXL below describes.
 
 The system has three layers:
 
 | Layer | Role | Components |
 |-------|------|------------|
-| **Client** | KV operations, page allocation, region mapping | MaruHandler |
+| **Client** | KV operations, page allocation, region mapping (with `remote_cxl`, the region mapper on the memory node maps regions) | MaruHandler; region mapper (`remote_cxl`) |
 | **Metadata** | Key registry, allocation lifecycle | MaruServer (Remote) / marufs (Filesystem) |
 | **Memory** | Shared memory pool, capability issuance, crash recovery | MaruResourceManager (Remote) / marufs (Filesystem) |
 
@@ -81,7 +81,7 @@ The system has three layers:
 
 ## Key Design Properties
 
-**Zero-copy data path.** Clients access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead.
+**Zero-copy data path.** Clients on nodes attached to CXL access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; between those nodes, the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead. Clients on nodes without CXL keep the same separation: their NIC moves KV with one-sided RDMA and no Maru process is on that path, with one copy added between the GPU and a host staging buffer (see Remote CXL below).
 
 **Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
 

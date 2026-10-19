@@ -60,15 +60,19 @@ moves it, as for the cxl backend.
 ## Requirements
 
 - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node, and NIXL
-  with its UCX backend: `pip install nixl`.
+  with its UCX backend in the environment Maru is installed in:
+  `uv pip install nixl` (`pip install nixl` without uv).
 - On the memory nodes: the CXL/DAX device of the pool, visible on every memory
   node of the pool, and the resource manager on one of them, as for a local CXL
-  deployment. Use a devdax device. Install Maru with NIXL (`pip install
-  nixl`, then `./install.sh` from the Maru source tree): the installer also
+  deployment. Use a devdax device. Install Maru with NIXL (NIXL first,
+  then `./install.sh` from the Maru source tree): the installer also
   sets up the region mapper as a system service that starts and stops with the
   resource manager, so a memory node runs it without a separate step.
 - Every worker must reach maru-server and each memory node's region mapper and
   NIC, and so must maru-server reach the region mappers.
+- A pool that several memory nodes share: apply the multi-host settings of
+  Maru's [System Setup](../../../docs/source/getting_started/bios_setup.md) on
+  each of those memory nodes, as on hosts that share CXL memory.
 - A copy of the region mapper key (`/etc/maru/region-mapper.key` on the memory
   nodes, created by the installer) on every worker node and the maru-server
   node, readable only by the user that runs them. The memory nodes of a shared
@@ -217,8 +221,16 @@ manager, as for local CXL, and hands the region mapper list to the workers.
 It also talks to the region mappers itself for the regions of workers that
 left, so it needs the key. A shared pool lists
 every memory node, `--region-mapper host1:port,host2:port`; each region is then
-served by one of them, picked from the region number, so every worker reaches
-a region through the same node. maru-server runs once per app and pool.
+served by one of them, picked by a hash of the region number over that list, so
+every worker reaches a region through the same node. maru-server runs once per
+app and pool.
+
+To use several pools, run one maru-server per pool, each with that pool's
+resource manager and region mappers, and list them all in the workers'
+`maru_server_url`, comma separated
+(`MARU_SERVER_URL=tcp://10.0.0.2:<port>,tcp://10.0.0.3:<port>`). A worker opens
+a storage session with each maru-server and sends each request to one pool,
+picked by a hash of the request's first chunk key.
 
 ### 3. Worker nodes
 
