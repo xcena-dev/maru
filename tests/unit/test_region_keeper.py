@@ -359,6 +359,27 @@ def test_a_kept_region_whose_agent_stays_away_stops_being_found(env):
     assert rm.released == [region_id]
 
 
+def test_a_kept_region_its_agent_keeps_failing_to_map_stops_being_found(env):
+    # The agent answers, but cannot map the region: readers cannot either.
+    from maru_server.region_keeper import UNREACHABLE_S
+
+    directory, rm, clock, keeper, _, _ = env
+    pool, region_id = leave(directory, "a", key="k")
+    client = keeper._client(pick_agent(AGENTS, region_id))
+    for _ in range(2):
+        client.fail["map"] = RegionMapError("NIC busy", "unavailable")
+        keeper.run_once()
+        assert [p for p, *_ in directory.departed()] == [pool]
+        clock.advance(UNREACHABLE_S / 2)
+    client.fail["map"] = RegionMapError("NIC busy", "unavailable")
+    keeper.run_once()
+    # Its keys are gone and it is to go back.
+    assert [(p, state) for p, _, state, _ in directory.departed()] == [(pool, "return")]
+    keeper.run_once()
+    assert rm.released == [region_id]  # the agent answers: released, then freed
+    assert directory.departed() == []
+
+
 def test_a_kept_region_whose_boot_was_never_reported_goes_back(env):
     # Its owner died before its first heartbeat: a memory node reboot since
     # the keys were written cannot be ruled out, so its keys are not served.

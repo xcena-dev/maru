@@ -809,21 +809,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             )
         except (TransferTimeout, TransferUncertainError) as exc:
             # The NIC may still write: keep pages and slots until it ends.
-            with self._lock:
-                for h in group:
-                    region.untrack(h)
-                    region.quarantine(h.location)
-                    h.state = "isolated"
-                self._isolated.append(
-                    IsolatedTransfer(
-                        exc.pending,
-                        "WRITE",
-                        exc.pending.peer,
-                        region,
-                        [h.location for h in group],
-                        [h.slot for h in group],
-                    )
-                )
+            self._isolate_write(region, group, exc.pending)
             logger.warning("RDMA WRITE not confirmed: %s", exc)
             return False
         except Exception as exc:
@@ -859,7 +845,34 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     if not region.retired:
                         self._adopt(region, access)
             return False
+        except BaseException as exc:
+            # Interrupted while the WRITE may run: keep pages and slots out of
+            # use (the caller gives back only what is still being sent).
+            self._isolate_write(region, group, getattr(exc, "pending_transfer", None))
+            raise
         return True
+
+    def _isolate_write(
+        self, region: RemoteCxlRegion, group: list[RemoteCxlAllocation], pending: Any
+    ) -> None:
+        """Keep the pages and slots of a WRITE that may still run out of use;
+        with its NIXL transfer (``pending``) they come back once it ends."""
+        with self._lock:
+            for h in group:
+                region.untrack(h)
+                region.quarantine(h.location)
+                h.state = "isolated"
+            if pending is not None:
+                self._isolated.append(
+                    IsolatedTransfer(
+                        pending,
+                        "WRITE",
+                        pending.peer,
+                        region,
+                        [h.location for h in group],
+                        [h.slot for h in group],
+                    )
+                )
 
     def _give_back(self, handles: list[RemoteCxlAllocation]) -> None:
         """Pages written but not committed (or never written) return."""
@@ -1144,6 +1157,18 @@ class RemoteCxlStorageClient(RegionLifecycle):
                         "closing the connection to %s failed", peer, exc_info=True
                     )
                 return False
+            except BaseException as exc:
+                # Interrupted while the READ may run: its slots stay taken
+                # until NIXL releases the transfer.
+                pending = getattr(exc, "pending_transfer", None)
+                if pending is not None:
+                    with self._lock:
+                        self._isolated.append(
+                            IsolatedTransfer(
+                                pending, "READ", pending.peer, None, [], list(slots)
+                            )
+                        )
+                raise
         return True
 
     def _release_lease(self, lease_id: str) -> bool:

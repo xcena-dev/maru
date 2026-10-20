@@ -479,6 +479,8 @@ class NixlTransport:
         Raises:
             TransferTimeout: if the transfer does not finish in time.
             RuntimeError: if the transfer ends in an error state.
+            BaseException: an interrupt while the transfer may run is raised
+                as is, with the unfinished transfer as ``pending_transfer``.
         """
         if not pairs:
             return 0.0
@@ -492,6 +494,27 @@ class NixlTransport:
             handle = self._agent.initialize_xfer(op, local, remote, peer)
             pending = PendingTransfer(self, op, peer, handle)
             self._pending[id(handle)] = pending
+        try:
+            return self._run(op, peer, handle, pending, timeout_s)
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and not hasattr(exc, "pending_transfer"):
+                exc.pending_transfer = pending  # interrupted: the caller keeps it
+            raise
+        finally:
+            if pending.in_flight:
+                # An interrupt anywhere after the handle exists: whoever
+                # polls the transfer later may release it.
+                pending.hand_over()
+
+    def _run(
+        self,
+        op: str,
+        peer: str,
+        handle: Any,
+        pending: PendingTransfer,
+        timeout_s: float,
+    ) -> float:
+        """Post a transfer and poll it to completion (see :meth:`_xfer`)."""
         t0 = time.perf_counter()
         try:
             with self._lock:
@@ -522,6 +545,14 @@ class NixlTransport:
                     f"NIXL {op} to {peer} failed without confirmed cancellation",
                     pending,
                 ) from exc
+            raise
+        except BaseException as exc:
+            # Interrupted (KeyboardInterrupt, SystemExit) while the transfer
+            # may still run: hand it over unfinished, so close keeps the
+            # memory registered, and tell the caller which transfer it was so
+            # it keeps the buffers out of use.
+            pending.hand_over()
+            exc.pending_transfer = pending
             raise
         released = self.release_handle(op, peer, handle)
         pending.hand_over(finished=released)

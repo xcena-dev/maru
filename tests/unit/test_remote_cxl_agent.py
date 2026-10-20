@@ -458,6 +458,117 @@ def test_a_client_with_another_key_cannot_map():
         mem.stop()
 
 
+def test_a_connection_that_never_proves_the_key_is_closed(monkeypatch):
+    import maru_remote_cxl_agent.server as server
+
+    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
+    mem = FakeMemoryNode(FakeCxl())
+    sock, ask = _raw(mem)
+    try:
+        assert ask({"op": "hello"})["ok"]
+        sock.settimeout(5)
+        assert sock.recv(1) == b""  # the agent closed it
+    finally:
+        sock.close()
+
+
+def test_a_proven_connection_may_stay_idle(monkeypatch):
+    import maru_remote_cxl_agent.server as server
+
+    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
+    mem = FakeMemoryNode(FakeCxl())
+    sock, ask = _raw(mem)
+    try:
+        hello = ask({"op": "hello"})
+        proof = prove(shared_key(), "handler", hello["nonce"])
+        assert ask({"op": "auth", "proof": proof, "nonce": b"n" * 16})["ok"]
+        time.sleep(0.6)
+        assert ask({"op": "hello"})["ok"]
+    finally:
+        sock.close()
+
+
+def test_a_connection_that_only_says_hello_is_closed_at_its_deadline(monkeypatch):
+    # The deadline counts from the connection, not from its last request.
+    import maru_remote_cxl_agent.server as server
+
+    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
+    mem = FakeMemoryNode(FakeCxl())
+    sock, ask = _raw(mem)
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            assert time.monotonic() < deadline, "still served"
+            try:
+                if ask({"op": "hello"}) is None:
+                    break
+            except OSError:
+                break
+            time.sleep(0.1)
+    finally:
+        sock.close()
+
+
+def test_connections_beyond_the_limit_from_one_source_are_closed(monkeypatch):
+    import maru_remote_cxl_agent.server as server
+
+    monkeypatch.setattr(server, "MAX_PER_SOURCE", 2)
+    mem = FakeMemoryNode(FakeCxl())
+    socks = [_raw(mem) for _ in range(3)]
+    try:
+        assert socks[0][1]({"op": "hello"})["ok"]
+        assert socks[1][1]({"op": "hello"})["ok"]
+        socks[2][0].settimeout(5)
+        assert socks[2][0].recv(1) == b""
+    finally:
+        for sock, _ in socks:
+            sock.close()
+
+
+def test_running_out_of_file_descriptors_does_not_stop_the_agent():
+    import errno
+
+    mem = FakeMemoryNode(FakeCxl())
+    real = mem.server._sock
+
+    class Full:
+        failed = False
+
+        def accept(self):
+            if not self.failed:
+                self.failed = True
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real.accept()
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    mem.server._sock = Full()
+    sock, ask = _raw(mem)
+    try:
+        sock.settimeout(5)
+        assert ask({"op": "hello"})["ok"]  # accepted after the failed accept
+    finally:
+        sock.close()
+
+
+def test_connections_beyond_the_limit_are_closed(monkeypatch):
+    import maru_remote_cxl_agent.server as server
+
+    monkeypatch.setattr(server, "MAX_CONNECTIONS", 2)
+    mem = FakeMemoryNode(FakeCxl())
+    socks = [_raw(mem) for _ in range(3)]
+    try:
+        assert socks[0][1]({"op": "hello"})["ok"]
+        assert socks[1][1]({"op": "hello"})["ok"]
+        extra = socks[2][0]
+        extra.settimeout(5)
+        assert extra.recv(1) == b""
+    finally:
+        for sock, _ in socks:
+            sock.close()
+
+
 def test_the_client_checks_that_the_remote_cxl_agent_holds_the_key():
     # A process that poses as the remote CXL agent cannot hand out addresses.
     cxl = FakeCxl()

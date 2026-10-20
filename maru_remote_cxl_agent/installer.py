@@ -122,6 +122,8 @@ Restart=on-failure
 RestartSec=3
 # Registering a region with the NIC pins its memory.
 LimitMEMLOCK=infinity
+# Every worker and maru-server connection holds a file descriptor.
+LimitNOFILE=65536
 # Holds /run/maru, where the node lock lives.
 RuntimeDirectory=maru
 NoNewPrivileges=yes

@@ -266,3 +266,5 @@ class PoolRouter:
                 self.data.close()
             except Exception:
                 logger.warning("Could not close the RDMA data path", exc_info=True)
+            if self.data.transport is not None:
+                self._late = None  # the cleanup failed: a later close tries again

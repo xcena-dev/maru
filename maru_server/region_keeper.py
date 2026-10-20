@@ -220,7 +220,14 @@ class RegionKeeper:
                     pool_id, f"its remote CXL agent refused: {exc}"
                 )
             else:
+                # The agent answers but cannot map it: readers cannot either,
+                # so it counts as not reachable.
                 logger.warning("holding region %s failed: %s", handle["region_id"], exc)
+                self._note_unreachable(
+                    pool_id,
+                    self._clock(),
+                    f"its remote CXL agent could not map it for {UNREACHABLE_S:.0f} s",
+                )
             return
         self._unreachable.pop(pool_id, None)
         known = boot or (held[2] if held is not None else "")
@@ -230,15 +237,18 @@ class RegionKeeper:
             return
         self._held[pool_id] = (address, client.generation, known or now_boot)
 
-    def _note_unreachable(self, pool_id: str, now: float) -> None:
-        """Give a kept region back once its remote CXL agent is gone too long."""
+    def _note_unreachable(
+        self, pool_id: str, now: float, reason: str | None = None
+    ) -> None:
+        """Give a kept region back once it cannot be mapped for too long."""
         since = self._unreachable.setdefault(pool_id, now)
         if now - since >= UNREACHABLE_S:
             del self._unreachable[pool_id]
             self._held.pop(pool_id, None)
             self._directory.give_back(
                 pool_id,
-                f"its remote CXL agent did not answer for {UNREACHABLE_S:.0f} s",
+                reason
+                or f"its remote CXL agent did not answer for {UNREACHABLE_S:.0f} s",
             )
 
     def _release(self, pool_id: str, handle: dict, address: str) -> None:

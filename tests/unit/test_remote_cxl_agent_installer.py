@@ -37,6 +37,7 @@ def test_the_service_starts_and_stops_with_the_resource_manager():
     # A node without an RDMA NIC fails every start: stop retrying.
     assert "StartLimitIntervalSec=60" in unit
     assert "StartLimitBurst=5" in unit
+    assert "LimitNOFILE=65536" in unit
 
 
 def test_a_standalone_service_starts_at_boot_without_a_resource_manager():

@@ -270,6 +270,36 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
         time.sleep(0.05)
 
 
+def test_a_failed_late_cleanup_is_retried_by_a_later_close(pools):
+    r = router(pools, rdma_timeout_s=0.01)
+    agent = FakeNixlAgent.registry[
+        next(n for n in FakeNixlAgent.registry if n.startswith("maru-worker"))
+    ]
+    agent.stall = True
+    ok, _ = store(r, route_keys_per_pool(r)[0], ["k"])
+    assert ok == [False]
+    transport = r.data.transport
+    original, calls = transport.close, []
+
+    def refuse_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("NIXL refused the deregistration")
+        original()
+
+    transport.close = refuse_once
+    r.close()
+    agent.stall = False
+    agent.finish_stalled()
+    deadline = time.monotonic() + 5
+    while r._late is not None:  # the thread ran, failed and cleared its mark
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    assert r.data.staging is not None and calls == [1]
+    r.close()
+    assert r.data.staging is None and calls == [1, 1]
+
+
 def test_router_rejects_mismatched_rpcs_and_urls(pools):
     config = MaruConfig(
         storage_backend="remote_cxl",

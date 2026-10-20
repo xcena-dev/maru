@@ -23,6 +23,7 @@ import argparse
 import fcntl
 import logging
 import os
+import resource
 import signal
 import socket
 import struct
@@ -289,6 +290,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def raise_file_limit() -> None:
+    """Raise the soft file-descriptor limit to the hard one.
+
+    Every Handler connection holds a descriptor; the server keeps its
+    connection limit below the soft limit (``server._connection_limit``).
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (OSError, ValueError) as exc:
+        logger.warning("cannot raise the file-descriptor limit: %s", exc)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the remote CXL agent until SIGINT or SIGTERM.
 
@@ -331,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     except (NodeLockedError, OSError) as exc:
         logger.error("cannot take the node lock %s: %s", lock_file, exc)
         return 1
+
+    raise_file_limit()
 
     # Imported here: NIXL and the RM client are only needed to run the daemon.
     from maru_remote.transport import NixlTransport

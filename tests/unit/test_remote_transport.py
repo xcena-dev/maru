@@ -124,6 +124,51 @@ def test_disconnect_keeps_unconfirmed_transfers_pending(pair):
     assert pending.poll() and a.pending_peers() == set()
 
 
+def test_an_interrupted_transfer_is_handed_over_unfinished(pair, monkeypatch):
+    a, b, peer = pair
+    src, src_addr = _buf(16, 3)
+    remote, remote_addr = _buf(16)
+    a.register(src_addr, 16)
+    b.register(remote_addr, 16)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = True
+
+    def interrupted(handle):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake, "check_xfer_state", interrupted)
+    with pytest.raises(KeyboardInterrupt) as info:
+        a.write(peer, [(src_addr, remote_addr, 16)], timeout_s=5)
+    pending = info.value.pending_transfer
+    # Still unfinished and known: close keeps the registered memory.
+    assert not pending.in_flight and not pending.finished
+    assert a.pending_peers() == {peer}
+    monkeypatch.undo()
+    fake.finish_stalled()
+    assert pending.poll() and a.pending_peers() == set()
+
+
+def test_an_interrupt_while_releasing_a_done_transfer_hands_it_over(pair, monkeypatch):
+    a, b, peer = pair
+    src, src_addr = _buf(16, 3)
+    remote, remote_addr = _buf(16)
+    a.register(src_addr, 16)
+    b.register(remote_addr, 16)
+    fake = FakeNixlAgent.registry["a"]
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(a, "release_handle", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        a.write(peer, [(src_addr, remote_addr, 16)], timeout_s=5)
+    monkeypatch.undo()
+    (pending,) = a._pending.values()
+    assert not pending.in_flight  # a later poll may release it
+    assert pending.poll() and a.pending_peers() == set()
+    del fake
+
+
 def test_two_pollers_release_a_transfer_once(pair):
     import threading
 

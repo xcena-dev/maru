@@ -391,6 +391,57 @@ def test_unconfirmed_write_keeps_pages_and_slots_until_released(world):
     assert a._staging.free_count() == free_slots + 1
 
 
+def test_an_interrupted_write_keeps_its_pages_and_slots_until_it_ends(
+    world, monkeypatch
+):
+    a = world.client("a", pages=2)
+    agent = worker_agent("a")
+    agent.stall = True
+
+    def interrupted(handle):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "check_xfer_state", interrupted)
+    free_slots = a._staging.free_count()
+    handle = a.alloc(4)
+    handle.buf[:4] = b"late"
+    with pytest.raises(KeyboardInterrupt):
+        a.batch_store(["k"], [handle])
+    region = only_region(a)
+    # The NIC may still write: the page and the slot stay out of use.
+    assert handle.state == "isolated"
+    assert region.usage()["quarantined_bytes"] == PAGE
+    assert a._staging.free_count() == free_slots - 1
+    assert a.has_unconfirmed_transfers()
+    monkeypatch.undo()
+    agent.stall = False
+    agent.finish_stalled()
+    a._reap_isolated()
+    assert region.usage() == {"allocated_bytes": 0, "quarantined_bytes": 0}
+    assert a._staging.free_count() == free_slots
+
+
+def test_an_interrupted_read_keeps_its_slots_until_it_ends(world, monkeypatch):
+    a = world.client("a", pages=2)
+    put(a, "k", b"v")
+    agent = worker_agent("a")
+    agent.stall = True
+
+    def interrupted(handle):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "check_xfer_state", interrupted)
+    free_slots = a._staging.free_count()
+    with pytest.raises(KeyboardInterrupt):
+        a.batch_retrieve(["k"])
+    assert a._staging.free_count() < free_slots and a.has_unconfirmed_transfers()
+    monkeypatch.undo()
+    agent.stall = False
+    agent.finish_stalled()
+    a._reap_isolated()
+    assert not a.has_unconfirmed_transfers()
+
+
 def test_a_write_that_ends_in_an_error_after_its_deadline_keeps_its_page(world):
     """Released after an error, a WRITE may still be in the network."""
     a = world.client("a", pages=2, rdma_timeout_s=0.01)
