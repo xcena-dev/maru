@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 ROOM_LOW_PAGES = 64
 # How often a store that found no remote page says so
 UNPLACED_WARN_INTERVAL_S = 60.0
+# How often a closed client looks for its late transfers' end
+LATE_TRANSFER_POLL_S = 1.0
 # How often the refill thread looks at the room without being woken
 REFILL_CHECK_S = 1.0
 
@@ -112,8 +114,6 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # Orders free and store of an allocation that has no page yet
         self._unplaced_lock = threading.Lock()
         self._unplaced_warned_at = float("-inf")
-        # close left the data path registered for transfers still under way
-        self._data_path_left = False
 
     # ------------------------------------------------------------------ setup
 
@@ -661,13 +661,6 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def _end_transfer_locked(self) -> None:
         self._transfers -= 1
         self._transfers_idle.notify_all()
-        if self._data_path_left and not self._transfers and not self._isolated:
-            # close left the data path to this transfer; it was the last one.
-            self._data_path_left = False
-            try:
-                self._stop_data_path()
-            except Exception:  # the transfer's own result still counts
-                logger.warning("Could not stop the RDMA data path", exc_info=True)
 
     def _commit(
         self, keys: list[str], handles: list[RemoteCxlAllocation]
@@ -888,6 +881,26 @@ class RemoteCxlStorageClient(RegionLifecycle):
         """Whether a late RDMA may still touch this client's memory."""
         with self._lock:
             return bool(self._isolated) or self._transfers > 0
+
+    def reap_unconfirmed(self) -> bool:
+        """Give back what the transfers NIXL has released held.
+
+        Returns:
+            True when no late RDMA can touch this client's memory any more.
+        """
+        with self._lock:
+            self._reap_isolated()
+            return not self._isolated and not self._transfers
+
+    def _stop_data_path_later(self) -> None:
+        """After close: stop the data path once the late transfers ended."""
+        while not self.reap_unconfirmed():
+            time.sleep(LATE_TRANSFER_POLL_S)
+        with self._lock:
+            try:
+                self._stop_data_path()
+            except Exception:
+                logger.warning("Could not stop the RDMA data path", exc_info=True)
 
     # ------------------------------------------------------------------ load
 
@@ -1175,11 +1188,17 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if not self._isolated and not self._transfers:
                 self._stop_data_path()
             else:
-                # The last transfer under way stops it when it ends.
-                self._data_path_left = True
                 logger.warning(
-                    "RDMA transfers still own staging memory; leaving it registered"
+                    "RDMA transfers still own staging memory; it stays "
+                    "registered until they end"
                 )
+                if self._owns_data:
+                    # The heartbeat thread that reaped them is gone.
+                    threading.Thread(
+                        target=self._stop_data_path_later,
+                        daemon=True,
+                        name="maru-remote-cxl-late-transfers",
+                    ).start()
             self._keys.clear()
             self._pending.clear()
             self.connected = False

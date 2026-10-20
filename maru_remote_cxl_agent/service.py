@@ -380,8 +380,9 @@ class RegionMapService:
         A mapping whose handle the resource manager refuses (the region was
         freed, or its id names another region now) is released as a release
         does: deregistered, unmapped, refused to later maps. A mapping that
-        is out of use and still registered gets its deregistration again.
-        While the resource manager cannot be asked, every mapping stays.
+        is out of use (refused, or with no holder left) and still registered
+        gets its deregistration again. While the resource manager cannot be
+        asked, every mapping stays.
         """
         with self._lock:
             held = [
@@ -406,6 +407,10 @@ class RegionMapService:
                     return
                 self._sweep_failed = False
                 if allocated:
+                    with self._lock:
+                        if self._maps.get(m.handle.region_id) is m and not m.holders:
+                            # Its last holder left, but deregistering failed.
+                            self._release_locked(m.handle.region_id, m)
                     continue
             rid = m.handle.region_id
             with self._lock:

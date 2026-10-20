@@ -351,3 +351,20 @@ def test_the_sweep_and_close_deregister_a_half_failed_mapping():
     node.transport.deregister = deregister
     node.service.close()
     assert node.agent.registered == []
+
+
+def test_the_sweep_deregisters_a_mapping_whose_last_holder_left():
+    # The last holder's unmap could not deregister; the mapping is unused
+    # but still registered, and the region is still allocated.
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    deregister = node.transport.deregister
+    node.transport.deregister = refuse
+    node.service.unmap(1, handle["region_id"])
+    assert len(node.agent.registered) == 1 and node.mapper.unmapped == []
+    node.service.sweep()
+    assert len(node.agent.registered) == 1  # still refused: kept for later
+    node.transport.deregister = deregister
+    node.service.sweep()
+    assert node.agent.registered == [] and node.mapper.unmapped == [handle["offset"]]

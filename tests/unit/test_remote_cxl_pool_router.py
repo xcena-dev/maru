@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Several remote CXL pools behind one worker: routing, grouping and shared staging."""
 
+import time
+
 import pytest
 
 import maru_handler.storage.remote_cxl.router as router_module
@@ -256,7 +258,13 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
     r.close()
     # Unmapping now would let the NIC write into freed host memory.
     assert r.data.staging is not None
+    agent.stall = False
     agent.finish_stalled()
+    # Once NIXL released the transfer, the shared data path closes.
+    deadline = time.monotonic() + 5
+    while r.data.staging is not None:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
 
 
 def test_router_rejects_mismatched_rpcs_and_urls(pools):

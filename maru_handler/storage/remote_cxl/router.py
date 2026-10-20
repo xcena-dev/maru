@@ -6,13 +6,14 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
 from maru_common.storage_types import StorageError, StorageUnavailableError
 
 from ..cpu import CpuReadLease
-from .client import RemoteCxlStorageClient
+from .client import LATE_TRANSFER_POLL_S, RemoteCxlStorageClient
 from .datapath import RdmaDataPath
 from .region import RemoteCxlAllocation
 
@@ -239,7 +240,26 @@ class PoolRouter:
         self._close_clients()
         if any(c.has_unconfirmed_transfers() for c in self.clients):
             logger.warning(
-                "RDMA transfers still own staging memory; leaving it registered"
+                "RDMA transfers still own staging memory; it stays registered "
+                "until they end"
             )
+            threading.Thread(
+                target=self._close_data_later,
+                daemon=True,
+                name="maru-remote-cxl-late-transfers",
+            ).start()
             return
         self.data.close()
+
+    def _close_data_later(self) -> None:
+        """After close: close the shared data path once every pool's late
+        transfers ended."""
+        while True:
+            ended = [c.reap_unconfirmed() for c in self.clients]  # each reaps
+            if all(ended):
+                break
+            time.sleep(LATE_TRANSFER_POLL_S)
+        try:
+            self.data.close()
+        except Exception:
+            logger.warning("Could not close the RDMA data path", exc_info=True)

@@ -969,7 +969,39 @@ def test_the_last_transfer_after_close_stops_the_data_path(world):
     assert not stopped and a.has_unconfirmed_transfers()
     go.set()
     store.join(5)
+    deadline = time.monotonic() + 5
+    while not stopped:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
     assert stopped == [1] and not a.has_unconfirmed_transfers()
+    world.clients.remove(a)
+
+
+def test_a_write_unconfirmed_at_close_stops_the_data_path_once_released(world):
+    # The heartbeat thread that reaps released transfers is gone after close.
+    a = world.client("a", pages=2, rdma_timeout_s=0.01)
+    agent = worker_agent("a")
+    agent.stall = True
+    handle = a.alloc(4)
+    handle.buf[:4] = b"late"
+    assert a.batch_store(["k"], [handle]) == [False]
+    stopped = []
+    original = a._stop_data_path
+
+    def stop():
+        stopped.append(1)
+        original()
+
+    a._stop_data_path = stop
+    a.close()
+    assert not stopped and a._data.staging is not None
+    agent.stall = False
+    agent.finish_stalled()
+    deadline = time.monotonic() + 5
+    while not stopped:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    assert a._data.staging is None
     world.clients.remove(a)
 
 
