@@ -357,15 +357,18 @@ def test_the_sweep_deregisters_a_mapping_whose_last_holder_left():
     # The last holder's unmap could not deregister; the mapping is unused
     # but still registered, and the region is still allocated.
     node = Node()
-    handle = node.region()
+    in_use, handle = node.region(), node.region()
+    node.service.map(1, in_use)  # mapped first: the sweep asks the RM about it first
     node.service.map(1, handle)
     deregister = node.transport.deregister
     node.transport.deregister = refuse
     node.service.unmap(1, handle["region_id"])
-    assert len(node.agent.registered) == 1 and node.mapper.unmapped == []
+    assert len(node.agent.registered) == 2 and node.mapper.unmapped == []
     node.service.sweep()
-    assert len(node.agent.registered) == 1  # still refused: kept for later
+    assert len(node.agent.registered) == 2  # still refused: kept for later
     node.transport.deregister = deregister
     node.cxl.get_access = unreachable  # an unused mapping needs no RM answer
     node.service.sweep()
-    assert node.agent.registered == [] and node.mapper.unmapped == [handle["offset"]]
+    assert len(node.agent.registered) == 1 and node.mapper.unmapped == [
+        handle["offset"]
+    ]
