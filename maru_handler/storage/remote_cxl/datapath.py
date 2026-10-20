@@ -26,6 +26,10 @@ DOWN_BACKOFF_S = 5.0
 # Connecting to a remote CXL agent; replies may take longer (a first map
 # registers a whole region with the NIC).
 CONNECT_TIMEOUT_S = 3.0
+# Shortest wait for a remote CXL agent's reply. Replies otherwise wait as long
+# as an RDMA transfer (``rdma_timeout_s``); a short transfer deadline must not
+# cut off a map that registers a whole region.
+REPLY_TIMEOUT_MIN_S = 3.0
 
 
 class _StaleReplyError(StorageUnavailableError):
@@ -493,7 +497,7 @@ class RdmaDataPath:
 
         return RegionMapClient(
             address,
-            timeout_s=self.config.rdma_timeout_s,
+            timeout_s=max(self.config.rdma_timeout_s, REPLY_TIMEOUT_MIN_S),
             connect_timeout_s=CONNECT_TIMEOUT_S,
             key=self._key,
         )

@@ -1427,13 +1427,19 @@ def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     """One of two remote CXL agents of the pool is down: eviction frees pages
     only in regions on the node that answers."""
     a = shared.client("a", pages=1)
-    for i in range(8):  # one page per region: one region per key
-        put(a, f"k{i}", bytes([i]))
     by_node = {}
-    for region in a.regions.values():
-        by_node.setdefault(
-            pick_agent(a.remote_cxl_agents, region.region_id), []
-        ).append(region)
+    # One page per region: one region per key. Which node serves a region
+    # follows a hash of its id and the agents' addresses, so store until both
+    # nodes serve one (eight keys almost always suffice).
+    for i in range(64):
+        put(a, f"k{i}", bytes([i]))
+        by_node = {}
+        for region in a.regions.values():
+            by_node.setdefault(
+                pick_agent(a.remote_cxl_agents, region.region_id), []
+            ).append(region)
+        if i >= 7 and len(by_node) == 2:
+            break
     assert len(by_node) == 2
     first = a._keys["k0"].pool_id  # the least recently used key
     down = next(
@@ -1445,7 +1451,7 @@ def test_keys_on_a_down_node_are_not_evicted_for_room_on_another(shared):
     a._data.boots([down.address])  # the heartbeat finds it down
     time.sleep(0.1)  # the back-off ends; the node still does not answer
     a.config.auto_expand = False
-    assert put(a, "k8", b"8")[0] is True
+    assert put(a, "new", b"n")[0] is True
     on_down = [
         k
         for k, loc in a._keys.items()
