@@ -12,7 +12,13 @@ from maru_remote.region_map import (
 from maru_server.region_keeper import CHECK_S, DOWN_S, RegionKeeper
 from maru_server.replica_directory import ReplicaDirectory
 from tests.unit.remote_fakes import FakeClock
-from tests.unit.test_remote_cxl_directory import FakeRm, call, commit, open_session
+from tests.unit.test_remote_cxl_directory import (
+    PAGE,
+    FakeRm,
+    call,
+    commit,
+    open_session,
+)
 
 AGENTS = ["mem1:9860", "mem2:9860"]
 
@@ -72,12 +78,17 @@ def env():
     return directory, rm, clock, keeper, clients, boots
 
 
-def leave(directory, engine, key=None):
-    """Open a session (with one key if given) and close it drained."""
+def leave(directory, engine, key=None, boot="boot-1"):
+    """Open a session (with one key if given) and close it drained.
+
+    The owner reports its regions' memory node boot with the close, as a
+    Handler does; ``boot=None`` leaves it out.
+    """
     creds, pool = open_session(directory, engine)
     if key:
         commit(directory, creds, pool, key, 0)
-    call(directory, "close", **creds, drained=True)
+    pools = [] if boot is None else [{"pool_id": pool, "boot": boot}]
+    call(directory, "close", **creds, drained=True, pools=pools)
     region_id = next(h["region_id"] for p, h, *_ in directory.departed() if p == pool)
     return pool, region_id
 
@@ -194,6 +205,8 @@ def test_expiry_is_noticed_without_requests(env):
     directory, rm, clock, keeper, clients, _ = env
     creds, pool = open_session(directory, "a")
     commit(directory, creds, pool, "k", 0)
+    report = {"pool_id": pool, "allocated_bytes": PAGE, "quarantined_bytes": 0}
+    call(directory, "heartbeat", **creds, sequence=1, pools=[{**report, "boot": "b"}])
     clock.advance(31)
     keeper.run_once()
     region_id = rm.next_id - 1
@@ -344,6 +357,18 @@ def test_a_kept_region_whose_agent_stays_away_stops_being_found(env):
     clock.advance(DOWN_S + 0.1)
     keeper.run_once()
     assert rm.released == [region_id]
+
+
+def test_a_kept_region_whose_boot_was_never_reported_goes_back(env):
+    # Its owner died before its first heartbeat: a memory node reboot since
+    # the keys were written cannot be ruled out, so its keys are not served.
+    directory, rm, _, keeper, clients, _ = env
+    pool, region_id = leave(directory, "a", key="k", boot=None)
+    keeper.run_once()
+    keeper.run_once()
+    calls = [c for client in clients.values() for c in client.calls]
+    assert ("map", region_id) not in calls
+    assert rm.released == [region_id] and directory.departed() == []
 
 
 def test_a_short_outage_keeps_the_kept_region(env):

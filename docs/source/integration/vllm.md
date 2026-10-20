@@ -272,11 +272,18 @@ its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
 instead of landing in the next owner's KV.
 
 The backend stores KV chunkwise and needs `--enforce-eager`,
-`kv_load_failure_policy="recompute"` and one worker per engine. Loads and
-stores run on the engine thread unless `maru_async_load` and
-`maru_async_store` move them off it; synchronous loads also need
-`--no-async-scheduling`, while asynchronous loads run with vLLM's asynchronous
-scheduling on. The worker's staging buffer is registered with CUDA,
+`kv_load_failure_policy="recompute"` and one worker per engine. It turns on
+`maru_async_load` and `maru_async_store` unless they are set: loads run
+between steps and stores after the forward, so an RDMA transfer that waits for
+a slow memory node does not hold up the engine, and asynchronous loads run with
+vLLM's asynchronous scheduling on. Asynchronous loads need vLLM 0.16 or later,
+and an explicit `maru_rdma_staging_size` must then hold two requests (one for
+loads, one for stores). Setting them to `false` runs loads and stores on the
+engine thread; synchronous loads also need `--no-async-scheduling`. A store
+takes its staging slot and remote page on the engine thread without waiting:
+RDMA transfers run outside the client's lock, a background thread asks for a
+new region or evicts before the free pages run out, and a store that finds no
+free page or a busy client is skipped. The worker's staging buffer is registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
 for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install nixl` without uv).
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
@@ -320,8 +327,8 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_async_load` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
-| `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
+| `maru_async_load` | bool | `false` (`true` for `remote_cxl`) | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_store` | bool | `false` (`true` for `remote_cxl`) | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 | `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
 

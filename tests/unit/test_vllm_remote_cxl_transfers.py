@@ -256,6 +256,32 @@ def test_an_offthread_batch_does_not_wait_for_the_compute_stream(monkeypatch):
     assert log[-2:] == ["loader sync", "release 3"]
 
 
+def test_a_loader_thread_uploads_the_pointer_table_once(monkeypatch):
+    # Uploading it on the loader thread's default stream made every load wait
+    # for the forward running on the compute stream.
+    log = []
+    worker, cache, meta, ops = _kernel_worker(monkeypatch, log)
+    built = []
+    monkeypatch.setattr(
+        worker,
+        "_packed_load_kernel_ctx",
+        lambda layers, attn: built.append(1) or (ops, torch.zeros(1), 16, 4, 1, "F"),
+    )
+    own = _FakeStream(log, "loader")
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    for _ in range(3):
+        worker._load_leased_request(
+            [("layer", cache, 0)], meta, worker._last_attn_metadata, stream=own
+        )
+    assert len(built) == 1
+    # New KV caches (another address) get a new table.
+    other = cache.clone()
+    worker._load_leased_request(
+        [("layer", other, 0)], meta, worker._last_attn_metadata, stream=own
+    )
+    assert len(built) == 2
+
+
 def test_a_copy_error_waits_for_queued_copies_before_releasing(monkeypatch):
     log = []
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log)

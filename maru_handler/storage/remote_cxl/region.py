@@ -70,6 +70,13 @@ class RemoteCxlRegion:
         # Boot of the memory node at the last map
         self.boot = ""
 
+    def free_count(self) -> int:
+        """Free pages a store can take now (none while the region is unusable)."""
+        with self._lock:
+            if self.retired or not self.reachable:
+                return 0
+            return len(self._free)
+
     def has_free(self) -> bool:
         """Whether a page can be taken now."""
         with self._lock:

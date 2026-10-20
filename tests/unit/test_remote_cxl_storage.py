@@ -730,6 +730,203 @@ def test_a_reader_finishing_after_a_give_back_keeps_its_bytes(world):
     leases[0].release()
 
 
+# ------------------------------------------------- transfers outside the lock
+
+
+def hold_transfers(c, op):
+    """Make c's next RDMA ``op`` ("read" or "write") wait for the returned event."""
+    transport = c._data.transport
+    original = getattr(transport, op)
+    entered, go = threading.Event(), threading.Event()
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert go.wait(10)
+        return original(*args, **kwargs)
+
+    setattr(transport, op, held)
+    return entered, go
+
+
+def test_a_write_under_way_holds_up_neither_alloc_nor_a_load(world):
+    # alloc runs on the engine thread: a WRITE that waits on a slow memory
+    # node must not stall every running request.
+    a = world.client("a", pages=8, rdma_nonblocking_alloc=True)
+    put(a, "old", b"o")
+    entered, go = hold_transfers(a, "write")
+    handle = a.alloc(1)
+    handle.buf[:1] = b"n"
+    store = threading.Thread(target=a.batch_store, args=(["new"], [handle]))
+    store.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        other = a.alloc(1)
+        a.free(other)
+        assert a.has_local("old")
+        assert read(a, ["old"]) == [b"o"]
+        assert time.monotonic() - started < 1
+    finally:
+        go.set()
+        store.join(5)
+    assert read(a, ["new"]) == [b"n"]
+
+
+def test_a_read_under_way_does_not_hold_up_alloc(world):
+    a = world.client("a", pages=8, rdma_nonblocking_alloc=True)
+    put(a, "k", b"v")
+    entered, go = hold_transfers(a, "read")
+    got = {}
+    load = threading.Thread(target=lambda: got.setdefault("k", read(a, ["k"])))
+    load.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        handle = a.alloc(1)
+        a.free(handle)
+        assert time.monotonic() - started < 1
+    finally:
+        go.set()
+        load.join(5)
+    assert got["k"] == [b"v"]
+
+
+def test_a_nonblocking_alloc_never_waits_for_a_new_region(world):
+    # The refill thread asks for a region when the free pages run out; an
+    # alloc meanwhile is skipped instead of waiting for it.
+    a = world.client("a", pages=1, rdma_nonblocking_alloc=True)
+    storage = a.rpc.storage
+    asked, answer = threading.Event(), threading.Event()
+    askers = []
+
+    def slow_expand(action, payload):
+        if action == "expand":
+            askers.append(threading.current_thread().name)
+            asked.set()
+            answer.wait(5)
+        return storage(action, payload)
+
+    a.rpc.storage = slow_expand
+    first = a.alloc(1)  # the only page: the refill thread asks for a region
+    assert asked.wait(5)
+    started = time.monotonic()
+    with pytest.raises(MemoryError):
+        a.alloc(1)
+    assert time.monotonic() - started < 0.5
+    answer.set()
+    a.free(first)
+    deadline = time.monotonic() + 5
+    while len(a.regions) < 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert put(a, "k", b"y")[0] is True
+    assert askers == ["maru-remote-cxl-refill"]  # never the allocating thread
+
+
+def test_the_refill_thread_evicts_ahead_when_no_region_is_left(world):
+    a = world.client("a", pages=2, rdma_nonblocking_alloc=True, auto_expand=False)
+    assert put(a, "k0", b"x")[0] is True
+    assert put(a, "k1", b"y")[0] is True  # full: the refill thread evicts
+    deadline = time.monotonic() + 5
+    while not only_region(a).has_free():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert put(a, "k2", b"z")[0] is True
+
+
+def test_an_error_escaping_a_write_gives_its_pages_and_slots_back(world):
+    # The handles are being sent, so the caller's free cannot return them.
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    free_slots = a._staging.free_count()
+    handle = a.alloc(1)
+
+    def broken(group):
+        raise RuntimeError("unexpected")
+
+    a._write_group = broken
+    with pytest.raises(RuntimeError):
+        a.batch_store(["k"], [handle])
+    assert handle.state == "freed"
+    assert only_region(a).free_count() == 4
+    assert a._staging.free_count() == free_slots
+    assert not a.has_unconfirmed_transfers()
+
+
+def test_a_free_while_the_client_is_busy_is_done_by_the_refill_thread(world):
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    handle = a.alloc(1)
+    holding, done = threading.Event(), threading.Event()
+
+    def hold():
+        with a._lock:
+            holding.set()
+            done.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(5)
+    started = time.monotonic()
+    a.free(handle)  # parked, not waited for
+    assert time.monotonic() - started < 0.5 and handle.state == "writing"
+    done.set()
+    holder.join(5)
+    deadline = time.monotonic() + 5
+    while handle.state != "freed":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert only_region(a).free_count() == 4
+
+
+def test_close_waits_for_a_transfer_under_way(world):
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    entered, go = hold_transfers(a, "write")
+    handle = a.alloc(1)
+    handle.buf[:1] = b"z"
+    done = {}
+    store = threading.Thread(
+        target=lambda: done.setdefault("ok", a.batch_store(["k"], [handle]))
+    )
+    store.start()
+    assert entered.wait(5)
+    threads = list(a._threads)
+    closer = threading.Thread(target=a.close)
+    closer.start()
+    for t in threads:
+        t.join(5)
+    time.sleep(0.2)
+    # Its own threads are gone; close waits for the WRITE under way.
+    assert closer.is_alive() and a.regions and a.has_unconfirmed_transfers()
+    go.set()
+    store.join(5)
+    closer.join(5)
+    assert not closer.is_alive() and done["ok"] == [True]
+    world.clients.remove(a)
+
+
+def test_a_region_given_back_during_its_write_keeps_no_key(world):
+    # The give-back releases the region first, so the WRITE either landed
+    # before or fails at the NIC; the commit must not leave its key found.
+    a, b = world.client("a", pages=4, rdma_nonblocking_alloc=True), world.client("b")
+    region = only_region(a)
+    entered, go = hold_transfers(a, "write")
+    handle = a.alloc(1)
+    handle.buf[:1] = b"z"
+    store = threading.Thread(target=a.batch_store, args=(["k"], [handle]))
+    store.start()
+    try:
+        assert entered.wait(5)
+        assert a._lock.acquire(timeout=1)  # the WRITE does not hold it
+        try:
+            a._give_back_rebooted(region)
+        finally:
+            a._lock.release()
+    finally:
+        go.set()
+        store.join(5)
+    assert "k" not in a._keys
+    assert read(b, ["k"]) == [None]
+
+
 # ---------------------------------------------------------- remote CXL agent failures
 
 

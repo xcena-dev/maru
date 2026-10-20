@@ -183,6 +183,9 @@ class RegionKeeper:
     ) -> None:
         """Hold a kept region; give it back if its bytes may be stale.
 
+        They may be if its memory node rebooted since the owner last reported
+        its boot, or if the owner never reported one.
+
         A held region is mapped again at every check: the map shares the
         registration if it is still there, maps the region again after the
         remote CXL agent restarted (the connection opens anew), and is refused
@@ -191,6 +194,14 @@ class RegionKeeper:
         client = self._client(address)
         held = self._held.get(pool_id)
         if held is not None and held[1] == client.generation and not check:
+            return
+        if held is None and not boot:
+            # Its owner left before it ever reported the memory node's boot
+            # (it reports it with heartbeats and with a drained close), so a
+            # reboot since the keys were written cannot be ruled out.
+            self._directory.give_back(
+                pool_id, "the boot its keys were written under is unknown"
+            )
             return
         try:
             now_boot = client.map(handle).boot

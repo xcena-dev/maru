@@ -456,6 +456,24 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
     return True
 
 
+def _remote_cxl_defaults(extra: dict[str, Any]) -> dict[str, Any]:
+    """Turn on asynchronous loads and stores for remote_cxl unless set.
+
+    Synchronous ones run on the engine thread, where one RDMA transfer can
+    wait up to ``maru_rdma_timeout_s`` and stall every running request.
+    Asynchronous stores also add far less to TTFT, and asynchronous loads
+    work with vLLM's asynchronous scheduling. An explicit value (either name)
+    wins, so synchronous transfers stay available as an opt-in.
+    """
+    if extra.get("maru_storage_backend") != "remote_cxl":
+        return extra
+    out = dict(extra)
+    for knob in ("maru_async_load", "maru_async_store"):
+        if knob not in out and _RENAMED_KNOBS.get(knob) not in out:
+            out[knob] = True
+    return out
+
+
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry.
 
@@ -466,7 +484,10 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     ``maru_cache_namespace`` tells different weights apart. The storage
     backend enters it: a CPU or mixed engine cannot load a remote CXL
     engine's keys, so engines of different backends never share a namespace.
+    remote_cxl defaults to asynchronous loads and stores
+    (``_remote_cxl_defaults``).
     """
+    extra = _remote_cxl_defaults(extra)
     if (
         extra.get("maru_storage_backend") == "remote_cxl"
         and not _get_knob(extra, "maru_async_load")
@@ -704,6 +725,12 @@ def _create_maru_handler(
             if _remote_cxl_async(extra_config) and not metadata_only
             else 0.0
         ),
+        # Stores allocate on the engine thread, which must not wait on a
+        # transfer or the network.
+        rdma_nonblocking_alloc=(
+            extra_config.get("maru_storage_backend") == "remote_cxl"
+            and not metadata_only
+        ),
     )
     handler = MaruHandler(cfg)
     if not handler.connect():
@@ -840,13 +867,15 @@ class MaruKVConnector(KVConnectorBase_V1):
             requests' prompts plus resume lookahead; excess loads wait their
             turn. On vLLM 0.23+ without lookahead, admission uses vLLM's own
             reservation without an additional Maru block budget.
-            (default: false; was maru_enable_deferred_loading)
+            (default: false, true for remote_cxl; was
+            maru_enable_deferred_loading)
         maru_async_store: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
             with asynchronous D2H DMA. Metadata registration finishes on a
             background thread; finished requests retain their GPU blocks until
             get_finished() reports the store complete
-            (default: false; was maru_enable_write_behind)
+            (default: false, true for remote_cxl; was
+            maru_enable_write_behind)
         maru_overlap_load_with_compute: bool - With maru_async_load, queue a
             parked request's per-layer transfers while it waits and release
             it once its first layer has landed, so the remaining layers
@@ -1875,6 +1904,10 @@ class MaruWorkerConnector:
         # None = unresolved, False = kernel unusable (per-layer fallback).
         self._store_kernel_ctx: tuple | None = None
         self._store_kernel_unusable = False
+        # Packed load args for loader threads, keyed by the KV caches' device
+        # and layer pointers; the pointer table is uploaded once (see
+        # ``_loader_kernel_ctx``).
+        self._loader_kernel_cache: tuple | None = None
         # Distinct layer indices whose save_kv_layer call was seen this step;
         # the kernel store dispatches when the set completes (order-agnostic).
         self._store_layers_seen: set[int] = set()
@@ -3563,7 +3596,11 @@ class MaruWorkerConnector:
         attn = attn_metadata if attn_metadata is not None else self._last_attn_metadata
         num_layers = len(layers)
         ct = self._kv_chunk_tokens
-        kernel = self._packed_load_kernel_ctx(layers, attn)
+        kernel = (
+            self._loader_kernel_ctx(layers, attn, stream)
+            if stream is not None
+            else self._packed_load_kernel_ctx(layers, attn)
+        )
 
         # Queue all per-chunk transfers on a dedicated high-priority stream and
         # sync once at the end — mirrors LMCache batched_to_gpu (per-chunk
@@ -3695,6 +3732,41 @@ class MaruWorkerConnector:
                     f"packed-load {mode} {num_layers}L x {num_chunks}c (req {req_meta.req_id})"
                 )
         return failed
+
+    def _loader_kernel_ctx(
+        self,
+        layers: list[tuple[str, torch.Tensor, int]],
+        attn_metadata: Any,
+        stream: Any,
+    ) -> tuple | None:
+        """Packed load args for a loader thread, built once per KV cache set.
+
+        Building them uploads the layer pointer table to the GPU. On a loader
+        thread that upload ran on its default stream, where it waited for the
+        forward on the compute stream before every load could start. The
+        table changes only when vLLM's KV caches do, so it is uploaded once,
+        on the loader's stream, and the cache keeps the device copy alive for
+        every later load.
+
+        Args:
+            layers: ``(name, kv_cache, layer index)`` per attention layer.
+            attn_metadata: The step's attention metadata.
+            stream: The loader thread's CUDA stream.
+
+        Returns:
+            The arguments of :meth:`_packed_load_kernel_ctx`, or None.
+        """
+        key = (
+            layers[0][1].device,
+            tuple((idx, kv.data_ptr()) for _, kv, idx in layers),
+        )
+        cached = self._loader_kernel_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        with torch.cuda.stream(stream):
+            ctx = self._packed_load_kernel_ctx(layers, attn_metadata)
+        self._loader_kernel_cache = (key, ctx)
+        return ctx
 
     def _packed_load_kernel_ctx(
         self, layers: list[tuple[str, torch.Tensor, int]], attn_metadata: Any

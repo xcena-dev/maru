@@ -47,12 +47,13 @@ owner and maru-server can take a region away.
 > the deployment, as the CXL fabric is.
 
 The backend stores KV chunkwise and needs `TP=PP=DP=1`, `--enforce-eager`,
-unquantized KV and `kv_load_failure_policy="recompute"`. Loads and stores
-run on the engine thread by default; `maru_async_load` loads cache hits
-between steps and `maru_async_store` stores after the forward
-(`MARU_ASYNC=1` on the launcher sets both). Synchronous loads need
-`--no-async-scheduling`, which the launcher passes unless `MARU_ASYNC=1`;
-asynchronous loads run with vLLM's asynchronous scheduling on. The KV moves
+unquantized KV and `kv_load_failure_policy="recompute"`. By default the
+backend loads cache hits between steps (`maru_async_load`) and stores after
+the forward (`maru_async_store`), so an RDMA transfer that waits for a slow
+memory node does not hold up the engine; asynchronous loads run with vLLM's
+asynchronous scheduling on. Setting both to `false` (`MARU_SYNC=1` on the
+launcher) runs them on the engine thread, and synchronous loads need
+`--no-async-scheduling`, which the launcher then passes. The KV moves
 between the GPU and the worker's staging buffer, host memory registered with
 the NIC and with CUDA; with `maru_kv_ops` built, one copy kernel per chunk
 moves it, as for the cxl backend.
@@ -248,7 +249,7 @@ nodes, so give the workers the port `maru_server.sh` printed. The launcher
 runs (replace the model, namespace, address and NIC):
 
 ```bash
-vllm serve <model> --enforce-eager --no-async-scheduling --enable-prompt-tokens-details \
+vllm serve <model> --enforce-eager --enable-prompt-tokens-details \
   --kv-transfer-config '{
     "kv_connector": "MaruKVConnector",
     "kv_connector_module_path": "maru_vllm",
@@ -314,7 +315,7 @@ All example settings are in `env.sh`. Override them with environment variables:
 | `MARU_INST1_GPU` / `MARU_INST2_GPU` | `0` / `1` | GPU of each engine |
 | `MARU_NUMA_NODE` | none | NUMA node to bind each engine to |
 | `MARU_LOG_TIMING` | off | Log the connector's load and store timings |
-| `MARU_ASYNC` | off | Load cache hits between steps and store after the forward |
+| `MARU_SYNC` | off | Load and store on the engine thread instead of between steps and after the forward |
 | `GPU_MEM_UTIL` | `0.1` | vLLM GPU memory utilization |
 
 ## Troubleshooting

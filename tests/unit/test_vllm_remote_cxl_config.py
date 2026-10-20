@@ -110,10 +110,26 @@ def test_sync_remote_cxl_loads_need_vllm_async_scheduling_off():
     from maru_vllm.connector import _cpu_engine_config
 
     with pytest.raises(ValueError, match="--no-async-scheduling"):
-        _cpu_engine_config(extra(), _engine(True))
-    assert _cpu_engine_config(extra(), _engine(False))["maru_cache_namespace"]
+        _cpu_engine_config(extra(maru_async_load=False), _engine(True))
+    sync = extra(maru_async_load=False)
+    assert _cpu_engine_config(sync, _engine(False))["maru_cache_namespace"]
     # An asynchronous load reports its failure while the request is parked.
     assert _cpu_engine_config(extra(maru_async_load=True), _engine(True))
+
+
+def test_remote_cxl_loads_and_stores_are_asynchronous_unless_set():
+    # A synchronous RDMA transfer would wait on the engine thread.
+    from maru_vllm.connector import _cpu_engine_config
+
+    out = _cpu_engine_config(extra(), _engine(True))
+    assert out["maru_async_load"] is True and out["maru_async_store"] is True
+    out = _cpu_engine_config(
+        extra(maru_async_load=False, maru_async_store=False), _engine(False)
+    )
+    assert out["maru_async_load"] is False and out["maru_async_store"] is False
+    # The deprecated name still counts as set.
+    out = _cpu_engine_config(extra(maru_enable_write_behind=False), _engine(True))
+    assert "maru_async_store" not in out and out["maru_async_load"] is True
 
 
 def test_cpu_storage_keeps_its_async_scheduling_behavior():

@@ -58,6 +58,9 @@ class RegionLifecycle:
     def _call(self, action: str, **payload: Any) -> dict:
         raise NotImplementedError
 
+    def _heartbeat(self) -> None:
+        raise NotImplementedError
+
     # ------------------------------------------------------------ mapping
 
     def _add_region(self, info: dict) -> RemoteCxlRegion:
@@ -100,7 +103,21 @@ class RegionLifecycle:
         if region.boot and access.boot != region.boot:
             self._give_back_rebooted(region)
             return
+        first = not region.boot
         region.boot = access.boot
+        if first and access.boot:
+            # MaruServer learns the boot as the region starts to be used: if
+            # this worker dies, MaruServer can tell whether the memory node
+            # rebooted before it took the region over. Until a report reaches
+            # it, a region left behind goes back with its keys.
+            try:
+                self._heartbeat()
+            except Exception:
+                logger.warning(
+                    "reporting the boot of remote CXL region %d failed; the "
+                    "next heartbeat sends it",
+                    region.region_id,
+                )
 
     def _give_back_rebooted(self, region: RemoteCxlRegion) -> None:
         """Give back an own region whose memory node rebooted.

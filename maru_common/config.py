@@ -73,6 +73,10 @@ class MaruConfig:
     # Share of staging slots that stores leave free for loads; set when loads
     # and stores run on separate threads (asynchronous transfers)
     rdma_load_reserve: float = 0.0
+    # alloc is called from a thread that must not wait (vLLM's engine thread):
+    # it waits briefly for the client lock, takes only free pages, and a
+    # background thread gets more room ahead of the stores
+    rdma_nonblocking_alloc: bool = False
     # Key the remote CXL agents of the pool require (a copy of the memory node's
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
     remote_cxl_agent_key_file: str = "/etc/maru/remote-cxl-agent.key"
@@ -156,6 +160,7 @@ class MaruConfig:
             self.rdma_staging_size is not None
             or self.rdma_device
             or self.rdma_load_reserve
+            or self.rdma_nonblocking_alloc
         ):
             raise ValueError("RDMA settings require the remote_cxl storage backend")
         if self.pool_size < 0:

@@ -56,18 +56,17 @@ if [[ -n "${MARU_LOG_TIMING:-}" ]]; then
     TIMING_ENTRY="\"maru_log_timing\": true,"
 fi
 
-# MARU_ASYNC=1 loads cache hits between steps (maru_async_load) and stores
-# after the forward (maru_async_store); stores then leave half of the staging
-# buffer to loads.
-# Synchronous loads need vLLM's asynchronous scheduling off; asynchronous
-# loads run with it on, vLLM's default.
+# remote_cxl loads cache hits between steps (maru_async_load) and stores after
+# the forward (maru_async_store) by default; stores then leave half of the
+# staging buffer to loads. MARU_SYNC=1 runs both on the engine thread instead;
+# synchronous loads need vLLM's asynchronous scheduling off.
 ASYNC_ENTRY=""
-ASYNC_MODE="off"
-SCHEDULING=(--no-async-scheduling)
-if [[ -n "${MARU_ASYNC:-}" ]]; then
-    ASYNC_ENTRY="\"maru_async_load\": true, \"maru_async_store\": true,"
-    ASYNC_MODE="load and store"
-    SCHEDULING=()
+ASYNC_MODE="load and store"
+SCHEDULING=()
+if [[ -n "${MARU_SYNC:-}" ]]; then
+    ASYNC_ENTRY="\"maru_async_load\": false, \"maru_async_store\": false,"
+    ASYNC_MODE="off"
+    SCHEDULING=(--no-async-scheduling)
 fi
 
 NUMA=()

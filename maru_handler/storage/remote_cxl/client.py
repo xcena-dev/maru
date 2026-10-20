@@ -29,6 +29,17 @@ from .region import REMOTE_CXL, IsolatedTransfer, RemoteCxlAllocation, RemoteCxl
 
 logger = logging.getLogger(__name__)
 
+# How long ``alloc`` waits for the client lock. It runs on the engine thread,
+# and the lock is held only for bookkeeping and short MaruServer calls (never
+# across an RDMA transfer); a busy moment skips that chunk's store rather than
+# holding up every running request.
+ALLOC_LOCK_WAIT_S = 0.01
+# The refill thread gets room for stores ahead of them once the free pages of
+# usable regions fall below this many (at most an eighth of a region).
+ROOM_LOW_PAGES = 64
+# How often the refill thread looks at the room without being woken
+REFILL_CHECK_S = 1.0
+
 # MaruServer refusals of ``open`` that time heals
 TRANSIENT_OPEN_REFUSALS = (
     "reservation failed",
@@ -93,6 +104,16 @@ class RemoteCxlStorageClient(RegionLifecycle):
         self._unreleased: list[str] = []
         self._isolated: list[IsolatedTransfer] = []
         self._staging_warned = False
+        # RDMA transfers run without the lock; close waits for them to end.
+        self._transfers = 0
+        self._transfers_idle = threading.Condition(self._lock)
+        # With a nonblocking alloc, the refill thread expands or evicts when
+        # this is set (stores need room).
+        self._nonblocking = bool(getattr(config, "rdma_nonblocking_alloc", False))
+        self._refill = threading.Event()
+        # Allocations freed while the client was busy, freed by the refill thread
+        self._parked: list[RemoteCxlAllocation] = []
+        self._parked_lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
 
@@ -150,6 +171,14 @@ class RemoteCxlStorageClient(RegionLifecycle):
                             name="maru-remote-cxl-remap",
                         ),
                     ]
+                if self._nonblocking and self._threads:
+                    self._threads.append(
+                        threading.Thread(
+                            target=self._refill_loop,
+                            daemon=True,
+                            name="maru-remote-cxl-refill",
+                        )
+                    )
                 self.connected = True
                 self.ever_connected = True
                 for thread in self._threads:
@@ -291,6 +320,55 @@ class RemoteCxlStorageClient(RegionLifecycle):
             except Exception:
                 logger.warning("Remote CXL region remap failed", exc_info=True)
 
+    def _refill_loop(self) -> None:
+        """Get room for stores before they need it.
+
+        ``alloc`` runs on the engine thread and takes only free pages. Asking
+        MaruServer for a region and mapping it, or evicting, waits on the
+        network, so it happens here, when the free pages run low.
+        """
+        while not self._stop.is_set():
+            self._refill.wait(REFILL_CHECK_S)
+            self._refill.clear()
+            if self._stop.is_set() or not self.connected:
+                return
+            try:
+                with self._lock:
+                    self._free_parked()
+                    if self.connected:
+                        self._make_room()
+            except Exception:
+                logger.warning("Remote CXL refill failed", exc_info=True)
+
+    def _free_parked(self) -> None:
+        with self._parked_lock:
+            parked, self._parked = self._parked, []
+        for handle in parked:
+            self._free_locked(handle)
+
+    def _make_room(self) -> None:
+        """Expand or evict until the usable regions have enough free pages.
+
+        Called with the lock held.
+        """
+        for _ in range(8):
+            if self._room() >= self._low_room():
+                return
+            if self._may_expand() and self._expand():
+                continue
+            if not self._evict():
+                return
+
+    def _room(self) -> int:
+        return sum(r.free_count() for r in self.regions.values() if self._writable(r))
+
+    def _low_room(self) -> int:
+        """Free pages to keep: :data:`ROOM_LOW_PAGES`, at most an eighth of a
+        region, and at least one."""
+        page = self.config.chunk_size_bytes
+        region_pages = max(1, self.config.pool_size // page)
+        return max(1, min(ROOM_LOW_PAGES, region_pages // 8))
+
     def _heartbeat(self) -> None:
         """Renew the session without the client lock.
 
@@ -342,10 +420,19 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
         Raises:
             MemoryError: if no staging slot or page is free after trying to
-                get a region and to evict.
+                get a region and to evict. With ``rdma_nonblocking_alloc``
+                (the connector's engine thread) it never waits on the network:
+                it fails when no page is free now (the refill thread then gets
+                a region or evicts) or the client stays busy for
+                :data:`ALLOC_LOCK_WAIT_S`; a store skipped this way is not
+                needed for correctness.
             StorageUnavailableError: if the session is unavailable.
         """
-        with self._lock:
+        if not self._lock.acquire(
+            timeout=ALLOC_LOCK_WAIT_S if self._nonblocking else -1
+        ):
+            raise MemoryError("Remote CXL client is busy; skipping this store")
+        try:
             self._ensure()
             staging = self._staging
             if staging is None:
@@ -362,17 +449,24 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 self._staging.view(slots[0])[:size], location, slots[0], region
             )
             region.track(handle)
+            if self._nonblocking and self._room() < self._low_room():
+                self._refill.set()
             return handle
+        finally:
+            self._lock.release()
 
     def _take_page(self, size: int) -> tuple[RemoteCxlRegion, StorageLocation]:
         """A free page: from a region with room, a new region, or eviction.
 
         Only regions a WRITE can reach now are used: a WRITE to a region
-        whose remote CXL agent has not answered since it last failed would fail
-        after the transport's timeout and leave the page quarantined. Eviction likewise
-        frees pages only in those regions (``_evict``).
+        whose remote CXL agent has not answered since it last failed would
+        fail after the transport's timeout and leave the page quarantined.
+        Eviction likewise frees pages only in those regions (``_evict``).
+        A nonblocking alloc takes only a free page; the refill thread gets a
+        region or evicts (``_make_room``).
         """
-        for attempt in ("free", "expand", "evict"):
+        attempts = ("free",) if self._nonblocking else ("free", "expand", "evict")
+        for attempt in attempts:
             if attempt == "expand" and not (self._may_expand() and self._expand()):
                 continue
             if attempt == "evict" and not self._evict():
@@ -380,6 +474,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for region in self.regions.values():
                 if region.has_free() and self._writable(region):
                     return region, region.take_page(size)
+        if self._nonblocking:
+            self._refill.set()
         if self.regions and not any(self._writable(r) for r in self.regions.values()):
             raise MemoryError(
                 "No remote CXL region is reachable now; skipping new cache admission"
@@ -392,20 +488,33 @@ class RemoteCxlStorageClient(RegionLifecycle):
         A committed allocation or one a transfer may still touch is left
         alone; the connector's cleanup must not reuse it.
         """
-        with self._lock:
-            if handle.state != "writing":
-                return
-            region = handle.region
-            if region.retired or self.regions.get(region.pool_id) is not region:
-                # The region left with a closed session: only the slot returns.
-                self._give_slot(handle)
-                handle.state = "freed"
-                return
-            region.validate(handle)
-            region.untrack(handle)
-            region.give_page(handle.location)
+        if not self._lock.acquire(
+            timeout=ALLOC_LOCK_WAIT_S if self._nonblocking else -1
+        ):
+            # The engine thread does not wait: the refill thread frees it.
+            with self._parked_lock:
+                self._parked.append(handle)
+            self._refill.set()
+            return
+        try:
+            self._free_locked(handle)
+        finally:
+            self._lock.release()
+
+    def _free_locked(self, handle: RemoteCxlAllocation) -> None:
+        if handle.state != "writing":
+            return
+        region = handle.region
+        if region.retired or self.regions.get(region.pool_id) is not region:
+            # The region left with a closed session: only the slot returns.
             self._give_slot(handle)
             handle.state = "freed"
+            return
+        region.validate(handle)
+        region.untrack(handle)
+        region.give_page(handle.location)
+        self._give_slot(handle)
+        handle.state = "freed"
 
     def _give_slot(self, handle: RemoteCxlAllocation) -> None:
         try:
@@ -432,8 +541,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
     def has_local(self, key: str) -> bool:
         """Whether this session committed ``key`` and still holds it."""
-        with self._lock:
-            return self.connected and not self._stop.is_set() and key in self._keys
+        # Read without the lock: the engine thread asks, and a dict lookup
+        # sees either the old or the new state.
+        return self.connected and not self._stop.is_set() and key in self._keys
 
     # ----------------------------------------------------------------- store
 
@@ -473,9 +583,30 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 handle.region.validate(handle)
                 if handle.state != "writing":
                     raise ValueError("Remote CXL allocation was already submitted")
-            if not self._write(handles):
-                return [False] * len(keys)
-            return self._commit(keys, handles)
+            for handle in handles:
+                handle.state = "sending"  # ``free`` leaves it alone now
+            self._transfers += 1
+        try:
+            written = self._write(handles)
+        except BaseException:
+            with self._lock:
+                # The caller can no longer free them: give back what is
+                # still being sent (isolated pages stay out of use).
+                self._give_back([h for h in handles if h.state == "sending"])
+                self._end_transfer_locked()
+            raise
+        with self._lock:
+            try:
+                if not written:
+                    return [False] * len(keys)
+                return self._commit(keys, handles)
+            finally:
+                # close waits for this: the commit must not land after it
+                self._end_transfer_locked()
+
+    def _end_transfer_locked(self) -> None:
+        self._transfers -= 1
+        self._transfers_idle.notify_all()
 
     def _commit(
         self, keys: list[str], handles: list[RemoteCxlAllocation]
@@ -503,7 +634,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
         Pages are written region by region. If any region fails, nothing is
         committed: written pages and their slots go back, unconfirmed ones
-        are isolated.
+        are isolated. Runs without the client lock, which only the
+        bookkeeping takes: a transfer can wait up to ``rdma_timeout_s``.
+        Another thread may give the region back meanwhile; it releases the
+        region at its agent first, so a WRITE still on its way fails at the
+        NIC, and the commit drops a key whose region went back.
         """
         groups: dict[str, list[RemoteCxlAllocation]] = {}
         for h in handles:
@@ -517,13 +652,15 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if ok:
                 ok = False  # _write_group gave back or isolated the group
             else:
-                self._give_back(group)
-        if not ok:
-            self._give_back(written)
-            return False
-        for h in handles:
-            self._give_slot(h)
-        return True
+                with self._lock:
+                    self._give_back(group)
+        with self._lock:
+            if not ok:
+                self._give_back(written)
+                return False
+            for h in handles:
+                self._give_slot(h)
+            return True
 
     def _write_group(self, group: list[RemoteCxlAllocation]) -> bool:
         """WRITE the pages of one region; on failure they are given back or
@@ -531,77 +668,115 @@ class RemoteCxlStorageClient(RegionLifecycle):
         from maru_remote.transport import TransferTimeout, TransferUncertainError
 
         region = group[0].region
-        if region.retired:
-            # It went back after the pages were taken (memory node rebooted).
-            self._give_back(group)
-            return False
+        with self._lock:
+            if region.retired:
+                # It went back after the pages were taken (memory node rebooted).
+                self._give_back(group)
+                return False
         try:
-            access = self._map_own(region)
+            # Mapping may ask the region's agent: outside the lock.
+            access = self._region(region.pool_id, region.handle, own=True)
         except StorageUnavailableError as exc:
             logger.warning(
                 "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
             )
-            self._give_back(group)
-            self._set_aside(region)
+            with self._lock:
+                self._give_back(group)
+                self._set_aside(region)
             return False
-        if region.retired:
-            # Its memory node rebooted and the region went back.
-            self._give_back(group)
-            return False
-        pairs = [
-            (
-                self._staging.addr(h.slot),
-                access.base_addr + h.location.offset,
-                h.location.length,
-            )
-            for h in group
-        ]
+        with self._lock:
+            if region.retired:
+                # It went back while this map ran: undo the registration, as
+                # the retry of set-aside regions does.
+                region.mapped = True
+                self._data.release(region.pool_id, region.handle, self._agents)
+                self._give_back(group)
+                return False
+            self._adopt(region, access)
+            if region.retired:
+                # Its memory node rebooted and the region went back.
+                self._give_back(group)
+                return False
+            stale = not self._data.has_access(region.pool_id)
+        if stale:
+            # Another transfer's failure dropped the connection meanwhile.
+            try:
+                access = self._region(region.pool_id, region.handle, own=True)
+            except StorageUnavailableError as exc:
+                logger.warning(
+                    "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
+                )
+                with self._lock:
+                    self._give_back(group)
+                    self._set_aside(region)
+                return False
+        with self._lock:
+            if region.retired:
+                self._give_back(group)
+                return False
+            pairs = [
+                (
+                    self._staging.addr(h.slot),
+                    access.base_addr + h.location.offset,
+                    h.location.length,
+                )
+                for h in group
+            ]
         try:
             self._transport.write(
                 access.peer, pairs, timeout_s=self.config.rdma_timeout_s
             )
         except (TransferTimeout, TransferUncertainError) as exc:
             # The NIC may still write: keep pages and slots until it ends.
-            for h in group:
-                region.untrack(h)
-                region.quarantine(h.location)
-                h.state = "isolated"
-            self._isolated.append(
-                IsolatedTransfer(
-                    exc.pending,
-                    "WRITE",
-                    exc.pending.peer,
-                    region,
-                    [h.location for h in group],
-                    [h.slot for h in group],
+            with self._lock:
+                for h in group:
+                    region.untrack(h)
+                    region.quarantine(h.location)
+                    h.state = "isolated"
+                self._isolated.append(
+                    IsolatedTransfer(
+                        exc.pending,
+                        "WRITE",
+                        exc.pending.peer,
+                        region,
+                        [h.location for h in group],
+                        [h.slot for h in group],
+                    )
                 )
-            )
             logger.warning("RDMA WRITE not confirmed: %s", exc)
             return False
         except Exception as exc:
             logger.warning("RDMA WRITE failed: %s", exc)
-            self._data.disconnect({access.peer})
-            # The memory node's NIC still accepts the region's key, and a
-            # WRITE that ended in an error at this end may still be in the
-            # network. Its pages stay out of use while this worker owns the
-            # region; the release before the region goes back ends any late
-            # WRITE. The slots are safe: this end's connection is torn down.
-            for h in group:
-                region.untrack(h)
-                region.quarantine(h.location)
-                self._give_slot(h)
-                h.state = "freed"
+            with self._lock:
+                # The memory node's NIC still accepts the region's key, and a
+                # WRITE that ended in an error at this end may still be in the
+                # network. Its pages stay out of use while this worker owns the
+                # region; the release before the region goes back ends any late
+                # WRITE. The slots are safe once this end's connection is torn
+                # down, so the connection goes before the slots.
+                for h in group:
+                    region.untrack(h)
+                    region.quarantine(h.location)
+                    h.state = "freed"
+                self._data.disconnect({access.peer})
+                for h in group:
+                    self._give_slot(h)
             # A node that cannot be reached any more has the region set aside
             # now; its keys stop being reported as hits if it stays so.
             try:
-                self._map_own(region)
+                access = self._region(region.pool_id, region.handle, own=True)
             except StorageUnavailableError as map_exc:
                 logger.warning(
                     "Remote CXL region %d cannot be mapped: %s",
                     region.region_id,
                     map_exc,
                 )
-                self._set_aside(region)
+                with self._lock:
+                    self._set_aside(region)
+            else:
+                with self._lock:
+                    if not region.retired:
+                        self._adopt(region, access)
             return False
         return True
 
@@ -651,7 +826,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def has_unconfirmed_transfers(self) -> bool:
         """Whether a late RDMA may still touch this client's memory."""
         with self._lock:
-            return bool(self._isolated)
+            return bool(self._isolated) or self._transfers > 0
 
     # ------------------------------------------------------------------ load
 
@@ -733,29 +908,50 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 return [None] * len(keys)
             slots = self._take_read_slots(len(hits))
             hits = hits[: len(slots)]
+            self._transfers += 1
+        try:
+            got = self._read(hits, slots, result.get("regions", {}))
+        except BaseException:
+            # _read hands every slot back or isolates it before it
+            # returns; what escapes it (an interrupt) may leave a READ
+            # running, so its slots stay taken.
+            with self._lock:
+                try:
+                    if lease_id:
+                        self._release_lease(lease_id)
+                finally:
+                    self._end_transfer_locked()
+            raise
+        with self._lock:
             try:
-                got = self._read(hits, slots, result.get("regions", {}))
-            except BaseException:
-                # _read hands every slot back or isolates it before it
-                # returns; what escapes it (an interrupt) may leave a READ
-                # running, so its slots stay taken.
-                if lease_id:
-                    self._release_lease(lease_id)
-                raise
-            held = bool(lease_id) and self._release_lease(lease_id)
-            out: list[CpuReadLease | None] = [None] * len(keys)
-            unused = set(slots)
-            for (i, location), slot in zip(hits, slots, strict=False):
-                if not (got and held):
-                    continue
-                unused.discard(slot)
-                view = self._staging.view(slot)[: location.length]
-                out[i] = CpuReadLease(view, location, self._end_read(slot))
-                self._reads += 1
-            if got:
-                for slot in unused:
-                    self._staging.give(slot)
-            return out
+                return self._finish_read(keys, hits, slots, got, lease_id)
+            finally:
+                # close waits for this: the staging must outlive the leases
+                self._end_transfer_locked()
+
+    def _finish_read(
+        self,
+        keys: list[str],
+        hits: list[tuple[int, StorageLocation]],
+        slots: list[int],
+        got: bool,
+        lease_id: str | None,
+    ) -> list[CpuReadLease | None]:
+        """Hand out the bytes read if the server lease held; lock held."""
+        held = bool(lease_id) and self._release_lease(lease_id)
+        out: list[CpuReadLease | None] = [None] * len(keys)
+        unused = set(slots)
+        for (i, location), slot in zip(hits, slots, strict=False):
+            if not (got and held):
+                continue
+            unused.discard(slot)
+            view = self._staging.view(slot)[: location.length]
+            out[i] = CpuReadLease(view, location, self._end_read(slot))
+            self._reads += 1
+        if got:
+            for slot in unused:
+                self._staging.give(slot)
+        return out
 
     def _take_read_slots(self, hits: int) -> list[int]:
         """Staging slots for up to ``hits`` reads; the rest load as misses."""
@@ -781,7 +977,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
         On False the slots are back in the staging buffer, or isolated if a
         READ may still land in them. Errors end in False; only an interrupt
-        raises, and then the slots stay taken.
+        raises, and then the slots stay taken. Runs without the client lock;
+        the server lease keeps the keys (and so their pages) from being
+        evicted until the read is over.
         """
         from maru_remote.transport import TransferTimeout, TransferUncertainError
 
@@ -826,11 +1024,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 self._transport.read(peer, pairs, timeout_s=self.config.rdma_timeout_s)
             except (TransferTimeout, TransferUncertainError) as exc:
                 # A late READ only lands in these slots: isolate them.
-                self._isolated.append(
-                    IsolatedTransfer(
-                        exc.pending, "READ", exc.pending.peer, None, [], list(slots)
+                with self._lock:
+                    self._isolated.append(
+                        IsolatedTransfer(
+                            exc.pending, "READ", exc.pending.peer, None, [], list(slots)
+                        )
                     )
-                )
                 logger.warning("RDMA READ not confirmed: %s", exc)
                 return False
             except Exception as exc:
@@ -901,12 +1100,19 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     "Release RDMA read leases before closing the handler"
                 )
             self._stop.set()
+            self._refill.set()  # the refill thread sees the stop at once
         for thread in self._threads:
             thread.join()
         self._threads = []
         with self._lock:
+            self._free_parked()
+            # Transfers run without the lock: let those under way end (each
+            # within its timeout) before the regions and the data path go.
+            self._transfers_idle.wait_for(
+                lambda: not self._transfers, self.config.rdma_timeout_s + 5
+            )
             self._leave()
-            if not self._isolated:
+            if not self._isolated and not self._transfers:
                 self._stop_data_path()
             else:
                 logger.warning(
