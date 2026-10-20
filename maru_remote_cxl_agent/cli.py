@@ -373,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("UCX_RCACHE_ENABLE"),
     )
     try:
+        # Releases mappings of regions the resource manager reaped on its own.
+        service.start_sweep()
         server.serve_forever()
     finally:
         service.close()
