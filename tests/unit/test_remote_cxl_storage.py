@@ -442,6 +442,29 @@ def test_an_interrupted_read_keeps_its_slots_until_it_ends(world, monkeypatch):
     assert not a.has_unconfirmed_transfers()
 
 
+def test_an_interrupt_before_any_transfer_gives_the_buffers_back(world, monkeypatch):
+    # NIXL had no transfer yet: nothing was sent, so nothing is kept.
+    a = world.client("a", pages=2)
+    put(a, "k", b"v")
+    agent = worker_agent("a")
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "initialize_xfer", interrupted)
+    free_slots = a._staging.free_count()
+    handle = a.alloc(4)
+    handle.buf[:4] = b"none"
+    with pytest.raises(KeyboardInterrupt):
+        a.batch_store(["k2"], [handle])
+    assert handle.state == "freed"
+    with pytest.raises(KeyboardInterrupt):
+        a.batch_retrieve(["k"])
+    assert a._staging.free_count() == free_slots
+    assert not a.has_unconfirmed_transfers()
+    assert only_region(a).usage()["quarantined_bytes"] == 0
+
+
 def test_a_write_that_ends_in_an_error_after_its_deadline_keeps_its_page(world):
     """Released after an error, a WRITE may still be in the network."""
     a = world.client("a", pages=2, rdma_timeout_s=0.01)
@@ -1645,7 +1668,9 @@ def test_a_read_error_returns_each_slot_once_if_closing_the_connection_fails(
     assert len(set(b._staging._free)) == len(b._staging._free)
 
 
-def test_an_interrupt_during_a_read_keeps_its_slot_taken(world, monkeypatch):
+def test_an_interrupt_before_a_read_is_posted_frees_its_slot_and_lease(
+    world, monkeypatch
+):
     a, b = world.client("a"), world.client("b")
     put(a, "k", b"v")
     assert read(b, ["k"]) == [b"v"]
@@ -1657,8 +1682,9 @@ def test_an_interrupt_during_a_read_keeps_its_slot_taken(world, monkeypatch):
     free = b._staging.free_count()
     with pytest.raises(KeyboardInterrupt):
         b.batch_retrieve(["k"])
-    # The READ may still run: its slot is not handed out again.
-    assert b._staging.free_count() == free - 1
+    # No transfer was posted: the slot goes back (an interrupt while the
+    # READ runs keeps it: test_an_interrupted_read_keeps_its_slots_until_it_ends).
+    assert b._staging.free_count() == free
     # No lease of b pins "k": its owner can still evict it.
     victims = world.directory.execute("victims", {**a._credentials, "count": 1})
     assert [v["key"] for v in victims["result"]["entries"]] == ["k"]

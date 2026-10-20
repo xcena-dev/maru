@@ -846,9 +846,16 @@ class RemoteCxlStorageClient(RegionLifecycle):
                         self._adopt(region, access)
             return False
         except BaseException as exc:
-            # Interrupted while the WRITE may run: keep pages and slots out of
-            # use (the caller gives back only what is still being sent).
-            self._isolate_write(region, group, getattr(exc, "pending_transfer", None))
+            pending = getattr(exc, "pending_transfer", None)
+            if pending is None:
+                # Interrupted before NIXL had a transfer: nothing was sent.
+                with self._lock:
+                    self._give_back(group)
+            else:
+                # Interrupted while the WRITE may run: keep pages and slots
+                # out of use until it ends (the caller gives back only what
+                # is still being sent).
+                self._isolate_write(region, group, pending)
             raise
         return True
 
@@ -856,23 +863,22 @@ class RemoteCxlStorageClient(RegionLifecycle):
         self, region: RemoteCxlRegion, group: list[RemoteCxlAllocation], pending: Any
     ) -> None:
         """Keep the pages and slots of a WRITE that may still run out of use;
-        with its NIXL transfer (``pending``) they come back once it ends."""
+        they come back once its NIXL transfer (``pending``) ends."""
         with self._lock:
             for h in group:
                 region.untrack(h)
                 region.quarantine(h.location)
                 h.state = "isolated"
-            if pending is not None:
-                self._isolated.append(
-                    IsolatedTransfer(
-                        pending,
-                        "WRITE",
-                        pending.peer,
-                        region,
-                        [h.location for h in group],
-                        [h.slot for h in group],
-                    )
+            self._isolated.append(
+                IsolatedTransfer(
+                    pending,
+                    "WRITE",
+                    pending.peer,
+                    region,
+                    [h.location for h in group],
+                    [h.slot for h in group],
                 )
+            )
 
     def _give_back(self, handles: list[RemoteCxlAllocation]) -> None:
         """Pages written but not committed (or never written) return."""
@@ -1158,10 +1164,14 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     )
                 return False
             except BaseException as exc:
-                # Interrupted while the READ may run: its slots stay taken
-                # until NIXL releases the transfer.
                 pending = getattr(exc, "pending_transfer", None)
-                if pending is not None:
+                if pending is None:
+                    # Interrupted before NIXL had a transfer: nothing lands.
+                    for slot in slots:
+                        self._staging.give(slot)
+                else:
+                    # Interrupted while the READ may run: its slots stay taken
+                    # until NIXL releases the transfer.
                     with self._lock:
                         self._isolated.append(
                             IsolatedTransfer(
