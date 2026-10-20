@@ -207,7 +207,8 @@ def test_the_remote_cxl_agent_checks_a_region_once_and_shares_its_registration(w
     assert world.cxl.accesses.count(region.region_id) == 1
     holders = world.node.service.holders()
     assert len(holders[region.region_id]) == 2
-    scheduler = world.client("b-sched", metadata_only=True)
+    # The connector gives a worker's scheduler-side handler the worker's engine id.
+    scheduler = world.client("b", metadata_only=True)
     assert scheduler.batch_exists(["k"]) == [True]
 
 
@@ -844,6 +845,25 @@ def test_a_new_region_on_a_down_node_goes_back_at_once(world, monkeypatch):
     with pytest.raises(MemoryError):
         put(a, "k3", b"x")
     assert world.cxl.released == [2] and len(world.cxl.regions) == 1
+
+
+def test_a_failed_nixl_cleanup_keeps_the_staging_buffer_for_a_retry(world):
+    # NIXL may still have the staging buffer registered with the NIC.
+    a = world.client("a", pages=1)
+    put(a, "k", b"v")
+    data = a._data
+    transport, staging = data.transport, data.staging
+    close = transport.close
+
+    def fail():
+        raise RuntimeError("NIXL cleanup failed")
+
+    transport.close = fail
+    data.close()
+    assert data.transport is transport and data.staging is staging
+    transport.close = close
+    data.close()
+    assert data.transport is None and data.staging is None
 
 
 def test_a_region_mapped_without_an_access_is_released_before_it_goes_back(world):

@@ -460,7 +460,11 @@ class RdmaDataPath:
         return ok
 
     def close(self) -> None:
-        """Close remote CXL agent connections, the NIXL agent and the staging."""
+        """Close remote CXL agent connections, the NIXL agent and the staging.
+
+        If the NIXL agent cannot be cleaned up, it and the staging buffer stay,
+        and a later call tries again.
+        """
         with self._lock:
             clients = list(self._agents.values())
             self._agents.clear()
@@ -472,7 +476,13 @@ class RdmaDataPath:
             try:
                 self.transport.close()
             except Exception:
-                logger.warning("RDMA transport cleanup failed", exc_info=True)
+                # NIXL may still have the staging buffer registered with the
+                # NIC: keep both, so a later close retries (NixlTransport.close).
+                logger.warning(
+                    "RDMA transport cleanup failed; keeping the staging buffer",
+                    exc_info=True,
+                )
+                return
             self.transport = None
         if self.staging is not None:
             self.staging.close()

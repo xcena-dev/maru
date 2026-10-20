@@ -620,10 +620,14 @@ class ReplicaDirectory:
         namespace = p.get("namespace")
         now = self._clock()
         results = []
+        # Only a remote CXL session can read another session's region: a CPU
+        # or mixed session of the same namespace would be told of keys it
+        # cannot load, and an engine still waiting for its first region has
+        # no session to load them with.
+        remote_cxl = valid and bool(session.region_size)
         for key in keys:
             hit = bool(valid and self._select(session, key))
-            if not hit and isinstance(namespace, str):
-                # Remote CXL residency does not depend on the prober's session.
+            if not hit and remote_cxl:
                 pool = self._remote_cxl_lookup(namespace, key)
                 if pool is not None:
                     pool.last_use[key] = now
@@ -656,7 +660,12 @@ class ReplicaDirectory:
         for key in keys:
             loc = self._select(session, key)
             if loc is None:
-                pool = self._remote_cxl_lookup(session.namespace, key)
+                # Only a remote CXL session can read another session's region.
+                pool = (
+                    self._remote_cxl_lookup(session.namespace, key)
+                    if session.region_size
+                    else None
+                )
                 if pool is not None:
                     loc = pool.replicas[key]
                     pool.leased[key] = pool.leased.get(key, 0) + 1

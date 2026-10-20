@@ -126,6 +126,18 @@ def test_engine_namespace_tracks_revision_and_geometry():
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
 
 
+def test_engines_of_different_storage_backends_never_share_a_namespace():
+    """A CPU or mixed engine cannot load the keys of a remote CXL engine."""
+    config = engine_config()
+    digests = {
+        _cpu_engine_config({**extra(), "maru_storage_backend": backend}, config)[
+            "maru_cache_namespace"
+        ]
+        for backend in ("cpu", "mixed", "remote_cxl")
+    }
+    assert len(digests) == 3
+
+
 def test_engine_namespace_ignores_where_a_node_keeps_the_weights():
     """Nodes that load the same weights from different paths, with another
     transformers release, share; another maru_cache_namespace does not."""

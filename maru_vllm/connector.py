@@ -463,7 +463,9 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     their own replicas (cpu, mixed); any geometry change splits them. Where a
     node keeps the weights does not enter the digest, so engines on nodes that
     load the same model from different paths share; the caller's
-    ``maru_cache_namespace`` tells different weights apart.
+    ``maru_cache_namespace`` tells different weights apart. The storage
+    backend enters it: a CPU or mixed engine cannot load a remote CXL
+    engine's keys, so engines of different backends never share a namespace.
     """
     if (
         extra.get("maru_storage_backend") == "remote_cxl"
@@ -521,6 +523,7 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     }
     identity = {
         "namespace": extra["maru_cache_namespace"],
+        "storage_backend": extra.get("maru_storage_backend"),
         "revision": getattr(model, "revision", None),
         "model_config": model_config,
         "dtype": str(model.dtype),

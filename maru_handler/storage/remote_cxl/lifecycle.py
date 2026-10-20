@@ -45,7 +45,8 @@ class RegionLifecycle:
     regions: dict[str, RemoteCxlRegion]
     connected: bool
     _data: RdmaDataPath
-    _mappers: list[str]
+    _agents: list[str]
+    _unreturned: list[RemoteCxlRegion]
     _keys: dict[str, StorageLocation]
     _removing: list[dict]
     _dropping: list[dict]

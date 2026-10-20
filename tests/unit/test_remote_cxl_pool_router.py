@@ -150,7 +150,7 @@ def test_one_store_batch_spanning_two_pools_commits_each_to_its_server(pools):
             pools, ["k1", "k2"], ["k2", "k1"], strict=True
         ):
             reply = directory.execute(
-                "probe", {"engine_id": "x", "namespace": "ns", "keys": [key, other]}
+                "probe", {"engine_id": "w", "namespace": "ns", "keys": [key, other]}
             )
             assert reply["result"]["results"] == [True, False]
     finally:
@@ -158,8 +158,10 @@ def test_one_store_batch_spanning_two_pools_commits_each_to_its_server(pools):
 
 
 def test_another_worker_and_the_scheduler_pick_the_same_pool(pools):
+    # The connector builds a worker's scheduler-side handler with the
+    # worker's own engine id, so its probes see the worker's session.
     writer, reader = router(pools, "w1"), router(pools, "w2")
-    scheduler = router(pools, "sched", metadata_only=True)
+    scheduler = router(pools, "w2", metadata_only=True)
     try:
         for route_key in route_keys_per_pool(writer):
             store(writer, route_key, [route_key])

@@ -216,6 +216,39 @@ def test_the_thread_wakes_on_work_and_stops(env):
     assert all(("close",) in c.calls for c in clients.values())
 
 
+def test_stopping_while_a_check_waits_on_an_agent_leaves_the_regions_to_the_rm(
+    env, monkeypatch
+):
+    # The keeper thread and stop would share the agent connections.
+    import threading
+
+    from maru_server import region_keeper
+
+    directory, rm, _, keeper, clients, _ = env
+    monkeypatch.setattr(region_keeper, "STOP_JOIN_S", 0.05)
+    pool, region_id = leave(directory, "a", key="k")
+    client = keeper._client(pick_agent(AGENTS, region_id))
+    entered, answer = threading.Event(), threading.Event()
+    mapped = client.map
+
+    def slow_map(handle):
+        entered.set()
+        answer.wait(5)
+        return mapped(handle)
+
+    client.map = slow_map
+    keeper.start()
+    try:
+        assert entered.wait(5)
+        keeper.stop()
+        assert ("release", region_id) not in client.calls
+        assert ("close",) not in client.calls
+        assert rm.released == [] and [p for p, *_ in directory.departed()] == [pool]
+    finally:
+        answer.set()
+        keeper._thread.join(5)
+
+
 def test_maruserver_runs_a_keeper_only_with_remote_cxl_agents():
     from maru_server.server import MaruServer
 
@@ -289,8 +322,11 @@ def test_a_kept_region_whose_agent_stays_away_stops_being_found(env):
 
     directory, rm, clock, keeper, _, _ = env
     pool, region_id = leave(directory, "a", key="k")
+    reader, _ = open_session(directory, "x")
+    beats = iter(range(1, 100))
 
     def found():
+        call(directory, "heartbeat", **reader, sequence=next(beats), pools=[])
         reply = call(directory, "probe", engine_id="x", namespace="ns", keys=["k"])
         return reply["results"] == [True]
 

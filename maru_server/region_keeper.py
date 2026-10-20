@@ -51,6 +51,9 @@ REPLY_TIMEOUT_S = 10.0
 # found, as a live owner removes the keys of a region it cannot reach: its
 # keys would keep being hits that fail to read.
 UNREACHABLE_S = 30.0
+# How long stop waits for a check in progress; a check can wait longer on an
+# agent that does not answer (CONNECT_TIMEOUT_S + REPLY_TIMEOUT_S)
+STOP_JOIN_S = 10.0
 
 
 class RegionKeeper:
@@ -109,12 +112,19 @@ class RegionKeeper:
         first, so a reader's hold does not keep it registered after the
         resource manager hands it out again. A region whose remote CXL agent
         does not answer is left to the resource manager, as when MaruServer
-        dies.
+        dies. So is every region while a check still waits on an agent: the
+        keeper thread and this call would share the agent connections.
         """
         self._stop.set()
         self._directory.keeper_wakeup.set()
         if self._thread is not None:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=STOP_JOIN_S)
+            if self._thread.is_alive():
+                logger.warning(
+                    "region keeper still waits on a remote CXL agent; leaving "
+                    "the kept regions to the resource manager"
+                )
+                return
             self._thread = None
         try:
             self._give_back_all()

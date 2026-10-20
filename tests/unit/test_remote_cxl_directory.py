@@ -208,6 +208,41 @@ def test_a_key_committed_by_one_session_is_leased_and_read_by_another(env):
     assert call(directory, "release", **b, lease_id=got["lease_id"]) == {"held": True}
 
 
+def test_a_cpu_session_of_the_same_namespace_finds_no_remote_cxl_keys(env):
+    # It could not load them: its handler resolves CPU locations only.
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    cpu = {"server_epoch": directory.server_epoch, "session_token": "cpu"}
+    call(
+        directory,
+        "open",
+        **cpu,
+        engine_id="cpu",
+        namespace="ns",
+        node_id="node",
+        schema="opaque-bytes-v1",
+        capacity=PAGE,
+        page_size=PAGE,
+    )
+    probe = call(directory, "probe", engine_id="cpu", namespace="ns", keys=["k"])
+    assert probe["results"] == [False]
+    got = call(directory, "acquire", **cpu, keys=["k"])
+    assert got["entries"] == [None] and got["lease_id"] is None
+
+
+def test_an_engine_without_a_session_finds_no_remote_cxl_keys(env):
+    # An engine still waiting for its first region could not load them.
+    directory, _, _ = env
+    a, pool_a = open_session(directory, "a")
+    commit(directory, a, pool_a, "k", 0)
+    probe = call(directory, "probe", engine_id="b", namespace="ns", keys=["k"])
+    assert probe["results"] == [False]
+    open_session(directory, "b")
+    probe = call(directory, "probe", engine_id="b", namespace="ns", keys=["k"])
+    assert probe["results"] == [True]
+
+
 def test_first_commit_wins_across_sessions(env):
     directory, _, _ = env
     a, pool_a = open_session(directory, "a")
