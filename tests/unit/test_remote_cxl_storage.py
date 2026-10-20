@@ -791,9 +791,9 @@ def test_a_read_under_way_does_not_hold_up_alloc(world):
     assert got["k"] == [b"v"]
 
 
-def test_a_nonblocking_alloc_never_waits_for_a_new_region(world):
-    # The refill thread asks for a region when the free pages run out; an
-    # alloc meanwhile is skipped instead of waiting for it.
+def test_a_nonblocking_alloc_never_waits_and_its_store_gets_a_page(world):
+    # alloc takes only a staging slot, even while the refill thread asks for
+    # a region; the store then waits for that region instead of being skipped.
     a = world.client("a", pages=1, rdma_nonblocking_alloc=True)
     storage = a.rpc.storage
     asked, answer = threading.Event(), threading.Event()
@@ -807,20 +807,37 @@ def test_a_nonblocking_alloc_never_waits_for_a_new_region(world):
         return storage(action, payload)
 
     a.rpc.storage = slow_expand
-    first = a.alloc(1)  # the only page: the refill thread asks for a region
+    assert put(a, "k0", b"x")[0] is True  # the only page: the refill thread asks
     assert asked.wait(5)
     started = time.monotonic()
-    with pytest.raises(MemoryError):
-        a.alloc(1)
-    assert time.monotonic() - started < 0.5
+    handle = a.alloc(1)
+    handle.buf[:1] = b"y"
+    assert time.monotonic() - started < 0.5 and not handle.placed
     answer.set()
-    a.free(first)
-    deadline = time.monotonic() + 5
-    while len(a.regions) < 2:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-    assert put(a, "k", b"y")[0] is True
-    assert askers == ["maru-remote-cxl-refill"]  # never the allocating thread
+    assert a.batch_store(["k1"], [handle]) == [True]
+    assert len(a.regions) >= 2  # the refill thread may already ask for a third
+    assert read(a, ["k0", "k1"]) == [b"x", b"y"]
+    assert set(askers) == {"maru-remote-cxl-refill"}  # never the allocating thread
+
+
+def test_a_store_that_finds_no_page_gives_its_slots_back(world):
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    free_slots = a._staging.free_count()
+    first, second = a.alloc(1), a.alloc(1)
+    first.buf[:1] = b"x"
+    original, asked = a._take_page, []
+
+    def one_page(size):
+        asked.append(size)
+        if len(asked) > 1:
+            raise MemoryError("Remote CXL regions are full")
+        return original(size)
+
+    a._take_page = one_page
+    assert a.batch_store(["k1", "k2"], [first, second]) == [True, False]
+    assert second.state == "freed" and not second.placed
+    assert a._staging.free_count() == free_slots
+    assert read(a, ["k1", "k2"]) == [b"x", None]
 
 
 def test_the_refill_thread_evicts_ahead_when_no_region_is_left(world):
@@ -852,8 +869,64 @@ def test_an_error_escaping_a_write_gives_its_pages_and_slots_back(world):
     assert not a.has_unconfirmed_transfers()
 
 
-def test_a_free_while_the_client_is_busy_is_done_by_the_refill_thread(world):
+def test_an_error_placing_a_page_gives_the_slots_and_pages_back(world):
+    # Placement may now evict on the store thread: a malformed MaruServer
+    # reply there must not leave the batch's slots or pages taken.
+    a = world.client("a", pages=2, rdma_nonblocking_alloc=True, auto_expand=False)
+    free_slots = a._staging.free_count()
+    handles = [a.alloc(1) for _ in range(3)]
+    for h, byte in zip(handles, b"xyz", strict=True):
+        h.buf[:1] = bytes([byte])
+
+    def malformed():
+        raise ValueError("zip() argument 2 is shorter than argument 1")
+
+    a._evict = malformed
+    assert a.batch_store(["k0", "k1", "k2"], handles) == [True, True, False]
+    for h in handles:
+        a.free(h)  # the connector's cleanup: nothing left to give back
+    assert [h.state for h in handles][2] == "freed"
+    assert a._staging.free_count() == free_slots
+    assert read(a, ["k0", "k1", "k2"]) == [b"x", b"y", None]
+
+
+def test_a_batch_that_gets_no_page_starts_no_transfer(world):
     a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    free_slots = a._staging.free_count()
+    handle = a.alloc(1)
+
+    def full(size):
+        raise MemoryError("Remote CXL regions are full")
+
+    a._take_page = full
+    assert a.batch_store(["k"], [handle]) == [False]
+    assert handle.state == "freed" and a._transfers == 0
+    assert a._staging.free_count() == free_slots
+
+
+def test_an_interrupted_placement_gives_the_batch_back(world):
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    free_slots = a._staging.free_count()
+    handles = [a.alloc(1) for _ in range(2)]
+    original, asked = a._take_page, []
+
+    def interrupted(size):
+        asked.append(size)
+        if len(asked) > 1:
+            raise KeyboardInterrupt
+        return original(size)
+
+    a._take_page = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        a.batch_store(["k0", "k1"], handles)
+    assert [h.state for h in handles] == ["freed", "freed"]
+    assert a._staging.free_count() == free_slots
+    assert only_region(a).free_count() == 4
+
+
+def test_a_free_while_the_client_is_busy_does_not_wait(world):
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True)
+    free_slots = a._staging.free_count()
     handle = a.alloc(1)
     holding, done = threading.Event(), threading.Event()
 
@@ -866,15 +939,38 @@ def test_a_free_while_the_client_is_busy_is_done_by_the_refill_thread(world):
     holder.start()
     assert holding.wait(5)
     started = time.monotonic()
-    a.free(handle)  # parked, not waited for
-    assert time.monotonic() - started < 0.5 and handle.state == "writing"
+    a.free(handle)  # no page yet: only its slot goes back
+    assert time.monotonic() - started < 0.5 and handle.state == "freed"
+    assert a._staging.free_count() == free_slots
     done.set()
     holder.join(5)
-    deadline = time.monotonic() + 5
-    while handle.state != "freed":
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
     assert only_region(a).free_count() == 4
+
+
+def test_the_last_transfer_after_close_stops_the_data_path(world):
+    # close gave up waiting for a WRITE and left the data path registered;
+    # that WRITE ending stops it.
+    a = world.client("a", pages=4, rdma_nonblocking_alloc=True, rdma_timeout_s=0.1)
+    stopped = []
+    original = a._stop_data_path
+
+    def stop():
+        stopped.append(1)
+        original()
+
+    a._stop_data_path = stop
+    entered, go = hold_transfers(a, "write")
+    handle = a.alloc(1)
+    handle.buf[:1] = b"z"
+    store = threading.Thread(target=a.batch_store, args=(["k"], [handle]))
+    store.start()
+    assert entered.wait(5)
+    a.close()
+    assert not stopped and a.has_unconfirmed_transfers()
+    go.set()
+    store.join(5)
+    assert stopped == [1] and not a.has_unconfirmed_transfers()
+    world.clients.remove(a)
 
 
 def test_close_waits_for_a_transfer_under_way(world):

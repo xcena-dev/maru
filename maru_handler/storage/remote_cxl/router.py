@@ -140,6 +140,11 @@ class PoolRouter:
         return self.clients[best]
 
     def _owner(self, handle: RemoteCxlAllocation) -> RemoteCxlStorageClient:
+        if not handle.placed:
+            # A nonblocking alloc: the store places the page in its pool.
+            if any(c is handle.owner for c in self.clients):
+                return handle.owner
+            raise ValueError("Allocation does not belong to a remote CXL pool")
         for c in self.clients:
             if c.regions.get(handle.region.pool_id) is handle.region:
                 return c
@@ -160,8 +165,11 @@ class PoolRouter:
         """Give back an allocation that was not stored."""
         # A handle of a closed session only gives back its slot in the shared
         # staging buffer, which any client can do.
+        if not handle.placed and any(c is handle.owner for c in self.clients):
+            handle.owner.free(handle)
+            return
         for c in self.clients:
-            if c.regions.get(handle.region.pool_id) is handle.region:
+            if handle.placed and c.regions.get(handle.region.pool_id) is handle.region:
                 c.free(handle)
                 return
         self.clients[0].free(handle)

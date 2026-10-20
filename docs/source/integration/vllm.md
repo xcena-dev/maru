@@ -279,11 +279,13 @@ a slow memory node does not hold up the engine, and asynchronous loads run with
 vLLM's asynchronous scheduling on. Asynchronous loads need vLLM 0.16 or later,
 and an explicit `maru_rdma_staging_size` must then hold two requests (one for
 loads, one for stores). Setting them to `false` runs loads and stores on the
-engine thread; synchronous loads also need `--no-async-scheduling`. A store
-takes its staging slot and remote page on the engine thread without waiting:
-RDMA transfers run outside the client's lock, a background thread asks for a
-new region or evicts before the free pages run out, and a store that finds no
-free page or a busy client is skipped. The worker's staging buffer is registered with CUDA,
+engine thread; synchronous loads also need `--no-async-scheduling`. With
+asynchronous stores the engine thread takes only a staging slot for a chunk,
+waiting on no lock and no network; the thread that sends the store gives each
+chunk its remote page, and a background thread asks for a new region or
+evicts before the free pages run out, so that thread rarely waits. RDMA
+transfers run outside the client's lock. The worker's staging buffer is
+registered with CUDA,
 so the copy kernel moves KV between the GPU and the staging buffer as it does
 for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install nixl` without uv).
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)

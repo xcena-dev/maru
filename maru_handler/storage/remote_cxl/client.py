@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict
@@ -29,14 +30,11 @@ from .region import REMOTE_CXL, IsolatedTransfer, RemoteCxlAllocation, RemoteCxl
 
 logger = logging.getLogger(__name__)
 
-# How long ``alloc`` waits for the client lock. It runs on the engine thread,
-# and the lock is held only for bookkeeping and short MaruServer calls (never
-# across an RDMA transfer); a busy moment skips that chunk's store rather than
-# holding up every running request.
-ALLOC_LOCK_WAIT_S = 0.01
 # The refill thread gets room for stores ahead of them once the free pages of
 # usable regions fall below this many (at most an eighth of a region).
 ROOM_LOW_PAGES = 64
+# How often a store that found no remote page says so
+UNPLACED_WARN_INTERVAL_S = 60.0
 # How often the refill thread looks at the room without being woken
 REFILL_CHECK_S = 1.0
 
@@ -107,13 +105,15 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # RDMA transfers run without the lock; close waits for them to end.
         self._transfers = 0
         self._transfers_idle = threading.Condition(self._lock)
-        # With a nonblocking alloc, the refill thread expands or evicts when
-        # this is set (stores need room).
+        # A nonblocking alloc takes only a staging slot; the store places its
+        # page, and the refill thread expands or evicts ahead when this is set.
         self._nonblocking = bool(getattr(config, "rdma_nonblocking_alloc", False))
         self._refill = threading.Event()
-        # Allocations freed while the client was busy, freed by the refill thread
-        self._parked: list[RemoteCxlAllocation] = []
-        self._parked_lock = threading.Lock()
+        # Orders free and store of an allocation that has no page yet
+        self._unplaced_lock = threading.Lock()
+        self._unplaced_warned_at = float("-inf")
+        # close left the data path registered for transfers still under way
+        self._data_path_left = False
 
     # ------------------------------------------------------------------ setup
 
@@ -323,9 +323,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def _refill_loop(self) -> None:
         """Get room for stores before they need it.
 
-        ``alloc`` runs on the engine thread and takes only free pages. Asking
-        MaruServer for a region and mapping it, or evicting, waits on the
-        network, so it happens here, when the free pages run low.
+        A store places its pages when it starts (:meth:`batch_store`), and
+        asking MaruServer for a region, or evicting, waits on the network.
+        This thread does it ahead, when the free pages run low, so a store
+        rarely waits for it.
         """
         while not self._stop.is_set():
             self._refill.wait(REFILL_CHECK_S)
@@ -334,17 +335,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 return
             try:
                 with self._lock:
-                    self._free_parked()
                     if self.connected:
                         self._make_room()
             except Exception:
                 logger.warning("Remote CXL refill failed", exc_info=True)
-
-    def _free_parked(self) -> None:
-        with self._parked_lock:
-            parked, self._parked = self._parked, []
-        for handle in parked:
-            self._free_locked(handle)
 
     def _make_room(self) -> None:
         """Expand or evict until the usable regions have enough free pages.
@@ -408,7 +402,13 @@ class RemoteCxlStorageClient(RegionLifecycle):
     # ------------------------------------------------------------ allocation
 
     def alloc(self, size: int, route_key: str | None = None) -> RemoteCxlAllocation:
-        """A staging slot and a remote page for ``size`` bytes.
+        """A staging slot for ``size`` bytes and, with a blocking alloc, the
+        remote page they go to.
+
+        With ``rdma_nonblocking_alloc`` (the connector's engine thread) it
+        takes only the slot and never waits for the client lock or the
+        network: :meth:`batch_store` places the page, on the thread that
+        stores.
 
         Args:
             size: Bytes to store, at most one page.
@@ -419,41 +419,36 @@ class RemoteCxlStorageClient(RegionLifecycle):
             :meth:`batch_store` or :meth:`free`.
 
         Raises:
-            MemoryError: if no staging slot or page is free after trying to
-                get a region and to evict. With ``rdma_nonblocking_alloc``
-                (the connector's engine thread) it never waits on the network:
-                it fails when no page is free now (the refill thread then gets
-                a region or evicts) or the client stays busy for
-                :data:`ALLOC_LOCK_WAIT_S`; a store skipped this way is not
-                needed for correctness.
+            MemoryError: if no staging slot is free, or (blocking alloc) no
+                page after trying to get a region and to evict.
+            ValueError: if ``size`` does not fit in a page.
             StorageUnavailableError: if the session is unavailable.
         """
-        if not self._lock.acquire(
-            timeout=ALLOC_LOCK_WAIT_S if self._nonblocking else -1
-        ):
-            raise MemoryError("Remote CXL client is busy; skipping this store")
-        try:
-            self._ensure()
-            staging = self._staging
-            if staging is None:
-                raise StorageUnavailableError("RDMA staging buffer is not set up")
-            slots = staging.take(1, keep=staging.load_reserve)
-            if slots is None:
-                raise MemoryError("RDMA staging buffer has no slot for stores")
+        if type(size) is not int or not 0 < size <= self.config.chunk_size_bytes:
+            raise ValueError("Remote CXL allocation must fit in one page")
+        if self._nonblocking:
+            return self._take_slot(size)
+        with self._lock:
+            handle = self._take_slot(size)
             try:
-                region, location = self._take_page(size)
+                handle.region, handle.location = self._take_page(size)
             except BaseException:
-                self._staging.give(slots[0])
+                self._give_slot(handle)
                 raise
-            handle = RemoteCxlAllocation(
-                self._staging.view(slots[0])[:size], location, slots[0], region
-            )
-            region.track(handle)
-            if self._nonblocking and self._room() < self._low_room():
-                self._refill.set()
+            handle.region.track(handle)
             return handle
-        finally:
-            self._lock.release()
+
+    def _take_slot(self, size: int) -> RemoteCxlAllocation:
+        self._ensure()
+        staging = self._staging
+        if staging is None:
+            raise StorageUnavailableError("RDMA staging buffer is not set up")
+        slots = staging.take(1, keep=staging.load_reserve)
+        if slots is None:
+            raise MemoryError("RDMA staging buffer has no slot for stores")
+        return RemoteCxlAllocation(
+            staging.view(slots[0])[:size], None, slots[0], None, size, owner=self
+        )
 
     def _take_page(self, size: int) -> tuple[RemoteCxlRegion, StorageLocation]:
         """A free page: from a region with room, a new region, or eviction.
@@ -462,11 +457,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
         whose remote CXL agent has not answered since it last failed would
         fail after the transport's timeout and leave the page quarantined.
         Eviction likewise frees pages only in those regions (``_evict``).
-        A nonblocking alloc takes only a free page; the refill thread gets a
-        region or evicts (``_make_room``).
+        Called with the lock held.
         """
-        attempts = ("free",) if self._nonblocking else ("free", "expand", "evict")
-        for attempt in attempts:
+        for attempt in ("free", "expand", "evict"):
             if attempt == "expand" and not (self._may_expand() and self._expand()):
                 continue
             if attempt == "evict" and not self._evict():
@@ -474,32 +467,70 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for region in self.regions.values():
                 if region.has_free() and self._writable(region):
                     return region, region.take_page(size)
-        if self._nonblocking:
-            self._refill.set()
         if self.regions and not any(self._writable(r) for r in self.regions.values()):
             raise MemoryError(
                 "No remote CXL region is reachable now; skipping new cache admission"
             )
         raise MemoryError("Remote CXL regions are full; skipping new cache admission")
 
+    def _place(self, handles: list[RemoteCxlAllocation]) -> list[bool]:
+        """Give each allocation without a page one; per allocation, whether
+        it has a page now. One that gets none returns its slot.
+
+        Called with the lock held, by the thread that stores.
+        """
+        placed = []
+        error: Exception | None = None
+        for handle in handles:
+            if not handle.placed and error is None:
+                try:
+                    region, location = self._take_page(handle.length)
+                    handle.region, handle.location = region, location
+                    region.track(handle)
+                except (MemoryError, StorageUnavailableError) as exc:
+                    error = exc  # the later ones would not find a page either
+                except Exception as exc:
+                    # A malformed MaruServer reply while expanding or evicting
+                    logger.error("Remote CXL page placement failed", exc_info=True)
+                    error = exc
+            if not handle.placed:
+                self._give_slot(handle)
+                handle.state = "freed"
+            placed.append(handle.placed)
+        if error is not None:
+            now = time.monotonic()
+            if now - self._unplaced_warned_at >= UNPLACED_WARN_INTERVAL_S:
+                self._unplaced_warned_at = now
+                logger.warning(
+                    "%s (%d of %d chunks not stored); further ones are not "
+                    "logged for %d s",
+                    error,
+                    placed.count(False),
+                    len(handles),
+                    UNPLACED_WARN_INTERVAL_S,
+                )
+        if self._nonblocking and self._room() < self._low_room():
+            self._refill.set()
+        return placed
+
     def free(self, handle: RemoteCxlAllocation) -> None:
         """Give back an allocation that was not stored.
 
         A committed allocation or one a transfer may still touch is left
-        alone; the connector's cleanup must not reuse it.
+        alone; the connector's cleanup must not reuse it. An allocation
+        without a page gives back its slot without the client lock.
         """
-        if not self._lock.acquire(
-            timeout=ALLOC_LOCK_WAIT_S if self._nonblocking else -1
-        ):
-            # The engine thread does not wait: the refill thread frees it.
-            with self._parked_lock:
-                self._parked.append(handle)
-            self._refill.set()
-            return
-        try:
+        if not isinstance(handle, RemoteCxlAllocation):
+            raise ValueError("Allocation does not belong to this remote CXL client")
+        with self._unplaced_lock:
+            if handle.state != "writing":
+                return  # submitted: the store gives it back
+            if not handle.placed:
+                self._give_slot(handle)
+                handle.state = "freed"
+                return
+        with self._lock:
             self._free_locked(handle)
-        finally:
-            self._lock.release()
 
     def _free_locked(self, handle: RemoteCxlAllocation) -> None:
         if handle.state != "writing":
@@ -580,33 +611,63 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for key, handle in zip(keys, handles, strict=True):
                 if not isinstance(key, str) or not key or len(key) > 4096:
                     raise ValueError("Invalid remote CXL key")
-                handle.region.validate(handle)
-                if handle.state != "writing":
+                if not isinstance(handle, RemoteCxlAllocation):
+                    raise ValueError("Allocation does not belong to this client")
+                if handle.placed:
+                    handle.region.validate(handle)
+            with self._unplaced_lock:
+                if any(h.state != "writing" for h in handles):
                     raise ValueError("Remote CXL allocation was already submitted")
-            for handle in handles:
-                handle.state = "sending"  # ``free`` leaves it alone now
+                for handle in handles:
+                    handle.state = "sending"  # ``free`` leaves it alone now
+            try:
+                placed = self._place(handles)
+            except BaseException:
+                # The caller can no longer free them: pages and slots go back.
+                self._give_back(
+                    [h for h in handles if h.placed and h.state == "sending"]
+                )
+                for h in handles:
+                    if h.state == "sending":
+                        self._give_slot(h)
+                        h.state = "freed"
+                raise
+            if not any(placed):
+                return [False] * len(keys)
             self._transfers += 1
+        sent = [h for h, ok in zip(handles, placed, strict=True) if ok]
         try:
-            written = self._write(handles)
+            written = self._write(sent)
         except BaseException:
             with self._lock:
                 # The caller can no longer free them: give back what is
                 # still being sent (isolated pages stay out of use).
-                self._give_back([h for h in handles if h.state == "sending"])
+                self._give_back([h for h in sent if h.state == "sending"])
                 self._end_transfer_locked()
             raise
         with self._lock:
             try:
                 if not written:
-                    return [False] * len(keys)
-                return self._commit(keys, handles)
+                    stored = [False] * len(sent)
+                else:
+                    sent_keys = [k for k, ok in zip(keys, placed, strict=True) if ok]
+                    stored = self._commit(sent_keys, sent)
             finally:
                 # close waits for this: the commit must not land after it
                 self._end_transfer_locked()
+        results = iter(stored)
+        return [next(results) if ok else False for ok in placed]
 
     def _end_transfer_locked(self) -> None:
         self._transfers -= 1
         self._transfers_idle.notify_all()
+        if self._data_path_left and not self._transfers and not self._isolated:
+            # close left the data path to this transfer; it was the last one.
+            self._data_path_left = False
+            try:
+                self._stop_data_path()
+            except Exception:  # the transfer's own result still counts
+                logger.warning("Could not stop the RDMA data path", exc_info=True)
 
     def _commit(
         self, keys: list[str], handles: list[RemoteCxlAllocation]
@@ -1105,7 +1166,6 @@ class RemoteCxlStorageClient(RegionLifecycle):
             thread.join()
         self._threads = []
         with self._lock:
-            self._free_parked()
             # Transfers run without the lock: let those under way end (each
             # within its timeout) before the regions and the data path go.
             self._transfers_idle.wait_for(
@@ -1115,6 +1175,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if not self._isolated and not self._transfers:
                 self._stop_data_path()
             else:
+                # The last transfer under way stops it when it ends.
+                self._data_path_left = True
                 logger.warning(
                     "RDMA transfers still own staging memory; leaving it registered"
                 )

@@ -16,18 +16,31 @@ REMOTE_CXL = "remote_cxl"
 
 @dataclass(eq=False)
 class RemoteCxlAllocation:
-    """A remote page being written through one staging slot."""
+    """A staging slot holding bytes for a remote page.
+
+    ``region`` and ``location`` name the page. An allocation made on a thread
+    that must not wait gets them only when it is stored (``placed`` False
+    until then).
+    """
 
     buf: memoryview
-    location: StorageLocation
+    location: StorageLocation | None
     slot: int
-    region: RemoteCxlRegion
+    region: RemoteCxlRegion | None
+    length: int
     state: str = "writing"
+    # The client that allocated it (a ``PoolRouter`` routes by it)
+    owner: Any = field(default=None, repr=False)
 
     @property
     def size(self) -> int:
         """Bytes the caller may write into ``buf``."""
-        return self.location.length
+        return self.length
+
+    @property
+    def placed(self) -> bool:
+        """Whether the allocation has its remote page."""
+        return self.region is not None
 
 
 class RemoteCxlRegion:

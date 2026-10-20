@@ -735,7 +735,7 @@ def _create_maru_handler(
             else 0.0
         ),
         # Stores allocate on the engine thread, which must not wait on a
-        # transfer or the network.
+        # transfer or the network: it takes only a staging slot.
         rdma_nonblocking_alloc=(
             extra_config.get("maru_storage_backend") == "remote_cxl"
             and not metadata_only

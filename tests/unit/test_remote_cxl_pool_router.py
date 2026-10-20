@@ -157,6 +157,29 @@ def test_one_store_batch_spanning_two_pools_commits_each_to_its_server(pools):
         r.close()
 
 
+def test_a_nonblocking_alloc_is_stored_and_freed_in_its_own_pool(pools):
+    # The engine thread's alloc takes only a staging slot: the router routes
+    # it by the client that allocated it, before it has a page.
+    r = router(pools, rdma_nonblocking_alloc=True)
+    try:
+        free_slots = r.data.staging.free_count()
+        first, second = route_key_of(r, 0), route_key_of(r, 1)
+        h1 = r.alloc(2, route_key=first)
+        h2 = r.alloc(2, route_key=second)
+        dropped = r.alloc(2, route_key=second)
+        assert not (h1.placed or h2.placed)
+        h1.buf[:2], h2.buf[:2] = b"p1", b"p2"
+        assert r.batch_store(["k1", "k2"], [h1, h2]) == [True, True]
+        assert [pool_index(r, h1), pool_index(r, h2)] == [0, 1]
+        r.free(dropped)
+        assert dropped.state == "freed"
+        assert r.data.staging.free_count() == free_slots
+        assert read(r, ["k1"], first) == [b"p1"]
+        assert read(r, ["k2"], second) == [b"p2"]
+    finally:
+        r.close()
+
+
 def test_another_worker_and_the_scheduler_pick_the_same_pool(pools):
     # The connector builds a worker's scheduler-side handler with the
     # worker's own engine id, so its probes see the worker's session.

@@ -74,7 +74,7 @@ class MaruConfig:
     # and stores run on separate threads (asynchronous transfers)
     rdma_load_reserve: float = 0.0
     # alloc is called from a thread that must not wait (vLLM's engine thread):
-    # it waits briefly for the client lock, takes only free pages, and a
+    # it takes only a staging slot, the store gives the remote page, and a
     # background thread gets more room ahead of the stores
     rdma_nonblocking_alloc: bool = False
     # Key the remote CXL agents of the pool require (a copy of the memory node's
