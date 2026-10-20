@@ -35,8 +35,10 @@ logger = logging.getLogger(__name__)
 ROOM_LOW_PAGES = 64
 # How often a store that found no remote page says so
 UNPLACED_WARN_INTERVAL_S = 60.0
-# How often a closed client looks for its late transfers' end
+# How often a closed client looks for its late transfers' end, and after how
+# long it says that they have not ended
 LATE_TRANSFER_POLL_S = 1.0
+LATE_TRANSFER_WARN_S = 60.0
 # How often the refill thread looks at the room without being woken
 REFILL_CHECK_S = 1.0
 
@@ -46,6 +48,31 @@ TRANSIENT_OPEN_REFUSALS = (
     "one active worker per engine_id",
     "session limit reached",
 )
+
+
+def wait_for_late_transfers(clients: list[RemoteCxlStorageClient]) -> None:
+    """Block until no late RDMA can touch the closed ``clients``' memory.
+
+    Runs on a thread of its own after close: the heartbeat thread that
+    reaped released transfers is gone. A transfer NIXL never releases keeps
+    it waiting, as its memory must stay registered.
+    """
+    started, warned = time.monotonic(), False
+    while True:
+        try:
+            ended = [c.reap_unconfirmed() for c in clients]  # each one reaps
+            if all(ended):
+                return
+        except Exception:
+            logger.warning("Could not reap late RDMA transfers", exc_info=True)
+        if not warned and time.monotonic() - started >= LATE_TRANSFER_WARN_S:
+            warned = True
+            logger.warning(
+                "RDMA transfers are still unconfirmed %d s after close; the "
+                "staging buffer stays registered until they end",
+                LATE_TRANSFER_WARN_S,
+            )
+        time.sleep(LATE_TRANSFER_POLL_S)
 
 
 class RemoteCxlStorageClient(RegionLifecycle):
@@ -894,8 +921,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
     def _stop_data_path_later(self) -> None:
         """After close: stop the data path once the late transfers ended."""
-        while not self.reap_unconfirmed():
-            time.sleep(LATE_TRANSFER_POLL_S)
+        wait_for_late_transfers([self])
         with self._lock:
             try:
                 self._stop_data_path()

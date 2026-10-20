@@ -391,6 +391,16 @@ class RegionMapService:
                 if m.ready.is_set() and m.registration is not None
             ]
         for m in held:
+            with self._lock:
+                if (
+                    m.error is None
+                    and self._maps.get(m.handle.region_id) is m
+                    and (not m.holders)
+                ):
+                    # Its last holder left, but deregistering failed: retry
+                    # without asking the resource manager, as unmap does.
+                    self._release_locked(m.handle.region_id, m)
+                    continue
             if m.error is None:
                 try:
                     allocated = self._allocated(m.handle)
@@ -407,10 +417,6 @@ class RegionMapService:
                     return
                 self._sweep_failed = False
                 if allocated:
-                    with self._lock:
-                        if self._maps.get(m.handle.region_id) is m and not m.holders:
-                            # Its last holder left, but deregistering failed.
-                            self._release_locked(m.handle.region_id, m)
                     continue
             rid = m.handle.region_id
             with self._lock:

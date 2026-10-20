@@ -258,6 +258,9 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
     r.close()
     # Unmapping now would let the NIC write into freed host memory.
     assert r.data.staging is not None
+    late = r._late
+    r.close()  # a second close leaves the data path to that thread
+    assert r._late is late and r.data.staging is not None
     agent.stall = False
     agent.finish_stalled()
     # Once NIXL released the transfer, the shared data path closes.

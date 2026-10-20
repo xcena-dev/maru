@@ -366,5 +366,6 @@ def test_the_sweep_deregisters_a_mapping_whose_last_holder_left():
     node.service.sweep()
     assert len(node.agent.registered) == 1  # still refused: kept for later
     node.transport.deregister = deregister
+    node.cxl.get_access = unreachable  # an unused mapping needs no RM answer
     node.service.sweep()
     assert node.agent.registered == [] and node.mapper.unmapped == [handle["offset"]]

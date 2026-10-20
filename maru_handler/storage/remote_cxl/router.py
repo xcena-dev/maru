@@ -6,14 +6,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-import time
 from collections.abc import Callable
 from typing import Any
 
 from maru_common.storage_types import StorageError, StorageUnavailableError
 
 from ..cpu import CpuReadLease
-from .client import LATE_TRANSFER_POLL_S, RemoteCxlStorageClient
+from .client import RemoteCxlStorageClient, wait_for_late_transfers
 from .datapath import RdmaDataPath
 from .region import RemoteCxlAllocation
 
@@ -69,6 +68,9 @@ class PoolRouter:
             RemoteCxlStorageClient(config, rpc, data=self.data) for rpc in rpcs
         ]
         self._stop = threading.Event()
+        # Orders the data path's close; set: a thread closes it after late transfers
+        self._data_close_lock = threading.Lock()
+        self._late: threading.Thread | None = None
         self._retry: threading.Thread | None = None
         self._connect_lock = threading.Lock()
 
@@ -238,28 +240,29 @@ class PoolRouter:
         if self._retry is not None:
             self._retry.join(timeout=5)
         self._close_clients()
-        if any(c.has_unconfirmed_transfers() for c in self.clients):
-            logger.warning(
-                "RDMA transfers still own staging memory; it stays registered "
-                "until they end"
-            )
-            threading.Thread(
-                target=self._close_data_later,
-                daemon=True,
-                name="maru-remote-cxl-late-transfers",
-            ).start()
-            return
-        self.data.close()
+        with self._data_close_lock:
+            if self._late is not None:
+                return  # a thread closes the data path once transfers end
+            if any(c.has_unconfirmed_transfers() for c in self.clients):
+                logger.warning(
+                    "RDMA transfers still own staging memory; it stays registered "
+                    "until they end"
+                )
+                self._late = threading.Thread(
+                    target=self._close_data_later,
+                    daemon=True,
+                    name="maru-remote-cxl-late-transfers",
+                )
+                self._late.start()
+                return
+            self.data.close()
 
     def _close_data_later(self) -> None:
         """After close: close the shared data path once every pool's late
         transfers ended."""
-        while True:
-            ended = [c.reap_unconfirmed() for c in self.clients]  # each reaps
-            if all(ended):
-                break
-            time.sleep(LATE_TRANSFER_POLL_S)
-        try:
-            self.data.close()
-        except Exception:
-            logger.warning("Could not close the RDMA data path", exc_info=True)
+        wait_for_late_transfers(self.clients)
+        with self._data_close_lock:
+            try:
+                self.data.close()
+            except Exception:
+                logger.warning("Could not close the RDMA data path", exc_info=True)
