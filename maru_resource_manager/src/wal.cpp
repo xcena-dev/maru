@@ -39,6 +39,14 @@ struct WalFreeV3 {
   uint64_t regionId;
 };
 
+static uint32_t payloadSize(uint32_t type) {
+  switch (static_cast<WalRecordType>(type)) {
+  case WalRecordType::ALLOC: return sizeof(Allocation);
+  case WalRecordType::FREE: return sizeof(WalFreeV3);
+  }
+  return 0;
+}
+
 WalStore::WalStore(const std::string &stateDir) : stateDir_(stateDir) {
   // Migrate legacy WAL filename if present
   std::string legacyPath = stateDir_ + "/" + kLegacyWalName;
@@ -98,8 +106,23 @@ int WalStore::ensureOpen() {
   return 0;
 }
 
-int WalStore::appendRecord(WalRecordType type, const void *payload, uint32_t len,
-                           bool keepUnsynced, bool *written) {
+static void encodeRecord(std::vector<uint8_t> &buf, WalRecordType type,
+                         const void *payload, uint32_t len) {
+  WalHeader hdr{};
+  hdr.magic = kWalMagic;
+  hdr.version = kWalVersion;
+  hdr.type = static_cast<uint32_t>(type);
+  hdr.reserved = 0;
+  hdr.payloadLen = len;
+  hdr.ts = nowSec();
+  const size_t at = buf.size();
+  buf.resize(at + sizeof(hdr) + len);
+  std::memcpy(buf.data() + at, &hdr, sizeof(hdr));
+  if (len > 0) std::memcpy(buf.data() + at + sizeof(hdr), payload, len);
+}
+
+int WalStore::appendBuffer(const std::vector<uint8_t> &buf, bool keepUnsynced,
+                           bool *written) {
   if (written) *written = false;
   if (appendError_ != 0) {
     return appendError_;
@@ -113,27 +136,13 @@ int WalStore::appendRecord(WalRecordType type, const void *payload, uint32_t len
     return -errno;
   }
 
-  WalHeader hdr{};
-  hdr.magic = kWalMagic;
-  hdr.version = kWalVersion;
-  hdr.type = static_cast<uint32_t>(type);
-  hdr.reserved = 0;
-  hdr.payloadLen = len;
-  hdr.ts = nowSec();
-
   // One buffer avoids a separate header write. Regular-file writes are not
   // guaranteed crash-atomic; recovery discards an incomplete final record.
-  std::vector<uint8_t> buf(sizeof(hdr) + len);
-  std::memcpy(buf.data(), &hdr, sizeof(hdr));
-  if (len > 0) {
-    std::memcpy(buf.data() + sizeof(hdr), payload, len);
-  }
-
   rc = writeFull(walFd_, buf.data(), buf.size());
   if (rc != 0) {
-    // Only part of the record: the caller keeps its old state, so remove the
-    // bytes. If that fails they stay a torn tail, which recovery discards as
-    // long as nothing is appended after it.
+    // Only part of the records: the caller keeps its old state, so remove
+    // the bytes. If that fails they stay a torn tail, which recovery
+    // discards as long as nothing is appended after it.
     if (::ftruncate(walFd_, st.st_size) != 0) {
       appendError_ = rc;
       logf(LogLevel::Error,
@@ -164,45 +173,25 @@ int WalStore::appendRecord(WalRecordType type, const void *payload, uint32_t len
 }
 
 int WalStore::appendAlloc(const Allocation &alloc) {
-  return appendRecord(WalRecordType::ALLOC, &alloc, sizeof(alloc), false, nullptr);
+  std::vector<uint8_t> buf;
+  encodeRecord(buf, WalRecordType::ALLOC, &alloc, sizeof(alloc));
+  return appendBuffer(buf, false, nullptr);
 }
 
 int WalStore::appendFree(uint64_t regionId, bool *written) {
-  WalFreeV3 fr{};
-  fr.regionId = regionId;
-  return appendRecord(WalRecordType::FREE, &fr, sizeof(fr), true, written);
+  return appendFrees({regionId}, written);
 }
 
-static PoolState *findPool(std::vector<PoolState> &pools, uint32_t poolId) {
-  for (auto &p : pools) {
-    if (p.poolId == poolId) {
-      return &p;
-    }
+int WalStore::appendFrees(const std::vector<uint64_t> &regionIds, bool *written) {
+  if (written) *written = false;
+  if (regionIds.empty()) return 0;
+  std::vector<uint8_t> buf;
+  for (uint64_t id : regionIds) {
+    WalFreeV3 fr{};
+    fr.regionId = id;
+    encodeRecord(buf, WalRecordType::FREE, &fr, sizeof(fr));
   }
-  return nullptr;
-}
-
-static void removeExtent(PoolState &pool, uint64_t off, uint64_t len) {
-  std::vector<Extent> newList;
-  for (const auto &ex : pool.freeList) {
-    uint64_t exEnd = ex.offset + ex.length;
-    uint64_t alEnd = off + len;
-    if (alEnd <= ex.offset || off >= exEnd) {
-      newList.push_back(ex);
-      continue;
-    }
-    if (off > ex.offset) {
-      newList.push_back(Extent{ex.offset, off - ex.offset});
-    }
-    if (alEnd < exEnd) {
-      newList.push_back(Extent{alEnd, exEnd - alEnd});
-    }
-  }
-  pool.freeList.swap(newList);
-}
-
-static void addExtent(PoolState &pool, uint64_t off, uint64_t len) {
-  pool.freeList.push_back(Extent{off, len});
+  return appendBuffer(buf, true, written);
 }
 
 // True if the bytes can start a header this version appends. ts and the
@@ -216,7 +205,7 @@ static bool headerPrefix(const uint8_t *bytes, size_t len) {
     expected.magic = kWalMagic;
     expected.version = kWalVersion;
     expected.type = static_cast<uint32_t>(type);
-    expected.payloadLen = type == WalRecordType::ALLOC ? sizeof(Allocation) : sizeof(WalFreeV3);
+    expected.payloadLen = payloadSize(expected.type);
     if (std::memcmp(bytes, &expected, known) == 0) return true;
   }
   return false;
@@ -266,11 +255,9 @@ static int visitRecords(const std::string &path,
     if ((rc = readFull(fd, &hdr, sizeof(hdr))) != 0) break;
     remaining -= sizeof(hdr);
     const bool alloc = hdr.type == static_cast<uint32_t>(WalRecordType::ALLOC);
-    const bool free = hdr.type == static_cast<uint32_t>(WalRecordType::FREE);
     if (hdr.magic != kWalMagic ||
         (hdr.version != kWalVersion && hdr.version != kLegacyWalVersion) ||
-        (!alloc && !free) ||
-        hdr.payloadLen != (alloc ? sizeof(Allocation) : sizeof(WalFreeV3))) {
+        payloadSize(hdr.type) == 0 || hdr.payloadLen != payloadSize(hdr.type)) {
       rc = -EPROTO;
       break;
     }
@@ -314,132 +301,79 @@ int WalStore::discardTornTail() {
   return rc;
 }
 
-int WalStore::referencedPools(std::set<uint32_t> &pools) const {
-  std::set<uint32_t> staged;
-  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
-    if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
-      Allocation a{};
-      std::memcpy(&a, payload.data(), sizeof(a));
-      staged.insert(a.poolId);
-    }
-    return 0;
-  });
-  if (rc == 0 || rc == -ENOENT) pools = std::move(staged);
-  return rc;
+// Fields that identify an allocation record; the token is recomputed at load.
+static bool sameAllocation(const Allocation &a, const Allocation &b) {
+  return a.handle.regionId == b.handle.regionId && a.handle.offset == b.handle.offset &&
+         a.handle.length == b.handle.length && a.nonce == b.nonce &&
+         std::strncmp(a.clientId, b.clientId, sizeof(a.clientId)) == 0 &&
+         a.requestedSize == b.requestedSize && a.allocLength == b.allocLength &&
+         a.poolId == b.poolId && a.realOffset == b.realOffset;
 }
 
-int WalStore::liveAllocations(const std::set<uint32_t> &pools,
-                              std::map<uint64_t, Allocation> &live) const {
-  std::map<uint64_t, Allocation> staged;
-  for (const auto &[id, a] : live)
-    if (pools.count(a.poolId)) staged.emplace(id, a);
+int WalStore::buildLedger(const std::map<uint64_t, Allocation> &global,
+                          uint64_t globalNextRegionId, Ledger &out) const {
+  Ledger ledger;
+  ledger.live = global;
+  ledger.nextRegionId = globalNextRegionId;
   const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
     if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
       Allocation a{};
       std::memcpy(&a, payload.data(), sizeof(a));
-      if (pools.count(a.poolId)) staged[a.handle.regionId] = a;
+      const uint64_t id = a.handle.regionId;
+      // Reserve every ID the log ever used, freed or not, in any pool.
+      if (id >= ledger.nextRegionId) ledger.nextRegionId = id + 1;
+      auto live = ledger.live.find(id);
+      if (live == ledger.live.end()) {
+        ledger.live.emplace(id, a);
+      } else if (!sameAllocation(live->second, a)) {
+        // Writers before #91 could reuse an ID across pools; which record a
+        // later FREE meant cannot be known.
+        logf(LogLevel::Error,
+             "region %llu is recorded for pool %u and for pool %u (an RM before #91 reused "
+             "region IDs); stop every client of this RM, then move %s aside and restart",
+             static_cast<unsigned long long>(id), live->second.poolId, a.poolId,
+             walPath().c_str());
+        return -EEXIST;
+      }
+      // An identical record is one global.meta already holds: a log whose
+      // removal after a checkpoint was lost is replayed with the same result,
+      // unless an RM before #91 reused a region ID in it.
     } else {
       WalFreeV3 fr{};
       std::memcpy(&fr, payload.data(), sizeof(fr));
-      staged.erase(fr.regionId); // Region IDs are never reused across pools.
+      ledger.live.erase(fr.regionId);
     }
     return 0;
   });
   if (rc != 0 && rc != -ENOENT) return rc;
-  live = std::move(staged);
+  out = std::move(ledger);
   return 0;
 }
 
-int WalStore::replay(std::vector<PoolState> &pools,
-                     std::map<uint64_t, Allocation> &allocations,
-                     uint64_t &nextRegionId) {
-  for (const auto &p : pools) {
-    if (validateFreeList(p) != 0) return -EUCLEAN;
-    for (const auto &[id, a] : allocations) {
-      if (a.poolId == p.poolId && (id != a.handle.regionId || !validAllocation(p, a)))
-        return -EUCLEAN;
-    }
-  }
-  auto stagedPools = pools;
-  auto stagedAllocations = allocations;
-  uint64_t stagedNext = nextRegionId;
-  const int rc = visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
+bool WalStore::startsAtFirstRegion() const {
+  bool first = false;
+  visitRecords(walPath(), [&](uint32_t type, const auto &payload) {
     if (type == static_cast<uint32_t>(WalRecordType::ALLOC)) {
-      Allocation al{};
-      std::memcpy(&al, payload.data(), sizeof(al));
-      // Reserve IDs even for devices that have not appeared yet. Otherwise a
-      // live pool can reuse one before a later rescan replays this record.
-      if (al.handle.regionId >= stagedNext) {
-        stagedNext = al.handle.regionId + 1;
-      }
-      PoolState *pool = findPool(stagedPools, al.poolId);
-      if (!pool) {
-        return 0;
-      }
-      if (!validAllocation(*pool, al)) return -EUCLEAN;
-      auto existing = stagedAllocations.find(al.handle.regionId);
-      if (existing != stagedAllocations.end() && existing->second.poolId != al.poolId) {
-        // Older writers may already have reused an ID across pools. Reject
-        // the replay so the caller rolls back instead of losing a live handle.
-        return -EEXIST;
-      }
-      removeExtent(*pool, al.realOffset, al.allocLength);
-      stagedAllocations[al.handle.regionId] = al;
-    } else {
-      WalFreeV3 fr{};
-      std::memcpy(&fr, payload.data(), sizeof(fr));
-      auto globalIt = stagedAllocations.find(fr.regionId);
-      if (globalIt == stagedAllocations.end()) {
-        return 0;
-      }
-      const Allocation &al = globalIt->second;
-      PoolState *pool = findPool(stagedPools, al.poolId);
-      if (!pool) {
-        return 0;
-      }
-      if (!validAllocation(*pool, al)) return -EUCLEAN;
-      addExtent(*pool, al.realOffset, al.allocLength);
-      stagedAllocations.erase(globalIt);
+      Allocation a{};
+      std::memcpy(&a, payload.data(), sizeof(a));
+      first = a.handle.regionId == 1;
     }
-    return 0;
+    return 1; // Only the first record matters.
   });
-  if (rc != 0) return rc;
-  pools = std::move(stagedPools);
-  allocations = std::move(stagedAllocations);
-  nextRegionId = stagedNext;
-  return 0;
+  return first;
 }
 
-int WalStore::checkpoint(const std::vector<PoolState> &pools,
-                         MetadataStore &metadata,
+int WalStore::checkpoint(MetadataStore &metadata,
                          const std::map<uint64_t, Allocation> &allocations,
                          uint64_t nextRegionId) {
-  for (const auto &pool : pools) {
-    if (validatePoolState(pool, allocations) != 0) return -EUCLEAN;
-  }
-  for (const auto &[id, a] : allocations) {
-    bool found = false;
-    for (const auto &p : pools) if (p.poolId == a.poolId) found = true;
-    if (!found) return -EAGAIN;
-    if (id >= nextRegionId) return -EUCLEAN;
-  }
-  for (const auto &pool : pools) {
-    int rc = metadata.save(pool);
-    if (rc != 0) {
-      return rc;
-    }
-  }
   int rc = metadata.saveGlobal(allocations, nextRegionId);
-  if (rc != 0) {
-    return rc;
-  }
-  // The renames must be on disk before the WAL they replace is removed: a
-  // power loss could otherwise keep the unlink and lose the checkpoint.
+  if (rc != 0) return rc;
+  // The rename must be on disk before the WAL it replaces is removed: a
+  // power loss could otherwise keep the unlink and lose the checkpoint. A
+  // lost unlink replays the log onto the checkpoint that covers it, with the
+  // same result (see buildLedger).
   rc = syncDirectory(stateDir_);
-  if (rc != 0) {
-    return rc;
-  }
-
+  if (rc != 0) return rc;
   // Close the WAL fd before unlinking so the next append reopens a fresh file
   if (walFd_ >= 0) {
     ::close(walFd_);

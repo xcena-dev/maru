@@ -48,7 +48,7 @@ flowchart TB
 
 `Reaper` runs a background thread that periodically detects terminated client processes and reclaims their leaked allocations through `PoolManager`.
 
-`MetadataStore` persists per-pool free lists and the global allocation map as checkpoint files with integrity verification. `WalStore` provides crash recovery by recording every allocation and free operation to a write-ahead log before modifying in-memory state.
+`MetadataStore` persists the global allocation map (the checkpoint) and one identity record per pool (device UUID and layout), with integrity verification. `WalStore` provides crash recovery by recording every allocation and free operation to a write-ahead log before modifying in-memory state.
 
 ---
 
@@ -107,11 +107,34 @@ All allocation sizes are rounded up to the pool's alignment boundary. For DEV_DA
 
 ## 4. Persistence & Recovery
 
-The Resource Manager ensures durability through a combination of write-ahead logging and periodic checkpoints.
+The **allocation ledger** is the only authority on which ranges are in use: the global checkpoint (`global.meta`) plus the write-ahead log (WAL) since it. Every allocation and free is appended to the WAL (and synced) before it is acknowledged. A **checkpoint** writes the whole ledger, including pools whose device is absent or refused, to `global.meta` and retires the WAL. Free lists are not persisted: a pool's free list is its device's data range minus its live allocations.
 
-Every allocation and free operation is first appended to the **WAL** before modifying in-memory state. Periodically, a **checkpoint** is triggered: per-pool free lists and the global allocation map are saved atomically. The WAL is then cleared.
+Each pool also has a record, `pool_N.meta` (version 7), holding the device's UUID and the layout it was served with (type, data range, alignment). It is written before the pool is first served and whenever the pool starts over; checkpoints do not write it. Records of version 6, written by earlier resource managers, hold a free list only and are migrated (see below).
 
-On startup, the **recovery sequence** proceeds as: (1) scan for current hardware, (2) initialize pools with device sizes, (3) restore state from the last checkpoint, (4) replay any WAL records written since that checkpoint, and (5) recompute free sizes from the reconstituted free lists.
+**Startup.** The resource manager reads the excluded device list, `global.meta` and the WAL, and builds the ledger for every pool. It then judges each device on its own:
+
+| The device | Outcome |
+|---|---|
+| Carries the recorded UUID, its layout matches the record and its identity tags, and its allocations fit | Served as recorded |
+| Has no header and no history | New pool: a fresh UUID header and record |
+| Lost its header, or its layout changed (e.g. re-provisioned to another size), and no allocation on it may still be in use | Starts over (reset): the pool is rebuilt from the device; the previous record is kept as `pool_N.meta.reset-<time>` |
+| As above, but an allocation's owner may still be running (a remote owner, or a local process that is alive) | Refused: not served, nothing written; the rest of the resource manager keeps running |
+| Holds another pool's UUID, an unknown header version, a record from a newer resource manager, or a UUID another device also holds | Refused |
+| Formatted by ROOF, excluded, or not answering, or the pool records cannot be listed | Skipped (excluded devices are never opened) |
+
+An owner counts as gone only when it is a local process whose PID no longer exists, or one recorded in an earlier boot (the `boot_id=` line of `rm.conf`). Remote owners are never assumed gone by recovery. Startup exits only when the ledger itself cannot be trusted or the state directory cannot be written: an unreadable `global.meta`, WAL or excluded device list; pool records without `global.meta` (unless the WAL reaches back to region 1); one region ID claimed by two different records (possible only in a WAL in which a resource manager before #91 reused region IDs; stop every client, move the WAL aside and restart); a missing secret with live allocations. Devices are rejudged at every rescan (every 10 s and on SIGHUP), so a refused device whose last local owner exits starts over automatically.
+
+**Identity tags.** The reserved area after the 32-byte header holds, every 256 bytes up to 2 MiB, a tag with the device UUID and its own offset. A region whose interleave members were swapped, reordered or reset keeps its header but no longer has consistent tags, and is treated as a changed layout.
+
+**Migration.** `global.meta` and the WAL keep their format, so the ledger carries over as it is. A version 6 record holds only a free list, which the ledger makes redundant, so it is treated like a missing record: a device with its header and allocations that fit is served and recorded as version 7; a device without its header starts over or is refused as in the table above. A version 6 device whose layout changed while its header survived is therefore served once at the upgrade; the identity tags written then catch later changes.
+
+**Checkpoint.** A checkpoint writes `global.meta` (tmp, fsync, rename), syncs the directory and then removes the WAL. If a crash loses the removal, the WAL is applied again onto the checkpoint that already holds it, with the same result: this resource manager never reuses a region ID, an ALLOC already in `global.meta` is skipped, and a FREE of a region not in it does nothing. The exception is a WAL in which a resource manager before #91 reused a region ID; startup then exits as above. When `global.meta` is missing at startup, an empty one is created and the WAL is kept.
+
+**Operator commands**: [`maru-rm-ctl`](../api_reference/maru_rm_ctl.md) shows why a device is not served and resolves it (`include` with `--reinit`, `--adopt` or `--restore-header`; `discard`; `release`).
+
+**Downgrade** is forward-only: an earlier resource manager exits on a version 7 record, and cannot serve a pool with allocations without a version 6 free list. To go back, stop all clients, check that `maru-rm-ctl allocations` is empty, stop the resource manager, move `pool_*.meta` aside, and start the earlier version.
+
+**Deployment assumptions** (shared with the reaper, §5): host names are unique in the cluster, and local clients and the resource manager share the host PID namespace. `rm.conf` belongs to the resource manager: do not manage it with configuration tools or restore it from a backup.
 
 ---
 
@@ -120,6 +143,8 @@ On startup, the **recovery sequence** proceeds as: (1) scan for current hardware
 The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
+
+Allocations of a pool that is not served (absent, refused or excluded device) are reclaimed only when a local owner is gone; the grace period below does not apply to them, because a remote owner cut off by the network may still be running.
 
 For **remote clients** (different hostname), the server monitors TCP connection state. When a remote client disconnects, a grace period begins (configurable via `--grace-period`, default 30 seconds). If the client reconnects within the grace period, the timer is cancelled and allocations are preserved. If not, its allocations are reclaimed.
 
@@ -143,7 +168,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 ## 7. Server Configuration
 
-The server is configured via CLI arguments. On startup, the resource manager writes host, port, and log level to `rm.conf` in the state directory (atomic tmp+rename) for reference.
+The server is configured via CLI arguments. On startup, the resource manager writes host, port, and log level to `rm.conf` in the state directory (atomic tmp+rename) for reference. The same file holds the `boot_id=` line used by recovery (§4).
 
 | Option | Default | Description |
 |--------|---------|-------------|

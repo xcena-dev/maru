@@ -13,6 +13,7 @@ import socket
 import threading
 
 from .constants import DEFAULT_ADDRESS
+from .device_scanner import read_device_uuid, scan_dax_devices
 from .ipc import (
     HEADER_SIZE,
     AllocReq,
@@ -72,7 +73,9 @@ class MaruShmClient:
         device_table: dict[str, str] | None = None,
     ):
         self._address = address or DEFAULT_ADDRESS
-        self._device_table = device_table or {}  # uuid -> local_dax_path
+        self._device_table = dict(device_table or {})  # uuid -> local_dax_path
+        # A client given a table (even an empty one) resolves devices by UUID.
+        self._resolve_by_uuid = device_table is not None
         self._path_cache: dict[int, str] = {}  # region_id -> device path
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
@@ -233,14 +236,15 @@ class MaruShmClient:
 
         handle = resp.handle
         if resp.dax_path:
-            path = resp.dax_path
-            # Client-side UUID resolution: use local device table
-            if resp.device_uuid and self._device_table:
-                local = self._device_table.get(resp.device_uuid)
-                if local:
-                    path = local
-            with self._lock:
-                self._path_cache[handle.region_id] = path
+            # The allocation stands either way: an unknown device fails at
+            # mmap time instead, where nothing is lost.
+            try:
+                path = self._resolve_device_path(resp.dax_path, resp.device_uuid)
+            except RuntimeError as exc:
+                logger.warning("alloc(region_id=%d): %s", handle.region_id, exc)
+            else:
+                with self._lock:
+                    self._path_cache[handle.region_id] = path
 
         logger.debug(
             "alloc(size=%d, dax_path=%s) -> region_id=%d path=%s",
@@ -290,6 +294,40 @@ class MaruShmClient:
         """
         return self._request_access(handle)
 
+    def _resolve_device_path(self, rm_path: str, device_uuid: str) -> str:
+        """Map the RM's device (path, UUID) to this host's device path.
+
+        The RM's path can name a different device on this host, so a client
+        built with a device table never opens it unless the UUID matches.
+
+        Raises:
+            RuntimeError: If the UUID cannot be found on this host.
+        """
+        if not device_uuid or not self._resolve_by_uuid:
+            return rm_path
+        with self._lock:
+            local = self._device_table.get(device_uuid)
+        if local:
+            return local
+
+        # Unknown UUID: the table may predate the device, so rescan once.
+        # Merge, so a device whose header read fails now keeps its entry.
+        table = dict(scan_dax_devices())
+        with self._lock:
+            self._device_table.update(table)
+        local = table.get(device_uuid)
+        if local:
+            return local
+
+        # Sysfs may be invisible (e.g. a single-host setup in a container).
+        found = read_device_uuid(rm_path)
+        if found == device_uuid:
+            return rm_path
+        raise RuntimeError(
+            f"device UUID {device_uuid} (RM path {rm_path}) not found on this "
+            f"host; header at {rm_path} has UUID {found}"
+        )
+
     def _request_access(self, handle: MaruHandle) -> GetAccessResp:
         """Request access info from the resource manager via GET_ACCESS_REQ."""
         req = GetAccessReq(handle=handle, client_id=self._client_id)
@@ -322,12 +360,9 @@ class MaruShmClient:
         # Slow path: network RPC outside lock
         if path is None:
             access_resp = self._request_access(handle)
-            path = access_resp.dax_path
-            # Client-side UUID resolution: use local device table
-            if access_resp.device_uuid and self._device_table:
-                local = self._device_table.get(access_resp.device_uuid)
-                if local:
-                    path = local
+            path = self._resolve_device_path(
+                access_resp.dax_path, access_resp.device_uuid
+            )
 
         # Create mmap and update cache
         with self._lock:

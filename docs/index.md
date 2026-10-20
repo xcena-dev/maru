@@ -147,6 +147,7 @@ SGLang HiCache <source/integration/sglang>
 Python API <source/api_reference/api>
 Configuration <source/api_reference/config>
 Handler Plugins <source/api_reference/plugins>
+Resource Manager Admin (maru-rm-ctl) <source/api_reference/maru_rm_ctl>
 ```
 
 ## Future Work

@@ -78,7 +78,22 @@ class MaruRmCtlTest(unittest.TestCase):
             (["allocations", "/dev/dax2.0"], "allocations dax2.0\n"),
             (["exclude", "/dev/dax2.0"], "exclude dax2.0\n"),
             (["include", "dax2.0", "--reinit"], "include dax2.0 --reinit\n"),
+            (["include", "dax2.0", "--adopt"], "include dax2.0 --adopt\n"),
+            (
+                ["include", "dax2.0", "--restore-header"],
+                "include dax2.0 --restore-header\n",
+            ),
+            (["discard", "/dev/dax2.0"], "discard dax2.0\n"),
+            (["discard", "dax2.0", "--confirm"], "discard dax2.0 --confirm\n"),
+            (
+                ["discard", "dax2.0", "--confirm", "--force"],
+                "discard dax2.0 --confirm --force\n",
+            ),
             (["release", "42"], "release 42\n"),
+            (
+                ["release", "42", "--confirm", "--force"],
+                "release 42 --confirm --force\n",
+            ),
             (["release", "42", "--confirm"], "release 42 --confirm\n"),
             (["wipe", "/dev/dax2.0"], "wipe dax2.0\n"),
             (["wipe", "dax2.0", "--confirm"], "wipe dax2.0 --confirm\n"),
@@ -131,7 +146,15 @@ class MaruRmCtlTest(unittest.TestCase):
         self.assertIn("may still complete", err.getvalue())
 
     def test_bad_arguments_never_reach_the_rm(self):
-        for argv in (["exclude", "sda"], ["release", "-1"], ["include"], ["wipe"]):
+        for argv in (
+            ["exclude", "sda"],
+            ["release", "-1"],
+            ["include"],
+            ["wipe"],
+            ["discard", "dax2.0", "--force"],
+            ["release", "42", "--force"],
+            ["include", "dax2.0", "--adopt", "--reinit"],
+        ):
             with (
                 self.assertRaises(SystemExit),
                 contextlib.redirect_stderr(io.StringIO()),

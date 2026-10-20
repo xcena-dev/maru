@@ -1,17 +1,63 @@
 #include "server_config.h"
 
+#include "util.h"
+
+#include <fcntl.h>
 #include <getopt.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 namespace maru {
+
+static constexpr const char *kBootMarkerKey = "boot_id=";
+
+std::string readBootMarker(const std::string &stateDir) {
+    std::ifstream in(stateDir + "/rm.conf");
+    std::string line, marker;
+    while (std::getline(in, line))
+        if (line.rfind(kBootMarkerKey, 0) == 0) marker = line.substr(std::strlen(kBootMarkerKey));
+    return marker;
+}
+
+int writeBootMarker(const std::string &stateDir, const std::string &bootId) {
+    const std::string path = stateDir + "/rm.conf";
+    std::string content;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line))
+            if (line.rfind(kBootMarkerKey, 0) != 0) content += line + "\n";
+    }
+    if (!bootId.empty()) content += kBootMarkerKey + bootId + "\n";
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) return -errno;
+    int rc = writeFull(fd, content.data(), content.size());
+    if (rc == 0 && ::fsync(fd) != 0) rc = -errno;
+    ::close(fd);
+    if (rc == 0 && ::rename(tmp.c_str(), path.c_str()) != 0) rc = -errno;
+    if (rc != 0) {
+        ::unlink(tmp.c_str());
+        return rc;
+    }
+    // The new marker is in effect. If a power loss undoes the rename, the
+    // next start is in a new boot, where the older marker is right anyway.
+    if ((rc = syncDirectory(stateDir)) != 0)
+        logf(LogLevel::Warn, "cannot sync %s after updating rm.conf: %s", stateDir.c_str(),
+             std::strerror(-rc));
+    return 0;
+}
 
 void writeConfigFile(const ServerConfig &cfg) {
     std::string confPath = cfg.stateDir + "/rm.conf";
     std::string tmpPath = confPath + ".tmp";
+    // Kept until recovery has used it (pool_recovery.cpp, boot marker).
+    const std::string bootMarker = readBootMarker(cfg.stateDir);
 
     FILE *fp = std::fopen(tmpPath.c_str(), "w");
     if (!fp) {
@@ -23,6 +69,7 @@ void writeConfigFile(const ServerConfig &cfg) {
     std::fprintf(fp, "host=%s\n", cfg.host.c_str());
     std::fprintf(fp, "port=%u\n", cfg.port);
     std::fprintf(fp, "log_level=%s\n", logLevelStr(cfg.logLevel));
+    if (!bootMarker.empty()) std::fprintf(fp, "%s%s\n", kBootMarkerKey, bootMarker.c_str());
     bool writeOk = (std::ferror(fp) == 0);
     std::fclose(fp);
 

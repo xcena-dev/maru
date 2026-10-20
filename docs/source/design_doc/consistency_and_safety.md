@@ -115,20 +115,15 @@ sequenceDiagram
     Note over RM: Resource Manager restart detected
 
     rect rgb(240, 248, 255)
-        RM->>RM: Load last checkpoint (free lists + allocation map)
+        RM->>RM: Load last checkpoint (allocation map)
         RM->>RM: Replay WAL entries since checkpoint
-        RM->>RM: Recompute free sizes from reconstituted state
+        RM->>RM: Derive each pool's free list from its device and allocations
         RM->>RM: Verify CRC32 integrity on all metadata
         Note over RM: Resource Manager ready
     end
 ```
 
-**Resource Manager** persists every allocation and free operation to a
-write-ahead log (WAL) before modifying in-memory state. Every 100 operations,
-a checkpoint is taken: free lists and the global allocation map are saved with
-CRC32 integrity verification. On restart, the last checkpoint is loaded and
-any subsequent WAL entries are replayed, fully reconstructing the allocation
-state.
+**Resource Manager** persists every allocation and free operation to a write-ahead log (WAL) before modifying in-memory state. Every 100 operations, a checkpoint is taken: the global allocation map of every pool, served or not, is saved with CRC32 integrity verification. On restart, the last checkpoint is loaded and any subsequent WAL entries are replayed, fully reconstructing the allocation state; each pool's free list is its device's data range minus its allocations. See the Resource Manager design document, §4, for how each device is then judged.
 
 ### 3.2 Client Crash Recovery
 
