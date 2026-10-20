@@ -1096,7 +1096,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
         On False the slots are back in the staging buffer, or isolated if a
         READ may still land in them. Errors end in False; only an interrupt
-        raises, and then the slots stay taken. Runs without the client lock;
+        raises, and then the slots stay taken if NIXL had created the
+        transfer, and go back otherwise. Runs without the client lock;
         the server lease keeps the keys (and so their pages) from being
         evicted until the read is over.
         """
