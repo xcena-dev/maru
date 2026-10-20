@@ -3,6 +3,7 @@
 copy kernel over the staging buffer (design note 3.11)."""
 
 import contextlib
+import itertools
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -177,16 +178,38 @@ def test_the_loader_thread_takes_the_batched_path_on_its_own_stream(monkeypatch)
 
 
 class _FakeStream:
-    def __init__(self, log=None, name="load", fail_sync=False):
+    def __init__(self, log=None, name="load", fail_sync=False, done=False):
         self.log = [] if log is None else log
         self.name = name
         self.fail_sync = fail_sync
+        self.done = done
 
     def wait_stream(self, other):
         self.log.append(f"{self.name} waits")
 
     def synchronize(self):
         self.log.append(f"{self.name} sync")
+        if self.fail_sync:
+            raise RuntimeError("CUDA error")
+
+    def record_event(self):
+        return _FakeEvent(self.log, self.name, self.fail_sync, self.done)
+
+
+class _FakeEvent:
+    """A CUDA event of a fake stream: its copies have ended once waited for,
+    or already when ``done``; ``fail_sync`` makes asking about them fail."""
+
+    def __init__(self, log, name, fail_sync=False, done=False):
+        self.log, self.name, self.fail_sync, self.done = log, name, fail_sync, done
+
+    def query(self):
+        if self.fail_sync:
+            raise RuntimeError("CUDA error")
+        return self.done
+
+    def synchronize(self):
+        self.log.append(f"{self.name} event sync")
         if self.fail_sync:
             raise RuntimeError("CUDA error")
 
@@ -253,7 +276,183 @@ def test_an_offthread_batch_does_not_wait_for_the_compute_stream(monkeypatch):
         [("layer", cache, 0)], meta, worker._last_attn_metadata, stream=own
     )
     assert "load waits" not in log and "loader waits" not in log
-    assert log[-2:] == ["loader sync", "release 3"]
+    assert log[-2:] == ["loader event sync", "release 3"]
+
+
+def _pipelined(
+    monkeypatch,
+    log,
+    stream_fails=False,
+    missing=None,
+    chunks=1,
+    slots=None,
+    done=False,
+    deferred=False,
+    setup=None,
+):
+    """A loader-thread load of 3 chunks, read ``chunks`` chunks per batch.
+
+    ``missing`` is the index of a chunk the pool no longer has, ``slots`` the
+    staging slots of the handler (the load's own batches take them), ``done``
+    whether a batch's copies have ended as soon as they are queued, and
+    ``setup(worker, ops, stream)`` may change the worker before the load.
+    """
+    import maru_vllm.connector as connector
+
+    monkeypatch.setattr(connector, "_LOAD_PIPELINE_CHUNKS", chunks)
+    worker, cache, meta, ops = _kernel_worker(monkeypatch, log)
+    meta.deferred_load = deferred
+    keys = _req_chunk_keys(meta, 8)
+    held = [0]
+
+    def retrieve(requested, route_key=None):
+        log.append(f"read {keys.index(requested[0])}")
+        held[0] += len(requested)
+        return [
+            None if keys.index(k) == missing else _view(_slab(keys.index(k)))
+            for k in requested
+        ]
+
+    def release(infos):
+        held[0] -= len(infos)
+        log.append(f"release {len(infos)}")
+        if deferred:
+            log.append(f"done {'load' in worker._deferred_done}")
+
+    worker._handler.release_retrieved.side_effect = release
+    if slots is not None:
+        worker._handler.retrieve_capacity.side_effect = lambda: slots - held[0]
+    worker._batch_retrieve_all = retrieve
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    own = _FakeStream(log, "loader", fail_sync=stream_fails, done=done)
+    if setup is not None:
+        setup(worker, ops, own)
+    worker._load_leased_request(
+        [("layer", cache, 0)], meta, worker._last_attn_metadata, stream=own
+    )
+    return worker, keys
+
+
+def _fail_copy(at, then=None):
+    """Make the copy of chunk ``at`` raise, after calling ``then(stream)``."""
+
+    def setup(worker, ops, stream):
+        calls = []
+
+        def kernel(*a, **k):
+            calls.append(1)
+            if len(calls) == at + 1:
+                if then is not None:
+                    then(stream)
+                raise RuntimeError("copy failed")
+            stream.log.append("kernel")
+
+        ops.multi_layer_kv_transfer.side_effect = kernel
+
+    return setup
+
+
+def test_a_loader_thread_reads_the_next_batch_while_copies_run(monkeypatch):
+    # The copy of a request no longer waits for its whole READ.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log)
+    assert log.index("read 1") < log.index("loader event sync")
+    assert log.index("read 2") < log.index("loader event sync")
+    assert log.count("kernel") == 3 and log.count("release 1") == 3
+    assert "loader sync" not in log  # each batch waits on its own event
+    assert not worker.take_failed_load_blocks()
+
+
+def test_a_pipelined_miss_fails_from_its_batch_after_the_earlier_copies(monkeypatch):
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, missing=1)
+    assert "read 2" not in log
+    # The miss batch goes back at once, chunk 0 once its copies ended.
+    assert log.count("release 1") == 2 and "loader event sync" in log
+    assert worker.take_failed_load_blocks() == {2, 3, 4, 5}
+
+
+def test_unconfirmed_pipelined_copies_keep_their_slots(monkeypatch):
+    # Waiting on a batch's event failed: its copies may still read the slots,
+    # and the request is recomputed from that batch.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True)
+    assert "release 1" not in log
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+
+
+def test_a_short_staging_waits_for_the_oldest_batch(monkeypatch):
+    # Two slots and batches of two: the third chunk waits for the first
+    # batch's copies instead of finding no slot and recomputing.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, chunks=2, slots=2)
+    assert log.index("loader event sync") < log.index("release 2") < log.index("read 2")
+    assert log.count("kernel") == 3
+    assert not worker.take_failed_load_blocks()
+
+
+def test_batches_whose_copies_ended_go_back_before_the_next_read(monkeypatch):
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, done=True)
+    assert log.index("release 1") < log.index("read 1")
+    assert log.count("release 1") == 3
+    assert not worker.take_failed_load_blocks()
+
+
+def test_a_deferred_load_is_done_only_after_its_last_batch(monkeypatch):
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, deferred=True)
+    assert log.count("release 1") == 3 and "done True" not in log
+    assert worker._deferred_done == {"load"}
+    assert not worker.take_failed_load_blocks()
+
+
+def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
+    # The stream drained: every batch goes back, and chunk 2 is recomputed.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2))
+    assert log.count("release 1") == 3
+    assert worker.take_failed_load_blocks() == {4, 5}
+
+
+def test_an_undrained_failed_copy_keeps_every_unconfirmed_slot(monkeypatch):
+    # The stream could not be drained: no batch is known to be done, so all
+    # keep their slots and the request is recomputed from its first batch.
+    def stuck(stream):
+        stream.fail_sync = True
+
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2, then=stuck))
+    assert "release 1" not in log
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+
+
+def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):
+    def stuck(worker, ops, stream):
+        stream.fail_sync = True
+
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=stuck)
+    assert log == ["read 0", "kernel"]
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+
+
+def test_an_event_that_cannot_be_recorded_drains_and_releases(monkeypatch):
+    def no_event(worker, ops, stream):
+        events = []
+
+        def record():
+            events.append(1)
+            if len(events) == 2:
+                raise RuntimeError("no event")
+            return _FakeEvent(stream.log, stream.name)
+
+        stream.record_event = record
+
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=no_event)
+    assert log.count("release 1") == 2 and "read 2" not in log
+    assert worker.take_failed_load_blocks() == {2, 3, 4, 5}
 
 
 def test_a_loader_thread_uploads_the_pointer_table_once(monkeypatch):
@@ -302,7 +501,9 @@ def test_slots_stay_taken_if_queued_copies_cannot_be_waited_for(monkeypatch):
 
 def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
     worker, cache = _worker(0)
-    capacities = iter([0, 0, 3])
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(worker, "_pin_slot_mapping_for_async_h2d", lambda m: m)
+    capacities = itertools.chain([0, 0], itertools.repeat(3))
     worker._handler.retrieve_capacity.side_effect = lambda: next(capacities)
     meta = _load_meta(deferred_load=True)
     worker._batch_retrieve_all = lambda req, route_key=None: [
