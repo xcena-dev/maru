@@ -179,13 +179,13 @@ moves: mapping a region. One-sided RDMA reaches only memory that a process on
 the target node has mapped and registered with that node's NIC, and a node
 without CXL cannot map the region itself. A **remote CXL agent** on every memory
 node is that process: it maps the regions Handlers ask for and registers them
-with the node's NIC, as DaxMapper maps them inside a Handler on a CXL-attached
-node, and returns each region's address and NIC key. The Handler then reads and
+with the node's NIC (the job DaxMapper does inside a Handler on a CXL-attached
+node), and returns each region's address and remote key. The Handler then reads and
 writes a region with one-sided RDMA between its staging buffer and the region,
 and the bytes go from NIC to NIC without passing through a process on the
 memory node.
 
-![The nodes of a remote_cxl deployment. GPU worker nodes, outside the pool, run vLLM with MaruKVConnector and MaruHandler (remote_cxl backend) and have a NIC. The metadata node runs maru-server, one per app and pool, which the Handler reaches with the storage session RPC for regions and keys. The memory nodes form the RDMA memory pool: one of them runs the resource-manager, which MaruServer asks to allocate and free regions, and every one runs a remote CXL agent. The agent's RegionMapService answers the Handler's map request with region R's address and NIC key, checks R's handle with the resource manager, maps R from the CXL memory and registers it with the memory node's NIC. KV bytes go from the Handler through the worker's NIC to the memory node's NIC with one-sided RDMA READ and WRITE, and from there into region R.](../image/remote_cxl_overview.png)
+![The nodes of a remote_cxl deployment. GPU worker nodes without CXL, outside the pool, run vLLM with MaruKVConnector and MaruHandler (remote_cxl backend) and have a NIC. The metadata node runs maru-server, one per app per pool, which the Handler reaches with the storage session RPC for regions and keys. The memory nodes form the RDMA memory pool: one of them runs the resource-manager, which MaruServer asks to allocate and free regions, and every one runs a remote CXL agent. The agent's RegionMapService answers the Handler's map request with region R's address and remote key, checks R's handle with the resource manager, maps R from the CXL memory and registers it with the memory node's NIC. KV bytes go from the Handler through the worker's NIC to the memory node's NIC with one-sided RDMA READ and WRITE, and from there into region R.](../image/remote_cxl_overview.png)
 
 ![The cxl backend and the remote_cxl backend take the same steps: the Resource Manager gives region R to MaruServer, MaruServer gives R's handle to the Handler, R is mapped after a GET_ACCESS check, and KV moves. With the cxl backend the Handler maps R itself; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
 
@@ -204,7 +204,7 @@ How the properties above carry over:
 
   ![Who can map a region. (a) cxl backend: a process on a host attached to the CXL device whose user may open the DAX device file maps R; a process of another user is refused, and a host off the device has no device. (b) remote_cxl backend: a process on a host of the RDMA network that can read the key file proves the key to the remote CXL agent and maps R, then reads and writes it by RDMA; a process without the key is refused, and a host off the RDMA network cannot reach the remote CXL agent](../image/remote_cxl_who_maps.png)
 - **Region lifetime.** A region goes back to the Resource Manager only after
-  its remote CXL agent deregistered it from the NIC, so an RDMA WRITE of the old
+  its remote CXL agent has deregistered it from the NIC, so an RDMA WRITE of the old
   owner that is still in flight fails at the NIC instead of landing in the
   next owner's KV. When a worker leaves, MaruServer keeps its regions that hold
   keys, as it keeps a cxl Handler's regions while keys refer to them, and gives
