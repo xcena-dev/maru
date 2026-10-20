@@ -309,10 +309,33 @@ its remote CXL agent deregistered it from the NIC (`release`):
 - If MaruServer restarted, nobody takes the regions over, so the Handler
   releases them itself.
 
-**Staging slots.** Loads and stores share the staging buffer. With
-asynchronous transfers, stores leave a share of the slots free for loads:
+**Regions the Resource Manager reclaims on its own.** When maru-server dies
+or loses its Resource Manager connection, the Resource Manager reclaims its
+regions after a grace period without asking the remote CXL agent, and may
+give the same range to a new owner. The remote CXL agent keeps its
+registrations in step with the Resource Manager. Before it registers a
+region, it asks the Resource Manager about every region it holds on an
+overlapping range and releases those the Resource Manager no longer knows;
+it refuses the map if it cannot ask. Once a second it asks about all its
+mappings and releases the reclaimed ones. A late WRITE through the old
+registration then fails at the NIC before the new owner's region is
+registered:
 
-![Staging slots with asynchronous transfers: stores leave half of the slots, by count, free for loads. A load batch fills the free load slots by RDMA READ from the region that holds its keys and goes back after its GPU copy; a store copies from the GPU and WRITEs to the worker's own region](../image/remote_cxl_staging_slots.png)
+![A region the Resource Manager reclaimed after its maru-server died. Worker A kept region A's address and NIC key; worker B maps region B on the same range and stores NEW! in page p; then A sends a late WRITE through region A's old registration. (a) With no check before mapping, both registrations cover page p and the late WRITE overwrites it, so B reads LATE. (b) The remote CXL agent asks the Resource Manager about region A before it maps region B and releases it first, so the late WRITE fails at the NIC and B reads NEW!](../image/remote_cxl_rm_reclaim.png)
+
+A new owner that uses the range without this agent (a cxl Handler on the
+memory node) can still receive such a WRITE until the next check: about one
+second while the agent can reach the Resource Manager.
+
+**Staging slots.** Loads and stores share the staging buffer. With
+asynchronous transfers (the default on this backend), stores leave a share of
+the slots free for loads. The loader thread reads 8 chunks at a time and
+reads the next batch while the previous batch's GPU copies run; a batch's
+slots go back once its copies have ended. A store takes only a slot on vLLM's
+engine thread; the write-behind thread gives each chunk its page and WRITEs
+it:
+
+![Staging slots with asynchronous transfers: stores leave half of the slots, by count, free for loads. The loader thread reads batch b+1 by RDMA READ while batch b's GPU copy runs, and a batch's slots go back after its copy; the engine thread queues a store's copy from the GPU into its slot, and the write-behind thread gives the chunk its page and WRITEs it to the worker's own region](../image/remote_cxl_staging_slots.png)
 
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),
