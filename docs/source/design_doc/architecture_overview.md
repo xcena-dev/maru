@@ -175,10 +175,17 @@ KV cache stays in the CXL memory of *memory nodes* and moves over RDMA. The
 three layers and the resource flow stay as above: the Resource Manager gives
 regions to MaruServer, and MaruServer gives them to each MaruHandler, one when
 its storage session opens and one more whenever its regions are full. One step
-moves: mapping a region. A **remote CXL agent** on every memory node maps the
-regions Handlers ask for and registers them with the node's NIC, as DaxMapper
-maps them inside a Handler on a CXL-attached node. The Handler then reads and
-writes a region with one-sided RDMA between its staging buffer and the region.
+moves: mapping a region. One-sided RDMA reaches only memory that a process on
+the target node has mapped and registered with that node's NIC, and a node
+without CXL cannot map the region itself. A **remote CXL agent** on every memory
+node is that process: it maps the regions Handlers ask for and registers them
+with the node's NIC, as DaxMapper maps them inside a Handler on a CXL-attached
+node, and returns each region's address and NIC key. The Handler then reads and
+writes a region with one-sided RDMA between its staging buffer and the region,
+and the bytes go from NIC to NIC without passing through a process on the
+memory node.
+
+![The nodes of a remote_cxl deployment. GPU worker nodes, outside the pool, run vLLM with MaruKVConnector and MaruHandler (remote_cxl backend) and have a NIC. The metadata node runs maru-server, one per app and pool, which the Handler reaches with the storage session RPC for regions and keys. The memory nodes form the RDMA memory pool: one of them runs the resource-manager, which MaruServer asks to allocate and free regions, and every one runs a remote CXL agent. The agent's RegionMapService answers the Handler's map request with region R's address and NIC key, checks R's handle with the resource manager, maps R from the CXL memory and registers it with the memory node's NIC. KV bytes go from the Handler through the worker's NIC to the memory node's NIC with one-sided RDMA READ and WRITE, and from there into region R.](../image/remote_cxl_overview.png)
 
 ![The cxl backend and the remote_cxl backend take the same steps: the Resource Manager gives region R to MaruServer, MaruServer gives R's handle to the Handler, R is mapped after a GET_ACCESS check, and KV moves. With the cxl backend the Handler maps R itself; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
 
