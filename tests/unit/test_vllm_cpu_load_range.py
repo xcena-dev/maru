@@ -98,6 +98,8 @@ def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
             )
         ],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        # vLLM always fills this; the step computes the held-back block.
+        num_scheduled_tokens={"load": 4},
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )
