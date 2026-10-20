@@ -8,7 +8,7 @@ Maru consists of two server components and a client library. A deployment with G
 
 | Component | Role | Package |
 |-----------|------|---------|
-| **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
+| **Resource Manager** | Manages the CXL memory of a memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
 | **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "maru"
 version = "0.1.0"
-description = "Maru - A high-performance KV cache manager for CXL shared memory"
+description = "Maru - A high-performance KV cache manager on CXL and RDMA memory pools"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
