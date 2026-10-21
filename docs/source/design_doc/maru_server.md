@@ -153,7 +153,7 @@ the handshake.
 
 **Regions of a worker that left.** When a session closes drained or expires,
 MaruServer takes its regions over. A region that holds keys is *kept*: its
-keys are still found, and the `RegionKeeper` thread holds its mapping at the
+keys are still found, and the `RegionKeeper` thread keeps its mapping at the
 remote CXL agent so readers keep reading. A region without keys goes back. The
 keeper releases a region at its remote CXL agent before MaruServer frees it at
 the Resource Manager, so a late RDMA WRITE fails at the NIC. A kept region goes
