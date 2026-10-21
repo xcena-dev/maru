@@ -299,7 +299,9 @@ class RegionMapService:
         ranges = message.get("ranges", [])
         if not isinstance(ranges, list) or len(ranges) > _MAX_EXTENSION_RANGES:
             raise ValueError("ranges must be a list of at most 4096 maps")
-        write = message.get("write") is True
+        write = message.get("write", False)
+        if type(write) is not bool:
+            raise ValueError("write must be true or false")
         with self._lock:
             for r in ranges:
                 if not isinstance(r, dict):

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -16,6 +17,8 @@ from maru_common.storage_types import StorageLocation, StorageUnavailableError
 logger = logging.getLogger(__name__)
 
 REMOTE_CXL = "remote_cxl"
+# How often the access policy is asked about pages given back
+REUSE_POLL_S = 0.01
 
 
 @dataclass(eq=False)
@@ -90,6 +93,8 @@ class RemoteCxlRegion:
         # (``AccessPolicy.reusable``); pages it holds wait in _waiting_reuse.
         self.reuse_guard: Callable[[StorageLocation], bool] | None = None
         self._waiting_reuse: list[StorageLocation] = []
+        self._reuse_asked_at = float("-inf")
+        self._reuse_warned = False
 
     def free_count(self) -> int:
         """Free pages a store can take now (none while the region is unusable)."""
@@ -120,7 +125,8 @@ class RemoteCxlRegion:
                 )
             if type(size) is not int or not 0 < size <= self.page_size:
                 raise ValueError("Remote CXL allocation must fit in one page")
-            self._reap_reusable()
+            # Out of pages: ask now rather than wait for the next interval.
+            self._reap_reusable(force=not self._free)
             if not self._free:
                 raise MemoryError("Remote CXL region is full")
             page = self._free.popleft()
@@ -167,21 +173,27 @@ class RemoteCxlRegion:
                 return
             self._free.append(location.offset // self.page_size)
 
-    def _reap_reusable(self) -> None:
+    def _reap_reusable(self, force: bool = False) -> None:
         """Free the pages given back that the access policy lets go now.
 
+        The policy is asked at most every ``REUSE_POLL_S`` unless ``force``.
         A page the policy does not answer for (it raised) stays waiting.
         """
         if not self._waiting_reuse:
             return
+        now = time.monotonic()
+        if not force and now - self._reuse_asked_at < REUSE_POLL_S:
+            return
+        self._reuse_asked_at = now
         waiting = []
         for location in self._waiting_reuse:
             try:
                 ready = bool(self.reuse_guard(location))
-            except Exception:
-                logger.warning(
-                    "access policy could not answer for a page", exc_info=True
-                )
+                self._reuse_warned = False
+            except Exception as exc:
+                if not self._reuse_warned:
+                    logger.warning("access policy could not answer for a page: %s", exc)
+                    self._reuse_warned = True
                 ready = False
             if ready:
                 self._free.append(location.offset // self.page_size)

@@ -17,7 +17,14 @@ from maru_handler.storage.access_policy import (
 from maru_remote.region_map import read_handle
 from maru_remote_cxl_agent.extension import RegionExtension, load_region_extension
 from maru_remote_cxl_agent.service import MapDenied, NotMapped
-from tests.unit.test_remote_cxl_storage import PAGE, World, put, read
+from tests.unit.test_remote_cxl_storage import (
+    PAGE,
+    World,
+    only_region,
+    put,
+    read,
+    worker_agent,
+)
 
 
 class FakeExtension:
@@ -65,6 +72,12 @@ class FakePolicy:
         if "disorder" in self.fail:
             transfer(1, len(ranges))
             return
+        if "retry" in self.fail:
+            try:
+                transfer(0, 1)
+            except Exception:
+                transfer(0, 1)  # must raise: a READ may still land
+            return
         stop = len(ranges) - (1 if "short" in self.fail else 0)
         for i in range(0, stop, self.step):
             transfer(i, min(i + self.step, stop))
@@ -84,6 +97,8 @@ class FakePolicy:
         self.calls.append(("written", token))
 
     def completed_write(self, locations):
+        if "late" in self.fail:
+            raise RuntimeError("cannot take it yet")
         self.calls.append(("late", len(locations)))
 
     def reusable(self, location):
@@ -97,6 +112,13 @@ class _EntryPoint:
 
     def load(self):
         return self._target
+
+
+@pytest.fixture(autouse=True)
+def _ask_reuse_every_time(monkeypatch):
+    import maru_handler.storage.remote_cxl.region as region_module
+
+    monkeypatch.setattr(region_module, "REUSE_POLL_S", 0.0)
 
 
 @pytest.fixture
@@ -277,3 +299,55 @@ def test_closing_the_agent_closes_the_extension(setup):
     ext.hold = True
     w.node.service.close(extension_drain_s=0.05)
     assert ext.closed
+
+
+def test_a_failed_transfer_cannot_be_retried_into_the_same_slots(setup):
+    w, ext, policy = setup
+    c = w.client("a", access_policy="fake")
+    assert put(c, "k", b"x" * PAGE)[0]
+    calls = []
+
+    def broken(peer, pairs, **kwargs):
+        calls.append(len(pairs))
+        raise RuntimeError("NIC error")
+
+    c._transport.read = broken
+    policy.fail.add("retry")
+    assert read(c, ["k"]) == [None]
+    assert calls == [1]  # the second transfer never reached the transport
+
+
+def test_a_policy_without_an_agent_extension_stores_and_loads_nothing(monkeypatch):
+    w = World()  # the agent has no region extension
+    policy = FakePolicy()
+    monkeypatch.setattr(client_module, "load_access_policy", lambda n, c: policy)
+    try:
+        c = w.client("a", access_policy="fake")
+        assert put(c, "k", b"x" * PAGE)[0] is False
+        assert not any(x[0] == "prepare" for x in policy.calls)
+    finally:
+        w.close()
+
+
+def test_a_late_write_returns_its_slot_and_its_page_waits_for_the_policy(setup):
+    w, ext, policy = setup
+    c = w.client("a", pages=2, rdma_timeout_s=0.01, access_policy="fake")
+    agent = worker_agent("a")
+    agent.stall = True
+    handle = c.alloc(4)
+    handle.buf[:4] = b"late"
+    assert c.batch_store(["k"], [handle]) == [False]
+    region = only_region(c)
+    free_slots = c._staging.free_count()
+    policy.fail.add("late")
+    agent.stall = False
+    agent.finish_stalled()
+    c._reap_isolated()
+    # The NIXL transfer ended: the slot is back, the page waits for the policy.
+    assert c._staging.free_count() == free_slots + 1
+    assert not c.has_unconfirmed_transfers()
+    assert region.usage()["quarantined_bytes"] == PAGE
+    policy.fail.discard("late")
+    c._reap_isolated()
+    assert ("late", 1) in policy.calls
+    assert region.usage() == {"allocated_bytes": 0, "quarantined_bytes": 0}

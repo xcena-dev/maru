@@ -163,6 +163,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # lease while the session lives, and a leased key cannot be evicted
         self._unreleased: list[str] = []
         self._isolated: list[IsolatedTransfer] = []
+        self._late_pages: list[tuple[RemoteCxlRegion, list[StorageLocation]]] = []
         self._staging_warned = False
         # RDMA transfers run without the lock; close waits for them to end.
         self._transfers = 0
@@ -1371,9 +1372,15 @@ class RemoteCxlStorageClient(RegionLifecycle):
             BaseException: what the policy or the transport raised.
         """
         cursor = 0
+        done = False
 
         def transfer(start: int, end: int) -> None:
             nonlocal cursor
+            if failure:
+                # A READ may still land in the slots: no further READ into them.
+                raise failure[0]
+            if done:
+                raise RuntimeError("the read already returned; its slots are gone")
             if start != cursor or not start < end <= len(pairs):
                 raise ValueError(
                     f"access policy read ranges[{start}:{end}] after {cursor}"
@@ -1387,7 +1394,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 raise
             cursor = end
 
-        self._policy.read(_RegionChannel(self._data, access), ranges, transfer)
+        try:
+            self._policy.read(_RegionChannel(self._data, access), ranges, transfer)
+        finally:
+            done = True
         if failure:
             raise failure[0]
         if cursor != len(pairs):

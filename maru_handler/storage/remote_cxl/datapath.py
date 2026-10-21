@@ -213,6 +213,13 @@ class RdmaDataPath:
             raise StorageUnavailableError(
                 "the connection that mapped the region changed"
             )
+        if not client.region_extension:
+            # The worker has an access policy and the agent nothing to answer
+            # it: a configuration error, not a passing outage.
+            raise StorageError(
+                f"remote CXL agent {access.agent} has no region extension for "
+                "this worker's access policy"
+            )
         try:
             reply = client.extension({**message, "epoch": client.epoch})
         except RegionMapUnavailable as exc:

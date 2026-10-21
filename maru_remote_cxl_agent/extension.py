@@ -18,9 +18,16 @@ half of a worker's access policy (``maru_handler.storage.access_policy``):
   handle does not prepare a write.
 
 The agent owns mapping, NIC registration and the checks above; the extension
-owns whatever it does to the memory of those regions. Its hooks run under the
-agent's lock and must return promptly: work that waits on hardware belongs on
-the extension's own threads.
+owns whatever it does to the memory of those regions.
+
+Threads and locks: ``request`` and ``retire`` run under the agent's lock, so
+every other request of every worker waits for them; they must return
+promptly, and work that waits on hardware belongs on the extension's own
+threads. ``validate_access`` and ``mapped`` run on the threads that map
+regions, possibly several at once. The extension must be thread-safe.
+
+``retire`` may be asked about a region ``mapped`` never saw (its mapping
+failed half way); the extension answers True for a region it does not know.
 """
 
 from __future__ import annotations

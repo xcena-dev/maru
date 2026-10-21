@@ -24,8 +24,12 @@ What Maru owns and what the policy owns:
   message belongs to a region the sending connection holds before the
   counterpart sees it.
 
-Every hook may block; the storage backend calls it without its lock held. A
-hook that raises makes the operation take an outcome Maru already has:
+Locks: ``read``, ``write_batch_limit``, ``prepare_write`` and ``written`` run
+without the backend's locks and may block (a policy bounds its own waits).
+``reusable`` and ``completed_write`` run while the backend holds its locks:
+they must answer promptly, and a policy that cannot tell yet answers False
+or raises and is asked again later. A hook that raises makes the operation
+take an outcome Maru already has:
 
 =====================  ===================================================
 hook raises             outcome
@@ -119,8 +123,10 @@ class AccessPolicy(Protocol):
 
         ``transfer(start, end)`` reads ``ranges[start:end]``. The policy must
         call it in order, with each ``start`` equal to the previous ``end``,
-        until every range is read; it decides only when each call happens.
-        An exception ``transfer`` raises must propagate.
+        until every range is read, and only on the calling thread before
+        ``read`` returns; it decides only when each call happens. Once a
+        transfer raised, every later call raises too, and the exception
+        should propagate.
         """
         ...
 
@@ -131,7 +137,12 @@ class AccessPolicy(Protocol):
     def prepare_write(
         self, channel: AccessChannel, ranges: Sequence[AccessRange]
     ) -> Any:
-        """Make ``ranges`` ready to be written; return a token for :meth:`written`."""
+        """Make ``ranges`` ready to be written; return a token for :meth:`written`.
+
+        A prepared page whose WRITE never reports :meth:`written` (it failed,
+        or its region went back) is next seen through :meth:`reusable`; the
+        policy ends the preparation there.
+        """
         ...
 
     def written(self, channel: AccessChannel, token: Any) -> None:

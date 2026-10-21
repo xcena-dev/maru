@@ -373,6 +373,8 @@ class RegionMapClient:
         self.node = ""
         self.boot = ""
         self.generation = 0
+        # Whether the agent has a region extension (from its hello)
+        self.region_extension = False
 
     def hello(self) -> dict:
         """Connect if needed and return the remote CXL agent's identity.
@@ -526,6 +528,7 @@ class RegionMapClient:
         self.epoch = str(reply["epoch"])
         self.node = str(reply["node"])
         self.boot = boot
+        self.region_extension = reply.get("region_extension") is True
 
     def _authenticate(self, nonce: Any) -> None:
         """Prove the key to the remote CXL agent and check its proof.
