@@ -294,6 +294,19 @@ def build_parser() -> argparse.ArgumentParser:
         "released it",
     )
     parser.add_argument(
+        "--region-extension",
+        default="",
+        help="Name of a region extension an installed package registers under "
+        "the maru.region_extensions entry point (e.g. a device's access "
+        "policy counterpart). Default: none",
+    )
+    parser.add_argument(
+        "--region-extension-config",
+        default="",
+        help="Opaque string passed to the region extension, typically the path "
+        "of its own configuration file",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -375,6 +388,15 @@ def main(argv: list[str] | None = None) -> int:
     from maru_shm import MaruShmClient
 
     epoch = uuid.uuid4().hex
+    extension = None
+    if args.region_extension:
+        from .extension import load_region_extension
+
+        extension = load_region_extension(
+            args.region_extension, epoch, args.region_extension_config
+        )
+    elif args.region_extension_config:
+        build_parser().error("--region-extension-config needs --region-extension")
     transport = NixlTransport(
         f"maru-remote-cxl-agent-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
     )
@@ -386,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         node_id=args.node_id,
         epoch=epoch,
         boot_id=boot_id,
+        extension=extension,
     )
     server = RegionMapServer(service, host, args.port, key)
 

@@ -375,6 +375,8 @@ _RDMA_KNOBS = (
     "maru_rdma_staging_size",
     "maru_rdma_timeout_s",
     "maru_remote_cxl_agent_key_file",
+    "maru_access_policy",
+    "maru_access_policy_config",
 )
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
 _MIN_RDMA_STAGING = 1024**3
@@ -733,6 +735,14 @@ def _create_maru_handler(
         rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30.0)),
         remote_cxl_agent_key_file=extra_config.get(
             "maru_remote_cxl_agent_key_file", "~/.maru/remote-cxl-agent.key"
+        ),
+        # A device package's access policy runs where the bytes move: the
+        # worker, not the metadata-only scheduler.
+        access_policy=(
+            "" if metadata_only else extra_config.get("maru_access_policy", "")
+        ),
+        access_policy_config=(
+            "" if metadata_only else extra_config.get("maru_access_policy_config", "")
         ),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE

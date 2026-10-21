@@ -455,6 +455,25 @@ class RegionMapClient:
         with self._lock:
             self._send({"op": "release", "handle": dict(handle)})
 
+    def extension(self, message: dict) -> dict:
+        """Send an access policy's message to the remote CXL agent's extension.
+
+        Args:
+            message: ``action``, ``ranges``, ``write``, ``epoch`` and the
+                policy's own fields.
+
+        Returns:
+            The extension's reply (without ``ok``).
+
+        Raises:
+            RegionMapError: if the agent refused it (no extension, a range
+                this connection does not hold, or the extension raised).
+            RegionMapUnavailable: if no connection got a reply.
+        """
+        with self._lock:
+            reply = self._send({**message, "op": "extension"})
+        return {k: v for k, v in reply.items() if k != "ok"}
+
     def close(self) -> None:
         """Close the connection, which releases every mapping it holds."""
         with self._lock:

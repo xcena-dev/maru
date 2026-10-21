@@ -80,6 +80,12 @@ class MaruConfig:
     # Key the remote CXL agents of the pool require (a copy of the memory node's
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
+    # Out-of-tree access policy (maru_handler.storage.access_policy): the name
+    # an installed package registers under ``maru.access_policies``, and an
+    # opaque string handed to it (typically its own configuration file).
+    # Empty: no policy; the backend moves bytes as soon as it can.
+    access_policy: str = ""
+    access_policy_config: str = ""
 
     @property
     def server_urls(self) -> list[str]:
@@ -144,6 +150,10 @@ class MaruConfig:
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.access_policy and self.storage_backend != "remote_cxl":
+            raise ValueError("access_policy is supported by the remote_cxl backend")
+        if self.access_policy_config and not self.access_policy:
+            raise ValueError("access_policy_config needs access_policy")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
         if self.storage_backend == "remote_cxl":

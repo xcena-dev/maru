@@ -75,6 +75,9 @@ class RegionLifecycle:
             self.config.chunk_size_bytes,
             info["handle"],
         )
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            region.reuse_guard = policy.reusable
         self.regions[region.pool_id] = region
         try:
             self._map_own(region)
@@ -562,6 +565,18 @@ class RegionLifecycle:
                 # Pages go back to the region they came from; a retired
                 # region ignores them.
                 if entry.region is not None and entry.pending.completed:
+                    policy = getattr(self, "_policy", None)
+                    if policy is not None:
+                        # The policy prepared these pages for the WRITE that
+                        # turned out complete; it finishes them first.
+                        try:
+                            policy.completed_write(entry.locations)
+                        except Exception:
+                            logger.warning(
+                                "access policy did not take a late WRITE", exc_info=True
+                            )
+                            kept.append(entry)
+                            continue
                     for location in entry.locations:
                         entry.region.unquarantine(location)
                         entry.region.give_page(location)

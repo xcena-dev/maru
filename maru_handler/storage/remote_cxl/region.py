@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from maru_common.storage_types import StorageLocation, StorageUnavailableError
+
+logger = logging.getLogger(__name__)
 
 REMOTE_CXL = "remote_cxl"
 
@@ -82,17 +86,23 @@ class RemoteCxlRegion:
         self.mapped = False
         # Boot of the memory node at the last map
         self.boot = ""
+        # Access policy hook asked before a page given back is reused
+        # (``AccessPolicy.reusable``); pages it holds wait in _waiting_reuse.
+        self.reuse_guard: Callable[[StorageLocation], bool] | None = None
+        self._waiting_reuse: list[StorageLocation] = []
 
     def free_count(self) -> int:
         """Free pages a store can take now (none while the region is unusable)."""
         with self._lock:
             if self.retired or not self.reachable:
                 return 0
+            self._reap_reusable()
             return len(self._free)
 
     def has_free(self) -> bool:
         """Whether a page can be taken now."""
         with self._lock:
+            self._reap_reusable()
             return not self.retired and self.reachable and bool(self._free)
 
     def take_page(self, size: int) -> StorageLocation:
@@ -110,6 +120,7 @@ class RemoteCxlRegion:
                 )
             if type(size) is not int or not 0 < size <= self.page_size:
                 raise ValueError("Remote CXL allocation must fit in one page")
+            self._reap_reusable()
             if not self._free:
                 raise MemoryError("Remote CXL region is full")
             page = self._free.popleft()
@@ -150,7 +161,33 @@ class RemoteCxlRegion:
         with self._lock:
             if location.pool_id != self.pool_id or self.retired:
                 return
+            if self.reuse_guard is not None:
+                self._waiting_reuse.append(location)
+                self._reap_reusable()
+                return
             self._free.append(location.offset // self.page_size)
+
+    def _reap_reusable(self) -> None:
+        """Free the pages given back that the access policy lets go now.
+
+        A page the policy does not answer for (it raised) stays waiting.
+        """
+        if not self._waiting_reuse:
+            return
+        waiting = []
+        for location in self._waiting_reuse:
+            try:
+                ready = bool(self.reuse_guard(location))
+            except Exception:
+                logger.warning(
+                    "access policy could not answer for a page", exc_info=True
+                )
+                ready = False
+            if ready:
+                self._free.append(location.offset // self.page_size)
+            else:
+                waiting.append(location)
+        self._waiting_reuse = waiting
 
     def quarantine(self, location: StorageLocation) -> None:
         """Count a page a late transfer may still touch."""
@@ -176,6 +213,7 @@ class RemoteCxlRegion:
         with self._lock:
             self.retired = True
             self._free.clear()
+            self._waiting_reuse.clear()
 
 
 @dataclass(frozen=True)

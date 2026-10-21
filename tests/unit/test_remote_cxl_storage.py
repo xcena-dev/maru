@@ -70,7 +70,7 @@ class Rpc:
 
 
 class World:
-    def __init__(self, nodes=1):
+    def __init__(self, nodes=1, extension=None):
         reset_fake_agents()
         self.clock = FakeClock()
         self.cxl = FakeCxl()
@@ -80,7 +80,10 @@ class World:
             clock=self.clock,
             session_ttl=30,
         )
-        self.nodes = [FakeMemoryNode(self.cxl, f"mem{i + 1}") for i in range(nodes)]
+        self.nodes = [
+            FakeMemoryNode(self.cxl, f"mem{i + 1}", extension=extension)
+            for i in range(nodes)
+        ]
         self.clients: list[RemoteCxlStorageClient] = []
         # MaruServer's side of the regions whose owner left; tests run it
         # one pass at a time.
