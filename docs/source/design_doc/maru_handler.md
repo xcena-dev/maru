@@ -235,7 +235,7 @@ more (`expand`) whenever all of them are full. The remote CXL agent on a region'
 memory node maps the region and registers it with that node's NIC; the Handler
 reaches the region with one-sided RDMA.
 
-![Components of the remote_cxl backend: worker nodes, the metadata node and the memory nodes of a shared CXL pool](../image/remote_cxl_sw_structure.png)
+![Components of the remote_cxl backend. Worker nodes: MaruKVConnector calls MaruHandler, whose PoolRouter picks a request's pool and hands it to that pool's RemoteCxlStorageClient; all clients share one RdmaDataPath (RegionMapClient, StagingBuffer, NIXL). Metadata node: MaruServer with ReplicaDirectory (storage sessions), AllocationManager (resource manager requests) and RegionKeeper. Memory nodes of a shared CXL pool: the resource manager, and on every node a remote CXL agent whose RegionMapServer takes connections for RegionMapService, which checks a handle with the resource manager, maps the region with DaxRegionMapper and registers it with NIXL](../image/remote_cxl_sw_structure.png)
 
 | Component | Role |
 |-----------|------|
