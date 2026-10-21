@@ -230,8 +230,9 @@ for launch configuration, memory lifetime and validation instructions.
 Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The KV
 stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
-and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the region
-size), a unique `maru_engine_id`, an immutable-weights `maru_cache_namespace`,
+and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
+memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`, an
+immutable-weights `maru_cache_namespace`,
 `maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
 default `/etc/maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
 worker's RDMA NIC, e.g. `mlx5_0:1`).
@@ -319,7 +320,7 @@ Settings in `kv_connector_extra_config`:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
-| `maru_pool_size` | str/int | `1G` | CXL memory pool size (`4G`, `500M`, etc.); with `remote_cxl`, required: the size of one region, and the worker gets one more region whenever its regions are full |
+| `maru_pool_size` | str/int | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, etc.): its first allocation, and each further one when its memory is full; required with `remote_cxl`, where each allocation is one region |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | str | auto | Unique instance ID (default: auto-generated UUID) |
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
@@ -520,9 +521,11 @@ Controls how many tokens per chunk when storing KV cache:
 
 ### maru_pool_size
 
-CXL memory allocated per instance. With the `remote_cxl` backend, it is the size
-of one region: when the worker's regions are full, it gets one more region of
-this size. Capacity estimation:
+CXL memory an instance gets at a time: its first allocation, and each further
+one when its memory is full. The `cxl` and `remote_cxl` backends use it the same
+way; with `remote_cxl` each allocation is one region. (`cpu` and `mixed` take
+fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) The estimate
+below sizes one allocation:
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes

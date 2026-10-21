@@ -144,7 +144,7 @@ vllm serve <model> --kv-transfer-config '{
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
-| `maru_pool_size` | `str \| int` | `1G` | CXL memory pool size (`4G`, `500M`, or integer bytes). With `remote_cxl`, required: the size of one region; the engine gets one more region whenever its regions are full |
+| `maru_pool_size` | `str \| int` | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, or integer bytes): its first allocation, and each further one when its memory is full. Required with `remote_cxl`, where each allocation is one region; `cpu` and `mixed` use `maru_cpu_pool_size` and `maru_cxl_pool_size` |
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
@@ -163,7 +163,7 @@ apply to that backend only:
 | `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
 | `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
 | `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
-| `maru_pool_size` | `str \| int` | required | Region size; the engine gets one more region whenever its regions are full |
+| `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
 | `maru_remote_cxl_agent_key_file` | `str` | `/etc/maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |

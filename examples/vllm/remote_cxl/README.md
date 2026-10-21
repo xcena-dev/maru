@@ -273,7 +273,8 @@ model shape match, whichever path each node loads the weights from, so use a
 namespace that identifies the exact weights.
 `maru_engine_id` names the engine's storage session and must be unique among
 the engines of one maru-server; the launcher uses `<hostname>-<instance>`.
-`maru_pool_size` is the region size. `--enable-prompt-tokens-details` only
+`maru_pool_size` is the CXL memory the engine gets at a time (one region), as
+with the cxl backend. `--enable-prompt-tokens-details` only
 makes vLLM report cached tokens per request, which the test scripts read.
 
 ### 4. Test
