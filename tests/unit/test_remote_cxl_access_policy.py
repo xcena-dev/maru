@@ -162,6 +162,7 @@ def test_store_and_load_run_through_the_policy_and_its_extension(setup):
         ("transfer", 2),
     ]
     assert ext.mapped_regions
+    assert w.node.service.hello()["region_extension"] is True
 
 
 @pytest.mark.parametrize("failure", ["read", "disorder", "short"])

@@ -262,9 +262,13 @@ class RegionMapService:
         self._extension = extension
 
     def hello(self) -> dict:
-        """Identity of this remote CXL agent process and of the node's boot."""
+        """Identity of this remote CXL agent process and of the node's boot;
+        ``region_extension`` is added when one is loaded."""
         self._discard_notifs()
-        return {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
+        identity = {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
+        if self._extension is not None:
+            identity["region_extension"] = True
+        return identity
 
     def extension_request(self, conn: int, message: dict) -> dict:
         """Hand an access policy's message to the region extension.
