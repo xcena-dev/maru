@@ -234,7 +234,7 @@ and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
 memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`, an
 immutable-weights `maru_cache_namespace`,
 `maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
-default `/etc/maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
+default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
 worker's RDMA NIC, e.g. `mlx5_0:1`).
 
 ![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)

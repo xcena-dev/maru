@@ -381,6 +381,9 @@ _MIN_RDMA_STAGING = 1024**3
 _RDMA_ASYNC_LOAD_RESERVE = 0.5
 # How long the loader thread waits for a staging slot another load holds.
 _LEASED_SLOT_WAIT_S = 1.0
+# Failed handler creations in a row (5 s apart) after which the engine says,
+# at ERROR, that it serves without the cache and what to check
+_HANDLER_FAILURES_BEFORE_ERROR = 12
 # Chunks per READ batch of a loader thread: a batch's GPU copies run while the
 # next batch is read, so the copy of a request no longer waits for its whole
 # READ.
@@ -727,7 +730,7 @@ def _create_maru_handler(
         ),
         rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30.0)),
         remote_cxl_agent_key_file=extra_config.get(
-            "maru_remote_cxl_agent_key_file", "/etc/maru/remote-cxl-agent.key"
+            "maru_remote_cxl_agent_key_file", "~/.maru/remote-cxl-agent.key"
         ),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE
@@ -1949,6 +1952,7 @@ class MaruWorkerConnector:
 
         # Backoff timer to avoid reconnect storms when server is down.
         self._handler_retry_after: float = 0.0
+        self._handler_failures = 0
 
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
@@ -1981,15 +1985,28 @@ class MaruWorkerConnector:
                     "_maru_request_chunks": -(-max_model_len // self._kv_chunk_tokens),
                 }
             self._handler = _create_maru_handler(extra_config)
+            self._handler_failures = 0
         except Exception as exc:
             if self._cpu_mode and isinstance(exc, StorageError):
                 raise ValueError(f"CPU cache setup rejected: {exc}") from exc
             if self._cpu_mode and isinstance(exc, ValueError):
                 raise  # a configuration error does not heal on retry
             self._handler_retry_after = time.monotonic() + 5.0
-            logger.warning(
-                "Worker MaruHandler creation failed, backing off 5s: %s", exc
-            )
+            self._handler_failures += 1
+            if self._handler_failures % _HANDLER_FAILURES_BEFORE_ERROR == 0:
+                # A refusal that does not heal (two engines with one
+                # maru_engine_id, a pool that stays full) looks the same.
+                logger.error(
+                    "Worker MaruHandler creation failed %d times in a row; the "
+                    "engine serves without the cache. Check that maru_engine_id "
+                    "is unique and that the pool has room for maru_pool_size: %s",
+                    self._handler_failures,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Worker MaruHandler creation failed, backing off 5s: %s", exc
+                )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
@@ -4718,7 +4735,7 @@ class MaruWorkerConnector:
                             handler.free(handle)
                         except Exception:
                             pass
-                    self._complete_write_behind_keys([base_key], [False])
+                    self._complete_write_behind_keys([base_key], [False], reported=True)
                     continue
                 ready_keys.append(base_key)
                 ready_handles.append(handle)
@@ -4788,13 +4805,18 @@ class MaruWorkerConnector:
                 f"write-behind packed-store {self._num_layers}L x {len(keys)}c"
             )
 
-    def _complete_write_behind_keys(self, keys: list[str], results: list[bool]) -> None:
-        """Publish key outcomes and release all request waiters atomically."""
+    def _complete_write_behind_keys(
+        self, keys: list[str], results: list[bool], *, reported: bool = False
+    ) -> None:
+        """Publish key outcomes and release all request waiters atomically.
+
+        ``reported``: the caller already logged why the keys failed.
+        """
         with self._store_lock:
             for base_key, ok in zip(keys, results, strict=True):
                 if ok:
                     self._record_stored(base_key)
-                else:
+                elif not reported:
                     logger.warning("Maru write-behind store failed: %s", base_key)
                 self._pending_store_keys.discard(base_key)
                 for req_id in self._store_key_waiters.pop(base_key, set()):

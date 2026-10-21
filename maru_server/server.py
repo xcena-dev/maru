@@ -7,7 +7,7 @@ import logging
 import signal
 from threading import RLock
 
-from maru_remote.region_map import DEFAULT_KEY_FILE, KeyFileError, load_key
+from maru_remote.region_map import DEFAULT_COPY_FILE, KeyFileError, load_key
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -55,6 +55,7 @@ class MaruServer:
             cpu_session_ttl,
             reserve_cxl=self._reserve_storage_region if enable_cxl else None,
             release_cxl=self._release_storage_region if enable_cxl else None,
+            largest_cxl_pool=self._largest_storage_pool if enable_cxl else None,
         )
         self._region_keeper = None
         if enable_cxl and self._remote_cxl_agents:
@@ -108,6 +109,16 @@ class MaruServer:
     def _reserve_storage_region(self, owner: str, size: int) -> MaruHandle | None:
         """Reserve a typed pool without exposing it to legacy clients."""
         return self.request_alloc(owner, size, legacy_visible=False)
+
+    def _largest_storage_pool(self) -> int | None:
+        """Bytes of the largest pool a storage region may come from."""
+        pools = self._allocation_manager.pool_stats()
+        sizes = [
+            p.total_size
+            for p in pools
+            if not self._dax_paths or p.dax_path in self._dax_paths
+        ]
+        return max(sizes, default=None)
 
     def _release_storage_region(self, owner: str, region_id: int) -> bool:
         """Idempotent release of a typed pool, after the owner unmaps it."""
@@ -544,10 +555,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--remote-cxl-agent-key-file",
-        default=DEFAULT_KEY_FILE,
+        default=DEFAULT_COPY_FILE,
         help=(
             "Key the remote CXL agents require (a copy of a memory node's "
-            f"{DEFAULT_KEY_FILE}); used with --remote-cxl-agent"
+            f"{DEFAULT_COPY_FILE}); used with --remote-cxl-agent"
         ),
     )
     args = parser.parse_args()

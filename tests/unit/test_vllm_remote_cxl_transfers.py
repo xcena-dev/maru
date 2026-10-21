@@ -692,4 +692,6 @@ def test_a_full_staging_buffer_skips_the_async_store_quietly(monkeypatch, caplog
     skips = [r for r in caplog.records if "store skipped" in r.getMessage()]
     assert len(skips) == 1  # two chunks skipped, one line per minute
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    # and no further line per chunk when the skipped keys complete
+    assert not [r for r in caplog.records if "store failed" in r.getMessage()]
     worker.shutdown()

@@ -20,7 +20,7 @@ import os
 import threading
 import time
 
-from maru_shm.device_scanner import scan_dax_devices
+from maru_shm.device_scanner import read_device_uuid, scan_dax_devices
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +88,26 @@ class DaxRegionMapper:
 
         Returns:
             The path to open on this node.
+
+        Raises:
+            RuntimeError: if no device here has the UUID. The RM's path may
+                name another device on this node, so it is opened only when
+                its header carries the UUID, as ``MaruShmClient`` does.
         """
-        if device_uuid:
-            if self._device_table is None or device_uuid not in self._device_table:
-                self._device_table = dict(scan_dax_devices())  # devices come and go
-            local = self._device_table.get(device_uuid)
-            if local:
-                return local
-        return dax_path
+        if not device_uuid:
+            return dax_path
+        if self._device_table is None or device_uuid not in self._device_table:
+            self._device_table = dict(scan_dax_devices())  # devices come and go
+        local = self._device_table.get(device_uuid)
+        if local:
+            return local
+        found = read_device_uuid(dax_path)
+        if found == device_uuid:
+            return dax_path
+        raise RuntimeError(
+            f"device UUID {device_uuid} (RM path {dax_path}) not found on this "
+            f"node; the header at {dax_path} has UUID {found}"
+        )
 
     def map(self, dax_path: str, device_uuid: str, offset: int, length: int) -> int:
         """Map ``length`` bytes at ``offset`` of the region's device read/write.
@@ -111,6 +123,7 @@ class DaxRegionMapper:
 
         Raises:
             OSError: if the device cannot be opened or mapped.
+            RuntimeError: if no device here has the region's UUID (resolve).
         """
         self._expire_placeholders()
         path = self.resolve(dax_path, device_uuid)

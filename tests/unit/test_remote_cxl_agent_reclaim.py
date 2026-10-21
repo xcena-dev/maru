@@ -605,3 +605,21 @@ def test_a_hold_the_rm_could_not_save_is_unheld():
         node.service.map(1, handle)
     node.service.sweep()
     assert node.cxl.holds == {}
+
+
+def test_the_sweep_deregisters_a_failed_mapping_while_the_rm_is_away():
+    node = Node()
+    live = node.region()
+    node.service.map(1, live)  # checked first, and the RM does not answer
+    handle = node.region()
+    deregister = node.transport.deregister
+    node.transport.partial_metadata = lambda registration: refuse()
+    node.transport.deregister = refuse
+    with pytest.raises(RuntimeError):
+        node.service.map(1, handle)
+    assert len(node.agent.registered) == 2
+    node.transport.deregister = deregister
+    node.cxl.get_access = unreachable  # the sweep cannot ask the RM
+    node.service.sweep()
+    assert len(node.agent.registered) == 1  # only the live one stays
+    assert node.service.holders() == {live["region_id"]: {1}}

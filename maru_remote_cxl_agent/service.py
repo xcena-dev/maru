@@ -428,41 +428,42 @@ class RegionMapService:
                 if m.ready.is_set() and m.registration is not None
             ]
             for m in held:
-                if m.error is None and not m.holders:
-                    # Its last holder left, but deregistering failed: retry
-                    # without asking the resource manager, as unmap does.
+                if m.error is not None or not m.holders:
+                    # Out of use (failed, released or its last holder left)
+                    # but deregistering failed: retry without asking the
+                    # resource manager, which may be away.
                     self._release_locked(m.handle.region_id, m)
-            held = [m for m in held if self._maps.get(m.handle.region_id) is m]
+            held = [
+                m
+                for m in held
+                if self._maps.get(m.handle.region_id) is m and m.error is None
+            ]
         for m in held:
-            if m.error is None:
-                try:
-                    allocated = self._allocated(m.handle)
-                except Exception as exc:
-                    # Say so once while the resource manager stays away; the
-                    # other mappings wait for the next sweep.
-                    if not self._sweep_failed:
-                        logger.warning(
-                            "cannot check mapped regions with the resource "
-                            "manager; keeping them: %s",
-                            exc,
-                        )
-                    self._sweep_failed = True
-                    return
-                self._sweep_failed = False
-                if allocated:
-                    continue
+            try:
+                allocated = self._allocated(m.handle)
+            except Exception as exc:
+                # Say so once while the resource manager stays away; the
+                # other mappings wait for the next sweep.
+                if not self._sweep_failed:
+                    logger.warning(
+                        "cannot check mapped regions with the resource "
+                        "manager; keeping them: %s",
+                        exc,
+                    )
+                self._sweep_failed = True
+                return
+            self._sweep_failed = False
+            if allocated:
+                continue
             rid = m.handle.region_id
             with self._lock:
-                if self._maps.get(rid) is not m:
-                    continue  # released meanwhile
-                if m.error is None:
-                    logger.warning(
-                        "region %d was freed by the resource manager; releasing it",
-                        rid,
-                    )
-                    self._retire_locked(m, "the resource manager freed it")
-                else:
-                    self._release_locked(rid, m)
+                if self._maps.get(rid) is not m or m.error is not None:
+                    continue  # released or failed meanwhile
+                logger.warning(
+                    "region %d was freed by the resource manager; releasing it",
+                    rid,
+                )
+                self._retire_locked(m, "the resource manager freed it")
 
     def start_sweep(self, interval_s: float = SWEEP_INTERVAL_S) -> None:
         """Run :meth:`sweep` every ``interval_s`` seconds until :meth:`close`.

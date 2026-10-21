@@ -79,7 +79,7 @@ class MaruConfig:
     rdma_nonblocking_alloc: bool = False
     # Key the remote CXL agents of the pool require (a copy of the memory node's
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
-    remote_cxl_agent_key_file: str = "/etc/maru/remote-cxl-agent.key"
+    remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
 
     @property
     def server_urls(self) -> list[str]:

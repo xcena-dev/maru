@@ -286,3 +286,26 @@ def test_worker_reports_a_staging_misconfiguration_instead_of_retrying(monkeypat
     )
     with pytest.raises(ValueError, match="fewer chunks than one max_model_len"):
         worker._ensure_handler()
+
+
+def test_a_refusal_that_keeps_coming_is_said_at_error(monkeypatch):
+    import maru_vllm.connector as connector
+    from maru_common.storage_types import StorageUnavailableError
+    from tests.unit.vllm_connector_helpers import make_worker
+
+    def refuse(config):
+        raise StorageUnavailableError(
+            "Storage supports one active worker per engine_id"
+        )
+
+    errors = []
+    monkeypatch.setattr(connector, "_create_maru_handler", refuse)
+    monkeypatch.setattr(connector.logger, "error", lambda msg, *a: errors.append(a))
+    worker = make_worker(16, 256, extra())
+    for _ in range(connector._HANDLER_FAILURES_BEFORE_ERROR - 1):
+        worker._handler_retry_after = 0.0
+        worker._ensure_handler()
+    assert errors == []
+    worker._handler_retry_after = 0.0
+    worker._ensure_handler()
+    assert len(errors) == 1 and errors[0][0] == connector._HANDLER_FAILURES_BEFORE_ERROR

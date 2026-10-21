@@ -371,3 +371,19 @@ def test_no_pool_answering_fails_the_connect(pools):
     rpcs = [DownRpc(directory, [node.address]) for directory, node in pools]
     with pytest.raises(StorageUnavailableError):
         router(pools, rpcs=rpcs)
+
+
+def test_an_unavailable_pool_is_logged_by_its_own_url(pools, monkeypatch):
+    class Down(Rpc):
+        def handshake(self):
+            raise ConnectionError("MaruServer is not running")
+
+    said = []
+    monkeypatch.setattr(router_module.logger, "warning", lambda msg, *a: said.append(a))
+    (da, na), (db, nb) = pools
+    r = router(pools, rpcs=[Rpc(da, [na.address]), Down(db, [nb.address])])
+    try:
+        assert [a[0] for a in said] == [URLS[1]]
+    finally:
+        r._stop.set()
+        r.close()

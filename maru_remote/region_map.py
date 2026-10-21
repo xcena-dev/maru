@@ -58,9 +58,13 @@ logger = logging.getLogger(__name__)
 
 MAX_FRAME = 16 * 1024 * 1024
 _LEN = struct.Struct("!I")
-# Shared by the remote CXL agents of a deployment, its workers and its
-# MaruServers; readable only by the users that run them.
+# The key the installer creates on a memory node, read by its remote CXL agent;
+# shared by the remote CXL agents of a deployment.
 DEFAULT_KEY_FILE = "/etc/maru/remote-cxl-agent.key"
+# The copy that workers and MaruServers read, readable only by their user. A
+# node apart from it: a worker installed with the agent gets its own key in
+# DEFAULT_KEY_FILE, which is not the deployment's.
+DEFAULT_COPY_FILE = "~/.maru/remote-cxl-agent.key"
 NONCE_BYTES = 16
 
 
@@ -136,7 +140,8 @@ def load_key(path: str) -> bytes:
     """Read the remote CXL agent key.
 
     Args:
-        path: Key file; one line of hex digits (at least 32).
+        path: Key file; one line of hex digits (at least 32). ``~`` is the
+            user's home.
 
     Returns:
         The key bytes.
@@ -145,6 +150,7 @@ def load_key(path: str) -> bytes:
         KeyFileError: if the file cannot be read, is readable by every user,
             or does not hold a key.
     """
+    path = os.path.expanduser(path)
     try:
         with open(path) as f:
             mode = os.fstat(f.fileno()).st_mode
@@ -499,7 +505,7 @@ class RegionMapClient:
             if nonce is not None:
                 raise RegionMapUnavailable(
                     "it requires the remote CXL agent key; set the key file "
-                    f"(default {DEFAULT_KEY_FILE})"
+                    f"(default {DEFAULT_COPY_FILE})"
                 )
             return
         if nonce is None:

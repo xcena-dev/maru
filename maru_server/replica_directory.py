@@ -28,6 +28,7 @@ longest ago first), or when its keys cannot be read any more.
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from threading import Event, RLock
 
@@ -37,8 +38,21 @@ from maru_remote.region_map import read_handle
 
 logger = logging.getLogger(__name__)
 
+
+class RegionTooLargeError(ValueError):
+    """A remote CXL region larger than any pool can give; room never heals it."""
+
+
 REMOTE_CXL = "remote_cxl"
 MAX_REGIONS_PER_SESSION = 4096
+# Sessions that hold space or may still use it; an expired remote CXL session
+# holds nothing (MaruServer took its regions over) and does not count
+MAX_SESSIONS = 1024
+# Expired remote CXL sessions kept so that a late drained close or
+# return_region still succeeds; the oldest record goes beyond this (a
+# return_region for it is then refused, and MaruServer still gives the region
+# back, having taken it over)
+MAX_EXPIRED_REMOTE_SESSIONS = 4096
 RELEASE_RETRY_S = 1.0
 # A kept region given back to make room is waited for this long before
 # another one goes for the same reason.
@@ -124,6 +138,7 @@ class ReplicaDirectory:
         reserve_cxl=None,
         release_cxl=None,
         clock=None,
+        largest_cxl_pool=None,
     ):
         if capacity_limit <= 0 or session_ttl <= 0:
             raise ValueError("CPU capacity limit and session TTL must be positive")
@@ -132,10 +147,14 @@ class ReplicaDirectory:
         self.session_ttl = session_ttl
         self._reserve_cxl = reserve_cxl
         self._release_cxl = release_cxl
+        # () -> bytes of the largest pool a region may come from, or None
+        self._largest_cxl_pool = largest_cxl_pool
         self._clock = clock or (lambda: time.monotonic())
         self._sessions: dict[str, StorageSession] = {}
         self._engines: dict[str, str] = {}
         self._closed_tokens: set[str] = set()
+        # Expired remote CXL sessions, oldest first (see MAX_SESSIONS)
+        self._expired_remote: OrderedDict[str, None] = OrderedDict()
         # (namespace, key) -> remote CXL region holding the key
         self._remote_cxl_index: dict[tuple[str, str], StoragePool] = {}
         # Regions whose release the RM has not confirmed yet
@@ -186,6 +205,11 @@ class ReplicaDirectory:
                 # with it.
                 self._drop_reader_leases(session)
                 self._take_over(session)
+                if not session.pools:
+                    self._expired_remote[session.token] = None
+        while len(self._expired_remote) > MAX_EXPIRED_REMOTE_SESSIONS:
+            token, _ = self._expired_remote.popitem(last=False)
+            self._sessions.pop(token, None)
         self._retry_releases()
 
     def _session(self, payload: dict) -> StorageSession:
@@ -295,7 +319,7 @@ class ReplicaDirectory:
             return self._grant(previous)
         if engine in self._engines:
             raise ValueError("Storage supports one active worker per engine_id")
-        if len(self._sessions) >= 1024:
+        if len(self._sessions) - len(self._expired_remote) >= MAX_SESSIONS:
             raise ValueError("Storage session limit reached")
         if region_size:
             self._check_remote_cxl_peers(namespace, schema, page_size)
@@ -370,6 +394,8 @@ class ReplicaDirectory:
         """A session's first region; a refusal makes the engine wait first in line."""
         try:
             region = self._reserve_region(namespace, schema, size, page_size)
+        except RegionTooLargeError:
+            raise  # the engine does not retry, so nobody waits for it
         except ValueError:
             self._first_region_waits[engine] = self._clock()
             raise
@@ -384,12 +410,28 @@ class ReplicaDirectory:
                 del self._first_region_waits[waiter]
         return any(waiter != engine for waiter in self._first_region_waits)
 
+    def _largest_pool(self) -> int | None:
+        if self._largest_cxl_pool is None:
+            return None
+        try:
+            return self._largest_cxl_pool()
+        except Exception:
+            return None  # unknown: the refusal stays one that room may heal
+
     def _reserve_region(
         self, namespace: str, schema: str, size: int, page_size: int
     ) -> StoragePool:
         owner_id = "remote_cxl:" + uuid.uuid4().hex
         handle = self._reserve_cxl(owner_id, size)
         if handle is None:
+            largest = self._largest_pool()
+            if largest is not None and size > largest:
+                # No room will ever come: a refusal the worker does not retry.
+                raise RegionTooLargeError(
+                    f"Remote CXL region size {size} is larger than the largest "
+                    f"pool of the resource manager ({largest} bytes); lower "
+                    "maru_pool_size"
+                )
             # The keeper gives a kept region back to make room for the next try.
             self._refused_reservations += 1
             self.keeper_wakeup.set()
@@ -862,7 +904,17 @@ class ReplicaDirectory:
         region.leased.clear()
 
     def _release_region(self, region: StoragePool) -> None:
-        if self._release_cxl(region.owner_id, region.handle.region_id):
+        try:
+            released = self._release_cxl(region.owner_id, region.handle.region_id)
+        except Exception:
+            # The RM may not have freed it: retried as an unconfirmed release.
+            logger.warning(
+                "releasing remote CXL region %s at the resource manager failed",
+                region.pool_id,
+                exc_info=True,
+            )
+            released = False
+        if released:
             self._releasing.pop(region.pool_id, None)
         else:
             self._releasing[region.pool_id] = region
@@ -897,6 +949,7 @@ class ReplicaDirectory:
             if cxl and not self._release_cxl(cxl.owner_id, cxl.handle.region_id):
                 raise ValueError("CXL pool release unconfirmed; retry drained close")
             del self._sessions[token]
+            self._expired_remote.pop(token, None)
         return {}
 
     # ------------------------------------------------------------------ usage

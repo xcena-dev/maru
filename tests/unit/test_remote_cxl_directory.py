@@ -23,6 +23,7 @@ class FakeRm:
         self.regions: dict[int, int] = {}
         self.released: list[int] = []
         self.fail_release = False
+        self.unreachable = False
 
     def reserve(self, owner, size):
         if self.used + size > self.limit:
@@ -34,6 +35,8 @@ class FakeRm:
         return handle
 
     def release(self, owner, region_id):
+        if self.unreachable:
+            raise ConnectionError("Resource manager is not running")
         if self.fail_release:
             return False
         self.used -= self.regions.pop(region_id)
@@ -754,3 +757,65 @@ def test_the_drained_close_carries_the_boot_of_each_region(env):
         pools=[{"pool_id": pool_a, "boot": "b-7"}],
     )
     assert [boot for *_, boot in directory.departed()] == ["b-7"]
+
+
+def test_expired_remote_cxl_sessions_leave_the_session_limit(env, monkeypatch):
+    from maru_server import replica_directory
+
+    monkeypatch.setattr(replica_directory, "MAX_SESSIONS", 2)
+    directory, _, clock = env
+    open_session(directory, "a")
+    open_session(directory, "b")
+    with pytest.raises(ValueError, match="session limit"):
+        open_session(directory, "c")
+    clock.advance(31)  # both expire; MaruServer takes their regions over
+    open_session(directory, "c")
+    open_session(directory, "d")
+    with pytest.raises(ValueError, match="session limit"):
+        open_session(directory, "e")
+
+
+def test_the_oldest_expired_remote_cxl_session_record_goes(env, monkeypatch):
+    from maru_server import replica_directory
+
+    monkeypatch.setattr(replica_directory, "MAX_EXPIRED_REMOTE_SESSIONS", 1)
+    directory, _, clock = env
+    a, _ = open_session(directory, "a")
+    clock.advance(31)
+    b, _ = open_session(directory, "b")
+    clock.advance(31)
+    directory.execute("usage", {})  # a request runs the expiry
+    # b's record stays, so its late drained close succeeds; a's went.
+    call(directory, "close", **b, drained=True)
+    assert "a" not in directory._sessions
+
+
+def test_a_release_that_raises_is_retried(env):
+    directory, rm, _ = env
+    a, _ = open_session(directory, "a")
+    b, _ = open_session(directory, "b")
+    rm.unreachable = True
+    call(directory, "close", **a, drained=True)
+    released_by_keeper(directory)
+    assert rm.released == []
+    rm.unreachable = False
+    heartbeat(directory, b)
+    assert rm.released == [1]
+
+
+def test_a_region_larger_than_every_pool_is_refused_for_good():
+    clock, rm = FakeClock(), FakeRm(limit=1 << 20)
+    directory = ReplicaDirectory(
+        reserve_cxl=rm.reserve,
+        release_cxl=rm.release,
+        clock=clock,
+        session_ttl=30,
+        largest_cxl_pool=lambda: 1 << 20,
+    )
+    with pytest.raises(ValueError, match="larger than the largest pool") as refused:
+        open_session(directory, "a", pages=(2 << 20) // PAGE)
+    assert "reservation failed" not in str(refused.value)  # not retried
+    assert not directory._first_region_waits  # nobody waits for it
+    rm.limit = 0  # a full pool is still a refusal that room heals
+    with pytest.raises(ValueError, match="reservation failed"):
+        open_session(directory, "b")

@@ -845,6 +845,27 @@ def test_the_device_mapper_maps_the_region_of_the_local_device(tmp_path):
     assert device.read_bytes()[4096:4102] == b"region"
 
 
+def test_the_device_mapper_refuses_a_device_whose_uuid_is_not_here(
+    tmp_path, monkeypatch
+):
+    """The RM's path may name another device on this node: it is opened only
+    when its header carries the region's UUID."""
+    from maru_remote_cxl_agent import mapper as mapper_module
+
+    other = tmp_path / "dax-other"
+    other.write_bytes(bytes(8192))
+    monkeypatch.setattr(mapper_module, "scan_dax_devices", lambda: [])
+    headers = {str(other): "uuid-other"}
+    monkeypatch.setattr(mapper_module, "read_device_uuid", headers.get)
+    mapper = DaxRegionMapper({})
+    with pytest.raises(RuntimeError, match="uuid-1 .* not found"):
+        mapper.resolve(str(other), "uuid-1")
+    with pytest.raises(RuntimeError, match="not found"):
+        mapper.map(str(other), "uuid-1", 0, 4096)
+    headers[str(other)] = "uuid-1"  # sysfs cannot see it, but the header matches
+    assert mapper.resolve(str(other), "uuid-1") == str(other)
+
+
 def test_an_unmapped_range_is_not_given_to_the_next_mapping(tmp_path):
     from maru_remote_cxl_agent import mapper as mapper_module
 
@@ -878,3 +899,18 @@ def test_the_device_mapper_reports_a_failed_map(tmp_path):
     mapper = DaxRegionMapper({})
     with pytest.raises(OSError):
         mapper.map(str(tmp_path / "missing"), "", 0, 4096)
+
+
+def test_workers_read_a_key_copy_in_their_home_by_default(tmp_path, monkeypatch):
+    """A worker installed with the agent gets its own key in /etc/maru, which
+    is not the deployment's; workers and MaruServer read their copy."""
+    from maru_common.config import MaruConfig
+    from maru_remote.region_map import DEFAULT_COPY_FILE, load_key
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    key = tmp_path / ".maru" / "remote-cxl-agent.key"
+    key.parent.mkdir()
+    key.write_text("ab" * 16 + "\n")
+    key.chmod(0o600)
+    assert MaruConfig(auto_connect=False).remote_cxl_agent_key_file == DEFAULT_COPY_FILE
+    assert load_key(DEFAULT_COPY_FILE) == bytes.fromhex("ab" * 16)

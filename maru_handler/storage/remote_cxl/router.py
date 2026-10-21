@@ -89,7 +89,7 @@ class PoolRouter:
         if not self.config.metadata_only:
             self.data.start()
         failures = []
-        for c in self.clients:
+        for c, url in zip(self.clients, self.urls, strict=True):
             try:
                 c.connect()
             except StorageError:
@@ -98,9 +98,7 @@ class PoolRouter:
                 raise
             except Exception as exc:
                 failures.append(exc)
-                logger.warning(
-                    "Remote CXL pool %s is unavailable: %s", c.config.server_url, exc
-                )
+                logger.warning("Remote CXL pool %s is unavailable: %s", url, exc)
         if len(failures) == len(self.clients):
             self.data.close()
             raise failures[0]
@@ -119,20 +117,24 @@ class PoolRouter:
     def _retry_loop(self) -> None:
         """Connect the pools that never connected until each one answers."""
         while not self._stop.wait(POOL_RETRY_S):
-            waiting = [c for c in self.clients if not c.ever_connected]
+            waiting = [
+                (c, url)
+                for c, url in zip(self.clients, self.urls, strict=True)
+                if not c.ever_connected
+            ]
             if not waiting:
                 return
-            for c in waiting:
+            for c, url in waiting:
                 with self._connect_lock:
                     if self._stop.is_set():
                         return
                     try:
                         c.connect()
-                        logger.info(
-                            "Remote CXL pool %s is available", c.config.server_url
-                        )
+                        logger.info("Remote CXL pool %s is available", url)
                     except Exception as exc:
-                        logger.debug("Remote CXL pool still unavailable: %s", exc)
+                        logger.debug(
+                            "Remote CXL pool %s still unavailable: %s", url, exc
+                        )
 
     def _pick(self, route_key: str | None) -> RemoteCxlStorageClient:
         if not route_key:

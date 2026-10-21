@@ -76,7 +76,8 @@ moves it, as for the cxl backend.
   each of those memory nodes, as on hosts that share CXL memory.
 - A copy of the remote CXL agent key (`/etc/maru/remote-cxl-agent.key` on the memory
   nodes, created by the installer) on every worker node and the maru-server
-  node, readable only by the user that runs them. The memory nodes of a shared
+  node, readable only by the user that runs them; they read
+  `~/.maru/remote-cxl-agent.key` by default. The memory nodes of a shared
   pool use the same key.
 - The remote CXL agent runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
   its registration cache off (`UCX_RCACHE_ENABLE=n`). It sets both itself and
@@ -236,7 +237,9 @@ picked by a hash of the request's first chunk key.
 
 ### 3. Worker nodes
 
-On each worker node, point the engines at maru-server:
+Install Maru with NIXL and without the resource manager (`./install.sh --no-rm`):
+a plain `./install.sh` would also set up a remote CXL agent and a key of the
+worker's own. Then point the engines at maru-server:
 
 ```bash
 export MARU_SERVER_URL=tcp://10.0.0.2:<maru-server port> MARU_WORKER_UCX_DEVICE=mlx5_0:1
@@ -338,8 +341,11 @@ All example settings are in `env.sh`. Override them with environment variables:
   full; `maru-server` logs `giving back remote CXL region`.
 - **`key check failed`** (in the engine or maru-server log): the process has
   no copy of the remote CXL agent key, or another one. Copy the memory nodes'
-  `/etc/maru/remote-cxl-agent.key` (0600, owned by the process's user) and point
-  `maru_remote_cxl_agent_key_file` or `--remote-cxl-agent-key-file` at it.
+  `/etc/maru/remote-cxl-agent.key` to `~/.maru/remote-cxl-agent.key` of the
+  process's user (0600), or point `maru_remote_cxl_agent_key_file` or
+  `--remote-cxl-agent-key-file` at another copy. A worker installed with a plain
+  `./install.sh` also runs an agent with a key of its own in `/etc/maru`; remove
+  that service with `sudo "$(which install-maru-remote-cxl-agent)" --uninstall`.
 - **Engines on another node cannot connect**: maru-server listens on
   `127.0.0.1` by default, and so does `remote_cxl_agent.sh`; the remote CXL agent
   service listens on its RDMA NIC's address. Set `MARU_SERVER_BIND_HOST` and

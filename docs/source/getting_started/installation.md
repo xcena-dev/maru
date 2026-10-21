@@ -70,7 +70,7 @@ Install all components (Python package + Resource Manager):
 ./install.sh
 ```
 
-To install **without the Resource Manager** (e.g., on nodes that only run LLM instances with MaruHandler):
+To install **without the Resource Manager** (e.g., on nodes that only run LLM instances with MaruHandler, and always on `remote_cxl` worker nodes, which would otherwise get a remote CXL agent and a key of their own):
 
 ```bash
 ./install.sh --no-rm
@@ -84,7 +84,8 @@ starts and stops with the Resource Manager, and creates the remote CXL agent key
 `/etc/maru/remote-cxl-agent.key`. Set the node's RDMA NIC in
 `/etc/maru/remote-cxl-agent.env` (`MARU_REMOTE_CXL_AGENT_UCX_DEVICE`): the service
 listens on that NIC's address. Workers and maru-server need a copy of the key,
-readable only by the users that run them. The
+readable only by the users that run them; they read
+`~/.maru/remote-cxl-agent.key` by default. The
 [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 walks through a deployment.
 

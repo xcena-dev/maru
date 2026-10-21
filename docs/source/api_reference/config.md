@@ -27,7 +27,7 @@ class MaruConfig:
     rdma_staging_size: int | None = None
     rdma_timeout_s: float = 30.0
     rdma_load_reserve: float = 0.0
-    remote_cxl_agent_key_file: str = "/etc/maru/remote-cxl-agent.key"
+    remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
 ```
 
 ### Parameters
@@ -50,7 +50,7 @@ class MaruConfig:
 | `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` only: host staging buffer registered with the NIC and CUDA (bytes); `None` uses the larger of 64 pages and 1 GiB |
 | `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
 | `rdma_load_reserve` | `float` | `0.0` | `remote_cxl` only: share of staging slots, in `[0, 1)`, that stores leave free for loads; set when loads and stores run on separate threads |
-| `remote_cxl_agent_key_file` | `str` | `"/etc/maru/remote-cxl-agent.key"` | `remote_cxl` only: copy of the memory nodes' remote CXL agent key, readable by the worker's user only |
+| `remote_cxl_agent_key_file` | `str` | `"~/.maru/remote-cxl-agent.key"` | `remote_cxl` only: copy of the memory nodes' remote CXL agent key, readable by the worker's user only |
 
 ### Examples
 
@@ -100,7 +100,7 @@ maru-server [OPTIONS]
 | `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `--dax-path` | any pool | DAX device path for allocation. Repeat for multiple pools (fill-first fallback). |
 | `--remote-cxl-agent` | none | Remote CXL agent (`host:port`) of a memory node of this pool, for `remote_cxl` workers. Repeat or separate with commas for every memory node of a shared pool |
-| `--remote-cxl-agent-key-file` | `/etc/maru/remote-cxl-agent.key` | Copy of the remote CXL agent key; read when `--remote-cxl-agent` is given |
+| `--remote-cxl-agent-key-file` | `~/.maru/remote-cxl-agent.key` | Copy of the remote CXL agent key; read when `--remote-cxl-agent` is given |
 
 ### Examples
 
@@ -164,7 +164,7 @@ apply to that backend only:
 | `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
 | `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
 | `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
-| `maru_remote_cxl_agent_key_file` | `str` | `/etc/maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
+| `maru_remote_cxl_agent_key_file` | `str` | `~/.maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
