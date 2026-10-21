@@ -379,6 +379,7 @@ def test_unconfirmed_pipelined_copies_keep_their_slots(monkeypatch):
     worker, _ = _pipelined(monkeypatch, log, stream_fails=True)
     assert "release 1" not in log
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert not worker._loaded_request_keys["load"][1]
 
 
 def test_a_short_staging_waits_for_the_oldest_batch(monkeypatch):
@@ -401,10 +402,11 @@ def test_batches_whose_copies_ended_go_back_before_the_next_read(monkeypatch):
 
 def test_a_deferred_load_is_done_only_after_its_last_batch(monkeypatch):
     log = []
-    worker, _ = _pipelined(monkeypatch, log, deferred=True)
+    worker, keys = _pipelined(monkeypatch, log, deferred=True)
     assert log.count("release 1") == 3 and "done True" not in log
     assert worker._deferred_done == {"load"}
     assert not worker.take_failed_load_blocks()
+    assert worker._loaded_request_keys["load"][1] == set(keys)
 
 
 def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
@@ -413,6 +415,7 @@ def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
     worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2))
     assert log.count("release 1") == 3
     assert worker.take_failed_load_blocks() == {4, 5}
+    assert not worker._loaded_request_keys["load"][1]
 
 
 def test_an_undrained_failed_copy_keeps_every_unconfirmed_slot(monkeypatch):
@@ -694,4 +697,155 @@ def test_a_full_staging_buffer_skips_the_async_store_quietly(monkeypatch, caplog
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
     # and no further line per chunk when the skipped keys complete
     assert not [r for r in caplog.records if "store failed" in r.getMessage()]
+    worker.shutdown()
+
+
+def _loaded_store_worker(monkeypatch, *, tokens=24, start=0, end=16, missing=None):
+    """Actually load CPU-backed remote slabs before checking store copies."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    cache = next(iter(worker._kv_caches.values()))
+    worker._handler.retrieve_capacity.return_value = 1
+    worker._handler.storage_gpu_accessible.return_value = False
+    load = MaruReqMeta(
+        "loaded",
+        list(range(tokens)),
+        list(range(6)),
+        False,
+        num_matched_chunks=tokens // 8,
+        load_start_token=start,
+        load_end_token=end,
+    )
+    keys = _req_chunk_keys(load, 8)
+    worker._batch_retrieve_all = lambda requested, route_key=None: [
+        None if keys.index(key) == missing else _view(_slab(keys.index(key)))
+        for key in requested
+    ]
+    worker._load_leased_request([("layer", cache, 0)], load, make_flash_attn_metadata())
+    return worker, kernel, allocs, load, keys
+
+
+def _resumed_store(load, *, request_id=None, computed=None):
+    tokens = len(load.token_ids)
+    computed = load.load_end_token if computed is None else computed
+    return MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                request_id or load.req_id,
+                load.token_ids,
+                load.block_ids,
+                True,
+                num_computed_tokens=computed,
+                num_scheduled_tokens=max(1, tokens - computed),
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("tokens, expected", [(16, []), (24, [2])])
+def test_a_remote_hit_skips_prefix_gather_and_write_behind(
+    monkeypatch, tokens, expected
+):
+    worker, kernel, allocs, load, keys = _loaded_store_worker(
+        monkeypatch, tokens=tokens
+    )
+    handler = worker._handler
+    assert not worker.take_failed_load_blocks()
+    worker._store_packed_slabs_write_behind(kernel, _resumed_store(load))
+    worker.shutdown()  # wait for any background batch_store to finish
+    assert len(allocs) == kernel[0].multi_layer_kv_transfer.call_count == len(expected)
+    if expected:
+        assert handler.batch_store.call_args.args[0] == [keys[i] for i in expected]
+    else:
+        handler.batch_store.assert_not_called()
+    assert not worker._stored_keys
+
+
+def test_a_partial_remote_range_keeps_boundary_chunks_eligible(monkeypatch):
+    worker, kernel, allocs, load, keys = _loaded_store_worker(
+        monkeypatch, start=4, end=20
+    )
+    handler = worker._handler
+    assert not worker.take_failed_load_blocks()
+    worker._store_packed_slabs_write_behind(kernel, _resumed_store(load))
+    worker.shutdown()
+    assert len(allocs) == kernel[0].multi_layer_kv_transfer.call_count == 2
+    assert handler.batch_store.call_args.args[0] == [keys[0], keys[2]]
+
+
+@pytest.mark.parametrize("missing", [0, 1])
+def test_a_failed_remote_load_keeps_recomputed_prefix_storable(monkeypatch, missing):
+    worker, kernel, allocs, load, keys = _loaded_store_worker(
+        monkeypatch, end=24, missing=missing
+    )
+    handler = worker._handler
+    assert worker.take_failed_load_blocks()
+    worker._store_packed_slabs_write_behind(kernel, _resumed_store(load, computed=0))
+    worker.shutdown()
+    assert len(allocs) == kernel[0].multi_layer_kv_transfer.call_count == 3
+    assert handler.batch_store.call_args.args[0] == keys
+
+
+def test_write_behind_still_coalesces_prefill_without_a_remote_load(monkeypatch):
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("compute", list(range(24)), list(range(6)), False)
+    handler = worker._handler
+    first = _resumed_store(load, computed=0)
+    first.requests[0].num_scheduled_tokens = 8
+    worker._store_packed_slabs_write_behind(kernel, first)
+    assert not allocs
+    worker._store_packed_slabs_write_behind(kernel, _resumed_store(load, computed=8))
+    worker.shutdown()
+    assert len(allocs) == 3
+    assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8)
+
+
+@pytest.mark.parametrize("request_id", ["another", "loaded"])
+def test_loaded_keys_are_not_permanently_skipped_by_later_requests(
+    monkeypatch, request_id
+):
+    worker, kernel, allocs, load, keys = _loaded_store_worker(monkeypatch, tokens=16)
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, _resumed_store(load))
+    assert not allocs
+    worker.get_finished_saving({load.req_id})
+    assert not worker._loaded_request_keys
+    # A later request rechecks the pool. If its load misses, its recomputed
+    # KV must be eligible even with the same request id or the same keys.
+    worker._store_packed_slabs_write_behind(
+        kernel, _resumed_store(load, request_id=request_id, computed=0)
+    )
+    worker.shutdown()
+    assert len(allocs) == 2
+    assert handler.batch_store.call_args.args[0] == keys
+
+
+@pytest.mark.parametrize(
+    "field", ["preempted_req_ids", "finished_req_ids", "recv_only_finished_req_ids"]
+)
+def test_request_cleanup_discards_its_loaded_store_keys(monkeypatch, field):
+    worker, _, _, load, _ = _loaded_store_worker(monkeypatch, tokens=16)
+    assert worker._loaded_request_keys[load.req_id][1]
+    worker.handle_preemptions(MaruConnectorMetadata(**{field: {load.req_id}}))
+    assert not worker._loaded_request_keys
+    worker.shutdown()
+
+
+def test_aborting_a_queued_loader_prevents_late_store_skip_state(monkeypatch):
+    worker, _, _, load, _ = _loaded_store_worker(monkeypatch, tokens=16)
+    cache = next(iter(worker._kv_caches.values()))
+    # Capture the real submit gate before its queued job can start.
+    worker._deferred_executor = SimpleNamespace(submit=Mock())
+    worker._kv_caches = {"layer": SimpleNamespace(device=torch.device("cuda"))}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert worker._try_submit_deferred_load(load)
+    assert load.req_id in worker._inflight_deferred_req_ids
+    worker.handle_preemptions(
+        MaruConnectorMetadata(recv_only_finished_req_ids={load.req_id})
+    )
+    # It starts after the abort, and every copy succeeds. The identity
+    # registered at submit was removed, so completion must not recreate it.
+    worker._load_leased_request([("layer", cache, 0)], load, make_flash_attn_metadata())
+    assert not worker.take_failed_load_blocks()
+    assert not worker._loaded_request_keys
+    worker._deferred_executor = None
     worker.shutdown()

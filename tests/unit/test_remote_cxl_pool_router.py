@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Several remote CXL pools behind one worker: routing, grouping and shared staging."""
 
+import threading
 import time
 
 import pytest
@@ -19,7 +20,7 @@ from tests.unit.remote_fakes import (
     key_file,
     reset_fake_agents,
 )
-from tests.unit.test_remote_cxl_storage import PAGE, Rpc
+from tests.unit.test_remote_cxl_storage import PAGE, Rpc, hold_transfers
 
 URLS = ["tcp://meta-a:5555", "tcp://meta-b:5555"]
 
@@ -268,6 +269,63 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
     while r.data.staging is not None:
         assert time.monotonic() < deadline
         time.sleep(0.05)
+
+
+@pytest.mark.parametrize("pool", [0, 1])
+def test_close_does_not_issue_a_lease_from_a_pool_read_under_way(pools, pool):
+    r = router(pools)
+    route_key = route_key_of(r, pool)
+    assert store(r, route_key, ["k"])[0] == [True]
+    c = r.clients[pool]
+    entered, go = hold_transfers(c, "read")
+    result, stopped, failures = {}, [], []
+    close_data = r.data.close
+
+    def record_close():
+        stopped.append([client._reads for client in r.clients])
+        close_data()
+
+    def close():
+        try:
+            r.close()
+        except BaseException as exc:
+            failures.append(exc)
+
+    r.data.close = record_close
+    load = threading.Thread(
+        target=lambda: result.setdefault(
+            "leases", r.batch_retrieve(["k"], route_key=route_key)
+        )
+    )
+    load.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        assert c._stop.wait(5)
+    finally:
+        go.set()
+        load.join(5)
+        closer.join(5)
+    assert not (load.is_alive() or closer.is_alive() or failures)
+    assert result["leases"] == [None]
+    assert stopped == [[0, 0]]
+    assert r.data.staging is None
+
+
+def test_close_keeps_shared_staging_for_an_already_issued_pool_lease(pools):
+    r = router(pools)
+    route_key = route_key_of(r, 1)
+    assert store(r, route_key, ["k"])[0] == [True]
+    (lease,) = r.batch_retrieve(["k"], route_key=route_key)
+    staging, transport = r.data.staging, r.data.transport
+    with pytest.raises(RuntimeError, match="Release RDMA read leases"):
+        r.close()
+    assert r.data.staging is staging and r.data.transport is transport
+    assert bytes(lease.view) == b"k"
+    lease.release()
+    r.close()
+    assert r.data.staging is None
 
 
 def test_close_ends_a_pool_disabled_earlier(pools):

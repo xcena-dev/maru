@@ -940,7 +940,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def has_unconfirmed_transfers(self) -> bool:
         """Whether a late RDMA may still touch this client's memory."""
         with self._lock:
-            return bool(self._isolated) or self._transfers > 0
+            return (
+                bool(self._isolated)
+                or self._transfers > 0
+                or self._data.has_unconfirmed_probes()
+            )
 
     def reap_unconfirmed(self) -> bool:
         """Give back what the transfers NIXL has released held.
@@ -950,7 +954,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
         """
         with self._lock:
             self._reap_isolated()
-            return not self._isolated and not self._transfers
+            probes_ended = self._data.reap_probes()
+            return not self._isolated and not self._transfers and probes_ended
 
     def _stop_data_path_later(self) -> None:
         """After close: stop the data path once the late transfers ended."""
@@ -1043,7 +1048,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
             hits = hits[: len(slots)]
             self._transfers += 1
         try:
-            got = self._read(hits, slots, result.get("regions", {}))
+            got = self._read(
+                hits,
+                slots,
+                result.get("regions", {}),
+                result.get("region_boots", {}),
+            )
         except BaseException:
             # _read hands every slot back or isolates it before it
             # returns; what escapes it (an interrupt) may leave a READ
@@ -1075,7 +1085,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
         out: list[CpuReadLease | None] = [None] * len(keys)
         unused = set(slots)
         for (i, location), slot in zip(hits, slots, strict=False):
-            if not (got and held):
+            # close() may have begun while the READ ran without the lock.
+            # It waits for this transfer and then tears the staging down, so
+            # do not hand out a new lease after its initial live-lease check.
+            if not (got and held and not self._stop.is_set()):
                 continue
             unused.discard(slot)
             view = self._staging.view(slot)[: location.length]
@@ -1105,6 +1118,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         hits: list[tuple[int, StorageLocation]],
         slots: list[int],
         regions: dict[str, dict],
+        region_boots: dict[str, str],
     ) -> bool:
         """READ each hit into its slot; False if not confirmed for all.
 
@@ -1135,6 +1149,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
                         f"fit a {self._staging.slot_bytes}-byte staging slot"
                     )
                 access = self._region(location.pool_id, handle)
+                expected_boot = region_boots.get(location.pool_id)
+                if not expected_boot or access.boot != expected_boot:
+                    raise StorageUnavailableError(
+                        "A leased region's memory-node boot is unknown or changed"
+                    )
                 if location.offset + location.length > access.length:
                     raise StorageUnavailableError(
                         "A leased location ends past its region"
@@ -1263,7 +1282,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if self.connected or self.regions:
                 # A disabled session already left its regions.
                 self._leave()
-            if not self._isolated and not self._transfers:
+            if not self.has_unconfirmed_transfers():
                 self._stop_data_path()
             else:
                 logger.warning(

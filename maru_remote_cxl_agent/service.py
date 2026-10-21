@@ -48,6 +48,11 @@ away from its owner.
 A map reply carries the NIXL metadata of that region's registration only,
 so a Handler learns the remote key of the regions it asked for and no other.
 
+The NIXL agent here has no progress thread. A map request names the worker's
+NIXL agent, and UCX is driven from the map until that agent announces itself
+over its connection (:class:`~maru_remote_cxl_agent.progress.ConnectProgress`);
+every hello, map and sweep also drives it once.
+
 Requests for different regions run concurrently; requests for one region
 wait for the first one to finish mapping it, and a first map waits for
 earlier first maps of an overlapping range.
@@ -66,6 +71,8 @@ from typing import Any
 from maru_remote.region_map import read_token
 from maru_shm.client import HoldRefusedError
 from maru_shm.types import MaruHandle
+
+from .progress import ConnectProgress
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +226,7 @@ class RegionMapService:
         self._rm = rm
         self._mapper = mapper
         self._transport = transport
+        self._progress = ConnectProgress(transport)
         self.node_id = node_id
         self.epoch = epoch
         self.boot_id = boot_id
@@ -253,13 +261,16 @@ class RegionMapService:
                 if m.ready.is_set() and m.error is None
             }
 
-    def map(self, conn: int, handle: Any) -> dict:
+    def map(self, conn: int, handle: Any, nixl_agent: str | None = None) -> dict:
         """Map a region for a connection, or share an existing mapping.
 
         Args:
             conn: Connection id of the requesting Handler.
             handle: ``MaruHandle.to_dict()`` of the region, or its read
                 handle (``maru_remote.region_map.read_handle``).
+            nixl_agent: Name of the worker's NIXL agent, which loads the
+                reply and then announces itself; UCX is driven until then.
+                None for a caller that issues no RDMA.
 
         Returns:
             ``{"region_id", "addr", "length", "metadata"}``; ``metadata``
@@ -275,6 +286,14 @@ class RegionMapService:
                 mapping of the region's range is gone.
         """
         self._discard_notifs()
+        reply = self._map(conn, handle)
+        if nixl_agent is not None:
+            # Before the reply leaves: the announcement may follow at once.
+            self._progress.expect(nixl_agent)
+        return reply
+
+    def _map(self, conn: int, handle: Any) -> dict:
+        """The mapping of :meth:`map`."""
         h = parse_handle(handle)
         if isinstance(h, ReadHandle):
             return self._map_for_reader(conn, h)
@@ -410,8 +429,10 @@ class RegionMapService:
         gets its deregistration again. While the resource manager cannot be
         asked, every mapping stays. The unholds of released regions that
         have not reached the resource manager are sent again, and the holds
-        of this agent's earlier process are dropped once.
+        of this agent's earlier process are dropped once. UCX is driven once
+        (workers' notifications, a connection setup that outlasted its wait).
         """
+        self._discard_notifs()
         try:
             self._reset_holds()
         except Exception:
@@ -482,9 +503,9 @@ class RegionMapService:
         self._sweeper.start()
 
     def _discard_notifs(self) -> None:
-        """Drop the notifications workers send to check their connection here."""
+        """Drive UCX once and drop the notifications workers sent here."""
         try:
-            self._transport.discard_notifs()
+            self._progress.drain()
         except Exception:
             # They pile up while this fails; say so once.
             if not self._drain_failed:
@@ -496,6 +517,7 @@ class RegionMapService:
     def close(self) -> None:
         """Stop the sweep and release every region (the process is ending)."""
         self._stop.set()
+        self._progress.close()
         if self._sweeper is not None:
             self._sweeper.join(timeout=_SWEEP_JOIN_S)
         with self._lock:

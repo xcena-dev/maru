@@ -36,7 +36,7 @@ dev = [
 ]
 # NIXL for the remote_cxl storage backend and the remote CXL agent (maru-remote-cxl-agent)
 rdma = [
-    "nixl",
+    "nixl>=1.2.0,<2",
 ]
 docs = [
     "sphinx>=7.0",

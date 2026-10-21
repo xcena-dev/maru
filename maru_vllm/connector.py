@@ -1831,6 +1831,11 @@ class MaruWorkerConnector:
         # retrieve). _deferred_lock guards every _deferred_*/failed structure;
         # both the loader thread and the engine thread mutate them.
         self._deferred_lock = threading.Lock()
+        # A successful remote load already found these full chunks in its
+        # pool. Skip their write-behind copies for this request only. Keep
+        # the load metadata identity so an abandoned/replaced load cannot
+        # publish a late result into another request's state.
+        self._loaded_request_keys: dict[str, tuple[MaruReqMeta, set[str]]] = {}
         self._deferred_executor: ThreadPoolExecutor | None = None
         self._deferred_stream: torch.cuda.Stream | None = None
         self._deferred_stream_device: torch.device | None = None
@@ -2386,6 +2391,8 @@ class MaruWorkerConnector:
         # that window is recorded against this id instead.
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
+            if self._remote_cxl_mode:
+                self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
         self._deferred_executor.submit(
             self._deferred_load_job, req_meta, layers, device
         )
@@ -3122,6 +3129,11 @@ class MaruWorkerConnector:
             stream: The loader thread's CUDA stream, or None on the engine
                 thread (the load stream, ordered after the compute stream).
         """
+        with self._deferred_lock:
+            if req_meta.req_id not in self._inflight_deferred_req_ids:
+                self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
+            # An off-thread load was registered before submission. If its
+            # request ended meanwhile, do not recreate the removed entry.
         ct = self._kv_chunk_tokens
         chunk_keys = _req_chunk_keys(req_meta, ct)
         num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
@@ -3346,6 +3358,14 @@ class MaruWorkerConnector:
         if unconfirmed is not None:
             self._fail_deferred_load(unconfirmed)
             return
+        # Every READ and GPU copy succeeded. Boundary chunks were loaded
+        # only in part; leave them eligible for the existing store path.
+        full_first = (start + ct - 1) // ct - first
+        full_end = end // ct - first
+        with self._deferred_lock:
+            loaded = self._loaded_request_keys.get(req_meta.req_id)
+            if loaded is not None and loaded[0] is req_meta:
+                loaded[1].update(chunk_keys[full_first:full_end])
         if req_meta.deferred_load:
             logger.info(
                 "Maru: deferred load of %d chunks in %d batch(es) for req %s",
@@ -3556,11 +3576,17 @@ class MaruWorkerConnector:
         self._recv_only_finished_req_ids.difference_update(recv_only)
         finished_req_ids = finished_req_ids - recv_only
         if not self._write_behind:
+            with self._deferred_lock:
+                for req_id in finished_req_ids | recv_only:
+                    self._loaded_request_keys.pop(req_id, None)
             return None
         queued = self._queued_store_batches
         self._queued_store_batches = []
         for kernel, metadata in queued:
             self._store_packed_slabs_write_behind(kernel, metadata)
+        with self._deferred_lock:
+            for req_id in finished_req_ids | recv_only:
+                self._loaded_request_keys.pop(req_id, None)
         with self._store_lock:
             self._finished_store_requests.update(finished_req_ids)
             done = {
@@ -3591,6 +3617,13 @@ class MaruWorkerConnector:
         # preemption were drained at that preemption. Do not synchronize the
         # shared store stream for recv-only aborts (it may serve other requests).
         self._recv_only_finished_req_ids.update(metadata.recv_only_finished_req_ids)
+        with self._deferred_lock:
+            for req_id in (
+                metadata.preempted_req_ids
+                | metadata.finished_req_ids
+                | metadata.recv_only_finished_req_ids
+            ):
+                self._loaded_request_keys.pop(req_id, None)
         if (
             self._write_behind
             and metadata.preempted_req_ids
@@ -4637,6 +4670,20 @@ class MaruWorkerConnector:
             if start_chunk >= end_chunk:
                 continue
 
+            loaded_keys: frozenset[str] = frozenset()
+            if self._remote_cxl_mode:
+                with self._deferred_lock:
+                    loaded = self._loaded_request_keys.get(req_meta.req_id)
+                    if loaded is not None:
+                        loaded_keys = frozenset(loaded[1])
+            chunks = [
+                ci
+                for ci in range(start_chunk, end_chunk)
+                if chunk_keys[ci] not in loaded_keys
+            ]
+            if not chunks:
+                continue
+
             needed_tokens = end_chunk * ct
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, needed_tokens)
             if slot_mapping.shape[0] < needed_tokens:
@@ -4652,7 +4699,7 @@ class MaruWorkerConnector:
             # Several storage-session pools: a request's chunks go to the pool
             # its first chunk key picks.
             route = _session_route(self._cpu_mode, chunk_keys)
-            for ci in range(start_chunk, end_chunk):
+            for ci in chunks:
                 base_key = chunk_keys[ci]
                 chunk_slots = slot_mapping[ci * ct : (ci + 1) * ct]
                 entry = key_entries.get(base_key)
@@ -5017,6 +5064,7 @@ class MaruWorkerConnector:
             self._recv_only_finished_req_ids.clear()
             self._inflight_deferred_req_ids.clear()
             self._abandoned_req_ids.clear()
+            self._loaded_request_keys.clear()
         if self._handler is not None:
             try:
                 self._handler.close()

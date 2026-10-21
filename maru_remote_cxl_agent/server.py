@@ -44,6 +44,9 @@ MAX_PER_SOURCE = 64
 FD_RESERVE = 64
 # How often a turned-away connection is logged
 FULL_WARN_INTERVAL_S = 60.0
+# Longest NIXL agent name a map request may give (a worker's name is
+# "maru-worker-<engine id>-<8 hex digits>")
+MAX_NIXL_AGENT_NAME = 512
 # accept() errors that mean the listening socket itself is broken; any other
 # (no room now, or an error pending on the new connection) is passed over
 _LISTENER_BROKEN = {errno.EBADF, errno.EINVAL, errno.ENOTSOCK}
@@ -131,7 +134,17 @@ def handle_request(
                 "code": "denied",
             }
         if op == "map":
-            return {"ok": True, **service.map(conn, message.get("handle"))}
+            nixl_agent = message.get("nixl_agent")
+            if nixl_agent is not None and (
+                type(nixl_agent) is not str
+                or not nixl_agent
+                or len(nixl_agent) > MAX_NIXL_AGENT_NAME
+            ):
+                raise ValueError(
+                    f"nixl_agent must be a name of 1 to {MAX_NIXL_AGENT_NAME} characters"
+                )
+            reply = service.map(conn, message.get("handle"), nixl_agent)
+            return {"ok": True, **reply}
         if op == "unmap":
             region_id = message.get("region_id")
             if type(region_id) is not int:

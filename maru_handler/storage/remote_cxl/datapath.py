@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import mmap
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from typing import Any
 
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_remote.region_map import pick_agent
+from maru_remote.transport import buffer_address
 
 from ..staging import StagingBuffer
 from .region import RegionAccess
@@ -30,6 +32,9 @@ CONNECT_TIMEOUT_S = 3.0
 # as an RDMA transfer (``rdma_timeout_s``); a short transfer deadline must not
 # cut off a map that registers a whole region.
 REPLY_TIMEOUT_MIN_S = 3.0
+# Bytes a new NIXL connection reads from the region it was loaded for, which
+# completes the connection's setup (see RdmaDataPath._complete_connection)
+CONNECT_PROBE_BYTES = 64
 
 
 class _StaleReplyError(StorageUnavailableError):
@@ -75,7 +80,16 @@ class RdmaDataPath:
         self._needs_key = agent_factory is None
         self.staging: StagingBuffer | None = None
         self.transport: Any = None
+        # A transport retained after failed setup/cleanup is not ready to use.
+        self._started = False
+        # Name of the NIXL agent in self.transport; map requests carry it
+        self.transport_name = ""
         self._registration: Any = None
+        # Registered page that connection probes read into, and the probes
+        # that did not finish (their handles are released before close)
+        self._probe: mmap.mmap | None = None
+        self._probe_addr = 0
+        self._probes: list[Any] = []
         self._agents: dict[str, Any] = {}
         self._access: dict[str, RegionAccess] = {}
         # Remote CXL agent -> time until which it counts as down
@@ -93,6 +107,10 @@ class RdmaDataPath:
         # metadata was last loaded through that agent's connection. A peer
         # dropped after a transfer error stays listed; has_peer() tells.
         self._loaded: dict[str, tuple[str, int]] = {}
+        # A peer introduced by a map whose connection probe has not yet
+        # succeeded. Retain its identity to check/drop a failed endpoint
+        # before a later map tries to load metadata into it again.
+        self._unready: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
         # Held from the check of a peer to the load of its metadata, and
         # while a peer is dropped
@@ -103,10 +121,16 @@ class RdmaDataPath:
 
         Raises:
             StorageError: if the remote CXL agent key cannot be read.
+            StorageUnavailableError: if earlier setup or cleanup retained
+                incomplete resources; close them before restarting.
             Exception: if the buffer, the NIXL agent or the registration
-                fails; nothing is left set up.
+                fails. Buffers remain owned if deregistration also fails.
         """
         if self.transport is not None:
+            if not self._started:
+                raise StorageUnavailableError(
+                    "RDMA data path cleanup is pending; close it before restarting"
+                )
             return
         if self._needs_key and self._key is None:
             from maru_remote.region_map import KeyFileError, load_key
@@ -117,7 +141,9 @@ class RdmaDataPath:
                 raise StorageError(str(exc)) from exc
         page = self.config.chunk_size_bytes
         size = self.config.rdma_staging_size or max(64 * page, DEFAULT_STAGING)
-        staging = transport = None
+        staging = transport = registration = None
+        probe = mmap.mmap(-1, mmap.PAGESIZE)
+        probe_addr = buffer_address(probe)
         try:
             staging = StagingBuffer(size, page)
             staging.load_reserve = int(staging.count * self.config.rdma_load_reserve)
@@ -127,20 +153,39 @@ class RdmaDataPath:
             registration = transport.register(
                 staging.address, staging.nbytes, "staging"
             )
+            transport.register(probe_addr, len(probe), "connect-probe")
         except BaseException:
+            cleaned = True
             if transport is not None:
                 try:
                     transport.close()
                 except Exception:
                     logger.warning("RDMA transport cleanup failed", exc_info=True)
-            if staging is not None:
-                staging.close()
+                    cleaned = False
+            if cleaned:
+                if staging is not None:
+                    staging.close()
+                probe.close()
+            else:
+                # The first registration may have succeeded before the
+                # probe's registration failed. Keep both buffers until a
+                # later close confirms deregistration.
+                self.staging, self.transport, self._registration = (
+                    staging,
+                    transport,
+                    registration,
+                )
+                self.transport_name = name
+                self._probe, self._probe_addr = probe, probe_addr
             raise
         self.staging, self.transport, self._registration = (
             staging,
             transport,
             registration,
         )
+        self.transport_name = name
+        self._probe, self._probe_addr = probe, probe_addr
+        self._started = True
 
     def region(
         self, pool_id: str, handle: dict, agents: list[str], own: bool = False
@@ -185,7 +230,7 @@ class RdmaDataPath:
         client = self._client(address)
         for attempt in range(2):
             try:
-                reply = client.map(handle)
+                reply = client.map(handle, nixl_agent=self.transport_name)
             except RegionMapUnavailable as exc:
                 # The client closed the connection: whatever the request
                 # mapped is released by the agent when it sees the
@@ -219,7 +264,12 @@ class RdmaDataPath:
             # into a peer this agent already knows adds the region to it.
             try:
                 peer = self._load_peer(
-                    address, reply.generation, reply.metadata, pool_id, region_id
+                    address,
+                    reply.generation,
+                    reply.metadata,
+                    pool_id,
+                    region_id,
+                    reply.addr,
                 )
             except _StaleReplyError:
                 if attempt:
@@ -243,8 +293,14 @@ class RdmaDataPath:
         metadata: bytes,
         pool_id: str,
         region_id: object,
+        remote_addr: int | None = None,
     ) -> str:
         """Load a map reply's metadata into the remote CXL agent's NIXL peer.
+
+        Then the peer is sent an empty notification (``announce``), which
+        ends the agent's wait for this worker's connection, and a peer loaded
+        anew has its connection completed by a small READ at ``remote_addr``
+        (:meth:`_complete_connection`).
 
         UCX fails a connection on its own when the peer stops answering (a
         stopped process, a network outage), and NIXL closes it but keeps it
@@ -262,11 +318,12 @@ class RdmaDataPath:
                 since another map loaded the peer; the agent released what
                 that connection held.
             StorageUnavailableError: if NIXL refused to drop the old peer or
-                to load the metadata.
+                to load the metadata, or a new connection failed.
         """
         with self._load_lock:
             with self._lock:
-                loaded = self._loaded.get(address)
+                ready = self._loaded.get(address)
+                loaded = ready or self._unready.get(address)
             if loaded is not None and generation < loaded[1]:
                 raise _StaleReplyError(
                     f"region {region_id} could not be mapped: the reply came "
@@ -287,15 +344,91 @@ class RdmaDataPath:
                     f"region {region_id} could not be mapped: NIXL kept the "
                     f"connection to {loaded[0]}"
                 )
+            connected = loaded is not None and self.transport.has_peer(loaded[0])
+            if not connected:
+                with self._lock:
+                    self._loaded.pop(address, None)
+                    self._unready.pop(address, None)
             try:
-                peer = self.transport.add_peer(metadata)
+                peer = self.transport.add_peer(
+                    metadata,
+                    peer=loaded[0] if connected and loaded is not None else None,
+                    timeout_s=self.config.rdma_timeout_s,
+                )
             except Exception as exc:
                 raise StorageUnavailableError(
                     f"NIXL refused the metadata of region {region_id}: {exc}"
                 ) from exc
             with self._lock:
+                self._unready[address] = (peer, generation)
+            # Keep disconnect and another metadata load out until the new
+            # connection is ready; a failed probe must not mark it ready.
+            if not self.transport.announce(peer):
+                logger.debug("NIXL refused to announce this worker to %s", peer)
+            if remote_addr is not None and not (
+                connected and ready is not None and ready[0] == peer
+            ):
+                self._complete_connection(peer, remote_addr, region_id)
+            with self._lock:
                 self._loaded[address] = (peer, generation)
+                self._unready.pop(address, None)
         return peer
+
+    def _complete_connection(
+        self, peer: str, remote_addr: int, region_id: object
+    ) -> None:
+        """Complete a new NIXL connection with a small READ from its region.
+
+        The worker progresses UCX through status queries and its native event
+        thread. Complete setup here while the remote CXL agent drives its
+        passive side for this map, so later KV transfers need not wait for
+        connection setup.
+
+        Args:
+            peer: Peer loaded anew.
+            remote_addr: Address of the region the map reply named.
+            region_id: The region, for messages.
+
+        Raises:
+            StorageUnavailableError: if the READ fails or does not finish in
+                time. An uncertain request and its probe buffer stay owned
+                until completion is confirmed.
+        """
+        self.reap_probes()
+        try:
+            self.transport.read(
+                peer,
+                [(self._probe_addr, remote_addr, CONNECT_PROBE_BYTES)],
+                timeout_s=self.config.rdma_timeout_s,
+            )
+        except BaseException as exc:
+            pending = getattr(exc, "pending", None) or getattr(
+                exc, "pending_transfer", None
+            )
+            if pending is not None:
+                with self._lock:
+                    self._probes.append(pending)
+            if not isinstance(exc, Exception):
+                raise
+            raise StorageUnavailableError(
+                f"region {region_id} could not be mapped: the new RDMA "
+                f"connection to {peer} failed: {exc}"
+            ) from exc
+
+    def has_unconfirmed_probes(self) -> bool:
+        """Whether a connection probe may still touch registered memory."""
+        with self._lock:
+            return bool(self._probes)
+
+    def reap_probes(self) -> bool:
+        """Release completed connection probes; True when none remains.
+
+        The client and shared-pool router include these probes in their
+        late-transfer cleanup, even if no KV transfer was ever posted.
+        """
+        with self._lock:
+            self._probes = [p for p in self._probes if not p.poll()]
+            return not self._probes
 
     def is_down(self, address: str) -> bool:
         """Whether a map through this remote CXL agent failed a moment ago."""
@@ -469,14 +602,17 @@ class RdmaDataPath:
         If the NIXL agent cannot be cleaned up, it and the staging buffer stay,
         and a later call tries again.
         """
+        self._started = False
         with self._lock:
             clients = list(self._agents.values())
             self._agents.clear()
             self._access.clear()
             self._loaded.clear()
+            self._unready.clear()
         for client in clients:
             client.close()  # releases every mapping the connection held
         if self.transport is not None:
+            self.reap_probes()
             try:
                 self.transport.close()
             except Exception:
@@ -488,6 +624,9 @@ class RdmaDataPath:
                 )
                 return
             self.transport = None
+        if self._probe is not None:
+            self._probe.close()
+            self._probe = None
         if self.staging is not None:
             self.staging.close()
             self.staging = None
@@ -524,8 +663,12 @@ class RdmaDataPath:
 
 def _default_transport(config: Any) -> Callable[[str], Any]:
     def make(name: str) -> Any:
+        from maru_remote.native_agent import NativeNixlAgent
         from maru_remote.transport import NixlTransport
 
-        return NixlTransport(name, ucx_device=config.rdma_device)
+        agent = NativeNixlAgent(name, progress_thread=True, event_timeout_us=1000)
+        params = {"ucx_devices": config.rdma_device} if config.rdma_device else {}
+        agent.create_backend("UCX", params)
+        return NixlTransport(name, agent=agent)
 
     return make

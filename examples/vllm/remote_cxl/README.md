@@ -61,8 +61,11 @@ moves it, as for the cxl backend.
 ## Requirements
 
 - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node, and NIXL
-  with its UCX backend in the environment Maru is installed in:
-  `uv pip install nixl` (`pip install nixl` without uv).
+  with its UCX backend in the environment Maru is installed in. For the
+  validated vLLM 0.22.1 / Torch 2.11.0 / CUDA 13 stack, install from the Maru
+  source root using the constraints for this example:
+  `uv pip install -c examples/vllm/remote_cxl/constraints-vllm022.txt nixl`
+  (`pip install` in place of `uv pip install` without uv).
 - On the memory nodes: the CXL/DAX device of the pool, visible on every memory
   node of the pool, and the resource manager on one of them, as for a local CXL
   deployment. Use a devdax device. Install Maru with NIXL (NIXL first,
@@ -79,10 +82,20 @@ moves it, as for the cxl backend.
   node, readable only by the user that runs them; they read
   `~/.maru/remote-cxl-agent.key` by default. The memory nodes of a shared
   pool use the same key.
-- The remote CXL agent runs UCX on the RDMA transports only (`UCX_TLS=rc,dc`) with
-  its registration cache off (`UCX_RCACHE_ENABLE=n`). It sets both itself and
-  refuses to start if they are set otherwise: with the TCP transport or the
-  registration cache, a deregistered region can still be written.
+- The remote CXL agent uses `UCX_TLS=rc,dc,cuda_copy` with its registration
+  cache off (`UCX_RCACHE_ENABLE=n`). RC/DC carries the remote DRAM bytes;
+  `cuda_copy` supplies local CUDA memory-type support required by NIXL 1.5
+  on GPU hosts. The agent sets both defaults and rejects TCP, shared-memory
+  and CUDA IPC transports, or a registration cache that would keep released
+  regions registered.
+
+The serving checks use NIXL 1.2.0 and its matching CUDA wheel. Maru's native
+API and CXL-to-host-to-GPU correctness checks also pass with NIXL 1.5.0,
+but that does not validate the full vLLM stack. In the tested CUDA 13 wheel,
+NIXL 1.5's optional EP plugin has no Torch 2.11 binary, and vLLM 0.22.1
+fails during startup when it imports that plugin. Keep the example's
+constraints when using this serving stack; select newer dependencies only
+after checking them together.
 
 ## Quick start (one host)
 
@@ -325,7 +338,8 @@ All example settings are in `env.sh`. Override them with environment variables:
 ## Troubleshooting
 
 - **The remote CXL agent refuses to start with `UCX_TLS` or `UCX_RCACHE_ENABLE`**:
-  unset them, or set `UCX_TLS` to RDMA transports (`rc`, `dc`) and
+  unset them, or include an RDMA transport (`rc`, `dc`) and `cuda_copy` in
+  `UCX_TLS`, with
   `UCX_RCACHE_ENABLE=n`. Only for a test on a host without an RDMA NIC,
   `--allow-unchecked-transport` lets it run on other transports; a late RDMA
   WRITE can then land in a region after its owner gave it back.

@@ -3,6 +3,7 @@
 Handler-side client, the command line and the device mapper."""
 
 import ctypes
+import gc
 import os
 import threading
 import time
@@ -705,7 +706,18 @@ def test_main_refuses_to_start_without_a_bind_address(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "value", ["rc", "rc,dc", "rc_x,ud_x:aux", "rc_verbs,ud_verbs:aux", "dc_mlx5,self"]
+    "value",
+    [
+        "rc",
+        "rc,dc",
+        "rc_x,ud_x:aux",
+        "rc_verbs,ud_verbs:aux",
+        "dc_mlx5,self",
+        "rc,dc,cuda_copy",
+        "rc,cuda_copy",
+        "dc_mlx5,cuda_copy",
+        "rc_x,ud_x:aux,cuda_copy",
+    ],
 )
 def test_transports_that_check_remote_keys_are_accepted(value):
     env = {"UCX_TLS": value}
@@ -716,7 +728,26 @@ def test_transports_that_check_remote_keys_are_accepted(value):
 # passes only as rc's connection-setup helper (":aux"). "ib" enables UD fully.
 @pytest.mark.parametrize(
     "value",
-    ["tcp", "rc,tcp", "sm", "all", "^tcp", "cma", "ib", "ud", "rc,ud_x", "ud_mlx5"],
+    [
+        "tcp",
+        "rc,tcp",
+        "sm",
+        "all",
+        "^tcp",
+        "cma",
+        "ib",
+        "ud",
+        "rc,ud_x",
+        "ud_mlx5",
+        "cuda",
+        "cuda_ipc",
+        "rc,cuda",
+        "rc,cuda_ipc",
+        "rc,cuda_copy,tcp",
+        "rc,cuda_copy,sm",
+        "rc,cuda_copy,shm",
+        "rc,cuda_copy,cuda_ipc",
+    ],
 )
 def test_transports_that_do_not_check_remote_keys_are_refused(value):
     with pytest.raises(cli.UncheckedTransportError):
@@ -726,9 +757,20 @@ def test_transports_that_do_not_check_remote_keys_are_refused(value):
 
 def test_an_unset_transport_list_becomes_the_rdma_transports():
     env = {}
-    assert cli.require_checked_transport(env) == "rc,dc"
-    assert env["UCX_TLS"] == "rc,dc"
+    assert cli.require_checked_transport(env) == "rc,dc,cuda_copy"
+    assert env["UCX_TLS"] == "rc,dc,cuda_copy"
     assert env["UCX_RCACHE_ENABLE"] == "n"
+
+
+@pytest.mark.parametrize(
+    "value", ["cuda_copy", "self,cuda_copy", "ud_x:aux,cuda_copy", "rc:aux,cuda_copy"]
+)
+def test_cuda_copy_requires_a_primary_key_checking_remote_transport(value):
+    with pytest.raises(cli.UncheckedTransportError, match="without an RC/DC"):
+        cli.require_checked_transport({"UCX_TLS": value})
+    assert (
+        cli.require_checked_transport({"UCX_TLS": value}, allow_unchecked=True) == value
+    )
 
 
 @pytest.mark.parametrize("value", ["y", "try", "yes", "off", "false"])
@@ -867,8 +909,6 @@ def test_the_device_mapper_refuses_a_device_whose_uuid_is_not_here(
 
 
 def test_an_unmapped_range_is_not_given_to_the_next_mapping(tmp_path):
-    from maru_remote_cxl_agent import mapper as mapper_module
-
     device = tmp_path / "dax-local"
     device.write_bytes(bytes(1 << 20))
     now = [0.0]
@@ -880,10 +920,54 @@ def test_an_unmapped_range_is_not_given_to_the_next_mapping(tmp_path):
     assert second != first
     assert mapper.held_addresses() == [(first, 1 << 20)]
     mapper.unmap(second, 1 << 20)
-    now[0] = mapper_module.ADDRESS_QUARANTINE_S + 1
+    # The old 600 s timeout cannot fence a worker paused before posting.
+    # Passing a full week must not permit either old address to be reused.
+    now[0] = 7 * 24 * 60 * 60
     third = mapper.map("/dev/x", "u", 0, 1 << 20)
-    assert mapper.held_addresses() == []  # expired placeholders are dropped
+    assert third not in {first, second}
+    assert mapper.held_addresses() == [(first, 1 << 20), (second, 1 << 20)]
     mapper.unmap(third, 1 << 20)
+
+
+def test_a_failed_new_map_preserves_the_old_address_reservations(tmp_path, monkeypatch):
+    from maru_remote_cxl_agent import mapper as mapper_module
+
+    device = tmp_path / "dax-local"
+    device.write_bytes(bytes(4096))
+    mapper = DaxRegionMapper({"u": str(device)})
+    address = mapper.map("/dev/x", "u", 0, 4096)
+    mapper.unmap(address, 4096)
+
+    def no_address_space(*args):
+        ctypes.set_errno(12)  # ENOMEM, as for address-space/VMA exhaustion
+        return mapper_module._MAP_FAILED
+
+    monkeypatch.setattr(mapper_module._libc, "mmap", no_address_space)
+    with pytest.raises(OSError) as error:
+        mapper.map("/dev/x", "u", 0, 4096)
+    assert error.value.errno == 12
+    assert mapper.held_addresses() == [(address, 4096)]
+
+
+def test_mapper_object_cleanup_does_not_release_registered_addresses(tmp_path):
+    device = tmp_path / "dax-local"
+    device.write_bytes(bytes(4096))
+    mapper = DaxRegionMapper({"u": str(device)})
+    address = mapper.map("/dev/x", "u", 0, 4096)
+    mapper.unmap(address, 4096)
+    del mapper
+    gc.collect()
+    # Service/object cleanup must not create an address-reuse window while
+    # this process and its NIC connections may still be alive.
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            bounds, permissions, *_ = line.split()
+            start, end = (int(value, 16) for value in bounds.split("-"))
+            if start <= address < end:
+                assert permissions[:3] == "---"
+                break
+        else:
+            pytest.fail("released registered address was no longer reserved")
 
 
 def test_a_discarded_mapping_is_not_held(tmp_path):

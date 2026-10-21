@@ -288,8 +288,43 @@ the process:
 
 ![A worker maps region R2 after its remote CXL agent stopped answering and answers again. (a) Without the check, R2's metadata is loaded into the peer that still holds the closed connection, and the worker process crashes. (b) The Handler checks the peer first; the check is refused, so it drops the peer, connects anew and loads R2's metadata, and RDMA of R2 works](../image/remote_cxl_failed_peer.png)
 
+Adding a region's metadata also waits for all existing transfers to that peer
+to release their handles. NIXL 1.2.0 can discard the peer's whole metadata
+when an update fails, making an ongoing transfer report an error before its
+DMA ends. The pending-handle check and metadata update hold the same lock as
+transfer creation; while waiting, the lock is released so transfers continue
+to progress. Transfers to another known peer do not delay the update. A new
+peer whose name is not known yet waits for all existing handles. If the wait
+exceeds the RDMA timeout, the map fails safely without loading metadata.
+The data path remembers a peer as soon as metadata is introduced, even if
+the connection probe fails. A retry checks that peer and drops a failed
+endpoint before loading metadata again; it marks the connection ready only
+after the probe succeeds.
+
+**A memory node that rebooted.** The owner reports the node's boot id when it
+first maps a region. An acquire reply includes that recorded id in
+`region_boots`, separately from the region handles. Before reading a leased
+region, the reader compares the recorded boot with the boot in its map reply.
+An unknown or different boot makes the batch a miss and releases its lease
+and staging slots. This also covers the interval after the owner or keeper
+has registered a region again but has not yet retired its old keys. A new
+agent process on the same boot preserves cache reuse. A reader talking to a
+server that does not provide the recorded boot treats those entries as misses.
+
 **Giving regions back.** A region goes back to the Resource Manager only after
 its remote CXL agent deregistered it from the NIC (`release`):
+
+The agent replaces the released virtual-address range with an inaccessible
+anonymous reservation and keeps it until its process exits. A timer is
+insufficient: a worker paused just before posting a WRITE may resume after
+any deadline, and the NIC can reuse a key if a new region uses the old
+address. Keeping every released address unused prevents that alias. These
+reservations use virtual address space and kernel mapping records without
+retaining CXL capacity or populated data pages. If the process runs out of
+address space or mapping records, a new map fails safely; capacity planning
+must allow for region churn and a controlled agent restart. Service cleanup
+does not remove the reservations early; the OS reclaims them at process exit,
+after that process's NIC connections end.
 
 ![The resource flow is the same for both backends; what keeps a returned region safe from late writes differs. A cxl Handler's copies are done when it returns a region. A remote_cxl Handler's RDMA WRITE may still be in flight, so whoever gives the region back (its owner, or MaruServer once the owner has left) has the remote CXL agent deregister it first, and a late WRITE fails at the NIC](../image/remote_cxl_return_rule.png)
 
@@ -335,6 +370,62 @@ engine thread; the write-behind thread gives each chunk its page and WRITEs
 it:
 
 ![Staging slots with asynchronous transfers: stores leave half of the slots, by count, free for loads. The loader thread reads batch b+1 by RDMA READ while batch b's GPU copy runs, and a batch's slots go back after its copy; the engine thread queues a store's copy from the GPU into its slot, and the write-behind thread gives the chunk its page and WRITEs it to the worker's own region](../image/remote_cxl_staging_slots.png)
+
+For remote CXL write-behind stores, a request skips full chunks that it has
+successfully loaded from the pool. The loader records them only after every
+READ and GPU copy completed; the resumed store filters them before gathering
+GPU bytes or allocating staging slots. A failed or partially failed load
+leaves its chunks eligible for recompute and storage. Partly loaded boundary
+chunks remain eligible too. Chunked-prefill stores still collect the chunks
+computed in earlier steps when the prompt completes.
+
+This is a per-request admission decision, not a permanent record that a key
+exists: the record ends at finish, preemption or abort. A key evicted after
+the successful load may stay absent for the rest of that request, but its
+already loaded GPU bytes remain valid. The next request probes the pool
+again and can recompute and store a miss. Other storage backends retain their
+existing store policy.
+
+**CPU use.** The worker uses a small adapter over NIXL's public native API.
+It enables the UCX progress thread with `pthrDelay=1000` microseconds: after
+progressing and arming the workers, the thread waits for their event file
+descriptors, with a 1 ms periodic fallback. This is an event wait, so a ready
+event can wake it earlier; it does not add a fixed sleep to each transfer.
+Transfer status queries still progress UCX on the posting thread. The memory
+node's remote CXL agent retains progress OFF. The remote CXL agent
+issues no transfers, and the bytes of an established connection need no CPU
+on the memory node; its side has work when a worker connects. A map request
+names the worker's NIXL agent, and the remote CXL agent drives UCX from the
+map until that agent announces itself with an empty notification over the
+connection, and once on every hello, map and once-a-second sweep. The worker
+completes a new connection at the map with a small READ from the region, so
+no later transfer waits for the connection setup. An idle remote CXL agent
+does not busy-poll UCX.
+
+![Each worker shares one data path and NIXL agent across pools. The Python loader queries active transfers with a 200 microsecond pause. Independently, NIXL's C++ thread progresses UCX, arms its event FD and waits for an event or a 1 ms fallback timeout. The memory agent keeps progress OFF and only drives connections and periodic sweeps.](../image/remote_cxl_progress.png)
+
+The two rows are threads of the same worker. A ready event can wake the
+native thread before its timeout; 1 ms is the configured fallback, not an
+OS scheduling deadline. [Editable diagram](../image/remote_cxl_progress.mmd).
+
+The adapter imports NIXL lazily and requires NIXL `>=1.2.0,<2`, its public
+native APIs and a matching CUDA wheel. Python call contracts have been
+checked against `1.2.0` and `1.5.0`; newer versions retain capability checks.
+Missing public native exports, incompatible versions and mismatched wheel
+versions raise `ImportError`. It only accepts Maru's DRAM tuple descriptors
+and preserves their order. Full and partial metadata remain native bytes.
+No Python NIXL agent is created and replaced, and no vendor private fields
+or global monkeypatches are used.
+
+Native transfer handles retain their native agent and have no destructor,
+automatic cancellation or free. `NixlTransport` remains responsible for
+their explicit release. Native query/post/release exceptions propagate as
+they do through the installed Python wrapper, retaining unknown transfers
+and their memory. An unexpected raw status other than SUCCESS or IN_PROG is
+also an exception, rather than a synthetic terminal ERR that could free a
+live handle. An event timeout does not prove completion or change the
+existing metadata, read-lease, staging or RM-hold lifetime rules. The idle
+CPU and end-to-end latency of this adapter require device validation.
 
 > **See also:** [Architecture Overview](architecture_overview.md),
 > [Memory Model](memory_model.md),

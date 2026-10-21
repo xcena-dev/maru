@@ -9,6 +9,12 @@ A timed-out transfer or failed cancellation can leave the NIC accessing its
 buffers. :class:`TransferTimeout` and :class:`TransferUncertainError` carry a
 :class:`PendingTransfer` so the caller can retain those buffers until
 :meth:`PendingTransfer.poll` confirms handle release.
+
+The default NIXL agent runs without its progress thread. A worker data path
+injects a native adapter with progress enabled and a 1 ms event-wait fallback.
+Transfer state queries still drive UCX on their caller. A remote CXL agent
+issues no transfers and retains progress OFF, so it drives UCX while a worker
+connects (``maru_remote_cxl_agent.progress``).
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ def buffer_address(buf: Any) -> int:
 
 
 def _default_agent(agent_name: str, ucx_device: str) -> Any:
-    """Create a real NIXL agent with only the UCX backend.
+    """Create a real NIXL agent with only the UCX backend and no progress thread.
 
     Args:
         agent_name: Unique agent name.
@@ -57,7 +63,9 @@ def _default_agent(agent_name: str, ucx_device: str) -> Any:
     """
     from nixl._api import nixl_agent, nixl_agent_config
 
-    agent = nixl_agent(agent_name, nixl_agent_config(backends=[]))
+    agent = nixl_agent(
+        agent_name, nixl_agent_config(enable_prog_thread=False, backends=[])
+    )
     params = {"ucx_devices": ucx_device} if ucx_device else {}
     agent.create_backend("UCX", params)
     return agent
@@ -106,8 +114,8 @@ class PendingTransfer:
         """Check whether the transfer has ended; release the handle if so.
 
         Returns:
-            True only after NIXL releases the handle, confirming completion
-            or cancellation. False while progress or cleanup is uncertain,
+            True only after a terminal state and NIXL handle release.
+            False while progress, state queries or cleanup are uncertain,
             including while the posting thread still polls it.
         """
         with self._poll_lock:
@@ -121,7 +129,9 @@ class PendingTransfer:
                 logger.warning(
                     "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
                 )
-                state = None  # Try cancellation; a failed query proves nothing.
+                # Releasing an active NIXL handle can succeed while its RMA
+                # still touches memory. A failed query is no completion proof.
+                return False
             if state == "PROC":
                 return False
             if state == "DONE":
@@ -246,20 +256,59 @@ class NixlTransport:
                 self._agent.get_partial_agent_metadata(registration, inc_conn_info=True)
             )
 
-    def add_peer(self, md: bytes) -> str:
-        """Load (or reload) a peer's metadata.
+    def add_peer(
+        self,
+        md: bytes,
+        *,
+        peer: str | None = None,
+        timeout_s: float = 0.0,
+    ) -> str:
+        """Load metadata after the affected peer's transfers have ended.
+
+        NIXL can discard all metadata of a peer when adding a registration
+        fails. Its active requests then report an error before their RMA
+        ends, so metadata updates wait for every existing handle of that
+        peer. Checking the handles and loading metadata hold the same lock
+        that creates new transfers. Waiting releases it so those transfers
+        can finish.
 
         Args:
             md: Metadata bytes from the peer's :meth:`metadata`.
+            peer: Name already loaded for these metadata, if known. When
+                omitted, wait for all peers: the blob's name is opaque here.
+            timeout_s: Maximum wait for existing handles, in seconds.
 
         Returns:
             The peer name as ``str``.
+
+        Raises:
+            RuntimeError: if handles remain at the deadline, or the known
+                peer failed while waiting; no metadata is loaded then.
+            Exception: if NIXL refuses the metadata after handles have ended.
         """
-        with self._lock:
-            name = self._agent.add_remote_agent(md)
-            name = name.decode() if isinstance(name, bytes) else str(name)
-            self._peers.add(name)
-        return name
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            with self._lock:
+                pending = [
+                    p for p in self._pending.values() if peer is None or p.peer == peer
+                ]
+                if not pending:
+                    if peer in self._tainted:
+                        raise RuntimeError(
+                            f"NIXL peer {peer} failed before metadata load"
+                        )
+                    name = self._agent.add_remote_agent(md)
+                    name = name.decode() if isinstance(name, bytes) else str(name)
+                    self._peers.add(name)
+                    return name
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"NIXL {peer or 'peers'} still has unreleased transfers; "
+                    "metadata was not loaded"
+                )
+            for transfer in pending:
+                transfer.poll()
+            time.sleep(min(_POLL_SLEEP_S, max(0.0, deadline - time.monotonic())))
 
     def remove_peer(self, name: str) -> None:
         """Forget a peer.
@@ -307,10 +356,43 @@ class NixlTransport:
                 return False
         return True
 
+    def announce(self, name: str) -> bool:
+        """Send a peer an empty notification once its metadata is loaded.
+
+        The notification travels over the connection that loading the peer
+        sets up, so it reaches a remote CXL agent once that connection is
+        complete; the agent drives UCX until then
+        (``maru_remote_cxl_agent.progress``).
+
+        Args:
+            name: Peer name returned by :meth:`add_peer`.
+
+        Returns:
+            False if NIXL refused to send it (the connection failed).
+        """
+        with self._lock:
+            try:
+                self._agent.send_notif(name, b"")
+            except Exception:
+                return False
+        return True
+
+    def take_notifs(self) -> dict[str, list[bytes]]:
+        """Drive UCX once and return the notifications peers sent since.
+
+        Returns:
+            Peer name -> messages it sent.
+        """
+        with self._lock:
+            notifs = self._agent.get_new_notifs()
+        return {
+            (k.decode() if isinstance(k, bytes) else str(k)): list(v)
+            for k, v in notifs.items()
+        }
+
     def discard_notifs(self) -> None:
         """Drop the notifications peers sent (their :meth:`peer_usable` checks)."""
-        with self._lock:
-            self._agent.get_new_notifs()
+        self.take_notifs()
 
     def pending_peers(self) -> set[str]:
         """Peers that still have a transfer whose handle is not released."""
@@ -322,17 +404,16 @@ class NixlTransport:
 
         A reliable connection that saw an error fails every later transfer;
         removing the peer lets the next :meth:`add_peer` connect anew.
-        Transfers to the peer whose handle NIXL has not released stay
-        pending: removing the peer does not prove that the NIC stopped using
-        their buffers, so their owners keep them until :meth:`PendingTransfer.poll`
-        confirms the release. Transfers another thread still polls are left
-        to that thread.
+        The peer and its remote keys stay while any transfer still owns a
+        handle, including one another thread still polls. Invalidating that
+        metadata can make NIXL report ERR while an RMA continues writing.
 
         Args:
             name: Peer name returned by :meth:`add_peer`.
 
         Returns:
-            True if the peer is gone; False if NIXL refused to remove it.
+            True if the peer is gone; False while transfers remain or NIXL
+            refused to remove it.
         """
         with self._lock:
             pending = [p for p in self._pending.values() if p.peer == name]
@@ -340,6 +421,11 @@ class NixlTransport:
             p.poll()  # releases the handle if NIXL lets it go now
         try:
             with self._lock:
+                if any(p.peer == name for p in self._pending.values()):
+                    # Invalidating metadata while a transfer is active also
+                    # destroys its rkeys and makes NIXL report ERR before the
+                    # RMA has ended. Keep the peer until every transfer ends.
+                    return False
                 self._agent.remove_remote_agent(name)
                 self._peers.discard(name)
                 self._tainted.discard(name)
@@ -516,6 +602,7 @@ class NixlTransport:
     ) -> float:
         """Post a transfer and poll it to completion (see :meth:`_xfer`)."""
         t0 = time.perf_counter()
+        state = None
         try:
             with self._lock:
                 state = self._agent.transfer(handle)
@@ -538,7 +625,10 @@ class NixlTransport:
         except Exception as exc:
             with self._lock:
                 self._tainted.add(peer)
-            released = self.release_handle(op, peer, handle)
+            # Only a confirmed terminal state permits releasing the handle.
+            # A post/query exception may leave a live RMA behind even when
+            # release_xfer_handle would return success.
+            released = state == "ERR" and self.release_handle(op, peer, handle)
             pending.hand_over(finished=released)
             if not released:
                 raise TransferUncertainError(

@@ -193,7 +193,9 @@ How the properties above carry over:
 
 - **Data path.** No Maru process is on it: the worker's NIC and the memory
   node's NIC move the bytes. One copy is added, between the GPU and the
-  worker's staging buffer.
+  worker's staging buffer. The remote CXL agent uses CPU when it maps a
+  region and while a worker sets up its RDMA connection. It does not busy-poll
+  while idle; periodic sweeps still progress UCX and check regions.
 - **Capability-based access.** The remote CXL agent is the process that opens
   the DAX device on a memory node, and it checks a handle with the Resource
   Manager (`HOLD`, a `GET_ACCESS` that also keeps the region's range out of

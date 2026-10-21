@@ -6,19 +6,18 @@ The remote CXL agent maps a region with libc ``mmap`` so it gets a plain address
 to register with the NIC, without CUDA registration or prefaulting: a memory
 node has no GPU, and NIC registration pins every page of the range anyway.
 
-An unmapped region's address range is not given to a later mapping for a
-while (:data:`ADDRESS_QUARANTINE_S`): it is replaced by an inaccessible
-placeholder. A NIC can hand out the same remote key again when the same
-address range is registered again, and a late RDMA WRITE that still carries
-the old key and address would then land in the new region. With a new
-address, the old key and address match no registration and the WRITE fails.
+An unmapped region's address range is reserved for the rest of this process:
+it is replaced by an inaccessible placeholder. A NIC can hand out the same
+remote key again when the same address range is registered again. A worker
+paused before posting a WRITE can resume arbitrarily late with the old key
+and address; a timeout cannot fence it. Keeping the old address unused makes
+that WRITE fail instead of landing in a new region.
 """
 
 import ctypes
 import logging
 import os
 import threading
-import time
 
 from maru_shm.device_scanner import read_device_uuid, scan_dax_devices
 
@@ -33,10 +32,6 @@ _MAP_PRIVATE = 0x02
 _MAP_FIXED = 0x10
 _MAP_ANONYMOUS = 0x20
 _MAP_NORESERVE = 0x4000
-
-# How long an unmapped region's address range stays out of use. Far longer
-# than an RDMA connection retransmits a request (seconds).
-ADDRESS_QUARANTINE_S = 600.0
 
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
@@ -64,19 +59,21 @@ class DaxRegionMapper:
     def __init__(
         self,
         device_table: dict[str, str] | None = None,
-        clock=time.monotonic,
+        clock=None,
     ) -> None:
         """Create the mapper.
 
         Args:
             device_table: UUID -> local device path. Scanned from the local
                 DAX devices on first use when omitted.
-            clock: Monotonic clock (tests pass a fake one).
+            clock: Retained for callers that supplied a clock. Address
+                reservations no longer expire with elapsed time.
         """
         self._device_table = device_table
-        self._clock = clock
-        # Placeholders over unmapped regions: (expiry, address, length)
-        self._quarantine: list[tuple[float, int, int]] = []
+        # Placeholders over unmapped regions: (address, length). They remain
+        # reserved even after this object is discarded; the OS removes them
+        # when the process exits. They consume address space, not CXL pages.
+        self._quarantine: list[tuple[int, int]] = []
         self._lock = threading.Lock()
 
     def resolve(self, dax_path: str, device_uuid: str) -> str:
@@ -125,7 +122,6 @@ class DaxRegionMapper:
             OSError: if the device cannot be opened or mapped.
             RuntimeError: if no device here has the region's UUID (resolve).
         """
-        self._expire_placeholders()
         path = self.resolve(dax_path, device_uuid)
         fd = os.open(path, os.O_RDWR)
         try:
@@ -143,8 +139,9 @@ class DaxRegionMapper:
         """Drop a mapping made by :meth:`map`; its addresses stay unused.
 
         The device mapping is replaced in one step by an inaccessible
-        anonymous placeholder, so no other mapping can take the range before
-        :data:`ADDRESS_QUARANTINE_S` has passed.
+        anonymous placeholder, so no later mapping in this process can take
+        the range. No timer, object destruction or service cleanup removes
+        it; only process exit releases these reservations.
 
         Args:
             addr: Address returned by :meth:`map`.
@@ -165,10 +162,7 @@ class DaxRegionMapper:
             err = ctypes.get_errno()
             raise OSError(err, f"unmap {addr:#x}+{length}: {os.strerror(err)}")
         with self._lock:
-            self._quarantine.append(
-                (self._clock() + ADDRESS_QUARANTINE_S, addr, length)
-            )
-        self._expire_placeholders()
+            self._quarantine.append((addr, length))
 
     def discard(self, addr: int, length: int) -> None:
         """Drop a mapping that was never registered with the NIC.
@@ -185,24 +179,8 @@ class DaxRegionMapper:
         if _libc.munmap(addr, length) != 0:
             err = ctypes.get_errno()
             raise OSError(err, f"munmap {addr:#x}+{length}: {os.strerror(err)}")
-        self._expire_placeholders()
 
     def held_addresses(self) -> list[tuple[int, int]]:
         """Address ranges kept out of use (for tests and status)."""
         with self._lock:
-            return [(addr, length) for _, addr, length in self._quarantine]
-
-    def _expire_placeholders(self) -> None:
-        now = self._clock()
-        with self._lock:
-            expired = [q for q in self._quarantine if q[0] <= now]
-            self._quarantine = [q for q in self._quarantine if q[0] > now]
-        for _, addr, length in expired:
-            if _libc.munmap(addr, length) != 0:
-                err = ctypes.get_errno()
-                logger.warning(
-                    "munmap of placeholder %#x+%d failed: %s",
-                    addr,
-                    length,
-                    os.strerror(err),
-                )
+            return list(self._quarantine)

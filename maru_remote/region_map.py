@@ -386,11 +386,15 @@ class RegionMapClient:
         with self._lock:
             return self._send({"op": "hello"})
 
-    def map(self, handle: dict) -> MapReply:
+    def map(self, handle: dict, nixl_agent: str | None = None) -> MapReply:
         """Ask the remote CXL agent to map and register a region.
 
         Args:
             handle: ``MaruHandle.to_dict()`` of the region.
+            nixl_agent: Name of the NIXL agent that loads the reply and then
+                announces itself (``NixlTransport.announce``); the remote CXL
+                agent drives UCX until the announcement arrives. None for a
+                caller that issues no RDMA (MaruServer).
 
         Returns:
             Where the region is reachable.
@@ -399,8 +403,11 @@ class RegionMapClient:
             RegionMapError: if the remote CXL agent refused (e.g. a wrong handle).
             RegionMapUnavailable: if the remote CXL agent cannot be reached.
         """
+        message: dict[str, Any] = {"op": "map", "handle": dict(handle)}
+        if nixl_agent is not None:
+            message["nixl_agent"] = nixl_agent
         with self._lock:
-            reply = self._send({"op": "map", "handle": dict(handle)})
+            reply = self._send(message)
             return MapReply(
                 int(reply["region_id"]),
                 int(reply["addr"]),

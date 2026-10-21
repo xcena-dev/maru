@@ -699,6 +699,7 @@ class ReplicaDirectory:
         entries = []
         remote_cxl_held: list[tuple[StoragePool, str]] = []
         regions = {}
+        region_boots = {}
         for key in keys:
             loc = self._select(session, key)
             if loc is None:
@@ -715,6 +716,9 @@ class ReplicaDirectory:
                     pool.acquired_objects += 1
                     remote_cxl_held.append((pool, key))
                     regions[pool.pool_id] = self._region_handle(session, pool)
+                    # Readers must reject a mapping made after the memory
+                    # node rebooted, before the owner/keeper retires its keys.
+                    region_boots[pool.pool_id] = pool.boot
             else:
                 session.pools[loc.medium].acquired_objects += 1
             entries.append(loc)
@@ -729,6 +733,7 @@ class ReplicaDirectory:
             "entries": [asdict(loc) if loc else None for loc in entries],
             "lease_id": lease_id,
             "regions": regions,
+            "region_boots": region_boots,
         }
 
     @staticmethod

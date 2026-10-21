@@ -3,6 +3,7 @@
 served on loopback TCP; the CXL device, the resource manager and NIXL are
 fakes."""
 
+import ctypes
 import dataclasses
 import threading
 import time
@@ -1105,6 +1106,60 @@ def test_close_waits_for_a_transfer_under_way(world):
     world.clients.remove(a)
 
 
+def test_close_does_not_issue_a_lease_for_a_read_under_way(world):
+    a = world.client("a")
+    put(a, "k", b"v")
+    staging = a._staging
+    entered, go = hold_transfers(a, "read")
+    result, stopped, failures = {}, [], []
+    stop_data_path = a._stop_data_path
+
+    def record_stop():
+        stopped.append((a._reads, staging.free_count()))
+        stop_data_path()
+
+    def close():
+        try:
+            a.close()
+        except BaseException as exc:
+            failures.append(exc)
+
+    a._stop_data_path = record_stop
+    load = threading.Thread(
+        target=lambda: result.setdefault("leases", a.batch_retrieve(["k"]))
+    )
+    load.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        assert a._stop.wait(5)
+    finally:
+        go.set()
+        load.join(5)
+        closer.join(5)
+    assert not (load.is_alive() or closer.is_alive() or failures)
+    assert result["leases"] == [None]
+    assert stopped == [(0, staging.count)]
+    assert a._staging is None and a._transfers == 0
+    assert all(not region.leased for region in world.directory._departed.values())
+
+
+def test_close_preserves_a_previously_issued_read_lease(world):
+    a = world.client("a")
+    put(a, "k", b"v")
+    (lease,) = a.batch_retrieve(["k"])
+    staging, transport = a._staging, a._transport
+    with pytest.raises(RuntimeError, match="Release RDMA read leases"):
+        a.close()
+    assert a.connected and not a._stop.is_set()
+    assert a._staging is staging and a._transport is transport
+    assert bytes(lease.view) == b"v"
+    lease.release()
+    a.close()
+    assert a._staging is None
+
+
 def test_a_region_given_back_during_its_write_keeps_no_key(world):
     # The give-back releases the region first, so the WRITE either landed
     # before or fails at the NIC; the commit must not leave its key found.
@@ -1272,7 +1327,7 @@ def test_a_region_mapped_without_an_access_is_released_before_it_goes_back(world
     transport = a._data.transport
     add_peer = transport.add_peer
 
-    def refuse(metadata):
+    def refuse(metadata, **kwargs):
         raise RuntimeError("NIXL refused the metadata")
 
     transport.add_peer = refuse
@@ -1444,6 +1499,249 @@ def test_a_map_reply_from_an_ended_connection_is_not_loaded(world):
     assert a._data._loaded[world.node.address] == (peer, generation)
 
 
+@pytest.mark.parametrize("failure", ["endpoint", "uncertain_err", "uncertain_done"])
+def test_a_failed_connection_probe_remembers_its_peer_for_safe_retry(
+    world, monkeypatch, failure
+):
+    a = world.client("a", rdma_timeout_s=0.01)
+    put(a, "k", b"v")
+    region = only_region(a)
+    address = world.node.address
+    data = a._data
+    access = data.region(region.pool_id, region.handle, a.remote_cxl_agents)
+    generation = data._client(address).generation
+    metadata = world.node.service.map(999, region.handle)["metadata"]
+    assert data.disconnect({access.peer})
+    complete_connection = data._complete_connection
+    agent = worker_agent("a")
+
+    def fail_endpoint(peer, remote_addr, region_id):
+        agent.fail_endpoint(peer)
+        raise StorageUnavailableError("injected connection probe failure")
+
+    if failure == "endpoint":
+        monkeypatch.setattr(data, "_complete_connection", fail_endpoint)
+    else:
+        agent.stall = True
+    with pytest.raises(StorageUnavailableError):
+        data._load_peer(
+            address,
+            generation,
+            metadata,
+            region.pool_id,
+            region.region_id,
+            access.base_addr,
+        )
+    assert address not in data._loaded
+    assert data._unready[address] == (access.peer, generation)
+    if failure == "endpoint":
+        monkeypatch.setattr(data, "_complete_connection", complete_connection)
+    else:
+        agent.stall = False
+        if failure == "uncertain_err":
+            agent.fail_endpoint(access.peer)
+        agent.finish_stalled()
+    # Loading directly into the failed peer would raise (and segfault with
+    # the NIXL endpoint bug). The remembered identity lets it be dropped.
+    assert (
+        data._load_peer(
+            address,
+            generation,
+            metadata,
+            region.pool_id,
+            region.region_id,
+            access.base_addr,
+        )
+        == access.peer
+    )
+    assert data._loaded[address] == (access.peer, generation)
+    assert address not in data._unready
+    assert not data.has_unconfirmed_probes()
+    assert access.peer not in agent.failed
+
+
+def test_a_worker_names_its_nixl_agent_and_announces_itself_after_each_map(
+    world, monkeypatch
+):
+    """The agent drives UCX from each map until the worker's announcement."""
+    progress = world.node.service._progress
+    awaited = []
+    real_expect = progress.expect
+    monkeypatch.setattr(
+        progress, "expect", lambda name: (awaited.append(name), real_expect(name))
+    )
+    a = world.client("a")
+    assert put(a, "k", b"v")[0] is True
+    b = world.client("b")
+    assert read(b, ["k"]) == [b"v"]  # its own region, then a's with a read handle
+    assert awaited == [a._data.transport_name] + [b._data.transport_name] * 2
+    deadline = time.monotonic() + 5
+    while progress.running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not progress.running() and progress.expecting() == set()
+
+
+def probe_reads(monkeypatch):
+    """Record the connection probes (small READs) every transport issues."""
+    probes = []
+    real_read = NixlTransport.read
+
+    def read(self, peer, pairs, *args, **kwargs):
+        if [n for _local, _remote, n in pairs] == [datapath.CONNECT_PROBE_BYTES]:
+            probes.append((self._agent.name, peer))
+        return real_read(self, peer, pairs, *args, **kwargs)
+
+    monkeypatch.setattr(NixlTransport, "read", read)
+    return probes
+
+
+def test_a_new_connection_is_completed_once_by_a_small_read(world, monkeypatch):
+    probes = probe_reads(monkeypatch)
+    a = world.client("a")  # maps its first region: a new connection
+    assert probes == [(a._data.transport_name, world.node.agent.name)]
+    assert put(a, "k", b"v")[0] is True
+    b = world.client("b")
+    assert read(b, ["k"]) == [b"v"]  # b's own region and a's: one connection
+    assert probes[1:] == [(b._data.transport_name, world.node.agent.name)]
+
+
+def test_a_restarted_agent_is_connected_anew_and_probed_again(world, monkeypatch):
+    probes = probe_reads(monkeypatch)
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    assert read(b, ["k"]) == [b"v"]
+    world.node.restart()
+    del probes[:]
+    put(a, "k2", b"v2")  # maps its region again through the new agent
+    assert probes == [(a._data.transport_name, world.node.agent.name)]
+
+
+def test_a_failed_connection_probe_fails_the_map(world, monkeypatch):
+    real_read = NixlTransport.read
+
+    def failing(self, peer, pairs, *args, **kwargs):
+        if [n for _local, _remote, n in pairs] == [datapath.CONNECT_PROBE_BYTES]:
+            raise RuntimeError("NIXL READ to the agent ended in state ERR")
+        return real_read(self, peer, pairs, *args, **kwargs)
+
+    a = world.client("a")
+    assert put(a, "k", b"v")[0] is True
+    region = only_region(a)
+    assert a._data.disconnect({world.node.agent.name})  # the next map connects anew
+    monkeypatch.setattr(NixlTransport, "read", failing)
+    with pytest.raises(StorageUnavailableError, match="new RDMA connection"):
+        a._data.region(region.pool_id, region.handle, [world.node.address])
+    assert not a._data.has_access(region.pool_id)
+    monkeypatch.setattr(NixlTransport, "read", real_read)
+    assert put(a, "k2", b"v2")[0] is True  # connected anew
+    assert read(world.client("b"), ["k", "k2"]) == [b"v", b"v2"]
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_an_unfinished_connection_probe_is_reaped_after_close(
+    world, monkeypatch, interrupted
+):
+    """No KV transfer exists to keep the probe's registered page alive."""
+    import maru_handler.storage.remote_cxl.client as client_module
+
+    monkeypatch.setattr(client_module, "LATE_TRANSFER_POLL_S", 0.01)
+    a = world.client("a", rdma_timeout_s=0.02)
+    region = only_region(a)
+    agent = worker_agent("a")
+    data = a._data
+    assert data.disconnect({world.node.agent.name})
+    agent.stall = True
+    original_check = agent.check_xfer_state
+    if interrupted:
+
+        def interrupt(_handle):
+            raise KeyboardInterrupt("probe interrupted")
+
+        monkeypatch.setattr(agent, "check_xfer_state", interrupt)
+    error = KeyboardInterrupt if interrupted else StorageUnavailableError
+    try:
+        with pytest.raises(error):
+            data.region(region.pool_id, region.handle, [world.node.address])
+    finally:
+        monkeypatch.setattr(agent, "check_xfer_state", original_check)
+    assert data.has_unconfirmed_probes()
+    assert a.has_unconfirmed_transfers()
+    assert world.node.address not in data._loaded
+    a.close()
+    assert data.transport is not None
+    assert data._probe is not None and not data._probe.closed
+    agent.finish_stalled()
+    deadline = time.monotonic() + 5
+    while data.transport is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert data.transport is None
+    assert data._probe is None
+    assert data.staging is None
+
+
+def test_a_reader_rejects_bytes_mapped_after_the_writers_memory_node_rebooted(world):
+    """Pause a remapping owner before _adopt can retire its old keys."""
+    a = world.client("a")
+    ok, allocation = put(a, "k", b"old")
+    assert ok
+    region = only_region(a)
+    world.node.restart(reboot=True)
+    # The agent has registered the full owner handle, but _map_own has not
+    # yet compared its reply with the owner's previous boot id.
+    reply = world.node.service.map(999, region.handle)
+    ctypes.memmove(reply["addr"] + allocation.location.offset, b"bad", 3)
+    b = world.client("b")
+    assert b.batch_exists(["k"]) == [True]
+    assert read(b, ["k"]) == [None]
+
+
+def test_a_reader_rejects_a_region_whose_recorded_boot_is_unknown(world):
+    a = world.client("a")
+    assert put(a, "k", b"old")[0]
+    world.directory._remote_cxl_index[("ns", "k")].boot = ""
+    b = world.client("b")
+    free = b._staging.free_count()
+    assert read(b, ["k"]) == [None]
+    assert b._staging.free_count() == free
+    assert not world.directory._remote_cxl_index[("ns", "k")].leased
+    # The next successful owner report restores reuse without changing keys.
+    a._heartbeat()
+    assert read(b, ["k"]) == [b"old"]
+
+
+def test_failed_probe_registration_keeps_buffers_when_deregistration_fails(world):
+    a = world.client("a")
+
+    def make_transport(name):
+        transport = NixlTransport(name, agent=FakeNixlAgent(name))
+        original_register, original_close = transport.register, transport.close
+        registrations, closes = [], []
+
+        def register(*args):
+            registrations.append(args)
+            if len(registrations) == 2:
+                raise RuntimeError("probe registration failed")
+            return original_register(*args)
+
+        def close():
+            closes.append(True)
+            if len(closes) == 1:
+                raise RuntimeError("deregistration failed")
+            return original_close()
+
+        transport.register, transport.close = register, close
+        return transport
+
+    data = datapath.RdmaDataPath(a.config, transport_factory=make_transport)
+    with pytest.raises(RuntimeError, match="probe registration failed"):
+        data.start()
+    assert data.transport is not None
+    assert data.staging is not None
+    assert data._probe is not None and not data._probe.closed
+    data.close()
+    assert data.transport is None and data.staging is None and data._probe is None
+
+
 def test_a_map_reply_from_an_ended_connection_is_mapped_again(world, monkeypatch):
     """Another thread loaded the peer over a newer connection after this
     reply came: the mapping it names went with the old connection."""
@@ -1453,8 +1751,8 @@ def test_a_map_reply_from_an_ended_connection_is_mapped_again(world, monkeypatch
     real_map = client.map
     generations = []
 
-    def map_first_reply_stale(handle):
-        reply = real_map(handle)
+    def map_first_reply_stale(handle, **kwargs):
+        reply = real_map(handle, **kwargs)
         generations.append(reply.generation)
         if len(generations) == 1:
             return dataclasses.replace(reply, generation=reply.generation - 1)
@@ -1476,8 +1774,8 @@ def test_a_reply_from_an_ended_connection_is_not_used_before_any_newer_load(
     real_map = client.map
     generations = []
 
-    def map_first_reply_stale(handle):
-        reply = real_map(handle)
+    def map_first_reply_stale(handle, **kwargs):
+        reply = real_map(handle, **kwargs)
         generations.append(reply.generation)
         if len(generations) == 1:
             return dataclasses.replace(reply, generation=reply.generation - 1)
@@ -1599,7 +1897,7 @@ def test_reads_of_a_down_node_miss_without_waiting_for_it(world, monkeypatch):
     assert read(b, ["k"]) == [None]  # the map fails: the mapper is now down
     client = b._data._client(world.node.address)
 
-    def no_connect(handle):
+    def no_connect(handle, **kwargs):
         raise AssertionError("a down remote CXL agent was asked again")
 
     client.map = no_connect

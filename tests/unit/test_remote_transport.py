@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """NIXL wrapper: registration bounds, batched transfers, unreleased timeouts."""
 
+import threading
+import time
+
 import pytest
 
 from maru_remote.transport import (
@@ -78,6 +81,162 @@ def test_partial_metadata_names_only_its_ranges():
     assert r1 == src and r2 == src
 
 
+@pytest.mark.parametrize("known_peer", [True, False])
+def test_metadata_load_failure_cannot_invalidate_an_active_transfer(pair, known_peer):
+    a, b, peer = pair
+    destination, address = _buf(16)
+    source, remote_address = _buf(16, 7)
+    a.register(address, 16)
+    b.register(remote_address, 16)
+    # Load the range before the audited transfer.
+    a.add_peer(b.metadata(), peer=peer)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = True
+    with pytest.raises(TransferTimeout) as timeout:
+        a.read(peer, [(address, remote_address, 16)], timeout_s=0.001)
+    pending = timeout.value.pending
+    loads = []
+
+    def failing_update(md):
+        # NIXL 1.2 loadRemoteSections erases the whole remote section when
+        # adding a registration fails. No such load may run during an RMA.
+        loads.append(md)
+        fake.remove_remote_agent(peer)
+        raise RuntimeError("injected metadata unpack failure")
+
+    fake.add_remote_agent = failing_update
+    with pytest.raises(RuntimeError, match="metadata was not loaded"):
+        a.add_peer(b.metadata(), peer=peer if known_peer else None, timeout_s=0.002)
+    assert not loads and peer in fake.peers and not pending.finished
+    assert destination == bytearray(16)
+    fake.finish_stalled()
+    assert pending.poll() and destination == source
+    # Once every handle ended, an update failure has no active RMA to harm.
+    with pytest.raises(RuntimeError, match="metadata unpack failure"):
+        a.add_peer(b.metadata(), peer=peer)
+    assert len(loads) == 1
+
+
+def test_metadata_load_waits_without_blocking_transfer_progress(pair):
+    a, b, peer = pair
+    destination, address = _buf(16)
+    source, remote_address = _buf(16, 9)
+    a.register(address, 16)
+    b.register(remote_address, 16)
+    a.add_peer(b.metadata(), peer=peer)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = True
+    with pytest.raises(TransferTimeout) as timeout:
+        a.read(peer, [(address, remote_address, 16)], timeout_s=0.001)
+    result = []
+    loader = threading.Thread(
+        target=lambda: result.append(a.add_peer(b.metadata(), peer=peer, timeout_s=1))
+    )
+    loader.start()
+    time.sleep(0.01)
+    assert loader.is_alive() and not result
+    fake.finish_stalled()
+    loader.join(5)
+    assert not loader.is_alive() and result == [peer]
+    assert timeout.value.pending.finished and destination == source
+
+
+def test_metadata_for_another_known_peer_does_not_wait(pair):
+    a, b, peer = pair
+    other = NixlTransport("other", agent=FakeNixlAgent("other"))
+    other_peer = a.add_peer(other.metadata())
+    destination, address = _buf(16)
+    source, remote_address = _buf(16, 2)
+    a.register(address, 16)
+    b.register(remote_address, 16)
+    a.add_peer(b.metadata(), peer=peer)
+    FakeNixlAgent.registry["a"].stall = True
+    with pytest.raises(TransferTimeout) as timeout:
+        a.read(peer, [(address, remote_address, 16)], timeout_s=0.001)
+    assert a.add_peer(other.metadata(), peer=other_peer) == other_peer
+    assert not timeout.value.pending.finished
+    FakeNixlAgent.registry["a"].finish_stalled()
+    assert timeout.value.pending.poll()
+    other.close()
+
+
+def test_a_transfer_cannot_start_inside_a_metadata_load(pair):
+    a, b, peer = pair
+    destination, address = _buf(16)
+    source, remote_address = _buf(16, 4)
+    a.register(address, 16)
+    b.register(remote_address, 16)
+    fake = FakeNixlAgent.registry["a"]
+    add_remote = fake.add_remote_agent
+    initialize = fake.initialize_xfer
+    entered, finish, initialized = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def held_load(md):
+        entered.set()
+        assert finish.wait(5)
+        return add_remote(md)
+
+    def record_initialize(*args, **kwargs):
+        initialized.set()
+        return initialize(*args, **kwargs)
+
+    fake.add_remote_agent = held_load
+    fake.initialize_xfer = record_initialize
+    loader = threading.Thread(target=lambda: a.add_peer(b.metadata(), peer=peer))
+    poster = threading.Thread(
+        target=lambda: a.read(peer, [(address, remote_address, 16)])
+    )
+    loader.start()
+    assert entered.wait(5)
+    poster.start()
+    try:
+        assert not initialized.wait(0.01)
+    finally:
+        finish.set()
+        loader.join(5)
+        poster.join(5)
+    assert not (loader.is_alive() or poster.is_alive())
+    assert initialized.is_set() and destination == source
+
+
+def test_a_peer_that_failed_during_the_wait_is_not_reloaded(pair):
+    a, b, peer = pair
+    destination, address = _buf(16)
+    source, remote_address = _buf(16, 3)
+    a.register(address, 16)
+    b.register(remote_address, 16)
+    a.add_peer(b.metadata(), peer=peer)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = True
+    with pytest.raises(TransferTimeout) as timeout:
+        a.read(peer, [(address, remote_address, 16)], timeout_s=0.001)
+    loads, failures = [], []
+    add_remote = fake.add_remote_agent
+
+    def record_load(md):
+        loads.append(md)
+        return add_remote(md)
+
+    def load():
+        try:
+            a.add_peer(b.metadata(), peer=peer, timeout_s=1)
+        except RuntimeError as exc:
+            failures.append(str(exc))
+
+    fake.add_remote_agent = record_load
+    loader = threading.Thread(target=load)
+    loader.start()
+    time.sleep(0.01)
+    timeout.value.pending.handle[3] = "ERR"
+    loader.join(5)
+    assert not loader.is_alive() and not loads
+    assert len(failures) == 1 and "failed before metadata load" in failures[0]
+
+
 def test_a_write_after_deregistration_fails_and_breaks_the_connection():
     a = NixlTransport("a", agent=FakeNixlAgent("a"))
     b = NixlTransport("b", agent=FakeNixlAgent("b"))
@@ -116,12 +275,39 @@ def test_disconnect_keeps_unconfirmed_transfers_pending(pair):
     with pytest.raises(TransferTimeout) as info:
         a.write(peer, [(src_addr, remote_addr, 16)], timeout_s=0.01)
     pending = info.value.pending
-    assert a.disconnect(peer)
-    assert peer not in fake.peers
-    # Removing the peer is no proof that the NIC stopped using the buffers.
+    assert not a.disconnect(peer)
+    assert peer in fake.peers
+    # Metadata and its rkeys stay until the transfer has actually ended.
     assert not pending.finished and a.pending_peers() == {peer}
     fake.finish_stalled()
     assert pending.poll() and a.pending_peers() == set()
+    assert a.disconnect(peer) and peer not in fake.peers
+
+
+def test_a_failed_state_query_never_cancels_a_live_rma(pair, monkeypatch):
+    a, b, peer = pair
+    src, src_addr = _buf(16, 3)
+    remote, remote_addr = _buf(16)
+    a.register(src_addr, 16)
+    b.register(remote_addr, 16)
+    fake = FakeNixlAgent.registry["a"]
+    fake.stall = True
+
+    def unavailable(_handle):
+        raise RuntimeError("state temporarily unavailable")
+
+    with monkeypatch.context() as m:
+        m.setattr(fake, "check_xfer_state", unavailable)
+        with pytest.raises(TransferUncertainError) as info:
+            a.write(peer, [(src_addr, remote_addr, 16)])
+        pending = info.value.pending
+        assert not pending.poll()
+        assert not a.disconnect(peer)
+        assert fake.released == []
+        assert peer in fake.peers and not pending.finished
+    fake.finish_stalled()
+    assert pending.poll() and pending.completed
+    assert a.disconnect(peer)
 
 
 def test_an_interrupted_transfer_is_handed_over_unfinished(pair, monkeypatch):
@@ -229,11 +415,12 @@ def test_disconnect_leaves_a_transfer_its_poster_still_polls(pair, monkeypatch):
     writer.start()
     assert polling.wait(5)
     assert fake.finish_stalled() == 1  # done, but the writer has not looked yet
-    assert a.disconnect(peer)
+    assert not a.disconnect(peer)
     assert fake.released == []  # the writer still owns the handle
     go_on.set()
     writer.join(5)
     assert outcome == {"done": True} and len(fake.released) == 1
+    assert a.disconnect(peer)
     assert list(remote) == [4] * 16
 
 

@@ -57,7 +57,10 @@ CHECKED_UCX_TRANSPORTS = frozenset(
 # passes only as an auxiliary transport (":aux"), which UCX uses to set up rc
 # connections; "ib" is left out because it enables UD for RDMA too.
 AUX_ONLY_UCX_TRANSPORTS = frozenset({"ud", "ud_v", "ud_x", "ud_verbs", "ud_mlx5"})
-DEFAULT_UCX_TRANSPORTS = "rc,dc"
+# NIXL 1.5 requires CUDA memory support on hosts with NVIDIA GPUs, even when
+# Maru registers only DRAM. cuda_copy is a local memory-type helper, not a
+# replacement for a remote key-checking RC/DC data transport.
+DEFAULT_UCX_TRANSPORTS = "rc,dc,cuda_copy"
 # UCX's registration cache keeps a registration alive after NIXL releases it.
 # Only spellings known to turn it off pass; anything else must be set to n.
 RCACHE_OFF = ("n", "no", "0")
@@ -167,11 +170,20 @@ def require_checked_transport(
             "region can still be written; use InfiniBand/RoCE transports "
             f"(e.g. {DEFAULT_UCX_TRANSPORTS}) or --allow-unchecked-transport"
         )
+    if "cuda_copy" in items and not allow_unchecked:
+        rdma = CHECKED_UCX_TRANSPORTS - {"self"}
+        if not any(item in rdma for item in items):
+            raise UncheckedTransportError(
+                f"UCX_TLS={value!r} enables local cuda_copy without an RC/DC "
+                "remote data transport; include rc or dc"
+            )
     return value
 
 
 def _checked_transport(item: str) -> bool:
     """Whether one ``UCX_TLS`` entry keeps RDMA on key-checking transports."""
+    if item == "cuda_copy":
+        return True
     name, _, flag = item.partition(":")
     if name in CHECKED_UCX_TRANSPORTS:
         return True
