@@ -623,3 +623,18 @@ def test_the_sweep_deregisters_a_failed_mapping_while_the_rm_is_away():
     node.service.sweep()
     assert len(node.agent.registered) == 1  # only the live one stays
     assert node.service.holders() == {live["region_id"]: {1}}
+
+
+def test_a_refused_hold_keeps_the_unhold_still_queued():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    unhold = node.cxl.unhold
+    node.cxl.unhold = lambda *a: unreachable(None)
+    node.service.unmap(1, handle["region_id"])  # its unhold does not get through
+    node.reap(handle)  # the owner frees it: held, so it drains
+    with pytest.raises(HoldRefusedError):
+        node.service.map(1, handle)  # a draining region cannot be held
+    node.cxl.unhold = unhold
+    node.service.sweep()
+    assert node.cxl.holds == {} and node.cxl.draining == {}

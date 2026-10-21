@@ -724,12 +724,14 @@ class RegionMapService:
             Exception: if the resource manager cannot be asked.
         """
         with self._hold_lock:
-            # This map's hold supersedes an unhold of the same handle still
-            # waiting for the RM (another handle's stays queued).
+            access = self._rm.hold_access(h, self.node_id, self.epoch)
+            # The new hold supersedes an unhold of the same handle still
+            # waiting for the RM. A refused hold leaves it queued: the old
+            # hold may still be there (a region freed meanwhile drains).
             with self._lock:
                 if self._unheld.get(h.region_id) == h:
                     del self._unheld[h.region_id]
-            return self._rm.hold_access(h, self.node_id, self.epoch)
+            return access
 
     def _reset_holds(self) -> None:
         """Drop the holds of this agent's earlier processes, once.
