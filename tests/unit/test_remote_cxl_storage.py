@@ -1453,7 +1453,13 @@ def test_a_failed_peer_is_connected_anew_while_its_agent_connection_holds(world)
     assert read(b, ["k1"]) == [b"1"]  # the first region maps again
 
 
-def test_the_remote_cxl_agent_drops_the_connection_checks(world):
+def test_the_remote_cxl_agent_drops_the_connection_checks(world, monkeypatch):
+    # Test hello's drain independently of the connection-progress thread,
+    # which can consume these notifications before the assertion below.
+    monkeypatch.setattr(
+        "maru_remote_cxl_agent.progress.ConnectProgress.expect",
+        lambda _self, _name: None,
+    )
     a = world.client("a", pages=1)
     put(a, "k1", b"1")
     put(a, "k2", b"2")  # a second region: its map checks the loaded peer
