@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from maru_remote.region_map import read_token
+from maru_shm.client import HoldRefusedError
 from maru_shm.types import MaruHandle
 
 logger = logging.getLogger(__name__)
@@ -200,11 +201,12 @@ class RegionMapService:
             rm: Resource manager client (``MaruShmClient``) with
                 ``get_access(handle)``, ``hold_access(handle, holder,
                 instance)``, ``unhold(handle, holder, instance)`` and
-                ``reset_holds(holder, instance)``. They raise RuntimeError
-                when the resource manager refuses a request (a handle whose
-                region was freed, or whose id names another region now) and
-                another exception (ConnectionError, OSError) when it cannot
-                be asked.
+                ``reset_holds(holder, instance)``. ``get_access`` raises
+                RuntimeError when the resource manager refuses a handle (its
+                region was freed, or its id names another region now); the
+                hold calls raise ``HoldRefusedError`` when it refused and
+                recorded nothing. Other exceptions (ConnectionError, OSError,
+                another RuntimeError) leave the outcome unknown.
             mapper: Maps a region's device (``DaxRegionMapper``).
             transport: NIXL transport that registers mappings with the NIC
                 (``NixlTransport``).
@@ -690,7 +692,9 @@ class RegionMapService:
                     self._maps.pop(h.region_id, None)
                     # Nothing is registered. A hold that may have been
                     # recorded goes; a refused one never was.
-                    if held or (held is False and not isinstance(exc, RuntimeError)):
+                    if held or (
+                        held is False and not isinstance(exc, HoldRefusedError)
+                    ):
                         self._unheld[h.region_id] = h
                 elif not self._release_locked(h.region_id, m):
                     # Tracked until deregistered: release, the sweep, close
@@ -766,7 +770,7 @@ class RegionMapService:
             for rid, h in pending:
                 try:
                     self._rm.unhold(h, self.node_id, self.epoch)
-                except RuntimeError as exc:
+                except HoldRefusedError as exc:
                     # Refused: the RM holds nothing this handle can name.
                     logger.warning("unholding region %d was refused: %s", rid, exc)
                 except Exception as exc:

@@ -39,7 +39,15 @@ from .uds_helpers import read_full, write_full
 logger = logging.getLogger(__name__)
 
 
-class HoldsUnsupportedError(RuntimeError):
+class HoldRefusedError(RuntimeError):
+    """The resource manager refused a hold request; it recorded nothing.
+
+    A bad token, a region that is not allocated (or is draining), or a
+    malformed holder name. Other failures leave the outcome unknown.
+    """
+
+
+class HoldsUnsupportedError(HoldRefusedError):
     """The resource manager predates region holds (restart it with this Maru)."""
 
 
@@ -334,6 +342,8 @@ class MaruShmClient:
         hdr, payload = self._rpc(MsgType.HOLD_REQ, req.pack())
         self._check_hold_error(hdr, payload, "Hold failed")
         resp = GetAccessResp.unpack(payload)
+        if resp.status in (-errno.ENOENT, -errno.EINVAL):
+            raise HoldRefusedError(f"Hold failed with status {resp.status}")
         if resp.status != 0:
             raise RuntimeError(f"Hold failed with status {resp.status}")
         return resp
@@ -357,6 +367,8 @@ class MaruShmClient:
         hdr, payload = self._rpc(MsgType.UNHOLD_REQ, req.pack())
         self._check_hold_error(hdr, payload, "Unhold failed")
         resp = FreeResp.unpack(payload)
+        if resp.status == -errno.EINVAL:
+            raise HoldRefusedError(f"Unhold failed with status {resp.status}")
         if resp.status != 0:
             raise RuntimeError(f"Unhold failed with status {resp.status}")
 
@@ -391,6 +403,8 @@ class MaruShmClient:
                     "the resource manager does not support region holds; "
                     "restart it with this Maru version"
                 )
+            if err.status == -errno.EACCES:
+                raise HoldRefusedError(f"{context} ({err.status}): {err.message}")
             raise RuntimeError(f"{context} ({err.status}): {err.message}")
 
     def _resolve_device_path(self, rm_path: str, device_uuid: str) -> str:

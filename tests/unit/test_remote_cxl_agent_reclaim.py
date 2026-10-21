@@ -19,6 +19,7 @@ import pytest
 from maru_remote.transport import NixlTransport
 from maru_remote_cxl_agent.mapper import DaxRegionMapper
 from maru_remote_cxl_agent.service import MapDenied, RegionMapService
+from maru_shm.client import HoldRefusedError
 from maru_shm.types import MaruHandle
 from tests.unit.remote_fakes import (
     FakeCxl,
@@ -527,7 +528,7 @@ def test_a_refused_unhold_does_not_hold_back_the_rest():
 
     def refuse_first(handle, holder, instance):
         if handle.region_id == first["region_id"]:
-            raise RuntimeError("Unhold failed (-13): invalid auth token")
+            raise HoldRefusedError("Unhold failed (-13): invalid auth token")
         unhold(handle, holder, instance)
 
     node.cxl.unhold = refuse_first
@@ -569,3 +570,38 @@ def test_a_failed_reset_is_retried_and_said_once(monkeypatch):
     node.cxl.reset_holds = reset
     node.service.map(1, handle)
     assert node.cxl.holds == {handle["region_id"]: {"mem1": "e1"}}
+
+
+def test_an_unhold_the_rm_could_not_save_is_sent_again():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    unhold, calls = node.cxl.unhold, []
+
+    def unsaved_once(h, holder, instance):
+        calls.append(h.region_id)
+        if len(calls) == 1:
+            raise RuntimeError("Unhold failed with status -5")
+        unhold(h, holder, instance)
+
+    node.cxl.unhold = unsaved_once
+    node.service.release(handle)
+    assert node.cxl.holds  # kept: the outcome is unknown
+    node.service.sweep()
+    assert node.cxl.holds == {} and calls == [handle["region_id"]] * 2
+
+
+def test_a_hold_the_rm_could_not_save_is_unheld():
+    node = Node()
+    handle = node.region()
+    hold = node.cxl.hold_access
+
+    def unsaved(h, holder, instance):
+        hold(h, holder, instance)  # recorded in memory, not synced
+        raise RuntimeError("Hold failed with status -5")
+
+    node.cxl.hold_access = unsaved
+    with pytest.raises(RuntimeError, match="-5"):
+        node.service.map(1, handle)
+    node.service.sweep()
+    assert node.cxl.holds == {}

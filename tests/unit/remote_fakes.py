@@ -339,7 +339,12 @@ class FakeCxl:
         self.released.append(region_id)
 
     def hold_access(self, handle, holder, instance):
-        access = self.get_access(handle)
+        from maru_shm.client import HoldRefusedError
+
+        try:
+            access = self.get_access(handle)
+        except RuntimeError as exc:
+            raise HoldRefusedError(str(exc)) from exc
         self.holds.setdefault(handle.region_id, {})[holder] = instance
         return access
 
@@ -347,7 +352,9 @@ class FakeCxl:
         region_id = handle.region_id
         known = self.regions.get(region_id) or self.draining.get(region_id)
         if known is not None and known != handle:
-            raise RuntimeError("Unhold failed (-13): invalid auth token")
+            from maru_shm.client import HoldRefusedError
+
+            raise HoldRefusedError("Unhold failed (-13): invalid auth token")
         held = self.holds.get(region_id, {})
         if held.get(holder) == instance:
             del held[holder]
