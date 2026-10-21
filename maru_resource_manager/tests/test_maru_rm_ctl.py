@@ -97,6 +97,8 @@ class MaruRmCtlTest(unittest.TestCase):
             (["release", "42", "--confirm"], "release 42 --confirm\n"),
             (["wipe", "/dev/dax2.0"], "wipe dax2.0\n"),
             (["wipe", "dax2.0", "--confirm"], "wipe dax2.0 --confirm\n"),
+            (["drop-holds", "node-a"], "drop-holds node-a\n"),
+            (["drop-holds", "node-a", "--confirm"], "drop-holds node-a --confirm\n"),
         ]
         for argv, expected in cases:
             code, request, out, _ = self.run_ctl("OK\nbody\n", *argv)
@@ -112,6 +114,15 @@ class MaruRmCtlTest(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("refused: Device or resource busy", err)
         self.assertIn("region=7", err)
+
+    def test_unconfirmed_drop_holds_lists_them_as_a_refusal(self):
+        code, request, out, err = self.run_ctl(
+            "ERR 1 Operation not permitted\nregion=7 holder=node-a instance=e1 draining\n",
+            "drop-holds",
+            "node-a",
+        )
+        self.assertEqual((code, request, out), (1, "drop-holds node-a\n", ""))
+        self.assertIn("region=7 holder=node-a instance=e1 draining", err)
 
     def test_unfinished_exclusion_is_neither_success_nor_refusal(self):
         code, _, out, err = self.run_ctl(
@@ -154,6 +165,11 @@ class MaruRmCtlTest(unittest.TestCase):
             ["discard", "dax2.0", "--force"],
             ["release", "42", "--force"],
             ["include", "dax2.0", "--adopt", "--reinit"],
+            ["drop-holds"],
+            ["drop-holds", "node a"],
+            ["drop-holds", ""],
+            ["drop-holds", "n" * 129],
+            ["drop-holds", "node-a", "--force"],
         ):
             with (
                 self.assertRaises(SystemExit),

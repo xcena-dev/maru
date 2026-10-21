@@ -674,7 +674,9 @@ bool PoolManager::ownerGone(const Allocation &a) const
 void PoolManager::recountClients()
 {
     clientAllocCounts_.clear();
-    for (const auto &[id, a] : allocations_) ++clientAllocCounts_[a.clientId];
+    // A draining region was freed by its owner.
+    for (const auto &[id, a] : allocations_)
+        if (!isDraining(id)) ++clientAllocCounts_[a.clientId];
     // A PID that owns nothing now may be reused: its next owner must not be
     // compared with the old start time (the reaper would take it for reuse).
     std::set<pid_t> owners;
@@ -1081,7 +1083,7 @@ int PoolManager::getPathForHandle(const Handle &handle, std::string &outPath)
     std::lock_guard<std::mutex> lock(mu_);
 
     auto globalIt = allocations_.find(handle.regionId);
-    if (globalIt == allocations_.end())
+    if (globalIt == allocations_.end() || isDraining(handle.regionId))
     {
         return -ENOENT;
     }
@@ -1135,7 +1137,8 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     for (const auto &kv : allocations_)
     {
         const char *cid = kv.second.clientId;
-        if (cid[0] == '\0')
+        // A draining region was freed already; its holders release it.
+        if (cid[0] == '\0' || isDraining(kv.first))
         {
             continue;
         }
@@ -1201,6 +1204,8 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
             reapRetries_.insert(cid);
         }
     }
+    // Retry a drained region whose release failed when its last hold went.
+    finishDrainingLocked(false);
 }
 
 void PoolManager::logWalAppendFailure(const char *operation, int error)
@@ -1312,6 +1317,62 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
     {
         return -ENOENT;
     }
+    if (isDraining(regionId))
+    {
+        return 0;
+    }
+    if (!isHeld(regionId))
+    {
+        return releaseAllocation(regionId);
+    }
+
+    // A remote agent may still write through its registration of the range:
+    // keep it out of use until the last holder unholds it. Recorded first, so
+    // a restart cannot hand the range out either.
+    draining_.insert(regionId);
+    int syncRc = 0;
+    const int rc = saveHoldsLocked(syncRc);
+    if (rc != 0)
+    {
+        draining_.erase(regionId);
+        return rc;
+    }
+    dropClientRef(globalIt->second.clientId);
+    logf(LogLevel::Info, "region %llu freed while held (%s); draining until unheld",
+         static_cast<unsigned long long>(regionId), holdState(regionId).c_str() + 1);
+    // Draining stands (the file has it), but a power loss could undo it: the
+    // owner retries, and freeing a draining region returns 0.
+    return syncRc;
+}
+
+void PoolManager::dropClientRef(const char *clientId)
+{
+    if (clientId[0] == '\0')
+    {
+        return;
+    }
+    auto countIt = clientAllocCounts_.find(clientId);
+    if (countIt != clientAllocCounts_.end())
+    {
+        if (--countIt->second == 0)
+        {
+            clientAllocCounts_.erase(countIt);
+            if (isLocalClient(clientId))
+            {
+                pid_t pid = pidFromClientId(clientId);
+                if (pid > 0) pidStartTimes_.erase(pid);
+            }
+        }
+    }
+}
+
+int PoolManager::releaseAllocation(uint64_t regionId)
+{
+    auto globalIt = allocations_.find(regionId);
+    if (globalIt == allocations_.end())
+    {
+        return -ENOENT;
+    }
 
     const Allocation &alloc = globalIt->second;
 
@@ -1361,23 +1422,12 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
         targetPool->freeSize += alloc.allocLength;
     }
 
-    // Update client refcount
-    if (alloc.clientId[0] != '\0')
+    // A draining region dropped its owner's count when it was freed.
+    if (draining_.erase(regionId) == 0)
     {
-        auto countIt = clientAllocCounts_.find(alloc.clientId);
-        if (countIt != clientAllocCounts_.end())
-        {
-            if (--countIt->second == 0)
-            {
-                clientAllocCounts_.erase(countIt);
-                if (isLocalClient(alloc.clientId))
-                {
-                    pid_t pid = pidFromClientId(alloc.clientId);
-                    if (pid > 0) pidStartTimes_.erase(pid);
-                }
-            }
-        }
+        dropClientRef(alloc.clientId);
     }
+    holds_.erase(regionId);
 
     allocations_.erase(globalIt);
 
@@ -1391,9 +1441,14 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
 int PoolManager::verifyAndGetPath(const Handle &handle, std::string &outPath)
 {
     std::lock_guard<std::mutex> lock(mu_);
+    return verifyAndGetPathLocked(handle, outPath);
+}
 
+int PoolManager::verifyAndGetPathLocked(const Handle &handle, std::string &outPath)
+{
+    // A draining region reads as freed, whoever asks.
     auto globalIt = allocations_.find(handle.regionId);
-    if (globalIt == allocations_.end())
+    if (globalIt == allocations_.end() || isDraining(handle.regionId))
     {
         return -ENOENT;
     }
@@ -1490,6 +1545,9 @@ int PoolManager::adminStatus(std::string &out)
     if (excludedSyncRc_ != 0)
         out += "excluded_list=not-durable reason=" + std::string(std::strerror(-excludedSyncRc_)) +
                "\n";
+    size_t holds = 0;
+    for (const auto &[id, holders] : holds_) holds += holders.size();
+    appendf(out, "holds=%zu draining=%zu\n", holds, draining_.size());
     if (checkpointBlock_.empty())
         out += "checkpoints=enabled\n";
     else
@@ -1522,7 +1580,7 @@ int PoolManager::adminAllocations(const std::string &device, std::string &out)
                    " pool=" + std::to_string(a.poolId) + " device=" + deviceOf(a.poolId) +
                    " size=" + std::to_string(a.allocLength) +
                    " offset=" + std::to_string(a.realOffset) + " client=" + a.clientId +
-                   " owner=" + ownerState(a.clientId) + "\n";
+                   " owner=" + ownerState(a.clientId) + holdState(id) + "\n";
     return 0;
 }
 
@@ -1822,13 +1880,15 @@ int PoolManager::adminRelease(uint64_t regionId, bool confirmed, bool force, std
         out = "release failed: " + std::string(std::strerror(-rc)) + "\n";
         return rc;
     }
-    logf(LogLevel::Warn, "admin: released region %llu (%llu bytes, pool %u) owned by %s%s",
+    // A held region drains: it is free for its owner, not yet for others.
+    const std::string held = holdState(regionId);
+    logf(LogLevel::Warn, "admin: released region %llu (%llu bytes, pool %u) owned by %s%s%s",
          static_cast<unsigned long long>(regionId),
          static_cast<unsigned long long>(a.allocLength), a.poolId, a.clientId,
-         force ? " (forced)" : "");
-    appendf(out, "released region=%llu size=%llu client=%s\n",
+         force ? " (forced)" : "", held.c_str());
+    appendf(out, "released region=%llu size=%llu client=%s%s\n",
             static_cast<unsigned long long>(regionId),
-            static_cast<unsigned long long>(a.allocLength), a.clientId);
+            static_cast<unsigned long long>(a.allocLength), a.clientId, held.c_str());
     return 0;
 }
 
@@ -1854,11 +1914,12 @@ int PoolManager::adminDiscard(const std::string &device, bool confirmed, bool fo
     std::string running;
     for (const auto &a : live)
     {
-        appendf(list, "region=%llu size=%llu client=%s owner=%s\n",
+        appendf(list, "region=%llu size=%llu client=%s owner=%s%s\n",
                 static_cast<unsigned long long>(a.handle.regionId),
                 static_cast<unsigned long long>(a.allocLength), a.clientId,
-                ownerState(a.clientId));
-        if (isLocalClient(a.clientId) && localOwnerAlive(a.clientId))
+                ownerState(a.clientId), holdState(a.handle.regionId).c_str());
+        if (!isDraining(a.handle.regionId) && isLocalClient(a.clientId) &&
+            localOwnerAlive(a.clientId))
             running += std::string(a.clientId) + " " + ownerProcessInfo(a.clientId) + "\n";
     }
     if (!confirmed)
@@ -1886,13 +1947,20 @@ int PoolManager::adminDiscard(const std::string &device, bool confirmed, bool fo
         return rc;
     }
     PoolState *pool = findPoolById(poolId);
+    // The operator confirmed that nothing maps these regions, remote agents
+    // included, so their holds go with them.
+    bool holdsChanged = false;
     for (const auto &a : live)
     {
         if (pool && pool->type == DaxType::FS_DAX) deleteFsDaxFile(pool->devPath, a.handle.regionId);
         allocations_.erase(a.handle.regionId);
+        holdsChanged |= holds_.erase(a.handle.regionId) + draining_.erase(a.handle.regionId) > 0;
     }
     if (pool) rebuildFreeList(*pool);
     recountClients();
+    // Records of regions that are gone are dropped at the next start anyway.
+    int holdsSyncRc = 0;
+    const int holdsRc = holdsChanged ? saveHoldsLocked(holdsSyncRc) : 0;
     for (auto &[devPath, u] : unserved_)
         if (u.poolId == poolId) retryAfter_.erase(devPath);
     logf(LogLevel::Warn, "admin: discarded %zu allocation(s) of pool %u%s", live.size(), poolId,
@@ -1902,6 +1970,9 @@ int PoolManager::adminDiscard(const std::string &device, bool confirmed, bool fo
     if (rc != 0)
         out += "WARNING: the records reached the WAL but syncing it failed; appends are paused "
                "until a checkpoint\n";
+    if (holdsRc != 0)
+        out += "WARNING: the holds file was not updated (" + std::string(std::strerror(-holdsRc)) +
+               "); its records of these regions are dropped at the next start\n";
     return 0;
 }
 

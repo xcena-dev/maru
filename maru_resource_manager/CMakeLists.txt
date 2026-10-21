@@ -17,12 +17,14 @@ add_executable(maru_resource_manager
     src/main.cpp
     src/server_config.cpp
     src/log.cpp
+    src/pool_holds.cpp
     src/pool_manager.cpp
     src/pool_recovery.cpp
     src/pool_validation.cpp
     src/metadata.cpp
     src/wal.cpp
     src/reaper.cpp
+    src/region_holds.cpp
     src/request_handler.cpp
     src/tcp_server.cpp
 )
@@ -70,12 +72,14 @@ if(MARU_BUILD_TESTS)
         src/util.cpp
         src/server_config.cpp
         src/log.cpp
+        src/pool_holds.cpp
         src/pool_manager.cpp
         src/pool_recovery.cpp
         src/pool_validation.cpp
         src/metadata.cpp
         src/wal.cpp
         src/reaper.cpp
+        src/region_holds.cpp
         src/request_handler.cpp
         src/tcp_server.cpp
     )
@@ -108,7 +112,7 @@ if(MARU_BUILD_TESTS)
 
     add_executable(maru_rm_recovery_tests
         tests/test_header_recovery.cpp tests/test_device_exclusion.cpp
-        tests/fake_dax_fs.cpp tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
+        tests/test_region_holds.cpp tests/fake_dax_fs.cpp tests/checkpoint_fault.cpp ${RM_LIB_SOURCES})
     target_include_directories(maru_rm_recovery_tests PRIVATE include src)
     target_compile_options(maru_rm_recovery_tests PRIVATE -Wall -Wextra -Wpedantic)
     target_link_options(maru_rm_recovery_tests PRIVATE ${TEST_SYSCALL_WRAPS})

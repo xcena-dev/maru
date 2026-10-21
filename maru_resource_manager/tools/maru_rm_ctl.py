@@ -32,6 +32,11 @@ own user only):
   wipe daxN.M --confirm        zero all of an excluded device, header included
                                (e.g. before handing it over, or to reset it for
                                tests); waits until done, which can take minutes
+  drop-holds HOLDER [--confirm]
+                               list the regions a remote agent (node HOLDER)
+                               holds; --confirm drops those holds once that
+                               node's agent is gone for good, releasing the
+                               regions freed while held
 
 Exit codes: 0 = done, 1 = refused by the RM, 2 = RM unreachable,
 3 = sent but no reply in time (the command may still complete; run status),
@@ -49,6 +54,8 @@ from pathlib import Path
 
 DEFAULT_STATE_DIR = "/var/lib/maru-resourced"
 DEVICE = re.compile(r"(?:/dev/)?(dax(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
+# A remote agent's node ID, as the RM records it: printable ASCII, no spaces.
+HOLDER = re.compile(r"[\x21-\x7e]{1,128}")
 
 
 def device_name(text: str) -> str:
@@ -56,6 +63,14 @@ def device_name(text: str) -> str:
     if not match:
         raise argparse.ArgumentTypeError(f"expected daxN.M or /dev/daxN.M: {text}")
     return match[1]
+
+
+def holder_name(text: str) -> str:
+    if not HOLDER.fullmatch(text):
+        raise argparse.ArgumentTypeError(
+            f"expected 1-128 printable characters without spaces: {text!r}"
+        )
+    return text
 
 
 def region_id(text: str) -> int:
@@ -83,6 +98,8 @@ def request_line(args: argparse.Namespace) -> str:
         )
     if args.command == "wipe":
         return f"wipe {args.device}" + (" --confirm" if args.confirm else "")
+    if args.command == "drop-holds":
+        return f"drop-holds {args.holder}" + (" --confirm" if args.confirm else "")
     return (
         f"release {args.region}"
         + (" --confirm" if args.confirm else "")
@@ -183,6 +200,19 @@ def parser() -> argparse.ArgumentParser:
         "--confirm",
         action="store_true",
         help="no host maps the device and its contents may be destroyed",
+    )
+    drop = commands.add_parser(
+        "drop-holds",
+        help="list or drop a remote agent's region holds",
+        description="List the regions the remote agent of node HOLDER holds. "
+        "Freed regions stay out of use while held; --confirm drops the holds.",
+    )
+    drop.add_argument("holder", type=holder_name)
+    drop.add_argument(
+        "--confirm",
+        action="store_true",
+        help="the agent of that node is gone for good, and its NIC registrations "
+        "with it",
     )
     return root
 
