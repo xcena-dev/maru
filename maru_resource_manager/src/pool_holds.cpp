@@ -32,6 +32,7 @@ std::string PoolManager::holdState(uint64_t regionId) const
 int PoolManager::saveHoldsLocked(int &syncRc)
 {
     const int rc = saveRegionHolds(stateDir_, holds_, draining_, syncRc);
+    if (rc == 0) holdsSyncRc_ = syncRc;
     if (rc != 0)
         logf(LogLevel::Error, "cannot save region holds in %s/holds: %s", stateDir_.c_str(),
              std::strerror(-rc));
@@ -40,6 +41,16 @@ int PoolManager::saveHoldsLocked(int &syncRc)
              "region holds saved in %s/holds but the directory was not synced: %s",
              stateDir_.c_str(), std::strerror(-syncRc));
     return rc;
+}
+
+int PoolManager::confirmHoldsDurableLocked()
+{
+    if (holdsSyncRc_ == 0) return 0;
+    holdsSyncRc_ = syncDirectory(stateDir_);
+    if (holdsSyncRc_ != 0)
+        logf(LogLevel::Error, "region holds in %s/holds are still not synced: %s",
+             stateDir_.c_str(), std::strerror(-holdsSyncRc_));
+    return holdsSyncRc_;
 }
 
 int PoolManager::loadHoldsLocked(size_t &stale)
@@ -124,7 +135,8 @@ int PoolManager::hold(const Handle &handle, const std::string &holder,
     auto previous = holders.find(holder);
     if (previous != holders.end() && previous->second == instance)
     {
-        return 0;
+        // A retry after an unsynced save: succeed only once it is durable.
+        return confirmHoldsDurableLocked();
     }
     // A newer instance of the holder replaces the old one: one agent per node.
     const std::string replaced = previous != holders.end() ? previous->second : "";

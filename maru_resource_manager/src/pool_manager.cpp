@@ -1319,7 +1319,8 @@ int PoolManager::doFreeAllocation(uint64_t regionId)
     }
     if (isDraining(regionId))
     {
-        return 0;
+        // The owner's retry after an unsynced save: the mark must be durable.
+        return confirmHoldsDurableLocked();
     }
     if (!isHeld(regionId))
     {

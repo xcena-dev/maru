@@ -245,6 +245,10 @@ private:
     // protection then reports syncRc, one that removes it succeeds (a power
     // loss brings back the older file, which only holds more).
     int saveHoldsLocked(int &syncRc);
+    // 0 once the holds file last renamed into place is known durable; else
+    // sync the directory again and return the result. An idempotent request
+    // (a retried HOLD or FREE) must not report success before this does.
+    int confirmHoldsDurableLocked();
     // Read the holds file and drop records of regions not in the ledger,
     // counted in `stale`.
     int loadHoldsLocked(size_t &stale);
@@ -304,6 +308,8 @@ private:
     // Freed while held: still in allocations_, so its range stays out of the
     // free list and survives a restart, but freed for everyone else.
     std::set<uint64_t> draining_;
+    // -errno while the last holds file renamed into place is not synced.
+    int holdsSyncRc_{0};
     uint64_t nextRegionId_{1};
 
     // client_id → {pid, start_time} for reaper PID-reuse detection (in-memory only)

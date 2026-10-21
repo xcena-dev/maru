@@ -277,7 +277,7 @@ TEST_F(RegionHoldTest, UnsyncedSaveKeepsTheNewState) {
     EXPECT_EQ(holdsFile(), "hold " + region(h) + " node-a epoch-1\nhold " + region(other) +
                                " node-a epoch-1\ndraining " + region(h) + "\n");
     EXPECT_EQ(access(pm, h), "error " + std::to_string(-ENOENT));
-    EXPECT_EQ(pm.verifyAndFree(h, owner), 0); // The owner's retry.
+    EXPECT_EQ(pm.verifyAndFree(h, owner), -EIO); // A retry: not durable yet.
     EXPECT_EQ(pm.unhold(h, "node-a", "epoch-1"), 0);
     EXPECT_EQ(pm.allocationCount(), 1u);
     uint32_t dropped = 0;
@@ -291,6 +291,35 @@ TEST_F(RegionHoldTest, UnsyncedSaveKeepsTheNewState) {
     EXPECT_GE(checkpoint_fault::failures(), 6u);
     EXPECT_EQ(holdsFile(), "");
     EXPECT_EQ(access(pm, other), dev(0));
+}
+
+TEST_F(RegionHoldTest, RetriedRequestSucceedsOnlyOnceTheSaveIsDurable) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    std::string path;
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    EXPECT_EQ(pm.hold(h, "node-a", "epoch-1", path), -EIO);
+    EXPECT_EQ(holdsFile(), "hold " + region(h) + " node-a epoch-1\n");
+    // The agent's retry finds the hold recorded, but not yet durable.
+    EXPECT_EQ(pm.hold(h, "node-a", "epoch-1", path), -EIO);
+    checkpoint_fault::clear();
+    EXPECT_EQ(pm.hold(h, "node-a", "epoch-1", path), 0);
+    EXPECT_EQ(checkpoint_fault::failures(), 2u);
+    // Durable now: a further retry does not sync again.
+    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
+    EXPECT_EQ(pm.hold(h, "node-a", "epoch-1", path), 0);
+    EXPECT_EQ(checkpoint_fault::failures(), 0u);
+
+    // The same for the owner's retried FREE of a held region.
+    EXPECT_EQ(pm.verifyAndFree(h, owner), -EIO);
+    EXPECT_EQ(pm.verifyAndFree(h, owner), -EIO);
+    checkpoint_fault::clear();
+    EXPECT_EQ(pm.verifyAndFree(h, owner), 0);
+    EXPECT_EQ(access(pm, h), "error " + std::to_string(-ENOENT));
+    EXPECT_EQ(pm.verifyAndFree(h, owner), 0);
 }
 
 TEST_F(RegionHoldTest, ResetNeverReleasesARegionHeldMeanwhile) {
