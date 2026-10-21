@@ -1021,3 +1021,23 @@ def test_a_worker_refuses_an_agent_without_a_boot_id():
             client.map(cxl.reserve("owner", 4096).to_dict())
     finally:
         mem.stop()
+
+
+def test_main_refuses_to_start_when_its_region_extension_cannot_load(
+    monkeypatch, tmp_path
+):
+    import maru_remote_cxl_agent.extension as extension
+
+    def refuse(name, epoch, config):
+        raise ValueError(f"no package registers region extension {name!r}")
+
+    monkeypatch.setattr(extension, "load_region_extension", refuse)
+    monkeypatch.setenv("UCX_TLS", "rc")
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    argv += ["--key-file", key_file(), "--host", "127.0.0.1"]
+    assert cli.main([*argv, "--region-extension", "device"]) == 1
+    # The node lock went with the failed start: another agent may take it.
+    lock_fd = cli.hold_node_lock(str(tmp_path / "lock"))
+    import os
+
+    os.close(lock_fd)

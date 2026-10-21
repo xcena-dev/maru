@@ -392,10 +392,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.region_extension:
         from .extension import load_region_extension
 
-        extension = load_region_extension(
-            args.region_extension, epoch, args.region_extension_config
-        )
+        try:
+            extension = load_region_extension(
+                args.region_extension, epoch, args.region_extension_config
+            )
+        except Exception as exc:
+            logger.error(
+                "cannot load region extension %s: %s", args.region_extension, exc
+            )
+            os.close(lock_fd)
+            return 1
     elif args.region_extension_config:
+        os.close(lock_fd)
         build_parser().error("--region-extension-config needs --region-extension")
     transport = NixlTransport(
         f"maru-remote-cxl-agent-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
