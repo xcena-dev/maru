@@ -340,6 +340,15 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 1
 
+    boot_id = read_boot_id()
+    if not boot_id:
+        # Without it no worker could tell that the node rebooted and lost
+        # the writes its CPU caches held; workers refuse such an agent.
+        logger.error(
+            "cannot read this node's boot id (/proc/sys/kernel/random/boot_id)"
+        )
+        return 1
+
     lock_file = args.lock_file or default_lock_file(args.node_id)
     try:
         lock_fd = hold_node_lock(lock_file)
@@ -364,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         transport,
         node_id=args.node_id,
         epoch=epoch,
-        boot_id=read_boot_id(),
+        boot_id=boot_id,
     )
     server = RegionMapServer(service, host, args.port, key)
 

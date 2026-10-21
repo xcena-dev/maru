@@ -914,3 +914,26 @@ def test_workers_read_a_key_copy_in_their_home_by_default(tmp_path, monkeypatch)
     key.chmod(0o600)
     assert MaruConfig(auto_connect=False).remote_cxl_agent_key_file == DEFAULT_COPY_FILE
     assert load_key(DEFAULT_COPY_FILE) == bytes.fromhex("ab" * 16)
+
+
+def test_main_refuses_a_node_without_a_boot_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("UCX_TLS", "rc")
+    monkeypatch.setattr(cli, "read_boot_id", lambda: "")
+    argv = ["--rm-address", "mem1:9850", "--host", "127.0.0.1"]
+    lock = str(tmp_path / "lock")
+    assert cli.main([*argv, "--lock-file", lock, "--key-file", key_file()]) == 1
+    assert not (tmp_path / "lock").exists()  # stopped before the node lock
+
+
+def test_a_worker_refuses_an_agent_without_a_boot_id():
+    """Without it a reboot of the memory node, which loses writes its CPU
+    caches held, could not be told from a restart of the agent."""
+    cxl = FakeCxl()
+    mem = FakeMemoryNode(cxl)
+    try:
+        mem.service.boot_id = ""
+        client = RegionMapClient(mem.address, timeout_s=5, key=shared_key())
+        with pytest.raises(RegionMapUnavailable, match="no boot id"):
+            client.map(cxl.reserve("owner", 4096).to_dict())
+    finally:
+        mem.stop()

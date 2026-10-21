@@ -489,9 +489,17 @@ class RegionMapClient:
             raise RegionMapUnavailable(
                 f"remote CXL agent {self.address}: key check failed: {exc}"
             ) from exc
+        boot = str(reply.get("boot", ""))
+        if not boot:
+            # A reboot of the node, which loses writes its CPU caches held,
+            # could not be told from a restart of the agent.
+            self._drop()
+            raise RegionMapUnavailable(
+                f"remote CXL agent {self.address} reports no boot id of its node"
+            )
         self.epoch = str(reply["epoch"])
         self.node = str(reply["node"])
-        self.boot = str(reply.get("boot", ""))
+        self.boot = boot
 
     def _authenticate(self, nonce: Any) -> None:
         """Prove the key to the remote CXL agent and check its proof.
