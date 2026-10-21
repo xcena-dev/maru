@@ -270,6 +270,19 @@ def test_close_keeps_staging_while_a_late_transfer_may_land(pools):
         time.sleep(0.05)
 
 
+def test_close_ends_a_pool_disabled_earlier(pools):
+    """A pool whose session expired holds no region but still runs its
+    threads; the router's close ends them."""
+    r = router(pools)
+    ok, _ = store(r, route_keys_per_pool(r)[0], ["k"])
+    assert ok == [True]
+    c = next(c for c in r.clients if c.regions)
+    c._disable("session expired")
+    assert not c.connected and not c.regions
+    r.close()
+    assert c._stop.is_set() and c._threads == []
+
+
 def test_a_failed_late_cleanup_is_retried_by_a_later_close(pools):
     r = router(pools, rdma_timeout_s=0.01)
     agent = FakeNixlAgent.registry[

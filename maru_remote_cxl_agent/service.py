@@ -265,8 +265,9 @@ class RegionMapService:
                 m = self._maps.get(h.region_id)
                 if m is None:
                     # A new region may reuse the id of a released one only
-                    # with another handle (a restarted resource manager).
-                    self._released.pop(h.region_id, None)
+                    # with another handle (a restarted resource manager); the
+                    # release record goes once the resource manager accepts
+                    # that handle (_establish).
                     m = _Mapping(h, seq=next(self._seq))
                     self._maps[h.region_id] = m
                     step = "establish"
@@ -618,6 +619,10 @@ class RegionMapService:
         try:
             self._wait_for_earlier(m)
             access = self._rm.get_access(h)
+            with self._lock:
+                if self._released.get(h.region_id) != h:
+                    # The resource manager handed the id out again.
+                    self._released.pop(h.region_id, None)
             m.device = _device_of(access)
             self._fence(m)
             addr = self._mapper.map(

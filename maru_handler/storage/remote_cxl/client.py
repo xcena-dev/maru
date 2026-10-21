@@ -26,7 +26,13 @@ from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
 from .datapath import RdmaDataPath
 from .lifecycle import RegionLifecycle
-from .region import REMOTE_CXL, IsolatedTransfer, RemoteCxlAllocation, RemoteCxlRegion
+from .region import (
+    REMOTE_CXL,
+    IsolatedTransfer,
+    RegionAccess,
+    RemoteCxlAllocation,
+    RemoteCxlRegion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -743,6 +749,40 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 self._give_slot(h)
             return True
 
+    def _map_for_write(
+        self, region: RemoteCxlRegion, group: list[RemoteCxlAllocation]
+    ) -> RegionAccess | None:
+        """Map an own region for a WRITE and check its memory node's boot.
+
+        Returns None, with the group's pages given back, if the region
+        cannot be mapped (it is set aside) or went back.
+        """
+        try:
+            # Mapping may ask the region's agent: outside the lock.
+            access = self._region(region.pool_id, region.handle, own=True)
+        except StorageUnavailableError as exc:
+            logger.warning(
+                "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
+            )
+            with self._lock:
+                self._give_back(group)
+                self._set_aside(region)
+            return None
+        with self._lock:
+            if region.retired:
+                # It went back while this map ran: undo the registration, as
+                # the retry of set-aside regions does.
+                region.mapped = True
+                self._data.release(region.pool_id, region.handle, self._agents)
+                self._give_back(group)
+                return None
+            self._adopt(region, access)
+            if region.retired:
+                # Its memory node rebooted and the region went back.
+                self._give_back(group)
+                return None
+        return access
+
     def _write_group(self, group: list[RemoteCxlAllocation]) -> bool:
         """WRITE the pages of one region; on failure they are given back or
         isolated, and False is returned."""
@@ -754,42 +794,16 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 # It went back after the pages were taken (memory node rebooted).
                 self._give_back(group)
                 return False
-        try:
-            # Mapping may ask the region's agent: outside the lock.
-            access = self._region(region.pool_id, region.handle, own=True)
-        except StorageUnavailableError as exc:
-            logger.warning(
-                "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
-            )
-            with self._lock:
-                self._give_back(group)
-                self._set_aside(region)
+        access = self._map_for_write(region, group)
+        if access is None:
             return False
         with self._lock:
-            if region.retired:
-                # It went back while this map ran: undo the registration, as
-                # the retry of set-aside regions does.
-                region.mapped = True
-                self._data.release(region.pool_id, region.handle, self._agents)
-                self._give_back(group)
-                return False
-            self._adopt(region, access)
-            if region.retired:
-                # Its memory node rebooted and the region went back.
-                self._give_back(group)
-                return False
             stale = not self._data.has_access(region.pool_id)
         if stale:
-            # Another transfer's failure dropped the connection meanwhile.
-            try:
-                access = self._region(region.pool_id, region.handle, own=True)
-            except StorageUnavailableError as exc:
-                logger.warning(
-                    "Remote CXL region %d cannot be mapped: %s", region.region_id, exc
-                )
-                with self._lock:
-                    self._give_back(group)
-                    self._set_aside(region)
+            # Another transfer's failure dropped the connection meanwhile. A
+            # restarted agent drops it too, so the new map's boot is checked.
+            access = self._map_for_write(region, group)
+            if access is None:
                 return False
         with self._lock:
             if region.retired:
@@ -1246,7 +1260,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
             self._transfers_idle.wait_for(
                 lambda: not self._transfers, self.config.rdma_timeout_s + 5
             )
-            self._leave()
+            if self.connected or self.regions:
+                # A disabled session already left its regions.
+                self._leave()
             if not self._isolated and not self._transfers:
                 self._stop_data_path()
             else:

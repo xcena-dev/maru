@@ -158,6 +158,19 @@ def test_a_new_region_under_a_released_id_maps(node):
     assert node.service.map(1, reused)["region_id"] == handle["region_id"]
 
 
+def test_a_refused_map_under_a_released_id_keeps_the_release(node):
+    """A map with another token the resource manager refuses leaves the
+    record: the released handle stays refused."""
+    handle = node.region()
+    node.service.map(1, handle)
+    node.service.release(handle)
+    with pytest.raises(RuntimeError, match="GetAccess"):
+        node.service.map(2, {**handle, "auth_token": handle["auth_token"] + 1})
+    with pytest.raises(MapDenied, match="released"):
+        node.service.map(2, handle)
+    assert node.agent.registered == []
+
+
 def test_a_release_with_another_handle_is_denied(node):
     handle = node.region()
     node.service.map(1, handle)

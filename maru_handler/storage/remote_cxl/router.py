@@ -228,8 +228,10 @@ class PoolRouter:
         return c.batch_retrieve(keys) if c.connected else [None] * len(keys)
 
     def _close_clients(self) -> None:
+        # A pool disabled after an expiry or a MaruServer restart holds no
+        # region but still has its threads and MaruServer connection.
         for c in self.clients:
-            if c.connected or c.regions:
+            if c.ever_connected or c.connected or c.regions:
                 c.close()
 
     def close(self) -> None:

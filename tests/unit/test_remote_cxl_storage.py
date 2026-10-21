@@ -1730,6 +1730,29 @@ def test_a_reboot_a_store_notices_ends_the_leases_on_the_keys_of_its_regions(wor
     assert region.pool_id not in a.regions
 
 
+def test_a_store_that_maps_its_region_again_notices_a_reboot(world, monkeypatch):
+    """Another transfer drops the connection while a store maps its region:
+    the second map checks the memory node's boot as the first one does."""
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    region = only_region(a)
+    world.node.restart(reboot=True)
+    a._check_boots = lambda: pytest.fail("the store must notice the reboot")
+    has_access, dropped = a._data.has_access, []
+
+    def dropped_meanwhile(pool_id):
+        if not dropped:
+            dropped.append(pool_id)
+            a._data.disconnect({a._data._access[pool_id].peer})
+        return has_access(pool_id)
+
+    monkeypatch.setattr(a._data, "has_access", dropped_meanwhile)
+    assert put(a, "k2", b"w")[0] is False  # nothing is written after the reboot
+    assert dropped == [region.pool_id]
+    assert region.retired
+    assert b.batch_exists(["k", "k2"]) == [False, False]
+
+
 def test_a_worker_whose_only_region_went_back_closes_its_session(world):
     a = world.client("a")
     put(a, "k", b"v")
@@ -1776,6 +1799,31 @@ def test_a_commit_confirmed_after_its_region_went_back_records_no_key(world):
     a._resolve_pending()
     assert a._pending == {} and "k" not in a._keys
     assert c.batch_exists(["k"]) == [False]
+
+
+def test_an_evicted_key_another_session_leased_meanwhile_stays_tracked(
+    world, monkeypatch
+):
+    """MaruServer keeps a victim another session leased before the remove:
+    the owner still tracks it, so it goes when the region's keys go."""
+    a, b = world.client("a"), world.client("b")
+    put(a, "k", b"v")
+    call, leases = a._call, []
+
+    def lease_before_remove(action, **payload):
+        if action == "remove" and not leases:
+            reply = world.directory.execute(
+                "acquire", {**b._credentials, "keys": ["k"]}
+            )
+            leases.append(reply["result"]["lease_id"])
+        return call(action, **payload)
+
+    monkeypatch.setattr(a, "_call", lease_before_remove)
+    assert a._evict() is False  # the leased key and its page stay
+    assert a.has_local("k")
+    world.directory.execute("release", {**b._credentials, "lease_id": leases[0]})
+    a._drop_keys(only_region(a))
+    assert b.batch_exists(["k"]) == [False]
 
 
 def test_an_unconfirmed_lease_release_is_sent_again(world):

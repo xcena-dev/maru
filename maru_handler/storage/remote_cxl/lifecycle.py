@@ -443,6 +443,7 @@ class RegionLifecycle:
             self._removing.extend(victims)
             logger.warning("Remote CXL eviction outcome unknown; retrying later")
             return False
+        self._track_kept(victims, statuses)
         return self._reclaim(victims, statuses)
 
     def _reclaim(self, entries: list[dict], statuses: list[str]) -> bool:
@@ -468,7 +469,30 @@ class RegionLifecycle:
             logger.warning("Remote CXL eviction retry failed", exc_info=True)
             return False
         del self._removing[: len(entries)]
+        self._track_kept(entries, statuses)
         return self._reclaim(entries, statuses)
+
+    def _track_kept(self, entries: list[dict], statuses: list[str]) -> None:
+        """Track again the evicted keys MaruServer kept.
+
+        A victim was unleased when MaruServer picked it, but another session
+        may lease it before the remove: MaruServer then keeps the key, and
+        this session must still remove it when the region's keys go. Keys of
+        a region that already went back, or whose keys were removed, stay
+        with the drops that handle that region.
+        """
+        for entry, status in zip(entries, statuses, strict=True):
+            if status != "KEPT":
+                continue
+            region = self.regions.get(entry["location"]["pool_id"])
+            if region is None or region.retired:
+                continue  # MaruServer drops the keys of a region given back
+            if not region.reachable and region.unreachable_since is None:
+                self._dropping.append(entry)  # its region's keys were removed
+            else:
+                self._keys.setdefault(
+                    entry["key"], StorageLocation(**entry["location"])
+                )
 
     # ------------------------------------------------------ keys that go
 
