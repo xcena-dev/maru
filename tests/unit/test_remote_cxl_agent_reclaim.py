@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remote CXL agent: regions the resource manager frees without a release here.
 
-When MaruServer exits, the resource manager reaps its regions on its own and
-may give their device range to a new region. The agent releases a mapping of
-such a freed region before it registers a new region over the range (the
-fence), and a periodic sweep releases the rest. A mapping whose metadata
-failed and whose deregistration failed stays tracked until deregistered.
+When MaruServer exits, the resource manager reaps its regions on its own. The
+agent holds every region it registers, so the resource manager keeps a reaped
+region's range out of use until the agent's sweep has released it and sent
+the unhold. A range freed without the hold (an operator's discard) may go to
+a new region at once: the agent releases a mapping of such a range before it
+registers a new region over it (the fence). A mapping whose metadata failed
+and whose deregistration failed stays tracked until deregistered.
 """
 
 import ctypes
@@ -78,6 +80,10 @@ class Node:
         """The resource manager frees a region on its own (its client left)."""
         self.cxl.release("owner", handle["region_id"])
 
+    def discard(self, handle):
+        """The resource manager frees a region and drops its holds."""
+        self.cxl.discard(handle["region_id"])
+
 
 def tags(events):
     return [(kind, item if kind == "register" else "-") for kind, item in events]
@@ -94,11 +100,11 @@ def unreachable(handle):
 # ------------------------------------------------------------------ fence
 
 
-def test_mapping_a_new_region_over_a_reaped_range_releases_the_old_one_first():
+def test_mapping_a_new_region_over_a_discarded_range_releases_the_old_one_first():
     node = Node(real_mapper=True)
     old = node.region()
     old_reply = node.service.map(1, old)
-    node.reap(old)
+    node.discard(old)
     new = node.region("next owner")
     assert new["offset"] == old["offset"]  # the resource manager reuses the range
 
@@ -141,7 +147,7 @@ def test_a_new_region_is_refused_while_the_resource_manager_cannot_vouch_for_the
     node = Node()
     old = node.region()
     node.service.map(1, old)
-    node.reap(old)
+    node.discard(old)
     new = node.region("next owner")
     get_access = node.cxl.get_access
 
@@ -167,7 +173,7 @@ def test_a_new_region_is_refused_while_the_old_one_stays_registered():
     node = Node()
     old = node.region()
     node.service.map(1, old)
-    node.reap(old)
+    node.discard(old)
     new = node.region("next owner")
     deregister = node.transport.deregister
     node.transport.deregister = refuse
@@ -198,8 +204,8 @@ def test_a_reused_region_id_maps_once_the_old_region_is_gone():
 
 
 def test_a_first_map_waits_for_an_earlier_one_of_its_range():
-    # The old region passed GET_ACCESS and is registering when the resource
-    # manager reaps it and gives the range to a new region.
+    # The old region passed its hold and is registering when the resource
+    # manager drops it and gives the range to a new region.
     node = Node()
     old = node.region()
     registering, go = threading.Event(), threading.Event()
@@ -215,7 +221,7 @@ def test_a_first_map_waits_for_an_earlier_one_of_its_range():
     first = threading.Thread(target=lambda: node.service.map(1, old))
     first.start()
     assert registering.wait(5)
-    node.reap(old)
+    node.discard(old)
     new = node.region("next owner")
     replies = []
     second = threading.Thread(target=lambda: replies.append(node.service.map(2, new)))
@@ -372,3 +378,194 @@ def test_the_sweep_deregisters_a_mapping_whose_last_holder_left():
     assert len(node.agent.registered) == 1 and node.mapper.unmapped == [
         handle["offset"]
     ]
+
+
+# ------------------------------------------------------------------ holds
+
+
+def test_a_reaped_region_keeps_its_range_until_the_agent_releases_it():
+    node = Node()
+    reaped = node.region()
+    node.service.map(1, reaped)
+    node.reap(reaped)
+    assert node.cxl.holds == {reaped["region_id"]: {"mem1": "e1"}}
+    # The range stays out of use while the agent still registers it.
+    assert node.region("next owner")["offset"] != reaped["offset"]
+
+    node.service.sweep()  # releases it and unholds it
+
+    assert node.cxl.holds == {} and node.cxl.draining == {}
+    assert node.region("third owner")["offset"] == reaped["offset"]
+
+
+def test_another_agent_cannot_map_a_new_region_over_a_held_range():
+    """A shared pool: the region's range goes to a region that agent Y maps
+    only after agent X, which registered the reaped region, released it."""
+    x = Node(real_mapper=True)
+    y_agent = FakeNixlAgent("mem-y")
+    y = RegionMapService(
+        x.cxl,
+        DaxRegionMapper({}),
+        NixlTransport("mem-y", agent=y_agent),
+        node_id="mem2",
+        epoch="e1",
+    )
+    old = x.region()
+    old_reply = x.service.map(1, old)
+    x.reap(old)
+    new = x.region("next owner")
+    assert new["offset"] != old["offset"]
+    new_reply = y.map(2, new)
+
+    worker = NixlTransport("worker", agent=FakeNixlAgent("worker"))
+    buf = ctypes.create_string_buffer(SIZE)
+    worker.register(ctypes.addressof(buf), SIZE)
+    old_peer = worker.add_peer(old_reply["metadata"])
+    new_peer = worker.add_peer(new_reply["metadata"])
+    ctypes.memset(buf, 0xCD, SIZE)
+    worker.write(new_peer, [(ctypes.addressof(buf), new_reply["addr"], SIZE)])
+    ctypes.memset(buf, 0xAB, SIZE)
+    # A late WRITE through X's old registration lands in the old range only.
+    worker.write(old_peer, [(ctypes.addressof(buf), old_reply["addr"], SIZE)])
+    assert x.cxl.page(new["offset"], SIZE) == b"\xcd" * SIZE
+
+    x.service.sweep()
+    assert x.region("third owner")["offset"] == old["offset"]
+    x.service.close()
+    y.close()
+
+
+def test_a_release_unholds_before_it_returns():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    node.service.release(handle)
+    assert node.cxl.holds == {}
+    node.reap(handle)  # MaruServer gives it back: freed at once
+    assert node.cxl.draining == {}
+
+
+def test_an_unhold_that_fails_is_sent_again_by_the_sweep():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    unhold = node.cxl.unhold
+    node.cxl.unhold = lambda *a: unreachable(None)
+    node.service.release(handle)
+    node.reap(handle)
+    assert handle["region_id"] in node.cxl.draining  # kept out of use
+
+    node.cxl.unhold = unhold
+    node.service.sweep()
+    assert node.cxl.holds == {} and node.cxl.draining == {}
+
+
+def test_a_map_that_fails_after_its_hold_unholds_the_region():
+    node = Node()
+    handle = node.region()
+    node.transport.register = refuse
+    with pytest.raises(RuntimeError, match="NIC busy"):
+        node.service.map(1, handle)
+    node.service.sweep()
+    assert node.cxl.holds == {}
+
+
+def test_a_restarted_agent_drops_the_holds_of_its_earlier_process():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)  # the process then ends without a release
+    node.reap(handle)
+    restarted = RegionMapService(
+        node.cxl, node.mapper, node.transport, node_id="mem1", epoch="e2"
+    )
+    restarted.sweep()
+    assert node.cxl.holds == {} and node.cxl.draining == {}
+
+
+def test_a_hold_of_the_current_process_survives_a_reset():
+    node = Node()
+    handle = node.region()
+    node.service.map(1, handle)
+    node.service.sweep()  # resets once, for epoch e1
+    assert node.cxl.holds == {handle["region_id"]: {"mem1": "e1"}}
+
+
+def test_a_resource_manager_without_holds_refuses_the_map():
+    from maru_shm.client import HoldsUnsupportedError
+
+    node = Node()
+    handle = node.region()
+
+    def old_rm(*args):
+        raise HoldsUnsupportedError(
+            "the resource manager does not support region holds"
+        )
+
+    node.cxl.reset_holds = old_rm
+    with pytest.raises(HoldsUnsupportedError, match="does not support"):
+        node.service.map(1, handle)
+    assert node.agent.registered == []
+
+
+def test_a_refused_map_leaves_no_unhold_that_blocks_the_others():
+    node = Node()
+    good = node.region()
+    node.service.map(1, good)
+    bad = {**node.region(), "auth_token": 1}  # the RM refuses this handle
+    with pytest.raises(RuntimeError, match="GetAccess"):
+        node.service.map(2, bad)
+    node.service.release(good)
+    assert node.cxl.holds == {}
+
+
+def test_a_refused_unhold_does_not_hold_back_the_rest():
+    node = Node()
+    first, second = node.region(), node.region()
+    node.service.map(1, first)
+    node.service.map(1, second)
+    unhold = node.cxl.unhold
+
+    def refuse_first(handle, holder, instance):
+        if handle.region_id == first["region_id"]:
+            raise RuntimeError("Unhold failed (-13): invalid auth token")
+        unhold(handle, holder, instance)
+
+    node.cxl.unhold = refuse_first
+    node.service.drop(1)  # both go; the first unhold is refused
+    assert node.cxl.holds == {first["region_id"]: {"mem1": "e1"}}
+    node.service.sweep()
+    assert node.cxl.holds == {first["region_id"]: {"mem1": "e1"}}  # not retried
+
+
+def test_unmap_drop_and_close_unhold():
+    node = Node()
+    a, b, c = node.region(), node.region(), node.region()
+    node.service.map(1, a)
+    node.service.map(2, b)
+    node.service.map(3, c)
+    node.service.unmap(1, a["region_id"])
+    assert set(node.cxl.holds) == {b["region_id"], c["region_id"]}
+    node.service.drop(2)
+    assert set(node.cxl.holds) == {c["region_id"]}
+    node.service.close()
+    assert node.cxl.holds == {}
+
+
+def test_a_failed_reset_is_retried_and_said_once(monkeypatch):
+    import maru_remote_cxl_agent.service as service
+
+    said = []
+    monkeypatch.setattr(service.logger, "warning", lambda msg, *a: said.append(msg))
+    node = Node()
+    reset = node.cxl.reset_holds
+    node.cxl.reset_holds = lambda *a: unreachable(None)
+    handle = node.region()
+    for _ in range(3):
+        with pytest.raises(ConnectionError):
+            node.service.map(1, handle)
+        node.service.sweep()
+    assert len([m for m in said if "earlier processes" in m]) == 1
+    assert node.cxl.holds == {}  # nothing was held, nothing is queued
+    node.cxl.reset_holds = reset
+    node.service.map(1, handle)
+    assert node.cxl.holds == {handle["region_id"]: {"mem1": "e1"}}

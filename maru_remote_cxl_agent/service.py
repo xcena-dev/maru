@@ -30,6 +30,13 @@ CXL-attached node. For each region a Handler asks for:
    every held mapping every :data:`SWEEP_INTERVAL_S` and releases the freed
    ones, which bounds how long an old registration overlaps a region that a
    Handler on this node writes through its own mapping.
+6. The first map holds the region at the resource manager (``HOLD``, which
+   checks the handle as ``GET_ACCESS`` does), and the region is unheld once
+   it is deregistered here. The resource manager keeps a freed region's
+   range out of use while it is held, so no new region gets the range while
+   an old registration of it lives here, whichever node or path maps the
+   new region. A restarted agent first drops the holds of its earlier
+   process (``RESET_HOLDS``), whose registrations ended with it.
 
 Two kinds of handle name a region. The handle itself carries the resource
 manager's auth token; MaruServer gives it to the region's owner only. A
@@ -190,11 +197,14 @@ class RegionMapService:
         """Create the service.
 
         Args:
-            rm: Resource manager client with ``get_access(handle)``
-                (``MaruShmClient``). ``get_access`` raises RuntimeError when
-                the resource manager refuses a handle (its region was freed,
-                or the id names another region now) and another exception
-                (ConnectionError, OSError) when it cannot be asked.
+            rm: Resource manager client (``MaruShmClient``) with
+                ``get_access(handle)``, ``hold_access(handle, holder,
+                instance)``, ``unhold(handle, holder, instance)`` and
+                ``reset_holds(holder, instance)``. They raise RuntimeError
+                when the resource manager refuses a request (a handle whose
+                region was freed, or whose id names another region now) and
+                another exception (ConnectionError, OSError) when it cannot
+                be asked.
             mapper: Maps a region's device (``DaxRegionMapper``).
             transport: NIXL transport that registers mappings with the NIC
                 (``NixlTransport``).
@@ -218,6 +228,14 @@ class RegionMapService:
         self._stop = threading.Event()
         self._sweeper: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Holds and unholds go to the resource manager one at a time, so an
+        # unhold of a released region never overtakes the hold of its next map.
+        self._hold_lock = threading.Lock()
+        self._holds_reset = False
+        self._reset_failed = False
+        # Regions deregistered here whose unhold has not reached the RM yet
+        self._unheld: dict[int, MaruHandle] = {}
+        self._unhold_failed = False
 
     def hello(self) -> dict:
         """Identity of this remote CXL agent process and of the node's boot."""
@@ -318,6 +336,7 @@ class RegionMapService:
             m.holders.discard(conn)
             if not m.holders:
                 self._release_locked(region_id, m)
+        self._flush_unholds()
 
     def release(self, handle: Any) -> None:
         """Deregister and unmap a region, whoever holds it.
@@ -348,18 +367,21 @@ class RegionMapService:
                 m = self._maps.get(h.region_id)
                 if m is None:
                     self._remember_released(h)
-                    return
+                    break
                 if m.ready.is_set():
                     if m.handle != h:
                         raise MapDenied(f"handle does not match region {h.region_id}")
                     if not self._release_locked(h.region_id, m):
                         raise RuntimeError(f"deregistering region {h.region_id} failed")
                     self._remember_released(h)
-                    return
+                    break
             try:
                 self._wait(m)
             except RuntimeError:
                 pass  # the mapping failed: the next pass finds what is left
+        # The unhold goes before the reply, so the region the caller gives
+        # back next is freed at once; a failed one is retried by the sweep.
+        self._flush_unholds()
 
     def drop(self, conn: int) -> None:
         """A connection closed: drop its hold on every region.
@@ -374,6 +396,7 @@ class RegionMapService:
                 m.holders.discard(conn)
                 if not m.holders:
                     self._release_locked(rid, m)
+        self._flush_unholds()
 
     def sweep(self) -> None:
         """Check every held mapping with the resource manager once.
@@ -383,8 +406,19 @@ class RegionMapService:
         does: deregistered, unmapped, refused to later maps. A mapping that
         is out of use (refused, or with no holder left) and still registered
         gets its deregistration again. While the resource manager cannot be
-        asked, every mapping stays.
+        asked, every mapping stays. The unholds of released regions that
+        have not reached the resource manager are sent again, and the holds
+        of this agent's earlier process are dropped once.
         """
+        try:
+            self._reset_holds()
+        except Exception:
+            pass  # said in _reset_holds; the next sweep or first map tries again
+        self._check_maps()
+        self._flush_unholds()
+
+    def _check_maps(self) -> None:
+        """The mapping checks of :meth:`sweep`."""
         with self._lock:
             held = [
                 m
@@ -465,6 +499,7 @@ class RegionMapService:
             for rid, m in list(self._maps.items()):
                 if m.ready.is_set() and m.registration is not None:
                     self._release_locked(rid, m)
+        self._flush_unholds()
 
     def _sweep_loop(self, interval_s: float) -> None:
         while not self._stop.wait(interval_s):
@@ -616,9 +651,13 @@ class RegionMapService:
     def _establish(self, m: _Mapping, conn: int) -> dict:
         """Check, map and register a region; the caller created ``m``."""
         h = m.handle
+        held: bool | None = None  # None: not asked; False: outcome unknown
         try:
             self._wait_for_earlier(m)
-            access = self._rm.get_access(h)
+            self._reset_holds()
+            held = False
+            access = self._hold(h)
+            held = True
             with self._lock:
                 if self._released.get(h.region_id) != h:
                     # The resource manager handed the id out again.
@@ -649,6 +688,10 @@ class RegionMapService:
                 m.ready.set()
                 if m.registration is None:
                     self._maps.pop(h.region_id, None)
+                    # Nothing is registered. A hold that may have been
+                    # recorded goes; a refused one never was.
+                    if held or (held is False and not isinstance(exc, RuntimeError)):
+                        self._unheld[h.region_id] = h
                 elif not self._release_locked(h.region_id, m):
                     # Tracked until deregistered: release, the sweep, close
                     # or a later map of the region try again.
@@ -666,6 +709,79 @@ class RegionMapService:
             m.ready.set()
         logger.info("mapped region %d (%d bytes) at %#x", h.region_id, h.length, addr)
         return self._reply(m)
+
+    def _hold(self, h: MaruHandle) -> Any:
+        """Check ``h`` with the resource manager and hold its region.
+
+        Raises:
+            RuntimeError: if the resource manager refuses the handle (or
+                predates holds: ``HoldsUnsupportedError``).
+            Exception: if the resource manager cannot be asked.
+        """
+        with self._hold_lock:
+            # This map's hold supersedes an unhold of the same handle still
+            # waiting for the RM (another handle's stays queued).
+            with self._lock:
+                if self._unheld.get(h.region_id) == h:
+                    del self._unheld[h.region_id]
+            return self._rm.hold_access(h, self.node_id, self.epoch)
+
+    def _reset_holds(self) -> None:
+        """Drop the holds of this agent's earlier processes, once.
+
+        Raises:
+            Exception: if the resource manager cannot be asked or refuses.
+        """
+        if self._holds_reset:
+            return
+        with self._hold_lock:
+            if self._holds_reset:
+                return
+            try:
+                dropped = self._rm.reset_holds(self.node_id, self.epoch)
+            except Exception as exc:
+                if not self._reset_failed:  # once while it keeps failing
+                    logger.warning(
+                        "cannot drop the holds of earlier processes: %s", exc
+                    )
+                self._reset_failed = True
+                raise
+            self._holds_reset = True
+            self._reset_failed = False
+        if dropped:
+            logger.info("dropped %d hold(s) of earlier processes", dropped)
+
+    def _flush_unholds(self) -> None:
+        """Unhold the regions deregistered here, at the resource manager.
+
+        Called without the lock. A region mapped again meanwhile keeps its
+        new hold. One that cannot be unheld now stays queued for the sweep;
+        meanwhile the resource manager only keeps its range out of use.
+        """
+        with self._hold_lock:
+            with self._lock:
+                pending = [
+                    (rid, h) for rid, h in self._unheld.items() if rid not in self._maps
+                ]
+            for rid, h in pending:
+                try:
+                    self._rm.unhold(h, self.node_id, self.epoch)
+                except RuntimeError as exc:
+                    # Refused: the RM holds nothing this handle can name.
+                    logger.warning("unholding region %d was refused: %s", rid, exc)
+                except Exception as exc:
+                    if not self._unhold_failed:
+                        logger.warning(
+                            "cannot unhold released regions at the resource "
+                            "manager; retrying: %s",
+                            exc,
+                        )
+                    self._unhold_failed = True
+                    return
+                with self._lock:
+                    if self._unheld.get(rid) is h:
+                        del self._unheld[rid]
+            self._unhold_failed = False
 
     @staticmethod
     def _reply(m: _Mapping) -> dict:
@@ -718,6 +834,7 @@ class RegionMapService:
             logger.error("deregistering region %d failed", region_id, exc_info=True)
             return False
         del self._maps[region_id]
+        self._unheld[region_id] = m.handle
         try:
             self._mapper.unmap(m.addr, m.handle.length)
         except OSError:

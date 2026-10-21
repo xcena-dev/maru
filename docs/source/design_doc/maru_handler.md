@@ -311,21 +311,20 @@ its remote CXL agent deregistered it from the NIC (`release`):
 
 **Regions the Resource Manager reclaims on its own.** When maru-server dies
 or loses its Resource Manager connection, the Resource Manager reclaims its
-regions after a grace period without asking the remote CXL agent, and may
-give the same range to a new owner. The remote CXL agent keeps its
-registrations in step with the Resource Manager. Before it registers a
-region, it asks the Resource Manager about every region it holds on an
-overlapping range and releases those the Resource Manager no longer knows;
-it refuses the map if it cannot ask. Once a second it asks about all its
-mappings and releases the reclaimed ones. A late WRITE through the old
-registration then fails at the NIC before the new owner's region is
-registered:
+regions after a grace period without asking the remote CXL agent. The remote
+CXL agent holds every region it registers (`HOLD`), so the Resource Manager
+keeps a reclaimed region's range out of use while the agent still registers
+it. Once a second the agent asks about all its mappings, releases the
+reclaimed ones and unholds them; only then can the range go to a new region,
+whichever memory node maps it or whether a cxl Handler on the memory node
+uses it. A late WRITE through the old registration fails at the NIC:
 
-![A region the Resource Manager reclaimed after its maru-server died. Worker A kept region A's address and NIC key; worker B maps region B on the same range and stores NEW! in page p; then A sends a late WRITE through region A's old registration. (a) With no check before mapping, both registrations cover page p and the late WRITE overwrites it, so B reads LATE. (b) The remote CXL agent asks the Resource Manager about region A before it maps region B and releases it first, so the late WRITE fails at the NIC and B reads NEW!](../image/remote_cxl_rm_reclaim.png)
+![A shared pool: worker A kept region R's address and NIC key at agent X on memory node 1 when R's maru-server died; worker B gets region R2 on the same range through agent Y on memory node 2 and stores NEW! in page p; then A sends a late WRITE through R's old registration at X. (a) Without a hold, the Resource Manager hands R's range to R2 at once and the late WRITE overwrites page p, so B reads LATE. (b) With a hold, the range waits until X has released R and sent the unhold; the late WRITE fails at node 1's NIC and B reads NEW!](../image/remote_cxl_rm_hold.png)
 
-A new owner that uses the range without this agent (a cxl Handler on the
-memory node) can still receive such a WRITE until the next check: about one
-second while the agent can reach the Resource Manager.
+The agent also checks, before it registers a region, every region it holds
+on an overlapping range, and releases those the Resource Manager no longer
+knows (for example after `maru-rm-ctl discard`); it refuses the map if it
+cannot ask.
 
 **Staging slots.** Loads and stores share the staging buffer. With
 asynchronous transfers (the default on this backend), stores leave a share of

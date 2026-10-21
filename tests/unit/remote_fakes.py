@@ -269,7 +269,9 @@ class FakeCxl:
     ``DaxRegionMapper``. Regions are reserved first fit, so a released range
     is handed out again under a new region id, as the real resource manager
     does. ``get_access`` checks a handle the way ``GET_ACCESS`` does. Every
-    remote CXL agent of the pool maps the same bytes.
+    remote CXL agent of the pool maps the same bytes. A region freed while a
+    remote CXL agent holds it keeps its range until the last ``unhold``, as
+    the real resource manager does; ``discard`` frees it regardless.
     """
 
     def __init__(self, size: int = 1 << 20) -> None:
@@ -286,14 +288,18 @@ class FakeCxl:
         self.released: list[int] = []
         self.accesses: list[int] = []
         self.fail_release = False
+        # region id -> {holder: instance}; freed regions still held
+        self.holds: dict[int, dict[str, str]] = {}
+        self.draining: dict[int, object] = {}
 
     @property
     def used(self) -> int:
-        return sum(h.length for h in self.regions.values())
+        return sum(h.length for h in (*self.regions.values(), *self.draining.values()))
 
     def _fit(self, size: int) -> int | None:
         start = 0
-        for h in sorted(self.regions.values(), key=lambda h: h.offset):
+        taken = (*self.regions.values(), *self.draining.values())
+        for h in sorted(taken, key=lambda h: h.offset):
             if h.offset - start >= size:
                 return start
             start = h.offset + h.length
@@ -316,11 +322,50 @@ class FakeCxl:
         return handle
 
     def release(self, owner, region_id):
+        """Free a region (its owner's FREE, or the reaper); a held one drains."""
         if self.fail_release:
             return False
-        self.regions.pop(region_id)
+        handle = self.regions.pop(region_id)
         self.released.append(region_id)
+        if self.holds.get(region_id):
+            self.draining[region_id] = handle
         return True
+
+    def discard(self, region_id):
+        """Free a region and drop its holds (an operator's discard)."""
+        self.regions.pop(region_id, None)
+        self.draining.pop(region_id, None)
+        self.holds.pop(region_id, None)
+        self.released.append(region_id)
+
+    def hold_access(self, handle, holder, instance):
+        access = self.get_access(handle)
+        self.holds.setdefault(handle.region_id, {})[holder] = instance
+        return access
+
+    def unhold(self, handle, holder, instance):
+        region_id = handle.region_id
+        known = self.regions.get(region_id) or self.draining.get(region_id)
+        if known is not None and known != handle:
+            raise RuntimeError("Unhold failed (-13): invalid auth token")
+        held = self.holds.get(region_id, {})
+        if held.get(holder) == instance:
+            del held[holder]
+        self._settle(region_id)
+
+    def reset_holds(self, holder, instance):
+        dropped = 0
+        for region_id, held in list(self.holds.items()):
+            if held.get(holder, instance) != instance:
+                del held[holder]
+                dropped += 1
+            self._settle(region_id)
+        return dropped
+
+    def _settle(self, region_id):
+        if not self.holds.get(region_id):
+            self.holds.pop(region_id, None)
+            self.draining.pop(region_id, None)
 
     def get_access(self, handle):
         from types import SimpleNamespace

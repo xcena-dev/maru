@@ -196,7 +196,8 @@ How the properties above carry over:
   worker's staging buffer.
 - **Capability-based access.** The remote CXL agent is the process that opens
   the DAX device on a memory node, and it checks a handle with the Resource
-  Manager (`GET_ACCESS`) before it maps a region. Who may ask it is bound as
+  Manager (`HOLD`, a `GET_ACCESS` that also keeps the region's range out of
+  use until the agent lets go of it) before it maps a region. Who may ask it is bound as
   who may open a DAX device is: it listens on the node's RDMA network address,
   and every connection proves the remote CXL agent key, a file that only the
   users running workers and maru-server can read. A reader gets a read handle,
