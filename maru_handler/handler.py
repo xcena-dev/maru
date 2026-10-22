@@ -22,8 +22,13 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from uuid import uuid4
 
 from maru_common import MaruConfig
+from maru_common.storage_types import (
+    KV_DELETE_AT_CAPABILITY,
+    KV_PAGE_GENERATION_CAPABILITY,
+)
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -111,6 +116,12 @@ class MaruHandler:
 
         # Connection state
         self._key_to_location: dict[str, tuple[int, int]] = {}
+        self._page_to_key: dict[tuple[int, int], tuple[str, str, int | None]] = {}
+        self._key_to_pages: dict[str, set[tuple[int, int]]] = {}
+        self._next_page_generation = 0
+        self._reclaim_mismatches = 0
+        self._session_id: str | None = None
+        self._capabilities: set[str] = set()
         self._connected = False
 
         # Region-added callback (set by CxlMemoryAdapter)
@@ -268,7 +279,12 @@ class MaruHandler:
             return self._connected
         if self._config.metadata_only:
             if not self._connected:
+                self._session_id = str(uuid4())
                 self._rpc.connect()
+                response = self._rpc.handshake(
+                    instance_id=self._config.instance_id, session_id=self._session_id
+                )
+                self._capabilities = set(response.get("capabilities", []))
                 self._connected = True
             return True
         if self._connected:
@@ -276,6 +292,8 @@ class MaruHandler:
 
         try:
             # 1. Connect RPC client
+            self._session_id = str(uuid4())
+            self._capabilities.clear()
             self._rpc.connect()
 
             # 1b. Scan local devices and handshake with server
@@ -292,7 +310,10 @@ class MaruHandler:
                 )
 
             try:
-                handshake_resp = self._rpc.handshake()
+                handshake_resp = self._rpc.handshake(
+                    instance_id=self._config.instance_id, session_id=self._session_id
+                )
+                self._capabilities = set(handshake_resp.get("capabilities", []))
                 rm_address = handshake_resp.get("rm_address") or self._config.rm_address
             except Exception:
                 logger.debug("Handshake failed, using config rm_address", exc_info=True)
@@ -480,6 +501,8 @@ class MaruHandler:
             self._connected = False
             self._owned = None
             self._key_to_location.clear()
+            self._page_to_key.clear()
+            self._key_to_pages.clear()
 
     # =========================================================================
     # KV Operations
@@ -563,7 +586,8 @@ class MaruHandler:
     def free(self, handle: AllocHandle | CpuAllocation) -> None:
         """Free a page previously obtained via alloc().
 
-        Can be called before store() (discard) or after (eviction).
+        Only unsubmitted pages may be freed. Registered or quarantined pages
+        must be removed with batch_delete_at() before they can be reclaimed.
         CPU M1 only frees unsubmitted writes: store transfers ownership to
         the pool, including when its RPC outcome is unknown.
 
@@ -571,7 +595,8 @@ class MaruHandler:
             handle: AllocHandle from alloc()
 
         Raises:
-            ValueError: If handle is not tracked (already freed or invalid)
+            ValueError: If the page is registered, quarantined, already freed,
+                or invalid.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -584,24 +609,9 @@ class MaruHandler:
             region_id = handle._region_id
             page_index = handle._page_index
 
-            # Find and remove the key mapping if stored
-            key_to_remove = None
-            for key, loc in self._key_to_location.items():
-                if loc == (region_id, page_index):
-                    key_to_remove = key
-                    break
-
-            if key_to_remove is not None:
-                del self._key_to_location[key_to_remove]
-
+            if (region_id, page_index) in self._page_to_key:
+                raise ValueError("Cannot free a registered or quarantined page")
             self._owned.free(region_id, page_index)
-
-            logger.debug(
-                "free: region=%d, page=%d, key=%s",
-                region_id,
-                page_index,
-                key_to_remove,
-            )
 
         self._record_stats("free", 0, (time.monotonic() - t0) * 1e6)
 
@@ -620,7 +630,12 @@ class MaruHandler:
             handle: AllocHandle from alloc()
 
         Returns:
-            True if successful
+            True if registered or already present. An unknown register outcome
+            returns False and retains the page in quarantine.
+
+        Note:
+            After a normal return, this call owns the handle. Do not free it;
+            batch_delete_at() can resolve quarantines on generation-aware servers.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -635,60 +650,55 @@ class MaruHandler:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
 
-            # Duplicate skip
-            if key in self._key_to_location:
-                self._owned.free(handle._region_id, handle._page_index)
-                logger.debug("store: key=%s already in local map, skipping", key)
-                store_ok = True
-            elif self._rpc.exists_kv(key):
-                self._owned.free(handle._region_id, handle._page_index)
-                logger.debug("store: key=%s already exists on server, skipping", key)
+            location = (handle._region_id, handle._page_index)
+            if location in self._page_to_key:
+                raise ValueError("Handle is already registered or quarantined")
+            try:
+                exists = self._rpc.exists_kv(key)
+            except Exception:
+                exists = None
+            if exists:
+                self._owned.free(*location)
                 store_ok = True
             else:
-                region_id = handle._region_id
-                page_index = handle._page_index
+                if exists is False:
+                    self._discard_stale_local(key)
+                region_id, page_index = location
                 offset = page_index * self._owned.get_chunk_size()
-                total_size = handle._size
-                store_size = total_size
-
+                store_size = handle._size
+                # Retain ownership before sending: an exception can hide a commit.
+                self._track_page(key, location, "QUARANTINED")
                 try:
-                    is_new = self._rpc.register_kv(
-                        key=key,
-                        region_id=region_id,
-                        kv_offset=offset,
-                        kv_length=total_size,
-                    )
-                except Exception:
-                    self._owned.free(region_id, page_index)
-                    logger.error(
-                        "store: register_kv RPC failed for key=%s, freed page (region=%d, page=%d)",
-                        key,
-                        region_id,
-                        page_index,
-                        exc_info=True,
-                    )
-                    store_size = total_size
-                    # store_ok stays False
-                else:
-                    if not is_new:
-                        self._owned.free(region_id, page_index)
-                        logger.debug(
-                            "store: key=%s lost register race, freed page (region=%d, page=%d)",
-                            key,
-                            region_id,
-                            page_index,
+                    generation = self._page_to_key[location][2]
+                    if generation is None:
+                        is_new = self._rpc.register_kv(
+                            key=key,
+                            region_id=region_id,
+                            kv_offset=offset,
+                            kv_length=handle._size,
                         )
+                        status = "REGISTERED" if is_new else "DUPLICATE"
                     else:
-                        self._key_to_location[key] = (region_id, page_index)
-                        logger.debug(
-                            "store: key=%s, region=%d, page=%d, offset=%d, size=%d",
-                            key,
-                            region_id,
-                            page_index,
-                            offset,
-                            total_size,
+                        response = self._rpc.batch_register_at_kv(
+                            [self._versioned_entry(key, location, handle._size)]
                         )
-                    store_ok = True
+                        status = (
+                            response.results[0]
+                            if response.success and response.results
+                            else None
+                        )
+                except Exception:
+                    logger.error(
+                        "store: register outcome unknown for key=%s", key, exc_info=True
+                    )
+                else:
+                    if status == "REGISTERED":
+                        self._mark_registered(key, location)
+                        store_ok = True
+                    elif status in {"DUPLICATE", "RETIRED"}:
+                        self._forget_page(key, location)
+                        self._owned.free(*location)
+                        store_ok = status == "DUPLICATE"
 
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
@@ -850,6 +860,16 @@ class MaruHandler:
         self._ensure_connected()
         t0 = time.monotonic()
 
+        if KV_DELETE_AT_CAPABILITY in self._capabilities and key in self._key_to_pages:
+            result = self.batch_delete_at([key])[0] == "DELETED"
+            self._record_stats(
+                "delete",
+                0,
+                (time.monotonic() - t0) * 1e6,
+                result="hit" if result else "miss",
+            )
+            return result
+
         with self._write_lock:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
@@ -860,7 +880,7 @@ class MaruHandler:
                 location = self._key_to_location.pop(key, None)
                 if location is not None:
                     region_id, page_index = location
-                    self._owned.free(region_id, page_index)
+                    self._reclaim_page(key, (region_id, page_index))
                 logger.debug("Deleted key=%s", key)
             else:
                 logger.debug("Delete key=%s: not found on server", key)
@@ -872,6 +892,115 @@ class MaruHandler:
             result="hit" if result else "miss",
         )
         return result
+
+    def batch_delete_at(self, keys: list[str]) -> list[str | None]:
+        """Delete owned locations, retaining pinned or unresolved pages.
+
+        Returns DELETED, ABSENT or PINNED per key; None means nonlocal or an
+        unknown outcome. Requires the server's kv_delete_at capability.
+        Quarantined registrations can be resolved only when they were submitted
+        with page generations. Legacy quarantines are retained until close.
+        """
+        self._ensure_connected()
+        if KV_DELETE_AT_CAPABILITY not in self._capabilities:
+            raise RuntimeError("Server does not support kv_delete_at")
+        with self._write_lock:
+            if self._closing.is_set():
+                raise RuntimeError("Handler is closing")
+            locations = []
+            entries = []
+            chunk_size = self._owned.get_chunk_size()
+            for key in dict.fromkeys(keys):
+                for loc in sorted(self._key_to_pages.get(key, ())):
+                    _, state, generation = self._page_to_key[loc]
+                    # A legacy registration may still be waiting at a worker.
+                    # Without generations, ABSENT cannot resolve its quarantine.
+                    if state == "QUARANTINED" and generation is None:
+                        continue
+                    locations.append((key, loc, generation))
+                    entry = (key, loc[0], loc[1] * chunk_size)
+                    if generation is not None:
+                        token = self._mapper.get_region(loc[0]).handle.auth_token
+                        entry += (generation, token)
+                    entries.append(entry)
+            if not entries:
+                return [None] * len(keys)
+            response = self._rpc.batch_delete_at_kv(entries)
+            outcomes: dict[str, str | None] = {}
+            if response.success:
+                for i, (key, loc, generation) in enumerate(locations):
+                    status = response.results[i] if i < len(response.results) else None
+                    if status not in {"DELETED", "ABSENT", "PINNED"}:
+                        status = None
+                    if status in {"DELETED", "ABSENT"}:
+                        self._reclaim_page(key, loc, generation)
+                    previous = outcomes.get(key, "ABSENT")
+                    if previous is None or status is None:
+                        outcomes[key] = None
+                    elif "PINNED" in (previous, status):
+                        outcomes[key] = "PINNED"
+                    elif "DELETED" in (previous, status):
+                        outcomes[key] = "DELETED"
+                    else:
+                        outcomes[key] = "ABSENT"
+            return [outcomes.get(key) for key in keys]
+
+    def _track_page(self, key: str, location: tuple[int, int], state: str) -> None:
+        generation = None
+        if KV_PAGE_GENERATION_CAPABILITY in self._capabilities:
+            self._next_page_generation += 1
+            generation = self._next_page_generation
+        self._page_to_key[location] = (key, state, generation)
+        self._key_to_pages.setdefault(key, set()).add(location)
+
+    def _versioned_entry(self, key: str, loc: tuple[int, int], size: int) -> tuple:
+        generation = self._page_to_key[loc][2]
+        token = self._mapper.get_region(loc[0]).handle.auth_token
+        return (
+            key,
+            loc[0],
+            loc[1] * self._owned.get_chunk_size(),
+            size,
+            generation,
+            token,
+        )
+
+    def _mark_registered(self, key: str, location: tuple[int, int]) -> None:
+        generation = self._page_to_key[location][2]
+        self._page_to_key[location] = (key, "REGISTERED", generation)
+        self._key_to_location[key] = location
+
+    def _forget_page(self, key: str, location: tuple[int, int]) -> None:
+        del self._page_to_key[location]
+        locations = self._key_to_pages[key]
+        locations.remove(location)
+        if not locations:
+            del self._key_to_pages[key]
+        if self._key_to_location.get(key) == location:
+            del self._key_to_location[key]
+
+    def _reclaim_page(
+        self, key: str, location: tuple[int, int], generation: int | None = None
+    ) -> bool:
+        record = self._page_to_key.get(location)
+        if (
+            record is None
+            or record[0] != key
+            or (generation is not None and record[2] != generation)
+        ):
+            self._reclaim_mismatches += 1
+            logger.error("Page ownership mismatch: key=%s location=%s", key, location)
+            return False
+        self._owned.free(*location)
+        self._forget_page(key, location)
+        return True
+
+    def _discard_stale_local(self, key: str) -> None:
+        # Called only after the server confirmed absence. Unknown registrations
+        # remain quarantined until conditional deletion resolves their outcome.
+        location = self._key_to_location.get(key)
+        if location is not None:
+            self._reclaim_page(key, location)
 
     def healthcheck(self) -> bool:
         """Check if the handler and MaruServer are healthy.
@@ -1070,17 +1199,15 @@ class MaruHandler:
             existed (in the local map, on the server, or registered by
             another client while this call ran). The page of a key that
             already existed or lost the register race is freed. False
-            means the register RPC failed, in which case every page is
-            freed, or that the server's response had no result for the
-            key. The server may still have registered that key's page, so
-            the page is retained (allocated, untracked) until the handler
-            closes.
+            means the register RPC failed or omitted a result. Its page is
+            quarantined until batch_delete_at() resolves the unknown outcome;
+            it cannot be freed or reused while the server may reference it.
 
         Raises:
             RuntimeError: If the handler is metadata-only, not connected, or
                 closing.
-            ValueError: If keys and handles differ in length, or (CPU path)
-                a key or handle is invalid.
+            ValueError: If keys and handles differ in length, handles are not
+                distinct unsubmitted pages, or (CPU path) a key is invalid.
             StorageUnavailableError: (CPU path) If the cache session is
                 unavailable.
 
@@ -1109,6 +1236,11 @@ class MaruHandler:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
 
+            locations = [(h._region_id, h._page_index) for h in handles]
+            if len(set(locations)) != len(locations) or any(
+                loc in self._page_to_key for loc in locations
+            ):
+                raise ValueError("Handles must be distinct unsubmitted pages")
             chunk_size = self._owned.get_chunk_size()
             results = [True] * len(keys)
             register_entries = []
@@ -1122,7 +1254,7 @@ class MaruHandler:
                 logger.error(
                     "batch_exists RPC failed, proceeding without check", exc_info=True
                 )
-                exists_results = [False] * len(keys)
+                exists_results = []
 
             skipped = sum(exists_results)
             if skipped > 0:
@@ -1134,13 +1266,7 @@ class MaruHandler:
 
             # Phase 2: Build register entries, free duplicates
             for i, (key, handle) in enumerate(zip(keys, handles, strict=True)):
-                if key in self._key_to_location:
-                    self._owned.free(handle._region_id, handle._page_index)
-                    logger.debug(
-                        "batch_store: key=%s already in local map, skipping", key
-                    )
-                    continue
-                if exists_results[i]:
+                if i < len(exists_results) and exists_results[i]:
                     self._owned.free(handle._region_id, handle._page_index)
                     logger.debug(
                         "batch_store: key=%s already exists on server, skipping",
@@ -1148,69 +1274,56 @@ class MaruHandler:
                     )
                     continue
 
+                if i < len(exists_results) and not exists_results[i]:
+                    self._discard_stale_local(key)
+
                 region_id = handle._region_id
                 page_index = handle._page_index
                 allocations[i] = (region_id, page_index)
                 offset = page_index * chunk_size
                 register_entries.append((key, region_id, offset, handle._size))
 
-            # Phase 3: Batch register
+            # Mark all submitted pages before sending; lost replies are ambiguous.
+            for i, loc in allocations.items():
+                self._track_page(keys[i], loc, "QUARANTINED")
             if register_entries:
                 try:
-                    batch_resp = self._rpc.batch_register_kv(register_entries)
-                except Exception:
-                    logger.error("Batch register RPC failed", exc_info=True)
-                    for _idx, (rid, pidx) in allocations.items():
-                        self._owned.free(rid, pidx)
-                    return [False] * len(keys)
-
-                if not batch_resp.success:
-                    logger.error("Batch register RPC failed")
-                    for _idx, (rid, pidx) in allocations.items():
-                        self._owned.free(rid, pidx)
-                    return [False] * len(keys)
-
-                batch_idx = 0
-                for i in range(len(keys)):
-                    if i not in allocations:
-                        continue
-                    if batch_idx >= len(batch_resp.results):
-                        # No result for this entry: the server may or may not
-                        # have registered it. Report failure, but keep the
-                        # page allocated, since freeing it could hand out a
-                        # page the server's metadata still points to.
-                        rid, pidx = allocations.pop(i)
-                        results[i] = False
-                        logger.error(
-                            "batch_store: no register result for key=%s, "
-                            "keeping page untracked (region=%d, page=%d)",
-                            keys[i],
-                            rid,
-                            pidx,
+                    versioned = KV_PAGE_GENERATION_CAPABILITY in self._capabilities
+                    if versioned:
+                        batch_resp = self._rpc.batch_register_at_kv(
+                            [
+                                self._versioned_entry(keys[i], loc, handles[i]._size)
+                                for i, loc in allocations.items()
+                            ]
                         )
+                    else:
+                        batch_resp = self._rpc.batch_register_kv(register_entries)
+                except Exception:
+                    logger.error("Batch register outcome unknown", exc_info=True)
+                    batch_resp = None
+                for batch_idx, (i, loc) in enumerate(allocations.items()):
+                    if (
+                        batch_resp is None
+                        or not batch_resp.success
+                        or batch_idx >= len(batch_resp.results)
+                    ):
+                        results[i] = False
                         continue
-                    is_new = batch_resp.results[batch_idx]
-                    batch_idx += 1
-                    if is_new:
-                        continue
-                    # Another client registered the key between the
-                    # existence check and this RPC. The key is in the pool,
-                    # so it counts as stored (as store() reports it); the
-                    # page written here is referenced by nobody and goes
-                    # back to the allocator.
-                    rid, pidx = allocations.pop(i)
-                    self._owned.free(rid, pidx)
-                    logger.debug(
-                        "batch_store: key=%s lost register race, freed page (region=%d, page=%d)",
-                        keys[i],
-                        rid,
-                        pidx,
-                    )
-
-            # Track
-            for i, key in enumerate(keys):
-                if results[i] and i in allocations:
-                    self._key_to_location[key] = allocations[i]
+                    status = batch_resp.results[batch_idx]
+                    if not versioned:
+                        status = (
+                            "REGISTERED"
+                            if status is True
+                            else ("DUPLICATE" if status is False else None)
+                        )
+                    if status == "REGISTERED":
+                        self._mark_registered(keys[i], loc)
+                    elif status in {"DUPLICATE", "RETIRED"}:
+                        self._forget_page(keys[i], loc)
+                        self._owned.free(*loc)
+                        results[i] = status == "DUPLICATE"
+                    else:
+                        results[i] = False
 
             total_bytes = sum(handles[i]._size for i in range(len(keys)) if results[i])
             logger.debug(
@@ -1447,7 +1560,7 @@ class MaruHandler:
         )
 
     def has_local(self, key: str) -> bool:
-        """Whether this handler still owns a committed CPU replica."""
+        """Whether this handler owns a confirmed CXL entry or CPU replica."""
         return (
             self._cpu.has_local(key)
             if self._cpu is not None

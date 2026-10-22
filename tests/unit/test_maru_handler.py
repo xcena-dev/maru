@@ -582,7 +582,7 @@ class TestMaruHandlerCoverage:
         handler.close()
 
     def test_batch_store_overwrite_existing_key(self):
-        """batch_store skips keys already in local map — idempotent, returns True."""
+        """batch_store skips keys confirmed by the server — idempotent, returns True."""
         handler = _make_mock_handler()
 
         # First store
@@ -592,12 +592,12 @@ class TestMaruHandlerCoverage:
         handler.store(key="42", handle=h)
         assert "42" in handler._key_to_location
 
-        # batch_exists_kv mock (Phase 1 check): key not on server either
+        # batch_exists_kv mock (Phase 1 check): key remains on server
         batch_exists_resp = MagicMock()
-        batch_exists_resp.results = [False]
+        batch_exists_resp.results = [True]
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
 
-        # batch_store with same key — should skip via local map check, return True
+        # batch_store with same key — should skip via server check, return True
         h2 = handler.alloc(size=3)
         buf2 = h2.buf
         buf2[:3] = b"new"
@@ -868,7 +868,7 @@ class TestMaruHandlerCoverage:
         handler.close()
 
     def test_store_overwrite_existing_key(self):
-        """store() now skips duplicates — second store is a no-op via local map check."""
+        """store() now skips duplicates — second store is a no-op after server confirmation."""
         handler = _make_mock_handler()
 
         h1 = handler.alloc(size=2)
@@ -877,7 +877,8 @@ class TestMaruHandlerCoverage:
         assert result1 is True
         assert "1" in handler._key_to_location
 
-        # Second store same key: skipped via local _key_to_location check, returns True
+        handler._rpc.exists_kv.return_value = True
+        # Second store same key: skipped after server confirmation, returns True
         h2 = handler.alloc(size=2)
         h2.buf[:2] = b"v2"
         result2 = handler.store(key="1", handle=h2)
@@ -1725,8 +1726,9 @@ class TestFree:
         handler.store(key="42", handle=handle)
         assert "42" in handler._key_to_location
 
-        handler.free(handle)
-        assert "42" not in handler._key_to_location
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(handle)
+        assert handler.has_local("42")
         handler.close()
 
     def test_free_reclaims_page(self):
@@ -1774,6 +1776,7 @@ class TestStoreWithHandle:
         h0 = handler.alloc(size=5)
         h0.buf[:5] = b"first"
         handler.store(key="42", handle=h0)
+        handler._rpc.exists_kv.return_value = True
 
         handle = handler.alloc(size=64)
         result = handler.store(key="42", handle=handle)
@@ -2001,3 +2004,318 @@ class TestFixedPoolAllocation:
             handler.alloc(size=4)
 
         handler.close()
+
+
+class TestRegistrationSafety:
+    @pytest.mark.parametrize("batch", [False, True])
+    def test_applied_register_lost_reply_keeps_page(self, batch):
+        from maru_common import BatchDeleteAtKVResponse, BatchExistsKVResponse
+        from maru_common.storage_types import (
+            KV_DELETE_AT_CAPABILITY,
+            KV_PAGE_GENERATION_CAPABILITY,
+        )
+
+        handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+        handler._capabilities = {KV_DELETE_AT_CAPABILITY, KV_PAGE_GENERATION_CAPABILITY}
+        directory = {}
+        handler._rpc.batch_exists_kv.return_value = BatchExistsKVResponse([False])
+
+        def register(**entry):
+            directory[entry["key"]] = (entry["region_id"], entry["kv_offset"])
+            raise TimeoutError("reply lost after commit")
+
+        def batch_register(entries):
+            for key, rid, offset, *_ in entries:
+                directory[key] = (rid, offset)
+            raise TimeoutError("reply lost after commit")
+
+        handler._rpc.register_kv.side_effect = register
+        handler._rpc.batch_register_kv.side_effect = batch_register
+        handler._rpc.batch_register_at_kv.side_effect = batch_register
+        handle = handler.alloc(4)
+        handle.buf[:] = b"safe"
+        if batch:
+            assert handler.batch_store(["key"], [handle]) == [False]
+        else:
+            assert handler.store("key", handle) is False
+        assert "key" in directory
+        assert not handler.has_local("key")
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(handle)
+        with pytest.raises(ValueError, match="exhausted"):
+            handler.alloc(4)
+        handler._rpc.batch_delete_at_kv.return_value = BatchDeleteAtKVResponse(
+            success=True, results=["DELETED"]
+        )
+        assert handler.batch_delete_at(["key"]) == ["DELETED"]
+        assert handler.alloc(4) is not None
+        handler.close()
+
+    @pytest.mark.parametrize("batch", [False, True])
+    def test_reregister_after_peer_delete(self, batch):
+        from maru_common import BatchExistsKVResponse, BatchRegisterKVResponse
+
+        handler = _make_mock_handler(pool_size=2048, auto_expand=False)
+        old = handler.alloc(4)
+        assert handler.store("key", old)
+        new = handler.alloc(4)
+        handler._rpc.batch_exists_kv.return_value = BatchExistsKVResponse([False])
+        handler._rpc.batch_register_kv.return_value = BatchRegisterKVResponse(
+            success=True, results=[True]
+        )
+        if batch:
+            assert handler.batch_store(["key"], [new]) == [True]
+        else:
+            assert handler.store("key", new)
+        assert handler.has_local("key")
+        # The stale page was reclaimed while the newly registered page is protected.
+        assert handler.alloc(4) is not None
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(new)
+        handler.close()
+
+    @pytest.mark.parametrize("status", ["DELETED", "ABSENT", "PINNED"])
+    def test_conditional_delete_owned_only(self, status):
+        from maru_common import BatchDeleteAtKVResponse
+        from maru_common.storage_types import KV_DELETE_AT_CAPABILITY
+
+        handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+        handler._capabilities = {KV_DELETE_AT_CAPABILITY}
+        handle = handler.alloc(4)
+        assert handler.store("own", handle)
+        handler._rpc.batch_delete_at_kv.return_value = BatchDeleteAtKVResponse(
+            success=True, results=[status]
+        )
+        assert handler.batch_delete_at(["peer", "own"]) == [None, status]
+        handler._rpc.batch_delete_at_kv.assert_called_once_with(
+            [("own", handle._region_id, handle._page_index * 1024)]
+        )
+        assert handler.has_local("own") == (status == "PINNED")
+        if status == "PINNED":
+            with pytest.raises(ValueError, match="exhausted"):
+                handler.alloc(4)
+        else:
+            assert handler.alloc(4) is not None
+        handler.close()
+
+    def test_old_server_cannot_conditional_delete(self):
+        handler = _make_mock_handler()
+        handler._capabilities.clear()
+        with pytest.raises(RuntimeError, match="kv_delete_at"):
+            handler.batch_delete_at(["key"])
+        handler._rpc.batch_delete_at_kv.assert_not_called()
+        handler.close()
+
+    @pytest.mark.parametrize("results", [[], ["INVALID"]])
+    def test_missing_delete_result_retains_page(self, results):
+        from maru_common import BatchDeleteAtKVResponse
+        from maru_common.storage_types import KV_DELETE_AT_CAPABILITY
+
+        handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+        handler._capabilities = {KV_DELETE_AT_CAPABILITY}
+        handle = handler.alloc(4)
+        handler.store("own", handle)
+        handler._rpc.batch_delete_at_kv.return_value = BatchDeleteAtKVResponse(
+            success=True, results=results
+        )
+        assert handler.batch_delete_at(["own"]) == [None]
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(handle)
+        handler.close()
+
+    def test_reverse_map_mismatch_never_frees_page(self):
+        from maru_common import BatchDeleteAtKVResponse
+        from maru_common.storage_types import KV_DELETE_AT_CAPABILITY
+
+        handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+        handler._capabilities = {KV_DELETE_AT_CAPABILITY}
+        handle = handler.alloc(4)
+        handler.store("own", handle)
+        location = (handle._region_id, handle._page_index)
+
+        def changed_owner(entries):
+            handler._page_to_key[location] = ("new", "REGISTERED")
+            return BatchDeleteAtKVResponse(success=True, results=["DELETED"])
+
+        handler._rpc.batch_delete_at_kv.side_effect = changed_owner
+        handler.batch_delete_at(["own"])
+        assert handler._reclaim_mismatches == 1
+        with pytest.raises(ValueError, match="exhausted"):
+            handler.alloc(4)
+        handler.close()
+
+
+@pytest.mark.parametrize("results", [[], [True]])
+def test_missing_register_results_are_quarantined(results):
+    from maru_common import BatchExistsKVResponse, BatchRegisterKVResponse
+
+    handler = _make_mock_handler(pool_size=2048, auto_expand=False)
+    handles = [handler.alloc(4), handler.alloc(4)]
+    handler._rpc.batch_exists_kv.return_value = BatchExistsKVResponse([False, False])
+    handler._rpc.batch_register_kv.return_value = BatchRegisterKVResponse(True, results)
+    assert handler.batch_store(["first", "second"], handles) == [bool(results), False]
+    for handle in handles:
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(handle)
+    with pytest.raises(ValueError, match="exhausted"):
+        handler.alloc(4)
+    handler.close()
+
+
+def test_delete_reply_lost_then_absent_reclaims_once():
+    from maru_common import BatchDeleteAtKVResponse
+    from maru_common.storage_types import KV_DELETE_AT_CAPABILITY
+
+    handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+    handler._capabilities = {KV_DELETE_AT_CAPABILITY}
+    handle = handler.alloc(4)
+    handler.store("key", handle)
+    handler._rpc.batch_delete_at_kv.side_effect = [
+        TimeoutError("reply lost after deletion"),
+        BatchDeleteAtKVResponse(True, ["ABSENT"]),
+    ]
+    with pytest.raises(TimeoutError):
+        handler.batch_delete_at(["key"])
+    with pytest.raises(ValueError, match="exhausted"):
+        handler.alloc(4)
+    assert handler.batch_delete_at(["key"]) == ["ABSENT"]
+    assert handler.batch_delete_at(["key"]) == [None]
+    assert handler.alloc(4) is not None
+    handler.close()
+
+
+def test_handshake_generates_new_session_on_reconnect():
+    handler = _make_mock_handler()
+    first = handler._rpc.handshake.call_args.kwargs["session_id"]
+    handler.close()
+    assert handler.connect()
+    second = handler._rpc.handshake.call_args.kwargs["session_id"]
+    assert first and second and first != second
+    assert (
+        handler._rpc.handshake.call_args.kwargs["instance_id"]
+        == handler._config.instance_id
+    )
+    handler.close()
+
+
+def test_legacy_quarantine_cannot_be_reclaimed_by_absent():
+    from maru_common.storage_types import KV_DELETE_AT_CAPABILITY
+
+    handler = _make_mock_handler(pool_size=1024, auto_expand=False)
+    handler._capabilities = {KV_DELETE_AT_CAPABILITY}
+    handler._rpc.register_kv.side_effect = TimeoutError("unknown outcome")
+    handle = handler.alloc(4)
+    assert not handler.store("key", handle)
+    assert handler.batch_delete_at(["key"]) == [None]
+    handler._rpc.batch_delete_at_kv.assert_not_called()
+    with pytest.raises(ValueError, match="exhausted"):
+        handler.alloc(4)
+    handler.close()
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_async_worker_reorder_and_page_reuse(server_port, batch):
+    """A delete overtakes a timed-out register at an actual async worker pool."""
+    import threading
+    import time
+
+    from maru_server.rpc_async_server import RpcAsyncServer
+    from maru_server.server import MaruServer
+
+    server = MaruServer()
+    rpc = RpcAsyncServer(server, port=server_port, num_workers=3)
+    received, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    original = server.batch_register_at_kv
+    delayed_entries = []
+    late_results = []
+
+    def delayed_register(entries):
+        if not delayed_entries:
+            delayed_entries.extend(entries)
+            received.set()
+            assert resume.wait(5), "test did not release delayed registration"
+            try:
+                result = original(entries)
+                late_results.extend(result)
+                return result
+            finally:
+                finished.set()
+        return original(entries)
+
+    server.batch_register_at_kv = delayed_register
+    thread = threading.Thread(target=rpc.start, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while not rpc._running and time.monotonic() < deadline:
+        time.sleep(0.005)
+    handler = MaruHandler(
+        MaruConfig(
+            server_url=f"tcp://127.0.0.1:{server_port}",
+            timeout_ms=150,
+            pool_size=1024,
+            chunk_size_bytes=1024,
+            auto_expand=False,
+            auto_connect=False,
+            use_async_rpc=True,
+        )
+    )
+    try:
+        assert handler.connect()
+        first = handler.alloc(4)
+        first.buf[:] = b"old!"
+        if batch:
+            assert handler.batch_store(["key"], [first]) == [False]
+        else:
+            assert handler.store("key", first) is False
+        assert received.is_set()
+        with pytest.raises(ValueError, match="registered or quarantined"):
+            handler.free(first)
+        assert handler.batch_delete_at(["key"]) == ["ABSENT"]
+        second = handler.alloc(4)
+        assert (first.region_id, first.page_index) == (
+            second.region_id,
+            second.page_index,
+        )
+        second.buf[:] = b"new!"
+        resume.set()
+        assert finished.wait(3)
+        assert late_results == ["RETIRED"]
+        assert not server.exists_kv("key")
+        assert handler.store("key", second)
+        # A stale delete of the same key and page must not delete the new generation.
+        key, rid, offset, _, generation, token = delayed_entries[0]
+        response = handler._rpc.batch_delete_at_kv(
+            [(key, rid, offset, generation, token)]
+        )
+        assert response.results == ["ABSENT"]
+        assert bytes(handler.retrieve("key").view) == b"new!"
+        assert handler.batch_delete_at(["key"]) == ["DELETED"]
+    finally:
+        resume.set()
+        handler.close()
+        rpc.stop()
+        thread.join(3)
+
+
+def test_owned_delete_uses_generation_condition_instead_of_key_only_rpc():
+    from maru_common import BatchDeleteAtKVResponse, BatchRegisterAtKVResponse
+    from maru_common.storage_types import (
+        KV_DELETE_AT_CAPABILITY,
+        KV_PAGE_GENERATION_CAPABILITY,
+    )
+
+    handler = _make_mock_handler()
+    handler._capabilities = {KV_DELETE_AT_CAPABILITY, KV_PAGE_GENERATION_CAPABILITY}
+    handler._rpc.batch_register_at_kv.return_value = BatchRegisterAtKVResponse(
+        True, ["REGISTERED"]
+    )
+    handle = handler.alloc(4)
+    assert handler.store("key", handle)
+    handler._rpc.batch_delete_at_kv.return_value = BatchDeleteAtKVResponse(
+        True, ["DELETED"]
+    )
+    assert handler.delete("key")
+    handler._rpc.delete_kv.assert_not_called()
+    entries = handler._rpc.batch_delete_at_kv.call_args.args[0]
+    assert entries == [("key", handle.region_id, handle.page_index * 1024, 1, 12345)]
+    handler.close()

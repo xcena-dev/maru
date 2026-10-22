@@ -741,3 +741,70 @@ class TestRpcClientThreadSafety:
 
         assert not errors
         assert max_in_flight == 1, "send->recv exchanges overlapped on the socket"
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_conditional_delete_rpc(success):
+    client = RpcClient()
+    client._send_request = MagicMock(
+        return_value={
+            "success": success,
+            "results": ["DELETED", "ABSENT", "PINNED"] if success else [],
+        }
+    )
+    response = client.batch_delete_at_kv([("key", 3, 64)])
+    assert response.success is success
+    assert response.results == (["DELETED", "ABSENT", "PINNED"] if success else [])
+    client._send_request.assert_called_once_with(
+        MessageType.BATCH_DELETE_AT_KV,
+        {"entries": [{"key": "key", "region_id": 3, "kv_offset": 64}]},
+    )
+
+
+@pytest.mark.parametrize("response", [{}, {"error": "timeout", "success": False}])
+def test_register_missing_result_is_unknown(response):
+    client = RpcClient()
+    client._send_request = MagicMock(return_value=response)
+    with pytest.raises(ConnectionError):
+        client.register_kv("key", 3, 0, 16)
+
+
+def test_generation_register_and_delete_rpc():
+    client = RpcClient()
+    client._send_request = MagicMock(
+        return_value={"success": True, "results": ["REGISTERED"]}
+    )
+    response = client.batch_register_at_kv([("key", 3, 0, 16, 2, 12345)])
+    assert response.success and response.results == ["REGISTERED"]
+    client._send_request.assert_called_once_with(
+        MessageType.BATCH_REGISTER_AT_KV,
+        {
+            "entries": [
+                {
+                    "key": "key",
+                    "region_id": 3,
+                    "kv_offset": 0,
+                    "kv_length": 16,
+                    "generation": 2,
+                    "auth_token": 12345,
+                }
+            ]
+        },
+    )
+    client._send_request.reset_mock()
+    client._send_request.return_value = {"success": True, "results": ["ABSENT"]}
+    assert client.batch_delete_at_kv([("key", 3, 0, 2, 12345)]).results == ["ABSENT"]
+    client._send_request.assert_called_once_with(
+        MessageType.BATCH_DELETE_AT_KV,
+        {
+            "entries": [
+                {
+                    "key": "key",
+                    "region_id": 3,
+                    "kv_offset": 0,
+                    "generation": 2,
+                    "auth_token": 12345,
+                }
+            ]
+        },
+    )

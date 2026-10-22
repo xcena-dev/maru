@@ -41,6 +41,8 @@ class RpcHandlerMixin:
                 MessageType.BATCH_LOOKUP_KV.value: self._handle_batch_lookup_kv,
                 MessageType.BATCH_EXISTS_KV.value: self._handle_batch_exists_kv,
                 MessageType.BATCH_PIN_KV.value: self._handle_batch_pin_kv,
+                MessageType.BATCH_REGISTER_AT_KV.value: self._handle_batch_register_at_kv,
+                MessageType.BATCH_DELETE_AT_KV.value: self._handle_batch_delete_at_kv,
                 MessageType.BATCH_UNPIN_KV.value: self._handle_batch_unpin_kv,
                 # Admin
                 MessageType.GET_STATS.value: self._handle_get_stats,
@@ -116,12 +118,15 @@ class RpcHandlerMixin:
             req.kv_offset,
             req.kv_length,
         )
-        is_new = self._server.register_kv(
-            key=req.key,
-            region_id=req.region_id,
-            kv_offset=req.kv_offset,
-            kv_length=req.kv_length,
-        )
+        try:
+            is_new = self._server.register_kv(
+                key=req.key,
+                region_id=req.region_id,
+                kv_offset=req.kv_offset,
+                kv_length=req.kv_length,
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
         return {"success": True, "is_new": is_new}
 
     def _handle_lookup_kv(self, req: Any) -> dict:
@@ -177,8 +182,37 @@ class RpcHandlerMixin:
                 e.kv_offset,
                 e.kv_length,
             )
-        results = self._server.batch_register_kv(entries)
+        try:
+            results = self._server.batch_register_kv(entries)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
         return {"success": True, "results": results}
+
+    def _handle_batch_register_at_kv(self, req: Any) -> dict:
+        entries = [
+            (e.key, e.region_id, e.kv_offset, e.kv_length, e.generation, e.auth_token)
+            for e in req.entries
+        ]
+        try:
+            return {
+                "success": True,
+                "results": self._server.batch_register_at_kv(entries),
+            }
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _handle_batch_delete_at_kv(self, req: Any) -> dict:
+        entries = [
+            (e.key, e.region_id, e.kv_offset, e.generation, e.auth_token)
+            for e in req.entries
+        ]
+        try:
+            return {
+                "success": True,
+                "results": self._server.batch_delete_at_kv(entries),
+            }
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
 
     def _handle_batch_lookup_kv(self, req: Any) -> dict:
         """Handle batch lookup KV request."""
@@ -262,6 +296,8 @@ class RpcHandlerMixin:
 
     def _handle_handshake(self, req: Any) -> dict:
         from maru_common.storage_types import (
+            KV_DELETE_AT_CAPABILITY,
+            KV_PAGE_GENERATION_CAPABILITY,
             MIXED_STORAGE_CAPABILITY,
             STORAGE_CAPABILITY,
         )
@@ -269,7 +305,11 @@ class RpcHandlerMixin:
         return {
             "success": True,
             "rm_address": self._server.rm_address,
-            "capabilities": [STORAGE_CAPABILITY]
+            "capabilities": [
+                STORAGE_CAPABILITY,
+                KV_DELETE_AT_CAPABILITY,
+                KV_PAGE_GENERATION_CAPABILITY,
+            ]
             + (
                 [MIXED_STORAGE_CAPABILITY]
                 if self._server.replica_directory.supports_mixed

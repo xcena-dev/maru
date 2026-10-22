@@ -1178,3 +1178,42 @@ class TestRpcAsyncClientFullAsyncFlow:
                 pass
 
         asyncio.run(test_coro())
+
+
+def test_conditional_delete_blocking_async_client():
+    client = RpcAsyncClient()
+    client._send_request = MagicMock(
+        return_value={"success": True, "results": ["DELETED", "PINNED", "ABSENT"]}
+    )
+    result = client.batch_delete_at_kv([("key", 3, 0)])
+    assert result.success
+    assert result.results == ["DELETED", "PINNED", "ABSENT"]
+    client._send_request.assert_called_once_with(
+        MessageType.BATCH_DELETE_AT_KV,
+        {"entries": [{"key": "key", "region_id": 3, "kv_offset": 0}]},
+    )
+
+
+def test_page_generation_rpc_on_async_client():
+    client = RpcAsyncClient()
+    client._send_request = MagicMock(
+        return_value={"success": True, "results": ["REGISTERED"]}
+    )
+    assert client.batch_register_at_kv([("key", 3, 0, 16, 2, 12345)]).results == [
+        "REGISTERED"
+    ]
+    client._send_request.assert_called_once_with(
+        MessageType.BATCH_REGISTER_AT_KV,
+        {
+            "entries": [
+                {
+                    "key": "key",
+                    "region_id": 3,
+                    "kv_offset": 0,
+                    "kv_length": 16,
+                    "generation": 2,
+                    "auth_token": 12345,
+                }
+            ]
+        },
+    )

@@ -15,9 +15,11 @@ from typing import Any
 
 from maru_common import (
     AllocationManagerStats,
+    BatchDeleteAtKVResponse,
     BatchExistsKVResponse,
     BatchLookupKVResponse,
     BatchPinKVResponse,
+    BatchRegisterAtKVResponse,
     BatchRegisterKVResponse,
     BatchUnpinKVResponse,
     GetStatsResponse,
@@ -181,9 +183,9 @@ class RpcClientBase(abc.ABC):
                 "kv_length": kv_length,
             },
         )
-        if "error" in response:
-            raise ConnectionError(f"register_kv RPC failed: {response['error']}")
-        return response.get("is_new", False)
+        if "error" in response or type(response.get("is_new")) is not bool:
+            raise ConnectionError(f"register_kv outcome unknown: {response}")
+        return response["is_new"]
 
     def lookup_kv(self, key: str) -> LookupKVResponse:
         """Lookup a KV entry by key.
@@ -207,7 +209,9 @@ class RpcClientBase(abc.ABC):
             True if exists
         """
         response = self._send_request(MessageType.EXISTS_KV, {"key": key})
-        return response.get("exists", False)
+        if "error" in response or type(response.get("exists")) is not bool:
+            raise ConnectionError(f"exists_kv RPC failed: {response}")
+        return response["exists"]
 
     def pin_kv(self, key: str) -> bool:
         """Check if a KV entry exists and pin it atomically.
@@ -248,6 +252,55 @@ class RpcClientBase(abc.ABC):
     # =========================================================================
     # Batch KV Operations
     # =========================================================================
+
+    def batch_delete_at_kv(
+        self,
+        entries: list[
+            tuple[str, int, int] | tuple[str, int, int, int | None, int | None]
+        ],
+    ) -> BatchDeleteAtKVResponse:
+        """Delete matching locations; failed RPCs never authorize reclamation."""
+        response = self._send_request(
+            MessageType.BATCH_DELETE_AT_KV,
+            {
+                "entries": [
+                    {"key": e[0], "region_id": e[1], "kv_offset": e[2]}
+                    | ({"generation": e[3], "auth_token": e[4]} if len(e) == 5 else {})
+                    for e in entries
+                ]
+            },
+        )
+        return BatchDeleteAtKVResponse(
+            success=response.get("success", False),
+            results=response.get("results", []),
+            error=response.get("error"),
+        )
+
+    def batch_register_at_kv(
+        self, entries: list[tuple[str, int, int, int, int, int]]
+    ) -> BatchRegisterAtKVResponse:
+        """Register page generations using the kv_page_generation capability."""
+        response = self._send_request(
+            MessageType.BATCH_REGISTER_AT_KV,
+            {
+                "entries": [
+                    {
+                        "key": key,
+                        "region_id": rid,
+                        "kv_offset": offset,
+                        "kv_length": length,
+                        "generation": generation,
+                        "auth_token": token,
+                    }
+                    for key, rid, offset, length, generation, token in entries
+                ]
+            },
+        )
+        return BatchRegisterAtKVResponse(
+            success=response.get("success", False),
+            results=response.get("results", []),
+            error=response.get("error"),
+        )
 
     def batch_register_kv(
         self, entries: list[tuple[str, int, int, int]]
@@ -387,9 +440,16 @@ class RpcClientBase(abc.ABC):
         response = self._send_request(MessageType.HEARTBEAT, {})
         return "error" not in response
 
-    def handshake(self) -> dict:
-        """Perform handshake with server. Returns server config (rm_address, etc.)."""
-        return self._send_request(MessageType.HANDSHAKE, {})
+    def handshake(
+        self, instance_id: str | None = None, session_id: str | None = None
+    ) -> dict:
+        """Perform handshake, optionally identifying this process session."""
+        data = {}
+        if instance_id is not None:
+            data["instance_id"] = instance_id
+        if session_id is not None:
+            data["session_id"] = session_id
+        return self._send_request(MessageType.HANDSHAKE, data)
 
     def storage(self, action: str, payload: dict) -> dict:
         """Execute an operation in the opt-in storage directory."""

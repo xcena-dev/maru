@@ -178,7 +178,7 @@ sequenceDiagram
     H-->>C: success
 ```
 
-If the key already exists (in the local cache or on the server), the store is **skipped without overwrite** — same key implies same content (content-addressed). Otherwise, data is written to shared memory **before** the key is registered. Other instances can never observe a partial write — the key only becomes visible after the data is fully committed.
+If the server confirms that the key already exists, the store is **skipped without overwrite** — same key implies same content (content-addressed). Otherwise, data is written to shared memory **before** the key is registered. Other instances can never observe a partial write — the key only becomes visible after the data is fully committed.
 
 ### 4.2 Retrieve
 

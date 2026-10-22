@@ -344,7 +344,9 @@ class RpcAsyncClient(RpcClientBase):
                     "kv_length": kv_length,
                 },
             )
-            return response.get("is_new", False)
+            if "error" in response or type(response.get("is_new")) is not bool:
+                raise ConnectionError(f"register_kv outcome unknown: {response}")
+            return response["is_new"]
 
         return asyncio.run_coroutine_threadsafe(_coro(), self._loop)
 

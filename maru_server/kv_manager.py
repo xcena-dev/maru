@@ -18,6 +18,15 @@ class KVEntry:
     kv_offset: int  # Offset within allocation (relative to handle.offset)
     kv_length: int  # Size of KV data
     pin_count: int = 0  # Pin count for eviction protection
+    generation: int | None = None
+
+
+@dataclass
+class _PageState:
+    """Latest generation at an owned page; key=None marks it retired."""
+
+    generation: int
+    key: str | None
 
 
 class DeleteResult(enum.Enum):
@@ -41,6 +50,7 @@ class KVManager:
     def __init__(self):
         self._store: dict[str, KVEntry] = {}
         self._lock = RLock()
+        self._pages: dict[int, dict[int, _PageState]] = {}
 
     def register(
         self, key: str, region_id: int, kv_offset: int, kv_length: int
@@ -69,6 +79,47 @@ class KVManager:
             )
             logger.debug("Registered KV: key=%s, region_id=%d", key, region_id)
             return (True, region_id)  # New entry, need to increment alloc ref
+
+    def register_at(
+        self, key: str, region_id: int, kv_offset: int, kv_length: int, generation: int
+    ) -> tuple[str, int | None]:
+        """Register an allocation generation without resurrecting retired pages.
+
+        Replaying the same live registration is REGISTERED without another ref.
+        A key registered elsewhere is DUPLICATE; a retired or older allocation
+        is RETIRED. CONFLICT retains ownership when the page is still in use.
+        """
+        with self._lock:
+            pages = self._pages.setdefault(region_id, {})
+            page = pages.get(kv_offset)
+            if page is not None:
+                if generation < page.generation or (
+                    generation == page.generation and page.key is None
+                ):
+                    return "RETIRED", None
+                if page.key is not None:
+                    if (
+                        generation == page.generation
+                        and page.key == key
+                        and self._store[key].kv_length == kv_length
+                    ):
+                        return "REGISTERED", None
+                    return "CONFLICT", None
+            if key in self._store:
+                # This allocation was never published; retire it so a replay
+                # cannot publish it after the client has freed the duplicate.
+                pages[kv_offset] = _PageState(generation, None)
+                return "DUPLICATE", None
+            self._store[key] = KVEntry(
+                region_id, kv_offset, kv_length, generation=generation
+            )
+            pages[kv_offset] = _PageState(generation, key)
+            return "REGISTERED", region_id
+
+    def forget_region(self, region_id: int) -> None:
+        """Discard page generations after the underlying allocation is released."""
+        with self._lock:
+            self._pages.pop(region_id, None)
 
     def lookup(self, key: str) -> KVEntry | None:
         """
@@ -143,9 +194,60 @@ class KVManager:
                 )
                 return (DeleteResult.PINNED, None)
 
+            self._retire(entry)
             region_id = self._store.pop(key).region_id
             logger.debug("Deleted KV: key=%s, region_id=%d", key, region_id)
             return (DeleteResult.DELETED, region_id)
+
+    def delete_at(
+        self, key: str, region_id: int, kv_offset: int, generation: int | None = None
+    ) -> tuple[str, int | None]:
+        """Delete only the expected unpinned registration.
+
+        A versioned ABSENT also retires that page generation, rejecting any
+        register that arrives later. Older deletes never affect a newer page.
+        """
+        with self._lock:
+            entry = self._store.get(key)
+            matches = entry is not None and (
+                entry.region_id,
+                entry.kv_offset,
+                entry.generation,
+            ) == (region_id, kv_offset, generation)
+            if generation is not None:
+                page = self._pages.get(region_id, {}).get(kv_offset)
+                if page is not None:
+                    if page.generation > generation:
+                        return "ABSENT", None
+                    if page.key is not None and not matches:
+                        raise ValueError("Page belongs to another live registration")
+                if (
+                    entry is not None
+                    and (entry.region_id, entry.kv_offset) == (region_id, kv_offset)
+                    and not matches
+                ):
+                    raise ValueError("Page generation does not match registration")
+                if not matches:
+                    self._pages.setdefault(region_id, {})[kv_offset] = _PageState(
+                        generation, None
+                    )
+                    return "ABSENT", None
+            elif entry is None or (entry.region_id, entry.kv_offset) != (
+                region_id,
+                kv_offset,
+            ):
+                return "ABSENT", None
+            if entry.pin_count:
+                return "PINNED", None
+            self._retire(entry)
+            del self._store[key]
+            return "DELETED", region_id
+
+    def _retire(self, entry: KVEntry) -> None:
+        if entry.generation is not None:
+            self._pages.setdefault(entry.region_id, {})[entry.kv_offset] = _PageState(
+                entry.generation, None
+            )
 
     def get_stats(self) -> dict:
         """Get KV statistics."""
@@ -171,31 +273,6 @@ class KVManager:
     # =========================================================================
     # Batch Operations
     # =========================================================================
-
-    def batch_register(self, entries: list[tuple[str, int, int, int]]) -> list[bool]:
-        """
-        Register multiple KV entries in a single operation.
-
-        Args:
-            entries: List of (key, region_id, kv_offset, kv_length) tuples
-
-        Returns:
-            List of booleans indicating if each entry was newly registered
-        """
-        results = []
-        with self._lock:
-            for key, region_id, kv_offset, kv_length in entries:
-                if key in self._store:
-                    # Duplicate key — skip
-                    results.append(False)
-                else:
-                    self._store[key] = KVEntry(
-                        region_id=region_id,
-                        kv_offset=kv_offset,
-                        kv_length=kv_length,
-                    )
-                    results.append(True)
-        return results
 
     def batch_lookup(self, keys: list[str]) -> list[KVEntry | None]:
         """

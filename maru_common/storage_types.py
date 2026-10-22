@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Descriptors for the opt-in storage directory (separate from legacy DAX KV)."""
+"""Storage descriptors and negotiated KV capabilities."""
 
 from dataclasses import dataclass
 
+KV_DELETE_AT_CAPABILITY = "kv_delete_at"
+KV_PAGE_GENERATION_CAPABILITY = "kv_page_generation"
 STORAGE_CAPABILITY = "cpu_storage_v1"
 MIXED_STORAGE_CAPABILITY = "mixed_storage_v1"
 MAX_STORAGE_BATCH = 1024

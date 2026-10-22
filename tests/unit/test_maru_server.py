@@ -2,6 +2,8 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for MaruServer orchestration logic."""
 
+import pytest
+
 from maru_server.server import MaruServer
 
 
@@ -273,7 +275,11 @@ class TestGetUsage:
         dropped from per-instance accounting rather than crashing."""
         server = MaruServer()
         # Register against a region that was never allocated on this server.
-        server.register_kv(key="orphan", region_id=99999, kv_offset=0, kv_length=500)
+        with pytest.raises(ValueError, match="Unknown region"):
+            server.register_kv(
+                key="orphan", region_id=99999, kv_offset=0, kv_length=500
+            )
+        assert not server.exists_kv("orphan")
 
         usage = server.get_usage()
         assert usage["instances"] == []  # no owning instance -> nothing attributed
@@ -549,3 +555,169 @@ class TestMaruServerEdgeCases:
         assert results[1] is not None  # Valid
         assert results[1]["handle"].region_id == region_id2
         assert results[2] is None  # Key doesn't exist
+
+
+def test_unknown_region_rejects_entire_batch():
+    from maru_common import BatchKVEntry, BatchRegisterKVRequest, MessageType
+    from maru_server.rpc_handler_mixin import RpcHandlerMixin
+
+    server = MaruServer()
+    region = server.request_alloc("owner", 4096)
+    rpc = RpcHandlerMixin()
+    rpc._server = server
+    request = BatchRegisterKVRequest(
+        entries=[
+            BatchKVEntry("valid", region.region_id, 0, 16),
+            BatchKVEntry("unknown", 99999, 0, 16),
+        ]
+    )
+    response = rpc._handle_message(MessageType.BATCH_REGISTER_KV, request)
+    assert response["success"] is False
+    assert "Unknown region" in response["error"]
+    assert not server.exists_kv("valid")
+    assert not server.exists_kv("unknown")
+
+
+def test_conditional_delete_decrements_refs_only_once():
+    server = MaruServer()
+    region = server.request_alloc("owner", 4096)
+    server.register_kv("key", region.region_id, 0, 16)
+    server.return_alloc("owner", region.region_id)
+    server.pin_kv("key")
+    entry = [("key", region.region_id, 0)]
+    assert server.batch_delete_at_kv(entry) == ["PINNED"]
+    server.unpin("key")
+    assert server.batch_delete_at_kv(entry) == ["DELETED"]
+    assert server.list_allocations() == []
+    assert server.batch_delete_at_kv(entry) == ["ABSENT"]
+
+
+def test_page_generations_are_removed_with_region():
+    server = MaruServer()
+    handle = server.request_alloc("owner", 4096)
+    entry = [("key", handle.region_id, 0, 1, handle.auth_token)]
+    assert server.batch_delete_at_kv(entry) == ["ABSENT"]
+    server.return_alloc("owner", handle.region_id)
+    # The removed region must reject late writes before any generation state is created.
+    with pytest.raises(ValueError, match="Unknown region"):
+        server.batch_register_at_kv(
+            [("key", handle.region_id, 0, 16, 1, handle.auth_token)]
+        )
+    assert handle.region_id not in server._kv_manager._pages
+
+
+def test_versioned_batch_validates_all_regions_before_registering():
+    server = MaruServer()
+    handle = server.request_alloc("owner", 4096)
+    with pytest.raises(ValueError, match="Unknown region"):
+        server.batch_register_at_kv(
+            [
+                ("valid", handle.region_id, 0, 16, 1, handle.auth_token),
+                ("unknown", 99999, 0, 16, 1, handle.auth_token),
+            ]
+        )
+    assert not server.exists_kv("valid")
+
+
+def test_allocation_token_rejects_requests_for_previous_incarnation():
+    server = MaruServer()
+    handle = server.request_alloc("owner", 4096)
+    token = handle.auth_token + 1
+    with pytest.raises(ValueError, match="identity changed"):
+        server.batch_register_at_kv([("key", handle.region_id, 0, 16, 1, token)])
+    with pytest.raises(ValueError, match="identity changed"):
+        server.batch_delete_at_kv([("key", handle.region_id, 0, 1, token)])
+    assert not server.exists_kv("key")
+
+
+def test_deferred_free_removes_generation_records_after_delete_batch():
+    server = MaruServer()
+    handle = server.request_alloc("owner", 4096)
+    rid, token = handle.region_id, handle.auth_token
+    assert server.batch_register_at_kv([("key", rid, 0, 16, 1, token)]) == [
+        "REGISTERED"
+    ]
+    server.return_alloc("owner", rid)
+    assert server.batch_delete_at_kv(
+        [
+            ("key", rid, 0, 1, token),
+            ("absent", rid, 1024, 1, token),
+        ]
+    ) == ["DELETED", "ABSENT"]
+    assert rid not in server._kv_manager._pages
+    assert server.list_allocations() == []
+
+
+def test_versioned_rpc_handlers_and_capability():
+    from maru_common import (
+        BatchDeleteAtKVRequest,
+        BatchRegisterAtKVRequest,
+        DeleteAtKVEntry,
+        HandshakeRequest,
+        MessageType,
+        RegisterAtKVEntry,
+    )
+    from maru_common.storage_types import (
+        KV_DELETE_AT_CAPABILITY,
+        KV_PAGE_GENERATION_CAPABILITY,
+    )
+    from maru_server.rpc_handler_mixin import RpcHandlerMixin
+
+    server = MaruServer()
+    handle = server.request_alloc("owner", 4096)
+    rid, token = handle.region_id, handle.auth_token
+    rpc = RpcHandlerMixin()
+    rpc._server = server
+    handshake = rpc._handle_handshake(HandshakeRequest())
+    assert {KV_DELETE_AT_CAPABILITY, KV_PAGE_GENERATION_CAPABILITY} <= set(
+        handshake["capabilities"]
+    )
+    request = BatchRegisterAtKVRequest([RegisterAtKVEntry("key", rid, 0, 16, 1, token)])
+    assert rpc._handle_message(MessageType.BATCH_REGISTER_AT_KV, request)[
+        "results"
+    ] == ["REGISTERED"]
+    deletion = BatchDeleteAtKVRequest([DeleteAtKVEntry("key", rid, 0, 1, token)])
+    assert rpc._handle_message(MessageType.BATCH_DELETE_AT_KV, deletion)["results"] == [
+        "DELETED"
+    ]
+    # Replayed registrations and deletions are safe in either order.
+    assert rpc._handle_message(MessageType.BATCH_REGISTER_AT_KV, request)[
+        "results"
+    ] == ["RETIRED"]
+    assert rpc._handle_message(MessageType.BATCH_DELETE_AT_KV, deletion)["results"] == [
+        "ABSENT"
+    ]
+    request.entries[0].auth_token += 1
+    assert (
+        rpc._handle_message(MessageType.BATCH_REGISTER_AT_KV, request)["success"]
+        is False
+    )
+    deletion.entries[0].auth_token += 1
+    assert (
+        rpc._handle_message(MessageType.BATCH_DELETE_AT_KV, deletion)["success"]
+        is False
+    )
+
+
+def test_reallocated_region_starts_new_generation_lifetime(monkeypatch):
+    from maru_shm import MaruHandle
+
+    server = MaruServer()
+    first = server.request_alloc("owner", 4096)
+    rid, token = first.region_id, first.auth_token
+    server.batch_delete_at_kv([("old", rid, 0, 100, token)])
+    server.return_alloc("owner", rid)
+    monkeypatch.setattr(
+        server._allocation_manager._client,
+        "alloc",
+        lambda *args, **kwargs: MaruHandle(
+            region_id=rid, length=4096, auth_token=token + 1
+        ),
+    )
+    second = server.request_alloc("owner", 4096)
+    assert server.batch_register_at_kv([("new", rid, 0, 16, 1, second.auth_token)]) == [
+        "REGISTERED"
+    ]
+    with pytest.raises(ValueError, match="identity changed"):
+        server.batch_delete_at_kv([("old", rid, 0, 100, token)])
+    assert server.exists_kv("new")

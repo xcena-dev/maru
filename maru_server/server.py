@@ -112,26 +112,28 @@ class MaruServer:
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
-            if legacy_visible:
-                handle = self._allocation_manager.allocate(
-                    instance_id, size, dax_path=path
-                )
-            else:
-                handle = self._allocation_manager.allocate(
-                    instance_id,
-                    size,
-                    dax_path=path,
-                    legacy_visible=False,
-                )
-            if handle:
-                logger.info(
-                    "Allocated %d bytes for %s from %s: region_id=%d",
-                    size,
-                    instance_id,
-                    path or "(any)",
-                    handle.region_id,
-                )
-                return handle
+            with self._lock:
+                if legacy_visible:
+                    handle = self._allocation_manager.allocate(
+                        instance_id, size, dax_path=path
+                    )
+                else:
+                    handle = self._allocation_manager.allocate(
+                        instance_id,
+                        size,
+                        dax_path=path,
+                        legacy_visible=False,
+                    )
+                if handle:
+                    self._kv_manager.forget_region(handle.region_id)
+                    logger.info(
+                        "Allocated %d bytes for %s from %s: region_id=%d",
+                        size,
+                        instance_id,
+                        path or "(any)",
+                        handle.region_id,
+                    )
+                    return handle
             logger.debug(
                 "Pool %s refused allocation for %s (%d bytes)",
                 path or "(any)",
@@ -146,7 +148,10 @@ class MaruServer:
         """Handle allocation return request from client."""
         if self._allocation_manager is None:
             return False
-        success = self._allocation_manager.release(instance_id, region_id)
+        with self._lock:
+            success = self._allocation_manager.release(instance_id, region_id)
+            if self._allocation_manager.get_handle(region_id) is None:
+                self._kv_manager.forget_region(region_id)
         if success:
             logger.info("Released region_id=%d by %s", region_id, instance_id)
         return success
@@ -163,7 +168,16 @@ class MaruServer:
         """Handle client disconnection."""
         if self._allocation_manager is None:
             return
-        self._allocation_manager.disconnect_client(instance_id)
+        with self._lock:
+            regions = [
+                rid
+                for rid, owner in self._allocation_manager.region_owners().items()
+                if owner == instance_id
+            ]
+            self._allocation_manager.disconnect_client(instance_id)
+            for rid in regions:
+                if self._allocation_manager.get_handle(rid) is None:
+                    self._kv_manager.forget_region(rid)
         logger.info("Client %s disconnected, released allocations", instance_id)
 
     # =========================================================================
@@ -174,9 +188,8 @@ class MaruServer:
         self, key: str, region_id: int, kv_offset: int, kv_length: int
     ) -> bool:
         """Register a KV entry."""
-        if self._allocation_manager is None:
-            return False
         with self._lock:
+            self._validate_kv_regions([region_id])
             is_new, alloc_to_ref = self._kv_manager.register(
                 key, region_id, kv_offset, kv_length
             )
@@ -224,7 +237,7 @@ class MaruServer:
             result, region_to_deref = self._kv_manager.delete(key)
 
             if region_to_deref is not None:
-                self._allocation_manager.decrement_kv_ref(region_to_deref)
+                self._decrement_kv_ref(region_to_deref)
 
         return result == DeleteResult.DELETED
 
@@ -242,9 +255,8 @@ class MaruServer:
         Returns:
             List of booleans indicating if each entry was newly registered
         """
-        if self._allocation_manager is None:
-            return [False] * len(entries)
         with self._lock:
+            self._validate_kv_regions([entry[1] for entry in entries])
             results = []
             for key, region_id, kv_offset, kv_length in entries:
                 is_new, alloc_to_ref = self._kv_manager.register(
@@ -253,6 +265,77 @@ class MaruServer:
                 if alloc_to_ref is not None:
                     self._allocation_manager.increment_kv_ref(alloc_to_ref)
                 results.append(is_new)
+            return results
+
+    def _validate_kv_regions(self, region_ids: list[int]) -> None:
+        if self._allocation_manager is None:
+            raise ValueError("Allocation manager unavailable")
+        for region_id in region_ids:
+            if self._allocation_manager.get_handle(region_id) is None:
+                raise ValueError(f"Unknown region: {region_id}")
+
+    def _validate_page_version(
+        self, region_id: int, offset: int, generation: int, auth_token: int
+    ) -> None:
+        self._validate_kv_regions([region_id])
+        handle = self._allocation_manager.get_handle(region_id)
+        if handle.auth_token != auth_token:
+            raise ValueError("Region allocation identity changed")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("Page generation must be a positive integer")
+        if type(offset) is not int or not 0 <= offset < handle.length:
+            raise ValueError("Page offset is outside the allocation")
+
+    def _decrement_kv_ref(self, region_id: int) -> None:
+        self._allocation_manager.decrement_kv_ref(region_id)
+        if self._allocation_manager.get_handle(region_id) is None:
+            self._kv_manager.forget_region(region_id)
+
+    def batch_register_at_kv(
+        self, entries: list[tuple[str, int, int, int, int, int]]
+    ) -> list[str]:
+        """Register allocation generations, validating the entire batch first."""
+        with self._lock:
+            for _, rid, offset, length, generation, token in entries:
+                self._validate_page_version(rid, offset, generation, token)
+                handle = self._allocation_manager.get_handle(rid)
+                if type(length) is not int or not 0 < length <= handle.length - offset:
+                    raise ValueError("KV length is outside the allocation")
+            results = []
+            for key, rid, offset, length, generation, _ in entries:
+                result, ref = self._kv_manager.register_at(
+                    key, rid, offset, length, generation
+                )
+                if ref is not None:
+                    self._allocation_manager.increment_kv_ref(ref)
+                results.append(result)
+            return results
+
+    def batch_delete_at_kv(
+        self,
+        entries: list[
+            tuple[str, int, int] | tuple[str, int, int, int | None, int | None]
+        ],
+    ) -> list[str]:
+        """Delete matching locations; versioned ABSENT fences late registrations."""
+        with self._lock:
+            for entry in entries:
+                if len(entry) == 5 and entry[3] is not None:
+                    self._validate_page_version(entry[1], entry[2], entry[3], entry[4])
+            results = []
+            for entry in entries:
+                key, rid, offset = entry[:3]
+                generation = entry[3] if len(entry) == 5 else None
+                result, ref = self._kv_manager.delete_at(key, rid, offset, generation)
+                if ref is not None:
+                    self._decrement_kv_ref(ref)
+                results.append(result)
+            for rid in {entry[1] for entry in entries}:
+                if (
+                    self._allocation_manager is not None
+                    and self._allocation_manager.get_handle(rid) is None
+                ):
+                    self._kv_manager.forget_region(rid)
             return results
 
     def batch_lookup_kv(self, keys: list[str]) -> list[dict | None]:

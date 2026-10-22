@@ -129,51 +129,6 @@ class TestKVManager:
 class TestKVManagerBatch:
     """Test cases for KVManager batch operations."""
 
-    def test_batch_register_new_keys(self):
-        """Register 3 new keys via batch_register. Verify all return is_new=True and can be looked up."""
-        manager = KVManager()
-        entries = [
-            ("100", 1, 0, 256),
-            ("200", 1, 256, 512),
-            ("300", 2, 0, 1024),
-        ]
-
-        results = manager.batch_register(entries)
-        assert results == [True, True, True]
-
-        # Verify all can be looked up
-        for key, region_id, kv_offset, kv_length in entries:
-            entry = manager.lookup(key)
-            assert entry is not None
-            assert entry.region_id == region_id
-            assert entry.kv_offset == kv_offset
-            assert entry.kv_length == kv_length
-
-    def test_batch_register_existing_key(self):
-        """Register a key, then batch_register with that key + a new one. Verify is_new flags are correct."""
-        manager = KVManager()
-
-        # Register first key
-        manager.register(key="100", region_id=1, kv_offset=0, kv_length=256)
-
-        # Batch register with existing key + new key
-        entries = [
-            ("100", 1, 0, 256),  # existing
-            ("200", 1, 256, 512),  # new
-        ]
-
-        results = manager.batch_register(entries)
-        assert results == [False, True]
-
-        # Verify existing key is still present (idempotent, no ref_count)
-        entry = manager.lookup("100")
-        assert entry is not None
-        assert entry.region_id == 1
-
-        # Verify new key registered
-        entry = manager.lookup("200")
-        assert entry is not None
-
     def test_batch_lookup_mixed(self):
         """Register some keys, then batch_lookup a mix of existing and non-existing keys. Verify found flags."""
         manager = KVManager()
@@ -425,3 +380,53 @@ class TestKVManagerBatchPin:
         """batch_unpin([]) returns empty list."""
         manager = KVManager()
         assert manager.batch_unpin([]) == []
+
+
+def test_delete_at_checks_location_before_pin():
+    manager = KVManager()
+    manager.register("key", 1, 64, 32)
+    manager.pin("key")
+    assert manager.delete_at("key", 2, 64) == ("ABSENT", None)
+    assert manager.delete_at("key", 1, 0) == ("ABSENT", None)
+    assert manager.delete_at("key", 1, 64) == ("PINNED", None)
+    manager.unpin("key")
+    assert manager.delete_at("key", 1, 64) == ("DELETED", 1)
+    assert manager.delete_at("key", 1, 64) == ("ABSENT", None)
+
+
+def test_absent_delete_retires_generation_before_register_arrives():
+    manager = KVManager()
+    assert manager.delete_at("key", 1, 0, 1) == ("ABSENT", None)
+    assert manager.register_at("key", 1, 0, 16, 1) == ("RETIRED", None)
+    assert manager.lookup("key") is None
+
+
+def test_old_delete_and_register_cannot_affect_reused_page():
+    manager = KVManager()
+    assert manager.register_at("key", 1, 0, 16, 1) == ("REGISTERED", 1)
+    assert manager.delete_at("key", 1, 0, 1) == ("DELETED", 1)
+    assert manager.register_at("key", 1, 0, 16, 2) == ("REGISTERED", 1)
+    assert manager.delete_at("key", 1, 0, 1) == ("ABSENT", None)
+    assert manager.register_at("key", 1, 0, 16, 1) == ("RETIRED", None)
+    assert manager.lookup("key").generation == 2
+
+
+def test_versioned_register_replay_does_not_increment_ref():
+    manager = KVManager()
+    assert manager.register_at("key", 1, 0, 16, 1) == ("REGISTERED", 1)
+    assert manager.register_at("key", 1, 0, 16, 1) == ("REGISTERED", None)
+    assert manager.register_at("other", 1, 0, 16, 2) == ("CONFLICT", None)
+    manager.pin("key")
+    assert manager.delete_at("key", 1, 0, 1) == ("PINNED", None)
+    assert manager.register_at("key", 1, 0, 16, 1) == ("REGISTERED", None)
+    manager.unpin("key")
+    assert manager.delete_at("key", 1, 0, 1) == ("DELETED", 1)
+
+
+def test_duplicate_registration_is_retired_without_touching_peer():
+    manager = KVManager()
+    manager.register_at("key", 1, 0, 16, 1)
+    assert manager.register_at("key", 2, 0, 16, 1) == ("DUPLICATE", None)
+    manager.delete("key")
+    assert manager.register_at("key", 2, 0, 16, 1) == ("RETIRED", None)
+    assert manager.lookup("key") is None

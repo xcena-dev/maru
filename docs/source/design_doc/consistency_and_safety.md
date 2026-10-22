@@ -99,6 +99,43 @@ produce the following guarantees:
 | Store + retrieve (same key) | No partial read — key invisible until data committed |
 | Concurrent retrieve | Lock-free on client; shared mappings need no synchronization |
 
+### Registration timeouts and page reuse
+
+A register timeout leaves its outcome unknown: the server may have committed
+it or a worker may still be waiting to process it. The handler quarantines the
+submitted page and rejects `free()` until the outcome is resolved. Missing
+batch results have the same treatment. Unsubmitted pages can still be discarded
+with `free()`.
+
+When the server advertises `kv_page_generation`, the handler uses
+`BATCH_REGISTER_AT_KV` with a monotonically increasing generation for each
+submitted page. `BATCH_DELETE_AT_KV` includes the expected generation and region
+allocation token. The server checks the generation, changes the directory and
+updates allocation references under its locks. A successful deletion or
+versioned `ABSENT` retires that generation even if the register has not arrived:
+
+1. `delete(A, page=7, generation=1)` returns `ABSENT` and retires generation 1.
+2. A delayed `register(A, page=7, generation=1)` returns `RETIRED`.
+3. A reused page can register generation 2. Replaying the generation 1 deletion
+   cannot remove generation 2, even when the key is also A.
+
+Pinned registrations return `PINNED`; their pages remain allocated. Replaying a
+live registration returns `REGISTERED` without incrementing its allocation
+reference again. `DUPLICATE` means another allocation owns the key, so the
+unpublished page can be freed; that generation is also retired against replay.
+`CONFLICT`, an RPC failure or a missing result keeps the page quarantined.
+
+The server retains one generation record per used page offset until its region
+is actually freed, including deferred frees. Unknown regions and mismatched
+allocation tokens reject versioned requests. This binds retirement records to
+the allocation lifetime without retaining process session tombstones.
+
+Servers without `kv_page_generation` use the existing registration RPCs.
+Quarantined legacy registrations cannot be reclaimed from an `ABSENT` response,
+since a late register could still publish them. The handler retains these pages
+until close. The new conditional delete API requires `kv_delete_at`; legacy
+key-only deletion retains its existing semantics.
+
 ---
 
 ## 3. Crash Recovery

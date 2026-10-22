@@ -56,6 +56,8 @@ class MessageType(IntEnum):
     BATCH_EXISTS_KV = 0x22
     BATCH_PIN_KV = 0x23
     BATCH_UNPIN_KV = 0x24
+    BATCH_DELETE_AT_KV = 0x25
+    BATCH_REGISTER_AT_KV = 0x26
 
     # Opt-in storage directory, independent of legacy CXL key semantics.
     STORAGE = 0x30
@@ -398,6 +400,61 @@ class BatchPinKVResponse:
 
 
 @dataclass
+class DeleteAtKVEntry:
+    """Key and expected location for conditional deletion."""
+
+    key: str
+    region_id: int
+    kv_offset: int
+    generation: int | None = None
+    auth_token: int | None = field(default=None, repr=False)
+
+
+@dataclass
+class RegisterAtKVEntry:
+    """Versioned registration bound to the owning region's allocation handle."""
+
+    key: str
+    region_id: int
+    kv_offset: int
+    kv_length: int
+    generation: int
+    auth_token: int = field(repr=False)
+
+
+@dataclass
+class BatchRegisterAtKVRequest:
+    """BATCH_REGISTER_AT_KV (0x26) - Register a page allocation generation."""
+
+    entries: list[RegisterAtKVEntry]
+
+
+@dataclass
+class BatchRegisterAtKVResponse:
+    """REGISTERED, DUPLICATE, RETIRED or CONFLICT per submitted page."""
+
+    success: bool
+    results: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class BatchDeleteAtKVRequest:
+    """BATCH_DELETE_AT_KV (0x25) - Delete only matching, unpinned locations."""
+
+    entries: list[DeleteAtKVEntry]
+
+
+@dataclass
+class BatchDeleteAtKVResponse:
+    """Per-entry DELETED, PINNED or ABSENT results; absent includes moved keys."""
+
+    success: bool
+    results: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
 class BatchUnpinKVRequest:
     """BATCH_UNPIN_KV (0x24) - Batch unpin KV entries."""
 
@@ -532,6 +589,7 @@ class HandshakeRequest:
 
     client_version: int = PROTOCOL_VERSION
     instance_id: str | None = None
+    session_id: str | None = None
 
 
 @dataclass
@@ -602,6 +660,11 @@ MESSAGE_CLASSES = {
         BatchPinKVResponse,
     ),
     MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
+    MessageType.BATCH_DELETE_AT_KV: (BatchDeleteAtKVRequest, BatchDeleteAtKVResponse),
+    MessageType.BATCH_REGISTER_AT_KV: (
+        BatchRegisterAtKVRequest,
+        BatchRegisterAtKVResponse,
+    ),
     # Admin
     MessageType.GET_STATS: (GetStatsRequest, GetStatsResponse),
     MessageType.GET_USAGE: (GetUsageRequest, GetUsageResponse),

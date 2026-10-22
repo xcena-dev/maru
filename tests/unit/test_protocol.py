@@ -327,3 +327,66 @@ class TestMessageClasses:
             req_class, resp_class = MESSAGE_CLASSES[msg_type]
             assert req_class is not None
             assert resp_class is not None
+
+
+def test_conditional_delete_protocol_round_trip():
+    from maru_common import (
+        BatchDeleteAtKVRequest,
+        BatchDeleteAtKVResponse,
+        DeleteAtKVEntry,
+        HandshakeRequest,
+        MessageType,
+        Serializer,
+    )
+
+    serializer = Serializer()
+    request = BatchDeleteAtKVRequest([DeleteAtKVEntry("key", 3, 1024)])
+    _, decoded = serializer.decode_request(
+        serializer.encode(MessageType.BATCH_DELETE_AT_KV, request)
+    )
+    assert decoded == request
+    response = BatchDeleteAtKVResponse(True, ["DELETED", "ABSENT", "PINNED"])
+    _, decoded = serializer.decode_response(
+        serializer.encode(
+            MessageType.BATCH_DELETE_AT_KV | MessageType.RESPONSE, response
+        )
+    )
+    assert decoded == response
+    handshake = HandshakeRequest(instance_id="owner", session_id="session")
+    _, decoded = serializer.decode_request(
+        serializer.encode(MessageType.HANDSHAKE, handshake)
+    )
+    assert decoded == handshake
+
+
+def test_page_generation_messages_round_trip():
+    from maru_common import (
+        BatchDeleteAtKVRequest,
+        BatchRegisterAtKVRequest,
+        BatchRegisterAtKVResponse,
+        DeleteAtKVEntry,
+        MessageType,
+        RegisterAtKVEntry,
+        Serializer,
+    )
+
+    serializer = Serializer()
+    request = BatchRegisterAtKVRequest([RegisterAtKVEntry("key", 3, 0, 16, 2, 12345)])
+    _, decoded = serializer.decode_request(
+        serializer.encode(MessageType.BATCH_REGISTER_AT_KV, request)
+    )
+    assert decoded == request
+    response = BatchRegisterAtKVResponse(
+        True, ["REGISTERED", "DUPLICATE", "RETIRED", "CONFLICT"]
+    )
+    _, decoded = serializer.decode_response(
+        serializer.encode(
+            MessageType.BATCH_REGISTER_AT_KV | MessageType.RESPONSE, response
+        )
+    )
+    assert decoded == response
+    deletion = BatchDeleteAtKVRequest([DeleteAtKVEntry("key", 3, 0, 2, 12345)])
+    _, decoded = serializer.decode_request(
+        serializer.encode(MessageType.BATCH_DELETE_AT_KV, deletion)
+    )
+    assert decoded == deletion
