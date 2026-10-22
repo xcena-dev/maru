@@ -287,6 +287,9 @@ def attach_capturing_handler(
 
     worker._handler = MagicMock()
     worker._handler.alloc.side_effect = _alloc
+    worker._handler.batch_exists.side_effect = lambda keys: [
+        key in store for key in keys
+    ]
     worker._handler.batch_store.side_effect = _batch_store
     return store
 

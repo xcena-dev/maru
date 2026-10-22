@@ -41,6 +41,9 @@ class RpcHandlerMixin:
                 MessageType.BATCH_LOOKUP_KV.value: self._handle_batch_lookup_kv,
                 MessageType.BATCH_EXISTS_KV.value: self._handle_batch_exists_kv,
                 MessageType.BATCH_PIN_KV.value: self._handle_batch_pin_kv,
+                MessageType.BATCH_PIN_LOOKUP_KV.value: self._handle_batch_pin_lookup_kv,
+                MessageType.BATCH_UNPIN_SESSION_KV.value: self._handle_batch_unpin_session,
+                MessageType.RELEASE_SESSION.value: self._handle_release_session,
                 MessageType.BATCH_REGISTER_AT_KV.value: self._handle_batch_register_at_kv,
                 MessageType.BATCH_DELETE_AT_KV.value: self._handle_batch_delete_at_kv,
                 MessageType.BATCH_UNPIN_KV.value: self._handle_batch_unpin_kv,
@@ -188,6 +191,38 @@ class RpcHandlerMixin:
             return {"success": False, "error": str(exc)}
         return {"success": True, "results": results}
 
+    def _handle_batch_pin_lookup_kv(self, req: Any) -> dict:
+        try:
+            results = self._server.batch_pin_lookup_kv(
+                req.session_id, req.keys, req.mode, req.times
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return {
+            "success": True,
+            "entries": [
+                {"found": False}
+                if item is None
+                else {
+                    "found": True,
+                    "handle": item["handle"].to_dict(),
+                    "kv_offset": item["kv_offset"],
+                    "kv_length": item["kv_length"],
+                }
+                for item in results
+            ],
+        }
+
+    def _handle_batch_unpin_session(self, req: Any) -> dict:
+        return {
+            "success": True,
+            "held": self._server.batch_unpin_session(req.session_id, req.keys),
+        }
+
+    def _handle_release_session(self, req: Any) -> dict:
+        self._server.release_kv_session(req.session_id)
+        return {"success": True}
+
     def _handle_batch_register_at_kv(self, req: Any) -> dict:
         entries = [
             (e.key, e.region_id, e.kv_offset, e.kv_length, e.generation, e.auth_token)
@@ -298,10 +333,14 @@ class RpcHandlerMixin:
         from maru_common.storage_types import (
             KV_DELETE_AT_CAPABILITY,
             KV_PAGE_GENERATION_CAPABILITY,
+            KV_PIN_SESSION_CAPABILITY,
             MIXED_STORAGE_CAPABILITY,
             STORAGE_CAPABILITY,
         )
 
+        session_id = getattr(req, "session_id", None)
+        if session_id:
+            self._server.open_kv_session(session_id)
         return {
             "success": True,
             "rm_address": self._server.rm_address,
@@ -309,6 +348,7 @@ class RpcHandlerMixin:
                 STORAGE_CAPABILITY,
                 KV_DELETE_AT_CAPABILITY,
                 KV_PAGE_GENERATION_CAPABILITY,
+                KV_PIN_SESSION_CAPABILITY,
             ]
             + (
                 [MIXED_STORAGE_CAPABILITY]

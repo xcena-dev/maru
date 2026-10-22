@@ -203,6 +203,14 @@ sequenceDiagram
 
 If the region is owned by this client, it is already mapped and can be used directly. If the region belongs to another client, DaxMapper maps it on demand. The region mapping is cached for subsequent accesses.
 
+Readers that can race deletion use `batch_retrieve_pinned(keys)` instead of
+unprotected retrieval. It returns a list-like `PinnedViews` lease. Call
+`lease.release()` only after every CPU read or GPU copy using those views has
+completed; releasing a slice also releases the shared lease. Drain readers
+before calling `handler.close()`, which releases the handler's remaining
+session pins. See {ref}`Read pins and deletion <cxl-read-pins>`
+for the wire protocol and legacy-server behavior.
+
 ### 4.3 Delete
 
 ```mermaid

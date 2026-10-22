@@ -19,6 +19,7 @@ class KVEntry:
     kv_length: int  # Size of KV data
     pin_count: int = 0  # Pin count for eviction protection
     generation: int | None = None
+    anonymous_pins: int = 0
 
 
 @dataclass
@@ -51,6 +52,7 @@ class KVManager:
         self._store: dict[str, KVEntry] = {}
         self._lock = RLock()
         self._pages: dict[int, dict[int, _PageState]] = {}
+        self._session_pins: dict[str, dict[str, int]] = {}
 
     def register(
         self, key: str, region_id: int, kv_offset: int, kv_length: int
@@ -150,6 +152,7 @@ class KVManager:
             if entry is None:
                 return False
             entry.pin_count += 1
+            entry.anonymous_pins += 1
             logger.debug("Pinned KV: key=%s, pin_count=%d", key, entry.pin_count)
             return True
 
@@ -164,10 +167,11 @@ class KVManager:
             if entry is None:
                 logger.warning("Unpin failed: key=%s not found", key)
                 return False
-            if entry.pin_count <= 0:
+            if entry.anonymous_pins <= 0:
                 logger.warning("Unpin failed: key=%s pin_count already 0", key)
                 return False
             entry.pin_count -= 1
+            entry.anonymous_pins -= 1
             logger.debug("Unpinned KV: key=%s, pin_count=%d", key, entry.pin_count)
             return True
 
@@ -249,6 +253,69 @@ class KVManager:
                 entry.generation, None
             )
 
+    def open_session(self, session_id: str) -> None:
+        """Open a session before it can hold read pins."""
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("A nonempty session id is required")
+        with self._lock:
+            self._session_pins.setdefault(session_id, {})
+
+    def pin_lookup(
+        self,
+        session_id: str,
+        keys: list[str],
+        mode: str = "prefix",
+        times: list[int] | None = None,
+    ) -> list[KVEntry | None]:
+        """Pin and resolve under one lock; prefix stops at the first miss."""
+        counts = times or [1] * len(keys)
+        if mode not in {"prefix", "independent"} or len(counts) != len(keys):
+            raise ValueError("Invalid pin lookup mode or counts")
+        if any(type(n) is not int or n < 1 for n in counts):
+            raise ValueError("Pin counts must be positive integers")
+        with self._lock:
+            held = self._session_pins.get(session_id)
+            if held is None:
+                raise ValueError("Pin session is not connected")
+            results = []
+            missing = False
+            for key, count in zip(keys, counts, strict=True):
+                entry = self._store.get(key) if not missing else None
+                if entry is not None:
+                    entry.pin_count += count
+                    held[key] = held.get(key, 0) + count
+                elif mode == "prefix":
+                    missing = True
+                results.append(entry)
+            return results
+
+    def unpin_session(self, session_id: str, keys: list[str]) -> list[bool]:
+        """Release one owned pin per key, returning whether it was still held."""
+        with self._lock:
+            held = self._session_pins.get(session_id, {})
+            results = []
+            for key in keys:
+                count = held.get(key, 0)
+                entry = self._store.get(key)
+                if count and entry is not None:
+                    entry.pin_count -= 1
+                    if count == 1:
+                        del held[key]
+                    else:
+                        held[key] = count - 1
+                    results.append(True)
+                else:
+                    results.append(False)
+            return results
+
+    def release_session(self, session_id: str) -> None:
+        """Close a session; queued late pin requests cannot reopen it."""
+        with self._lock:
+            for key, count in self._session_pins.pop(session_id, {}).items():
+                entry = self._store.get(key)
+                if entry is not None:
+                    entry.pin_count -= count
+
     def get_stats(self) -> dict:
         """Get KV statistics."""
         with self._lock:
@@ -327,6 +394,7 @@ class KVManager:
                     results.extend([False] * (len(keys) - len(results)))
                     break
                 entry.pin_count += 1
+                entry.anonymous_pins += 1
                 results.append(True)
             return results
 
@@ -340,14 +408,13 @@ class KVManager:
             results = []
             for key in keys:
                 entry = self._store.get(key)
-                if entry is None or entry.pin_count <= 0:
+                if entry is None or entry.anonymous_pins <= 0:
                     results.append(False)
                 else:
                     entry.pin_count -= 1
+                    entry.anonymous_pins -= 1
                     results.append(True)
             return results
 
-    # TODO: Add pin timeout monitor (PinMonitor) when eviction is implemented.
-    # Track _pin_timestamps per key, run a periodic check_pin_timeouts() in a
-    # daemon thread to force-unpin entries that exceed a TTL. This prevents
-    # pin leaks when clients crash without sending unpin RPCs.
+    # Crash cleanup needs session liveness and a reader-completion contract.
+    # Per-key forced expiry could reuse a page while a GPU still reads it.

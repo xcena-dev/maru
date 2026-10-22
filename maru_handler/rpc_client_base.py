@@ -19,9 +19,11 @@ from maru_common import (
     BatchExistsKVResponse,
     BatchLookupKVResponse,
     BatchPinKVResponse,
+    BatchPinLookupKVResponse,
     BatchRegisterAtKVResponse,
     BatchRegisterKVResponse,
     BatchUnpinKVResponse,
+    BatchUnpinSessionKVResponse,
     GetStatsResponse,
     GetUsageResponse,
     InstanceUsage,
@@ -301,6 +303,53 @@ class RpcClientBase(abc.ABC):
             results=response.get("results", []),
             error=response.get("error"),
         )
+
+    def batch_pin_lookup_kv(
+        self,
+        session_id: str,
+        keys: list[str],
+        mode: str = "prefix",
+        times: list[int] | None = None,
+    ) -> BatchPinLookupKVResponse:
+        """Atomically acquire session pins and locations on capable servers."""
+        response = self._send_request(
+            MessageType.BATCH_PIN_LOOKUP_KV,
+            {
+                "session_id": session_id,
+                "keys": keys,
+                "mode": mode,
+                "times": times or [],
+            },
+        )
+        entries = self._parse_batch_lookup_kv(response).entries
+        return BatchPinLookupKVResponse(
+            success=response.get("success", False),
+            entries=entries,
+            error=response.get("error"),
+        )
+
+    def batch_unpin_session(
+        self, session_id: str, keys: list[str]
+    ) -> BatchUnpinSessionKVResponse:
+        """Release one session-owned pin per key."""
+        response = self._send_request(
+            MessageType.BATCH_UNPIN_SESSION_KV,
+            {
+                "session_id": session_id,
+                "keys": keys,
+            },
+        )
+        return BatchUnpinSessionKVResponse(
+            success=response.get("success", False),
+            held=response.get("held", []),
+            error=response.get("error"),
+        )
+
+    def release_session(self, session_id: str) -> bool:
+        """Close a pin session once every local reader has finished."""
+        return self._send_request(
+            MessageType.RELEASE_SESSION, {"session_id": session_id}
+        ).get("success", False)
 
     def batch_register_kv(
         self, entries: list[tuple[str, int, int, int]]

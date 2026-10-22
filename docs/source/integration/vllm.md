@@ -141,6 +141,25 @@ Instance B:
 
 ## Setup
 
+### Deletion during a cache hit
+
+Use `"kv_load_failure_policy": "recompute"` in the KV transfer configuration
+when missing CXL objects should fall back to computation. A scheduler hit does
+not reserve the object. The worker atomically pins the object before reading
+and holds that pin through the last GPU copy. Objects deleted before that pin
+are reported as load failures; objects already pinned cannot be deleted.
+
+Only externally allocated blocks are reported on failure. Shared GPU hits and
+the compute tail remain valid. A partial hit loads the contiguous prefix
+available in every required layer and reports the missing tail after that copy
+completes. Repeated failures stop Maru loading for that request after two
+attempts. Recomputed keys are checked against server residency before storage,
+so an earlier store in the same worker cannot suppress restoring a deleted key.
+
+The read-pin protocol is capability-gated (`kv_pin_session`). Old servers use
+pin-before-lookup. Neither path force-expires active pins; graceful shutdown
+drains GPU readers before releasing pins. Automatic CXL eviction is separate.
+
 **Start Maru server:**
 
 ```bash

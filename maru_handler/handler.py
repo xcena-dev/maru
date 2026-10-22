@@ -28,6 +28,7 @@ from maru_common import MaruConfig
 from maru_common.storage_types import (
     KV_DELETE_AT_CAPABILITY,
     KV_PAGE_GENERATION_CAPABILITY,
+    KV_PIN_SESSION_CAPABILITY,
 )
 from maru_shm import MaruHandle
 
@@ -38,6 +39,7 @@ from .memory import (
     OwnedRegionManager,
     PagedMemoryAllocator,
 )
+from .memory.pinned import PinnedViews
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
 from .storage.cpu import CpuAllocation, CpuReadLease
@@ -450,6 +452,7 @@ class MaruHandler:
             return
         if self._config.metadata_only:
             if self._connected:
+                self._release_pin_session()
                 self._rpc.close()
             self._connected = False
             return
@@ -474,6 +477,8 @@ class MaruHandler:
                 #    ranges) — must run before the unmap in step 3.
                 if self._plugins:
                     self._dispatch_plugins("on_close", self)
+
+                self._release_pin_session()
 
                 # 1. Close owned regions (allocator cleanup only) → get region_ids
                 owned_region_ids: list[int] = []
@@ -1105,6 +1110,11 @@ class MaruHandler:
             logger.error("batch_retrieve RPC failed", exc_info=True)
             return [None] * len(keys)
 
+        return self._map_retrieved(keys, batch_resp, t0)
+
+    def _map_retrieved(
+        self, keys: list[str], batch_resp, t0: float
+    ) -> list[MemoryInfo | None]:
         results: list[MemoryInfo | None] = []
         for i, entry in enumerate(batch_resp.entries):
             if not entry.found or entry.handle is None:
@@ -1178,6 +1188,87 @@ class MaruHandler:
             result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return results
+
+    @property
+    def supports_pinned_retrieve(self) -> bool:
+        """Whether this handler implements explicit CXL read-pin leases."""
+        return self._cpu is None
+
+    def batch_retrieve_pinned(
+        self, keys: list[str], mode: str = "prefix"
+    ) -> PinnedViews:
+        """Pin before exposing views, releasing only after the caller's final copy.
+
+        New servers combine pin and lookup atomically and attribute pins to the
+        handler session. Legacy servers pin first, then lookup; an unknown pin
+        outcome is never guessed or unpinned against another reader's count.
+        """
+        self._ensure_connected()
+        if self._cpu is not None or self._config.metadata_only:
+            raise RuntimeError("Pinned CXL reads require a data handler")
+        if not keys:
+            return PinnedViews([], lambda: None)
+        t0 = time.monotonic()
+        session = KV_PIN_SESSION_CAPABILITY in self._capabilities
+        session_id = self._session_id
+        if session:
+            response = self._rpc.batch_pin_lookup_kv(session_id, keys, mode)
+            if not response.success:
+                raise ConnectionError(response.error or "Pin lookup outcome unknown")
+            held = [
+                key
+                for key, entry in zip(keys, response.entries, strict=False)
+                if entry.found
+            ]
+        else:
+            pins = self._rpc.batch_pin_kv(keys).results
+            held = [key for key, pinned in zip(keys, pins, strict=False) if pinned]
+            if len(pins) != len(keys):
+                self._release_read_pins(held, session=False)
+                raise ConnectionError("Pin reply was truncated")
+            try:
+                response = self._rpc.batch_lookup_kv(keys)
+                # Never expose a location that was not pinned, including keys
+                # after the first miss in the legacy prefix-stop operation.
+                for entry, pinned in zip(response.entries, pins, strict=False):
+                    if not pinned:
+                        entry.found = False
+            except Exception:
+                self._release_read_pins(held, session=False)
+                raise
+        lease = PinnedViews(
+            [], lambda: self._release_read_pins(held, session, session_id)
+        )
+        try:
+            if len(response.entries) != len(keys):
+                raise ConnectionError("Pin lookup reply length does not match keys")
+            lease.extend(self._map_retrieved(keys, response, t0))
+        except Exception:
+            lease.release()
+            raise
+        return lease
+
+    def _release_read_pins(
+        self, keys: list[str], session: bool, session_id: str | None = None
+    ) -> None:
+        if not keys:
+            return
+        try:
+            if session:
+                self._rpc.batch_unpin_session(session_id, keys)
+            else:
+                self._rpc.batch_unpin(keys)
+        except Exception:
+            # A session close resolves unknown unpins without touching another
+            # session. Retaining a pin is safer than an ambiguous second unpin.
+            logger.warning("Could not release read pins", exc_info=True)
+
+    def _release_pin_session(self) -> None:
+        if self._session_id and KV_PIN_SESSION_CAPABILITY in self._capabilities:
+            try:
+                self._rpc.release_session(self._session_id)
+            except Exception:
+                logger.warning("Could not close pin session", exc_info=True)
 
     def batch_store(
         self,

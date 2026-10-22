@@ -338,6 +338,39 @@ class MaruServer:
                     self._kv_manager.forget_region(rid)
             return results
 
+    def open_kv_session(self, session_id: str) -> None:
+        """Open the handler's pin session during handshake."""
+        self._kv_manager.open_session(session_id)
+
+    def batch_pin_lookup_kv(
+        self,
+        session_id: str,
+        keys: list[str],
+        mode: str = "prefix",
+        times: list[int] | None = None,
+    ) -> list[dict | None]:
+        """Resolve locations while pinning against concurrent deletion."""
+        with self._lock:
+            entries = self._kv_manager.pin_lookup(session_id, keys, mode, times)
+            return [
+                None
+                if entry is None
+                else {
+                    "handle": self._allocation_manager.get_handle(entry.region_id),
+                    "kv_offset": entry.kv_offset,
+                    "kv_length": entry.kv_length,
+                }
+                for entry in entries
+            ]
+
+    def batch_unpin_session(self, session_id: str, keys: list[str]) -> list[bool]:
+        """Unpin only counts held by the calling handler session."""
+        return self._kv_manager.unpin_session(session_id, keys)
+
+    def release_kv_session(self, session_id: str) -> None:
+        """Release pins after the handler has drained its outstanding readers."""
+        self._kv_manager.release_session(session_id)
+
     def batch_lookup_kv(self, keys: list[str]) -> list[dict | None]:
         """
         Lookup multiple KV entries in a single operation.

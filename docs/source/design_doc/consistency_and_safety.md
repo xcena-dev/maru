@@ -136,6 +136,60 @@ since a late register could still publish them. The handler retains these pages
 until close. The new conditional delete API requires `kv_delete_at`; legacy
 key-only deletion retains its existing semantics.
 
+(cxl-read-pins)=
+
+### Read pins and deletion
+
+The vLLM worker acquires a read pin immediately before mapping a CXL object.
+A scheduler hit is a residency hint: an object deleted before the worker pins
+it is reported as a load failure. Configure vLLM's
+`kv_load_failure_policy="recompute"` to recompute that range.
+
+With `kv_pin_session`, `BATCH_PIN_LOOKUP_KV` checks existence, increments the
+session's pin count and returns locations under the KVManager lock. `prefix`
+stops at the first miss; `independent` handles every key separately. The latter
+also supports multiple pins per key through `times`. Anonymous legacy pins
+have a separate count, so legacy unpins cannot consume session-owned pins.
+
+```mermaid
+sequenceDiagram
+    participant W as vLLM worker
+    participant S as MaruServer
+    participant D as Deleting handler
+    participant G as CUDA load stream
+    W->>S: Pin lookup (session, keys)
+    S-->>W: Pinned locations or misses
+    W->>G: Wait for producing compute, then copy
+    D->>S: Conditional delete
+    S-->>D: PINNED (keep the page)
+    G-->>W: Final copy event completed
+    W->>S: Unpin this session's keys
+    D->>S: Retry conditional delete
+    S-->>D: DELETED (page may be reused)
+```
+
+`batch_retrieve_pinned()` returns `PinnedViews`, whose explicit `release()` is
+idempotent. Python collection does not unpin: a CUDA kernel may still read the
+mapping after the Python call returns. Inline packed loads release after their
+load stream synchronizes; asynchronous and layerwise loads retain the lease
+until the final copy event completes. Abort and shutdown drain copies before
+release. The worker never performs an unpin RPC under its load-bookkeeping lock.
+
+Unpins affect only the issuing session. `RELEASE_SESSION` removes its remaining
+counts at handler close and rejects queued late pin requests. A timed-out pin
+or unpin is not retried ambiguously; unresolved counts remain until session
+close. There is no forced pin expiry or heartbeat timeout in this change:
+crashed readers may leave pins until the server restarts. Legacy servers use
+pin-before-lookup and retain unknown anonymous pin outcomes conservatively.
+
+Load failures invalidate only the externally allocated token interval, excluding
+the shared GPU prefix, compute tail and null block. When a contiguous prefix is
+available in every layer, the worker copies it before reporting the missing
+tail. A copy error invalidates the entire external interval. Scheduler probes
+and per-step store probes recheck server residency; a deleted key can therefore
+be stored again after recomputation. Two failed load attempts stop further Maru
+loads for that request. Automatic eviction remains a separate feature.
+
 ---
 
 ## 3. Crash Recovery

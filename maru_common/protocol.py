@@ -58,6 +58,9 @@ class MessageType(IntEnum):
     BATCH_UNPIN_KV = 0x24
     BATCH_DELETE_AT_KV = 0x25
     BATCH_REGISTER_AT_KV = 0x26
+    BATCH_PIN_LOOKUP_KV = 0x27
+    BATCH_UNPIN_SESSION_KV = 0x28
+    RELEASE_SESSION = 0x29
 
     # Opt-in storage directory, independent of legacy CXL key semantics.
     STORAGE = 0x30
@@ -455,6 +458,48 @@ class BatchDeleteAtKVResponse:
 
 
 @dataclass
+class BatchPinLookupKVRequest:
+    """Atomically pin and resolve keys within a connected handler session."""
+
+    session_id: str
+    keys: list[str]
+    mode: str = "prefix"
+    times: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BatchPinLookupKVResponse:
+    success: bool
+    entries: list[LookupResult] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class BatchUnpinSessionKVRequest:
+    """Release only this session's counts; other sessions remain protected."""
+
+    session_id: str
+    keys: list[str]
+
+
+@dataclass
+class BatchUnpinSessionKVResponse:
+    success: bool
+    held: list[bool] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class ReleaseSessionRequest:
+    session_id: str
+
+
+@dataclass
+class ReleaseSessionResponse:
+    success: bool
+
+
+@dataclass
 class BatchUnpinKVRequest:
     """BATCH_UNPIN_KV (0x24) - Batch unpin KV entries."""
 
@@ -660,6 +705,15 @@ MESSAGE_CLASSES = {
         BatchPinKVResponse,
     ),
     MessageType.BATCH_UNPIN_KV: (BatchUnpinKVRequest, BatchUnpinKVResponse),
+    MessageType.BATCH_PIN_LOOKUP_KV: (
+        BatchPinLookupKVRequest,
+        BatchPinLookupKVResponse,
+    ),
+    MessageType.BATCH_UNPIN_SESSION_KV: (
+        BatchUnpinSessionKVRequest,
+        BatchUnpinSessionKVResponse,
+    ),
+    MessageType.RELEASE_SESSION: (ReleaseSessionRequest, ReleaseSessionResponse),
     MessageType.BATCH_DELETE_AT_KV: (BatchDeleteAtKVRequest, BatchDeleteAtKVResponse),
     MessageType.BATCH_REGISTER_AT_KV: (
         BatchRegisterAtKVRequest,

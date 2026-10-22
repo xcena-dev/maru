@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from maru_common.storage_types import StorageError
+from maru_handler.memory.pinned import PinnedViews
 from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
@@ -90,6 +91,7 @@ _LAYERWISE_STREAM_COUNT = 1
 # this request's first token nothing while the hold stays inside the delay the
 # scheduler takes to re-admit the request anyway.
 _LAYERWISE_RELEASE_AFTER_LAYERS = 1
+_MAX_FAILED_LOADS = 2
 
 
 def _parse_release_after(value: Any) -> int:
@@ -574,7 +576,7 @@ class MaruReqMeta:
     num_matched_chunks: int = 0  # For load: how many chunks to load
     num_scheduled_tokens: int = 0  # For store: tokens covered this step
     num_computed_tokens: int = 0  # For store: tokens already computed before this step
-    # CPU/mixed external-token interval, excluding GPU hits and compute tail.
+    # External-token interval, excluding GPU hits and the compute tail.
     # None retains compatibility with metadata constructed without explicit bounds.
     load_start_token: int = 0
     load_end_token: int | None = None
@@ -592,6 +594,8 @@ class MaruReqMeta:
     # O(n) hash num_layers times per store. Lives only as long as the step's
     # metadata object. compare=False so it never affects equality/repr.
     _chunk_keys_memo: list[str] | None = field(default=None, compare=False, repr=False)
+    _compute_ready: Any = field(default=None, compare=False, repr=False)
+    _failed_from_token: int | None = field(default=None, compare=False, repr=False)
 
 
 def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
@@ -927,7 +931,7 @@ class MaruKVConnector(KVConnectorBase_V1):
         return self._scheduler.request_finished(request, block_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        """Return block ids whose deferred load failed (vLLM recomputes them)."""
+        """Return block ids whose load failed (vLLM recomputes them)."""
         assert self._worker is not None
         return self._worker.take_failed_load_blocks()
 
@@ -1038,10 +1042,8 @@ class MaruSchedulerConnector:
         # blocks alone cannot, because step boundaries are not chunk-aligned.
         self._requests_need_store: dict[str, tuple[list[int], list[int]]] = {}
 
-        # Local cache of keys known to exist (avoid repeated RPC).
-        # TODO: add max size / eviction when long-running deployments
-        # accumulate enough keys to matter.
-        self._known_keys: set[str] = set()
+        self._load_preemptions: dict[str, int] = {}
+        self._failed_loads: dict[str, int] = {}
 
         # Backoff timer to avoid reconnect storms when server is down.
         self._handler_retry_after: float = 0.0
@@ -1076,74 +1078,33 @@ class MaruSchedulerConnector:
             )
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
-        """Count how many consecutive prefix chunks are cached in Maru.
-
-        Uses batch_exists for efficiency: single RPC call checks all chunks.
-
-        Returns:
-            Number of consecutive cached chunks from the beginning.
-        """
+        """Recheck residency on every match; a positive local cache can go stale."""
         keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
         if not keys:
             return 0
-
-        if self._cpu_mode:
-            self._ensure_handler()
-            if self._handler is None:
-                return 0
-            try:
-                results = self._handler.batch_exists(keys)
-            except Exception:
-                return 0
-            # Re-probe each time: CPU residency is tied to a live worker session.
-            return next((i for i, hit in enumerate(results) if not hit), len(results))
-
-        # Check local cache first - find longest prefix of known keys.
-        # We use a "_DONE" marker (written after all layers are stored)
-        # rather than checking a single layer, to avoid false positives
-        # when a partial layer store failure leaves only some layers.
-        local_hits = 0
-        for key in keys:
-            sentinel = self._chunk_exists_key(key)
-            if sentinel in self._known_keys:
-                local_hits += 1
-            else:
-                break
-
-        if local_hits == len(keys):
-            return local_hits
-
-        # Need to check remaining chunks via RPC
         self._ensure_handler()
         if self._handler is None:
-            return local_hits
-
-        # Check all unchecked chunks at once via batch_exists
-        remaining_keys = [self._chunk_exists_key(k) for k in keys[local_hits:]]
+            return 0
         try:
-            _t0 = time.monotonic()
-            results = self._handler.batch_exists(remaining_keys)
-            if self._timing:
-                _emit_timing(
-                    f"lookup batch_exists {len(remaining_keys)} keys = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
+            results = self._handler.batch_exists(
+                [self._chunk_exists_key(key) for key in keys]
+            )
+        except Exception as exc:
+            logger.warning("Maru batch_exists failed: %s", exc)
+            return 0
+        return next((i for i, exists in enumerate(results) if not exists), len(results))
+
+    def _count_failed_load(self, request: Request) -> None:
+        previous = self._load_preemptions.pop(request.request_id, None)
+        if previous is not None and previous == getattr(request, "num_preemptions", 0):
+            count = self._failed_loads.get(request.request_id, 0) + 1
+            self._failed_loads[request.request_id] = count
+            if count == _MAX_FAILED_LOADS:
+                logger.warning(
+                    "Maru: %d loads failed for req %s; computing without Maru",
+                    count,
+                    request.request_id,
                 )
-        except Exception as e:
-            logger.warning("Maru batch_exists failed: %s", e)
-            return local_hits
-
-        # Count consecutive hits
-        rpc_hits = 0
-        for exists in results:
-            if not exists:
-                break
-            rpc_hits += 1
-
-        # Cache the newly discovered keys
-        for i in range(rpc_hits):
-            self._known_keys.add(remaining_keys[i])
-
-        return local_hits + rpc_hits
 
     def get_num_new_matched_tokens(
         self,
@@ -1225,6 +1186,10 @@ class MaruSchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
+        self._last_match_result.pop(request.request_id, None)
+        self._count_failed_load(request)
+        if self._failed_loads.get(request.request_id, 0) >= _MAX_FAILED_LOADS:
+            return 0, False
         if self._cpu_mode and _cpu_bypass_request(request):
             self._cpu_bypass_requests.add(request.request_id)
             return 0, False
@@ -1269,8 +1234,7 @@ class MaruSchedulerConnector:
         # Cache the result so update_state_after_alloc can reuse it
         # without a redundant _count_matched_chunks call.
         self._last_match_result[request.request_id] = num_matched_chunks
-        if self._cpu_mode:
-            self._load_starts[request.request_id] = num_computed_tokens
+        self._load_starts[request.request_id] = num_computed_tokens
 
         return new_matched, self._deferred_loading
 
@@ -1297,9 +1261,11 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_ready.add(request.request_id)
             return
         num_chunks = self._last_match_result.pop(request.request_id, 0)
-        if self._cpu_mode:
-            start = self._load_starts.pop(request.request_id, 0)
-            self._load_ranges[request.request_id] = (start, start + num_external_tokens)
+        start = self._load_starts.pop(request.request_id, 0)
+        self._load_ranges[request.request_id] = (start, start + num_external_tokens)
+        self._load_preemptions[request.request_id] = getattr(
+            request, "num_preemptions", 0
+        )
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
@@ -1347,6 +1313,8 @@ class MaruSchedulerConnector:
                     num_matched_chunks=num_chunks,
                     deferred_load=True,
                     layerwise_load=layerwise_load,
+                    load_start_token=self._load_ranges.get(req_id, (0, None))[0],
+                    load_end_token=self._load_ranges.get(req_id, (0, None))[1],
                 )
             )
         self._pending_deferred_loads.clear()
@@ -1495,6 +1463,9 @@ class MaruSchedulerConnector:
             self._parked_blocks.pop(rid, None)
             self._admission_waiters.pop(rid, None)
             self._last_match_result.pop(rid, None)
+            if rid in scheduler_output.finished_req_ids:
+                self._load_preemptions.pop(rid, None)
+                self._failed_loads.pop(rid, None)
 
         self._requests_need_load.clear()
         self._load_ranges.clear()
@@ -1548,11 +1519,8 @@ class MaruWorkerConnector:
         self._head_size = head_size
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
-        # TODO: _stored_keys grows unbounded and may become stale if CXL
-        # eviction removes the actual data. Consider TTL-based expiry or
-        # periodic batch_exists validation. Also risks memory growth in
-        # long-running deployments (num_chunks × num_layers keys).
-        self._stored_keys: set[str] = set()
+        self._confirmed_store_keys: set[str] = set()
+        self._store_presence_meta: MaruConnectorMetadata | None = None
         # Track per-chunk layer completion for writing _DONE markers.
         # chunk_base_key -> set of stored layer indices
         self._chunk_layer_progress: dict[str, set[int]] = {}
@@ -1582,6 +1550,7 @@ class MaruWorkerConnector:
         # _failed_load_blocks feeds get_block_ids_with_load_errors so vLLM
         # recomputes instead of consuming unloaded KV.
         self._deferred_events: dict[str, torch.cuda.Event] = {}
+        self._deferred_failure_meta: dict[str, MaruReqMeta] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._recv_only_finished_req_ids: set[str] = set()
@@ -1948,7 +1917,6 @@ class MaruWorkerConnector:
                 # missing at allocation time (update_state_after_alloc
                 # defaults to 0), so this is the third way a parked request
                 # can reach the worker with no load to perform.
-                # _fail_deferred_load ignores inline requests.
                 self._fail_deferred_load(req_meta)
                 continue
 
@@ -1974,6 +1942,9 @@ class MaruWorkerConnector:
                 continue
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+
+            if not self._cpu_mode:
+                slot_mapping = self._mask_load_slots(req_meta, slot_mapping)
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
@@ -2003,8 +1974,7 @@ class MaruWorkerConnector:
                 continue
 
             if len(infos) != len(keys):
-                if self._cpu_mode:
-                    self._handler.release_retrieved(infos)
+                self._release_retrieved(infos)
                 # A truncated response would otherwise shift every later
                 # layer's objects by one position — silent wrong KV.
                 logger.error(
@@ -2017,18 +1987,11 @@ class MaruWorkerConnector:
                 self._fail_deferred_load(req_meta)
                 continue
 
-            # All-or-nothing: a miss (chunk evicted between the scheduler's
-            # exists-check and this load) aborts the request's load so we never
-            # inject a partially-populated (corrupt) KV cache — vLLM recomputes.
-            miss = next((i for i, v in enumerate(infos) if v is None), -1)
-            if miss >= 0:
-                if self._cpu_mode:
-                    self._handler.release_retrieved(infos)
-                logger.warning(
-                    "Maru load miss: %s — aborting load for req %s (recompute)",
-                    keys[miss],
-                    req_meta.req_id,
-                )
+            num_chunks, infos = self._available_load_prefix(
+                req_meta, num_chunks, infos, len(layers)
+            )
+            if not num_chunks:
+                self._release_retrieved(infos)
                 self._fail_deferred_load(req_meta)
                 continue
 
@@ -2048,9 +2011,8 @@ class MaruWorkerConnector:
             try:
                 self._load_packed(layers, prepared_requests, attn_metadata)
             finally:
-                if self._cpu_mode:
-                    for _, _, _, infos in prepared_requests:
-                        self._handler.release_retrieved(infos)
+                for _, _, _, infos in prepared_requests:
+                    self._release_retrieved(infos)
             if self._timing:
                 _emit_timing(
                     f"packed-load wall {len(prepared_requests)} req = "
@@ -2073,6 +2035,9 @@ class MaruWorkerConnector:
                 "Maru: %d inline load(s) without attention metadata; skipping",
                 len(inline),
             )
+            for req_meta, _, _, infos in inline:
+                self._release_retrieved(infos)
+                self._fail_deferred_load(req_meta)
             return
 
         self._load_sync(layers, inline, attn_metadata)
@@ -2117,11 +2082,24 @@ class MaruWorkerConnector:
         # Marked before the job can run: until it queues its copies there is
         # nothing for handle_preemptions to drain, so an abort arriving in
         # that window is recorded against this id instead.
+        try:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device))
+        except Exception as exc:
+            logger.warning("Maru deferred submission failed: %s", exc)
+            return False
+        req_meta._compute_ready = ready
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
-        self._deferred_executor.submit(
-            self._deferred_load_job, req_meta, layers, device
-        )
+        try:
+            self._deferred_executor.submit(
+                self._deferred_load_job, req_meta, layers, device
+            )
+        except Exception as exc:
+            with self._deferred_lock:
+                self._inflight_deferred_req_ids.discard(req_meta.req_id)
+            logger.warning("Maru deferred submission failed: %s", exc)
+            return False
         return True
 
     def _deferred_load_job(
@@ -2141,6 +2119,8 @@ class MaruWorkerConnector:
         the request's blocks through ``take_failed_load_blocks`` so vLLM
         recomputes instead of consuming unloaded KV.
         """
+        infos = None
+        transferred = False
         try:
             handler = self._handler
             chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
@@ -2164,6 +2144,7 @@ class MaruWorkerConnector:
                 return
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+            slot_mapping = self._mask_load_slots(req_meta, slot_mapping)
             # Layerwise keys come back layer-major in this job's own layer
             # order — consumers index the retained dict by true layer index,
             # never by list position.
@@ -2188,13 +2169,10 @@ class MaruWorkerConnector:
                 )
                 self._fail_deferred_load(req_meta)
                 return
-            miss = next((i for i, v in enumerate(infos) if v is None), -1)
-            if miss >= 0:
-                logger.warning(
-                    "Maru deferred load miss: %s — recompute for req %s",
-                    keys[miss],
-                    req_meta.req_id,
-                )
+            num_chunks, infos = self._available_load_prefix(
+                req_meta, num_chunks, infos, len(layers)
+            )
+            if not num_chunks:
                 self._fail_deferred_load(req_meta)
                 return
 
@@ -2221,6 +2199,13 @@ class MaruWorkerConnector:
                     if events is not None
                     else None
                 )
+                # A partial hit must finish its valid prefix before reporting
+                # the missing tail; it cannot use the early unpark gate.
+                if req_meta._failed_from_token is not None:
+                    if events is None:
+                        self._fail_deferred_load(req_meta)
+                        return
+                    gate = next(reversed(events.values()), None)
                 with self._deferred_lock:
                     # Checked and published under one lock: a drain running in
                     # between would otherwise mark the request abandoned after
@@ -2236,6 +2221,10 @@ class MaruWorkerConnector:
                                 # the gate event fires, so nothing blocks the
                                 # loader thread.
                                 self._deferred_events[req_meta.req_id] = gate
+                                if req_meta._failed_from_token is not None:
+                                    self._deferred_failure_meta[req_meta.req_id] = (
+                                        req_meta
+                                    )
                         else:
                             self._deferred_layerwise_loads[req_meta.req_id] = (
                                 req_meta,
@@ -2245,6 +2234,7 @@ class MaruWorkerConnector:
                             )
                         if events is None or gate is None:
                             self._deferred_done.add(req_meta.req_id)
+                        transferred = True
                 if abandoned:
                     # The request was aborted while this load ran, so no
                     # forward will wait per layer and the completion report is
@@ -2289,6 +2279,8 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
+            if req_meta._compute_ready is not None:
+                stream.wait_event(req_meta._compute_ready)
             with torch.cuda.stream(stream):
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
                 for ci in range(num_chunks):
@@ -2340,6 +2332,9 @@ class MaruWorkerConnector:
                     slot_mapping,
                     slot_gpu,
                 ]
+                if req_meta._failed_from_token is not None:
+                    self._deferred_failure_meta[req_meta.req_id] = req_meta
+                transferred = True
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s (packed, off-thread)",
@@ -2359,6 +2354,8 @@ class MaruWorkerConnector:
                     pass
             self._fail_deferred_load(req_meta)
         finally:
+            if infos is not None and not transferred:
+                self._release_retrieved(infos)
             # This load is accounted for now, however it ended. An abort
             # arriving after this point finds the queued copies themselves.
             with self._deferred_lock:
@@ -2487,6 +2484,8 @@ class MaruWorkerConnector:
         try:
             torch.cuda.set_device(device)
             stream = self._layerwise_stream_for(device)
+            if req_meta._compute_ready is not None:
+                stream.wait_event(req_meta._compute_ready)
             pinned = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             attn = self._last_attn_metadata
             tokens = num_chunks * self._kv_chunk_tokens
@@ -2611,6 +2610,8 @@ class MaruWorkerConnector:
                             )
                 except Exception as e:
                     self._fail_load(req_meta, e)
+                finally:
+                    self._release_read_refs(infos)
             return
 
         if self._load_stream is None or self._load_stream_device != device:
@@ -2618,15 +2619,21 @@ class MaruWorkerConnector:
             self._load_stream_device = device
         load_stream = self._load_stream
         load_stream.wait_stream(torch.cuda.current_stream(device))
-        entries = [
-            (
-                req_meta,
-                num_chunks,
-                self._pin_slot_mapping_for_async_h2d(slot_mapping),
-                infos,
-            )
-            for req_meta, num_chunks, slot_mapping, infos in entries
-        ]
+        try:
+            entries = [
+                (
+                    req_meta,
+                    num_chunks,
+                    self._pin_slot_mapping_for_async_h2d(slot_mapping),
+                    infos,
+                )
+                for req_meta, num_chunks, slot_mapping, infos in entries
+            ]
+        except Exception as e:
+            for req_meta, _, _, infos in entries:
+                self._fail_load(req_meta, e)
+                self._release_read_refs(infos)
+            return
 
         _t0 = time.monotonic()
         # Collected locally and published only once every layer is queued.
@@ -2674,9 +2681,9 @@ class MaruWorkerConnector:
                 load_stream.synchronize()
             except Exception:
                 pass
-            with self._deferred_lock:
-                for req_meta, *_ in entries:
-                    self._failed_load_blocks.update(req_meta.block_ids)
+            for req_meta, _, _, infos in entries:
+                self._fail_load(req_meta, e)
+                self._release_read_refs(infos)
             return
 
         for layer_name, event in issued.items():
@@ -2813,24 +2820,11 @@ class MaruWorkerConnector:
         return out
 
     def _fail_deferred_load(self, req_meta: MaruReqMeta) -> None:
-        """Mark a deferred load as failed so the scheduler recomputes it.
-
-        The request's blocks are reported through
-        ``get_block_ids_with_load_errors`` (vLLM resets its computed-token
-        count) and the request id through ``get_finished_loading`` (vLLM
-        unparks it from WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads
-        also report errors, but only for their externally allocated blocks.
-        """
-        if self._cpu_mode and not req_meta.is_store:
+        """Report a missing load for inline and parked requests alike."""
+        if not req_meta.is_store:
             self._fail_load(
-                req_meta, RuntimeError("CPU replica unavailable during load")
+                req_meta, RuntimeError("Cache object unavailable during load")
             )
-            return
-        if not req_meta.deferred_load:
-            return
-        with self._deferred_lock:
-            self._failed_load_blocks.update(req_meta.block_ids)
-            self._deferred_done.add(req_meta.req_id)
 
     def _cpu_load_range(self, req_meta: MaruReqMeta) -> tuple[int, int]:
         """Only externally allocated tokens may be copied or invalidated."""
@@ -2841,7 +2835,20 @@ class MaruWorkerConnector:
             end, len(req_meta.block_ids) * self._block_size
         )
 
-    def _fail_load(self, req_meta: MaruReqMeta, exc: Exception) -> None:
+    def _complete_load(self, req_meta: MaruReqMeta) -> None:
+        if req_meta._failed_from_token is not None:
+            self._fail_load(
+                req_meta,
+                RuntimeError("Cache prefix ended before the requested range"),
+                loaded_prefix=True,
+            )
+        elif req_meta.deferred_load:
+            with self._deferred_lock:
+                self._deferred_done.add(req_meta.req_id)
+
+    def _fail_load(
+        self, req_meta: MaruReqMeta, exc: Exception, *, loaded_prefix: bool = False
+    ) -> None:
         """Contain one request's load failure instead of letting it raise.
 
         vLLM calls ``start_load_kv`` outside its own try, so an exception
@@ -2855,14 +2862,18 @@ class MaruWorkerConnector:
             "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
         )
         with self._deferred_lock:
-            blocks = req_meta.block_ids
-            if self._cpu_mode:
-                start, end = self._cpu_load_range(req_meta)
-                blocks = blocks[
+            start, end = self._cpu_load_range(req_meta)
+            if loaded_prefix and req_meta._failed_from_token is not None:
+                start = max(start, req_meta._failed_from_token)
+            blocks = (
+                req_meta.block_ids[
                     start // self._block_size : (end + self._block_size - 1)
                     // self._block_size
                 ]
-            self._failed_load_blocks.update(blocks)
+                if start < end
+                else []
+            )
+            self._failed_load_blocks.update(block for block in blocks if block != 0)
             if req_meta.deferred_load:
                 self._deferred_done.add(req_meta.req_id)
 
@@ -2875,8 +2886,8 @@ class MaruWorkerConnector:
         WAITING_FOR_REMOTE_KVS; unless they are reported through
         ``get_finished_loading`` (with their blocks through
         ``get_block_ids_with_load_errors``), vLLM keeps them parked forever
-        and never frees their blocks. Inline requests are unaffected —
-        ``_fail_deferred_load`` ignores them.
+        and never frees their blocks. Inline failures must also report the
+        externally allocated blocks for recomputation.
 
         Args:
             metadata: The step's connector metadata.
@@ -2911,10 +2922,11 @@ class MaruWorkerConnector:
             self._load_stream = torch.cuda.Stream(device=device, priority=-1)
             self._load_stream_device = device
         load_stream = self._load_stream
+        load_stream.wait_stream(torch.cuda.current_stream(device))
 
         for req_meta, num_chunks, slot_mapping, infos in entries:
-            slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             try:
+                slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
                 with torch.cuda.stream(load_stream):
                     slot_mapping_gpu = slot_mapping.to(device, non_blocking=True)
                     for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
@@ -2940,6 +2952,8 @@ class MaruWorkerConnector:
                     event = torch.cuda.Event()
                     event.record(load_stream)
             except Exception as e:
+                load_stream.synchronize()
+                self._release_retrieved(infos)
                 self._fail_load(req_meta, e)
                 continue
             with self._deferred_lock:
@@ -2949,6 +2963,8 @@ class MaruWorkerConnector:
                     slot_mapping,
                     slot_mapping_gpu,
                 ]
+                if req_meta._failed_from_token is not None:
+                    self._deferred_failure_meta[req_meta.req_id] = req_meta
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s",
@@ -2959,7 +2975,10 @@ class MaruWorkerConnector:
             )
 
     def get_finished_loading(self) -> set[str] | None:
-        """Return req ids whose deferred loads completed since the last call."""
+        """Return completed loads after releasing their read pins."""
+        self._release_completed_load_refs()
+        refs = []
+        failures = []
         with self._deferred_lock:
             done = set(self._deferred_done)
             self._deferred_done.clear()
@@ -2967,7 +2986,16 @@ class MaruWorkerConnector:
                 if event.query():
                     done.add(req_id)
                     del self._deferred_events[req_id]
-                    self._deferred_refs.pop(req_id, None)
+                    refs.append(self._deferred_refs.pop(req_id, None))
+                    failure = self._deferred_failure_meta.pop(req_id, None)
+                    if failure is not None:
+                        failures.append(failure)
+        self._release_read_refs(refs)
+        for req_meta in failures:
+            self._complete_load(req_meta)
+        if failures:
+            with self._deferred_lock:
+                self._deferred_done.difference_update(done)
         return done or None
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
@@ -3059,9 +3087,11 @@ class MaruWorkerConnector:
         """
         drain: list[torch.cuda.Event] = []
         owed: set[str] = set()
+        refs = []
         with self._deferred_lock:
             for req_id in req_ids:
-                self._deferred_layerwise_loads.pop(req_id, None)
+                refs.append(self._deferred_layerwise_loads.pop(req_id, None))
+                self._deferred_failure_meta.pop(req_id, None)
                 pre_issued = self._deferred_layerwise_events.pop(req_id, None)
                 if not pre_issued:
                     if report and req_id in self._inflight_deferred_req_ids:
@@ -3069,15 +3099,17 @@ class MaruWorkerConnector:
                     continue
                 drain.extend(pre_issued.values())
                 if report and self._deferred_events.pop(req_id, None) is not None:
-                    self._deferred_refs.pop(req_id, None)
+                    refs.append(self._deferred_refs.pop(req_id, None))
                     owed.add(req_id)
         _drain_events(drain)
+        self._release_read_refs(refs)
+        self._release_completed_load_refs()
         if owed:
             with self._deferred_lock:
                 self._deferred_done |= owed
 
     def take_failed_load_blocks(self) -> set[int]:
-        """Return (and clear) block ids whose deferred load failed."""
+        """Return (and clear) block ids whose load failed."""
         with self._deferred_lock:
             failed = self._failed_load_blocks
             self._failed_load_blocks = set()
@@ -3112,6 +3144,10 @@ class MaruWorkerConnector:
                         )
             except Exception as e:
                 self._fail_load(req_meta, e)
+            else:
+                self._complete_load(req_meta)
+            finally:
+                self._release_retrieved(infos)
 
     def _load_packed(
         self,
@@ -3162,6 +3198,7 @@ class MaruWorkerConnector:
 
         dtype = layers[0][1].dtype
         staged_chunks: dict[str, int] = {}
+        failed: dict[str, Exception] = {}
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 try:
@@ -3225,12 +3262,9 @@ class MaruWorkerConnector:
                                     layer_name,
                                     num_chunks=1,
                                 )
-                except Exception as e:
-                    self._fail_load(req_meta, e)
+                except Exception as exc:
+                    failed[req_meta.req_id] = exc
                     continue
-                if req_meta.deferred_load:
-                    with self._deferred_lock:
-                        self._deferred_done.add(req_meta.req_id)
         if use_stream:
             # Loads must complete before the forward pass reads the paged cache
             # (packed makes wait_for_layer_load a no-op).
@@ -3238,6 +3272,10 @@ class MaruWorkerConnector:
             self._load_stream.synchronize()
 
         for req_meta, num_chunks, _, _ in prepared_requests:
+            if req_meta.req_id in failed:
+                self._fail_load(req_meta, failed[req_meta.req_id])
+            else:
+                self._complete_load(req_meta)
             staged = staged_chunks.get(req_meta.req_id, 0)
             if kernel is None:
                 mode = "fallback"
@@ -3401,38 +3439,136 @@ class MaruWorkerConnector:
             stream.wait_event(event)
 
     def _release_completed_load_refs(self) -> None:
-        """Drop load-batch refs whose queued copies have completed.
-
-        Each ``_active_load_refs`` entry pairs the refs of one scheduled load
-        batch with the event recorded after that batch's last copy. Entries
-        whose event has not completed are retained: under vLLM async
-        scheduling this method (called from the next step's
-        ``start_load_kv``) can run while the previous step's copies are still
-        queued, and the pinned slot mappings and CXL mmap views must outlive
-        those copies.
-        """
+        """Unpin completed copies without holding the bookkeeping lock."""
+        released = []
         with self._deferred_lock:
-            if not self._active_load_refs:
-                return
-            self._active_load_refs = [
-                entry for entry in self._active_load_refs if not entry[0].query()
+            pending = []
+            for event, refs in self._active_load_refs:
+                if event.query():
+                    released.append(refs)
+                else:
+                    pending.append((event, refs))
+            self._active_load_refs = pending
+        self._release_read_refs(released)
+
+    def _release_retrieved(self, infos: Any) -> None:
+        if self._cpu_mode:
+            if self._handler is not None:
+                self._handler.release_retrieved(infos)
+        else:
+            self._release_read_refs(infos)
+
+    def _available_load_prefix(
+        self, req_meta: MaruReqMeta, num_chunks: int, infos: list[Any], num_layers: int
+    ) -> tuple[int, list[Any]]:
+        """Keep only the contiguous prefix present in every required layer.
+
+        The original lease remains held even for discarded objects until the
+        last copy completes. A partial prefix is reported only after its copy.
+        """
+        req_meta._failed_from_token = None
+        width = num_chunks
+        for index, info in enumerate(infos):
+            if info is None:
+                width = min(width, index % num_chunks)
+        if width == num_chunks:
+            return width, infos
+        # CPU pools already reserve only the externally allocated subrange.
+        # Keep their existing all-or-nothing lease semantics.
+        if self._cpu_mode:
+            return 0, infos
+        start, _ = self._cpu_load_range(req_meta)
+        if width * self._kv_chunk_tokens <= start:
+            return 0, infos
+        req_meta._failed_from_token = width * self._kv_chunk_tokens
+        values = (
+            [
+                infos[li * num_chunks + ci]
+                for li in range(num_layers)
+                for ci in range(width)
             ]
+            if self._use_layerwise
+            else infos[:width]
+        )
+        if isinstance(infos, PinnedViews):
+            values = PinnedViews(values, infos.release)
+        return width, values
+
+    @staticmethod
+    def _release_read_refs(refs: Any) -> None:
+        if isinstance(refs, PinnedViews):
+            refs.release()
+        elif isinstance(refs, dict):
+            for value in refs.values():
+                MaruWorkerConnector._release_read_refs(value)
+        elif isinstance(refs, (tuple, list)):
+            for value in refs:
+                MaruWorkerConnector._release_read_refs(value)
 
     def _batch_retrieve_all(self, keys: list[str], batch_size: int = 1024) -> list:
-        """``batch_retrieve`` over ``keys`` in payload-bounded chunks (ordered).
-
-        A single request can produce num_layers x num_chunks keys (thousands),
-        so the batch RPC is split into ``batch_size``-key chunks to bound
-        payload while keeping RPC count ~O(len(keys) / batch_size).
-        """
+        """Retrieve bounded batches and retain their read pins as one lease."""
         handler = self._handler
         assert handler is not None
-        if self._cpu_mode or len(keys) <= batch_size:
+        if self._cpu_mode:
             return list(handler.batch_retrieve(keys))
-        out: list[Any] = []
-        for i in range(0, len(keys), batch_size):
-            out.extend(handler.batch_retrieve(keys[i : i + batch_size]))
-        return out
+        pinned = getattr(handler, "supports_pinned_retrieve", False) is True
+        batches = []
+        try:
+            for i in range(0, len(keys), batch_size):
+                part = keys[i : i + batch_size]
+                if pinned:
+                    batches.append(
+                        handler.batch_retrieve_pinned(
+                            part,
+                            mode="independent" if self._use_layerwise else "prefix",
+                        )
+                    )
+                else:
+                    batches.append(handler.batch_retrieve(part))
+        except Exception:
+            self._release_read_refs(batches)
+            raise
+        values = [info for batch in batches for info in batch]
+        return (
+            PinnedViews(values, lambda: self._release_read_refs(batches))
+            if pinned
+            else values
+        )
+
+    def _mask_load_slots(
+        self, req_meta: MaruReqMeta, slots: torch.Tensor
+    ) -> torch.Tensor:
+        start, end = self._cpu_load_range(req_meta)
+        masked = slots.clone()
+        masked[:start] = -1
+        masked[end:] = -1
+        return masked
+
+    def _refresh_store_presence(self, metadata: MaruConnectorMetadata) -> None:
+        """Use a batch server probe once per step, including locally owned keys."""
+        if self._cpu_mode or self._store_presence_meta is metadata:
+            return
+        self._store_presence_meta = metadata
+        keys = set()
+        for req in metadata.requests:
+            if not req.is_store:
+                continue
+            for base in _req_chunk_keys(req, self._kv_chunk_tokens):
+                if self._use_layerwise:
+                    keys.update(
+                        _chunk_layer_key(base, index)
+                        for index in range(self._num_layers)
+                    )
+                else:
+                    keys.add(base)
+        ordered = sorted(keys)
+        try:
+            present = self._handler.batch_exists(ordered) if ordered else []
+        except Exception:
+            present = []
+        self._confirmed_store_keys = {
+            key for key, exists in zip(ordered, present, strict=False) if exists
+        }
 
     def save_kv_layer(
         self,
@@ -3442,6 +3578,7 @@ class MaruWorkerConnector:
         metadata: MaruConnectorMetadata,
     ) -> None:
         """Save KV cache to Maru CXL in chunk granularity."""
+        self._refresh_store_presence(metadata)
         self._ensure_handler()
         if self._handler is None:
             return
@@ -3781,6 +3918,7 @@ class MaruWorkerConnector:
         blocking copy to CXL. One stream synchronize gates ``batch_store`` so
         a key is never registered before its slab bytes are fully in CXL.
         """
+        self._refresh_store_presence(metadata)
         ops, ptrs, pbs, block_size, head_size, fmt = kernel
         handler = self._handler
         assert handler is not None
@@ -3811,7 +3949,7 @@ class MaruWorkerConnector:
         staged_chunks = 0
         # Requests sharing a prefix can yield the same base_key within one
         # step; the single deferred batch_store no longer dedupes them the way
-        # the per-request fallback's eager _stored_keys updates did.
+        # the per-request fallback's eager presence updates did.
         seen_keys: set[str] = set()
         with stream_ctx:
             for req_meta in metadata.requests:
@@ -3930,6 +4068,7 @@ class MaruWorkerConnector:
         before allocation so overlapping requests/steps never issue duplicate
         stores while an earlier copy is still in flight.
         """
+        self._refresh_store_presence(metadata)
         handler = self._handler
         if handler is None:
             logger.error("Maru write-behind store: handler unavailable; skipping step")
@@ -4224,11 +4363,11 @@ class MaruWorkerConnector:
     def _is_stored(self, key: str) -> bool:
         if self._cpu_mode:
             return self._handler is not None and self._handler.has_local(key)
-        return key in self._stored_keys
+        return key in self._confirmed_store_keys
 
     def _record_stored(self, key: str) -> None:
         if not self._cpu_mode:
-            self._stored_keys.add(key)
+            self._confirmed_store_keys.add(key)
 
     def _write_done_marker(self, base_key: str) -> None:
         """Write a chunk's ``_DONE`` marker once all its layers are stored.
@@ -4304,9 +4443,16 @@ class MaruWorkerConnector:
         self._layerwise_streams = []
         self._layerwise_stream_device = None
         self._layer_load_events.clear()
-        self._active_load_refs.clear()
         with self._deferred_lock:
-            self._deferred_layerwise_loads.clear()
+            refs = [
+                self._active_load_refs,
+                self._deferred_layerwise_loads,
+                self._deferred_refs,
+            ]
+            self._active_load_refs = []
+            self._deferred_layerwise_loads = {}
+            self._deferred_refs = {}
+            self._deferred_failure_meta.clear()
             self._deferred_layerwise_events.clear()
             self._deferred_events.clear()
             self._deferred_refs.clear()
@@ -4314,6 +4460,7 @@ class MaruWorkerConnector:
             self._recv_only_finished_req_ids.clear()
             self._inflight_deferred_req_ids.clear()
             self._abandoned_req_ids.clear()
+        self._release_read_refs(refs)
         if self._handler is not None:
             try:
                 self._handler.close()
