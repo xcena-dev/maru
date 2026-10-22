@@ -1549,6 +1549,9 @@ class MaruWorkerConnector:
     """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
 
     _cpu_mode = False
+    # Read by the layout paths; a worker built with __new__ knows no layout.
+    _cache_config: Any = None
+    _cache_layout: str | None = None
 
     def __init__(
         self,

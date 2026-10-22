@@ -152,6 +152,19 @@ class TestReadLayout:
         assert worker._cache_layout == "BLHNC"
         assert worker._kv_layout is not None and worker._kv_layout.kv_packed
 
+    def test_worker_built_without_init_knows_no_layout(self):
+        # Test helpers and subclasses allocate workers with __new__; the class
+        # defaults stand in for what __init__ and register_kv_caches set.
+        from maru_vllm.connector import MaruWorkerConnector
+
+        worker = MaruWorkerConnector.__new__(MaruWorkerConnector)
+        worker._block_size, worker._num_kv_heads, worker._head_size = 4, None, None
+        worker._kv_layout = None
+        assert worker._cache_config is None and worker._cache_layout is None
+        rank5 = torch.zeros(2, 7, 4, 2, 3)  # a pre-0.29 flash cache
+        expected = _detect_kv_layout(tuple(rank5.shape), 4, None, None, None)
+        assert expected is not None and worker._layout_for(rank5) == expected
+
 
 class TestPackedSlab:
     """The default chunkwise format over logical pages, CPU fallback path."""
