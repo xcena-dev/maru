@@ -466,6 +466,107 @@ def test_an_interrupt_before_any_transfer_gives_the_buffers_back(world, monkeypa
     assert only_region(a).usage()["quarantined_bytes"] == 0
 
 
+@pytest.mark.parametrize("blocked_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "failure", ["timeout", "uncertain", "interrupt", "before_post", "error"]
+)
+def test_a_failed_read_keeps_only_the_pending_peers_slots(
+    blocked_index, failure, monkeypatch
+):
+    """Completed and unposted peers stay reusable while a late READ is held."""
+    w = World(nodes=3)
+    reader = agent = None
+    try:
+        owner = w.client("owner", pages=2)
+        by_node = {}
+        for i in range(60):
+            key = f"key-{i}"
+            assert put(owner, key, key.encode())[0]
+            region = owner.regions[owner._keys[key].pool_id]
+            address = pick_agent(owner.remote_cxl_agents, region.region_id)
+            by_node.setdefault(address, []).append(key)
+            if len(by_node) == 3 and all(len(keys) >= 2 for keys in by_node.values()):
+                break
+        assert len(by_node) == 3
+        assert all(len(keys) >= 2 for keys in by_node.values())
+        # Interleave slots: a peer's two destinations are not adjacent.
+        keys = [keys[i] for i in range(2) for keys in by_node.values()]
+        reader = w.client("reader", rdma_timeout_s=0.01)
+        assert read(reader, keys) == [key.encode() for key in keys]
+        free = reader._staging.free_count()
+        address = list(by_node)[blocked_index]
+        blocked_peer = next(n.agent.name for n in w.nodes if n.address == address)
+        agent = worker_agent("reader")
+        original_read = reader._transport.read
+        original_check = agent.check_xfer_state
+        calls = []
+
+        def fail_one_peer(peer, pairs, **kwargs):
+            calls.append(peer)
+            if peer == blocked_peer:
+                if failure == "before_post":
+                    raise KeyboardInterrupt
+                if failure == "error":
+                    raise RuntimeError("READ was not posted")
+            agent.stall = peer == blocked_peer
+            return original_read(peer, pairs, **kwargs)
+
+        def fail_state_check(handle):
+            if handle[0] == "READ" and handle[4] == blocked_peer:
+                if failure == "uncertain":
+                    raise RuntimeError("state is unknown")
+                if failure == "interrupt":
+                    raise KeyboardInterrupt
+            return original_check(handle)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(reader._transport, "read", fail_one_peer)
+            patch.setattr(agent, "check_xfer_state", fail_state_check)
+            if failure in ("interrupt", "before_post"):
+                with pytest.raises(KeyboardInterrupt):
+                    reader.batch_retrieve(keys)
+            else:
+                assert read(reader, keys) == [None] * len(keys)
+        assert len(calls) == blocked_index + 1
+        held = failure in ("timeout", "uncertain", "interrupt")
+        assert len(reader._isolated) == int(held)
+        assert reader._staging.free_count() == free - (2 if held else 0)
+        assert len(set(reader._staging._free)) == reader._staging.free_count()
+        if held:
+            entry = reader._isolated[0]
+            destinations = {addr for addr, _, _ in entry.pending.handle[1]}
+            assert {reader._staging.addr(slot) for slot in entry.slots} == destinations
+            assert len(entry.slots) == 2
+            reader._reap_isolated()
+            assert reader._staging.free_count() == free - 2
+            # Reusing every unrelated slot must not expose it to the late READ.
+            reusable = reader._staging.take(free - 2)
+            assert reusable is not None
+            try:
+                for slot in reusable:
+                    reader._staging.view(slot)[:] = b"x" * PAGE
+                agent.stall = False
+                assert agent.finish_stalled() == 1
+                for slot in reusable:
+                    assert bytes(reader._staging.view(slot)) == b"x" * PAGE
+                reader._reap_isolated()
+                reader._reap_isolated()  # no double return
+                assert not reader._isolated
+                assert reader._staging.free_count() == 2
+            finally:
+                for slot in reusable:
+                    reader._staging.give(slot)
+        assert reader._staging.free_count() == free
+        assert len(set(reader._staging._free)) == free
+        assert read(reader, keys) == [key.encode() for key in keys]
+    finally:
+        if agent is not None:
+            agent.stall = False
+            agent.finish_stalled()
+            reader._reap_isolated()
+        w.close()
+
+
 def test_a_write_that_ends_in_an_error_after_its_deadline_keeps_its_page(world):
     """Released after an error, a WRITE may still be in the network."""
     a = world.client("a", pages=2, rdma_timeout_s=0.01)

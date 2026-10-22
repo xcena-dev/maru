@@ -1132,6 +1132,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         from maru_remote.transport import TransferTimeout, TransferUncertainError
 
         by_peer: dict[str, list[tuple[int, int, int]]] = {}
+        slots_by_peer: dict[str, list[int]] = {}
         try:
             for (_, location), slot in zip(hits, slots, strict=False):
                 # An own region is mapped with its handle; another session's
@@ -1165,6 +1166,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
                         location.length,
                     )
                 )
+                slots_by_peer.setdefault(access.peer, []).append(slot)
         except Exception as exc:
             # A region that cannot be mapped (node down, or its owner
             # released it) loads as a miss.
@@ -1177,12 +1179,18 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 self._transport.read(peer, pairs, timeout_s=self.config.rdma_timeout_s)
             except (TransferTimeout, TransferUncertainError) as exc:
                 # A late READ only lands in these slots: isolate them.
+                peer_slots = slots_by_peer[peer]
                 with self._lock:
                     self._isolated.append(
                         IsolatedTransfer(
-                            exc.pending, "READ", exc.pending.peer, None, [], list(slots)
+                            exc.pending, "READ", exc.pending.peer, None, [], peer_slots
                         )
                     )
+                # Earlier peers completed; later peers have not been posted.
+                held = set(peer_slots)
+                for slot in slots:
+                    if slot not in held:
+                        self._staging.give(slot)
                 logger.warning("RDMA READ not confirmed: %s", exc)
                 return False
             except Exception as exc:
@@ -1206,12 +1214,17 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 else:
                     # Interrupted while the READ may run: its slots stay taken
                     # until NIXL releases the transfer.
+                    peer_slots = slots_by_peer[peer]
                     with self._lock:
                         self._isolated.append(
                             IsolatedTransfer(
-                                pending, "READ", pending.peer, None, [], list(slots)
+                                pending, "READ", pending.peer, None, [], peer_slots
                             )
                         )
+                    held = set(peer_slots)
+                    for slot in slots:
+                        if slot not in held:
+                            self._staging.give(slot)
                 raise
         return True
 
