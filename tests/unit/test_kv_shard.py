@@ -2,10 +2,14 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for maru_vllm.kv_shard: naming the KV slice each TP rank holds.
 
-Pure integer logic; needs neither torch nor vLLM.
+The module is pure integer logic, but importing it goes through the
+``maru_vllm`` package, which loads the vLLM connector.
 """
 
 import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
 
 from maru_vllm.kv_shard import WHOLE_MODEL, KVShard, tp_kv_shard, tp_kv_shards
 
