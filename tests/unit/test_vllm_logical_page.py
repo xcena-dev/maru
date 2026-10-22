@@ -29,8 +29,12 @@ from maru_vllm.kv_layout import _detect_kv_layout, _vllm_kv_cache_layout
 from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
     deferred_metadata,
+    fake_new_request_data,
+    fake_scheduler_output,
     make_bare_worker,
     make_flash_attn_metadata,
+    make_scheduler,
+    make_vllm_scheduler,
     make_worker,
     resolved_cache_config,
     store_metadata,
@@ -289,3 +293,54 @@ def test_mla_registered_and_bound_pages_agree():
     for page in (registered, bound):
         got = worker._extract_kv_from_layer(page, slots, meta, "L0")
         torch.testing.assert_close(got, src)
+
+
+class TestStepOrdering:
+    """vLLM 0.29+ starts loads after the forward unless one is synchronous."""
+
+    def _activate(self, output):
+        sched = make_scheduler(4, 8, {"maru_async_load": True})
+        sched._layerwise_overlap = True
+        request = SimpleNamespace(
+            request_id="r1", prompt_token_ids=list(range(64)), num_tokens=64
+        )
+        sched._last_match_result["r1"] = 8
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([3, 4, 5],)
+        sched.update_state_after_alloc(request, blocks, 64)
+        sched.build_connector_meta(fake_scheduler_output())
+        sched.update_state_after_alloc(request, MagicMock(), 0)
+        output.scheduled_new_reqs = [
+            fake_new_request_data(request.prompt_token_ids, [3, 4, 5])
+        ]
+        output.num_scheduled_tokens = {"r1": 1}
+        return sched.build_connector_meta(output)
+
+    def test_layerwise_activation_starts_loads_before_the_forward(self):
+        """The resumed request's attention waits on per-layer events that
+        start_load_kv registers, so they must exist before it runs."""
+        output = fake_scheduler_output()
+        output.has_sync_kv_loads = False
+        meta = self._activate(output)
+        assert meta.layerwise_load_req_ids == {"r1"}
+        assert output.has_sync_kv_loads is True
+
+    def test_older_scheduler_output_is_left_alone(self):
+        output = fake_scheduler_output()
+        meta = self._activate(output)
+        assert meta.layerwise_load_req_ids == {"r1"}
+        assert not hasattr(output, "has_sync_kv_loads")
+
+    def test_steps_without_layerwise_loads_keep_vllms_choice(self):
+        sched = make_scheduler(4, 8)
+        output = fake_scheduler_output()
+        output.has_sync_kv_loads = False
+        sched.build_connector_meta(output)
+        assert output.has_sync_kv_loads is False
+
+
+def test_preemption_does_not_drop_output(tmp_path):
+    """A best-effort cache opts out of vLLM's producer-role default."""
+    engine = make_vllm_scheduler(tmp_path, 4, 8)
+    assert engine.connector.requires_kv_delivery is False
+    assert getattr(engine, "requires_kv_delivery", False) is False

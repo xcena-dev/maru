@@ -826,6 +826,16 @@ class MaruKVConnector(KVConnectorBase_V1):
                 cache_config=vllm_config.cache_config,
             )
 
+    @property
+    def requires_kv_delivery(self) -> bool:
+        """Opt out of vLLM's default, which follows the producer role.
+
+        Maru is a best-effort cache: a store lost to preemption is a later
+        miss, not KV a consumer is waiting for, so preemption need not drop
+        the request's in-flight output.
+        """
+        return False
+
     # ==================================
     # Scheduler-side methods
     # ==================================
@@ -1501,6 +1511,14 @@ class MaruSchedulerConnector:
 
         self._requests_need_load.clear()
         self._load_ranges.clear()
+        if meta.layerwise_load_req_ids and hasattr(
+            scheduler_output, "has_sync_kv_loads"
+        ):
+            # vLLM 0.29+ calls start_load_kv after the forward unless a load of
+            # this step is synchronous. A resumed overlap request's attention
+            # waits on per-layer events that start_load_kv registers, so the
+            # step must start loads first, as vLLM's own HiSparse does.
+            scheduler_output.has_sync_kv_loads = True
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
