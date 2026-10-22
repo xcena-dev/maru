@@ -1501,6 +1501,9 @@ class TestPackedKernelRoundtripGPU:
             extra_config=extra_config,
             num_kv_heads=self.HEADS,
             head_size=self.HEAD_SIZE,
+            # What vLLM 0.23-0.25 reports for this shape; the kernel format
+            # depends on it.
+            kv_cache_layout="NHD",
         )
         worker._kv_caches = caches
         worker._num_layers = len(caches)

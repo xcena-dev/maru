@@ -44,7 +44,9 @@ from maru_vllm.kv_layout import (
     KVLayout,
     _canonical_paged_view,
     _detect_kv_layout,
+    _is_logical_page_layout,
     _layout_fits,
+    _mla_pages,
     _vllm_kv_cache_layout,
 )
 
@@ -821,6 +823,7 @@ class MaruKVConnector(KVConnectorBase_V1):
                 extra_config=extra,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
+                cache_config=vllm_config.cache_config,
             )
 
     # ==================================
@@ -1536,6 +1539,7 @@ class MaruWorkerConnector:
         extra_config: dict[str, Any],
         num_kv_heads: int | None = None,
         head_size: int | None = None,
+        cache_config: Any = None,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -1546,6 +1550,10 @@ class MaruWorkerConnector:
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
         self._head_size = head_size
+        # Where vLLM 0.29+ records the KV cache layout it resolved; read in
+        # register_kv_caches into _cache_layout (see _vllm_kv_cache_layout).
+        self._cache_config = cache_config
+        self._cache_layout: str | None = None
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -4353,7 +4361,8 @@ class MaruWorkerConnector:
 
         The exact inverse of ``_extract_kv_from_layer``, branch for branch:
         - MLA: [num_blocks, block_size, ...]
-        - Triton: [num_blocks, num_kv_heads, block_size, head_dim]
+        - Legacy rank-4 Triton: [num_blocks, num_kv_heads, block_size,
+          head_dim], but never vLLM 0.29+'s logical page
         - Everything else: whatever axis order the backend chose, resolved at
           registration and canonicalized before the scatter.
         """
@@ -4371,13 +4380,14 @@ class MaruWorkerConnector:
         )
 
         if isinstance(layer_meta, MLACommonMetadata):
-            num_pages = dst_kv_cache.shape[0]
-            page_size = dst_kv_cache.shape[1]
-            flat = dst_kv_cache.reshape(num_pages * page_size, -1)
-            src = src_kv_data.reshape(slot_mapping.shape[0], -1)
-            flat[slot_mapping] = src
+            pages = _mla_pages(dst_kv_cache)
+            page_size = pages.shape[1]
+            src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
+            pages[slot_mapping // page_size, slot_mapping % page_size] = src
         elif (
-            isinstance(layer_meta, TritonAttentionMetadata) and dst_kv_cache.dim() == 4
+            isinstance(layer_meta, TritonAttentionMetadata)
+            and dst_kv_cache.dim() == 4
+            and not _is_logical_page_layout(self._cache_layout)
         ):
             # Legacy rank-4 Triton; rank-5 takes the layout branch (see
             # _extract_kv_from_layer). This reshape assumes dim 1 is the head
@@ -4444,13 +4454,20 @@ class MaruWorkerConnector:
         )
 
         if isinstance(layer_meta, MLACommonMetadata):
-            num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
-            flat = kv_layer.reshape(num_pages * page_size, -1)
-            return flat[slot_mapping]
-        elif isinstance(layer_meta, TritonAttentionMetadata) and kv_layer.dim() == 4:
+            pages = _mla_pages(kv_layer)
+            page_size = pages.shape[1]
+            gathered = pages[slot_mapping // page_size, slot_mapping % page_size]
+            return gathered.reshape(slot_mapping.shape[0], -1)
+        elif (
+            isinstance(layer_meta, TritonAttentionMetadata)
+            and kv_layer.dim() == 4
+            and not _is_logical_page_layout(self._cache_layout)
+        ):
             # Legacy rank-4 Triton (NB, NH, BS, HD). Rank-5 Triton is the
             # common (NB, 2, BS, NH, HS) and takes the layout branch, which
             # also keeps its slab bytes K/V-major like every other backend.
+            # So does vLLM 0.29+'s (NB, NH, BS, K|V) page: read through this
+            # branch its token-major rows would not match the chunk slab.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             return kv_layer[block_idxs, :, offsets]
@@ -4502,7 +4519,7 @@ class MaruWorkerConnector:
         return _detect_kv_layout(
             shape,
             self._block_size,
-            _vllm_kv_cache_layout(),
+            self._cache_layout,
             self._num_kv_heads,
             self._head_size,
         )
@@ -4525,7 +4542,7 @@ class MaruWorkerConnector:
         sample = next(iter(kv_caches.values()))
         if not hasattr(sample, "shape"):
             return None
-        kv_layout = _vllm_kv_cache_layout()
+        kv_layout = self._cache_layout = _vllm_kv_cache_layout(self._cache_config)
         layout = _detect_kv_layout(
             tuple(sample.shape),
             self._block_size,
@@ -4543,15 +4560,22 @@ class MaruWorkerConnector:
                 kv_layout,
             )
             return None
+        if layout.kv_axis is None:
+            kv = "fused"
+        elif layout.kv_packed:
+            kv = "split from the last dimension"
+        else:
+            kv = f"axis {layout.kv_axis}"
         logger.info(
             "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d "
-            "num_heads=%d head_size=%d",
-            layout.format_name,
+            "num_heads=%d head_size=%d K/V=%s",
+            layout.format_name or "per-layer",
             kv_layout,
             layout.num_blocks,
             layout.block_size,
             layout.num_heads,
             layout.head_size,
+            kv,
         )
         return layout
 

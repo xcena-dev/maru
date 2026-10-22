@@ -11,6 +11,7 @@ no connector state. The connector consumes the result; only
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -32,8 +33,9 @@ class KVLayout:
     cache layout: vLLM allocates with the NHD/HND permutation and then
     permutes straight back in ``gpu_model_runner``, so ``.shape`` is always
     the backend's ``get_kv_cache_shape()`` and HND changes only strides.
-    Indexing by shape is therefore stride-agnostic; only ``format_name``
-    needs NHD/HND.
+    vLLM 0.29+ goes further and hands every layer the same logical page
+    ``[B, H, N, C]`` whatever its physical order. Indexing by shape is
+    therefore stride-agnostic; only ``format_name`` needs the physical order.
 
     Attributes:
         num_blocks: Pages in the paged cache.
@@ -41,7 +43,8 @@ class KVLayout:
         num_heads: KV heads (post-GQA), or 1 when the head axis is flattened.
         head_size: Width of one head.
         kv_axis: Index of the K/V axis, or None when K and V share the last
-            dimension (cpu_attn, flash_attn_diffkv, turboquant, MLA).
+            dimension in a way that cannot be split (cpu_attn,
+            flash_attn_diffkv, turboquant, MLA).
         block_axis: Index of the ``num_blocks`` axis.
         token_axis: Index of the ``block_size`` axis.
         shape: The tensor shape this layout was detected from. A resolved
@@ -51,6 +54,10 @@ class KVLayout:
         format_name: ``maru_kv_ops.EngineKVFormat`` member, or None when
             this layout has no kernel form and must use per-layer transfers.
             Read only by the packed-kernel path, which walks memory itself.
+        kv_packed: True when K and V are the two halves of the last dimension,
+            K first, as in vLLM 0.29+'s ``[B, H, N, K|V]`` page. ``kv_axis``
+            then names that dimension, which ``_canonical_paged_view`` splits
+            into ``(2, head_size)``, so transfers see a real K/V axis.
     """
 
     num_blocks: int
@@ -62,6 +69,7 @@ class KVLayout:
     token_axis: int
     shape: tuple[int, ...]
     format_name: str | None
+    kv_packed: bool = False
 
     @property
     def page_buffer_size(self) -> int:
@@ -69,17 +77,68 @@ class KVLayout:
         return self.num_blocks * self.block_size
 
 
-def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
+def _is_logical_page_layout(kv_layout: str | None) -> bool:
+    """Whether ``kv_layout`` is a vLLM 0.29+ ``KVCacheLayout`` name.
+
+    vLLM 0.29 (RFC #42082) resolves one physical layout per model and gives
+    every layer a view with the logical shape ``[B, H, N, C]`` — blocks, KV
+    heads, tokens, content — in which the name changes only the strides.
+    Older vLLM reports "NHD" or "HND" and lets each backend pick its own
+    shape. Any other name is a member of the newer enum.
+    """
+    return kv_layout is not None and kv_layout not in ("NHD", "HND")
+
+
+def _kv_layout_candidates(
+    shape: tuple[int, ...], kv_layout: str | None, head_size: int | None = None
+) -> list[KVLayout]:
     """Every reading of ``shape`` that some vLLM attention backend produces.
 
     In descending priority, which settles only ties the cross-checks in
-    ``_detect_kv_layout`` could not. ``hnd`` picks ``format_name``, no axis.
+    ``_detect_kv_layout`` could not. ``kv_layout`` picks ``format_name``
+    (no kernel format unless it is "NHD" or "HND"), and a vLLM 0.29+ layout
+    name also fixes the rank-4 axis order; ``head_size`` decides whether that
+    page's content splits evenly into K and V.
     """
     rank = len(shape)
     out: list[KVLayout] = []
+    hnd = kv_layout == "HND"
+    # The kernel formats describe the per-backend shapes of vLLM < 0.29 in
+    # their NHD or HND memory order. Under any other layout name, or none,
+    # the physical order is not one the formats name, so hand the kernel
+    # nothing rather than misdescribe memory to it.
+    kernel_ok = kv_layout in ("NHD", "HND")
 
-    def add(kv, blk, tok, nh, hs, fmt=None):
-        out.append(KVLayout(shape[blk], shape[tok], nh, hs, kv, blk, tok, shape, fmt))
+    def add(kv, blk, tok, nh, hs, fmt=None, packed=False):
+        out.append(
+            KVLayout(
+                shape[blk],
+                shape[tok],
+                nh,
+                hs,
+                kv,
+                blk,
+                tok,
+                shape,
+                fmt if kernel_ok else None,
+                packed,
+            )
+        )
+
+    if _is_logical_page_layout(kv_layout) and rank == 4:
+        # vLLM 0.29+: (NB, NH, BS, C) for every attention backend, with K then
+        # V in C for dense attention. Splitting C exposes the K/V axis, so the
+        # slab holds the same K/V-major bytes as a rank-5 flash cache did.
+        # That needs C to be exactly two heads wide: diffkv's uneven split,
+        # packed quantized content, and MLA's single latent (no head_size is
+        # passed) keep the fused reading, whose halves are a storage
+        # convention. Both readings are stride-agnostic. Neither has a kernel
+        # format: the *_TWO_HS formats move whole token rows as one plane.
+        if head_size is not None and shape[3] == 2 * head_size:
+            add(3, 0, 2, shape[1], head_size, packed=True)
+        elif shape[3] % 2 == 0:
+            add(None, 0, 2, shape[1], shape[3] // 2)
+        return out
 
     if rank == 5:
         # (NB, 2, BS, NH, HS) — flash_attn, flashinfer, flex, triton, aiter.
@@ -124,7 +183,7 @@ def _kv_layout_candidates(shape: tuple[int, ...], hnd: bool) -> list[KVLayout]:
 def _detect_kv_layout(
     shape: tuple[int, ...],
     block_size: int,
-    kv_layout: str,
+    kv_layout: str | None,
     num_kv_heads: int | None = None,
     head_size: int | None = None,
 ) -> KVLayout | None:
@@ -138,23 +197,27 @@ def _detect_kv_layout(
     Args:
         shape: Shape of one layer's KV tensor.
         block_size: Tokens per page; must land on the token axis. Required.
-        kv_layout: "NHD" or "HND". Selects the kernel format only.
+        kv_layout: What :func:`_vllm_kv_cache_layout` returned: "NHD" or
+            "HND" select the kernel format, a vLLM 0.29+ layout name also
+            fixes the rank-4 axis order, and None means unknown, which keeps
+            every layout off the kernel.
         num_kv_heads: KV heads per rank, when known. Separates the two rank-4
             fused orders. Skip for MLA, which reports 1 either way.
         head_size: Width of one head. A tiebreak, not a requirement, since
-            triton_attn appends ``scale_pad`` to it.
+            triton_attn appends ``scale_pad`` to it — except that a vLLM 0.29+
+            page splits into K and V only when it is exactly two heads wide.
 
     Returns:
         The resolved layout, or None when no candidate survives. Callers keep
         their existing fallback in that case rather than guessing.
     """
     scored: list[tuple[int, int, KVLayout]] = []
-    for priority, cand in enumerate(_kv_layout_candidates(shape, kv_layout == "HND")):
+    for priority, cand in enumerate(_kv_layout_candidates(shape, kv_layout, head_size)):
         if cand.block_size != block_size:
             continue
         # Flattened candidates cannot see the head axis, so they skip the head
         # check — and must therefore lose to a fused candidate that passes it.
-        flattened = cand.kv_axis is not None and len(shape) == 4
+        flattened = cand.kv_axis is not None and len(shape) == 4 and not cand.kv_packed
         score = 0
         if num_kv_heads is not None and not flattened:
             if cand.num_heads != num_kv_heads:
@@ -172,8 +235,8 @@ def _detect_kv_layout(
         c
         for neg, _, c in scored[1:]
         if neg == scored[0][0]
-        and (c.kv_axis, c.block_axis, c.token_axis)
-        != (best.kv_axis, best.block_axis, best.token_axis)
+        and (c.kv_axis, c.block_axis, c.token_axis, c.kv_packed)
+        != (best.kv_axis, best.block_axis, best.token_axis, best.kv_packed)
     ]
     if rivals:
         # Genuinely ambiguous — the readings differ and every cross-check
@@ -195,28 +258,74 @@ def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
     Lets extract and inject share one indexing expression. Must stay a view:
     reshape copies when the cache is non-contiguous, which is what HND
     allocation produces, and an index-put would then land in the copy.
+    Splitting the last dimension of a packed layout is always a view.
     """
+    if layout.kv_packed:
+        t = t.unflatten(-1, (2, -1))
     if layout.kv_axis is None:
         return t.movedim((layout.block_axis, layout.token_axis), (0, 1))
     return t.movedim((layout.kv_axis, layout.block_axis, layout.token_axis), (0, 1, 2))
 
 
+def _mla_pages(t: torch.Tensor) -> torch.Tensor:
+    """View an MLA cache as ``[num_blocks, block_size, latent...]``.
+
+    vLLM 0.29+ registers MLA's logical page ``[B, 1, N, C]`` and binds each
+    layer to its squeeze, so the registered and the bound tensor differ by
+    the unit head axis. Callers index the result per slot instead of
+    reshaping it, which would copy a strided page and lose an index-put.
+    """
+    if t.dim() == 4 and t.shape[1] == 1:
+        return t.squeeze(1)
+    return t
+
+
 _kv_cache_layout_warned = False
 
 
-def _vllm_kv_cache_layout() -> str:
-    """Return vLLM's resolved cache layout, "NHD" or "HND".
+def _resolved_kv_cache_layout(cache_config: Any) -> str | None:
+    """The ``KVCacheLayout`` name vLLM 0.29+ resolved, or None before 0.29.
 
-    The physical memory order, which no tensor reports — it only matters for
-    picking the kernel format. Reading it asserts outside a
-    ``set_current_vllm_config`` context, and a silent "NHD" on an HND
-    deployment would misdescribe memory to the kernel, so warn once.
+    The engine core resolves the layout once and records it on every
+    worker's ``cache_config`` before the KV cache is allocated.
+
+    Raises:
+        ValueError: On vLLM 0.29+ when the layout is not resolved yet.
+    """
+    if cache_config is None:
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+        except ImportError:
+            return None
+        cache_config = getattr(get_current_vllm_config_or_none(), "cache_config", None)
+    if not hasattr(cache_config, "get_resolved_kv_cache_layout"):
+        return None
+    return cache_config.get_resolved_kv_cache_layout().name
+
+
+def _vllm_kv_cache_layout(cache_config: Any = None) -> str | None:
+    """Return vLLM's resolved KV cache layout, or None when it cannot be read.
+
+    vLLM 0.29+ resolves one ``KVCacheLayout`` per model and records its name
+    ("LBNHC", "LBHNC", ...) on ``cache_config.kv_cache_layout``; older vLLM
+    reports "NHD" or "HND" through ``get_kv_cache_layout``, which asserts
+    outside a ``set_current_vllm_config`` context. The physical memory order,
+    which no tensor reports, matters only to the packed kernel, so a layout
+    that cannot be read keeps the kernel off: assuming NHD would misdescribe
+    an HND cache to it. Warns once.
+
+    Args:
+        cache_config: The engine's ``CacheConfig``. Without it, the current
+            config context is read, which vLLM sets only around its own calls.
 
     Returns:
-        The layout, or vLLM's documented default when it cannot be read.
+        A vLLM 0.29+ layout name, "NHD" or "HND", or None.
     """
     global _kv_cache_layout_warned
     try:
+        layout = _resolved_kv_cache_layout(cache_config)
+        if layout is not None:
+            return layout
         from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
         return get_kv_cache_layout()
@@ -225,12 +334,12 @@ def _vllm_kv_cache_layout() -> str:
             _kv_cache_layout_warned = True
             logger.warning(
                 "MaruWorkerConnector: cannot read vLLM's KV cache layout "
-                "(%s: %s); assuming NHD. Packed-kernel transfers would be "
-                "wrong on an HND deployment.",
+                "(%s: %s); KV transfers use per-layer copies, not the "
+                "packed kernel.",
                 type(e).__name__,
                 e,
             )
-        return "NHD"
+        return None
 
 
 def _layout_fits(layout: KVLayout, shape: tuple[int, ...]) -> bool:
