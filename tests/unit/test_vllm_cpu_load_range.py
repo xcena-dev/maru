@@ -139,7 +139,8 @@ def test_real_scheduler_preserves_other_request_sharing_prefix(
     assert manager.allocate_slots(decoding, 17) is not None
     decoding.num_computed_tokens = 17
     manager.cache_blocks(decoding, 16)
-    blocks, hit = manager.get_computed_blocks(loading)
+    # Newer vLLM appends a shared-prefix boundary to the returned pair.
+    blocks, hit = manager.get_computed_blocks(loading)[:2]
     assert hit == 4
     assert (
         manager.allocate_slots(

@@ -4492,7 +4492,8 @@ class TestDeferredAdmissionFitsCache:
             tmp_path, 4, 8, {"maru_async_load": True}, speculative_method="ngram"
         )
         chunks = {200: 12, 52: 6}
-        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        sched = engine.connector._scheduler
+        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
         requests = [
             Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
             for name, count in (("big", 200), ("small", 52))
@@ -4500,7 +4501,15 @@ class TestDeferredAdmissionFitsCache:
         for request in requests:
             engine.add_request(request)
         engine.schedule()
-        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
+        # Without lookahead slots both prompts fit (50 + 13 of 63 blocks), so
+        # Maru holds neither back. Whether small parks too is vLLM's call:
+        # 0.31+ reserves every speculative method's draft slots for a parked
+        # load itself (Scheduler._spec_decode_step_blocks), older vLLM none.
+        assert sched._num_lookahead_tokens == 0
+        assert not sched._admission_waiters
+        assert requests[0].status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        if not hasattr(engine, "_spec_decode_step_blocks"):
+            assert requests[1].status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
     @pytest.mark.parametrize("method", ["draft_model", "eagle"])
     def test_model_limit_does_not_overreserve_speculative_loads(self, tmp_path, method):
@@ -4517,7 +4526,8 @@ class TestDeferredAdmissionFitsCache:
             max_model_len=200,
         )
         chunks = {199: 12, 52: 4}
-        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        sched = engine.connector._scheduler
+        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
         requests = [
             Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
             for name, count in (("big", 199), ("small", 52))
@@ -4526,9 +4536,20 @@ class TestDeferredAdmissionFitsCache:
             engine.add_request(request)
         engine.schedule()
         # The model's 200-token limit caps big at 50 blocks. With small's
-        # 17 blocks including lookahead, both fit the 67 usable blocks.
-        assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in requests)
-        self._finish_loads(engine, [r.request_id for r in requests])
+        # 17 blocks including lookahead, both fit the 67 usable blocks, so
+        # Maru admits both. vLLM 0.31+ also reserves big's draft slots
+        # itself and may hold small back on its own account.
+        assert sched._parked_blocks.get("big") == 50
+        assert not sched._admission_waiters
+        assert requests[0].status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        if not hasattr(engine, "_spec_decode_step_blocks"):
+            assert requests[1].status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        parked = [
+            r.request_id
+            for r in requests
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        self._finish_loads(engine, parked)
         assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
 
     def test_upstream_reservation_allows_overlapping_loads(self, tmp_path):
