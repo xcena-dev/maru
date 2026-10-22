@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 pytest.importorskip("torch", reason="torch not installed")
+pytest.importorskip("vllm", reason="vllm not installed")
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
