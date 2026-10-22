@@ -432,7 +432,10 @@ Controls how many tokens per chunk when storing KV cache:
 
 ### maru_pool_size
 
-CXL memory allocated per instance. Capacity estimation:
+CXL memory allocated per worker process. Under tensor parallelism every TP
+rank allocates its own pool and stores only its own KV heads, so
+`num_kv_heads` below is the rank's share: the model's KV heads divided by the
+TP size, and at least 1. Capacity estimation:
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -442,6 +445,55 @@ Example (Llama 7B, fp16):
 ```
 32 layers × 128 head_dim × 32 heads × 2(K+V) × 4096 tokens × 2 bytes ≈ 2GB
 ```
+
+### Tensor parallelism
+
+The CXL backend runs at any tensor-parallel size. vLLM starts one connector
+per TP worker, and each worker stores and loads only the KV it holds. Its
+chunk keys name that slice by the KV heads it covers:
+
+| A worker holds | Chunk key | Example |
+|---|---|---|
+| Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
+| KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
+
+The layerwise format appends its `_L<layer>` and `_DONE` suffixes after this
+one.
+
+The scheduler reports a chunk as cached only when every slice of it is
+stored, so no rank is ever asked to load a slice that is missing. The ranks
+do not talk to each other: vLLM sends every worker the same metadata, treats
+a load or store as finished only once every worker reports it, and
+recomputes from the first block that any worker reports as failed.
+
+Ranks that hold identical KV share one slice name: the MLA latent, and the
+heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
+at TP=8 put each head on two ranks). The first rank of each such group stores
+the slice and the others only load it.
+
+Because keys name heads rather than ranks, engines of different TP sizes
+share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
+TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
+slice is never read as a different set of heads.
+
+Each worker process connects its own MaruHandler:
+
+- `maru_pool_size` applies to each TP rank. A rank stores 1/TP of every
+  chunk, so ranks with `P / TP` each hold as many tokens as a single TP=1
+  worker with `P`.
+- A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
+  sees each rank as its own owner. Leaving it unset already gives every
+  process its own UUID.
+
+Under vLLM's default `kv_load_failure_policy="fail"`, a load failure on any
+rank fails the whole request. Set the policy to `"recompute"` to recompute it
+from the first failed block instead.
+
+Pipeline parallelism and decode or prefill context parallelism are refused at
+startup. The key format reserves `_l<a>-<b>` for the decoder-layer range of a
+pipeline stage; supporting PP still requires each stage to address its layers
+locally in the slab and the placement kernel, which index them globally
+today. The CPU and mixed backends still require TP=1.
 
 ## Comparison with LMCache Path
 
