@@ -449,8 +449,14 @@ Example (Llama 7B, fp16):
 ### Tensor parallelism
 
 The CXL backend runs at any tensor-parallel size. vLLM starts one connector
-per TP worker, and each worker stores and loads only the KV it holds. Its
-chunk keys name that slice by the KV heads it covers:
+per TP worker, and each worker stores and loads only the KV it holds. Every
+rank hashes a prompt to the same chunk keys, so a key must also name the
+slice: if all ranks registered their heads under one key, the server would
+keep the first and every other rank would load heads that are not its own.
+
+![Two TP ranks with one key per chunk: the server keeps rank 0's heads and rank 1 loads them without an error. With one key per slice, each rank loads its own heads](../image/tp_key_per_slice.png)
+
+Chunk keys therefore name a slice by the KV heads it covers:
 
 | A worker holds | Chunk key | Example |
 |---|---|---|
@@ -459,12 +465,6 @@ chunk keys name that slice by the KV heads it covers:
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after this
 one.
-
-The scheduler reports a chunk as cached only when every slice of it is
-stored, so no rank is ever asked to load a slice that is missing. The ranks
-do not talk to each other: vLLM sends every worker the same metadata, treats
-a load or store as finished only once every worker reports it, and
-recomputes from the first block that any worker reports as failed.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
 heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
@@ -475,6 +475,21 @@ Because keys name heads rather than ranks, engines of different TP sizes
 share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
 TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
 slice is never read as a different set of heads.
+
+![How a chunk's KV splits into slices for Llama-3.1-8B at TP=1, 2 and 8, Qwen2.5-7B at TP=8 where each KV head is on two ranks, and an MLA model at TP=8 where every rank holds the same latent; for each, which ranks store a slice and which only load it](../image/tp_slices_by_layout.png)
+
+The scheduler reports a chunk as cached only when every slice of it is
+stored, so no rank is ever asked to load a slice that is missing. It has no
+rank of its own, but it knows the TP size and the model's KV heads, so it
+lists every slice itself and checks all of them in one `batch_exists`.
+
+![With TP=2 and rank 1's slice of chunk 1 missing, the hit ends after chunk 0, although chunks 2 and 3 are complete](../image/tp_hit_rule.png)
+
+The ranks do not talk to each other. vLLM sends every worker the same
+metadata, treats a load or store as finished only once every worker reports
+it, and recomputes from the first block that any worker reports as failed.
+
+![The scheduler sends the same metadata to every rank; each rank stores and loads its own slice through its own MaruHandler; vLLM combines the ranks' reports](../image/tp_rank_reports.png)
 
 Each worker process connects its own MaruHandler:
 
@@ -494,6 +509,8 @@ startup. The key format reserves `_l<a>-<b>` for the decoder-layer range of a
 pipeline stage; supporting PP still requires each stage to address its layers
 locally in the slab and the placement kernel, which index them globally
 today. The CPU and mixed backends still require TP=1.
+
+![Key format: kv_<h> for a slice holding every KV head, kv_<h>_h<a>-<b> under TP, and the reserved kv_<h>_h<a>-<b>_l<c>-<d> for a pipeline stage](../image/tp_key_format.png)
 
 ## Comparison with LMCache Path
 
