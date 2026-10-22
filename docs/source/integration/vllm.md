@@ -6,6 +6,16 @@
 
 **Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
+**vLLM v0.29+** resolves one KV cache layout per model in the engine core
+(`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC`
+and `LBHNC`) and hands every layer the logical page
+`[blocks, KV heads, tokens, K|V]`, whatever the physical order. Maru reads the
+resolved layout from the engine and splits each head's row into its K and V
+halves, so for dense attention a chunk object holds the same K/V-major bytes as
+a rank-5 cache of vLLM v0.25 and earlier, and the CPU and mixed backends accept
+these pages. The packed placement kernels have no format for them, so chunk
+transfers use per-layer copies on these versions. Tested with v0.32.
+
 ```bash
 uv pip install vllm
 ```
@@ -302,6 +312,8 @@ would not all fit at once. With speculative lookahead (for example, draft-model
 or EAGLE decoding), Maru retains its budget: the upstream reservation counts
 prompt tails but can leave too little room for the oldest request's lookahead.
 Methods without lookahead slots, such as ngram, use the ordinary version rule.
+vLLM 0.31+ reserves the draft slots of every speculative method itself, so a
+load Maru admits can still wait for vLLM's own reservation.
 
 This budget counts GPU blocks; `maru_load_admission_window` below counts loads
 in flight.
