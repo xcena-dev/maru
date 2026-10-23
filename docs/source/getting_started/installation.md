@@ -89,6 +89,25 @@ readable only by the users that run them; they read
 [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 walks through a deployment.
 
+The installer checks for NIXL, not for an RDMA NIC, when selecting this service.
+It enables the unit without starting it immediately. Starting the Resource
+Manager later also starts the agent; with the default empty NIC and listen
+address, the agent fails to start until its RDMA interface is configured. The
+unit stops retrying after five failed starts in a minute. This agent failure
+does not stop the Resource Manager.
+
+A memory node used only for the local `cxl` backend does not need the agent.
+Without NIXL the installer skips its service. If NIXL is installed for another
+purpose on such a node, disable only the unused agent:
+
+```bash
+sudo systemctl disable --now maru-remote-cxl-agent.service
+```
+
+Reinstalling with NIXL enables the unit again. `./install.sh --no-rm` skips both
+platform services, so it is the worker-node installation path rather than a
+way to keep the Resource Manager without its agent on a memory node.
+
 <br/>
 
 ### 1.3 KV Placement Kernels (vLLM connector)

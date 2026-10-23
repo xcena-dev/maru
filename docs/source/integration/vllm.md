@@ -302,6 +302,30 @@ for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install 
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 for one-host and multi-node launch steps.
 
+#### Transfer errors and worker recovery
+
+A timeout or a native NIXL status-query error does not establish that the NIC
+has stopped accessing memory. Maru keeps the affected transfer handle and its
+staging slots registered until completion and handle release are confirmed.
+Other peers' completed or unposted READ slots are returned. Failed stores are
+not published, and failed loads follow the configured recompute policy.
+
+Persistent native errors can retain those slots for the lifetime of the worker.
+Repeated errors can exhaust its staging capacity, causing stores to be skipped
+and loads to miss. Look for `RDMA READ not confirmed`, `RDMA WRITE not confirmed`
+and `RDMA transfers still own staging memory` in the worker log. Closing or
+reconnecting the Handler alone may leave the registered memory retained.
+
+To recover capacity, stop and restart the entire vLLM engine that owns the
+affected worker. Confirm that its old worker processes have exited before
+starting replacements; terminating only the HTTP frontend is insufficient if
+the workers remain alive. The replacement creates a fresh NIXL agent and staging
+buffer. Retired regions can become cold misses, so allow recomputation and cache
+warm-up. Restarting only the memory-node agent does not establish that a live
+worker's uncertain transfers have been reclaimed. Do not force-return their
+slots or drop live RM holds to recover capacity. Safe automatic reclamation
+inside a running worker remains follow-up work.
+
 #### Several memory nodes and pools
 
 **Shared pool.** Several memory nodes can share one CXL memory, as hosts on a
