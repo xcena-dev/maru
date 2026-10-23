@@ -2,7 +2,8 @@
 
 ## MaruConfig
 
-Client-side configuration dataclass.
+Selected fields of the client-side configuration dataclass. The complete
+definition is `maru_common.config.MaruConfig`; behavior depends on the backend.
 
 ```python
 from maru import MaruConfig
@@ -36,9 +37,9 @@ class MaruConfig:
 | --- | --- | --- | --- |
 | `server_url` | `str` | `"tcp://localhost:5555"` | ZeroMQ endpoint of MaruServer. With `storage_backend="remote_cxl"`, a comma-separated list of endpoints, one maru-server per pool |
 | `instance_id` | `str \| None` | `None` (auto-generated UUID) | Unique client identifier |
-| `pool_size` | `int` | `104_857_600` (100MB) | Initial memory pool size to request (bytes) |
+| `pool_size` | `int` | `104_857_600` (100MB) | Region size for `cxl`/`remote_cxl`; storage-session private-pool settings have different capacity rules (see the memory model) |
 | `chunk_size_bytes` | `int` | `1_048_576` (1MB) | Page size for paged allocation (bytes) |
-| `auto_connect` | `bool` | `True` | Connect automatically on `MaruHandler.__init__` |
+| `auto_connect` | `bool` | `True` | Connect on context-manager entry; construction alone does not connect |
 | `timeout_ms` | `int` | `2000` | RPC socket timeout in milliseconds |
 | `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
 | `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
@@ -47,7 +48,7 @@ class MaruConfig:
 | `engine_id` | `str \| None` | `None` | Engine identity of a storage session; required for `cpu`, `mixed` and `remote_cxl` |
 | `cache_namespace` | `str \| None` | `None` | Namespace whose keys a storage session shares; required for `cpu`, `mixed` and `remote_cxl` |
 | `rdma_device` | `str` | `""` (UCX default) | `remote_cxl` only: RDMA NIC for NIXL/UCX, e.g. `"mlx5_0:1"` |
-| `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` only: host staging buffer registered with the NIC and CUDA (bytes); `None` uses the larger of 64 pages and 1 GiB |
+| `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` host staging budget in bytes; `None` uses the larger of 64 pages and 1 GiB. Separate from the CXL region budget |
 | `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
 | `rdma_load_reserve` | `float` | `0.0` | `remote_cxl` only: share of staging slots, in `[0, 1)`, that stores leave free for loads; set when loads and stores run on separate threads |
 | `remote_cxl_agent_key_file` | `str` | `"~/.maru/remote-cxl-agent.key"` | `remote_cxl` only: copy of the memory nodes' remote CXL agent key, readable by the worker's user only |
@@ -162,7 +163,7 @@ apply to that backend only:
 | --- | --- | --- | --- |
 | `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
 | `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
-| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
+| `maru_cache_namespace` | `str` | required | Must identify the exact immutable weights revision. Sharing also requires compatible schema/layout and the same pool; model shape alone is insufficient |
 | `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
 | `maru_remote_cxl_agent_key_file` | `str` | `~/.maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |

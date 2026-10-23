@@ -1,6 +1,6 @@
 # Dynamo Examples
 
-Run Dynamo's vLLM backend with Maru to share KV cache between workers.
+Run Dynamo's vLLM backend with Maru's directly mapped `cxl` backend to share KV between workers.
 The scripts live in `examples/dynamo/single_node/`.
 
 ## Prerequisites

@@ -4,6 +4,12 @@
 
 **vLLM v0.14+** — required for `KVConnectorBase_V1` support.
 
+This is an interface minimum, not validation of every version, model and
+backend combination. Check the selected backend's restrictions below. The
+remote CXL example has its own validated engine/Torch/CUDA/NIXL constraints;
+see {ref}`nixl-stack`. CPU/mixed pools, shared CXL and RDMA paths have different
+sharing and transfer contracts.
+
 **Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
 **vLLM v0.29+** resolves one KV cache layout per model in the engine core
@@ -41,18 +47,18 @@ flowchart LR
     subgraph direct["Direct (this connector)"]
         direction TB
         V2["vLLM"] --> MKV["MaruKVConnector"]
-        MKV --> MH2["MaruHandler"] --> CXL2["CXL"]
+        MKV --> MH2["MaruHandler"] --> PATH2["Selected storage path<br/>cxl: mapped CXL<br/>remote_cxl: CPU staging + RDMA"]
     end
 
     prev --> direct
 ```
 
-By removing the LMCache middleware layer, the direct connector achieves:
+The direct connector supports the following integration and data paths:
 
 - **Fewer dependencies** — only vLLM + Maru (the `remote_cxl` backend also needs NIXL)
-- **Zero-copy save path** (default `cxl` backend) — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
-- **Zero-copy load path** (default `cxl` backend) — CXL mmap (CUDA pinned) → GPU via DMA
-- **No serialization overhead** — raw tensor bytes, no `MemoryObj` conversion
+- **Mapped CXL transfers** (`cxl` backend) — GPU ↔ mapped CXL copies. CUDA registration, cache layout and the available placement kernels determine the copy or fallback path; GPU bytes still move.
+- **RDMA transfers** (`remote_cxl` backend) — GPU ↔ worker CPU DRAM staging copies, then staging ↔ memory-node CXL transfers over one-sided RDMA. This path needs a host staging buffer.
+- **Raw KV payloads** — no `MemoryObj` conversion in this connector; metadata RPC still serializes control information
 
 ### Component Roles
 
@@ -63,9 +69,11 @@ MaruKVConnector implements vLLM's `KVConnectorBase_V1` interface with a dual-rol
 | **SCHEDULER** | `MaruSchedulerConnector` | Checks chunk-by-chunk which prefix is cached; builds metadata for worker |
 | **WORKER** | `MaruWorkerConnector` | Performs actual GPU ↔ CXL data transfers per chunk per layer |
 
-Both roles share the same `MaruHandler` connection to CXL shared memory.
+The scheduler uses a metadata-only Handler; the worker's Handler owns the payload path for the selected backend.
 
 ## Data Path
+
+The following store/load sequences illustrate the default `cxl` backend. See "CXL on memory nodes over RDMA" below for `remote_cxl` and its staging buffer.
 
 ### Store Path (GPU → CXL)
 
@@ -83,7 +91,7 @@ sequenceDiagram
     loop For each chunk (256 tokens)
         MKV->>MH: alloc(nbytes)
         MH-->>MKV: handle (CXL page)
-        MKV->>CXL: dst.copy_(gpu_tensor) — single cudaMemcpy
+        MKV->>CXL: GPU to mapped CXL copy
         MKV->>MH: store(key, handle=handle) — register only, no memcpy
         MH->>MS: register_kv(key, region_id, offset, length)
     end
@@ -247,7 +255,38 @@ immutable-weights `maru_cache_namespace`,
 default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
 worker's RDMA NIC, e.g. `mlx5_0:1`).
 
-![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
+The region mapping and reclamation sequence is shown below. A normal worker
+close can hand registered regions to MaruServer's keeper; it does not always
+free them. Repeated reads and stores reuse the established mapping.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker Handler
+    participant S as MaruServer
+    participant R as Resource Manager
+    participant A as Memory-node agent
+    W->>S: open session / expand
+    S->>R: ALLOC region
+    R-->>S: owner handle
+    S-->>W: region handle
+    W->>A: map(handle)
+    A->>R: HOLD(handle, agent generation)
+    R-->>A: device range + retained allocation
+    A->>A: mmap + NIC registration
+    A-->>W: RDMA address + remote key
+    Note over W,A: Payload: GPU ↔ worker CPU staging ↔ RDMA ↔ CXL
+    Note over S,A: Later: region selected for reclamation
+    S->>A: release(owner handle)
+    A->>A: NIC deregistration
+    A->>R: UNHOLD
+    A-->>S: released
+    S->>R: FREE
+    Note over S,R: RM also defers reuse while a HOLD remains
+```
+
+Keeper reclamation can invalidate outstanding server read leases rather than
+wait for readers. A failed READ or final lease check must become a cache miss;
+the connector must not restore those bytes to the GPU.
 
 Resources flow as for the cxl backend: the resource manager gives regions to
 maru-server and maru-server gives them to the worker, one region when its
@@ -296,9 +335,12 @@ waiting on no lock and no network; the thread that sends the store gives each
 chunk its remote page, and a background thread asks for a new region or
 evicts before the free pages run out, so that thread rarely waits. RDMA
 transfers run outside the client's lock. The worker's staging buffer is
-registered with CUDA,
-so the copy kernel moves KV between the GPU and the staging buffer as it does
-for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install nixl` without uv).
+registered with CUDA when supported. A built placement extension, a supported
+layout and suitable buffers are all needed for the packed copy path; otherwise
+transfers fall back to per-layer copies. Async settings do not make an
+unsupported layout use the packed kernel. NIXL is required; use the
+{ref}`matched NIXL stack <nixl-stack>` rather than selecting its version in
+isolation from the engine and Torch.
 See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
 for one-host and multi-node launch steps.
 

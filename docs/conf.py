@@ -66,6 +66,9 @@ source_suffix = {
 exclude_patterns = ["_build"]
 myst_enable_extensions = ["colon_fence", "deflist"]
 myst_fence_as_directive = ["mermaid"]
+myst_heading_anchors = 3
+# Preserve aspect ratio instead of shrinking tall sequences into 500px.
+mermaid_height = "auto"
 
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
