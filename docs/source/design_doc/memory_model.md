@@ -118,6 +118,10 @@ staging, whose own read lease still owns the slot. Uncertain native transfers
 can retain staging after Handler close. See the recovery boundary in the
 {doc}`vLLM guide <../integration/vllm>`.
 
+Server leases are revocable when a region is invalidated or reclaimed by the
+keeper. A completed READ is not enough: if the final directory check says the
+lease was lost, discard the staged result and report a miss.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Owned

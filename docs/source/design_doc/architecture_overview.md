@@ -253,7 +253,7 @@ sequenceDiagram
     A->>A: mmap + NIC registration
     A-->>W: RDMA address + remote key
     Note over W,A: Payload: GPU ↔ worker CPU staging ↔ RDMA ↔ CXL
-    Note over S,A: Later: reclaim after readers / keeper are done
+    Note over S,A: Later: region selected for reclamation
     S->>A: release(owner handle)
     A->>A: NIC deregistration
     A->>R: UNHOLD
@@ -261,6 +261,10 @@ sequenceDiagram
     S->>R: FREE
     Note over S,R: RM also defers reuse while a HOLD remains
 ```
+
+Keeper reclamation can invalidate outstanding server read leases rather than
+wait for readers. A failed READ or final lease check must become a cache miss;
+the connector must not restore those bytes to the GPU.
 
 How the properties above carry over:
 
