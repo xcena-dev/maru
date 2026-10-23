@@ -47,11 +47,11 @@ flowchart LR
     prev --> direct
 ```
 
-By removing the LMCache middleware layer, the direct connector achieves:
+The direct connector supports the following integration and data paths:
 
 - **Fewer dependencies** — only vLLM + Maru (the `remote_cxl` backend also needs NIXL)
-- **Zero-copy save path** (default `cxl` backend) — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
-- **Zero-copy load path** (default `cxl` backend) — CXL mmap (CUDA pinned) → GPU via DMA
+- **Mapped CXL transfers** (`cxl` backend) — GPU ↔ mapped CXL copies. CUDA registration, cache layout and the available placement kernels determine the copy or fallback path; GPU bytes still move.
+- **RDMA transfers** (`remote_cxl` backend) — GPU ↔ worker CPU DRAM staging copies, then staging ↔ memory-node CXL transfers over one-sided RDMA. This path needs a host staging buffer.
 - **No serialization overhead** — raw tensor bytes, no `MemoryObj` conversion
 
 ### Component Roles
@@ -63,9 +63,11 @@ MaruKVConnector implements vLLM's `KVConnectorBase_V1` interface with a dual-rol
 | **SCHEDULER** | `MaruSchedulerConnector` | Checks chunk-by-chunk which prefix is cached; builds metadata for worker |
 | **WORKER** | `MaruWorkerConnector` | Performs actual GPU ↔ CXL data transfers per chunk per layer |
 
-Both roles share the same `MaruHandler` connection to CXL shared memory.
+The scheduler uses a metadata-only Handler; the worker's Handler owns the payload path for the selected backend.
 
 ## Data Path
+
+The following store/load sequences illustrate the default `cxl` backend. See "CXL on memory nodes over RDMA" below for `remote_cxl` and its staging buffer.
 
 ### Store Path (GPU → CXL)
 
@@ -83,7 +85,7 @@ sequenceDiagram
     loop For each chunk (256 tokens)
         MKV->>MH: alloc(nbytes)
         MH-->>MKV: handle (CXL page)
-        MKV->>CXL: dst.copy_(gpu_tensor) — single cudaMemcpy
+        MKV->>CXL: GPU to mapped CXL copy
         MKV->>MH: store(key, handle=handle) — register only, no memcpy
         MH->>MS: register_kv(key, region_id, offset, length)
     end

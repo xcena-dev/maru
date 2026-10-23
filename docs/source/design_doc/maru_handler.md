@@ -5,7 +5,7 @@ The `MaruHandler` is the client-side library that applications (e.g., LMCache/vL
 1. **KV cache client** — provides `store`/`retrieve`/`exists`/`delete` APIs.
 2. **Memory manager** — owns CXL memory regions, manages paged allocation within them, and auto-expands when space runs out.
 
-Data flows directly between the handler and CXL shared memory via memory-mapped regions — neither the MaruServer nor the resource manager is involved in the data path.
+With the `cxl` backend, the Handler accesses memory-mapped CXL regions. With `remote_cxl`, it moves KV between worker-side CPU staging and memory-node CXL over RDMA. Neither path relays payload bytes through MaruServer or the Resource Manager. Sections 1–4 below describe `cxl`; section 5 describes the additional components and buffer lifetimes of `remote_cxl`.
 
 ## 1. Component Hierarchy
 
@@ -172,7 +172,7 @@ sequenceDiagram
     end
     ORM-->>H: (region, page)
     H->>DM: Get writable buffer view
-    H->>CXL: Write data (zero-copy)
+    H->>CXL: Write payload into mapped region
     H->>CP: Register key → location
     CP-->>H: OK
     H-->>C: success
@@ -197,7 +197,7 @@ sequenceDiagram
         H->>DM: Map shared region
     end
     H->>DM: Get buffer view
-    H->>CXL: Direct read (zero-copy)
+    H->>CXL: View mapped payload
     H-->>C: data
 ```
 

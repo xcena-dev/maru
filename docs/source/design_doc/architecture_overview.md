@@ -1,10 +1,12 @@
 # Architecture Overview
 
-Maru manages KV cache data in CXL shared memory, enabling cross-instance sharing across multiple nodes. Nodes attached to the CXL memory share it without data transfer; nodes without CXL reach it over RDMA (see Remote CXL below).
+Maru manages shared KV storage with two access paths. CXL-attached nodes map the pool directly with `cxl`, while nodes without CXL read and write a memory node's pool over RDMA with `remote_cxl`. GPU transfers copy bytes in both cases.
 
 ---
 
 ## System Architecture
+
+The diagram below shows the `cxl` backend and its control plane alternatives. The `remote_cxl` backend uses worker-side staging and a memory-node agent, as the Remote CXL section describes.
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -67,7 +69,7 @@ flowchart TB
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — on nodes attached to CXL, direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode. Nodes without CXL move KV over RDMA, as Remote CXL below describes.
+> **Data Plane** (solid arrows) — direct access to mapped CXL memory with `cxl`. GPU transfers still copy bytes. The control plane alternatives in this diagram share that data path; `remote_cxl` uses a different payload path.
 
 The system has three layers:
 
@@ -81,7 +83,7 @@ The system has three layers:
 
 ## Key Design Properties
 
-**Zero-copy data path.** Clients on nodes attached to CXL access KV data directly in shared memory — no server process ever touches the data path (dashed arrows in the diagram). The only traffic on the control plane is lightweight metadata; between those nodes, the data itself never moves. This strict control/data plane separation means data-path performance is bounded by memory bandwidth, not by software overhead. Clients on nodes without CXL keep the same separation: their NIC moves KV with one-sided RDMA and no Maru process is on that path, with one copy added between the GPU and a host staging buffer (see Remote CXL below).
+**Payload bypasses the metadata server.** With `cxl`, a CPU reader can view a mapped KV object without an additional host copy. This avoids sending that payload between compute nodes over an RDMA or IP network, but CPU writes and GPU ↔ CXL transfers still move bytes. With `remote_cxl`, a worker copies KV between GPU memory and CPU DRAM staging, and its NIC transfers the bytes between staging and the memory node's CXL. MaruServer and the remote CXL agent do not relay the payload. Mapping, registration, metadata RPC, copies and transfer scheduling still consume time; the control/data plane split alone does not establish a latency, scaling or energy advantage.
 
 **Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
 
@@ -122,11 +124,13 @@ flowchart LR
 
 **Pluggable control plane.** The control plane is isolated behind a stable interface, so its implementation can change without affecting the data path. Remote mode (current) uses a centralized MaruServer + MaruResourceManager. Shared Filesystem mode (in development) replaces both with MaruFs, enforcing memory access control at the kernel level for stronger security than user-space RPC.
 
-**Capability-based memory access.** Clients never open shared memory devices directly. The Resource Manager acts as a capability broker, issuing authorized handles that grant access to specific memory regions (the Memory layer in the diagram). This confines hardware access to a single trusted process and decouples clients from the underlying memory technology.
+**Region handles.** The Resource Manager issues handles for allocated regions. With `cxl`, the Handler checks a handle and opens the DAX device to map that region on its own node. With `remote_cxl`, the memory node's agent performs the mapping and NIC registration; the worker uses the returned RDMA access information. The worker therefore needs no local DAX device for that backend.
 
 ---
 
 ## Data Flow
+
+These sequences describe the directly mapped `cxl` backend. The Remote CXL section below describes the additional staging, RDMA completion and lease lifetimes of `remote_cxl`.
 
 ### Store
 
@@ -139,7 +143,7 @@ sequenceDiagram
 
     C->>H: store(key, data)
     H->>H: allocate page from owned region
-    H->>CXL: write data directly (zero-copy)
+    H->>CXL: write payload into mapped region
     H->>CP: register key → location
     CP-->>H: OK
     H-->>C: success
@@ -160,7 +164,7 @@ sequenceDiagram
     H->>CP: lookup key
     CP-->>H: location (region, offset, length)
     H->>H: map region if not yet mapped
-    H->>CXL: direct read (zero-copy)
+    H->>CXL: view mapped payload
     H-->>C: data
 ```
 

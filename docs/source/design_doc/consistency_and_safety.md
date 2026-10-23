@@ -4,6 +4,8 @@
 
 ## 1. Data Visibility
 
+The sequence and CPU cache-flush steps below describe directly mapped `cxl` memory. With `remote_cxl`, the caller first fills worker-side staging, and the storage client completes the RDMA WRITE into the remote region before publishing its key. Writing staging alone does not make the remote payload visible. See the {doc}`remote CXL Handler design <maru_handler>` for its transfer and lease lifetimes.
+
 Maru publishes an object's location after the writer finishes writing its
 payload. Once `store()` returns successfully, other instances can look up that
 location through the metadata server.

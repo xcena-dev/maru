@@ -12,9 +12,12 @@ backend. HiCache organizes KV cache in three tiers:
 | **L3** | **CXL Shared Memory** | **Maru** |
 
 When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3.
-On cache hit, pages flow back up.  Because Maru's L3 is shared memory, **all
-SGLang instances on the same node can read each other's KV cache** — enabling
-P2P sharing without network transfer.
+On cache hit, pages flow back up. In this guide the Maru adapter uses the
+directly mapped `cxl` backend, so SGLang instances on the same node can reuse
+the shared L3 without a P2P network payload transfer. Cache hits still copy
+bytes from CXL to host DRAM and then to GPU memory. This configuration does
+not select the `remote_cxl` backend; see the {doc}`vLLM guide <vllm>` for that
+backend's staging and RDMA path.
 
 ## Prerequisites
 

@@ -4,7 +4,9 @@
 
 ## Motivation
 
-Maru's architecture separates the **data plane** (direct zero-copy access to CXL shared memory) from the **control plane** (KV metadata registry and region lifecycle management). The control plane is pluggable — its implementation can change without affecting how data is read or written.
+This page describes the directly mapped `cxl` data plane and its proposed filesystem control plane. Here **Remote mode** means metadata RPC to MaruServer/Resource Manager; it does not mean the `remote_cxl` storage backend, whose payload path includes CPU staging and RDMA.
+
+For `cxl`, Maru separates direct access to mapped CXL memory from KV metadata and region lifecycle management. A CPU consumer can view mapped bytes without another host copy, while GPU transfers still copy bytes. The filesystem proposal changes the control plane for that directly mapped path.
 
 The first control plane implementation, **Remote mode**, uses a centralized MaruServer and Maru Resource Manager communicating over RPC:
 
@@ -105,7 +107,7 @@ sequenceDiagram
     H->>ORM: allocate()
     ORM-->>H: (region_name, page_index)
 
-    Note over H,CXL: Step 1 — Write to CXL (zero-copy, same as Remote mode)
+    Note over H,CXL: Step 1 — Write into mapped CXL (same as RPC control mode)
     H->>XM: get_buffer_view(region_name, offset, size)
     XM-->>H: memoryview slice
     H->>CXL: buf[:] = data
@@ -147,7 +149,7 @@ sequenceDiagram
     XM->>XC: open_region(name, readonly=True)
     XM->>XC: mmap_region(fd, size)
 
-    Note over H,CXL: Step 4 — Read from CXL (zero-copy, same as Remote mode)
+    Note over H,CXL: Step 4 — View mapped CXL (same as RPC control mode)
     H->>XM: get_buffer_view(region_name, offset, size)
     XM-->>H: memoryview
     H-->>C: MemoryInfo(view)
