@@ -65,7 +65,8 @@ class FakePolicy:
         self.held = set()
         self.calls = []
 
-    def read(self, channel, ranges, transfer):
+    def read(self, channel, ranges, transfer, request_id=""):
+        self.read_requests = [*getattr(self, "read_requests", []), request_id]
         if "read" in self.fail:
             raise RuntimeError("policy refused")
         assert channel.request("plan", ranges)["seen"] == len(ranges)

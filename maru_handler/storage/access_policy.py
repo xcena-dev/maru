@@ -18,6 +18,12 @@ What Maru owns and what the policy owns:
 - The policy decides *when* the bytes of a read move (it calls the transfer
   Maru hands it, in order), whether a page may be written now, and whether a
   page given back may be reused yet.
+- A policy may also take read hints (optional hooks ``read_hint`` and
+  ``read_hint_end``, see :class:`ReadHintHooks`): the engine knows which
+  keys a request will load well before the load starts, and the backend
+  tells the policy where those bytes are, so slow media can be read ahead
+  while the request waits. Hints run in the process that gives them (a
+  serving engine's scheduler), off its threads.
 - The policy talks to its own counterpart next to the memory through
   :class:`AccessChannel`. Maru carries those messages over the connection it
   already authenticated, and the memory side checks that every range in a
@@ -118,8 +124,12 @@ class AccessPolicy(Protocol):
         channel: AccessChannel,
         ranges: Sequence[AccessRange],
         transfer: Callable[[int, int], None],
+        request_id: str = "",
     ) -> None:
         """Move the bytes of ``ranges`` by calling ``transfer``.
+
+        ``request_id`` names the request whose load reads them, as a read
+        hint named it ("" if the engine did not say).
 
         ``transfer(start, end)`` reads ``ranges[start:end]``. The policy must
         call it in order, with each ``start`` equal to the previous ``end``,
@@ -155,6 +165,33 @@ class AccessPolicy(Protocol):
 
     def reusable(self, location: StorageLocation) -> bool:
         """Whether a page given back may hold new data now."""
+        ...
+
+
+class ReadHintHooks(Protocol):
+    """Optional hooks of an access policy that takes read hints.
+
+    The backend calls them on its hint thread, in the order the hints were
+    given; a policy without them gets no hints. They may block (only the
+    hint thread waits). An exception is logged and the hint dropped: the
+    load reads every byte either way.
+    """
+
+    def read_hint(
+        self, channel: Any, request_id: str, ranges: Sequence[AccessRange]
+    ) -> None:
+        """``request_id`` will read ``ranges`` of one region, in this order.
+
+        ``channel.request(action, ranges, **payload)`` reaches the region
+        extension of the agent that maps the region. The agent takes a hint
+        for a region this process does not hold, as long as it maps it, and
+        never as a write. The bytes are not leased: they may be gone or
+        replaced by the time the load leases them.
+        """
+        ...
+
+    def read_hint_end(self, channel: Any, request_id: str) -> None:
+        """``request_id`` ended; what was prepared for it may go."""
         ...
 
 

@@ -25,7 +25,8 @@ from maru_common.storage_types import (
 from ..access_policy import AccessRange, load_access_policy
 from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
-from .datapath import RdmaDataPath
+from .datapath import REPLY_TIMEOUT_MIN_S, RdmaDataPath
+from .hints import ReadHints
 from .lifecycle import RegionLifecycle
 from .region import (
     REMOTE_CXL,
@@ -182,6 +183,98 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if getattr(config, "access_policy", "")
             else None
         )
+        # Read hints (hints.py): the policy hears which bytes a load will
+        # read before it starts. Off without a policy that takes them.
+        self._hints = (
+            ReadHints(self._policy, self._hint_locate, self._hint_send)
+            if self._policy is not None
+            else None
+        )
+        self._hint_agents: dict[str, Any] = {}
+        self._hint_key: bytes | None = None
+        # The request whose load this thread reads (read_context)
+        self._reading = threading.local()
+
+    # ------------------------------------------------------------ read hints
+
+    def hint_read(
+        self, request_id: str, keys: list[str], route_key: str | None = None
+    ) -> None:
+        """Tell the access policy that ``request_id`` will read ``keys`` soon.
+
+        Returns at once: the lookup of the leading hit keys and the policy's
+        ``read_hint`` run on the hint thread. Without a policy that takes
+        hints this does nothing. A hint takes no lease; the load still
+        leases and reads every key.
+        """
+        if self._hints is not None and self._hints.enabled:
+            self._hints.hint(request_id, keys)
+
+    def end_read_hint(self, request_id: str) -> None:
+        """``request_id`` ended: the policy may drop what it prepared for it."""
+        if self._hints is not None and self._hints.enabled:
+            self._hints.end(request_id)
+
+    def set_read_request(self, request_id: str) -> None:
+        """Name the request whose load this thread's next reads belong to.
+
+        The access policy's ``read`` hook gets the name, so it can find what
+        a read hint prepared; ``""`` clears it.
+        """
+        self._reading.request_id = request_id
+
+    def _hint_locate(self, keys: list[str]) -> list[tuple[str, list[AccessRange]]]:
+        """The leading hit keys, grouped per region in key order, with the
+        remote CXL agent of each region (on the hint thread)."""
+        from maru_remote.region_map import pick_agent
+
+        self._ensure(data=False)
+        groups: list[tuple[str, list[AccessRange]]] = []
+        current = None
+        for i in range(0, len(keys), MAX_STORAGE_BATCH):
+            batch = keys[i : i + MAX_STORAGE_BATCH]
+            result = self._call(
+                "probe",
+                engine_id=self.config.engine_id,
+                namespace=self.config.cache_namespace,
+                keys=batch,
+                locations=True,
+            )
+            entries = result.get("entries") or []
+            regions = result.get("regions") or {}
+            for entry in entries[: len(batch)]:
+                if entry is None:
+                    return groups  # the load reads the leading hits only
+                location = StorageLocation(**entry)
+                handle = regions.get(location.pool_id)
+                if handle is None or not self._agents:
+                    return groups
+                if current != location.pool_id:
+                    agent = pick_agent(self._agents, int(handle["region_id"]))
+                    groups.append((agent, []))
+                    current = location.pool_id
+                groups[-1][1].append(AccessRange(handle, location))
+            if len(entries) < len(batch):
+                return groups
+        return groups
+
+    def _hint_send(self, agent: str, message: dict) -> dict:
+        """Send a hint message on this process's own connection to ``agent``."""
+        from maru_remote.region_map import RegionMapClient, load_key
+
+        client = self._hint_agents.get(agent)
+        if client is None:
+            if self._hint_key is None:
+                self._hint_key = load_key(self.config.remote_cxl_agent_key_file)
+            client = self._hint_agents[agent] = RegionMapClient(
+                agent,
+                timeout_s=max(self.config.rdma_timeout_s, REPLY_TIMEOUT_MIN_S),
+                key=self._hint_key,
+            )
+        client.hello()  # connects if needed; the epoch below is its agent's
+        if not client.region_extension:
+            raise StorageError(f"remote CXL agent {agent} has no region extension")
+        return client.extension({**message, "epoch": client.epoch})
 
     # ------------------------------------------------------------------ setup
 
@@ -1395,7 +1488,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
             cursor = end
 
         try:
-            self._policy.read(_RegionChannel(self._data, access), ranges, transfer)
+            self._policy.read(
+                _RegionChannel(self._data, access),
+                ranges,
+                transfer,
+                getattr(self._reading, "request_id", ""),
+            )
         finally:
             done = True
         if failure:
@@ -1461,6 +1559,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
         for thread in self._threads:
             thread.join()
         self._threads = []
+        if self._hints is not None:
+            self._hints.close()
+        for agent in self._hint_agents.values():
+            agent.close()
+        self._hint_agents.clear()
         with self._lock:
             # Transfers run without the lock: let those under way end (each
             # within its timeout) before the regions and the data path go.

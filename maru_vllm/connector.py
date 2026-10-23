@@ -19,13 +19,15 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import hashlib
 import json
 import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -361,13 +363,25 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     num_full_chunks = len(token_ids) // chunk_tokens
     if num_full_chunks == 0:
         return []
-    arr = torch.tensor(token_ids[: num_full_chunks * chunk_tokens]).numpy()
+    # The scheduler's lookup, its read hint and the worker's load key the
+    # same prompt: hash it once.
+    return list(
+        _hashed_chunk_keys(
+            tuple(token_ids[: num_full_chunks * chunk_tokens]), chunk_tokens
+        )
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _hashed_chunk_keys(tokens: tuple[int, ...], chunk_tokens: int) -> tuple[str, ...]:
+    """Chunk keys of a prompt of whole chunks (see :func:`_chunk_keys`)."""
+    arr = torch.tensor(tokens).numpy()
     hasher = hashlib.blake2b(digest_size=8)  # 8 bytes → 16 hex chars
     keys = []
-    for i in range(num_full_chunks):
+    for i in range(len(tokens) // chunk_tokens):
         hasher.update(arr[i * chunk_tokens : (i + 1) * chunk_tokens].tobytes())
         keys.append(f"kv_{hasher.hexdigest()}")
-    return keys
+    return tuple(keys)
 
 
 _RDMA_KNOBS = (
@@ -377,6 +391,7 @@ _RDMA_KNOBS = (
     "maru_remote_cxl_agent_key_file",
     "maru_access_policy",
     "maru_access_policy_config",
+    "maru_read_hint_on_arrival",
 )
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
 _MIN_RDMA_STAGING = 1024**3
@@ -736,14 +751,10 @@ def _create_maru_handler(
         remote_cxl_agent_key_file=extra_config.get(
             "maru_remote_cxl_agent_key_file", "~/.maru/remote-cxl-agent.key"
         ),
-        # A device package's access policy runs where the bytes move: the
-        # worker, not the metadata-only scheduler.
-        access_policy=(
-            "" if metadata_only else extra_config.get("maru_access_policy", "")
-        ),
-        access_policy_config=(
-            "" if metadata_only else extra_config.get("maru_access_policy_config", "")
-        ),
+        # A device package's access policy: the worker's moves the bytes;
+        # the scheduler's only hears read hints (which loads come next).
+        access_policy=extra_config.get("maru_access_policy", ""),
+        access_policy_config=extra_config.get("maru_access_policy_config", ""),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE
             if _remote_cxl_async(extra_config) and not metadata_only
@@ -1169,6 +1180,56 @@ class MaruKVConnector(KVConnectorBase_V1):
 # ============================================================================
 
 
+_ARRIVAL_HINTER: Any = None
+
+
+def _install_arrival_hint(connector: Any) -> None:
+    """Have vLLM's engine hand each request to ``connector`` when it arrives.
+
+    EngineCore turns a received request into a Request on its input thread
+    (``preprocess_add_request``), but its scheduler looks the request up only
+    once the running engine step ends: under load, tens of milliseconds
+    later. The wrapper passes the new Request to
+    ``connector.request_arrived`` right away, so storage can prepare the
+    bytes the request will load while it waits. Installed once per process;
+    an engine without a Maru scheduler connector uses the latest one.
+    """
+    global _ARRIVAL_HINTER
+    _ARRIVAL_HINTER = connector
+    try:
+        from vllm.v1.engine import core as engine_core
+    except Exception:
+        logger.warning("Maru: no vLLM engine core here; read hints on arrival are off")
+        return
+    cls = engine_core.EngineCore
+    original = getattr(cls, "preprocess_add_request", None)
+    if original is None:
+        logger.warning(
+            "Maru: this vLLM has no EngineCore.preprocess_add_request; "
+            "read hints on arrival are off"
+        )
+        return
+    if getattr(original, "_maru_arrival_hint", False):
+        return
+
+    @functools.wraps(original)
+    def preprocess_add_request(self: Any, request: Any) -> Any:
+        result = original(self, request)
+        scheduler = getattr(getattr(self, "scheduler", None), "connector", None)
+        target = getattr(scheduler, "_scheduler", None)
+        if not hasattr(target, "request_arrived"):
+            target = _ARRIVAL_HINTER
+        if target is not None:
+            try:
+                target.request_arrived(result[0])
+            except Exception:
+                logger.debug("Maru: arrival hint not queued", exc_info=True)
+        return result
+
+    preprocess_add_request._maru_arrival_hint = True  # type: ignore[attr-defined]
+    cls.preprocess_add_request = preprocess_add_request
+
+
 class MaruSchedulerConnector:
     """Scheduler-side: checks chunk-by-chunk which prefix is cached in Maru."""
 
@@ -1194,6 +1255,17 @@ class MaruSchedulerConnector:
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
+        # Read hints (MaruHandler.hint_read): storage hears which keys a
+        # request will load once the scheduler finds them, or as soon as the
+        # request arrives with maru_read_hint_on_arrival. One hint per
+        # request, none after its end, and its end follows its hint.
+        self._hinted: set[str] = set()
+        self._arrived: set[str] = set()
+        self._hint_lock = threading.Lock()
+        self._handler_lock = threading.Lock()
+        self._arrival_pool: ThreadPoolExecutor | None = None
+        if bool(extra_config.get("maru_read_hint_on_arrival", False)):
+            _install_arrival_hint(self)
 
         # Requests that need KV loaded from maru
         self._requests_need_load: dict[str, tuple[Request, int]] = {}
@@ -1289,18 +1361,84 @@ class MaruSchedulerConnector:
     def _ensure_handler(self):
         if self._handler is not None:
             return
-        if time.monotonic() < self._handler_retry_after:
-            return
-        # A scheduler never allocates or maps a data pool.
-        try:
-            self._handler = _create_maru_handler(self._extra_config, metadata_only=True)
-        except Exception as exc:
-            if self._cpu_mode and isinstance(exc, StorageError):
-                raise ValueError(f"CPU cache setup rejected: {exc}") from exc
-            self._handler_retry_after = time.monotonic() + 5.0
-            logger.warning(
-                "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
+        # The arrival-hint thread may get here too: create one handler.
+        with self._handler_lock:
+            if self._handler is not None:
+                return
+            if time.monotonic() < self._handler_retry_after:
+                return
+            # A scheduler never allocates or maps a data pool.
+            try:
+                self._handler = _create_maru_handler(
+                    self._extra_config, metadata_only=True
+                )
+            except Exception as exc:
+                if self._cpu_mode and isinstance(exc, StorageError):
+                    raise ValueError(f"CPU cache setup rejected: {exc}") from exc
+                self._handler_retry_after = time.monotonic() + 5.0
+                logger.warning(
+                    "Scheduler MaruHandler creation failed, backing off 5s: %s", exc
+                )
+
+    def request_arrived(self, request: Request) -> None:
+        """vLLM received ``request``: hint its reads off the caller's thread.
+
+        Called on the engine's input thread (see :func:`_install_arrival_hint`).
+        """
+        with self._hint_lock:
+            self._arrived.add(request.request_id)
+        if self._arrival_pool is None:
+            self._arrival_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-arrival-hint"
             )
+        self._arrival_pool.submit(self._hint_on_arrival, request)
+
+    def _hint_on_arrival(self, request: Request) -> None:
+        try:
+            if not self._deferred_loading or (
+                self._cpu_mode and _cpu_bypass_request(request)
+            ):
+                return  # the load would not wait for the request's turn
+            token_ids = list(request.prompt_token_ids or [])
+            if len(token_ids) < self._kv_chunk_tokens:
+                return
+            self._ensure_handler()
+            # Every chunk from the first: storage hints the leading hits.
+            keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+            self._hint(request.request_id, keys, arrival=True)
+        except Exception:
+            logger.debug("Maru: arrival read hint failed", exc_info=True)
+
+    def _hint(self, request_id: str, keys: list[str], *, arrival: bool = False) -> None:
+        """Give storage the read hint of ``request_id`` once."""
+        handler = self._handler
+        if handler is None or not keys:
+            return
+        with self._hint_lock:
+            if request_id in self._hinted:
+                return
+            if arrival and request_id not in self._arrived:
+                return  # it ended before the hint was ready
+            self._hinted.add(request_id)
+            try:
+                handler.hint_read(
+                    request_id, keys, **_session_route(self._cpu_mode, keys)
+                )
+            except Exception:
+                logger.debug("Maru: read hint failed", exc_info=True)
+
+    def _end_hint(self, request_id: str) -> None:
+        with self._hint_lock:
+            self._arrived.discard(request_id)
+            if request_id not in self._hinted:
+                return
+            self._hinted.discard(request_id)
+            handler = self._handler
+            if handler is not None:
+                try:
+                    handler.end_read_hint(request_id)
+                except Exception:
+                    logger.debug("Maru: read hint end failed", exc_info=True)
 
     def _count_matched_chunks(self, token_ids: list[int]) -> int:
         """Count how many consecutive prefix chunks are cached in Maru.
@@ -1506,6 +1644,12 @@ class MaruSchedulerConnector:
         self._last_match_result[request.request_id] = num_matched_chunks
         if self._cpu_mode:
             self._load_starts[request.request_id] = num_computed_tokens
+        if self._deferred_loading:
+            # The load waits for vLLM to admit it: tell storage what it reads.
+            ct = self._kv_chunk_tokens
+            keys = _chunk_keys(token_ids, ct)
+            first, last = num_computed_tokens // ct, -(-matched_tokens // ct)
+            self._hint(request.request_id, keys[first:last])
 
         return new_matched, self._deferred_loading
 
@@ -1765,6 +1909,7 @@ class MaruSchedulerConnector:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Transfer block ownership to the worker for write-behind stores."""
+        self._end_hint(request.request_id)
         self._async_load_issued.discard(request.request_id)
         if request.request_id in self._awaiting_deferred_recv:
             # vLLM already retains a parked request's blocks until its receive
@@ -2300,7 +2445,8 @@ class MaruWorkerConnector:
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
-                infos = self._batch_retrieve_all(keys, **route)
+                with self._read_context(req_meta.req_id):
+                    infos = self._batch_retrieve_all(keys, **route)
                 if self._timing:
                     _emit_timing(
                         f"retrieve batch {len(keys)} keys = "
@@ -2505,9 +2651,10 @@ class MaruWorkerConnector:
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
 
             _t0 = time.monotonic()
-            infos = self._batch_retrieve_all(
-                keys, **_session_route(self._cpu_mode, chunk_keys)
-            )
+            with self._read_context(req_meta.req_id):
+                infos = self._batch_retrieve_all(
+                    keys, **_session_route(self._cpu_mode, chunk_keys)
+                )
             if self._timing:
                 _emit_timing(
                     f"deferred retrieve batch {len(keys)} keys = "
@@ -3312,7 +3459,8 @@ class MaruWorkerConnector:
                 batches += 1
                 try:
                     _t0 = time.monotonic()
-                    infos = self._batch_retrieve_all(keys, **route)
+                    with self._read_context(req_meta.req_id):
+                        infos = self._batch_retrieve_all(keys, **route)
                     if self._timing:
                         _emit_timing(
                             f"retrieve batch {len(keys)} keys = "
@@ -4142,6 +4290,22 @@ class MaruWorkerConnector:
         if not self._remote_cxl_mode or self._handler is None:
             return False
         return bool(self._handler.storage_gpu_accessible())
+
+    @contextlib.contextmanager
+    def _read_context(self, request_id: str) -> Iterator[None]:
+        """Tell storage which request the reads in this block load for.
+
+        An access policy matches them with that request's read hint.
+        """
+        mark = getattr(self._handler, "set_read_request", None)
+        if mark is None:
+            yield
+            return
+        mark(request_id)
+        try:
+            yield
+        finally:
+            mark("")
 
     def _batch_retrieve_all(
         self, keys: list[str], batch_size: int = 1024, route_key: str | None = None

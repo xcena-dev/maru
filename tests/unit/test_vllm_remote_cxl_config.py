@@ -319,7 +319,9 @@ def test_access_policy_settings_need_the_remote_cxl_backend():
 
 
 @pytest.mark.parametrize("metadata_only", [False, True])
-def test_the_access_policy_goes_to_the_worker_only(monkeypatch, metadata_only):
+def test_the_access_policy_goes_to_the_worker_and_the_scheduler(
+    monkeypatch, metadata_only
+):
     seen = []
 
     class Handler:
@@ -338,5 +340,6 @@ def test_the_access_policy_goes_to_the_worker_only(monkeypatch, metadata_only):
         ),
         metadata_only=metadata_only,
     )
-    expected = ("", "") if metadata_only else ("device", "/etc/device.toml")
+    # The worker's policy moves bytes; the scheduler's hears read hints.
+    expected = ("device", "/etc/device.toml")
     assert (seen[0].access_policy, seen[0].access_policy_config) == expected

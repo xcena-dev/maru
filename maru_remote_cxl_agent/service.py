@@ -275,13 +275,17 @@ class RegionMapService:
 
         Every range must lie in a region this connection holds, mapped and
         in use, under a handle that matches it; a read handle may not
+        prepare a write. A read hint (``hint`` true) is advice about reads
+        that have not started: its regions need to be mapped and in use
+        here, but not held by this connection, so a process without a data
+        path (a serving engine's scheduler) may send one, and it may not
         prepare a write. The check and the extension's answer happen under
         the lock, so a release cannot come between them.
 
         Args:
             conn: Connection id.
-            message: ``action``, ``ranges``, ``write``, ``epoch`` and the
-                policy's own fields.
+            message: ``action``, ``ranges``, ``write``, ``hint``, ``epoch``
+                and the policy's own fields.
 
         Returns:
             The extension's reply.
@@ -302,6 +306,11 @@ class RegionMapService:
         write = message.get("write", False)
         if type(write) is not bool:
             raise ValueError("write must be true or false")
+        hint = message.get("hint", False)
+        if type(hint) is not bool:
+            raise ValueError("hint must be true or false")
+        if hint and write:
+            raise MapDenied("a read hint cannot prepare a write")
         with self._lock:
             for r in ranges:
                 if not isinstance(r, dict):
@@ -313,7 +322,7 @@ class RegionMapService:
                     or not m.ready.is_set()
                     or m.error is not None
                     or m.retiring
-                    or conn not in m.holders
+                    or (conn not in m.holders and not hint)
                 ):
                     raise NotMapped(f"region {h.region_id} is not held here")
                 if isinstance(h, ReadHandle):

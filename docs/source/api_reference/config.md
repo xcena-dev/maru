@@ -168,6 +168,9 @@ apply to that backend only:
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
+| `maru_access_policy` | `str` | empty | Name of an installed access policy (entry point in `maru.access_policies`) that decides when the backend's transfers run; see [Access policies](../design_doc/access_policies.md) |
+| `maru_access_policy_config` | `str` | empty | Opaque string given to that policy, typically its own configuration file |
+| `maru_read_hint_on_arrival` | `bool` | `false` | Give the access policy its read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` |
 
 ### Remote CXL agent (`maru-remote-cxl-agent`)
 
@@ -184,6 +187,8 @@ it, and the service reads these variables from `/etc/maru/remote-cxl-agent.env`.
 | `--key-file` (`MARU_REMOTE_CXL_AGENT_KEY_FILE`) | `/etc/maru/remote-cxl-agent.key` | Key every connection must prove; the installer creates it |
 | `--node-id` | hostname | Name of the memory node; names the default lock file |
 | `--lock-file` (`MARU_REMOTE_CXL_AGENT_LOCK_FILE`) | `/run/maru/remote-cxl-agent-<node>.lock` | Keeps one remote CXL agent per node |
+| `--region-extension` | none | Name of an installed region extension (entry point in `maru.region_extensions`), the memory-node half of an access policy; see [Access policies](../design_doc/access_policies.md) |
+| `--region-extension-config` | empty | Opaque string given to that extension |
 | `--allow-unchecked-transport` | off | Accept UCX transports that do not check remote keys (tests on one host only) |
 | `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 

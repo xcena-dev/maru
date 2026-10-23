@@ -15,7 +15,10 @@ half of a worker's access policy (``maru_handler.storage.access_policy``):
 - It receives the messages policies send through their channel, after the
   agent checked that every range in a message belongs to a region the
   sending connection holds, matches its handle, fits in it, and that a read
-  handle does not prepare a write.
+  handle does not prepare a write. A read hint (``message["hint"]`` true)
+  is advice that reads of its ranges will follow; its regions only need to
+  be mapped here, since the scheduler that sends it holds none, and it
+  never prepares a write. The extension may ignore any hint.
 
 The agent owns mapping, NIC registration and the checks above; the extension
 owns whatever it does to the memory of those regions.
