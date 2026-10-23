@@ -1379,8 +1379,21 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         """
         return self.request_finished(request, block_ids[0] if block_ids else [])
 
+    def get_transfer_results(self, finished_req_ids: set[str]) -> Any:
+        """``get_finished``, with the parked loads that failed (vLLM 0.30+).
+
+        A failed parked load of a model with several KV cache groups is
+        reported here, per request (``failed_recving``), not by its blocks.
+        """
+        results = super().get_transfer_results(finished_req_ids)
+        assert self._worker is not None
+        failed = self._worker.take_failed_recv_req_ids(results.finished_recving)
+        if failed:
+            results.failed_recving |= failed
+        return results
+
     def get_block_ids_with_load_errors(self) -> set[int]:
-        """Return block ids whose deferred load failed (vLLM recomputes them)."""
+        """Return block ids whose load failed (vLLM recomputes them)."""
         assert self._worker is not None
         return self._worker.take_failed_load_blocks()
 
@@ -2155,7 +2168,9 @@ class MaruSchedulerConnector:
         self._awaiting_deferred_recv.difference_update(
             connector_output.finished_recving or ()
         )
-        if getattr(connector_output, "invalid_block_ids", None):
+        if getattr(connector_output, "invalid_block_ids", None) or getattr(
+            connector_output, "failed_recving", None
+        ):
             # A load failed, so some key in _known_keys may name an object
             # that is gone, and the report does not say which. Forget them
             # all: the next lookups ask MaruServer again, so neither the
@@ -2264,12 +2279,15 @@ class MaruWorkerConnector:
         # completion is observed via get_finished_loading(). _deferred_done
         # collects synchronously finished (CPU fallback) or failed requests;
         # _failed_load_blocks feeds get_block_ids_with_load_errors so vLLM
-        # recomputes instead of consuming unloaded KV.
+        # recomputes instead of consuming unloaded KV. The failed parked
+        # loads of a model with several groups go to _failed_recv_req_ids
+        # instead (see _report_failed_load).
         self._deferred_events: dict[str, torch.cuda.Event] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
         self._recv_only_finished_req_ids: set[str] = set()
         self._failed_load_blocks: set[int] = set()
+        self._failed_recv_req_ids: set[str] = set()
         # Loads the background thread has taken but not yet accounted for, and
         # those among them whose request was abandoned meanwhile. A request
         # aborted while parked keeps its blocks until this connector reports
@@ -4265,9 +4283,10 @@ class MaruWorkerConnector:
 
         The request's blocks are reported through
         ``get_block_ids_with_load_errors`` (vLLM resets its computed-token
-        count) and the request id through ``get_finished_loading`` (vLLM
-        unparks it from WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads
-        also report errors, but only for their externally allocated blocks.
+        count), or with several groups its id (``_report_failed_load``), and
+        the request id through ``get_finished_loading`` (vLLM unparks it from
+        WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads also report errors,
+        but only for their externally allocated blocks.
         """
         if self._cpu_mode and not req_meta.is_store:
             self._fail_load(
@@ -4277,8 +4296,22 @@ class MaruWorkerConnector:
         if not req_meta.deferred_load:
             return
         with self._deferred_lock:
-            self._failed_load_blocks.update(self._loaded_blocks(req_meta))
+            self._report_failed_load(req_meta, self._loaded_blocks(req_meta))
             self._deferred_done.add(req_meta.req_id)
+
+    def _report_failed_load(self, req_meta: MaruReqMeta, blocks: list[int]) -> None:
+        """Record a failed load for vLLM; the caller holds ``_deferred_lock``.
+
+        A parked load of a model with several KV cache groups is reported by
+        its request id (``get_transfer_results``): block ids are unique only
+        within a group, and vLLM 0.32 stops the engine on a block-level
+        failure with several groups. vLLM 0.30 takes either and recomputes
+        such a request from its first token. Other loads report their blocks.
+        """
+        if req_meta.deferred_load and req_meta.group_block_ids:
+            self._failed_recv_req_ids.add(req_meta.req_id)
+        else:
+            self._failed_load_blocks.update(blocks)
 
     def _loaded_blocks(self, req_meta: MaruReqMeta) -> list[int]:
         """Blocks a failed load of ``req_meta`` should have filled.
@@ -4328,7 +4361,7 @@ class MaruWorkerConnector:
                     start // self._block_size : (end + self._block_size - 1)
                     // self._block_size
                 ]
-            self._failed_load_blocks.update(blocks)
+            self._report_failed_load(req_meta, blocks)
             if req_meta.deferred_load:
                 self._deferred_done.add(req_meta.req_id)
 
@@ -4567,10 +4600,23 @@ class MaruWorkerConnector:
                 self._deferred_done |= owed
 
     def take_failed_load_blocks(self) -> set[int]:
-        """Return (and clear) block ids whose deferred load failed."""
+        """Return (and clear) block ids whose load failed."""
         with self._deferred_lock:
             failed = self._failed_load_blocks
             self._failed_load_blocks = set()
+        return failed
+
+    def take_failed_recv_req_ids(self, finished: set[str]) -> set[str]:
+        """Return (and clear) the failed parked loads among ``finished``.
+
+        A failure is recorded with its completion (``_deferred_done``) under
+        one lock, so one recorded after ``finished`` was taken is reported
+        with the completion that follows: vLLM wants a failed request in
+        the same report as its completion.
+        """
+        with self._deferred_lock:
+            failed = self._failed_recv_req_ids & finished
+            self._failed_recv_req_ids -= failed
         return failed
 
     def _load_sync(

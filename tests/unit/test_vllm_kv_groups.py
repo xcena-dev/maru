@@ -20,6 +20,7 @@ pytest.importorskip("vllm")
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
     KVConnectorRole,
     supports_hma,
 )
@@ -697,25 +698,34 @@ def test_a_request_whose_load_failed_computes_without_maru(caplog):
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 1088
 
 
-@pytest.mark.parametrize("reported", [True, False])
-def test_a_later_request_asks_maru_again_only_after_a_reported_failure(reported):
+@pytest.mark.parametrize("report", ["blocks", "request", None])
+def test_a_later_request_asks_maru_again_only_after_a_reported_failure(report):
     """Under the default "fail" the failed request ends in an error and vLLM
     never asks about it again; a later request with the prefix must not get
-    the same failing hit. Without a failure the known keys stand."""
+    the same failing hit. A failure comes by its blocks, or by its request
+    for a parked load of several groups. Without one the known keys stand."""
     a = list(range(1200))
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     first = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, first) == 1088
     sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
-    if reported:
+    if report == "blocks":
         _report_failure(sched)
+    elif report == "request":
+        sched.update_connector_output(
+            SimpleNamespace(
+                finished_recving={"b"}, failed_recving={"b"}, invalid_block_ids=set()
+            )
+        )
     else:  # vLLM passes every step's connector output, mostly with no failure
         sched.update_connector_output(
             SimpleNamespace(finished_recving={"x"}, invalid_block_ids=set())
         )
     sched.request_finished(first, [])
     later = SimpleNamespace(request_id="c", prompt_token_ids=a)
-    assert sched.get_num_new_matched_tokens(later, 0)[0] == (0 if reported else 1088)
+    assert sched.get_num_new_matched_tokens(later, 0)[0] == (
+        1088 if report is None else 0
+    )
 
 
 def test_a_request_asked_for_once_more_trusts_the_known_keys():
@@ -1629,19 +1639,53 @@ def test_a_sliding_window_load_writes_only_the_window():
     assert not _token_rows(swa_dst[0], 0, "0.30").any()
 
 
-def test_a_missing_object_fails_the_blocks_maru_loads():
+def _reported_failures(worker):
+    """What one report tells vLLM of failed loads: the failed blocks, the
+    parked loads that finished, and the failed ones among them."""
+    finished = worker.get_finished_loading() or set()
+    return (
+        worker.take_failed_load_blocks(),
+        finished,
+        worker.take_failed_recv_req_ids(finished),
+    )
+
+
+# Every group's real blocks over tokens 0-31: the states where the hit ends
+# (1, 3, 5) and attention 7, 8. Not the null block, nor the blocks the step
+# computes (2, 4, 6, 9).
+FAILED_INLINE = ({1, 3, 5, 7, 8}, set(), set())
+# vLLM 0.32 stops the engine on a block-level failure with several groups,
+# whose block ids are unique only within a group: a parked load is reported
+# by its request, with its completion.
+FAILED_PARKED = (set(), {"b"}, {"b"})
+
+
+def test_a_failed_parked_load_is_reported_by_its_request():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
     del store[group_object_key(k1, 2)]
     worker, target = _loading_worker(store)
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)
-    # Every group's real blocks over tokens 0-31: the states where the hit
-    # ends (1, 3, 5) and attention 7, 8. Not the null block, nor the blocks
-    # the step computes (2, 4, 6, 9).
-    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
-    assert worker.get_finished_loading() == {"b"}
+    assert _reported_failures(worker) == FAILED_PARKED
+    assert _reported_failures(worker) == (set(), set(), set())
     assert not target.any()
+
+
+def test_connector_reports_failed_parked_loads_with_their_completion():
+    if not hasattr(KVConnectorBase_V1, "get_transfer_results"):
+        pytest.skip("this vLLM reports load failures by block only")
+    _, _, store = _stored_qwen()
+    del store[group_object_key(_chunk_keys(list(range(40)), TINY_BLOCK)[1], 2)]
+    worker, _ = _loading_worker(store)
+    connector = MaruKVConnector.__new__(MaruKVConnector)
+    connector._worker = worker
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    worker.start_load_kv(_FORWARD, meta)
+    results = connector.get_transfer_results(set())
+    assert results.finished_recving == {"b"}
+    assert results.failed_recving == {"b"}
+    assert connector.get_block_ids_with_load_errors() == set()
 
 
 def test_a_load_skips_what_vllms_prefix_cache_holds():
@@ -2084,8 +2128,7 @@ def test_a_failure_while_placing_is_reported(parked):
     else:
         meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
     worker.start_load_kv(_FORWARD, meta)
-    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
-    assert worker.get_finished_loading() == ({"b"} if parked else None)
+    assert _reported_failures(worker) == (FAILED_PARKED if parked else FAILED_INLINE)
 
 
 @pytest.mark.parametrize("parked", [False, True], ids=["inline", "parked"])
@@ -2105,8 +2148,7 @@ def test_an_unavailable_handler_fails_the_loads(parked):
         list(range(40)), QWEN_BLOCKS, 0, 32, req_ids=("a",)
     ).requests
     worker.start_load_kv(_FORWARD, meta)
-    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
-    assert worker.get_finished_loading() == ({"b"} if parked else None)
+    assert _reported_failures(worker) == (FAILED_PARKED if parked else FAILED_INLINE)
     assert not target.any()
 
 
@@ -2116,8 +2158,7 @@ def test_an_inline_load_of_a_missing_object_is_reported():
     del store[group_object_key(k1, 0)]
     worker, target = _loading_worker(store)
     worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
-    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
-    assert worker.get_finished_loading() is None
+    assert _reported_failures(worker) == FAILED_INLINE
     assert not target.any()
 
 
@@ -2129,8 +2170,7 @@ def test_a_failure_on_the_loader_thread_unparks_and_is_reported():
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)
     worker._deferred_executor.shutdown(wait=True)
-    assert worker.take_failed_load_blocks() == {1, 3, 5, 7, 8}
-    assert worker.get_finished_loading() == {"b"}
+    assert _reported_failures(worker) == FAILED_PARKED
 
 
 def test_a_parked_load_lands_after_work_queued_before_it():

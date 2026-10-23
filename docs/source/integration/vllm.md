@@ -602,14 +602,14 @@ Tests ran with tensor parallel size 1. Hybrid models are supported on this conne
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default). The CPU and mixed backends take one group only.
+- `maru_storage_backend` is `cxl` (the default). The CPU, mixed and remote_cxl backends take one group only.
 - `maru_use_layerwise` is `false` (the default). Several groups are stored in chunkwise format only.
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
 - The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
-- `kv_load_failure_policy="recompute"` comes with `maru_async_load=true` (see {ref}`vllm-load-failures`). The default `fail` needs nothing else.
+- `kv_load_failure_policy="recompute"` comes with `maru_async_load=true`. Under the default `fail` inline loads run too, but on vLLM 0.32 a failed inline load stops the engine; see {ref}`vllm-load-failures`.
 
 ```bash
 vllm serve Qwen/Qwen3.5-0.8B \
@@ -645,7 +645,7 @@ vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load 
 - `fail` (vLLM's default) ends the request with an error.
 - `recompute` computes the request again; with several groups vLLM 0.30 restarts it from the first token. With inline loads (`maru_async_load=false`), vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)), so for a model with several groups the connector refuses `recompute` with inline loads at startup. With `maru_async_load=true` every load is parked and vLLM recomputes a failed load correctly.
 
-With several groups, use `recompute` together with `maru_async_load=true`, or keep `fail`.
+With several groups, set `maru_async_load=true`, under either policy. Maru reports a failed parked load by its request. A failed inline load can be reported only by its blocks, and vLLM 0.32 stops the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group. On vLLM 0.30 an inline load that fails under `fail` ends its request with an error.
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
