@@ -173,6 +173,7 @@ def make_vllm_scheduler(
     import torch
     from vllm.config import (
         CacheConfig,
+        DeviceConfig,
         KVTransferConfig,
         ModelConfig,
         ParallelConfig,
@@ -180,6 +181,7 @@ def make_vllm_scheduler(
         SpeculativeConfig,
         VllmConfig,
     )
+    from vllm.platforms import current_platform
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -213,6 +215,13 @@ def make_vllm_scheduler(
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
+    # A CUDA build of vLLM on a host without a GPU, such as the CI unit-test
+    # container, resolves no platform, and the DeviceConfig("auto") that
+    # VllmConfig defaults to raises there. The scheduler never touches the
+    # device, so such a host names the CPU instead.
+    device_kwargs: dict[str, Any] = {}
+    if not current_platform.device_type:
+        device_kwargs["device_config"] = DeviceConfig(device="cpu")
     vllm_config = VllmConfig(
         model_config=model_config,
         speculative_config=speculative_config,
@@ -234,6 +243,7 @@ def make_vllm_scheduler(
                 **(extra_config or {}),
             },
         ),
+        **device_kwargs,
     )
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
