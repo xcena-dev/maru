@@ -51,6 +51,8 @@ class RegionLifecycle:
     _removing: list[dict]
     _dropping: list[dict]
     _isolated: list[IsolatedTransfer]
+    # Pages of late-completed WRITEs waiting for the access policy
+    _late_pages: list[tuple[RemoteCxlRegion, list[StorageLocation]]]
     _expand_op: str | None
     _credentials: dict
     _lock: threading.RLock
@@ -75,6 +77,9 @@ class RegionLifecycle:
             self.config.chunk_size_bytes,
             info["handle"],
         )
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            region.reuse_guard = policy.reusable
         self.regions[region.pool_id] = region
         try:
             self._map_own(region)
@@ -556,21 +561,49 @@ class RegionLifecycle:
         still be in the network, so its pages stay out of use while this
         worker owns the region, as after a WRITE that fails at once.
         """
+        policy = getattr(self, "_policy", None)
         kept = []
         for entry in self._isolated:
             if entry.pending.finished or entry.pending.poll():
                 # Pages go back to the region they came from; a retired
                 # region ignores them.
                 if entry.region is not None and entry.pending.completed:
-                    for location in entry.locations:
-                        entry.region.unquarantine(location)
-                        entry.region.give_page(location)
+                    if policy is not None and not entry.region.retired:
+                        # The access policy prepared these pages for the WRITE
+                        # that turned out complete: they wait for it to take
+                        # them (_settle_late_pages). The slots do not.
+                        self._late_pages.append((entry.region, list(entry.locations)))
+                    else:
+                        for location in entry.locations:
+                            entry.region.unquarantine(location)
+                            entry.region.give_page(location)
                 if self._data.staging is not None:
                     for slot in entry.slots:
                         self._data.staging.give(slot)
             else:
                 kept.append(entry)
         self._isolated = kept
+        self._settle_late_pages()
+
+    def _settle_late_pages(self) -> None:
+        """Hand the pages of late-completed WRITEs to the access policy, then
+        back to their region; a page the policy did not take waits for the
+        next housekeeping pass."""
+        policy = getattr(self, "_policy", None)
+        waiting = []
+        for region, locations in self._late_pages:
+            if region.retired:
+                continue  # its pages went back with it
+            try:
+                policy.completed_write(locations)
+            except Exception as exc:
+                logger.warning("access policy did not take a late WRITE: %s", exc)
+                waiting.append((region, locations))
+                continue
+            for location in locations:
+                region.unquarantine(location)
+                region.give_page(location)
+        self._late_pages = waiting
 
     def _settle_writes(self, timeout_s: float) -> bool:
         """Wait (bounded) for the unconfirmed WRITEs to end.

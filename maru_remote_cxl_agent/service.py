@@ -64,6 +64,7 @@ import hmac
 import itertools
 import logging
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -85,6 +86,11 @@ _RELEASED_KEPT = 65536
 # second (same node) to 30 s (another node); this bounds how much longer an
 # old registration lives.
 SWEEP_INTERVAL_S = 1.0
+# Ranges one region extension message may name
+_MAX_EXTENSION_RANGES = 4096
+# How long close waits for a region extension to let its regions go
+_EXTENSION_DRAIN_S = 30.0
+_EXTENSION_DRAIN_POLL_S = 0.01
 # How long close() waits for a sweep in progress (it may wait on the RM).
 _SWEEP_JOIN_S = 5.0
 
@@ -136,6 +142,10 @@ class _Mapping:
     registration: Any = None
     metadata: bytes = b""
     holders: set[int] = field(default_factory=set)
+    # Set once the NIC no longer holds the registration; a region extension
+    # may keep the mapping a while longer (``retiring``) before it goes back.
+    fenced: bool = False
+    retiring: bool = False
 
 
 def parse_handle(value: Any) -> MaruHandle | ReadHandle:
@@ -201,6 +211,7 @@ class RegionMapService:
         node_id: str,
         epoch: str,
         boot_id: str = "",
+        extension: Any = None,
     ) -> None:
         """Create the service.
 
@@ -222,6 +233,8 @@ class RegionMapService:
             boot_id: Identity of this boot of the node. A new boot lost what
                 the node's CPU caches held, including bytes its NIC wrote
                 there that had not reached the CXL memory yet.
+            extension: Region extension (``extension.RegionExtension``) or
+                None.
         """
         self._rm = rm
         self._mapper = mapper
@@ -246,11 +259,92 @@ class RegionMapService:
         # Regions deregistered here whose unhold has not reached the RM yet
         self._unheld: dict[int, MaruHandle] = {}
         self._unhold_failed = False
+        self._extension = extension
 
     def hello(self) -> dict:
-        """Identity of this remote CXL agent process and of the node's boot."""
+        """Identity of this remote CXL agent process and of the node's boot;
+        ``region_extension`` is added when one is loaded."""
         self._discard_notifs()
-        return {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
+        identity = {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
+        if self._extension is not None:
+            identity["region_extension"] = True
+        return identity
+
+    def extension_request(self, conn: int, message: dict) -> dict:
+        """Hand an access policy's message to the region extension.
+
+        Every range must lie in a region this connection holds, mapped and
+        in use, under a handle that matches it; a read handle may not
+        prepare a write. A read hint (``hint`` true) is advice about reads
+        that have not started: its regions need to be mapped here and held
+        by some connection, not necessarily this one, so a process without a data
+        path (a serving engine's scheduler) may send one, and it may not
+        prepare a write. The check and the extension's answer happen under
+        the lock, so a release cannot come between them.
+
+        Args:
+            conn: Connection id.
+            message: ``action``, ``ranges``, ``write``, ``hint``, ``epoch``
+                and the policy's own fields.
+
+        Returns:
+            The extension's reply.
+
+        Raises:
+            ValueError: if no extension is loaded or the message is malformed.
+            NotMapped: if a range's region is not held on this connection.
+            MapDenied: if a handle does not match, or a read handle prepares
+                a write, or the message is for another epoch.
+        """
+        if self._extension is None:
+            raise ValueError("this remote CXL agent has no region extension")
+        if message.get("epoch") != self.epoch:
+            raise MapDenied("the message is for another remote CXL agent process")
+        ranges = message.get("ranges", [])
+        if not isinstance(ranges, list) or len(ranges) > _MAX_EXTENSION_RANGES:
+            raise ValueError("ranges must be a list of at most 4096 maps")
+        write = message.get("write", False)
+        if type(write) is not bool:
+            raise ValueError("write must be true or false")
+        hint = message.get("hint", False)
+        if type(hint) is not bool:
+            raise ValueError("hint must be true or false")
+        if hint and write:
+            raise MapDenied("a read hint cannot prepare a write")
+        with self._lock:
+            for r in ranges:
+                if not isinstance(r, dict):
+                    raise ValueError("a range must be a map")
+                h = parse_handle(r.get("handle"))
+                m = self._maps.get(h.region_id)
+                if (
+                    m is None
+                    or not m.ready.is_set()
+                    or m.error is not None
+                    or m.retiring
+                    or not m.holders
+                    or (conn not in m.holders and not hint)
+                ):
+                    raise NotMapped(f"region {h.region_id} is not held here")
+                if isinstance(h, ReadHandle):
+                    if write:
+                        raise MapDenied("a read handle cannot prepare a write")
+                    if not h.matches(m.handle):
+                        raise MapDenied(
+                            f"read token does not match region {h.region_id}"
+                        )
+                elif h != m.handle:
+                    raise MapDenied(f"handle does not match region {h.region_id}")
+                offset, length = r.get("offset"), r.get("length")
+                if (
+                    type(offset) is not int
+                    or type(length) is not int
+                    or offset < 0
+                    or length <= 0
+                    or offset + length > h.length
+                ):
+                    raise ValueError("a range must lie in its region")
+            return self._extension.request(conn, message, ranges)
 
     def holders(self) -> dict[int, set[int]]:
         """Mapped regions and the connections holding each (for tests, status)."""
@@ -258,7 +352,7 @@ class RegionMapService:
             return {
                 rid: set(m.holders)
                 for rid, m in self._maps.items()
-                if m.ready.is_set() and m.error is None
+                if m.ready.is_set() and m.error is None and not m.retiring
             }
 
     def map(self, conn: int, handle: Any, nixl_agent: str | None = None) -> dict:
@@ -312,9 +406,11 @@ class RegionMapService:
                     step = "establish"
                 elif not m.ready.is_set():
                     step = "wait"
-                elif m.error is None and m.handle == h:
+                elif m.error is None and m.handle == h and not m.retiring:
                     m.holders.add(conn)
                     return self._reply(m)
+                elif m.retiring:
+                    raise NotMapped(f"region {h.region_id} is being released")
                 else:
                     step = "replace"
             if step == "establish":
@@ -335,6 +431,8 @@ class RegionMapService:
                 if m is None or (m.ready.is_set() and m.error is not None):
                     raise NotMapped(f"region {h.region_id} is not mapped here")
                 if m.ready.is_set():
+                    if m.retiring:
+                        raise NotMapped(f"region {h.region_id} is being released")
                     if not h.matches(m.handle):
                         raise MapDenied(
                             f"read token does not match region {h.region_id}"
@@ -393,7 +491,10 @@ class RegionMapService:
                     if m.handle != h:
                         raise MapDenied(f"handle does not match region {h.region_id}")
                     if not self._release_locked(h.region_id, m):
-                        raise RuntimeError(f"deregistering region {h.region_id} failed")
+                        raise RuntimeError(
+                            f"region {h.region_id} is still held: deregistering "
+                            "failed or the region extension is still working on it"
+                        )
                     self._remember_released(h)
                     break
             try:
@@ -449,10 +550,11 @@ class RegionMapService:
                 if m.ready.is_set() and m.registration is not None
             ]
             for m in held:
-                if m.error is not None or not m.holders:
+                if m.error is not None or not m.holders or m.retiring:
                     # Out of use (failed, released or its last holder left)
-                    # but deregistering failed: retry without asking the
-                    # resource manager, which may be away.
+                    # but deregistering failed, or the region extension still
+                    # holds it: retry without asking the resource manager,
+                    # which may be away.
                     self._release_locked(m.handle.region_id, m)
             held = [
                 m
@@ -514,17 +616,35 @@ class RegionMapService:
         else:
             self._drain_failed = False
 
-    def close(self) -> None:
-        """Stop the sweep and release every region (the process is ending)."""
+    def close(self, extension_drain_s: float = _EXTENSION_DRAIN_S) -> None:
+        """Stop the sweep and release every region (the process is ending).
+
+        Regions a region extension still works on get up to
+        ``extension_drain_s`` seconds to be let go, then the extension is
+        closed; what it still holds is its own to report.
+        """
         self._stop.set()
         self._progress.close()
         if self._sweeper is not None:
             self._sweeper.join(timeout=_SWEEP_JOIN_S)
-        with self._lock:
-            for rid, m in list(self._maps.items()):
-                if m.ready.is_set() and m.registration is not None:
-                    self._release_locked(rid, m)
+        deadline = time.monotonic() + extension_drain_s
+        while True:
+            with self._lock:
+                for rid, m in list(self._maps.items()):
+                    if m.ready.is_set() and m.registration is not None:
+                        self._release_locked(rid, m)
+                waiting = any(m.retiring for m in self._maps.values())
+            if not waiting or time.monotonic() >= deadline:
+                break
+            time.sleep(_EXTENSION_DRAIN_POLL_S)
         self._flush_unholds()
+        if self._extension is not None:
+            if waiting:
+                logger.error("the region extension still holds regions at exit")
+            try:
+                self._extension.close()
+            except Exception:
+                logger.error("closing the region extension failed", exc_info=True)
 
     def _sweep_loop(self, interval_s: float) -> None:
         while not self._stop.wait(interval_s):
@@ -688,6 +808,8 @@ class RegionMapService:
                     # The resource manager handed the id out again.
                     self._released.pop(h.region_id, None)
             m.device = _device_of(access)
+            if self._extension is not None:
+                self._extension.validate_access(h.to_dict(), access)
             self._fence(m)
             addr = self._mapper.map(
                 access.dax_path, access.device_uuid, h.offset, h.length
@@ -702,6 +824,8 @@ class RegionMapService:
                 raise
             try:
                 metadata = self._transport.partial_metadata(registration)
+                if self._extension is not None:
+                    self._extension.mapped(h.to_dict(), access)
             except BaseException:
                 # The NIC holds a key for these addresses: they are
                 # deregistered and kept out of use as on a release.
@@ -853,15 +977,35 @@ class RegionMapService:
         Returns:
             True if the region is deregistered (and no longer mapped here).
         """
-        try:
-            self._transport.deregister(m.registration)
-        except Exception:
-            # Keep the mapping: unmapping a range the NIC still holds would
-            # leave a registration without its mapping. A mapping in use is
-            # shared by later requests; one out of use is deregistered again
-            # by the next release, sweep, map of its range or close.
-            logger.error("deregistering region %d failed", region_id, exc_info=True)
-            return False
+        if not m.fenced:
+            try:
+                self._transport.deregister(m.registration)
+            except Exception:
+                # Keep the mapping: unmapping a range the NIC still holds would
+                # leave a registration without its mapping. A mapping in use is
+                # shared by later requests; one out of use is deregistered again
+                # by the next release, sweep, map of its range or close.
+                logger.error("deregistering region %d failed", region_id, exc_info=True)
+                return False
+            m.fenced = True
+        if self._extension is not None:
+            # The NIC no longer reaches the region; the extension may still
+            # be working on its memory. Until it lets go the mapping stays,
+            # out of use, and the sweep, a release or close ask again.
+            try:
+                done = self._extension.retire(m.handle.to_dict())
+            except Exception:
+                logger.error(
+                    "region extension did not answer for region %d",
+                    region_id,
+                    exc_info=True,
+                )
+                done = False
+            if not done:
+                # Out of use from now on: no holder keeps it, no request uses it.
+                m.retiring = True
+                m.holders.clear()
+                return False
         del self._maps[region_id]
         self._unheld[region_id] = m.handle
         try:

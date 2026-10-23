@@ -229,6 +229,28 @@ class PoolRouter:
         c = self._pick(route_key or keys[0])
         return c.batch_retrieve(keys) if c.connected else [None] * len(keys)
 
+    @property
+    def read_hints_enabled(self) -> bool:
+        """Whether any pool's access policy takes read hints."""
+        return any(c.read_hints_enabled for c in self.clients)
+
+    def hint_read(
+        self, request_id: str, keys: list[str], route_key: str | None = None
+    ) -> None:
+        """Hint the pool the route key (or the first key) picks."""
+        if keys:
+            self._pick(route_key or keys[0]).hint_read(request_id, keys)
+
+    def end_read_hint(self, request_id: str) -> None:
+        """End the hint wherever it went (a pool that got none ignores it)."""
+        for c in self.clients:
+            c.end_read_hint(request_id)
+
+    def set_read_request(self, request_id: str) -> None:
+        """Name the request this thread loads for, in every pool."""
+        for c in self.clients:
+            c.set_read_request(request_id)
+
     def _close_clients(self) -> None:
         # A pool disabled after an expiry or a MaruServer restart holds no
         # region but still has its threads and MaruServer connection.

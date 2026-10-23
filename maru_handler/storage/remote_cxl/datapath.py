@@ -187,6 +187,51 @@ class RdmaDataPath:
         self._probe, self._probe_addr = probe, probe_addr
         self._started = True
 
+    def extension_request(self, access: RegionAccess, message: dict) -> dict:
+        """Send an access policy's message over the connection that mapped a region.
+
+        The message goes to the remote CXL agent that mapped the region, on
+        the connection the mapping belongs to: the agent checks the message's
+        ranges against what that connection holds.
+
+        Args:
+            access: The region's access, from :meth:`region`.
+            message: ``action``, ``ranges``, ``write`` and the policy's fields.
+
+        Returns:
+            The extension's reply.
+
+        Raises:
+            StorageUnavailableError: if the connection that mapped the region
+                was replaced, before or during the request.
+            StorageError: if the agent refused the message.
+        """
+        from maru_remote.region_map import RegionMapError, RegionMapUnavailable
+
+        client = self._client(access.agent)
+        if client.generation != access.generation:
+            raise StorageUnavailableError(
+                "the connection that mapped the region changed"
+            )
+        if not client.region_extension:
+            # The worker has an access policy and the agent nothing to answer
+            # it: a configuration error, not a passing outage.
+            raise StorageError(
+                f"remote CXL agent {access.agent} has no region extension for "
+                "this worker's access policy"
+            )
+        try:
+            reply = client.extension({**message, "epoch": client.epoch})
+        except RegionMapUnavailable as exc:
+            raise StorageUnavailableError(str(exc)) from exc
+        except RegionMapError as exc:
+            raise StorageError(str(exc)) from exc
+        if client.generation != access.generation:
+            raise StorageUnavailableError(
+                "the connection that mapped the region changed"
+            )
+        return reply
+
     def region(
         self, pool_id: str, handle: dict, agents: list[str], own: bool = False
     ) -> RegionAccess:

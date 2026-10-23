@@ -9,7 +9,7 @@ import socket
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any
 
@@ -22,9 +22,11 @@ from maru_common.storage_types import (
     StorageUnavailableError,
 )
 
+from ..access_policy import AccessRange, load_access_policy
 from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
-from .datapath import RdmaDataPath
+from .datapath import REPLY_TIMEOUT_MIN_S, RdmaDataPath
+from .hints import ReadHints
 from .lifecycle import RegionLifecycle
 from .region import (
     REMOTE_CXL,
@@ -79,6 +81,32 @@ def wait_for_late_transfers(clients: list[RemoteCxlStorageClient]) -> None:
                 LATE_TRANSFER_WARN_S,
             )
         time.sleep(LATE_TRANSFER_POLL_S)
+
+
+class _RegionChannel:
+    """``AccessChannel`` of one mapped region: messages go to its remote CXL
+    agent on the connection that mapped it."""
+
+    def __init__(self, data: RdmaDataPath, access: RegionAccess) -> None:
+        self._data = data
+        self._access = access
+
+    def request(
+        self,
+        action: str,
+        ranges: Sequence[AccessRange] = (),
+        *,
+        write: bool = False,
+        **payload: Any,
+    ) -> dict:
+        """Send one policy message; see ``AccessChannel.request``."""
+        message = {
+            **payload,
+            "action": action,
+            "ranges": [r.to_dict() for r in ranges],
+            "write": bool(write),
+        }
+        return self._data.extension_request(self._access, message)
 
 
 class RemoteCxlStorageClient(RegionLifecycle):
@@ -136,6 +164,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # lease while the session lives, and a leased key cannot be evicted
         self._unreleased: list[str] = []
         self._isolated: list[IsolatedTransfer] = []
+        self._late_pages: list[tuple[RemoteCxlRegion, list[StorageLocation]]] = []
         self._staging_warned = False
         # RDMA transfers run without the lock; close waits for them to end.
         self._transfers = 0
@@ -147,6 +176,111 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # Orders free and store of an allocation that has no page yet
         self._unplaced_lock = threading.Lock()
         self._unplaced_warned_at = float("-inf")
+        # Out-of-tree access policy the config names (access_policy.py); it
+        # decides when transfers run and when pages given back are reused.
+        self._policy = (
+            load_access_policy(config.access_policy, config.access_policy_config)
+            if getattr(config, "access_policy", "")
+            else None
+        )
+        # Read hints (hints.py): the policy hears which bytes a load will
+        # read before it starts. Off without a policy that takes them.
+        self._hints = (
+            ReadHints(self._policy, self._hint_locate, self._hint_send)
+            if self._policy is not None
+            else None
+        )
+        self._hint_agents: dict[str, Any] = {}
+        self._hint_key: bytes | None = None
+        # The request whose load this thread reads (read_context)
+        self._reading = threading.local()
+
+    # ------------------------------------------------------------ read hints
+
+    @property
+    def read_hints_enabled(self) -> bool:
+        """Whether this backend's access policy takes read hints."""
+        return self._hints is not None and self._hints.enabled
+
+    def hint_read(
+        self, request_id: str, keys: list[str], route_key: str | None = None
+    ) -> None:
+        """Tell the access policy that ``request_id`` will read ``keys`` soon.
+
+        Returns at once: the lookup of the leading hit keys and the policy's
+        ``read_hint`` run on the hint thread. Without a policy that takes
+        hints this does nothing. A hint takes no lease; the load still
+        leases and reads every key.
+        """
+        if self.read_hints_enabled:
+            self._hints.hint(request_id, keys)
+
+    def end_read_hint(self, request_id: str) -> None:
+        """``request_id`` ended: the policy may drop what it prepared for it."""
+        if self.read_hints_enabled:
+            self._hints.end(request_id)
+
+    def set_read_request(self, request_id: str) -> None:
+        """Name the request whose load this thread's next reads belong to.
+
+        The access policy's ``read`` hook gets the name, so it can find what
+        a read hint prepared; ``""`` clears it.
+        """
+        self._reading.request_id = request_id
+
+    def _hint_locate(self, keys: list[str]) -> list[tuple[str, list[AccessRange]]]:
+        """The leading hit keys, grouped per region in key order, with the
+        remote CXL agent of each region (on the hint thread)."""
+        from maru_remote.region_map import pick_agent
+
+        self._ensure(data=False)
+        groups: list[tuple[str, list[AccessRange]]] = []
+        current = None
+        for i in range(0, len(keys), MAX_STORAGE_BATCH):
+            batch = keys[i : i + MAX_STORAGE_BATCH]
+            result = self._call(
+                "probe",
+                engine_id=self.config.engine_id,
+                namespace=self.config.cache_namespace,
+                keys=batch,
+                locations=True,
+            )
+            entries = result.get("entries") or []
+            regions = result.get("regions") or {}
+            for entry in entries[: len(batch)]:
+                if entry is None:
+                    return groups  # the load reads the leading hits only
+                location = StorageLocation(**entry)
+                handle = regions.get(location.pool_id)
+                if handle is None or not self._agents:
+                    return groups
+                if current != location.pool_id:
+                    agent = pick_agent(self._agents, int(handle["region_id"]))
+                    groups.append((agent, []))
+                    current = location.pool_id
+                groups[-1][1].append(AccessRange(handle, location))
+            if len(entries) < len(batch):
+                return groups
+        return groups
+
+    def _hint_send(self, agent: str, message: dict) -> dict:
+        """Send a hint message on this process's own connection to ``agent``."""
+        from maru_remote.region_map import RegionMapClient, load_key
+
+        client = self._hint_agents.get(agent)
+        if client is None:
+            if self._hint_key is None:
+                self._hint_key = load_key(self.config.remote_cxl_agent_key_file)
+            client = self._hint_agents[agent] = RegionMapClient(
+                agent,
+                timeout_s=max(self.config.rdma_timeout_s, REPLY_TIMEOUT_MIN_S),
+                key=self._hint_key,
+            )
+        if not client.epoch:
+            client.hello()  # connects; a reconnect later renews the epoch
+        if not client.region_extension:
+            raise StorageError(f"remote CXL agent {agent} has no region extension")
+        return client.extension({**message, "epoch": client.epoch})
 
     # ------------------------------------------------------------------ setup
 
@@ -786,8 +920,6 @@ class RemoteCxlStorageClient(RegionLifecycle):
     def _write_group(self, group: list[RemoteCxlAllocation]) -> bool:
         """WRITE the pages of one region; on failure they are given back or
         isolated, and False is returned."""
-        from maru_remote.transport import TransferTimeout, TransferUncertainError
-
         region = group[0].region
         with self._lock:
             if region.retired:
@@ -805,9 +937,44 @@ class RemoteCxlStorageClient(RegionLifecycle):
             access = self._map_for_write(region, group)
             if access is None:
                 return False
+        if self._policy is None:
+            return self._write_batch(region, access, group, None)
+        channel = _RegionChannel(self._data, access)
+        try:
+            limit = self._policy.write_batch_limit(channel)
+            if type(limit) is not int or limit <= 0:
+                raise ValueError(f"invalid write batch limit {limit!r}")
+        except Exception:
+            logger.warning("access policy gave no write batch limit", exc_info=True)
+            with self._lock:
+                self._give_back(group)
+            return False
+        batches = [group[i : i + limit] for i in range(0, len(group), limit)]
+        for i, batch in enumerate(batches):
+            if not self._write_batch(region, access, batch, channel):
+                # Nothing of the group is committed: the rest goes back too.
+                with self._lock:
+                    for other in batches[:i] + batches[i + 1 :]:
+                        self._give_back(other)
+                return False
+        return True
+
+    def _write_batch(
+        self,
+        region: RemoteCxlRegion,
+        access: RegionAccess,
+        batch: list[RemoteCxlAllocation],
+        channel: _RegionChannel | None,
+    ) -> bool:
+        """WRITE one batch of a region's pages; on failure they are given back
+        or isolated, and False is returned. With an access policy
+        (``channel`` set) the policy prepares the pages first and learns of
+        the WRITE's completion after."""
+        from maru_remote.transport import TransferTimeout, TransferUncertainError
+
         with self._lock:
             if region.retired:
-                self._give_back(group)
+                self._give_back(batch)
                 return False
             pairs = [
                 (
@@ -815,15 +982,31 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     access.base_addr + h.location.offset,
                     h.location.length,
                 )
-                for h in group
+                for h in batch
             ]
+        token = None
+        if channel is not None:
+            ranges = [AccessRange(region.handle, h.location) for h in batch]
+            try:
+                token = self._policy.prepare_write(channel, ranges)
+            except Exception:
+                # The pages go back; the policy is asked before they are reused.
+                logger.warning("access policy did not prepare a WRITE", exc_info=True)
+                with self._lock:
+                    self._give_back(batch)
+                return False
+            with self._lock:
+                if region.retired:
+                    # It went back while the policy prepared the pages.
+                    self._give_back(batch)
+                    return False
         try:
             self._transport.write(
                 access.peer, pairs, timeout_s=self.config.rdma_timeout_s
             )
         except (TransferTimeout, TransferUncertainError) as exc:
             # The NIC may still write: keep pages and slots until it ends.
-            self._isolate_write(region, group, exc.pending)
+            self._isolate_write(region, batch, exc.pending)
             logger.warning("RDMA WRITE not confirmed: %s", exc)
             return False
         except Exception as exc:
@@ -835,12 +1018,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 # region; the release before the region goes back ends any late
                 # WRITE. The slots are safe once this end's connection is torn
                 # down, so the connection goes before the slots.
-                for h in group:
+                for h in batch:
                     region.untrack(h)
                     region.quarantine(h.location)
                     h.state = "freed"
                 self._data.disconnect({access.peer})
-                for h in group:
+                for h in batch:
                     self._give_slot(h)
             # A node that cannot be reached any more has the region set aside
             # now; its keys stop being reported as hits if it stays so.
@@ -864,13 +1047,23 @@ class RemoteCxlStorageClient(RegionLifecycle):
             if pending is None:
                 # Interrupted before NIXL had a transfer: nothing was sent.
                 with self._lock:
-                    self._give_back(group)
+                    self._give_back(batch)
             else:
                 # Interrupted while the WRITE may run: keep pages and slots
                 # out of use until it ends (the caller gives back only what
                 # is still being sent).
-                self._isolate_write(region, group, pending)
+                self._isolate_write(region, batch, pending)
             raise
+        if channel is not None:
+            try:
+                self._policy.written(channel, token)
+            except Exception:
+                logger.warning(
+                    "access policy did not take a WRITE's end", exc_info=True
+                )
+                with self._lock:
+                    self._give_back(batch)
+                return False
         return True
 
     def _isolate_write(
@@ -1133,6 +1326,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
         by_peer: dict[str, list[tuple[int, int, int]]] = {}
         slots_by_peer: dict[str, list[int]] = {}
+        # With an access policy: per region, its access, ranges, pairs and slots
+        groups: dict[
+            str, tuple[RegionAccess, list[AccessRange], list[tuple], list[int]]
+        ] = {}
         try:
             for (_, location), slot in zip(hits, slots, strict=False):
                 # An own region is mapped with its handle; another session's
@@ -1159,14 +1356,18 @@ class RemoteCxlStorageClient(RegionLifecycle):
                     raise StorageUnavailableError(
                         "A leased location ends past its region"
                     )
-                by_peer.setdefault(access.peer, []).append(
-                    (
-                        self._staging.addr(slot),
-                        access.base_addr + location.offset,
-                        location.length,
-                    )
+                pair = (
+                    self._staging.addr(slot),
+                    access.base_addr + location.offset,
+                    location.length,
                 )
+                by_peer.setdefault(access.peer, []).append(pair)
                 slots_by_peer.setdefault(access.peer, []).append(slot)
+                if self._policy is not None:
+                    group = groups.setdefault(location.pool_id, (access, [], [], []))
+                    group[1].append(AccessRange(handle, location))
+                    group[2].append(pair)
+                    group[3].append(slot)
         except Exception as exc:
             # A region that cannot be mapped (node down, or its owner
             # released it) loads as a miss.
@@ -1174,38 +1375,63 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for slot in slots:
                 self._staging.give(slot)
             return False
-        for peer, pairs in by_peer.items():
+        if self._policy is None:
+            work = [(peer, pairs, None) for peer, pairs in by_peer.items()]
+        else:
+            work = [(g[0].peer, g[2], g) for g in groups.values()]
+        for peer, pairs, group in work:
+            failure: list[BaseException] = []  # what the transport raised
             try:
-                self._transport.read(peer, pairs, timeout_s=self.config.rdma_timeout_s)
-            except (TransferTimeout, TransferUncertainError) as exc:
-                # A late READ only lands in these slots: isolate them.
-                peer_slots = slots_by_peer[peer]
-                with self._lock:
-                    self._isolated.append(
-                        IsolatedTransfer(
-                            exc.pending, "READ", exc.pending.peer, None, [], peer_slots
-                        )
+                if group is None:
+                    self._transport.read(
+                        peer, pairs, timeout_s=self.config.rdma_timeout_s
                     )
-                # Earlier peers completed; later peers have not been posted.
-                held = set(peer_slots)
-                for slot in slots:
-                    if slot not in held:
+                else:
+                    self._policy_read(group[0], group[1], pairs, failure)
+            except BaseException as raised:
+                if group is not None and not failure:
+                    # The policy failed with no READ under way: a miss.
+                    for slot in slots:
                         self._staging.give(slot)
-                logger.warning("RDMA READ not confirmed: %s", exc)
-                return False
-            except Exception as exc:
-                # NIXL released the failed transfer: nothing lands any more.
-                logger.warning("RDMA READ failed: %s", exc)
-                for slot in slots:
-                    self._staging.give(slot)
-                try:
-                    self._data.disconnect({peer})
-                except Exception:
-                    logger.warning(
-                        "closing the connection to %s failed", peer, exc_info=True
-                    )
-                return False
-            except BaseException as exc:
+                    if not isinstance(raised, Exception):
+                        raise
+                    logger.warning("access policy did not complete a READ: %s", raised)
+                    return False
+                exc = failure[0] if failure else raised
+                # Only this unit's slots can still receive a late READ.
+                peer_slots = group[3] if group is not None else slots_by_peer[peer]
+                if isinstance(exc, (TransferTimeout, TransferUncertainError)):
+                    # A late READ only lands in these slots: isolate them.
+                    with self._lock:
+                        self._isolated.append(
+                            IsolatedTransfer(
+                                exc.pending,
+                                "READ",
+                                exc.pending.peer,
+                                None,
+                                [],
+                                peer_slots,
+                            )
+                        )
+                    # Earlier units completed; later ones have not been posted.
+                    held = set(peer_slots)
+                    for slot in slots:
+                        if slot not in held:
+                            self._staging.give(slot)
+                    logger.warning("RDMA READ not confirmed: %s", exc)
+                    return False
+                if isinstance(exc, Exception):
+                    # NIXL released the failed transfer: nothing lands any more.
+                    logger.warning("RDMA READ failed: %s", exc)
+                    for slot in slots:
+                        self._staging.give(slot)
+                    try:
+                        self._data.disconnect({peer})
+                    except Exception:
+                        logger.warning(
+                            "closing the connection to %s failed", peer, exc_info=True
+                        )
+                    return False
                 pending = getattr(exc, "pending_transfer", None)
                 if pending is None:
                     # Interrupted before NIXL had a transfer: nothing lands.
@@ -1214,7 +1440,6 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 else:
                     # Interrupted while the READ may run: its slots stay taken
                     # until NIXL releases the transfer.
-                    peer_slots = slots_by_peer[peer]
                     with self._lock:
                         self._isolated.append(
                             IsolatedTransfer(
@@ -1227,6 +1452,63 @@ class RemoteCxlStorageClient(RegionLifecycle):
                             self._staging.give(slot)
                 raise
         return True
+
+    def _policy_read(
+        self,
+        access: RegionAccess,
+        ranges: list[AccessRange],
+        pairs: list[tuple[int, int, int]],
+        failure: list[BaseException],
+    ) -> None:
+        """Let the access policy run the READs of one region.
+
+        The policy calls the transfer in order until every range is read; an
+        exception the transport raised is recorded in ``failure`` and raised
+        again even if the policy swallowed it.
+
+        Raises:
+            ValueError: if the policy read out of order or left ranges unread.
+            BaseException: what the policy or the transport raised.
+        """
+        cursor = 0
+        done = False
+
+        def transfer(start: int, end: int) -> None:
+            nonlocal cursor
+            if failure:
+                # A READ may still land in the slots: no further READ into them.
+                raise failure[0]
+            if done:
+                raise RuntimeError("the read already returned; its slots are gone")
+            if start != cursor or not start < end <= len(pairs):
+                raise ValueError(
+                    f"access policy read ranges[{start}:{end}] after {cursor}"
+                )
+            try:
+                self._transport.read(
+                    access.peer, pairs[start:end], timeout_s=self.config.rdma_timeout_s
+                )
+            except BaseException as exc:
+                failure.append(exc)
+                raise
+            cursor = end
+
+        # Only a policy that takes read hints is told which request reads.
+        named = (
+            {"request_id": getattr(self._reading, "request_id", "")}
+            if self.read_hints_enabled
+            else {}
+        )
+        try:
+            self._policy.read(
+                _RegionChannel(self._data, access), ranges, transfer, **named
+            )
+        finally:
+            done = True
+        if failure:
+            raise failure[0]
+        if cursor != len(pairs):
+            raise ValueError(f"access policy read {cursor} of {len(pairs)} ranges")
 
     def _release_lease(self, lease_id: str) -> bool:
         """Release a server lease; True only if it held for the whole read.
@@ -1286,6 +1568,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
         for thread in self._threads:
             thread.join()
         self._threads = []
+        # The hint thread owns its agent connections until it ended.
+        if self._hints is None or self._hints.close():
+            for agent in self._hint_agents.values():
+                agent.close()
+            self._hint_agents.clear()
         with self._lock:
             # Transfers run without the lock: let those under way end (each
             # within its timeout) before the regions and the data path go.
