@@ -44,43 +44,45 @@ Node A stores the KV it computes in a shared KV cache, and nodes B and C load it
 
 These are the storage access paths. Connector packing, CUDA registration and fallback copies can add temporary buffers; neither backend eliminates GPU data movement.
 
-The following diagram shows the directly mapped `cxl` path. The `remote_cxl` path is described below and in the architecture overview.
+The diagram shows two example pools and their worker access paths. Workers share KV with other workers using the same pool and backend. Each control-plane box groups the pool's metadata and allocation services; it does not represent one process or one physical node. RM means Resource Manager.
 
 ```mermaid
 flowchart TB
-    subgraph S1["Server 1"]
-        direction TB
-        I1(["LLM Instance"])
-        H1{{"MaruHandler"}}
-        I1 --- H1
-    end
-    subgraph S2["Server 2"]
-        direction TB
-        I2(["LLM Instance"])
-        H2{{"MaruHandler"}}
-        I2 --- H2
-    end
-    subgraph S3["Server 3"]
-        direction TB
-        I3(["LLM Instance"])
-        H3{{"MaruHandler"}}
-        I3 --- H3
+    subgraph Direct["cxl"]
+        direction LR
+        CW["GPU worker<br/>MaruHandler<br/>CXL attached"]
+        CC["Control plane<br/>MaruServer + RM"]
+        CM[("CXL pool")]
+        CW <-.->|"metadata RPC"| CC
+        CC -.->|"alloc/free"| CM
+        CW <==>|"GPU copy"| CM
     end
 
-    M["Maru Control Plane"]
-
-    subgraph CXL["CXL Shared Memory"]
-        KV["KV Cache"]
+    subgraph Remote["remote_cxl"]
+        direction LR
+        RW["GPU worker<br/>MaruHandler<br/>no local CXL"]
+        ST["CPU DRAM staging<br/>(on worker)"]
+        RC["Control plane<br/>MaruServer + RM"]
+        AG["Remote CXL agent<br/>(memory node)"]
+        RM[("RDMA pool<br/>CXL on memory node")]
+        RW <-.->|"metadata RPC"| RC
+        RW <-.->|"map/release"| AG
+        RW <==>|"GPU copy"| ST
+        ST <==>|"RDMA READ/WRITE"| RM
+        RC -.->|"alloc/free"| RM
+        AG -.->|"map + NIC register"| RM
     end
 
-    H1 & H2 & H3 <-.->|"store/retrieve"| M
-    H1 & H2 & H3 <==>|"direct read/write"| CXL
-    M -.->|"manage"| CXL
+    Direct ~~~ Remote
+    style Direct fill:#eff6ff,stroke:#3b82f6
+    style Remote fill:#f0fdf4,stroke:#22c55e
+    style AG fill:#fff7ed,stroke:#f97316
+    style RM fill:#fff7ed,stroke:#f97316
 ```
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — direct access to mapped CXL memory with the `cxl` backend. GPU reads and writes copy bytes between that memory and GPU VRAM. The control plane alternatives share this directly mapped path; `remote_cxl` uses the staging and RDMA path described above.
+> **Data Plane** (thick solid arrows) — `cxl` copies KV between GPU memory and mapped CXL. `remote_cxl` copies it between GPU memory and worker CPU staging, then transfers it between staging and memory-node CXL over RDMA. Payload arrows bypass the control plane and remote CXL agent.
 
 GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in an RDMA memory pool, the CXL memory of memory nodes: a remote CXL agent on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). The agent is needed because one-sided RDMA reaches only memory that a process on the memory node has mapped and registered with its NIC, and a worker without CXL cannot map the region itself. Only control messages go to maru-server and the remote CXL agent. See [Remote CXL](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html#remote-cxl-cxl-memory-of-other-nodes-over-rdma) in the architecture overview.
 

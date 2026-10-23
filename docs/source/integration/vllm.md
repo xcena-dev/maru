@@ -41,7 +41,7 @@ flowchart LR
     subgraph direct["Direct (this connector)"]
         direction TB
         V2["vLLM"] --> MKV["MaruKVConnector"]
-        MKV --> MH2["MaruHandler"] --> CXL2["CXL"]
+        MKV --> MH2["MaruHandler"] --> PATH2["Selected storage path<br/>cxl: mapped CXL<br/>remote_cxl: CPU staging + RDMA"]
     end
 
     prev --> direct

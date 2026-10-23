@@ -6,7 +6,47 @@ Maru manages shared KV storage with two access paths. CXL-attached nodes map the
 
 ## System Architecture
 
-The diagram below shows the `cxl` backend and its control plane alternatives. The `remote_cxl` backend uses worker-side staging and a memory-node agent, as the Remote CXL section describes.
+The first diagram shows both access paths as separate example pools. Workers share KV within the same pool and backend. Each control-plane box groups metadata and allocation services; it is not one process or one physical node. RM means Resource Manager.
+
+```mermaid
+flowchart TB
+    subgraph Direct["cxl"]
+        direction LR
+        CW["GPU worker<br/>MaruHandler<br/>CXL attached"]
+        CC["Control plane<br/>MaruServer + RM"]
+        CM[("CXL pool")]
+        CW <-.->|"metadata RPC"| CC
+        CC -.->|"alloc/free"| CM
+        CW <==>|"GPU copy"| CM
+    end
+
+    subgraph Remote["remote_cxl"]
+        direction LR
+        RW["GPU worker<br/>MaruHandler<br/>no local CXL"]
+        ST["CPU DRAM staging<br/>(on worker)"]
+        RC["Control plane<br/>MaruServer + RM"]
+        AG["Remote CXL agent<br/>(memory node)"]
+        RM[("RDMA pool<br/>CXL on memory node")]
+        RW <-.->|"metadata RPC"| RC
+        RW <-.->|"map/release"| AG
+        RW <==>|"GPU copy"| ST
+        ST <==>|"RDMA READ/WRITE"| RM
+        RC -.->|"alloc/free"| RM
+        AG -.->|"map + NIC register"| RM
+    end
+
+    Direct ~~~ Remote
+    style Direct fill:#eff6ff,stroke:#3b82f6
+    style Remote fill:#f0fdf4,stroke:#22c55e
+    style AG fill:#fff7ed,stroke:#f97316
+    style RM fill:#fff7ed,stroke:#f97316
+```
+
+Thick solid arrows carry KV payloads; dotted arrows are control requests. The `remote_cxl` payload travels through worker CPU staging and the memory node's NIC, while the remote CXL agent handles mapping and registration. Neither payload path passes through MaruServer.
+
+### cxl control plane alternatives
+
+The following diagram details the directly mapped `cxl` backend and its RPC or proposed filesystem control plane. The filesystem proposal is not an alternative RDMA transport.
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -35,7 +75,7 @@ flowchart TB
 
     subgraph ControlPlane["Control Plane"]
         direction LR
-        subgraph Remote["Remote Mode"]
+        subgraph Remote["RPC Metadata Mode"]
             direction TB
             MS["MaruServer"]:::maru
             D["MaruResourceManager"]:::maru
@@ -85,7 +125,7 @@ The system has three layers:
 
 **Payload bypasses the metadata server.** With `cxl`, a CPU reader can view a mapped KV object without an additional host copy. This avoids sending that payload between compute nodes over an RDMA or IP network, but CPU writes and GPU ↔ CXL transfers still move bytes. With `remote_cxl`, a worker copies KV between GPU memory and CPU DRAM staging, and its NIC transfers the bytes between staging and the memory node's CXL. MaruServer and the remote CXL agent do not relay the payload. Mapping, registration, metadata RPC, copies and transfer scheduling still consume time; the control/data plane split alone does not establish a latency, scaling or energy advantage.
 
-**Per-application control plane.** Each application group runs its own metadata service for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages the shared memory pool across all groups. The diagram below illustrates this in Remote mode:
+**Per-application control plane.** Each application group runs its own metadata service per pool for isolation (e.g., app A with 2 instances, app B with 3 instances). A single Resource Manager manages that pool across all groups. The following diagram shows control requests for one pool, which can be a directly mapped CXL pool or an RDMA memory pool; it does not draw either payload path.
 
 ```mermaid
 %%{ init: { "flowchart": { "curve": "linear" } } }%%
@@ -107,16 +147,16 @@ flowchart LR
     MSB["MaruServer B"]:::maru
     RM["MaruResourceManager"]:::rm
 
-    A1 & A2 --> MSA
-    B1 & B2 & B3 --> MSB
-    MSA & MSB --> RM
+    A1 & A2 -.->|"metadata"| MSA
+    B1 & B2 & B3 -.->|"metadata"| MSB
+    MSA & MSB -.->|"regions"| RM
 
-    subgraph CXL["CXL Shared Memory Pool"]
+    subgraph CXL["CXL / RDMA pool"]
         direction TB
         R0["Region 0"] ~~~ R1["Region 1"] ~~~ R2["Region 2"] ~~~ R3["Region 3"]
     end
 
-    RM --> CXL
+    RM -.->|"allocate / free"| CXL
 
     classDef maru fill:#f8cecc,stroke:#b85450,font-weight:bold
     classDef rm fill:#d5e8d4,stroke:#82b366,font-weight:bold

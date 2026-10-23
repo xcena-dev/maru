@@ -5,6 +5,8 @@ Dynamo connects to Maru through its **vLLM backend**. Configure each
 used for standalone vLLM. Dynamo routes requests to the workers, and the
 connector handles KV cache sharing through Maru.
 
+The pool's access path depends on the selected backend: `cxl` maps CXL on the worker, while `remote_cxl` transfers KV through worker CPU staging and RDMA. The diagram groups that payload path in one box; workers reuse KV within the same pool and backend.
+
 ```mermaid
 flowchart TB
     Client["OpenAI API client"] --> FE["Dynamo frontend"]
@@ -16,7 +18,7 @@ flowchart TB
     end
     FE --> V0 & V1
     C0 & C1 -.->|"metadata"| MS["MaruServer"]
-    C0 & C1 <-->|"KV payload"| CXL[("CXL shared memory")]
+    C0 & C1 <-->|"backend-specific KV path"| Pool["Selected Maru pool access<br/>cxl: mapped CXL<br/>remote_cxl: CPU staging + RDMA"]
 ```
 
 See {doc}`vllm` for connector settings and the
