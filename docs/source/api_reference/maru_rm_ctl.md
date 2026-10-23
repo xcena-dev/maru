@@ -24,6 +24,7 @@ Devices are named `daxN.M` or `/dev/daxN.M`. The RM serves device `daxN.M` as po
 | `discard daxN.M [--confirm [--force]]` | Release every allocation of the device's pool without opening the device. Without `--confirm` it only lists them |
 | `release REGION --confirm [--force]` | Release one allocation, e.g. of a remote owner that died while the RM was down |
 | `wipe daxN.M --confirm` | Zero all of an excluded device, header included. Waits until done, which can take minutes; Ctrl-C stops it and leaves the device partly zeroed |
+| `drop-holds NODE [--confirm]` | List the regions the remote CXL agent of memory node NODE holds. A freed region stays out of use while held; `--confirm` drops the holds once that node's agent is gone for good |
 
 `discard` and `release` refuse while a local owner process is still running. `--force` releases anyway, for a PID that is running but is not the owner, such as a PID reused after a reboot. Before either command, stop every process that maps the regions on every host: the RM cannot see remote owners.
 

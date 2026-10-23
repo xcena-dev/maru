@@ -7,6 +7,7 @@ import logging
 import signal
 from threading import RLock
 
+from maru_remote.region_map import DEFAULT_COPY_FILE, KeyFileError, load_key
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
@@ -32,8 +33,14 @@ class MaruServer:
         enable_cxl: bool = True,
         cpu_capacity_limit: int = 64 * 1024**3,
         cpu_session_ttl: float = 30,
+        remote_cxl_agents: list[str] | None = None,
+        remote_cxl_agent_key: bytes | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
+        # Remote CXL agents of the pool's memory nodes, handed to remote CXL workers in
+        # the handshake as the RM address is. MaruServer calls them itself only
+        # for regions whose owner left (region_keeper.py).
+        self._remote_cxl_agents = list(remote_cxl_agents or [])
         self._dax_paths = dax_paths
         from .replica_directory import ReplicaDirectory
 
@@ -48,7 +55,16 @@ class MaruServer:
             cpu_session_ttl,
             reserve_cxl=self._reserve_storage_region if enable_cxl else None,
             release_cxl=self._release_storage_region if enable_cxl else None,
+            largest_cxl_pool=self._largest_storage_pool if enable_cxl else None,
         )
+        self._region_keeper = None
+        if enable_cxl and self._remote_cxl_agents:
+            from .region_keeper import RegionKeeper
+
+            self._region_keeper = RegionKeeper(
+                self.replica_directory, self._remote_cxl_agents, remote_cxl_agent_key
+            )
+            self._region_keeper.start()
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
         # Periodically force-unpin entries that exceed a TTL to prevent
         # pin leaks from crashed clients.
@@ -85,9 +101,24 @@ class MaruServer:
         """Resource manager address used by this server."""
         return self._rm_address
 
+    @property
+    def remote_cxl_agents(self) -> list[str]:
+        """Remote CXL agent addresses of the pool's memory nodes."""
+        return list(self._remote_cxl_agents)
+
     def _reserve_storage_region(self, owner: str, size: int) -> MaruHandle | None:
         """Reserve a typed pool without exposing it to legacy clients."""
         return self.request_alloc(owner, size, legacy_visible=False)
+
+    def _largest_storage_pool(self) -> int | None:
+        """Bytes of the largest pool a storage region may come from."""
+        pools = self._allocation_manager.pool_stats()
+        sizes = [
+            p.total_size
+            for p in pools
+            if not self._dax_paths or p.dax_path in self._dax_paths
+        ]
+        return max(sizes, default=None)
 
     def _release_storage_region(self, owner: str, region_id: int) -> bool:
         """Idempotent release of a typed pool, after the owner unmaps it."""
@@ -374,7 +405,7 @@ class MaruServer:
 
         l1_usage = self.replica_directory.get_usage()
         for pool in l1_usage["pools"]:
-            if pool["medium"] == "cxl":
+            if pool["medium"] in ("cxl", "remote_cxl"):
                 owner = pool["owner_instance_id"]
                 used_by_instance[owner] = (
                     used_by_instance.get(owner, 0) + pool["ready_bytes"]
@@ -434,6 +465,8 @@ class MaruServer:
 
     def close(self) -> None:
         """Shutdown the server and release resources."""
+        if self._region_keeper is not None:
+            self._region_keeper.stop()
         self._stats_manager.close()
         if self._allocation_manager is not None:
             self._allocation_manager.close()
@@ -509,9 +542,42 @@ def main() -> None:
         default=64 * 1024**3,
         help="Maximum granted CPU pool bytes per node (default: 64 GiB)",
     )
+    parser.add_argument(
+        "--remote-cxl-agent",
+        action="append",
+        default=None,
+        dest="remote_cxl_agents",
+        help=(
+            "Remote CXL agent address (host:port) of a memory node of this pool, "
+            "for remote CXL workers. Repeat or separate with commas for every memory "
+            "node of a shared pool."
+        ),
+    )
+    parser.add_argument(
+        "--remote-cxl-agent-key-file",
+        default=DEFAULT_COPY_FILE,
+        help=(
+            "Key the remote CXL agents require (a copy of a memory node's "
+            f"{DEFAULT_COPY_FILE}); used with --remote-cxl-agent"
+        ),
+    )
     args = parser.parse_args()
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
+    remote_cxl_agents = [
+        address.strip()
+        for item in args.remote_cxl_agents or []
+        for address in item.split(",")
+        if address.strip()
+    ]
+    if args.cpu_only and remote_cxl_agents:
+        parser.error("--cpu-only cannot be combined with --remote-cxl-agent")
+    remote_cxl_agent_key = None
+    if remote_cxl_agents:
+        try:
+            remote_cxl_agent_key = load_key(args.remote_cxl_agent_key_file)
+        except KeyFileError as exc:
+            parser.error(str(exc))
 
     setup_logging(args.log_level)
 
@@ -521,6 +587,8 @@ def main() -> None:
         dax_paths=args.dax_paths,
         enable_cxl=not args.cpu_only,
         cpu_capacity_limit=args.cpu_capacity_limit,
+        remote_cxl_agents=remote_cxl_agents,
+        remote_cxl_agent_key=remote_cxl_agent_key,
     )
     rpc_server = RpcServer(server, host=args.host, port=args.port)
 

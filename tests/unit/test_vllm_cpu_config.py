@@ -126,6 +126,49 @@ def test_engine_namespace_tracks_revision_and_geometry():
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
 
 
+def test_engines_of_different_storage_backends_never_share_a_namespace():
+    """A CPU or mixed engine cannot load the keys of a remote CXL engine."""
+    config = engine_config()
+    digests = {
+        _cpu_engine_config({**extra(), "maru_storage_backend": backend}, config)[
+            "maru_cache_namespace"
+        ]
+        for backend in ("cpu", "mixed", "remote_cxl")
+    }
+    assert len(digests) == 3
+
+
+def test_engine_namespace_ignores_where_a_node_keeps_the_weights():
+    """Nodes that load the same weights from different paths, with another
+    transformers release, share; another maru_cache_namespace does not."""
+
+    def node(path, transformers_version):
+        config = engine_config()
+        config.model_config.model = path
+        config.model_config.hf_config = SimpleNamespace(
+            to_dict=lambda: {
+                "heads": 4,
+                "_name_or_path": path,
+                "transformers_version": transformers_version,
+                "_commit_hash": None,
+            }
+        )
+        return config
+
+    a = _cpu_engine_config(extra(), node("org/model", "5.11.0"))["maru_cache_namespace"]
+    b = _cpu_engine_config(extra(), node("/models/model", "5.12.0"))[
+        "maru_cache_namespace"
+    ]
+    assert a == b
+    other = {**extra(), "maru_cache_namespace": "other-weights"}
+    assert (
+        a
+        != _cpu_engine_config(other, node("org/model", "5.11.0"))[
+            "maru_cache_namespace"
+        ]
+    )
+
+
 def test_cpu_requires_recompute_instead_of_failing_a_cache_miss():
     config = engine_config()
     config.kv_transfer_config.kv_load_failure_policy = "fail"
@@ -158,7 +201,7 @@ def test_cpu_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():
 def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     scheduler = make_scheduler(4, 4, extra())
     scheduler._known_keys = {"any-old-key"}
-    scheduler._handler = SimpleNamespace(batch_exists=lambda _: [True, False])
+    scheduler._handler = SimpleNamespace(batch_exists=lambda _, **route: [True, False])
     assert scheduler._count_matched_chunks(list(range(8))) == 1
-    scheduler._handler.batch_exists = lambda _: [False, False]
+    scheduler._handler.batch_exists = lambda _, **route: [False, False]
     assert scheduler._count_matched_chunks(list(range(8))) == 0

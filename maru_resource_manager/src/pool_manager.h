@@ -97,6 +97,22 @@ public:
     /// Atomically verify auth token and get device path. Returns -EACCES on bad token.
     int verifyAndGetPath(const Handle &handle, std::string &outPath);
 
+    /// Region holds of remote agents (holder = node ID, instance = the agent
+    /// process's epoch). A region freed while held drains: it stays out of
+    /// the free list, and reads as freed, until its last hold is dropped.
+    ///
+    /// Verify the token as verifyAndGetPath, record the hold (replacing an
+    /// older instance of the holder) and return the device path. -ENOENT if
+    /// the region is absent or draining, -EINVAL for a bad name.
+    int hold(const Handle &handle, const std::string &holder, const std::string &instance,
+             std::string &outPath);
+    /// Drop the holder's hold if it is this instance's. The token is verified
+    /// as by hold (-EACCES); 0 if the region or the hold is gone.
+    int unhold(const Handle &handle, const std::string &holder, const std::string &instance);
+    /// Drop every hold of the holder made by another instance (that process
+    /// and its registrations are gone).
+    int resetHolds(const std::string &holder, const std::string &instance, uint32_t &dropped);
+
     void getStats(std::vector<PoolState> &out);
     /// Lightweight check: returns true if at least one pool is loaded.
     bool hasPools() const;
@@ -141,6 +157,9 @@ public:
     /// Return every allocation of a device's pool, without opening the device.
     int adminDiscard(const std::string &device, bool confirmed, bool force,
                      std::string &out);
+    /// List a holder's holds; once the operator confirmed that node's agent
+    /// is gone for good, drop them.
+    int adminDropHolds(const std::string &holder, bool confirmed, std::string &out);
     /// Zero all of an excluded device, header included. Runs without holding
     /// the pool lock; stops between chunks once `cancel` is set.
     int adminWipe(const std::string &device, bool confirmed, std::string &out,
@@ -207,8 +226,35 @@ private:
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
-    /// Caller MUST hold mu_.
+    /// A held region drains instead. Caller MUST hold mu_.
     int doFreeAllocation(uint64_t regionId);
+    /// Log the free and return the range. Caller MUST hold mu_.
+    int releaseAllocation(uint64_t regionId);
+    void dropClientRef(const char *clientId);
+
+    int verifyAndGetPathLocked(const Handle &handle, std::string &outPath);
+
+    // Region holds (pool_holds.cpp). Caller MUST hold mu_.
+    bool isHeld(uint64_t regionId) const { return holds_.count(regionId) != 0; }
+    bool isDraining(uint64_t regionId) const { return draining_.count(regionId) != 0; }
+    // " held_by=a,b draining" for maru-rm-ctl; "" for a plain allocation.
+    std::string holdState(uint64_t regionId) const;
+    // Rewrite the holds file. Nonzero: the file is unchanged, so the caller
+    // undoes its change. Zero: the file has the new state, so memory keeps it
+    // even if `syncRc` says the directory sync failed; a change that adds
+    // protection then reports syncRc, one that removes it succeeds (a power
+    // loss brings back the older file, which only holds more).
+    int saveHoldsLocked(int &syncRc);
+    // 0 once the holds file last renamed into place is known durable; else
+    // sync the directory again and return the result. An idempotent request
+    // (a retried HOLD or FREE) must not report success before this does.
+    int confirmHoldsDurableLocked();
+    // Read the holds file and drop records of regions not in the ledger,
+    // counted in `stale`.
+    int loadHoldsLocked(size_t &stale);
+    // Free draining regions without holds; save the file if anything changed
+    // or `save` is set. Returns the number freed.
+    size_t finishDrainingLocked(bool save);
 
     mutable std::mutex mu_;
     std::string stateDir_;
@@ -256,6 +302,14 @@ private:
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;
+    // Remote agents' holds: region -> holder -> instance. Every region here
+    // is in allocations_.
+    std::map<uint64_t, std::map<std::string, std::string>> holds_;
+    // Freed while held: still in allocations_, so its range stays out of the
+    // free list and survives a restart, but freed for everyone else.
+    std::set<uint64_t> draining_;
+    // -errno while the last holds file renamed into place is not synced.
+    int holdsSyncRc_{0};
     uint64_t nextRegionId_{1};
 
     // client_id → {pid, start_time} for reaper PID-reuse detection (in-memory only)

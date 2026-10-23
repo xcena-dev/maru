@@ -6,6 +6,7 @@ Communicates with the resource manager over a persistent TCP connection
 using the binary IPC protocol defined in maru_shm.ipc.
 """
 
+import errno
 import logging
 import mmap as mmap_module
 import os
@@ -23,15 +24,31 @@ from .ipc import (
     FreeResp,
     GetAccessReq,
     GetAccessResp,
+    HoldReq,
     MsgHeader,
     MsgType,
+    ResetHoldsReq,
+    ResetHoldsResp,
     StatsReq,
     StatsResp,
+    UnholdReq,
 )
 from .types import MaruHandle, MaruPoolInfo
 from .uds_helpers import read_full, write_full
 
 logger = logging.getLogger(__name__)
+
+
+class HoldRefusedError(RuntimeError):
+    """The resource manager refused a hold request; it recorded nothing.
+
+    A bad token, a region that is not allocated (or is draining), or a
+    malformed holder name. Other failures leave the outcome unknown.
+    """
+
+
+class HoldsUnsupportedError(HoldRefusedError):
+    """The resource manager predates region holds (restart it with this Maru)."""
 
 
 def _make_client_id() -> str:
@@ -276,6 +293,119 @@ class MaruShmClient:
         with self._lock:
             self._close_region_locked(handle.region_id)
         logger.debug("free(region_id=%d)", handle.region_id)
+
+    def get_access(self, handle: MaruHandle) -> GetAccessResp:
+        """Check a handle with the resource manager and get its device.
+
+        Always asks the resource manager (``GET_ACCESS``), unlike :meth:`mmap`,
+        which reuses a device path it saw before for the same region.
+
+        Args:
+            handle: Handle of the region.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            RuntimeError: if the resource manager refuses the handle.
+        """
+        return self._request_access(handle)
+
+    def hold_access(
+        self, handle: MaruHandle, holder: str, instance: str
+    ) -> GetAccessResp:
+        """Check a handle as :meth:`get_access` does and hold the region.
+
+        While ``holder`` holds the region, the resource manager keeps its
+        range out of use after it is freed, until :meth:`unhold`.
+
+        Args:
+            handle: Handle of the region.
+            holder: Who registers the region (a remote CXL agent's node).
+            instance: The holder's process instance; :meth:`reset_holds` drops
+                the holds of the others.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the handle.
+        """
+        req = HoldReq(
+            handle=handle,
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.HOLD_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Hold failed")
+        resp = GetAccessResp.unpack(payload)
+        if resp.status in (-errno.ENOENT, -errno.EINVAL):
+            raise HoldRefusedError(f"Hold failed with status {resp.status}")
+        if resp.status != 0:
+            raise RuntimeError(f"Hold failed with status {resp.status}")
+        return resp
+
+    def unhold(self, handle: MaruHandle, holder: str, instance: str) -> None:
+        """Tell the resource manager that ``holder`` released a region.
+
+        Unholding a region that is not held, or no longer allocated, succeeds.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the request.
+        """
+        req = UnholdReq(
+            handle=handle,
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.UNHOLD_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Unhold failed")
+        resp = FreeResp.unpack(payload)
+        if resp.status == -errno.EINVAL:
+            raise HoldRefusedError(f"Unhold failed with status {resp.status}")
+        if resp.status != 0:
+            raise RuntimeError(f"Unhold failed with status {resp.status}")
+
+    def reset_holds(self, holder: str, instance: str) -> int:
+        """Drop the holds of ``holder``'s other instances; they have ended.
+
+        Returns:
+            How many holds were dropped.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the request.
+        """
+        req = ResetHoldsReq(
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.RESET_HOLDS_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Reset holds failed")
+        resp = ResetHoldsResp.unpack(payload)
+        if resp.status != 0:
+            raise RuntimeError(f"Reset holds failed with status {resp.status}")
+        return resp.dropped
+
+    def _check_hold_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
+        if hdr.msg_type == MsgType.ERROR_RESP:
+            err = ErrorResp.unpack(payload)
+            if err.status == -errno.ENOSYS:
+                raise HoldsUnsupportedError(
+                    "the resource manager does not support region holds; "
+                    "restart it with this Maru version"
+                )
+            if err.status == -errno.EACCES:
+                raise HoldRefusedError(f"{context} ({err.status}): {err.message}")
+            raise RuntimeError(f"{context} ({err.status}): {err.message}")
 
     def _resolve_device_path(self, rm_path: str, device_uuid: str) -> str:
         """Map the RM's device (path, UUID) to this host's device path.

@@ -156,9 +156,11 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
     const auto live = poolAllocations(poolId);
     std::vector<uint64_t> gone;
     size_t alive = 0;
+    // A held or draining region may still be written by a remote agent.
     for (const auto &a : live)
     {
-        if (ownerGone(a)) gone.push_back(a.handle.regionId);
+        const uint64_t id = a.handle.regionId;
+        if (ownerGone(a) && !isHeld(id) && !isDraining(id)) gone.push_back(id);
         else ++alive;
     }
     plan.live = live.size();
@@ -197,7 +199,9 @@ void PoolManager::decide(const DeviceProbe &probe, const PoolRecord &record,
             {
                 size_t mAlive = 0;
                 for (const auto &a : poolAllocations(static_cast<uint32_t>(m)))
-                    if (!ownerGone(a)) ++mAlive;
+                    if (!ownerGone(a) || isHeld(a.handle.regionId) ||
+                        isDraining(a.handle.regionId))
+                        ++mAlive;
                 if (mAlive)
                     return refuse("the device holds pool " + std::to_string(m) + "'s data with " +
                                   std::to_string(mAlive) + " live allocation(s); discard pool " +
@@ -581,9 +585,26 @@ int PoolManager::executePlans(std::unique_lock<std::mutex> &lock, std::vector<De
         // Exited owners' allocations leave the ledger before anything else.
         if (plan.action == DevicePlan::Action::Reset)
         {
+            // The lock was released since decide() (an earlier plan's device
+            // I/O): a region held meanwhile must not be released, and the
+            // pool must not start over under it.
             std::vector<uint64_t> frees;
+            bool held = false;
             for (uint64_t id : plan.frees)
-                if (allocations_.count(id)) frees.push_back(id);
+            {
+                if (!allocations_.count(id)) continue;
+                held |= isHeld(id) || isDraining(id);
+                frees.push_back(id);
+            }
+            if (held)
+            {
+                plan.action = DevicePlan::Action::Skip;
+                plan.reason = "an allocation was held while the device was being recovered; "
+                              "judged again at the next scan";
+                markUnserved(plan);
+                slots->release(path);
+                continue;
+            }
             if (!frees.empty())
             {
                 bool written = false;
@@ -734,10 +755,26 @@ int PoolManager::finishBootMarker()
 {
     if (previousBoot_)
     {
-        // Every local owner in the ledger ran in an earlier boot.
+        // Every local owner in the ledger ran in an earlier boot. A region a
+        // remote agent holds drains instead: the agent outlived the reboot.
         std::vector<uint64_t> frees;
+        size_t drains = 0;
         for (const auto &[id, a] : allocations_)
-            if (isLocalClientId(a.clientId)) frees.push_back(id);
+        {
+            if (!isLocalClientId(a.clientId)) continue;
+            if (!isHeld(id) && !isDraining(id)) frees.push_back(id);
+            else if (draining_.insert(id).second) ++drains;
+        }
+        if (drains)
+        {
+            int syncRc = 0;
+            const int rc = saveHoldsLocked(syncRc);
+            if (rc != 0 || syncRc != 0) return rc != 0 ? rc : syncRc;
+            logf(LogLevel::Warn,
+                 "%zu held allocation(s) of local processes from an earlier boot drain until "
+                 "unheld",
+                 drains);
+        }
         if (!frees.empty())
         {
             bool written = false;
@@ -826,6 +863,10 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
     }
     allocations_ = std::move(ledger.live);
     nextRegionId_ = ledger.nextRegionId;
+    // Before any decision: a held allocation is never taken for an exited one.
+    size_t staleHolds = 0;
+    rc = loadHoldsLocked(staleHolds);
+    if (rc != 0) return rc;
 
     loadBootMarker();
     std::vector<DeviceInfo> devices;
@@ -870,6 +911,9 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
     executePlans(lock, plans);
     // The ledger holds every pool's allocations, served or not.
     setCheckpointBlock("");
+    // Holds dropped while the RM was down (or a release that failed) leave
+    // draining regions without holds.
+    finishDrainingLocked(staleHolds != 0);
     return 0;
 }
 

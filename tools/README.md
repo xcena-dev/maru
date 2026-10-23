@@ -41,6 +41,9 @@ red). It has two screens you switch between:
   each under a `── server :PORT (pid N) ──` block — so multiple servers are
   covered without knowing their ports. Pass `-p`/`--host` to pin a single
   (possibly remote) server instead.
+  Each region of a `remote_cxl` worker is a row of its own, named
+  `remote_cxl:<id>`; `marutop usage` lists those regions under their worker's
+  engine id in its L1 storage pools table.
 
 **STATS view** (select an instance + `enter`): a full per-instance dashboard —
 an op table (count / delta / avg / min / max latency + an activity sparkline),

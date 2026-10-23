@@ -53,6 +53,19 @@ The {doc}`../getting_started/quick_start` producer and consumer follow this patt
 
 For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 
+For `remote_cxl`, the remote agent defaults to
+`UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`. RC/DC remains the remote
+DRAM payload path whose NIC checks the remote key. `cuda_copy` enables local
+CUDA memory-type support required by NIXL 1.5 on NVIDIA GPU hosts, including
+hosts where Maru registers only DRAM. Its UCX interface requires its own
+interface identity and does not support host-to-host copies; it is not an
+alternative cross-process payload route. The CLI accepts it only alongside
+a primary RC/DC transport. It still rejects the broader `cuda` alias,
+`cuda_ipc`, TCP and shared-memory transports. Explicit UCX filters on worker
+processes also need `cuda_copy` on such hosts. Verify actual RC/DC selection
+and late-WRITE rejection on the deployed NIXL/UCX version; allowing the local
+helper is not evidence that the device validation passed.
+
 > **See also:** [MaruHandler Architecture](maru_handler.md)
 
 ---

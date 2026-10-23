@@ -450,6 +450,93 @@ class ProcessRecoveryTest(unittest.TestCase):
             time.sleep(0.1)
         self.stop()
 
+    def hold(self, handle, holder=b"node-a", instance=b"epoch-1", expected_kind=None):
+        fixed = HANDLE.pack(*handle) + struct.pack("<II", len(holder), len(instance))
+        return self.request(
+            11, fixed + holder + instance + self.client_id, expected_kind
+        )
+
+    def unhold(self, handle, holder=b"node-a", instance=b"epoch-1", expected_kind=None):
+        fixed = HANDLE.pack(*handle) + struct.pack("<II", len(holder), len(instance))
+        response = self.request(
+            13, fixed + holder + instance + self.client_id, expected_kind
+        )
+        if expected_kind:
+            return response
+        self.assertEqual(len(response), 4)
+        return struct.unpack("<i", response)[0]
+
+    def access_status(self, handle):
+        response = self.request(9, HANDLE.pack(*handle) + self.client_id)
+        return struct.unpack_from("<i", response)[0]
+
+    def test_region_holds_over_tcp(self):
+        self.start()
+        handle = self.allocate()
+        response = self.hold(handle)
+        status, path_len = struct.unpack_from("<iI", response)
+        self.assertEqual(status, 0)
+        self.assertEqual(response[8 : 8 + path_len], b"/dev/dax0.0")
+        self.assertEqual(struct.unpack_from("<QQ", response, 8 + path_len), handle[1:3])
+        # A bad token is an error reply on a connection that stays open; a bad
+        # name is the request's own status.
+        bad = (*handle[:3], handle[3] ^ 1)
+        response = self.hold(bad, expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", response)[0], -errno.EACCES)
+        for holder, instance in ((b"node a", b"epoch-1"), (b"node-a", b"epoch\x001")):
+            response = self.hold(handle, holder=holder, instance=instance)
+            self.assertEqual(struct.unpack_from("<iI", response), (-errno.EINVAL, 0))
+            self.assertEqual(self.unhold(handle, holder, instance), -errno.EINVAL)
+        response = self.unhold(bad, expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", response)[0], -errno.EACCES)
+        self.access(handle)  # The connection stays open.
+
+        # Freed while held: freed for its owner, out of use for everyone.
+        self.free(handle)
+        self.assertEqual(self.access_status(handle), -errno.ENOENT)
+        other = self.allocate()
+        self.assertNotEqual(other[1], handle[1])
+        self.stop()
+        self.start()
+        self.assertEqual(self.access_status(handle), -errno.ENOENT)
+        self.check_stats({"/dev/dax0.0": 2})
+        self.assertEqual(self.unhold(handle, instance=b"epoch-0"), 0)
+        self.check_stats({"/dev/dax0.0": 2})
+        self.assertEqual(self.unhold(handle), 0)
+        self.assertEqual(self.unhold(handle), 0)  # No longer allocated.
+        self.check_stats({"/dev/dax0.0": 1})
+        reused = self.allocate()
+        self.assertEqual(reused[1], handle[1])
+
+        # A new agent instance drops what its predecessor held.
+        self.assertEqual(struct.unpack_from("<i", self.hold(reused))[0], 0)
+        self.free(reused)
+        fixed = struct.pack("<II", 6, 7)
+        response = self.request(15, fixed + b"node-a" + b"epoch-2" + self.client_id)
+        self.assertEqual(struct.unpack("<iI", response), (0, 1))
+        self.check_stats({"/dev/dax0.0": 1})
+        code, output = self.ctl("status")
+        self.assertEqual(code, 0, output)
+        self.assertIn("holds=0 draining=0", output)
+
+        # Truncated names close the connection; so does an unknown type, which
+        # is how a client learns that an RM has no holds.
+        truncated = HANDLE.pack(*other) + struct.pack("<II", 100, 1) + b"x"
+        response = self.request(13, truncated, expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", response)[0], -errno.EPROTO)
+        self.assertEqual(self.connection.recv(1), b"")
+        self.connection.close()
+        port = int((self.root / "port").read_text())
+        self.connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        response = self.request(17, expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", response)[0], -errno.ENOSYS)
+        self.assertEqual(self.connection.recv(1), b"")
+        self.connection.close()
+        self.connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.free(other)
+        self.stop()
+        self.checkpoint(0)
+
     def test_second_instance_is_refused(self):
         self.start()
         handle = self.allocate()

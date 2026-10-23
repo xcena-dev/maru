@@ -4,15 +4,16 @@ This document describes how to build and install Maru.
 
 ## System Components
 
-Maru consists of two server components and a client library:
+Maru consists of two server components and a client library. A deployment with GPU nodes without CXL (the `remote_cxl` backend) adds a remote CXL agent on each memory node:
 
 | Component | Role | Package |
 |-----------|------|---------|
-| **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
+| **Resource Manager** | Manages the CXL memory of a memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
+| **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |
 
-In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler, which connects to both the Resource Manager and Metadata Server over the network.
+In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler. With the default `cxl` backend, MaruHandler connects to both the Resource Manager and Metadata Server over the network. With the `remote_cxl` backend, it connects to the Metadata Server and to the remote CXL agent of each memory node instead; the remote CXL agents reach the Resource Manager, which runs on a memory node.
 
 ## Prerequisites
 
@@ -22,8 +23,9 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - cmake: 3.28.3+
 - git
 - [uv](https://docs.astral.sh/uv/) — recommended Python package installer
-- CXL DAX device (`/dev/dax*`) or emulation environment
-  - **Multi-node:** All participating nodes must be connected to a shared CXL memory pool (e.g., via CXL switch).
+- CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
+  - **Multi-node:** All nodes that share the pool over CXL must be connected to the shared CXL memory pool (e.g., via CXL switch). GPU nodes without CXL reach it over RDMA instead (`remote_cxl` backend).
+- For the `remote_cxl` backend: an RDMA NIC (RoCE or InfiniBand) on every worker and memory node, a route from the maru-server node to the remote CXL agents on the memory nodes' RDMA network addresses, and NIXL in the same environment, installed before `./install.sh` (`uv pip install nixl`, or `pip install nixl` without uv)
 
 See {doc}`bios_setup` for platform BIOS settings and DEV_DAX verification, and {doc}`../design_doc/consistency_and_safety` for the cache-visibility requirements of cross-host sharing.
 
@@ -68,13 +70,43 @@ Install all components (Python package + Resource Manager):
 ./install.sh
 ```
 
-To install **without the Resource Manager** (e.g., on nodes that only run LLM instances with MaruHandler):
+To install **without the Resource Manager** (e.g., on nodes that only run LLM instances with MaruHandler, and always on `remote_cxl` worker nodes, which would otherwise get a remote CXL agent and a key of their own):
 
 ```bash
 ./install.sh --no-rm
 ```
 
-> **Note:** Client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager.
+> **Note:** With the default `cxl` backend, client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager. Workers that use the `remote_cxl` backend need no CXL device: they reach the CXL memory of the memory nodes over RDMA.
+
+With NIXL installed (`uv pip install nixl` before `./install.sh`), the
+installer also sets up the remote CXL agent as `maru-remote-cxl-agent.service`, which
+starts and stops with the Resource Manager, and creates the remote CXL agent key
+`/etc/maru/remote-cxl-agent.key`. Set the node's RDMA NIC in
+`/etc/maru/remote-cxl-agent.env` (`MARU_REMOTE_CXL_AGENT_UCX_DEVICE`): the service
+listens on that NIC's address. Workers and maru-server need a copy of the key,
+readable only by the users that run them; they read
+`~/.maru/remote-cxl-agent.key` by default. The
+[remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
+walks through a deployment.
+
+The installer checks for NIXL, not for an RDMA NIC, when selecting this service.
+It enables the unit without starting it immediately. Starting the Resource
+Manager later also starts the agent; with the default empty NIC and listen
+address, the agent fails to start until its RDMA interface is configured. The
+unit stops retrying after five failed starts in a minute. This agent failure
+does not stop the Resource Manager.
+
+A memory node used only for the local `cxl` backend does not need the agent.
+Without NIXL the installer skips its service. If NIXL is installed for another
+purpose on such a node, disable only the unused agent:
+
+```bash
+sudo systemctl disable --now maru-remote-cxl-agent.service
+```
+
+Reinstalling with NIXL enables the unit again. `./install.sh --no-rm` skips both
+platform services, so it is the worker-node installation path rather than a
+way to keep the Resource Manager without its agent on a memory node.
 
 <br/>
 
@@ -198,6 +230,7 @@ Multi-node requires changing default bind addresses from `127.0.0.1` to a networ
 - **Resource Manager**: change `--host` to accept remote connections
 - **Metadata Server**: change `--host` and set `--rm-address` to the Resource Manager's externally reachable address
 - **MaruHandler**: set `server_url` to the Metadata Server's address. The Resource Manager address is received automatically via handshake.
+- **Remote CXL Agent** (`remote_cxl` backend): set `MARU_RM_ADDRESS` in `/etc/maru/remote-cxl-agent.env` to the address the Resource Manager listens on; a Resource Manager bound to a network address answers only there.
 
 To run the Resource Manager as the systemd service on a network address, override its command line:
 

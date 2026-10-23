@@ -66,5 +66,11 @@ public:
     static void removeAllocation(PoolManager &pm, uint64_t regionId) {
         pm.allocations_.erase(regionId);
     }
+    // A hold that arrives while the pool lock is released (in memory only).
+    static void addHold(PoolManager &pm, uint64_t regionId, const std::string &holder,
+                        const std::string &instance) {
+        std::lock_guard<std::mutex> lock(pm.mu_);
+        pm.holds_[regionId][holder] = instance;
+    }
 };
 } // namespace maru

@@ -28,7 +28,8 @@ for GPU-specific options.
 ## Integration Architecture
 
 MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing
-between vLLM instances through CXL shared memory — **without any middleware**.
+between vLLM instances — **without any middleware**. With the default `cxl`
+backend, the KV moves through CXL shared memory.
 
 ```mermaid
 flowchart LR
@@ -50,9 +51,9 @@ flowchart LR
 
 By removing the LMCache middleware layer, the direct connector achieves:
 
-- **Fewer dependencies** — only vLLM + Maru
-- **Zero-copy save path** — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
-- **Zero-copy load path** — CXL mmap (CUDA pinned) → GPU via DMA
+- **Fewer dependencies** — only vLLM + Maru (the `remote_cxl` backend also needs NIXL)
+- **Zero-copy save path** (default `cxl` backend) — GPU → CXL via single `cudaMemcpy` (no intermediate CPU buffer)
+- **Zero-copy load path** (default `cxl` backend) — CXL mmap (CUDA pinned) → GPU via DMA
 - **No serialization overhead** — raw tensor bytes, no `MemoryObj` conversion
 
 ### Component Roles
@@ -240,14 +241,126 @@ eviction and SSD are later milestones. See the
 [mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
 for launch configuration, memory lifetime and validation instructions.
 
+### CXL on memory nodes over RDMA
+
+Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The KV
+stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
+and writes it with one-sided RDMA, and only control messages go to maru-server
+and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
+memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`, an
+immutable-weights `maru_cache_namespace`,
+`maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
+default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
+worker's RDMA NIC, e.g. `mlx5_0:1`).
+
+![The cxl backend and the remote_cxl backend take the same steps: the resource manager gives region R to MaruServer (1), MaruServer gives R's handle to the Handler (2), R is mapped through a GET_ACCESS check (3 to 5), and KV moves (6). With the cxl backend the Handler maps R itself and copies through the mapping; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
+
+Resources flow as for the cxl backend: the resource manager gives regions to
+maru-server and maru-server gives them to the worker, one region when its
+storage session opens and one more each time its regions are full. Only the
+step that maps a region moves, from the Handler to the memory node.
+
+![Components of the remote_cxl backend. Worker nodes: MaruKVConnector calls MaruHandler, whose PoolRouter (with several pools) picks a request's pool and hands it to that pool's RemoteCxlStorageClient; all clients share one RdmaDataPath (RegionMapClient, StagingBuffer, NIXL). Metadata node: MaruServer with ReplicaDirectory (storage sessions), AllocationManager (resource manager requests) and RegionKeeper. Memory nodes of a shared CXL pool: the resource manager, and on every node a remote CXL agent whose RegionMapServer takes connections for RegionMapService, which holds the region at the resource manager (HOLD, checking its handle; UNHOLD after deregistering), maps it with DaxRegionMapper and registers it with NIXL](../image/remote_cxl_sw_structure.png)
+
+Each memory
+node runs a remote CXL agent (`maru-remote-cxl-agent`), a service shared by every app:
+it maps the regions Handlers ask for and registers them with the node's NIC.
+With NIXL installed, `./install.sh` sets it up as `maru-remote-cxl-agent.service`,
+which starts and stops with the resource manager; its settings (NIC, port 9860,
+key file) are in `/etc/maru/remote-cxl-agent.env`. It listens on the NIC's address
+on the RDMA network, and every worker and maru-server proves the remote CXL agent
+key (`/etc/maru/remote-cxl-agent.key`, created by the installer) on each
+connection, so only processes that can read a copy of the key map regions, as
+only users that can open the DAX device map them on a CXL-attached node. The
+protocol itself is not encrypted, like the resource manager's, so keep the
+RDMA network to the hosts of the deployment.
+A memory node of a shared pool that runs no resource manager installs the
+service alone (`install-maru-remote-cxl-agent --standalone`, which starts it at
+boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
+the {ref}`multi-node configuration <installation-multi-node-config>`.
+maru-server takes the pool's remote CXL agents with `--remote-cxl-agent host:port`
+(one per memory node) and `--remote-cxl-agent-key-file`, and hands the list to
+the workers. Engines read each other's keys under a server lease; a reader
+gets a read handle, which maps a region but cannot release it. When a worker
+stops, maru-server keeps its regions that hold keys and holds their mapping,
+so the keys stay readable as a stopped cxl Handler's keys do; it gives a kept
+region back when the resource manager is full. A region goes back only after
+its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
+instead of landing in the next owner's KV.
+
+The backend stores KV chunkwise and needs `--enforce-eager`,
+`kv_load_failure_policy="recompute"` and one worker per engine. It turns on
+`maru_async_load` and `maru_async_store` unless they are set: loads run
+between steps and stores after the forward, so an RDMA transfer that waits for
+a slow memory node does not hold up the engine, and asynchronous loads run with
+vLLM's asynchronous scheduling on. Asynchronous loads need vLLM 0.16 or later,
+and an explicit `maru_rdma_staging_size` must then hold two requests (one for
+loads, one for stores). Setting them to `false` runs loads and stores on the
+engine thread; synchronous loads also need `--no-async-scheduling`. With
+asynchronous stores the engine thread takes only a staging slot for a chunk,
+waiting on no lock and no network; the thread that sends the store gives each
+chunk its remote page, and a background thread asks for a new region or
+evicts before the free pages run out, so that thread rarely waits. RDMA
+transfers run outside the client's lock. The worker's staging buffer is
+registered with CUDA,
+so the copy kernel moves KV between the GPU and the staging buffer as it does
+for mapped CXL memory. NIXL is required (`uv pip install nixl`, or `pip install nixl` without uv).
+See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
+for one-host and multi-node launch steps.
+
+#### Transfer errors and worker recovery
+
+A timeout or a native NIXL status-query error does not establish that the NIC
+has stopped accessing memory. Maru keeps the affected transfer handle and its
+staging slots registered until completion and handle release are confirmed.
+Other peers' completed or unposted READ slots are returned. Failed stores are
+not published, and failed loads follow the configured recompute policy.
+
+Persistent native errors can retain those slots for the lifetime of the worker.
+Repeated errors can exhaust its staging capacity, causing stores to be skipped
+and loads to miss. Look for `RDMA READ not confirmed`, `RDMA WRITE not confirmed`
+and `RDMA transfers still own staging memory` in the worker log. Closing or
+reconnecting the Handler alone may leave the registered memory retained.
+
+To recover capacity, stop and restart the entire vLLM engine that owns the
+affected worker. Confirm that its old worker processes have exited before
+starting replacements; terminating only the HTTP frontend is insufficient if
+the workers remain alive. The replacement creates a fresh NIXL agent and staging
+buffer. Retired regions can become cold misses, so allow recomputation and cache
+warm-up. Restarting only the memory-node agent does not establish that a live
+worker's uncertain transfers have been reclaimed. Do not force-return their
+slots or drop live RM holds to recover capacity. Safe automatic reclamation
+inside a running worker remains follow-up work.
+
+#### Several memory nodes and pools
+
+**Shared pool.** Several memory nodes can share one CXL memory, as hosts on a
+CXL switch do. Each of them runs a remote CXL agent; maru-server takes all of
+them, with `--remote-cxl-agent` repeated or comma separated, and hands the list to
+the workers. Each region is served by one memory node, picked by a hash of the
+region number over that list, so the region's owner and its readers map it at
+the same node and move its KV through that node's NIC. The memory nodes use the
+same remote CXL agent key and the multi-host settings of
+{doc}`System Setup <../getting_started/bios_setup>`.
+
+![A shared pool of two memory nodes, each running a remote CXL agent. Each region is mapped by one node, the remote CXL agent m with the largest hash of m and the region number: node 1 maps R1 and R3, node 2 maps R2. The worker node of R2's owner maps R2 at memory node 2 and writes it by RDMA through that node; the worker node of a reader maps R2 at the same node and reads it by RDMA](../image/remote_cxl_shared_pool.png)
+
+**Several pools.** Each pool has its own maru-server. List them in
+`maru_server_url`, comma separated (`"tcp://10.0.0.2:5555,tcp://10.0.0.3:5555"`):
+the worker opens a storage session with each, and sends each request to one
+pool, picked by a hash of the request's first chunk key, so all chunks of a
+request stay in one pool. A pool whose maru-server does not answer when the
+worker starts only makes its prefixes miss; the worker connects to it once it
+answers.
+
 ### Connector settings
 
 Settings in `kv_connector_extra_config`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address |
-| `maru_pool_size` | str/int | `1G` | CXL memory pool size (`4G`, `500M`, etc.) |
+| `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
+| `maru_pool_size` | str/int | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, etc.): its first allocation, and each further one when its memory is full; required with `remote_cxl`, where each allocation is one region |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | str | auto | Unique instance ID (default: auto-generated UUID) |
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
@@ -257,8 +370,8 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_async_load` | bool | `false` | Load cache hits on a background thread between steps instead of inside the forward pass |
-| `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
+| `maru_async_load` | bool | `false` (`true` for `remote_cxl`) | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_store` | bool | `false` (`true` for `remote_cxl`) | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 | `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
 
@@ -450,7 +563,11 @@ Controls how many tokens per chunk when storing KV cache:
 
 ### maru_pool_size
 
-CXL memory allocated per instance. Capacity estimation:
+CXL memory an instance gets at a time: its first allocation, and each further
+one when its memory is full. The `cxl` and `remote_cxl` backends use it the same
+way; with `remote_cxl` each allocation is one region. (`cpu` and `mixed` take
+fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) The estimate
+below sizes one allocation:
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -530,7 +647,7 @@ vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load 
 
 With several groups, use `recompute` together with `maru_async_load=true`, or keep `fail`.
 
-After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. A request whose load fails twice is computed without Maru.
+After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
 (vllm-hybrid-one-group)=
 ### Running a hybrid model as one group
@@ -549,8 +666,9 @@ A model whose extra groups are sliding-window or chunked-local attention can run
 | Serialization | LMCache MemoryObj conversion | torch tensor ↔ bytes direct |
 | Prefix matching | LMCache CacheEngineKey hashing | vLLM token prefix hashing |
 | Configuration | LMCACHE_CONFIG_FILE YAML | kv_connector_extra_config JSON |
-| Save path | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
-| Load path | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
+| Storage backends | `cxl` | `cxl`, `cpu`, `mixed`, `remote_cxl` |
+| Save path (`cxl` backend) | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
+| Load path (`cxl` backend) | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
 
 ## Troubleshooting
 

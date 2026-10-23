@@ -23,7 +23,7 @@ static constexpr const char *kUsage =
     "usage: status | allocations [daxN.M] | exclude daxN.M | "
     "include daxN.M [--reinit|--adopt|--restore-header] | "
     "release REGION [--confirm [--force]] | discard daxN.M [--confirm [--force]] | "
-    "wipe daxN.M [--confirm]\n";
+    "wipe daxN.M [--confirm] | drop-holds HOLDER [--confirm]\n";
 
 AdminServer::AdminServer(PoolManager &pm, std::string socketPath)
     : pm_(pm), path_(std::move(socketPath)) {}
@@ -213,6 +213,9 @@ std::string AdminServer::handleLine(PoolManager &pm, const std::string &line,
                (args.size() < 3 || args[2] == "--confirm") &&
                (args.size() < 4 || args[3] == "--force")) {
         rc = pm.adminDiscard(args[1], args.size() >= 3, args.size() == 4, out);
+    } else if (command == "drop-holds" &&
+               (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm"))) {
+        rc = pm.adminDropHolds(args[1], args.size() == 3, out);
     } else if (command == "wipe" &&
                (args.size() == 2 || (args.size() == 3 && args[2] == "--confirm"))) {
         rc = pm.adminWipe(args[1], args.size() == 3, out, cancelled);

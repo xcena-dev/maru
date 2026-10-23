@@ -4826,13 +4826,14 @@ class TestDeferredAdmissionFitsCache:
 
     def test_failed_load_asked_again_drops_its_old_room(self):
         # A failed load that invalidates the first block sends the request
-        # back to WAITING with its blocks freed, and vLLM asks again. Its old
-        # reservation must not count against the waiter it shares room with.
+        # back to WAITING with its blocks freed, and vLLM asks again. It
+        # computes without Maru, and its old reservation must not count
+        # against the waiter it shares room with.
         sched = self._sched(num_gpu_blocks=70)
         big, mid = self._request("big"), self._request("mid")
         self._park(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
-        assert sched.get_num_new_matched_tokens(big, 0)[0] is None  # mid first
+        assert sched.get_num_new_matched_tokens(big, 0) == (0, False)
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
 
     def test_waiter_is_not_looked_up_again_until_it_fits(self):
