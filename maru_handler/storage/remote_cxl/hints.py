@@ -29,8 +29,10 @@ from ..access_policy import AccessRange
 
 logger = logging.getLogger(__name__)
 
-#: Hints waiting for the background thread; more are dropped.
+#: Hints waiting for the background thread; more are dropped (ends are not).
 MAX_PENDING_HINTS = 1024
+#: A dropped hint is logged as a warning once per this many drops.
+DROP_WARNING_EVERY = 1024
 
 
 class HintChannel:
@@ -89,12 +91,16 @@ class ReadHints:
         self._end = getattr(policy, "read_hint_end", None)
         self._locate = locate
         self._send = send
-        self._queue: queue.Queue[tuple[str, str, list[str]] | None] = queue.Queue(
-            MAX_PENDING_HINTS
+        # Unbounded so an end is never lost; _pending bounds the hints in it.
+        self._queue: queue.SimpleQueue[tuple[str, str, list[str]] | None] = (
+            queue.SimpleQueue()
         )
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        # Agents each hinted request reached, for its end
+        self._pending = 0
+        self._dropped = 0
+        self._closed = False
+        # Agents each hinted request reached, for its end (hint thread only)
         self._agents: dict[str, list[str]] = {}
 
     @property
@@ -103,34 +109,67 @@ class ReadHints:
         return self._hint is not None
 
     def hint(self, request_id: str, keys: list[str]) -> None:
-        """Queue a hint that ``request_id`` will read ``keys`` in this order."""
-        if self._hint is not None and request_id and keys:
-            self._put(("hint", request_id, list(keys)))
+        """Queue a hint that ``request_id`` will read ``keys`` in this order.
+
+        Dropped, with a warning now and then, while
+        :data:`MAX_PENDING_HINTS` hints wait.
+        """
+        if self._hint is None or not request_id or not keys:
+            return
+        with self._lock:
+            if self._pending >= MAX_PENDING_HINTS:
+                self._dropped += 1
+                dropped = self._dropped
+            else:
+                self._pending += 1
+                dropped = 0
+        if dropped:
+            if dropped % DROP_WARNING_EVERY == 1:
+                logger.warning(
+                    "read hints dropped (%d so far): %d are waiting for the policy",
+                    dropped,
+                    MAX_PENDING_HINTS,
+                )
+            return
+        self._put(("hint", request_id, list(keys)))
 
     def end(self, request_id: str) -> None:
         """Queue the end of ``request_id``: what was prepared for it may go."""
         if self._hint is not None and request_id:
             self._put(("end", request_id, []))
 
-    def close(self) -> None:
-        """Stop the thread after the hints already queued."""
+    def close(self, timeout_s: float = 5.0) -> bool:
+        """Stop the thread after the hints already queued; hints after this
+        are ignored.
+
+        Returns:
+            True if the thread ended (or never started) within
+            ``timeout_s``; the caller may then close what it sends on.
+        """
         with self._lock:
+            self._closed = True
             thread, self._thread = self._thread, None
-        if thread is not None:
-            self._queue.put(None)
-            thread.join(timeout=5.0)
+        if thread is None:
+            return True
+        self._queue.put(None)
+        thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            logger.warning("read hint thread still busy after %.0f s", timeout_s)
+            return False
+        return True
 
     def _put(self, item: tuple[str, str, list[str]]) -> None:
         with self._lock:
+            if self._closed:
+                if item[0] == "hint":
+                    self._pending -= 1
+                return
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._run, name="maru-read-hints", daemon=True
                 )
                 self._thread.start()
-        try:
-            self._queue.put_nowait(item)
-        except queue.Full:
-            logger.debug("read hint dropped: %d hints are waiting", MAX_PENDING_HINTS)
+            self._queue.put(item)
 
     def _run(self) -> None:
         while True:
@@ -138,6 +177,9 @@ class ReadHints:
             if item is None:
                 return
             kind, request_id, keys = item
+            if kind == "hint":
+                with self._lock:
+                    self._pending -= 1
             try:
                 if kind == "hint":
                     self._give(request_id, keys)

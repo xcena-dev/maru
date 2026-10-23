@@ -1272,6 +1272,10 @@ class MaruHandler:
         )
         return batch_resp.results
 
+    def read_hints_enabled(self) -> bool:
+        """Whether storage takes read hints (:meth:`hint_read` does anything)."""
+        return bool(getattr(self._cpu, "read_hints_enabled", False))
+
     def hint_read(
         self, request_id: str, keys: list[str], route_key: str | None = None
     ) -> None:

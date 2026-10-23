@@ -363,25 +363,13 @@ def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     num_full_chunks = len(token_ids) // chunk_tokens
     if num_full_chunks == 0:
         return []
-    # The scheduler's lookup, its read hint and the worker's load key the
-    # same prompt: hash it once.
-    return list(
-        _hashed_chunk_keys(
-            tuple(token_ids[: num_full_chunks * chunk_tokens]), chunk_tokens
-        )
-    )
-
-
-@functools.lru_cache(maxsize=256)
-def _hashed_chunk_keys(tokens: tuple[int, ...], chunk_tokens: int) -> tuple[str, ...]:
-    """Chunk keys of a prompt of whole chunks (see :func:`_chunk_keys`)."""
-    arr = torch.tensor(tokens).numpy()
+    arr = torch.tensor(token_ids[: num_full_chunks * chunk_tokens]).numpy()
     hasher = hashlib.blake2b(digest_size=8)  # 8 bytes → 16 hex chars
     keys = []
-    for i in range(len(tokens) // chunk_tokens):
+    for i in range(num_full_chunks):
         hasher.update(arr[i * chunk_tokens : (i + 1) * chunk_tokens].tobytes())
         keys.append(f"kv_{hasher.hexdigest()}")
-    return tuple(keys)
+    return keys
 
 
 _RDMA_KNOBS = (
@@ -1258,14 +1246,17 @@ class MaruSchedulerConnector:
         # Read hints (MaruHandler.hint_read): storage hears which keys a
         # request will load once the scheduler finds them, or as soon as the
         # request arrives with maru_read_hint_on_arrival. One hint per
-        # request, none after its end, and its end follows its hint.
+        # request, none after its end, and its end follows its hint. All of
+        # it runs only for storage that takes hints (_read_hints_on).
         self._hinted: set[str] = set()
         self._arrived: set[str] = set()
+        # Chunk keys an arrival hint computed, for the request's lookup
+        self._arrival_keys: dict[str, list[str]] = {}
         self._hint_lock = threading.Lock()
         self._handler_lock = threading.Lock()
         self._arrival_pool: ThreadPoolExecutor | None = None
-        if bool(extra_config.get("maru_read_hint_on_arrival", False)):
-            _install_arrival_hint(self)
+        self._hints_handler: Any = None
+        self._hints_enabled = False
 
         # Requests that need KV loaded from maru
         self._requests_need_load: dict[str, tuple[Request, int]] = {}
@@ -1277,6 +1268,14 @@ class MaruSchedulerConnector:
         # loading — get_num_new_matched_tokens returns async_load=True.
         self._deferred_loading = bool(_get_knob(extra_config, "maru_async_load"))
         _validate_deferred_loading(self._deferred_loading)
+        if bool(extra_config.get("maru_read_hint_on_arrival", False)):
+            if self._deferred_loading:
+                _install_arrival_hint(self)
+            else:
+                logger.warning(
+                    "Maru: maru_read_hint_on_arrival requires "
+                    "maru_async_load=true; disabling it"
+                )
         self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
         overlap_requested = bool(
@@ -1385,29 +1384,43 @@ class MaruSchedulerConnector:
 
         Called on the engine's input thread (see :func:`_install_arrival_hint`).
         """
+        if self._handler is not None and not self._read_hints_on():
+            return
+        if self._cpu_mode and _cpu_bypass_request(request):
+            return  # the load would not wait for the request's turn
         with self._hint_lock:
             self._arrived.add(request.request_id)
-        if self._arrival_pool is None:
-            self._arrival_pool = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="maru-arrival-hint"
-            )
-        self._arrival_pool.submit(self._hint_on_arrival, request)
+            if self._arrival_pool is None:
+                self._arrival_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="maru-arrival-hint"
+                )
+            pool = self._arrival_pool
+        pool.submit(self._hint_on_arrival, request)
 
     def _hint_on_arrival(self, request: Request) -> None:
         try:
-            if not self._deferred_loading or (
-                self._cpu_mode and _cpu_bypass_request(request)
-            ):
-                return  # the load would not wait for the request's turn
             token_ids = list(request.prompt_token_ids or [])
             if len(token_ids) < self._kv_chunk_tokens:
                 return
             self._ensure_handler()
+            if not self._read_hints_on():
+                return
             # Every chunk from the first: storage hints the leading hits.
             keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
             self._hint(request.request_id, keys, arrival=True)
         except Exception:
             logger.debug("Maru: arrival read hint failed", exc_info=True)
+
+    def _read_hints_on(self) -> bool:
+        """Whether storage takes read hints (asked once per handler)."""
+        handler = self._handler
+        if handler is None or not self._deferred_loading:
+            return False
+        if self._hints_handler is not handler:
+            enabled = getattr(handler, "read_hints_enabled", None)
+            self._hints_enabled = bool(enabled()) if callable(enabled) else False
+            self._hints_handler = handler
+        return self._hints_enabled
 
     def _hint(self, request_id: str, keys: list[str], *, arrival: bool = False) -> None:
         """Give storage the read hint of ``request_id`` once."""
@@ -1417,8 +1430,10 @@ class MaruSchedulerConnector:
         with self._hint_lock:
             if request_id in self._hinted:
                 return
-            if arrival and request_id not in self._arrived:
-                return  # it ended before the hint was ready
+            if arrival:
+                if request_id not in self._arrived:
+                    return  # it ended before the hint was ready
+                self._arrival_keys[request_id] = keys
             self._hinted.add(request_id)
             try:
                 handler.hint_read(
@@ -1430,6 +1445,7 @@ class MaruSchedulerConnector:
     def _end_hint(self, request_id: str) -> None:
         with self._hint_lock:
             self._arrived.discard(request_id)
+            self._arrival_keys.pop(request_id, None)
             if request_id not in self._hinted:
                 return
             self._hinted.discard(request_id)
@@ -1440,15 +1456,22 @@ class MaruSchedulerConnector:
                 except Exception:
                     logger.debug("Maru: read hint end failed", exc_info=True)
 
-    def _count_matched_chunks(self, token_ids: list[int]) -> int:
+    def _count_matched_chunks(
+        self, token_ids: list[int], keys: list[str] | None = None
+    ) -> int:
         """Count how many consecutive prefix chunks are cached in Maru.
 
         Uses batch_exists for efficiency: single RPC call checks all chunks.
 
+        Args:
+            token_ids: The prompt.
+            keys: Its chunk keys, if already computed.
+
         Returns:
             Number of consecutive cached chunks from the beginning.
         """
-        keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
+        if keys is None:
+            keys = _chunk_keys(token_ids, self._kv_chunk_tokens)
         if not keys:
             return 0
 
@@ -1606,7 +1629,15 @@ class MaruSchedulerConnector:
             return 0, False
 
         _t0 = time.monotonic()
-        num_matched_chunks = self._count_matched_chunks(token_ids)
+        with self._hint_lock:
+            keys = self._arrival_keys.get(request.request_id)
+        if keys is None and self._read_hints_on():
+            keys = _chunk_keys(token_ids, self._kv_chunk_tokens)  # once, for both
+        num_matched_chunks = (
+            self._count_matched_chunks(token_ids)
+            if keys is None
+            else self._count_matched_chunks(token_ids, keys)
+        )
         if self._timing:
             _emit_timing(
                 f"get_num_new_matched (incl _chunk_keys) {len(token_ids)} tok = "
@@ -1644,10 +1675,11 @@ class MaruSchedulerConnector:
         self._last_match_result[request.request_id] = num_matched_chunks
         if self._cpu_mode:
             self._load_starts[request.request_id] = num_computed_tokens
-        if self._deferred_loading:
+        if self._read_hints_on():
             # The load waits for vLLM to admit it: tell storage what it reads.
             ct = self._kv_chunk_tokens
-            keys = _chunk_keys(token_ids, ct)
+            if keys is None:
+                keys = _chunk_keys(token_ids, ct)
             first, last = num_computed_tokens // ct, -(-matched_tokens // ct)
             self._hint(request.request_id, keys[first:last])
 

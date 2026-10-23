@@ -40,7 +40,9 @@ flowchart LR
 - **The access policy** (entry point group `maru.access_policies`, selected with
   `maru_access_policy`) runs in the engine's processes. In the worker it decides
   *when* each READ runs and whether a page may be written or reused. In the
-  scheduler it only hears read hints.
+  scheduler it only hears read hints. The scheduler and every worker build
+  their own instance, so the policy's constructor runs in each of those
+  processes.
 - **The region extension** (entry point group `maru.region_extensions`, selected
   with `--region-extension` on the agent) is the policy's counterpart next to
   the memory. It receives the policy's messages after the agent checked them,
@@ -94,10 +96,16 @@ sequenceDiagram
   the keys up at maru-server (a probe that also returns where each hit is and a
   read handle of its region; it takes no lease) and calls the policy, in the
   order hints were given.
-- **Advice only.** The agent accepts a hint for a region it maps even from a
-  process that holds no region (the scheduler has no data path), but never as a
-  write. A hint that is late, lost or wrong costs only the time it would have
-  saved: the load still leases and reads every key, and the policy's `read`
-  hook learns the request id it serves, so it can match the load with its hint.
+- **Advice only.** The agent accepts a hint for a region it maps and some
+  connection holds, even from a process that holds no region (the scheduler
+  has no data path), but never as a write. A hint that is late, lost or wrong
+  costs only the time it would have saved: the load still leases and reads
+  every key, and the policy's `read` hook is passed `request_id=` the request
+  it serves, so it can match the load with its hint.
+- **Inexact by design.** A hint on arrival covers the leading hits from the
+  first chunk, before vLLM's own prefix cache is consulted, so the load may
+  read fewer chunks than the hint named. While 1024 hints wait, further hints
+  are dropped with a warning; ends are never dropped. A process that dies
+  sends no end, so a policy should also expire what it prepared.
 - **Off without a policy.** Without an access policy that defines `read_hint`,
-  no thread starts and no probe is sent.
+  no thread starts, no probe is sent and the scheduler keeps no hint state.

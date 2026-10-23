@@ -14,10 +14,14 @@ from tests.unit.vllm_connector_helpers import make_scheduler
 class Handler:
     """Scheduler-side MaruHandler stand-in that records hints."""
 
-    def __init__(self, hits):
+    def __init__(self, hits, hints_enabled=True):
         self.hits = hits
         self.hints = []
         self.ends = []
+        self.enabled = hints_enabled
+
+    def read_hints_enabled(self):
+        return self.enabled
 
     def batch_exists(self, keys, route_key=None):
         return [i < self.hits for i in range(len(keys))]
@@ -137,3 +141,44 @@ def test_the_engine_hands_each_received_request_to_its_scheduler(monkeypatch):
     connector._install_arrival_hint(sched)
     engine.preprocess_add_request("r2")
     assert arrived == ["r1", "r2"]
+
+
+def test_storage_without_hints_costs_the_scheduler_nothing():
+    sched = make_scheduler(4, 8, extra(maru_async_load=True))
+    sched._handler = Handler(hits=5, hints_enabled=False)
+    request = _request("r1")
+    matched, load_async = sched.get_num_new_matched_tokens(request, 8)
+    assert load_async and matched > 0
+    sched.request_arrived(request)
+    sched.request_finished(request, [])
+    assert sched._handler.hints == [] and sched._handler.ends == []
+    assert not sched._hinted and not sched._arrived and sched._arrival_pool is None
+
+
+def test_the_lookup_reuses_the_keys_an_arrival_hint_computed():
+    sched = _scheduler(hits=5)
+    request = _request("r1")
+    sched.request_arrived(request)
+    deadline = time.monotonic() + 5
+    while not sched._handler.hints:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    seen = []
+    sched._count_matched_chunks = lambda tokens, keys=None: seen.append(keys) or 5
+    sched.get_num_new_matched_tokens(request, 8)
+    assert seen == [sched._handler.hints[0][1]]
+    sched.request_finished(request, [])
+    assert not sched._arrival_keys
+
+
+def test_arrival_hints_need_asynchronous_loading(monkeypatch):
+    import maru_vllm.connector as connector
+
+    installed, warnings = [], []
+    monkeypatch.setattr(connector, "_install_arrival_hint", installed.append)
+    monkeypatch.setattr(
+        connector.logger, "warning", lambda msg, *a: warnings.append(msg % a)
+    )
+    make_scheduler(4, 8, extra(maru_read_hint_on_arrival=True))
+    assert installed == []
+    assert any("requires maru_async_load" in w for w in warnings)

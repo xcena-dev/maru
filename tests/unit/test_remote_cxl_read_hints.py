@@ -6,11 +6,13 @@ metadata-only scheduler) are real; a fake policy and a fake extension stand in
 for a device package.
 """
 
+import threading
 import time
 
 import pytest
 
 import maru_handler.storage.remote_cxl.client as client_module
+import maru_handler.storage.remote_cxl.hints as hints_module
 from maru_remote.region_map import read_handle
 from maru_remote_cxl_agent.service import MapDenied, NotMapped
 from tests.unit.test_remote_cxl_access_policy import FakeExtension, FakePolicy
@@ -168,3 +170,99 @@ def test_a_probe_says_where_hits_are_only_when_asked(setup):
     (handle,) = found["regions"].values()
     region = next(iter(worker.regions.values()))
     assert handle == read_handle(region.handle)  # never the owner's handle
+
+
+def test_a_hint_needs_a_region_some_connection_holds(setup):
+    w, ext, policy = setup
+    worker = w.client("a", access_policy="fake")
+    assert put(worker, "k", b"x" * PAGE)[0]
+    service = w.node.service
+    region = next(iter(worker.regions.values()))
+    m = service._maps[region.handle["region_id"]]
+    message = {
+        "action": "ahead",
+        "hint": True,
+        "write": False,
+        "epoch": service.epoch,
+        "ranges": [{"handle": read_handle(region.handle), "offset": 0, "length": 1}],
+    }
+    held = set(m.holders)
+    m.holders.clear()  # the last holder left; the sweep has not released it yet
+    try:
+        with pytest.raises(NotMapped):
+            service.extension_request(10_000, message)
+    finally:
+        m.holders.update(held)
+
+
+def test_a_policy_without_hint_hooks_reads_with_three_arguments(monkeypatch):
+    class ThreeArgumentPolicy(FakePolicy):
+        def read(self, channel, ranges, transfer):
+            super().read(channel, ranges, transfer)
+
+    w = World(extension=RecordingExtension())
+    try:
+        policy = ThreeArgumentPolicy()
+        monkeypatch.setattr(client_module, "load_access_policy", lambda n, c: policy)
+        worker = w.client("a", access_policy="fake")
+        assert put(worker, "k", b"\x07" * PAGE)[0]
+        worker.set_read_request("r1")
+        assert read(worker, ["k"]) == [b"\x07" * PAGE]
+        assert not worker.read_hints_enabled
+    finally:
+        w.close()
+
+
+class _BlockedPolicy:
+    """A hinting policy whose first hint blocks until released."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.hints = []
+        self.ends = []
+
+    def read_hint(self, channel, request_id, ranges):
+        self.release.wait(5)
+        self.hints.append(request_id)
+
+    def read_hint_end(self, channel, request_id):
+        self.ends.append(request_id)
+
+
+def test_ends_are_kept_when_too_many_hints_wait(monkeypatch):
+    monkeypatch.setattr(hints_module, "MAX_PENDING_HINTS", 2)
+    warnings = []
+    monkeypatch.setattr(
+        hints_module.logger, "warning", lambda msg, *a: warnings.append(msg % a)
+    )
+    policy = _BlockedPolicy()
+    hints = hints_module.ReadHints(
+        policy, lambda keys: [("agent", [])], lambda a, m: {}
+    )
+    hints.hint("r0", ["k"])  # the thread takes it and blocks
+    _until(lambda: hints._pending == 0)
+    hints.hint("r1", ["k"])
+    hints.hint("r2", ["k"])
+    hints.hint("r3", ["k"])  # dropped
+    assert len(warnings) == 1 and "read hints dropped" in warnings[0]
+    for rid in ("r0", "r1", "r2", "r3"):
+        hints.end(rid)
+    policy.release.set()
+    _until(lambda: len(policy.ends) == 3)
+    assert policy.hints == ["r0", "r1", "r2"]
+    assert policy.ends == ["r0", "r1", "r2"]  # r3 never reached the policy
+    assert hints.close()
+
+
+def test_hints_after_close_are_ignored():
+    policy = _BlockedPolicy()
+    policy.release.set()
+    hints = hints_module.ReadHints(
+        policy, lambda keys: [("agent", [])], lambda a, m: {}
+    )
+    hints.hint("r1", ["k"])
+    _until(lambda: policy.hints)
+    assert hints.close()
+    hints.hint("r2", ["k"])
+    hints.end("r1")
+    assert hints._thread is None and policy.hints == ["r1"] and not policy.ends

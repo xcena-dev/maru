@@ -197,6 +197,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
 
     # ------------------------------------------------------------ read hints
 
+    @property
+    def read_hints_enabled(self) -> bool:
+        """Whether this backend's access policy takes read hints."""
+        return self._hints is not None and self._hints.enabled
+
     def hint_read(
         self, request_id: str, keys: list[str], route_key: str | None = None
     ) -> None:
@@ -207,12 +212,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
         hints this does nothing. A hint takes no lease; the load still
         leases and reads every key.
         """
-        if self._hints is not None and self._hints.enabled:
+        if self.read_hints_enabled:
             self._hints.hint(request_id, keys)
 
     def end_read_hint(self, request_id: str) -> None:
         """``request_id`` ended: the policy may drop what it prepared for it."""
-        if self._hints is not None and self._hints.enabled:
+        if self.read_hints_enabled:
             self._hints.end(request_id)
 
     def set_read_request(self, request_id: str) -> None:
@@ -271,7 +276,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 timeout_s=max(self.config.rdma_timeout_s, REPLY_TIMEOUT_MIN_S),
                 key=self._hint_key,
             )
-        client.hello()  # connects if needed; the epoch below is its agent's
+        if not client.epoch:
+            client.hello()  # connects; a reconnect later renews the epoch
         if not client.region_extension:
             raise StorageError(f"remote CXL agent {agent} has no region extension")
         return client.extension({**message, "epoch": client.epoch})
@@ -1487,12 +1493,15 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 raise
             cursor = end
 
+        # Only a policy that takes read hints is told which request reads.
+        named = (
+            {"request_id": getattr(self._reading, "request_id", "")}
+            if self.read_hints_enabled
+            else {}
+        )
         try:
             self._policy.read(
-                _RegionChannel(self._data, access),
-                ranges,
-                transfer,
-                getattr(self._reading, "request_id", ""),
+                _RegionChannel(self._data, access), ranges, transfer, **named
             )
         finally:
             done = True
@@ -1559,11 +1568,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
         for thread in self._threads:
             thread.join()
         self._threads = []
-        if self._hints is not None:
-            self._hints.close()
-        for agent in self._hint_agents.values():
-            agent.close()
-        self._hint_agents.clear()
+        # The hint thread owns its agent connections until it ended.
+        if self._hints is None or self._hints.close():
+            for agent in self._hint_agents.values():
+                agent.close()
+            self._hint_agents.clear()
         with self._lock:
             # Transfers run without the lock: let those under way end (each
             # within its timeout) before the regions and the data path go.

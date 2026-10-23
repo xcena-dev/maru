@@ -124,12 +124,12 @@ class AccessPolicy(Protocol):
         channel: AccessChannel,
         ranges: Sequence[AccessRange],
         transfer: Callable[[int, int], None],
-        request_id: str = "",
     ) -> None:
         """Move the bytes of ``ranges`` by calling ``transfer``.
 
-        ``request_id`` names the request whose load reads them, as a read
-        hint named it ("" if the engine did not say).
+        A policy that takes read hints (:class:`ReadHintHooks`) is also
+        passed ``request_id=``: the request whose load reads the ranges, as
+        its read hint named it ("" if the engine did not say).
 
         ``transfer(start, end)`` reads ``ranges[start:end]``. The policy must
         call it in order, with each ``start`` equal to the previous ``end``,
@@ -174,7 +174,14 @@ class ReadHintHooks(Protocol):
     The backend calls them on its hint thread, in the order the hints were
     given; a policy without them gets no hints. They may block (only the
     hint thread waits). An exception is logged and the hint dropped: the
-    load reads every byte either way.
+    load reads every byte either way. A policy with these hooks takes
+    ``request_id`` as a keyword argument of :meth:`AccessPolicy.read`.
+
+    Hints are advice: a hint can be dropped when too many wait, and the
+    engine may hint chunks its own prefix cache later serves, so a load may
+    read less than its hint named. An end is never dropped once its hint
+    reached the policy, but the policy should still expire what it prepared
+    (a process that dies sends no end).
     """
 
     def read_hint(

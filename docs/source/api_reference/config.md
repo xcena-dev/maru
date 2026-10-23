@@ -170,7 +170,7 @@ apply to that backend only:
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
 | `maru_access_policy` | `str` | empty | Name of an installed access policy (entry point in `maru.access_policies`) that decides when the backend's transfers run; see [Access policies](../design_doc/access_policies.md) |
 | `maru_access_policy_config` | `str` | empty | Opaque string given to that policy, typically its own configuration file |
-| `maru_read_hint_on_arrival` | `bool` | `false` | Give the access policy its read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` |
+| `maru_read_hint_on_arrival` | `bool` | `false` | Give the access policy its read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` (off with a warning otherwise) |
 
 ### Remote CXL agent (`maru-remote-cxl-agent`)
 

@@ -229,6 +229,11 @@ class PoolRouter:
         c = self._pick(route_key or keys[0])
         return c.batch_retrieve(keys) if c.connected else [None] * len(keys)
 
+    @property
+    def read_hints_enabled(self) -> bool:
+        """Whether any pool's access policy takes read hints."""
+        return any(c.read_hints_enabled for c in self.clients)
+
     def hint_read(
         self, request_id: str, keys: list[str], route_key: str | None = None
     ) -> None:
