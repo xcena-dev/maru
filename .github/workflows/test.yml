@@ -78,6 +78,29 @@ jobs:
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
 
+      - name: Install vLLM
+        # The vLLM connector tests import torch and vLLM, and pytest skips
+        # their modules at collection when either is missing. One interpreter
+        # installs the vLLM release the connector targets so they run; 3.13
+        # and 3.14 keep covering an install without either. The container has
+        # no GPU, so the tests that need CUDA or the maru_kv_ops kernels still
+        # skip.
+        if: matrix.python-version == '3.12'
+        env:
+          # Nexus sends nothing for a wheel it has not cached until it has
+          # fetched the whole file upstream. Over the lab link that outlasts
+          # uv's 30 s default for the larger wheels vLLM pulls in, so the
+          # first install of a vLLM release failed. Four attempts of 300 s
+          # still end inside the job timeout.
+          UV_HTTP_TIMEOUT: "300"
+        run: |
+          # Resolved together with Maru's own requirements, so that neither set
+          # silently replaces a version the other needs.
+          uv pip install -e ".[dev]" "vllm==0.32.0"
+          # An install that cannot be imported would turn those modules back
+          # into collection skips and leave the job green.
+          python -c "import torch, vllm; print(f'torch {torch.__version__}, vllm {vllm.__version__}')"
+
       - name: Run unit tests with coverage
         run: |
           pytest -m "not integration" \

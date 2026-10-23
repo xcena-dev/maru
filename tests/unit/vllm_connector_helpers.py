@@ -41,8 +41,14 @@ def make_worker(
     extra_config: dict[str, Any] | None = None,
     num_kv_heads: int | None = None,
     head_size: int | None = None,
+    kv_cache_layout: str | None = None,
 ) -> MaruWorkerConnector:
-    """Construct a MaruWorkerConnector (no CXL hardware or GPU required)."""
+    """Construct a MaruWorkerConnector (no CXL hardware or GPU required).
+
+    ``kv_cache_layout`` is the layout the engine reports: a vLLM 0.29+
+    ``KVCacheLayout`` name such as "LBNHC", or "NHD"/"HND" as older vLLM
+    reports it. None leaves the worker to read vLLM's own.
+    """
     from maru_vllm.connector import MaruWorkerConnector
 
     return MaruWorkerConnector(
@@ -51,6 +57,22 @@ def make_worker(
         extra_config={} if extra_config is None else extra_config,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        cache_config=resolved_cache_config(kv_cache_layout),
+    )
+
+
+def resolved_cache_config(kv_cache_layout: str | None) -> Any:
+    """Stand-in for a vLLM 0.29+ ``CacheConfig`` with a resolved layout.
+
+    It reports any name it is given, so "NHD"/"HND" stand for an older
+    engine's ``get_kv_cache_layout()``, which this vLLM no longer has.
+    """
+    if kv_cache_layout is None:
+        return None
+    layout = SimpleNamespace(name=kv_cache_layout)
+    return SimpleNamespace(
+        kv_cache_layout=kv_cache_layout,
+        get_resolved_kv_cache_layout=lambda: layout,
     )
 
 
@@ -59,6 +81,7 @@ def make_bare_worker(
     kv_caches: dict[str, Any] | None = None,
     num_kv_heads: int | None = None,
     head_size: int | None = None,
+    kv_cache_layout: str | None = None,
 ) -> MaruWorkerConnector:
     """Allocate a MaruWorkerConnector without running __init__.
 
@@ -72,6 +95,8 @@ def make_bare_worker(
     worker._kv_caches = {}
     worker._num_kv_heads = num_kv_heads
     worker._head_size = head_size
+    worker._cache_config = resolved_cache_config(kv_cache_layout)
+    worker._cache_layout = kv_cache_layout
     # Resolved in register_kv_caches on a real connector; do it here so layout
     # aware helpers see the same value they would in production.
     worker._kv_layout = None
@@ -148,6 +173,7 @@ def make_vllm_scheduler(
     import torch
     from vllm.config import (
         CacheConfig,
+        DeviceConfig,
         KVTransferConfig,
         ModelConfig,
         ParallelConfig,
@@ -155,6 +181,7 @@ def make_vllm_scheduler(
         SpeculativeConfig,
         VllmConfig,
     )
+    from vllm.platforms import current_platform
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -188,6 +215,13 @@ def make_vllm_scheduler(
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
+    # A CUDA build of vLLM on a host without a GPU, such as the CI unit-test
+    # container, resolves no platform, and the DeviceConfig("auto") that
+    # VllmConfig defaults to raises there. The scheduler never touches the
+    # device, so such a host names the CPU instead.
+    device_kwargs: dict[str, Any] = {}
+    if not current_platform.device_type:
+        device_kwargs["device_config"] = DeviceConfig(device="cpu")
     vllm_config = VllmConfig(
         model_config=model_config,
         speculative_config=speculative_config,
@@ -209,6 +243,7 @@ def make_vllm_scheduler(
                 **(extra_config or {}),
             },
         ),
+        **device_kwargs,
     )
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
