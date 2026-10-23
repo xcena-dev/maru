@@ -162,7 +162,7 @@ flowchart LR
     classDef rm fill:#d5e8d4,stroke:#82b366,font-weight:bold
 ```
 
-**Pluggable control plane.** The control plane is isolated behind a stable interface, so its implementation can change without affecting the data path. Remote mode (current) uses a centralized MaruServer + MaruResourceManager. Shared Filesystem mode (in development) replaces both with MaruFs, enforcing memory access control at the kernel level for stronger security than user-space RPC.
+**Control-plane proposal.** The current shared-pool control plane uses MaruServer and MaruResourceManager. The proposed MaruFs design would replace their directly mapped `cxl` control path with filesystem operations. It is not a shipping backend or an RDMA transport; kernel-mediated permissions are a design goal, not a demonstrated security comparison with RPC.
 
 **Region handles.** The Resource Manager issues handles for allocated regions. With `cxl`, the Handler checks a handle and opens the DAX device to map that region on its own node. With `remote_cxl`, the memory node's agent performs the mapping and NIC registration; the worker uses the returned RDMA access information. The worker therefore needs no local DAX device for that backend.
 
@@ -181,15 +181,17 @@ sequenceDiagram
     participant CP as Control Plane
     participant CXL as CXL Shared Memory
 
-    C->>H: store(key, data)
+    C->>H: alloc(size)
     H->>H: allocate page from owned region
-    H->>CXL: write payload into mapped region
+    H-->>C: writable handle
+    C->>CXL: finish payload write and required flush
+    C->>H: store(key, handle)
     H->>CP: register key → location
     CP-->>H: OK
     H-->>C: success
 ```
 
-Data is written to shared memory **before** the key is registered. Other instances can never observe a partial write — the key only becomes visible after the data is fully committed.
+The caller must finish the payload transfer and required visibility operations **before** registering the key. Readers then discover a completed object through the registry. This assumes the published payload remains immutable; metadata ordering does not finish an outstanding GPU copy or make non-coherent host caches coherent.
 
 ### Retrieve (cross-instance)
 
@@ -231,13 +233,41 @@ memory node.
 
 ![The nodes of a remote_cxl deployment. GPU worker nodes without CXL, outside the pool, run vLLM with MaruKVConnector and MaruHandler (remote_cxl backend) and have a NIC. The metadata node runs maru-server, one per app per pool, which the Handler reaches with the storage session RPC for regions and keys. The memory nodes form the RDMA memory pool: one of them runs the resource-manager, which MaruServer asks to allocate and free regions, and every one runs a remote CXL agent. The agent's RegionMapService answers the Handler's map request with region R's address and remote key, checks R's handle with the resource manager, maps R from the CXL memory and registers it with the memory node's NIC. KV bytes go from the Handler through the worker's NIC to the memory node's NIC with one-sided RDMA READ and WRITE, and from there into region R.](../image/remote_cxl_overview.png)
 
-![The cxl backend and the remote_cxl backend take the same steps: the Resource Manager gives region R to MaruServer, MaruServer gives R's handle to the Handler, R is mapped after a GET_ACCESS check, and KV moves. With the cxl backend the Handler maps R itself; with the remote_cxl backend the remote CXL agent on the memory node maps R and registers it with the NIC, and the Handler moves KV by RDMA](../image/remote_cxl_concept.png)
+The sequence below shows a remote region's first mapping and eventual reclamation.
+Ordinary worker shutdown can transfer the region to MaruServer's keeper instead
+of freeing it. A read or store reuses the mapping; it does not repeat this sequence.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker Handler
+    participant S as MaruServer
+    participant R as Resource Manager
+    participant A as Memory-node agent
+    W->>S: open session / expand
+    S->>R: ALLOC region
+    R-->>S: owner handle
+    S-->>W: region handle
+    W->>A: map(handle)
+    A->>R: HOLD(handle, agent generation)
+    R-->>A: device range + retained allocation
+    A->>A: mmap + NIC registration
+    A-->>W: RDMA address + remote key
+    Note over W,A: Payload: GPU ↔ worker CPU staging ↔ RDMA ↔ CXL
+    Note over S,A: Later: reclaim after readers / keeper are done
+    S->>A: release(owner handle)
+    A->>A: NIC deregistration
+    A->>R: UNHOLD
+    A-->>S: released
+    S->>R: FREE
+    Note over S,R: RM also defers reuse while a HOLD remains
+```
 
 How the properties above carry over:
 
-- **Data path.** No Maru process is on it: the worker's NIC and the memory
-  node's NIC move the bytes. One copy is added, between the GPU and the
-  worker's staging buffer. The remote CXL agent uses CPU when it maps a
+- **Data path.** MaruServer and the memory-node agent do not relay payloads.
+  The worker's connector copies between its GPU cache and CPU staging; the
+  two NICs transfer between staging and CXL by RDMA. Packing and fallback
+  paths can use additional temporary buffers. The remote CXL agent uses CPU when it maps a
   region and while a worker sets up its RDMA connection. It does not busy-poll
   while idle; periodic sweeps still progress UCX and check regions.
 - **Capability-based access.** The remote CXL agent is the process that opens
@@ -265,15 +295,21 @@ The {ref}`MaruHandler <maru-handler-remote-cxl>` and
 
 ## Extensibility
 
-MaruHandler is **framework-independent**. Its interface operates on string keys and memory views — a minimal, framework-neutral contract. Any inference framework can integrate with Maru by writing a thin adapter layer (typically under 200 lines) that converts framework-specific cache keys to strings and delegates to MaruHandler's store/retrieve API.
+MaruHandler exposes string-keyed storage operations that framework adapters can
+call. Backend support still belongs to each adapter: these LMCache and SGLang
+guides use directly mapped `cxl`; the native vLLM connector also supports
+`remote_cxl` and private `cpu`/`mixed` modes. A new adapter must honor the selected
+backend's layout, completion and read-lease contract.
 
 ```mermaid
 graph LR
     A[LMCache] -->|MaruConnector| D[MaruHandler]
     B[SGLang] -->|MaruStorage| D
-    C[Other Framework] -->|Custom Adapter| D
-    D --> E[MaruServer]
-    D --> F[CXL Shared Memory]
+    C[Native vLLM] -->|MaruKVConnector| D
+    D -.->|metadata| E[MaruServer]
+    D -->|cxl| F[Direct CXL mapping]
+    D -->|native vLLM remote_cxl| G[Worker staging + RDMA]
+    D -->|native vLLM cpu / mixed| H[Worker-private pools]
 ```
 
 > **See also:** [LMCache](../integration/lmcache.md),

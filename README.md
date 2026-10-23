@@ -15,6 +15,11 @@ Maru stores reusable KV in a shared pool. With the `cxl` backend, CXL-attached n
 
 Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the `remote_cxl` backend for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
 
+The native vLLM connector also offers worker-private `cpu` and `mixed` caches.
+Those modes do not provide cross-worker sharing in the current implementation.
+See the [backend guide](https://xcena-dev.github.io/maru/source/integration/vllm.html)
+to choose the storage path before following the default CXL quick start.
+
 <p align="center">
   <img src="docs/source/image/maru_shared_kv_cache.png" alt="Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network">
 </p>
@@ -111,7 +116,7 @@ All components run on the same machine in a single-node setup. For multi-node de
 - CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
 - For the `remote_cxl` backend:
   - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node; the maru-server node must reach the remote CXL agents on the memory nodes' RDMA network addresses
-  - NIXL in the same environment, before `./install.sh`: `uv pip install nixl` (`pip install nixl` without uv)
+  - A compatible NIXL/Torch/CUDA stack before `./install.sh`; use the [NIXL stack instructions](docs/source/getting_started/installation.md#nixl-stack), including constraints for the provided vLLM 0.22.1 example
 
 ```bash
 sudo apt-get update
@@ -194,14 +199,14 @@ with MaruHandler(config) as handler:
     # 1. Allocate a page in CXL shared memory
     handle = handler.alloc(size=len(data))
 
-    # 2. Write directly to CXL memory (mmap — no intermediate buffer)
+    # 2. Copy the payload into the directly mapped CXL page
     handle.buf[:] = data
 
     # 3. Register the key — only metadata (key → region, offset) is sent
-    handler.store(key=42, handle=handle)
+    handler.store(key="example-key", handle=handle)
 
     # Retrieve: returns a memoryview pointing into CXL memory
-    result = handler.retrieve(key=42)
+    result = handler.retrieve(key="example-key")
     assert result is not None
     assert bytes(result.view[:5]) == b"AAAAA"
 ```

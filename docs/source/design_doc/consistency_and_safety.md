@@ -1,7 +1,5 @@
 # Consistency and Safety
 
----
-
 ## 1. Data Visibility
 
 The sequence and CPU cache-flush steps below describe directly mapped `cxl` memory. With `remote_cxl`, the caller first fills worker-side staging, and the storage client completes the RDMA WRITE into the remote region before publishing its key. Writing staging alone does not make the remote payload visible. See the {doc}`remote CXL Handler design <maru_handler>` for its transfer and lease lifetimes.
@@ -74,7 +72,10 @@ helper is not evidence that the device validation passed.
 
 ## 2. Concurrency
 
-Maru serializes at two levels:
+The following lock diagram describes the legacy `cxl` Handler and registry.
+Storage-session clients have their own locks, leases and transfer completion
+rules; remote CXL transfers can run outside the client lock while staging
+remains owned until completion.
 
 ```mermaid
 flowchart LR
@@ -99,7 +100,8 @@ flowchart LR
 ```
 
 - **Client**: `_write_lock` serializes all writes (store, delete) within a
-  single handler instance. Retrieve is lock-free.
+  single handler instance. Retrieval does not take that write lock, but can
+  still wait on RPC, mapping and other synchronization.
 - **Server**: A single `RLock` serializes all metadata mutations (register,
   delete, ref-count updates) across instances.
 
@@ -109,17 +111,19 @@ produce the following guarantees:
 | Scenario | Behavior |
 |----------|----------|
 | Same-key store (cross-instance) | First registration wins; losing writer frees its page |
-| Different-key store (cross-instance) | Parallel — independent pages, independent server calls |
+| Different-key store (cross-instance) | Payload writes can use independent pages; metadata updates remain serialized |
 | Store within one instance | Serialized by client write lock |
 | Store + retrieve (same key) | No partial read — key invisible until data committed |
-| Concurrent retrieve | Lock-free on client; shared mappings need no synchronization |
+| Concurrent retrieve | Can overlap, subject to RPC/mapping synchronization and the platform's visibility rules |
 
 ---
 
 ## 3. Crash Recovery
 
-Maru is designed so that metadata can be reconstructed after a crash. The
-recovery strategy differs by component.
+RM allocation metadata can be reconstructed from its checkpoint and WAL.
+MaruServer's key/session directory is in memory; RM recovery does not restore
+it or make CXL DRAM payloads durable. Cache availability after a failure depends
+on the component and backend.
 
 ### 3.1 Recovery Sequence
 
@@ -142,13 +146,18 @@ sequenceDiagram
 
 ### 3.2 Client Crash Recovery
 
-When a client process terminates unexpectedly (crash, kill, network partition),
-its allocated memory regions must be reclaimed to prevent leaks.
+Process exit, session expiry and network loss are different events. The legacy
+`cxl` region owner tracked by the RM is usually MaruServer, not each GPU worker.
+Local owners can be checked by PID/start time; remote owners use connection
+state and a grace period. A timeout alone does not prove that NIC access or a
+worker's exported views have ended.
 
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
-| Resource Manager | Reaper polls process liveness every 1 second | Orphaned regions returned to free list; WAL records the free operation |
-| MaruServer | Deferred freeing state machine | Region freed only when both owner disconnected **and** KV reference count reaches zero |
+| Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until deregistration is confirmed |
+| Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
+| `remote_cxl` directory | Session close/expiry, region and agent status | Can keep regions with valid keys; agent release precedes normal region return |
+| `cpu`, current `mixed` | Worker session and read leases | Hides inaccessible replicas; expiry alone does not reclaim buffers or uncertain grants |
 
 The reaper defends against PID reuse by caching each client's process start
 time at allocation time. If the PID is recycled by the OS, the start-time
@@ -161,9 +170,15 @@ mismatch triggers reclamation.
 
 ## 4. Failure Modes
 
-| Failure | Impact | Recovery | Data Loss |
-|---------|--------|----------|-----------|
-| Client crash | Owned regions orphaned; keys become stale | Reaper + deferred freeing | None |
-| Resource Manager crash | New region allocation blocked | WAL + checkpoint replay on restart | None |
-| Network partition (client-server) | Affected client cannot store/retrieve | Client reconnects when network recovers | None |
-| CXL device failure | All data on the device is lost | Not supported -- no cross-device replication | **Total** |
+| Failure | Impact | Recovery boundary |
+|---|---|---|
+| Worker exit | Private CPU/mixed replicas become inaccessible; remote CXL keys may remain in kept regions | Recompute unavailable keys and create a fresh worker/session as required by the backend |
+| MaruServer restart | Volatile key/session metadata is lost | Restart affected storage-session workers and allow cache warm-up; RM WAL does not restore those keys |
+| Resource Manager restart | Allocation operations pause while the ledger and holds are recovered | Restore allocation metadata and revalidate devices; this does not establish payload durability |
+| Network partition or uncertain native transfer | Reads can miss and unknown NIC accesses can retain staging | Use recompute; recover a persistently affected worker by stopping its whole engine and confirming process exit |
+| Memory-node reboot or device failure | Cached bytes can be lost or invalid | Invalidate affected regions and recompute; this implementation does not promise automatic cross-device replication |
+
+See the {doc}`vLLM recovery procedure <../integration/vllm>` for persistent native
+errors and {doc}`memory_model` for the distinct local read lease, server read
+lease and RM hold lifetimes. A successful metadata heartbeat is not a device
+read, a GPU-ready result or proof that a cache survived a restart.

@@ -6,6 +6,11 @@ Maru stores reusable KV in a shared pool. With the `cxl` backend, CXL-attached n
 
 Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the `remote_cxl` backend for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
 
+The native vLLM connector also offers worker-private `cpu` and `mixed` caches.
+Those modes do not provide cross-worker sharing in the current implementation.
+See the {doc}`backend guide <source/integration/vllm>` to choose the storage
+path before following the default CXL quick start.
+
 :::{image} source/image/maru_shared_kv_cache.png
 :alt: Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network
 :align: center

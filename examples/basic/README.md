@@ -5,7 +5,7 @@ Demonstrates the default `cxl` backend: write into a mapped CXL page, publish it
 ## Prerequisites
 
 - Maru installed (`uv pip install -e .`)
-- Maru Resource Manager running (`systemctl status maru-resourced`)
+- Maru Resource Manager running (`systemctl status maru-resource-manager`)
 - CXL DAX device available (`/dev/dax*`)
 
 For setup instructions, see the [Installation Guide](../../docs/source/getting_started/installation.md).

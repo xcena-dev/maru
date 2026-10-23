@@ -7,6 +7,10 @@ connector handles KV cache sharing through Maru.
 
 The pool's access path depends on the selected backend: `cxl` maps CXL on the worker, while `remote_cxl` transfers KV through worker CPU staging and RDMA. The diagram groups that payload path in one box; workers reuse KV within the same pool and backend.
 
+The provided Dynamo example uses `cxl`. A standalone vLLM backend result does
+not validate the same combination under Dynamo: an RDMA deployment also needs
+the agent/NIXL setup and validation with the chosen Dynamo/vLLM versions.
+
 ```mermaid
 flowchart TB
     Client["OpenAI API client"] --> FE["Dynamo frontend"]

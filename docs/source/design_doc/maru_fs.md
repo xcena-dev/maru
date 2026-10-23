@@ -1,6 +1,6 @@
 # marufs — Shared Filesystem Mode
 
-> **Status**: Under active development, release coming soon.
+> **Status**: Design proposal. This page is not a shipping backend configuration or a release-date commitment.
 
 ## Motivation
 
@@ -27,7 +27,7 @@ While functional, this design carries operational burdens:
 | **User-space access control** | Memory access control is enforced in user-space RPC, which is weaker than kernel-level enforcement |
 | **IPC complexity** | Multi-hop RPC protocol between MaruServer and Resource Manager is hard to debug and maintain |
 
-**Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level for stronger security than user-space RPC.
+The proposed **Shared Filesystem mode (marufs)** would replace the CXL control-plane processes with a kernel filesystem module (`marufs.ko`). The intended VFS checks below are design goals, not measured proof of stronger isolation or a replacement for remote CXL's staging/RDMA path.
 
 ```
 ┌─────────────┐   VFS + ioctl   ┌─────────────────┐
@@ -57,11 +57,12 @@ Deployment is as simple as loading `marufs.ko` and mounting. No server processes
 
 ### 2. Kernel-level Access Control
 
-Remote mode enforces memory access control in user-space via RPC — any process that can reach the server can potentially bypass authorization. Filesystem mode moves access control into the kernel:
+The current CXL path uses RM handles and local DAX permissions. The proposal
+would move region-management and metadata permission checks to the VFS layer:
 
 - **Permission flags** (`PERM_READ`, `PERM_WRITE`, `PERM_DELETE`, `PERM_ADMIN`, `PERM_IOCTL`) are enforced at the VFS layer
 - **Default permissions** are set at region creation via `perm_set_default`
-- The kernel mediates all region access — no way to bypass without kernel privilege
+- Mapping and metadata operations would be mediated by the kernel module; platform/device access still needs its own controls
 
 ### 3. Kernel-managed Global KV Index
 
@@ -228,7 +229,11 @@ Filesystem mode introduces three components that replace their Remote mode count
 
 ## Concurrency Guarantees
 
-All components are thread-safe. Write operations (store, delete, region map/unmap, allocation/free) are serialized. Read operations (retrieve, buffer view access) are lock-free. This follows the same concurrency model as Remote mode.
+The proposal serializes mutations such as store, delete, region map/unmap and
+allocation/free, while permitting reads to overlap where their lifetimes allow.
+It does not establish formal lock-free execution or validate the behavior of a
+shipping filesystem backend. The current RPC Handler's reads can still wait on
+RPC, mapping and synchronization.
 
 > **See also:** [Consistency and Safety](consistency_and_safety.md)
 

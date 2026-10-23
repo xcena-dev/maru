@@ -1,19 +1,28 @@
 # vLLM Examples
 
 Runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
-which moves KV cache through CXL shared memory without LMCache in the serving
-path. They live under `examples/vllm/`:
+which accesses the selected Maru backend without LMCache in the serving path.
+The single-instance and P2P launchers below use directly mapped `cxl`.
+Examples live under `examples/vllm/`:
 
 | Example | Directory | What it shows |
 |---------|-----------|---------------|
 | Single-instance verification | `examples/vllm/single/` | One instance stores KV and reuses it on a repeat request — the cheapest connector check |
 | P2P KV cache sharing | `examples/vllm/p2p_sharing/` | Two instances share KV cache, so the second skips prefill |
 | CXL on memory nodes over RDMA | `examples/vllm/remote_cxl/` | Engines on nodes without CXL share KV in a memory node's CXL pool over RDMA |
+| Worker-private CPU cache | `examples/vllm/cpu/` | GPU inference with CPU DRAM storage; no CXL or RM |
+| Worker-private CPU + CXL cache | `examples/vllm/mixed/` | Fixed private pools; cross-worker sharing is not implemented |
 
-Start with the single-instance example: it needs one GPU and isolates the
-store and load paths before any cross-instance behavior is involved.
+For a CXL-attached worker, start with the single-instance example. For a worker
+without CXL, choose remote CXL or CPU storage instead. The
+[CPU](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md) and
+[mixed](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
+guides specify their capacity, layout and lifetime restrictions.
 
 ## Prerequisites
+
+These prerequisites describe the default `cxl` single-instance/P2P launchers.
+The remote CXL, CPU and mixed examples have their own environment requirements.
 
 - 1 GPU for the single-instance example, 2+ for P2P
 - Maru installed with its KV placement kernels: `./install.sh` from the Maru
@@ -21,8 +30,9 @@ store and load paths before any cross-instance behavior is involved.
   environment that already has PyTorch and the CUDA toolkit. The connector
   carries its own CUDA kernels for the coalesced multi-layer transfers and
   falls back to a transfer per layer without them, which is materially slower.
-  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` says
-  which path it will take.
+  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks
+  importability only. The engine's layout and transfer logs determine the
+  actual path; vLLM 0.29+ logical layouts still use per-layer copies here.
 - vLLM v0.14+ installed
 - `maru-server` binary available
 
@@ -55,8 +65,9 @@ cd examples/vllm/single
 ```
 
 The script starts `maru-server` and one vLLM instance, then sends the same
-prompt twice. `Cache Hit: Yes` with a TTFT speedup confirms both paths. It
-exits non-zero on a cache miss; check `single.log` for connector errors (a
+prompt twice. Check the hit and the worker's completed restore, and compare
+generated output with recompute. TTFT alone does not prove a correct restore.
+The script exits non-zero on a cache miss; check `single.log` for errors (a
 missing `Maru: loaded N layers` message means the worker load path failed).
 
 ### Step-by-step
@@ -175,7 +186,7 @@ the regions as for local CXL.
 ```bash
 cd examples/vllm/remote_cxl
 # One host with 2 GPUs, an RDMA NIC, a CXL/DAX device, the resource manager
-# running (sudo systemctl start maru-resource-manager) and NIXL (uv pip install nixl)
+# running (sudo systemctl start maru-resource-manager) and the constrained NIXL stack
 MARU_DAX_PATH=/dev/dax0.0 MARU_AGENT_UCX_DEVICE=mlx5_0:1 \
 MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh
 ```
