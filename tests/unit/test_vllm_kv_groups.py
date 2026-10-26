@@ -185,14 +185,14 @@ def test_chunk_is_one_block_with_a_mamba_group():
 
 
 def _check(
-    groups, block_size, use_layerwise=False, speculative=False, inline_recompute=False
+    groups, block_size, use_layerwise=False, speculative=False, inline_loads=False
 ):
     check_multi_group_support(
         groups,
         block_size=block_size,
         use_layerwise=use_layerwise,
         speculative=speculative,
-        inline_recompute=inline_recompute,
+        inline_loads=inline_loads,
     )
 
 
@@ -335,30 +335,33 @@ def _one_group_config():
 
 
 @pytest.mark.parametrize(
-    ("kv_cache_config", "policy", "async_load", "refused"),
+    ("kv_cache_config", "extra", "parked"),
     [
-        (gpt_oss_config, "recompute", False, True),
-        (gpt_oss_config, "fail", False, False),
-        # Every load is parked, and vLLM recomputes a failed parked load right.
-        (gpt_oss_config, "recompute", True, False),
-        (_one_group_config, "recompute", False, False),
+        (gpt_oss_config, {}, True),
+        (gpt_oss_config, {"maru_async_load": True}, True),
+        (gpt_oss_config, {"maru_async_load": False}, None),
+        (gpt_oss_config, {"maru_enable_deferred_loading": False}, None),
+        (_one_group_config, {}, False),
     ],
 )
-def test_recompute_policy_is_refused_for_inline_loads_of_several_groups(
-    kv_cache_config, policy, async_load, refused
-):
-    """vLLM 0.30 recomputes a failed inline load of a several-group model
-    wrongly; the default policy fails the request instead."""
-    config = _connector_config(16, maru_async_load=async_load)
-    config.kv_transfer_config.kv_load_failure_policy = policy
-    if not refused:
-        MaruKVConnector(config, KVConnectorRole.SCHEDULER, kv_cache_config())
+def test_several_groups_park_every_load(kv_cache_config, extra, parked):
+    """vLLM 0.31+ stops the engine on a failed inline load of a model with
+    several groups (#126), and vLLM 0.30 recomputes one into wrong output
+    under "recompute" (vllm-project/vllm#49250). Such a model parks its
+    loads unless told otherwise, and inline loads are refused; one group
+    keeps the inline default."""
+    config = _connector_config(16, **extra)
+    if parked is not None:
+        connector = MaruKVConnector(
+            config, KVConnectorRole.SCHEDULER, kv_cache_config()
+        )
+        assert connector._scheduler._deferred_loading is parked
         return
     for role in (KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER):
-        with pytest.raises(ValueError, match="maru_async_load=true") as refusal:
+        with pytest.raises(ValueError, match="maru_async_load=false") as refusal:
             MaruKVConnector(config, role, kv_cache_config())
+    assert "xcena-dev/maru#126" in str(refusal.value)
     assert "vllm-project/vllm#49250" in str(refusal.value)
-    assert "kv_load_failure_policy='fail'" in str(refusal.value)
 
 
 @pytest.mark.parametrize("declared", [True, False])
@@ -1838,17 +1841,17 @@ def test_vllm_scheduler_hands_every_group_to_the_connector(tmp_path):
 
     engine.add_request(Request("b", tokens, SamplingParams(max_tokens=1), None))
     output = engine.schedule()
-    # 3 whole chunks short of the last token: 96 tokens hit, 4 computed.
-    assert output.num_scheduled_tokens["b"] == 4
+    # 3 whole chunks short of the last token: 96 tokens hit, parked while
+    # they load (several groups park every load).
+    assert "b" not in output.num_scheduled_tokens
     (req,) = output.kv_connector_metadata.requests
-    assert not req.is_store and req.num_matched_chunks == 3
-    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (96, 4)
+    assert not req.is_store and req.deferred_load and req.num_matched_chunks == 3
     assert (req.load_start_token, req.load_end_token) == (0, 96)
     swa, full = req.group_block_ids
-    # vLLM gives the window (tokens 65-95) and the new token's block real
-    # blocks, and nothing before it.
-    assert swa[:4] == [0, 0, 0, 0] and all(swa[4:]) and len(swa) == 7
-    assert all(full) and len(full) == 7
+    # vLLM gives the hit's window (tokens 64-95) real blocks, and nothing
+    # before it.
+    assert swa == [0, 0, 0, 0, swa[4], swa[5]] and swa[4] and swa[5]
+    assert all(full) and len(full) == 6
 
     engine.finish_requests("b", RequestStatus.FINISHED_ABORTED)
     finished.assert_called_once()
@@ -2028,25 +2031,12 @@ def _add_hit_request(engine, tokens):
     )
 
 
-def test_vllm_scheduler_gives_an_inline_mamba_load_both_state_blocks(tmp_path):
-    engine = _mamba_engine(tmp_path)
-    _add_hit_request(engine, list(range(100)))
-    output = engine.schedule()
-    assert output.num_scheduled_tokens["b"] == 4
-    (req,) = output.kv_connector_metadata.requests
-    assert not req.is_store and not req.deferred_load and req.num_matched_chunks == 6
-    assert (req.num_computed_tokens, req.num_scheduled_tokens) == (96, 4)
-    mamba, full = req.group_block_ids
-    # The hit's last block (position 5) and the step's (position 6) are real;
-    # the worker writes the state to both.
-    assert mamba[:5] == [0] * 5 and all(mamba[5:]) and len(mamba) == 7
-    assert all(full) and len(full) == 7
-
-
-def test_vllm_scheduler_gives_a_parked_mamba_load_the_hits_last_block(tmp_path):
+@pytest.mark.parametrize("extra", [None, {"maru_async_load": True}])
+def test_vllm_scheduler_gives_a_parked_mamba_load_the_hits_last_block(tmp_path, extra):
+    """Parked by default with several groups, or when asked for."""
     from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
-    engine = _mamba_engine(tmp_path, {"maru_async_load": True})
+    engine = _mamba_engine(tmp_path, extra)
     _add_hit_request(engine, list(range(100)))
     output = engine.schedule()
     assert "b" not in output.num_scheduled_tokens  # parked while it loads

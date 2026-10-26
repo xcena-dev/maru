@@ -254,22 +254,24 @@ def check_multi_group_support(
     block_size: int,
     use_layerwise: bool,
     speculative: bool,
-    inline_recompute: bool,
+    inline_loads: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
     A model with one group is always accepted. Several groups are supported
     in chunkwise (packed) format with full attention, sliding window and
-    Mamba (``align``) groups, without speculative decoding. The CPU and mixed
-    backends reject several groups on their own, in ``MaruKVConnector``.
+    Mamba (``align``) groups, with parked loads, without speculative
+    decoding. The CPU, mixed and remote_cxl backends reject several groups
+    on their own, in ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.
         block_size: ``cache_config.block_size``, which the connector uses.
         use_layerwise: ``maru_use_layerwise``.
         speculative: Whether speculative decoding is configured.
-        inline_recompute: Whether ``kv_load_failure_policy`` is
-            ``"recompute"`` while loads run inline (``maru_async_load`` off).
+        inline_loads: Whether loads run inline (``maru_async_load`` set to
+            false; ``MaruKVConnector`` turns it on for several groups unless
+            set).
 
     Raises:
         ValueError: With the reason and the setting to change.
@@ -309,18 +311,20 @@ def check_multi_group_support(
             "MaruKVConnector needs every KV cache group to use the block size "
             f"{block_size} (got {group_block_sizes}){one_group_hint(groups)}"
         )
-    if inline_recompute:
-        # vLLM's V2 model runner does not rewind its device-side state
-        # (vllm-project/vllm#49250); reproduced on vLLM 0.30 without Maru, by
-        # a connector that reports its claimed blocks as failed. vLLM
-        # recomputes a failed parked load correctly.
+    if inline_loads:
+        # A failed inline load is reported by its blocks, which vLLM 0.31+
+        # refuses with several groups: block ids are unique only within a
+        # group, and its per-request report takes only parked requests. vLLM
+        # 0.30 takes it, but under "recompute" its V2 model runner does not
+        # rewind its device-side state (vllm-project/vllm#49250).
         raise ValueError(
-            "MaruKVConnector does not support kv_load_failure_policy="
-            "'recompute' with inline loads for models with several KV cache "
-            "groups: vLLM recomputes a request whose inline KV load failed and "
-            "can return wrong output (vllm-project/vllm#49250). Set "
-            "maru_async_load=true, under which vLLM recomputes a failed load "
-            "correctly, or keep kv_load_failure_policy='fail'"
+            "MaruKVConnector loads a model with several KV cache groups only "
+            "between steps (maru_async_load=true, its default for such a "
+            "model): vLLM 0.31 and later stop the engine on a failed inline "
+            "load of such a model (xcena-dev/maru#126), and vLLM 0.30 "
+            "recomputes one into wrong output under kv_load_failure_policy="
+            "'recompute' (vllm-project/vllm#49250). Remove "
+            f"maru_async_load=false{one_group_hint(groups)}"
         )
 
 

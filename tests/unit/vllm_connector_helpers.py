@@ -174,8 +174,7 @@ def make_vllm_scheduler(
         max_model_len: Token limit used by the model and scheduler.
         kv_cache_groups: ``KVCacheGroupSpec`` list replacing the default single
             full-attention group, for models with several groups.
-        kv_load_failure_policy: vLLM's policy for a failed KV load. With
-            several groups and inline loads Maru refuses ``"recompute"``.
+        kv_load_failure_policy: vLLM's policy for a failed KV load.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its

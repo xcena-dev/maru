@@ -370,7 +370,7 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_async_load` | bool | `false` (`true` for `remote_cxl`) | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_load` | bool | `false` (`true` for `remote_cxl` and for models with several KV cache groups) | Load cache hits on a background thread between steps instead of inside the forward pass |
 | `maru_async_store` | bool | `false` (`true` for `remote_cxl`) | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 | `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
@@ -609,7 +609,7 @@ The connector refuses to start a model with several groups unless:
 - Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
 - The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
-- `kv_load_failure_policy="recompute"` comes with `maru_async_load=true`. Under the default `fail` inline loads run too, but on vLLM 0.32 a failed inline load stops the engine; see {ref}`vllm-load-failures`.
+- Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
 
 ```bash
 vllm serve Qwen/Qwen3.5-0.8B \
@@ -643,9 +643,9 @@ On B200 or GB200, add `--attention-backend TRITON_ATTN`.
 vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load fails:
 
 - `fail` (vLLM's default) ends the request with an error.
-- `recompute` computes the request again; with several groups vLLM 0.30 restarts it from the first token. With inline loads (`maru_async_load=false`), vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)), so for a model with several groups the connector refuses `recompute` with inline loads at startup. With `maru_async_load=true` every load is parked and vLLM recomputes a failed load correctly.
+- `recompute` computes the request again; with several groups vLLM restarts it from the first token.
 
-With several groups, set `maru_async_load=true`, under either policy. Maru reports a failed parked load by its request. A failed inline load can be reported only by its blocks, and vLLM 0.32 stops the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group. On vLLM 0.30 an inline load that fails under `fail` ends its request with an error.
+With several groups every load is parked, and Maru reports a failed parked load by its request. An inline load could be reported only by its blocks: vLLM 0.31 and later stop the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group ([#126](https://github.com/xcena-dev/maru/issues/126)), and under `recompute` vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)). The connector therefore turns `maru_async_load` on for such a model and refuses `maru_async_load=false`. Upstream changes that would allow inline loads again are tracked in [#127](https://github.com/xcena-dev/maru/issues/127).
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 

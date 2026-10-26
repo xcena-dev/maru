@@ -505,6 +505,26 @@ def _remote_cxl_defaults(extra: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _several_group_defaults(
+    extra: dict[str, Any], groups: list[KVGroup]
+) -> dict[str, Any]:
+    """Turn on parked loads for a model with several KV cache groups unless set.
+
+    vLLM 0.31+ takes a failed load of such a model only by its request, and
+    only for a parked request; a failed inline load stops the engine there
+    (xcena-dev/maru#126). ``check_multi_group_support`` refuses an explicit
+    ``maru_async_load=false``.
+    """
+    knob = "maru_async_load"
+    if len(groups) <= 1 or knob in extra or _RENAMED_KNOBS[knob] in extra:
+        return extra
+    logger.info(
+        "Maru: %d KV cache groups, so loads are parked (maru_async_load=true)",
+        len(groups),
+    )
+    return {**extra, knob: True}
+
+
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry.
 
@@ -1172,16 +1192,13 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             )
 
         if len(self._kv_groups) > 1:
+            extra = _several_group_defaults(extra, self._kv_groups)
             check_multi_group_support(
                 self._kv_groups,
                 block_size=self._block_size,
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative=vllm_config.speculative_config is not None,
-                inline_recompute=(
-                    getattr(self._kv_transfer_config, "kv_load_failure_policy", "fail")
-                    == "recompute"
-                    and not _get_knob(extra, "maru_async_load")
-                ),
+                inline_loads=not _get_knob(extra, "maru_async_load"),
             )
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
