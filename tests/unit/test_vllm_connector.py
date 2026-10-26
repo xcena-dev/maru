@@ -24,6 +24,7 @@ from maru_vllm.connector import (
     _parse_size,
 )
 from tests.unit.vllm_connector_helpers import (
+    FailingSyncStream,
     attach_capturing_handler,
     capture_float32,
     deferred_metadata,
@@ -3940,6 +3941,49 @@ class TestPackedStorage:
         assert len(allocated) == 2  # one slab per chunk
         assert freed == allocated  # every handle returned on the except path
         assert worker._stored_keys == set()
+
+    def test_kernel_store_registers_nothing_whose_copy_failed(self):
+        """A slab whose copy cannot be confirmed is freed, not registered:
+        another instance would read incomplete KV as a hit."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+
+        worker, store = self._make_worker()
+        kv_layers = [kv.cuda() for kv in self._kv_layers()]
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        kernel = self._fake_store_kernel(kv_layers)
+        allocated = []
+        worker._handler.alloc.side_effect = lambda n: (
+            allocated.append(SimpleNamespace(buf=memoryview(bytearray(n))))
+            or allocated[-1]
+        )
+        freed = []
+        worker._handler.free.side_effect = freed.append
+        device = kv_layers[0].device
+        worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(device))
+        worker._sync_store_stream_device = device
+
+        meta = MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=list(range(self.PROMPT)),
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+        with pytest.raises(RuntimeError, match="injected"):
+            worker._store_packed_slabs(kernel, meta)
+        assert len(allocated) == 2  # one slab per chunk
+        worker._handler.batch_store.assert_not_called()
+        assert store == {}
+        assert worker._stored_keys == set()
+        assert freed == allocated
 
     def test_kernel_store_writes_kv2ltd_slab_roundtrip(self):
         """_store_packed_slabs: one kernel D2H per chunk, one key per chunk,

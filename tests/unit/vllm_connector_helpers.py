@@ -297,6 +297,24 @@ def make_flash_attn_metadata() -> MagicMock:
 # =============================================================================
 
 
+class FailingSyncStream:
+    """A CUDA stream whose ``synchronize`` reports a failed copy.
+
+    It waits for the queued work first, so the CUDA context stays usable,
+    and then raises as an asynchronous copy error would.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def synchronize(self) -> None:
+        self.stream.synchronize()
+        raise RuntimeError("injected asynchronous copy failure")
+
+
 def capture_bytes(buf: Any) -> bytes:
     """Capture a stored slab as raw bytes."""
     return bytes(buf)

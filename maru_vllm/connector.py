@@ -5374,7 +5374,8 @@ class MaruWorkerConnector:
         (``maru_async_store``) like a single-group model's, since their
         blocks stay until the request finishes. Everything stored now is
         registered with one ``batch_store``, including what a group gathered
-        before it failed.
+        before it failed, unless its copies could not be confirmed
+        (``_gather_packed_slabs``).
         """
         if not self._multi_group or not self._group_caches:
             return
@@ -5683,7 +5684,9 @@ class MaruWorkerConnector:
         Appends each slab's key and handle to ``keys`` and ``handles``, which
         the caller owns and registers. The stream is synchronized before
         returning, on an exception too, so every appended slab is fully in
-        CXL and nothing allocated is lost.
+        CXL and nothing allocated is lost. If synchronizing fails, the slabs
+        this call appended may not have landed: they are freed and removed
+        before the error propagates, so none of them is registered.
         """
         ops, ptrs, pbs, block_size, head_size, fmt = kernel
         handler = self._handler
@@ -5788,7 +5791,12 @@ class MaruWorkerConnector:
                         handles.append(handle)
         finally:
             if stream is not None:
-                stream.synchronize()
+                try:
+                    stream.synchronize()
+                except Exception:
+                    self._free_handles_best_effort(handles[first_key:])
+                    del keys[first_key:], handles[first_key:]
+                    raise
         if self._timing and len(keys) > first_key:
             mode = "kernel"
             if staged_chunks:

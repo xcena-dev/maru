@@ -53,6 +53,7 @@ from maru_vllm.kv_groups import (
     window_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
+    FailingSyncStream,
     attach_capturing_handler,
     fake_cached_reqs,
     fake_scheduler_output,
@@ -1451,6 +1452,20 @@ def test_kernel_store_uses_the_group_pointer_table():
     assert worker._group_kernels[3] is not None
     assert len(store) == 5
     _check_qwen_objects(worker, store, shared, tokens)
+
+
+def test_kernel_store_registers_no_group_object_whose_copy_failed():
+    """The attention group's slabs, whose copies could not be confirmed, are
+    freed instead of registered; the Mamba states, copied synchronously,
+    still are."""
+    worker, store, shared = _kernel_worker()
+    worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(shared.device))
+    worker._sync_store_stream_device = shared.device
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
+    assert set(store) == {group_object_key(k1, g) for g in range(3)}
+    assert worker._handler.free.call_count == 2  # the two attention slabs
 
 
 def test_kernel_write_behind_stores_attention_later_and_states_now():
