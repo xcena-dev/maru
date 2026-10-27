@@ -153,9 +153,10 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # config asks for them.
         self._read_hints = bool(getattr(config, "read_hints", False))
         self._write_hints = bool(getattr(config, "write_hints", False))
+        self._read_promotes = bool(getattr(config, "read_promotes", False))
         self._hints = (
             MemoryHints(self._hint_locate, self._hint_send)
-            if self._read_hints or self._write_hints
+            if self._read_hints or self._write_hints or self._read_promotes
             else None
         )
         self._hint_agents: dict[str, Any] = {}
@@ -185,6 +186,19 @@ class RemoteCxlStorageClient(RegionLifecycle):
         """``request_id`` ended: the memory side may drop what it prepared."""
         if self._read_hints:
             self._hints.end(request_id)
+
+    def promote_read(self, request_id: str, route_key: str | None = None) -> None:
+        """The load of ``request_id``, which another process hinted, starts
+        now: tell the memory side, so it brings that request's bytes in
+        first.
+
+        Returns at once; the hint thread sends ``read_promote`` to every
+        remote CXL agent of the pool that takes it (this process does not
+        know which of them took the hint). Without read promotes this does
+        nothing.
+        """
+        if self._read_promotes and self._agents:
+            self._hints.promote(request_id, list(self._agents))
 
     def _hint_locate(self, keys: list[str]) -> list[tuple[str, list[dict]]]:
         """The leading hit keys as ranges, per remote CXL agent that maps

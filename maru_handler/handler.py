@@ -1296,6 +1296,22 @@ class MaruHandler:
         if hint is not None:
             hint(request_id, keys, route_key=route_key)
 
+    def promote_read(self, request_id: str, route_key: str | None = None) -> None:
+        """The load of ``request_id`` starts now; returns at once.
+
+        Storage that sends read promotes tells the memory side, so it brings
+        in that request's hinted bytes ahead of other hinted ones. For a
+        process that loads what another process hinted (a vLLM worker loads
+        what its scheduler hinted with :meth:`hint_read`).
+
+        Args:
+            request_id: The serving engine's request id, as hinted.
+            route_key: The request's first chunk key (picks the pool).
+        """
+        promote = getattr(self._cpu, "promote_read", None)
+        if promote is not None:
+            promote(request_id, route_key=route_key)
+
     def end_read_hint(self, request_id: str) -> None:
         """``request_id`` ended; storage may drop what it prepared for it."""
         end = getattr(self._cpu, "end_read_hint", None)

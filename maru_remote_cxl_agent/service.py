@@ -356,8 +356,9 @@ class RegionMapService:
 
         Args:
             conn: Connection id.
-            message: ``action`` (``read_hint``, ``read_hint_end`` or
-                ``write_hint``), ``request``, ``ranges`` and ``epoch``.
+            message: ``action`` (``read_hint``, ``read_hint_end``,
+                ``read_promote`` or ``write_hint``), ``request``, ``ranges``
+                and ``epoch``.
 
         Raises:
             ValueError: if no extension is loaded, the message is malformed or
@@ -427,8 +428,8 @@ class RegionMapService:
             ValueError: if the connection has too many requests open.
         """
         request = message["request"]
-        if message["action"] == "write_hint":
-            return False  # a write hint has no end and stays open nowhere
+        if message["action"] in ("write_hint", "read_promote"):
+            return False  # neither has an end nor stays open
         if message["action"] == "read_hint_end":
             requests = self._hint_requests.get(conn)
             if requests is not None:

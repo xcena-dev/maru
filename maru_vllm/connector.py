@@ -857,9 +857,14 @@ def _create_maru_handler(
             "maru_remote_cxl_agent_key_file", "~/.maru/remote-cxl-agent.key"
         ),
         # The scheduler hints each load before its worker starts it, so the
-        # worker sends no read hints of its own; the worker hints its stores.
-        # Write hints follow read hints unless set apart.
+        # worker sends no read hints of its own: it promotes each hinted load
+        # as it starts, and hints its stores. Write hints follow read hints
+        # unless set apart.
         read_hints=metadata_only and bool(extra_config.get("maru_read_hints", False)),
+        # (only loads the scheduler hinted: those are asynchronous)
+        read_promotes=not metadata_only
+        and bool(extra_config.get("maru_read_hints", False))
+        and bool(_get_knob(extra_config, "maru_async_load")),
         write_hints=not metadata_only
         and bool(
             extra_config.get(
@@ -4521,6 +4526,13 @@ class MaruWorkerConnector:
         """
         handler = self._handler
         assert handler is not None
+        # The scheduler hinted this load; the memory side hears it starts now.
+        promote = getattr(handler, "promote_read", None)
+        if promote is not None:
+            try:
+                promote(req_meta.req_id, **route)
+            except Exception:
+                logger.debug("Maru: read promote not queued", exc_info=True)
         ct = self._kv_chunk_tokens
         start, end = self._cpu_load_range(req_meta)
         first = start // ct
