@@ -11,8 +11,8 @@ pytest.importorskip("vllm")
 import torch
 
 from maru_vllm.connector import (
-    _cpu_bypass_request,
     _cpu_engine_config,
+    _uncacheable_request,
     _validate_storage_config,
 )
 from tests.unit.vllm_connector_helpers import make_scheduler, make_worker
@@ -188,9 +188,9 @@ def test_cpu_requires_eager_hooks_and_unquantized_kv():
 
 
 def test_embeddings_are_bypassed_without_tensor_truth_conversion():
-    assert _cpu_bypass_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
-    assert _cpu_bypass_request(SimpleNamespace(cache_salt=""))
-    assert not _cpu_bypass_request(SimpleNamespace(mm_features=[]))
+    assert _uncacheable_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
+    assert _uncacheable_request(SimpleNamespace(cache_salt=""))
+    assert not _uncacheable_request(SimpleNamespace(mm_features=[]))
 
 
 def test_cpu_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():

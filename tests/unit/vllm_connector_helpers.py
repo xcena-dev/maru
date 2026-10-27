@@ -42,12 +42,14 @@ def make_worker(
     num_kv_heads: int | None = None,
     head_size: int | None = None,
     kv_cache_layout: str | None = None,
+    **kwargs: Any,
 ) -> MaruWorkerConnector:
     """Construct a MaruWorkerConnector (no CXL hardware or GPU required).
 
     ``kv_cache_layout`` is the layout the engine reports: a vLLM 0.29+
     ``KVCacheLayout`` name such as "LBNHC", or "NHD"/"HND" as older vLLM
-    reports it. None leaves the worker to read vLLM's own.
+    reports it. None leaves the worker to read vLLM's own. Other kwargs go
+    to its constructor.
     """
     from maru_vllm.connector import MaruWorkerConnector
 
@@ -58,6 +60,7 @@ def make_worker(
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         cache_config=resolved_cache_config(kv_cache_layout),
+        **kwargs,
     )
 
 
@@ -110,14 +113,16 @@ def make_scheduler(
     block_size: int,
     kv_chunk_tokens: int,
     extra_config: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> MaruSchedulerConnector:
-    """Construct a MaruSchedulerConnector."""
+    """Construct a MaruSchedulerConnector; kwargs go to its constructor."""
     from maru_vllm.connector import MaruSchedulerConnector
 
     return MaruSchedulerConnector(
         block_size=block_size,
         kv_chunk_tokens=kv_chunk_tokens,
         extra_config={} if extra_config is None else extra_config,
+        **kwargs,
     )
 
 
@@ -148,6 +153,8 @@ def make_vllm_scheduler(
     speculative_method: Literal["draft_model", "eagle", "ngram"] | None = None,
     num_speculative_tokens: int = 16,
     max_model_len: int = 512,
+    kv_cache_groups: list[Any] | None = None,
+    kv_load_failure_policy: str = "recompute",
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -165,6 +172,9 @@ def make_vllm_scheduler(
         speculative_method: Optional draft-model, EAGLE or ngram configuration.
         num_speculative_tokens: Draft tokens when speculation is enabled.
         max_model_len: Token limit used by the model and scheduler.
+        kv_cache_groups: ``KVCacheGroupSpec`` list replacing the default single
+            full-attention group, for models with several groups.
+        kv_load_failure_policy: vLLM's policy for a failed KV load.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -237,7 +247,7 @@ def make_vllm_scheduler(
             kv_connector="MaruKVConnector",
             kv_connector_module_path="maru_vllm",
             kv_role="kv_both",
-            kv_load_failure_policy="recompute",
+            kv_load_failure_policy=kv_load_failure_policy,
             kv_connector_extra_config={
                 "maru_kv_chunk_tokens": kv_chunk_tokens,
                 **(extra_config or {}),
@@ -249,7 +259,8 @@ def make_vllm_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[
+        kv_cache_groups=kv_cache_groups
+        or [
             KVCacheGroupSpec(
                 ["layer"],
                 FullAttentionSpec(
@@ -284,6 +295,24 @@ def make_flash_attn_metadata() -> MagicMock:
 # =============================================================================
 # Handler mock that captures stored objects
 # =============================================================================
+
+
+class FailingSyncStream:
+    """A CUDA stream whose ``synchronize`` reports a failed copy.
+
+    It waits for the queued work first, so the CUDA context stays usable,
+    and then raises as an asynchronous copy error would.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def synchronize(self) -> None:
+        self.stream.synchronize()
+        raise RuntimeError("injected asynchronous copy failure")
 
 
 def capture_bytes(buf: Any) -> bytes:

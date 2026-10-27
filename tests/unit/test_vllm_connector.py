@@ -24,6 +24,7 @@ from maru_vllm.connector import (
     _parse_size,
 )
 from tests.unit.vllm_connector_helpers import (
+    FailingSyncStream,
     attach_capturing_handler,
     capture_float32,
     deferred_metadata,
@@ -1823,6 +1824,150 @@ class TestBuildConnectorMetaStoreAccumulation:
 
 
 # =============================================================================
+# Requests whose KV depends on more than their token ids (CXL backend)
+# =============================================================================
+
+
+class TestUncacheableRequests:
+    """Images, LoRA, cache salts and prompt embeddings skip Maru (#116)."""
+
+    CHUNK = 8
+    EXTRA = {
+        "mm_features": [object()],
+        "lora_request": object(),
+        "cache_salt": "tenant-a",
+        "prompt_embeds": torch.ones(2, 2),
+    }
+
+    def _scheduler(self, extra_config=None):
+        sched = make_scheduler(
+            block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=extra_config
+        )
+        sched._handler = MagicMock()
+        sched._handler.batch_exists.return_value = [True] * 8
+        return sched
+
+    @staticmethod
+    def _request(req_id, **extra):
+        return SimpleNamespace(
+            request_id=req_id, prompt_token_ids=list(range(70)), **extra
+        )
+
+    def _new_req(self, field, req_id="r1"):
+        """vLLM's NewRequestData: it carries no cache_salt."""
+        new_req = fake_new_request_data(list(range(70)), list(range(18)), req_id)
+        if field != "cache_salt":
+            setattr(new_req, field, self.EXTRA[field])
+        return new_req
+
+    @staticmethod
+    def _meta(sched, new_reqs=(), cached=None, scheduled=None, preempted=()):
+        output = fake_scheduler_output(
+            list(new_reqs),
+            cached or fake_cached_reqs([], [], []),
+            {"r1": 20} if scheduled is None else scheduled,
+        )
+        output.preempted_req_ids = set(preempted)
+        return sched.build_connector_meta(output)
+
+    @pytest.mark.parametrize("async_load", [False, True])
+    @pytest.mark.parametrize("field", list(EXTRA))
+    def test_neither_loads_nor_stores(self, field, async_load):
+        sched = self._scheduler({"maru_async_load": async_load})
+
+        matched, load_async = sched.get_num_new_matched_tokens(
+            self._request("r1", **{field: self.EXTRA[field]}), 0
+        )
+
+        assert (matched, load_async) == (0, False)
+        sched._handler.batch_exists.assert_not_called()
+        # The cache_salt case is skipped by the id recorded when matching.
+        meta = self._meta(sched, [self._new_req(field)])
+        assert meta.requests == []
+        assert "r1" not in sched._requests_need_store
+        # Nor does a later chunked-prefill step store it.
+        meta = self._meta(sched, cached=fake_cached_reqs(["r1"], [None], [20]))
+        assert meta.requests == []
+
+    def test_a_request_never_matched_is_skipped_by_its_inputs(self):
+        sched = self._scheduler()
+
+        meta = self._meta(sched, [self._new_req("mm_features")])
+
+        assert meta.requests == []
+
+    def test_a_resumed_request_is_skipped_again(self):
+        """Preemption forgets the id; vLLM matches the request again on resume."""
+        sched = self._scheduler()
+        request = self._request("r1", cache_salt="tenant-a")
+        sched.get_num_new_matched_tokens(request, 0)
+        self._meta(sched, [self._new_req("cache_salt")])
+
+        self._meta(sched, scheduled={}, preempted={"r1"})
+        assert "r1" not in sched._bypass_requests
+
+        assert sched.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert self._meta(sched, [self._new_req("cache_salt")]).requests == []
+
+    @pytest.mark.parametrize("write_behind", [False, True])
+    def test_a_skipped_request_finishes_once(self, tmp_path, write_behind):
+        """With write-behind, vLLM keeps a finished request's blocks until the
+        worker reports it; the report must come exactly once, after vLLM still
+        tracks the request (its ``req_id in self.requests`` assertion)."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.outputs import KVConnectorOutput
+        from vllm.v1.request import Request, RequestStatus
+
+        from maru_vllm.connector import MaruKVConnector
+
+        config = {"maru_async_store": write_behind}
+        engine = make_vllm_scheduler(tmp_path, 4, 8, config)
+        sched = engine.connector._scheduler
+        worker = make_worker(4, 8, config)
+        facade = SimpleNamespace(_worker=worker, _scheduler=sched)
+        pool = engine.kv_cache_manager.block_pool
+        free_blocks = pool.get_num_free_blocks()
+
+        request = Request(
+            "r1",
+            list(range(8)),
+            SamplingParams(max_tokens=1),
+            None,
+            cache_salt="tenant-a",
+        )
+        engine.add_request(request)
+        engine.schedule()
+        assert "r1" in sched._bypass_requests
+
+        def consume(result):
+            sending, recving = result
+            engine._update_from_kv_xfer_finished(
+                KVConnectorOutput(finished_sending=sending, finished_recving=recving)
+            )
+
+        engine.finish_requests("r1", RequestStatus.FINISHED_ABORTED)
+        output = engine.schedule()
+        worker.handle_preemptions(output.kv_connector_metadata)
+        consume(MaruKVConnector.get_finished(facade, output.finished_req_ids))
+        consume(MaruKVConnector.get_finished(facade, set()))
+        assert not engine.requests
+        assert pool.get_num_free_blocks() == free_blocks
+
+    def test_text_requests_still_load_and_store(self):
+        sched = self._scheduler()
+
+        matched, _ = sched.get_num_new_matched_tokens(
+            self._request("r1", mm_features=[], lora_request=None), 0
+        )
+        assert matched == 64
+
+        new_req = fake_new_request_data(list(range(70)), list(range(18)), "r2")
+        meta = self._meta(sched, [new_req], scheduled={"r2": 20})
+        assert [r.req_id for r in meta.requests] == ["r2"]
+        assert meta.requests[0].is_store
+
+
+# =============================================================================
 # Deferred (between-step) loading
 # =============================================================================
 
@@ -3371,6 +3516,16 @@ class TestWriteBehindStoreLifecycle:
         )
         assert worker._queued_store_batches == []
 
+    def test_shutdown_drains_the_sync_store_stream(self):
+        worker = self._make_worker()
+        stream = MagicMock()
+        worker._sync_store_stream = stream
+
+        worker.shutdown()
+
+        stream.synchronize.assert_called_once_with()
+        assert worker._sync_store_stream is None
+
     def test_shutdown_drains_layerwise_streams_before_unmapping(self):
         """Copies queued off-thread read pinned buffers and CXL views that
         closing the handler unmaps, and they run on no other stream."""
@@ -3786,6 +3941,49 @@ class TestPackedStorage:
         assert len(allocated) == 2  # one slab per chunk
         assert freed == allocated  # every handle returned on the except path
         assert worker._stored_keys == set()
+
+    def test_kernel_store_registers_nothing_whose_copy_failed(self):
+        """A slab whose copy cannot be confirmed is freed, not registered:
+        another instance would read incomplete KV as a hit."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+
+        worker, store = self._make_worker()
+        kv_layers = [kv.cuda() for kv in self._kv_layers()]
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        kernel = self._fake_store_kernel(kv_layers)
+        allocated = []
+        worker._handler.alloc.side_effect = lambda n: (
+            allocated.append(SimpleNamespace(buf=memoryview(bytearray(n))))
+            or allocated[-1]
+        )
+        freed = []
+        worker._handler.free.side_effect = freed.append
+        device = kv_layers[0].device
+        worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(device))
+        worker._sync_store_stream_device = device
+
+        meta = MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=list(range(self.PROMPT)),
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+        with pytest.raises(RuntimeError, match="injected"):
+            worker._store_packed_slabs(kernel, meta)
+        assert len(allocated) == 2  # one slab per chunk
+        worker._handler.batch_store.assert_not_called()
+        assert store == {}
+        assert worker._stored_keys == set()
+        assert freed == allocated
 
     def test_kernel_store_writes_kv2ltd_slab_roundtrip(self):
         """_store_packed_slabs: one kernel D2H per chunk, one key per chunk,
@@ -4672,13 +4870,14 @@ class TestDeferredAdmissionFitsCache:
 
     def test_failed_load_asked_again_drops_its_old_room(self):
         # A failed load that invalidates the first block sends the request
-        # back to WAITING with its blocks freed, and vLLM asks again. Its old
-        # reservation must not count against the waiter it shares room with.
+        # back to WAITING with its blocks freed, and vLLM asks again. It
+        # computes without Maru, and its old reservation must not count
+        # against the waiter it shares room with.
         sched = self._sched(num_gpu_blocks=70)
         big, mid = self._request("big"), self._request("mid")
         self._park(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
-        assert sched.get_num_new_matched_tokens(big, 0)[0] is None  # mid first
+        assert sched.get_num_new_matched_tokens(big, 0) == (0, False)
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
 
     def test_waiter_is_not_looked_up_again_until_it_fits(self):
