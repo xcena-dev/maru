@@ -308,8 +308,9 @@ Mixed CXL uses an RM-backed DAX mapping with the same ownership contract.
 Both are faulted in and registered with CUDA when they open (`pin_pools`), and
 a pool that fails registration keeps pageable copies. Neither hands a host
 pointer to a direct-access GPU kernel. Copies stay synchronous to the load that
-needs them. Kernel placement from these pools and async transfers require separate
-validation.
+needs them; within it, a pinned chunk's copy overlaps the previous chunk's
+per-layer injects. Kernel placement from these pools and async transfers require
+separate validation.
 
 The first PR negotiates `cpu_storage_v1` and, on a CXL-enabled server,
 `mixed_storage_v1`. It adds a metadata-only `STORAGE` message family while

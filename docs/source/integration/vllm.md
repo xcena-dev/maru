@@ -391,6 +391,7 @@ operation:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open; `false` keeps them pageable |
+| `maru_load_copy_ahead` | int | `2` | Chunk slabs a load without a placement kernel (vLLM 0.29+ layouts) copies to the GPU ahead of its per-layer injects, on a side stream; `0` copies each slab in line |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
 | `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
 
