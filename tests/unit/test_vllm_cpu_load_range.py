@@ -104,6 +104,7 @@ def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
             )
         ],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={"load": 8},
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )

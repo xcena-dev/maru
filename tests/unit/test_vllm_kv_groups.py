@@ -425,6 +425,16 @@ def _step(sched, scheduled, **kwargs):
     return req
 
 
+def _load_and_store(sched, scheduled, **kwargs):
+    """The load and the store metadata of a step that loads ``r1`` inline."""
+    meta = sched.build_connector_meta(
+        fake_scheduler_output(num_scheduled_tokens={"r1": scheduled}, **kwargs)
+    )
+    load, store = meta.requests
+    assert not load.is_store and store.is_store
+    return load, store
+
+
 def test_an_image_request_skips_maru_with_several_groups():
     """The Qwen3.5 image case of #116 takes this path."""
     sched = _two_group_scheduler()
@@ -495,10 +505,10 @@ def test_resumed_load_carries_every_group():
 
     new_block_ids = ([1, 2, 3, 4], [11, 12, 13, 14])
     cached = fake_cached_reqs(["r1"], [new_block_ids], [32], resumed=["r1"])
-    req = _step(sched, 32, cached=cached)
-    assert not req.is_store
+    req, store = _load_and_store(sched, 32, cached=cached)
     assert req.block_ids == [1, 2, 3, 4]
     assert req.group_block_ids == new_block_ids
+    assert store.group_block_ids == new_block_ids
 
 
 # =============================================================================
@@ -1754,13 +1764,12 @@ def test_inline_loads_of_several_groups_carry_their_step():
     sched.update_state_after_alloc(request, MagicMock(), 32)
     new_req = _new_req(([1, 2, 3, 4], [11, 12, 13, 14]))
     new_req.num_computed_tokens = 32
-    req = _step(sched, 32, new_reqs=[new_req])
-    assert not req.is_store
+    req, _ = _load_and_store(sched, 32, new_reqs=[new_req])
     assert (req.num_computed_tokens, req.num_scheduled_tokens) == (32, 32)
 
     single = make_scheduler(16, 32)
     single.update_state_after_alloc(request, MagicMock(), 32)
-    req = _step(single, 32, new_reqs=[new_req])
+    req, _ = _load_and_store(single, 32, new_reqs=[new_req])
     assert (req.num_computed_tokens, req.num_scheduled_tokens) == (0, 0)
 
 
