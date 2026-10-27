@@ -5,6 +5,11 @@ its load, and ends them when the request finishes."""
 import time
 from types import SimpleNamespace
 
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
 import maru
 from maru_vllm.connector import _chunk_keys, _create_maru_handler
 from tests.unit.test_vllm_remote_cxl_config import extra
