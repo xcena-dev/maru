@@ -33,6 +33,13 @@ and the extension only hears what helps the device serve it sooner.
   advice; the extension may ignore any of them. The agent lets one
   connection keep a bounded number of requests open (hinted, not ended);
   the extension bounds what it keeps per request and in all, too.
+- It may also take read promotes (``read_promote``, if its
+  ``hint_actions`` names it): the load of the named request starts now, so
+  its hinted bytes go ahead of other hinted ones. A promote has no ranges
+  and no end, and it comes from the loading process, usually not the one
+  that sent the read hint (a vLLM worker promotes what its scheduler
+  hinted), on another connection and to every agent of the pool: match it
+  to a hint by request id alone, and ignore one that names no hint here.
 - It may also take write hints (``write_hint``, if its ``hint_actions``
   names it): the pages a store is about to WRITE, in write order, under a
   token for the store, with the same checks and no end. Memory that would
@@ -110,9 +117,10 @@ class RegionExtension(Protocol):
         """Queue a hint whose ``ranges`` the agent checked.
 
         ``message`` has ``action`` (``read_hint``, ``read_hint_end`` or, if
-        the extension takes it, ``write_hint``), ``request`` and ``epoch``;
-        ``ranges`` are ``{"handle", "offset", "length"}`` maps in read or
-        write order (empty for an end). Runs outside the
+        the extension takes them, ``read_promote`` or ``write_hint``),
+        ``request`` and ``epoch``; ``ranges`` are ``{"handle", "offset",
+        "length"}`` maps in read or write order (empty for an end or a
+        promote). Runs outside the
         agent's lock, after its checks; a region may have gone in between,
         so a hint may name one that is no longer mapped. It only queues,
         within microseconds, and its return value is ignored.
@@ -137,8 +145,9 @@ class OptionalRegionHooks(Protocol):
     the extension defines it."""
 
     #: The hint actions the extension takes, among ``read_hint``,
-    #: ``read_hint_end`` and ``write_hint``; the agent advertises these and
-    #: refuses others. Without it: ``read_hint`` and ``read_hint_end``.
+    #: ``read_hint_end``, ``read_promote`` and ``write_hint``; the agent
+    #: advertises these and refuses others. Without it: ``read_hint`` and
+    #: ``read_hint_end``.
     hint_actions: tuple[str, ...]
 
     def memory_generation(self) -> str:

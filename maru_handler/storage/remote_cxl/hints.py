@@ -17,6 +17,12 @@ to its storage) can still hint each load as its READs start: the bytes are
 known from the lease, and a long load's later chunks can be brought in while
 its first ones are read.
 
+A read promote (``read_promote``) says that the load of a request someone
+hinted starts now, so the memory side can bring that request's bytes in
+ahead of the other hinted ones. The process that loads is usually not the
+one that hinted (a vLLM worker loads what its scheduler hinted), so it
+sends the promote to every agent of the pool, naming the request only.
+
 A write hint (``write_hint``) names the pages a store is about to WRITE, in
 write order, as soon as the store has its pages and before it posts the
 WRITEs. Memory that would otherwise fill each written page from its slow
@@ -107,6 +113,13 @@ class MemoryHints:
         if token and groups:
             self._queue_hint(("write", token, groups))
 
+    def promote(self, request_id: str, agents: list[str]) -> None:
+        """Queue a read promote: the load of ``request_id`` starts now. Sent
+        to each of ``agents`` that takes it; no ranges, no end. Dropped as a
+        read hint is."""
+        if request_id and agents:
+            self._queue_hint(("promote", request_id, list(agents)))
+
     def end(self, request_id: str) -> None:
         """Queue the end of ``request_id``: what was prepared for it may go."""
         if request_id:
@@ -179,6 +192,10 @@ class MemoryHints:
                     self._give(request_id, payload)
                 elif kind == "write":
                     self._send_all("write_hint", request_id, payload)
+                elif kind == "promote":
+                    self._send_all(
+                        "read_promote", request_id, [(a, []) for a in payload]
+                    )
                 else:
                     self._finish(request_id)
             except Exception:
@@ -197,11 +214,12 @@ class MemoryHints:
         self, action: str, request_id: str, groups: list[tuple[str, list[dict]]]
     ) -> list[str]:
         """Send ``action`` with each agent's ranges, in messages of at most
-        :data:`MAX_HINT_RANGES`; the agents that took it."""
+        :data:`MAX_HINT_RANGES` (one message if there are none); the agents
+        that took it."""
         reached: list[str] = []
         for agent, ranges in groups:
             try:
-                for i in range(0, len(ranges), MAX_HINT_RANGES):
+                for i in range(0, max(len(ranges), 1), MAX_HINT_RANGES):
                     message = {
                         "action": action,
                         "request": request_id,

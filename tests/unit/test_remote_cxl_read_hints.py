@@ -472,3 +472,53 @@ def test_write_hints_go_only_where_asked_and_taken(setup):
     region = only_region(worker)
     with pytest.raises(ValueError, match="action"):
         service.hint(10_000, _hint_message(service, region.handle, action="write_hint"))
+
+
+class PromoteExtension(FakeExtension):
+    hint_actions = ("read_hint", "read_hint_end", "read_promote")
+
+
+def test_a_worker_promotes_the_load_its_scheduler_hinted():
+    ext = PromoteExtension()
+    w = World(extension=ext, max_hint_requests=1)
+    try:
+        worker = w.client("a", read_promotes=True)
+        assert put(worker, "k0", b"x" * PAGE)[0]
+        scheduler = w.client("a", metadata_only=True, read_hints=True)
+        scheduler.hint_read("r1", ["k0"])
+        _until(lambda: len(ext.hints) == 1)
+        worker.promote_read("r1")
+        _until(lambda: len(ext.hints) == 2)
+        (hint_conn, hint, _), (promote_conn, promote, ranges) = ext.hints
+        assert (promote["action"], promote["request"], ranges) == (
+            "read_promote",
+            "r1",
+            [],
+        )
+        # The promote comes from the loading process, on its own connection.
+        assert promote_conn != hint_conn
+        # It opens no request at the agent: more promotes pass the limit of 1.
+        worker.promote_read("r2")
+        worker.promote_read("r3")
+        _until(lambda: len(ext.hints) == 4)
+    finally:
+        w.close()
+
+
+def test_read_promotes_go_only_where_asked_and_taken(setup):
+    w, ext = setup  # an extension that takes read hints only
+    worker = w.client("a", read_promotes=True)
+    plain = w.client("b")
+    assert put(worker, "k0", b"x" * PAGE)[0]
+    worker.promote_read("r1")
+    plain.promote_read("r1")  # read promotes off: ignored
+    _until(lambda: worker._hints._queue.empty())
+    assert worker._hints.close()
+    assert not ext.hints and plain._hints is None
+    service = w.node.service
+    region = only_region(worker)
+    with pytest.raises(ValueError, match="action"):
+        service.hint(
+            10_000,
+            _hint_message(service, region.handle, action="read_promote", ranges=[]),
+        )

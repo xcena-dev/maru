@@ -106,13 +106,21 @@ def test_only_the_scheduler_sends_read_hints(monkeypatch):
             return True
 
     monkeypatch.setattr(maru, "MaruHandler", Recorder)
-    config = extra(maru_remote_cxl_agent_key_file="/k", maru_read_hints=True)
+    config = extra(
+        maru_remote_cxl_agent_key_file="/k", maru_read_hints=True, maru_async_load=True
+    )
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
     # The scheduler hints each load before its worker reads it; the worker
     # hints its stores, as read hints are on.
     assert [c.read_hints for c in seen] == [True, False]
     assert [c.write_hints for c in seen] == [False, True]
+    # The worker promotes each load its scheduler hinted as it starts.
+    assert [c.read_promotes for c in seen] == [False, True]
+    seen.clear()
+    # Without asynchronous loads the scheduler hints nothing to promote.
+    _create_maru_handler({**config, "maru_async_load": False}, metadata_only=False)
+    assert not seen[0].read_promotes
     seen.clear()
     _create_maru_handler({**config, "maru_write_hints": False}, metadata_only=False)
     _create_maru_handler(

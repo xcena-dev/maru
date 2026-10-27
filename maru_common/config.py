@@ -91,6 +91,11 @@ class MaruConfig:
     # remote CXL agents whose region extension takes them before its WRITEs,
     # so memory that fills a written page from a slow tier can prepare it.
     write_hints: bool = False
+    # Send read promotes (remote_cxl only): when a load starts for a request
+    # another process hinted (a vLLM worker loads what its scheduler
+    # hinted), the remote CXL agents whose region extension takes them hear
+    # that this request is loading now.
+    read_promotes: bool = False
 
     @property
     def server_urls(self) -> list[str]:
@@ -159,6 +164,8 @@ class MaruConfig:
             raise ValueError("read_hints is supported by the remote_cxl backend")
         if self.write_hints and self.storage_backend != "remote_cxl":
             raise ValueError("write_hints is supported by the remote_cxl backend")
+        if self.read_promotes and self.storage_backend != "remote_cxl":
+            raise ValueError("read_promotes is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
         if self.storage_backend == "remote_cxl":

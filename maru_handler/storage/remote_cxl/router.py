@@ -241,6 +241,13 @@ class PoolRouter:
         if keys:
             self._pick(route_key or keys[0]).hint_read(request_id, keys)
 
+    def promote_read(self, request_id: str, route_key: str | None = None) -> None:
+        """Promote the read in the pool the route key picks (every pool
+        without one)."""
+        clients = [self._pick(route_key)] if route_key else self.clients
+        for c in clients:
+            c.promote_read(request_id)
+
     def end_read_hint(self, request_id: str) -> None:
         """End the hint wherever it went (a pool that got none ignores it)."""
         for c in self.clients:
