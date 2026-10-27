@@ -12,7 +12,12 @@ from .cpu import CpuPool
 
 
 class CxlPool(CpuPool):
-    """The same page/ownership contract backed by an actual RM DAX mapping."""
+    """The same page/ownership contract backed by an actual RM DAX mapping.
+
+    ``page_lock`` faults the mapping in and registers it with CUDA, as
+    DaxMapper.map_region does for the cxl backend's regions, so that this
+    pool's GPU copies run as fast as that backend's.
+    """
 
     def __init__(self, grant: dict, page_size: int, rm_address: str):
         from maru_shm import PROT_READ, PROT_WRITE, MaruHandle, MaruShmClient
@@ -49,6 +54,7 @@ class MixedPool:
         page_size: int,
         rm_address: str,
         write_order: tuple[str, ...],
+        pin: bool = False,
     ):
         self.pools: dict[str, CpuPool] = {}
         self.policy = FixedOrderPolicy(write_order)
@@ -60,6 +66,12 @@ class MixedPool:
                     if medium == "cpu"
                     else CxlPool(grant, page_size, rm_address)
                 )
+            if pin:
+                # Only once every pool is mapped: a CXL pool that fails to map
+                # makes the worker retry, and would otherwise cost the CPU
+                # pool's prefault again on every retry.
+                for pool in self.pools.values():
+                    pool.page_lock()
         except Exception:
             self.close()
             raise

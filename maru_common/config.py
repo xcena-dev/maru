@@ -65,6 +65,9 @@ class MaruConfig:
     cxl_pool_size: int | None = None  # Fixed CXL budget in mixed mode
     write_order: tuple[str, ...] = ("cpu", "cxl")
     read_order: tuple[str, ...] = ("cpu", "cxl")
+    # cpu and mixed: fault the pools in and register them with CUDA when they
+    # open, as the cxl backend's regions are; False keeps them pageable
+    pin_pools: bool = True
     # Remote CXL storage: pool_size is the size of one region in a memory node's CXL;
     # the session gets one more region whenever all of its regions are full
     rdma_device: str = ""  # RDMA NIC for NIXL/UCX, e.g. "mlx5_0:1"; empty = default

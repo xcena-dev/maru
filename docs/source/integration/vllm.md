@@ -211,6 +211,10 @@ CPU mode requires `maru_cpu_pool_size`, a unique `maru_engine_id` per engine,
 an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`, and
 `kv_load_failure_policy="recompute"` in the KV transfer configuration. It supports
 one worker, homogeneous unquantized KV layers and synchronous chunkwise transfers.
+The worker faults the pool in and registers it with CUDA when it opens, as the
+`cxl` backend's regions are, so that GPU copies run at the DMA rate and stores
+do not fault in fresh pages. This locks the whole pool in memory and adds seconds
+to startup for tens of GB; `maru_pin_pools=false` keeps the pool pageable.
 A full pool skips new stores. Sharing, eviction and async/layerwise CPU transfers
 are not enabled in M1.
 
@@ -386,6 +390,7 @@ operation:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open; `false` keeps them pageable |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
 | `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
 

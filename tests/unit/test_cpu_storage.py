@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU directory and allocation failures without a GPU or resource manager."""
 
+import ctypes
+import mmap
 from dataclasses import asdict
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -404,3 +407,202 @@ def test_later_batch_failure_releases_previously_acquired_reads():
         assert client._reads == 0
     finally:
         client.close()
+
+
+# =============================================================================
+# Page-locking the pool (pin)
+# =============================================================================
+
+PAGE = 4096
+CAPACITY = 4 * PAGE
+
+
+def _mock_torch_cuda(register_rc=0):
+    """A torch stand-in whose cudart answers host (un)registration."""
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = True
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = (register_rc,)
+    cudart.cudaHostUnregister.return_value = (0,)
+    mock_torch.cuda.cudart.return_value = cudart
+    return mock_torch, cudart
+
+
+def _address(mapping):
+    return ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+
+
+class _RecordingMap(mmap.mmap):
+    """An anonymous mapping that records madvise and single-byte writes."""
+
+    def __init__(self, *args, fail_madvise=False):
+        self.calls = []
+        self.fail_madvise = fail_madvise
+
+    def __new__(cls, *args, fail_madvise=False):
+        return super().__new__(cls, *args)
+
+    def madvise(self, option, *args):
+        self.calls.append(("madvise", option))
+        if self.fail_madvise:
+            raise OSError(22, "Invalid argument")
+        return super().madvise(option, *args)
+
+    def __setitem__(self, index, value):
+        if isinstance(index, int):
+            self.calls.append(("write", index))
+        super().__setitem__(index, value)
+
+
+def test_pinned_pool_registers_its_whole_mapping_until_close():
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, pin=True)
+        address = _address(pool._mapping)
+        assert pool.cuda_registered
+        cudart.cudaHostRegister.assert_called_once_with(address, CAPACITY, 0)
+        pool.close()
+    cudart.cudaHostUnregister.assert_called_once_with(address)
+    assert not pool.cuda_registered
+
+
+def test_pool_is_prefaulted_before_registration():
+    from maru_handler.memory.mapper import _MADV_POPULATE_WRITE
+
+    mapping = _RecordingMap(-1, CAPACITY)
+    mock_torch, cudart = _mock_torch_cuda()
+    cudart.cudaHostRegister.side_effect = lambda *args: (
+        mapping.calls.append(("register",)) or (0,)
+    )
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, mapping=mapping, pin=True)
+        pool.close()
+    assert mapping.calls == [("madvise", _MADV_POPULATE_WRITE), ("register",)]
+
+
+def test_prefault_without_madvise_writes_each_page_back_unchanged():
+    """Kernels before 5.14 have no MADV_POPULATE_WRITE; a read would only map
+    the zero page of an anonymous pool, so each page is written instead."""
+    from maru_handler.memory.mapper import _PAGE_SIZE
+
+    mapping = _RecordingMap(-1, CAPACITY, fail_madvise=True)
+    mapping[:] = bytes(range(256)) * (CAPACITY // 256)
+    expected = bytes(mapping[:])
+    mapping.calls.clear()
+    mock_torch, _ = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, mapping=mapping, pin=True)
+        assert mapping.calls[1:] == [
+            ("write", offset) for offset in range(0, CAPACITY, _PAGE_SIZE)
+        ]
+        assert bytes(mapping[:]) == expected
+        assert pool.cuda_registered
+        pool.close()
+
+
+def test_maru_prefault_off_skips_the_prefault_only(monkeypatch):
+    import maru_handler.memory.mapper as mapper_mod
+
+    monkeypatch.setattr(mapper_mod, "_PREFAULT_ENABLED", False)
+    mapping = _RecordingMap(-1, CAPACITY)
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, mapping=mapping, pin=True)
+        assert mapping.calls == []
+        assert pool.cuda_registered
+        pool.close()
+    cudart.cudaHostRegister.assert_called_once()
+
+
+def test_failed_registration_leaves_a_working_pageable_pool(monkeypatch):
+    import maru_handler.memory.mapper as mapper_mod
+
+    cleared = []
+    monkeypatch.setattr(
+        mapper_mod, "_clear_cuda_sticky_error", lambda: cleared.append(1)
+    )
+    mock_torch, cudart = _mock_torch_cuda(register_rc=2)  # cudaErrorMemoryAllocation
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, pin=True)
+        assert not pool.cuda_registered
+        handle = pool.alloc(5)
+        handle.buf[:] = b"bytes"
+        pool.free(handle)
+        pool.close()
+    assert cleared == [1]
+    cudart.cudaHostUnregister.assert_not_called()
+
+
+def test_registration_error_leaves_the_pool_pageable():
+    mock_torch, cudart = _mock_torch_cuda()
+    cudart.cudaHostRegister.side_effect = RuntimeError("CUDA error")
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, pin=True)
+        assert not pool.cuda_registered
+        pool.close()
+    cudart.cudaHostUnregister.assert_not_called()
+
+
+def test_without_cuda_or_pin_the_pool_is_not_registered():
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        CpuPool("p", CAPACITY, PAGE).close()
+        mock_torch.cuda.is_available.return_value = False
+        CpuPool("q", CAPACITY, PAGE, pin=True).close()
+    cudart.cudaHostRegister.assert_not_called()
+
+
+def test_close_unregisters_once_when_an_exported_view_delays_it():
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, pin=True)
+        exported = memoryview(pool._mapping)[:8]
+        with pytest.raises(RuntimeError, match="exported CPU buffers"):
+            pool.close()
+        exported.release()
+        pool.close()
+    cudart.cudaHostUnregister.assert_called_once()
+
+
+@pytest.mark.parametrize("pin", [True, False])
+def test_client_pins_its_pool_as_configured(monkeypatch, pin):
+    pinned = []
+    monkeypatch.setattr(CpuPool, "page_lock", lambda self: pinned.append(self.medium))
+    client = cpu_client(ReplicaDirectory(), pin_pools=pin)
+    try:
+        assert pinned == (["cpu"] if pin else [])
+    finally:
+        client.close()
+
+
+def test_pools_are_pinned_by_default():
+    assert MaruConfig().pin_pools is True
+
+
+def test_pinned_pool_hands_out_page_locked_buffers():
+    """With CUDA, torch sees the pool's buffers as pinned: the load path
+    decides from ``is_pinned()`` whether a slab can be copied ahead."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    pool = CpuPool("p", 1 << 20, PAGE, pin=True)
+    try:
+        assert pool.cuda_registered
+        handle = pool.alloc(PAGE)
+        slab = torch.frombuffer(handle.buf, dtype=torch.uint8)
+        assert slab.is_pinned()
+        del slab
+        pool.free(handle)
+    finally:
+        pool.close()
+
+
+def test_page_lock_is_idempotent_and_refuses_a_closed_pool():
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        pool = CpuPool("p", CAPACITY, PAGE, pin=True)
+        pool.page_lock()
+        cudart.cudaHostRegister.assert_called_once()
+        pool.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            pool.page_lock()

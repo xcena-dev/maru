@@ -440,6 +440,8 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
         )
     if backend != "remote_cxl" and any(name in extra for name in _RDMA_KNOBS):
         raise ValueError("RDMA settings require maru_storage_backend='remote_cxl'")
+    if "maru_pin_pools" in extra and backend not in {"cpu", "mixed"}:
+        raise ValueError("maru_pin_pools applies to the cpu and mixed backends")
     if backend == "cxl":
         return False
     pool_key = _session_pool_key(extra)
@@ -773,6 +775,7 @@ def _create_maru_handler(
         ),
         write_order=extra_config.get("maru_write_order", ("cpu", "cxl")),
         read_order=extra_config.get("maru_read_order", ("cpu", "cxl")),
+        pin_pools=bool(extra_config.get("maru_pin_pools", True)),
         rdma_device=extra_config.get("maru_rdma_device", ""),
         rdma_staging_size=(
             _rdma_staging_size(extra_config, chunk_size)
@@ -1118,6 +1121,12 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             memory and still placed by the kernel. See design note P6.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
+        maru_pin_pools: bool - cpu and mixed backends: fault the pools in and
+            register them with CUDA when they open, as the cxl backend's
+            regions are, so that GPU copies run at the DMA rate and stores
+            do not fault in fresh pages. This locks the whole pool in memory
+            and adds seconds to startup for a pool of tens of GB. False
+            keeps the pools pageable (default: true)
         maru_load_admission_window: int - With maru_async_load, cap how many
             requests' packed loads may be enqueued on the deferred stream but
             not yet complete. The loader thread blocks before each GPU

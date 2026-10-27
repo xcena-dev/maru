@@ -90,9 +90,15 @@ class CpuStorageClient:
                             page_size,
                             handshake.get("rm_address") or self.config.rm_address,
                             self.config.write_order,
+                            pin=self.config.pin_pools,
                         )
                         if mixed
-                        else CpuPool(grant["pool_id"], capacity, page_size)
+                        else CpuPool(
+                            grant["pool_id"],
+                            capacity,
+                            page_size,
+                            pin=self.config.pin_pools,
+                        )
                     )
                     interval = grant["session_ttl"] / 3
                     self._thread = threading.Thread(
