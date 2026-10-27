@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Read hints: tell the memory side which bytes a load will read, before it starts.
+"""Memory hints: tell the memory side which bytes will be read or written soon.
 
 A serving engine knows which stored keys a request will load well before
 its worker starts the load: the request waits for the running engine step
@@ -16,6 +16,12 @@ A process that gives no early hints (a worker whose engine names no request
 to its storage) can still hint each load as its READs start: the bytes are
 known from the lease, and a long load's later chunks can be brought in while
 its first ones are read.
+
+A write hint (``write_hint``) names the pages a store is about to WRITE, in
+write order, as soon as the store has its pages and before it posts the
+WRITEs. Memory that would otherwise fill each written page from its slow
+tier on the first WRITE can prepare the pages instead. A write hint has no
+end; it never gives the memory side leave to change the pages.
 
 All of it runs on one background thread per client, in the order hints were
 given, so the caller (an engine's input thread or its scheduler) never waits
@@ -45,8 +51,8 @@ MAX_HINT_RANGES = 4096
 MAX_OPEN_HINTS = 4096
 
 
-class ReadHints:
-    """Sends read hints to remote CXL agents on one background thread.
+class MemoryHints:
+    """Sends read and write hints to remote CXL agents on one background thread.
 
     Args:
         locate: ``keys -> [(agent, ranges)]``: the leading hit keys, per
@@ -54,8 +60,8 @@ class ReadHints:
             ``{"handle", "offset", "length"}`` map in key order. Called on
             the hint thread (it may ask MaruServer).
         send: ``(agent, message) -> bool`` over a connection of this
-            process to that agent; False if the agent has no region
-            extension (the message was not sent).
+            process to that agent; False if the agent's region extension
+            does not take the message's action (it was not sent).
     """
 
     def __init__(
@@ -93,6 +99,13 @@ class ReadHints:
         """Queue a hint whose ranges are known already (``locate``'s form)."""
         if request_id and groups:
             self._queue_hint(("ranges", request_id, groups))
+
+    def write_hint(self, token: str, groups: list[tuple[str, list[dict]]]) -> None:
+        """Queue a write hint: the pages in ``groups`` (``locate``'s form, in
+        write order) are about to be written. ``token`` names the store; a
+        write hint has no end. Dropped as a read hint is."""
+        if token and groups:
+            self._queue_hint(("write", token, groups))
 
     def end(self, request_id: str) -> None:
         """Queue the end of ``request_id``: what was prepared for it may go."""
@@ -164,37 +177,45 @@ class ReadHints:
                     self._give(request_id, self._locate(payload))
                 elif kind == "ranges":
                     self._give(request_id, payload)
+                elif kind == "write":
+                    self._send_all("write_hint", request_id, payload)
                 else:
                     self._finish(request_id)
             except Exception:
                 # Advice only: the load reads the bytes either way.
-                logger.debug(
-                    "read hint %s for %s failed", kind, request_id, exc_info=True
-                )
+                logger.debug("hint %s for %s failed", kind, request_id, exc_info=True)
 
     def _give(self, request_id: str, groups: list[tuple[str, list[dict]]]) -> None:
         if request_id in self._agents:
             return  # hinted already
-        reached = self._agents[request_id] = []
+        self._agents[request_id] = self._send_all("read_hint", request_id, groups)
+        while len(self._agents) > MAX_OPEN_HINTS:
+            # Its end never came (or comes later): end it now.
+            self._finish(next(iter(self._agents)))
+
+    def _send_all(
+        self, action: str, request_id: str, groups: list[tuple[str, list[dict]]]
+    ) -> list[str]:
+        """Send ``action`` with each agent's ranges, in messages of at most
+        :data:`MAX_HINT_RANGES`; the agents that took it."""
+        reached: list[str] = []
         for agent, ranges in groups:
             try:
                 for i in range(0, len(ranges), MAX_HINT_RANGES):
                     message = {
-                        "action": "read_hint",
+                        "action": action,
                         "request": request_id,
                         "ranges": ranges[i : i + MAX_HINT_RANGES],
                     }
                     if not self._send(agent, message):
-                        break  # no region extension there
+                        break  # its region extension takes no such hint
                     if agent not in reached:
                         reached.append(agent)
             except Exception:
                 logger.debug(
-                    "read hint for %s not sent to %s", request_id, agent, exc_info=True
+                    "%s for %s not sent to %s", action, request_id, agent, exc_info=True
                 )
-        while len(self._agents) > MAX_OPEN_HINTS:
-            # Its end never came (or comes later): end it now.
-            self._finish(next(iter(self._agents)))
+        return reached
 
     def _finish(self, request_id: str) -> None:
         for agent in self._agents.pop(request_id, None) or []:

@@ -25,7 +25,7 @@ from maru_common.storage_types import (
 from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
 from .datapath import REPLY_TIMEOUT_MIN_S, RdmaDataPath
-from .hints import ReadHints
+from .hints import MemoryHints
 from .lifecycle import RegionLifecycle
 from .region import (
     REMOTE_CXL,
@@ -148,22 +148,25 @@ class RemoteCxlStorageClient(RegionLifecycle):
         # Orders free and store of an allocation that has no page yet
         self._unplaced_lock = threading.Lock()
         self._unplaced_warned_at = float("-inf")
-        # Read hints (hints.py): the memory side hears which bytes a load
-        # will read before it starts. Off unless the config asks for them.
+        # Read and write hints (hints.py): the memory side hears which bytes
+        # a load will read or a store write before it does. Off unless the
+        # config asks for them.
+        self._read_hints = bool(getattr(config, "read_hints", False))
+        self._write_hints = bool(getattr(config, "write_hints", False))
         self._hints = (
-            ReadHints(self._hint_locate, self._hint_send)
-            if getattr(config, "read_hints", False)
+            MemoryHints(self._hint_locate, self._hint_send)
+            if self._read_hints or self._write_hints
             else None
         )
         self._hint_agents: dict[str, Any] = {}
         self._hint_key: bytes | None = None
 
-    # ------------------------------------------------------------ read hints
+    # ---------------------------------------------------------------- hints
 
     @property
     def read_hints_enabled(self) -> bool:
         """Whether this backend sends read hints."""
-        return self._hints is not None
+        return self._read_hints
 
     def hint_read(
         self, request_id: str, keys: list[str], route_key: str | None = None
@@ -175,12 +178,12 @@ class RemoteCxlStorageClient(RegionLifecycle):
         hints this does nothing. A hint takes no lease; the load still
         leases and reads every key.
         """
-        if self._hints is not None:
+        if self._read_hints:
             self._hints.hint(request_id, keys)
 
     def end_read_hint(self, request_id: str) -> None:
         """``request_id`` ended: the memory side may drop what it prepared."""
-        if self._hints is not None:
+        if self._read_hints:
             self._hints.end(request_id)
 
     def _hint_locate(self, keys: list[str]) -> list[tuple[str, list[dict]]]:
@@ -233,7 +236,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         as it starts, under a name of its own, and ends that hint once the
         load is over. Queued only: the READs do not wait for it.
         """
-        if self._hints is None or not hits or not self._agents:
+        if not self._read_hints or not hits or not self._agents:
             return ""
         from maru_remote.region_map import pick_agent
 
@@ -252,6 +255,31 @@ class RemoteCxlStorageClient(RegionLifecycle):
         name = f"maru-load-{uuid.uuid4().hex}"
         self._hints.hint_ranges(name, list(by_agent.items()))
         return name
+
+    def _hint_write(self, handles: list[RemoteCxlAllocation]) -> None:
+        """Hint the pages a store is about to WRITE, in write order (region
+        by region, as :meth:`_write` sends them). Queued only: the WRITEs do
+        not wait for it, and it has no end."""
+        if not self._write_hints or not handles or not self._agents:
+            return
+        from maru_remote.region_map import pick_agent
+
+        groups: dict[str, list[RemoteCxlAllocation]] = {}
+        for h in handles:
+            groups.setdefault(h.region.pool_id, []).append(h)
+        by_agent: dict[str, list[dict]] = {}
+        for group in groups.values():
+            region = group[0].region
+            agent = pick_agent(self._agents, region.region_id)
+            by_agent.setdefault(agent, []).extend(
+                {
+                    "handle": region.handle,
+                    "offset": h.location.offset,
+                    "length": h.location.length,
+                }
+                for h in group
+            )
+        self._hints.write_hint(f"maru-store-{uuid.uuid4().hex}", list(by_agent.items()))
 
     def _hint_send(self, agent: str, message: dict) -> bool:
         """Send a hint message on this process's own connection to ``agent``;
@@ -795,6 +823,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 return [False] * len(keys)
             self._transfers += 1
         sent = [h for h, ok in zip(handles, placed, strict=True) if ok]
+        self._hint_write(sent)
         try:
             written = self._write(sent)
         except BaseException:

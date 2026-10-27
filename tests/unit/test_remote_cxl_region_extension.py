@@ -11,7 +11,12 @@ import time
 import pytest
 
 import maru_handler.storage.remote_cxl.datapath as datapath
-from maru_remote.region_map import HINT_ACTIONS, RegionMapClient, hint_actions
+from maru_remote.region_map import (
+    DEFAULT_HINT_ACTIONS,
+    HINT_ACTIONS,
+    RegionMapClient,
+    hint_actions,
+)
 from maru_remote_cxl_agent.extension import RegionExtension, load_region_extension
 from maru_remote_cxl_agent.service import NotMapped
 from tests.unit.remote_fakes import shared_key
@@ -93,7 +98,8 @@ def test_the_data_path_is_unchanged_and_the_hello_says_which_hints_it_takes(setu
     assert read(c, ["k"]) == [b"x" * PAGE]
     assert ext.mapped_regions and not ext.hints
     advertised = w.node.service.hello()["region_extension"]
-    assert hint_actions(advertised) == frozenset(HINT_ACTIONS)
+    # An extension that does not say takes read hints only.
+    assert hint_actions(advertised) == frozenset(DEFAULT_HINT_ACTIONS)
     # An agent without an extension, or of an earlier protocol, takes none.
     assert hint_actions(None) == frozenset()
     assert hint_actions(True) == frozenset()

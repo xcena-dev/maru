@@ -395,6 +395,7 @@ _RDMA_KNOBS = (
     "maru_rdma_timeout_s",
     "maru_remote_cxl_agent_key_file",
     "maru_read_hints",
+    "maru_write_hints",
     "maru_read_hint_on_arrival",
 )
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
@@ -856,8 +857,15 @@ def _create_maru_handler(
             "maru_remote_cxl_agent_key_file", "~/.maru/remote-cxl-agent.key"
         ),
         # The scheduler hints each load before its worker starts it, so the
-        # worker sends no hints of its own.
+        # worker sends no read hints of its own; the worker hints its stores.
+        # Write hints follow read hints unless set apart.
         read_hints=metadata_only and bool(extra_config.get("maru_read_hints", False)),
+        write_hints=not metadata_only
+        and bool(
+            extra_config.get(
+                "maru_write_hints", extra_config.get("maru_read_hints", False)
+            )
+        ),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE
             if _remote_cxl_async(extra_config) and not metadata_only

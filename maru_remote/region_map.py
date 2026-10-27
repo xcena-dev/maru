@@ -36,9 +36,10 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   remote CXL agent deregisters and unmaps it whoever else holds it, and refuses
   later maps of the handle. Releasing a region that is not mapped succeeds.
   A read handle cannot release.
-- ``extension`` with ``action`` (``read_hint`` or ``read_hint_end``),
-  ``request``, ``ranges`` and ``epoch``: a read hint for the agent's region
-  extension; every range must lie in a region the agent maps.
+- ``extension`` with ``action`` (``read_hint``, ``read_hint_end`` or
+  ``write_hint``), ``request``, ``ranges`` and ``epoch``: a hint for the
+  agent's region extension, among the actions its hello advertises; every
+  range must lie in a region the agent maps.
 
 Replies carry ``ok``; a failure has ``error`` and ``code``. The remote CXL agent
 treats a closed connection as an unmap of every region the connection mapped.
@@ -75,7 +76,9 @@ DEFAULT_COPY_FILE = "~/.maru/remote-cxl-agent.key"
 NONCE_BYTES = 16
 # Read hint messages a region extension may take (``op: extension``), and the
 # version of their protocol an agent advertises in its hello
-HINT_ACTIONS = ("read_hint", "read_hint_end")
+HINT_ACTIONS = ("read_hint", "read_hint_end", "write_hint")
+# What a region extension takes when it does not say (``hint_actions``)
+DEFAULT_HINT_ACTIONS = ("read_hint", "read_hint_end")
 HINT_PROTOCOL_VERSION = 1
 
 

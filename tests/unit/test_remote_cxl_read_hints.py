@@ -192,7 +192,7 @@ def test_a_probe_says_where_hits_are_only_when_asked(setup):
 def test_a_long_hint_is_split_into_messages_the_agent_takes(monkeypatch):
     monkeypatch.setattr(hints_module, "MAX_HINT_RANGES", 2)
     sent = []
-    hints = hints_module.ReadHints(
+    hints = hints_module.MemoryHints(
         lambda keys: [("agent", [{"offset": i} for i in range(5)])],
         lambda agent, message: sent.append(message) or True,
     )
@@ -224,7 +224,7 @@ def test_ends_are_kept_when_too_many_hints_wait(monkeypatch):
         hints_module.logger, "warning", lambda msg, *a: warnings.append(msg % a)
     )
     send = _Blocked()
-    hints = hints_module.ReadHints(lambda keys: [("agent", [{}])], send)
+    hints = hints_module.MemoryHints(lambda keys: [("agent", [{}])], send)
     hints.hint("r0", ["k"])  # the thread takes it and blocks
     _until(lambda: hints._pending == 0)
     hints.hint("r1", ["k"])
@@ -249,7 +249,7 @@ def test_ends_are_kept_when_too_many_hints_wait(monkeypatch):
 def test_hints_after_close_are_ignored():
     send = _Blocked()
     send.release.set()
-    hints = hints_module.ReadHints(lambda keys: [("agent", [{}])], send)
+    hints = hints_module.MemoryHints(lambda keys: [("agent", [{}])], send)
     hints.hint("r1", ["k"])
     _until(lambda: send.messages)
     assert hints.close()
@@ -395,7 +395,7 @@ def test_hint_lookups_run_beside_the_scheduler_lookups(setup):
 def test_the_oldest_open_hint_is_ended_past_the_limit(monkeypatch):
     monkeypatch.setattr(hints_module, "MAX_OPEN_HINTS", 2)
     sent = []
-    hints = hints_module.ReadHints(
+    hints = hints_module.MemoryHints(
         lambda keys: [("agent", [{"offset": 0}])],
         lambda agent, message: (
             sent.append((message["action"], message["request"])) or True
@@ -421,3 +421,54 @@ def test_a_region_given_back_is_forgotten_by_the_data_path(setup):
     w.node.restart(reboot=True)
     a._check_boots()  # the region goes back
     assert region.pool_id not in a._data._replied  # noqa: SLF001
+
+
+class WriteHintExtension(FakeExtension):
+    hint_actions = ("read_hint", "read_hint_end", "write_hint")
+
+
+def test_a_store_hints_its_pages_before_its_writes():
+    ext = WriteHintExtension()
+    w = World(extension=ext, max_hint_requests=1)
+    try:
+        worker = w.client("a", write_hints=True)
+        handles = []
+        for i in range(3):
+            h = worker.alloc(PAGE)
+            h.buf[:PAGE] = bytes([i + 1]) * PAGE
+            handles.append(h)
+        offsets = [h.location.offset for h in handles]
+        assert worker.batch_store(["k0", "k1", "k2"], handles) == [True] * 3
+        _until(lambda: ext.hints)
+        _, message, ranges = ext.hints[0]
+        assert message["action"] == "write_hint"
+        assert message["request"].startswith("maru-store-")
+        region = only_region(worker)
+        assert [r["offset"] for r in ranges] == offsets  # in write order
+        assert all(r["handle"] == region.handle for r in ranges)
+        # A write hint has no end and keeps no request open at the agent:
+        # more stores are hinted past the one-request limit.
+        for key in ("k3", "k4"):
+            assert put(worker, key, b"y" * PAGE)[0]
+        _until(lambda: len(ext.hints) == 3)
+        assert {m["action"] for _, m, _ in ext.hints} == {"write_hint"}
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+    finally:
+        w.close()
+
+
+def test_write_hints_go_only_where_asked_and_taken(setup):
+    w, ext = setup  # an extension that takes read hints only
+    worker = w.client("a", write_hints=True)
+    plain = w.client("b")
+    assert put(worker, "k0", b"x" * PAGE)[0]
+    assert put(plain, "k1", b"x" * PAGE)[0]
+    _until(lambda: worker._hints._queue.empty())
+    assert worker._hints.close()
+    assert not ext.hints
+    (agent,) = worker._hint_agents.values()
+    assert "write_hint" not in agent.hint_actions
+    service = w.node.service
+    region = only_region(worker)
+    with pytest.raises(ValueError, match="action"):
+        service.hint(10_000, _hint_message(service, region.handle, action="write_hint"))
