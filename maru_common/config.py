@@ -87,6 +87,10 @@ class MaruConfig:
     # agents whose region extension takes them hear which bytes it will read
     # (maru_handler.storage.remote_cxl.hints). Advice; the data path is the same.
     read_hints: bool = False
+    # Send write hints (remote_cxl only): a store's pages are named to the
+    # remote CXL agents whose region extension takes them before its WRITEs,
+    # so memory that fills a written page from a slow tier can prepare it.
+    write_hints: bool = False
 
     @property
     def server_urls(self) -> list[str]:
@@ -153,6 +157,8 @@ class MaruConfig:
                 raise ValueError("CPU pool supports at most 1000000 pages")
         if self.read_hints and self.storage_backend != "remote_cxl":
             raise ValueError("read_hints is supported by the remote_cxl backend")
+        if self.write_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("write_hints is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
         if self.storage_backend == "remote_cxl":

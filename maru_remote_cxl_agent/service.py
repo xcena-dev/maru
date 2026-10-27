@@ -69,7 +69,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
-from maru_remote.region_map import HINT_ACTIONS, HINT_PROTOCOL_VERSION, read_token
+from maru_remote.region_map import (
+    DEFAULT_HINT_ACTIONS,
+    HINT_ACTIONS,
+    HINT_PROTOCOL_VERSION,
+    read_token,
+)
 from maru_shm.client import HoldRefusedError
 from maru_shm.types import MaruHandle
 
@@ -293,6 +298,12 @@ class RegionMapService:
         self._unheld: dict[int, MaruHandle] = {}
         self._unhold_failed = False
         self._extension = extension
+        # Hint actions the extension takes (its optional ``hint_actions``)
+        self._hint_actions = tuple(
+            a
+            for a in HINT_ACTIONS
+            if a in getattr(extension, "hint_actions", DEFAULT_HINT_ACTIONS)
+        )
 
     @property
     def boot(self) -> str:
@@ -325,17 +336,19 @@ class RegionMapService:
         if self._extension is not None:
             identity["region_extension"] = {
                 "version": HINT_PROTOCOL_VERSION,
-                "actions": list(HINT_ACTIONS),
+                "actions": list(self._hint_actions),
             }
         return identity
 
     def hint(self, conn: int, message: dict) -> None:
-        """Hand a read hint to the region extension.
+        """Hand a read or write hint to the region extension.
 
-        Every range must lie in a region mapped here and held by some
-        connection, under a handle that matches it; the connection that
-        sends the hint need hold none (a serving engine's scheduler holds no
-        region). A hint is advice about reads and never writes anything.
+        The action must be one the extension takes. Every range must lie in
+        a region mapped here and held by some connection, under a handle
+        that matches it; the connection that sends the hint need hold none
+        (a serving engine's scheduler holds no region). A hint is advice:
+        a read hint about reads to come, a write hint about pages a store is
+        about to WRITE; neither gives leave to change any memory.
         The checks run under the lock and the extension is called after it,
         so a region may go between the two; a hint is advice, and one about
         a region that went is harmless. A connection may keep at most
@@ -343,8 +356,8 @@ class RegionMapService:
 
         Args:
             conn: Connection id.
-            message: ``action`` (``read_hint`` or ``read_hint_end``),
-                ``request``, ``ranges`` and ``epoch``.
+            message: ``action`` (``read_hint``, ``read_hint_end`` or
+                ``write_hint``), ``request``, ``ranges`` and ``epoch``.
 
         Raises:
             ValueError: if no extension is loaded, the message is malformed or
@@ -357,8 +370,8 @@ class RegionMapService:
             raise ValueError("this remote CXL agent has no region extension")
         if message.get("epoch") != self.epoch:
             raise MapDenied("the message is for another remote CXL agent process")
-        if message.get("action") not in HINT_ACTIONS:
-            raise ValueError(f"action must be one of {', '.join(HINT_ACTIONS)}")
+        if message.get("action") not in self._hint_actions:
+            raise ValueError(f"action must be one of {', '.join(self._hint_actions)}")
         if type(message.get("request")) is not str:
             raise ValueError("request must be a string")
         ranges = message.get("ranges", [])
@@ -414,7 +427,9 @@ class RegionMapService:
             ValueError: if the connection has too many requests open.
         """
         request = message["request"]
-        if message["action"] != "read_hint":
+        if message["action"] == "write_hint":
+            return False  # a write hint has no end and stays open nowhere
+        if message["action"] == "read_hint_end":
             requests = self._hint_requests.get(conn)
             if requests is not None:
                 requests.discard(request)

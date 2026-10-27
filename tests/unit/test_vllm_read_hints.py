@@ -109,8 +109,17 @@ def test_only_the_scheduler_sends_read_hints(monkeypatch):
     config = extra(maru_remote_cxl_agent_key_file="/k", maru_read_hints=True)
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
-    # The scheduler hints each load before its worker reads it.
+    # The scheduler hints each load before its worker reads it; the worker
+    # hints its stores, as read hints are on.
     assert [c.read_hints for c in seen] == [True, False]
+    assert [c.write_hints for c in seen] == [False, True]
+    seen.clear()
+    _create_maru_handler({**config, "maru_write_hints": False}, metadata_only=False)
+    _create_maru_handler(
+        {**extra(maru_remote_cxl_agent_key_file="/k"), "maru_write_hints": True},
+        metadata_only=False,
+    )
+    assert [c.write_hints for c in seen] == [False, True]
 
 
 def test_a_hint_ends_when_its_load_is_done_and_only_once():
