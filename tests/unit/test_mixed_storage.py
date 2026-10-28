@@ -271,7 +271,9 @@ def test_mixed_requires_explicit_server_capability():
 @pytest.mark.parametrize("pin", [True, False])
 def test_mixed_pins_both_pools_as_configured(server, monkeypatch, pin):
     pinned = []
-    monkeypatch.setattr(CpuPool, "page_lock", lambda self: pinned.append(self.medium))
+    monkeypatch.setattr(
+        CpuPool, "page_lock", lambda self, keepalive=None: pinned.append(self.medium)
+    )
     client = mixed_client(server, pin_pools=pin)
     try:
         assert sorted(pinned) == (["cpu", "cxl"] if pin else [])
@@ -305,7 +307,9 @@ def test_a_cxl_pool_that_fails_to_map_leaves_the_cpu_pool_unpinned(server, monke
         raise PermissionError("DAX mapping not permitted")
 
     pinned = []
-    monkeypatch.setattr(CpuPool, "page_lock", lambda self: pinned.append(self.medium))
+    monkeypatch.setattr(
+        CpuPool, "page_lock", lambda self, keepalive=None: pinned.append(self.medium)
+    )
     monkeypatch.setattr("maru_handler.storage.mixed.CxlPool", fail_map)
     with pytest.raises(PermissionError):
         mixed_client(server)

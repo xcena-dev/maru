@@ -1188,8 +1188,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             register them with CUDA when they open, as the cxl backend's
             regions are, so that GPU copies run at the DMA rate and stores
             do not fault in fresh pages. This locks the whole pool in memory
-            and adds seconds to startup for a pool of tens of GB. False
-            keeps the pools pageable (default: true)
+            and adds seconds to startup for a pool of tens of GB; a CPU pool
+            larger than the memory available stays pageable. False keeps the
+            pools pageable (default: true)
         maru_load_copy_ahead: int - Chunk slabs that a load without a
             placement kernel (vLLM 0.29+ packed layouts) copies to the GPU
             ahead of its per-layer injects, on a side stream, so that the

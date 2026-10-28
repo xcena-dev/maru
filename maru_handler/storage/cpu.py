@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """A bounded, process-local CPU pool and explicit read-buffer ownership.
 
-With ``pin`` the pool is faulted in and registered with CUDA when it opens,
-as DaxMapper does for CXL regions: GPU copies then run at the DMA rate
-instead of being staged through the driver's own pinned buffers, and a store
-no longer faults in fresh pages. Registration is best effort. A pool that
-fails it stays pageable, and copies check each slab's pin status. The pool
-never hands a host pointer to the direct-access CUDA kernels. Eviction is a
-later capability, not an assumption of this allocator.
+``page_lock`` faults the pool in and registers it with CUDA, as DaxMapper does
+for CXL regions; the storage client does so when it opens the pool. GPU copies
+then run at the DMA rate instead of being staged through the driver's own
+pinned buffers, and a store no longer faults in fresh pages. Registration is
+best effort. A pool that fails it stays pageable, and copies check each slab's
+pin status. The pool never hands a host pointer to the direct-access CUDA
+kernels. Eviction is a later capability, not an assumption of this allocator.
 """
 
 import ctypes
+import errno
 import logging
 import mmap
 import time
@@ -18,11 +19,67 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
 
 from maru_common.storage_types import CpuLocation
 
 logger = logging.getLogger(__name__)
+
+# One madvise call holds the GIL for as long as it runs, about 13 s for 72 GiB,
+# and with it the storage client's heartbeat and every other thread of the
+# worker; the prefault runs in steps of this size instead.
+_PREFAULT_STEP = 1 << 30
+_MEMINFO = "/proc/meminfo"
+_SELF_CGROUP = "/proc/self/cgroup"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def _available_memory() -> int | None:
+    """Bytes the process can still commit before the OOM killer acts.
+
+    MemAvailable, capped by the headroom of each cgroup (v2) on the way to the
+    root that limits memory. Reclaimable page cache counts as available in
+    both. The NUMA binding of the process is not taken into account.
+
+    Returns:
+        The bytes, or None if /proc/meminfo does not tell.
+    """
+    try:
+        with open(_MEMINFO) as meminfo:
+            available = next(
+                int(line.split()[1]) << 10
+                for line in meminfo
+                if line.startswith("MemAvailable:")
+            )
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    try:
+        with open(_SELF_CGROUP) as cgroup:
+            path = next(line[3:].strip() for line in cgroup if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return available
+    group = _CGROUP_ROOT / path.lstrip("/")
+    while True:
+        try:
+            limit = (group / "memory.max").read_text().strip()
+            if limit != "max":
+                stat = dict(
+                    line.split()
+                    for line in (group / "memory.stat").read_text().splitlines()
+                )
+                available = min(
+                    available,
+                    int(limit)
+                    - int((group / "memory.current").read_text())
+                    + int(stat.get("active_file", 0))
+                    + int(stat.get("inactive_file", 0)),
+                )
+        except (OSError, ValueError):
+            pass
+        if group == _CGROUP_ROOT or group == group.parent:
+            return available
+        group = group.parent
 
 
 @dataclass(eq=False)
@@ -71,7 +128,6 @@ class CpuPool:
         *,
         medium: str = "cpu",
         mapping: mmap.mmap | None = None,
-        pin: bool = False,
     ):
         if capacity < page_size or page_size <= 0 or capacity % page_size:
             raise ValueError(
@@ -92,57 +148,78 @@ class CpuPool:
         # Whether the pool is registered with CUDA (see page_lock)
         self.cuda_registered = False
         self._cuda_address = 0
-        if pin:
-            self.page_lock()
 
-    def page_lock(self) -> None:
+    def page_lock(self, keepalive: Callable[[], None] | None = None) -> None:
         """Fault the pool in and register it with CUDA, best effort.
 
         Prefaulting writes every page once, so that neither the registration
         nor a later store faults them in one at a time; ``MARU_PREFAULT=0``
-        skips it, as for CXL regions. On failure the pool stays pageable.
-        A pool that is already registered is left as it is.
+        skips it, as for CXL regions. Both commit the whole pool, so a CPU
+        pool larger than the memory available is left pageable: the kernel
+        answers that with the OOM killer, not with an error. On any failure
+        the pool stays pageable. A pool that is already registered is left
+        as it is.
+
+        Args:
+            keepalive: Called after each prefault step and after the
+                registration, so that a storage session outlives the
+                page-lock (about 15 s for 72 GiB).
         """
         if self.cuda_registered:
             return
         if self._closed:
             raise RuntimeError("CPU pool is closed")
-        from maru_handler.memory.mapper import (
-            _MADV_POPULATE_WRITE,
-            _PAGE_SIZE,
-            _PREFAULT_ENABLED,
-            _clear_cuda_sticky_error,
-            _cuda_rc,
-        )
+        from maru_handler.memory.mapper import _PREFAULT_ENABLED
 
-        name = f"{self.medium.upper()} pool {self.pool_id}"
-        t0 = time.monotonic()
-        if _PREFAULT_ENABLED:
-            try:
-                self._mapping.madvise(_MADV_POPULATE_WRITE)
-            except OSError:
-                # Kernels before 5.14. Writing each page's first byte back
-                # faults it in writable without changing what it holds; a
-                # read would map the shared zero page of an anonymous pool.
-                for offset in range(0, self.capacity, _PAGE_SIZE):
-                    self._mapping[offset] = self._mapping[offset]
-        t1 = time.monotonic()
         try:
             import torch
 
             if not torch.cuda.is_available():
                 return
+        except ImportError:
+            return
+        name = f"{self.medium.upper()} pool {self.pool_id}"
+        if self.medium == "cpu":
+            available = _available_memory()
+            if available is not None and self.capacity > available:
+                logger.warning(
+                    "The %s (%d MiB) is larger than the memory available "
+                    "(%d MiB), so it stays pageable: page-locking commits the "
+                    "whole pool at once. Lower its size, or set "
+                    "maru_pin_pools=false",
+                    name,
+                    self.capacity >> 20,
+                    available >> 20,
+                )
+                return
+        logger.info("Page-locking the %s: %d MiB", name, self.capacity >> 20)
+        t0 = time.monotonic()
+        if _PREFAULT_ENABLED and not self._prefault(name, keepalive):
+            return
+        try:
+            self._register(name, time.monotonic() - t0)
+        finally:
+            if keepalive is not None:
+                keepalive()
+
+    def _register(self, name: str, prefault_seconds: float) -> None:
+        """Register the pool with CUDA; on failure it stays pageable."""
+        import torch
+
+        from maru_handler.memory.mapper import _clear_cuda_sticky_error, _cuda_rc
+
+        t1 = time.monotonic()
+        try:
             address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
             rc = _cuda_rc(
                 torch.cuda.cudart().cudaHostRegister(address, self.capacity, 0)
             )
-        except (ImportError, RuntimeError, OSError) as exc:
-            if not isinstance(exc, ImportError):
-                logger.warning(
-                    "cudaHostRegister failed for the %s: %s; it stays pageable",
-                    name,
-                    exc,
-                )
+        except (RuntimeError, OSError) as exc:
+            logger.warning(
+                "cudaHostRegister failed for the %s: %s; it stays pageable",
+                name,
+                exc,
+            )
             return
         if rc != 0:
             # As for CXL regions (see DaxMapper.map_region): clear the
@@ -163,9 +240,45 @@ class CpuPool:
             "Page-locked the %s: %d MiB (prefault %.1f s, CUDA registration %.1f s)",
             name,
             self.capacity >> 20,
-            t1 - t0,
+            prefault_seconds,
             time.monotonic() - t1,
         )
+
+    def _prefault(self, name: str, keepalive: Callable[[], None] | None) -> bool:
+        """Fault every page of the pool in writable, one step at a time.
+
+        Returns:
+            False if the kernel refused for another reason than lacking
+            MADV_POPULATE_WRITE (before 5.14); the pool is then left pageable.
+        """
+        from maru_handler.memory.mapper import _MADV_POPULATE_WRITE, _PAGE_SIZE
+
+        populate = True
+        for offset in range(0, self.capacity, _PREFAULT_STEP):
+            end = min(offset + _PREFAULT_STEP, self.capacity)
+            if populate:
+                try:
+                    self._mapping.madvise(_MADV_POPULATE_WRITE, offset, end - offset)
+                except OSError as exc:
+                    if exc.errno not in (errno.EINVAL, errno.ENOSYS):
+                        logger.warning(
+                            "Prefaulting the %s failed after %d MiB: %s; it "
+                            "stays pageable",
+                            name,
+                            offset >> 20,
+                            exc,
+                        )
+                        return False
+                    populate = False
+            if not populate:
+                # Kernels before 5.14. Writing each page's first byte back
+                # faults it in writable without changing what it holds; a
+                # read would map the shared zero page of an anonymous pool.
+                for page in range(offset, end, _PAGE_SIZE):
+                    self._mapping[page] = self._mapping[page]
+            if keepalive is not None:
+                keepalive()
+        return True
 
     def _page_unlock(self) -> None:
         """Unregister the pool from CUDA, before its mapping is closed."""
