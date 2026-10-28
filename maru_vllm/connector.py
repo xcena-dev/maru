@@ -734,8 +734,9 @@ def _rdma_staging_size(extra: dict[str, Any], page_size: int) -> int | None:
 def _validate_cxl_parallelism(parallel_config: Any) -> None:
     """Refuse parallel layouts whose KV the CXL backend cannot address yet.
 
-    Tensor parallelism is supported: every rank's keys name the KV heads it
-    holds (see ``maru_vllm.kv_shard``). Pipeline parallelism additionally
+    Tensor parallelism is supported: every rank's keys name the slice it
+    holds, a range of KV heads or its part of each Mamba-type state (see
+    ``maru_vllm.kv_shard``). Pipeline parallelism additionally
     needs each stage to address its own layers, but the placement kernel's
     pointer table and the slab's layer axis are indexed by global layer
     number, and no key names a stage's layers yet. Context parallelism

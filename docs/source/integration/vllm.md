@@ -576,10 +576,10 @@ Controls how many tokens per chunk when storing KV cache:
 CXL memory an instance gets at a time: its first allocation, and each further
 one when its memory is full. The `cxl` and `remote_cxl` backends use it the same
 way; with `remote_cxl` each allocation is one region. (`cpu` and `mixed` take
-fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) Under tensor
-parallelism every TP rank is its own instance and stores only its own KV heads,
-so `num_kv_heads` below is the rank's share: the model's KV heads divided by the
-TP size, and at least 1. The estimate below sizes one allocation:
+fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) The estimate
+below sizes one allocation. Under tensor parallelism it applies to each rank,
+and `num_kv_heads` is one rank's share: the model's KV heads divided by the TP
+size, and at least 1 (see {ref}`vllm-tensor-parallelism`):
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -591,79 +591,77 @@ Example (Llama 7B, fp16):
 ```
 
 (vllm-tensor-parallelism)=
-### Tensor parallelism
+## Tensor parallelism
 
-The CXL backend runs at any tensor-parallel size. vLLM starts one connector
-per TP worker, and each worker stores and loads only the KV it holds. Every
-rank hashes a prompt to the same chunk keys, so a key must also name the
-slice: if all ranks registered their heads under one key, the server would
-keep the first and every other rank would load heads that are not its own.
+The CXL backend supports tensor parallelism. vLLM starts one connector per TP
+worker, and each worker stores and loads only the KV it holds. Every rank
+hashes a prompt to the same chunk keys, so a key must also name the slice: if
+all ranks registered their heads under one key, the server would keep the
+first and every other rank would load heads that are not its own.
 
-Chunk keys therefore name a slice by the KV heads it covers:
+Chunk keys therefore name a slice by what it holds:
 
 | A worker holds | Chunk key | Example |
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
+| Part `r` of each Mamba-type state, in a model with several KV cache groups | `kv_<hash>_s<r>of<TP>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_s0of2_g0` on rank 0 |
 
-The layerwise format appends its `_L<layer>` and `_DONE` suffixes after this
-one.
+The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
+slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
+appends `_g<group_id>` and names the KV heads of each attention group, full or
+sliding window, as above: Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_g3` on
+rank 0.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
 heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
-at TP=8 put each head on two ranks). The first rank of each such group stores
-the slice and the others only load it.
+at TP=8 put each head on two ranks). The lowest of those ranks stores the
+slice and the others only load it. A Mamba-type state is named by rank
+instead: vLLM divides every state evenly over the ranks, and a rank's Gated
+DeltaNet conv state gathers its share of the q, k and v channels, which no
+head range describes. No two ranks hold the same part, so every rank stores
+its own, including a rank that only loads replicated heads.
 
 Because keys name heads rather than ranks, engines of different TP sizes
 share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
 TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
-slice is never read as a different set of heads.
+slice is never read as a different set of heads. Mamba-type states differ
+for every TP size, so a model with such a group hits only on chunks that an
+engine of the same TP size stored.
 
-The scheduler reports a chunk as cached only when every slice of it is
-stored, so no rank is ever asked to load a slice that is missing. It has no
-rank of its own, but it knows the TP size and the model's KV heads, so it
-lists every slice itself and checks all of them in one `batch_exists`.
-
-A model with several KV cache groups (see {ref}`vllm-hybrid-models`) names
-a slice in each (chunk, group) object, before the group's `_g<group_id>`.
-An attention group, full or sliding window, names its KV heads as above. A
-Mamba-type group names its part of the state, `_s<rank>of<TP>`: vLLM divides
-every Mamba state evenly over the ranks, and a rank's Gated DeltaNet conv
-state gathers its share of the q, k and v channels, which no head range
-describes. For example, Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_g3` and
-`kv_<hash>_s0of2_g0` on rank 0. No two ranks hold the same part of a state,
-so every rank stores its own, including a rank that only loads the
-replicated heads of an attention group. A chunk counts as cached only when
-every slice of every group it needs is stored. A model with several
-attention groups, such as gpt-oss, needs a tensor parallel size of at most
-its KV heads: above that, vLLM replicates each group's heads by that group's
-own count, which the connector cannot tell from the model's.
+The scheduler reports a chunk as cached only when every slice that the hit
+needs is stored, so no rank is asked to load a slice the lookup did not
+find. It has no rank of its own, but it knows the TP size and the model's KV
+heads, so it lists every slice itself and checks all of them in one
+`batch_exists`.
 
 The ranks do not talk to each other. vLLM sends every worker the same
-metadata, treats a load or store as finished only once every worker reports
-it, and recomputes from the first block that any worker reports as failed;
-with several KV cache groups, it recomputes the whole request.
+metadata and treats a load or store as finished only once every worker
+reports it. A load that fails on any rank is handled for the whole request by
+`kv_load_failure_policy`: under vLLM's default `"fail"` the request fails;
+under `"recompute"` vLLM recomputes it from the first block any worker
+reports as failed, or from its first token for a model with several KV cache
+groups (see {ref}`vllm-load-failures`).
 
 Each worker process connects its own MaruHandler:
 
-- `maru_pool_size` applies to each TP rank. Without replicated KV heads a
-  rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as many
-  tokens as a single TP=1 worker with `P`. A rank that only loads
-  replicated heads stores none of them, only its own part of each Mamba
-  state.
+- `maru_pool_size` applies to each TP rank, and every rank takes its first
+  allocation when it connects, even one that stores nothing. Without
+  replicated KV heads a rank stores 1/TP of every chunk, so ranks with
+  `P / TP` each hold as many tokens as a single TP=1 worker with `P`. A rank
+  that only loads replicated heads or an MLA latent stores none of them, only
+  its own part of each Mamba-type state.
 - A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
   sees each rank as its own owner. Leaving it unset already gives every
   process its own UUID.
 
-Under vLLM's default `kv_load_failure_policy="fail"`, a load failure on any
-rank fails the whole request. Set the policy to `"recompute"` to recompute it
-from the first failed block instead.
-
 Pipeline parallelism and decode or prefill context parallelism are refused at
-startup. The key format reserves `_l<a>-<b>` for the decoder-layer range of a
-pipeline stage; supporting PP still requires each stage to address its layers
-locally in the slab and the placement kernel, which index them globally
-today. The CPU, mixed and remote_cxl backends still require TP=1.
+startup: a pipeline stage would have to address its layers locally in the
+slab and the placement kernel, which index them globally. A model with
+several attention groups, such as gpt-oss, is refused at a tensor parallel
+size above its KV heads: vLLM then replicates each group's heads by that
+group's own count, which the connector cannot tell from the model's. The CPU,
+mixed and remote_cxl backends still require TP=1.
 
 (vllm-hybrid-models)=
 ## Hybrid models
@@ -683,7 +681,7 @@ vLLM puts layers that keep different kinds of KV cache into separate KV cache gr
 
 The connector checks the group types at startup and refuses an unsupported model with the types it found. A model that passes this check can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
 
-Tests on GPU ran with tensor parallel size 1; under tensor parallelism each group names its own slice, see {ref}`vllm-tensor-parallelism`. Hybrid models are supported on this connector only, not on the LMCache path.
+Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1. Hybrid models are supported on this connector only, not on the LMCache path.
 
 ### Required settings
 

@@ -2534,10 +2534,8 @@ def test_tp_kernel_stores_each_ranks_heads(write_behind):
 
 
 def test_tp_refuses_replicated_heads_with_several_attention_groups():
-    """With more ranks than KV heads, vLLM replicates each attention group's
-    heads by that group's own count, which the model-wide count may not be:
-    a rank holding distinct heads would skip its store and load another
-    rank's. Refused rather than guessed."""
+    """Above TP = KV heads, several attention groups are refused
+    (check_multi_group_support); one attention group is named as usual."""
     with pytest.raises(ValueError, match="several attention groups"):
         MaruKVConnector(
             _tp_connector_config(16, 16, 8),
