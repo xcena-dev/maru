@@ -2873,7 +2873,9 @@ class MaruWorkerConnector:
         if (
             self._kv_shard.suffix
             and layout is not None
-            and len(layout.shape) == 5
+            # Layouts with a real head axis: the rank-5 caches of vLLM < 0.29
+            # and the rank-4 logical page [B, H, N, C] of vLLM 0.29+.
+            and (len(layout.shape) == 5 or _is_logical_page_layout(self._cache_layout))
             and layout.num_heads != self._kv_shard.num_heads
         ):
             # The keys name KV heads [start, end) as vLLM's QKVParallelLinear

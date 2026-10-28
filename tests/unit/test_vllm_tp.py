@@ -12,6 +12,7 @@ that is exactly how every rank but one loaded another rank's KV heads.
 CPU tensors only: the packed path takes its per-layer fallback.
 """
 
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -36,7 +37,10 @@ from maru_vllm.connector import (
     _validate_cxl_parallelism,
 )
 from maru_vllm.kv_shard import tp_kv_shard
-from tests.unit.vllm_connector_helpers import make_flash_attn_metadata
+from tests.unit.vllm_connector_helpers import (
+    make_flash_attn_metadata,
+    resolved_cache_config,
+)
 
 BLOCK = 4
 CHUNK = 8
@@ -45,6 +49,9 @@ NUM_BLOCKS = 4
 PROMPT = 16  # two chunks, filling every slot of the four blocks
 HEAD_SIZE = 2
 LAYER_NAMES = [f"model.layers.{i}.self_attn" for i in range(NUM_LAYERS)]
+# The layout an engine reports: none before vLLM 0.29, then a KVCacheLayout
+# name, under which every layer's paged KV is the logical page.
+KV_CACHE_LAYOUTS = [None, "LBNHC"]
 
 
 class FirstWinsServer:
@@ -90,29 +97,48 @@ class FirstWinsServer:
         return handler
 
 
-def rank_kv(seed: int, heads: int) -> list[torch.Tensor]:
-    """Flash-layout paged KV ``(blocks, 2, block, heads, head)`` per layer.
+def rank_kv(
+    seed: int, heads: int, kv_cache_layout: str | None = None
+) -> list[torch.Tensor]:
+    """Paged KV per layer, in the shape vLLM hands over under ``kv_cache_layout``.
 
-    Values depend on ``seed`` and the layer, so a slice loaded into the wrong
-    rank or layer is caught. Replicas of one slice share a seed.
+    Without a layout name, as before vLLM 0.29: the flash backends'
+    ``(blocks, 2, block, heads, head)``. Under a vLLM 0.29+ layout name: the
+    logical page ``(blocks, heads, block, K|V)``. Values depend on ``seed``
+    and the layer, so a slice loaded into the wrong rank or layer is caught.
+    Replicas of one slice share a seed.
     """
-    numel = NUM_BLOCKS * 2 * BLOCK * heads * HEAD_SIZE
+    if kv_cache_layout is None:
+        shape = (NUM_BLOCKS, 2, BLOCK, heads, HEAD_SIZE)
+    else:
+        shape = (NUM_BLOCKS, heads, BLOCK, 2 * HEAD_SIZE)
     return [
-        (seed * 10_000 + layer * 1_000 + torch.arange(numel, dtype=torch.float32))
-        .reshape(NUM_BLOCKS, 2, BLOCK, heads, HEAD_SIZE)
+        (
+            seed * 10_000
+            + layer * 1_000
+            + torch.arange(math.prod(shape), dtype=torch.float32)
+        )
+        .reshape(shape)
         .contiguous()
         for layer in range(NUM_LAYERS)
     ]
 
 
-def rank_worker(server: FirstWinsServer, shard, **extra) -> MaruWorkerConnector:
+def rank_worker(
+    server: FirstWinsServer, shard, kv_cache_layout: str | None = None, **extra
+) -> MaruWorkerConnector:
     worker = MaruWorkerConnector(
         block_size=BLOCK,
         kv_chunk_tokens=CHUNK,
         extra_config=extra,
+        head_size=HEAD_SIZE,
+        cache_config=resolved_cache_config(kv_cache_layout),
         kv_shard=shard,
     )
     worker._num_layers = NUM_LAYERS
+    # register_kv_caches reads this from cache_config; the round trips below
+    # hand their caches over through the forward context instead.
+    worker._cache_layout = kv_cache_layout
     worker._handler = server.handler()
     return worker
 
@@ -135,9 +161,11 @@ def store_step(worker: MaruWorkerConnector, kv: list[torch.Tensor]) -> None:
         worker.save_kv_layer(name, layer, attn, metadata)
 
 
-def load_step(worker: MaruWorkerConnector, heads: int) -> list[torch.Tensor]:
+def load_step(
+    worker: MaruWorkerConnector, heads: int, kv_cache_layout: str | None = None
+) -> list[torch.Tensor]:
     """One forward that loads both chunks into fresh paged KV; returns it."""
-    dst = [torch.zeros_like(layer) for layer in rank_kv(0, heads)]
+    dst = [torch.zeros_like(layer) for layer in rank_kv(0, heads, kv_cache_layout)]
     forward = SimpleNamespace(
         no_compile_layers={
             name: SimpleNamespace(kv_cache=layer)
@@ -170,13 +198,14 @@ def assert_same_kv(actual: list[torch.Tensor], expected: list[torch.Tensor]) -> 
 # =============================================================================
 
 
+@pytest.mark.parametrize("kv_cache_layout", KV_CACHE_LAYOUTS)
 @pytest.mark.parametrize(("tp_size", "total_heads"), [(2, 4), (4, 4), (4, 8)])
-def test_each_rank_loads_its_own_heads(tp_size, total_heads):
+def test_each_rank_loads_its_own_heads(tp_size, total_heads, kv_cache_layout):
     server = FirstWinsServer()
     heads = total_heads // tp_size
     shards = [tp_kv_shard(rank, tp_size, total_heads) for rank in range(tp_size)]
-    workers = [rank_worker(server, shard) for shard in shards]
-    kvs = [rank_kv(rank + 1, heads) for rank in range(tp_size)]
+    workers = [rank_worker(server, shard, kv_cache_layout) for shard in shards]
+    kvs = [rank_kv(rank + 1, heads, kv_cache_layout) for rank in range(tp_size)]
 
     for worker, kv in zip(workers, kvs, strict=True):
         store_step(worker, kv)
@@ -186,7 +215,7 @@ def test_each_rank_loads_its_own_heads(tp_size, total_heads):
         key + shard.suffix for key in base for shard in shards
     }
     for worker, kv in zip(workers, kvs, strict=True):
-        assert_same_kv(load_step(worker, heads), kv)
+        assert_same_kv(load_step(worker, heads, kv_cache_layout), kv)
         assert worker.take_failed_load_blocks() == set()
 
 
@@ -257,11 +286,16 @@ def test_chunk_keys_follow_the_callers_slice():
     assert _req_chunk_keys(meta, CHUNK, "") == base
 
 
-def test_register_refuses_a_cache_whose_head_count_the_key_does_not_name():
-    worker = rank_worker(FirstWinsServer(), tp_kv_shard(0, 2, 8))  # names 4 heads
-    caches = dict(zip(LAYER_NAMES, rank_kv(1, 2), strict=True))  # holds 2
+@pytest.mark.parametrize("kv_cache_layout", KV_CACHE_LAYOUTS)
+def test_register_refuses_a_cache_whose_head_count_the_key_does_not_name(
+    kv_cache_layout,
+):
+    caches = dict(zip(LAYER_NAMES, rank_kv(1, 2, kv_cache_layout), strict=True))
+    names_four = rank_worker(FirstWinsServer(), tp_kv_shard(0, 2, 8), kv_cache_layout)
     with pytest.raises(ValueError, match="holds 2 KV heads"):
-        worker.register_kv_caches(caches)
+        names_four.register_kv_caches(caches)
+    names_two = rank_worker(FirstWinsServer(), tp_kv_shard(0, 2, 4), kv_cache_layout)
+    names_two.register_kv_caches(caches)
 
 
 # =============================================================================
