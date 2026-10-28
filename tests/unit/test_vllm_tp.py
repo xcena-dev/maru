@@ -25,6 +25,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import maru_vllm.connector as connector_module
+from maru_common.kv_shard import tp_kv_shard
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     MaruKVConnector,
@@ -35,7 +36,6 @@ from maru_vllm.connector import (
     _req_chunk_keys,
     _validate_cxl_parallelism,
 )
-from maru_vllm.kv_shard import tp_kv_shard
 from tests.unit.vllm_connector_helpers import (
     FirstWinsServer,
     make_flash_attn_metadata,

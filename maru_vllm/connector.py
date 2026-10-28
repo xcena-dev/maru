@@ -41,6 +41,14 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_common.kv_shard import (
+    WHOLE_MODEL,
+    KVShard,
+    tp_kv_shard,
+    tp_kv_shards,
+    tp_part_shard,
+    tp_part_shards,
+)
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
     GROUP_FULL,
@@ -66,14 +74,6 @@ from maru_vllm.kv_layout import (
     _mla_pages,
     _scatter_kv,
     _vllm_kv_cache_layout,
-)
-from maru_vllm.kv_shard import (
-    WHOLE_MODEL,
-    KVShard,
-    tp_kv_shard,
-    tp_kv_shards,
-    tp_part_shard,
-    tp_part_shards,
 )
 
 if TYPE_CHECKING:
@@ -736,7 +736,7 @@ def _validate_cxl_parallelism(parallel_config: Any) -> None:
 
     Tensor parallelism is supported: every rank's keys name the slice it
     holds, a range of KV heads or its part of each Mamba-type state (see
-    ``maru_vllm.kv_shard``). Pipeline parallelism additionally
+    ``maru_common.kv_shard``). Pipeline parallelism additionally
     needs each stage to address its own layers, but the placement kernel's
     pointer table and the slab's layer axis are indexed by global layer
     number, and no key names a stage's layers yet. Context parallelism
@@ -798,7 +798,7 @@ def _names_attention_by_rank(
     With more TP ranks than KV heads, vLLM replicates each attention group's
     heads by that group's own count. The connector knows only the model's
     count, which a model with one attention group shares, but several groups
-    need not (see ``maru_vllm.kv_shard``).
+    need not (see ``maru_common.kv_shard``).
     """
     attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
     return len(attention) > 1 and tp_size > total_kv_heads

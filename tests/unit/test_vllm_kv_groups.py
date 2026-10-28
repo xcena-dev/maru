@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import maru_vllm.connector as connector_module
+from maru_common.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_part_shard
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     MaruKVConnector,
@@ -53,7 +54,6 @@ from maru_vllm.kv_groups import (
     state_view,
     window_chunks,
 )
-from maru_vllm.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_part_shard
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     FirstWinsServer,

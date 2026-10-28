@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Unit tests for maru_vllm.kv_shard: naming the KV slice each TP rank holds.
+"""Unit tests for maru_common.kv_shard: naming the KV slice each TP rank holds.
 
-The module is pure integer logic, but importing it goes through the
-``maru_vllm`` package, which loads the vLLM connector.
+The module is pure integer logic, so these tests need neither torch nor an
+inference engine.
 """
 
 import pytest
 
-pytest.importorskip("torch")
-pytest.importorskip("vllm")
-
-from maru_vllm.kv_shard import (
+from maru_common.kv_shard import (
     WHOLE_MODEL,
     KVShard,
     tp_kv_shard,

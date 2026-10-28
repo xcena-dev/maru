@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Which slice of each chunk's KV one vLLM worker holds, and its key suffix.
+"""Which slice of each chunk's KV one worker holds, and its key suffix.
 
-Under tensor parallelism every worker process runs its own connector and
-holds its own slice of the paged KV cache, yet all of them hash a prompt to
-the same chunk keys. A key must therefore name the slice as well as the
-prefix: otherwise every rank registers its heads under one key, the server
-keeps whichever arrived first, and the other ranks load heads that are not
-theirs. Code calls a slice a shard (``KVShard``).
+Under tensor parallelism every worker process of an inference engine runs
+its own connector and holds its own slice of the paged KV cache, yet all
+of them hash a prompt to the same chunk keys. A key must therefore name the
+slice as well as the prefix: otherwise every rank registers its heads under
+one key, the server keeps whichever arrived first, and the other ranks load
+heads that are not theirs. Code calls a slice a shard (``KVShard``).
 
 A slice of attention KV is named by the KV heads it covers and, once
 pipeline parallelism is supported, the decoder layers, rather than by the
@@ -20,23 +20,24 @@ A slice covering the whole model keeps the bare chunk key, as at TP=1.
 Two kinds of slice are named by rank instead, ``_s<part>of<parts>``, the
 rank's part of its TP group:
 
-- A Mamba-type state (vLLM's ``MambaSpec``, such as Gated DeltaNet's conv
-  and recurrent state). vLLM gives each rank 1/TP of every state tensor,
-  and a rank's conv state gathers its share of the q, k and v channels,
-  which no single head range describes.
-- The attention KV of a model with several attention groups at more TP
-  ranks than KV heads. vLLM then replicates each group's heads by that
-  group's own count, which the connector cannot tell from the model's (one
-  model sets its sliding-window layers' count in model code), so it cannot
-  tell which ranks share heads.
+- A Mamba-type state, such as Gated DeltaNet's conv and recurrent state.
+  Each rank holds 1/TP of every state tensor, and a rank's conv state
+  gathers its share of the q, k and v channels, which no single head range
+  describes.
+- The attention KV of a model with several kinds of attention layer (such
+  as sliding-window and full) at more TP ranks than KV heads. The engine
+  then replicates each kind's heads by that kind's own count, which the
+  connector cannot always tell from the model's (one model sets its
+  sliding-window layers' count in model code), so it cannot tell which
+  ranks share heads.
 
 A part still names content, since the same model at the same TP size puts
 the same bytes in it. Engines of different TP sizes never share a part, and
 every rank stores its own, at the cost of storing replicated heads once per
 rank.
 
-Pure: integers in, names out. The connector supplies the parallel sizes and
-the rank from vLLM.
+Pure: integers in, names out, with no inference engine imported. Each
+engine's connector supplies the parallel sizes and the rank.
 """
 
 from __future__ import annotations
@@ -130,13 +131,13 @@ def _check_rank(tp_rank: int, tp_size: int) -> None:
 def tp_kv_shard(tp_rank: int, tp_size: int, total_kv_heads: int) -> KVShard:
     """The KV slice that tensor-parallel rank ``tp_rank`` holds.
 
-    Follows vLLM's ``QKVParallelLinear``: with at least as many KV heads as
-    ranks each rank takes a contiguous ``total_kv_heads // tp_size`` of them;
-    with fewer, each head is replicated on ``tp_size // total_kv_heads``
-    consecutive ranks and rank r holds head ``r // replicas``. vLLM requires
-    one count to divide the other, and so does this function. KV that every
-    rank holds whole, such as an MLA latent, is a single head that every
-    rank replicates.
+    The usual tensor-parallel split of KV heads, as vLLM's
+    ``QKVParallelLinear`` makes it: with at least as many KV heads as ranks
+    each rank takes a contiguous ``total_kv_heads // tp_size`` of them; with
+    fewer, each head is replicated on ``tp_size // total_kv_heads``
+    consecutive ranks and rank r holds head ``r // replicas``. One count
+    must divide the other. KV that every rank holds whole, such as an MLA
+    latent, is a single head that every rank replicates.
 
     Args:
         tp_rank: The worker's rank in its tensor-parallel group.
