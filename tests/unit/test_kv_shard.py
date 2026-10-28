@@ -93,7 +93,7 @@ def test_rejects_splits_vllm_cannot_build(rank, tp_size, total_heads):
 def test_part_shard_names_its_part_of_the_tp_group():
     """vLLM splits a Mamba state by rank, not along one head axis."""
     shard = tp_part_shard(1, 2)
-    assert shard.suffix == "_s1of2"
+    assert shard.suffix == "_tp2_r1"
     assert shard.is_writer
     assert not shard.splits_heads
     assert tp_part_shard(0, 1).suffix == ""
@@ -102,7 +102,7 @@ def test_part_shard_names_its_part_of_the_tp_group():
 def test_part_shards_of_different_tp_sizes_never_share_a_name():
     two = {s.suffix for s in tp_part_shards(2)}
     four = {s.suffix for s in tp_part_shards(4)}
-    assert two == {"_s0of2", "_s1of2"}
+    assert two == {"_tp2_r0", "_tp2_r1"}
     assert len(four) == 4
     assert two.isdisjoint(four)
 

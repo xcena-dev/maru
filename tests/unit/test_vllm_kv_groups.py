@@ -2278,7 +2278,11 @@ def test_tp_ranks_store_and_load_their_own_slices(version):
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
     assert set(server.objects) == {
         *(group_object_key(k + h, 3) for k in (k0, k1) for h in ("_h0-2", "_h2-4")),
-        *(group_object_key(k1 + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)),
+        *(
+            group_object_key(k1 + s, g)
+            for s in ("_tp2_r0", "_tp2_r1")
+            for g in range(3)
+        ),
     }
     for rank in range(2):
         target = torch.zeros_like(_shared())
@@ -2340,7 +2344,7 @@ def test_tp_replica_skips_attention_but_stores_its_state():
 
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
     assert _registered_keys(workers[1]) == {
-        group_object_key(k1 + "_s1of4", g) for g in range(3)
+        group_object_key(k1 + "_tp4_r1", g) for g in range(3)
     }
     assert group_object_key(k0 + "_h0-1", 3) in _registered_keys(workers[0])
 
@@ -2384,7 +2388,7 @@ def _rank_parts(rank, tp_size):
     ("shards", "names"),
     [
         (lambda rank: _tp_shards(rank, 2, 4), ("_h0-2", "_h2-4")),
-        (lambda rank: _rank_parts(rank, 4), ("_s0of4", "_s1of4")),
+        (lambda rank: _rank_parts(rank, 4), ("_tp4_r0", "_tp4_r1")),
     ],
     ids=["by-heads", "by-rank"],
 )
@@ -2436,7 +2440,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads(shards, names):
 # rank each, and two parts of each Mamba state (groups 0-2).
 QWEN35_TP2 = {
     "shard_suffixes": ("_h0-1", "_h1-2"),
-    "state_suffixes": ("_s0of2", "_s1of2"),
+    "state_suffixes": ("_tp2_r0", "_tp2_r1"),
 }
 
 
@@ -2445,7 +2449,9 @@ def _qwen35_tp2_objects(keys):
     at chunk 1: attention for every chunk, states for chunk 1."""
     attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
     states = {
-        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
+        group_object_key(keys[1] + s, g)
+        for s in ("_tp2_r0", "_tp2_r1")
+        for g in range(3)
     }
     return attention | states
 
@@ -2460,7 +2466,7 @@ def test_tp_hit_needs_every_slice_of_every_group():
     assert stored <= set(sched._handler.queries[0])
 
     # One rank's part of one Mamba state is missing: no chunk can resume.
-    missing_state = group_object_key(keys[1] + "_s1of2", 0)
+    missing_state = group_object_key(keys[1] + "_tp2_r1", 0)
     assert _hit(_qwen35_scheduler(stored - {missing_state}, **QWEN35_TP2), a) == 0
     missing_heads = group_object_key(keys[0] + "_h1-2", 3)
     assert _hit(_qwen35_scheduler(stored - {missing_heads}, **QWEN35_TP2), a) == 0
@@ -2482,14 +2488,14 @@ def test_tp_connector_wires_each_group_slice(monkeypatch):
     qwen_config = _tp_connector_config(QWEN35_BLOCK, 2, 2)
     qwen = MaruKVConnector(qwen_config, KVConnectorRole.SCHEDULER, qwen35_config())
     assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
-    assert qwen._scheduler._state_suffixes == ("_s0of2", "_s1of2")
+    assert qwen._scheduler._state_suffixes == ("_tp2_r0", "_tp2_r1")
 
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
     worker = MaruKVConnector(
         qwen_config, KVConnectorRole.WORKER, qwen35_config()
     )._worker
     assert worker._kv_shard.suffix == "_h1-2"
-    assert worker._state_shard.suffix == "_s1of2"
+    assert worker._state_shard.suffix == "_tp2_r1"
 
 
 def test_tp1_several_groups_keep_bare_keys(monkeypatch):
@@ -2555,10 +2561,10 @@ def test_tp_names_attention_by_rank_above_the_kv_heads(monkeypatch):
     own copy."""
     config = _tp_connector_config(16, 16, 8)
     gpt = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
-    assert gpt._scheduler._shard_suffixes == tuple(f"_s{r}of16" for r in range(16))
+    assert gpt._scheduler._shard_suffixes == tuple(f"_tp16_r{r}" for r in range(16))
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 3)
     worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
-    assert worker._worker._kv_shard.suffix == "_s3of16"
+    assert worker._worker._kv_shard.suffix == "_tp16_r3"
     assert worker._worker._kv_shard.is_writer
     # One attention group: its heads are the model's, replicated as named.
     qwen = MaruKVConnector(
@@ -2580,12 +2586,17 @@ def test_tp_connector_wires_replicated_heads_of_a_hybrid_model(monkeypatch):
     config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
     sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, qwen35_config())
     assert sched._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
-    assert sched._scheduler._state_suffixes == ("_s0of4", "_s1of4", "_s2of4", "_s3of4")
+    assert sched._scheduler._state_suffixes == (
+        "_tp4_r0",
+        "_tp4_r1",
+        "_tp4_r2",
+        "_tp4_r3",
+    )
     worker = _qwen35_tp4_worker(monkeypatch, 1)
     # Rank 1 holds rank 0's KV head but a part of each state of its own.
     assert worker._kv_shard.suffix == "_h0-1"
     assert not worker._kv_shard.is_writer
-    assert worker._state_shard.suffix == "_s1of4"
+    assert worker._state_shard.suffix == "_tp4_r1"
     assert worker._state_shard.is_writer
 
 
@@ -2595,13 +2606,13 @@ def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
     messages = [r.getMessage() for r in caplog.records]
     (line,) = [m for m in messages if "TP rank 1 of 4" in m]
     assert "'_h0-1' and only loads it" in line
-    assert "stores its part '_s1of4' of each Mamba-type state" in line
+    assert "stores its part '_tp4_r1' of each Mamba-type state" in line
 
 
 def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
     a = list(range(1200))
     keys = _chunk_keys(a, QWEN35_BLOCK)
-    stored = _qwen35_tp2_objects(keys) - {group_object_key(keys[1] + "_s1of2", 0)}
+    stored = _qwen35_tp2_objects(keys) - {group_object_key(keys[1] + "_tp2_r1", 0)}
     with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
         assert _hit(_qwen35_scheduler(stored, **QWEN35_TP2), a) == 0
     assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)

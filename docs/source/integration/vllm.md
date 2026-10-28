@@ -605,7 +605,7 @@ Chunk keys therefore name a slice by what it holds:
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
-| Part `r` of a slice named by rank, in a model with several KV cache groups: each Mamba-type state, and the attention KV above TP = KV heads (below) | `kv_<hash>_s<r>of<TP>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_s0of2_g0` on rank 0 |
+| Rank `r`'s part of a slice named by rank, in a model with several KV cache groups: each Mamba-type state, and the attention KV when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_tp2_r0_g0` on rank 0 |
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)

@@ -17,8 +17,8 @@ partition the model differently can never mistake each other's slices for
 their own. A slice covering the whole model keeps the bare chunk key, as at
 TP=1.
 
-Two kinds of slice are named by rank instead, ``_s<part>of<parts>``, the
-rank's part of its TP group:
+Two kinds of slice are named by rank instead, as ``_tp<parts>_r<part>``
+(the TP size and the rank whose part it is):
 
 - A Mamba-type state, such as Gated DeltaNet's conv and recurrent state.
   Each rank holds 1/TP of every state tensor, and a rank's conv state
@@ -85,15 +85,16 @@ class KVShard:
     def suffix(self) -> str:
         """What a chunk key appends to name this slice; empty for the whole.
 
-        ``_h<start>-<end>`` names a range of KV heads and
-        ``_s<part>of<parts>`` a rank's part. The same name always means the
-        same bytes. Cached, since store paths read it per layer.
+        ``_h<start>-<end>`` names a range of KV heads, and
+        ``_tp<parts>_r<part>`` a rank's part at that TP size. The same name
+        always means the same bytes. Cached, since store paths read it per
+        layer.
         """
         suffix = ""
         if self.splits_heads:
             suffix += f"_h{self.head_start}-{self.head_end}"
         if self.parts > 1:
-            suffix += f"_s{self.part}of{self.parts}"
+            suffix += f"_tp{self.parts}_r{self.part}"
         return suffix
 
     @property
