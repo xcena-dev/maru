@@ -1870,64 +1870,29 @@ class MaruSchedulerConnector:
             # Re-probe each time: CPU residency is tied to a live worker session.
             return next((i for i, hit in enumerate(results) if not hit), len(results))
 
-        # Check local cache first - find longest prefix of known keys.
-        # We use a "_DONE" marker (written after all layers are stored)
-        # rather than checking a single layer, to avoid false positives
-        # when a partial layer store failure leaves only some layers.
-        # Under TP each worker stores its own KV slice of a chunk under its
-        # own suffix, so a chunk counts only once every slice is stored: a
-        # rank whose slice is missing would have nothing to load.
+        # A chunk counts once its "_DONE" marker is stored (written after all
+        # layers, so a partial layer store failure is no false positive) for
+        # every slice in _shard_suffixes. Known markers are tried first; the
+        # unknown ones go in one batch_exists.
         sentinels = [
             [self._chunk_exists_key(key + suffix) for suffix in self._shard_suffixes]
             for key in keys
         ]
-        local_hits = 0
-        for chunk_sentinels in sentinels:
-            if all(sentinel in self._known_keys for sentinel in chunk_sentinels):
-                local_hits += 1
-            else:
-                break
 
-        if local_hits == len(keys):
-            return local_hits
+        def leading(stored: set[str]) -> int:
+            return next(
+                (
+                    i
+                    for i, chunk in enumerate(sentinels)
+                    if not stored.issuperset(chunk)
+                ),
+                len(sentinels),
+            )
 
-        # Need to check remaining chunks via RPC
-        self._ensure_handler()
-        if self._handler is None:
-            return local_hits
-
-        # Check every slice of all unchecked chunks at once via batch_exists
-        remaining_keys = [
-            sentinel
-            for chunk_sentinels in sentinels[local_hits:]
-            for sentinel in chunk_sentinels
-        ]
-        try:
-            _t0 = time.monotonic()
-            results = self._handler.batch_exists(remaining_keys)
-            if self._timing:
-                _emit_timing(
-                    f"lookup batch_exists {len(remaining_keys)} keys = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
-                )
-        except Exception as e:
-            logger.warning("Maru batch_exists failed: %s", e)
-            return local_hits
-
-        # Count consecutive chunks with every slice present. A short reply
-        # leaves the rest unknown, i.e. a miss.
-        num_shards = len(self._shard_suffixes)
-        rpc_hits = 0
-        for start in range(0, len(remaining_keys), num_shards):
-            chunk_results = results[start : start + num_shards]
-            if len(chunk_results) < num_shards or not all(chunk_results):
-                break
-            rpc_hits += 1
-
-        # Cache the newly discovered keys
-        self._known_keys.update(remaining_keys[: rpc_hits * num_shards])
-
-        return local_hits + rpc_hits
+        hits = leading(self._known_keys)
+        if hits == len(keys):
+            return hits
+        return leading(self._stored_keys([s for chunk in sentinels for s in chunk]))
 
     def _note_failed_load(self, request: Request) -> None:
         """Record a failed load when vLLM asks about a request again after it.
@@ -1957,11 +1922,9 @@ class MaruSchedulerConnector:
     def _stored_keys(self, keys: list[str]) -> set[str]:
         """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
 
-        Remembers positives, as ``_count_matched_chunks`` does, until a
-        reported load failure clears them (``update_connector_output``). Only
-        the cxl backend in chunkwise format gets here: CPU mode must re-probe
-        residency, and layerwise format checks ``_DONE`` markers, and the
-        constructor refuses both with several groups.
+        Remembers positives until a reported load failure clears them
+        (``update_connector_output``). CPU mode does not come here: its
+        residency is tied to a live worker session, so it re-probes.
         """
         unknown = [k for k in keys if k not in self._known_keys]
         if unknown:
@@ -2004,13 +1967,12 @@ class MaruSchedulerConnector:
             return 0
 
         def object_keys(i: int, g: KVGroup) -> list[str]:
+            suffixes = (
+                self._state_suffixes if g.kind == GROUP_MAMBA else self._shard_suffixes
+            )
             return [
                 group_object_key(chunk_keys[i] + suffix, g.group_id)
-                for suffix in (
-                    self._state_suffixes
-                    if g.kind == GROUP_MAMBA
-                    else self._shard_suffixes
-                )
+                for suffix in suffixes
             ]
 
         def hit_among(stored: set[str]) -> tuple[int, int]:
