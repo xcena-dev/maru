@@ -896,9 +896,9 @@ class MaruReqMeta:
     num_computed_tokens: int = 0
     # For store: where the request's stores start. Its num_computed_tokens in
     # its first step since it was scheduled or resumed, or the end of the
-    # chunks that step loads if later: a fully cached prompt holds one block
-    # back for vLLM to compute, inside a chunk Maru already has. The tokens
-    # before it were loaded or are vLLM's own prefix cache. Write-behind,
+    # chunks its lookup found in Maru if later: a fully cached prompt holds
+    # one block back for vLLM to compute, inside a chunk Maru already has.
+    # The tokens before it are in Maru or vLLM's own prefix cache. Write-behind,
     # which stores a prompt in its last prefill step, starts at the chunk
     # holding this token; per-step stores at the later of it and
     # num_computed_tokens.
@@ -990,9 +990,9 @@ def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> r
     Absolute chunk indices ``[computed // C, (computed + scheduled) // C)``,
     so consecutive steps stay contiguous when step boundaries are not chunk
     aligned: a chunk straddling a boundary belongs to the step finishing it.
-    None starts before ``store_start_token``: the chunks a request loaded,
-    including the last one of a fully cached prompt, part of which vLLM
-    computes again, are in Maru already.
+    None starts before ``store_start_token``: the chunks a request's lookup
+    found, including the last one of a fully cached prompt, part of which
+    vLLM computes again, are in Maru already.
     """
     if req_meta.num_scheduled_tokens <= 0:
         return range(num_chunks)
@@ -1617,6 +1617,10 @@ class MaruSchedulerConnector:
         # Cached match results from get_num_new_matched_tokens,
         # consumed by update_state_after_alloc to avoid redundant RPC.
         self._last_match_result: dict[str, int] = {}
+        # Per request, from its last lookup: the leading chunks Maru reported,
+        # and the tokens the request counts as computed once that lookup's
+        # load (if any) is in. Its first store never starts inside them.
+        self._maru_hits: dict[str, tuple[int, int]] = {}
         self._load_starts: dict[str, int] = {}
         self._load_ranges: dict[str, tuple[int, int]] = {}
 
@@ -1959,6 +1963,7 @@ class MaruSchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
+        self._maru_hits.pop(request.request_id, None)
         reason = _uncacheable_request(request)
         if reason is not None:
             logger.debug("Maru skips request %s: it has %s", request.request_id, reason)
@@ -1997,6 +2002,11 @@ class MaruSchedulerConnector:
         # Align to block size
         matched_tokens = _align_down(matched_tokens, self._block_size)
         new_matched = matched_tokens - num_computed_tokens
+        # Also when vLLM's own prefix cache covers the hit and nothing loads.
+        self._maru_hits[request.request_id] = (
+            num_matched_chunks,
+            max(num_computed_tokens, matched_tokens),
+        )
 
         if new_matched <= 0:
             return 0, False
@@ -2069,30 +2079,38 @@ class MaruSchedulerConnector:
         block_ids: tuple[list[int], ...],
         num_computed: int,
         num_scheduled: int,
-        loaded_chunks: int = 0,
     ) -> MaruReqMeta | None:
         """Store metadata for the prompt chunks a step completes, if any.
 
         For the first step of a new or resumed request, whether or not it
-        loads: ``block_ids`` cover it from token 0. Storing starts after the
-        ``loaded_chunks`` the step loads from Maru. vLLM counts them as
-        computed, except that a fully cached prompt holds one block back for
-        vLLM to compute, inside a chunk Maru already has. A request whose
-        prompt still has full chunks past this step is tracked in
-        ``_requests_need_store``, so later chunked-prefill steps store them
-        too. None when the step leaves nothing to store.
+        loads, inline or parked: ``block_ids`` cover it from token 0. Storing
+        never starts inside the chunks the request's lookup found in Maru
+        (``_maru_hits``). vLLM counts them as computed, but a fully cached
+        prompt holds one block back for vLLM to compute, and vLLM's own prefix
+        cache can cover a hit so that nothing loads. A request is tracked in
+        ``_requests_need_store`` until its prompt is computed, so later
+        chunked-prefill steps store the rest and a preemption keeps its store
+        start. None when the step leaves nothing to store.
         """
         ct = self._kv_chunk_tokens
         # A request resumed after a preemption keeps the start it had before:
         # write-behind stores nothing until the prompt's last prefill step, so
         # the chunks it computed before the preemption are not in Maru yet.
-        # Never before the end of the chunks this step loads, which Maru has.
         preempted = self._requests_need_store.pop(req_id, None)
-        first = num_computed if preempted is None else min(num_computed, preempted[2])
-        store_start = max(first, loaded_chunks * ct)
+        store_start = (
+            num_computed if preempted is None else min(num_computed, preempted[2])
+        )
+        # Not inside the chunks the lookup found, unless the request resumes
+        # short of what that lookup's load gives: a parked load that failed,
+        # whose chunks may be gone.
+        hit = self._maru_hits.pop(req_id, None)
+        if hit is not None and num_computed >= hit[1]:
+            store_start = max(store_start, hit[0] * ct)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)
-        if end_chunk < num_full_chunks:
+        # Tracked until the prompt is computed, not only its full chunks: a
+        # request preempted before then may compute chunks again on resuming.
+        if num_computed + num_scheduled < len(token_ids):
             self._requests_need_store[req_id] = (
                 token_ids,
                 tuple(list(ids) for ids in block_ids),
@@ -2169,10 +2187,9 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_waiting.discard(new_req.req_id)
 
             num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
-            loaded_chunks = 0
             if new_req.req_id in self._requests_need_load:
                 # Load cached chunks from maru
-                _, loaded_chunks = self._requests_need_load[new_req.req_id]
+                _, num_chunks = self._requests_need_load[new_req.req_id]
                 load_start, load_end = self._load_ranges.get(new_req.req_id, (0, None))
                 meta.requests.append(
                     MaruReqMeta(
@@ -2180,7 +2197,7 @@ class MaruSchedulerConnector:
                         token_ids=token_ids,
                         block_ids=new_req.block_ids[0],
                         is_store=False,
-                        num_matched_chunks=loaded_chunks,
+                        num_matched_chunks=num_chunks,
                         load_start_token=load_start,
                         load_end_token=load_end,
                         group_block_ids=self._group_block_ids(new_req.block_ids),
@@ -2202,7 +2219,6 @@ class MaruSchedulerConnector:
                 new_req.block_ids,
                 num_computed,
                 num_scheduled,
-                loaded_chunks,
             )
             if store is not None:
                 meta.requests.append(store)
@@ -2252,7 +2268,6 @@ class MaruSchedulerConnector:
                     new_block_ids,
                     num_computed,
                     num_new,
-                    num_chunks,
                 )
                 if store is not None:
                     meta.requests.append(store)
@@ -2287,22 +2302,25 @@ class MaruSchedulerConnector:
                         tracked,
                         store_start,
                     )
-                meta.requests.append(
-                    MaruReqMeta(
-                        req_id=req_id,
-                        token_ids=token_ids,
-                        block_ids=tracked[0],
-                        is_store=True,
-                        num_scheduled_tokens=num_new,
-                        num_computed_tokens=num_computed,
-                        store_start_token=store_start,
-                        group_block_ids=self._group_block_ids(tracked),
-                    )
-                )
-                # Drop tracking once all full chunks have been stored.
                 total_scheduled = num_computed + num_new
-                num_full_chunks = len(token_ids) // self._kv_chunk_tokens
-                if total_scheduled // self._kv_chunk_tokens >= num_full_chunks:
+                ct = self._kv_chunk_tokens
+                # Once every full chunk is in, the rest of the prompt has none
+                # to store; the request stays tracked only for a preemption.
+                if num_computed < len(token_ids) // ct * ct:
+                    meta.requests.append(
+                        MaruReqMeta(
+                            req_id=req_id,
+                            token_ids=token_ids,
+                            block_ids=tracked[0],
+                            is_store=True,
+                            num_scheduled_tokens=num_new,
+                            num_computed_tokens=num_computed,
+                            store_start_token=store_start,
+                            group_block_ids=self._group_block_ids(tracked),
+                        )
+                    )
+                # Drop tracking once the prompt is computed.
+                if total_scheduled >= len(token_ids):
                     del self._requests_need_store[req_id]
 
         # Clean up state for finished/preempted requests to prevent
@@ -2326,6 +2344,7 @@ class MaruSchedulerConnector:
             self._parked_blocks.pop(rid, None)
             self._admission_waiters.pop(rid, None)
             self._last_match_result.pop(rid, None)
+            self._maru_hits.pop(rid, None)
         for rid in scheduler_output.finished_req_ids:
             self._requests_need_store.pop(rid, None)
         for rid in scheduler_output.preempted_req_ids or ():

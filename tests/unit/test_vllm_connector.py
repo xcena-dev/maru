@@ -2133,60 +2133,6 @@ class TestSyncPartialHitStoresComputedChunks:
         )
         assert [r.is_store for r in meta.requests] == [False]
 
-    def _preempt_then_resume(self, cached_chunks, v1):
-        """Track r1 over an 8-token first step, preempt it, resume it loading.
-
-        Another instance stores the prompt meanwhile, so the resume loads its
-        first ``cached_chunks`` chunks. The V1 model runner sends the resumed
-        request as a cached one, the V2 runner as a new one.
-        """
-        sched = make_scheduler(
-            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
-        )
-        sched._handler = MagicMock()
-        sched.build_connector_meta(
-            fake_scheduler_output([self._new_req(40, 0)], None, {"r1": 8})
-        )
-        assert "r1" in sched._requests_need_store
-        preempted = fake_scheduler_output([], None, {})
-        preempted.preempted_req_ids = {"r1"}
-        sched.build_connector_meta(preempted)
-
-        sched._handler.batch_exists.return_value = [True] * cached_chunks + [False] * (
-            5 - cached_chunks
-        )
-        request = SimpleNamespace(
-            request_id="r1",
-            prompt_token_ids=list(range(40)),
-            all_token_ids=list(range(40)),
-        )
-        matched, _ = sched.get_num_new_matched_tokens(request, 0)
-        blocks = MagicMock()
-        blocks.get_block_ids.return_value = (list(range(10)),)
-        sched.update_state_after_alloc(request, blocks, matched)
-        rest = {"r1": 40 - matched}
-        if v1:
-            cached = fake_cached_reqs(["r1"], [(list(range(10)),)], [matched], ["r1"])
-            output = fake_scheduler_output([], cached, rest)
-        else:
-            output = fake_scheduler_output([self._new_req(40, matched)], None, rest)
-        return matched, sched.build_connector_meta(output)
-
-    @pytest.mark.parametrize("v1", [True, False], ids=["resumed", "new"])
-    def test_full_hit_after_a_preemption_stores_nothing(self, v1):
-        """The start kept from before the preemption stays past the hit."""
-        matched, meta = self._preempt_then_resume(5, v1)
-        assert matched == 36
-        assert [r.is_store for r in meta.requests] == [False]
-
-    @pytest.mark.parametrize("v1", [True, False], ids=["resumed", "new"])
-    def test_partial_hit_after_a_preemption_stores_from_the_loaded_end(self, v1):
-        """Write-behind starts here: it must not copy the loaded chunks again."""
-        matched, meta = self._preempt_then_resume(2, v1)
-        assert matched == 16
-        (store,) = [r for r in meta.requests if r.is_store]
-        assert store.store_start_token == 16
-
     def test_stores_start_at_store_start_token(self):
         """The per-step stores skip the chunk the held-back block is in."""
         meta = store_req_meta(
@@ -2198,6 +2144,151 @@ class TestSyncPartialHitStoresComputedChunks:
         assert list(_step_chunks(meta, self.CHUNK, 5)) == [4]
         meta.store_start_token = 40
         assert list(_step_chunks(meta, self.CHUNK, 5)) == []
+
+
+class TestStoreStartsPastTheHit:
+    """A request stores none of the chunks its lookup found in Maru.
+
+    Each case drives one request (8-token chunks, 4-token blocks) through the
+    scheduler as vLLM does: lookup, allocation, the parked load when
+    ``maru_async_load`` is on, and prefill steps, with a preemption and a
+    resume where the case needs one. The V1 model runner sends a resumed
+    request as a cached one ("resumed"), the V2 runner as a new one ("new").
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _scheduler(self, async_load=False):
+        sched = make_scheduler(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_async_load": async_load},
+        )
+        sched._handler = MagicMock()
+        return sched
+
+    def _admit(self, sched, tokens, cached_chunks, local=0):
+        """Look the request up and allocate it; return its computed tokens.
+
+        Maru holds the prompt's first ``cached_chunks`` chunks and vLLM's own
+        prefix cache its first ``local`` tokens. A parked load completes.
+        """
+        sched._known_keys.clear()
+        sched._handler.batch_exists.side_effect = lambda keys: [
+            i < cached_chunks for i in range(len(keys))
+        ]
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(tokens)),
+            all_token_ids=list(range(tokens)),
+        )
+        matched, parked = sched.get_num_new_matched_tokens(request, local)
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (self._blocks(tokens),)
+        sched.update_state_after_alloc(request, blocks, matched)
+        if parked and matched:
+            sched.build_connector_meta(fake_scheduler_output([], None, {}))
+            sched.update_state_after_alloc(request, blocks, 0)
+        return local + matched
+
+    def _blocks(self, tokens):
+        return list(range(-(-tokens // self.BLOCK)))
+
+    def _step(self, sched, tokens, computed, scheduled, how):
+        """Schedule one step; return its store entries.
+
+        ``how``: "new" (a new request, or a resume the V2 runner sends),
+        "resumed" (a resume the V1 runner sends) or "cached" (a later step).
+        """
+        prompt = list(range(tokens))
+        if how == "new":
+            new = fake_new_request_data(
+                prompt, self._blocks(tokens), num_computed_tokens=computed
+            )
+            output = fake_scheduler_output([new], None, {"r1": scheduled})
+        else:
+            resumed = how == "resumed"
+            cached = fake_cached_reqs(
+                ["r1"],
+                [(self._blocks(tokens),) if resumed else None],
+                [computed],
+                ["r1"] if resumed else [],
+            )
+            output = fake_scheduler_output([], cached, {"r1": scheduled})
+        meta = sched.build_connector_meta(output)
+        return [r for r in meta.requests if r.is_store]
+
+    def _preempt(self, sched):
+        output = fake_scheduler_output([], None, {})
+        output.preempted_req_ids = {"r1"}
+        sched.build_connector_meta(output)
+
+    def test_a_parked_full_hit_stores_nothing(self):
+        sched = self._scheduler(async_load=True)
+        computed = self._admit(sched, 40, cached_chunks=5)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, "new") == []
+
+    def test_a_hit_vllm_prefix_cache_covers_stores_nothing(self):
+        """Nothing loads, but the chunk the held-back block is in is in Maru."""
+        sched = self._scheduler()
+        computed = self._admit(sched, 40, cached_chunks=5, local=36)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, "new") == []
+
+    @pytest.mark.parametrize("how", ["resumed", "new"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    def test_a_full_hit_after_a_preemption_stores_nothing(self, async_load, how):
+        """The start kept from before the preemption stays past the hit."""
+        sched = self._scheduler(async_load)
+        self._step(sched, 40, self._admit(sched, 40, 0), 8, "new")
+        self._preempt(sched)
+        computed = self._admit(sched, 40, cached_chunks=5)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, how) == []
+
+    @pytest.mark.parametrize("how", ["resumed", "new"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    def test_a_partial_hit_after_a_preemption_stores_from_its_end(
+        self, async_load, how
+    ):
+        """Write-behind starts here: it must not copy the loaded chunks again."""
+        sched = self._scheduler(async_load)
+        self._step(sched, 40, self._admit(sched, 40, 0), 8, "new")
+        self._preempt(sched)
+        computed = self._admit(sched, 40, cached_chunks=2)
+        assert computed == 16
+        (store,) = self._step(sched, 40, computed, 24, how)
+        assert store.store_start_token == 16
+
+    def test_a_failed_parked_load_stores_what_it_computes(self):
+        """vLLM recomputes the request, and the chunks it lost may be gone."""
+        sched = self._scheduler(async_load=True)
+        assert self._admit(sched, 40, cached_chunks=3) == 24
+        # The load failed: the request computes from its own prefix cache.
+        (store,) = self._step(sched, 40, 0, 40, "new")
+        assert store.store_start_token == 0
+
+    def test_a_request_preempted_in_its_prompt_tail_stores_on(self):
+        """It may compute chunks it once had from vLLM's prefix cache.
+
+        20 tokens: 2 full chunks and a 4-token tail. vLLM's prefix cache
+        covers chunk 0 at first; after the preemption it does not.
+        """
+        sched = self._scheduler()
+        computed = self._admit(sched, 20, cached_chunks=0, local=8)
+        assert computed == 8
+        (store,) = self._step(sched, 20, 8, 8, "new")
+        assert list(_step_chunks(store, self.CHUNK, 2)) == [1]
+        # Every full chunk is in: the tail stores nothing, but stays tracked.
+        assert self._step(sched, 20, 16, 2, "cached") == []
+        assert "r1" in sched._requests_need_store
+        self._preempt(sched)
+        assert self._admit(sched, 20, cached_chunks=0) == 0
+        (store,) = self._step(sched, 20, 0, 20, "resumed")
+        assert list(_step_chunks(store, self.CHUNK, 2)) == [0, 1]
+        assert "r1" not in sched._requests_need_store
 
 
 # =============================================================================
