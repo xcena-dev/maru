@@ -10,8 +10,10 @@ pytest.importorskip("vllm")
 
 import torch
 
+import maru
 from maru_vllm.connector import (
     _cpu_engine_config,
+    _create_maru_handler,
     _uncacheable_request,
     _validate_storage_config,
 )
@@ -205,3 +207,30 @@ def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     assert scheduler._count_matched_chunks(list(range(8))) == 1
     scheduler._handler.batch_exists = lambda _, **route: [False, False]
     assert scheduler._count_matched_chunks(list(range(8))) == 0
+
+
+@pytest.mark.parametrize(
+    "setting,pinned", [({}, True), ({"maru_pin_pools": False}, False)]
+)
+def test_the_handler_pins_its_pools_unless_told_not_to(monkeypatch, setting, pinned):
+    seen = {}
+
+    class FakeHandler:
+        def __init__(self, cfg):
+            seen["cfg"] = cfg
+
+        def connect(self):
+            return True
+
+    monkeypatch.setattr(maru, "MaruHandler", FakeHandler)
+    _create_maru_handler({**extra(), "maru_chunk_size": "1M", **setting})
+    assert seen["cfg"].pin_pools is pinned
+    assert _validate_storage_config(mixed_extra(**setting))
+
+
+@pytest.mark.parametrize("backend", ["cxl", "remote_cxl"])
+def test_pin_pools_applies_only_to_the_cpu_and_mixed_pools(backend):
+    with pytest.raises(ValueError, match="maru_pin_pools"):
+        _validate_storage_config(
+            {"maru_storage_backend": backend, "maru_pin_pools": False}
+        )
