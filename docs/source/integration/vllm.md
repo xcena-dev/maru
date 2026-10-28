@@ -634,7 +634,10 @@ describes. For example, Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_g3` and
 `kv_<hash>_s0of2_g0` on rank 0. No two ranks hold the same part of a state,
 so every rank stores its own, including a rank that only loads the
 replicated heads of an attention group. A chunk counts as cached only when
-every slice of every group it needs is stored.
+every slice of every group it needs is stored. A model with several
+attention groups, such as gpt-oss, needs a tensor parallel size of at most
+its KV heads: above that, vLLM replicates each group's heads by that group's
+own count, which the connector cannot tell from the model's.
 
 The ranks do not talk to each other. vLLM sends every worker the same
 metadata, treats a load or store as finished only once every worker reports

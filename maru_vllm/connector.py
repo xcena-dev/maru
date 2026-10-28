@@ -821,6 +821,33 @@ def _group_shard_suffixes(
     }
 
 
+def _validate_group_heads(
+    groups: list[KVGroup], tp_size: int, total_kv_heads: int
+) -> None:
+    """Refuse replicated KV heads in a model with several attention groups.
+
+    With more TP ranks than KV heads, vLLM replicates each attention group's
+    heads by that group's own count, which the model-wide count need not be.
+    A rank holding distinct heads of a group that has more of them would be
+    taken for a replica: it would skip its store and load another rank's
+    heads. A single attention group's heads are the model's. Below this
+    point, a group with another count is refused when its cache registers
+    (``MaruWorkerConnector._check_slice_heads``).
+
+    Raises:
+        ValueError: If the model has several attention groups and more TP
+            ranks than KV heads.
+    """
+    attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
+    if len(attention) > 1 and tp_size > total_kv_heads:
+        raise ValueError(
+            "MaruKVConnector cannot name the KV heads of several attention "
+            f"groups at tensor parallel size {tp_size}, above the model's "
+            f"{total_kv_heads} KV heads; use a tensor parallel size of at most "
+            f"{total_kv_heads}"
+        )
+
+
 def _rank_scoped_extra(
     extra_config: dict[str, Any], tp_rank: int, tp_size: int
 ) -> dict[str, Any]:
@@ -1429,6 +1456,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 speculative=vllm_config.speculative_config is not None,
                 inline_loads=not _get_knob(extra, "maru_async_load"),
             )
+            _validate_group_heads(self._kv_groups, tp_size, total_kv_heads)
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
             )

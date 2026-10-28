@@ -2525,3 +2525,83 @@ def test_tp1_several_groups_keep_bare_keys(monkeypatch):
     assert sched._scheduler._group_suffixes == {0: ("",), 1: ("",)}
     worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
     assert worker._worker._group_shards == {}
+
+
+class _FillOps:
+    """maru_kv_ops stand-in whose D2H gather fills the slab with ``fill``."""
+
+    class TransferDirection:
+        D2H = "D2H"
+        H2D = "H2D"
+
+    def __init__(self, fill):
+        self.fill = fill
+
+    def multi_layer_kv_transfer(self, slab, *args, **kwargs):
+        slab.fill_(self.fill)
+
+
+def _attention_slab(store, key):
+    return torch.frombuffer(bytearray(store[key]), dtype=torch.bfloat16)
+
+
+def test_tp_kernel_gather_stores_each_ranks_heads():
+    """The kernel store, as on GPU, names each rank's attention slab by its
+    own heads."""
+    store = {}
+    tokens = list(range(40))
+    for rank in range(2):
+        worker = _tp_worker(
+            tiny_kv_caches("0.23", _rank_shared(rank)), _tp_shards(rank, 2, 4), store
+        )
+        worker._group_kernels[3] = (_FillOps(rank + 1), None, None, TINY_BLOCK, 8, "")
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+
+    for k in _chunk_keys(tokens, TINY_BLOCK):
+        for rank, heads in enumerate(("_h0-2", "_h2-4")):
+            slab = _attention_slab(store, group_object_key(k + heads, 3))
+            assert torch.all(slab == rank + 1)
+
+
+def test_tp_write_behind_stores_each_ranks_heads():
+    """Write-behind attention stores name each rank's heads as well."""
+    if not torch.cuda.is_available():
+        pytest.skip("write-behind needs CUDA streams")
+    store = {}
+    tokens = list(range(40))
+    for rank in range(2):
+        worker = _tp_worker(
+            tiny_kv_caches("0.23", _rank_shared(rank).cuda()),
+            _tp_shards(rank, 2, 4),
+            store,
+            extra_config={"maru_async_store": True},
+        )
+        worker._group_kernels[3] = (_FillOps(rank + 1), None, None, TINY_BLOCK, 8, "")
+        worker._store_executor = _HeldExecutor()
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        worker._store_executor.run()
+
+    for k in _chunk_keys(tokens, TINY_BLOCK):
+        for rank, heads in enumerate(("_h0-2", "_h2-4")):
+            slab = _attention_slab(store, group_object_key(k + heads, 3))
+            assert torch.all(slab == rank + 1)
+
+
+def test_tp_refuses_replicated_heads_with_several_attention_groups():
+    """With more ranks than KV heads, vLLM replicates each attention group's
+    heads by that group's own count, which the model-wide count may not be:
+    a rank holding distinct heads would skip its store and load another
+    rank's. Refused rather than guessed."""
+    with pytest.raises(ValueError, match="several attention groups"):
+        MaruKVConnector(
+            _tp_connector_config(16, 16, 8),
+            KVConnectorRole.SCHEDULER,
+            gpt_oss_config(),
+        )
+    # One attention group: its heads are the model's, replicated as named.
+    qwen = MaruKVConnector(
+        _tp_connector_config(QWEN35_BLOCK, 4, 2),
+        KVConnectorRole.SCHEDULER,
+        qwen35_config(),
+    )
+    assert qwen._scheduler._group_suffixes[3] == ("_h0-1", "_h1-2")
