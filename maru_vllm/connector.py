@@ -19,6 +19,7 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -1483,13 +1484,17 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     None,
                     kv_shard.num_heads,
                 ):
-                    # The keys name KV heads as vLLM's QKVParallelLinear splits
-                    # them; layout detection then holds every cache to vLLM's
-                    # count. A rank given another count was split otherwise.
+                    # tp_kv_shard follows the head split vLLM makes, whose
+                    # per-rank count get_num_kv_heads reports. The two agree
+                    # today; should a later vLLM split heads another way, this
+                    # stops the engine instead of letting the keys name heads
+                    # the rank does not hold. Layout detection then checks
+                    # every registered cache against num_kv_heads.
                     raise ValueError(
-                        f"Maru: vLLM gives TP rank {tp_rank} {num_kv_heads} KV "
-                        f"heads, but its key suffix {kv_shard.suffix!r} names "
-                        f"{kv_shard.num_heads} of {kv_shard.total_heads}"
+                        f"Maru: vLLM puts {num_kv_heads} KV heads on TP rank "
+                        f"{tp_rank}, but its key suffix {kv_shard.suffix!r} "
+                        f"names {kv_shard.num_heads} of the model's "
+                        f"{kv_shard.total_heads}"
                     )
                 state_shard = tp_part_shard(tp_rank, tp_size)
                 extra = _rank_scoped_extra(extra, tp_rank, tp_size)
@@ -1993,6 +1998,9 @@ class MaruSchedulerConnector:
         if not chunk_keys:
             return 0
 
+        # hit_chunks can ask about a (chunk, group) more than once, and the
+        # RPC below asks about every one: build each key list once.
+        @functools.cache
         def object_keys(i: int, g: KVGroup) -> list[str]:
             suffixes = (
                 self._state_suffixes if g.kind == GROUP_MAMBA else self._shard_suffixes
@@ -6174,10 +6182,7 @@ class MaruWorkerConnector:
             return None
         sample = next(iter(self._kv_caches.values()))
         return _SlabTarget(
-            self._num_layers,
-            per_layer_bytes,
-            sample.dtype,
-            sample.device,
+            self._num_layers, per_layer_bytes, sample.dtype, sample.device
         )
 
     def _store_packed_slabs(

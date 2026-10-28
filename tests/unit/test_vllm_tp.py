@@ -246,12 +246,12 @@ def test_chunk_keys_follow_the_callers_slice():
 
 
 def test_worker_refuses_a_head_count_its_key_does_not_name(monkeypatch):
-    """The keys name KV heads as vLLM's QKVParallelLinear splits them. A rank
-    that vLLM gives another count was split some other way."""
+    """The keys follow vLLM's head split. A vLLM that put another count on a
+    rank would have split the heads some other way, so the worker refuses."""
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 0)
     config = fake_vllm_config(2, 8)  # names 4 heads per rank
     config.model_config.get_num_kv_heads = lambda pc: 2
-    with pytest.raises(ValueError, match="gives TP rank 0 2 KV heads"):
+    with pytest.raises(ValueError, match="puts 2 KV heads on TP rank 0"):
         MaruKVConnector(config, KVConnectorRole.WORKER)
 
 
