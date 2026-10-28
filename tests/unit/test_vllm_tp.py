@@ -25,7 +25,6 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import maru_vllm.connector as connector_module
-from maru_handler.memory.types import MemoryInfo
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     MaruKVConnector,
@@ -38,8 +37,11 @@ from maru_vllm.connector import (
 )
 from maru_vllm.kv_shard import tp_kv_shard
 from tests.unit.vllm_connector_helpers import (
+    FirstWinsServer,
     make_flash_attn_metadata,
-    resolved_cache_config,
+    make_scheduler,
+    make_worker,
+    tp_model_config,
 )
 
 BLOCK = 4
@@ -49,52 +51,10 @@ NUM_BLOCKS = 4
 PROMPT = 16  # two chunks, filling every slot of the four blocks
 HEAD_SIZE = 2
 LAYER_NAMES = [f"model.layers.{i}.self_attn" for i in range(NUM_LAYERS)]
-# The layout an engine reports: none before vLLM 0.29, then a KVCacheLayout
-# name, under which every layer's paged KV is the logical page.
+# The layout name an engine reports. None stands in for vLLM < 0.29, whose
+# "NHD"/"HND" leaves each backend its own shape; under a vLLM 0.29+
+# KVCacheLayout name every layer's paged KV is the logical page.
 KV_CACHE_LAYOUTS = [None, "LBNHC"]
-
-
-class FirstWinsServer:
-    """In-memory MaruServer: the first registrant of a key wins."""
-
-    def __init__(self) -> None:
-        self.objects: dict[str, bytes] = {}
-
-    def _register(self, key: str, handle) -> None:
-        self.objects.setdefault(key, bytes(handle.buf))
-
-    def handler(self) -> MagicMock:
-        """A MaruHandler stand-in for one worker process."""
-        handler = MagicMock()
-        handler.alloc.side_effect = lambda nbytes: SimpleNamespace(
-            buf=memoryview(bytearray(max(nbytes, 1)))
-        )
-
-        def batch_store(keys, handles):
-            for key, handle in zip(keys, handles, strict=True):
-                self._register(key, handle)
-            # A losing register still reports the key as stored.
-            return [True] * len(keys)
-
-        def batch_retrieve(keys):
-            return [
-                MemoryInfo(
-                    view=memoryview(bytearray(self.objects[key])),
-                    region_id=index,
-                    page_index=0,
-                )
-                if key in self.objects
-                else None
-                for index, key in enumerate(keys)
-            ]
-
-        handler.batch_store.side_effect = batch_store
-        handler.store.side_effect = self._register
-        handler.batch_retrieve.side_effect = batch_retrieve
-        handler.batch_exists.side_effect = lambda keys: [
-            key in self.objects for key in keys
-        ]
-        return handler
 
 
 def rank_kv(
@@ -102,11 +62,10 @@ def rank_kv(
 ) -> list[torch.Tensor]:
     """Paged KV per layer, in the shape vLLM hands over under ``kv_cache_layout``.
 
-    Without a layout name, as before vLLM 0.29: the flash backends'
+    Without a layout name, vLLM < 0.29's flash backends:
     ``(blocks, 2, block, heads, head)``. Under a vLLM 0.29+ layout name: the
     logical page ``(blocks, heads, block, K|V)``. Values depend on ``seed``
     and the layer, so a slice loaded into the wrong rank or layer is caught.
-    Replicas of one slice share a seed.
     """
     if kv_cache_layout is None:
         shape = (NUM_BLOCKS, 2, BLOCK, heads, HEAD_SIZE)
@@ -127,12 +86,12 @@ def rank_kv(
 def rank_worker(
     server: FirstWinsServer, shard, kv_cache_layout: str | None = None, **extra
 ) -> MaruWorkerConnector:
-    worker = MaruWorkerConnector(
-        block_size=BLOCK,
-        kv_chunk_tokens=CHUNK,
-        extra_config=extra,
+    worker = make_worker(
+        BLOCK,
+        CHUNK,
+        extra,
         head_size=HEAD_SIZE,
-        cache_config=resolved_cache_config(kv_cache_layout),
+        kv_cache_layout=kv_cache_layout,
         kv_shard=shard,
     )
     worker._num_layers = NUM_LAYERS
@@ -302,12 +261,7 @@ def test_worker_refuses_a_head_count_its_key_does_not_name(monkeypatch):
 
 
 def tp_scheduler(stored: set[str], suffixes, **extra) -> MaruSchedulerConnector:
-    scheduler = MaruSchedulerConnector(
-        block_size=BLOCK,
-        kv_chunk_tokens=CHUNK,
-        extra_config=extra,
-        shard_suffixes=suffixes,
-    )
+    scheduler = make_scheduler(BLOCK, CHUNK, extra, shard_suffixes=suffixes)
     scheduler._handler = MagicMock()
     scheduler._handler.batch_exists.side_effect = lambda keys: [
         key in stored for key in keys
@@ -367,13 +321,6 @@ def fake_vllm_config(
     tp_size: int, total_heads: int, *, use_mla: bool = False, **parallel
 ) -> SimpleNamespace:
     """The parts of VllmConfig the connector reads, without device probing."""
-    model_config = SimpleNamespace(
-        use_mla=use_mla,
-        max_model_len=4096,
-        get_total_num_kv_heads=lambda: total_heads,
-        get_num_kv_heads=lambda pc: max(1, total_heads // pc.tensor_parallel_size),
-        get_head_size=lambda: HEAD_SIZE,
-    )
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             kv_connector_extra_config={"maru_instance_id": "inst1"},
@@ -381,7 +328,7 @@ def fake_vllm_config(
         ),
         cache_config=SimpleNamespace(block_size=BLOCK, num_gpu_blocks=None),
         parallel_config=SimpleNamespace(tensor_parallel_size=tp_size, **parallel),
-        model_config=model_config,
+        model_config=tp_model_config(total_heads, use_mla=use_mla, head_size=HEAD_SIZE),
         speculative_config=None,
         num_lookahead_tokens=0,
     )

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV cache groups: description, support checks, hits, per-group block ids,
-worker registration, stores and loads.
+worker registration, stores and loads, and tensor parallelism.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
@@ -56,6 +56,7 @@ from maru_vllm.kv_groups import (
 from maru_vllm.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_state_shard
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
+    FirstWinsServer,
     attach_capturing_handler,
     fake_cached_reqs,
     fake_scheduler_output,
@@ -63,6 +64,7 @@ from tests.unit.vllm_connector_helpers import (
     make_scheduler,
     make_vllm_scheduler,
     make_worker,
+    tp_model_config,
 )
 
 QWEN35_BLOCK = 544
@@ -587,9 +589,12 @@ def _stored_by(tokens, chunk, attention_groups, state_groups, state_chunks):
     return stored
 
 
-def _qwen35_scheduler(stored):
+def _qwen35_scheduler(stored, **kwargs):
     sched = make_scheduler(
-        QWEN35_BLOCK, QWEN35_BLOCK, kv_groups=describe_kv_groups(qwen35_config())
+        QWEN35_BLOCK,
+        QWEN35_BLOCK,
+        kv_groups=describe_kv_groups(qwen35_config()),
+        **kwargs,
     )
     sched._handler = _Store(stored)
     return sched
@@ -2240,33 +2245,13 @@ def _tp_shards(rank, tp_size, total_heads):
     }
 
 
-def _tp_worker(kv_caches, shards, store, config=None, chunk=TINY_BLOCK, **kwargs):
-    """A registered rank whose handler keeps a key's first registrant, as
-    MaruServer does, in ``store`` shared by every rank."""
-    kwargs.setdefault("num_kv_heads", 2)
-    kwargs.setdefault("head_size", 8)
-    worker = make_worker(
-        TINY_BLOCK,
-        chunk,
-        kv_cache_layout=_engine_layout(kv_caches),
-        kv_groups=describe_kv_groups(config or tiny_config()),
-        **shards,
-        **kwargs,
+def _tp_worker(kv_caches, shards, server, config=None, chunk=TINY_BLOCK, **kwargs):
+    """A registered rank on ``server``, which every rank shares."""
+    worker = _worker(
+        config, chunk, kv_cache_layout=_engine_layout(kv_caches), **shards, **kwargs
     )
-    worker._ensure_handler = MagicMock()
     worker.register_kv_caches(kv_caches)
-
-    def _batch_store(keys, handles):
-        for key, handle in zip(keys, handles, strict=True):
-            store.setdefault(key, bytes(handle.buf))
-        return [True] * len(keys)
-
-    worker._handler = MagicMock()
-    worker._handler.alloc.side_effect = lambda n: SimpleNamespace(
-        buf=memoryview(bytearray(n))
-    )
-    worker._handler.batch_store.side_effect = _batch_store
-    _serve(worker, store)
+    worker._handler = server.handler()
     return worker
 
 
@@ -2279,26 +2264,26 @@ def test_tp_ranks_store_and_load_their_own_slices(version):
     """TP=2 over 4 KV heads on one first-register-wins server: each rank
     stores its own heads and its own part of every Mamba state, and loads
     them back rather than the other rank's."""
-    store = {}
+    server = FirstWinsServer()
     tokens = list(range(40))
     sources, stored = [], []
     for rank in range(2):
         sources.append(_rank_shared(rank))
         worker = _tp_worker(
-            tiny_kv_caches(version, sources[rank]), _tp_shards(rank, 2, 4), store
+            tiny_kv_caches(version, sources[rank]), _tp_shards(rank, 2, 4), server
         )
         worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
         stored.append(worker)
 
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
-    assert set(store) == {
+    assert set(server.objects) == {
         *(group_object_key(k + h, 3) for k in (k0, k1) for h in ("_h0-2", "_h2-4")),
         *(group_object_key(k1 + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)),
     }
     for rank in range(2):
         target = torch.zeros_like(_shared())
         worker = _tp_worker(
-            tiny_kv_caches(version, target), _tp_shards(rank, 2, 4), store
+            tiny_kv_caches(version, target), _tp_shards(rank, 2, 4), server
         )
         worker.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
         assert worker.take_failed_load_blocks() == set()
@@ -2333,7 +2318,7 @@ def test_tp_replica_skips_attention_but_stores_its_state():
     """TP=4 over 2 KV heads: ranks 0 and 1 hold head 0, but each holds its
     own part of every Mamba state. Rank 1 stores only its state and loads
     rank 0's attention."""
-    store = {}
+    server = FirstWinsServer()
     tokens = list(range(40))
     source0 = _rank_shared(0)
     # Same attention bytes (blocks 4, 5), different states (blocks 1-3).
@@ -2346,7 +2331,7 @@ def test_tp_replica_skips_attention_but_stores_its_state():
         worker = _tp_worker(
             _one_head_caches(source),
             _tp_shards(rank, 4, 2),
-            store,
+            server,
             num_kv_heads=1,
             head_size=16,
         )
@@ -2363,7 +2348,7 @@ def test_tp_replica_skips_attention_but_stores_its_state():
     worker = _tp_worker(
         _one_head_caches(target),
         _tp_shards(1, 4, 2),
-        store,
+        server,
         num_kv_heads=1,
         head_size=16,
     )
@@ -2391,7 +2376,7 @@ def _swa_caches(shared):
 
 def test_tp_sliding_window_ranks_load_their_own_heads():
     """A small gpt-oss at TP=2: both groups carry each rank's own heads."""
-    store = {}
+    server = FirstWinsServer()
     tokens = list(range(80))
     config = tiny_swa_config()
     stored = []
@@ -2399,7 +2384,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
         worker = _tp_worker(
             _swa_caches(_rank_shared(rank)),
             _tp_shards(rank, 2, 4),
-            store,
+            server,
             config,
             chunk=64,
         )
@@ -2407,14 +2392,14 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
         stored.append(worker)
 
     (k0,) = _chunk_keys(tokens, 64)
-    assert set(store) == {
+    assert set(server.objects) == {
         group_object_key(k0 + h, g) for h in ("_h0-2", "_h2-4") for g in (0, 1)
     }
     for rank in range(2):
         worker = _tp_worker(
             _swa_caches(torch.zeros_like(_shared())),
             _tp_shards(rank, 2, 4),
-            store,
+            server,
             config,
             chunk=64,
         )
@@ -2432,49 +2417,44 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
                     )
 
 
-def _qwen35_tp_scheduler(stored):
-    """The Qwen3.5 scheduler at TP=2: two parts of each Mamba state, and the
-    two KV heads of its attention group on one rank each."""
-    parts = ("_s0of2", "_s1of2")
-    sched = make_scheduler(
-        QWEN35_BLOCK,
-        QWEN35_BLOCK,
-        kv_groups=describe_kv_groups(qwen35_config()),
-        shard_suffixes=("_h0-1", "_h1-2"),
-        state_suffixes=parts,
-    )
-    sched._handler = _Store(stored)
-    return sched
+# Qwen3.5 at TP=2: the two KV heads of its attention group (group 3) on one
+# rank each, and two parts of each Mamba state (groups 0-2).
+QWEN35_TP2 = {
+    "shard_suffixes": ("_h0-1", "_h1-2"),
+    "state_suffixes": ("_s0of2", "_s1of2"),
+}
+
+
+def _qwen35_tp2_objects(keys):
+    """What both ranks store of a 1,200-token prompt whose first step ended
+    at chunk 1: attention for every chunk, states for chunk 1."""
+    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
+    states = {
+        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
+    }
+    return attention | states
 
 
 def test_tp_hit_needs_every_slice_of_every_group():
     a = list(range(1200))  # step 1 ends at token 1,088
     keys = _chunk_keys(a, QWEN35_BLOCK)
-    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
-    states = {
-        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
-    }
-    sched = _qwen35_tp_scheduler(attention | states)
+    stored = _qwen35_tp2_objects(keys)
+    sched = _qwen35_scheduler(stored, **QWEN35_TP2)
     assert _hit(sched, a) == 1088
     # One lookup asked about every slice of every group.
-    assert attention | states <= set(sched._handler.queries[0])
+    assert stored <= set(sched._handler.queries[0])
 
-    # A rank that stored no state part can resume nowhere.
+    # One rank's part of one Mamba state is missing: no chunk can resume.
     missing_state = group_object_key(keys[1] + "_s1of2", 0)
-    assert _hit(_qwen35_tp_scheduler((attention | states) - {missing_state}), a) == 0
+    assert _hit(_qwen35_scheduler(stored - {missing_state}, **QWEN35_TP2), a) == 0
     missing_heads = group_object_key(keys[0] + "_h1-2", 3)
-    assert _hit(_qwen35_tp_scheduler((attention | states) - {missing_heads}), a) == 0
+    assert _hit(_qwen35_scheduler(stored - {missing_heads}, **QWEN35_TP2), a) == 0
 
 
 def _tp_connector_config(block_size, tp_size, total_heads):
     config = _connector_config(block_size)
     config.parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
-    config.model_config.use_mla = False
-    config.model_config.get_total_num_kv_heads = lambda: total_heads
-    config.model_config.get_num_kv_heads = lambda pc: max(
-        1, total_heads // pc.tensor_parallel_size
-    )
-    config.model_config.get_head_size = lambda: 64
+    config.model_config = tp_model_config(total_heads)
     return config
 
 
@@ -2525,40 +2505,21 @@ class _FillOps:
         slab.fill_(self.fill)
 
 
-def _attention_slab(store, key):
-    return torch.frombuffer(bytearray(store[key]), dtype=torch.bfloat16)
-
-
-def test_tp_kernel_gather_stores_each_ranks_heads():
-    """The kernel store, as on GPU, names each rank's attention slab by its
-    own heads."""
-    store = {}
-    tokens = list(range(40))
-    for rank in range(2):
-        worker = _tp_worker(
-            tiny_kv_caches("0.23", _rank_shared(rank)), _tp_shards(rank, 2, 4), store
-        )
-        worker._group_kernels[3] = (_FillOps(rank + 1), None, None, TINY_BLOCK, 8, "")
-        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
-
-    for k in _chunk_keys(tokens, TINY_BLOCK):
-        for rank, heads in enumerate(("_h0-2", "_h2-4")):
-            slab = _attention_slab(store, group_object_key(k + heads, 3))
-            assert torch.all(slab == rank + 1)
-
-
-def test_tp_write_behind_stores_each_ranks_heads():
-    """Write-behind attention stores name each rank's heads as well."""
-    if not torch.cuda.is_available():
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_tp_kernel_stores_each_ranks_heads(write_behind):
+    """The kernel stores of a GPU run, gathered now or written behind, name
+    each rank's attention slab by its own heads."""
+    if write_behind and not torch.cuda.is_available():
         pytest.skip("write-behind needs CUDA streams")
-    store = {}
+    server = FirstWinsServer()
     tokens = list(range(40))
     for rank in range(2):
+        shared = _rank_shared(rank)
         worker = _tp_worker(
-            tiny_kv_caches("0.23", _rank_shared(rank).cuda()),
+            tiny_kv_caches("0.23", shared.cuda() if write_behind else shared),
             _tp_shards(rank, 2, 4),
-            store,
-            extra_config={"maru_async_store": True},
+            server,
+            extra_config={"maru_async_store": True} if write_behind else None,
         )
         worker._group_kernels[3] = (_FillOps(rank + 1), None, None, TINY_BLOCK, 8, "")
         worker._store_executor = _HeldExecutor()
@@ -2567,7 +2528,8 @@ def test_tp_write_behind_stores_each_ranks_heads():
 
     for k in _chunk_keys(tokens, TINY_BLOCK):
         for rank, heads in enumerate(("_h0-2", "_h2-4")):
-            slab = _attention_slab(store, group_object_key(k + heads, 3))
+            raw = server.objects[group_object_key(k + heads, 3)]
+            slab = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
             assert torch.all(slab == rank + 1)
 
 
@@ -2623,11 +2585,7 @@ def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
 def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
     a = list(range(1200))
     keys = _chunk_keys(a, QWEN35_BLOCK)
-    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
-    states = {
-        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
-    }
-    stored = (attention | states) - {group_object_key(keys[1] + "_s1of2", 0)}
+    stored = _qwen35_tp2_objects(keys) - {group_object_key(keys[1] + "_s1of2", 0)}
     with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
-        assert _hit(_qwen35_tp_scheduler(stored), a) == 0
+        assert _hit(_qwen35_scheduler(stored, **QWEN35_TP2), a) == 0
     assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)

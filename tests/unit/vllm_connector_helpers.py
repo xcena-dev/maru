@@ -355,6 +355,69 @@ def attach_capturing_handler(
     return store
 
 
+class FirstWinsServer:
+    """In-memory MaruServer: the first registrant of a key wins, and a losing
+    register still reports success, as MaruServer and batch_store do. TP
+    ranks that wrote under one key would load each other's KV here."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def _register(self, key: str, handle) -> None:
+        self.objects.setdefault(key, bytes(handle.buf))
+
+    def handler(self) -> MagicMock:
+        """A MaruHandler stand-in for one worker process."""
+        from maru_handler.memory.types import MemoryInfo
+
+        handler = MagicMock()
+        handler.alloc.side_effect = lambda nbytes: SimpleNamespace(
+            buf=memoryview(bytearray(max(nbytes, 1)))
+        )
+
+        def batch_store(keys, handles):
+            for key, handle in zip(keys, handles, strict=True):
+                self._register(key, handle)
+            # A losing register still reports the key as stored.
+            return [True] * len(keys)
+
+        def batch_retrieve(keys):
+            return [
+                MemoryInfo(
+                    view=memoryview(bytearray(self.objects[key])),
+                    region_id=index,
+                    page_index=0,
+                )
+                if key in self.objects
+                else None
+                for index, key in enumerate(keys)
+            ]
+
+        handler.batch_store.side_effect = batch_store
+        handler.store.side_effect = self._register
+        handler.batch_retrieve.side_effect = batch_retrieve
+        handler.batch_exists.side_effect = lambda keys: [
+            key in self.objects for key in keys
+        ]
+        return handler
+
+
+def tp_model_config(
+    total_kv_heads: int, *, use_mla: bool = False, head_size: int = 64
+) -> SimpleNamespace:
+    """The parts of vLLM's ModelConfig the connector reads under TP.
+
+    ``get_num_kv_heads`` follows vLLM: ``max(1, heads // TP)`` per rank.
+    """
+    return SimpleNamespace(
+        use_mla=use_mla,
+        max_model_len=4096,
+        get_total_num_kv_heads=lambda: total_kv_heads,
+        get_num_kv_heads=lambda pc: max(1, total_kv_heads // pc.tensor_parallel_size),
+        get_head_size=lambda: head_size,
+    )
+
+
 # =============================================================================
 # Request metadata builders
 # =============================================================================
