@@ -641,13 +641,16 @@ own count, which the connector cannot tell from the model's.
 
 The ranks do not talk to each other. vLLM sends every worker the same
 metadata, treats a load or store as finished only once every worker reports
-it, and recomputes from the first block that any worker reports as failed.
+it, and recomputes from the first block that any worker reports as failed;
+with several KV cache groups, it recomputes the whole request.
 
 Each worker process connects its own MaruHandler:
 
-- `maru_pool_size` applies to each TP rank. A rank stores 1/TP of every
-  chunk, so ranks with `P / TP` each hold as many tokens as a single TP=1
-  worker with `P`.
+- `maru_pool_size` applies to each TP rank. Without replicated KV heads a
+  rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as many
+  tokens as a single TP=1 worker with `P`. A rank that only loads
+  replicated heads stores none of them, only its own part of each Mamba
+  state.
 - A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
   sees each rank as its own owner. Leaving it unset already gives every
   process its own UUID.
