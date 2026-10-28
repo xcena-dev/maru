@@ -286,16 +286,14 @@ def test_chunk_keys_follow_the_callers_slice():
     assert _req_chunk_keys(meta, CHUNK, "") == base
 
 
-@pytest.mark.parametrize("kv_cache_layout", KV_CACHE_LAYOUTS)
-def test_register_refuses_a_cache_whose_head_count_the_key_does_not_name(
-    kv_cache_layout,
-):
-    caches = dict(zip(LAYER_NAMES, rank_kv(1, 2, kv_cache_layout), strict=True))
-    names_four = rank_worker(FirstWinsServer(), tp_kv_shard(0, 2, 8), kv_cache_layout)
-    with pytest.raises(ValueError, match="holds 2 KV heads"):
-        names_four.register_kv_caches(caches)
-    names_two = rank_worker(FirstWinsServer(), tp_kv_shard(0, 2, 4), kv_cache_layout)
-    names_two.register_kv_caches(caches)
+def test_worker_refuses_a_head_count_its_key_does_not_name(monkeypatch):
+    """The keys name KV heads as vLLM's QKVParallelLinear splits them. A rank
+    that vLLM gives another count was split some other way."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 0)
+    config = fake_vllm_config(2, 8)  # names 4 heads per rank
+    config.model_config.get_num_kv_heads = lambda pc: 2
+    with pytest.raises(ValueError, match="gives TP rank 0 2 KV heads"):
+        MaruKVConnector(config, KVConnectorRole.WORKER)
 
 
 # =============================================================================

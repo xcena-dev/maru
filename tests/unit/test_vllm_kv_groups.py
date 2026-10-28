@@ -2432,13 +2432,6 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
                     )
 
 
-def test_tp_group_cache_head_count_is_checked():
-    """The attention slice names 1 head of 4, but the rank's cache holds 2."""
-    shards = _tp_shards(0, 4, 4)
-    with pytest.raises(ValueError, match="holds 2 KV heads"):
-        _tp_worker(tiny_kv_caches("0.30", _shared()), shards, {})
-
-
 def _qwen35_tp_scheduler(stored):
     """The Qwen3.5 scheduler at TP=2: two parts of each Mamba state, and the
     two KV heads of its attention group on one rank each."""

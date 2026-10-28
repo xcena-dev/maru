@@ -789,33 +789,6 @@ def _tp_rank() -> int:
     return get_tensor_model_parallel_rank()
 
 
-def _validate_group_heads(
-    groups: list[KVGroup], tp_size: int, total_kv_heads: int
-) -> None:
-    """Refuse replicated KV heads in a model with several attention groups.
-
-    With more TP ranks than KV heads, vLLM replicates each attention group's
-    heads by that group's own count, which the model-wide count need not be.
-    A rank holding distinct heads of a group that has more of them would be
-    taken for a replica: it would skip its store and load another rank's
-    heads. A single attention group's heads are the model's. Below this
-    point, a group with another count is refused when its cache registers
-    (``MaruWorkerConnector._check_slice_heads``).
-
-    Raises:
-        ValueError: If the model has several attention groups and more TP
-            ranks than KV heads.
-    """
-    attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
-    if len(attention) > 1 and tp_size > total_kv_heads:
-        raise ValueError(
-            "MaruKVConnector cannot name the KV heads of several attention "
-            f"groups at tensor parallel size {tp_size}, above the model's "
-            f"{total_kv_heads} KV heads; use a tensor parallel size of at most "
-            f"{total_kv_heads}"
-        )
-
-
 def _rank_scoped_extra(
     extra_config: dict[str, Any], tp_rank: int, tp_size: int
 ) -> dict[str, Any]:
@@ -1421,8 +1394,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative=vllm_config.speculative_config is not None,
                 inline_loads=not _get_knob(extra, "maru_async_load"),
+                tp_size=tp_size,
+                total_kv_heads=total_kv_heads,
             )
-            _validate_group_heads(self._kv_groups, tp_size, total_kv_heads)
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
             )
@@ -1480,6 +1454,18 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             if tp_size > 1:
                 tp_rank = _tp_rank()
                 kv_shard = tp_kv_shard(tp_rank, tp_size, total_kv_heads)
+                if kv_shard.splits_heads and num_kv_heads not in (
+                    None,
+                    kv_shard.num_heads,
+                ):
+                    # The keys name KV heads as vLLM's QKVParallelLinear splits
+                    # them; layout detection then holds every cache to vLLM's
+                    # count. A rank given another count was split otherwise.
+                    raise ValueError(
+                        f"Maru: vLLM gives TP rank {tp_rank} {num_kv_heads} KV "
+                        f"heads, but its key suffix {kv_shard.suffix!r} names "
+                        f"{kv_shard.num_heads} of {kv_shard.total_heads}"
+                    )
                 state_shard = tp_state_shard(tp_rank, tp_size)
                 extra = _rank_scoped_extra(extra, tp_rank, tp_size)
                 logger.info(
@@ -2940,7 +2926,6 @@ class MaruWorkerConnector:
             return
         self._num_layers = len(kv_caches)
         self._kv_layout = self._resolve_kv_layout(kv_caches)
-        self._check_slice_heads(self._kv_layout, self._kv_shard)
         if self._cpu_mode:
             layout = self._kv_layout
             if (
@@ -3011,27 +2996,6 @@ class MaruWorkerConnector:
         )
         self._connect_eagerly(kv_caches)
 
-    def _check_slice_heads(self, layout: KVLayout | None, shard: KVShard) -> None:
-        """Refuse a cache whose KV head count is not the one ``shard`` names.
-
-        The keys name KV heads [start, end) as vLLM's QKVParallelLinear
-        splits them. A cache holding another count was split some other way,
-        so the names would not describe the bytes. Only layouts with a real
-        head axis are checked: the rank-5 caches of vLLM < 0.29 and the
-        rank-4 logical page [B, H, N, C] of vLLM 0.29+.
-        """
-        if (
-            shard.splits_heads
-            and layout is not None
-            and (len(layout.shape) == 5 or _is_logical_page_layout(self._cache_layout))
-            and layout.num_heads != shard.num_heads
-        ):
-            raise ValueError(
-                f"Maru: this rank's KV cache holds {layout.num_heads} KV heads, "
-                f"but its key suffix {shard.suffix!r} names "
-                f"{shard.num_heads} of {shard.total_heads}"
-            )
-
     def _register_group_caches(
         self, kv_caches: dict[str, Any], layers: dict[str, Any] | None
     ) -> None:
@@ -3051,8 +3015,6 @@ class MaruWorkerConnector:
             num_kv_heads=self._num_kv_heads,
             head_size=self._head_size,
         )
-        for cache in self._group_caches:
-            self._check_slice_heads(cache.layout, self._slice(cache.group))
         self._page_size_bytes = max(
             g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
         )

@@ -255,14 +255,17 @@ def check_multi_group_support(
     use_layerwise: bool,
     speculative: bool,
     inline_loads: bool,
+    tp_size: int = 1,
+    total_kv_heads: int = 1,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
     A model with one group is always accepted. Several groups are supported
     in chunkwise (packed) format with full attention, sliding window and
     Mamba (``align``) groups, with parked loads, without speculative
-    decoding. The CPU, mixed and remote_cxl backends reject several groups
-    on their own, in ``MaruKVConnector``.
+    decoding, and with several attention groups only at a tensor parallel
+    size up to the model's KV heads. The CPU, mixed and remote_cxl backends
+    reject several groups on their own, in ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.
@@ -272,6 +275,9 @@ def check_multi_group_support(
         inline_loads: Whether loads run inline (``maru_async_load`` set to
             false; ``MaruKVConnector`` turns it on for several groups unless
             set).
+        tp_size: vLLM's tensor parallel size.
+        total_kv_heads: The model's KV heads (1 at TP=1, where they do not
+            matter).
 
     Raises:
         ValueError: With the reason and the setting to change.
@@ -284,6 +290,20 @@ def check_multi_group_support(
             "MaruKVConnector does not support KV cache groups of type "
             f"{', '.join(unsupported)} alongside other groups; supported are "
             f"{', '.join(_SUPPORTED_SPECS)}{one_group_hint(groups)}"
+        )
+    attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
+    if len(attention) > 1 and tp_size > total_kv_heads:
+        # Every attention group's keys name its heads by the model's KV head
+        # count (maru_vllm.kv_shard). With more ranks than that, vLLM
+        # replicates each group's heads by the group's own count, which can
+        # differ: a rank holding distinct heads of a group with more of them
+        # would be taken for a replica, skip its store and load another
+        # rank's heads.
+        raise ValueError(
+            "MaruKVConnector cannot name the KV heads of several attention "
+            f"groups at tensor parallel size {tp_size}, above the model's "
+            f"{total_kv_heads} KV heads; use a tensor parallel size of at most "
+            f"{total_kv_heads}"
         )
     if use_layerwise:
         raise ValueError(
