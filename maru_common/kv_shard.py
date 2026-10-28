@@ -24,12 +24,12 @@ rank's part of its TP group:
   Each rank holds 1/TP of every state tensor, and a rank's conv state
   gathers its share of the q, k and v channels, which no single head range
   describes.
-- The attention KV of a model with several kinds of attention layer (such
-  as sliding-window and full) at more TP ranks than KV heads. The engine
-  then replicates each kind's heads by that kind's own count, which the
-  connector cannot always tell from the model's (one model sets its
-  sliding-window layers' count in model code), so it cannot tell which
-  ranks share heads.
+- The attention KV of a model whose attention layers fall into several
+  groups (sliding-window and full layers, for example) at more TP ranks
+  than KV heads. The engine then replicates each group's heads by that
+  group's own count, which the connector cannot always tell from the
+  model's (one model sets its sliding-window layers' count in model code),
+  so it cannot tell which ranks share heads.
 
 A part still names content, since the same model at the same TP size puts
 the same bytes in it. Engines of different TP sizes never share a part, and
