@@ -682,7 +682,7 @@ vLLM puts layers that keep different kinds of KV cache into separate KV cache gr
 
 The connector checks the group types at startup and refuses an unsupported model with the types it found. A model that passes this check can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
 
-Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1. Hybrid models are supported on this connector only, not on the LMCache path.
+Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1, and at size 2 on vLLM 0.32. Hybrid models are supported on this connector only, not on the LMCache path.
 
 ### Required settings
 
