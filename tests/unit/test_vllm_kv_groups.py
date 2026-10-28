@@ -2605,3 +2605,51 @@ def test_tp_refuses_replicated_heads_with_several_attention_groups():
         qwen35_config(),
     )
     assert qwen._scheduler._group_suffixes[3] == ("_h0-1", "_h1-2")
+
+
+def _qwen35_tp4_worker(monkeypatch, rank):
+    """A Qwen3.5 worker at TP=4: its 2 KV heads sit on two ranks each."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: rank)
+    config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
+    return MaruKVConnector(config, KVConnectorRole.WORKER, qwen35_config())._worker
+
+
+def test_tp_connector_wires_replicated_heads_of_a_hybrid_model(monkeypatch):
+    config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, qwen35_config())
+    parts = ("_s0of4", "_s1of4", "_s2of4", "_s3of4")
+    assert sched._scheduler._group_suffixes == {
+        0: parts,
+        1: parts,
+        2: parts,
+        3: ("_h0-1", "_h1-2"),
+    }
+    shards = _qwen35_tp4_worker(monkeypatch, 1)._group_shards
+    # Rank 1 holds rank 0's KV head but a part of each state of its own.
+    assert shards[3].suffix == "_h0-1"
+    assert not shards[3].is_writer
+    assert all(shards[g].suffix == "_s1of4" and shards[g].is_writer for g in range(3))
+
+
+def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
+        _qwen35_tp4_worker(monkeypatch, 1)
+    messages = [r.getMessage() for r in caplog.records]
+    (line,) = [m for m in messages if "TP rank 1 of 4" in m]
+    assert "g0 '_s1of4'" in line
+    assert "g3 '_h0-1' (loads only" in line
+    # Not the one-group line, which would say rank 1 stores nothing.
+    assert not any("it only loads" in m for m in messages)
+
+
+def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
+    a = list(range(1200))
+    keys = _chunk_keys(a, QWEN35_BLOCK)
+    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
+    states = {
+        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
+    }
+    stored = (attention | states) - {group_object_key(keys[1] + "_s1of2", 0)}
+    with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
+        assert _hit(_qwen35_tp_scheduler(stored), a) == 0
+    assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)

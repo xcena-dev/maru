@@ -1529,29 +1529,39 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         )
                         for g in self._kv_groups
                     }
+                extra = _rank_scoped_extra(extra, tp_rank, tp_size)
+                if group_shards:
+                    # A rank can be a replica for an attention group and still
+                    # store its own part of every Mamba state.
                     logger.info(
-                        "Maru: TP rank %d names its KV cache groups %s",
+                        "Maru: TP rank %d of %d stores and loads each KV cache "
+                        "group under its slice: %s",
                         tp_rank,
+                        tp_size,
                         ", ".join(
                             f"g{group_id} {shard.suffix!r}"
-                            + ("" if shard.is_writer else " (loads only)")
+                            + (
+                                ""
+                                if shard.is_writer
+                                else " (loads only; a replica rank stores it)"
+                            )
                             for group_id, shard in group_shards.items()
                         ),
                     )
-                extra = _rank_scoped_extra(extra, tp_rank, tp_size)
-                logger.info(
-                    "Maru: TP rank %d of %d holds %s under key suffix %r; %s",
-                    tp_rank,
-                    tp_size,
-                    "the whole KV (replicated on every rank)"
-                    if kv_replicated
-                    else f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
-                    f"of {kv_shard.total_heads}",
-                    kv_shard.suffix,
-                    "it stores and loads"
-                    if kv_shard.is_writer
-                    else "it only loads; a replica rank stores this slice",
-                )
+                else:
+                    logger.info(
+                        "Maru: TP rank %d of %d holds %s under key suffix %r; %s",
+                        tp_rank,
+                        tp_size,
+                        "the whole KV (replicated on every rank)"
+                        if kv_replicated
+                        else f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
+                        f"of {kv_shard.total_heads}",
+                        kv_shard.suffix,
+                        "it stores and loads"
+                        if kv_shard.is_writer
+                        else "it only loads; a replica rank stores this slice",
+                    )
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
@@ -2105,10 +2115,13 @@ class MaruSchedulerConnector:
             # "stored but no hit" is the case worth explaining.
             logger.info(
                 "Maru KV lookup: req=%s can resume after %d of %d chunks; the "
-                "later chunk ends lack a Mamba state or sliding window",
+                "later chunk ends lack a Mamba state or sliding window%s",
                 req_id,
                 hit,
                 prefix,
+                ", or a TP rank's slice of one"
+                if any(len(s) > 1 for s in self._group_suffixes.values())
+                else "",
             )
         return hit
 
