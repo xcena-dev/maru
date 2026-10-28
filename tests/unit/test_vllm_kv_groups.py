@@ -53,7 +53,7 @@ from maru_vllm.kv_groups import (
     state_view,
     window_chunks,
 )
-from maru_vllm.kv_shard import tp_kv_shard, tp_state_shard
+from maru_vllm.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_state_shard
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     attach_capturing_handler,
@@ -2232,13 +2232,11 @@ def _rank_shared(rank):
     return (_shared().to(torch.int64) + 97 * rank).remainder(251).to(torch.uint8)
 
 
-def _tp_shards(rank, tp_size, total_heads, config=None):
-    """Each group's slice on ``rank``: KV heads, or a part of a Mamba state."""
+def _tp_shards(rank, tp_size, total_heads):
+    """``rank``'s KV heads and its part of each Mamba state."""
     return {
-        g.group_id: tp_state_shard(rank, tp_size)
-        if g.kind == GROUP_MAMBA
-        else tp_kv_shard(rank, tp_size, total_heads)
-        for g in describe_kv_groups(config or tiny_config())
+        "kv_shard": tp_kv_shard(rank, tp_size, total_heads),
+        "state_shard": tp_state_shard(rank, tp_size),
     }
 
 
@@ -2252,7 +2250,7 @@ def _tp_worker(kv_caches, shards, store, config=None, chunk=TINY_BLOCK, **kwargs
         chunk,
         kv_cache_layout=_engine_layout(kv_caches),
         kv_groups=describe_kv_groups(config or tiny_config()),
-        group_shards=shards,
+        **shards,
         **kwargs,
     )
     worker._ensure_handler = MagicMock()
@@ -2400,7 +2398,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
     for rank in range(2):
         worker = _tp_worker(
             _swa_caches(_rank_shared(rank)),
-            _tp_shards(rank, 2, 4, config),
+            _tp_shards(rank, 2, 4),
             store,
             config,
             chunk=64,
@@ -2415,7 +2413,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
     for rank in range(2):
         worker = _tp_worker(
             _swa_caches(torch.zeros_like(_shared())),
-            _tp_shards(rank, 2, 4, config),
+            _tp_shards(rank, 2, 4),
             store,
             config,
             chunk=64,
@@ -2449,7 +2447,8 @@ def _qwen35_tp_scheduler(stored):
         QWEN35_BLOCK,
         QWEN35_BLOCK,
         kv_groups=describe_kv_groups(qwen35_config()),
-        group_shard_suffixes={0: parts, 1: parts, 2: parts, 3: ("_h0-1", "_h1-2")},
+        shard_suffixes=("_h0-1", "_h1-2"),
+        state_suffixes=parts,
     )
     sched._handler = _Store(stored)
     return sched
@@ -2490,29 +2489,19 @@ def test_tp_connector_wires_each_group_slice(monkeypatch):
     gpt = MaruKVConnector(
         _tp_connector_config(16, 2, 8), KVConnectorRole.SCHEDULER, gpt_oss_config()
     )
-    heads = ("_h0-4", "_h4-8")
-    assert gpt._scheduler._group_suffixes == {0: heads, 1: heads}
+    assert gpt._scheduler._shard_suffixes == ("_h0-4", "_h4-8")
 
     qwen_config = _tp_connector_config(QWEN35_BLOCK, 2, 2)
     qwen = MaruKVConnector(qwen_config, KVConnectorRole.SCHEDULER, qwen35_config())
-    parts = ("_s0of2", "_s1of2")
-    assert qwen._scheduler._group_suffixes == {
-        0: parts,
-        1: parts,
-        2: parts,
-        3: ("_h0-1", "_h1-2"),
-    }
+    assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
+    assert qwen._scheduler._state_suffixes == ("_s0of2", "_s1of2")
 
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
     worker = MaruKVConnector(
         qwen_config, KVConnectorRole.WORKER, qwen35_config()
     )._worker
-    assert {g: s.suffix for g, s in worker._group_shards.items()} == {
-        0: "_s1of2",
-        1: "_s1of2",
-        2: "_s1of2",
-        3: "_h1-2",
-    }
+    assert worker._kv_shard.suffix == "_h1-2"
+    assert worker._state_shard.suffix == "_s1of2"
 
 
 def test_tp1_several_groups_keep_bare_keys(monkeypatch):
@@ -2522,9 +2511,11 @@ def test_tp1_several_groups_keep_bare_keys(monkeypatch):
     monkeypatch.setattr(connector_module, "_tp_rank", no_rank)
     config = _tp_connector_config(16, 1, 8)
     sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
-    assert sched._scheduler._group_suffixes == {0: ("",), 1: ("",)}
+    assert sched._scheduler._shard_suffixes == ("",)
+    assert sched._scheduler._state_suffixes == ("",)
     worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
-    assert worker._worker._group_shards == {}
+    assert worker._worker._kv_shard == WHOLE_MODEL
+    assert worker._worker._state_shard == WHOLE_MODEL
 
 
 class _FillOps:
@@ -2604,7 +2595,7 @@ def test_tp_refuses_replicated_heads_with_several_attention_groups():
         KVConnectorRole.SCHEDULER,
         qwen35_config(),
     )
-    assert qwen._scheduler._group_suffixes[3] == ("_h0-1", "_h1-2")
+    assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
 
 
 def _qwen35_tp4_worker(monkeypatch, rank):
@@ -2617,18 +2608,14 @@ def _qwen35_tp4_worker(monkeypatch, rank):
 def test_tp_connector_wires_replicated_heads_of_a_hybrid_model(monkeypatch):
     config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
     sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, qwen35_config())
-    parts = ("_s0of4", "_s1of4", "_s2of4", "_s3of4")
-    assert sched._scheduler._group_suffixes == {
-        0: parts,
-        1: parts,
-        2: parts,
-        3: ("_h0-1", "_h1-2"),
-    }
-    shards = _qwen35_tp4_worker(monkeypatch, 1)._group_shards
+    assert sched._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
+    assert sched._scheduler._state_suffixes == ("_s0of4", "_s1of4", "_s2of4", "_s3of4")
+    worker = _qwen35_tp4_worker(monkeypatch, 1)
     # Rank 1 holds rank 0's KV head but a part of each state of its own.
-    assert shards[3].suffix == "_h0-1"
-    assert not shards[3].is_writer
-    assert all(shards[g].suffix == "_s1of4" and shards[g].is_writer for g in range(3))
+    assert worker._kv_shard.suffix == "_h0-1"
+    assert not worker._kv_shard.is_writer
+    assert worker._state_shard.suffix == "_s1of4"
+    assert worker._state_shard.is_writer
 
 
 def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
@@ -2636,10 +2623,8 @@ def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
         _qwen35_tp4_worker(monkeypatch, 1)
     messages = [r.getMessage() for r in caplog.records]
     (line,) = [m for m in messages if "TP rank 1 of 4" in m]
-    assert "g0 '_s1of4'" in line
-    assert "g3 '_h0-1' (loads only" in line
-    # Not the one-group line, which would say rank 1 stores nothing.
-    assert not any("it only loads" in m for m in messages)
+    assert "'_h0-1' and only loads it" in line
+    assert "stores its part '_s1of4' of each Mamba-type state" in line
 
 
 def test_tp_lookup_log_names_a_missing_rank_slice(caplog):

@@ -244,7 +244,7 @@ def test_replicated_heads_are_stored_once_and_loaded_by_every_replica():
 
 def test_mla_style_replicated_kv_is_stored_by_rank_zero_under_the_bare_key():
     server = FirstWinsServer()
-    shards = [tp_kv_shard(rank, 2, 1, replicated=True) for rank in range(2)]
+    shards = [tp_kv_shard(rank, 2, 1) for rank in range(2)]
     workers = [rank_worker(server, shard) for shard in shards]
     kv = rank_kv(7, 1)
 

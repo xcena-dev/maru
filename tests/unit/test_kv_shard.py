@@ -57,10 +57,10 @@ def test_sharded_heads_are_each_stored_by_their_own_rank():
 
 
 def test_mla_latent_is_one_slice_that_rank_zero_stores():
-    shards = [tp_kv_shard(rank, 8, 1, replicated=True) for rank in range(8)]
+    shards = [tp_kv_shard(rank, 8, 1) for rank in range(8)]
     assert {s.suffix for s in shards} == {""}
     assert [s.is_writer for s in shards] == [True] + [False] * 7
-    assert tp_kv_shards(8, 1, replicated=True) == [shards[0]]
+    assert tp_kv_shards(8, 1) == [shards[0]]
 
 
 def test_engines_of_different_tp_sizes_share_only_slices_of_the_same_heads():

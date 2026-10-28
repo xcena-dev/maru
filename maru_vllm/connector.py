@@ -25,10 +25,9 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -74,6 +73,7 @@ from maru_vllm.kv_shard import (
     tp_kv_shard,
     tp_kv_shards,
     tp_state_shard,
+    tp_state_shards,
 )
 
 if TYPE_CHECKING:
@@ -765,21 +765,21 @@ def _validate_cxl_parallelism(parallel_config: Any) -> None:
         )
 
 
-def _tp_geometry(vllm_config: VllmConfig) -> tuple[int, int, bool]:
-    """Return ``(tp_size, total_kv_heads, replicated)`` for KV sharding.
+def _tp_geometry(vllm_config: VllmConfig) -> tuple[int, int]:
+    """Return ``(tp_size, total_kv_heads)`` for naming each rank's KV slice.
 
-    ``replicated`` is True when every rank holds the whole KV (an MLA
-    latent); the head count is then irrelevant and reported as 1. TP=1 never
-    reads the model config, so a single-GPU engine behaves exactly as before.
+    An MLA latent, which every rank holds whole, counts as one KV head. At
+    TP=1 this is ``(1, 1)`` without reading the model config: one rank holds
+    every head, so nothing the model reports can change a TP=1 engine's keys.
     """
     parallel_config = getattr(vllm_config, "parallel_config", None)
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
     if tp_size == 1:
-        return 1, 1, False
+        return 1, 1
     model_config = vllm_config.model_config
     if getattr(model_config, "use_mla", False):
-        return tp_size, 1, True
-    return tp_size, int(model_config.get_total_num_kv_heads()), False
+        return tp_size, 1
+    return tp_size, int(model_config.get_total_num_kv_heads())
 
 
 def _tp_rank() -> int:
@@ -787,38 +787,6 @@ def _tp_rank() -> int:
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
     return get_tensor_model_parallel_rank()
-
-
-def _group_kv_shard(
-    group: KVGroup,
-    tp_rank: int,
-    tp_size: int,
-    total_kv_heads: int,
-    replicated: bool,
-) -> KVShard:
-    """The slice of one KV cache group that TP rank ``tp_rank`` holds.
-
-    An attention group (full or sliding window) holds KV heads, as a model
-    with one group does; a Mamba group holds a part of each state.
-    """
-    if group.kind == GROUP_MAMBA:
-        return tp_state_shard(tp_rank, tp_size)
-    return tp_kv_shard(tp_rank, tp_size, total_kv_heads, replicated)
-
-
-def _group_shard_suffixes(
-    groups: list[KVGroup], tp_size: int, total_kv_heads: int, replicated: bool
-) -> dict[int, tuple[str, ...]]:
-    """Every distinct slice suffix of each group over the ranks, in rank order."""
-    return {
-        g.group_id: tuple(
-            dict.fromkeys(
-                _group_kv_shard(g, rank, tp_size, total_kv_heads, replicated).suffix
-                for rank in range(tp_size)
-            )
-        )
-        for g in groups
-    }
 
 
 def _validate_group_heads(
@@ -1061,15 +1029,15 @@ class MaruReqMeta:
     # vLLM's group order, each accumulated like block_ids (whose list is the
     # first entry). Empty for a single-group model.
     group_block_ids: tuple[list[int], ...] = ()
-    # Per-step memo of _chunk_keys(token_ids). The same MaruReqMeta object is
-    # shared across a step's per-layer save_kv_layer calls (and the step's
-    # start_load_kv), so computing chunk keys once here avoids recomputing the
-    # O(n) hash num_layers times per store. Lives only as long as the step's
+    # Per-step memo of _chunk_keys(token_ids), by the slice suffix appended
+    # ("" for the bare keys). The same MaruReqMeta object is shared across a
+    # step's per-layer save_kv_layer calls (and the step's start_load_kv), so
+    # computing chunk keys once here avoids recomputing the O(n) hash
+    # num_layers times per store; a rank with several KV cache groups asks
+    # for each group's suffix in turn. Lives only as long as the step's
     # metadata object. compare=False so it never affects equality/repr.
-    _chunk_keys_memo: list[str] | None = field(default=None, compare=False, repr=False)
-    # The memo with a worker's KV-shard suffix applied: (suffix, keys).
-    _shard_keys_memo: tuple[str, list[str]] | None = field(
-        default=None, compare=False, repr=False
+    _chunk_keys_memo: dict[str, list[str]] = field(
+        default_factory=dict, compare=False, repr=False
     )
 
 
@@ -1080,19 +1048,19 @@ def _req_chunk_keys(
 
     Mirrors LMCache's per-session hash cache: the O(n) key hash is computed
     once per request per step instead of once per layer on the store path.
-    ``shard_suffix`` names the KV slice the calling worker holds
-    (``KVShard.suffix``). It is required so that no store or load path can
-    fall back to the bare key, which every TP rank would share.
+    ``shard_suffix`` names the slice the calling worker holds of the KV, or
+    of one KV cache group (``KVShard.suffix``, "" for all of it). It has no
+    default, so that a new store or load path cannot silently use the bare
+    key that every TP rank shares.
     """
-    if req_meta._chunk_keys_memo is None:
-        req_meta._chunk_keys_memo = _chunk_keys(req_meta.token_ids, chunk_tokens)
-    if not shard_suffix:
-        return req_meta._chunk_keys_memo
-    memo = req_meta._shard_keys_memo
-    if memo is None or memo[0] != shard_suffix:
-        memo = (shard_suffix, [key + shard_suffix for key in req_meta._chunk_keys_memo])
-        req_meta._shard_keys_memo = memo
-    return memo[1]
+    memo = req_meta._chunk_keys_memo
+    if shard_suffix in memo:
+        return memo[shard_suffix]
+    if "" not in memo:
+        memo[""] = _chunk_keys(req_meta.token_ids, chunk_tokens)
+    if shard_suffix:
+        memo[shard_suffix] = [key + shard_suffix for key in memo[""]]
+    return memo[shard_suffix]
 
 
 @dataclass(frozen=True)
@@ -1101,16 +1069,15 @@ class _SlabTarget:
 
     A single-group model stores every layer under the chunk key. With
     several KV cache groups each attention group is its own target, keyed
-    ``<chunk key>_g<group id>`` and reading that group's block ids. Chunk
-    keys carry the target's ``suffix``, which names the KV slice this rank
-    holds (``maru_vllm.kv_shard``).
+    ``<chunk key>_g<group id>`` and reading that group's block ids. Either
+    way the chunk key names the slice this rank holds
+    (``MaruWorkerConnector._slice_chunk_keys``).
 
     Attributes:
         num_layers: Layers in the slab.
         layer_bytes: One layer's KV for one chunk.
         dtype: KV element type.
         device: Device of the paged KV tensors.
-        suffix: The slice's key suffix, for ``_req_chunk_keys``.
         group: The group, or None for a single-group model.
     """
 
@@ -1118,7 +1085,6 @@ class _SlabTarget:
     layer_bytes: int
     dtype: torch.dtype
     device: torch.device
-    suffix: str
     group: KVGroup | None = None
 
     def key(self, chunk_key: str) -> str:
@@ -1427,7 +1393,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 )
         else:
             _validate_cxl_parallelism(getattr(vllm_config, "parallel_config", None))
-        tp_size, total_kv_heads, kv_replicated = _tp_geometry(vllm_config)
+        tp_size, total_kv_heads = _tp_geometry(vllm_config)
         self._kv_chunk_tokens = int(
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
@@ -1484,16 +1450,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 max_model_len=vllm_config.model_config.max_model_len,
                 kv_groups=self._kv_groups,
                 shard_suffixes=[
-                    shard.suffix
-                    for shard in tp_kv_shards(tp_size, total_kv_heads, kv_replicated)
+                    shard.suffix for shard in tp_kv_shards(tp_size, total_kv_heads)
                 ],
-                group_shard_suffixes=(
-                    _group_shard_suffixes(
-                        self._kv_groups, tp_size, total_kv_heads, kv_replicated
-                    )
-                    if len(self._kv_groups) > 1
-                    else None
-                ),
+                state_suffixes=[shard.suffix for shard in tp_state_shards(tp_size)],
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -1517,51 +1476,29 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     type(e).__name__,
                     e,
                 )
-            kv_shard = WHOLE_MODEL
-            group_shards: dict[int, KVShard] = {}
+            kv_shard = state_shard = WHOLE_MODEL
             if tp_size > 1:
                 tp_rank = _tp_rank()
-                kv_shard = tp_kv_shard(tp_rank, tp_size, total_kv_heads, kv_replicated)
-                if len(self._kv_groups) > 1:
-                    group_shards = {
-                        g.group_id: _group_kv_shard(
-                            g, tp_rank, tp_size, total_kv_heads, kv_replicated
-                        )
-                        for g in self._kv_groups
-                    }
+                kv_shard = tp_kv_shard(tp_rank, tp_size, total_kv_heads)
+                state_shard = tp_state_shard(tp_rank, tp_size)
                 extra = _rank_scoped_extra(extra, tp_rank, tp_size)
-                if group_shards:
-                    # A rank can be a replica for an attention group and still
-                    # store its own part of every Mamba state.
-                    logger.info(
-                        "Maru: TP rank %d of %d stores and loads each KV cache "
-                        "group under its slice: %s",
-                        tp_rank,
-                        tp_size,
-                        ", ".join(
-                            f"g{group_id} {shard.suffix!r}"
-                            + (
-                                ""
-                                if shard.is_writer
-                                else " (loads only; a replica rank stores it)"
-                            )
-                            for group_id, shard in group_shards.items()
-                        ),
-                    )
-                else:
-                    logger.info(
-                        "Maru: TP rank %d of %d holds %s under key suffix %r; %s",
-                        tp_rank,
-                        tp_size,
-                        "the whole KV (replicated on every rank)"
-                        if kv_replicated
-                        else f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
-                        f"of {kv_shard.total_heads}",
-                        kv_shard.suffix,
-                        "it stores and loads"
-                        if kv_shard.is_writer
-                        else "it only loads; a replica rank stores this slice",
-                    )
+                logger.info(
+                    "Maru: TP rank %d of %d holds %s under key suffix %r and %s%s",
+                    tp_rank,
+                    tp_size,
+                    f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
+                    f"of {kv_shard.total_heads}"
+                    if kv_shard.splits_heads
+                    else "the whole KV",
+                    kv_shard.suffix,
+                    "stores it"
+                    if kv_shard.is_writer
+                    else "only loads it: a lower rank holding the same KV stores it",
+                    f"; it stores its part {state_shard.suffix!r} of each "
+                    "Mamba-type state"
+                    if any(g.kind == GROUP_MAMBA for g in self._kv_groups)
+                    else "",
+                )
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
@@ -1571,7 +1508,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 kv_groups=self._kv_groups,
                 cache_config=vllm_config.cache_config,
                 kv_shard=kv_shard,
-                group_shards=group_shards,
+                state_shard=state_shard,
             )
 
     @property
@@ -1750,7 +1687,7 @@ class MaruSchedulerConnector:
 
     _cpu_mode = False
     _shard_suffixes: tuple[str, ...] = ("",)
-    _group_suffixes: Mapping[int, tuple[str, ...]] = MappingProxyType({})
+    _state_suffixes: tuple[str, ...] = ("",)
 
     def __init__(
         self,
@@ -1762,7 +1699,7 @@ class MaruSchedulerConnector:
         max_model_len: int | None = None,
         kv_groups: list[KVGroup] | None = None,
         shard_suffixes: Sequence[str] = ("",),
-        group_shard_suffixes: Mapping[int, Sequence[str]] | None = None,
+        state_suffixes: Sequence[str] = ("",),
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
@@ -1780,14 +1717,11 @@ class MaruSchedulerConnector:
         self._shard_suffixes = tuple(shard_suffixes)
         if not self._shard_suffixes:
             raise ValueError("shard_suffixes must name at least one KV slice")
-        # The same with several groups, by group id: every slice of every
-        # group must be stored. Groups not listed have one slice, "".
-        self._group_suffixes = {
-            group_id: tuple(suffixes)
-            for group_id, suffixes in (group_shard_suffixes or {}).items()
-        }
-        if not all(self._group_suffixes.values()):
-            raise ValueError("group_shard_suffixes must name a slice for each group")
+        # With several KV cache groups, attention groups use those and Mamba
+        # groups the suffix of every rank's part of the state ("" at TP=1).
+        self._state_suffixes = tuple(state_suffixes)
+        if not self._state_suffixes:
+            raise ValueError("state_suffixes must name at least one part")
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -2074,8 +2008,8 @@ class MaruSchedulerConnector:
         of the chunk may have left the GPU before the store. Keys already
         known to exist are tried first; when they fall short of every chunk,
         all groups' remaining keys go in one RPC. See ``kv_groups.hit_chunks``.
-        Under TP a group's object exists only once every rank's slice of it
-        is stored: a rank whose slice is missing would have nothing to load.
+        Under TP a (chunk, group) counts only when every rank's slice of it
+        is stored.
         """
         chunk_tokens = self._kv_chunk_tokens
         num_chunks = (len(token_ids) - 1) // chunk_tokens
@@ -2086,7 +2020,11 @@ class MaruSchedulerConnector:
         def object_keys(i: int, g: KVGroup) -> list[str]:
             return [
                 group_object_key(chunk_keys[i] + suffix, g.group_id)
-                for suffix in self._group_suffixes.get(g.group_id, ("",))
+                for suffix in (
+                    self._state_suffixes
+                    if g.kind == GROUP_MAMBA
+                    else self._shard_suffixes
+                )
             ]
 
         def hit_among(stored: set[str]) -> tuple[int, int]:
@@ -2120,7 +2058,7 @@ class MaruSchedulerConnector:
                 hit,
                 prefix,
                 ", or a TP rank's slice of one"
-                if any(len(s) > 1 for s in self._group_suffixes.values())
+                if len(self._shard_suffixes) > 1 or len(self._state_suffixes) > 1
                 else "",
             )
         return hit
@@ -2674,8 +2612,9 @@ class MaruWorkerConnector:
     # Read by the layout paths; a worker built with __new__ knows no layout.
     _cache_config: Any = None
     _cache_layout: str | None = None
+    # A worker built with __new__ holds all KV, as at TP=1.
     _kv_shard: KVShard = WHOLE_MODEL
-    _group_shards: Mapping[int, KVShard] = MappingProxyType({})
+    _state_shard: KVShard = WHOLE_MODEL
 
     def __init__(
         self,
@@ -2687,7 +2626,7 @@ class MaruWorkerConnector:
         kv_groups: list[KVGroup] | None = None,
         cache_config: Any = None,
         kv_shard: KVShard = WHOLE_MODEL,
-        group_shards: Mapping[int, KVShard] | None = None,
+        state_shard: KVShard = WHOLE_MODEL,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -2715,14 +2654,12 @@ class MaruWorkerConnector:
         # register_kv_caches into _cache_layout (see _vllm_kv_cache_layout).
         self._cache_config = cache_config
         self._cache_layout: str | None = None
-        # The KV slice this worker holds. Every key it stores or loads carries
-        # the slice's suffix (empty at TP=1), and a replica rank of a slice
-        # that another rank stores only loads it.
+        # The KV heads this rank holds (all of them at TP=1), named in the
+        # keys of every attention group, and its part of each Mamba-type
+        # state. _slice() picks one per group. A rank that is not a slice's
+        # writer only loads it.
         self._kv_shard = kv_shard
-        # With several groups, the slice of each group by group id: KV heads
-        # for an attention group, a part of the state for a Mamba group.
-        # Groups not listed hold everything, as at TP=1.
-        self._group_shards = dict(group_shards or {})
+        self._state_shard = state_shard
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -3115,7 +3052,7 @@ class MaruWorkerConnector:
             head_size=self._head_size,
         )
         for cache in self._group_caches:
-            self._check_slice_heads(cache.layout, self._group_shard(cache.group))
+            self._check_slice_heads(cache.layout, self._slice(cache.group))
         self._page_size_bytes = max(
             g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
         )
@@ -3306,9 +3243,7 @@ class MaruWorkerConnector:
                 self._load_leased_request(layers, req_meta, attn_metadata)
                 continue
 
-            chunk_keys = _req_chunk_keys(
-                req_meta, self._kv_chunk_tokens, self._kv_shard.suffix
-            )
+            chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
                 self._fail_deferred_load(req_meta)
@@ -3602,12 +3537,12 @@ class MaruWorkerConnector:
             else:
                 chunks = range(first, hit)
             plan += [(cache, ci) for ci in chunks]
-        # Each group's objects carry the slice of that group this rank holds.
+        chunk_keys = {
+            c.group.group_id: self._slice_chunk_keys(req_meta, c.group)
+            for c in self._group_caches
+        }
         keys = [
-            group_object_key(
-                _req_chunk_keys(req_meta, ct, self._group_shard(c.group).suffix)[ci],
-                c.group.group_id,
-            )
+            group_object_key(chunk_keys[c.group.group_id][ci], c.group.group_id)
             for c, ci in plan
         ]
         try:
@@ -3840,9 +3775,7 @@ class MaruWorkerConnector:
                     stream=self._deferred_stream,
                 )
                 return
-            chunk_keys = _req_chunk_keys(
-                req_meta, self._kv_chunk_tokens, self._kv_shard.suffix
-            )
+            chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
@@ -4539,7 +4472,7 @@ class MaruWorkerConnector:
             # An off-thread load was registered before submission. If its
             # request ended meanwhile, do not recreate the removed entry.
         ct = self._kv_chunk_tokens
-        chunk_keys = _req_chunk_keys(req_meta, ct, self._kv_shard.suffix)
+        chunk_keys = self._slice_chunk_keys(req_meta)
         num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
         start, end = self._cpu_load_range(req_meta)
         first_chunk = start // ct
@@ -5758,9 +5691,7 @@ class MaruWorkerConnector:
         layer_idx = self._get_layer_index(layer_name)
 
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(
-                req_meta, self._kv_chunk_tokens, self._kv_shard.suffix
-            )
+            chunk_keys = self._slice_chunk_keys(req_meta)
             if not chunk_keys:
                 continue
 
@@ -5928,9 +5859,7 @@ class MaruWorkerConnector:
             return
 
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(
-                req_meta, self._kv_chunk_tokens, self._kv_shard.suffix
-            )
+            chunk_keys = self._slice_chunk_keys(req_meta)
             if not chunk_keys:
                 continue
 
@@ -6044,7 +5973,7 @@ class MaruWorkerConnector:
         handles: list = []
         for cache in self._group_caches:
             group = cache.group
-            if not self._group_shard(group).is_writer:
+            if not self._slice(group).is_writer:
                 # Another rank holds the same KV heads and stores them. Each
                 # rank holds its own part of a Mamba state, so it stores that.
                 continue
@@ -6078,13 +6007,22 @@ class MaruWorkerConnector:
             per_token * self._kv_chunk_tokens,
             first.dtype,
             first.device,
-            self._group_shard(cache.group).suffix,
             cache.group,
         )
 
-    def _group_shard(self, group: KVGroup) -> KVShard:
-        """The slice of ``group`` this rank holds; everything at TP=1."""
-        return self._group_shards.get(group.group_id, WHOLE_MODEL)
+    def _slice(self, group: KVGroup | None) -> KVShard:
+        """The slice this rank holds of ``group``, or of a one-group model."""
+        if group is not None and group.kind == GROUP_MAMBA:
+            return self._state_shard
+        return self._kv_shard
+
+    def _slice_chunk_keys(
+        self, req_meta: MaruReqMeta, group: KVGroup | None = None
+    ) -> list[str]:
+        """The request's chunk keys, named for the slice this rank holds."""
+        return _req_chunk_keys(
+            req_meta, self._kv_chunk_tokens, self._slice(group).suffix
+        )
 
     def _group_kernel(self, cache: GroupCache) -> tuple | None:
         """Kernel ctx for an attention group's stores and loads.
@@ -6144,7 +6082,7 @@ class MaruWorkerConnector:
         ct = self._kv_chunk_tokens
         slab_bytes = target.layer_bytes * target.num_layers
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, ct, target.suffix)
+            chunk_keys = self._slice_chunk_keys(req_meta, target.group)
             chunks = _step_chunks(req_meta, ct, len(chunk_keys))
             if not chunks:
                 continue
@@ -6213,15 +6151,16 @@ class MaruWorkerConnector:
             if req_meta.num_scheduled_tokens <= 0:
                 continue
             end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-            chunk_keys = _req_chunk_keys(req_meta, ct, self._group_shard(group).suffix)
-            if end % ct or end // ct > len(chunk_keys):
+            if end % ct or end > len(req_meta.token_ids):
                 continue
             block_ids = req_meta.group_block_ids[group.group_id]
             position = end // group.block_size - 1
             if position >= len(block_ids) or block_ids[position] == 0:
                 continue
             block = block_ids[position]
-            key = group_object_key(chunk_keys[end // ct - 1], group.group_id)
+            key = group_object_key(
+                self._slice_chunk_keys(req_meta, group)[end // ct - 1], group.group_id
+            )
             if self._is_stored(key) or key in keys:
                 continue
             handle = None
@@ -6288,7 +6227,6 @@ class MaruWorkerConnector:
             per_layer_bytes,
             sample.dtype,
             sample.device,
-            self._kv_shard.suffix,
         )
 
     def _store_packed_slabs(
@@ -6386,7 +6324,7 @@ class MaruWorkerConnector:
         try:
             with stream_ctx:
                 for req_meta in self._store_entries(metadata):
-                    chunk_keys = _req_chunk_keys(req_meta, ct, slab_target.suffix)
+                    chunk_keys = self._slice_chunk_keys(req_meta, slab_target.group)
                     if not chunk_keys:
                         continue
                     chunks = _step_chunks(req_meta, ct, len(chunk_keys))
@@ -6504,7 +6442,7 @@ class MaruWorkerConnector:
         # retain every request ID even though only one physical copy is queued.
         key_entries: dict[str, tuple[torch.Tensor, set[str], dict[str, str]]] = {}
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, ct, target.suffix)
+            chunk_keys = self._slice_chunk_keys(req_meta, target.group)
             if not chunk_keys:
                 continue
             end_chunk = _step_chunks(req_meta, ct, len(chunk_keys)).stop
