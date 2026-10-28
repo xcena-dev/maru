@@ -428,7 +428,7 @@ class _CopyAhead:
     Host slabs must stay valid until their copies finish. The consumer
     stream waits for every copy, so synchronizing it, or an event recorded on
     it after the last inject, covers them; ``synchronize`` waits for the
-    copies alone. One instance serves one consumer stream, so one thread.
+    copies alone. One instance serves one consumer stream on one thread.
     """
 
     def __init__(
@@ -439,9 +439,9 @@ class _CopyAhead:
         self._device = device
         self._depth = depth
         # Per slab shape: one [device slab, event after its last inject]
-        # per ring position
+        # per ring position, and the position its next slab takes
         self._rings: dict[tuple, list[list]] = {}
-        self._turn = 0
+        self._turns: dict[tuple, int] = {}
 
     def stage(self, host: torch.Tensor) -> tuple[torch.Tensor, list]:
         """Queue the copy of ``host`` and make the consumer stream wait for it.
@@ -454,8 +454,9 @@ class _CopyAhead:
         ring = self._rings.get(key)
         if ring is None:
             ring = self._rings[key] = [[None, None] for _ in range(self._depth)]
-        slot = ring[self._turn % self._depth]
-        self._turn += 1
+        turn = self._turns.get(key, 0)
+        self._turns[key] = turn + 1
+        slot = ring[turn % self._depth]
         if slot[1] is not None:
             self.stream.wait_event(slot[1])
         with torch.cuda.stream(self.stream):
@@ -1194,9 +1195,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         maru_load_copy_ahead: int - Chunk slabs that a load without a
             placement kernel (vLLM 0.29+ packed layouts) copies to the GPU
             ahead of its per-layer injects, on a side stream, so that the
-            copies overlap the injects. Each stream that loads keeps that
-            many slabs of GPU memory. Pinned slabs only. 0 copies each slab
-            in line (default: 2)
+            copies overlap the injects. Each thread and stream that loads
+            keeps that many slabs of GPU memory for the life of the worker,
+            allocated on its first load, after vLLM has sized its KV cache,
+            so gpu_memory_utilization does not account for them. Pinned
+            slabs only. 0 copies each slab in line (default: 2)
         maru_load_admission_window: int - With maru_async_load, cap how many
             requests' packed loads may be enqueued on the deferred stream but
             not yet complete. The loader thread blocks before each GPU
@@ -2420,7 +2423,7 @@ class MaruWorkerConnector:
         self._load_copy_ahead = int(extra_config.get("maru_load_copy_ahead", 2))
         if self._load_copy_ahead < 0:
             raise ValueError("maru_load_copy_ahead must be 0 or more")
-        self._copy_ahead: dict[tuple[torch.device, int], _CopyAhead] = {}
+        self._copy_ahead: dict[tuple[torch.device, int, int], _CopyAhead] = {}
         self._copy_ahead_lock = threading.Lock()
         # Overlap loads whose off-thread copy issue failed: the loader thread
         # resolved the RPC/mmap metadata and the resumed forward consumes
@@ -4892,7 +4895,7 @@ class MaruWorkerConnector:
                             )
                         else:
                             # Fallback: per-layer slice -> inject (same slab).
-                            ahead = self._inject_slab_layers(
+                            if self._inject_slab_layers(
                                 slab_host,
                                 dev,
                                 load_stream,
@@ -4900,9 +4903,8 @@ class MaruWorkerConnector:
                                 chunk_slots,
                                 attn,
                                 non_blocking=use_stream,
-                            )
-                            if ahead is not None:
-                                copied_ahead.add(ahead)
+                                copied_ahead=copied_ahead,
+                            ):
                                 ahead_chunks[req_meta.req_id] = (
                                     ahead_chunks.get(req_meta.req_id, 0) + 1
                                 )
@@ -4915,7 +4917,8 @@ class MaruWorkerConnector:
                         self._deferred_done.add(req_meta.req_id)
         if not use_stream:
             # Nothing waits for these copies on the stream the caller syncs
-            # (if any), and the caller releases the host slabs on return.
+            # (if any), and the caller releases the host slabs on return,
+            # those of the requests whose injects failed too.
             for ahead in copied_ahead:
                 ahead.synchronize()
         if use_stream and wait:
@@ -4959,7 +4962,8 @@ class MaruWorkerConnector:
         chunk_slots: torch.Tensor,
         attn_metadata: Any,
         non_blocking: bool,
-    ) -> _CopyAhead | None:
+        copied_ahead: set[_CopyAhead] | None = None,
+    ) -> bool:
         """Copy one chunk slab to the device and inject it layer by layer.
 
         The placement of a load without a kernel. A slab that can be is
@@ -4975,15 +4979,20 @@ class MaruWorkerConnector:
             chunk_slots: The chunk's slot mapping, on the device.
             attn_metadata: The step's attention metadata.
             non_blocking: Copy in line without waiting for the host.
+            copied_ahead: Gets the ring before the slab's copy is queued on
+                it, so that the caller can wait for the copy before it
+                releases the slab, even if an inject fails.
 
         Returns:
-            The ring the slab was copied ahead through, or None.
+            Whether the slab was copied ahead.
         """
         ahead = self._copy_ahead_for(device, slab_host, load_stream)
         if ahead is None:
             slab_dev = slab_host.to(device, non_blocking=non_blocking)
             slot = None
         else:
+            if copied_ahead is not None:
+                copied_ahead.add(ahead)
             slab_dev, slot = ahead.stage(slab_host)
         try:
             for layer_name, kv_cache_layer, true_idx in layers:
@@ -4998,7 +5007,7 @@ class MaruWorkerConnector:
         finally:
             if ahead is not None:
                 ahead.done(slot)
-        return ahead
+        return ahead is not None
 
     def _copy_ahead_for(
         self,
@@ -5011,7 +5020,9 @@ class MaruWorkerConnector:
         Only a whole, page-locked slab on a CUDA device is copied ahead. A
         pageable slab is staged by the driver, so its copy overlaps nothing,
         and part of a chunk is a strided slice. The ring belongs to the
-        stream the injects run on: the load stream, else the current one.
+        stream the injects run on, the load stream or else the current one,
+        and to the calling thread: without a load stream, the engine and
+        loader threads may both inject on the default stream.
 
         Args:
             device: The paged KV cache's device.
@@ -5027,7 +5038,7 @@ class MaruWorkerConnector:
         ):
             return None
         consumer = load_stream or torch.cuda.current_stream(device)
-        key = (device, consumer.cuda_stream)
+        key = (device, consumer.cuda_stream, threading.get_ident())
         with self._copy_ahead_lock:
             ahead = self._copy_ahead.get(key)
             if ahead is None:

@@ -10,6 +10,7 @@ its reader has run, and that loads through it restore every layer, inline and
 deferred.
 """
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -56,6 +57,58 @@ class TestWhichSlabs:
         assert worker._copy_ahead_for(cuda, slab[:, :, :4], None) is None
         off = make_worker(4, 8, {"maru_load_copy_ahead": 0})
         assert off._copy_ahead_for(cuda, slab, None) is None
+
+    def test_a_failed_inject_still_waits_for_its_copy(self, monkeypatch):
+        """Without a load stream nothing else waits for the side stream, and
+        the caller releases the host slabs once the load returns, those of
+        a request whose inject raised (a layout refusal) too."""
+        from maru_handler.memory.types import MemoryInfo
+        from maru_vllm.connector import MaruReqMeta
+
+        events = []
+
+        class Ring:
+            def stage(self, host):
+                events.append("stage")
+                return host, None
+
+            def done(self, slot):
+                events.append("done")
+
+            def synchronize(self):
+                events.append("synchronize")
+
+        def refuse(*args, **kwargs):
+            events.append("inject")
+            raise ValueError("unrecognized layout")
+
+        worker = make_worker(4, 8)
+        monkeypatch.setattr(worker, "_packed_load_kernel_ctx", lambda *a: None)
+        monkeypatch.setattr(worker, "_copy_ahead_for", lambda *a: Ring())
+        monkeypatch.setattr(worker, "_inject_kv_into_layer", refuse)
+        layers = [
+            (f"model.layers.{i}.self_attn", torch.zeros(2, 2, 4, 1, 6), i)
+            for i in range(2)
+        ]
+        slab = torch.zeros(2, 2, 8, 6)  # [2, layers, chunk tokens, hidden]
+        request = MaruReqMeta(
+            req_id="r1",
+            token_ids=list(range(8)),
+            block_ids=[0, 1],
+            is_store=False,
+            num_matched_chunks=1,
+        )
+        info = MemoryInfo(
+            view=memoryview(slab.numpy()).cast("B"), region_id=0, page_index=0
+        )
+        failed = worker._load_packed(
+            layers,
+            [(request, 1, torch.arange(8), [info])],
+            make_flash_attn_metadata(),
+        )
+        events.append("return")
+        assert failed == {"r1"}
+        assert events == ["stage", "inject", "done", "synchronize", "return"]
 
 
 @requires_cuda
@@ -109,6 +162,37 @@ class TestRing:
         assert worker._copy_ahead_for(device, slab, None) is current
         other = worker._copy_ahead_for(device, slab, torch.cuda.Stream(device=device))
         assert other is not None and other is not current
+
+    def test_each_thread_that_loads_has_its_own_ring(self):
+        """Without a load stream the engine and loader threads may both inject
+        on the default stream, and a ring is not thread-safe."""
+        worker = make_worker(4, 8)
+        device = self._device()
+        slab = torch.zeros(2, 3, 8, 6).pin_memory()
+        mine = worker._copy_ahead_for(device, slab, None)
+        theirs = []
+        thread = threading.Thread(
+            target=lambda: theirs.append(worker._copy_ahead_for(device, slab, None))
+        )
+        thread.start()
+        thread.join()
+        assert theirs[0].consumer == mine.consumer
+        assert theirs[0] is not mine
+
+    def test_interleaved_shapes_each_take_their_whole_ring(self):
+        device = self._device()
+        ahead = _CopyAhead(device, torch.cuda.Stream(device=device), depth=2)
+        small = torch.zeros(4).pin_memory()
+        large = torch.zeros(8).pin_memory()
+        slots = []
+        with torch.cuda.stream(ahead.consumer):
+            for host in (small, large, small, large):
+                _, slot = ahead.stage(host)
+                ahead.done(slot)
+                slots.append(slot)
+        ahead.consumer.synchronize()
+        assert slots[0] is not slots[2]
+        assert slots[1] is not slots[3]
 
 
 @requires_cuda
