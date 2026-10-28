@@ -52,6 +52,7 @@ from maru_vllm.kv_groups import (
     state_view,
     window_chunks,
 )
+from maru_vllm.kv_shard import tp_kv_shard, tp_state_shard
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     attach_capturing_handler,
@@ -2218,3 +2219,222 @@ def test_a_parked_load_lands_after_work_queued_before_it():
     torch.cuda.synchronize()
     assert worker.get_finished_loading() == {"b"}
     _check_loaded(stored, worker, source, target, in_place=False)
+
+
+# =============================================================================
+# Tensor parallelism
+# =============================================================================
+
+
+def _rank_shared(rank):
+    """``_shared()`` with every byte shifted by rank: each rank's own KV."""
+    return (_shared().to(torch.int64) + 97 * rank).remainder(251).to(torch.uint8)
+
+
+def _tp_shards(rank, tp_size, total_heads, config=None):
+    """Each group's slice on ``rank``: KV heads, or a part of a Mamba state."""
+    return {
+        g.group_id: tp_state_shard(rank, tp_size)
+        if g.kind == GROUP_MAMBA
+        else tp_kv_shard(rank, tp_size, total_heads)
+        for g in describe_kv_groups(config or tiny_config())
+    }
+
+
+def _tp_worker(kv_caches, shards, store, config=None, chunk=TINY_BLOCK, **kwargs):
+    """A registered rank whose handler keeps a key's first registrant, as
+    MaruServer does, in ``store`` shared by every rank."""
+    kwargs.setdefault("num_kv_heads", 2)
+    kwargs.setdefault("head_size", 8)
+    worker = make_worker(
+        TINY_BLOCK,
+        chunk,
+        kv_cache_layout=_engine_layout(kv_caches),
+        kv_groups=describe_kv_groups(config or tiny_config()),
+        group_shards=shards,
+        **kwargs,
+    )
+    worker._ensure_handler = MagicMock()
+    worker.register_kv_caches(kv_caches)
+
+    def _batch_store(keys, handles):
+        for key, handle in zip(keys, handles, strict=True):
+            store.setdefault(key, bytes(handle.buf))
+        return [True] * len(keys)
+
+    worker._handler = MagicMock()
+    worker._handler.alloc.side_effect = lambda n: SimpleNamespace(
+        buf=memoryview(bytearray(n))
+    )
+    worker._handler.batch_store.side_effect = _batch_store
+    _serve(worker, store)
+    return worker
+
+
+def _registered_keys(worker):
+    return {k for c in worker._handler.batch_store.call_args_list for k in c.args[0]}
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_tp_ranks_store_and_load_their_own_slices(version):
+    """TP=2 over 4 KV heads on one first-register-wins server: each rank
+    stores its own heads and its own part of every Mamba state, and loads
+    them back rather than the other rank's."""
+    store = {}
+    tokens = list(range(40))
+    sources, stored = [], []
+    for rank in range(2):
+        sources.append(_rank_shared(rank))
+        worker = _tp_worker(
+            tiny_kv_caches(version, sources[rank]), _tp_shards(rank, 2, 4), store
+        )
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        stored.append(worker)
+
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    assert set(store) == {
+        *(group_object_key(k + h, 3) for k in (k0, k1) for h in ("_h0-2", "_h2-4")),
+        *(group_object_key(k1 + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)),
+    }
+    for rank in range(2):
+        target = torch.zeros_like(_shared())
+        worker = _tp_worker(
+            tiny_kv_caches(version, target), _tp_shards(rank, 2, 4), store
+        )
+        worker.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
+        assert worker.take_failed_load_blocks() == set()
+        src = stored[rank]._group_caches[3].tensors
+        dst = worker._group_caches[3].tensors
+        for a_block, b_block in ((4, 7), (5, 8)):
+            for a, b in zip(src, dst, strict=True):
+                assert torch.equal(
+                    _token_rows(b, b_block, version), _token_rows(a, a_block, version)
+                )
+        for g in range(3):
+            for layer in range(2):
+                assert torch.equal(
+                    _state(target, layer, B_BLOCKS[g][1]),
+                    _state(sources[rank], layer, QWEN_BLOCKS[g][1]),
+                )
+
+
+def _one_head_attn(region):
+    """A rank's attention layer holding one KV head (flash, vLLM 0.23)."""
+    return region.view(torch.bfloat16).view(TINY_BLOCKS, 2, 16, 1, 16)
+
+
+def _one_head_caches(shared):
+    caches = tiny_kv_caches("0.23", shared)
+    for p, i in enumerate(TINY_ATTN):
+        caches[f"layers.{i}.attn"] = _one_head_attn(_region(shared, p))
+    return caches
+
+
+def test_tp_replica_skips_attention_but_stores_its_state():
+    """TP=4 over 2 KV heads: ranks 0 and 1 hold head 0, but each holds its
+    own part of every Mamba state. Rank 1 stores only its state and loads
+    rank 0's attention."""
+    store = {}
+    tokens = list(range(40))
+    source0 = _rank_shared(0)
+    # Same attention bytes (blocks 4, 5), different states (blocks 1-3).
+    source1 = source0.clone()
+    for p in range(2):
+        start = p * TINY_LAYER_BYTES + TINY_SLOT
+        source1[start : start + 3 * TINY_SLOT] += 1
+    workers = []
+    for rank, source in enumerate((source0, source1)):
+        worker = _tp_worker(
+            _one_head_caches(source),
+            _tp_shards(rank, 4, 2),
+            store,
+            num_kv_heads=1,
+            head_size=16,
+        )
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        workers.append(worker)
+
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    assert _registered_keys(workers[1]) == {
+        group_object_key(k1 + "_s1of4", g) for g in range(3)
+    }
+    assert group_object_key(k0 + "_h0-1", 3) in _registered_keys(workers[0])
+
+    target = torch.zeros_like(_shared())
+    worker = _tp_worker(
+        _one_head_caches(target),
+        _tp_shards(1, 4, 2),
+        store,
+        num_kv_heads=1,
+        head_size=16,
+    )
+    worker.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
+    assert worker.take_failed_load_blocks() == set()
+    src = workers[0]._group_caches[3].tensors
+    dst = worker._group_caches[3].tensors
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(b[b_block], a[a_block])
+    for g in range(3):
+        for layer in range(2):
+            assert torch.equal(
+                _state(target, layer, B_BLOCKS[g][1]),
+                _state(source1, layer, QWEN_BLOCKS[g][1]),
+            )
+
+
+def _swa_caches(shared):
+    return {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.30")
+        for i in range(4)
+    }
+
+
+def test_tp_sliding_window_ranks_load_their_own_heads():
+    """A small gpt-oss at TP=2: both groups carry each rank's own heads."""
+    store = {}
+    tokens = list(range(80))
+    config = tiny_swa_config()
+    stored = []
+    for rank in range(2):
+        worker = _tp_worker(
+            _swa_caches(_rank_shared(rank)),
+            _tp_shards(rank, 2, 4, config),
+            store,
+            config,
+            chunk=64,
+        )
+        worker.wait_for_save(_store_meta(tokens, ([7, 8, 9, 10], [3, 4, 5, 6]), 0, 64))
+        stored.append(worker)
+
+    (k0,) = _chunk_keys(tokens, 64)
+    assert set(store) == {
+        group_object_key(k0 + h, g) for h in ("_h0-2", "_h2-4") for g in (0, 1)
+    }
+    for rank in range(2):
+        worker = _tp_worker(
+            _swa_caches(torch.zeros_like(_shared())),
+            _tp_shards(rank, 2, 4, config),
+            store,
+            config,
+            chunk=64,
+        )
+        blocks = ([0, 0, 1, 2], [3, 4, 5, 6])
+        worker.start_load_kv(_FORWARD, _load_meta(tokens, blocks, 1, 64, 16))
+        assert worker.take_failed_load_blocks() == set()
+        for gid, pairs in ((0, ((9, 1), (10, 2))), (1, ((3, 3), (6, 6)))):
+            src = stored[rank]._group_caches[gid].tensors
+            dst = worker._group_caches[gid].tensors
+            for a_block, b_block in pairs:
+                for a, b in zip(src, dst, strict=True):
+                    assert torch.equal(
+                        _token_rows(b, b_block, "0.30"),
+                        _token_rows(a, a_block, "0.30"),
+                    )
+
+
+def test_tp_group_cache_head_count_is_checked():
+    """The attention slice names 1 head of 4, but the rank's cache holds 2."""
+    shards = _tp_shards(0, 4, 4)
+    with pytest.raises(ValueError, match="holds 2 KV heads"):
+        _tp_worker(tiny_kv_caches("0.30", _shared()), shards, {})
