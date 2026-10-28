@@ -822,6 +822,19 @@ def test_write_behind_starts_at_the_first_chunk_the_request_computed(monkeypatch
     assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8)[1:]
 
 
+def test_write_behind_skips_the_chunk_a_full_hit_holds_back(monkeypatch):
+    """vLLM computes the held-back block again, but Maru has its chunk."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("hit", list(range(24)), list(range(6)), False)
+    metadata = _resumed_store(load, computed=20)
+    metadata.requests[0].store_start_token = 24
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, metadata)
+    worker.shutdown()
+    assert not allocs
+    handler.batch_store.assert_not_called()
+
+
 @pytest.mark.parametrize("request_id", ["another", "loaded"])
 def test_loaded_keys_are_not_permanently_skipped_by_later_requests(
     monkeypatch, request_id

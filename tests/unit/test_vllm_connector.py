@@ -23,6 +23,7 @@ from maru_vllm.connector import (
     _chunk_keys,
     _get_knob,
     _parse_size,
+    _step_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
@@ -2070,6 +2071,79 @@ class TestBuildConnectorMetaStoreAccumulation:
 
         assert owns_blocks is enabled
         assert params is None
+
+
+class TestSyncPartialHitStoresComputedChunks:
+    """A request that loads its leading chunks stores only what it computes.
+
+    From #100. A fully cached prompt holds one block back for vLLM to
+    compute, inside a chunk Maru already has, so that chunk is not stored.
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _scheduler_with_load(self, num_tokens, cached_chunks, num_computed=0):
+        sched = make_scheduler(
+            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+        )
+        sched._handler = MagicMock()
+        total_chunks = num_tokens // self.CHUNK
+        sched._handler.batch_exists.return_value = [True] * cached_chunks + [False] * (
+            total_chunks - cached_chunks
+        )
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(num_tokens)),
+            all_token_ids=list(range(num_tokens)),
+        )
+        matched, load_async = sched.get_num_new_matched_tokens(request, num_computed)
+        assert load_async is False
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (list(range(num_tokens // self.BLOCK)),)
+        sched.update_state_after_alloc(request, blocks, matched)
+        return sched, num_computed + matched
+
+    def _new_req(self, num_tokens, num_computed):
+        return fake_new_request_data(
+            prompt_token_ids=list(range(num_tokens)),
+            block_ids=list(range(-(-num_tokens // self.BLOCK))),
+            num_computed_tokens=num_computed,
+        )
+
+    def test_full_hit_held_back_block_stores_nothing(self):
+        # 40 tokens = exactly 5 chunks, all cached: one block is held back for
+        # the engine to compute. Every chunk already exists, so no store.
+        sched, computed = self._scheduler_with_load(40, cached_chunks=5)
+        assert computed == 36
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([self._new_req(40, computed)], None, {"r1": 4})
+        )
+        assert [r.is_store for r in meta.requests] == [False]
+
+    def test_full_hit_resumed_with_a_load_stores_nothing(self):
+        """The same full hit, loaded when the request resumes (V1 runner)."""
+        sched, computed = self._scheduler_with_load(40, cached_chunks=5)
+        meta = sched.build_connector_meta(
+            fake_scheduler_output(
+                [],
+                fake_cached_reqs(["r1"], [(list(range(10)),)], [computed], ["r1"]),
+                {"r1": 4},
+            )
+        )
+        assert [r.is_store for r in meta.requests] == [False]
+
+    def test_stores_start_at_store_start_token(self):
+        """The per-step stores skip the chunk the held-back block is in."""
+        meta = store_req_meta(
+            token_ids=list(range(40)),
+            block_ids=list(range(10)),
+            num_computed_tokens=36,
+            num_scheduled_tokens=4,
+        )
+        assert list(_step_chunks(meta, self.CHUNK, 5)) == [4]
+        meta.store_start_token = 40
+        assert list(_step_chunks(meta, self.CHUNK, 5)) == []
 
 
 # =============================================================================

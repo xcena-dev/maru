@@ -827,11 +827,14 @@ class MaruReqMeta:
     # and tokens computed before it.
     num_scheduled_tokens: int = 0
     num_computed_tokens: int = 0
-    # For store: the first token the request computes itself, its
-    # num_computed_tokens in its first step since it was scheduled or
-    # resumed. The tokens before it were loaded or are vLLM's own prefix
-    # cache, so write-behind, which stores a prompt in its last prefill step,
-    # starts at the chunk holding this token, as the per-step stores do.
+    # For store: where the request's stores start. Its num_computed_tokens in
+    # its first step since it was scheduled or resumed, or the end of the
+    # chunks that step loads if later: a fully cached prompt holds one block
+    # back for vLLM to compute, inside a chunk Maru already has. The tokens
+    # before it were loaded or are vLLM's own prefix cache. Write-behind,
+    # which stores a prompt in its last prefill step, starts at the chunk
+    # holding this token; per-step stores at the later of it and
+    # num_computed_tokens.
     store_start_token: int = 0
     # CPU/mixed external-token interval, excluding GPU hits and compute tail.
     # None retains compatibility with metadata constructed without explicit bounds.
@@ -915,19 +918,20 @@ class _SlabTarget:
 
 
 def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> range:
-    """Chunks of the prompt that ``req_meta``'s step completes.
+    """Chunks of the prompt that ``req_meta``'s step completes and stores.
 
     Absolute chunk indices ``[computed // C, (computed + scheduled) // C)``,
     so consecutive steps stay contiguous when step boundaries are not chunk
     aligned: a chunk straddling a boundary belongs to the step finishing it.
+    None starts before ``store_start_token``: the chunks a request loaded,
+    including the last one of a fully cached prompt, part of which vLLM
+    computes again, are in Maru already.
     """
     if req_meta.num_scheduled_tokens <= 0:
         return range(num_chunks)
     end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-    return range(
-        req_meta.num_computed_tokens // chunk_tokens,
-        min(end // chunk_tokens, num_chunks),
-    )
+    start = max(req_meta.num_computed_tokens, req_meta.store_start_token)
+    return range(start // chunk_tokens, min(end // chunk_tokens, num_chunks))
 
 
 # Attention backends the placement kernels do not serve: the same ones
@@ -1983,30 +1987,36 @@ class MaruSchedulerConnector:
         block_ids: tuple[list[int], ...],
         num_computed: int,
         num_scheduled: int,
-    ) -> MaruReqMeta:
-        """Store metadata for the prompt chunks a step completes.
+        loaded_chunks: int = 0,
+    ) -> MaruReqMeta | None:
+        """Store metadata for the prompt chunks a step completes, if any.
 
         For the first step of a new or resumed request, whether or not it
-        loads: ``block_ids`` cover it from token 0. A request whose prompt
-        still has full chunks past this step is tracked in
+        loads: ``block_ids`` cover it from token 0. Storing starts after the
+        ``loaded_chunks`` the step loads from Maru. vLLM counts them as
+        computed, except that a fully cached prompt holds one block back for
+        vLLM to compute, inside a chunk Maru already has. A request whose
+        prompt still has full chunks past this step is tracked in
         ``_requests_need_store``, so later chunked-prefill steps store them
-        too.
+        too. None when the step leaves nothing to store.
         """
+        ct = self._kv_chunk_tokens
+        start = max(num_computed, loaded_chunks * ct)
         # A request resumed after a preemption keeps the start it had before:
         # write-behind stores nothing until the prompt's last prefill step, so
         # the chunks it computed before the preemption are not in Maru yet.
         preempted = self._requests_need_store.pop(req_id, None)
-        store_start = (
-            num_computed if preempted is None else min(num_computed, preempted[2])
-        )
-        num_full_chunks = len(token_ids) // self._kv_chunk_tokens
-        stored_chunks = (num_computed + num_scheduled) // self._kv_chunk_tokens
-        if stored_chunks < num_full_chunks:
+        store_start = start if preempted is None else min(start, preempted[2])
+        num_full_chunks = len(token_ids) // ct
+        end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)
+        if end_chunk < num_full_chunks:
             self._requests_need_store[req_id] = (
                 token_ids,
                 tuple(list(ids) for ids in block_ids),
                 store_start,
             )
+        if store_start // ct >= end_chunk:
+            return None
         return MaruReqMeta(
             req_id=req_id,
             token_ids=token_ids,
@@ -2076,9 +2086,10 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_waiting.discard(new_req.req_id)
 
             num_computed = getattr(new_req, "num_computed_tokens", 0) or 0
+            loaded_chunks = 0
             if new_req.req_id in self._requests_need_load:
                 # Load cached chunks from maru
-                _, num_chunks = self._requests_need_load[new_req.req_id]
+                _, loaded_chunks = self._requests_need_load[new_req.req_id]
                 load_start, load_end = self._load_ranges.get(new_req.req_id, (0, None))
                 meta.requests.append(
                     MaruReqMeta(
@@ -2086,7 +2097,7 @@ class MaruSchedulerConnector:
                         token_ids=token_ids,
                         block_ids=new_req.block_ids[0],
                         is_store=False,
-                        num_matched_chunks=num_chunks,
+                        num_matched_chunks=loaded_chunks,
                         load_start_token=load_start,
                         load_end_token=load_end,
                         group_block_ids=self._group_block_ids(new_req.block_ids),
@@ -2102,15 +2113,16 @@ class MaruSchedulerConnector:
             num_scheduled = scheduler_output.num_scheduled_tokens.get(
                 new_req.req_id, len(token_ids)
             )
-            meta.requests.append(
-                self._store_meta(
-                    new_req.req_id,
-                    token_ids,
-                    new_req.block_ids,
-                    num_computed,
-                    num_scheduled,
-                )
+            store = self._store_meta(
+                new_req.req_id,
+                token_ids,
+                new_req.block_ids,
+                num_computed,
+                num_scheduled,
+                loaded_chunks,
             )
+            if store is not None:
+                meta.requests.append(store)
 
         # Cached requests: chunked-prefill continuations and resumed loads.
         # Do NOT gate the store on ``resumed`` — chunked-prefill requests
@@ -2151,15 +2163,16 @@ class MaruSchedulerConnector:
                 )
                 # A resumed request gets every block again, so new_block_ids
                 # covers it from token 0, as a new request's do.
-                meta.requests.append(
-                    self._store_meta(
-                        req_id,
-                        list(request.prompt_token_ids or []),
-                        new_block_ids,
-                        num_computed,
-                        num_new,
-                    )
+                store = self._store_meta(
+                    req_id,
+                    list(request.prompt_token_ids or []),
+                    new_block_ids,
+                    num_computed,
+                    num_new,
+                    num_chunks,
                 )
+                if store is not None:
+                    meta.requests.append(store)
             elif req_id in self._requests_need_store:
                 token_ids, tracked, store_start = self._requests_need_store[req_id]
                 if resumed or tracked is None:
@@ -2168,11 +2181,11 @@ class MaruSchedulerConnector:
                     # new_block_ids lists from token 0.
                     if new_block_ids is None:
                         continue
-                    meta.requests.append(
-                        self._store_meta(
-                            req_id, token_ids, new_block_ids, num_computed, num_new
-                        )
+                    store = self._store_meta(
+                        req_id, token_ids, new_block_ids, num_computed, num_new
                     )
+                    if store is not None:
+                        meta.requests.append(store)
                     continue
                 # Chunked-prefill continuation: store the chunks completed by
                 # this step. Extend the accumulated block list first so the
