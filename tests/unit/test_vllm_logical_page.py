@@ -43,7 +43,7 @@ from tests.unit.vllm_connector_helpers import (
 LAYOUTS = ["LBNHC", "LBHNC", "BLNHC", "BHLNC"]
 
 
-def logical_pages(layout: str, k: list, v: list) -> list:
+def logical_pages(layout: str, k: list, v: list, device: str = "cpu") -> list:
     """Layer views as vLLM 0.29+ registers them: ``[B, H, N, K|V]``.
 
     ``k[l]`` and ``v[l]`` are layer ``l``'s keys and values as
@@ -51,25 +51,29 @@ def logical_pages(layout: str, k: list, v: list) -> list:
     layout's physical order — per layer for the L-outermost layouts, blocks
     outermost (layers interleaved inside each block) for the others — while
     every returned view has the same logical shape, as in vLLM's
-    ``create_kv_cache_views``.
+    ``create_kv_cache_views``. The pages are allocated on ``device``.
     """
     nb, bs, nh, hs = k[0].shape
     layers, c = len(k), 2 * hs
+
+    def empty(*shape):
+        return torch.empty(*shape, device=device)
+
     if layout == "LBHNC":
-        views = [torch.empty(nb, nh, bs, c) for _ in range(layers)]
+        views = [empty(nb, nh, bs, c) for _ in range(layers)]
     elif layout == "LBNHC":
-        views = [torch.empty(nb, bs, nh, c).permute(0, 2, 1, 3) for _ in range(layers)]
+        views = [empty(nb, bs, nh, c).permute(0, 2, 1, 3) for _ in range(layers)]
     elif layout == "BLNHC":
-        raw = torch.empty(nb, layers, bs, nh, c)
+        raw = empty(nb, layers, bs, nh, c)
         views = [raw[:, i].permute(0, 2, 1, 3) for i in range(layers)]
     elif layout == "BHLNC":
-        raw = torch.empty(nb, nh, layers, bs, c)
+        raw = empty(nb, nh, layers, bs, c)
         views = [raw[:, :, i] for i in range(layers)]
     else:
         raise ValueError(layout)
     for view, key, value in zip(views, k, v, strict=True):
-        view[..., :hs] = key.permute(0, 2, 1, 3)
-        view[..., hs:] = value.permute(0, 2, 1, 3)
+        view[..., :hs] = key.permute(0, 2, 1, 3).to(device)
+        view[..., hs:] = value.permute(0, 2, 1, 3).to(device)
     return views
 
 

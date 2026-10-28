@@ -2,6 +2,7 @@
 """Mixed placement, typed CXL ownership and failure handling (mock RM only)."""
 
 from dataclasses import asdict
+from unittest.mock import patch
 
 import pytest
 
@@ -12,8 +13,9 @@ from maru_common.storage_types import (
     StorageUnavailableError,
 )
 from maru_handler.storage.client import CpuStorageClient
+from maru_handler.storage.cpu import CpuPool
 from maru_server import MaruServer
-from tests.unit.test_cpu_storage import DirectRpc, put
+from tests.unit.test_cpu_storage import DirectRpc, _mock_torch_cuda, put
 
 
 class MixedRpc(DirectRpc):
@@ -264,3 +266,51 @@ def test_mixed_requires_explicit_server_capability():
         assert not server.replica_directory.get_usage()["pools"]
     finally:
         server.close()
+
+
+@pytest.mark.parametrize("pin", [True, False])
+def test_mixed_pins_both_pools_as_configured(server, monkeypatch, pin):
+    pinned = []
+    monkeypatch.setattr(
+        CpuPool, "page_lock", lambda self, keepalive=None: pinned.append(self.medium)
+    )
+    client = mixed_client(server, pin_pools=pin)
+    try:
+        assert sorted(pinned) == (["cpu", "cxl"] if pin else [])
+    finally:
+        client.close()
+
+
+def test_mixed_cxl_pool_is_registered_like_a_cxl_region(server):
+    """The CXL pool's mapping is registered whole, as DaxMapper registers the
+    cxl backend's regions, and unregistered before the RM takes it back."""
+    mock_torch, cudart = _mock_torch_cuda()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        client = mixed_client(server)
+        pools = client.pool.pools
+        assert pools["cpu"].cuda_registered and pools["cxl"].cuda_registered
+        assert sorted(c.args[1] for c in cudart.cudaHostRegister.call_args_list) == [
+            128,
+            128,
+        ]
+        put(client, "k", b"kv")
+        client.close()
+    assert cudart.cudaHostUnregister.call_count == 2
+    assert not any(p.cuda_registered for p in pools.values())
+
+
+def test_a_cxl_pool_that_fails_to_map_leaves_the_cpu_pool_unpinned(server, monkeypatch):
+    """The worker retries a failed open, so pinning the CPU pool before the CXL
+    pool has mapped would cost its prefault again on every retry."""
+
+    def fail_map(*args, **kwargs):
+        raise PermissionError("DAX mapping not permitted")
+
+    pinned = []
+    monkeypatch.setattr(
+        CpuPool, "page_lock", lambda self, keepalive=None: pinned.append(self.medium)
+    )
+    monkeypatch.setattr("maru_handler.storage.mixed.CxlPool", fail_map)
+    with pytest.raises(PermissionError):
+        mixed_client(server)
+    assert pinned == []

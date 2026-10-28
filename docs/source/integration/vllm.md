@@ -211,6 +211,14 @@ CPU mode requires `maru_cpu_pool_size`, a unique `maru_engine_id` per engine,
 an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`, and
 `kv_load_failure_policy="recompute"` in the KV transfer configuration. It supports
 one worker, homogeneous unquantized KV layers and synchronous chunkwise transfers.
+The worker faults the pool in and registers it with CUDA when it opens, as the
+`cxl` backend's regions are, so that GPU copies run at the DMA rate and stores
+do not fault in fresh pages. This locks the whole pool in memory and adds seconds
+to startup for tens of GB. A pool larger than the memory available stays
+pageable, and `maru_pin_pools=false` keeps any pool pageable. The worker opens
+the pool in `register_kv_caches`; if that fails, the first request that loads or
+stores opens it and waits for the page-lock, as the `cxl` backend's first
+request waits for its region mapping.
 A full pool skips new stores. Sharing, eviction and async/layerwise CPU transfers
 are not enabled in M1.
 
@@ -386,6 +394,8 @@ operation:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open, unless a CPU pool is larger than the memory available; `false` keeps them pageable |
+| `maru_load_copy_ahead` | int | `2` | Chunk slabs a load without a placement kernel (vLLM 0.29+ layouts) copies to the GPU ahead of its per-layer injects, on a side stream; `0` copies each slab in line. Each thread and stream that loads keeps this many slabs of GPU memory for the life of the worker, each `2 × layers × chunk tokens × KV hidden size × dtype size` (32 MiB for Llama 3.1 8B at 256-token chunks). They are allocated on the first load, after vLLM has sized its KV cache, so `gpu_memory_utilization` does not account for them |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
 | `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
 

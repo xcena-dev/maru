@@ -6,13 +6,20 @@ reserved by ReplicaDirectory, and returned only after the owner unmaps them.
 Cross-engine CXL mapping, replication and eviction are later capabilities.
 """
 
+from collections.abc import Callable
+
 from maru_common.storage_policy import FixedOrderPolicy
 
 from .cpu import CpuPool
 
 
 class CxlPool(CpuPool):
-    """The same page/ownership contract backed by an actual RM DAX mapping."""
+    """The same page/ownership contract backed by an actual RM DAX mapping.
+
+    ``page_lock`` faults the mapping in and registers it with CUDA, as
+    DaxMapper.map_region does for the cxl backend's regions, so that this
+    pool's GPU copies run as fast as that backend's.
+    """
 
     def __init__(self, grant: dict, page_size: int, rm_address: str):
         from maru_shm import PROT_READ, PROT_WRITE, MaruHandle, MaruShmClient
@@ -63,6 +70,11 @@ class MixedPool:
         except Exception:
             self.close()
             raise
+
+    def page_lock(self, keepalive: Callable[[], None] | None = None) -> None:
+        """Page-lock every pool, best effort (see ``CpuPool.page_lock``)."""
+        for pool in self.pools.values():
+            pool.page_lock(keepalive)
 
     def alloc(self, size: int):
         for medium in self.policy.candidates(set(self.pools)):

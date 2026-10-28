@@ -64,8 +64,10 @@ policies can use the same pool and replica descriptors.
 
 M2a retains the CPU baseline's single-worker, text-only, homogeneous unquantized
 KV, synchronous chunkwise and eager requirements. CPU and CXL transfers both
-use synchronous copies; this path does not require the optional CUDA extension
-or depend on pinning the host mapping.
+use synchronous copies; this path does not require the optional CUDA extension.
+Both pools are page-locked when they open (`maru_pin_pools`, default `true`);
+correctness does not depend on it, as a pool that fails registration keeps the
+pageable copy path.
 
 **Both pools are scoped to the owning worker in this version.** Mixed CXL regions
 and keys are separate from the legacy shared CXL cache. Another engine cannot
