@@ -10,7 +10,6 @@ import pytest
 
 from maru_common.kv_shard import (
     WHOLE_MODEL,
-    KVShard,
     tp_kv_shard,
     tp_kv_shards,
     tp_part_shard,
@@ -89,17 +88,6 @@ def test_whole_model_keeps_the_bare_key():
 def test_rejects_splits_vllm_cannot_build(rank, tp_size, total_heads):
     with pytest.raises(ValueError):
         tp_kv_shard(rank, tp_size, total_heads)
-
-
-def test_layer_range_names_a_pipeline_stage():
-    """The key format pipeline parallelism will use, fixed ahead of it."""
-    stage = KVShard(0, 4, 8, layer_start=16, layer_end=32, total_layers=32)
-    assert stage.suffix == "_h0-4_l16-32"
-    assert KVShard(layer_start=0, layer_end=16, total_layers=32).suffix == "_l0-16"
-    # A stage holding every layer names only its heads.
-    assert KVShard(0, 4, 8, layer_start=0, layer_end=32, total_layers=32).suffix == (
-        "_h0-4"
-    )
 
 
 def test_part_shard_names_its_part_of_the_tp_group():

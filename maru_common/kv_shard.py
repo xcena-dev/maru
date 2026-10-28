@@ -9,13 +9,13 @@ slice as well as the prefix: otherwise every rank registers its heads under
 one key, the server keeps whichever arrived first, and the other ranks load
 heads that are not theirs. Code calls a slice a shard (``KVShard``).
 
-A slice of attention KV is named by the KV heads it covers and, once
-pipeline parallelism is supported, the decoder layers, rather than by the
-rank that holds it. Ranks holding identical KV (an MLA latent, or more TP
-ranks than KV heads) therefore share one key: the first of them stores it
-and the others only load it (``KVShard.is_writer``). Engines that partition
-the model differently can never mistake each other's slices for their own.
-A slice covering the whole model keeps the bare chunk key, as at TP=1.
+A slice of attention KV is named by the KV heads it covers rather than by
+the rank that holds it. Ranks holding identical KV (an MLA latent, or more
+TP ranks than KV heads) therefore share one key: the first of them stores
+it and the others only load it (``KVShard.is_writer``). Engines that
+partition the model differently can never mistake each other's slices for
+their own. A slice covering the whole model keeps the bare chunk key, as at
+TP=1.
 
 Two kinds of slice are named by rank instead, ``_s<part>of<parts>``, the
 rank's part of its TP group:
@@ -55,13 +55,6 @@ class KVShard:
         head_end: One past the last KV head of the slice.
         total_heads: The model's KV heads when the slice is a range of them;
             1 otherwise (all KV, an MLA latent, or a slice named by rank).
-        layer_start: First decoder layer of the slice; ignored while
-            ``total_layers`` is 0.
-        layer_end: One past the last decoder layer of the slice; ignored
-            while ``total_layers`` is 0.
-        total_layers: Decoder layers of the whole model, or 0 when the slice
-            covers all of them. Nonzero only once pipeline parallelism is
-            supported.
         replica_index: Position of this rank among the ranks that hold this
             same slice.
         num_replicas: Ranks that hold this same slice.
@@ -73,9 +66,6 @@ class KVShard:
     head_start: int = 0
     head_end: int = 1
     total_heads: int = 1
-    layer_start: int = 0
-    layer_end: int = 0
-    total_layers: int = 0
     replica_index: int = 0
     num_replicas: int = 1
     part: int = 0
@@ -95,21 +85,15 @@ class KVShard:
     def suffix(self) -> str:
         """What a chunk key appends to name this slice; empty for the whole.
 
-        ``_h<start>-<end>`` names a range of KV heads, ``_s<part>of<parts>``
-        a rank's part and, under pipeline parallelism,
-        ``_l<start>-<end>`` a range of decoder layers. The same name always
-        means the same bytes. Cached, since store paths read it per layer.
+        ``_h<start>-<end>`` names a range of KV heads and
+        ``_s<part>of<parts>`` a rank's part. The same name always means the
+        same bytes. Cached, since store paths read it per layer.
         """
         suffix = ""
         if self.splits_heads:
             suffix += f"_h{self.head_start}-{self.head_end}"
         if self.parts > 1:
             suffix += f"_s{self.part}of{self.parts}"
-        if self.total_layers and (self.layer_start, self.layer_end) != (
-            0,
-            self.total_layers,
-        ):
-            suffix += f"_l{self.layer_start}-{self.layer_end}"
         return suffix
 
     @property
