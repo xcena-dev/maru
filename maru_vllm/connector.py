@@ -2083,12 +2083,13 @@ class MaruSchedulerConnector:
         too. None when the step leaves nothing to store.
         """
         ct = self._kv_chunk_tokens
-        start = max(num_computed, loaded_chunks * ct)
         # A request resumed after a preemption keeps the start it had before:
         # write-behind stores nothing until the prompt's last prefill step, so
         # the chunks it computed before the preemption are not in Maru yet.
+        # Never before the end of the chunks this step loads, which Maru has.
         preempted = self._requests_need_store.pop(req_id, None)
-        store_start = start if preempted is None else min(start, preempted[2])
+        first = num_computed if preempted is None else min(num_computed, preempted[2])
+        store_start = max(first, loaded_chunks * ct)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)
         if end_chunk < num_full_chunks:
