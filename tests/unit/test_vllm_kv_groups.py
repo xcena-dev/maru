@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+import maru_vllm.connector as connector_module
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     MaruKVConnector,
@@ -2438,3 +2439,89 @@ def test_tp_group_cache_head_count_is_checked():
     shards = _tp_shards(0, 4, 4)
     with pytest.raises(ValueError, match="holds 2 KV heads"):
         _tp_worker(tiny_kv_caches("0.30", _shared()), shards, {})
+
+
+def _qwen35_tp_scheduler(stored):
+    """The Qwen3.5 scheduler at TP=2: two parts of each Mamba state, and the
+    two KV heads of its attention group on one rank each."""
+    parts = ("_s0of2", "_s1of2")
+    sched = make_scheduler(
+        QWEN35_BLOCK,
+        QWEN35_BLOCK,
+        kv_groups=describe_kv_groups(qwen35_config()),
+        group_shard_suffixes={0: parts, 1: parts, 2: parts, 3: ("_h0-1", "_h1-2")},
+    )
+    sched._handler = _Store(stored)
+    return sched
+
+
+def test_tp_hit_needs_every_slice_of_every_group():
+    a = list(range(1200))  # step 1 ends at token 1,088
+    keys = _chunk_keys(a, QWEN35_BLOCK)
+    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
+    states = {
+        group_object_key(keys[1] + s, g) for s in ("_s0of2", "_s1of2") for g in range(3)
+    }
+    sched = _qwen35_tp_scheduler(attention | states)
+    assert _hit(sched, a) == 1088
+    # One lookup asked about every slice of every group.
+    assert attention | states <= set(sched._handler.queries[0])
+
+    # A rank that stored no state part can resume nowhere.
+    missing_state = group_object_key(keys[1] + "_s1of2", 0)
+    assert _hit(_qwen35_tp_scheduler((attention | states) - {missing_state}), a) == 0
+    missing_heads = group_object_key(keys[0] + "_h1-2", 3)
+    assert _hit(_qwen35_tp_scheduler((attention | states) - {missing_heads}), a) == 0
+
+
+def _tp_connector_config(block_size, tp_size, total_heads):
+    config = _connector_config(block_size)
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+    config.model_config.use_mla = False
+    config.model_config.get_total_num_kv_heads = lambda: total_heads
+    config.model_config.get_num_kv_heads = lambda pc: max(
+        1, total_heads // pc.tensor_parallel_size
+    )
+    config.model_config.get_head_size = lambda: 64
+    return config
+
+
+def test_tp_connector_wires_each_group_slice(monkeypatch):
+    gpt = MaruKVConnector(
+        _tp_connector_config(16, 2, 8), KVConnectorRole.SCHEDULER, gpt_oss_config()
+    )
+    heads = ("_h0-4", "_h4-8")
+    assert gpt._scheduler._group_suffixes == {0: heads, 1: heads}
+
+    qwen_config = _tp_connector_config(QWEN35_BLOCK, 2, 2)
+    qwen = MaruKVConnector(qwen_config, KVConnectorRole.SCHEDULER, qwen35_config())
+    parts = ("_s0of2", "_s1of2")
+    assert qwen._scheduler._group_suffixes == {
+        0: parts,
+        1: parts,
+        2: parts,
+        3: ("_h0-1", "_h1-2"),
+    }
+
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    worker = MaruKVConnector(
+        qwen_config, KVConnectorRole.WORKER, qwen35_config()
+    )._worker
+    assert {g: s.suffix for g, s in worker._group_shards.items()} == {
+        0: "_s1of2",
+        1: "_s1of2",
+        2: "_s1of2",
+        3: "_h1-2",
+    }
+
+
+def test_tp1_several_groups_keep_bare_keys(monkeypatch):
+    def no_rank():
+        raise AssertionError("TP=1 must not query the TP group")
+
+    monkeypatch.setattr(connector_module, "_tp_rank", no_rank)
+    config = _tp_connector_config(16, 1, 8)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
+    assert sched._scheduler._group_suffixes == {0: ("",), 1: ("",)}
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._group_shards == {}

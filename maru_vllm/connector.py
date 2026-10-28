@@ -68,7 +68,13 @@ from maru_vllm.kv_layout import (
     _scatter_kv,
     _vllm_kv_cache_layout,
 )
-from maru_vllm.kv_shard import WHOLE_MODEL, KVShard, tp_kv_shard, tp_kv_shards
+from maru_vllm.kv_shard import (
+    WHOLE_MODEL,
+    KVShard,
+    tp_kv_shard,
+    tp_kv_shards,
+    tp_state_shard,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -783,6 +789,38 @@ def _tp_rank() -> int:
     return get_tensor_model_parallel_rank()
 
 
+def _group_kv_shard(
+    group: KVGroup,
+    tp_rank: int,
+    tp_size: int,
+    total_kv_heads: int,
+    replicated: bool,
+) -> KVShard:
+    """The slice of one KV cache group that TP rank ``tp_rank`` holds.
+
+    An attention group (full or sliding window) holds KV heads, as a model
+    with one group does; a Mamba group holds a part of each state.
+    """
+    if group.kind == GROUP_MAMBA:
+        return tp_state_shard(tp_rank, tp_size)
+    return tp_kv_shard(tp_rank, tp_size, total_kv_heads, replicated)
+
+
+def _group_shard_suffixes(
+    groups: list[KVGroup], tp_size: int, total_kv_heads: int, replicated: bool
+) -> dict[int, tuple[str, ...]]:
+    """Every distinct slice suffix of each group over the ranks, in rank order."""
+    return {
+        g.group_id: tuple(
+            dict.fromkeys(
+                _group_kv_shard(g, rank, tp_size, total_kv_heads, replicated).suffix
+                for rank in range(tp_size)
+            )
+        )
+        for g in groups
+    }
+
+
 def _rank_scoped_extra(
     extra_config: dict[str, Any], tp_rank: int, tp_size: int
 ) -> dict[str, Any]:
@@ -1421,6 +1459,13 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     shard.suffix
                     for shard in tp_kv_shards(tp_size, total_kv_heads, kv_replicated)
                 ],
+                group_shard_suffixes=(
+                    _group_shard_suffixes(
+                        self._kv_groups, tp_size, total_kv_heads, kv_replicated
+                    )
+                    if len(self._kv_groups) > 1
+                    else None
+                ),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -1445,9 +1490,26 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     e,
                 )
             kv_shard = WHOLE_MODEL
+            group_shards: dict[int, KVShard] = {}
             if tp_size > 1:
                 tp_rank = _tp_rank()
                 kv_shard = tp_kv_shard(tp_rank, tp_size, total_kv_heads, kv_replicated)
+                if len(self._kv_groups) > 1:
+                    group_shards = {
+                        g.group_id: _group_kv_shard(
+                            g, tp_rank, tp_size, total_kv_heads, kv_replicated
+                        )
+                        for g in self._kv_groups
+                    }
+                    logger.info(
+                        "Maru: TP rank %d names its KV cache groups %s",
+                        tp_rank,
+                        ", ".join(
+                            f"g{group_id} {shard.suffix!r}"
+                            + ("" if shard.is_writer else " (loads only)")
+                            for group_id, shard in group_shards.items()
+                        ),
+                    )
                 extra = _rank_scoped_extra(extra, tp_rank, tp_size)
                 logger.info(
                     "Maru: TP rank %d of %d holds %s under key suffix %r; %s",
@@ -1471,6 +1533,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 kv_groups=self._kv_groups,
                 cache_config=vllm_config.cache_config,
                 kv_shard=kv_shard,
+                group_shards=group_shards,
             )
 
     @property
@@ -1649,6 +1712,7 @@ class MaruSchedulerConnector:
 
     _cpu_mode = False
     _shard_suffixes: tuple[str, ...] = ("",)
+    _group_suffixes: Mapping[int, tuple[str, ...]] = MappingProxyType({})
 
     def __init__(
         self,
@@ -1660,6 +1724,7 @@ class MaruSchedulerConnector:
         max_model_len: int | None = None,
         kv_groups: list[KVGroup] | None = None,
         shard_suffixes: Sequence[str] = ("",),
+        group_shard_suffixes: Mapping[int, Sequence[str]] | None = None,
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
@@ -1677,6 +1742,14 @@ class MaruSchedulerConnector:
         self._shard_suffixes = tuple(shard_suffixes)
         if not self._shard_suffixes:
             raise ValueError("shard_suffixes must name at least one KV slice")
+        # The same with several groups, by group id: every slice of every
+        # group must be stored. Groups not listed have one slice, "".
+        self._group_suffixes = {
+            group_id: tuple(suffixes)
+            for group_id, suffixes in (group_shard_suffixes or {}).items()
+        }
+        if not all(self._group_suffixes.values()):
+            raise ValueError("group_shard_suffixes must name a slice for each group")
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -1963,6 +2036,8 @@ class MaruSchedulerConnector:
         of the chunk may have left the GPU before the store. Keys already
         known to exist are tried first; when they fall short of every chunk,
         all groups' remaining keys go in one RPC. See ``kv_groups.hit_chunks``.
+        Under TP a group's object exists only once every rank's slice of it
+        is stored: a rank whose slice is missing would have nothing to load.
         """
         chunk_tokens = self._kv_chunk_tokens
         num_chunks = (len(token_ids) - 1) // chunk_tokens
@@ -1970,12 +2045,18 @@ class MaruSchedulerConnector:
         if not chunk_keys:
             return 0
 
+        def object_keys(i: int, g: KVGroup) -> list[str]:
+            return [
+                group_object_key(chunk_keys[i] + suffix, g.group_id)
+                for suffix in self._group_suffixes.get(g.group_id, ("",))
+            ]
+
         def hit_among(stored: set[str]) -> tuple[int, int]:
             return hit_chunks(
                 self._kv_groups,
                 len(chunk_keys),
                 chunk_tokens,
-                lambda i, g: group_object_key(chunk_keys[i], g.group_id) in stored,
+                lambda i, g: all(key in stored for key in object_keys(i, g)),
             )
 
         hit, prefix = hit_among(self._known_keys)
@@ -1983,9 +2064,10 @@ class MaruSchedulerConnector:
             hit, prefix = hit_among(
                 self._stored_keys(
                     [
-                        group_object_key(key, g.group_id)
-                        for key in chunk_keys
+                        key
+                        for i in range(len(chunk_keys))
                         for g in self._kv_groups
+                        for key in object_keys(i, g)
                     ]
                 )
             )

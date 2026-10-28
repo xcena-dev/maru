@@ -590,6 +590,7 @@ Example (Llama 7B, fp16):
 32 layers × 128 head_dim × 32 heads × 2(K+V) × 4096 tokens × 2 bytes ≈ 2GB
 ```
 
+(vllm-tensor-parallelism)=
 ### Tensor parallelism
 
 The CXL backend runs at any tensor-parallel size. vLLM starts one connector
@@ -623,6 +624,18 @@ stored, so no rank is ever asked to load a slice that is missing. It has no
 rank of its own, but it knows the TP size and the model's KV heads, so it
 lists every slice itself and checks all of them in one `batch_exists`.
 
+A model with several KV cache groups (see {ref}`vllm-hybrid-models`) names
+a slice in each (chunk, group) object, before the group's `_g<group_id>`.
+An attention group, full or sliding window, names its KV heads as above. A
+Mamba-type group names its part of the state, `_s<rank>of<TP>`: vLLM divides
+every Mamba state evenly over the ranks, and a rank's Gated DeltaNet conv
+state gathers its share of the q, k and v channels, which no head range
+describes. For example, Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_g3` and
+`kv_<hash>_s0of2_g0` on rank 0. No two ranks hold the same part of a state,
+so every rank stores its own, including a rank that only loads the
+replicated heads of an attention group. A chunk counts as cached only when
+every slice of every group it needs is stored.
+
 The ranks do not talk to each other. vLLM sends every worker the same
 metadata, treats a load or store as finished only once every worker reports
 it, and recomputes from the first block that any worker reports as failed.
@@ -644,7 +657,7 @@ Pipeline parallelism and decode or prefill context parallelism are refused at
 startup. The key format reserves `_l<a>-<b>` for the decoder-layer range of a
 pipeline stage; supporting PP still requires each stage to address its layers
 locally in the slab and the placement kernel, which index them globally
-today. The CPU and mixed backends still require TP=1.
+today. The CPU, mixed and remote_cxl backends still require TP=1.
 
 (vllm-hybrid-models)=
 ## Hybrid models
@@ -664,7 +677,7 @@ vLLM puts layers that keep different kinds of KV cache into separate KV cache gr
 
 The connector checks the group types at startup and refuses an unsupported model with the types it found. A model that passes this check can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
 
-Tests ran with tensor parallel size 1. Hybrid models are supported on this connector only, not on the LMCache path.
+Tests on GPU ran with tensor parallel size 1; under tensor parallelism each group names its own slice, see {ref}`vllm-tensor-parallelism`. Hybrid models are supported on this connector only, not on the LMCache path.
 
 ### Required settings
 
