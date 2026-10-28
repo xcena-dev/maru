@@ -16,8 +16,8 @@ from maru_vllm.kv_shard import (
     KVShard,
     tp_kv_shard,
     tp_kv_shards,
-    tp_state_shard,
-    tp_state_shards,
+    tp_part_shard,
+    tp_part_shards,
 )
 
 
@@ -105,26 +105,26 @@ def test_layer_range_names_a_pipeline_stage():
     )
 
 
-def test_state_shard_names_its_part_of_the_tp_group():
+def test_part_shard_names_its_part_of_the_tp_group():
     """vLLM splits a Mamba state by rank, not along one head axis."""
-    shard = tp_state_shard(1, 2)
+    shard = tp_part_shard(1, 2)
     assert shard.suffix == "_s1of2"
     assert shard.is_writer
     assert not shard.splits_heads
-    assert tp_state_shard(0, 1).suffix == ""
+    assert tp_part_shard(0, 1).suffix == ""
 
 
-def test_state_shards_of_different_tp_sizes_never_share_a_name():
-    two = {s.suffix for s in tp_state_shards(2)}
-    four = {s.suffix for s in tp_state_shards(4)}
+def test_part_shards_of_different_tp_sizes_never_share_a_name():
+    two = {s.suffix for s in tp_part_shards(2)}
+    four = {s.suffix for s in tp_part_shards(4)}
     assert two == {"_s0of2", "_s1of2"}
     assert len(four) == 4
     assert two.isdisjoint(four)
 
 
-def test_state_shard_rank_must_be_in_the_group():
+def test_part_shard_rank_must_be_in_the_group():
     with pytest.raises(ValueError, match="outside a group of 2"):
-        tp_state_shard(2, 2)
+        tp_part_shard(2, 2)
 
 
 def test_splits_heads_only_for_a_head_range():

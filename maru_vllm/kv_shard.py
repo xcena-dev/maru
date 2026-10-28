@@ -17,14 +17,23 @@ and the others only load it (``KVShard.is_writer``). Engines that partition
 the model differently can never mistake each other's slices for their own.
 A slice covering the whole model keeps the bare chunk key, as at TP=1.
 
-A Mamba-type state (vLLM's ``MambaSpec``, such as Gated DeltaNet's conv and
-recurrent state) is the exception, named by rank: vLLM gives each rank 1/TP
-of every state tensor, and a rank's conv state gathers its share of the q,
-k and v channels, which no single head range describes. Its slice is named
-``_s<part>of<parts>``, the rank's part of its TP group. That still names
-content, since the same model at the same TP size puts the same bytes in
-each part. Engines of different TP sizes never share a state slice, and no
-two ranks hold the same part, so every rank stores its own.
+Two kinds of slice are named by rank instead, ``_s<part>of<parts>``, the
+rank's part of its TP group:
+
+- A Mamba-type state (vLLM's ``MambaSpec``, such as Gated DeltaNet's conv
+  and recurrent state). vLLM gives each rank 1/TP of every state tensor,
+  and a rank's conv state gathers its share of the q, k and v channels,
+  which no single head range describes.
+- The attention KV of a model with several attention groups at more TP
+  ranks than KV heads. vLLM then replicates each group's heads by that
+  group's own count, which the connector cannot tell from the model's (one
+  model sets its sliding-window layers' count in model code), so it cannot
+  tell which ranks share heads.
+
+A part still names content, since the same model at the same TP size puts
+the same bytes in it. Engines of different TP sizes never share a part, and
+every rank stores its own, at the cost of storing replicated heads once per
+rank.
 
 Pure: integers in, names out. The connector supplies the parallel sizes and
 the rank from vLLM.
@@ -44,7 +53,7 @@ class KVShard:
         head_start: First KV head of the slice.
         head_end: One past the last KV head of the slice.
         total_heads: The model's KV heads when the slice is a range of them;
-            1 otherwise (all KV, an MLA latent, or a Mamba-type state).
+            1 otherwise (all KV, an MLA latent, or a slice named by rank).
         layer_start: First decoder layer of the slice; ignored while
             ``total_layers`` is 0.
         layer_end: One past the last decoder layer of the slice; ignored
@@ -55,9 +64,9 @@ class KVShard:
         replica_index: Position of this rank among the ranks that hold this
             same slice.
         num_replicas: Ranks that hold this same slice.
-        state_part: For a Mamba-type state, the rank's part of it.
-        state_parts: Parts a Mamba-type state is split into (the TP size),
-            or 1 for a slice of KV heads.
+        part: For a slice named by rank, the rank's part of its TP group.
+        parts: Parts of a slice named by rank (the TP size), or 1 for a
+            slice named by KV heads.
     """
 
     head_start: int = 0
@@ -68,8 +77,8 @@ class KVShard:
     total_layers: int = 0
     replica_index: int = 0
     num_replicas: int = 1
-    state_part: int = 0
-    state_parts: int = 1
+    part: int = 0
+    parts: int = 1
 
     @property
     def num_heads(self) -> int:
@@ -86,15 +95,15 @@ class KVShard:
         """What a chunk key appends to name this slice; empty for the whole.
 
         ``_h<start>-<end>`` names a range of KV heads, ``_s<part>of<parts>``
-        a part of a Mamba-type state and, under pipeline parallelism,
+        a rank's part and, under pipeline parallelism,
         ``_l<start>-<end>`` a range of decoder layers. The same name always
         means the same bytes. Cached, since store paths read it per layer.
         """
         suffix = ""
         if self.splits_heads:
             suffix += f"_h{self.head_start}-{self.head_end}"
-        if self.state_parts > 1:
-            suffix += f"_s{self.state_part}of{self.state_parts}"
+        if self.parts > 1:
+            suffix += f"_s{self.part}of{self.parts}"
         if self.total_layers and (self.layer_start, self.layer_end) != (
             0,
             self.total_layers,
@@ -186,30 +195,32 @@ def tp_kv_shards(tp_size: int, total_kv_heads: int) -> list[KVShard]:
     return list(shards.values())
 
 
-def tp_state_shard(tp_rank: int, tp_size: int) -> KVShard:
-    """The part of a Mamba-type state that tensor-parallel rank ``tp_rank`` holds.
+def tp_part_shard(tp_rank: int, tp_size: int) -> KVShard:
+    """The part that tensor-parallel rank ``tp_rank`` holds of a slice named
+    by rank: a Mamba-type state, or attention KV whose heads cannot be told
+    apart (see the module docstring).
 
     Args:
         tp_rank: The worker's rank in its tensor-parallel group.
         tp_size: Tensor-parallel group size.
 
     Returns:
-        The slice ``tp_rank`` holds; the whole state at TP=1.
+        The slice ``tp_rank`` holds; the whole KV at TP=1.
 
     Raises:
         ValueError: On a rank outside the group.
     """
     _check_rank(tp_rank, tp_size)
-    return KVShard(state_part=tp_rank, state_parts=tp_size)
+    return KVShard(part=tp_rank, parts=tp_size)
 
 
-def tp_state_shards(tp_size: int) -> list[KVShard]:
-    """The parts of a Mamba-type state the scheduler checks, in rank order.
+def tp_part_shards(tp_size: int) -> list[KVShard]:
+    """The parts of a slice named by rank that the scheduler checks.
 
     Args:
         tp_size: Tensor-parallel group size.
 
     Returns:
-        One slice per rank; every rank stores its own part.
+        One slice per rank, in rank order; every rank stores its own part.
     """
-    return [tp_state_shard(rank, tp_size) for rank in range(tp_size)]
+    return [tp_part_shard(rank, tp_size) for rank in range(tp_size)]

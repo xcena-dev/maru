@@ -72,8 +72,8 @@ from maru_vllm.kv_shard import (
     KVShard,
     tp_kv_shard,
     tp_kv_shards,
-    tp_state_shard,
-    tp_state_shards,
+    tp_part_shard,
+    tp_part_shards,
 )
 
 if TYPE_CHECKING:
@@ -790,6 +790,20 @@ def _tp_rank() -> int:
     return get_tensor_model_parallel_rank()
 
 
+def _names_attention_by_rank(
+    groups: list[KVGroup], tp_size: int, total_kv_heads: int
+) -> bool:
+    """Whether attention slices are named by rank rather than by KV heads.
+
+    With more TP ranks than KV heads, vLLM replicates each attention group's
+    heads by that group's own count. The connector knows only the model's
+    count, which a model with one attention group shares, but several groups
+    need not (see ``maru_vllm.kv_shard``).
+    """
+    attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
+    return len(attention) > 1 and tp_size > total_kv_heads
+
+
 def _rank_scoped_extra(
     extra_config: dict[str, Any], tp_rank: int, tp_size: int
 ) -> dict[str, Any]:
@@ -1368,6 +1382,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         else:
             _validate_cxl_parallelism(getattr(vllm_config, "parallel_config", None))
         tp_size, total_kv_heads = _tp_geometry(vllm_config)
+        attention_by_rank = _names_attention_by_rank(
+            self._kv_groups, tp_size, total_kv_heads
+        )
         self._kv_chunk_tokens = int(
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
@@ -1395,8 +1412,6 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative=vllm_config.speculative_config is not None,
                 inline_loads=not _get_knob(extra, "maru_async_load"),
-                tp_size=tp_size,
-                total_kv_heads=total_kv_heads,
             )
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
@@ -1425,9 +1440,14 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 max_model_len=vllm_config.model_config.max_model_len,
                 kv_groups=self._kv_groups,
                 shard_suffixes=[
-                    shard.suffix for shard in tp_kv_shards(tp_size, total_kv_heads)
+                    shard.suffix
+                    for shard in (
+                        tp_part_shards(tp_size)
+                        if attention_by_rank
+                        else tp_kv_shards(tp_size, total_kv_heads)
+                    )
                 ],
-                state_suffixes=[shard.suffix for shard in tp_state_shards(tp_size)],
+                state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -1454,7 +1474,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             kv_shard = state_shard = WHOLE_MODEL
             if tp_size > 1:
                 tp_rank = _tp_rank()
-                kv_shard = tp_kv_shard(tp_rank, tp_size, total_kv_heads)
+                kv_shard = (
+                    tp_part_shard(tp_rank, tp_size)
+                    if attention_by_rank
+                    else tp_kv_shard(tp_rank, tp_size, total_kv_heads)
+                )
                 if kv_shard.splits_heads and num_kv_heads not in (
                     None,
                     kv_shard.num_heads,
@@ -1467,7 +1491,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         f"heads, but its key suffix {kv_shard.suffix!r} names "
                         f"{kv_shard.num_heads} of {kv_shard.total_heads}"
                     )
-                state_shard = tp_state_shard(tp_rank, tp_size)
+                state_shard = tp_part_shard(tp_rank, tp_size)
                 extra = _rank_scoped_extra(extra, tp_rank, tp_size)
                 logger.info(
                     "Maru: TP rank %d of %d holds %s under key suffix %r and %s%s",
@@ -1476,6 +1500,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
                     f"of {kv_shard.total_heads}"
                     if kv_shard.splits_heads
+                    else "its attention KV, named by rank"
+                    if attention_by_rank
                     else "the whole KV",
                     kv_shard.suffix,
                     "stores it"

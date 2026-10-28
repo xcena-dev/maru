@@ -53,7 +53,7 @@ from maru_vllm.kv_groups import (
     state_view,
     window_chunks,
 )
-from maru_vllm.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_state_shard
+from maru_vllm.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_part_shard
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     FirstWinsServer,
@@ -2241,7 +2241,7 @@ def _tp_shards(rank, tp_size, total_heads):
     """``rank``'s KV heads and its part of each Mamba state."""
     return {
         "kv_shard": tp_kv_shard(rank, tp_size, total_heads),
-        "state_shard": tp_state_shard(rank, tp_size),
+        "state_shard": tp_part_shard(rank, tp_size),
     }
 
 
@@ -2374,8 +2374,23 @@ def _swa_caches(shared):
     }
 
 
-def test_tp_sliding_window_ranks_load_their_own_heads():
-    """A small gpt-oss at TP=2: both groups carry each rank's own heads."""
+def _rank_parts(rank, tp_size):
+    """Attention named by rank, as above TP = KV heads with several groups."""
+    part = tp_part_shard(rank, tp_size)
+    return {"kv_shard": part, "state_shard": part}
+
+
+@pytest.mark.parametrize(
+    ("shards", "names"),
+    [
+        (lambda rank: _tp_shards(rank, 2, 4), ("_h0-2", "_h2-4")),
+        (lambda rank: _rank_parts(rank, 4), ("_s0of4", "_s1of4")),
+    ],
+    ids=["by-heads", "by-rank"],
+)
+def test_tp_sliding_window_ranks_load_their_own_heads(shards, names):
+    """A small gpt-oss: both groups carry each rank's own KV, named by heads
+    or, above TP = KV heads, by rank."""
     server = FirstWinsServer()
     tokens = list(range(80))
     config = tiny_swa_config()
@@ -2383,7 +2398,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
     for rank in range(2):
         worker = _tp_worker(
             _swa_caches(_rank_shared(rank)),
-            _tp_shards(rank, 2, 4),
+            shards(rank),
             server,
             config,
             chunk=64,
@@ -2393,12 +2408,12 @@ def test_tp_sliding_window_ranks_load_their_own_heads():
 
     (k0,) = _chunk_keys(tokens, 64)
     assert set(server.objects) == {
-        group_object_key(k0 + h, g) for h in ("_h0-2", "_h2-4") for g in (0, 1)
+        group_object_key(k0 + name, g) for name in names for g in (0, 1)
     }
     for rank in range(2):
         worker = _tp_worker(
             _swa_caches(torch.zeros_like(_shared())),
-            _tp_shards(rank, 2, 4),
+            shards(rank),
             server,
             config,
             chunk=64,
@@ -2533,15 +2548,18 @@ def test_tp_kernel_stores_each_ranks_heads(write_behind):
             assert torch.all(slab == rank + 1)
 
 
-def test_tp_refuses_replicated_heads_with_several_attention_groups():
-    """Above TP = KV heads, several attention groups are refused
-    (check_multi_group_support); one attention group is named as usual."""
-    with pytest.raises(ValueError, match="several attention groups"):
-        MaruKVConnector(
-            _tp_connector_config(16, 16, 8),
-            KVConnectorRole.SCHEDULER,
-            gpt_oss_config(),
-        )
+def test_tp_names_attention_by_rank_above_the_kv_heads(monkeypatch):
+    """Above TP = KV heads, vLLM replicates each attention group's heads by
+    the group's own count, which several groups need not share. gpt-oss at
+    TP=16 names its attention KV by rank instead, and every rank stores its
+    own copy."""
+    config = _tp_connector_config(16, 16, 8)
+    gpt = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
+    assert gpt._scheduler._shard_suffixes == tuple(f"_s{r}of16" for r in range(16))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 3)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._kv_shard.suffix == "_s3of16"
+    assert worker._worker._kv_shard.is_writer
     # One attention group: its heads are the model's, replicated as named.
     qwen = MaruKVConnector(
         _tp_connector_config(QWEN35_BLOCK, 4, 2),

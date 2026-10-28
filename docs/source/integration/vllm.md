@@ -605,7 +605,7 @@ Chunk keys therefore name a slice by what it holds:
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
-| Part `r` of each Mamba-type state, in a model with several KV cache groups | `kv_<hash>_s<r>of<TP>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_s0of2_g0` on rank 0 |
+| Part `r` of a slice named by rank, in a model with several KV cache groups: each Mamba-type state, and the attention KV above TP = KV heads (below) | `kv_<hash>_s<r>of<TP>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_s0of2_g0` on rank 0 |
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
@@ -620,7 +620,11 @@ slice and the others only load it. A Mamba-type state is named by rank
 instead: vLLM divides every state evenly over the ranks, and a rank's Gated
 DeltaNet conv state gathers its share of the q, k and v channels, which no
 head range describes. No two ranks hold the same part, so every rank stores
-its own, including a rank that only loads replicated heads.
+its own, including a rank that only loads replicated heads. A model with
+several attention groups, such as gpt-oss, names its attention KV by rank as
+well at a tensor parallel size above its KV heads: vLLM then replicates each
+group's heads by that group's own count, which the connector cannot tell
+from the model's. Every rank then stores its own copy of its heads.
 
 Because keys name heads rather than ranks, engines of different TP sizes
 share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
@@ -657,11 +661,8 @@ Each worker process connects its own MaruHandler:
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
 startup: a pipeline stage would have to address its layers locally in the
-slab and the placement kernel, which index them globally. A model with
-several attention groups, such as gpt-oss, is refused at a tensor parallel
-size above its KV heads: vLLM then replicates each group's heads by that
-group's own count, which the connector cannot tell from the model's. The CPU,
-mixed and remote_cxl backends still require TP=1.
+slab and the placement kernel, which index them globally. The CPU, mixed and
+remote_cxl backends still require TP=1.
 
 (vllm-hybrid-models)=
 ## Hybrid models
