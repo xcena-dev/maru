@@ -796,13 +796,18 @@ def _names_attention_by_rank(
 ) -> bool:
     """Whether attention slices are named by rank rather than by KV heads.
 
-    With more TP ranks than KV heads, vLLM replicates each attention group's
-    heads by that group's own count. The connector knows only the model's
-    count, which a model with one attention group shares, but several groups
-    need not (see ``maru_common.kv_shard``).
+    With more TP ranks than KV heads, vLLM replicates each attention layer's
+    heads by that layer's own count. The connector knows only the model's
+    count, which sliding-window and full-attention layers need not share
+    (see ``maru_common.kv_shard``). Such layers fall into several groups,
+    or, with vLLM's hybrid KV cache manager off, into one full-attention
+    group whose spec keeps the sliding window.
     """
     attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
-    return len(attention) > 1 and tp_size > total_kv_heads
+    merged = any(
+        g.kind == GROUP_FULL and g.sliding_window is not None for g in attention
+    )
+    return (len(attention) > 1 or merged) and tp_size > total_kv_heads
 
 
 def _rank_scoped_extra(

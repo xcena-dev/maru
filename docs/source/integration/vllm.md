@@ -605,7 +605,7 @@ Chunk keys therefore name a slice by what it holds:
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
-| Rank `r`'s part of a slice named by rank, in a model with several KV cache groups: each Mamba-type state, and the attention KV when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>_c<chunk_tokens>_g<group_id>` | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0` on rank 0 |
+| Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0` on rank 0 |
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
@@ -624,7 +624,12 @@ its own, including a rank that only loads replicated heads. A model with
 several attention groups, such as gpt-oss, names its attention KV by rank as
 well at a tensor parallel size above its KV heads: vLLM then replicates each
 group's heads by that group's own count, which the connector cannot tell
-from the model's. Every rank then stores its own copy of its heads.
+from the model's. Every rank then stores its own copy of its heads. So does
+a model whose sliding-window and full-attention layers vLLM keeps in one
+group, as it does with its hybrid KV cache manager off
+(`--disable-hybrid-kv-cache-manager`, or vLLM before 0.30): one rank's object
+holds both kinds of layer, and two ranks that share a full-attention head can
+hold different sliding-window heads.
 
 Because keys name heads rather than ranks, engines of different TP sizes
 share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and

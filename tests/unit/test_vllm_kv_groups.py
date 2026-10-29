@@ -2610,6 +2610,40 @@ def test_tp_names_attention_by_rank_above_the_kv_heads(monkeypatch):
     assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
 
 
+def _one_attention_group(**spec):
+    """gpt-oss's 24 layers in one full-attention group."""
+    layers = [f"model.layers.{i}.attn" for i in range(24)]
+    return SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(layers, FullAttentionSpec(**GPT_OSS_ATTN, **spec))
+        ],
+        num_blocks=NUM_BLOCKS,
+    )
+
+
+def test_tp_names_attention_by_rank_in_one_group_with_a_sliding_window(monkeypatch):
+    """With its hybrid KV cache manager off, vLLM keeps sliding-window and
+    full layers in one full-attention group whose spec keeps the window. The
+    two kinds can replicate different head counts (8 and 4 at TP=8: ranks 0
+    and 1 share a full-attention head, not a sliding-window one), so every
+    rank names and stores its own KV."""
+    config = _tp_connector_config(16, 16, 8)
+    merged = _one_attention_group(sliding_window=128)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, merged)
+    assert sched._scheduler._shard_suffixes == tuple(f"_tp16_r{r}" for r in range(16))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, merged)._worker
+    assert worker._kv_shard.suffix == "_tp16_r1"
+    assert worker._kv_shard.is_writer
+    # Full attention alone replicates the model's heads, which it names.
+    full = MaruKVConnector(config, KVConnectorRole.SCHEDULER, _one_attention_group())
+    assert full._scheduler._shard_suffixes == tuple(f"_h{h}-{h + 1}" for h in range(8))
+    # Up to TP = KV heads every rank holds its own heads in either case.
+    tp8 = _tp_connector_config(16, 8, 8)
+    sched = MaruKVConnector(tp8, KVConnectorRole.SCHEDULER, merged)
+    assert sched._scheduler._shard_suffixes == tuple(f"_h{h}-{h + 1}" for h in range(8))
+
+
 def _qwen35_tp4_worker(monkeypatch, rank):
     """A Qwen3.5 worker at TP=4: its 2 KV heads sit on two ranks each."""
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: rank)

@@ -24,12 +24,14 @@ Two kinds of slice are named by rank instead, as ``_tp<parts>_r<part>``
   Each rank holds 1/TP of every state tensor, and a rank's conv state
   gathers its share of the q, k and v channels, which no single head range
   describes.
-- The attention KV of a model whose attention layers fall into several
-  groups (sliding-window and full layers, for example) at more TP ranks
-  than KV heads. The engine then replicates each group's heads by that
-  group's own count, which the connector cannot always tell from the
-  model's (one model sets its sliding-window layers' count in model code),
-  so it cannot tell which ranks share heads.
+- The attention KV of a model with sliding-window and full layers at more
+  TP ranks than KV heads, whether the engine keeps the two kinds in
+  separate KV cache groups or in one. The engine replicates each layer's
+  heads by that layer's own count, which the connector cannot always tell
+  from the model's (one model sets its sliding-window layers' count in
+  model code), so it cannot tell which ranks share heads. Kept in one
+  group, a rank's object holds both kinds, and two ranks that share the
+  full layers' head can still differ in the sliding-window one.
 
 A part still names content, since the same model at the same TP size puts
 the same bytes in it. Engines of different TP sizes never share a part, and
