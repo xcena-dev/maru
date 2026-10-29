@@ -16,7 +16,7 @@ a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
 a Mamba group keeps only the state at the chunk's last block. A model with
 one group keeps the bare chunk key; with several, each object is keyed
-``<chunk key>_g<group id>``.
+``<chunk key>_c<chunk tokens>_g<group id>`` (see :func:`group_object_key`).
 """
 
 from __future__ import annotations
@@ -139,9 +139,17 @@ def describe_kv_groups(
     return groups
 
 
-def group_object_key(chunk_key: str, group_id: int) -> str:
-    """Key of the (chunk, group) object for a model with several groups."""
-    return f"{chunk_key}_g{group_id}"
+def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
+    """Key of the (chunk, group) object for a model with several groups.
+
+    A chunk key hashes the tokens from the prompt's start to the chunk's
+    end, so it does not say where the chunk starts, and the chunk length
+    does. It varies between engines: with a Mamba group a chunk is one vLLM
+    block, sized from the per-rank Mamba state and attention page, so
+    Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token ones at TP=4,
+    where rank 0 holds the same KV head and names it alike.
+    """
+    return f"{chunk_key}_c{chunk_tokens}_g{group_id}"
 
 
 def window_chunks(group: KVGroup, end: int, chunk_tokens: int) -> range:

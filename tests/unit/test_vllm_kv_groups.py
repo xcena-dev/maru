@@ -569,6 +569,21 @@ def test_window_chunks():
     )
 
 
+def test_group_objects_name_their_chunk_length():
+    """Qwen3.5-0.8B's chunk is one block: 544 tokens at TP=2, 272 at TP=4.
+    Both engines hash tokens 0-543 to one chunk key (TP=2's chunk 0, TP=4's
+    chunk 1), and rank 0 holds KV head 0 in both, so only the chunk length
+    keeps a 272-token object from passing for a 544-token one."""
+    tokens = list(range(QWEN35_BLOCK))
+    (tp2,) = _chunk_keys(tokens, QWEN35_BLOCK)
+    _, tp4 = _chunk_keys(tokens, QWEN35_BLOCK // 2)
+    assert tp2 == tp4
+    heads = tp_kv_shard(0, 2, 2).suffix
+    assert tp_kv_shard(0, 4, 2).suffix == heads == "_h0-1"
+    assert group_object_key(tp2 + heads, 3, QWEN35_BLOCK) == f"{tp2}_h0-1_c544_g3"
+    assert group_object_key(tp4 + heads, 3, QWEN35_BLOCK // 2) == f"{tp2}_h0-1_c272_g3"
+
+
 class _Store:
     """A MaruHandler stand-in holding a set of keys."""
 
@@ -584,8 +599,10 @@ class _Store:
 def _stored_by(tokens, chunk, attention_groups, state_groups, state_chunks):
     """Keys a request stores: attention objects for every chunk, states for some."""
     keys = _chunk_keys(tokens, chunk)
-    stored = {group_object_key(k, g) for k in keys for g in attention_groups}
-    stored |= {group_object_key(keys[i], g) for i in state_chunks for g in state_groups}
+    stored = {group_object_key(k, g, chunk) for k in keys for g in attention_groups}
+    stored |= {
+        group_object_key(keys[i], g, chunk) for i in state_chunks for g in state_groups
+    }
     return stored
 
 
@@ -651,7 +668,9 @@ def test_lookup_asks_every_group_in_one_rpc():
     assert _hit(sched, b) == 1632
     (query,) = sched._handler.queries
     keys = _chunk_keys(b, QWEN35_BLOCK)[:3]
-    assert query == [group_object_key(k, g) for k in keys for g in range(4)]
+    assert query == [
+        group_object_key(k, g, QWEN35_BLOCK) for k in keys for g in range(4)
+    ]
 
 
 def test_known_keys_that_give_every_chunk_skip_the_rpc():
@@ -729,7 +748,9 @@ def test_a_later_request_asks_maru_again_only_after_a_reported_failure(report):
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     first = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, first) == 1088
-    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    sched._handler.keys.discard(
+        group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1, QWEN35_BLOCK)
+    )
     if report == "blocks":
         _report_failure(sched)
     elif report == "request":
@@ -1267,17 +1288,19 @@ def test_a_step_ending_on_a_chunk_stores_every_group(version):
     # Attention: both chunks the step completed. Mamba: only the chunk the
     # step ended on; chunk 0's state was overwritten within the step.
     assert set(store) == {
-        group_object_key(k0, 3),
-        group_object_key(k1, 3),
-        *(group_object_key(k1, g) for g in range(3)),
+        group_object_key(k0, 3, TINY_BLOCK),
+        group_object_key(k1, 3, TINY_BLOCK),
+        *(group_object_key(k1, g, TINY_BLOCK) for g in range(3)),
     }
     attn = worker._group_caches[3].tensors
     for key, block in ((k0, 4), (k1, 5)):
         expected = _expected_slab(attn, [block], version)
-        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+        assert torch.equal(
+            _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
+        )
     # A state object holds each layer's state at a stride of one block slot.
     for g in range(3):
-        obj = store[group_object_key(k1, g)]
+        obj = store[group_object_key(k1, g, TINY_BLOCK)]
         assert len(obj) == 2 * TINY_SLOT
         block = QWEN_BLOCKS[g][1]
         for p in range(2):
@@ -1294,7 +1317,7 @@ def test_a_step_ending_inside_a_chunk_stores_no_state():
         _store_meta(tokens, ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6]), 0, 40)
     )
     keys = _chunk_keys(tokens, TINY_BLOCK)
-    assert set(store) == {group_object_key(k, 3) for k in keys[:2]}
+    assert set(store) == {group_object_key(k, 3, TINY_BLOCK) for k in keys[:2]}
 
 
 def test_a_null_state_block_stores_no_state():
@@ -1302,8 +1325,8 @@ def test_a_null_state_block_stores_no_state():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, ([0, 0], [0, 2], [0, 3], [4, 5]), 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert group_object_key(k1, 0) not in store
-    assert group_object_key(k1, 1) in store
+    assert group_object_key(k1, 0, TINY_BLOCK) not in store
+    assert group_object_key(k1, 1, TINY_BLOCK) in store
 
 
 def test_shared_prefix_is_stored_once_per_key():
@@ -1331,9 +1354,9 @@ def test_sliding_window_reads_the_null_block_behind_the_window():
     (k0,) = _chunk_keys(tokens, 64)
     swa, full = (c.tensors for c in worker._group_caches)
     expected = _expected_slab(swa, [0, 8, 9, 10], "0.30")
-    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 0, 64)], expected), expected)
     expected = _expected_slab(full, [3, 4, 5, 6], "0.30")
-    assert torch.equal(_slab(store[group_object_key(k0, 1)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 1, 64)], expected), expected)
 
 
 def test_without_the_kernel_a_write_behind_store_is_synchronous():
@@ -1377,9 +1400,9 @@ def test_a_later_step_stores_the_state_at_its_own_end():
     blocks = ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6])
     worker.wait_for_save(_store_meta(tokens, blocks, 32, 16))
     k2 = _chunk_keys(tokens, TINY_BLOCK)[2]
-    assert set(store) == {group_object_key(k2, g) for g in range(4)}
+    assert set(store) == {group_object_key(k2, g, TINY_BLOCK) for g in range(4)}
     shared = _shared()
-    obj = store[group_object_key(k2, 1)]
+    obj = store[group_object_key(k2, 1, TINY_BLOCK)]
     assert obj[:TINY_STATE] == bytes(_region(shared, 0)[2 * TINY_SLOT :][:TINY_STATE])
 
 
@@ -1406,8 +1429,8 @@ def test_a_failing_group_keeps_the_others_and_leaks_nothing():
     worker.wait_for_save(meta)
     ka, kb = _chunk_keys(a, TINY_BLOCK), _chunk_keys(b, TINY_BLOCK)
     assert set(store) == {
-        *(group_object_key(k, 3) for k in ka),
-        *(group_object_key(k, g) for k in (ka[1], kb[1]) for g in range(3)),
+        *(group_object_key(k, 3, TINY_BLOCK) for k in ka),
+        *(group_object_key(k, g, TINY_BLOCK) for k in (ka[1], kb[1]) for g in range(3)),
     }
     assert worker._handler.batch_store.call_count == 1
     assert worker._handler.alloc.call_count == len(store)
@@ -1453,9 +1476,11 @@ def _check_qwen_objects(worker, store, shared, tokens):
     attn = [t.cpu() for t in worker._group_caches[3].tensors]
     for key, block in ((k0, 4), (k1, 5)):
         expected = _expected_slab(attn, [block], "0.23")
-        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+        assert torch.equal(
+            _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
+        )
     for g in range(3):
-        obj = store[group_object_key(k1, g)]
+        obj = store[group_object_key(k1, g, TINY_BLOCK)]
         block = QWEN_BLOCKS[g][1]
         for p in range(2):
             state = _region(shared, p)[block * TINY_SLOT :][:TINY_STATE].cpu()
@@ -1481,7 +1506,7 @@ def test_kernel_store_registers_no_group_object_whose_copy_failed():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert set(store) == {group_object_key(k1, g) for g in range(3)}
+    assert set(store) == {group_object_key(k1, g, TINY_BLOCK) for g in range(3)}
     assert worker._handler.free.call_count == 2  # the two attention slabs
 
 
@@ -1490,7 +1515,7 @@ def test_kernel_write_behind_stores_attention_later_and_states_now():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert all(group_object_key(k1, g) in store for g in range(3))
+    assert all(group_object_key(k1, g, TINY_BLOCK) in store for g in range(3))
     worker._store_executor.shutdown(wait=True)
     assert len(store) == 5
     _check_qwen_objects(worker, store, shared, tokens)
@@ -1515,7 +1540,7 @@ def test_kernel_store_reads_the_null_block_behind_the_window():
     (k0,) = _chunk_keys(tokens, 64)
     swa = [t.cpu() for t in worker._group_caches[0].tensors]
     expected = _expected_slab(swa, [0, 8, 9, 10], "0.23")
-    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 0, 64)], expected), expected)
 
 
 class _HeldExecutor:
@@ -1698,7 +1723,7 @@ FAILED_PARKED = (set(), {"b"}, {"b"})
 def test_a_failed_parked_load_is_reported_by_its_request():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
-    del store[group_object_key(k1, 2)]
+    del store[group_object_key(k1, 2, TINY_BLOCK)]
     worker, target = _loading_worker(store)
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)
@@ -1711,7 +1736,9 @@ def test_connector_reports_failed_parked_loads_with_their_completion():
     if not hasattr(KVConnectorBase_V1, "get_transfer_results"):
         pytest.skip("this vLLM reports load failures by block only")
     _, _, store = _stored_qwen()
-    del store[group_object_key(_chunk_keys(list(range(40)), TINY_BLOCK)[1], 2)]
+    del store[
+        group_object_key(_chunk_keys(list(range(40)), TINY_BLOCK)[1], 2, TINY_BLOCK)
+    ]
     worker, _ = _loading_worker(store)
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._worker = worker
@@ -1732,13 +1759,13 @@ def test_a_load_skips_what_vllms_prefix_cache_holds():
     worker.start_load_kv(_FORWARD, meta)
     (keys,), _ = worker._handler.batch_retrieve.call_args
     k0, k1 = _chunk_keys(list(range(40)), TINY_BLOCK)
-    assert group_object_key(k0, 3) not in keys
+    assert group_object_key(k0, 3, TINY_BLOCK) not in keys
     dst = worker._group_caches[3].tensors
     assert not _token_rows(dst[0], 7, "0.30").any()
     src = stored._group_caches[3].tensors
     assert torch.equal(_token_rows(dst[0], 8, "0.30"), _token_rows(src[0], 5, "0.30"))
 
-    del store[group_object_key(k1, 3)]
+    del store[group_object_key(k1, 3, TINY_BLOCK)]
     worker.start_load_kv(_FORWARD, meta)
     assert worker.take_failed_load_blocks() == {1, 3, 5, 8}
 
@@ -2176,7 +2203,7 @@ def test_an_unavailable_handler_fails_the_loads(parked):
 def test_an_inline_load_of_a_missing_object_is_reported():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
-    del store[group_object_key(k1, 0)]
+    del store[group_object_key(k1, 0, TINY_BLOCK)]
     worker, target = _loading_worker(store)
     worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
     assert _reported_failures(worker) == FAILED_INLINE
@@ -2277,9 +2304,13 @@ def test_tp_ranks_store_and_load_their_own_slices(version):
 
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
     assert set(server.objects) == {
-        *(group_object_key(k + h, 3) for k in (k0, k1) for h in ("_h0-2", "_h2-4")),
         *(
-            group_object_key(k1 + s, g)
+            group_object_key(k + h, 3, TINY_BLOCK)
+            for k in (k0, k1)
+            for h in ("_h0-2", "_h2-4")
+        ),
+        *(
+            group_object_key(k1 + s, g, TINY_BLOCK)
             for s in ("_tp2_r0", "_tp2_r1")
             for g in range(3)
         ),
@@ -2344,9 +2375,9 @@ def test_tp_replica_skips_attention_but_stores_its_state():
 
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
     assert _registered_keys(workers[1]) == {
-        group_object_key(k1 + "_tp4_r1", g) for g in range(3)
+        group_object_key(k1 + "_tp4_r1", g, TINY_BLOCK) for g in range(3)
     }
-    assert group_object_key(k0 + "_h0-1", 3) in _registered_keys(workers[0])
+    assert group_object_key(k0 + "_h0-1", 3, TINY_BLOCK) in _registered_keys(workers[0])
 
     target = torch.zeros_like(_shared())
     worker = _tp_worker(
@@ -2412,7 +2443,7 @@ def test_tp_sliding_window_ranks_load_their_own_heads(shards, names):
 
     (k0,) = _chunk_keys(tokens, 64)
     assert set(server.objects) == {
-        group_object_key(k0 + name, g) for name in names for g in (0, 1)
+        group_object_key(k0 + name, g, 64) for name in names for g in (0, 1)
     }
     for rank in range(2):
         worker = _tp_worker(
@@ -2447,9 +2478,13 @@ QWEN35_TP2 = {
 def _qwen35_tp2_objects(keys):
     """What both ranks store of a 1,200-token prompt whose first step ended
     at chunk 1: attention for every chunk, states for chunk 1."""
-    attention = {group_object_key(k + h, 3) for k in keys for h in ("_h0-1", "_h1-2")}
+    attention = {
+        group_object_key(k + h, 3, QWEN35_BLOCK)
+        for k in keys
+        for h in ("_h0-1", "_h1-2")
+    }
     states = {
-        group_object_key(keys[1] + s, g)
+        group_object_key(keys[1] + s, g, QWEN35_BLOCK)
         for s in ("_tp2_r0", "_tp2_r1")
         for g in range(3)
     }
@@ -2466,9 +2501,9 @@ def test_tp_hit_needs_every_slice_of_every_group():
     assert stored <= set(sched._handler.queries[0])
 
     # One rank's part of one Mamba state is missing: no chunk can resume.
-    missing_state = group_object_key(keys[1] + "_tp2_r1", 0)
+    missing_state = group_object_key(keys[1] + "_tp2_r1", 0, QWEN35_BLOCK)
     assert _hit(_qwen35_scheduler(stored - {missing_state}, **QWEN35_TP2), a) == 0
-    missing_heads = group_object_key(keys[0] + "_h1-2", 3)
+    missing_heads = group_object_key(keys[0] + "_h1-2", 3, QWEN35_BLOCK)
     assert _hit(_qwen35_scheduler(stored - {missing_heads}, **QWEN35_TP2), a) == 0
 
 
@@ -2549,7 +2584,7 @@ def test_tp_kernel_stores_each_ranks_heads(write_behind):
 
     for k in _chunk_keys(tokens, TINY_BLOCK):
         for rank, heads in enumerate(("_h0-2", "_h2-4")):
-            raw = server.objects[group_object_key(k + heads, 3)]
+            raw = server.objects[group_object_key(k + heads, 3, TINY_BLOCK)]
             slab = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
             assert torch.all(slab == rank + 1)
 
@@ -2612,7 +2647,9 @@ def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
 def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
     a = list(range(1200))
     keys = _chunk_keys(a, QWEN35_BLOCK)
-    stored = _qwen35_tp2_objects(keys) - {group_object_key(keys[1] + "_tp2_r1", 0)}
+    stored = _qwen35_tp2_objects(keys) - {
+        group_object_key(keys[1] + "_tp2_r1", 0, QWEN35_BLOCK)
+    }
     with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
         assert _hit(_qwen35_scheduler(stored, **QWEN35_TP2), a) == 0
     assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)

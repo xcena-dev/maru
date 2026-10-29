@@ -86,9 +86,12 @@ class KVShard:
         """What a chunk key appends to name this slice; empty for the whole.
 
         ``_h<start>-<end>`` names a range of KV heads, and
-        ``_tp<parts>_r<part>`` a rank's part at that TP size. The same name
-        always means the same bytes. Cached, since store paths read it per
-        layer.
+        ``_tp<parts>_r<part>`` a rank's part at that TP size. The suffix
+        names only the slice: for one name to mean one set of bytes, the
+        rest of the key must name the chunk's tokens, including the chunk
+        length where engines can differ in it (vLLM's keys for several KV
+        cache groups add ``_c<chunk tokens>``). Cached, since store paths
+        read it per layer.
         """
         suffix = ""
         if self.splits_heads:

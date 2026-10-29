@@ -1058,8 +1058,8 @@ class _SlabTarget:
 
     A single-group model stores every layer under the chunk key. With
     several KV cache groups each attention group is its own target, keyed
-    ``<chunk key>_g<group id>`` and reading that group's block ids. Either
-    way the chunk key names the slice this rank holds
+    ``<chunk key>_c<chunk tokens>_g<group id>`` and reading that group's
+    block ids. Either way the chunk key names the slice this rank holds
     (``MaruWorkerConnector._slice_chunk_keys``).
 
     Attributes:
@@ -1068,6 +1068,7 @@ class _SlabTarget:
         dtype: KV element type.
         device: Device of the paged KV tensors.
         group: The group, or None for a single-group model.
+        chunk_tokens: Tokens per chunk, which a group's key names.
     """
 
     num_layers: int
@@ -1075,11 +1076,12 @@ class _SlabTarget:
     dtype: torch.dtype
     device: torch.device
     group: KVGroup | None = None
+    chunk_tokens: int = 0
 
     def key(self, chunk_key: str) -> str:
         if self.group is None:
             return chunk_key
-        return group_object_key(chunk_key, self.group.group_id)
+        return group_object_key(chunk_key, self.group.group_id, self.chunk_tokens)
 
     def block_ids(self, req_meta: MaruReqMeta) -> list[int]:
         """Block ids to read this step's completed chunks from.
@@ -2006,7 +2008,7 @@ class MaruSchedulerConnector:
                 self._state_suffixes if g.kind == GROUP_MAMBA else self._shard_suffixes
             )
             return [
-                group_object_key(chunk_keys[i] + suffix, g.group_id)
+                group_object_key(chunk_keys[i] + suffix, g.group_id, chunk_tokens)
                 for suffix in suffixes
             ]
 
@@ -3501,7 +3503,7 @@ class MaruWorkerConnector:
             for c in self._group_caches
         }
         keys = [
-            group_object_key(chunk_keys[c.group.group_id][ci], c.group.group_id)
+            group_object_key(chunk_keys[c.group.group_id][ci], c.group.group_id, ct)
             for c, ci in plan
         ]
         try:
@@ -5967,6 +5969,7 @@ class MaruWorkerConnector:
             first.dtype,
             first.device,
             cache.group,
+            self._kv_chunk_tokens,
         )
 
     def _slice(self, group: KVGroup | None) -> KVShard:
@@ -6118,7 +6121,9 @@ class MaruWorkerConnector:
                 continue
             block = block_ids[position]
             key = group_object_key(
-                self._slice_chunk_keys(req_meta, group)[end // ct - 1], group.group_id
+                self._slice_chunk_keys(req_meta, group)[end // ct - 1],
+                group.group_id,
+                ct,
             )
             if self._is_stored(key) or key in keys:
                 continue
