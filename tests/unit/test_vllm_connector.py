@@ -18,10 +18,12 @@ import torch
 
 from maru_vllm.connector import (
     _RENAMED_KNOBS,
+    MaruConnectorMetadata,
     _align_down,
     _chunk_keys,
     _get_knob,
     _parse_size,
+    _step_chunks,
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
@@ -38,6 +40,7 @@ from tests.unit.vllm_connector_helpers import (
     make_vllm_scheduler,
     make_worker,
     store_metadata,
+    store_req_meta,
 )
 
 # =============================================================================
@@ -1409,6 +1412,133 @@ class TestPackedStoreLoadRoundtrip:
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name])
 
+    def test_a_step_that_loads_stores_only_what_it_computes(self):
+        """An inline load and the store of the chunks computed after it (#111)."""
+        src = self._source_caches()
+        stored, token_ids = self._store(src)
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        hit = 2
+        loaded_tokens = hit * self.CHUNK
+
+        dst = {name: torch.zeros_like(tensor) for name, tensor in src.items()}
+        worker = self._make_worker(dst)
+        new_objects = attach_capturing_handler(worker, capture=bytearray)
+        worker._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(view=memoryview(stored[key]), region_id=0, page_index=i)
+            for i, key in enumerate(keys)
+        ]
+        block_ids = list(range(self.NUM_BLOCKS))
+        metadata = MaruConnectorMetadata(
+            requests=[
+                deferred_req_meta(
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    num_matched_chunks=hit,
+                    deferred_load=False,
+                ),
+                store_req_meta(
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    num_computed_tokens=loaded_tokens,
+                    num_scheduled_tokens=self.PROMPT - loaded_tokens,
+                ),
+            ]
+        )
+        forward_context = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=tensor) for name, tensor in dst.items()
+            },
+            attn_metadata=make_flash_attn_metadata(),
+        )
+
+        worker.start_load_kv(forward_context, metadata)
+        # The forward computes the tokens past the hit.
+        for name in self._layer_names():
+            dst[name][loaded_tokens // self.BLOCK :] = src[name][
+                loaded_tokens // self.BLOCK :
+            ]
+        attn_metadata = make_flash_attn_metadata()
+        for name in self._layer_names():
+            worker.save_kv_layer(name, dst[name], attn_metadata, metadata)
+
+        for name in self._layer_names():
+            torch.testing.assert_close(dst[name], src[name])
+        assert set(new_objects) == set(chunk_keys[hit:])
+        for key in chunk_keys[hit:]:
+            assert new_objects[key] == stored[key]
+
+    def test_a_request_whose_load_fails_stores_nothing(self):
+        """Its forward ran over blocks the load never filled (#111)."""
+        src = self._source_caches()
+        token_ids = list(range(self.PROMPT))
+        other_ids = list(range(1000, 1000 + self.PROMPT))
+        hit = 2
+        loaded_tokens = hit * self.CHUNK
+        worker = self._make_worker(src)
+        new_objects = attach_capturing_handler(worker, capture=bytearray)
+        # The hit was evicted after the scheduler looked it up.
+        worker._handler.batch_retrieve.side_effect = lambda keys: [None] * len(keys)
+        block_ids = list(range(self.NUM_BLOCKS))
+
+        def store(req_id, tokens):
+            return store_req_meta(
+                token_ids=tokens,
+                block_ids=block_ids,
+                req_id=req_id,
+                num_computed_tokens=loaded_tokens,
+                num_scheduled_tokens=self.PROMPT - loaded_tokens,
+            )
+
+        def step(metadata):
+            worker.handle_preemptions(metadata)
+            worker.start_load_kv(forward_context, metadata)
+            for name in self._layer_names():
+                worker.save_kv_layer(name, src[name], attn_metadata, metadata)
+
+        forward_context = SimpleNamespace(
+            no_compile_layers={
+                name: SimpleNamespace(kv_cache=tensor) for name, tensor in src.items()
+            },
+            attn_metadata=make_flash_attn_metadata(),
+        )
+        attn_metadata = make_flash_attn_metadata()
+        step(
+            MaruConnectorMetadata(
+                requests=[
+                    deferred_req_meta(
+                        token_ids=token_ids,
+                        block_ids=block_ids,
+                        num_matched_chunks=hit,
+                        deferred_load=False,
+                    ),
+                    store("r1", token_ids),
+                    store("r2", other_ids),
+                ]
+            )
+        )
+        other_keys = set(_chunk_keys(other_ids, self.CHUNK)[hit:])
+        assert set(new_objects) == other_keys
+
+        # Nor in its later steps, until it finishes.
+        step(MaruConnectorMetadata(requests=[store("r1", token_ids)]))
+        assert set(new_objects) == other_keys
+        step(MaruConnectorMetadata(finished_req_ids={"r1"}))
+        assert not worker._unsound_kv_req_ids
+
+    def test_a_parked_load_failing_on_the_loader_thread_still_stores(self):
+        """The loader hands a parked remote load's batches on as inline parts."""
+        worker = self._make_worker(self._source_caches())
+        part = deferred_req_meta(
+            token_ids=list(range(self.PROMPT)),
+            block_ids=list(range(self.NUM_BLOCKS)),
+            num_matched_chunks=2,
+            deferred_load=False,
+        )
+        worker._inflight_deferred_req_ids.add(part.req_id)
+        worker._fail_load(part, RuntimeError("copy failed"))
+        assert worker.take_failed_load_blocks()
+        assert not worker._unsound_kv_req_ids
+
 
 # =============================================================================
 # Packed store -> load round trip through the fused kernel (GPU)
@@ -1798,6 +1928,126 @@ class TestBuildConnectorMetaStoreAccumulation:
         assert req.block_ids == list(range(15))
         assert req.num_computed_tokens == 58
 
+    def test_inline_load_stores_the_chunks_computed_after_it(self):
+        """A request that loads a hit stores what it computes past it (#111)."""
+        sched = self._make_scheduler()
+        sched._count_matched_chunks = lambda tokens: 2
+        token_ids = list(range(64))
+        request = SimpleNamespace(request_id="r1", prompt_token_ids=token_ids)
+        assert sched.get_num_new_matched_tokens(request, 0) == (16, False)
+        sched.update_state_after_alloc(request, MagicMock(), 16)
+        new_req = fake_new_request_data(token_ids, list(range(10)))
+        new_req.num_computed_tokens = 16
+
+        meta = sched.build_connector_meta(
+            self._output([new_req], self._cached([], [], []), {"r1": 24})
+        )
+        load, store = meta.requests
+        assert not load.is_store and load.num_matched_chunks == 2
+        assert store.is_store
+        assert (store.num_computed_tokens, store.num_scheduled_tokens) == (16, 24)
+        assert store.block_ids == list(range(10))
+        assert store.store_start_token == 16
+
+        # Later chunked-prefill steps store the rest of the prompt.
+        meta = sched.build_connector_meta(
+            self._output(
+                [], self._cached(["r1"], [(list(range(10, 16)),)], [40]), {"r1": 24}
+            )
+        )
+        (store,) = meta.requests
+        assert store.is_store and store.block_ids == list(range(16))
+        # Write-behind stores from the first chunk the request computed.
+        assert store.store_start_token == 16
+        assert "r1" not in sched._requests_need_store
+
+    def _preempt_mid_prefill(self, sched, token_ids):
+        """Run r1's first prefill step over 20 tokens, then preempt it."""
+        new_req = fake_new_request_data(token_ids, list(range(5)))
+        sched.build_connector_meta(
+            self._output([new_req], self._cached([], [], []), {"r1": 20})
+        )
+        preempted = self._output([], self._cached([], [], []), {})
+        preempted.preempted_req_ids = {"r1"}
+        assert sched.build_connector_meta(preempted).requests == []
+
+    def test_a_request_preempted_mid_prefill_stores_on_when_it_resumes(self):
+        """The V1 model runner sends it back as a resumed cached request (#111)."""
+        sched = self._make_scheduler()
+        token_ids = list(range(64))
+        self._preempt_mid_prefill(sched, token_ids)
+
+        # vLLM's prefix cache covers its first 8 tokens; its blocks are new.
+        meta = sched.build_connector_meta(
+            self._output(
+                [],
+                self._cached(["r1"], [(list(range(20, 30)),)], [8], resumed=["r1"]),
+                {"r1": 32},
+            )
+        )
+        (store,) = meta.requests
+        assert store.is_store and store.token_ids == token_ids
+        assert store.block_ids == list(range(20, 30))
+        assert (store.num_computed_tokens, store.num_scheduled_tokens) == (8, 32)
+        # Write-behind has not stored what it computed before the preemption.
+        assert store.store_start_token == 0
+
+        meta = sched.build_connector_meta(
+            self._output(
+                [], self._cached(["r1"], [(list(range(30, 36)),)], [40]), {"r1": 24}
+            )
+        )
+        (store,) = meta.requests
+        assert store.block_ids == list(range(20, 36))
+        assert store.store_start_token == 0
+        assert "r1" not in sched._requests_need_store
+
+    def test_a_request_resumed_as_a_new_request_drops_its_old_entry(self):
+        """The V2 model runner sends a resumed request as a new request."""
+        sched = self._make_scheduler()
+        token_ids = list(range(64))
+        self._preempt_mid_prefill(sched, token_ids)
+
+        resumed = fake_new_request_data(token_ids, list(range(20, 36)))
+        resumed.num_computed_tokens = 8
+        meta = sched.build_connector_meta(
+            self._output([resumed], self._cached([], [], []), {"r1": 56})
+        )
+        (store,) = meta.requests
+        assert store.block_ids == list(range(20, 36))
+        assert (store.num_computed_tokens, store.store_start_token) == (8, 0)
+        assert "r1" not in sched._requests_need_store
+
+    def test_a_preempted_request_that_finishes_drops_its_entry(self):
+        sched = self._make_scheduler()
+        self._preempt_mid_prefill(sched, list(range(64)))
+        finished = self._output([], self._cached([], [], []), {})
+        finished.finished_req_ids = {"r1"}
+        sched.build_connector_meta(finished)
+        assert "r1" not in sched._requests_need_store
+
+    def test_resumed_load_stores_the_chunks_computed_after_it(self):
+        sched = self._make_scheduler()
+        token_ids = list(range(64))
+        request = SimpleNamespace(
+            request_id="r1", prompt_token_ids=token_ids, all_token_ids=token_ids
+        )
+        sched.update_state_after_alloc(request, MagicMock(), 16)
+
+        meta = sched.build_connector_meta(
+            self._output(
+                [],
+                self._cached(["r1"], [(list(range(10)),)], [16], resumed=["r1"]),
+                {"r1": 24},
+            )
+        )
+        load, store = meta.requests
+        assert not load.is_store
+        assert store.is_store and store.token_ids == token_ids
+        assert store.block_ids == list(range(10))
+        assert (store.num_computed_tokens, store.num_scheduled_tokens) == (16, 24)
+        assert "r1" in sched._requests_need_store
+
     def test_preempted_ids_are_forwarded_for_store_stream_safety(self):
         sched = self._make_scheduler()
         output = self._output([], self._cached([], [], []), {})
@@ -1821,6 +2071,224 @@ class TestBuildConnectorMetaStoreAccumulation:
 
         assert owns_blocks is enabled
         assert params is None
+
+
+class TestSyncPartialHitStoresComputedChunks:
+    """A request that loads its leading chunks stores only what it computes.
+
+    From #100. A fully cached prompt holds one block back for vLLM to
+    compute, inside a chunk Maru already has, so that chunk is not stored.
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _scheduler_with_load(self, num_tokens, cached_chunks, num_computed=0):
+        sched = make_scheduler(
+            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+        )
+        sched._handler = MagicMock()
+        total_chunks = num_tokens // self.CHUNK
+        sched._handler.batch_exists.return_value = [True] * cached_chunks + [False] * (
+            total_chunks - cached_chunks
+        )
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(num_tokens)),
+            all_token_ids=list(range(num_tokens)),
+        )
+        matched, load_async = sched.get_num_new_matched_tokens(request, num_computed)
+        assert load_async is False
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (list(range(num_tokens // self.BLOCK)),)
+        sched.update_state_after_alloc(request, blocks, matched)
+        return sched, num_computed + matched
+
+    def _new_req(self, num_tokens, num_computed):
+        return fake_new_request_data(
+            prompt_token_ids=list(range(num_tokens)),
+            block_ids=list(range(-(-num_tokens // self.BLOCK))),
+            num_computed_tokens=num_computed,
+        )
+
+    def test_full_hit_held_back_block_stores_nothing(self):
+        # 40 tokens = exactly 5 chunks, all cached: one block is held back for
+        # the engine to compute. Every chunk already exists, so no store.
+        sched, computed = self._scheduler_with_load(40, cached_chunks=5)
+        assert computed == 36
+        meta = sched.build_connector_meta(
+            fake_scheduler_output([self._new_req(40, computed)], None, {"r1": 4})
+        )
+        assert [r.is_store for r in meta.requests] == [False]
+
+    def test_full_hit_resumed_with_a_load_stores_nothing(self):
+        """The same full hit, loaded when the request resumes (V1 runner)."""
+        sched, computed = self._scheduler_with_load(40, cached_chunks=5)
+        meta = sched.build_connector_meta(
+            fake_scheduler_output(
+                [],
+                fake_cached_reqs(["r1"], [(list(range(10)),)], [computed], ["r1"]),
+                {"r1": 4},
+            )
+        )
+        assert [r.is_store for r in meta.requests] == [False]
+
+    def test_stores_start_at_store_start_token(self):
+        """The per-step stores skip the chunk the held-back block is in."""
+        meta = store_req_meta(
+            token_ids=list(range(40)),
+            block_ids=list(range(10)),
+            num_computed_tokens=36,
+            num_scheduled_tokens=4,
+        )
+        assert list(_step_chunks(meta, self.CHUNK, 5)) == [4]
+        meta.store_start_token = 40
+        assert list(_step_chunks(meta, self.CHUNK, 5)) == []
+
+
+class TestStoreStartsPastTheHit:
+    """A request stores none of the chunks its lookup found in Maru.
+
+    Each case drives one request (8-token chunks, 4-token blocks) through the
+    scheduler as vLLM does: lookup, allocation, the parked load when
+    ``maru_async_load`` is on, and prefill steps, with a preemption and a
+    resume where the case needs one. The V1 model runner sends a resumed
+    request as a cached one ("resumed"), the V2 runner as a new one ("new").
+    """
+
+    CHUNK = 8
+    BLOCK = 4
+
+    def _scheduler(self, async_load=False):
+        sched = make_scheduler(
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={"maru_async_load": async_load},
+        )
+        sched._handler = MagicMock()
+        return sched
+
+    def _admit(self, sched, tokens, cached_chunks, local=0):
+        """Look the request up and allocate it; return its computed tokens.
+
+        Maru holds the prompt's first ``cached_chunks`` chunks and vLLM's own
+        prefix cache its first ``local`` tokens. A parked load completes.
+        """
+        sched._known_keys.clear()
+        sched._handler.batch_exists.side_effect = lambda keys: [
+            i < cached_chunks for i in range(len(keys))
+        ]
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(tokens)),
+            all_token_ids=list(range(tokens)),
+        )
+        matched, parked = sched.get_num_new_matched_tokens(request, local)
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (self._blocks(tokens),)
+        sched.update_state_after_alloc(request, blocks, matched)
+        if parked and matched:
+            sched.build_connector_meta(fake_scheduler_output([], None, {}))
+            sched.update_state_after_alloc(request, blocks, 0)
+        return local + matched
+
+    def _blocks(self, tokens):
+        return list(range(-(-tokens // self.BLOCK)))
+
+    def _step(self, sched, tokens, computed, scheduled, how):
+        """Schedule one step; return its store entries.
+
+        ``how``: "new" (a new request, or a resume the V2 runner sends),
+        "resumed" (a resume the V1 runner sends) or "cached" (a later step).
+        """
+        prompt = list(range(tokens))
+        if how == "new":
+            new = fake_new_request_data(
+                prompt, self._blocks(tokens), num_computed_tokens=computed
+            )
+            output = fake_scheduler_output([new], None, {"r1": scheduled})
+        else:
+            resumed = how == "resumed"
+            cached = fake_cached_reqs(
+                ["r1"],
+                [(self._blocks(tokens),) if resumed else None],
+                [computed],
+                ["r1"] if resumed else [],
+            )
+            output = fake_scheduler_output([], cached, {"r1": scheduled})
+        meta = sched.build_connector_meta(output)
+        return [r for r in meta.requests if r.is_store]
+
+    def _preempt(self, sched):
+        output = fake_scheduler_output([], None, {})
+        output.preempted_req_ids = {"r1"}
+        sched.build_connector_meta(output)
+
+    def test_a_parked_full_hit_stores_nothing(self):
+        sched = self._scheduler(async_load=True)
+        computed = self._admit(sched, 40, cached_chunks=5)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, "new") == []
+
+    def test_a_hit_vllm_prefix_cache_covers_stores_nothing(self):
+        """Nothing loads, but the chunk the held-back block is in is in Maru."""
+        sched = self._scheduler()
+        computed = self._admit(sched, 40, cached_chunks=5, local=36)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, "new") == []
+
+    @pytest.mark.parametrize("how", ["resumed", "new"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    def test_a_full_hit_after_a_preemption_stores_nothing(self, async_load, how):
+        """The start kept from before the preemption stays past the hit."""
+        sched = self._scheduler(async_load)
+        self._step(sched, 40, self._admit(sched, 40, 0), 8, "new")
+        self._preempt(sched)
+        computed = self._admit(sched, 40, cached_chunks=5)
+        assert computed == 36
+        assert self._step(sched, 40, computed, 4, how) == []
+
+    @pytest.mark.parametrize("how", ["resumed", "new"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    def test_a_partial_hit_after_a_preemption_stores_from_its_end(
+        self, async_load, how
+    ):
+        """Write-behind starts here: it must not copy the loaded chunks again."""
+        sched = self._scheduler(async_load)
+        self._step(sched, 40, self._admit(sched, 40, 0), 8, "new")
+        self._preempt(sched)
+        computed = self._admit(sched, 40, cached_chunks=2)
+        assert computed == 16
+        (store,) = self._step(sched, 40, computed, 24, how)
+        assert store.store_start_token == 16
+
+    def test_a_failed_parked_load_stores_what_it_computes(self):
+        """vLLM recomputes the request, and the chunks it lost may be gone."""
+        sched = self._scheduler(async_load=True)
+        assert self._admit(sched, 40, cached_chunks=3) == 24
+        # The load failed: the request computes from its own prefix cache.
+        (store,) = self._step(sched, 40, 0, 40, "new")
+        assert store.store_start_token == 0
+
+    def test_a_request_preempted_in_its_prompt_tail_stores_on(self):
+        """It may compute chunks it once had from vLLM's prefix cache.
+
+        20 tokens: 2 full chunks and a 4-token tail. vLLM's prefix cache
+        covers chunk 0 at first; after the preemption it does not.
+        """
+        sched = self._scheduler()
+        computed = self._admit(sched, 20, cached_chunks=0, local=8)
+        assert computed == 8
+        (store,) = self._step(sched, 20, 8, 8, "new")
+        assert list(_step_chunks(store, self.CHUNK, 2)) == [1]
+        # Every full chunk is in: the tail stores nothing, but stays tracked.
+        assert self._step(sched, 20, 16, 2, "cached") == []
+        assert "r1" in sched._requests_need_store
+        self._preempt(sched)
+        assert self._admit(sched, 20, cached_chunks=0) == 0
+        (store,) = self._step(sched, 20, 0, 20, "resumed")
+        assert list(_step_chunks(store, self.CHUNK, 2)) == [0, 1]
+        assert "r1" not in sched._requests_need_store
 
 
 # =============================================================================
@@ -2330,6 +2798,55 @@ class TestAsyncDeferredPackedLoad:
         torch.testing.assert_close(kv1, source[:, 1].view_as(kv1))
         assert worker._deferred_layerwise_loads == {}
         assert worker._layer_load_events == {}
+
+    def test_a_failed_layerwise_activation_stops_its_request_storing(self):
+        """The resumed forward computes over what the activation left unfilled."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+            },
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        meta = self._deferred_meta()
+        meta.num_matched_chunks = 1
+        meta.block_ids = [0]
+        # Too short for a chunk slab: the copy into the layers fails.
+        info = SimpleNamespace(view=memoryview(bytearray(4)), region_id=0, page_index=0)
+        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), [info])
+        kv = torch.zeros(2, 1, 4, 1)
+        forward = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv),
+                "model.layers.1.self_attn": SimpleNamespace(kv_cache=kv.clone()),
+            },
+            attn_metadata=None,
+        )
+        # r2 has nothing to activate: its load failed earlier and was
+        # reported, so vLLM computes it in full.
+        metadata = MaruConnectorMetadata(
+            requests=[
+                store_req_meta(
+                    token_ids=list(range(8)),
+                    block_ids=[0, 1],
+                    req_id=req_id,
+                    num_computed_tokens=4,
+                    num_scheduled_tokens=4,
+                )
+                for req_id in ("r1", "r2")
+            ],
+            layerwise_load_req_ids={"r1", "r2"},
+        )
+
+        worker.start_load_kv(forward, metadata)
+
+        assert worker._unsound_kv_req_ids == {"r1"}
+        assert [r.req_id for r in worker._store_entries(metadata)] == ["r2"]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_layerwise_activation_records_one_event_per_layer(self):

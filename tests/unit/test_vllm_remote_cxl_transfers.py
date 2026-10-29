@@ -779,7 +779,16 @@ def test_a_failed_remote_load_keeps_recomputed_prefix_storable(monkeypatch, miss
     )
     handler = worker._handler
     assert worker.take_failed_load_blocks()
+    assert not worker._loaded_request_keys[load.req_id][1]
+    # The failed request itself stores nothing: its forward ran over blocks
+    # the load never filled (#111).
     worker._store_packed_slabs_write_behind(kernel, _resumed_store(load, computed=0))
+    assert not allocs
+    # A later request with the prefix recomputes and stores all of it.
+    worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={load.req_id}))
+    worker._store_packed_slabs_write_behind(
+        kernel, _resumed_store(load, request_id="later", computed=0)
+    )
     worker.shutdown()
     assert len(allocs) == kernel[0].multi_layer_kv_transfer.call_count == 3
     assert handler.batch_store.call_args.args[0] == keys
@@ -797,6 +806,33 @@ def test_write_behind_still_coalesces_prefill_without_a_remote_load(monkeypatch)
     worker.shutdown()
     assert len(allocs) == 3
     assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8)
+
+
+def test_write_behind_starts_at_the_first_chunk_the_request_computed(monkeypatch):
+    """The chunks before it were loaded or are vLLM's prefix cache (#111)."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("hit", list(range(24)), list(range(6)), False)
+    metadata = _resumed_store(load, computed=12)
+    metadata.requests[0].store_start_token = 12
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, metadata)
+    worker.shutdown()
+    # Chunk 1 holds token 12: the request computed part of it.
+    assert len(allocs) == 2
+    assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8)[1:]
+
+
+def test_write_behind_skips_the_chunk_a_full_hit_holds_back(monkeypatch):
+    """vLLM computes the held-back block again, but Maru has its chunk."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("hit", list(range(24)), list(range(6)), False)
+    metadata = _resumed_store(load, computed=20)
+    metadata.requests[0].store_start_token = 24
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, metadata)
+    worker.shutdown()
+    assert not allocs
+    handler.batch_store.assert_not_called()
 
 
 @pytest.mark.parametrize("request_id", ["another", "loaded"])
