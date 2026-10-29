@@ -810,21 +810,42 @@ def _names_attention_by_rank(
     return (len(attention) > 1 or merged) and tp_size > total_kv_heads
 
 
+def _dp_index(vllm_config: VllmConfig) -> int:
+    """This engine's data-parallel index; 0 without data parallelism.
+
+    vLLM resets ``data_parallel_rank`` to 0 on each replica of a model
+    without MoE layers, which runs as an independent engine, and keeps the
+    replica's index in ``data_parallel_index``. Older vLLM has only the rank.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    index = getattr(parallel_config, "data_parallel_index", None)
+    if index is None:
+        index = getattr(parallel_config, "data_parallel_rank", 0)
+    return int(index or 0)
+
+
 def _rank_scoped_extra(
-    extra_config: dict[str, Any], tp_rank: int, tp_size: int
+    extra_config: dict[str, Any], tp_rank: int, tp_size: int, dp_index: int = 0
 ) -> dict[str, Any]:
-    """Give each TP worker its own ``maru_instance_id``.
+    """Give each worker process its own ``maru_instance_id``.
 
     Every worker process connects its own MaruHandler and owns its own CXL
-    pool. Under one configured id the server would see the ranks as a single
-    owner: pre-mapping skips the siblings' regions, usage is merged, and
-    owner-scoped cleanup would reach regions a sibling still uses. Without a
-    configured id each process already draws its own UUID.
+    pool. Under one configured id the server would see the processes as a
+    single owner: pre-mapping skips the siblings' regions, usage is merged,
+    and owner-scoped cleanup would reach regions a sibling still uses. A
+    data-parallel replica runs its own TP group, so ``-dp<index>`` tells
+    replicas apart and ``-tp<rank>`` the ranks of one; replica 0 keeps the
+    id it has without data parallelism. Without a configured id each process
+    already draws its own UUID.
     """
     instance_id = extra_config.get("maru_instance_id")
-    if tp_size == 1 or not instance_id:
+    if not instance_id or (tp_size == 1 and dp_index == 0):
         return extra_config
-    return {**extra_config, "maru_instance_id": f"{instance_id}-tp{tp_rank}"}
+    if dp_index > 0:
+        instance_id = f"{instance_id}-dp{dp_index}"
+    if tp_size > 1:
+        instance_id = f"{instance_id}-tp{tp_rank}"
+    return {**extra_config, "maru_instance_id": instance_id}
 
 
 def _vllm_version_at_least(minimum: str) -> bool:
@@ -1480,6 +1501,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     e,
                 )
             kv_shard = state_shard = WHOLE_MODEL
+            tp_rank = 0
             if tp_size > 1:
                 tp_rank = _tp_rank()
                 kv_shard = (
@@ -1504,7 +1526,6 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         f"{kv_shard.total_heads}"
                     )
                 state_shard = tp_part_shard(tp_rank, tp_size)
-                extra = _rank_scoped_extra(extra, tp_rank, tp_size)
                 logger.info(
                     "Maru: TP rank %d of %d holds %s under key suffix %r and %s%s",
                     tp_rank,
@@ -1524,6 +1545,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     if any(g.kind == GROUP_MAMBA for g in self._kv_groups)
                     else "",
                 )
+            extra = _rank_scoped_extra(extra, tp_rank, tp_size, _dp_index(vllm_config))
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,

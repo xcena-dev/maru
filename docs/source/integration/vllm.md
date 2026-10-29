@@ -661,8 +661,9 @@ Each worker process connects its own MaruHandler:
   that only loads replicated heads or an MLA latent stores none of them, only
   its own part of each Mamba-type state.
 - A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
-  sees each rank as its own owner. Leaving it unset already gives every
-  process its own UUID.
+  sees each rank as its own owner. With data parallelism, replica `d` > 0
+  adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving
+  the id unset already gives every process its own UUID.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
 startup: a pipeline stage would have to address its layers locally in the

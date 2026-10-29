@@ -366,6 +366,31 @@ def test_tp1_worker_is_unchanged(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("tp_size", "parallel", "instance_id"),
+    [
+        # A replica of a model without MoE layers: vLLM resets its rank to 0
+        # and keeps the replica's index.
+        (2, {"data_parallel_rank": 0, "data_parallel_index": 1}, "inst1-dp1-tp1"),
+        (2, {"data_parallel_rank": 3, "data_parallel_index": 3}, "inst1-dp3-tp1"),
+        (2, {"data_parallel_rank": 0, "data_parallel_index": 0}, "inst1-tp1"),
+        (1, {"data_parallel_rank": 0, "data_parallel_index": 2}, "inst1-dp2"),
+        # A vLLM without data_parallel_index.
+        (2, {"data_parallel_rank": 1}, "inst1-dp1-tp1"),
+    ],
+)
+def test_worker_scopes_its_instance_id_to_its_data_parallel_replica(
+    monkeypatch, tp_size, parallel, instance_id
+):
+    """Each data-parallel replica runs its own TP group, so rank 1 of one
+    replica must not share an owner id with rank 1 of another."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    connector = MaruKVConnector(
+        fake_vllm_config(tp_size, 8, **parallel), KVConnectorRole.WORKER
+    )
+    assert connector._worker._extra_config["maru_instance_id"] == instance_id
+
+
+@pytest.mark.parametrize(
     "parallel",
     [
         {"pipeline_parallel_size": 2},
