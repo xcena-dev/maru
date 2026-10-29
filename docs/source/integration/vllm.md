@@ -25,6 +25,30 @@ uv pip install vllm
 See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
 for GPU-specific options.
 
+(vllm-model-support)=
+## Model support
+
+Whether MaruKVConnector can store a model's KV cache depends on the KV cache
+structure that vLLM builds for the model. On the CXL backend (the default),
+at any tensor parallel size:
+
+| KV cache structure | Example models | Status |
+|---|---|---|
+| Full attention (MHA, GQA, MQA), one KV cache group | Llama-3.1-8B | Supported |
+| MLA, one KV cache group | DeepSeek-V2-Lite | Supported; above TP=1, rank 0 alone stores the latent that every rank holds |
+| Sliding window + full attention | gpt-oss-20b | Supported: as several KV cache groups on vLLM 0.30+, or as one group (see {ref}`vllm-hybrid-one-group`) |
+| Mamba-type + full attention | Qwen3.5-0.8B | Supported on vLLM 0.30+ |
+| Attention groups whose KV heads differ in count or size | MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape |
+| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape |
+| MLA with other kinds of group | GLM-5.3-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers |
+
+GPU tests of the supported structures ran with the example models on vLLM
+0.32, at tensor parallel sizes 1 and 2. Structures not listed are not tested.
+Models without attention layers, such as Mamba, are refused above TP=1.
+Models with several KV cache groups have settings and limits of their own;
+see {ref}`vllm-hybrid-models`. The CPU, mixed and remote_cxl backends take
+only models with one KV cache group, at TP=1.
+
 ## Integration Architecture
 
 MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing
@@ -597,8 +621,9 @@ Example (Llama 7B, fp16):
 (vllm-tensor-parallelism)=
 ## Tensor parallelism
 
-The CXL backend supports tensor parallelism. vLLM starts one connector per TP
-worker, and each worker stores and loads only the KV it holds. Every rank
+The CXL backend supports tensor parallelism for the KV cache structures in
+{ref}`vllm-model-support`. vLLM starts one connector per TP worker, and each
+worker stores and loads only the KV it holds. Every rank
 hashes a prompt to the same chunk keys, so a key must also name the slice: if
 all ranks registered their heads under one key, the server would keep the
 first and every other rank would load heads that are not its own.
