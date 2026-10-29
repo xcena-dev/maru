@@ -397,7 +397,31 @@ operation:
 | `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open, unless a CPU pool is larger than the memory available; `false` keeps them pageable |
 | `maru_load_copy_ahead` | int | `2` | Chunk slabs a load without a placement kernel (vLLM 0.29+ layouts) copies to the GPU ahead of its per-layer injects, on a side stream; `0` copies each slab in line. Each thread and stream that loads keeps this many slabs of GPU memory for the life of the worker, each `2 × layers × chunk tokens × KV hidden size × dtype size` (32 MiB for Llama 3.1 8B at 256-token chunks). They are allocated on the first load, after vLLM has sized its KV cache, so `gpu_memory_utilization` does not account for them |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
-| `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
+| `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr: per-stage CPU times (`Maru timing:` lines) and a request timeline (`REQ-TRACE`, `GPU-LOAD-QOS`, `STEP-TRACE`, `STEP-GPU` lines, see below) |
+
+#### Request timeline (`maru_log_timing`)
+
+Besides the per-stage `Maru timing:` lines, `maru_log_timing` writes one
+line per event of a cache-hit load, so a log parser can split time to first
+token into stages. Every field is `key=value`; `mono` and the `*_mono`
+fields are milliseconds of `time.monotonic()`, one clock for the scheduler
+and worker processes of a host.
+
+| Line | Written by | When |
+|------|------------|------|
+| `REQ-TRACE lookup_hit` / `lookup_miss` / `lookup_defer` | scheduler | the cache lookup answers; `lookup_defer` once when a hit waits for the parked-block budget |
+| `STEP-TRACE` | scheduler | every scheduler step: scheduled new and running requests, tokens, loads still parked |
+| `REQ-TRACE prefill_sched` | scheduler | a loaded request reaches its prefill step |
+| `REQ-TRACE retrieve_submit` / `job_start` / `maru_rpc` / `admit` / `enqueue` | worker | an asynchronous load is handed to the loader thread, starts, resolves its keys, passes the admission window (without overlap), and has queued its copies |
+| `GPU-LOAD-QOS` | worker | the last layer of a load landed on the GPU: bytes, copy time, the layer that released the request (`gate_layer`) and the copy time up to it (`hold_ms`) |
+| `REQ-TRACE recv_reported` | worker | the load is reported complete to vLLM |
+| `STEP-GPU` | worker | a forward that waited for layers still in flight finished: forward time and the time spent in those waits |
+
+GPU times come from CUDA timing events. A background thread checks them
+every millisecond and stamps the host time it first sees each complete, so
+the `*_mono` fields of `GPU-LOAD-QOS` and `STEP-GPU` lag the GPU by up to
+that period. The thread, the timing events and these lines exist only while
+`maru_log_timing` is on.
 
 #### Renamed parameters
 

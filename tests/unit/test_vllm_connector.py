@@ -2599,6 +2599,23 @@ class TestPreIssuedLayerwiseHandoff:
 
         assert worker._unpark_gate_event(events, layers) is second
 
+    def test_traced_load_reports_gate_layer_in_execution_order(self, capsys):
+        """maru_log_timing hands the queued copies to the poller with K."""
+        worker = self._worker(maru_log_timing=True, maru_overlap_release_after_layers=2)
+        tracked = []
+        worker._trace_poller.add_load = lambda *args: tracked.append(args)
+        start, first, second = MagicMock(), MagicMock(), MagicMock()
+        events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
+        layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
+        worker._trace_copy_starts["r1"] = (start, 1024)
+
+        gate = worker._unpark_gate_event(events, layers)
+        worker._trace_queued_load("r1", events, layers, gate)
+
+        assert tracked == [("r1", start, second, second, 1024, 2)]
+        assert worker._trace_copy_starts == {}
+        assert "REQ-TRACE enqueue req=r1 " in capsys.readouterr().err
+
     def test_release_gate_honours_the_knob(self):
         """The layer the gate picks is the knob's, in execution order."""
         worker = self._worker(maru_overlap_release_after_layers=2)
@@ -5082,3 +5099,109 @@ def test_deferred_loading_accepts_supported_vllm(monkeypatch, factory, version):
 
     monkeypatch.setattr(vllm, "__version__", version)
     factory(4, 8, {"maru_async_load": True})
+
+
+class _FakeTimingEvent:
+    """CUDA timing-event stand-in: completes when told, records a GPU time."""
+
+    def __init__(self, at_ms: float):
+        self.at_ms = at_ms
+        self.done = False
+
+    def query(self) -> bool:
+        return self.done
+
+    def elapsed_time(self, other: "_FakeTimingEvent") -> float:
+        return other.at_ms - self.at_ms
+
+
+def _trace_fields(line: str) -> dict[str, str]:
+    return dict(field.split("=", 1) for field in line.split() if "=" in field)
+
+
+class TestRequestTrace:
+    """maru_log_timing also writes request-timeline lines to stderr."""
+
+    def test_poller_reports_loads_and_forwards_once_complete(self, monkeypatch, capsys):
+        from maru_vllm.connector import _TracePoller
+
+        monkeypatch.setattr(_TracePoller, "_ensure_thread", lambda self: None)
+        poller = _TracePoller()
+        start, gate, end = (_FakeTimingEvent(t) for t in (10.0, 16.0, 40.0))
+        poller.add_load("r1", start, gate, end, 3_000_000, 2)
+        fwd_start, fwd_end = _FakeTimingEvent(0.0), _FakeTimingEvent(9.0)
+        waits = [
+            (_FakeTimingEvent(1.0), _FakeTimingEvent(3.0)),
+            (_FakeTimingEvent(4.0), _FakeTimingEvent(8.0)),
+        ]
+        poller.add_step(7, 123.0, fwd_start, fwd_end, waits)
+
+        gate.done = True
+        poller.poll()
+        assert capsys.readouterr().err == ""
+        end.done = fwd_end.done = True
+        poller.poll()
+        poller.poll()
+
+        lines = capsys.readouterr().err.splitlines()
+        assert len(lines) == 2
+        load = _trace_fields(next(x for x in lines if x.startswith("GPU-LOAD-QOS")))
+        assert (load["req"], load["bytes"], load["gate_layer"]) == (
+            "r1",
+            "3000000",
+            "2",
+        )
+        assert (float(load["dur_ms"]), float(load["hold_ms"])) == (30.0, 6.0)
+        assert float(load["GBps"]) == pytest.approx(0.1)
+        assert float(load["gate_mono"]) <= float(load["end_mono"])
+        step = _trace_fields(next(x for x in lines if x.startswith("STEP-GPU")))
+        assert (step["wstep"], step["waits"]) == ("7", "2")
+        assert (float(step["fwd_ms"]), float(step["layer_wait_ms"])) == (9.0, 6.0)
+
+    @pytest.mark.parametrize("timing", [True, False])
+    def test_scheduler_traces_a_deferred_load(self, tmp_path, capsys, timing):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.outputs import KVConnectorOutput
+        from vllm.v1.request import Request, RequestStatus
+
+        config = {
+            "maru_async_load": True,
+            "maru_overlap_load_with_compute": True,
+            "maru_log_timing": timing,
+        }
+        engine = make_vllm_scheduler(tmp_path, 4, 8, config)
+        engine.connector._scheduler._count_matched_chunks = lambda token_ids: 1
+        request = Request("r1", list(range(8)), SamplingParams(max_tokens=1), None)
+        engine.add_request(request)
+        engine.schedule()
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
+        output = engine.schedule()
+        assert [r.req_id for r in output.scheduled_new_reqs] == ["r1"]
+
+        lines = [
+            x
+            for x in capsys.readouterr().err.splitlines()
+            if x.startswith(("REQ-TRACE", "STEP-TRACE"))
+        ]
+        if not timing:
+            assert lines == []
+            assert make_worker(4, 8, config)._trace_poller is None
+            return
+        events = [
+            (x.split()[1] if x.startswith("REQ-TRACE") else "STEP", _trace_fields(x))
+            for x in lines
+        ]
+        assert [name for name, _ in events] == [
+            "lookup_hit",
+            "STEP",
+            "prefill_sched",
+            "STEP",
+        ]
+        hit, step1, sched, step2 = (fields for _, fields in events)
+        assert (hit["req"], hit["load"], hit["async_load"]) == ("r1", "4", "1")
+        assert (step1["step"], step1["loading"]) == ("1", "1")
+        assert (sched["req"], sched["step"]) == ("r1", "2")
+        assert (step2["step"], step2["loading"]) == ("2", "0")
+        monos = [float(fields["mono"]) for _, fields in events]
+        assert monos == sorted(monos)
