@@ -5205,3 +5205,5 @@ class TestRequestTrace:
         assert (step2["step"], step2["loading"]) == ("2", "0")
         monos = [float(fields["mono"]) for _, fields in events]
         assert monos == sorted(monos)
+        offsets = [float(f["wall"]) * 1000 - float(f["mono"]) for _, f in events]
+        assert max(offsets) - min(offsets) < 50  # one host clock, read together

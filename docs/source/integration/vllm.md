@@ -405,7 +405,9 @@ Besides the per-stage `Maru timing:` lines, `maru_log_timing` writes one
 line per event of a cache-hit load, so a log parser can split time to first
 token into stages. Every field is `key=value`; `mono` and the `*_mono`
 fields are milliseconds of `time.monotonic()`, one clock for the scheduler
-and worker processes of a host.
+and worker processes of a host. `REQ-TRACE` and `STEP-TRACE` lines also
+carry `wall`, Unix time in seconds read with the same `mono`, so a parser
+can place every line, including the `*_mono` fields, on wall-clock time.
 
 | Line | Written by | When |
 |------|------------|------|

@@ -253,7 +253,8 @@ def _emit_trace(line: str) -> None:
     prefix and follow the ``REQ-TRACE`` / ``GPU-LOAD-QOS`` / ``STEP-TRACE`` /
     ``STEP-GPU`` format of request-timeline log parsers: whitespace-separated
     ``key=value`` fields, with ``mono`` in milliseconds of
-    ``time.monotonic()``, one clock for every process on the host.
+    ``time.monotonic()``, one clock for every process on the host, and on
+    REQ-TRACE and STEP-TRACE lines ``wall`` in Unix seconds.
     """
     _write_stderr_line(line)
 
@@ -263,10 +264,21 @@ def _mono_ms() -> float:
     return time.monotonic() * 1000.0
 
 
+def _clock_fields() -> str:
+    """``mono=<ms> wall=<s>`` read together.
+
+    ``wall`` is Unix time in seconds. A parser maps the ``mono`` values of
+    lines that carry no ``wall`` (GPU-LOAD-QOS, STEP-GPU) onto wall-clock time
+    with the pairs on the lines that do, as it would with a logger's
+    timestamp prefix.
+    """
+    return f"mono={_mono_ms():.3f} wall={time.time():.6f}"
+
+
 def _trace_req(event: str, req_id: str, **fields: Any) -> None:
-    """Emit ``REQ-TRACE <event> req=<id> mono=<ms>`` plus ``fields``, stamped now."""
+    """Emit ``REQ-TRACE <event> req=<id> mono=<ms> wall=<s>`` plus ``fields``."""
     extra = "".join(f" {key}={value}" for key, value in fields.items())
-    _emit_trace(f"REQ-TRACE {event} req={req_id} mono={_mono_ms():.3f}{extra}")
+    _emit_trace(f"REQ-TRACE {event} req={req_id} {_clock_fields()}{extra}")
 
 
 class _TracePoller:
@@ -2504,7 +2516,7 @@ class MaruSchedulerConnector:
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         num_cached = len(getattr(cached, "req_ids", None) or ())
         _emit_trace(
-            f"STEP-TRACE step={self._trace_step} mono={_mono_ms():.3f} "
+            f"STEP-TRACE step={self._trace_step} {_clock_fields()} "
             f"new={len(scheduler_output.scheduled_new_reqs)} cached={num_cached} "
             f"tokens={scheduler_output.total_num_scheduled_tokens} "
             f"loading={len(self._trace_loads)}"
