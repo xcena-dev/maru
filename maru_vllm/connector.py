@@ -773,6 +773,9 @@ def _tp_geometry(vllm_config: VllmConfig) -> tuple[int, int]:
     An MLA latent, which every rank holds whole, counts as one KV head. At
     TP=1 this is ``(1, 1)`` without reading the model config: one rank holds
     every head, so nothing the model reports can change a TP=1 engine's keys.
+
+    Raises:
+        ValueError: Under TP, for a model vLLM reports no KV heads for.
     """
     parallel_config = getattr(vllm_config, "parallel_config", None)
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
@@ -781,7 +784,14 @@ def _tp_geometry(vllm_config: VllmConfig) -> tuple[int, int]:
     model_config = vllm_config.model_config
     if getattr(model_config, "use_mla", False):
         return tp_size, 1
-    return tp_size, int(model_config.get_total_num_kv_heads())
+    total_kv_heads = int(model_config.get_total_num_kv_heads())
+    if total_kv_heads < 1:
+        raise ValueError(
+            "MaruKVConnector supports tensor parallelism only for models with "
+            "attention layers; vLLM reports no KV heads for this one, as for an "
+            "attention-free model such as Mamba"
+        )
+    return tp_size, total_kv_heads
 
 
 def _tp_rank() -> int:

@@ -365,6 +365,12 @@ def test_tp1_worker_is_unchanged(monkeypatch):
     assert worker._extra_config["maru_instance_id"] == "inst1"
 
 
+def test_attention_free_model_is_refused_under_tp():
+    """vLLM reports 0 KV heads for an attention-free model such as Mamba."""
+    with pytest.raises(ValueError, match="attention-free"):
+        MaruKVConnector(fake_vllm_config(2, 0), KVConnectorRole.SCHEDULER)
+
+
 @pytest.mark.parametrize(
     ("tp_size", "parallel", "instance_id"),
     [
