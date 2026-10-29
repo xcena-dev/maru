@@ -5676,7 +5676,7 @@ class MaruWorkerConnector:
             # Several groups store after the forward (wait_for_save): Mamba
             # layers have no save hook, and their state is final only then.
             return
-        if not self._kv_shard.is_writer:
+        if not self._stores():
             # Another rank holds the same KV and stores it under the same
             # key. Skipping here queues nothing, so get_finished_saving still
             # reports this rank's finished requests at once.
@@ -5971,7 +5971,7 @@ class MaruWorkerConnector:
         handles: list = []
         for cache in self._group_caches:
             group = cache.group
-            if not self._slice(group).is_writer:
+            if not self._stores(group):
                 # Another rank holds the same KV heads and stores them. Each
                 # rank holds its own part of a Mamba state, so it stores that.
                 continue
@@ -6014,6 +6014,13 @@ class MaruWorkerConnector:
         if group is not None and group.kind == GROUP_MAMBA:
             return self._state_shard
         return self._kv_shard
+
+    def _stores(self, group: KVGroup | None = None) -> bool:
+        """Whether this rank stores its slice of ``group``, or of a one-group
+        model. Ranks holding the same KV share its name and only the lowest
+        stores it; every rank stores its own part of a Mamba-type state. Each
+        store path checks this before it queues anything."""
+        return self._slice(group).is_writer
 
     def _slice_chunk_keys(
         self, req_meta: MaruReqMeta, group: KVGroup | None = None

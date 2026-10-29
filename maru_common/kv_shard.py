@@ -59,7 +59,6 @@ class KVShard:
             1 otherwise (all KV, an MLA latent, or a slice named by rank).
         replica_index: Position of this rank among the ranks that hold this
             same slice.
-        num_replicas: Ranks that hold this same slice.
         part: For a slice named by rank, the rank's part of its TP group.
         parts: Parts of a slice named by rank (the TP size), or 1 for a
             slice named by KV heads.
@@ -69,7 +68,6 @@ class KVShard:
     head_end: int = 1
     total_heads: int = 1
     replica_index: int = 0
-    num_replicas: int = 1
     part: int = 0
     parts: int = 1
 
@@ -158,13 +156,7 @@ def tp_kv_shard(tp_rank: int, tp_size: int, total_kv_heads: int) -> KVShard:
         )
     replicas = tp_size // total_kv_heads
     head = tp_rank // replicas
-    return KVShard(
-        head,
-        head + 1,
-        total_kv_heads,
-        replica_index=tp_rank % replicas,
-        num_replicas=replicas,
-    )
+    return KVShard(head, head + 1, total_kv_heads, replica_index=tp_rank % replicas)
 
 
 def tp_kv_shards(tp_size: int, total_kv_heads: int) -> list[KVShard]:

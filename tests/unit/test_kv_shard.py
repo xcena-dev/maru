@@ -40,7 +40,7 @@ def test_suffix_names_the_heads_each_rank_holds(tp_size, total_heads, expected):
 def test_replicated_heads_are_stored_by_the_first_rank_of_each_head():
     shards = [tp_kv_shard(rank, 4, 2) for rank in range(4)]
     assert [s.is_writer for s in shards] == [True, False, True, False]
-    assert [s.num_replicas for s in shards] == [2, 2, 2, 2]
+    assert [s.replica_index for s in shards] == [0, 1, 0, 1]
     # The scheduler checks each distinct slice once.
     assert [s.suffix for s in tp_kv_shards(4, 2)] == ["_h0-1", "_h1-2"]
 
