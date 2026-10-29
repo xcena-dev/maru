@@ -29,7 +29,9 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 import maru_vllm.connector as connector_module
@@ -47,6 +49,7 @@ from maru_vllm.kv_groups import (
     GROUP_UNSUPPORTED,
     _spec_kind,
     check_multi_group_support,
+    check_one_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
     group_object_key,
@@ -249,6 +252,72 @@ def test_block_size_must_match_cache_config():
         _check(describe_kv_groups(gpt_oss_config()), 32)
 
 
+def _own_window_heads(**swa):
+    """gpt-oss, but its sliding-window layers keep their own KV heads, as
+    MiMo-V2's and Inkling's do."""
+    config = gpt_oss_config()
+    config.kv_cache_groups[0] = KVCacheGroupSpec(
+        config.kv_cache_groups[0].layer_names,
+        SlidingWindowSpec(sliding_window=128, **{**GPT_OSS_ATTN, **swa}),
+    )
+    return config
+
+
+@pytest.mark.parametrize("swa_block", [16, 32], ids=["one-block-size", "scaled"])
+def test_attention_groups_of_different_kv_shapes_are_refused(swa_block):
+    """2 KV heads of 128 per rank next to 8 of 64. vLLM gives the group with
+    the smaller page a larger block to keep one page size; the head shapes
+    are the reason given either way."""
+    config = _own_window_heads(num_kv_heads=2, head_size=128, block_size=swa_block)
+    with pytest.raises(ValueError, match="KV heads differ in count or size") as no:
+        _check(describe_kv_groups(config), 16)
+    assert "group 0: 2 KV heads per rank of size 128;" in str(no.value)
+    assert "group 1: 8 KV heads per rank of size 64)" in str(no.value)
+
+
+def test_attention_groups_whose_v_size_differs_are_refused():
+    config = _own_window_heads(head_size_v=128)
+    with pytest.raises(ValueError, match=r"of size 64 \(V 128\)"):
+        _check(describe_kv_groups(config), 16)
+
+
+def _one_group(*specs):
+    layers = [f"model.layers.{i}.attn" for i in range(len(specs))]
+    spec = (
+        specs[0]
+        if len(specs) == 1
+        else UniformTypeKVCacheSpecs(
+            block_size=specs[0].block_size,
+            kv_cache_specs=dict(zip(layers, specs, strict=True)),
+        )
+    )
+    return SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(layers, spec)], num_blocks=NUM_BLOCKS
+    )
+
+
+MLA_LATENT = MLAAttentionSpec(
+    block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+)
+DSA_INDEXER = MLAAttentionSpec(
+    block_size=64,
+    num_kv_heads=1,
+    head_size=132,
+    dtype=torch.uint8,
+    cache_role=kv_cache_interface.SparseCacheRole.INDEXER,
+)
+
+
+def test_one_group_of_different_kv_specs_is_refused():
+    """vLLM 0.32 puts DeepSeek-V3.2's MLA latent and its indexer cache, which
+    differ in shape, in one UniformTypeKVCacheSpecs group."""
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT, DSA_INDEXER)))
+    # One spec for every layer passes, MLA or not, and so do several groups.
+    check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT)))
+    check_one_group_support(describe_kv_groups(gpt_oss_config()))
+
+
 # =============================================================================
 # Connector
 # =============================================================================
@@ -261,6 +330,15 @@ def _connector_config(block_size, **extra):
         speculative_config=None,
         model_config=SimpleNamespace(max_model_len=4096),
     )
+
+
+def test_connector_refuses_one_group_of_different_kv_specs():
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        MaruKVConnector(
+            _connector_config(64),
+            KVConnectorRole.SCHEDULER,
+            _one_group(MLA_LATENT, DSA_INDEXER),
+        )
 
 
 def test_hybrid_support_is_declared_from_vllm_0_30():

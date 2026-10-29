@@ -685,14 +685,16 @@ The key names the chunk length because a chunk key hashes the prompt only up to 
 
 | Model | KV cache groups | Status |
 |---|---|---|
-| Qwen3.5 (tested: Qwen3.5-0.8B) | Gated DeltaNet (Mamba-type) + full attention | Supported; tested on vLLM 0.30 |
-| gpt-oss (tested: gpt-oss-20b) | sliding window + full attention | Supported; tested on vLLM 0.30 |
-| Other models whose groups are only full attention (`FullAttentionSpec`), sliding window (`SlidingWindowSpec`) or Mamba-type (`MambaSpec`) | | Pass the connector's group-type check; not tested |
-| GLM-5.3-Flash | MLA, indexer cache, `KpoolTailSpec`, KDA (Mamba-type) | Not supported yet |
+| Qwen3.5 (tested: Qwen3.5-0.8B) | Gated DeltaNet (Mamba-type) + full attention | Supported; tested on vLLM 0.30 and 0.32 |
+| gpt-oss (tested: gpt-oss-20b) | sliding window + full attention | Supported; tested on vLLM 0.30 and 0.32 |
+| Other models whose groups are only full attention (`FullAttentionSpec`), sliding window (`SlidingWindowSpec`) or Mamba-type (`MambaSpec`), with one KV head count and head size in every attention group | | Pass the connector's group check; not tested |
+| MiMo-V2, Inkling | sliding window + full attention, the sliding-window layers with KV heads of their own | Not supported yet; refused at startup |
+| DeepSeek-V3.2, GLM-5 (DSA) | MLA latent + indexer cache, which vLLM 0.32 puts in one group | Not supported yet; refused at startup |
+| GLM-5.3-Flash | MLA, indexer cache, `CircularBufferSpec` (`KpoolTailSpec` in vLLM 0.30), KDA (Mamba-type) | Not supported yet |
 | Llama 4 | chunked local + full attention | Not supported yet |
 | Other models with several groups where a group uses another type: MLA, static sink-token attention (`SinkFullAttentionSpec`), cross attention, or a subclass of a supported type such as `RSWASpec` | | Not supported yet |
 
-The connector checks the group types at startup and refuses an unsupported model with the types it found. A model that passes this check can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
+The connector checks the group types and the attention groups' KV shapes at startup and refuses an unsupported model with what it found. It also refuses one group whose layers keep different KV cache specs (vLLM's `UniformTypeKVCacheSpecs`), as the DSA models' does: a one-group model is stored in its first layer's shape. A model that passes these checks can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
 
 Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1, and at size 2 on vLLM 0.32. Hybrid models are supported on this connector only, not on the LMCache path.
 
@@ -705,6 +707,7 @@ The connector refuses to start a model with several groups unless:
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
+- Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
 - The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
 - Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.

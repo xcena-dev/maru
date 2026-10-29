@@ -56,6 +56,8 @@ class KVGroup:
         state_bytes: For a Mamba group, bytes of one layer's state in one
             block (its state shapes times dtypes), which vLLM pads up to
             ``slot_bytes``. 0 otherwise.
+        kv_shape: For an attention group, its KV heads per rank and the head
+            size of K and of V. None otherwise.
     """
 
     group_id: int
@@ -67,6 +69,7 @@ class KVGroup:
     sliding_window: int | None = None
     mamba_cache_mode: str | None = None
     state_bytes: int = 0
+    kv_shape: tuple[int, int, int] | None = None
 
     def object_bytes(self, chunk_tokens: int) -> int:
         """Bytes of this group's object for one chunk.
@@ -133,6 +136,15 @@ def describe_kv_groups(
                     )
                     if kind == GROUP_MAMBA
                     else 0
+                ),
+                kv_shape=(
+                    (
+                        int(spec.num_kv_heads),
+                        int(spec.head_size),
+                        int(getattr(spec, "head_size_v", None) or spec.head_size),
+                    )
+                    if kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)
+                    else None
                 ),
             )
         )
@@ -266,9 +278,10 @@ def check_multi_group_support(
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
-    A model with one group is always accepted. Several groups are supported
-    in chunkwise (packed) format with full attention, sliding window and
-    Mamba (``align``) groups, with parked loads, without speculative
+    A model with one group passes (``check_one_group_support`` checks it).
+    Several groups are supported in chunkwise (packed) format with full
+    attention, sliding window and Mamba (``align``) groups whose attention
+    groups share one KV shape, with parked loads, without speculative
     decoding. The CPU, mixed and remote_cxl backends reject several groups
     on their own, in ``MaruKVConnector``.
 
@@ -292,6 +305,18 @@ def check_multi_group_support(
             "MaruKVConnector does not support KV cache groups of type "
             f"{', '.join(unsupported)} alongside other groups; supported are "
             f"{', '.join(_SUPPORTED_SPECS)}{one_group_hint(groups)}"
+        )
+    shaped = [g for g in groups if g.kv_shape is not None]
+    if len({g.kv_shape for g in shaped}) > 1:
+        # MiMo-V2 and Inkling give their sliding-window layers their own KV
+        # heads and head size. vLLM then also gives those groups different
+        # block sizes, to keep one page size.
+        raise ValueError(
+            "MaruKVConnector does not support attention groups whose KV heads "
+            "differ in count or size; it stores every group with one head shape "
+            "and one block size ("
+            + "; ".join(f"group {g.group_id}: {_kv_shape_text(g)}" for g in shaped)
+            + ")"
         )
     if use_layerwise:
         raise ValueError(
@@ -333,6 +358,34 @@ def check_multi_group_support(
             "recomputes one into wrong output under kv_load_failure_policy="
             "'recompute' (vllm-project/vllm#49250). Remove "
             f"maru_async_load=false{one_group_hint(groups)}"
+        )
+
+
+def _kv_shape_text(group: KVGroup) -> str:
+    assert group.kv_shape is not None
+    heads, k_size, v_size = group.kv_shape
+    sizes = f"{k_size}" if v_size == k_size else f"{k_size} (V {v_size})"
+    return f"{heads} KV heads per rank of size {sizes}"
+
+
+def check_one_group_support(groups: list[KVGroup]) -> None:
+    """Reject a single group whose layers keep different KV cache specs.
+
+    vLLM puts layers of one kind in one group even when their KV differs in
+    shape, as ``UniformTypeKVCacheSpecs``: DeepSeek-V3.2's MLA latent and its
+    indexer cache, or, with the hybrid KV cache manager off, sliding-window
+    and full layers whose KV heads differ. The connector handles every layer
+    of a one-group model in the first layer's shape.
+
+    Raises:
+        ValueError: For such a group.
+    """
+    if len(groups) == 1 and groups[0].spec_name == "UniformTypeKVCacheSpecs":
+        raise ValueError(
+            "MaruKVConnector does not support a KV cache group whose layers "
+            "keep different KV cache specs (vLLM's UniformTypeKVCacheSpecs), "
+            "such as an MLA latent next to an indexer cache; it handles every "
+            "layer of a one-group model in the first layer's shape"
         )
 
 

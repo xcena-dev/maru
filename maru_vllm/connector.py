@@ -58,6 +58,7 @@ from maru_vllm.kv_groups import (
     GroupCache,
     KVGroup,
     check_multi_group_support,
+    check_one_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
     group_caches,
@@ -1443,6 +1444,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_chunk_tokens,
             )
 
+        check_one_group_support(self._kv_groups)
         if len(self._kv_groups) > 1:
             extra = _several_group_defaults(extra, self._kv_groups)
             check_multi_group_support(
