@@ -218,6 +218,23 @@ def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> A
     return default
 
 
+_STDERR_LOCK = threading.Lock()
+
+
+def _write_stderr_line(line: str) -> None:
+    """Write ``line`` and its newline to stderr in one call, under a lock.
+
+    ``print`` writes the text and the newline separately, so lines from the
+    scheduler, worker, loader and trace-poller threads could interleave in
+    the middle of a line.
+    """
+    import sys
+
+    with _STDERR_LOCK:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
 def _emit_timing(msg: str) -> None:
     """Write a diagnostic timing line to stderr.
 
@@ -226,9 +243,7 @@ def _emit_timing(msg: str) -> None:
     engine logs. Timing diagnostics therefore go straight to stderr, which
     the process log does capture.
     """
-    import sys
-
-    print(f"Maru timing: {msg}", file=sys.stderr, flush=True)
+    _write_stderr_line(f"Maru timing: {msg}")
 
 
 def _emit_trace(line: str) -> None:
@@ -240,9 +255,7 @@ def _emit_trace(line: str) -> None:
     ``key=value`` fields, with ``mono`` in milliseconds of
     ``time.monotonic()``, one clock for every process on the host.
     """
-    import sys
-
-    print(line, file=sys.stderr, flush=True)
+    _write_stderr_line(line)
 
 
 def _mono_ms() -> float:
