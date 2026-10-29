@@ -1566,6 +1566,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 cache_config=vllm_config.cache_config,
                 kv_shard=kv_shard,
                 state_shard=state_shard,
+                use_mla=bool(
+                    getattr(
+                        getattr(vllm_config, "model_config", None), "use_mla", False
+                    )
+                ),
             )
 
     @property
@@ -2634,9 +2639,12 @@ class MaruWorkerConnector:
     # Read by the layout paths; a worker built with __new__ knows no layout.
     _cache_config: Any = None
     _cache_layout: str | None = None
-    # A worker built with __new__ holds all KV, as at TP=1.
+    # A worker built with __new__ holds all KV, as at TP=1, of a model
+    # without MLA.
     _kv_shard: KVShard = WHOLE_MODEL
     _state_shard: KVShard = WHOLE_MODEL
+    _use_mla = False
+    _kv_planes = 2
 
     def __init__(
         self,
@@ -2649,6 +2657,7 @@ class MaruWorkerConnector:
         cache_config: Any = None,
         kv_shard: KVShard = WHOLE_MODEL,
         state_shard: KVShard = WHOLE_MODEL,
+        use_mla: bool = False,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -2682,6 +2691,12 @@ class MaruWorkerConnector:
         # writer only loads it.
         self._kv_shard = kv_shard
         self._state_shard = state_shard
+        # An MLA model's paged KV is one latent per token, which a chunkwise
+        # slab holds as one plane where K and V take two. Taken from the
+        # model config: a parked load can run before the first forward, with
+        # no attention metadata to tell MLA by.
+        self._use_mla = use_mla
+        self._kv_planes = 1 if use_mla else 2
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -3926,7 +3941,7 @@ class MaruWorkerConnector:
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
-                        2, num_layers, ct, -1
+                        self._kv_planes, num_layers, ct, -1
                     )
                     if kernel is not None:
                         # Stage the slab through the copy engine (async DMA —
@@ -4226,9 +4241,12 @@ class MaruWorkerConnector:
                             else:
                                 layer_host = torch.frombuffer(
                                     infos[ci].view, dtype=kv_cache_layer.dtype
-                                ).view(2, self._num_layers, self._kv_chunk_tokens, -1)[
-                                    :, true_idx
-                                ]
+                                ).view(
+                                    self._kv_planes,
+                                    self._num_layers,
+                                    self._kv_chunk_tokens,
+                                    -1,
+                                )[:, true_idx]
                             chunk_start = ci * self._kv_chunk_tokens
                             chunk_slots = slot_mapping[
                                 chunk_start : chunk_start + self._kv_chunk_tokens
@@ -4349,13 +4367,13 @@ class MaruWorkerConnector:
         """DMA one layer from chunkwise pages into one device tensor.
 
         A chunkwise page packs every layer of one chunk into
-        ``[2, layers, tokens, hidden]``, so one layer is strided. For a
-        contiguous page run, each layer's K (or V) plane is a fixed-width row
-        separated by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather
-        every chunk directly from registered CXL into
-        ``[chunks, 2, tokens, hidden]``. The caller can then inject all chunks
-        with one kernel. Gapped page allocations become multiple pitched runs
-        but keep the same output.
+        ``[2, layers, tokens, hidden]`` (one plane for an MLA latent), so one
+        layer is strided. For a contiguous page run, each layer's K (or V)
+        plane is a fixed-width row separated by one page pitch. One
+        ``cudaMemcpy2DAsync`` call per plane gathers every chunk directly from
+        registered CXL into ``[chunks, 2, tokens, hidden]``. The caller can
+        then inject all chunks with one kernel. Gapped page allocations become
+        multiple pitched runs but keep the same output.
         """
         if not infos or num_chunks <= 0:
             raise ValueError("packed layer copy requires at least one chunk")
@@ -4363,18 +4381,19 @@ class MaruWorkerConnector:
         if copy_2d is None:
             raise RuntimeError("cudaMemcpy2DAsync is unavailable")
 
+        planes = self._kv_planes
         first_slab = torch.frombuffer(infos[0].view, dtype=kv_cache_layer.dtype).view(
-            2, self._num_layers, self._kv_chunk_tokens, -1
+            planes, self._num_layers, self._kv_chunk_tokens, -1
         )
         hidden = first_slab.shape[-1]
         layer_dev = torch.empty(
-            (num_chunks, 2, self._kv_chunk_tokens, hidden),
+            (num_chunks, planes, self._kv_chunk_tokens, hidden),
             dtype=kv_cache_layer.dtype,
             device=kv_cache_layer.device,
         )
         plane_bytes = self._kv_chunk_tokens * hidden * kv_cache_layer.element_size()
-        slab_bytes = 2 * self._num_layers * plane_bytes
-        destination_pitch = 2 * plane_bytes
+        slab_bytes = planes * self._num_layers * plane_bytes
+        destination_pitch = planes * plane_bytes
 
         for chunk_start, run_chunks, run_view in self._chunk_runs(infos[:num_chunks]):
             run_host = torch.frombuffer(run_view, dtype=kv_cache_layer.dtype)
@@ -4383,7 +4402,7 @@ class MaruWorkerConnector:
                 if run_chunks > 1 and self._effective_page_size_bytes is not None
                 else slab_bytes
             )
-            for kv_idx in range(2):
+            for kv_idx in range(planes):
                 destination = (
                     layer_dev.data_ptr()
                     + chunk_start * destination_pitch
@@ -5241,9 +5260,9 @@ class MaruWorkerConnector:
                             chunk_index * ct : (chunk_index + 1) * ct
                         ]
                         # KV_2LTD host tensor aliasing CXL:
-                        # [2, L, tokens, h]
+                        # [2, L, tokens, h], [1, L, tokens, h] for MLA
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
-                            2, num_layers, ct, -1
+                            self._kv_planes, num_layers, ct, -1
                         )
                         whole_chunk = True
                         if self._cpu_mode:
@@ -5357,7 +5376,8 @@ class MaruWorkerConnector:
         copied in line on the current stream.
 
         Args:
-            slab_host: The chunk's ``[2, num_layers, tokens, hidden]`` slab.
+            slab_host: The chunk's ``[2, num_layers, tokens, hidden]`` slab,
+                ``[1, ...]`` for an MLA latent.
             device: The paged KV cache's device.
             load_stream: The stream the injects run on, or None for the
                 current stream.
@@ -5498,7 +5518,10 @@ class MaruWorkerConnector:
         layout = layout or self._kv_layout
         if layout is None or layout.format_name is None:
             return None
-        # Flash layout only (exclude MLA/Triton).
+        # Flash layout only (exclude MLA/Triton). An MLA latent has no K/V
+        # planes for the kernel, also when no metadata says MLA yet.
+        if self._use_mla:
+            return None
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadata,
         )
@@ -5824,7 +5847,9 @@ class MaruWorkerConnector:
         - **Fallback** (non-Flash layout, CPU, or an unbuilt ``maru_kv_ops``): each
           layer's Flash extract ``[2, chunk_tokens, hidden]`` is written to
           ``slab[0, layer_idx]`` and ``slab[1, layer_idx]``, one contiguous
-          copy per K/V plane. Non-Flash extracts have a
+          copy per K/V plane. An MLA model's latent ``[chunk_tokens, hidden]``
+          is the one plane of a ``[1, num_layers, chunk_tokens, hidden]``
+          slab; the kernel does not take it. Other extracts have a
           different rank and will raise (caught below → chunk skipped →
           recompute).
         """
@@ -5896,6 +5921,9 @@ class MaruWorkerConnector:
                     )
                     kv_contig = kv_data.detach().contiguous()
                     # Flash extract: [2, chunk_tokens, hidden] → KV_2LTD slab.
+                    # An MLA latent [chunk_tokens, hidden] is its one plane.
+                    if self._use_mla:
+                        kv_contig = kv_contig.unsqueeze(0)
                     kv2, ntok, hidden = kv_contig.shape
                     layer_bytes = kv_contig.nelement() * kv_contig.element_size()
 
@@ -6903,7 +6931,8 @@ class MaruWorkerConnector:
         """Inject loaded KV cache data into the paged GPU buffer.
 
         The exact inverse of ``_extract_kv_from_layer``, branch for branch:
-        - MLA: [num_blocks, block_size, ...]
+        - MLA: [num_blocks, block_size, ...], for an MLA model also when no
+          metadata says so (a parked load before the first forward)
         - Legacy rank-4 Triton: [num_blocks, num_kv_heads, block_size,
           head_dim], but never vLLM 0.29+'s logical page
         - Everything else: whatever axis order the backend chose, resolved at
@@ -6922,7 +6951,7 @@ class MaruWorkerConnector:
             else attn_metadata
         )
 
-        if isinstance(layer_meta, MLACommonMetadata):
+        if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
             src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
@@ -6982,7 +7011,7 @@ class MaruWorkerConnector:
             else attn_metadata
         )
 
-        if isinstance(layer_meta, MLACommonMetadata):
+        if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(kv_layer)
             page_size = pages.shape[1]
             gathered = pages[slot_mapping // page_size, slot_mapping % page_size]

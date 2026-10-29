@@ -84,7 +84,11 @@ def rank_kv(
 
 
 def rank_worker(
-    server: FirstWinsServer, shard, kv_cache_layout: str | None = None, **extra
+    server: FirstWinsServer,
+    shard,
+    kv_cache_layout: str | None = None,
+    use_mla: bool = False,
+    **extra,
 ) -> MaruWorkerConnector:
     worker = make_worker(
         BLOCK,
@@ -93,6 +97,7 @@ def rank_worker(
         head_size=HEAD_SIZE,
         kv_cache_layout=kv_cache_layout,
         kv_shard=shard,
+        use_mla=use_mla,
     )
     worker._num_layers = NUM_LAYERS
     # register_kv_caches reads this from cache_config; the round trips below
@@ -102,7 +107,9 @@ def rank_worker(
     return worker
 
 
-def store_step(worker: MaruWorkerConnector, kv: list[torch.Tensor]) -> None:
+def store_step(
+    worker: MaruWorkerConnector, kv: list[torch.Tensor], attn_metadata=None
+) -> None:
     """One prefill step: vLLM calls save_kv_layer once per layer."""
     metadata = MaruConnectorMetadata(
         requests=[
@@ -115,9 +122,10 @@ def store_step(worker: MaruWorkerConnector, kv: list[torch.Tensor]) -> None:
             )
         ]
     )
-    attn = make_flash_attn_metadata()
+    if attn_metadata is None:
+        attn_metadata = make_flash_attn_metadata()
     for name, layer in zip(LAYER_NAMES, kv, strict=True):
-        worker.save_kv_layer(name, layer, attn, metadata)
+        worker.save_kv_layer(name, layer, attn_metadata, metadata)
 
 
 def load_step(
@@ -125,12 +133,18 @@ def load_step(
 ) -> list[torch.Tensor]:
     """One forward that loads both chunks into fresh paged KV; returns it."""
     dst = [torch.zeros_like(layer) for layer in rank_kv(0, heads, kv_cache_layout)]
+    load_into(worker, dst, make_flash_attn_metadata())
+    return dst
+
+
+def load_into(worker: MaruWorkerConnector, dst: list[torch.Tensor], attn_metadata):
+    """One forward that loads both chunks into the paged KV ``dst``."""
     forward = SimpleNamespace(
         no_compile_layers={
             name: SimpleNamespace(kv_cache=layer)
             for name, layer in zip(LAYER_NAMES, dst, strict=True)
         },
-        attn_metadata=make_flash_attn_metadata(),
+        attn_metadata=attn_metadata,
     )
     metadata = MaruConnectorMetadata(
         requests=[
@@ -144,7 +158,6 @@ def load_step(
         ]
     )
     worker.start_load_kv(forward, metadata)
-    return dst
 
 
 def assert_same_kv(actual: list[torch.Tensor], expected: list[torch.Tensor]) -> None:
@@ -201,19 +214,69 @@ def test_replicated_heads_are_stored_once_and_loaded_by_every_replica():
         assert_same_kv(load_step(worker, 1), kv)
 
 
-def test_mla_style_replicated_kv_is_stored_by_rank_zero_under_the_bare_key():
+LATENT = 6  # one MLA latent row; 576 wide in DeepSeek-V2
+
+
+def mla_kv(seed: int, logical_page: bool) -> list[torch.Tensor]:
+    """MLA's paged latent per layer: ``[blocks, block, latent]``, or the
+    logical page ``[blocks, 1, block, latent]`` that vLLM 0.29+ registers."""
+    shape = (
+        (NUM_BLOCKS, 1, BLOCK, LATENT) if logical_page else (NUM_BLOCKS, BLOCK, LATENT)
+    )
+    return [
+        (
+            seed * 10_000
+            + layer * 1_000
+            + torch.arange(math.prod(shape), dtype=torch.float32)
+        ).reshape(shape)
+        for layer in range(NUM_LAYERS)
+    ]
+
+
+def mla_metadata():
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+
+    meta = MagicMock()
+    meta.__class__ = type("MLAMetadata", (MLACommonMetadata,), {})
+    return meta
+
+
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+@pytest.mark.parametrize("logical_page", [False, True], ids=["legacy", "logical-page"])
+def test_mla_latent_is_stored_by_rank_zero_and_loaded_by_every_rank(
+    layerwise, logical_page
+):
+    """Both TP ranks hold the whole MLA latent: rank 0 stores it under the
+    bare key, a chunkwise slab holding it as one plane per layer, and both
+    ranks load it."""
     server = FirstWinsServer()
     shards = [tp_kv_shard(rank, 2, 1) for rank in range(2)]
-    workers = [rank_worker(server, shard) for shard in shards]
-    kv = rank_kv(7, 1)
+    workers = [
+        rank_worker(server, shard, use_mla=True, maru_use_layerwise=layerwise)
+        for shard in shards
+    ]
+    kv = mla_kv(7, logical_page)
 
     for worker in workers:
-        store_step(worker, kv)
+        store_step(worker, kv, mla_metadata())
 
-    workers[1]._handler.batch_store.assert_not_called()
-    assert set(server.objects) == set(_chunk_keys(list(range(PROMPT)), CHUNK))
+    workers[1]._handler.alloc.assert_not_called()
+    base = _chunk_keys(list(range(PROMPT)), CHUNK)
+    if layerwise:
+        expected = {
+            f"{key}_{suffix}"
+            for key in base
+            for suffix in [*(f"L{i}" for i in range(NUM_LAYERS)), "DONE"]
+        }
+    else:
+        expected = set(base)
+        slab = NUM_LAYERS * CHUNK * LATENT * 4  # float32
+        assert {len(raw) for raw in server.objects.values()} == {slab}
+    assert set(server.objects) == expected
     for worker in workers:
-        assert_same_kv(load_step(worker, 1), kv)
+        dst = [torch.zeros_like(layer) for layer in kv]
+        load_into(worker, dst, mla_metadata())
+        assert_same_kv(dst, kv)
 
 
 def test_layerwise_keys_and_done_markers_carry_the_slice():
@@ -344,6 +407,14 @@ def test_scheduler_checks_a_replicated_slice_once():
         fake_vllm_config(4, 1, use_mla=True), KVConnectorRole.SCHEDULER
     )
     assert connector._scheduler._shard_suffixes == ("",)
+
+
+def test_worker_takes_mla_from_the_model_config():
+    """Not from attention metadata, which a parked load can run without."""
+    mla = MaruKVConnector(fake_vllm_config(1, 1, use_mla=True), KVConnectorRole.WORKER)
+    assert mla._worker._use_mla and mla._worker._kv_planes == 1
+    gqa = MaruKVConnector(fake_vllm_config(1, 8), KVConnectorRole.WORKER)
+    assert not gqa._worker._use_mla and gqa._worker._kv_planes == 2
 
 
 def test_worker_names_its_slice_and_scopes_its_instance_id(monkeypatch):
