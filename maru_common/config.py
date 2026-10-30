@@ -83,6 +83,10 @@ class MaruConfig:
     # Key the remote CXL agents of the pool require (a copy of the memory node's
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
+    # Send read hints (remote_cxl only): before a load starts, the remote CXL
+    # agents whose region extension takes them hear which bytes it will read
+    # (maru_handler.storage.remote_cxl.hints). Advice; the data path is the same.
+    read_hints: bool = False
 
     @property
     def server_urls(self) -> list[str]:
@@ -147,6 +151,8 @@ class MaruConfig:
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.read_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("read_hints is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
         if self.storage_backend == "remote_cxl":

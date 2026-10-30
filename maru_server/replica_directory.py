@@ -667,19 +667,35 @@ class ReplicaDirectory:
         # cannot load, and an engine still waiting for its first region has
         # no session to load them with.
         remote_cxl = valid and bool(session.region_size)
+        # With ``locations``, a remote CXL hit also says where it is, with a
+        # read handle of its region, so the caller can tell the memory side
+        # which bytes a load will read before it starts (read hints). A probe
+        # takes no lease: the bytes may be gone by the time the load leases
+        # them.
+        locations = p.get("locations") is True
+        entries: list[dict | None] = []
+        regions: dict[str, dict] = {}
         for key in keys:
             hit = bool(valid and self._select(session, key))
+            entry = None
             if not hit and remote_cxl:
                 pool = self._remote_cxl_lookup(namespace, key)
                 if pool is not None:
                     pool.last_use[key] = now
                     hit = True
+                    if locations:
+                        entry = asdict(pool.replicas[key])
+                        regions[pool.pool_id] = read_handle(pool.handle.to_dict())
             results.append(hit)
+            entries.append(entry)
         first = next(iter(self._all_pools(session)), None) if valid else None
-        return {
+        reply = {
             "results": results,
             "pool_id": first.pool_id if first is not None else None,
         }
+        if locations:
+            reply.update(entries=entries, regions=regions)
+        return reply
 
     # ------------------------------------------------------------------- read
 

@@ -309,3 +309,10 @@ def test_a_refusal_that_keeps_coming_is_said_at_error(monkeypatch):
     worker._handler_retry_after = 0.0
     worker._ensure_handler()
     assert len(errors) == 1 and errors[0][0] == connector._HANDLER_FAILURES_BEFORE_ERROR
+
+
+def test_read_hint_settings_need_the_remote_cxl_backend():
+    from tests.unit.test_vllm_cpu_config import extra as cpu_extra
+
+    with pytest.raises(ValueError, match="remote_cxl"):
+        _validate_storage_config({**cpu_extra(), "maru_read_hints": True})
