@@ -137,8 +137,15 @@ def load_step(
     return dst
 
 
-def load_into(worker: MaruWorkerConnector, dst: list[torch.Tensor], attn_metadata):
-    """One forward that loads both chunks into the paged KV ``dst``."""
+def load_into(
+    worker: MaruWorkerConnector,
+    dst: list[torch.Tensor],
+    attn_metadata,
+    parked: bool = False,
+):
+    """One forward that loads both chunks into the paged KV ``dst``. A
+    ``parked`` load is one vLLM holds in WAITING_FOR_REMOTE_KVS; with CPU
+    caches it runs in this call and is reported finished at once."""
     forward = SimpleNamespace(
         no_compile_layers={
             name: SimpleNamespace(kv_cache=layer)
@@ -154,6 +161,7 @@ def load_into(worker: MaruWorkerConnector, dst: list[torch.Tensor], attn_metadat
                 block_ids=list(range(NUM_BLOCKS)),
                 is_store=False,
                 num_matched_chunks=PROMPT // CHUNK,
+                deferred_load=parked,
             )
         ]
     )
@@ -381,12 +389,17 @@ def test_layerwise_lookup_checks_each_slice_done_marker():
 
 
 def fake_vllm_config(
-    tp_size: int, total_heads: int, *, use_mla: bool = False, **parallel
+    tp_size: int,
+    total_heads: int,
+    *,
+    use_mla: bool = False,
+    extra: dict | None = None,
+    **parallel,
 ) -> SimpleNamespace:
     """The parts of VllmConfig the connector reads, without device probing."""
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={"maru_instance_id": "inst1"},
+            kv_connector_extra_config={"maru_instance_id": "inst1", **(extra or {})},
             kv_load_failure_policy="recompute",
         ),
         cache_config=SimpleNamespace(block_size=BLOCK, num_gpu_blocks=None),
@@ -440,6 +453,122 @@ def test_attention_free_model_is_refused_under_tp():
     """vLLM reports 0 KV heads for an attention-free model such as Mamba."""
     with pytest.raises(ValueError, match="attention-free"):
         MaruKVConnector(fake_vllm_config(2, 0), KVConnectorRole.SCHEDULER)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "extra", "parked"),
+    [
+        (2, {}, True),
+        (2, {"maru_async_load": True}, True),
+        (2, {"maru_async_load": False}, None),
+        (2, {"maru_enable_deferred_loading": False}, None),
+        (1, {}, False),
+    ],
+)
+def test_tp_parks_every_load(monkeypatch, tp_size, extra, parked):
+    """An inline load runs in the step that computes its request, so a rank
+    whose load failed would compute from unfilled KV with the others, which
+    would store the result (#135). Above TP=1 loads are parked unless told
+    otherwise, and inline loads are refused; TP=1 keeps the inline default."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    config = fake_vllm_config(tp_size, 8, extra=extra)
+    if parked is not None:
+        connector = MaruKVConnector(config, KVConnectorRole.SCHEDULER)
+        assert connector._scheduler._deferred_loading is parked
+        connector = MaruKVConnector(config, KVConnectorRole.WORKER)
+        knob = connector_module._get_knob(
+            connector._worker._extra_config, "maru_async_load"
+        )
+        assert bool(knob) is parked
+        return
+    for role in (KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER):
+        with pytest.raises(ValueError, match="maru_async_load=false") as refusal:
+            MaruKVConnector(config, role)
+    assert "xcena-dev/maru#135" in str(refusal.value)
+
+
+@pytest.mark.parametrize("failing_rank", [0, 1], ids=["writer", "non-writer"])
+def test_a_parked_load_failing_on_one_rank_fails_it_for_every_rank(failing_rank):
+    """#135: with an MLA latent, rank 0 stores and rank 1 only loads. Whichever
+    rank's parked load fails, it reports the request loaded with its blocks
+    failed, and vLLM merges every rank's report before the request computes:
+    the request comes back finished only once both ranks report, with the
+    failed blocks for vLLM to recompute on every rank. Nothing is stored
+    while the request is parked."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.v1.outputs import KVConnectorOutput
+
+    server = FirstWinsServer()
+    workers = [
+        rank_worker(server, tp_kv_shard(rank, 2, 1), use_mla=True, maru_async_load=True)
+        for rank in range(2)
+    ]
+    kv = mla_kv(7, logical_page=False)
+    for worker in workers:
+        store_step(worker, kv, mla_metadata())
+    stored = dict(server.objects)
+
+    def fail_retrieve(*args, **kwargs):
+        raise RuntimeError("injected retrieve failure")
+
+    workers[failing_rank]._batch_retrieve_all = fail_retrieve
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+    reports = []
+    for worker in workers:
+        dst = [torch.zeros_like(layer) for layer in kv]
+        load_into(worker, dst, mla_metadata(), parked=True)
+        reports.append(
+            SimpleNamespace(
+                kv_connector_output=KVConnectorOutput(
+                    finished_recving=worker.get_finished_loading(),
+                    invalid_block_ids=worker.take_failed_load_blocks(),
+                )
+            )
+        )
+    assert reports[1 - failing_rank].kv_connector_output.invalid_block_ids == set()
+
+    merged = aggregator.aggregate(reports).kv_connector_output
+    assert merged.finished_recving == {"r1"}
+    assert merged.invalid_block_ids == set(range(NUM_BLOCKS))
+    assert server.objects == stored
+
+
+def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
+    """At TP=1 the resumed forward issues such a load's copies itself. Under
+    TP that would load in the step that computes the request, where a rank
+    whose copies failed is the only one that knows (#135), so the load fails
+    while the request is parked and vLLM recomputes it on every rank."""
+    from maru_common.kv_shard import tp_part_shard
+    from tests.unit.vllm_connector_helpers import deferred_req_meta
+
+    worker = make_worker(
+        BLOCK,
+        CHUNK,
+        {"maru_async_load": True, "maru_overlap_load_with_compute": True},
+        kv_shard=tp_kv_shard(1, 2, 8),
+        state_shard=tp_part_shard(1, 2),
+    )
+    worker._num_layers = 1
+    worker._handler = MagicMock()
+    worker._handler.batch_retrieve.return_value = [
+        SimpleNamespace(view=memoryview(bytearray(64)), region_id=0, page_index=i)
+        for i in range(PROMPT // CHUNK)
+    ]
+    worker._issue_layerwise_copies_offthread = lambda *args, **kwargs: None
+    meta = deferred_req_meta(
+        token_ids=list(range(PROMPT)),
+        block_ids=list(range(NUM_BLOCKS)),
+        num_matched_chunks=PROMPT // CHUNK,
+    )
+    meta.layerwise_load = True
+
+    worker._deferred_load_job(
+        meta, [("l0", torch.zeros(2, 16, 4, 1), 0)], torch.device("cpu")
+    )
+
+    assert worker.get_finished_loading() == {"r1"}
+    assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
+    assert worker._deferred_layerwise_loads == {}
 
 
 @pytest.mark.parametrize(

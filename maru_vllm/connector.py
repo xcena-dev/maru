@@ -601,6 +601,35 @@ def _several_group_defaults(
     return {**extra, knob: True}
 
 
+def _tensor_parallel_defaults(extra: dict[str, Any], tp_size: int) -> dict[str, Any]:
+    """Park every load above TP=1, and refuse ``maru_async_load=false``.
+
+    An inline load runs in the step that computes its request, and a rank
+    whose load fails is the only one that knows: the all-reduce in every layer
+    spreads its unfilled KV to every rank, and the other ranks store what they
+    computed from it (xcena-dev/maru#135). A parked load finishes on every rank
+    before the request computes, and vLLM merges all ranks' results first, so
+    a failure on one rank recomputes the request on all of them.
+
+    Raises:
+        ValueError: If ``maru_async_load`` is set to false.
+    """
+    knob = "maru_async_load"
+    if knob in extra or _RENAMED_KNOBS[knob] in extra:
+        if not _get_knob(extra, knob):
+            raise ValueError(
+                "MaruKVConnector loads only between steps under tensor "
+                "parallelism (maru_async_load=true, its default above TP=1), "
+                f"so it does not take maru_async_load=false at TP={tp_size}: "
+                "a rank whose inline load failed would compute from unfilled "
+                "KV with every other rank, and the other ranks would store the "
+                "result (xcena-dev/maru#135)"
+            )
+        return extra
+    logger.info("Maru: TP=%d, so loads are parked (maru_async_load=true)", tp_size)
+    return {**extra, knob: True}
+
+
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry.
 
@@ -1422,6 +1451,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         else:
             _validate_cxl_parallelism(getattr(vllm_config, "parallel_config", None))
         tp_size, total_kv_heads = _tp_geometry(vllm_config)
+        if tp_size > 1:
+            extra = _tensor_parallel_defaults(extra, tp_size)
         attention_by_rank = _names_attention_by_rank(
             self._kv_groups, tp_size, total_kv_heads
         )
@@ -3849,10 +3880,10 @@ class MaruWorkerConnector:
 
             if req_meta.layerwise_load:
                 # The RPC/mmap part is complete. Either queue the per-layer
-                # copies here, while the request is still parked, or retain
-                # the CXL views so the resumed forward issues them. Either
-                # way the keys/pages are preserved and the bulk load overlaps
-                # the request's own compute.
+                # copies here, while the request is still parked, or (at TP=1)
+                # retain the CXL views so the resumed forward issues them.
+                # Either way the keys/pages are preserved and the bulk load
+                # overlaps the request's own compute.
                 payload: Any = infos
                 if self._use_layerwise:
                     # Key by true layer index: the resumed forward walks its
@@ -3865,6 +3896,21 @@ class MaruWorkerConnector:
                 events = self._issue_layerwise_copies_offthread(
                     req_meta, num_chunks, slot_mapping, payload, layers, device
                 )
+                if events is None and self._state_shard.parts > 1:
+                    # The resumed forward would issue the copies in the step
+                    # that computes the request, where a rank whose copies
+                    # failed is the only one that knows (xcena-dev/maru#135).
+                    # Under TP the load fails while parked instead, so vLLM
+                    # merges the failure with the other ranks' results and
+                    # recomputes the request on all of them.
+                    logger.warning(
+                        "Maru: TP rank %d could not queue the layerwise-overlap "
+                        "copies of req %s; failing its load for recompute",
+                        self._state_shard.part,
+                        req_meta.req_id,
+                    )
+                    self._fail_deferred_load(req_meta)
+                    return
                 gate = (
                     self._unpark_gate_event(events, layers)
                     if events is not None
@@ -4129,7 +4175,7 @@ class MaruWorkerConnector:
         Returns:
             layer_name -> event, or None when the copies could not be queued.
             On None the caller retains the CXL views so the resumed forward
-            issues them the old way.
+            issues them the old way, or under TP fails the load.
         """
         stream: torch.cuda.Stream | None = None
         try:
@@ -4177,8 +4223,7 @@ class MaruWorkerConnector:
             return events
         except Exception as e:
             logger.error(
-                "Maru off-thread layerwise issue failed for req %s: %s — "
-                "falling back to in-forward issue",
+                "Maru off-thread layerwise issue failed for req %s: %s",
                 req_meta.req_id,
                 e,
             )

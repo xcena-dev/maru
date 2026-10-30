@@ -402,7 +402,7 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_async_load` | bool | `false` (`true` for `remote_cxl` and for models with several KV cache groups) | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_load` | bool | `false` (`true` for `remote_cxl`, for models with several KV cache groups, and above TP=1) | Load cache hits on a background thread between steps instead of inside the forward pass |
 | `maru_async_store` | bool | `false` (`true` for `remote_cxl`) | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 | `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
@@ -680,6 +680,18 @@ reports it. A load that fails on any rank is handled for the whole request by
 under `"recompute"` vLLM recomputes it from the first block any worker
 reports as failed, or from its first token for a model with several KV cache
 groups (see {ref}`vllm-load-failures`).
+
+Above TP=1 every load is parked (`maru_async_load=true`, which needs vLLM
+0.16+). The connector turns it on unless it is set, and refuses
+`maru_async_load=false`. A parked load finishes on every rank, and vLLM
+merges every rank's result, before the request computes. An inline load runs
+in the step that computes its request, and a rank whose load fails is the
+only one that knows: the all-reduce in every layer would spread its unfilled
+KV to every rank, and the other ranks would store what they computed from it
+([#135](https://github.com/xcena-dev/maru/issues/135)). For the same reason, a
+layerwise-overlap load (`maru_overlap_load_with_compute`) whose per-layer
+copies the loader thread cannot queue fails while the request is parked,
+instead of having the forward issue them as it does at TP=1.
 
 Each worker process connects its own MaruHandler:
 
