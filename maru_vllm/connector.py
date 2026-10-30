@@ -2967,7 +2967,14 @@ class MaruWorkerConnector:
                     **extra_config,
                     "_maru_request_chunks": -(-max_model_len // self._kv_chunk_tokens),
                 }
-            self._handler = _create_maru_handler(extra_config)
+            if self._stores_anything():
+                self._handler = _create_maru_handler(extra_config)
+            else:
+                # A rank that stores nothing only maps other ranks' pages to
+                # load them, so it takes one page (xcena-dev/maru#132).
+                self._handler = _create_maru_handler(
+                    extra_config, pool_size_override=self._effective_page_size_bytes
+                )
             self._handler_failures = 0
         except Exception as exc:
             if self._cpu_mode and isinstance(exc, StorageError):
@@ -6096,6 +6103,14 @@ class MaruWorkerConnector:
         stores it; every rank stores its own part of a Mamba-type state. Each
         store path checks this before it queues anything."""
         return self._slice(group).is_writer
+
+    def _stores_anything(self) -> bool:
+        """Whether this rank stores any object: a rank that only loads an MLA
+        latent or replicated KV heads does not, unless the model has a
+        Mamba-type group, whose state every rank stores its own part of."""
+        if self._multi_group:
+            return any(self._stores(group) for group in self._kv_groups)
+        return self._stores()
 
     def _slice_chunk_keys(
         self, req_meta: MaruReqMeta, group: KVGroup | None = None

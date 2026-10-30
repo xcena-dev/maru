@@ -2756,6 +2756,22 @@ def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
     assert "stores its part '_tp4_r1' of each Mamba-type state" in line
 
 
+def test_tp_rank_that_only_loads_attention_takes_a_whole_pool(monkeypatch):
+    """#132 leaves this rank alone: it loads rank 0's KV head but stores its
+    own part of each Mamba-type state."""
+    created = {}
+
+    def create_handler(extra_config, **kwargs):
+        created.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(connector_module, "_create_maru_handler", create_handler)
+    worker = _qwen35_tp4_worker(monkeypatch, 1)
+    worker._ensure_handler()
+    assert worker._handler is not None
+    assert "pool_size_override" not in created
+
+
 def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
     a = list(range(1200))
     keys = _chunk_keys(a, QWEN35_BLOCK)

@@ -605,9 +605,9 @@ CXL memory an instance gets at a time: its first allocation, and each further
 one when its memory is full. The `cxl` and `remote_cxl` backends use it the same
 way; with `remote_cxl` each allocation is one region. (`cpu` and `mixed` take
 fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) The estimate
-below sizes one allocation. Under tensor parallelism it applies to each rank,
-and `num_kv_heads` is one rank's share: the model's KV heads divided by the TP
-size, and at least 1 (see {ref}`vllm-tensor-parallelism`):
+below sizes one allocation. Under tensor parallelism it applies to each rank
+that stores, and `num_kv_heads` is one rank's share: the model's KV heads
+divided by the TP size, and at least 1 (see {ref}`vllm-tensor-parallelism`):
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -695,12 +695,13 @@ instead of having the forward issue them as it does at TP=1.
 
 Each worker process connects its own MaruHandler:
 
-- `maru_pool_size` applies to each TP rank, and every rank takes its first
-  allocation when it connects, even one that stores nothing. Without
-  replicated KV heads a rank stores 1/TP of every chunk, so ranks with
-  `P / TP` each hold as many tokens as a single TP=1 worker with `P`. A rank
-  that only loads replicated heads or an MLA latent stores none of them, only
-  its own part of each Mamba-type state.
+- `maru_pool_size` applies to each TP rank that stores. Without replicated KV
+  heads a rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as
+  many tokens as a single TP=1 worker with `P`. A rank that only loads
+  replicated heads or an MLA latent stores none of them, only its own part of
+  each Mamba-type state. A rank that stores nothing at all, such as every
+  rank but rank 0 of an MLA model, takes one page when it connects instead of
+  `maru_pool_size`.
 - A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
   sees each rank as its own owner. With data parallelism, replica `d` > 0
   adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving

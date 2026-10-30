@@ -571,6 +571,36 @@ def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
     assert worker._deferred_layerwise_loads == {}
 
 
+PAGE = 6 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("shard", "use_mla", "pool_size"),
+    [
+        (tp_kv_shard(0, 2, 1), True, None),  # rank 0 stores the MLA latent
+        (tp_kv_shard(1, 2, 1), True, PAGE),  # rank 1 only loads it
+        (tp_kv_shard(1, 2, 8), False, None),  # each rank stores its own heads
+        (tp_kv_shard(1, 4, 2), False, PAGE),  # rank 0's replica of a head
+    ],
+)
+def test_a_rank_that_stores_nothing_takes_one_page(
+    monkeypatch, shard, use_mla, pool_size
+):
+    """#132: maru_pool_size is per rank, but a rank that only loads others'
+    pages never fills its own; it takes one page instead of a whole pool."""
+    created = {}
+
+    def create_handler(extra_config, **kwargs):
+        created.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(connector_module, "_create_maru_handler", create_handler)
+    worker = make_worker(BLOCK, CHUNK, kv_shard=shard, use_mla=use_mla)
+    worker._page_size_bytes = PAGE
+    worker._ensure_handler()
+    assert created.get("pool_size_override") == pool_size
+
+
 @pytest.mark.parametrize(
     ("tp_size", "parallel", "instance_id"),
     [
