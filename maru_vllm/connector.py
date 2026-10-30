@@ -19,13 +19,14 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -41,6 +42,14 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_common.kv_shard import (
+    WHOLE_MODEL,
+    KVShard,
+    tp_kv_shard,
+    tp_kv_shards,
+    tp_part_shard,
+    tp_part_shards,
+)
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
     GROUP_FULL,
@@ -49,6 +58,7 @@ from maru_vllm.kv_groups import (
     GroupCache,
     KVGroup,
     check_multi_group_support,
+    check_one_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
     group_caches,
@@ -591,6 +601,35 @@ def _several_group_defaults(
     return {**extra, knob: True}
 
 
+def _tensor_parallel_defaults(extra: dict[str, Any], tp_size: int) -> dict[str, Any]:
+    """Park every load above TP=1, and refuse ``maru_async_load=false``.
+
+    An inline load runs in the step that computes its request, and a rank
+    whose load fails is the only one that knows: the all-reduce in every layer
+    spreads its unfilled KV to every rank, and the other ranks store what they
+    computed from it (xcena-dev/maru#135). A parked load finishes on every rank
+    before the request computes, and vLLM merges all ranks' results first, so
+    a failure on one rank recomputes the request on all of them.
+
+    Raises:
+        ValueError: If ``maru_async_load`` is set to false.
+    """
+    knob = "maru_async_load"
+    if knob in extra or _RENAMED_KNOBS[knob] in extra:
+        if not _get_knob(extra, knob):
+            raise ValueError(
+                "MaruKVConnector loads only between steps under tensor "
+                "parallelism (maru_async_load=true, its default above TP=1), "
+                f"so it does not take maru_async_load=false at TP={tp_size}: "
+                "a rank whose inline load failed would compute from unfilled "
+                "KV with every other rank, and the other ranks would store the "
+                "result (xcena-dev/maru#135)"
+            )
+        return extra
+    logger.info("Maru: TP=%d, so loads are parked (maru_async_load=true)", tp_size)
+    return {**extra, knob: True}
+
+
 def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry.
 
@@ -721,6 +760,132 @@ def _rdma_staging_size(extra: dict[str, Any], page_size: int) -> int | None:
     if need is None:
         return None
     return max(_MIN_RDMA_STAGING, 2 * need)
+
+
+def _validate_cxl_parallelism(parallel_config: Any) -> None:
+    """Refuse parallel layouts whose KV the CXL backend cannot address yet.
+
+    Tensor parallelism is supported: every rank's keys name the slice it
+    holds, a range of KV heads or its part of each Mamba-type state (see
+    ``maru_common.kv_shard``). Pipeline parallelism additionally
+    needs each stage to address its own layers, but the placement kernel's
+    pointer table and the slab's layer axis are indexed by global layer
+    number, and no key names a stage's layers yet. Context parallelism
+    splits a chunk's tokens across ranks, which no key names either. Rather
+    than fail mid-request or load another stage's or rank's KV, both are
+    refused at startup.
+
+    Args:
+        parallel_config: vLLM's ``ParallelConfig``.
+
+    Raises:
+        ValueError: If pipeline or context parallelism is enabled.
+    """
+    sizes = {
+        name: int(getattr(parallel_config, name, 1) or 1)
+        for name in (
+            "pipeline_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    }
+    unsupported = {name: size for name, size in sizes.items() if size != 1}
+    if unsupported:
+        raise ValueError(
+            "MaruKVConnector supports tensor parallelism but not "
+            + ", ".join(f"{name}={size}" for name, size in unsupported.items())
+        )
+
+
+def _tp_geometry(vllm_config: VllmConfig) -> tuple[int, int]:
+    """Return ``(tp_size, total_kv_heads)`` for naming each rank's KV slice.
+
+    An MLA latent, which every rank holds whole, counts as one KV head. At
+    TP=1 this is ``(1, 1)`` without reading the model config: one rank holds
+    every head, so nothing the model reports can change a TP=1 engine's keys.
+
+    Raises:
+        ValueError: Under TP, for a model vLLM reports no KV heads for.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+    if tp_size == 1:
+        return 1, 1
+    model_config = vllm_config.model_config
+    if getattr(model_config, "use_mla", False):
+        return tp_size, 1
+    total_kv_heads = int(model_config.get_total_num_kv_heads())
+    if total_kv_heads < 1:
+        raise ValueError(
+            "MaruKVConnector supports tensor parallelism only for models with "
+            "attention layers; vLLM reports no KV heads for this one, as for an "
+            "attention-free model such as Mamba"
+        )
+    return tp_size, total_kv_heads
+
+
+def _tp_rank() -> int:
+    """This worker's tensor-parallel rank; vLLM builds the group beforehand."""
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+    return get_tensor_model_parallel_rank()
+
+
+def _names_attention_by_rank(
+    groups: list[KVGroup], tp_size: int, total_kv_heads: int
+) -> bool:
+    """Whether attention slices are named by rank rather than by KV heads.
+
+    With more TP ranks than KV heads, vLLM replicates each attention layer's
+    heads by that layer's own count. The connector knows only the model's
+    count, which sliding-window and full-attention layers need not share
+    (see ``maru_common.kv_shard``). Such layers fall into several groups,
+    or, with vLLM's hybrid KV cache manager off, into one full-attention
+    group whose spec keeps the sliding window.
+    """
+    attention = [g for g in groups if g.kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)]
+    merged = any(
+        g.kind == GROUP_FULL and g.sliding_window is not None for g in attention
+    )
+    return (len(attention) > 1 or merged) and tp_size > total_kv_heads
+
+
+def _dp_index(vllm_config: VllmConfig) -> int:
+    """This engine's data-parallel index; 0 without data parallelism.
+
+    vLLM resets ``data_parallel_rank`` to 0 on each replica of a model
+    without MoE layers, which runs as an independent engine, and keeps the
+    replica's index in ``data_parallel_index``. Older vLLM has only the rank.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    index = getattr(parallel_config, "data_parallel_index", None)
+    if index is None:
+        index = getattr(parallel_config, "data_parallel_rank", 0)
+    return int(index or 0)
+
+
+def _rank_scoped_extra(
+    extra_config: dict[str, Any], tp_rank: int, tp_size: int, dp_index: int = 0
+) -> dict[str, Any]:
+    """Give each worker process its own ``maru_instance_id``.
+
+    Every worker process connects its own MaruHandler and owns its own CXL
+    pool. Under one configured id the server would see the processes as a
+    single owner: pre-mapping skips the siblings' regions, usage is merged,
+    and owner-scoped cleanup would reach regions a sibling still uses. A
+    data-parallel replica runs its own TP group, so ``-dp<index>`` tells
+    replicas apart and ``-tp<rank>`` the ranks of one; replica 0 keeps the
+    id it has without data parallelism. Without a configured id each process
+    already draws its own UUID.
+    """
+    instance_id = extra_config.get("maru_instance_id")
+    if not instance_id or (tp_size == 1 and dp_index == 0):
+        return extra_config
+    if dp_index > 0:
+        instance_id = f"{instance_id}-dp{dp_index}"
+    if tp_size > 1:
+        instance_id = f"{instance_id}-tp{tp_rank}"
+    return {**extra_config, "maru_instance_id": instance_id}
 
 
 def _vllm_version_at_least(minimum: str) -> bool:
@@ -919,32 +1084,49 @@ class MaruReqMeta:
     # vLLM's group order, each accumulated like block_ids (whose list is the
     # first entry). Empty for a single-group model.
     group_block_ids: tuple[list[int], ...] = ()
-    # Per-step memo of _chunk_keys(token_ids). The same MaruReqMeta object is
-    # shared across a step's per-layer save_kv_layer calls (and the step's
-    # start_load_kv), so computing chunk keys once here avoids recomputing the
-    # O(n) hash num_layers times per store. Lives only as long as the step's
+    # Per-step memo of _chunk_keys(token_ids), by the slice suffix appended
+    # ("" for the bare keys). The same MaruReqMeta object is shared across a
+    # step's per-layer save_kv_layer calls (and the step's start_load_kv), so
+    # computing chunk keys once here avoids recomputing the O(n) hash
+    # num_layers times per store; a rank with several KV cache groups asks
+    # for each group's suffix in turn. Lives only as long as the step's
     # metadata object. compare=False so it never affects equality/repr.
-    _chunk_keys_memo: list[str] | None = field(default=None, compare=False, repr=False)
+    _chunk_keys_memo: dict[str, list[str]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
 
-def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
-    """Chunk keys for a request, memoized on the (per-step) req_meta object.
+def _req_chunk_keys(
+    req_meta: MaruReqMeta, chunk_tokens: int, shard_suffix: str
+) -> list[str]:
+    """One worker's chunk keys for a request, memoized on the step's req_meta.
 
     Mirrors LMCache's per-session hash cache: the O(n) key hash is computed
     once per request per step instead of once per layer on the store path.
+    ``shard_suffix`` names the slice the calling worker holds of the KV, or
+    of one KV cache group (``KVShard.suffix``, "" for all of it). It has no
+    default, so that a new store or load path cannot silently use the bare
+    key that every TP rank shares.
     """
-    if req_meta._chunk_keys_memo is None:
-        req_meta._chunk_keys_memo = _chunk_keys(req_meta.token_ids, chunk_tokens)
-    return req_meta._chunk_keys_memo
+    memo = req_meta._chunk_keys_memo
+    if shard_suffix in memo:
+        return memo[shard_suffix]
+    if "" not in memo:
+        memo[""] = _chunk_keys(req_meta.token_ids, chunk_tokens)
+    if shard_suffix:
+        memo[shard_suffix] = [key + shard_suffix for key in memo[""]]
+    return memo[shard_suffix]
 
 
 @dataclass(frozen=True)
 class _SlabTarget:
     """Layers whose KV for one chunk is stored as one KV_2LTD slab.
 
-    A single-group model stores every layer under the bare chunk key. With
+    A single-group model stores every layer under the chunk key. With
     several KV cache groups each attention group is its own target, keyed
-    ``<chunk key>_g<group id>`` and reading that group's block ids.
+    ``<chunk key>_c<chunk tokens>_g<group id>`` and reading that group's
+    block ids. Either way the chunk key names the slice this rank holds
+    (``MaruWorkerConnector._slice_chunk_keys``).
 
     Attributes:
         num_layers: Layers in the slab.
@@ -952,6 +1134,7 @@ class _SlabTarget:
         dtype: KV element type.
         device: Device of the paged KV tensors.
         group: The group, or None for a single-group model.
+        chunk_tokens: Tokens per chunk, which a group's key names.
     """
 
     num_layers: int
@@ -959,11 +1142,12 @@ class _SlabTarget:
     dtype: torch.dtype
     device: torch.device
     group: KVGroup | None = None
+    chunk_tokens: int = 0
 
     def key(self, chunk_key: str) -> str:
         if self.group is None:
             return chunk_key
-        return group_object_key(chunk_key, self.group.group_id)
+        return group_object_key(chunk_key, self.group.group_id, self.chunk_tokens)
 
     def block_ids(self, req_meta: MaruReqMeta) -> list[int]:
         """Block ids to read this step's completed chunks from.
@@ -1264,6 +1448,14 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         else ""
                     )
                 )
+        else:
+            _validate_cxl_parallelism(getattr(vllm_config, "parallel_config", None))
+        tp_size, total_kv_heads = _tp_geometry(vllm_config)
+        if tp_size > 1:
+            extra = _tensor_parallel_defaults(extra, tp_size)
+        attention_by_rank = _names_attention_by_rank(
+            self._kv_groups, tp_size, total_kv_heads
+        )
         self._kv_chunk_tokens = int(
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
@@ -1283,6 +1475,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_chunk_tokens,
             )
 
+        check_one_group_support(self._kv_groups)
         if len(self._kv_groups) > 1:
             extra = _several_group_defaults(extra, self._kv_groups)
             check_multi_group_support(
@@ -1318,6 +1511,15 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 num_lookahead_tokens=lookahead,
                 max_model_len=vllm_config.model_config.max_model_len,
                 kv_groups=self._kv_groups,
+                shard_suffixes=[
+                    shard.suffix
+                    for shard in (
+                        tp_part_shards(tp_size)
+                        if attention_by_rank
+                        else tp_kv_shards(tp_size, total_kv_heads)
+                    )
+                ],
+                state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -1341,6 +1543,52 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     type(e).__name__,
                     e,
                 )
+            kv_shard = state_shard = WHOLE_MODEL
+            tp_rank = 0
+            if tp_size > 1:
+                tp_rank = _tp_rank()
+                kv_shard = (
+                    tp_part_shard(tp_rank, tp_size)
+                    if attention_by_rank
+                    else tp_kv_shard(tp_rank, tp_size, total_kv_heads)
+                )
+                if kv_shard.splits_heads and num_kv_heads not in (
+                    None,
+                    kv_shard.num_heads,
+                ):
+                    # tp_kv_shard follows the head split vLLM makes, whose
+                    # per-rank count get_num_kv_heads reports. The two agree
+                    # today; should a later vLLM split heads another way, this
+                    # stops the engine instead of letting the keys name heads
+                    # the rank does not hold. Layout detection then checks
+                    # every registered cache against num_kv_heads.
+                    raise ValueError(
+                        f"Maru: vLLM puts {num_kv_heads} KV heads on TP rank "
+                        f"{tp_rank}, but its key suffix {kv_shard.suffix!r} "
+                        f"names {kv_shard.num_heads} of the model's "
+                        f"{kv_shard.total_heads}"
+                    )
+                state_shard = tp_part_shard(tp_rank, tp_size)
+                logger.info(
+                    "Maru: TP rank %d of %d holds %s under key suffix %r and %s%s",
+                    tp_rank,
+                    tp_size,
+                    f"KV heads [{kv_shard.head_start}, {kv_shard.head_end}) "
+                    f"of {kv_shard.total_heads}"
+                    if kv_shard.splits_heads
+                    else "its attention KV, named by rank"
+                    if attention_by_rank
+                    else "the whole KV",
+                    kv_shard.suffix,
+                    "stores it"
+                    if kv_shard.is_writer
+                    else "only loads it: a lower rank holding the same KV stores it",
+                    f"; it stores its part {state_shard.suffix!r} of each "
+                    "Mamba-type state"
+                    if any(g.kind == GROUP_MAMBA for g in self._kv_groups)
+                    else "",
+                )
+            extra = _rank_scoped_extra(extra, tp_rank, tp_size, _dp_index(vllm_config))
             self._worker = MaruWorkerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
@@ -1349,6 +1597,13 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 head_size=head_size,
                 kv_groups=self._kv_groups,
                 cache_config=vllm_config.cache_config,
+                kv_shard=kv_shard,
+                state_shard=state_shard,
+                use_mla=bool(
+                    getattr(
+                        getattr(vllm_config, "model_config", None), "use_mla", False
+                    )
+                ),
             )
 
     @property
@@ -1526,6 +1781,8 @@ class MaruSchedulerConnector:
     """Scheduler-side: checks chunk-by-chunk which prefix is cached in Maru."""
 
     _cpu_mode = False
+    _shard_suffixes: tuple[str, ...] = ("",)
+    _state_suffixes: tuple[str, ...] = ("",)
 
     def __init__(
         self,
@@ -1536,6 +1793,8 @@ class MaruSchedulerConnector:
         num_lookahead_tokens: int = 0,
         max_model_len: int | None = None,
         kv_groups: list[KVGroup] | None = None,
+        shard_suffixes: Sequence[str] = ("",),
+        state_suffixes: Sequence[str] = ("",),
     ):
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
@@ -1547,6 +1806,17 @@ class MaruSchedulerConnector:
         self._num_lookahead_tokens = num_lookahead_tokens
         self._max_model_len = max_model_len
         self._bypass_requests: set[str] = set()
+        # Key suffix of every distinct KV slice the engine's workers hold
+        # (one "" at TP=1). Each worker stores only its own slice, so a chunk
+        # counts as cached only once all of them are stored.
+        self._shard_suffixes = tuple(shard_suffixes)
+        if not self._shard_suffixes:
+            raise ValueError("shard_suffixes must name at least one KV slice")
+        # With several KV cache groups, attention groups use those and Mamba
+        # groups the suffix of every rank's part of the state ("" at TP=1).
+        self._state_suffixes = tuple(state_suffixes)
+        if not self._state_suffixes:
+            raise ValueError("state_suffixes must name at least one part")
 
         # Lazy-init MaruHandler for exists checks
         self._handler = None
@@ -1709,52 +1979,29 @@ class MaruSchedulerConnector:
             # Re-probe each time: CPU residency is tied to a live worker session.
             return next((i for i, hit in enumerate(results) if not hit), len(results))
 
-        # Check local cache first - find longest prefix of known keys.
-        # We use a "_DONE" marker (written after all layers are stored)
-        # rather than checking a single layer, to avoid false positives
-        # when a partial layer store failure leaves only some layers.
-        local_hits = 0
-        for key in keys:
-            sentinel = self._chunk_exists_key(key)
-            if sentinel in self._known_keys:
-                local_hits += 1
-            else:
-                break
+        # A chunk counts once its "_DONE" marker is stored (written after all
+        # layers, so a partial layer store failure is no false positive) for
+        # every slice in _shard_suffixes. Known markers are tried first; the
+        # unknown ones go in one batch_exists.
+        sentinels = [
+            [self._chunk_exists_key(key + suffix) for suffix in self._shard_suffixes]
+            for key in keys
+        ]
 
-        if local_hits == len(keys):
-            return local_hits
+        def leading(stored: set[str]) -> int:
+            return next(
+                (
+                    i
+                    for i, chunk in enumerate(sentinels)
+                    if not stored.issuperset(chunk)
+                ),
+                len(sentinels),
+            )
 
-        # Need to check remaining chunks via RPC
-        self._ensure_handler()
-        if self._handler is None:
-            return local_hits
-
-        # Check all unchecked chunks at once via batch_exists
-        remaining_keys = [self._chunk_exists_key(k) for k in keys[local_hits:]]
-        try:
-            _t0 = time.monotonic()
-            results = self._handler.batch_exists(remaining_keys)
-            if self._timing:
-                _emit_timing(
-                    f"lookup batch_exists {len(remaining_keys)} keys = "
-                    f"{(time.monotonic() - _t0) * 1000:.2f} ms"
-                )
-        except Exception as e:
-            logger.warning("Maru batch_exists failed: %s", e)
-            return local_hits
-
-        # Count consecutive hits
-        rpc_hits = 0
-        for exists in results:
-            if not exists:
-                break
-            rpc_hits += 1
-
-        # Cache the newly discovered keys
-        for i in range(rpc_hits):
-            self._known_keys.add(remaining_keys[i])
-
-        return local_hits + rpc_hits
+        hits = leading(self._known_keys)
+        if hits == len(keys):
+            return hits
+        return leading(self._stored_keys([s for chunk in sentinels for s in chunk]))
 
     def _note_failed_load(self, request: Request) -> None:
         """Record a failed load when vLLM asks about a request again after it.
@@ -1784,11 +2031,9 @@ class MaruSchedulerConnector:
     def _stored_keys(self, keys: list[str]) -> set[str]:
         """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
 
-        Remembers positives, as ``_count_matched_chunks`` does, until a
-        reported load failure clears them (``update_connector_output``). Only
-        the cxl backend in chunkwise format gets here: CPU mode must re-probe
-        residency, and layerwise format checks ``_DONE`` markers, and the
-        constructor refuses both with several groups.
+        Remembers positives until a reported load failure clears them
+        (``update_connector_output``). CPU mode does not come here: its
+        residency is tied to a live worker session, so it re-probes.
         """
         unknown = [k for k in keys if k not in self._known_keys]
         if unknown:
@@ -1821,6 +2066,8 @@ class MaruSchedulerConnector:
         of the chunk may have left the GPU before the store. Keys already
         known to exist are tried first; when they fall short of every chunk,
         all groups' remaining keys go in one RPC. See ``kv_groups.hit_chunks``.
+        Under TP a (chunk, group) counts only when every rank's slice of it
+        is stored.
         """
         chunk_tokens = self._kv_chunk_tokens
         num_chunks = (len(token_ids) - 1) // chunk_tokens
@@ -1828,12 +2075,24 @@ class MaruSchedulerConnector:
         if not chunk_keys:
             return 0
 
+        # hit_chunks can ask about a (chunk, group) more than once, and the
+        # RPC below asks about every one: build each key list once.
+        @functools.cache
+        def object_keys(i: int, g: KVGroup) -> list[str]:
+            suffixes = (
+                self._state_suffixes if g.kind == GROUP_MAMBA else self._shard_suffixes
+            )
+            return [
+                group_object_key(chunk_keys[i] + suffix, g.group_id, chunk_tokens)
+                for suffix in suffixes
+            ]
+
         def hit_among(stored: set[str]) -> tuple[int, int]:
             return hit_chunks(
                 self._kv_groups,
                 len(chunk_keys),
                 chunk_tokens,
-                lambda i, g: group_object_key(chunk_keys[i], g.group_id) in stored,
+                lambda i, g: all(key in stored for key in object_keys(i, g)),
             )
 
         hit, prefix = hit_among(self._known_keys)
@@ -1841,9 +2100,10 @@ class MaruSchedulerConnector:
             hit, prefix = hit_among(
                 self._stored_keys(
                     [
-                        group_object_key(key, g.group_id)
-                        for key in chunk_keys
+                        key
+                        for i in range(len(chunk_keys))
                         for g in self._kv_groups
+                        for key in object_keys(i, g)
                     ]
                 )
             )
@@ -1853,10 +2113,13 @@ class MaruSchedulerConnector:
             # "stored but no hit" is the case worth explaining.
             logger.info(
                 "Maru KV lookup: req=%s can resume after %d of %d chunks; the "
-                "later chunk ends lack a Mamba state or sliding window",
+                "later chunk ends lack a Mamba state or sliding window%s",
                 req_id,
                 hit,
                 prefix,
+                ", or a TP rank's slice of one"
+                if len(self._shard_suffixes) > 1 or len(self._state_suffixes) > 1
+                else "",
             )
         return hit
 
@@ -2409,6 +2672,12 @@ class MaruWorkerConnector:
     # Read by the layout paths; a worker built with __new__ knows no layout.
     _cache_config: Any = None
     _cache_layout: str | None = None
+    # A worker built with __new__ holds all KV, as at TP=1, of a model
+    # without MLA.
+    _kv_shard: KVShard = WHOLE_MODEL
+    _state_shard: KVShard = WHOLE_MODEL
+    _use_mla = False
+    _kv_planes = 2
 
     def __init__(
         self,
@@ -2419,6 +2688,9 @@ class MaruWorkerConnector:
         head_size: int | None = None,
         kv_groups: list[KVGroup] | None = None,
         cache_config: Any = None,
+        kv_shard: KVShard = WHOLE_MODEL,
+        state_shard: KVShard = WHOLE_MODEL,
+        use_mla: bool = False,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -2446,6 +2718,18 @@ class MaruWorkerConnector:
         # register_kv_caches into _cache_layout (see _vllm_kv_cache_layout).
         self._cache_config = cache_config
         self._cache_layout: str | None = None
+        # The KV heads this rank holds (all of them at TP=1), named in the
+        # keys of every attention group, and its part of each Mamba-type
+        # state. _slice() picks one per group. A rank that is not a slice's
+        # writer only loads it.
+        self._kv_shard = kv_shard
+        self._state_shard = state_shard
+        # An MLA model's paged KV is one latent per token, which a chunkwise
+        # slab holds as one plane where K and V take two. Taken from the
+        # model config: a parked load can run before the first forward, with
+        # no attention metadata to tell MLA by.
+        self._use_mla = use_mla
+        self._kv_planes = 1 if use_mla else 2
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         # TODO: _stored_keys grows unbounded and may become stale if CXL
@@ -2683,7 +2967,14 @@ class MaruWorkerConnector:
                     **extra_config,
                     "_maru_request_chunks": -(-max_model_len // self._kv_chunk_tokens),
                 }
-            self._handler = _create_maru_handler(extra_config)
+            if self._stores_anything():
+                self._handler = _create_maru_handler(extra_config)
+            else:
+                # A rank that stores nothing only maps other ranks' pages to
+                # load them, so it takes one page (xcena-dev/maru#132).
+                self._handler = _create_maru_handler(
+                    extra_config, pool_size_override=self._effective_page_size_bytes
+                )
             self._handler_failures = 0
         except Exception as exc:
             if self._cpu_mode and isinstance(exc, StorageError):
@@ -3005,7 +3296,7 @@ class MaruWorkerConnector:
                 self._load_leased_request(layers, req_meta, attn_metadata)
                 continue
 
-            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
                 self._fail_deferred_load(req_meta)
@@ -3283,8 +3574,7 @@ class MaruWorkerConnector:
             after reporting the failure.
         """
         ct = self._kv_chunk_tokens
-        chunk_keys = _req_chunk_keys(req_meta, ct)
-        hit = min(req_meta.num_matched_chunks, len(chunk_keys))
+        hit = min(req_meta.num_matched_chunks, len(req_meta.token_ids) // ct)
         if hit == 0:
             self._fail_load(req_meta, RuntimeError("no chunk to load"))
             return None
@@ -3300,7 +3590,14 @@ class MaruWorkerConnector:
             else:
                 chunks = range(first, hit)
             plan += [(cache, ci) for ci in chunks]
-        keys = [group_object_key(chunk_keys[ci], c.group.group_id) for c, ci in plan]
+        chunk_keys = {
+            c.group.group_id: self._slice_chunk_keys(req_meta, c.group)
+            for c in self._group_caches
+        }
+        keys = [
+            group_object_key(chunk_keys[c.group.group_id][ci], c.group.group_id, ct)
+            for c, ci in plan
+        ]
         try:
             infos = self._batch_retrieve_all(keys)
         except Exception as e:
@@ -3531,7 +3828,7 @@ class MaruWorkerConnector:
                     stream=self._deferred_stream,
                 )
                 return
-            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
                 self._fail_deferred_load(req_meta)
@@ -3590,10 +3887,10 @@ class MaruWorkerConnector:
 
             if req_meta.layerwise_load:
                 # The RPC/mmap part is complete. Either queue the per-layer
-                # copies here, while the request is still parked, or retain
-                # the CXL views so the resumed forward issues them. Either
-                # way the keys/pages are preserved and the bulk load overlaps
-                # the request's own compute.
+                # copies here, while the request is still parked, or (at TP=1)
+                # retain the CXL views so the resumed forward issues them.
+                # Either way the keys/pages are preserved and the bulk load
+                # overlaps the request's own compute.
                 payload: Any = infos
                 if self._use_layerwise:
                     # Key by true layer index: the resumed forward walks its
@@ -3606,6 +3903,21 @@ class MaruWorkerConnector:
                 events = self._issue_layerwise_copies_offthread(
                     req_meta, num_chunks, slot_mapping, payload, layers, device
                 )
+                if events is None and self._state_shard.parts > 1:
+                    # The resumed forward would issue the copies in the step
+                    # that computes the request, where a rank whose copies
+                    # failed is the only one that knows (xcena-dev/maru#135).
+                    # Under TP the load fails while parked instead, so vLLM
+                    # merges the failure with the other ranks' results and
+                    # recomputes the request on all of them.
+                    logger.warning(
+                        "Maru: TP rank %d could not queue the layerwise-overlap "
+                        "copies of req %s; failing its load for recompute",
+                        self._state_shard.part,
+                        req_meta.req_id,
+                    )
+                    self._fail_deferred_load(req_meta)
+                    return
                 gate = (
                     self._unpark_gate_event(events, layers)
                     if events is not None
@@ -3684,7 +3996,7 @@ class MaruWorkerConnector:
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
-                        2, num_layers, ct, -1
+                        self._kv_planes, num_layers, ct, -1
                     )
                     if kernel is not None:
                         # Stage the slab through the copy engine (async DMA —
@@ -3870,7 +4182,7 @@ class MaruWorkerConnector:
         Returns:
             layer_name -> event, or None when the copies could not be queued.
             On None the caller retains the CXL views so the resumed forward
-            issues them the old way.
+            issues them the old way, or under TP fails the load.
         """
         stream: torch.cuda.Stream | None = None
         try:
@@ -3918,8 +4230,7 @@ class MaruWorkerConnector:
             return events
         except Exception as e:
             logger.error(
-                "Maru off-thread layerwise issue failed for req %s: %s — "
-                "falling back to in-forward issue",
+                "Maru off-thread layerwise issue failed for req %s: %s",
                 req_meta.req_id,
                 e,
             )
@@ -3984,9 +4295,12 @@ class MaruWorkerConnector:
                             else:
                                 layer_host = torch.frombuffer(
                                     infos[ci].view, dtype=kv_cache_layer.dtype
-                                ).view(2, self._num_layers, self._kv_chunk_tokens, -1)[
-                                    :, true_idx
-                                ]
+                                ).view(
+                                    self._kv_planes,
+                                    self._num_layers,
+                                    self._kv_chunk_tokens,
+                                    -1,
+                                )[:, true_idx]
                             chunk_start = ci * self._kv_chunk_tokens
                             chunk_slots = slot_mapping[
                                 chunk_start : chunk_start + self._kv_chunk_tokens
@@ -4107,13 +4421,13 @@ class MaruWorkerConnector:
         """DMA one layer from chunkwise pages into one device tensor.
 
         A chunkwise page packs every layer of one chunk into
-        ``[2, layers, tokens, hidden]``, so one layer is strided. For a
-        contiguous page run, each layer's K (or V) plane is a fixed-width row
-        separated by one page pitch. Two ``cudaMemcpy2DAsync`` calls gather
-        every chunk directly from registered CXL into
-        ``[chunks, 2, tokens, hidden]``. The caller can then inject all chunks
-        with one kernel. Gapped page allocations become multiple pitched runs
-        but keep the same output.
+        ``[2, layers, tokens, hidden]`` (one plane for an MLA latent), so one
+        layer is strided. For a contiguous page run, each layer's K (or V)
+        plane is a fixed-width row separated by one page pitch. One
+        ``cudaMemcpy2DAsync`` call per plane gathers every chunk directly from
+        registered CXL into ``[chunks, 2, tokens, hidden]``. The caller can
+        then inject all chunks with one kernel. Gapped page allocations become
+        multiple pitched runs but keep the same output.
         """
         if not infos or num_chunks <= 0:
             raise ValueError("packed layer copy requires at least one chunk")
@@ -4121,18 +4435,19 @@ class MaruWorkerConnector:
         if copy_2d is None:
             raise RuntimeError("cudaMemcpy2DAsync is unavailable")
 
+        planes = self._kv_planes
         first_slab = torch.frombuffer(infos[0].view, dtype=kv_cache_layer.dtype).view(
-            2, self._num_layers, self._kv_chunk_tokens, -1
+            planes, self._num_layers, self._kv_chunk_tokens, -1
         )
         hidden = first_slab.shape[-1]
         layer_dev = torch.empty(
-            (num_chunks, 2, self._kv_chunk_tokens, hidden),
+            (num_chunks, planes, self._kv_chunk_tokens, hidden),
             dtype=kv_cache_layer.dtype,
             device=kv_cache_layer.device,
         )
         plane_bytes = self._kv_chunk_tokens * hidden * kv_cache_layer.element_size()
-        slab_bytes = 2 * self._num_layers * plane_bytes
-        destination_pitch = 2 * plane_bytes
+        slab_bytes = planes * self._num_layers * plane_bytes
+        destination_pitch = planes * plane_bytes
 
         for chunk_start, run_chunks, run_view in self._chunk_runs(infos[:num_chunks]):
             run_host = torch.frombuffer(run_view, dtype=kv_cache_layer.dtype)
@@ -4141,7 +4456,7 @@ class MaruWorkerConnector:
                 if run_chunks > 1 and self._effective_page_size_bytes is not None
                 else slab_bytes
             )
-            for kv_idx in range(2):
+            for kv_idx in range(planes):
                 destination = (
                     layer_dev.data_ptr()
                     + chunk_start * destination_pitch
@@ -4228,7 +4543,7 @@ class MaruWorkerConnector:
             # An off-thread load was registered before submission. If its
             # request ended meanwhile, do not recreate the removed entry.
         ct = self._kv_chunk_tokens
-        chunk_keys = _req_chunk_keys(req_meta, ct)
+        chunk_keys = self._slice_chunk_keys(req_meta)
         num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
         start, end = self._cpu_load_range(req_meta)
         first_chunk = start // ct
@@ -4999,9 +5314,9 @@ class MaruWorkerConnector:
                             chunk_index * ct : (chunk_index + 1) * ct
                         ]
                         # KV_2LTD host tensor aliasing CXL:
-                        # [2, L, tokens, h]
+                        # [2, L, tokens, h], [1, L, tokens, h] for MLA
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
-                            2, num_layers, ct, -1
+                            self._kv_planes, num_layers, ct, -1
                         )
                         whole_chunk = True
                         if self._cpu_mode:
@@ -5115,7 +5430,8 @@ class MaruWorkerConnector:
         copied in line on the current stream.
 
         Args:
-            slab_host: The chunk's ``[2, num_layers, tokens, hidden]`` slab.
+            slab_host: The chunk's ``[2, num_layers, tokens, hidden]`` slab,
+                ``[1, ...]`` for an MLA latent.
             device: The paged KV cache's device.
             load_stream: The stream the injects run on, or None for the
                 current stream.
@@ -5256,7 +5572,10 @@ class MaruWorkerConnector:
         layout = layout or self._kv_layout
         if layout is None or layout.format_name is None:
             return None
-        # Flash layout only (exclude MLA/Triton).
+        # Flash layout only (exclude MLA/Triton). An MLA latent has no K/V
+        # planes for the kernel, also when no metadata says MLA yet.
+        if self._use_mla:
+            return None
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadata,
         )
@@ -5434,6 +5753,11 @@ class MaruWorkerConnector:
             # Several groups store after the forward (wait_for_save): Mamba
             # layers have no save hook, and their state is final only then.
             return
+        if not self._stores():
+            # Another rank holds the same KV and stores it under the same
+            # key. Skipping here queues nothing, so get_finished_saving still
+            # reports this rank's finished requests at once.
+            return
 
         if not self._use_layerwise:
             self._save_kv_layer_packed(layer_name, kv_layer, attn_metadata, metadata)
@@ -5442,7 +5766,7 @@ class MaruWorkerConnector:
         layer_idx = self._get_layer_index(layer_name)
 
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            chunk_keys = self._slice_chunk_keys(req_meta)
             if not chunk_keys:
                 continue
 
@@ -5577,7 +5901,9 @@ class MaruWorkerConnector:
         - **Fallback** (non-Flash layout, CPU, or an unbuilt ``maru_kv_ops``): each
           layer's Flash extract ``[2, chunk_tokens, hidden]`` is written to
           ``slab[0, layer_idx]`` and ``slab[1, layer_idx]``, one contiguous
-          copy per K/V plane. Non-Flash extracts have a
+          copy per K/V plane. An MLA model's latent ``[chunk_tokens, hidden]``
+          is the one plane of a ``[1, num_layers, chunk_tokens, hidden]``
+          slab; the kernel does not take it. Other extracts have a
           different rank and will raise (caught below → chunk skipped →
           recompute).
         """
@@ -5610,7 +5936,7 @@ class MaruWorkerConnector:
             return
 
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, self._kv_chunk_tokens)
+            chunk_keys = self._slice_chunk_keys(req_meta)
             if not chunk_keys:
                 continue
 
@@ -5649,6 +5975,9 @@ class MaruWorkerConnector:
                     )
                     kv_contig = kv_data.detach().contiguous()
                     # Flash extract: [2, chunk_tokens, hidden] → KV_2LTD slab.
+                    # An MLA latent [chunk_tokens, hidden] is its one plane.
+                    if self._use_mla:
+                        kv_contig = kv_contig.unsqueeze(0)
                     kv2, ntok, hidden = kv_contig.shape
                     layer_bytes = kv_contig.nelement() * kv_contig.element_size()
 
@@ -5724,6 +6053,10 @@ class MaruWorkerConnector:
         handles: list = []
         for cache in self._group_caches:
             group = cache.group
+            if not self._stores(group):
+                # Another rank holds the same KV heads and stores them. Each
+                # rank holds its own part of a Mamba state, so it stores that.
+                continue
             try:
                 if group.kind == GROUP_MAMBA:
                     self._gather_states(cache, metadata, keys, handles)
@@ -5755,6 +6088,36 @@ class MaruWorkerConnector:
             first.dtype,
             first.device,
             cache.group,
+            self._kv_chunk_tokens,
+        )
+
+    def _slice(self, group: KVGroup | None) -> KVShard:
+        """The slice this rank holds of ``group``, or of a one-group model."""
+        if group is not None and group.kind == GROUP_MAMBA:
+            return self._state_shard
+        return self._kv_shard
+
+    def _stores(self, group: KVGroup | None = None) -> bool:
+        """Whether this rank stores its slice of ``group``, or of a one-group
+        model. Ranks holding the same KV share its name and only the lowest
+        stores it; every rank stores its own part of a Mamba-type state. Each
+        store path checks this before it queues anything."""
+        return self._slice(group).is_writer
+
+    def _stores_anything(self) -> bool:
+        """Whether this rank stores any object: a rank that only loads an MLA
+        latent or replicated KV heads does not, unless the model has a
+        Mamba-type group, whose state every rank stores its own part of."""
+        if self._multi_group:
+            return any(self._stores(group) for group in self._kv_groups)
+        return self._stores()
+
+    def _slice_chunk_keys(
+        self, req_meta: MaruReqMeta, group: KVGroup | None = None
+    ) -> list[str]:
+        """The request's chunk keys, named for the slice this rank holds."""
+        return _req_chunk_keys(
+            req_meta, self._kv_chunk_tokens, self._slice(group).suffix
         )
 
     def _group_kernel(self, cache: GroupCache) -> tuple | None:
@@ -5815,7 +6178,7 @@ class MaruWorkerConnector:
         ct = self._kv_chunk_tokens
         slab_bytes = target.layer_bytes * target.num_layers
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, ct)
+            chunk_keys = self._slice_chunk_keys(req_meta, target.group)
             chunks = _step_chunks(req_meta, ct, len(chunk_keys))
             if not chunks:
                 continue
@@ -5884,15 +6247,18 @@ class MaruWorkerConnector:
             if req_meta.num_scheduled_tokens <= 0:
                 continue
             end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-            chunk_keys = _req_chunk_keys(req_meta, ct)
-            if end % ct or end // ct > len(chunk_keys):
+            if end % ct or end > len(req_meta.token_ids):
                 continue
             block_ids = req_meta.group_block_ids[group.group_id]
             position = end // group.block_size - 1
             if position >= len(block_ids) or block_ids[position] == 0:
                 continue
             block = block_ids[position]
-            key = group_object_key(chunk_keys[end // ct - 1], group.group_id)
+            key = group_object_key(
+                self._slice_chunk_keys(req_meta, group)[end // ct - 1],
+                group.group_id,
+                ct,
+            )
             if self._is_stored(key) or key in keys:
                 continue
             handle = None
@@ -6053,7 +6419,7 @@ class MaruWorkerConnector:
         try:
             with stream_ctx:
                 for req_meta in self._store_entries(metadata):
-                    chunk_keys = _req_chunk_keys(req_meta, ct)
+                    chunk_keys = self._slice_chunk_keys(req_meta, slab_target.group)
                     if not chunk_keys:
                         continue
                     chunks = _step_chunks(req_meta, ct, len(chunk_keys))
@@ -6171,7 +6537,7 @@ class MaruWorkerConnector:
         # retain every request ID even though only one physical copy is queued.
         key_entries: dict[str, tuple[torch.Tensor, set[str], dict[str, str]]] = {}
         for req_meta in self._store_entries(metadata):
-            chunk_keys = _req_chunk_keys(req_meta, ct)
+            chunk_keys = self._slice_chunk_keys(req_meta, target.group)
             if not chunk_keys:
                 continue
             end_chunk = _step_chunks(req_meta, ct, len(chunk_keys)).stop
@@ -6627,7 +6993,8 @@ class MaruWorkerConnector:
         """Inject loaded KV cache data into the paged GPU buffer.
 
         The exact inverse of ``_extract_kv_from_layer``, branch for branch:
-        - MLA: [num_blocks, block_size, ...]
+        - MLA: [num_blocks, block_size, ...], for an MLA model also when no
+          metadata says so (a parked load before the first forward)
         - Legacy rank-4 Triton: [num_blocks, num_kv_heads, block_size,
           head_dim], but never vLLM 0.29+'s logical page
         - Everything else: whatever axis order the backend chose, resolved at
@@ -6646,7 +7013,7 @@ class MaruWorkerConnector:
             else attn_metadata
         )
 
-        if isinstance(layer_meta, MLACommonMetadata):
+        if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
             src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
@@ -6706,7 +7073,7 @@ class MaruWorkerConnector:
             else attn_metadata
         )
 
-        if isinstance(layer_meta, MLACommonMetadata):
+        if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(kv_layer)
             page_size = pages.shape[1]
             gathered = pages[slot_mapping // page_size, slot_mapping % page_size]

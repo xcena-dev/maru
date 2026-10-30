@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV cache groups: description, support checks, hits, per-group block ids,
-worker registration, stores and loads.
+worker registration, stores and loads, and tensor parallelism.
 
 The real-spec cases use the geometry vLLM 0.30 reports for Qwen3.5-0.8B
 (Gated DeltaNet + full attention) and gpt-oss-20b (sliding window + full
@@ -29,9 +29,13 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
+import maru_vllm.connector as connector_module
+from maru_common.kv_shard import WHOLE_MODEL, tp_kv_shard, tp_part_shard
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     MaruKVConnector,
@@ -45,6 +49,7 @@ from maru_vllm.kv_groups import (
     GROUP_UNSUPPORTED,
     _spec_kind,
     check_multi_group_support,
+    check_one_group_support,
     chunk_tokens_for_groups,
     describe_kv_groups,
     group_object_key,
@@ -54,6 +59,7 @@ from maru_vllm.kv_groups import (
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
+    FirstWinsServer,
     attach_capturing_handler,
     fake_cached_reqs,
     fake_scheduler_output,
@@ -61,6 +67,7 @@ from tests.unit.vllm_connector_helpers import (
     make_scheduler,
     make_vllm_scheduler,
     make_worker,
+    tp_model_config,
 )
 
 QWEN35_BLOCK = 544
@@ -245,6 +252,81 @@ def test_block_size_must_match_cache_config():
         _check(describe_kv_groups(gpt_oss_config()), 32)
 
 
+def _own_window_heads(**swa):
+    """gpt-oss, but its sliding-window layers keep their own KV heads, as
+    MiMo-V2's and Inkling's do."""
+    config = gpt_oss_config()
+    config.kv_cache_groups[0] = KVCacheGroupSpec(
+        config.kv_cache_groups[0].layer_names,
+        SlidingWindowSpec(sliding_window=128, **{**GPT_OSS_ATTN, **swa}),
+    )
+    return config
+
+
+@pytest.mark.parametrize("swa_block", [16, 32], ids=["one-block-size", "scaled"])
+def test_attention_groups_of_different_kv_shapes_are_refused(swa_block):
+    """2 KV heads of 128 per rank next to 8 of 64. vLLM gives the group with
+    the smaller page a larger block to keep one page size; the head shapes
+    are the reason given either way."""
+    config = _own_window_heads(num_kv_heads=2, head_size=128, block_size=swa_block)
+    with pytest.raises(ValueError, match="KV heads differ in count or size") as no:
+        _check(describe_kv_groups(config), 16)
+    assert "group 0: 2 KV heads per rank of size 128;" in str(no.value)
+    assert "group 1: 8 KV heads per rank of size 64)" in str(no.value)
+
+
+def test_attention_groups_whose_v_size_differs_are_refused():
+    config = _own_window_heads(head_size_v=128)
+    with pytest.raises(ValueError, match=r"of size 64 \(V 128\)"):
+        _check(describe_kv_groups(config), 16)
+
+
+def _one_group(*specs):
+    layers = [f"model.layers.{i}.attn" for i in range(len(specs))]
+    spec = (
+        specs[0]
+        if len(specs) == 1
+        else UniformTypeKVCacheSpecs(
+            block_size=specs[0].block_size,
+            kv_cache_specs=dict(zip(layers, specs, strict=True)),
+        )
+    )
+    return SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(layers, spec)], num_blocks=NUM_BLOCKS
+    )
+
+
+MLA_LATENT = MLAAttentionSpec(
+    block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+)
+
+
+def _dsa_indexer():
+    """DeepSeek-V3.2's indexer cache, which vLLM tells from the MLA latent by
+    its cache role. vLLM has SparseCacheRole from 0.30."""
+    role = getattr(kv_cache_interface, "SparseCacheRole", None)
+    if role is None:
+        pytest.skip("this vLLM has no SparseCacheRole")
+    return MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        cache_role=role.INDEXER,
+    )
+
+
+def test_one_group_of_different_kv_specs_is_refused():
+    """vLLM 0.32 puts DeepSeek-V3.2's MLA latent and its indexer cache, which
+    differ in shape, in one UniformTypeKVCacheSpecs group."""
+    indexer = _dsa_indexer()
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT, indexer)))
+    # One spec for every layer passes, MLA or not, and so do several groups.
+    check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT)))
+    check_one_group_support(describe_kv_groups(gpt_oss_config()))
+
+
 # =============================================================================
 # Connector
 # =============================================================================
@@ -257,6 +339,16 @@ def _connector_config(block_size, **extra):
         speculative_config=None,
         model_config=SimpleNamespace(max_model_len=4096),
     )
+
+
+def test_connector_refuses_one_group_of_different_kv_specs():
+    indexer = _dsa_indexer()
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        MaruKVConnector(
+            _connector_config(64),
+            KVConnectorRole.SCHEDULER,
+            _one_group(MLA_LATENT, indexer),
+        )
 
 
 def test_hybrid_support_is_declared_from_vllm_0_30():
@@ -565,6 +657,21 @@ def test_window_chunks():
     )
 
 
+def test_group_objects_name_their_chunk_length():
+    """Qwen3.5-0.8B's chunk is one block: 544 tokens at TP=2, 272 at TP=4.
+    Both engines hash tokens 0-543 to one chunk key (TP=2's chunk 0, TP=4's
+    chunk 1), and rank 0 holds KV head 0 in both, so only the chunk length
+    keeps a 272-token object from passing for a 544-token one."""
+    tokens = list(range(QWEN35_BLOCK))
+    (tp2,) = _chunk_keys(tokens, QWEN35_BLOCK)
+    _, tp4 = _chunk_keys(tokens, QWEN35_BLOCK // 2)
+    assert tp2 == tp4
+    heads = tp_kv_shard(0, 2, 2).suffix
+    assert tp_kv_shard(0, 4, 2).suffix == heads == "_h0-1"
+    assert group_object_key(tp2 + heads, 3, QWEN35_BLOCK) == f"{tp2}_h0-1_c544_g3"
+    assert group_object_key(tp4 + heads, 3, QWEN35_BLOCK // 2) == f"{tp2}_h0-1_c272_g3"
+
+
 class _Store:
     """A MaruHandler stand-in holding a set of keys."""
 
@@ -580,14 +687,19 @@ class _Store:
 def _stored_by(tokens, chunk, attention_groups, state_groups, state_chunks):
     """Keys a request stores: attention objects for every chunk, states for some."""
     keys = _chunk_keys(tokens, chunk)
-    stored = {group_object_key(k, g) for k in keys for g in attention_groups}
-    stored |= {group_object_key(keys[i], g) for i in state_chunks for g in state_groups}
+    stored = {group_object_key(k, g, chunk) for k in keys for g in attention_groups}
+    stored |= {
+        group_object_key(keys[i], g, chunk) for i in state_chunks for g in state_groups
+    }
     return stored
 
 
-def _qwen35_scheduler(stored):
+def _qwen35_scheduler(stored, **kwargs):
     sched = make_scheduler(
-        QWEN35_BLOCK, QWEN35_BLOCK, kv_groups=describe_kv_groups(qwen35_config())
+        QWEN35_BLOCK,
+        QWEN35_BLOCK,
+        kv_groups=describe_kv_groups(qwen35_config()),
+        **kwargs,
     )
     sched._handler = _Store(stored)
     return sched
@@ -644,7 +756,9 @@ def test_lookup_asks_every_group_in_one_rpc():
     assert _hit(sched, b) == 1632
     (query,) = sched._handler.queries
     keys = _chunk_keys(b, QWEN35_BLOCK)[:3]
-    assert query == [group_object_key(k, g) for k in keys for g in range(4)]
+    assert query == [
+        group_object_key(k, g, QWEN35_BLOCK) for k in keys for g in range(4)
+    ]
 
 
 def test_known_keys_that_give_every_chunk_skip_the_rpc():
@@ -722,7 +836,9 @@ def test_a_later_request_asks_maru_again_only_after_a_reported_failure(report):
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     first = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, first) == 1088
-    sched._handler.keys.discard(group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1))
+    sched._handler.keys.discard(
+        group_object_key(_chunk_keys(a, QWEN35_BLOCK)[1], 1, QWEN35_BLOCK)
+    )
     if report == "blocks":
         _report_failure(sched)
     elif report == "request":
@@ -1260,17 +1376,19 @@ def test_a_step_ending_on_a_chunk_stores_every_group(version):
     # Attention: both chunks the step completed. Mamba: only the chunk the
     # step ended on; chunk 0's state was overwritten within the step.
     assert set(store) == {
-        group_object_key(k0, 3),
-        group_object_key(k1, 3),
-        *(group_object_key(k1, g) for g in range(3)),
+        group_object_key(k0, 3, TINY_BLOCK),
+        group_object_key(k1, 3, TINY_BLOCK),
+        *(group_object_key(k1, g, TINY_BLOCK) for g in range(3)),
     }
     attn = worker._group_caches[3].tensors
     for key, block in ((k0, 4), (k1, 5)):
         expected = _expected_slab(attn, [block], version)
-        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+        assert torch.equal(
+            _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
+        )
     # A state object holds each layer's state at a stride of one block slot.
     for g in range(3):
-        obj = store[group_object_key(k1, g)]
+        obj = store[group_object_key(k1, g, TINY_BLOCK)]
         assert len(obj) == 2 * TINY_SLOT
         block = QWEN_BLOCKS[g][1]
         for p in range(2):
@@ -1287,7 +1405,7 @@ def test_a_step_ending_inside_a_chunk_stores_no_state():
         _store_meta(tokens, ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6]), 0, 40)
     )
     keys = _chunk_keys(tokens, TINY_BLOCK)
-    assert set(store) == {group_object_key(k, 3) for k in keys[:2]}
+    assert set(store) == {group_object_key(k, 3, TINY_BLOCK) for k in keys[:2]}
 
 
 def test_a_null_state_block_stores_no_state():
@@ -1295,8 +1413,8 @@ def test_a_null_state_block_stores_no_state():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, ([0, 0], [0, 2], [0, 3], [4, 5]), 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert group_object_key(k1, 0) not in store
-    assert group_object_key(k1, 1) in store
+    assert group_object_key(k1, 0, TINY_BLOCK) not in store
+    assert group_object_key(k1, 1, TINY_BLOCK) in store
 
 
 def test_shared_prefix_is_stored_once_per_key():
@@ -1324,9 +1442,9 @@ def test_sliding_window_reads_the_null_block_behind_the_window():
     (k0,) = _chunk_keys(tokens, 64)
     swa, full = (c.tensors for c in worker._group_caches)
     expected = _expected_slab(swa, [0, 8, 9, 10], "0.30")
-    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 0, 64)], expected), expected)
     expected = _expected_slab(full, [3, 4, 5, 6], "0.30")
-    assert torch.equal(_slab(store[group_object_key(k0, 1)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 1, 64)], expected), expected)
 
 
 def test_without_the_kernel_a_write_behind_store_is_synchronous():
@@ -1370,9 +1488,9 @@ def test_a_later_step_stores_the_state_at_its_own_end():
     blocks = ([0, 0, 1], [0, 0, 2], [0, 0, 3], [4, 5, 6])
     worker.wait_for_save(_store_meta(tokens, blocks, 32, 16))
     k2 = _chunk_keys(tokens, TINY_BLOCK)[2]
-    assert set(store) == {group_object_key(k2, g) for g in range(4)}
+    assert set(store) == {group_object_key(k2, g, TINY_BLOCK) for g in range(4)}
     shared = _shared()
-    obj = store[group_object_key(k2, 1)]
+    obj = store[group_object_key(k2, 1, TINY_BLOCK)]
     assert obj[:TINY_STATE] == bytes(_region(shared, 0)[2 * TINY_SLOT :][:TINY_STATE])
 
 
@@ -1399,8 +1517,8 @@ def test_a_failing_group_keeps_the_others_and_leaks_nothing():
     worker.wait_for_save(meta)
     ka, kb = _chunk_keys(a, TINY_BLOCK), _chunk_keys(b, TINY_BLOCK)
     assert set(store) == {
-        *(group_object_key(k, 3) for k in ka),
-        *(group_object_key(k, g) for k in (ka[1], kb[1]) for g in range(3)),
+        *(group_object_key(k, 3, TINY_BLOCK) for k in ka),
+        *(group_object_key(k, g, TINY_BLOCK) for k in (ka[1], kb[1]) for g in range(3)),
     }
     assert worker._handler.batch_store.call_count == 1
     assert worker._handler.alloc.call_count == len(store)
@@ -1446,9 +1564,11 @@ def _check_qwen_objects(worker, store, shared, tokens):
     attn = [t.cpu() for t in worker._group_caches[3].tensors]
     for key, block in ((k0, 4), (k1, 5)):
         expected = _expected_slab(attn, [block], "0.23")
-        assert torch.equal(_slab(store[group_object_key(key, 3)], expected), expected)
+        assert torch.equal(
+            _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
+        )
     for g in range(3):
-        obj = store[group_object_key(k1, g)]
+        obj = store[group_object_key(k1, g, TINY_BLOCK)]
         block = QWEN_BLOCKS[g][1]
         for p in range(2):
             state = _region(shared, p)[block * TINY_SLOT :][:TINY_STATE].cpu()
@@ -1474,7 +1594,7 @@ def test_kernel_store_registers_no_group_object_whose_copy_failed():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert set(store) == {group_object_key(k1, g) for g in range(3)}
+    assert set(store) == {group_object_key(k1, g, TINY_BLOCK) for g in range(3)}
     assert worker._handler.free.call_count == 2  # the two attention slabs
 
 
@@ -1483,7 +1603,7 @@ def test_kernel_write_behind_stores_attention_later_and_states_now():
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert all(group_object_key(k1, g) in store for g in range(3))
+    assert all(group_object_key(k1, g, TINY_BLOCK) in store for g in range(3))
     worker._store_executor.shutdown(wait=True)
     assert len(store) == 5
     _check_qwen_objects(worker, store, shared, tokens)
@@ -1508,7 +1628,7 @@ def test_kernel_store_reads_the_null_block_behind_the_window():
     (k0,) = _chunk_keys(tokens, 64)
     swa = [t.cpu() for t in worker._group_caches[0].tensors]
     expected = _expected_slab(swa, [0, 8, 9, 10], "0.23")
-    assert torch.equal(_slab(store[group_object_key(k0, 0)], expected), expected)
+    assert torch.equal(_slab(store[group_object_key(k0, 0, 64)], expected), expected)
 
 
 class _HeldExecutor:
@@ -1691,7 +1811,7 @@ FAILED_PARKED = (set(), {"b"}, {"b"})
 def test_a_failed_parked_load_is_reported_by_its_request():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
-    del store[group_object_key(k1, 2)]
+    del store[group_object_key(k1, 2, TINY_BLOCK)]
     worker, target = _loading_worker(store)
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)
@@ -1704,7 +1824,9 @@ def test_connector_reports_failed_parked_loads_with_their_completion():
     if not hasattr(KVConnectorBase_V1, "get_transfer_results"):
         pytest.skip("this vLLM reports load failures by block only")
     _, _, store = _stored_qwen()
-    del store[group_object_key(_chunk_keys(list(range(40)), TINY_BLOCK)[1], 2)]
+    del store[
+        group_object_key(_chunk_keys(list(range(40)), TINY_BLOCK)[1], 2, TINY_BLOCK)
+    ]
     worker, _ = _loading_worker(store)
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._worker = worker
@@ -1725,13 +1847,13 @@ def test_a_load_skips_what_vllms_prefix_cache_holds():
     worker.start_load_kv(_FORWARD, meta)
     (keys,), _ = worker._handler.batch_retrieve.call_args
     k0, k1 = _chunk_keys(list(range(40)), TINY_BLOCK)
-    assert group_object_key(k0, 3) not in keys
+    assert group_object_key(k0, 3, TINY_BLOCK) not in keys
     dst = worker._group_caches[3].tensors
     assert not _token_rows(dst[0], 7, "0.30").any()
     src = stored._group_caches[3].tensors
     assert torch.equal(_token_rows(dst[0], 8, "0.30"), _token_rows(src[0], 5, "0.30"))
 
-    del store[group_object_key(k1, 3)]
+    del store[group_object_key(k1, 3, TINY_BLOCK)]
     worker.start_load_kv(_FORWARD, meta)
     assert worker.take_failed_load_blocks() == {1, 3, 5, 8}
 
@@ -2169,7 +2291,7 @@ def test_an_unavailable_handler_fails_the_loads(parked):
 def test_an_inline_load_of_a_missing_object_is_reported():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
-    del store[group_object_key(k1, 0)]
+    del store[group_object_key(k1, 0, TINY_BLOCK)]
     worker, target = _loading_worker(store)
     worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
     assert _reported_failures(worker) == FAILED_INLINE
@@ -2218,3 +2340,454 @@ def test_a_parked_load_lands_after_work_queued_before_it():
     torch.cuda.synchronize()
     assert worker.get_finished_loading() == {"b"}
     _check_loaded(stored, worker, source, target, in_place=False)
+
+
+# =============================================================================
+# Tensor parallelism
+# =============================================================================
+
+
+def _rank_shared(rank):
+    """``_shared()`` with every byte shifted by rank: each rank's own KV."""
+    return (_shared().to(torch.int64) + 97 * rank).remainder(251).to(torch.uint8)
+
+
+def _tp_shards(rank, tp_size, total_heads):
+    """``rank``'s KV heads and its part of each Mamba state."""
+    return {
+        "kv_shard": tp_kv_shard(rank, tp_size, total_heads),
+        "state_shard": tp_part_shard(rank, tp_size),
+    }
+
+
+def _tp_worker(kv_caches, shards, server, config=None, chunk=TINY_BLOCK, **kwargs):
+    """A registered rank on ``server``, which every rank shares."""
+    worker = _worker(
+        config, chunk, kv_cache_layout=_engine_layout(kv_caches), **shards, **kwargs
+    )
+    worker.register_kv_caches(kv_caches)
+    worker._handler = server.handler()
+    return worker
+
+
+def _registered_keys(worker):
+    return {k for c in worker._handler.batch_store.call_args_list for k in c.args[0]}
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_tp_ranks_store_and_load_their_own_slices(version):
+    """TP=2 over 4 KV heads on one first-register-wins server: each rank
+    stores its own heads and its own part of every Mamba state, and loads
+    them back rather than the other rank's."""
+    server = FirstWinsServer()
+    tokens = list(range(40))
+    sources, stored = [], []
+    for rank in range(2):
+        sources.append(_rank_shared(rank))
+        worker = _tp_worker(
+            tiny_kv_caches(version, sources[rank]), _tp_shards(rank, 2, 4), server
+        )
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        stored.append(worker)
+
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    assert set(server.objects) == {
+        *(
+            group_object_key(k + h, 3, TINY_BLOCK)
+            for k in (k0, k1)
+            for h in ("_h0-2", "_h2-4")
+        ),
+        *(
+            group_object_key(k1 + s, g, TINY_BLOCK)
+            for s in ("_tp2_r0", "_tp2_r1")
+            for g in range(3)
+        ),
+    }
+    for rank in range(2):
+        target = torch.zeros_like(_shared())
+        worker = _tp_worker(
+            tiny_kv_caches(version, target), _tp_shards(rank, 2, 4), server
+        )
+        worker.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
+        assert worker.take_failed_load_blocks() == set()
+        src = stored[rank]._group_caches[3].tensors
+        dst = worker._group_caches[3].tensors
+        for a_block, b_block in ((4, 7), (5, 8)):
+            for a, b in zip(src, dst, strict=True):
+                assert torch.equal(
+                    _token_rows(b, b_block, version), _token_rows(a, a_block, version)
+                )
+        for g in range(3):
+            for layer in range(2):
+                assert torch.equal(
+                    _state(target, layer, B_BLOCKS[g][1]),
+                    _state(sources[rank], layer, QWEN_BLOCKS[g][1]),
+                )
+
+
+def _one_head_attn(region):
+    """A rank's attention layer holding one KV head (flash, vLLM 0.23)."""
+    return region.view(torch.bfloat16).view(TINY_BLOCKS, 2, 16, 1, 16)
+
+
+def _one_head_caches(shared):
+    caches = tiny_kv_caches("0.23", shared)
+    for p, i in enumerate(TINY_ATTN):
+        caches[f"layers.{i}.attn"] = _one_head_attn(_region(shared, p))
+    return caches
+
+
+def test_tp_replica_skips_attention_but_stores_its_state():
+    """TP=4 over 2 KV heads: ranks 0 and 1 hold head 0, but each holds its
+    own part of every Mamba state. Rank 1 stores only its state and loads
+    rank 0's attention."""
+    server = FirstWinsServer()
+    tokens = list(range(40))
+    source0 = _rank_shared(0)
+    # Same attention bytes (blocks 4, 5), different states (blocks 1-3).
+    source1 = source0.clone()
+    for p in range(2):
+        start = p * TINY_LAYER_BYTES + TINY_SLOT
+        source1[start : start + 3 * TINY_SLOT] += 1
+    workers = []
+    for rank, source in enumerate((source0, source1)):
+        worker = _tp_worker(
+            _one_head_caches(source),
+            _tp_shards(rank, 4, 2),
+            server,
+            num_kv_heads=1,
+            head_size=16,
+        )
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        workers.append(worker)
+
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    assert _registered_keys(workers[1]) == {
+        group_object_key(k1 + "_tp4_r1", g, TINY_BLOCK) for g in range(3)
+    }
+    assert group_object_key(k0 + "_h0-1", 3, TINY_BLOCK) in _registered_keys(workers[0])
+
+    target = torch.zeros_like(_shared())
+    worker = _tp_worker(
+        _one_head_caches(target),
+        _tp_shards(1, 4, 2),
+        server,
+        num_kv_heads=1,
+        head_size=16,
+    )
+    worker.start_load_kv(_FORWARD, _load_meta(tokens, B_BLOCKS, 2, 32, 8))
+    assert worker.take_failed_load_blocks() == set()
+    src = workers[0]._group_caches[3].tensors
+    dst = worker._group_caches[3].tensors
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(b[b_block], a[a_block])
+    for g in range(3):
+        for layer in range(2):
+            assert torch.equal(
+                _state(target, layer, B_BLOCKS[g][1]),
+                _state(source1, layer, QWEN_BLOCKS[g][1]),
+            )
+
+
+def _swa_caches(shared):
+    return {
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.30")
+        for i in range(4)
+    }
+
+
+def _rank_parts(rank, tp_size):
+    """Attention named by rank, as above TP = KV heads with several groups."""
+    part = tp_part_shard(rank, tp_size)
+    return {"kv_shard": part, "state_shard": part}
+
+
+@pytest.mark.parametrize(
+    ("shards", "names"),
+    [
+        (lambda rank: _tp_shards(rank, 2, 4), ("_h0-2", "_h2-4")),
+        (lambda rank: _rank_parts(rank, 4), ("_tp4_r0", "_tp4_r1")),
+    ],
+    ids=["by-heads", "by-rank"],
+)
+def test_tp_sliding_window_ranks_load_their_own_heads(shards, names):
+    """A small gpt-oss: both groups carry each rank's own KV, named by heads
+    or, above TP = KV heads, by rank."""
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    config = tiny_swa_config()
+    stored = []
+    for rank in range(2):
+        worker = _tp_worker(
+            _swa_caches(_rank_shared(rank)),
+            shards(rank),
+            server,
+            config,
+            chunk=64,
+        )
+        worker.wait_for_save(_store_meta(tokens, ([7, 8, 9, 10], [3, 4, 5, 6]), 0, 64))
+        stored.append(worker)
+
+    (k0,) = _chunk_keys(tokens, 64)
+    assert set(server.objects) == {
+        group_object_key(k0 + name, g, 64) for name in names for g in (0, 1)
+    }
+    for rank in range(2):
+        worker = _tp_worker(
+            _swa_caches(torch.zeros_like(_shared())),
+            shards(rank),
+            server,
+            config,
+            chunk=64,
+        )
+        blocks = ([0, 0, 1, 2], [3, 4, 5, 6])
+        worker.start_load_kv(_FORWARD, _load_meta(tokens, blocks, 1, 64, 16))
+        assert worker.take_failed_load_blocks() == set()
+        for gid, pairs in ((0, ((9, 1), (10, 2))), (1, ((3, 3), (6, 6)))):
+            src = stored[rank]._group_caches[gid].tensors
+            dst = worker._group_caches[gid].tensors
+            for a_block, b_block in pairs:
+                for a, b in zip(src, dst, strict=True):
+                    assert torch.equal(
+                        _token_rows(b, b_block, "0.30"),
+                        _token_rows(a, a_block, "0.30"),
+                    )
+
+
+# Qwen3.5 at TP=2: the two KV heads of its attention group (group 3) on one
+# rank each, and two parts of each Mamba state (groups 0-2).
+QWEN35_TP2 = {
+    "shard_suffixes": ("_h0-1", "_h1-2"),
+    "state_suffixes": ("_tp2_r0", "_tp2_r1"),
+}
+
+
+def _qwen35_tp2_objects(keys):
+    """What both ranks store of a 1,200-token prompt whose first step ended
+    at chunk 1: attention for every chunk, states for chunk 1."""
+    attention = {
+        group_object_key(k + h, 3, QWEN35_BLOCK)
+        for k in keys
+        for h in ("_h0-1", "_h1-2")
+    }
+    states = {
+        group_object_key(keys[1] + s, g, QWEN35_BLOCK)
+        for s in ("_tp2_r0", "_tp2_r1")
+        for g in range(3)
+    }
+    return attention | states
+
+
+def test_tp_hit_needs_every_slice_of_every_group():
+    a = list(range(1200))  # step 1 ends at token 1,088
+    keys = _chunk_keys(a, QWEN35_BLOCK)
+    stored = _qwen35_tp2_objects(keys)
+    sched = _qwen35_scheduler(stored, **QWEN35_TP2)
+    assert _hit(sched, a) == 1088
+    # One lookup asked about every slice of every group.
+    assert stored <= set(sched._handler.queries[0])
+
+    # One rank's part of one Mamba state is missing: no chunk can resume.
+    missing_state = group_object_key(keys[1] + "_tp2_r1", 0, QWEN35_BLOCK)
+    assert _hit(_qwen35_scheduler(stored - {missing_state}, **QWEN35_TP2), a) == 0
+    missing_heads = group_object_key(keys[0] + "_h1-2", 3, QWEN35_BLOCK)
+    assert _hit(_qwen35_scheduler(stored - {missing_heads}, **QWEN35_TP2), a) == 0
+
+
+def _tp_connector_config(block_size, tp_size, total_heads):
+    config = _connector_config(block_size)
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+    config.model_config = tp_model_config(total_heads)
+    return config
+
+
+def test_tp_connector_wires_each_group_slice(monkeypatch):
+    gpt = MaruKVConnector(
+        _tp_connector_config(16, 2, 8), KVConnectorRole.SCHEDULER, gpt_oss_config()
+    )
+    assert gpt._scheduler._shard_suffixes == ("_h0-4", "_h4-8")
+
+    qwen_config = _tp_connector_config(QWEN35_BLOCK, 2, 2)
+    qwen = MaruKVConnector(qwen_config, KVConnectorRole.SCHEDULER, qwen35_config())
+    assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
+    assert qwen._scheduler._state_suffixes == ("_tp2_r0", "_tp2_r1")
+
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    worker = MaruKVConnector(
+        qwen_config, KVConnectorRole.WORKER, qwen35_config()
+    )._worker
+    assert worker._kv_shard.suffix == "_h1-2"
+    assert worker._state_shard.suffix == "_tp2_r1"
+
+
+def test_tp1_several_groups_keep_bare_keys(monkeypatch):
+    def no_rank():
+        raise AssertionError("TP=1 must not query the TP group")
+
+    monkeypatch.setattr(connector_module, "_tp_rank", no_rank)
+    config = _tp_connector_config(16, 1, 8)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
+    assert sched._scheduler._shard_suffixes == ("",)
+    assert sched._scheduler._state_suffixes == ("",)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._kv_shard == WHOLE_MODEL
+    assert worker._worker._state_shard == WHOLE_MODEL
+
+
+class _FillOps:
+    """maru_kv_ops stand-in whose D2H gather fills the slab with ``fill``."""
+
+    class TransferDirection:
+        D2H = "D2H"
+        H2D = "H2D"
+
+    def __init__(self, fill):
+        self.fill = fill
+
+    def multi_layer_kv_transfer(self, slab, *args, **kwargs):
+        slab.fill_(self.fill)
+
+
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_tp_kernel_stores_each_ranks_heads(write_behind):
+    """The kernel stores of a GPU run, gathered now or written behind, name
+    each rank's attention slab by its own heads."""
+    if write_behind and not torch.cuda.is_available():
+        pytest.skip("write-behind needs CUDA streams")
+    server = FirstWinsServer()
+    tokens = list(range(40))
+    for rank in range(2):
+        shared = _rank_shared(rank)
+        worker = _tp_worker(
+            tiny_kv_caches("0.23", shared.cuda() if write_behind else shared),
+            _tp_shards(rank, 2, 4),
+            server,
+            extra_config={"maru_async_store": True} if write_behind else None,
+        )
+        worker._group_kernels[3] = (_FillOps(rank + 1), None, None, TINY_BLOCK, 8, "")
+        worker._store_executor = _HeldExecutor()
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+        worker._store_executor.run()
+
+    for k in _chunk_keys(tokens, TINY_BLOCK):
+        for rank, heads in enumerate(("_h0-2", "_h2-4")):
+            raw = server.objects[group_object_key(k + heads, 3, TINY_BLOCK)]
+            slab = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16)
+            assert torch.all(slab == rank + 1)
+
+
+def test_tp_names_attention_by_rank_above_the_kv_heads(monkeypatch):
+    """Above TP = KV heads, vLLM replicates each attention group's heads by
+    the group's own count, which several groups need not share. gpt-oss at
+    TP=16 names its attention KV by rank instead, and every rank stores its
+    own copy."""
+    config = _tp_connector_config(16, 16, 8)
+    gpt = MaruKVConnector(config, KVConnectorRole.SCHEDULER, gpt_oss_config())
+    assert gpt._scheduler._shard_suffixes == tuple(f"_tp16_r{r}" for r in range(16))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 3)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._kv_shard.suffix == "_tp16_r3"
+    assert worker._worker._kv_shard.is_writer
+    # One attention group: its heads are the model's, replicated as named.
+    qwen = MaruKVConnector(
+        _tp_connector_config(QWEN35_BLOCK, 4, 2),
+        KVConnectorRole.SCHEDULER,
+        qwen35_config(),
+    )
+    assert qwen._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
+
+
+def _one_attention_group(**spec):
+    """gpt-oss's 24 layers in one full-attention group."""
+    layers = [f"model.layers.{i}.attn" for i in range(24)]
+    return SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(layers, FullAttentionSpec(**GPT_OSS_ATTN, **spec))
+        ],
+        num_blocks=NUM_BLOCKS,
+    )
+
+
+def test_tp_names_attention_by_rank_in_one_group_with_a_sliding_window(monkeypatch):
+    """With its hybrid KV cache manager off, vLLM keeps sliding-window and
+    full layers in one full-attention group whose spec keeps the window. The
+    two kinds can replicate different head counts (8 and 4 at TP=8: ranks 0
+    and 1 share a full-attention head, not a sliding-window one), so every
+    rank names and stores its own KV."""
+    config = _tp_connector_config(16, 16, 8)
+    merged = _one_attention_group(sliding_window=128)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, merged)
+    assert sched._scheduler._shard_suffixes == tuple(f"_tp16_r{r}" for r in range(16))
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, merged)._worker
+    assert worker._kv_shard.suffix == "_tp16_r1"
+    assert worker._kv_shard.is_writer
+    # Full attention alone replicates the model's heads, which it names.
+    full = MaruKVConnector(config, KVConnectorRole.SCHEDULER, _one_attention_group())
+    assert full._scheduler._shard_suffixes == tuple(f"_h{h}-{h + 1}" for h in range(8))
+    # Up to TP = KV heads every rank holds its own heads in either case.
+    tp8 = _tp_connector_config(16, 8, 8)
+    sched = MaruKVConnector(tp8, KVConnectorRole.SCHEDULER, merged)
+    assert sched._scheduler._shard_suffixes == tuple(f"_h{h}-{h + 1}" for h in range(8))
+
+
+def _qwen35_tp4_worker(monkeypatch, rank):
+    """A Qwen3.5 worker at TP=4: its 2 KV heads sit on two ranks each."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: rank)
+    config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
+    return MaruKVConnector(config, KVConnectorRole.WORKER, qwen35_config())._worker
+
+
+def test_tp_connector_wires_replicated_heads_of_a_hybrid_model(monkeypatch):
+    config = _tp_connector_config(QWEN35_BLOCK, 4, 2)
+    sched = MaruKVConnector(config, KVConnectorRole.SCHEDULER, qwen35_config())
+    assert sched._scheduler._shard_suffixes == ("_h0-1", "_h1-2")
+    assert sched._scheduler._state_suffixes == (
+        "_tp4_r0",
+        "_tp4_r1",
+        "_tp4_r2",
+        "_tp4_r3",
+    )
+    worker = _qwen35_tp4_worker(monkeypatch, 1)
+    # Rank 1 holds rank 0's KV head but a part of each state of its own.
+    assert worker._kv_shard.suffix == "_h0-1"
+    assert not worker._kv_shard.is_writer
+    assert worker._state_shard.suffix == "_tp4_r1"
+    assert worker._state_shard.is_writer
+
+
+def test_tp_worker_logs_what_it_stores_of_each_group(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
+        _qwen35_tp4_worker(monkeypatch, 1)
+    messages = [r.getMessage() for r in caplog.records]
+    (line,) = [m for m in messages if "TP rank 1 of 4" in m]
+    assert "'_h0-1' and only loads it" in line
+    assert "stores its part '_tp4_r1' of each Mamba-type state" in line
+
+
+def test_tp_rank_that_only_loads_attention_takes_a_whole_pool(monkeypatch):
+    """#132 leaves this rank alone: it loads rank 0's KV head but stores its
+    own part of each Mamba-type state."""
+    created = {}
+
+    def create_handler(extra_config, **kwargs):
+        created.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(connector_module, "_create_maru_handler", create_handler)
+    worker = _qwen35_tp4_worker(monkeypatch, 1)
+    worker._ensure_handler()
+    assert worker._handler is not None
+    assert "pool_size_override" not in created
+
+
+def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
+    a = list(range(1200))
+    keys = _chunk_keys(a, QWEN35_BLOCK)
+    stored = _qwen35_tp2_objects(keys) - {
+        group_object_key(keys[1] + "_tp2_r1", 0, QWEN35_BLOCK)
+    }
+    with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
+        assert _hit(_qwen35_scheduler(stored, **QWEN35_TP2), a) == 0
+    assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)

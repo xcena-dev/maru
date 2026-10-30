@@ -16,7 +16,7 @@ a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
 a Mamba group keeps only the state at the chunk's last block. A model with
 one group keeps the bare chunk key; with several, each object is keyed
-``<chunk key>_g<group id>``.
+``<chunk key>_c<chunk tokens>_g<group id>`` (see :func:`group_object_key`).
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ class KVGroup:
         state_bytes: For a Mamba group, bytes of one layer's state in one
             block (its state shapes times dtypes), which vLLM pads up to
             ``slot_bytes``. 0 otherwise.
+        kv_shape: For an attention group, its KV heads per rank and the head
+            size of K and of V. None otherwise.
     """
 
     group_id: int
@@ -67,6 +69,7 @@ class KVGroup:
     sliding_window: int | None = None
     mamba_cache_mode: str | None = None
     state_bytes: int = 0
+    kv_shape: tuple[int, int, int] | None = None
 
     def object_bytes(self, chunk_tokens: int) -> int:
         """Bytes of this group's object for one chunk.
@@ -134,14 +137,31 @@ def describe_kv_groups(
                     if kind == GROUP_MAMBA
                     else 0
                 ),
+                kv_shape=(
+                    (
+                        int(spec.num_kv_heads),
+                        int(spec.head_size),
+                        int(getattr(spec, "head_size_v", None) or spec.head_size),
+                    )
+                    if kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)
+                    else None
+                ),
             )
         )
     return groups
 
 
-def group_object_key(chunk_key: str, group_id: int) -> str:
-    """Key of the (chunk, group) object for a model with several groups."""
-    return f"{chunk_key}_g{group_id}"
+def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
+    """Key of the (chunk, group) object for a model with several groups.
+
+    A chunk key hashes the tokens from the prompt's start to the chunk's
+    end, so it does not say where the chunk starts, and the chunk length
+    does. It varies between engines: with a Mamba group a chunk is one vLLM
+    block, sized from the per-rank Mamba state and attention page, so
+    Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token ones at TP=4,
+    where rank 0 holds the same KV head and names it alike.
+    """
+    return f"{chunk_key}_c{chunk_tokens}_g{group_id}"
 
 
 def window_chunks(group: KVGroup, end: int, chunk_tokens: int) -> range:
@@ -258,9 +278,10 @@ def check_multi_group_support(
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
-    A model with one group is always accepted. Several groups are supported
-    in chunkwise (packed) format with full attention, sliding window and
-    Mamba (``align``) groups, with parked loads, without speculative
+    A model with one group passes (``check_one_group_support`` checks it).
+    Several groups are supported in chunkwise (packed) format with full
+    attention, sliding window and Mamba (``align``) groups whose attention
+    groups share one KV shape, with parked loads, without speculative
     decoding. The CPU, mixed and remote_cxl backends reject several groups
     on their own, in ``MaruKVConnector``.
 
@@ -284,6 +305,18 @@ def check_multi_group_support(
             "MaruKVConnector does not support KV cache groups of type "
             f"{', '.join(unsupported)} alongside other groups; supported are "
             f"{', '.join(_SUPPORTED_SPECS)}{one_group_hint(groups)}"
+        )
+    shaped = [g for g in groups if g.kv_shape is not None]
+    if len({g.kv_shape for g in shaped}) > 1:
+        # MiMo-V2 and Inkling give their sliding-window layers their own KV
+        # heads and head size. vLLM then also gives those groups different
+        # block sizes, to keep one page size.
+        raise ValueError(
+            "MaruKVConnector does not support attention groups whose KV heads "
+            "differ in count or size; it stores every group with one head shape "
+            "and one block size ("
+            + "; ".join(f"group {g.group_id}: {_kv_shape_text(g)}" for g in shaped)
+            + ")"
         )
     if use_layerwise:
         raise ValueError(
@@ -325,6 +358,34 @@ def check_multi_group_support(
             "recomputes one into wrong output under kv_load_failure_policy="
             "'recompute' (vllm-project/vllm#49250). Remove "
             f"maru_async_load=false{one_group_hint(groups)}"
+        )
+
+
+def _kv_shape_text(group: KVGroup) -> str:
+    assert group.kv_shape is not None
+    heads, k_size, v_size = group.kv_shape
+    sizes = f"{k_size}" if v_size == k_size else f"{k_size} (V {v_size})"
+    return f"{heads} KV heads per rank of size {sizes}"
+
+
+def check_one_group_support(groups: list[KVGroup]) -> None:
+    """Reject a single group whose layers keep different KV cache specs.
+
+    vLLM puts layers of one kind in one group even when their KV differs in
+    shape, as ``UniformTypeKVCacheSpecs``: DeepSeek-V3.2's MLA latent and its
+    indexer cache, or, with the hybrid KV cache manager off, sliding-window
+    and full layers whose KV heads differ. The connector handles every layer
+    of a one-group model in the first layer's shape.
+
+    Raises:
+        ValueError: For such a group.
+    """
+    if len(groups) == 1 and groups[0].spec_name == "UniformTypeKVCacheSpecs":
+        raise ValueError(
+            "MaruKVConnector does not support a KV cache group whose layers "
+            "keep different KV cache specs (vLLM's UniformTypeKVCacheSpecs), "
+            "such as an MLA latent next to an indexer cache; it handles every "
+            "layer of a one-group model in the first layer's shape"
         )
 
 

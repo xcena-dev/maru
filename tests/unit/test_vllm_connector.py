@@ -2848,6 +2848,61 @@ class TestAsyncDeferredPackedLoad:
         assert worker._unsound_kv_req_ids == {"r1"}
         assert [r.req_id for r in worker._store_entries(metadata)] == ["r2"]
 
+    @pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+    def test_layerwise_activation_cpu_fallback_places_an_mla_latent(self, layerwise):
+        """A parked load can resume before any forward has given attention
+        metadata to tell MLA by; the worker knows it from the model. A
+        chunkwise slab holds one latent plane per layer."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={
+                "maru_enable_deferred_loading": True,
+                "maru_enable_layerwise_overlap": True,
+                "maru_use_layerwise": layerwise,
+            },
+            use_mla=True,
+        )
+        worker._handler = MagicMock()
+        worker._num_layers = 2
+        source = torch.arange(2 * 4 * 3, dtype=torch.float32).view(1, 2, 4, 3)
+
+        def info(t):
+            return SimpleNamespace(
+                view=memoryview(bytearray(t.contiguous().numpy().tobytes())),
+                region_id=0,
+                page_index=0,
+            )
+
+        infos = (
+            [[info(source[0, layer])] for layer in range(2)]
+            if layerwise
+            else [info(source)]
+        )
+        meta = self._deferred_meta()
+        meta.num_matched_chunks = 1
+        meta.block_ids = [0]
+        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), infos)
+        kv0 = torch.zeros(1, 4, 3)  # [blocks, block, latent]
+        kv1 = torch.zeros_like(kv0)
+        forward = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.self_attn": SimpleNamespace(kv_cache=kv0),
+                "model.layers.1.self_attn": SimpleNamespace(kv_cache=kv1),
+            },
+            attn_metadata=None,
+        )
+
+        worker.start_load_kv(
+            forward,
+            MaruConnectorMetadata(layerwise_load_req_ids={"r1"}),
+        )
+
+        torch.testing.assert_close(kv0, source[0, 0].view_as(kv0))
+        torch.testing.assert_close(kv1, source[0, 1].view_as(kv1))
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_layerwise_activation_records_one_event_per_layer(self):
         from maru_vllm.connector import MaruConnectorMetadata
