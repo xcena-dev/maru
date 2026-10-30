@@ -1272,6 +1272,36 @@ class MaruHandler:
         )
         return batch_resp.results
 
+    def read_hints_enabled(self) -> bool:
+        """Whether storage sends read hints (:meth:`hint_read` does anything)."""
+        return bool(getattr(self._cpu, "read_hints_enabled", False))
+
+    def hint_read(
+        self, request_id: str, keys: list[str], route_key: str | None = None
+    ) -> None:
+        """Tell storage that ``request_id`` will read ``keys`` soon, in order.
+
+        Returns at once. Storage that sends read hints looks the keys up and
+        tells the memory side where their bytes are, so it can prepare them
+        before the load starts; other storage ignores it. The load still
+        reads every key.
+
+        Args:
+            request_id: The serving engine's request id.
+            keys: Chunk keys the request's load will read, in order.
+            route_key: The request's first chunk key (picks the pool, as in
+                :meth:`batch_exists`).
+        """
+        hint = getattr(self._cpu, "hint_read", None)
+        if hint is not None:
+            hint(request_id, keys, route_key=route_key)
+
+    def end_read_hint(self, request_id: str) -> None:
+        """``request_id`` ended; storage may drop what it prepared for it."""
+        end = getattr(self._cpu, "end_read_hint", None)
+        if end is not None:
+            end(request_id)
+
     def batch_pin(self, keys: list[str]) -> list[bool]:
         """Check existence and pin multiple keys in a single RPC call.
 
