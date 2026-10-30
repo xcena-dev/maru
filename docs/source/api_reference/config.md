@@ -28,6 +28,10 @@ class MaruConfig:
     rdma_timeout_s: float = 30.0
     rdma_load_reserve: float = 0.0
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
+    read_hints: bool = False
+    write_hints: bool = False
+    write_wait_ms: int = 50
+    read_promotes: bool = False
 ```
 
 ### Parameters
@@ -51,6 +55,10 @@ class MaruConfig:
 | `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
 | `rdma_load_reserve` | `float` | `0.0` | `remote_cxl` only: share of staging slots, in `[0, 1)`, that stores leave free for loads; set when loads and stores run on separate threads |
 | `remote_cxl_agent_key_file` | `str` | `"~/.maru/remote-cxl-agent.key"` | `remote_cxl` only: copy of the memory nodes' remote CXL agent key, readable by the worker's user only |
+| `read_hints` | `bool` | `False` | `remote_cxl` only: send [read hints](../design_doc/read_hints.md) to agents whose region extension takes them. A metadata-only client sends what `MaruHandler.hint_read` names; a client that loads hints each load as its READs start |
+| `read_promotes` | `bool` | `False` | `remote_cxl` only: tell agents whose region extension takes it when the load of a request another process hinted starts (`MaruHandler.promote_read`), so the memory side brings that request's bytes in first; see [Read and write hints](../design_doc/read_hints.md) |
+| `write_hints` | `bool` | `False` | `remote_cxl` only: send a write hint for each store's pages before its WRITEs to agents whose region extension takes them; see [Read and write hints](../design_doc/read_hints.md) |
+| `write_wait_ms` | `int` | `50` | With `write_hints`: how long a store waits for an agent whose region extension takes `write_wait` to prepare its pages before posting its WRITEs, which go either way; `0` never waits (0 to 10000) |
 
 ### Examples
 
@@ -168,6 +176,10 @@ apply to that backend only:
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
+| `maru_read_hints` | `bool` | `false` | The scheduler tells the memory nodes which pages each load will read before it starts, so a device with a cache in front of slower media can prefetch them, and the worker tells them when each such load starts; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise) |
+| `maru_write_hints` | `bool` | `maru_read_hints` | The worker names each store's pages to the memory nodes before it writes them, so such a device can prepare them instead of filling each from slower media on its first write. Follows `maru_read_hints` unless set |
+| `maru_write_wait_ms` | `int` | `50` | How long a store waits for the memory node to prepare its pages before writing them (with write hints, where the region extension takes it); `0` never waits |
+| `maru_read_hint_on_arrival` | `bool` | `false` | Send the read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` (off with a warning otherwise) |
 
 ### Remote CXL agent (`maru-remote-cxl-agent`)
 
@@ -184,6 +196,11 @@ it, and the service reads these variables from `/etc/maru/remote-cxl-agent.env`.
 | `--key-file` (`MARU_REMOTE_CXL_AGENT_KEY_FILE`) | `/etc/maru/remote-cxl-agent.key` | Key every connection must prove; the installer creates it |
 | `--node-id` | hostname | Name of the memory node; names the default lock file |
 | `--lock-file` (`MARU_REMOTE_CXL_AGENT_LOCK_FILE`) | `/run/maru/remote-cxl-agent-<node>.lock` | Keeps one remote CXL agent per node |
+| `--region-extension` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION`) | none | Name of an installed region extension (entry point in `maru.region_extensions`) that takes read and write hints and hears region maps; see [Read and write hints](../design_doc/read_hints.md). A package that provides one can set it for the service with a drop-in on `maru-remote-cxl-agent.service` |
+| `--region-extension-config` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG`) | empty | Opaque string given to that extension |
+| `--max-hint-requests` | `4096` | Read hint requests one connection may keep open; more are refused |
+| `--memory-generation-poll-s` | `0.1` | How often the extension's memory generation is read; a reset is acted on within the extension's detection time plus this |
+| `--memory-generation-grace-s` | `2.0` | How long the memory generation may go unanswered before every region is released and maps are refused until it answers |
 | `--allow-unchecked-transport` | off | Accept UCX transports that do not check remote keys (tests on one host only) |
 | `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 

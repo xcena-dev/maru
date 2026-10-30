@@ -87,6 +87,25 @@ def test_loads_go_in_batches_the_staging_buffer_can_hold(capacity):
         torch.testing.assert_close(value, slabs[keys[token // 8]][:, 0, token % 8, 0])
 
 
+def test_a_load_promotes_its_request_once_before_its_first_read():
+    worker, cache = _worker(1)  # three batches
+    meta = _load_meta()
+    keys = _req_chunk_keys(meta, 8)
+    calls = []
+    worker._handler.promote_read.side_effect = lambda rid, **route: calls.append(
+        ("promote", rid, route)
+    )
+
+    def retrieve(requested, route_key=None):
+        calls.append(("read", requested[0]))
+        return [_view(_slab()) for _ in requested]
+
+    worker._batch_retrieve_all = retrieve
+    worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    assert calls[0] == ("promote", "load", {"route_key": keys[0]})
+    assert [c[0] for c in calls] == ["promote", "read", "read", "read"]
+
+
 def test_a_missing_later_batch_fails_only_from_that_batch():
     worker, cache = _worker(1)
     meta = _load_meta()

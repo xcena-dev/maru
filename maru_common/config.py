@@ -83,6 +83,23 @@ class MaruConfig:
     # Key the remote CXL agents of the pool require (a copy of the memory node's
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
+    # Send read hints (remote_cxl only): before a load starts, the remote CXL
+    # agents whose region extension takes them hear which bytes it will read
+    # (maru_handler.storage.remote_cxl.hints). Advice; the data path is the same.
+    read_hints: bool = False
+    # Send write hints (remote_cxl only): a store's pages are named to the
+    # remote CXL agents whose region extension takes them before its WRITEs,
+    # so memory that fills a written page from a slow tier can prepare it.
+    write_hints: bool = False
+    # With write hints, how long a store waits (ms) for an agent whose
+    # region extension takes ``write_wait`` to prepare its pages before it
+    # posts the WRITEs; the WRITEs go either way. 0: never wait.
+    write_wait_ms: int = 50
+    # Send read promotes (remote_cxl only): when a load starts for a request
+    # another process hinted (a vLLM worker loads what its scheduler
+    # hinted), the remote CXL agents whose region extension takes them hear
+    # that this request is loading now.
+    read_promotes: bool = False
 
     @property
     def server_urls(self) -> list[str]:
@@ -147,6 +164,14 @@ class MaruConfig:
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.read_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("read_hints is supported by the remote_cxl backend")
+        if self.write_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("write_hints is supported by the remote_cxl backend")
+        if type(self.write_wait_ms) is not int or not 0 <= self.write_wait_ms <= 10_000:
+            raise ValueError("write_wait_ms must be an integer from 0 to 10000")
+        if self.read_promotes and self.storage_backend != "remote_cxl":
+            raise ValueError("read_promotes is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
         if self.storage_backend == "remote_cxl":

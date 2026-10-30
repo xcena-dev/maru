@@ -448,9 +448,17 @@ class FakeMemoryNode:
     """
 
     def __init__(
-        self, cxl: FakeCxl, name: str = "mem1", port: int = 0, key: object = "test"
+        self,
+        cxl: FakeCxl,
+        name: str = "mem1",
+        port: int = 0,
+        key: object = "test",
+        extension: object = None,
+        **service_options: object,
     ) -> None:
         self.cxl = cxl
+        self.extension = extension
+        self.service_options = service_options
         self.name = name
         self._port = port
         self.key = shared_key() if key == "test" else key
@@ -477,6 +485,8 @@ class FakeMemoryNode:
             node_id=self.name,
             epoch=epoch,
             boot_id=f"{self.name}-boot{self.boots}",
+            extension=self.extension,
+            **self.service_options,
         )
         self.server = RegionMapServer(self.service, "127.0.0.1", self._port, self.key)
         self._port = self.server.address[1]
