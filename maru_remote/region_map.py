@@ -12,7 +12,8 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
 
 - ``hello``: returns ``{"node", "epoch", "boot", "nonce"}``; the epoch is
   new on every start of the remote CXL agent process, ``boot`` on every boot of
-  the memory node, ``nonce`` on every connection. An agent with a region
+  the memory node and on every reset of memory that loses what it held (it
+  then carries the memory's generation), ``nonce`` on every connection. An agent with a region
   extension adds ``region_extension`` (see :func:`hint_actions`).
 - ``auth`` with ``proof`` and ``nonce``: the client proves it holds the
   remote CXL agent key (:func:`prove` over the connection's nonce) and the reply
@@ -21,13 +22,15 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   map regions, as only users who can open the DAX device map them on a
   CXL-attached node.
 - ``map`` with ``handle``: returns ``{"region_id", "addr", "length",
-  "metadata"}``. ``addr`` is the remote CXL agent's virtual address of the
-  region (VA_R); a Handler uses it only as the remote address of RDMA
-  requests. ``metadata`` is NIXL metadata naming this region's registration
+  "metadata", "boot"}``. ``addr`` is the remote CXL agent's virtual address
+  of the region (VA_R); a Handler uses it only as the remote address of RDMA
+  requests. ``boot`` is the current boot, as ``hello`` says it. ``metadata`` is NIXL metadata naming this region's registration
   only, with connection info. The handle is either the region's handle
   (``MaruHandle.to_dict()``, which only the region's owner and MaruServer
   hold) or its read handle (:func:`read_handle`, which MaruServer gives to
   readers); a read handle maps only a region that is mapped already.
+  ``fresh`` true says the owner allocated the region in this session and has
+  had no map reply for it yet, so it holds no KV.
 - ``unmap`` with ``region_id``: the connection no longer needs the region.
 - ``release`` with the region's handle: the region is being given back; the
   remote CXL agent deregisters and unmaps it whoever else holds it, and refuses
@@ -413,7 +416,9 @@ class RegionMapClient:
         with self._lock:
             return self._send({"op": "hello"})
 
-    def map(self, handle: dict, nixl_agent: str | None = None) -> MapReply:
+    def map(
+        self, handle: dict, nixl_agent: str | None = None, fresh: bool = False
+    ) -> MapReply:
         """Ask the remote CXL agent to map and register a region.
 
         Args:
@@ -422,6 +427,8 @@ class RegionMapClient:
                 announces itself (``NixlTransport.announce``); the remote CXL
                 agent drives UCX until the announcement arrives. None for a
                 caller that issues no RDMA (MaruServer).
+            fresh: The caller owns the region, allocated it in this session
+                and has had no map reply for it: it holds no KV yet.
 
         Returns:
             Where the region is reachable.
@@ -433,8 +440,13 @@ class RegionMapClient:
         message: dict[str, Any] = {"op": "map", "handle": dict(handle)}
         if nixl_agent is not None:
             message["nixl_agent"] = nixl_agent
+        if fresh:
+            message["fresh"] = True
         with self._lock:
             reply = self._send(message)
+            # The boot may change while the connection lives (a reset of the
+            # memory); an agent that does not say keeps the hello's.
+            self.boot = str(reply.get("boot") or self.boot)
             return MapReply(
                 int(reply["region_id"]),
                 int(reply["addr"]),

@@ -90,6 +90,10 @@ SWEEP_INTERVAL_S = 1.0
 _MAX_HINT_RANGES = 4096
 # Hint requests one connection may keep open (read_hint without its end)
 MAX_HINT_REQUESTS = 4096
+# How often the region extension's memory generation is read, and how long
+# it may fail to answer before the generation counts as unknown
+GENERATION_POLL_S = 0.1
+GENERATION_GRACE_S = 2.0
 # How long close waits for a region extension to let its regions go
 _EXTENSION_DRAIN_S = 30.0
 _EXTENSION_DRAIN_POLL_S = 0.01
@@ -215,6 +219,7 @@ class RegionMapService:
         boot_id: str = "",
         extension: Any = None,
         max_hint_requests: int = MAX_HINT_REQUESTS,
+        generation_grace_s: float = GENERATION_GRACE_S,
     ) -> None:
         """Create the service.
 
@@ -237,8 +242,14 @@ class RegionMapService:
                 the node's CPU caches held, including bytes its NIC wrote
                 there that had not reached the CXL memory yet.
             extension: Region extension (``extension.RegionExtension``) or
-                None.
+                None. One with ``memory_generation`` makes the advertised
+                boot ``<boot_id>:<generation>`` (see :attr:`boot`).
             max_hint_requests: Hint requests one connection may keep open.
+            generation_grace_s: How long the memory generation may fail to
+                answer before it counts as unknown (see :attr:`boot`).
+
+        Raises:
+            Exception: what the extension's ``memory_generation`` raised.
         """
         self._rm = rm
         self._mapper = mapper
@@ -247,6 +258,21 @@ class RegionMapService:
         self.node_id = node_id
         self.epoch = epoch
         self.boot_id = boot_id
+        # Memory a reset empties without a node reboot (a write-back cache)
+        # has a generation the region extension tells; it is part of the
+        # advertised boot, so workers treat a reset as a reboot.
+        self._generation_of = getattr(extension, "memory_generation", None)
+        self._generation = (
+            str(self._generation_of()) if self._generation_of is not None else None
+        )
+        # Read, compare and set of the generation, one caller at a time
+        self._generation_lock = threading.Lock()
+        self._generation_grace_s = generation_grace_s
+        self._generation_failing_since: float | None = None
+        self._generation_unknown = False
+        # Periods the generation was unknown; each makes a new boot
+        self._unknown_periods = 0
+        self._watcher: threading.Thread | None = None
         # Connection -> hint requests it opened and has not ended
         self._max_hint_requests = max_hint_requests
         self._hint_requests: dict[int, set[str]] = {}
@@ -268,12 +294,34 @@ class RegionMapService:
         self._unhold_failed = False
         self._extension = extension
 
+    @property
+    def boot(self) -> str:
+        """The boot this agent advertises; workers treat a change as a reboot
+        of the memory node.
+
+        - ``<boot_id>`` without a ``memory_generation`` hook;
+        - ``<boot_id>:<generation>`` with one;
+        - ``<boot_id>:unknown`` while the generation is unknown (maps are
+          refused then);
+        - ``<boot_id>:<generation>~<n>`` after the n-th unknown period, so a
+          region mapped before it is never trusted after it, whatever
+          generation the extension then tells.
+        """
+        if self._generation_of is None:
+            return self.boot_id
+        if self._generation_unknown:
+            return f"{self.boot_id}:unknown"
+        if self._unknown_periods:
+            return f"{self.boot_id}:{self._generation}~{self._unknown_periods}"
+        return f"{self.boot_id}:{self._generation}"
+
     def hello(self) -> dict:
         """Identity of this remote CXL agent process and of the node's boot;
         ``region_extension`` (the read hints it takes) is added when one is
         loaded."""
         self._discard_notifs()
-        identity = {"node": self.node_id, "epoch": self.epoch, "boot": self.boot_id}
+        self._check_generation()
+        identity = {"node": self.node_id, "epoch": self.epoch, "boot": self.boot}
         if self._extension is not None:
             identity["region_extension"] = {
                 "version": HINT_PROTOCOL_VERSION,
@@ -396,6 +444,7 @@ class RegionMapService:
         conn: int,
         handle: Any,
         nixl_agent: str | None = None,
+        fresh: bool = False,
     ) -> dict:
         """Map a region for a connection, or share an existing mapping.
 
@@ -406,6 +455,10 @@ class RegionMapService:
             nixl_agent: Name of the worker's NIXL agent, which loads the
                 reply and then announces itself; UCX is driven until then.
                 None for a caller that issues no RDMA.
+            fresh: The owner says the region holds no KV yet (it allocated
+                it in this session and had no map reply for it). Taken only
+                with the region's own handle and only by the map that maps
+                it here first; the region extension hears it then.
 
         Returns:
             ``{"region_id", "addr", "length", "metadata"}``; ``metadata``
@@ -415,19 +468,26 @@ class RegionMapService:
             ValueError: if the handle is malformed.
             MapDenied: if the handle does not match a mapped region or the
                 region was released.
-            NotMapped: if a read handle names a region not mapped here.
+            NotMapped: if a read handle names a region not mapped here, or
+                the memory generation is unknown.
             Exception: if the resource manager, the device or NIXL fails,
                 or the resource manager cannot be asked whether an old
                 mapping of the region's range is gone.
         """
         self._discard_notifs()
-        reply = self._map(conn, handle)
+        self._check_generation()
+        if self._generation_unknown:
+            raise NotMapped(
+                "the memory generation is unknown (the region extension does "
+                "not answer): no region is mapped until it does"
+            )
+        reply = self._map(conn, handle, fresh)
         if nixl_agent is not None:
             # Before the reply leaves: the announcement may follow at once.
             self._progress.expect(nixl_agent)
         return reply
 
-    def _map(self, conn: int, handle: Any) -> dict:
+    def _map(self, conn: int, handle: Any, fresh: bool) -> dict:
         """The mapping of :meth:`map`."""
         h = parse_handle(handle)
         if isinstance(h, ReadHandle):
@@ -455,7 +515,7 @@ class RegionMapService:
                 else:
                     step = "replace"
             if step == "establish":
-                return self._establish(m, conn)
+                return self._establish(m, conn, fresh)
             if step == "wait":
                 self._wait(m)
             else:
@@ -589,12 +649,98 @@ class RegionMapService:
         (workers' notifications, a connection setup that outlasted its wait).
         """
         self._discard_notifs()
+        self._check_generation()
         try:
             self._reset_holds()
         except Exception:
             pass  # said in _reset_holds; the next sweep or first map tries again
         self._check_maps()
         self._flush_unholds()
+
+    def _check_generation(self) -> None:
+        """Re-read the memory generation; on a change, let every mapping go.
+
+        A changed generation means the memory lost what it held (a reset of
+        a write-back cache). Every mapping is deregistered from the NIC, so
+        RDMA under way or still to come through an old registration fails,
+        and dropped as a release does; its handle may be mapped again. The
+        new boot is advertised from then on, so owners give their regions
+        back and readers load misses, as after a reboot.
+
+        A generation the extension does not tell for ``generation_grace_s``
+        counts as unknown: every mapping goes as on a change, the boot says
+        ``unknown`` and maps are refused until the extension answers again.
+        Read, compare and set run one caller at a time, so a caller that
+        read earlier never sets an older generation.
+        """
+        if self._generation_of is None:
+            return
+        with self._generation_lock:
+            try:
+                generation = str(self._generation_of())
+            except Exception:
+                self._generation_unanswered()
+                return
+            if self._generation_failing_since is not None:
+                logger.warning("the region extension tells the memory generation again")
+            self._generation_failing_since = None
+            with self._lock:
+                if self._generation_unknown:
+                    # Whatever the extension says now, the regions mapped
+                    # before went: a new boot keeps workers from trusting them.
+                    self._generation_unknown = False
+                    self._unknown_periods += 1
+                    self._generation = generation
+                    logger.warning("memory generation known again: boot %s", self.boot)
+                    return
+                if generation == self._generation:
+                    return
+                logger.warning(
+                    "memory generation changed from %s to %s: the memory was "
+                    "reset; releasing every mapped region",
+                    self._generation,
+                    generation,
+                )
+                self._generation = generation
+                self._release_all_locked("was lost in a memory reset")
+            self._flush_unholds()
+
+    def _generation_unanswered(self) -> None:
+        """The extension did not tell the generation; the generation lock is
+        held. After the grace period the generation counts as unknown."""
+        now = time.monotonic()
+        if self._generation_failing_since is None:
+            self._generation_failing_since = now
+            logger.error(
+                "the region extension cannot tell the memory generation; it "
+                "counts as unknown after %.1f s",
+                self._generation_grace_s,
+                exc_info=True,
+            )
+        if self._generation_unknown:
+            return
+        if now - self._generation_failing_since < self._generation_grace_s:
+            return
+        with self._lock:
+            logger.error(
+                "memory generation unknown: releasing every mapped region and "
+                "refusing maps until the region extension answers"
+            )
+            self._generation_unknown = True
+            self._release_all_locked("went: the memory generation is unknown")
+        self._flush_unholds()
+
+    def _release_all_locked(self, reason: str) -> None:
+        """Deregister and drop every mapping (the memory it names may be
+        gone); the lock is held. A mapping that cannot go yet stays out of
+        use, and the sweep, a map of it or close try again."""
+        for rid, m in list(self._maps.items()):
+            if not m.ready.is_set() or m.registration is None:
+                continue
+            if m.error is None:
+                m.error = RuntimeError(f"region {rid} {reason}")
+            m.holders.clear()
+            self._release_locked(rid, m)
 
     def _check_maps(self) -> None:
         """The mapping checks of :meth:`sweep`."""
@@ -659,6 +805,23 @@ class RegionMapService:
         )
         self._sweeper.start()
 
+    def start_generation_watch(self, interval_s: float = GENERATION_POLL_S) -> None:
+        """Read the memory generation every ``interval_s`` seconds until
+        :meth:`close` (nothing without a ``memory_generation`` hook).
+
+        A reset is then acted on within the extension's own detection time
+        plus ``interval_s``; hello, map and sweep also read it.
+        """
+        if self._watcher is not None or self._generation_of is None:
+            return
+        self._watcher = threading.Thread(
+            target=self._watch_loop,
+            args=(interval_s,),
+            name="region-map-generation",
+            daemon=True,
+        )
+        self._watcher.start()
+
     def _discard_notifs(self) -> None:
         """Drive UCX once and drop the notifications workers sent here."""
         try:
@@ -680,8 +843,9 @@ class RegionMapService:
         """
         self._stop.set()
         self._progress.close()
-        if self._sweeper is not None:
-            self._sweeper.join(timeout=_SWEEP_JOIN_S)
+        for thread in (self._sweeper, self._watcher):
+            if thread is not None:
+                thread.join(timeout=_SWEEP_JOIN_S)
         deadline = time.monotonic() + extension_drain_s
         while True:
             with self._lock:
@@ -700,6 +864,13 @@ class RegionMapService:
                 self._extension.close()
             except Exception:
                 logger.error("closing the region extension failed", exc_info=True)
+
+    def _watch_loop(self, interval_s: float) -> None:
+        while not self._stop.wait(interval_s):
+            try:
+                self._check_generation()
+            except Exception:
+                logger.error("checking the memory generation failed", exc_info=True)
 
     def _sweep_loop(self, interval_s: float) -> None:
         while not self._stop.wait(interval_s):
@@ -848,9 +1019,14 @@ class RegionMapService:
                     "still registered: deregistering it failed"
                 )
 
-    def _establish(self, m: _Mapping, conn: int) -> dict:
-        """Check, map and register a region; the caller created ``m``."""
+    def _establish(self, m: _Mapping, conn: int, fresh: bool = False) -> dict:
+        """Check, map and register a region; the caller created ``m``.
+
+        ``fresh`` (the owner's word that the region holds no KV) goes to the
+        region extension, before the reply that lets the owner write.
+        """
         h = m.handle
+        boot = self.boot  # a reset before the reply fails the map
         held: bool | None = None  # None: not asked; False: outcome unknown
         try:
             self._wait_for_earlier(m)
@@ -880,7 +1056,7 @@ class RegionMapService:
             try:
                 metadata = self._transport.partial_metadata(registration)
                 if self._extension is not None:
-                    self._extension.mapped(h.to_dict(), access)
+                    self._extension.mapped(h.to_dict(), access, fresh=fresh)
             except BaseException:
                 # The NIC holds a key for these addresses: they are
                 # deregistered and kept out of use as on a release.
@@ -911,10 +1087,28 @@ class RegionMapService:
             m.addr = addr
             m.registration = registration
             m.metadata = metadata
-            m.holders.add(conn)
-            m.ready.set()
+            reset = self.boot != boot
+            if reset:
+                # The memory was reset (or its generation became unknown)
+                # while this map ran: what the extension saw is gone.
+                m.error = NotMapped(
+                    f"region {h.region_id}: the memory was reset while it was mapped"
+                )
+                m.ready.set()
+                if not self._release_locked(h.region_id, m):
+                    logger.error(
+                        "region %d stays registered until it is deregistered",
+                        h.region_id,
+                    )
+            else:
+                m.holders.add(conn)
+                m.ready.set()
+                reply = self._reply(m)
+        if reset:
+            self._flush_unholds()
+            raise m.error
         logger.info("mapped region %d (%d bytes) at %#x", h.region_id, h.length, addr)
-        return self._reply(m)
+        return reply
 
     def _hold(self, h: MaruHandle) -> Any:
         """Check ``h`` with the resource manager and hold its region.
@@ -991,13 +1185,13 @@ class RegionMapService:
                         del self._unheld[rid]
             self._unhold_failed = False
 
-    @staticmethod
-    def _reply(m: _Mapping) -> dict:
+    def _reply(self, m: _Mapping) -> dict:
         return {
             "region_id": m.handle.region_id,
             "addr": m.addr,
             "length": m.handle.length,
             "metadata": m.metadata,
+            "boot": self.boot,
         }
 
     def _remember_released(self, h: MaruHandle) -> None:

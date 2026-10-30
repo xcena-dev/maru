@@ -15,7 +15,7 @@ import maru_handler.storage.remote_cxl.hints as hints_module
 from maru_remote.region_map import read_handle
 from maru_remote_cxl_agent.service import MapDenied, NotMapped
 from tests.unit.test_remote_cxl_region_extension import FakeExtension
-from tests.unit.test_remote_cxl_storage import PAGE, World, put, read
+from tests.unit.test_remote_cxl_storage import PAGE, World, only_region, put, read
 
 
 def _until(condition, timeout=5.0):
@@ -410,3 +410,14 @@ def test_the_oldest_open_hint_is_ended_past_the_limit(monkeypatch):
     _until(lambda: len(sent) == 5)
     assert sent[-1] == ("read_hint_end", "r2")
     assert hints.close()
+
+
+def test_a_region_given_back_is_forgotten_by_the_data_path(setup):
+    w, ext = setup
+    a = w.client("a")
+    assert put(a, "k", b"x" * PAGE)[0]
+    region = only_region(a)
+    assert region.pool_id in a._data._replied  # noqa: SLF001
+    w.node.restart(reboot=True)
+    a._check_boots()  # the region goes back
+    assert region.pool_id not in a._data._replied  # noqa: SLF001
