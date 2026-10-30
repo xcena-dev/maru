@@ -37,7 +37,7 @@ from maru_remote.region_map import DEFAULT_KEY_FILE, load_key
 
 from .mapper import DaxRegionMapper
 from .server import RegionMapServer
-from .service import RegionMapService
+from .service import MAX_HINT_REQUESTS, RegionMapService
 
 # Named, not __name__: under `python -m` the module is __main__, outside the
 # package logger that main() configures.
@@ -294,6 +294,28 @@ def build_parser() -> argparse.ArgumentParser:
         "released it",
     )
     parser.add_argument(
+        "--region-extension",
+        default=env.get("MARU_REMOTE_CXL_AGENT_REGION_EXTENSION", ""),
+        help="Name of a region extension an installed package registers under "
+        "the maru.region_extensions entry point (e.g. the read hint handler "
+        "of a CXL-SSD) (env MARU_REMOTE_CXL_AGENT_REGION_EXTENSION; default: "
+        "none)",
+    )
+    parser.add_argument(
+        "--region-extension-config",
+        default=env.get("MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG", ""),
+        help="Opaque string passed to the region extension, typically the path "
+        "of its own configuration file (env "
+        "MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG)",
+    )
+    parser.add_argument(
+        "--max-hint-requests",
+        type=int,
+        default=MAX_HINT_REQUESTS,
+        help="Read hint requests one connection may keep open; more are "
+        f"refused. Default: {MAX_HINT_REQUESTS}",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -375,6 +397,23 @@ def main(argv: list[str] | None = None) -> int:
     from maru_shm import MaruShmClient
 
     epoch = uuid.uuid4().hex
+    extension = None
+    if args.region_extension:
+        from .extension import load_region_extension
+
+        try:
+            extension = load_region_extension(
+                args.region_extension, epoch, args.region_extension_config
+            )
+        except Exception as exc:
+            logger.error(
+                "cannot load region extension %s: %s", args.region_extension, exc
+            )
+            os.close(lock_fd)
+            return 1
+    elif args.region_extension_config:
+        os.close(lock_fd)
+        build_parser().error("--region-extension-config needs --region-extension")
     transport = NixlTransport(
         f"maru-remote-cxl-agent-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
     )
@@ -386,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
         node_id=args.node_id,
         epoch=epoch,
         boot_id=boot_id,
+        extension=extension,
+        max_hint_requests=args.max_hint_requests,
     )
     server = RegionMapServer(service, host, args.port, key)
 
