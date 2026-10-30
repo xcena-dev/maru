@@ -2,9 +2,14 @@
 
 **Maru** is a high-performance **KV cache storage engine built on shared memory pools**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency. Maru supports two kinds of pool. A **CXL memory pool** is CXL memory that nodes attached to CXL reach through a CXL switch. An **RDMA memory pool** is the CXL memory of memory nodes, which GPU nodes without CXL reach over an RDMA network.
 
-Transfer-based sharing copies the KV across the network to every node that reuses it, byte by byte. As models get larger and contexts get longer, those copies become a structural bottleneck. On nodes attached to CXL, Maru takes the opposite approach: **don't move data, share the memory.** Instances on those nodes read and write KV cache data directly in CXL shared memory, and only lightweight metadata (tens of bytes) travels between components. GPU nodes without CXL reach the CXL memory of memory nodes with one-sided RDMA: the NICs move the bytes, and no process on the memory node handles them.
+Maru stores reusable KV in a shared pool. With the `cxl` backend, CXL-attached nodes map that pool directly, avoiding KV payload transfers between compute nodes over an RDMA or IP network. GPU loads and stores still copy bytes between GPU memory and CXL. With `remote_cxl`, GPU nodes reach a memory node's CXL over one-sided RDMA through a worker-side CPU DRAM staging buffer. The memory node's NIC transfers the payload; MaruServer and the remote CXL agent handle metadata and region setup rather than relaying KV bytes.
 
 Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the `remote_cxl` backend for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
+
+The native vLLM connector also offers worker-private `cpu` and `mixed` caches.
+Those modes do not provide cross-worker sharing in the current implementation.
+See the {doc}`backend guide <source/integration/vllm>` to choose the storage
+path before following the default CXL quick start.
 
 :::{image} source/image/maru_shared_kv_cache.png
 :alt: Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network
@@ -13,13 +18,13 @@ Node A stores the KV it computes in a shared KV cache, and nodes B and C load it
 
 ## Key Features
 
-- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. On nodes attached to CXL, Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization. Nodes that reach the pool over RDMA move KV through a host staging buffer: the GPU copies it to and from the buffer, and the NIC moves it to and from the CXL memory with one-sided RDMA.
+- **Shared KV Storage** — Instances reuse KV stored in a common pool instead of recomputing the cached prefix. Each instance still loads the KV it needs into its own GPU cache.
 
-- **Scales with Context Length and Concurrency** — Network-based sharing degrades as contexts grow and more consumers hit the same KV. On nodes attached to CXL, Maru never fans out KV payloads — scaling is bounded by shared-memory bandwidth, not network transfer.
+- **Two Access Paths** — CXL-attached workers map the pool directly (`cxl`). Workers without CXL use GPU ↔ CPU staging copies and staging ↔ CXL RDMA transfers (`remote_cxl`). Neither path relays the payload through MaruServer.
 
-- **Higher Hardware Utilization** — Instead of duplicating KV caches per instance, all instances on a pool draw from one shared KV cache, held in a CXL memory pool or an RDMA memory pool. Less duplication means more usable memory and higher effective cache capacity.
+- **Shared Pool Capacity** — Instances on a pool can reuse one stored KV object. Per-worker GPU caches and transfer buffers remain separate from that shared storage.
 
-- **Lower System Energy** — On nodes attached to CXL, eliminating bulk data transfer cuts NIC and CPU power draw, and shorter data paths reduce GPU idle time per request.
+- **Measured Performance** — The published {doc}`LMCache benchmark <source/performance/lmcache>` compares the `cxl` backend with LMCache P2P in a single-node setup. Latency, scaling and energy results depend on the backend, transport and workload; those measurements do not establish `remote_cxl` performance or an advantage over RDMA-based systems.
 
 - **GPU Nodes without CXL** — With the `remote_cxl` storage backend, vLLM workers on GPU nodes without CXL keep their KV in an RDMA memory pool, the CXL memory of memory nodes. A remote CXL agent on each memory node maps regions and registers them with the node's NIC, and workers read and write them with one-sided RDMA. An RDMA memory pool can span several memory nodes that share the same CXL memory, and a worker can use several RDMA memory pools. See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md).
 
@@ -27,42 +32,54 @@ Node A stores the KV it computes in a shared KV cache, and nodes B and C load it
 
 ## Architecture
 
+| KV access | `cxl` | `remote_cxl` |
+|---|---|---|
+| Worker access to the pool | Direct CXL mapping on a CXL-attached node | One-sided RDMA to CXL on a memory node |
+| GPU payload path | GPU ↔ mapped CXL region | GPU ↔ worker CPU DRAM staging ↔ RDMA ↔ CXL region |
+| Meaning of zero-copy | A CPU reader can view mapped KV without another host copy; GPU transfers still copy bytes | Retrieved bytes occupy a staging slot after an RDMA READ; this is not an end-to-end zero-copy path |
+| Metadata traffic | MaruServer RPC | MaruServer RPC plus remote CXL agent mapping and registration |
+
+These are the storage access paths. Connector packing, CUDA registration and fallback copies can add temporary buffers; neither backend eliminates GPU data movement.
+
+The diagram shows two example pools and their worker access paths. Workers share KV with other workers using the same pool and backend. Each control-plane box groups the pool's metadata and allocation services; it does not represent one process or one physical node. RM means Resource Manager.
+
 ```mermaid
 flowchart TB
-    subgraph S1["Server 1"]
-        direction TB
-        I1(["LLM Instance"])
-        H1{{"MaruHandler"}}
-        I1 --- H1
-    end
-    subgraph S2["Server 2"]
-        direction TB
-        I2(["LLM Instance"])
-        H2{{"MaruHandler"}}
-        I2 --- H2
-    end
-    subgraph S3["Server 3"]
-        direction TB
-        I3(["LLM Instance"])
-        H3{{"MaruHandler"}}
-        I3 --- H3
+    subgraph Direct["cxl"]
+        direction LR
+        CW["GPU worker<br/>MaruHandler<br/>CXL attached"]
+        CC["Control plane<br/>MaruServer + RM"]
+        CM[("CXL pool")]
+        CW <-.->|"metadata RPC"| CC
+        CC -.->|"alloc/free"| CM
+        CW <==>|"GPU copy"| CM
     end
 
-    M["Maru Control Plane"]
-
-    subgraph CXL["CXL Shared Memory"]
-        KV["KV Cache"]
+    subgraph Remote["remote_cxl"]
+        direction LR
+        RW["GPU worker<br/>MaruHandler<br/>no local CXL"]
+        ST["CPU DRAM staging<br/>(on worker)"]
+        RC["Control plane<br/>MaruServer + RM"]
+        AG["Remote CXL agent<br/>(memory node)"]
+        RM[("RDMA pool<br/>CXL on memory node")]
+        RW <-.->|"metadata RPC"| RC
+        RW <-.->|"map/release"| AG
+        RW <==>|"GPU copy"| ST
+        ST <==>|"RDMA READ/WRITE"| RM
+        RC -.->|"alloc/free"| RM
+        AG -.->|"map + NIC register"| RM
     end
 
-    H1 & H2 & H3 <-.->|"store/retrieve"| M
-    H1 & H2 & H3 <==>|"direct read/write"| CXL
-    M -.->|"manage"| CXL
-
+    Direct ~~~ Remote
+    style Direct fill:#eff6ff,stroke:#3b82f6
+    style Remote fill:#f0fdf4,stroke:#22c55e
+    style AG fill:#fff7ed,stroke:#f97316
+    style RM fill:#fff7ed,stroke:#f97316
 ```
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — on nodes attached to CXL, direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+> **Data Plane** (thick solid arrows) — `cxl` copies KV between GPU memory and mapped CXL. `remote_cxl` copies it between GPU memory and worker CPU staging, then transfers it between staging and memory-node CXL over RDMA. Payload arrows bypass the control plane and remote CXL agent.
 
 GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in an RDMA memory pool, the CXL memory of memory nodes: a remote CXL agent on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). The agent is needed because one-sided RDMA reaches only memory that a process on the memory node has mapped and registered with its NIC, and a worker without CXL cannot map the region itself. Only control messages go to maru-server and the remote CXL agent.
 
@@ -74,7 +91,7 @@ See {doc}`Architecture Overview <source/design_doc/architecture_overview>` for t
 
 ![Benchmark](source/image/benchmark.png)
 
-*P2P KV cache reuse, meta-llama/Llama-3.1-8B-Instruct, single-node. TTFT P50 (ms), lower is better. Multi-node results coming soon.*
+*P2P KV cache reuse with the `cxl` backend, meta-llama/Llama-3.1-8B-Instruct, single-node. The LMCache P2P baseline uses NIXL/UCX with TCP loopback. TTFT P50 (ms), lower is better. This chart does not measure `remote_cxl` or an RDMA P2P baseline.*
 
 See {doc}`full benchmark results <source/performance/lmcache>` for detailed TTFT, concurrency, and power efficiency comparisons.
 
@@ -154,7 +171,7 @@ Resource Manager Admin (maru-rm-ctl) <source/api_reference/maru_rm_ctl>
 
 - **NUMA node support for CXL memory** — Currently Maru requires CXL memory to be exposed as devdax devices (`/dev/dax*`). We plan to support CXL memory mapped as NUMA nodes, enabling broader hardware compatibility and simplified deployment.
 
-- **Direct integration with more inference frameworks** — Native KV cache connector for SGLang, enabling zero-copy shared memory without intermediate middleware dependencies.
+- **Direct integration with more inference frameworks** — Native KV cache connectors for additional frameworks, with the supported storage backend and copy path documented for each integration.
 
 - **CXL-based Near Data Processing (NDP)** — Offloading KV cache operations — such as compression/decompression, prefix matching, and eviction scoring — to compute-capable CXL devices, reducing host CPU overhead and data movement.
 
