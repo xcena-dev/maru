@@ -191,6 +191,8 @@ it, and the service reads these variables from `/etc/maru/remote-cxl-agent.env`.
 | `--region-extension` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION`) | none | Name of an installed region extension (entry point in `maru.region_extensions`) that takes read hints and hears region maps; see [Read hints](../design_doc/read_hints.md). A package that provides one can set it for the service with a drop-in on `maru-remote-cxl-agent.service` |
 | `--region-extension-config` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG`) | empty | Opaque string given to that extension |
 | `--max-hint-requests` | `4096` | Read hint requests one connection may keep open; more are refused |
+| `--memory-generation-poll-s` | `0.1` | How often the extension's memory generation is read; a reset is acted on within the extension's detection time plus this |
+| `--memory-generation-grace-s` | `2.0` | How long the memory generation may go unanswered before every region is released and maps are refused until it answers |
 | `--allow-unchecked-transport` | off | Accept UCX transports that do not check remote keys (tests on one host only) |
 | `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 

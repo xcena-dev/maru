@@ -33,8 +33,8 @@ flowchart LR
   sch -->|"probe locations (no lease)"| ms
   sch -->|"read_hint / read_hint_end"| ag
   ag -->|"checked hint"| ext
-  ag -->|"map"| ext
-  ext -.->|"prefetch"| dev
+  ag -->|"map (fresh)"| ext
+  ext -.->|"prefetch, discard"| dev
   wrk -->|"lookup, lease"| ms
   wrk ==>|"RDMA READ / WRITE"| dev
   classDef maru fill:#e8e8e8,stroke:#555,color:#111
@@ -52,13 +52,17 @@ flowchart LR
   sender needs to hold no region itself: the scheduler holds none.
 - **The region extension** (entry point group `maru.region_extensions`,
   selected with `--region-extension`) owns whatever it does to the device. It
-  hears each region as it is mapped, may refuse to map a region and may keep
-  a region from going back while a device command on it still runs.
+  hears each region as it is mapped, with `fresh` when the region's owner says
+  it has just allocated it and written nothing to it yet, so stale data on
+  flash need not be read back for the first writes. `fresh` is the owner's
+  word, not a proof, so the extension uses it only to drop the region's own
+  bytes, which the owner could overwrite anyway. It may refuse to map a region
+  and keep a region from going back while a device command on it still runs.
   The agent advertises in its hello which hint actions the extension takes;
   Maru sends hints only to agents that advertise them.
 - **Latency.** The agent asks the extension whether a region may go back while
-  every other request waits, and hands it each hint on request threads. The
-  extension answers these from its own
+  every other request waits, and hands it each hint and asks it the memory
+  generation on request threads. The extension answers these from its own
   state within microseconds: it queues a hint for its own thread and never
   waits on the device or another process there.
 
@@ -113,6 +117,37 @@ sequenceDiagram
 The message formats and the extension's hooks, locks and failure outcomes are
 documented in `maru_handler/storage/remote_cxl/hints.py`,
 `maru_remote/region_map.py` and `maru_remote_cxl_agent/extension.py`.
+
+## Memory resets
+
+A write-back cache loses what it held when the device resets, even if the
+node keeps running. Maru already handles the same loss after a reboot of the
+memory node: the agent advertises the node's boot, and when a worker sees it
+change, the owner gives its regions back (their keys go) and a reader whose
+region was written under another boot loads a miss.
+
+A region extension can tell the memory's generation, which changes on every
+reset that may have lost data. The agent then advertises the node's boot and
+that generation together as its boot. When the generation changes while the
+agent runs, the agent deregisters every region from the NIC, so RDMA still
+under way or still to come through an old registration fails, and drops its
+mappings; hello and map replies carry the new boot from then on, and a map
+that was under way when the memory was reset fails. The owners' and readers'
+existing reboot handling does the rest.
+
+- **How soon.** The agent reads the generation every 100 ms on its own thread
+  (`--memory-generation-poll-s`), and on every hello, map and sweep, so a
+  reset is acted on within the extension's own detection time plus that
+  interval. RDMA that lands in that window is lost with the reset, as any
+  write the device had not written back.
+- **When the extension does not answer.** For a short while (2 s by default,
+  `--memory-generation-grace-s`) the agent keeps the generation it had. After
+  that the generation is unknown: every region goes as on a reset, the boot
+  says `unknown` and the agent maps nothing until the extension answers
+  again. The boot that follows is always new (it also counts these periods),
+  even if the generation itself did not change: a reset while the extension
+  could not tell would not show in it, so a region mapped before an unknown
+  period is never trusted after it.
 
 ## Scope
 
