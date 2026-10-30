@@ -103,6 +103,9 @@ class RdmaDataPath:
         # was not turned into an access; the agent holds the region for
         # that connection until it is released or the connection ends.
         self._attempted: dict[str, tuple[str, int]] = {}
+        # Own regions that had a map reply: until then a region (allocated
+        # in this session) holds no KV, and its map says so (``fresh``).
+        self._replied: set[str] = set()
         # Remote CXL agent -> (NIXL peer, connection generation) when the peer's
         # metadata was last loaded through that agent's connection. A peer
         # dropped after a transfer error stays listed; has_peer() tells.
@@ -198,7 +201,8 @@ class RdmaDataPath:
             agents: Remote CXL agent addresses of the region's pool.
             own: Whether the region belongs to this worker's session; a map
                 reply is then remembered even if no access results from it
-                (see :meth:`map_attempted`).
+                (see :meth:`map_attempted`), and the maps before the first
+                reply tell the agent the region holds no KV yet.
 
         Returns:
             Where the region is reachable.
@@ -229,8 +233,10 @@ class RdmaDataPath:
             raise StorageUnavailableError(f"remote CXL agent {address} is down")
         client = self._client(address)
         for attempt in range(2):
+            with self._lock:
+                fresh = own and pool_id not in self._replied
             try:
-                reply = client.map(handle, nixl_agent=self.transport_name)
+                reply = client.map(handle, nixl_agent=self.transport_name, fresh=fresh)
             except RegionMapUnavailable as exc:
                 # The client closed the connection: whatever the request
                 # mapped is released by the agent when it sees the
@@ -251,6 +257,7 @@ class RdmaDataPath:
             if own:
                 with self._lock:
                     self._attempted[pool_id] = (address, reply.generation)
+                    self._replied.add(pool_id)
             if reply.generation != client.generation:
                 # The connection the reply came over ended since; the agent
                 # released what it held.
@@ -546,6 +553,7 @@ class RdmaDataPath:
             return Release.NO_REPLY
         with self._lock:
             self._unanswered.discard(address)
+            self._replied.discard(pool_id)
         self._not_mapped(pool_id)
         return Release.DONE
 

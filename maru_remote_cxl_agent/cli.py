@@ -37,7 +37,12 @@ from maru_remote.region_map import DEFAULT_KEY_FILE, load_key
 
 from .mapper import DaxRegionMapper
 from .server import RegionMapServer
-from .service import MAX_HINT_REQUESTS, RegionMapService
+from .service import (
+    GENERATION_GRACE_S,
+    GENERATION_POLL_S,
+    MAX_HINT_REQUESTS,
+    RegionMapService,
+)
 
 # Named, not __name__: under `python -m` the module is __main__, outside the
 # package logger that main() configures.
@@ -316,6 +321,22 @@ def build_parser() -> argparse.ArgumentParser:
         f"refused. Default: {MAX_HINT_REQUESTS}",
     )
     parser.add_argument(
+        "--memory-generation-poll-s",
+        type=float,
+        default=GENERATION_POLL_S,
+        help="How often the region extension's memory generation is read; a "
+        "reset of the memory is acted on within the extension's own detection "
+        f"time plus this. Default: {GENERATION_POLL_S}",
+    )
+    parser.add_argument(
+        "--memory-generation-grace-s",
+        type=float,
+        default=GENERATION_GRACE_S,
+        help="How long the memory generation may go unanswered before every "
+        "region is released and maps are refused until it answers. Default: "
+        f"{GENERATION_GRACE_S}",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -418,16 +439,25 @@ def main(argv: list[str] | None = None) -> int:
         f"maru-remote-cxl-agent-{args.node_id}-{epoch[:8]}", ucx_device=args.ucx_device
     )
     rm = MaruShmClient(address=args.rm_address)
-    service = RegionMapService(
-        rm,
-        DaxRegionMapper(),
-        transport,
-        node_id=args.node_id,
-        epoch=epoch,
-        boot_id=boot_id,
-        extension=extension,
-        max_hint_requests=args.max_hint_requests,
-    )
+    try:
+        service = RegionMapService(
+            rm,
+            DaxRegionMapper(),
+            transport,
+            node_id=args.node_id,
+            epoch=epoch,
+            boot_id=boot_id,
+            extension=extension,
+            max_hint_requests=args.max_hint_requests,
+            generation_grace_s=args.memory_generation_grace_s,
+        )
+    except Exception as exc:
+        # The region extension cannot tell its memory generation.
+        logger.error("cannot start the remote CXL agent: %s", exc)
+        transport.close()
+        rm.close()
+        os.close(lock_fd)
+        return 1
     server = RegionMapServer(service, host, args.port, key)
 
     def stop(signum, frame):
@@ -454,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Releases mappings of regions the resource manager reaped on its own.
         service.start_sweep()
+        service.start_generation_watch(args.memory_generation_poll_s)
         server.serve_forever()
     finally:
         service.close()

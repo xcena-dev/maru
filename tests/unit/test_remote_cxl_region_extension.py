@@ -24,6 +24,7 @@ class FakeExtension:
     def __init__(self):
         self.hints = []
         self.mapped_regions = []
+        self.fresh = {}
         self.refuse_map = False
         self.fail_mapped = False
         self.hold = False
@@ -34,10 +35,11 @@ class FakeExtension:
         if self.refuse_map:
             raise ValueError("not this device")
 
-    def mapped(self, handle, access):
+    def mapped(self, handle, access, *, fresh):
         if self.fail_mapped:
             raise RuntimeError("device command outcome unknown")
         self.mapped_regions.append(handle["region_id"])
+        self.fresh[handle["region_id"]] = fresh
 
     def hint(self, conn, message, ranges):
         self.hints.append((conn, dict(message), list(ranges)))
@@ -96,6 +98,32 @@ def test_the_data_path_is_unchanged_and_the_hello_says_which_hints_it_takes(setu
     assert hint_actions(None) == frozenset()
     assert hint_actions(True) == frozenset()
     assert hint_actions({"version": 0, "actions": list(HINT_ACTIONS)}) == frozenset()
+
+
+def test_only_the_first_map_of_a_region_its_owner_just_got_is_fresh(setup):
+    w, ext = setup
+    c = w.client("a")
+    (region,) = c.regions.values()
+    rid = region.handle["region_id"]
+    assert ext.fresh == {rid: True}
+    assert put(c, "k", b"x" * PAGE)[0]
+    # The agent restarts: the region is mapped again, with its KV in it.
+    w.node.restart()
+    c._data.forget(region.pool_id)
+    assert read(c, ["k"]) == [b"x" * PAGE]
+    assert ext.fresh[rid] is False
+
+
+def test_fresh_is_taken_only_with_the_owner_handle_on_a_first_map(setup):
+    w, ext = setup
+    c = w.client("a")
+    (region,) = c.regions.values()
+    rid = region.handle["region_id"]
+    service = w.node.service
+    conn = next(iter(service.holders()[rid]))
+    ext.fresh.clear()
+    service.map(conn, region.handle, fresh=True)  # mapped already: shared
+    assert ext.fresh == {}
 
 
 def test_a_region_stays_until_the_extension_lets_it_go(setup):
@@ -157,6 +185,8 @@ def test_a_region_whose_mapped_hook_fails_stays_out_of_use(monkeypatch, hold):
         service.sweep()
         c._retry_unreachable()
         assert region.reachable
+        # No map of it succeeded before: the retry was still fresh.
+        assert ext.fresh[rid] is True
         assert put(c, "k", b"x" * PAGE)[0]
         assert read(c, ["k"]) == [b"x" * PAGE]
     finally:
