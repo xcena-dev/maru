@@ -396,6 +396,7 @@ _RDMA_KNOBS = (
     "maru_remote_cxl_agent_key_file",
     "maru_read_hints",
     "maru_write_hints",
+    "maru_write_wait_ms",
     "maru_read_hint_on_arrival",
 )
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
@@ -871,6 +872,8 @@ def _create_maru_handler(
                 "maru_write_hints", extra_config.get("maru_read_hints", False)
             )
         ),
+        # A store waits this long (ms) for its pages to be prepared
+        write_wait_ms=int(extra_config.get("maru_write_wait_ms", 50)),
         rdma_load_reserve=(
             _RDMA_ASYNC_LOAD_RESERVE
             if _remote_cxl_async(extra_config) and not metadata_only

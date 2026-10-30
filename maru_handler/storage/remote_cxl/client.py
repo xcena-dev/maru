@@ -34,6 +34,7 @@ from .region import (
     RemoteCxlAllocation,
     RemoteCxlRegion,
 )
+from .waits import MemoryWaits
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,11 @@ class RemoteCxlStorageClient(RegionLifecycle):
         )
         self._hint_agents: dict[str, Any] = {}
         self._hint_key: bytes | None = None
+        # Write waits (waits.py): a store waits for its pages to be prepared
+        self._write_wait_ms = (
+            int(getattr(config, "write_wait_ms", 0) or 0) if self._write_hints else 0
+        )
+        self._waits = MemoryWaits(self._connect_agent, self._write_wait_ms)
 
     # ---------------------------------------------------------------- hints
 
@@ -270,10 +276,18 @@ class RemoteCxlStorageClient(RegionLifecycle):
         self._hints.hint_ranges(name, list(by_agent.items()))
         return name
 
-    def _hint_write(self, handles: list[RemoteCxlAllocation]) -> None:
-        """Hint the pages a store is about to WRITE, in write order (region
-        by region, as :meth:`_write` sends them). Queued only: the WRITEs do
-        not wait for it, and it has no end."""
+    def _prepare_write(self, handles: list[RemoteCxlAllocation]) -> None:
+        """Tell the memory side the pages a store is about to WRITE.
+
+        Each agent gets the pages it maps, in write order (region by region,
+        as :meth:`_write` sends them). One whose region extension takes
+        ``write_wait`` gets them in a ``write_wait`` on this store's own
+        connection, and the store waits for the answer: in all at most
+        ``write_wait_ms``, plus the reply timeout if the agent does not
+        answer. The others get a queued write hint. The WRITEs go whatever
+        the answer: preparing the pages saves time, and nothing depends on
+        it.
+        """
         if not self._write_hints or not handles or not self._agents:
             return
         from maru_remote.region_map import pick_agent
@@ -293,7 +307,31 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 }
                 for h in group
             )
-        self._hints.write_hint(f"maru-store-{uuid.uuid4().hex}", list(by_agent.items()))
+        token = f"maru-store-{uuid.uuid4().hex}"
+        waits = []
+        queued = []
+        for agent, ranges in by_agent.items():
+            if self._write_wait_ms and self._waits.takes(agent, "write_wait"):
+                waits.append((agent, ranges))
+            else:
+                queued.append((agent, ranges))
+        if queued:
+            self._hints.write_hint(token, queued)
+        deadline = time.monotonic() + self._write_wait_ms / 1000
+        for agent, ranges in waits:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                self._hints.write_hint(token, [(agent, ranges)])
+                continue
+            self._waits.write_wait(agent, token, ranges, remaining_ms)
+
+    def _connect_agent(self, agent: str, timeout_s: float) -> Any:
+        """A connection of this process to ``agent`` (not yet connected)."""
+        from maru_remote.region_map import RegionMapClient, load_key
+
+        if self._hint_key is None:
+            self._hint_key = load_key(self.config.remote_cxl_agent_key_file)
+        return RegionMapClient(agent, timeout_s=timeout_s, key=self._hint_key)
 
     def _hint_send(self, agent: str, message: dict) -> bool:
         """Send a hint message on this process's own connection to ``agent``;
@@ -837,7 +875,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 return [False] * len(keys)
             self._transfers += 1
         sent = [h for h, ok in zip(handles, placed, strict=True) if ok]
-        self._hint_write(sent)
+        self._prepare_write(sent)
         try:
             written = self._write(sent)
         except BaseException:
@@ -1464,6 +1502,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             for agent in self._hint_agents.values():
                 agent.close()
             self._hint_agents.clear()
+        self._waits.close()
         with self._lock:
             # Transfers run without the lock: let those under way end (each
             # within its timeout) before the regions and the data path go.

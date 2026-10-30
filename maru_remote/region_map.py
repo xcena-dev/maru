@@ -37,10 +37,11 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   later maps of the handle. Releasing a region that is not mapped succeeds.
   A read handle cannot release.
 - ``extension`` with ``action`` (``read_hint``, ``read_hint_end``,
-  ``read_promote`` or ``write_hint``), ``request``, ``ranges`` and
-  ``epoch``: a hint for the
-  agent's region extension, among the actions its hello advertises; every
-  range must lie in a region the agent maps.
+  ``read_promote``, ``write_hint`` or ``write_wait``), ``request``,
+  ``ranges`` and ``epoch``: a hint for the agent's region extension, among
+  the actions its hello advertises; every range must lie in a region the
+  agent maps. ``write_wait`` also carries ``timeout_ms``; its reply comes
+  once the extension prepared the pages or gave up, within that time.
 
 Replies carry ``ok``; a failure has ``error`` and ``code``. The remote CXL agent
 treats a closed connection as an unmap of every region the connection mapped.
@@ -77,7 +78,15 @@ DEFAULT_COPY_FILE = "~/.maru/remote-cxl-agent.key"
 NONCE_BYTES = 16
 # Read hint messages a region extension may take (``op: extension``), and the
 # version of their protocol an agent advertises in its hello
-HINT_ACTIONS = ("read_hint", "read_hint_end", "read_promote", "write_hint")
+HINT_ACTIONS = (
+    "read_hint",
+    "read_hint_end",
+    "read_promote",
+    "write_hint",
+    "write_wait",
+)
+# Longest wait a ``write_wait`` may ask for
+MAX_WRITE_WAIT_MS = 10_000
 # What a region extension takes when it does not say (``hint_actions``)
 DEFAULT_HINT_ACTIONS = ("read_hint", "read_hint_end")
 HINT_PROTOCOL_VERSION = 1

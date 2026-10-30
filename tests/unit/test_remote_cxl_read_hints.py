@@ -12,8 +12,9 @@ import time
 import pytest
 
 import maru_handler.storage.remote_cxl.hints as hints_module
-from maru_remote.region_map import read_handle
+from maru_remote.region_map import RegionMapClient, read_handle
 from maru_remote_cxl_agent.service import MapDenied, NotMapped
+from tests.unit.remote_fakes import shared_key
 from tests.unit.test_remote_cxl_region_extension import FakeExtension
 from tests.unit.test_remote_cxl_storage import PAGE, World, only_region, put, read
 
@@ -522,3 +523,162 @@ def test_read_promotes_go_only_where_asked_and_taken(setup):
             10_000,
             _hint_message(service, region.handle, action="read_promote", ranges=[]),
         )
+
+
+class WriteWaitExtension(FakeExtension):
+    hint_actions = ("read_hint", "read_hint_end", "write_hint", "write_wait")
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.release.set()
+        self.answer = {"ready": True}
+        self.waited = []
+
+    def hint(self, conn, message, ranges):
+        super().hint(conn, message, ranges)
+        if message["action"] == "write_wait":
+            self.waited.append(time.monotonic())
+            self.release.wait(message["timeout_ms"] / 1000)
+            return self.answer
+        return None
+
+
+def _store(worker, keys):
+    handles = []
+    for i, _ in enumerate(keys):
+        h = worker.alloc(PAGE)
+        h.buf[:PAGE] = bytes([i + 1]) * PAGE
+        handles.append(h)
+    return handles, worker.batch_store(keys, handles)
+
+
+def test_a_store_waits_for_its_pages_before_its_writes():
+    ext = WriteWaitExtension()
+    w = World(extension=ext)
+    try:
+        worker = w.client("a", write_hints=True, write_wait_ms=1000)
+        writes = []
+        post = worker._transport.write
+
+        def write(*args, **kwargs):
+            writes.append(time.monotonic())
+            return post(*args, **kwargs)
+
+        worker._transport.write = write
+        handles, stored = _store(worker, ["k0", "k1", "k2"])
+        assert stored == [True] * 3
+        # The wait carried the store's pages (no separate write hint) and
+        # ended before the first WRITE was posted.
+        actions = [m["action"] for _, m, _ in ext.hints]
+        assert actions == ["write_wait"]
+        _, message, ranges = ext.hints[0]
+        assert message["request"].startswith("maru-store-")
+        assert 0 < message["timeout_ms"] <= 1000
+        assert [r["offset"] for r in ranges] == [h.location.offset for h in handles]
+        assert ext.waited[0] < writes[0]
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+    finally:
+        w.close()
+
+
+def test_a_wait_that_runs_out_still_writes():
+    ext = WriteWaitExtension()
+    ext.release.clear()  # the pages never get ready
+    ext.answer = {"ready": False}
+    w = World(extension=ext)
+    try:
+        worker = w.client("a", write_hints=True, write_wait_ms=50)
+        started = time.monotonic()
+        assert _store(worker, ["k0"])[1] == [True]
+        assert time.monotonic() - started < 2.0
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+    finally:
+        w.close()
+
+
+def test_a_waiting_store_holds_up_no_other_connection():
+    ext = WriteWaitExtension()
+    ext.release.clear()
+    w = World(extension=ext)
+    try:
+        worker = w.client("a", write_hints=True, write_wait_ms=5000)
+        result = []
+        store = threading.Thread(target=lambda: result.append(_store(worker, ["k"])))
+        store.start()
+        _until(lambda: ext.waited)
+        # Another connection is served, and the agent's lock is free.
+        client = RegionMapClient(w.node.address, timeout_s=1, key=shared_key())
+        try:
+            started = time.monotonic()
+            client.hello()
+            w.node.service.holders()
+            assert time.monotonic() - started < 0.5
+        finally:
+            client.close()
+        ext.release.set()
+        store.join(5)
+        assert result and result[0][1] == [True]
+    finally:
+        w.close()
+
+
+def test_without_a_wait_the_store_sends_a_write_hint():
+    ext = WriteWaitExtension()
+    w = World(extension=ext)
+    try:
+        worker = w.client("a", write_hints=True, write_wait_ms=0)
+        assert _store(worker, ["k0"])[1] == [True]
+        _until(lambda: ext.hints)
+        assert [m["action"] for _, m, _ in ext.hints] == ["write_hint"]
+        assert not ext.waited
+    finally:
+        w.close()
+
+
+def test_the_agent_checks_a_write_wait():
+    ext = WriteWaitExtension()
+    w = World(extension=ext)
+    try:
+        worker = w.client("a")
+        assert put(worker, "k", b"x" * PAGE)[0]
+        service = w.node.service
+        region = only_region(worker)
+
+        def wait(timeout_ms):
+            message = _hint_message(service, region.handle, action="write_wait")
+            return service.hint(10_000, {**message, "timeout_ms": timeout_ms})
+
+        assert wait(100) == {"ready": True}
+        for bad in (0, -1, 10_001, "50", None):
+            with pytest.raises(ValueError, match="timeout_ms"):
+                wait(bad)
+        ext.answer = ["not", "a", "map"]
+        with pytest.raises(ValueError, match="no map"):
+            wait(100)
+        ext.answer = None
+        assert wait(100) == {}
+    finally:
+        w.close()
+    plain = World(extension=FakeExtension())  # takes no write waits
+    try:
+        worker = plain.client("a")
+        assert put(worker, "k", b"x" * PAGE)[0]
+        service = plain.node.service
+        message = _hint_message(
+            service, only_region(worker).handle, action="write_wait"
+        )
+        with pytest.raises(ValueError, match="action"):
+            service.hint(10_000, {**message, "timeout_ms": 100})
+    finally:
+        plain.close()
+
+
+def test_the_write_wait_is_bounded_in_the_config():
+    from maru_common.config import MaruConfig
+
+    base = {"storage_backend": "remote_cxl", "engine_id": "e", "cache_namespace": "ns"}
+    assert MaruConfig(**base).write_wait_ms == 50
+    for bad in (-1, 10_001, 1.5):
+        with pytest.raises(ValueError, match="write_wait_ms"):
+            MaruConfig(**base, write_wait_ms=bad)
