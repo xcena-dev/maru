@@ -299,20 +299,29 @@ def _one_group(*specs):
 MLA_LATENT = MLAAttentionSpec(
     block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
 )
-DSA_INDEXER = MLAAttentionSpec(
-    block_size=64,
-    num_kv_heads=1,
-    head_size=132,
-    dtype=torch.uint8,
-    cache_role=kv_cache_interface.SparseCacheRole.INDEXER,
-)
+
+
+def _dsa_indexer():
+    """DeepSeek-V3.2's indexer cache, which vLLM tells from the MLA latent by
+    its cache role. vLLM has SparseCacheRole from 0.30."""
+    role = getattr(kv_cache_interface, "SparseCacheRole", None)
+    if role is None:
+        pytest.skip("this vLLM has no SparseCacheRole")
+    return MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        cache_role=role.INDEXER,
+    )
 
 
 def test_one_group_of_different_kv_specs_is_refused():
     """vLLM 0.32 puts DeepSeek-V3.2's MLA latent and its indexer cache, which
     differ in shape, in one UniformTypeKVCacheSpecs group."""
+    indexer = _dsa_indexer()
     with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
-        check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT, DSA_INDEXER)))
+        check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT, indexer)))
     # One spec for every layer passes, MLA or not, and so do several groups.
     check_one_group_support(describe_kv_groups(_one_group(MLA_LATENT)))
     check_one_group_support(describe_kv_groups(gpt_oss_config()))
@@ -333,11 +342,12 @@ def _connector_config(block_size, **extra):
 
 
 def test_connector_refuses_one_group_of_different_kv_specs():
+    indexer = _dsa_indexer()
     with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
         MaruKVConnector(
             _connector_config(64),
             KVConnectorRole.SCHEDULER,
-            _one_group(MLA_LATENT, DSA_INDEXER),
+            _one_group(MLA_LATENT, indexer),
         )
 
 
