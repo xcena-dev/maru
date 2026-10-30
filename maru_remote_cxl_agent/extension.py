@@ -47,6 +47,13 @@ and the extension only hears what helps the device serve it sooner.
   the pages instead. A write hint gives no leave to change what the pages
   hold: the extension may only do what keeps their contents, since the
   hint can arrive late, after the WRITE, or be wrong.
+- It may also take write waits (``write_wait``, if its ``hint_actions``
+  names it): a write hint whose sender waits for the answer before it
+  posts the WRITEs. It carries the store's ranges like a write hint and
+  ``timeout_ms``; the extension prepares the pages as for a write hint and
+  answers (a map, e.g. ``{"ready": True}``, or None) once they are ready or
+  within ``timeout_ms``, whichever is first. The sender writes either way:
+  the answer only tells how the wait ended.
 - Memory that loses what it holds on a reset without a node reboot (a
   write-back cache) has a generation, which the optional
   ``memory_generation`` tells. The agent advertises
@@ -76,7 +83,10 @@ agent's checks, outside the lock, on the connection's request thread, and
 and the generation thread. These three answer from the extension's local
 state within microseconds: ``hint`` only queues the hint for the extension's
 own thread, in a bounded queue that drops hints (never ends) when full, and
-none of them waits on hardware or on another process. ``validate_access``
+none of them waits on hardware or on another process. The one exception is
+``hint`` for a ``write_wait``: it may wait up to the message's
+``timeout_ms`` (never longer), on the requesting connection's own thread,
+outside the agent's lock, so only that connection waits. ``validate_access``
 and ``mapped`` run on the threads that map regions, possibly several at
 once, and may wait. ``connection_closed`` runs outside the lock and must not
 block. The extension must be thread-safe.
@@ -113,17 +123,21 @@ class RegionExtension(Protocol):
         """
         ...
 
-    def hint(self, conn: int, message: dict, ranges: list[dict]) -> None:
-        """Queue a hint whose ``ranges`` the agent checked.
+    def hint(self, conn: int, message: dict, ranges: list[dict]) -> dict | None:
+        """Take a hint whose ``ranges`` the agent checked.
 
         ``message`` has ``action`` (``read_hint``, ``read_hint_end`` or, if
-        the extension takes them, ``read_promote`` or ``write_hint``),
-        ``request`` and ``epoch``; ``ranges`` are ``{"handle", "offset",
-        "length"}`` maps in read or write order (empty for an end or a
-        promote). Runs outside the
-        agent's lock, after its checks; a region may have gone in between,
-        so a hint may name one that is no longer mapped. It only queues,
-        within microseconds, and its return value is ignored.
+        the extension takes them, ``read_promote``, ``write_hint`` or
+        ``write_wait``), ``request`` and ``epoch``; ``ranges`` are
+        ``{"handle", "offset", "length"}`` maps in read or write order
+        (empty for an end or a promote). Runs outside the agent's lock,
+        after its checks; a region may have gone in between, so a hint may
+        name one that is no longer mapped.
+
+        For a ``write_wait`` it may wait up to ``message["timeout_ms"]`` and
+        returns the reply (a map without ``ok``, or None). For any other
+        action it only queues, within microseconds, and its return value is
+        ignored.
         """
         ...
 
@@ -145,9 +159,9 @@ class OptionalRegionHooks(Protocol):
     the extension defines it."""
 
     #: The hint actions the extension takes, among ``read_hint``,
-    #: ``read_hint_end``, ``read_promote`` and ``write_hint``; the agent
-    #: advertises these and refuses others. Without it: ``read_hint`` and
-    #: ``read_hint_end``.
+    #: ``read_hint_end``, ``read_promote``, ``write_hint`` and
+    #: ``write_wait``; the agent advertises these and refuses others.
+    #: Without it: ``read_hint`` and ``read_hint_end``.
     hint_actions: tuple[str, ...]
 
     def memory_generation(self) -> str:

@@ -73,6 +73,7 @@ from maru_remote.region_map import (
     DEFAULT_HINT_ACTIONS,
     HINT_ACTIONS,
     HINT_PROTOCOL_VERSION,
+    MAX_WRITE_WAIT_MS,
     read_token,
 )
 from maru_shm.client import HoldRefusedError
@@ -340,7 +341,7 @@ class RegionMapService:
             }
         return identity
 
-    def hint(self, conn: int, message: dict) -> None:
+    def hint(self, conn: int, message: dict) -> dict:
         """Hand a read or write hint to the region extension.
 
         The action must be one the extension takes. Every range must lie in
@@ -354,11 +355,21 @@ class RegionMapService:
         a region that went is harmless. A connection may keep at most
         ``max_hint_requests`` requests open (hinted and not ended).
 
+        ``write_wait`` is a write hint whose sender waits for the reply: the
+        extension prepares the pages for up to ``timeout_ms`` on this
+        connection's thread and its answer is the reply. Only this
+        connection waits; every connection has its own thread.
+
         Args:
             conn: Connection id.
             message: ``action`` (``read_hint``, ``read_hint_end``,
-                ``read_promote`` or ``write_hint``), ``request``, ``ranges``
-                and ``epoch``.
+                ``read_promote``, ``write_hint`` or ``write_wait``),
+                ``request``, ``ranges``, ``epoch`` and, for ``write_wait``,
+                ``timeout_ms``.
+
+        Returns:
+            The extension's answer to a ``write_wait`` (a map); ``{}`` for
+            the other actions.
 
         Raises:
             ValueError: if no extension is loaded, the message is malformed or
@@ -375,6 +386,12 @@ class RegionMapService:
             raise ValueError(f"action must be one of {', '.join(self._hint_actions)}")
         if type(message.get("request")) is not str:
             raise ValueError("request must be a string")
+        wait = message["action"] == "write_wait"
+        timeout_ms = message.get("timeout_ms")
+        if wait and (
+            type(timeout_ms) is not int or not 0 < timeout_ms <= MAX_WRITE_WAIT_MS
+        ):
+            raise ValueError(f"timeout_ms must be from 1 to {MAX_WRITE_WAIT_MS}")
         ranges = message.get("ranges", [])
         if not isinstance(ranges, list) or len(ranges) > _MAX_HINT_RANGES:
             raise ValueError(f"ranges must be a list of at most {_MAX_HINT_RANGES}")
@@ -410,12 +427,19 @@ class RegionMapService:
                     raise ValueError("a range must lie in its region")
             opened = self._open_hint_locked(conn, message)
         try:
-            self._extension.hint(conn, message, ranges)
+            answer = self._extension.hint(conn, message, ranges)
         except BaseException:
             if opened:
                 with self._lock:
                     self._hint_requests.get(conn, set()).discard(message["request"])
             raise
+        if not wait:
+            return {}
+        if answer is None:
+            return {}
+        if not isinstance(answer, dict) or "ok" in answer:
+            raise ValueError("the region extension answered write_wait with no map")
+        return answer
 
     def _open_hint_locked(self, conn: int, message: dict) -> bool:
         """Count a hint request open on its connection, or end it; the lock
@@ -428,8 +452,8 @@ class RegionMapService:
             ValueError: if the connection has too many requests open.
         """
         request = message["request"]
-        if message["action"] in ("write_hint", "read_promote"):
-            return False  # neither has an end nor stays open
+        if message["action"] in ("write_hint", "write_wait", "read_promote"):
+            return False  # none has an end or stays open
         if message["action"] == "read_hint_end":
             requests = self._hint_requests.get(conn)
             if requests is not None:

@@ -117,6 +117,10 @@ def test_only_the_scheduler_sends_read_hints(monkeypatch):
     assert [c.write_hints for c in seen] == [False, True]
     # The worker promotes each load its scheduler hinted as it starts.
     assert [c.read_promotes for c in seen] == [False, True]
+    assert seen[1].write_wait_ms == 50
+    seen.clear()
+    _create_maru_handler({**config, "maru_write_wait_ms": 0}, metadata_only=False)
+    assert seen[0].write_wait_ms == 0
     seen.clear()
     # Without asynchronous loads the scheduler hints nothing to promote.
     _create_maru_handler({**config, "maru_async_load": False}, metadata_only=False)

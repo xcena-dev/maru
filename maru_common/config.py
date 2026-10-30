@@ -91,6 +91,10 @@ class MaruConfig:
     # remote CXL agents whose region extension takes them before its WRITEs,
     # so memory that fills a written page from a slow tier can prepare it.
     write_hints: bool = False
+    # With write hints, how long a store waits (ms) for an agent whose
+    # region extension takes ``write_wait`` to prepare its pages before it
+    # posts the WRITEs; the WRITEs go either way. 0: never wait.
+    write_wait_ms: int = 50
     # Send read promotes (remote_cxl only): when a load starts for a request
     # another process hinted (a vLLM worker loads what its scheduler
     # hinted), the remote CXL agents whose region extension takes them hear
@@ -164,6 +168,8 @@ class MaruConfig:
             raise ValueError("read_hints is supported by the remote_cxl backend")
         if self.write_hints and self.storage_backend != "remote_cxl":
             raise ValueError("write_hints is supported by the remote_cxl backend")
+        if type(self.write_wait_ms) is not int or not 0 <= self.write_wait_ms <= 10_000:
+            raise ValueError("write_wait_ms must be an integer from 0 to 10000")
         if self.read_promotes and self.storage_backend != "remote_cxl":
             raise ValueError("read_promotes is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":
