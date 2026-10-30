@@ -12,7 +12,8 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
 
 - ``hello``: returns ``{"node", "epoch", "boot", "nonce"}``; the epoch is
   new on every start of the remote CXL agent process, ``boot`` on every boot of
-  the memory node, ``nonce`` on every connection.
+  the memory node, ``nonce`` on every connection. An agent with a region
+  extension adds ``region_extension`` (see :func:`hint_actions`).
 - ``auth`` with ``proof`` and ``nonce``: the client proves it holds the
   remote CXL agent key (:func:`prove` over the connection's nonce) and the reply
   proves the same over the client's nonce. A connection does nothing else
@@ -32,6 +33,9 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   remote CXL agent deregisters and unmaps it whoever else holds it, and refuses
   later maps of the handle. Releasing a region that is not mapped succeeds.
   A read handle cannot release.
+- ``extension`` with ``action`` (``read_hint`` or ``read_hint_end``),
+  ``request``, ``ranges`` and ``epoch``: a read hint for the agent's region
+  extension; every range must lie in a region the agent maps.
 
 Replies carry ``ok``; a failure has ``error`` and ``code``. The remote CXL agent
 treats a closed connection as an unmap of every region the connection mapped.
@@ -66,6 +70,10 @@ DEFAULT_KEY_FILE = "/etc/maru/remote-cxl-agent.key"
 # DEFAULT_KEY_FILE, which is not the deployment's.
 DEFAULT_COPY_FILE = "~/.maru/remote-cxl-agent.key"
 NONCE_BYTES = 16
+# Read hint messages a region extension may take (``op: extension``), and the
+# version of their protocol an agent advertises in its hello
+HINT_ACTIONS = ("read_hint", "read_hint_end")
+HINT_PROTOCOL_VERSION = 1
 
 
 def pick_agent(agents: list[str], region_id: int) -> str:
@@ -125,6 +133,23 @@ def read_handle(handle: dict) -> dict:
         "length": int(handle["length"]),
         "read_token": read_token(handle),
     }
+
+
+def hint_actions(advertised: Any) -> frozenset[str]:
+    """The read hint actions an agent's hello says its region extension takes.
+
+    An agent with a region extension advertises
+    ``{"version": HINT_PROTOCOL_VERSION, "actions": [...]}``; anything else
+    (no extension, or an extension of an earlier protocol) takes none.
+    """
+    if not isinstance(advertised, dict):
+        return frozenset()
+    if advertised.get("version") != HINT_PROTOCOL_VERSION:
+        return frozenset()
+    actions = advertised.get("actions")
+    if not isinstance(actions, list):
+        return frozenset()
+    return frozenset(a for a in actions if a in HINT_ACTIONS)
 
 
 class KeyFileError(ValueError):
@@ -373,6 +398,8 @@ class RegionMapClient:
         self.node = ""
         self.boot = ""
         self.generation = 0
+        # Hint actions the agent's region extension takes (from its hello)
+        self.hint_actions: frozenset[str] = frozenset()
 
     def hello(self) -> dict:
         """Connect if needed and return the remote CXL agent's identity.
@@ -455,6 +482,25 @@ class RegionMapClient:
         with self._lock:
             self._send({"op": "release", "handle": dict(handle)})
 
+    def extension(self, message: dict) -> dict:
+        """Send a read hint to the remote CXL agent's region extension.
+
+        Args:
+            message: ``action`` (``read_hint`` or ``read_hint_end``),
+                ``request``, ``ranges`` and ``epoch``.
+
+        Returns:
+            The agent's reply (without ``ok``).
+
+        Raises:
+            RegionMapError: if the agent refused it (no extension, a range
+                in no region it maps, or the extension raised).
+            RegionMapUnavailable: if no connection got a reply.
+        """
+        with self._lock:
+            reply = self._send({**message, "op": "extension"})
+        return {k: v for k, v in reply.items() if k != "ok"}
+
     def close(self) -> None:
         """Close the connection, which releases every mapping it holds."""
         with self._lock:
@@ -507,6 +553,7 @@ class RegionMapClient:
         self.epoch = str(reply["epoch"])
         self.node = str(reply["node"])
         self.boot = boot
+        self.hint_actions = hint_actions(reply.get("region_extension"))
 
     def _authenticate(self, nonce: Any) -> None:
         """Prove the key to the remote CXL agent and check its proof.

@@ -154,6 +154,9 @@ def handle_request(
         if op == "release":
             service.release(message.get("handle"))
             return {"ok": True, "released": True}
+        if op == "extension":
+            service.hint(conn, message)
+            return {"ok": True}
         return {"ok": False, "error": f"unknown op {op!r}", "code": "invalid"}
     except MapDenied as exc:
         return {"ok": False, "error": str(exc), "code": "denied"}
