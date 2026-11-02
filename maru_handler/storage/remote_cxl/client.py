@@ -325,27 +325,49 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 continue
             self._waits.write_wait(agent, token, ranges, remaining_ms)
 
+    def _advise(self, call: Callable[..., Any], *args: Any) -> Any:
+        """Run hint code on the data path; its failure never fails a transfer.
+
+        Hints and waits are advice: a store or load goes on without them.
+        Returns what ``call`` returns, or None if it raised.
+        """
+        try:
+            return call(*args)
+        except Exception:
+            logger.warning(
+                "remote CXL hint failed; the transfer goes on without it",
+                exc_info=True,
+            )
+            return None
+
+    def _agent_key(self) -> bytes:
+        """The agent key: the data path's (read once at start) if it has one."""
+        if self._hint_key is None:
+            key = self._data.key
+            if key is None:
+                from maru_remote.region_map import load_key
+
+                key = load_key(self.config.remote_cxl_agent_key_file)
+            self._hint_key = key
+        return self._hint_key
+
     def _connect_agent(self, agent: str, timeout_s: float) -> Any:
         """A connection of this process to ``agent`` (not yet connected)."""
-        from maru_remote.region_map import RegionMapClient, load_key
+        from maru_remote.region_map import RegionMapClient
 
-        if self._hint_key is None:
-            self._hint_key = load_key(self.config.remote_cxl_agent_key_file)
-        return RegionMapClient(agent, timeout_s=timeout_s, key=self._hint_key)
+        return RegionMapClient(agent, timeout_s=timeout_s, key=self._agent_key())
 
     def _hint_send(self, agent: str, message: dict) -> bool:
         """Send a hint message on this process's own connection to ``agent``;
         False if the agent has no region extension that takes its action."""
-        from maru_remote.region_map import RegionMapClient, load_key
+        from maru_remote.region_map import RegionMapClient
 
         client = self._hint_agents.get(agent)
         if client is None:
-            if self._hint_key is None:
-                self._hint_key = load_key(self.config.remote_cxl_agent_key_file)
             client = self._hint_agents[agent] = RegionMapClient(
                 agent,
                 timeout_s=max(self.config.rdma_timeout_s, REPLY_TIMEOUT_MIN_S),
-                key=self._hint_key,
+                key=self._agent_key(),
             )
         if not client.epoch:
             client.hello()  # connects; a reconnect later renews the epoch
@@ -875,8 +897,8 @@ class RemoteCxlStorageClient(RegionLifecycle):
                 return [False] * len(keys)
             self._transfers += 1
         sent = [h for h, ok in zip(handles, placed, strict=True) if ok]
-        self._prepare_write(sent)
         try:
+            self._advise(self._prepare_write, sent)
             written = self._write(sent)
         except BaseException:
             with self._lock:
@@ -1254,8 +1276,9 @@ class RemoteCxlStorageClient(RegionLifecycle):
             slots = self._take_read_slots(len(hits))
             hits = hits[: len(slots)]
             self._transfers += 1
-        load_hint = self._hint_load(hits, result.get("regions", {}))
+        load_hint = ""
         try:
+            load_hint = self._advise(self._hint_load, hits, result.get("regions", {}))
             got = self._read(
                 hits,
                 slots,
@@ -1275,7 +1298,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
             raise
         finally:
             if load_hint:
-                self._hints.end(load_hint)
+                self._advise(self._hints.end, load_hint)
         with self._lock:
             try:
                 return self._finish_read(keys, hits, slots, got, lease_id)

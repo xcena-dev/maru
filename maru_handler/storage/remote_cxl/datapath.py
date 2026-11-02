@@ -457,6 +457,12 @@ class RdmaDataPath:
         """Whether every one of these remote CXL agents is down right now."""
         return bool(agents) and all(self.is_down(m) for m in agents)
 
+    @property
+    def key(self) -> bytes | None:
+        """The agent key read at start; None before start or with a test
+        agent factory."""
+        return self._key
+
     def has_access(self, pool_id: str) -> bool:
         """Whether a region is mapped for this worker (an access is cached)."""
         with self._lock:

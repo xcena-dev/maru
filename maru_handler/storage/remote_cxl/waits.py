@@ -11,7 +11,8 @@ for the answer before the transfer goes:
   until they are ready; then it posts its WRITEs whatever the answer.
 
 A wait is advice too: the transfer goes whatever the answer, and an agent
-that does not answer only costs the wait. Each thread has its own
+that does not answer only costs the wait; such an agent is then not asked
+for ``UNREACHABLE_RETRY_S``. Each thread has its own
 connection per agent, so one store's wait never holds up another's, and
 none of them holds up hints or region maps.
 """
@@ -76,8 +77,11 @@ class MemoryWaits:
         try:
             client.extension(message)
         except Exception:
-            # Advice: the WRITEs go anyway, only slower.
+            # Advice: the WRITEs go anyway, only slower. An agent that did
+            # not answer in time is not asked again for a while, so the
+            # next stores do not each pay the reply timeout.
             logger.debug("write_wait at %s failed", agent, exc_info=True)
+            self._back_off(agent)
             return False
         return True
 
@@ -96,14 +100,20 @@ class MemoryWaits:
             if time.monotonic() < self._retry_at.get(agent, 0.0):
                 return None
             client = self._clients.get(key)
-            if client is None:
-                client = self._clients[key] = self._connect(agent, self._timeout_s)
         try:
+            if client is None:
+                client = self._connect(agent, self._timeout_s)
+                with self._lock:
+                    self._clients[key] = client
             if not client.epoch:
                 client.hello()  # connects; a reconnect renews the epoch
         except Exception:
             logger.debug("memory waits: %s unreachable", agent, exc_info=True)
-            with self._lock:
-                self._retry_at[agent] = time.monotonic() + UNREACHABLE_RETRY_S
+            self._back_off(agent)
             return None
         return client if action in client.hint_actions else None
+
+    def _back_off(self, agent: str) -> None:
+        """Ask ``agent`` nothing for ``UNREACHABLE_RETRY_S``."""
+        with self._lock:
+            self._retry_at[agent] = time.monotonic() + UNREACHABLE_RETRY_S

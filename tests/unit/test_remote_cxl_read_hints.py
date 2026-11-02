@@ -682,3 +682,105 @@ def test_the_write_wait_is_bounded_in_the_config():
     for bad in (-1, 10_001, 1.5):
         with pytest.raises(ValueError, match="write_wait_ms"):
             MaruConfig(**base, write_wait_ms=bad)
+
+
+def test_a_store_whose_wait_cannot_connect_still_stores():
+    # The reviewer's case: a write wait's connection raises (say the key file
+    # changed after start). The store goes on, its transfer ends, and close
+    # does not wait for an unfinished transfer.
+    from maru_remote.region_map import KeyFileError
+
+    ext = WriteWaitExtension()
+    w = World(extension=ext)
+    worker = w.client("a", write_hints=True, write_wait_ms=1000, rdma_timeout_s=5)
+
+    def connect(agent, timeout_s):
+        raise KeyFileError("the key file changed")
+
+    worker._waits._connect = connect
+    try:
+        assert _store(worker, ["k0"])[1] == [True]
+        assert worker._transfers == 0
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+    finally:
+        started = time.monotonic()
+        w.close()
+        assert time.monotonic() - started < 2.0
+
+
+def test_hint_code_that_raises_never_fails_a_transfer():
+    ext = WriteWaitExtension()
+    w = World(extension=ext)
+    worker = w.client(
+        "a", read_hints=True, write_hints=True, write_wait_ms=50, rdma_timeout_s=5
+    )
+
+    def broken(*args):
+        raise RuntimeError("hint code failed")
+
+    try:
+        worker._prepare_write = broken
+        assert _store(worker, ["k0"])[1] == [True]
+        assert worker._transfers == 0
+        worker._hint_load = broken
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+        assert worker._transfers == 0
+    finally:
+        started = time.monotonic()
+        w.close()
+        assert time.monotonic() - started < 2.0
+
+
+def test_hints_reuse_the_key_the_data_path_read_at_start(setup):
+    w, _ = setup
+    worker = w.client("a", read_hints=True)
+    assert put(worker, "k0", b"x" * PAGE)[0]
+    assert worker._data.key is not None
+    assert worker._agent_key() is worker._data.key
+
+
+class _TimingOutAgent:
+    epoch = "e1"
+    hint_actions = ("write_wait",)
+
+    def __init__(self):
+        self.calls = 0
+
+    def hello(self):
+        pass
+
+    def extension(self, message):
+        self.calls += 1
+        raise TimeoutError("no answer")
+
+    def close(self):
+        pass
+
+
+def test_an_agent_whose_wait_timed_out_is_not_asked_again_for_a_while():
+    from maru_handler.storage.remote_cxl.waits import MemoryWaits
+
+    agent = _TimingOutAgent()
+    waits = MemoryWaits(lambda name, timeout_s: agent, 50)
+    sent = 0
+    for _ in range(5):  # five stores in a row
+        if waits.takes("m1", "write_wait"):
+            sent += 1
+            assert not waits.write_wait("m1", "t", [], 50)
+    assert (sent, agent.calls) == (1, 1)
+
+
+def test_a_wait_connection_that_raises_backs_off_instead_of_raising():
+    from maru_handler.storage.remote_cxl.waits import MemoryWaits
+    from maru_remote.region_map import KeyFileError
+
+    calls = []
+
+    def connect(name, timeout_s):
+        calls.append(name)
+        raise KeyFileError("the key file changed")
+
+    waits = MemoryWaits(connect, 50)
+    assert not waits.takes("m1", "write_wait")
+    assert not waits.takes("m1", "write_wait")
+    assert calls == ["m1"]
