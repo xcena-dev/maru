@@ -1786,12 +1786,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
     def shutdown(self):
         if self._worker is not None:
             self._worker.shutdown()
-        if self._scheduler is not None and self._scheduler._handler is not None:
-            try:
-                self._scheduler._handler.close()
-            except Exception as e:
-                logger.error("Error closing scheduler MaruHandler: %s", e)
-            self._scheduler._handler = None
+        if self._scheduler is not None:
+            self._scheduler.shutdown()
 
 
 # ============================================================================
@@ -1927,6 +1923,8 @@ class MaruSchedulerConnector:
         self._hint_lock = threading.Lock()
         self._handler_lock = threading.Lock()
         self._arrival_pool: ThreadPoolExecutor | None = None
+        # Set by shutdown(): no arrival hint and no new handler after it
+        self._shut_down = False
         self._hints_handler: Any = None
         self._hints_enabled = False
 
@@ -2062,12 +2060,33 @@ class MaruSchedulerConnector:
         """
         return base_key if not self._use_layerwise else f"{base_key}_DONE"
 
+    def shutdown(self) -> None:
+        """Stop the arrival hints, then close the scheduler's MaruHandler.
+
+        A request that arrives afterwards is not hinted and creates no new
+        handler.
+        """
+        with self._handler_lock:
+            self._shut_down = True
+        with self._hint_lock:
+            pool, self._arrival_pool = self._arrival_pool, None
+        if pool is not None:
+            # An arrival hint under way may still use the handler.
+            pool.shutdown(wait=True, cancel_futures=True)
+        with self._handler_lock:
+            handler, self._handler = self._handler, None
+        if handler is not None:
+            try:
+                handler.close()
+            except Exception as e:
+                logger.error("Error closing scheduler MaruHandler: %s", e)
+
     def _ensure_handler(self):
         if self._handler is not None:
             return
         # The arrival-hint thread may get here too: create one handler.
         with self._handler_lock:
-            if self._handler is not None:
+            if self._handler is not None or self._shut_down:
                 return
             if time.monotonic() < self._handler_retry_after:
                 return
@@ -2089,11 +2108,15 @@ class MaruSchedulerConnector:
 
         Called on the engine's input thread (see :func:`_install_arrival_hint`).
         """
+        if self._shut_down:
+            return
         if self._handler is not None and not self._read_hints_on():
             return
         if _uncacheable_request(request) is not None:
             return  # Maru neither loads nor stores it
         with self._hint_lock:
+            if self._shut_down:
+                return
             self._arrived[request.request_id] = None
             while len(self._arrived) > _MAX_HINTED_REQUESTS:
                 old, _ = self._arrived.popitem(last=False)
@@ -2102,8 +2125,8 @@ class MaruSchedulerConnector:
                 self._arrival_pool = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="maru-arrival-hint"
                 )
-            pool = self._arrival_pool
-        pool.submit(self._hint_on_arrival, request)
+            # Under the lock: shutdown() takes the pool only after this.
+            self._arrival_pool.submit(self._hint_on_arrival, request)
 
     def _hint_on_arrival(self, request: Request) -> None:
         try:

@@ -257,3 +257,26 @@ def test_arrival_hints_need_asynchronous_loading(monkeypatch):
     make_scheduler(4, 8, extra(maru_read_hint_on_arrival=True))
     assert installed == []
     assert any("requires maru_async_load" in w for w in warnings)
+
+
+def test_shutdown_stops_arrival_hints_and_creates_no_new_handler(monkeypatch):
+    import maru_vllm.connector as connector
+
+    sched = _scheduler(hits=5)
+    closed = []
+    sched._handler.close = lambda: closed.append(True)
+    sched.request_arrived(_request("r1"))
+    pool = sched._arrival_pool
+    assert pool is not None
+    created = []
+    monkeypatch.setattr(
+        connector, "_create_maru_handler", lambda *a, **k: created.append(a)
+    )
+    sched.shutdown()
+    assert closed == [True] and sched._handler is None
+    assert sched._arrival_pool is None and pool._shutdown
+    # A request that arrives afterwards: no hint, no pool, no new handler.
+    sched.request_arrived(_request("r2"))
+    sched._ensure_handler()
+    assert sched._arrival_pool is None and sched._handler is None
+    assert created == []
