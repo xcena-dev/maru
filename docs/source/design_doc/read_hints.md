@@ -22,12 +22,13 @@ the same with or without hints.
 
 ![Two panels of the same vLLM engine with the Maru connector, each above a strip for the memory node (CXL-SSD) on a time axis from "request arrives" to "load starts". (a) Without prefetch hints: the request goes from the API server process through the input thread, the input queue and the scheduler's waiting queue to the worker, whose Maru connector sends the RDMA READ at "load starts"; on the memory node nothing happens while the request waits in vLLM, and then the READs wait while the device brings the KV from flash into its DRAM cache. (b) With prefetch hints: a Maru wrapper on the input thread's preprocess step hands the request to the scheduler's Maru connector, whose hint thread sends a read hint that reaches the memory node at "request arrives"; the device prefetches the KV from flash into its DRAM cache while the request waits, and the READs at "load starts" find it there](../image/read_hints_path.png)
 
-*Where a read hint leaves vLLM (schematic). Without hints (a), the device learns
-which KV is needed only from the READ. With hints (b), Maru sends the hint from
-vLLM's input thread as the request arrives, before the request reaches the
-scheduler's queues, so the device prefetches during the request's wait. Panel
-(b) is the path with `maru_read_hint_on_arrival`; without it, the read hint
-leaves when the scheduler first looks the request up. The memory node strip is
+*Where a read hint leaves vLLM (schematic). Without prefetch hints (a), the
+device learns which KV is needed only from the READ. With prefetch hints (b),
+Maru's wrapper runs on vLLM's input thread and calls the scheduler's Maru
+connector there; its hint thread sends the read hint before the request enters
+the input queue, so the device prefetches while the request waits. Path (b)
+needs `maru_read_hint_on_arrival`; without it, the read hint leaves when the
+scheduler first looks the request up. The memory node strip is
 simplified: a hint reaches the device through the remote
 CXL agent and the region extension (below).*
 
