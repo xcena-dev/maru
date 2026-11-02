@@ -278,6 +278,10 @@ class RegionMapService:
         self._generation_unknown = False
         # Periods the generation was unknown; each makes a new boot
         self._unknown_periods = 0
+        # The generation part of the advertised boot, rebuilt whole under
+        # the lock whenever the generation state changes: a reader without
+        # the lock sees it from before or after a change, never a mix.
+        self._boot_generation = self._generation_text()
         self._watcher: threading.Thread | None = None
         # Connection -> hint requests it opened and has not ended
         self._max_hint_requests = max_hint_requests
@@ -319,13 +323,17 @@ class RegionMapService:
           region mapped before it is never trusted after it, whatever
           generation the extension then tells.
         """
+        return self.boot_id + self._boot_generation
+
+    def _generation_text(self) -> str:
+        """The generation part of :attr:`boot` for the current state."""
         if self._generation_of is None:
-            return self.boot_id
+            return ""
         if self._generation_unknown:
-            return f"{self.boot_id}:unknown"
+            return ":unknown"
         if self._unknown_periods:
-            return f"{self.boot_id}:{self._generation}~{self._unknown_periods}"
-        return f"{self.boot_id}:{self._generation}"
+            return f":{self._generation}~{self._unknown_periods}"
+        return f":{self._generation}"
 
     def hello(self) -> dict:
         """Identity of this remote CXL agent process and of the node's boot;
@@ -728,9 +736,10 @@ class RegionMapService:
                 if self._generation_unknown:
                     # Whatever the extension says now, the regions mapped
                     # before went: a new boot keeps workers from trusting them.
-                    self._generation_unknown = False
                     self._unknown_periods += 1
                     self._generation = generation
+                    self._generation_unknown = False
+                    self._boot_generation = self._generation_text()
                     logger.warning("memory generation known again: boot %s", self.boot)
                     return
                 if generation == self._generation:
@@ -742,6 +751,7 @@ class RegionMapService:
                     generation,
                 )
                 self._generation = generation
+                self._boot_generation = self._generation_text()
                 self._release_all_locked("was lost in a memory reset")
             self._flush_unholds()
 
@@ -767,6 +777,7 @@ class RegionMapService:
                 "refusing maps until the region extension answers"
             )
             self._generation_unknown = True
+            self._boot_generation = self._generation_text()
             self._release_all_locked("went: the memory generation is unknown")
         self._flush_unholds()
 
