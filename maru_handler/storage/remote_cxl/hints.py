@@ -44,14 +44,17 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 
+from maru_remote import region_map
+
 logger = logging.getLogger(__name__)
 
 #: Hints waiting for the background thread; more are dropped (ends are not).
 MAX_PENDING_HINTS = 1024
 #: A dropped hint is logged as a warning once per this many drops.
 DROP_WARNING_EVERY = 1024
-#: Ranges one ``read_hint`` message names; a longer hint takes several.
-MAX_HINT_RANGES = 4096
+#: Ranges one hint message names (the agent's limit); a longer hint takes
+#: several.
+MAX_HINT_RANGES = region_map.MAX_HINT_RANGES
 #: Hinted requests kept open (not ended); past it the oldest is ended. An
 #: agent lets one connection keep as many open by default.
 MAX_OPEN_HINTS = 4096

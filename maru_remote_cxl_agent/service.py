@@ -73,6 +73,7 @@ from maru_remote.region_map import (
     DEFAULT_HINT_ACTIONS,
     HINT_ACTIONS,
     HINT_PROTOCOL_VERSION,
+    MAX_HINT_RANGES,
     MAX_WRITE_WAIT_MS,
     read_token,
 )
@@ -92,8 +93,6 @@ _RELEASED_KEPT = 65536
 # second (same node) to 30 s (another node); this bounds how much longer an
 # old registration lives.
 SWEEP_INTERVAL_S = 1.0
-# Ranges one read hint may name
-_MAX_HINT_RANGES = 4096
 # Hint requests one connection may keep open (read_hint without its end)
 MAX_HINT_REQUESTS = 4096
 # How often the region extension's memory generation is read, and how long
@@ -401,8 +400,8 @@ class RegionMapService:
         ):
             raise ValueError(f"timeout_ms must be from 1 to {MAX_WRITE_WAIT_MS}")
         ranges = message.get("ranges", [])
-        if not isinstance(ranges, list) or len(ranges) > _MAX_HINT_RANGES:
-            raise ValueError(f"ranges must be a list of at most {_MAX_HINT_RANGES}")
+        if not isinstance(ranges, list) or len(ranges) > MAX_HINT_RANGES:
+            raise ValueError(f"ranges must be a list of at most {MAX_HINT_RANGES}")
         with self._lock:
             for r in ranges:
                 if not isinstance(r, dict):

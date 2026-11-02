@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass
 
+from maru_remote.region_map import MAX_WRITE_WAIT_MS
+
 from .storage_policy import validate_order
 
 
@@ -168,8 +170,13 @@ class MaruConfig:
             raise ValueError("read_hints is supported by the remote_cxl backend")
         if self.write_hints and self.storage_backend != "remote_cxl":
             raise ValueError("write_hints is supported by the remote_cxl backend")
-        if type(self.write_wait_ms) is not int or not 0 <= self.write_wait_ms <= 10_000:
-            raise ValueError("write_wait_ms must be an integer from 0 to 10000")
+        if (
+            type(self.write_wait_ms) is not int
+            or not 0 <= self.write_wait_ms <= MAX_WRITE_WAIT_MS
+        ):
+            raise ValueError(
+                f"write_wait_ms must be an integer from 0 to {MAX_WRITE_WAIT_MS}"
+            )
         if self.read_promotes and self.storage_backend != "remote_cxl":
             raise ValueError("read_promotes is supported by the remote_cxl backend")
         if "," in self.server_url and self.storage_backend != "remote_cxl":

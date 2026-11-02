@@ -87,6 +87,8 @@ HINT_ACTIONS = (
 )
 # Longest wait a ``write_wait`` may ask for
 MAX_WRITE_WAIT_MS = 10_000
+# Ranges one hint message may name; the sender splits a longer hint
+MAX_HINT_RANGES = 4096
 # What a region extension takes when it does not say (``hint_actions``)
 DEFAULT_HINT_ACTIONS = ("read_hint", "read_hint_end")
 HINT_PROTOCOL_VERSION = 1

@@ -240,6 +240,22 @@ def read_boot_id(path: str = "/proc/sys/kernel/random/boot_id") -> str:
         return ""
 
 
+def _positive_int(text: str) -> int:
+    """An argparse type: an integer above zero."""
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be above zero: {text}")
+    return value
+
+
+def _positive_float(text: str) -> float:
+    """An argparse type: a number above zero."""
+    value = float(text)
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"must be above zero: {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Command-line options of ``maru-remote-cxl-agent``."""
     parser = argparse.ArgumentParser(
@@ -315,14 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-hint-requests",
-        type=int,
+        type=_positive_int,
         default=MAX_HINT_REQUESTS,
         help="Read hint requests one connection may keep open; more are "
         f"refused. Default: {MAX_HINT_REQUESTS}",
     )
     parser.add_argument(
         "--memory-generation-poll-s",
-        type=float,
+        type=_positive_float,
         default=GENERATION_POLL_S,
         help="How often the region extension's memory generation is read; a "
         "reset of the memory is acted on within the extension's own detection "
@@ -454,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         # The region extension cannot tell its memory generation.
         logger.error("cannot start the remote CXL agent: %s", exc)
+        if extension is not None:
+            try:
+                extension.close()
+            except Exception:
+                logger.error("closing the region extension failed", exc_info=True)
         transport.close()
         rm.close()
         os.close(lock_fd)

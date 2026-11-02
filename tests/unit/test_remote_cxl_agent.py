@@ -1067,3 +1067,50 @@ def test_main_refuses_to_start_when_its_region_extension_cannot_load(
     import os
 
     os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    "option", [["--max-hint-requests", "0"], ["--memory-generation-poll-s", "0"]]
+)
+def test_the_command_line_refuses_a_hint_limit_or_poll_of_zero(option):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(option)
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([option[0], "-1"])
+
+
+def test_main_closes_the_extension_when_the_service_cannot_start(monkeypatch, tmp_path):
+    import maru_remote.transport
+    import maru_remote_cxl_agent.extension
+    import maru_shm
+
+    class Extension:
+        closed = False
+
+        def close(self):
+            Extension.closed = True
+
+    class Closable:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the region extension cannot tell its generation")
+
+    monkeypatch.setenv("UCX_TLS", "rc")
+    monkeypatch.setattr(
+        maru_remote_cxl_agent.extension,
+        "load_region_extension",
+        lambda *args: Extension(),
+    )
+    monkeypatch.setattr(maru_remote.transport, "NixlTransport", Closable)
+    monkeypatch.setattr(maru_shm, "MaruShmClient", Closable)
+    monkeypatch.setattr(cli, "RegionMapService", refuse)
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    argv += ["--key-file", key_file(), "--host", "127.0.0.1"]
+    argv += ["--region-extension", "fake"]
+    assert cli.main(argv) == 1
+    assert Extension.closed
