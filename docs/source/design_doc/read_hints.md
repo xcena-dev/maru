@@ -1,4 +1,4 @@
-# Read and Write Hints
+# Prefetch Hints (Read and Write)
 
 Some CXL memory answers every address but not always at the same speed. A
 CXL-SSD, for example, keeps a DRAM cache in front of its flash: an RDMA READ of
@@ -10,11 +10,26 @@ from Maru, but it is fast only when it knows early which pages are coming.
 
 Maru knows that early. A request waits for the running engine step before the
 scheduler picks it, and for the scheduler to admit its load before the worker
-starts it. A **read hint** carries the pages a request will read to the memory
-side during that wait, so the device can prefetch them. A **write hint** names
-the pages a store is about to write, so the device can prepare them instead of
-filling each from flash on its first WRITE. Maru's KV data path (lookup, lease,
-RDMA READ and WRITE) is the same with or without hints.
+starts it. Maru tells the memory side what is coming with **prefetch hints**:
+advice that lets a device bring pages into its DRAM cache before the transfer
+that needs them, and that a memory node may ignore. They come in two kinds. A
+**read hint** carries the pages a request will read to the memory side during
+that wait, so the device can prefetch them. A **write hint** names the pages a
+store is about to write, so the device can prepare them instead of filling each
+from flash on its first WRITE. Maru moves no KV for a hint: the device moves
+its own pages, and Maru's KV data path (lookup, lease, RDMA READ and WRITE) is
+the same with or without hints.
+
+![Two panels of the same vLLM engine with the Maru connector, each above a strip for the memory node (CXL-SSD) on a time axis from "request arrives" to "load starts". (a) Without prefetch hints: the request goes from the API server process through the input thread, the input queue and the scheduler's waiting queue to the worker, whose Maru connector sends the RDMA READ at "load starts"; on the memory node nothing happens while the request waits in vLLM, and then the READs wait while the device brings the KV from flash into its DRAM cache. (b) With prefetch hints: a Maru wrapper on the input thread's preprocess step hands the request to the scheduler's Maru connector, whose hint thread sends a read hint that reaches the memory node at "request arrives"; the device prefetches the KV from flash into its DRAM cache while the request waits, and the READs at "load starts" find it there](../image/read_hints_path.png)
+
+*Where a read hint leaves vLLM (schematic). Without hints (a), the device learns
+which KV is needed only from the READ. With hints (b), Maru sends the hint from
+vLLM's input thread as the request arrives, before the request reaches the
+scheduler's queues, so the device prefetches during the request's wait. Panel
+(b) is the path with `maru_read_hint_on_arrival`; without it, the read hint
+leaves when the scheduler first looks the request up. The memory node strip is
+simplified: a hint reaches the device through the remote
+CXL agent and the region extension (below).*
 
 ## Who owns what
 
