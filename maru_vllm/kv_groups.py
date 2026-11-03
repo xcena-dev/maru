@@ -14,9 +14,12 @@ Storage unit: one Maru object per (chunk, group). vLLM gives every layer the
 same bytes per block slot in every group (Mamba state is padded up to it), so
 a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
-a Mamba group keeps only the state at the chunk's last block. A model with
-one group keeps the bare chunk key; with several, each object is keyed
-``<chunk key>_c<chunk tokens>_g<group id>`` (see :func:`group_object_key`).
+a Mamba group keeps only the state at the chunk's last block. An opaque group
+(DeepSeek-V4.1's compressed KV and indexer keys) keeps its blocks' bytes as
+vLLM packs them, one group page per block. A group vLLM does not prefix-cache
+is not stored. A model with one group keeps the bare chunk key; with several,
+each object is keyed ``<chunk key>_c<chunk tokens>_g<group id>`` (see
+:func:`group_object_key`).
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ from maru_vllm.kv_layout import KVLayout, _detect_kv_layout
 GROUP_FULL = "full"
 GROUP_SLIDING_WINDOW = "sliding_window"
 GROUP_MAMBA = "mamba"
+GROUP_OPAQUE = "opaque"
+GROUP_SKIP = "skip"
 GROUP_UNSUPPORTED = "unsupported"
 
 
@@ -43,14 +48,16 @@ class KVGroup:
     Attributes:
         group_id: Index in ``kv_cache_config.kv_cache_groups``; also the
             index of this group's list in vLLM's per-group block ids.
-        kind: ``GROUP_FULL``, ``GROUP_SLIDING_WINDOW``, ``GROUP_MAMBA`` or
-            ``GROUP_UNSUPPORTED``. A model with one group does not depend on
-            it.
+        kind: ``GROUP_FULL``, ``GROUP_SLIDING_WINDOW``, ``GROUP_MAMBA``,
+            ``GROUP_OPAQUE``, ``GROUP_SKIP`` or ``GROUP_UNSUPPORTED``. A model
+            with one group does not depend on it.
         spec_name: Class name of the group's ``kv_cache_spec``.
         layer_names: Layers in the group, in vLLM's order. The count can
             differ between groups.
         block_size: Tokens per block for this group.
         slot_bytes: Bytes one layer uses for one block (``page_size_bytes``).
+            For an opaque group on the worker, the whole group's bytes per
+            block, since vLLM's ``UniformTypeKVCacheSpecs`` sums its members.
         sliding_window: Window in tokens for a sliding-window group.
         mamba_cache_mode: Mamba state caching mode (``"align"`` etc.).
         state_bytes: For a Mamba group, bytes of one layer's state in one
@@ -58,6 +65,9 @@ class KVGroup:
             ``slot_bytes``. 0 otherwise.
         kv_shape: For an attention group, its KV heads per rank and the head
             size of K and of V. None otherwise.
+        replay_tokens: Tokens vLLM recomputes before a prefix hit to rebuild
+            this group (DeepSeek-V4.1's bounded-replay sliding window); 0 for
+            most groups.
     """
 
     group_id: int
@@ -70,13 +80,18 @@ class KVGroup:
     mamba_cache_mode: str | None = None
     state_bytes: int = 0
     kv_shape: tuple[int, int, int] | None = None
+    replay_tokens: int = 0
 
     def object_bytes(self, chunk_tokens: int) -> int:
-        """Bytes of this group's object for one chunk.
+        """Bytes of this group's object for one chunk; 0 for a skipped group.
 
         Args:
             chunk_tokens: Tokens per Maru chunk; a multiple of ``block_size``.
         """
+        if self.kind == GROUP_SKIP:
+            return 0
+        if self.kind == GROUP_OPAQUE:
+            return chunk_tokens // self.block_size * self.slot_bytes
         blocks = 1 if self.kind == GROUP_MAMBA else chunk_tokens // self.block_size
         return len(self.layer_names) * self.slot_bytes * blocks
 
@@ -98,6 +113,34 @@ def _spec_kind(spec_cls: type) -> str:
     return _SUPPORTED_SPECS.get(spec_cls.__name__, GROUP_UNSUPPORTED)
 
 
+# Spec classes whose blocks the connector copies as opaque bytes, without
+# reading their layout: an MLA group, alone or in a UniformTypeKVCacheSpecs
+# with others of its kind (DeepSeek-V4.1's compressed KV and indexer keys).
+_OPAQUE_SPECS = frozenset({"MLAAttentionSpec"})
+
+
+def _group_kind(spec: Any) -> str:
+    """Group kind of a vLLM KV cache group's spec.
+
+    A group vLLM does not prefix-cache (a bounded-replay sliding window, a
+    compressor ring) is skipped: vLLM rebuilds it after every hit, its own
+    prefix cache's included. The worker sees a group whose layers keep
+    different specs as a ``UniformTypeKVCacheSpecs`` and the scheduler sees
+    its first member; both are opaque when every member is an MLA spec.
+    """
+    if not getattr(spec, "prefix_cacheable", True):
+        return GROUP_SKIP
+    members = getattr(spec, "kv_cache_specs", None)
+    if isinstance(members, dict):
+        names = {type(member).__name__ for member in members.values()}
+        if names and names <= _OPAQUE_SPECS:
+            return GROUP_OPAQUE
+        return GROUP_UNSUPPORTED
+    if type(spec).__name__ in _OPAQUE_SPECS:
+        return GROUP_OPAQUE
+    return _spec_kind(type(spec))
+
+
 def describe_kv_groups(
     kv_cache_config: Any, default_mamba_cache_mode: str | None = None
 ) -> list[KVGroup]:
@@ -114,7 +157,7 @@ def describe_kv_groups(
     groups: list[KVGroup] = []
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
-        kind = _spec_kind(type(spec))
+        kind = _group_kind(spec)
         groups.append(
             KVGroup(
                 group_id=group_id,
@@ -146,6 +189,7 @@ def describe_kv_groups(
                     if kind in (GROUP_FULL, GROUP_SLIDING_WINDOW)
                     else None
                 ),
+                replay_tokens=int(getattr(spec, "prefix_replay_tokens", 0) or 0),
             )
         )
     return groups
@@ -185,9 +229,10 @@ def hit_chunks(
 
     A hit of ``k`` chunks resumes at token ``k * chunk_tokens`` and needs:
 
-    - every full-attention group: chunks ``0 .. k-1``;
+    - every full-attention or opaque group: chunks ``0 .. k-1``;
     - every sliding-window group: the chunks its window covers there;
-    - every Mamba group: chunk ``k-1``, whose object is the state there.
+    - every Mamba group: chunk ``k-1``, whose object is the state there;
+    - a skipped group: nothing, since vLLM rebuilds it.
 
     A Mamba state is stored only for a chunk that ended a scheduler step, so
     the hit is the longest full-attention prefix cut back to such a chunk.
@@ -205,7 +250,7 @@ def hit_chunks(
         group). ``hit < prefix`` when a later chunk lacks a Mamba state or a
         sliding window.
     """
-    full = [g for g in groups if g.kind == GROUP_FULL]
+    full = [g for g in groups if g.kind in (GROUP_FULL, GROUP_OPAQUE)]
     prefix = next(
         (i for i in range(num_chunks) if not all(has_object(i, g) for g in full)),
         num_chunks,
@@ -280,10 +325,11 @@ def check_multi_group_support(
 
     A model with one group passes (``check_one_group_support`` checks it).
     Several groups are supported in chunkwise (packed) format with full
-    attention, sliding window and Mamba (``align``) groups whose attention
-    groups share one KV shape, with parked loads, without speculative
-    decoding. The CPU, mixed and remote_cxl backends reject several groups
-    on their own, in ``MaruKVConnector``.
+    attention, sliding window, Mamba (``align``) and opaque (MLA) groups
+    whose attention groups share one KV shape, with parked loads, without
+    speculative decoding. Groups vLLM does not prefix-cache are skipped and
+    take no part in the checks. The CPU, mixed and remote_cxl backends
+    reject several groups on their own, in ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.
@@ -299,14 +345,21 @@ def check_multi_group_support(
     """
     if len(groups) <= 1:
         return
-    unsupported = sorted({g.spec_name for g in groups if g.kind == GROUP_UNSUPPORTED})
+    stored = [g for g in groups if g.kind != GROUP_SKIP]
+    if not stored:
+        raise ValueError(
+            "MaruKVConnector stores only the KV cache groups vLLM prefix-caches, "
+            f"and this model has none{one_group_hint(groups)}"
+        )
+    unsupported = sorted({g.spec_name for g in stored if g.kind == GROUP_UNSUPPORTED})
     if unsupported:
         raise ValueError(
             "MaruKVConnector does not support KV cache groups of type "
             f"{', '.join(unsupported)} alongside other groups; supported are "
-            f"{', '.join(_SUPPORTED_SPECS)}{one_group_hint(groups)}"
+            f"{', '.join([*_SUPPORTED_SPECS, *sorted(_OPAQUE_SPECS)])}"
+            f"{one_group_hint(groups)}"
         )
-    shaped = [g for g in groups if g.kv_shape is not None]
+    shaped = [g for g in stored if g.kv_shape is not None]
     if len({g.kv_shape for g in shaped}) > 1:
         # MiMo-V2 and Inkling give their sliding-window layers their own KV
         # heads and head size. vLLM then also gives those groups different
@@ -328,7 +381,7 @@ def check_multi_group_support(
             "MaruKVConnector does not support speculative decoding with models "
             f"that have several KV cache groups{one_group_hint(groups)}"
         )
-    for g in groups:
+    for g in stored:
         if g.kind == GROUP_MAMBA and g.mamba_cache_mode != "align":
             # vLLM 0.30 sets "none" whenever prefix caching is off, even over
             # --mamba-cache-mode align, and defaults to "align" when it is on.
@@ -338,7 +391,7 @@ def check_multi_group_support(
                 "'align', the default with prefix caching "
                 f"(--mamba-cache-mode align; got {g.mamba_cache_mode!r})"
             )
-    group_block_sizes = sorted({g.block_size for g in groups})
+    group_block_sizes = sorted({g.block_size for g in stored})
     if group_block_sizes != [block_size]:
         raise ValueError(
             "MaruKVConnector needs every KV cache group to use the block size "

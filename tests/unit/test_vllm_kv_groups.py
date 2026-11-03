@@ -45,6 +45,8 @@ from maru_vllm.connector import (
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
+    GROUP_OPAQUE,
+    GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
     _spec_kind,
@@ -185,6 +187,158 @@ def test_chunk_is_one_block_with_a_mamba_group():
     assert chunk_tokens_for_groups(qwen, 1088, QWEN35_BLOCK) == QWEN35_BLOCK
     gpt = describe_kv_groups(gpt_oss_config())
     assert chunk_tokens_for_groups(gpt, 256, 16) == 256
+
+
+# =============================================================================
+# DeepSeek-V4.1
+# =============================================================================
+
+DSV41_BLOCK = 16  # tiny geometry; scheduler tests pass block=128
+DSV41_GROUP = 4
+# The kv-source layers' compressed KV and indexer K: name -> bytes per state.
+DSV41_MEMBERS = {
+    "layers.2.attn.kv": 24,
+    "layers.8.attn.kv": 24,
+    "layers.14.attn.kv": 24,
+    "layers.2.attn.indexer": 8,
+    "layers.8.attn.indexer": 8,
+    "layers.14.attn.indexer": 8,
+    "layers.20.attn.kv": 48,
+    "layers.20.attn.indexer": 16,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class _ScratchSpec:
+    """A group vLLM does not prefix-cache: DSV4.1's replayed window or ring."""
+
+    block_size: int
+    page_size_bytes: int
+    prefix_replay_tokens: int = 0
+    prefix_cacheable: bool = False
+
+
+def dsv41_config(block=DSV41_BLOCK, side="worker"):
+    """DSV4.1-Flash's six groups; the scheduler sees group 4's first member."""
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=block, num_kv_heads=1, head_size=size, dtype=torch.uint8
+        )
+        for name, size in DSV41_MEMBERS.items()
+    }
+    window = _ScratchSpec(block // 4, 4096, prefix_replay_tokens=128)
+    groups = [
+        KVCacheGroupSpec([f"layers.{i}.attn.swa" for i in range(g, 40, 4)], window)
+        for g in range(4)
+    ]
+    packed = UniformTypeKVCacheSpecs(block_size=block, kv_cache_specs=mla)
+    groups.append(
+        KVCacheGroupSpec(
+            list(mla), packed if side == "worker" else mla["layers.2.attn.kv"]
+        )
+    )
+    groups.append(
+        KVCacheGroupSpec(
+            [f"layers.{i}.attn.ring" for i in (2, 8, 14)], _ScratchSpec(8, 64)
+        )
+    )
+    return SimpleNamespace(kv_cache_groups=groups, num_blocks=NUM_BLOCKS)
+
+
+def _check_dsv41(config):
+    check_multi_group_support(
+        describe_kv_groups(config),
+        block_size=DSV41_BLOCK,
+        use_layerwise=False,
+        speculative=False,
+        inline_loads=False,
+    )
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_dsv41_groups_skip_what_vllm_does_not_prefix_cache(side):
+    groups = describe_kv_groups(dsv41_config(side=side))
+    assert [g.kind for g in groups] == [GROUP_SKIP] * 4 + [GROUP_OPAQUE, GROUP_SKIP]
+    assert [g.replay_tokens for g in groups] == [128] * 4 + [0, 0]
+
+
+def test_dsv41_passes_the_support_check():
+    _check_dsv41(dsv41_config())
+
+
+@pytest.mark.parametrize(
+    ("setting", "chunk"), [(None, 256), (128, 128), (512, 512), (200, 128)]
+)
+def test_connector_starts_with_dsv41(setting, chunk):
+    """The chunk stays configurable: no Mamba group pins it to one block, and
+    it is only rounded down to a multiple of the block."""
+    extra = {} if setting is None else {"maru_kv_chunk_tokens": setting}
+    connector = MaruKVConnector(
+        _connector_config(128, **extra),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler"),
+    )
+    assert connector._kv_chunk_tokens == chunk
+    assert connector._scheduler._kv_chunk_tokens == chunk
+    assert connector._scheduler._multi_group
+
+
+def test_a_model_with_only_skipped_groups_is_refused():
+    config = dsv41_config()
+    del config.kv_cache_groups[DSV41_GROUP]
+    with pytest.raises(ValueError, match="prefix-cache"):
+        _check_dsv41(config)
+
+
+def test_a_prefix_cached_mla_window_is_refused():
+    """With bounded replay off vLLM prefix-caches the window."""
+    window_mla = getattr(kv_cache_interface, "SlidingWindowMLASpec", None)
+    if window_mla is None or "bounded_replay" not in {
+        f.name for f in dataclasses.fields(window_mla)
+    }:
+        pytest.skip("this vLLM has no bounded replay")
+    config = dsv41_config()
+    spec = window_mla(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=584,
+        dtype=torch.uint8,
+        sliding_window=128,
+        bounded_replay=False,
+    )
+    config.kv_cache_groups[0] = KVCacheGroupSpec(
+        config.kv_cache_groups[0].layer_names, spec
+    )
+    with pytest.raises(ValueError, match="SlidingWindowMLASpec"):
+        _check_dsv41(config)
+
+
+def test_mamba_states_in_one_uniform_group_are_refused():
+    """GLM-5.3-Flash's packed layout wraps its KDA states this way."""
+    names = ["layers.0.kda", "layers.1.kda"]
+    states = UniformTypeKVCacheSpecs(
+        block_size=DSV41_BLOCK, kv_cache_specs={n: _mamba_spec() for n in names}
+    )
+    config = dsv41_config()
+    config.kv_cache_groups[5] = KVCacheGroupSpec(names, states)
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        _check_dsv41(config)
+
+
+def test_an_opaque_object_holds_each_block_once():
+    groups = describe_kv_groups(dsv41_config())
+    page = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
+    assert groups[DSV41_GROUP].slot_bytes == page
+    assert groups[DSV41_GROUP].object_bytes(DSV41_BLOCK) == page
+    assert groups[DSV41_GROUP].object_bytes(2 * DSV41_BLOCK) == 2 * page
+    assert groups[0].object_bytes(2 * DSV41_BLOCK) == 0
+
+
+def test_hit_counts_an_opaque_group_like_full_attention():
+    groups = describe_kv_groups(dsv41_config())
+    stored = {0, 1, 3}  # chunk 2 of group 4 is missing
+    has = lambda i, g: g.group_id == DSV41_GROUP and i in stored
+    assert hit_chunks(groups, 4, 2 * DSV41_BLOCK, has) == (2, 2)
 
 
 # =============================================================================
