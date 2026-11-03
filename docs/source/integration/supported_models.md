@@ -28,7 +28,7 @@ On the CXL storage backend (the default):
    | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢 [2]_         | 🟢 [3]_         | Qwen3.5-0.8B   |
    | full attention                 | Qwen3-Next                         |                 |                 |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
-   | Attention groups whose KV      | Gemma 4, MiMo-V2, Inkling          | ❌              | ❌              |                |
+   | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |                |
    | heads differ in count or size  |                                    |                 |                 |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
    | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |                |
