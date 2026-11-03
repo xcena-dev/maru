@@ -327,8 +327,9 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and opaque (MLA) groups
     whose attention groups share one KV shape, with parked loads, without
-    speculative decoding. Groups vLLM does not prefix-cache are skipped and
-    take no part in the checks. The CPU, mixed and remote_cxl backends
+    speculative decoding; in layerwise format only when every stored group
+    is opaque (DeepSeek-V4.1). Groups vLLM does not prefix-cache are skipped
+    and take no part in the checks. The CPU, mixed and remote_cxl backends
     reject several groups on their own, in ``MaruKVConnector``.
 
     Args:
@@ -371,10 +372,12 @@ def check_multi_group_support(
             + "; ".join(f"group {g.group_id}: {_kv_shape_text(g)}" for g in shaped)
             + ")"
         )
-    if use_layerwise:
+    if use_layerwise and any(g.kind != GROUP_OPAQUE for g in stored):
         raise ValueError(
-            "MaruKVConnector supports models with several KV cache groups only "
-            f"in chunkwise format; set maru_use_layerwise=false{one_group_hint(groups)}"
+            "MaruKVConnector supports models with several KV cache groups in "
+            "layerwise format only when every group it stores is an MLA group "
+            "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
+            f"maru_use_layerwise=false{one_group_hint(groups)}"
         )
     if speculative:
         raise ValueError(
@@ -459,11 +462,15 @@ class GroupCache:
             over every layer at once: row ``b`` is block ``b``.
         layout: Paged KV layout of an attention group; None for Mamba and
             opaque groups.
+        spans: For an opaque group, each layer's ``(offset, bytes)`` inside a
+            row of ``tensors[0]``, in the group's layer order: the layerwise
+            format stores one object per span. Empty otherwise.
     """
 
     group: KVGroup
     tensors: tuple[torch.Tensor, ...]
     layout: KVLayout | None = None
+    spans: tuple[tuple[int, int], ...] = ()
 
 
 def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.Tensor:
@@ -517,7 +524,9 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
     return view
 
 
-def group_block_view(group: KVGroup, kv_caches: dict[str, Any]) -> torch.Tensor:
+def group_block_view(
+    group: KVGroup, kv_caches: dict[str, Any]
+) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
     """An opaque group's blocks as ``uint8 [num_blocks, slot_bytes]``.
 
     vLLM's packed (block-outermost) layout gives every block one stretch of
@@ -530,6 +539,10 @@ def group_block_view(group: KVGroup, kv_caches: dict[str, Any]) -> torch.Tensor:
         group: An opaque group; ``slot_bytes`` is its bytes per block.
         kv_caches: ``register_kv_caches``' argument, holding every layer of
             the group.
+
+    Returns:
+        The view, and each layer's ``(offset, bytes)`` inside a row, in the
+        group's layer order.
 
     Raises:
         ValueError: The layers do not share one buffer and block stride, or
@@ -573,7 +586,11 @@ def group_block_view(group: KVGroup, kv_caches: dict[str, Any]) -> torch.Tensor:
         )
     view = torch.empty(0, dtype=torch.uint8, device=first.device)
     view.set_(storage, start, (first.shape[0], group.slot_bytes), (stride, 1))
-    return view
+    spans = tuple(
+        (offset - start, end - offset)
+        for offset, end in zip(offsets, ends, strict=True)
+    )
+    return view, spans
 
 
 def _kernel_block_size(
@@ -650,7 +667,8 @@ def group_caches(
             caches.append(GroupCache(g, views))
             continue
         if g.kind == GROUP_OPAQUE:
-            caches.append(GroupCache(g, (group_block_view(g, kv_caches),)))
+            view, spans = group_block_view(g, kv_caches)
+            caches.append(GroupCache(g, (view,), spans=spans))
             continue
         if num_kv_heads is None:
             raise ValueError(

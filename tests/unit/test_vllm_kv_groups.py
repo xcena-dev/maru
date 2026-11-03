@@ -266,6 +266,25 @@ def test_dsv41_passes_the_support_check():
     _check_dsv41(dsv41_config())
 
 
+def test_dsv41_passes_the_support_check_in_the_layerwise_format():
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config()),
+        block_size=DSV41_BLOCK,
+        use_layerwise=True,
+        speculative=False,
+        inline_loads=False,
+    )
+
+
+def test_connector_starts_with_dsv41_in_the_layerwise_format():
+    connector = MaruKVConnector(
+        _connector_config(128, maru_use_layerwise=True),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler"),
+    )
+    assert connector._scheduler._use_layerwise
+
+
 @pytest.mark.parametrize(
     ("setting", "chunk"), [(None, 256), (128, 128), (512, 512), (200, 128)]
 )
@@ -479,7 +498,62 @@ def test_dsv41_chunk_without_all_its_blocks_is_not_stored():
     assert set(store) == {group_object_key(k0, DSV41_GROUP, 32)}
 
 
-def test_dsv41_only_the_writer_rank_stores_the_blocks():
+LAYERWISE = {"maru_use_layerwise": True}
+DSV41_FORMATS = pytest.mark.parametrize(
+    "extra", [{}, LAYERWISE], ids=["chunkwise", "layerwise"]
+)
+
+
+def _dsv41_keys(tokens, chunk, num_chunks, layerwise):
+    """Keys the first ``num_chunks`` chunks store: one object per chunk, or
+    one per layer and a ``_DONE`` marker."""
+    keys = set()
+    for key in _chunk_keys(tokens, chunk)[:num_chunks]:
+        base = group_object_key(key, DSV41_GROUP, chunk)
+        if layerwise:
+            keys |= {f"{base}_L{i}" for i in range(len(DSV41_MEMBERS))}
+            keys.add(f"{base}_DONE")
+        else:
+            keys.add(base)
+    return keys
+
+
+def _dsv41_spans():
+    """(offset, bytes) of each layer in a block's group page."""
+    spans, at = [], 0
+    for size in DSV41_MEMBERS.values():
+        spans.append((at, DSV41_BLOCK * size))
+        at += DSV41_BLOCK * size
+    return spans
+
+
+@pytest.mark.parametrize("per", [1, 2], ids=["1-block", "2-blocks"])
+def test_dsv41_layerwise_stores_each_layer_and_then_marks_the_chunk(per):
+    chunk = per * DSV41_BLOCK
+    worker, store = _dsv41_storing_worker(
+        _dsv41_shared(), chunk=chunk, extra_config=LAYERWISE
+    )
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+    assert set(store) == _dsv41_keys(tokens, chunk, 64 // chunk, layerwise=True)
+    blocks = _cache_of(worker, DSV41_GROUP).tensors[0]
+    for c, key in enumerate(_chunk_keys(tokens, chunk)[: 64 // chunk]):
+        base = group_object_key(key, DSV41_GROUP, chunk)
+        ids = DSV41_BLOCKS_A[c * per : (c + 1) * per]
+        for i, (offset, size) in enumerate(_dsv41_spans()):
+            expected = b"".join(
+                bytes(blocks[b, offset : offset + size].numpy()) for b in ids
+            )
+            assert store[f"{base}_L{i}"] == expected
+    # The markers go in a second RPC, once every layer of their chunk is in.
+    first, second = worker._handler.batch_store.call_args_list
+    assert not any(k.endswith("_DONE") for k in first.args[0])
+    assert all(k.endswith("_DONE") for k in second.args[0])
+    assert worker._page_size_bytes == per * DSV41_BLOCK * max(DSV41_MEMBERS.values())
+
+
+@DSV41_FORMATS
+def test_dsv41_only_the_writer_rank_stores_the_blocks(extra):
     """Every rank holds the same MLA bytes, so only rank 0 stores them, under
     keys without a slice suffix."""
     server = FirstWinsServer()
@@ -493,12 +567,11 @@ def test_dsv41_only_the_writer_rank_stores_the_blocks():
             server,
             dsv41_config(),
             chunk,
+            extra_config=extra,
         )
         worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
         workers.append(worker)
-    assert _registered_keys(workers[0]) == {
-        group_object_key(k, DSV41_GROUP, chunk) for k in _chunk_keys(tokens, chunk)
-    }
+    assert _registered_keys(workers[0]) == _dsv41_keys(tokens, chunk, 2, bool(extra))
     for worker in workers[1:]:
         assert _registered_keys(worker) == set()
 
@@ -506,27 +579,29 @@ def test_dsv41_only_the_writer_rank_stores_the_blocks():
 DSV41_BLOCKS_B = [3, 8, 1, 6]  # request B's group-4 blocks for the same tokens
 
 
-def _dsv41_stored(chunk=2 * DSV41_BLOCK):
+def _dsv41_stored(chunk=2 * DSV41_BLOCK, **kwargs):
     """Request A's objects for tokens 0-63."""
-    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk)
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk, **kwargs)
     worker.wait_for_save(
         _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64)
     )
     return worker, store
 
 
-def _dsv41_loading_worker(store, chunk=2 * DSV41_BLOCK):
+def _dsv41_loading_worker(store, chunk=2 * DSV41_BLOCK, **kwargs):
     target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
-    worker, _ = _dsv41_storing_worker(target, chunk=chunk)
+    worker, _ = _dsv41_storing_worker(target, chunk=chunk, **kwargs)
     _serve(worker, store)
     return worker
 
 
+@DSV41_FORMATS
 @pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
-def test_dsv41_parked_load_restores_the_blocks(per):
+def test_dsv41_parked_load_restores_the_blocks(per, extra):
     chunk = per * DSV41_BLOCK
-    stored, store = _dsv41_stored(chunk)
-    worker = _dsv41_loading_worker(store, chunk)
+    stored, store = _dsv41_stored(chunk, extra_config=extra)
+    assert set(store) == _dsv41_keys(list(range(80)), chunk, 64 // chunk, bool(extra))
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
     meta = _load_meta(
         list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
     )
@@ -536,14 +611,16 @@ def test_dsv41_parked_load_restores_the_blocks(per):
     assert worker.take_failed_load_blocks() == set()
 
 
+@DSV41_FORMATS
 @pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
-def test_dsv41_load_skips_blocks_vllms_cache_holds(per):
+def test_dsv41_load_skips_blocks_vllms_cache_holds(per, extra):
     """vLLM's prefix cache holds tokens 0-15, and that block may be shared.
     With one block per chunk the whole first chunk is skipped; with more,
     only the first block of the first chunk."""
     chunk = per * DSV41_BLOCK
-    stored, store = _dsv41_stored(chunk)
-    worker = _dsv41_loading_worker(store, chunk)
+    stored, store = _dsv41_stored(chunk, extra_config=extra)
+    assert set(store) == _dsv41_keys(list(range(80)), chunk, 64 // chunk, bool(extra))
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
     meta = _load_meta(
         list(range(80)),
         _dsv41_blocks(DSV41_BLOCKS_B),
@@ -558,7 +635,8 @@ def test_dsv41_load_skips_blocks_vllms_cache_holds(per):
         assert _block_bytes(worker, b) == _block_bytes(stored, a)
 
 
-def test_dsv41_every_rank_loads_the_writers_blocks():
+@DSV41_FORMATS
+def test_dsv41_every_rank_loads_the_writers_blocks(extra):
     server = FirstWinsServer()
     tokens = list(range(80))
     chunk = 2 * DSV41_BLOCK
@@ -568,8 +646,10 @@ def test_dsv41_every_rank_loads_the_writers_blocks():
         server,
         dsv41_config(),
         chunk,
+        extra_config=extra,
     )
     writer.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+    assert _registered_keys(writer) == _dsv41_keys(tokens, chunk, 2, bool(extra))
     for rank in range(1, 4):
         target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
         worker = _tp_worker(
@@ -578,6 +658,7 @@ def test_dsv41_every_rank_loads_the_writers_blocks():
             server,
             dsv41_config(),
             chunk,
+            extra_config=extra,
         )
         meta = _load_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_B), 2, deferred_load=True)
         worker.start_load_kv(_FORWARD, meta)
@@ -586,15 +667,34 @@ def test_dsv41_every_rank_loads_the_writers_blocks():
             assert _block_bytes(worker, b) == _block_bytes(writer, a)
 
 
-def _dsv41_scheduler(stored, chunk=256):
+def _dsv41_scheduler(stored, chunk=256, **extra):
     sched = make_scheduler(
         128,
         chunk,
-        {"maru_async_load": True},
+        {"maru_async_load": True, **extra},
         kv_groups=describe_kv_groups(dsv41_config(block=128, side="scheduler")),
     )
     sched._handler = _Store(stored)
     return sched
+
+
+def test_dsv41_layerwise_lookup_asks_for_the_done_markers():
+    a = list(range(1100))
+    markers = [
+        group_object_key(k, DSV41_GROUP, 256) + "_DONE" for k in _chunk_keys(a, 256)
+    ]
+    sched = _dsv41_scheduler(set(markers), **LAYERWISE)
+    assert _hit(sched, a) == 1024
+    (query,) = sched._handler.queries
+    assert query == markers
+
+
+def test_dsv41_layerwise_chunk_without_its_marker_is_a_miss():
+    """Its layers may be stored only in part."""
+    a = list(range(1100))
+    stored = _dsv41_keys(a, 256, 4, layerwise=True)
+    stored.remove(group_object_key(_chunk_keys(a, 256)[2], DSV41_GROUP, 256) + "_DONE")
+    assert _hit(_dsv41_scheduler(stored, **LAYERWISE), a) == 512
 
 
 def test_dsv41_lookup_asks_only_for_the_stored_group():

@@ -1378,7 +1378,12 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             into the paged cache per chunk, store gathers one D2H per chunk —
             falling back to per-layer copies otherwise. A slab whose region
             failed CUDA registration is staged through one chunk of GPU
-            memory and still placed by the kernel. See design note P6.
+            memory and still placed by the kernel. See design note P6. A model
+            with several KV cache groups takes layerwise only when every
+            group it stores is an MLA group (DeepSeek-V4.1): each layer of a
+            (chunk, group) object is keyed <object key>_L<position in the
+            group>, it is stored after the forward and loaded before it, and
+            its _DONE marker follows its layers.
 
     Diagnostics and fallback guards — leave these alone in normal operation:
         maru_pin_pools: bool - cpu and mixed backends: fault the pools in and
@@ -2084,11 +2089,14 @@ class MaruSchedulerConnector:
         # RPC below asks about every one: build each key list once.
         @functools.cache
         def object_keys(i: int, g: KVGroup) -> list[str]:
+            # Layerwise, a (chunk, group) is looked up by its _DONE marker.
             suffixes = (
                 self._state_suffixes if g.kind == GROUP_MAMBA else self._shard_suffixes
             )
             return [
-                group_object_key(chunk_keys[i] + suffix, g.group_id, chunk_tokens)
+                self._chunk_exists_key(
+                    group_object_key(chunk_keys[i] + suffix, g.group_id, chunk_tokens)
+                )
                 for suffix in suffixes
             ]
 
@@ -3115,9 +3123,18 @@ class MaruWorkerConnector:
             num_kv_heads=self._num_kv_heads,
             head_size=self._head_size,
         )
-        self._page_size_bytes = max(
-            g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
-        )
+        if self._use_layerwise:
+            # One object per (chunk, layer) of an opaque group, the only kind
+            # several groups store in this format.
+            self._page_size_bytes = max(
+                self._kv_chunk_tokens // c.group.block_size * size
+                for c in self._group_caches
+                for _, size in c.spans
+            )
+        else:
+            self._page_size_bytes = max(
+                g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
+            )
         configured = self._extra_config.get("maru_chunk_size")
         if configured is not None and _parse_size(configured) < self._page_size_bytes:
             raise ValueError(
@@ -3568,19 +3585,22 @@ class MaruWorkerConnector:
 
     def _retrieve_group_objects(
         self, req_meta: MaruReqMeta
-    ) -> tuple[int, list[tuple[GroupCache, int, Any]]] | None:
+    ) -> tuple[int, list[tuple[GroupCache, int, int | None, Any]]] | None:
         """Fetch every object the request's hit needs, in one batch.
 
-        The scheduler's hit rule decides which: full attention every hit
-        chunk, sliding window the chunks its window covers at the hit's end,
-        Mamba the last hit chunk. Chunks wholly before ``load_start_token``,
-        which vLLM's prefix cache already holds, are skipped. All or nothing:
-        an object missing since the scheduler's lookup fails the load, and
-        vLLM recomputes.
+        The scheduler's hit rule decides which: full attention and opaque
+        groups every hit chunk, sliding window the chunks its window covers
+        at the hit's end, Mamba the last hit chunk. Chunks wholly before
+        ``load_start_token``, which vLLM's prefix cache already holds, are
+        skipped. An opaque group in layerwise format has one object per
+        layer of each chunk. All or nothing: an object missing since the
+        scheduler's lookup fails the load, and vLLM recomputes.
 
         Returns:
-            ``(hit chunks, [(group, chunk index, object info)])``, or None
-            after reporting the failure.
+            ``(hit chunks, [(group, chunk index, layer, object info)])``,
+            where layer is the layer's position in an opaque group stored
+            layerwise and None otherwise; or None after reporting the
+            failure.
         """
         ct = self._kv_chunk_tokens
         hit = min(req_meta.num_matched_chunks, len(req_meta.token_ids) // ct)
@@ -3588,7 +3608,7 @@ class MaruWorkerConnector:
             self._fail_load(req_meta, RuntimeError("no chunk to load"))
             return None
         first = req_meta.load_start_token // ct
-        plan: list[tuple[GroupCache, int]] = []
+        plan: list[tuple[GroupCache, int, int | None]] = []
         for cache in self._group_caches:
             group = cache.group
             if group.kind == GROUP_MAMBA:
@@ -3598,15 +3618,22 @@ class MaruWorkerConnector:
                 chunks = range(max(window.start, first), window.stop)
             else:
                 chunks = range(first, hit)
-            plan += [(cache, ci) for ci in chunks]
+            parts: list[int | None] = (
+                list(range(len(cache.spans)))
+                if self._use_layerwise and group.kind == GROUP_OPAQUE
+                else [None]
+            )
+            plan += [(cache, ci, part) for ci in chunks for part in parts]
         chunk_keys = {
             c.group.group_id: self._slice_chunk_keys(req_meta, c.group)
             for c in self._group_caches
         }
-        keys = [
-            group_object_key(chunk_keys[c.group.group_id][ci], c.group.group_id, ct)
-            for c, ci in plan
-        ]
+        keys = []
+        for c, ci, part in plan:
+            key = group_object_key(
+                chunk_keys[c.group.group_id][ci], c.group.group_id, ct
+            )
+            keys.append(key if part is None else _chunk_layer_key(key, part))
         try:
             infos = self._batch_retrieve_all(keys)
         except Exception as e:
@@ -3619,12 +3646,14 @@ class MaruWorkerConnector:
                 RuntimeError(f"{missing} of {len(keys)} objects missing"),
             )
             return None
-        return hit, [(c, ci, info) for (c, ci), info in zip(plan, infos, strict=True)]
+        return hit, [
+            (c, ci, part, info) for (c, ci, part), info in zip(plan, infos, strict=True)
+        ]
 
     def _place_group_objects(
         self,
         req_meta: MaruReqMeta,
-        objects: tuple[int, list[tuple[GroupCache, int, Any]]],
+        objects: tuple[int, list[tuple[GroupCache, int, int | None, Any]]],
         device: torch.device,
         stage: bool,
     ) -> None:
@@ -3635,13 +3664,13 @@ class MaruWorkerConnector:
         as a parked load must (see ``_place_chunk``).
         """
         hit, placed = objects
-        for cache, ci, info in placed:
+        for cache, ci, part, info in placed:
             block_ids = req_meta.group_block_ids[cache.group.group_id]
             if cache.group.kind == GROUP_MAMBA:
                 self._place_state(cache, info, block_ids, req_meta, hit, device)
             elif cache.group.kind == GROUP_OPAQUE:
                 self._place_group_blocks(
-                    cache, ci, info, block_ids, req_meta.load_start_token, device
+                    cache, ci, info, block_ids, req_meta.load_start_token, device, part
                 )
             else:
                 self._place_chunk(
@@ -3768,20 +3797,23 @@ class MaruWorkerConnector:
         block_ids: list[int],
         start: int,
         device: torch.device,
+        layer: int | None = None,
     ) -> None:
         """Write an opaque group's object into the chunk's blocks.
 
-        Skips the blocks before ``start``, which vLLM's prefix cache already
-        holds (possibly shared with running requests).
+        ``layer`` names the layer of a layerwise object; None for a chunkwise
+        object, which holds the whole group page of each block. Skips the
+        blocks before ``start``, which vLLM's prefix cache already holds
+        (possibly shared with running requests).
         """
         group = cache.group
         (blocks,) = cache.tensors
         per = self._kv_chunk_tokens // group.block_size
-        size = group.object_bytes(self._kv_chunk_tokens)
+        offset, width = (0, group.slot_bytes) if layer is None else cache.spans[layer]
         src = (
-            torch.frombuffer(info.view[:size], dtype=torch.uint8)
+            torch.frombuffer(info.view[: per * width], dtype=torch.uint8)
             .to(device, non_blocking=True)
-            .view(per, group.slot_bytes)
+            .view(per, width)
         )
         for j in range(per):
             position = chunk * per + j
@@ -3791,7 +3823,9 @@ class MaruWorkerConnector:
                 raise RuntimeError(
                     f"group {group.group_id} has no block at position {position}"
                 )
-            blocks[block_ids[position]].copy_(src[j], non_blocking=True)
+            blocks[block_ids[position], offset : offset + width].copy_(
+                src[j], non_blocking=True
+            )
 
     def _try_submit_deferred_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a deferred load to the background loader thread.
@@ -6097,6 +6131,9 @@ class MaruWorkerConnector:
             return
         keys: list[str] = []
         handles: list = []
+        # Layerwise: each (chunk, group) object key -> its layers' keys, whose
+        # _DONE marker goes in once they are all registered.
+        markers: dict[str, list[str]] = {}
         for cache in self._group_caches:
             group = cache.group
             if not self._stores(group):
@@ -6108,7 +6145,7 @@ class MaruWorkerConnector:
                     self._gather_states(cache, metadata, keys, handles)
                     continue
                 if group.kind == GROUP_OPAQUE:
-                    self._gather_group_blocks(cache, metadata, keys, handles)
+                    self._gather_group_blocks(cache, metadata, keys, handles, markers)
                     continue
                 target = self._group_target(cache)
                 kernel = self._group_kernel(cache)
@@ -6123,6 +6160,31 @@ class MaruWorkerConnector:
                     "Maru store of KV cache group %d failed: %s", group.group_id, e
                 )
         self._register_objects(keys, handles, "group")
+        self._register_done_markers(markers)
+
+    def _register_done_markers(self, markers: dict[str, list[str]]) -> None:
+        """Register the ``_DONE`` marker of each layerwise (chunk, group)
+        whose layers are all stored, in one ``batch_store`` after theirs.
+
+        The scheduler looks a layerwise chunk up by its marker, so a marker
+        never names a chunk with a layer missing.
+        """
+        handler = self._handler
+        assert handler is not None
+        keys: list[str] = []
+        handles: list = []
+        for base, layer_keys in markers.items():
+            if not all(self._is_stored(key) for key in layer_keys):
+                continue
+            handle = None
+            try:
+                handle = handler.alloc(1)
+            except Exception as e:
+                logger.warning("Maru _DONE marker alloc failed for %s: %s", base, e)
+                continue
+            keys.append(f"{base}_DONE")
+            handles.append(handle)
+        self._register_objects(keys, handles, "layerwise marker")
 
     def _group_target(self, cache: GroupCache) -> _SlabTarget:
         """The slab of one attention group: its layers, in group order."""
@@ -6331,14 +6393,18 @@ class MaruWorkerConnector:
         metadata: MaruConnectorMetadata,
         keys: list[str],
         handles: list,
+        markers: dict[str, list[str]],
     ) -> None:
         """Copy the blocks of every chunk an opaque group's step completed.
 
-        The object holds the chunk's blocks in order, each as the group's
-        bytes vLLM packs into that block, without reading their format
-        (DeepSeek-V4.1's compressed KV and indexer keys). A chunk with a
-        block missing or null is not stored. Appends to the caller's ``keys``
-        and ``handles``.
+        Chunkwise, the object holds the chunk's blocks in order, each as the
+        group's bytes vLLM packs into that block, without reading their
+        format (DeepSeek-V4.1's compressed KV and indexer keys). Layerwise,
+        the i-th layer of the group gets its own object, keyed
+        ``<object key>_L<i>``, with that layer's bytes of the chunk's blocks,
+        and the object key goes into ``markers`` for its ``_DONE`` marker. A
+        chunk with a block missing or null is not stored. Appends to the
+        caller's ``keys`` and ``handles``.
         """
         handler = self._handler
         assert handler is not None
@@ -6346,13 +6412,18 @@ class MaruWorkerConnector:
         (blocks,) = cache.tensors
         ct = self._kv_chunk_tokens
         per = ct // group.block_size
-        size = group.object_bytes(ct)
+        spans = cache.spans if self._use_layerwise else ((0, group.slot_bytes),)
         for req_meta in self._store_entries(metadata):
             chunk_keys = self._slice_chunk_keys(req_meta, group)
             block_ids = req_meta.group_block_ids[group.group_id]
             for ci in _step_chunks(req_meta, ct, len(chunk_keys)):
-                key = group_object_key(chunk_keys[ci], group.group_id, ct)
-                if self._is_stored(key) or key in keys:
+                base = group_object_key(chunk_keys[ci], group.group_id, ct)
+                part_keys = (
+                    [_chunk_layer_key(base, i) for i in range(len(spans))]
+                    if self._use_layerwise
+                    else [base]
+                )
+                if all(self._is_stored(k) or k in keys for k in part_keys):
                     continue
                 ids = block_ids[ci * per : (ci + 1) * per]
                 if len(ids) < per or 0 in ids:
@@ -6365,20 +6436,25 @@ class MaruWorkerConnector:
                         ids,
                     )
                     continue
-                handle = None
-                try:
-                    handle = handler.alloc(size)
-                    obj = torch.frombuffer(handle.buf[:size], dtype=torch.uint8)
-                    obj.view(per, group.slot_bytes).copy_(
-                        blocks[torch.tensor(ids, device=blocks.device)]
-                    )
-                except Exception as e:
-                    logger.error("Maru group store error: %s: %s", key, e)
-                    if handle is not None:
-                        self._free_handles_best_effort([handle])
-                    continue
-                keys.append(key)
-                handles.append(handle)
+                index = torch.tensor(ids, device=blocks.device)
+                for key, (offset, size) in zip(part_keys, spans, strict=True):
+                    if self._is_stored(key) or key in keys:
+                        continue
+                    nbytes = per * size
+                    handle = None
+                    try:
+                        handle = handler.alloc(nbytes)
+                        obj = torch.frombuffer(handle.buf[:nbytes], dtype=torch.uint8)
+                        obj.view(per, size).copy_(blocks[index, offset : offset + size])
+                    except Exception as e:
+                        logger.error("Maru group store error: %s: %s", key, e)
+                        if handle is not None:
+                            self._free_handles_best_effort([handle])
+                        continue
+                    keys.append(key)
+                    handles.append(handle)
+                if self._use_layerwise:
+                    markers[base] = part_keys
 
     def _packed_store_kernel_ctx(self, attn_metadata: Any) -> tuple | None:
         """Kernel ctx for the coalesced packed store, or None for the fallback.
