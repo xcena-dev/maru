@@ -733,7 +733,12 @@ vllm serve Qwen/Qwen3.5-0.8B \
     }'
 ```
 
-On B200 or GB200, add `--attention-backend TRITON_ATTN`.
+On B200 or GB200, add `--attention-backend TRITON_ATTN`. On vLLM 0.32.1rc0 and later, also add `--gdn-prefill-backend triton`; see {ref}`vllm-gdn-prefill-backend`.
+
+(vllm-gdn-prefill-backend)=
+### Gated DeltaNet prefill kernel
+
+On vLLM 0.32.1rc0 and later, run a Gated DeltaNet model such as Qwen3.5 or Qwen3-Next with `--gdn-prefill-backend triton`. From these versions, when the GDN prefill kernel is FlashInfer's, vLLM no longer ends a scheduler step at the last block boundary of a prompt: the kernel writes the state there inside the forward. The connector stores a Mamba-type state only where a step ends on a chunk boundary, so a prompt prefilled in one step stores no state, and a later request with the same prefix hits nothing. Nothing reports an error. vLLM picks the FlashInfer kernel by default on Hopper, and on Blackwell when the model's linear-attention key heads are 128 wide and the CUDA runtime is 13 or later. `--attention-backend` does not change this kernel. vLLM 0.32.0 and earlier end the step at that boundary and are not affected.
 
 ### What differs from a model with one group
 

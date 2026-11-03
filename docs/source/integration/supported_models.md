@@ -18,7 +18,7 @@ CXL storage backend (the default), at any tensor parallel size:
 | Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | Supported | Llama-3.1-8B, TP 1 and 2 |
 | MLA, one KV cache group | DeepSeek-V3, DeepSeek-R1, Kimi-K2 | Supported; above TP=1, rank 0 alone stores the latent that every rank holds | DeepSeek-V2-Lite, TP 1 and 2 |
 | Sliding window + full attention | gpt-oss | Supported on vLLM 0.30+: as several KV cache groups, or as one group (see {ref}`vllm-hybrid-one-group`) | gpt-oss-20b, TP 1 and 2, both ways |
-| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | Supported on vLLM 0.30+ | Qwen3.5-0.8B, TP 1 and 2; Qwen3.8-27B and Qwen3.6-35B-A3B with dummy weights |
+| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | Supported on vLLM 0.30+; on vLLM 0.32.1rc0 and later, start vLLM with `--gdn-prefill-backend triton` (see {ref}`vllm-gdn-prefill-backend`) | Qwen3.5-0.8B, TP 1 and 2; Qwen3.8-27B and Qwen3.6-35B-A3B with dummy weights |
 | Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape | |
 | DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape | |
 | MLA with other kinds of group | GLM-5.3-Flash, DeepSeek-V4.1-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers | |
