@@ -68,6 +68,8 @@ class KVGroup:
         replay_tokens: Tokens vLLM recomputes before a prefix hit to rebuild
             this group (DeepSeek-V4.1's bounded-replay sliding window); 0 for
             most groups.
+        member_specs: For a ``UniformTypeKVCacheSpecs`` group, its members'
+            class names, so messages can name what it wraps. Empty otherwise.
     """
 
     group_id: int
@@ -81,6 +83,7 @@ class KVGroup:
     state_bytes: int = 0
     kv_shape: tuple[int, int, int] | None = None
     replay_tokens: int = 0
+    member_specs: tuple[str, ...] = ()
 
     def object_bytes(self, chunk_tokens: int) -> int:
         """Bytes of this group's object for one chunk; 0 for a skipped group.
@@ -190,9 +193,25 @@ def describe_kv_groups(
                     else None
                 ),
                 replay_tokens=int(getattr(spec, "prefix_replay_tokens", 0) or 0),
+                member_specs=_member_specs(spec),
             )
         )
     return groups
+
+
+def _member_specs(spec: Any) -> tuple[str, ...]:
+    """Class names of a ``UniformTypeKVCacheSpecs``'s members; () otherwise."""
+    members = getattr(spec, "kv_cache_specs", None)
+    if not isinstance(members, dict):
+        return ()
+    return tuple(sorted({type(member).__name__ for member in members.values()}))
+
+
+def _group_label(group: KVGroup) -> str:
+    """The group's spec class, with what it wraps for a UniformType group."""
+    if group.member_specs:
+        return f"{group.spec_name} of {', '.join(group.member_specs)}"
+    return group.spec_name
 
 
 def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
@@ -295,11 +314,12 @@ def one_group_hint(groups: list[KVGroup]) -> str:
     """How to run a model without a Mamba group as one KV cache group instead.
 
     vLLM can merge sliding-window layers into full attention when its hybrid
-    KV cache manager is off; Mamba layers it cannot merge. The attention
-    backend must then take layers with different windows in one group, which
-    FlashInfer (vLLM 0.30's default on Blackwell) does not.
+    KV cache manager is off; Mamba layers it cannot merge, nor DeepSeek-V4.1's
+    skipped and MLA groups. The attention backend must then take layers with
+    different windows in one group, which FlashInfer (vLLM 0.30's default on
+    Blackwell) does not.
     """
-    if any(g.kind == GROUP_MAMBA for g in groups):
+    if any(g.kind in (GROUP_MAMBA, GROUP_SKIP, GROUP_OPAQUE) for g in groups):
         return ""
     hint = (
         "; or start vLLM with --disable-hybrid-kv-cache-manager to run the "
@@ -352,13 +372,26 @@ def check_multi_group_support(
             "MaruKVConnector stores only the KV cache groups vLLM prefix-caches, "
             f"and this model has none{one_group_hint(groups)}"
         )
-    unsupported = sorted({g.spec_name for g in stored if g.kind == GROUP_UNSUPPORTED})
+    unsupported = [g for g in stored if g.kind == GROUP_UNSUPPORTED]
     if unsupported:
+        windowed = any(
+            "SlidingWindowMLASpec" in (g.spec_name, *g.member_specs)
+            for g in unsupported
+        )
         raise ValueError(
             "MaruKVConnector does not support KV cache groups of type "
-            f"{', '.join(unsupported)} alongside other groups; supported are "
+            f"{', '.join(sorted({_group_label(g) for g in unsupported}))} "
+            "alongside other groups; supported are "
             f"{', '.join([*_SUPPORTED_SPECS, *sorted(_OPAQUE_SPECS)])}"
-            f"{one_group_hint(groups)}"
+            + (
+                # vLLM prefix-caches DeepSeek-V4.1's sliding window only when
+                # bounded replay is off (V1 model runner, ROCm, or the flag).
+                ". DeepSeek-V4.1's sliding window must stay out of vLLM's "
+                "prefix cache: keep --swa-bounded-replay on and vLLM's V2 "
+                "model runner (both the default on CUDA)"
+                if windowed
+                else one_group_hint(groups)
+            )
         )
     shaped = [g for g in stored if g.kv_shape is not None]
     if len({g.kv_shape for g in shaped}) > 1:

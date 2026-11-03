@@ -208,40 +208,62 @@ DSV41_MEMBERS = {
 }
 
 
-@dataclasses.dataclass(frozen=True)
-class _ScratchSpec:
-    """A group vLLM does not prefix-cache: DSV4.1's replayed window or ring."""
+def _window_mla(block, bounded_replay=True):
+    """DeepSeek-V4.1's sliding-window cache; bounded replay keeps it out of
+    vLLM's prefix cache."""
+    window_mla = getattr(kv_cache_interface, "SlidingWindowMLASpec", None)
+    if window_mla is None or "bounded_replay" not in {
+        f.name for f in dataclasses.fields(window_mla)
+    }:
+        pytest.skip("this vLLM has no bounded replay")
+    return window_mla(
+        block_size=block,
+        num_kv_heads=1,
+        head_size=584,
+        dtype=torch.uint8,
+        sliding_window=128,
+        bounded_replay=bounded_replay,
+    )
 
-    block_size: int
-    page_size_bytes: int
-    prefix_replay_tokens: int = 0
-    prefix_cacheable: bool = False
+
+def _ring(block):
+    """DeepSeek-V4.1's compressor ring, which vLLM never prefix-caches."""
+    ring = getattr(kv_cache_interface, "CircularBufferSpec", None)
+    if ring is None:
+        pytest.skip("this vLLM has no CircularBufferSpec")
+    return ring(block_size=block, num_kv_heads=1, head_size=8, dtype=torch.uint8)
 
 
-def dsv41_config(block=DSV41_BLOCK, side="worker"):
-    """DSV4.1-Flash's six groups; the scheduler sees group 4's first member."""
+def _group(specs, side):
+    """A group as vLLM 0.33 hands it over: its packed planner wraps every
+    group in UniformTypeKVCacheSpecs for the worker, and the scheduler sees
+    the first member."""
+    first = next(iter(specs.values()))
+    spec = (
+        UniformTypeKVCacheSpecs(block_size=first.block_size, kv_cache_specs=specs)
+        if side == "worker"
+        else first
+    )
+    return KVCacheGroupSpec(list(specs), spec)
+
+
+def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
+    """DSV4.1-Flash's six groups: four sliding windows, the compressed KV and
+    indexer keys, and the compressor ring."""
+    window = window or _window_mla(block // 4)
     mla = {
         name: MLAAttentionSpec(
             block_size=block, num_kv_heads=1, head_size=size, dtype=torch.uint8
         )
         for name, size in DSV41_MEMBERS.items()
     }
-    window = _ScratchSpec(block // 4, 4096, prefix_replay_tokens=128)
     groups = [
-        KVCacheGroupSpec([f"layers.{i}.attn.swa" for i in range(g, 40, 4)], window)
+        _group({f"layers.{i}.attn.swa": window for i in range(g, 40, 4)}, side)
         for g in range(4)
     ]
-    packed = UniformTypeKVCacheSpecs(block_size=block, kv_cache_specs=mla)
-    groups.append(
-        KVCacheGroupSpec(
-            list(mla), packed if side == "worker" else mla["layers.2.attn.kv"]
-        )
-    )
-    groups.append(
-        KVCacheGroupSpec(
-            [f"layers.{i}.attn.ring" for i in (2, 8, 14)], _ScratchSpec(8, 64)
-        )
-    )
+    groups.append(_group(mla, side))
+    ring = _ring(8)
+    groups.append(_group({f"layers.{i}.attn.ring": ring for i in (2, 8, 14)}, side))
     return SimpleNamespace(kv_cache_groups=groups, num_blocks=NUM_BLOCKS)
 
 
@@ -309,27 +331,20 @@ def test_a_model_with_only_skipped_groups_is_refused():
         _check_dsv41(config)
 
 
-def test_a_prefix_cached_mla_window_is_refused():
-    """With bounded replay off vLLM prefix-caches the window."""
-    window_mla = getattr(kv_cache_interface, "SlidingWindowMLASpec", None)
-    if window_mla is None or "bounded_replay" not in {
-        f.name for f in dataclasses.fields(window_mla)
-    }:
-        pytest.skip("this vLLM has no bounded replay")
-    config = dsv41_config()
-    spec = window_mla(
-        block_size=4,
-        num_kv_heads=1,
-        head_size=584,
-        dtype=torch.uint8,
-        sliding_window=128,
-        bounded_replay=False,
-    )
-    config.kv_cache_groups[0] = KVCacheGroupSpec(
-        config.kv_cache_groups[0].layer_names, spec
-    )
-    with pytest.raises(ValueError, match="SlidingWindowMLASpec"):
-        _check_dsv41(config)
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_a_prefix_cached_mla_window_is_refused(side):
+    """With bounded replay off vLLM prefix-caches the window, which Maru does
+    not store. The worker, which reports first, sees it wrapped in
+    UniformTypeKVCacheSpecs; the error names the window spec and the setting
+    to keep, and not --disable-hybrid-kv-cache-manager, which cannot merge
+    DeepSeek-V4.1's groups."""
+    window = _window_mla(DSV41_BLOCK // 4, bounded_replay=False)
+    with pytest.raises(ValueError) as refused:
+        _check_dsv41(dsv41_config(side=side, window=window))
+    message = str(refused.value)
+    assert "SlidingWindowMLASpec" in message
+    assert "--swa-bounded-replay" in message
+    assert "--disable-hybrid-kv-cache-manager" not in message
 
 
 def test_mamba_states_in_one_uniform_group_are_refused():
