@@ -146,8 +146,7 @@ extra_config:
 For runnable examples, see
 [LMCache Examples](../getting_started/examples/lmcache/index.md).
 
-> **See also:** [Supported Models](supported_models.md),
-> [Architecture Overview](../design_doc/architecture_overview.md),
+> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
 > [MaruHandler Design](../design_doc/maru_handler.md),
 > [Python API Reference](../api_reference/api.md),
 > [Configuration Reference](../api_reference/config.md)
