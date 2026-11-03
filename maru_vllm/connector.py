@@ -6062,6 +6062,9 @@ class MaruWorkerConnector:
                 if group.kind == GROUP_MAMBA:
                     self._gather_states(cache, metadata, keys, handles)
                     continue
+                if group.kind == GROUP_OPAQUE:
+                    self._gather_group_blocks(cache, metadata, keys, handles)
+                    continue
                 target = self._group_target(cache)
                 kernel = self._group_kernel(cache)
                 if kernel is None:
@@ -6276,6 +6279,61 @@ class MaruWorkerConnector:
                 continue
             keys.append(key)
             handles.append(handle)
+
+    def _gather_group_blocks(
+        self,
+        cache: GroupCache,
+        metadata: MaruConnectorMetadata,
+        keys: list[str],
+        handles: list,
+    ) -> None:
+        """Copy the blocks of every chunk an opaque group's step completed.
+
+        The object holds the chunk's blocks in order, each as the group's
+        bytes vLLM packs into that block, without reading their format
+        (DeepSeek-V4.1's compressed KV and indexer keys). A chunk with a
+        block missing or null is not stored. Appends to the caller's ``keys``
+        and ``handles``.
+        """
+        handler = self._handler
+        assert handler is not None
+        group = cache.group
+        (blocks,) = cache.tensors
+        ct = self._kv_chunk_tokens
+        per = ct // group.block_size
+        size = group.object_bytes(ct)
+        for req_meta in self._store_entries(metadata):
+            chunk_keys = self._slice_chunk_keys(req_meta, group)
+            block_ids = req_meta.group_block_ids[group.group_id]
+            for ci in _step_chunks(req_meta, ct, len(chunk_keys)):
+                key = group_object_key(chunk_keys[ci], group.group_id, ct)
+                if self._is_stored(key) or key in keys:
+                    continue
+                ids = block_ids[ci * per : (ci + 1) * per]
+                if len(ids) < per or 0 in ids:
+                    logger.error(
+                        "Maru group store: req %s has no block for every part of "
+                        "chunk %d of group %d (blocks %s); skipping",
+                        req_meta.req_id,
+                        ci,
+                        group.group_id,
+                        ids,
+                    )
+                    continue
+                handle = None
+                try:
+                    handle = handler.alloc(size)
+                    obj = torch.frombuffer(handle.buf[:size], dtype=torch.uint8)
+                    obj.view(per, group.slot_bytes).copy_(
+                        blocks[torch.tensor(ids, device=blocks.device)]
+                    )
+                except Exception as e:
+                    logger.error("Maru group store error: %s: %s", key, e)
+                    if handle is not None:
+                        self._free_handles_best_effort([handle])
+                    continue
+                keys.append(key)
+                handles.append(handle)
 
     def _packed_store_kernel_ctx(self, attn_metadata: Any) -> tuple | None:
         """Kernel ctx for the coalesced packed store, or None for the fallback.

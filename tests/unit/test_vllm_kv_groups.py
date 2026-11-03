@@ -432,6 +432,77 @@ def test_opaque_members_must_fit_the_group_page():
         _dsv41_worker(caches)
 
 
+DSV41_BLOCKS_A = [5, 2, 7, 9]  # request A's group-4 blocks for tokens 0-63
+
+
+def _dsv41_blocks(ids):
+    """Every group's block ids; Maru reads only group 4's."""
+    ids = list(ids)
+    return tuple(ids if g == DSV41_GROUP else [0] * len(ids) for g in range(6))
+
+
+def _dsv41_storing_worker(shared, **kwargs):
+    worker = _dsv41_worker(dsv41_kv_caches(shared), **kwargs)
+    return worker, attach_capturing_handler(worker)
+
+
+def _block_bytes(worker, block):
+    return bytes(_cache_of(worker, DSV41_GROUP).tensors[0][block].numpy())
+
+
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_step_stores_each_whole_chunk_as_its_blocks(per):
+    """maru_kv_chunk_tokens sets how many blocks one object holds."""
+    chunk = per * DSV41_BLOCK
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk)
+    tokens, ids = list(range(80)), DSV41_BLOCKS_A + [11]  # blocks for tokens 0-79
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(ids), 0, 72))
+    keys = _chunk_keys(tokens, chunk)
+    done = 72 // chunk  # the chunks this step completed
+    assert set(store) == {
+        group_object_key(keys[c], DSV41_GROUP, chunk) for c in range(done)
+    }
+    for c in range(done):
+        expected = b"".join(
+            _block_bytes(worker, b) for b in ids[c * per : (c + 1) * per]
+        )
+        assert store[group_object_key(keys[c], DSV41_GROUP, chunk)] == expected
+    assert worker._page_size_bytes == per * DSV41_PAGE
+    assert worker._handler.batch_store.call_count == 1
+
+
+def test_dsv41_chunk_without_all_its_blocks_is_not_stored():
+    worker, store = _dsv41_storing_worker(_dsv41_shared())
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks([5, 2, 0, 9]), 0, 72))
+    k0, _ = _chunk_keys(tokens, 32)
+    assert set(store) == {group_object_key(k0, DSV41_GROUP, 32)}
+
+
+def test_dsv41_only_the_writer_rank_stores_the_blocks():
+    """Every rank holds the same MLA bytes, so only rank 0 stores them, under
+    keys without a slice suffix."""
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    chunk = 2 * DSV41_BLOCK
+    workers = []
+    for rank in range(4):
+        worker = _tp_worker(
+            dsv41_kv_caches(_dsv41_shared()),
+            _tp_shards(rank, 4, 1),
+            server,
+            dsv41_config(),
+            chunk,
+        )
+        worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+        workers.append(worker)
+    assert _registered_keys(workers[0]) == {
+        group_object_key(k, DSV41_GROUP, chunk) for k in _chunk_keys(tokens, chunk)
+    }
+    for worker in workers[1:]:
+        assert _registered_keys(worker) == set()
+
+
 # =============================================================================
 # Support checks
 # =============================================================================
