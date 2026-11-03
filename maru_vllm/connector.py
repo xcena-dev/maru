@@ -6424,6 +6424,9 @@ class MaruWorkerConnector:
                     else [base]
                 )
                 if all(self._is_stored(k) or k in keys for k in part_keys):
+                    if self._use_layerwise and not self._is_stored(f"{base}_DONE"):
+                        # Its layers are in but its marker failed: retry it.
+                        markers[base] = part_keys
                     continue
                 ids = block_ids[ci * per : (ci + 1) * per]
                 if len(ids) < per or 0 in ids:

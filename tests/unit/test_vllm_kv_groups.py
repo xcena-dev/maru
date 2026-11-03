@@ -505,14 +505,6 @@ def test_dsv41_step_stores_each_whole_chunk_as_its_blocks(per):
     assert worker._handler.batch_store.call_count == 1
 
 
-def test_dsv41_chunk_without_all_its_blocks_is_not_stored():
-    worker, store = _dsv41_storing_worker(_dsv41_shared())
-    tokens = list(range(80))
-    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks([5, 2, 0, 9]), 0, 72))
-    k0, _ = _chunk_keys(tokens, 32)
-    assert set(store) == {group_object_key(k0, DSV41_GROUP, 32)}
-
-
 LAYERWISE = {"maru_use_layerwise": True}
 DSV41_FORMATS = pytest.mark.parametrize(
     "extra", [{}, LAYERWISE], ids=["chunkwise", "layerwise"]
@@ -565,6 +557,68 @@ def test_dsv41_layerwise_stores_each_layer_and_then_marks_the_chunk(per):
     assert not any(k.endswith("_DONE") for k in first.args[0])
     assert all(k.endswith("_DONE") for k in second.args[0])
     assert worker._page_size_bytes == per * DSV41_BLOCK * max(DSV41_MEMBERS.values())
+
+
+@DSV41_FORMATS
+def test_dsv41_chunk_without_all_its_blocks_is_not_stored(extra):
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=extra)
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks([5, 2, 0, 9]), 0, 72))
+    assert set(store) == _dsv41_keys(tokens, 32, 1, bool(extra))
+
+
+def _refusing(worker, store, refused):
+    """Make ``worker``'s batch_store refuse the keys in ``refused``, a set the
+    caller can change between steps."""
+
+    def batch_store(keys, handles):
+        results = []
+        for key, handle in zip(keys, handles, strict=True):
+            if key not in refused:
+                store[key] = bytes(handle.buf)
+            results.append(key not in refused)
+        return results
+
+    worker._handler.batch_store.side_effect = batch_store
+
+
+def _dsv41_layerwise_step(worker, req_id):
+    """One step storing tokens 0-63 (chunks 0 and 1); the keys of each
+    batch_store it makes."""
+    calls = len(worker._handler.batch_store.call_args_list)
+    worker.wait_for_save(
+        _store_meta(
+            list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64, req_ids=(req_id,)
+        )
+    )
+    return [c.args[0] for c in worker._handler.batch_store.call_args_list[calls:]]
+
+
+def test_dsv41_layerwise_marks_no_chunk_with_a_layer_missing():
+    """A chunk whose layer failed to register gets no _DONE marker. The next
+    request with the prefix stores that layer alone, then the marker."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
+    k0, k1 = (group_object_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    refused = {f"{k0}_L3"}
+    _refusing(worker, store, refused)
+    _dsv41_layerwise_step(worker, "r1")
+    assert f"{k0}_DONE" not in store
+    assert f"{k1}_DONE" in store
+    refused.clear()
+    assert _dsv41_layerwise_step(worker, "r2") == [[f"{k0}_L3"], [f"{k0}_DONE"]]
+
+
+def test_dsv41_layerwise_retries_a_marker_that_failed():
+    """Every layer is in but the marker did not register: the next request
+    with the prefix registers the marker alone."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
+    k0, _ = (group_object_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    refused = {f"{k0}_DONE"}
+    _refusing(worker, store, refused)
+    _dsv41_layerwise_step(worker, "r1")
+    assert f"{k0}_DONE" not in store
+    refused.clear()
+    assert _dsv41_layerwise_step(worker, "r2") == [[f"{k0}_DONE"]]
 
 
 @DSV41_FORMATS
