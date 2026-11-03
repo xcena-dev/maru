@@ -22,10 +22,10 @@ On the CXL storage backend (the default):
    | Full attention (MHA, GQA), one | Qwen3 (dense and MoE), GLM-4.5,    | 🟢              | 🟢              | Llama-3.1-8B   |
    | KV cache group                 | GLM-4.6                            |                 |                 |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
-   | Sliding window + full          | gpt-oss                            | 🟢 [1]_         | 🟢              | gpt-oss-20b    |
+   | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | gpt-oss-20b    |
    | attention                      |                                    |                 |                 |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
-   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢 [2]_         | 🟢 [3]_         | Qwen3.5-0.8B   |
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢              | 🟢              | Qwen3.5-0.8B   |
    | full attention                 | Qwen3-Next                         |                 |                 |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
    | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |                |
@@ -36,16 +36,8 @@ On the CXL storage backend (the default):
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
    | MLA with other kinds of group  | GLM-5.3-Flash, DeepSeek-V4.1-Flash | ❌              | ❌              |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
-   | Chunked local + full attention | Llama 4                            | ❌ [4]_         | ❌              |                |
+   | Chunked local + full attention | Llama 4                            | ❌              | ❌              |                |
    +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
-
-.. [1] As several KV cache groups on vLLM 0.30 and later, or as one group
-   (see :ref:`vllm-hybrid-one-group`). gpt-oss-20b was tested both ways.
-.. [2] vLLM 0.30 and later. On vLLM 0.32.1rc0 and later, start vLLM with
-   ``--gdn-prefill-backend triton`` (see :ref:`vllm-gdn-prefill-backend`).
-.. [3] An engine hits only what an engine of the same TP size stored.
-.. [4] Refused at startup as several KV cache groups. It can run as one
-   group (see :ref:`vllm-hybrid-one-group`), which has not been tested.
 
 ```
 
