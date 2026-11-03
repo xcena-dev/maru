@@ -55,6 +55,7 @@ from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
     GROUP_OPAQUE,
+    GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GroupCache,
     KVGroup,
@@ -1802,6 +1803,9 @@ class MaruSchedulerConnector:
         self._extra_config = extra_config
         self._kv_groups = list(kv_groups or ())
         self._multi_group = len(self._kv_groups) > 1
+        # vLLM recomputes this many tokens before a prefix hit to rebuild a
+        # bounded-replay sliding window (DeepSeek-V4.1); 0 for most models.
+        self._replay_tokens = max((g.replay_tokens for g in self._kv_groups), default=0)
         self._cpu_mode = _validate_storage_config(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
@@ -2104,6 +2108,7 @@ class MaruSchedulerConnector:
                         key
                         for i in range(len(chunk_keys))
                         for g in self._kv_groups
+                        if g.kind != GROUP_SKIP
                         for key in object_keys(i, g)
                     ]
                 )
@@ -2354,7 +2359,10 @@ class MaruSchedulerConnector:
         cache can cover a hit so that nothing loads. A request is tracked in
         ``_requests_need_store`` until its prompt is computed, so later
         chunked-prefill steps store the rest and a preemption keeps its store
-        start. None when the step leaves nothing to store.
+        start. After a load, vLLM recomputes a bounded-replay window before
+        the hit (``_replay_tokens``), so a request resuming within that window
+        still holds the hit's chunks; a failed load resumes further back and
+        stores from there. None when the step leaves nothing to store.
         """
         ct = self._kv_chunk_tokens
         # A request resumed after a preemption keeps the start it had before:
@@ -2368,7 +2376,7 @@ class MaruSchedulerConnector:
         # short of what that lookup's load gives: a parked load that failed,
         # whose chunks may be gone.
         hit = self._maru_hits.pop(req_id, None)
-        if hit is not None and num_computed >= hit[1]:
+        if hit is not None and num_computed + self._replay_tokens >= hit[1]:
             store_start = max(store_start, hit[0] * ct)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)

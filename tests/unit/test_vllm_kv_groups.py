@@ -586,6 +586,62 @@ def test_dsv41_every_rank_loads_the_writers_blocks():
             assert _block_bytes(worker, b) == _block_bytes(writer, a)
 
 
+def _dsv41_scheduler(stored, chunk=256):
+    sched = make_scheduler(
+        128,
+        chunk,
+        {"maru_async_load": True},
+        kv_groups=describe_kv_groups(dsv41_config(block=128, side="scheduler")),
+    )
+    sched._handler = _Store(stored)
+    return sched
+
+
+def test_dsv41_lookup_asks_only_for_the_stored_group():
+    a = list(range(1100))
+    sched = _dsv41_scheduler(_stored_by(a, 256, [DSV41_GROUP], [], []))
+    assert _hit(sched, a) == 1024
+    (query,) = sched._handler.queries
+    assert query == [group_object_key(k, DSV41_GROUP, 256) for k in _chunk_keys(a, 256)]
+
+
+def test_dsv41_hit_needs_every_chunk_of_the_stored_group():
+    a = list(range(1100))
+    keys = _chunk_keys(a, 256)
+    stored = {
+        group_object_key(k, DSV41_GROUP, 256) for i, k in enumerate(keys) if i != 2
+    }
+    assert _hit(_dsv41_scheduler(stored), a) == 512
+
+
+def _dsv41_loaded(b, chunk):
+    """B shares A's first 1,100 tokens; Maru holds A's chunks up to token
+    1,024."""
+    a = list(range(1100))
+    sched = _dsv41_scheduler(_stored_by(a, chunk, [DSV41_GROUP], [], []), chunk)
+    request = SimpleNamespace(request_id="b", prompt_token_ids=b, num_preemptions=0)
+    assert _load_given(sched, request) == 1024
+    return sched
+
+
+@pytest.mark.parametrize("chunk", [128, 256, 512])
+def test_bounded_replay_does_not_store_the_last_hit_chunk_again(chunk):
+    """vLLM resumes a loaded request 128 tokens early to rebuild the window,
+    whatever the chunk size."""
+    b = list(range(1100)) + _other(1000)
+    sched = _dsv41_loaded(b, chunk)
+    meta = sched._store_meta("b", b, _dsv41_blocks(range(17)), 1024 - 128, 2100 - 896)
+    assert meta.store_start_token == 1024
+
+
+@pytest.mark.parametrize("chunk", [128, 256, 512])
+def test_a_failed_load_with_bounded_replay_stores_from_where_it_resumes(chunk):
+    b = list(range(1100)) + _other(1000)
+    sched = _dsv41_loaded(b, chunk)
+    meta = sched._store_meta("b", b, _dsv41_blocks(range(17)), 0, 2100)
+    assert meta.store_start_token == 0
+
+
 # =============================================================================
 # Support checks
 # =============================================================================
