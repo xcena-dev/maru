@@ -3631,6 +3631,10 @@ class MaruWorkerConnector:
             block_ids = req_meta.group_block_ids[cache.group.group_id]
             if cache.group.kind == GROUP_MAMBA:
                 self._place_state(cache, info, block_ids, req_meta, hit, device)
+            elif cache.group.kind == GROUP_OPAQUE:
+                self._place_group_blocks(
+                    cache, ci, info, block_ids, req_meta.load_start_token, device
+                )
             else:
                 self._place_chunk(
                     cache, ci, info, block_ids, req_meta.load_start_token, device, stage
@@ -3747,6 +3751,39 @@ class MaruWorkerConnector:
             block = block_ids[position]
             for i, states in enumerate(cache.tensors):
                 states[block].copy_(src[i], non_blocking=True)
+
+    def _place_group_blocks(
+        self,
+        cache: GroupCache,
+        chunk: int,
+        info: Any,
+        block_ids: list[int],
+        start: int,
+        device: torch.device,
+    ) -> None:
+        """Write an opaque group's object into the chunk's blocks.
+
+        Skips the blocks before ``start``, which vLLM's prefix cache already
+        holds (possibly shared with running requests).
+        """
+        group = cache.group
+        (blocks,) = cache.tensors
+        per = self._kv_chunk_tokens // group.block_size
+        size = group.object_bytes(self._kv_chunk_tokens)
+        src = (
+            torch.frombuffer(info.view[:size], dtype=torch.uint8)
+            .to(device, non_blocking=True)
+            .view(per, group.slot_bytes)
+        )
+        for j in range(per):
+            position = chunk * per + j
+            if position * group.block_size < start:
+                continue
+            if position >= len(block_ids) or block_ids[position] == 0:
+                raise RuntimeError(
+                    f"group {group.group_id} has no block at position {position}"
+                )
+            blocks[block_ids[position]].copy_(src[j], non_blocking=True)
 
     def _try_submit_deferred_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a deferred load to the background loader thread.

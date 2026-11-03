@@ -503,6 +503,89 @@ def test_dsv41_only_the_writer_rank_stores_the_blocks():
         assert _registered_keys(worker) == set()
 
 
+DSV41_BLOCKS_B = [3, 8, 1, 6]  # request B's group-4 blocks for the same tokens
+
+
+def _dsv41_stored(chunk=2 * DSV41_BLOCK):
+    """Request A's objects for tokens 0-63."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk)
+    worker.wait_for_save(
+        _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64)
+    )
+    return worker, store
+
+
+def _dsv41_loading_worker(store, chunk=2 * DSV41_BLOCK):
+    target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+    worker, _ = _dsv41_storing_worker(target, chunk=chunk)
+    _serve(worker, store)
+    return worker
+
+
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_parked_load_restores_the_blocks(per):
+    chunk = per * DSV41_BLOCK
+    stored, store = _dsv41_stored(chunk)
+    worker = _dsv41_loading_worker(store, chunk)
+    meta = _load_meta(
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads inline
+    for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
+        assert _block_bytes(worker, b) == _block_bytes(stored, a)
+    assert worker.take_failed_load_blocks() == set()
+
+
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_load_skips_blocks_vllms_cache_holds(per):
+    """vLLM's prefix cache holds tokens 0-15, and that block may be shared.
+    With one block per chunk the whole first chunk is skipped; with more,
+    only the first block of the first chunk."""
+    chunk = per * DSV41_BLOCK
+    stored, store = _dsv41_stored(chunk)
+    worker = _dsv41_loading_worker(store, chunk)
+    meta = _load_meta(
+        list(range(80)),
+        _dsv41_blocks(DSV41_BLOCKS_B),
+        64 // chunk,
+        computed=16,
+        deferred_load=True,
+        load_start_token=16,
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _block_bytes(worker, DSV41_BLOCKS_B[0]) == bytes(DSV41_PAGE)
+    for a, b in zip(DSV41_BLOCKS_A[1:], DSV41_BLOCKS_B[1:], strict=True):
+        assert _block_bytes(worker, b) == _block_bytes(stored, a)
+
+
+def test_dsv41_every_rank_loads_the_writers_blocks():
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    chunk = 2 * DSV41_BLOCK
+    writer = _tp_worker(
+        dsv41_kv_caches(_dsv41_shared()),
+        _tp_shards(0, 4, 1),
+        server,
+        dsv41_config(),
+        chunk,
+    )
+    writer.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+    for rank in range(1, 4):
+        target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+        worker = _tp_worker(
+            dsv41_kv_caches(target),
+            _tp_shards(rank, 4, 1),
+            server,
+            dsv41_config(),
+            chunk,
+        )
+        meta = _load_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_B), 2, deferred_load=True)
+        worker.start_load_kv(_FORWARD, meta)
+        assert worker.take_failed_load_blocks() == set()
+        for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
+            assert _block_bytes(worker, b) == _block_bytes(writer, a)
+
+
 # =============================================================================
 # Support checks
 # =============================================================================
