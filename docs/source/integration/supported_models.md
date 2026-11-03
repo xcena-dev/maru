@@ -13,21 +13,23 @@ MaruKVConnector stores the KV cache for vLLM. On the CXL storage backend (the
 default):
 
 | KV cache structure | Models | Status | Tensor parallel | Tested with |
-|---|---|---|---|---|
-| Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | Supported | Supported; tested at TP=2 | Llama-3.1-8B |
-| Sliding window + full attention | gpt-oss | Supported on vLLM 0.30+: as several KV cache groups, or as one group (see {ref}`vllm-hybrid-one-group`) | Supported; tested at TP=2 | gpt-oss-20b, as several groups and as one group |
-| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | Supported on vLLM 0.30+; on vLLM 0.32.1rc0 and later, start vLLM with `--gdn-prefill-backend triton` (see {ref}`vllm-gdn-prefill-backend`) | Supported; tested at TP=2. An engine hits only what an engine of the same TP size stored | Qwen3.5-0.8B |
-| Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape | Refused | |
-| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape | Refused | |
-| MLA with other kinds of group | GLM-5.3-Flash, DeepSeek-V4.1-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers | Refused | |
-| Chunked local + full attention | Llama 4 | Refused at startup as several KV cache groups. It can run as one group (see {ref}`vllm-hybrid-one-group`), which has not been tested | Refused as several KV cache groups; not tested as one group | |
+|---|---|---|:---:|---|
+| Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | Supported | ⭕ | Llama-3.1-8B |
+| Sliding window + full attention | gpt-oss | Supported on vLLM 0.30+: as several KV cache groups, or as one group (see {ref}`vllm-hybrid-one-group`) | ⭕ | gpt-oss-20b, as several groups and as one group |
+| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | Supported on vLLM 0.30+; on vLLM 0.32.1rc0 and later, start vLLM with `--gdn-prefill-backend triton` (see {ref}`vllm-gdn-prefill-backend`) | ⭕ | Qwen3.5-0.8B |
+| Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape | ❌ | |
+| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape | ❌ | |
+| MLA with other kinds of group | GLM-5.3-Flash, DeepSeek-V4.1-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers | ❌ | |
+| Chunked local + full attention | Llama 4 | Refused at startup as several KV cache groups. It can run as one group (see {ref}`vllm-hybrid-one-group`), which has not been tested | ❌ | |
 
 GPU tests ran on vLLM 0.30 and 0.32 with the CXL backend, with each model's
-released weights, at TP=1 and TP=2. For the models in "Tested with", every KV
-block loaded from Maru matched, byte for byte, what the engine had computed, or
-the greedy output matched a run without Maru. The other models in a row share
-its KV cache structure but have not been run, and tensor parallel sizes above 2
-have not been tested. Pipeline parallelism and decode or prefill context
+released weights. For the models in "Tested with", every KV block loaded from
+Maru matched, byte for byte, what the engine had computed, or the greedy output
+matched a run without Maru. The other models in a row share its KV cache
+structure but have not been run.
+
+Under tensor parallelism, a Gated DeltaNet model hits only what an engine of
+the same TP size stored. Pipeline parallelism and decode or prefill context
 parallelism are refused at startup. See {ref}`vllm-tensor-parallelism` for how
 each rank stores its part of the KV cache.
 
