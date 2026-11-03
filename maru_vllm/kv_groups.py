@@ -454,8 +454,11 @@ class GroupCache:
         tensors: For an attention group, each layer's paged KV tensor; all
             share one shape, dtype and strides. For a Mamba group, each
             layer's state as a ``uint8`` view of shape ``[num_blocks,
-            state_bytes]``: row ``b`` is block ``b``'s state.
-        layout: Paged KV layout of an attention group; None for Mamba.
+            state_bytes]``: row ``b`` is block ``b``'s state. For an opaque
+            group, one ``uint8`` view of shape ``[num_blocks, slot_bytes]``
+            over every layer at once: row ``b`` is block ``b``.
+        layout: Paged KV layout of an attention group; None for Mamba and
+            opaque groups.
     """
 
     group: KVGroup
@@ -514,6 +517,65 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
     return view
 
 
+def group_block_view(group: KVGroup, kv_caches: dict[str, Any]) -> torch.Tensor:
+    """An opaque group's blocks as ``uint8 [num_blocks, slot_bytes]``.
+
+    vLLM's packed (block-outermost) layout gives every block one stretch of
+    bytes and lays each group's layers out from its start: DeepSeek-V4.1's
+    compressed KV and indexer pages sit side by side there. Row ``b`` of the
+    view is block ``b``'s stretch for this group. It aliases vLLM's memory:
+    writing a row writes that block of every layer in the group.
+
+    Args:
+        group: An opaque group; ``slot_bytes`` is its bytes per block.
+        kv_caches: ``register_kv_caches``' argument, holding every layer of
+            the group.
+
+    Raises:
+        ValueError: The layers do not share one buffer and block stride, or
+            do not fit one group page at the start of each block.
+    """
+    tensors = [kv_caches[n] for n in group.layer_names]
+    first = tensors[0]
+    storage = first.untyped_storage()
+    base = storage.data_ptr()
+    if any(t.untyped_storage().data_ptr() != base for t in tensors):
+        raise ValueError(
+            f"MaruKVConnector: the layers of KV cache group {group.group_id} "
+            "are not in one buffer; Maru copies such a group block by block "
+            "from vLLM's packed KV cache"
+        )
+    stride = first.stride(0) * first.element_size()
+    geometry = {(t.shape[0], t.stride(0) * t.element_size()) for t in tensors}
+    if len(geometry) > 1:
+        raise ValueError(
+            f"MaruKVConnector: the layers of KV cache group {group.group_id} "
+            f"differ in block count or block stride (got {sorted(geometry)})"
+        )
+    offsets = [t.data_ptr() - base for t in tensors]
+    ends = [
+        offset + t[0].numel() * t.element_size()
+        for offset, t in zip(offsets, tensors, strict=True)
+    ]
+    start = min(offsets)
+    if (
+        any(
+            not 0 <= offset < stride or not t[0].is_contiguous()
+            for offset, t in zip(offsets, tensors, strict=True)
+        )
+        or max(ends) - start > group.slot_bytes
+        or start + group.slot_bytes > stride
+    ):
+        raise ValueError(
+            f"MaruKVConnector: the layers of KV cache group {group.group_id} "
+            f"do not fit one {group.slot_bytes}-byte group page at the start "
+            f"of each {stride}-byte block"
+        )
+    view = torch.empty(0, dtype=torch.uint8, device=first.device)
+    view.set_(storage, start, (first.shape[0], group.slot_bytes), (stride, 1))
+    return view
+
+
 def _kernel_block_size(
     shape: tuple[int, ...],
     block_size: int,
@@ -546,8 +608,12 @@ def group_caches(
 ) -> list[GroupCache]:
     """Map the worker's registered tensors onto the KV cache groups.
 
-    Every layer a group lists must be registered. Layers that no group lists
-    (none for the supported models) are left alone. An attention group's
+    Every layer a stored group lists must be registered. Layers that no group
+    lists (none for the supported models) are left alone, and so are the
+    groups vLLM does not prefix-cache: they get no cache, so callers find a
+    group's cache by ``cache.group.group_id``, not by its position. An opaque
+    group gets one view of its blocks (:func:`group_block_view`). An attention
+    group's
     layout comes from its first layer, and every layer of the group must
     share its shape, dtype and strides. A block of KV may not exceed the
     group's ``slot_bytes``, which the object sizes are computed from; it is
@@ -568,6 +634,8 @@ def group_caches(
     """
     caches = []
     for g in groups:
+        if g.kind == GROUP_SKIP:
+            continue
         missing = [n for n in g.layer_names if n not in kv_caches]
         if missing:
             raise ValueError(
@@ -580,6 +648,9 @@ def group_caches(
                 for n in g.layer_names
             )
             caches.append(GroupCache(g, views))
+            continue
+        if g.kind == GROUP_OPAQUE:
+            caches.append(GroupCache(g, (group_block_view(g, kv_caches),)))
             continue
         if num_kv_heads is None:
             raise ValueError(

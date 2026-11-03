@@ -54,6 +54,7 @@ from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
+    GROUP_OPAQUE,
     GROUP_SLIDING_WINDOW,
     GroupCache,
     KVGroup,
@@ -3117,7 +3118,7 @@ class MaruWorkerConnector:
             )
         self._group_kernels = {}
         for cache in self._group_caches:
-            if cache.group.kind == GROUP_MAMBA:
+            if cache.group.kind in (GROUP_MAMBA, GROUP_OPAQUE):
                 continue
             backend = _attention_backend(layers, cache.group.layer_names[0])
             if backend is None:

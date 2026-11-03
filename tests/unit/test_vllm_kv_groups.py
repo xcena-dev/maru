@@ -337,8 +337,99 @@ def test_an_opaque_object_holds_each_block_once():
 def test_hit_counts_an_opaque_group_like_full_attention():
     groups = describe_kv_groups(dsv41_config())
     stored = {0, 1, 3}  # chunk 2 of group 4 is missing
-    has = lambda i, g: g.group_id == DSV41_GROUP and i in stored
+
+    def has(i, g):
+        return g.group_id == DSV41_GROUP and i in stored
+
     assert hit_chunks(groups, 4, 2 * DSV41_BLOCK, has) == (2, 2)
+
+
+# vLLM's bytes per block: a wider group (the window) sets it above 2,560.
+DSV41_BLOCK_BYTES = 3072
+DSV41_NUM_BLOCKS = 12
+DSV41_PAGE = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
+
+
+def _dsv41_shared():
+    return (
+        torch.arange(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+    )
+
+
+def dsv41_kv_caches(shared):
+    """Group 4's members as vLLM registers them: packed from byte 0 of each
+    block."""
+    caches, at = {}, 0
+    for name, size in DSV41_MEMBERS.items():
+        caches[name] = torch.as_strided(
+            shared,
+            (DSV41_NUM_BLOCKS, DSV41_BLOCK, size),
+            (DSV41_BLOCK_BYTES, size, 1),
+            at,
+        )
+        at += DSV41_BLOCK * size
+    return caches
+
+
+def _dsv41_worker(kv_caches, chunk=2 * DSV41_BLOCK, **kwargs):
+    worker = _worker(dsv41_config(), chunk, **kwargs)
+    worker.register_kv_caches(kv_caches)
+    return worker
+
+
+def _cache_of(worker, group_id):
+    return next(c for c in worker._group_caches if c.group.group_id == group_id)
+
+
+def test_dsv41_registers_only_the_opaque_group_as_blocks():
+    shared = _dsv41_shared()
+    worker = _dsv41_worker(dsv41_kv_caches(shared))  # no window or ring tensors
+    (cache,) = worker._group_caches
+    (blocks,) = cache.tensors
+    assert cache.group.group_id == DSV41_GROUP
+    assert blocks.dtype == torch.uint8
+    assert blocks.shape == (DSV41_NUM_BLOCKS, DSV41_PAGE)
+    assert blocks.stride() == (DSV41_BLOCK_BYTES, 1)
+    assert blocks.data_ptr() == shared.data_ptr()
+    blocks[5].fill_(7)
+    assert bool((shared[5 * DSV41_BLOCK_BYTES :][:DSV41_PAGE] == 7).all())
+
+
+def test_dsv41_page_is_the_opaque_object():
+    worker = _dsv41_worker(dsv41_kv_caches(_dsv41_shared()))
+    assert worker._page_size_bytes == 2 * DSV41_PAGE
+
+
+def test_opaque_blocks_must_share_one_buffer():
+    caches = dsv41_kv_caches(_dsv41_shared())
+    caches["layers.20.attn.indexer"] = caches["layers.20.attn.indexer"].clone()
+    with pytest.raises(ValueError, match="one buffer"):
+        _dsv41_worker(caches)
+
+
+def test_opaque_blocks_must_share_one_block_stride():
+    shared = _dsv41_shared()
+    caches = dsv41_kv_caches(shared)
+    caches["layers.20.attn.indexer"] = torch.as_strided(
+        shared,
+        (DSV41_NUM_BLOCKS, DSV41_BLOCK, 16),
+        (DSV41_BLOCK_BYTES - 512, 16, 1),
+        2304,
+    )
+    with pytest.raises(ValueError, match="block stride"):
+        _dsv41_worker(caches)
+
+
+def test_opaque_members_must_fit_the_group_page():
+    shared = _dsv41_shared()
+    caches = dsv41_kv_caches(shared)
+    caches["layers.20.attn.indexer"] = torch.as_strided(
+        shared, (DSV41_NUM_BLOCKS, DSV41_BLOCK, 16), (DSV41_BLOCK_BYTES, 16, 1), 2600
+    )
+    with pytest.raises(ValueError, match="group page"):
+        _dsv41_worker(caches)
 
 
 # =============================================================================
