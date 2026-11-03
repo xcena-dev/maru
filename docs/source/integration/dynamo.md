@@ -19,6 +19,7 @@ flowchart TB
     C0 & C1 <-->|"KV payload"| CXL[("CXL shared memory")]
 ```
 
-See {doc}`vllm` for connector settings and the
+See {doc}`vllm` for connector settings, {doc}`supported_models` for the models
+the connector supports, and the
 {doc}`Dynamo example <../getting_started/examples/dynamo/index>` for setup and
 execution instructions.

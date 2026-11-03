@@ -25,29 +25,11 @@ uv pip install vllm
 See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
 for GPU-specific options.
 
-(vllm-model-support)=
 ## Model support
 
-Whether MaruKVConnector can store a model's KV cache depends on the KV cache
-structure that vLLM builds for the model. On the CXL backend (the default),
-at any tensor parallel size:
-
-| KV cache structure | Example models | Status |
-|---|---|---|
-| Full attention (MHA, GQA, MQA), one KV cache group | Llama-3.1-8B | Supported |
-| MLA, one KV cache group | DeepSeek-V2-Lite | Supported; above TP=1, rank 0 alone stores the latent that every rank holds |
-| Sliding window + full attention | gpt-oss-20b | Supported: as several KV cache groups on vLLM 0.30+, or as one group (see {ref}`vllm-hybrid-one-group`) |
-| Mamba-type + full attention | Qwen3.5-0.8B | Supported on vLLM 0.30+ |
-| Attention groups whose KV heads differ in count or size | MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape |
-| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape |
-| MLA with other kinds of group | GLM-5.3-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers |
-
-GPU tests of the supported structures ran with the example models on vLLM
-0.32, at tensor parallel sizes 1 and 2. Structures not listed are not tested.
-Models without attention layers, such as Mamba, are refused above TP=1.
-Models with several KV cache groups have settings and limits of their own;
-see {ref}`vllm-hybrid-models`. The CPU, mixed and remote_cxl backends take
-only models with one KV cache group, at TP=1.
+{doc}`supported_models` lists the KV cache structures and models the connector
+stores, the structures it refuses at startup, and the models that the CPU,
+mixed and remote_cxl backends take.
 
 ## Integration Architecture
 
@@ -176,6 +158,7 @@ Instance B:
   → Loads chunk 0, 1 from CXL, computes the rest
 ```
 
+(vllm-uncached-requests)=
 ### Requests Maru does not cache
 
 Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and vLLM's own prefix cache, when enabled (the default), still applies to them because it hashes these inputs. Keying such requests so they can hit is tracked in [#116](https://github.com/xcena-dev/maru/issues/116).
@@ -621,9 +604,9 @@ Example (Llama 7B, fp16):
 (vllm-tensor-parallelism)=
 ## Tensor parallelism
 
-The CXL backend supports tensor parallelism for the KV cache structures in
-{ref}`vllm-model-support`. vLLM starts one connector per TP worker, and each
-worker stores and loads only the KV it holds. Every rank
+The CXL backend supports tensor parallelism for the KV cache structures listed
+in {ref}`Supported Models <vllm-model-support>`. vLLM starts one connector per
+TP worker, and each worker stores and loads only the KV it holds. Every rank
 hashes a prompt to the same chunk keys, so a key must also name the slice: if
 all ranks registered their heads under one key, the server would keep the
 first and every other rank would load heads that are not its own.
@@ -719,22 +702,7 @@ vLLM puts layers that keep different kinds of KV cache into separate KV cache gr
 
 The key names the chunk length because a chunk key hashes the prompt only up to the chunk's end. With a Mamba-type group a chunk is one vLLM block, and vLLM sizes that block from the per-rank state and attention page, so engines with different TP sizes (or KV cache dtypes) can use different chunks: Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token chunks at TP=4. Their objects for the same prompt prefix then get different keys, and neither engine loads the other's.
 
-### Supported models
-
-| Model | KV cache groups | Status |
-|---|---|---|
-| Qwen3.5 (tested: Qwen3.5-0.8B) | Gated DeltaNet (Mamba-type) + full attention | Supported; tested on vLLM 0.30 and 0.32 |
-| gpt-oss (tested: gpt-oss-20b) | sliding window + full attention | Supported; tested on vLLM 0.30 and 0.32 |
-| Other models whose groups are only full attention (`FullAttentionSpec`), sliding window (`SlidingWindowSpec`) or Mamba-type (`MambaSpec`), with one KV head count and head size in every attention group | | Pass the connector's group check; not tested |
-| MiMo-V2, Inkling | sliding window + full attention, the sliding-window layers with KV heads of their own | Not supported yet; refused at startup |
-| DeepSeek-V3.2, GLM-5 (DSA) | MLA latent + indexer cache, which vLLM 0.32 puts in one group | Not supported yet; refused at startup |
-| GLM-5.3-Flash | MLA, indexer cache, `CircularBufferSpec` (`KpoolTailSpec` in vLLM 0.30), KDA (Mamba-type) | Not supported yet |
-| Llama 4 | chunked local + full attention | Not supported yet |
-| Other models with several groups where a group uses another type: MLA, static sink-token attention (`SinkFullAttentionSpec`), cross attention, or a subclass of a supported type such as `RSWASpec` | | Not supported yet |
-
-The connector checks the group types and the attention groups' KV shapes at startup and refuses an unsupported model with what it found. It also refuses one group whose layers keep different KV cache specs (vLLM's `UniformTypeKVCacheSpecs`), as the DSA models' does: a one-group model is stored in its first layer's shape. A model that passes these checks can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
-
-Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1, and at size 2 on vLLM 0.32. Hybrid models are supported on this connector only, not on the LMCache path.
+{doc}`supported_models` lists the hybrid models the connector stores and the ones it refuses at startup. Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`). Hybrid models are supported on this connector only, not on the LMCache path.
 
 ### Required settings
 

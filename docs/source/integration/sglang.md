@@ -167,6 +167,7 @@ for details on the write-through flush mechanism.
 | `ImportError: maru_sglang` | Package not installed | Run `uv pip install -e .` from `maru/` root |
 | Low TTFT speedup (< 1.5×) | Prompt too short for meaningful prefill savings | Use longer prompts (> 500 tokens) |
 
-> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
+> **See also:** [Supported Models](supported_models.md),
+> [Architecture Overview](../design_doc/architecture_overview.md),
 > [LMCache](lmcache.md),
 > [Python API Reference](../api_reference/api.md)
