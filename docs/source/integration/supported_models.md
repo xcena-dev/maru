@@ -12,15 +12,49 @@ it refuses. A structure or setting that is not listed here has not been tested.
 MaruKVConnector stores the KV cache for vLLM. On the CXL storage backend (the
 default):
 
-| KV cache structure | Models | Status | Tensor parallel | Tested with |
-|---|---|---|:---:|---|
-| Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | Supported | 🟢 | Llama-3.1-8B |
-| Sliding window + full attention | gpt-oss | Supported on vLLM 0.30+: as several KV cache groups, or as one group (see {ref}`vllm-hybrid-one-group`) | 🟢 | gpt-oss-20b, as several groups and as one group |
-| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | Supported on vLLM 0.30+; on vLLM 0.32.1rc0 and later, start vLLM with `--gdn-prefill-backend triton` (see {ref}`vllm-gdn-prefill-backend`) | 🟢 | Qwen3.5-0.8B |
-| Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape | ❌ | |
-| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape | ❌ | |
-| MLA with other kinds of group | GLM-5.3-Flash, DeepSeek-V4.1-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers | ❌ | |
-| Chunked local + full attention | Llama 4 | Refused at startup as several KV cache groups. It can run as one group (see {ref}`vllm-hybrid-one-group`), which has not been tested | ❌ | |
+```{eval-rst}
+.. table::
+   :class: maru-supported-models
+   :widths: auto
+
+   +--------------------------------+------------------------------------+-----------------------------------+----------------+
+   | KV cache structure             | Models                             | Supported status                  | Tested with    |
+   |                                |                                    +-----------------+-----------------+                |
+   |                                |                                    | Single GPU      | Tensor parallel |                |
+   +================================+====================================+=================+=================+================+
+   | Full attention (MHA, GQA), one | Qwen3 (dense and MoE), GLM-4.5,    | 🟢              | 🟢              | Llama-3.1-8B   |
+   | KV cache group                 | GLM-4.6                            |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Sliding window + full          | gpt-oss                            | 🟢 [1]_         | 🟢              | gpt-oss-20b    |
+   | attention                      |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢 [2]_         | 🟢 [3]_         | Qwen3.5-0.8B   |
+   | full attention                 | Qwen3-Next                         |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Attention groups whose KV      | Gemma 4, MiMo-V2, Inkling          | ❌              | ❌              |                |
+   | heads differ in count or size  |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |                |
+   | cache                          |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | MLA with other kinds of group  | GLM-5.3-Flash, DeepSeek-V4.1-Flash | ❌              | ❌              |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Chunked local + full attention | Llama 4                            | ❌ [4]_         | ❌              |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+
+.. [1] As several KV cache groups on vLLM 0.30 and later, or as one group
+   (see :ref:`vllm-hybrid-one-group`). gpt-oss-20b was tested both ways.
+.. [2] vLLM 0.30 and later. On vLLM 0.32.1rc0 and later, start vLLM with
+   ``--gdn-prefill-backend triton`` (see :ref:`vllm-gdn-prefill-backend`).
+.. [3] An engine hits only what an engine of the same TP size stored.
+.. [4] Refused at startup as several KV cache groups. It can run as one
+   group (see :ref:`vllm-hybrid-one-group`), which has not been tested.
+
+```
+
+🟢 means that Maru stores and loads the KV cache of such models, and ❌ that
+the connector refuses them at startup (see
+{ref}`Startup checks <supported-models-startup-checks>`).
 
 GPU tests ran on vLLM 0.30 and 0.32 with the CXL backend, with each model's
 released weights. For the models in "Tested with", every KV block loaded from
@@ -28,19 +62,29 @@ Maru matched, byte for byte, what the engine had computed, or the greedy output
 matched a run without Maru. The other models in a row share its KV cache
 structure but have not been run.
 
-Under tensor parallelism, a Gated DeltaNet model hits only what an engine of
-the same TP size stored. Pipeline parallelism and decode or prefill context
-parallelism are refused at startup. See {ref}`vllm-tensor-parallelism` for how
-each rank stores its part of the KV cache.
+Pipeline parallelism and decode or prefill context parallelism are refused at
+startup. See {ref}`vllm-tensor-parallelism` for how each rank stores its part
+of the KV cache.
 
+(supported-models-startup-checks)=
 ### Startup checks
 
 The connector checks the KV cache groups that vLLM builds for a model, and the
-KV shapes of its attention groups, when the engine starts, and refuses a
-structure it cannot store with what it found. A model that passes these checks
-can still be refused when the worker registers its KV cache, if the tensors do
-not match the groups' specs. Models with several KV cache groups also need the
-settings listed under {ref}`vllm-hybrid-models`.
+KV shapes of its attention groups, when the engine starts. It refuses a
+structure it cannot store and names what it found:
+
+- **Attention groups whose KV heads differ in count or size**: vLLM gives such
+  groups different block sizes, while the connector stores every group with one
+  block size and one KV shape.
+- **DSA**: vLLM 0.32 keeps the MLA latent and the indexer cache, which differ in
+  shape, in one group, while the connector stores every layer of a one-group
+  model in the first layer's shape.
+- **MLA or chunked local attention next to other groups**: the connector stores
+  several groups only for full attention, sliding window and Mamba-type layers.
+
+A model that passes these checks can still be refused when the worker registers
+its KV cache, if the tensors do not match the groups' specs. Models with several
+KV cache groups also need the settings listed under {ref}`vllm-hybrid-models`.
 
 ### Storage backends
 
