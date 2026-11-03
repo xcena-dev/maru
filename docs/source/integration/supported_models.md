@@ -2,16 +2,15 @@
 
 Whether Maru can store and reuse a model's KV cache depends on the integration
 and on the structure of the KV cache that the inference engine builds for the
-model. This page lists, for each integration, the structures Maru stores, the
-models they were tested with, and the structures it refuses. A structure or
-setting that is not listed here has not been tested.
+model. This page lists, for the vLLM, LMCache and SGLang integrations, the
+structures Maru stores, the models they were tested with, and the structures
+it refuses. A structure or setting that is not listed here has not been tested.
 
 (vllm-model-support)=
-## vLLM and NVIDIA Dynamo
+## vLLM
 
-MaruKVConnector stores the KV cache for vLLM. The `dynamo.vllm` workers of
-NVIDIA Dynamo use the same connector, so this section applies to both. On the
-CXL storage backend (the default), at any tensor parallel size:
+MaruKVConnector stores the KV cache for vLLM. On the CXL storage backend (the
+default), at any tensor parallel size:
 
 | KV cache structure | Models | Status | Tested with |
 |---|---|---|---|
