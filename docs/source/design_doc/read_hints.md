@@ -201,6 +201,11 @@ existing reboot handling does the rest.
 
 ## Scope
 
-Read hints are sent on the `remote_cxl` backend. A CXL-SSD attached to the GPU
-node's own host has the same need; there no agent sits between Maru and the
-device, and hints would reach the device software through a handler plugin.
+Read hints are sent on the `remote_cxl` and `cxl` backends. A CXL-SSD
+attached to the GPU node's own host has the same need; there no agent sits
+between Maru and the device, so a handler of the `cxl` backend gives the same
+read hints, read hint ends and read promotes to the handler plugins that take
+them (`on_memory_hint`, {doc}`../api_reference/plugins`), and the plugin
+passes them to the device software. The vLLM side is the same as above. Write
+hints and memory resets (the boot that carries a memory generation) are
+`remote_cxl` only: the `cxl` backend has no agent to carry a generation.

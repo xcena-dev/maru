@@ -176,8 +176,8 @@ apply to that backend only:
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
-| `maru_read_hints` | `bool` | `false` | The scheduler tells the memory nodes which pages each load will read before it starts, so a device with a cache in front of slower media can prefetch them, and the worker tells them when each such load starts; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise) |
-| `maru_write_hints` | `bool` | `maru_read_hints` | The worker names each store's pages to the memory nodes before it writes them, so such a device can prepare them instead of filling each from slower media on its first write. Follows `maru_read_hints` unless set |
+| `maru_read_hints` | `bool` | `false` | The scheduler tells the memory nodes which pages each load will read before it starts, so a device with a cache in front of slower media can prefetch them, and the worker tells them when each such load starts; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise). Also taken by the `cxl` backend, whose handler gives the hints to handler plugins ([Handler Plugins](plugins.md)) |
+| `maru_write_hints` | `bool` | `maru_read_hints` | The worker names each store's pages to the memory nodes before it writes them, so such a device can prepare them instead of filling each from slower media on its first write. Follows `maru_read_hints` unless set; `remote_cxl` only |
 | `maru_write_wait_ms` | `int` | `50` | How long a store waits for the memory node to prepare its pages before writing them (with write hints, where the region extension takes it); `0` never waits |
 | `maru_read_hint_on_arrival` | `bool` | `false` | Send the read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` (off with a warning otherwise) |
 
