@@ -284,11 +284,13 @@ vllm serve <model> --enforce-eager --enable-prompt-tokens-details \
   }'
 ```
 
-`maru_cache_namespace` is the sharing scope: engines share KV when it and the
-model shape match, whichever path each node loads the weights from, so use a
+`maru_cache_namespace` is the sharing scope: engines share KV when it, the
+model shape and the quantization vLLM runs (`--quantization`) match, whichever
+path each node loads the weights from, so use a
 namespace that identifies the exact weights.
 `maru_engine_id` names the engine's storage session and must be unique among
 the engines of one maru-server; the launcher uses `<hostname>-<instance>`.
+Under tensor parallelism each rank opens its own session, `<id>-tp<rank>`.
 `maru_pool_size` is the CXL memory the engine gets at a time (one region), as
 with the cxl backend. `--enable-prompt-tokens-details` only
 makes vLLM report cached tokens per request, which the test scripts read.

@@ -128,6 +128,46 @@ def test_engine_namespace_tracks_revision_and_geometry():
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
 
 
+def test_engine_namespace_tracks_the_quantization_vllm_runs():
+    """--quantization fp8 on an unquantized checkpoint computes other KV
+    from the same hf_config; an engine without one keeps its namespace."""
+    config = engine_config()
+    plain = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    config.model_config.quantization = None
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] == plain
+    config.model_config.quantization = "fp8"
+    fp8 = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    assert fp8 != plain
+    config.model_config.quantization = "mxfp4"
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] not in (
+        plain,
+        fp8,
+    )
+
+
+def test_engine_namespace_tracks_the_quantization_settings():
+    """--quantization-config (per-layer specs, ignore lists) changes the
+    weights' math without changing the method's name."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class Spec:
+        linear: str | None = None
+        ignore: tuple[str, ...] = ()
+
+    config = engine_config()
+    config.model_config.quantization = "fp8"
+
+    def namespace(settings):
+        config.model_config.quantization_config = settings
+        return _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+
+    plain = namespace(None)
+    assert namespace({"ignore": ["lm_head"]}) not in (plain, namespace({}))
+    assert namespace(Spec("fp8")) == namespace(Spec("fp8"))
+    assert namespace(Spec("fp8")) != namespace(Spec("fp8", ("lm_head",)))
+
+
 def test_engines_of_different_storage_backends_never_share_a_namespace():
     """A CPU or mixed engine cannot load the keys of a remote CXL engine."""
     config = engine_config()
