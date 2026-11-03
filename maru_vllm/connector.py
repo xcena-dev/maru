@@ -408,6 +408,9 @@ _RDMA_KNOBS = (
     "maru_write_wait_ms",
     "maru_read_hint_on_arrival",
 )
+# Read hint settings the cxl backend takes too: its hints go to handler
+# plugins (maru_handler.plugin.MaruHandlerPlugin.on_memory_hint).
+_CXL_HINT_KNOBS = ("maru_read_hints", "maru_read_hint_on_arrival")
 # Smallest default RDMA staging buffer (bytes), as in maru_handler.storage.remote_cxl.
 _MIN_RDMA_STAGING = 1024**3
 # Share of the RDMA staging slots that stores leave free for loads when loads
@@ -517,7 +520,10 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
         raise ValueError(
             "maru_storage_backend must be 'cxl', 'cpu', 'mixed' or 'remote_cxl'"
         )
-    if backend != "remote_cxl" and any(name in extra for name in _RDMA_KNOBS):
+    allowed = _CXL_HINT_KNOBS if backend == "cxl" else ()
+    if backend != "remote_cxl" and any(
+        name in extra and name not in allowed for name in _RDMA_KNOBS
+    ):
         raise ValueError("RDMA settings require maru_storage_backend='remote_cxl'")
     if "maru_pin_pools" in extra and backend not in {"cpu", "mixed"}:
         raise ValueError("maru_pin_pools applies to the cpu and mixed backends")
@@ -1031,6 +1037,7 @@ def _create_maru_handler(
         and bool(extra_config.get("maru_read_hints", False))
         and bool(_get_knob(extra_config, "maru_async_load")),
         write_hints=not metadata_only
+        and extra_config.get("maru_storage_backend", "cxl") == "remote_cxl"
         and bool(
             extra_config.get(
                 "maru_write_hints", extra_config.get("maru_read_hints", False)
@@ -4115,6 +4122,14 @@ class MaruWorkerConnector:
                 )
                 self._fail_deferred_load(req_meta)
                 return
+            # The scheduler hinted this load; the memory side hears it starts
+            # now (cxl backend with read hints; a no-op otherwise).
+            try:
+                handler.promote_read(
+                    req_meta.req_id, **_session_route(self._cpu_mode, chunk_keys)
+                )
+            except Exception:
+                logger.debug("Maru: read promote not queued", exc_info=True)
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
             # Layerwise keys come back layer-major in this job's own layer
