@@ -54,7 +54,7 @@ from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
-    GROUP_OPAQUE,
+    GROUP_MLA,
     GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GroupCache,
@@ -3124,7 +3124,7 @@ class MaruWorkerConnector:
             head_size=self._head_size,
         )
         if self._use_layerwise:
-            # One object per (chunk, layer) of an opaque group, the only kind
+            # One object per (chunk, layer) of an MLA group, the only kind
             # several groups store in this format.
             self._page_size_bytes = max(
                 self._kv_chunk_tokens // c.group.block_size * size
@@ -3143,7 +3143,7 @@ class MaruWorkerConnector:
             )
         self._group_kernels = {}
         for cache in self._group_caches:
-            if cache.group.kind in (GROUP_MAMBA, GROUP_OPAQUE):
+            if cache.group.kind in (GROUP_MAMBA, GROUP_MLA):
                 continue
             backend = _attention_backend(layers, cache.group.layer_names[0])
             if backend is None:
@@ -3588,17 +3588,17 @@ class MaruWorkerConnector:
     ) -> tuple[int, list[tuple[GroupCache, int, int | None, Any]]] | None:
         """Fetch every object the request's hit needs, in one batch.
 
-        The scheduler's hit rule decides which: full attention and opaque
+        The scheduler's hit rule decides which: full attention and MLA
         groups every hit chunk, sliding window the chunks its window covers
         at the hit's end, Mamba the last hit chunk. Chunks wholly before
         ``load_start_token``, which vLLM's prefix cache already holds, are
-        skipped. An opaque group in layerwise format has one object per
+        skipped. An MLA group in layerwise format has one object per
         layer of each chunk. All or nothing: an object missing since the
         scheduler's lookup fails the load, and vLLM recomputes.
 
         Returns:
             ``(hit chunks, [(group, chunk index, layer, object info)])``,
-            where layer is the layer's position in an opaque group stored
+            where layer is the layer's position in an MLA group stored
             layerwise and None otherwise; or None after reporting the
             failure.
         """
@@ -3620,7 +3620,7 @@ class MaruWorkerConnector:
                 chunks = range(first, hit)
             parts: list[int | None] = (
                 list(range(len(cache.spans)))
-                if self._use_layerwise and group.kind == GROUP_OPAQUE
+                if self._use_layerwise and group.kind == GROUP_MLA
                 else [None]
             )
             plan += [(cache, ci, part) for ci in chunks for part in parts]
@@ -3668,7 +3668,7 @@ class MaruWorkerConnector:
             block_ids = req_meta.group_block_ids[cache.group.group_id]
             if cache.group.kind == GROUP_MAMBA:
                 self._place_state(cache, info, block_ids, req_meta, hit, device)
-            elif cache.group.kind == GROUP_OPAQUE:
+            elif cache.group.kind == GROUP_MLA:
                 self._place_group_blocks(
                     cache, ci, info, block_ids, req_meta.load_start_token, device, part
                 )
@@ -3799,10 +3799,10 @@ class MaruWorkerConnector:
         device: torch.device,
         layer: int | None = None,
     ) -> None:
-        """Write an opaque group's object into the chunk's blocks.
+        """Write an MLA group's object into the chunk's blocks.
 
         ``layer`` names the layer of a layerwise object; None for a chunkwise
-        object, which holds the whole group page of each block. Skips the
+        object, which holds every layer's bytes of each block. Skips the
         blocks before ``start``, which vLLM's prefix cache already holds
         (possibly shared with running requests).
         """
@@ -6144,7 +6144,7 @@ class MaruWorkerConnector:
                 if group.kind == GROUP_MAMBA:
                     self._gather_states(cache, metadata, keys, handles)
                     continue
-                if group.kind == GROUP_OPAQUE:
+                if group.kind == GROUP_MLA:
                     self._gather_group_blocks(cache, metadata, keys, handles, markers)
                     continue
                 target = self._group_target(cache)
@@ -6395,11 +6395,11 @@ class MaruWorkerConnector:
         handles: list,
         markers: dict[str, list[str]],
     ) -> None:
-        """Copy the blocks of every chunk an opaque group's step completed.
+        """Copy the blocks of every chunk an MLA group's step completed.
 
         Chunkwise, the object holds the chunk's blocks in order, each as the
-        group's bytes vLLM packs into that block, without reading their
-        format (DeepSeek-V4.1's compressed KV and indexer keys). Layerwise,
+        bytes vLLM stores for the group in that block, without reading the
+        KV format (DeepSeek-V4.1's compressed KV and indexer keys). Layerwise,
         the i-th layer of the group gets its own object, keyed
         ``<object key>_L<i>``, with that layer's bytes of the chunk's blocks,
         and the object key goes into ``markers`` for its ``_DONE`` marker. A

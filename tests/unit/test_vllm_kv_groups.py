@@ -45,7 +45,7 @@ from maru_vllm.connector import (
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
-    GROUP_OPAQUE,
+    GROUP_MLA,
     GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
@@ -227,7 +227,8 @@ def _window_mla(block, bounded_replay=True):
 
 
 def _ring(block):
-    """DeepSeek-V4.1's compressor ring, which vLLM never prefix-caches."""
+    """DeepSeek-V4.1's KV compressor state, a circular buffer that vLLM never
+    prefix-caches."""
     ring = getattr(kv_cache_interface, "CircularBufferSpec", None)
     if ring is None:
         pytest.skip("this vLLM has no CircularBufferSpec")
@@ -235,7 +236,7 @@ def _ring(block):
 
 
 def _group(specs, side):
-    """A group as vLLM 0.33 hands it over: its packed planner wraps every
+    """A group as vLLM 0.33 hands it over: for DeepSeek-V4.1 it wraps every
     group in UniformTypeKVCacheSpecs for the worker, and the scheduler sees
     the first member."""
     first = next(iter(specs.values()))
@@ -249,7 +250,7 @@ def _group(specs, side):
 
 def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
     """DSV4.1-Flash's six groups: four sliding windows, the compressed KV and
-    indexer keys, and the compressor ring."""
+    indexer keys, and the KV compressor's circular buffer."""
     window = window or _window_mla(block // 4)
     mla = {
         name: MLAAttentionSpec(
@@ -280,7 +281,7 @@ def _check_dsv41(config):
 @pytest.mark.parametrize("side", ["worker", "scheduler"])
 def test_dsv41_groups_skip_what_vllm_does_not_prefix_cache(side):
     groups = describe_kv_groups(dsv41_config(side=side))
-    assert [g.kind for g in groups] == [GROUP_SKIP] * 4 + [GROUP_OPAQUE, GROUP_SKIP]
+    assert [g.kind for g in groups] == [GROUP_SKIP] * 4 + [GROUP_MLA, GROUP_SKIP]
     assert [g.replay_tokens for g in groups] == [128] * 4 + [0, 0]
 
 
@@ -348,7 +349,7 @@ def test_a_prefix_cached_mla_window_is_refused(side):
 
 
 def test_mamba_states_in_one_uniform_group_are_refused():
-    """GLM-5.3-Flash's packed layout wraps its KDA states this way."""
+    """vLLM wraps GLM-5.3-Flash's KDA states this way."""
     names = ["layers.0.kda", "layers.1.kda"]
     states = UniformTypeKVCacheSpecs(
         block_size=DSV41_BLOCK, kv_cache_specs={n: _mamba_spec() for n in names}
@@ -359,7 +360,7 @@ def test_mamba_states_in_one_uniform_group_are_refused():
         _check_dsv41(config)
 
 
-def test_an_opaque_object_holds_each_block_once():
+def test_an_mla_group_object_holds_each_block_once():
     groups = describe_kv_groups(dsv41_config())
     page = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
     assert groups[DSV41_GROUP].slot_bytes == page
@@ -368,7 +369,7 @@ def test_an_opaque_object_holds_each_block_once():
     assert groups[0].object_bytes(2 * DSV41_BLOCK) == 0
 
 
-def test_hit_counts_an_opaque_group_like_full_attention():
+def test_hit_counts_an_mla_group_like_full_attention():
     groups = describe_kv_groups(dsv41_config())
     stored = {0, 1, 3}  # chunk 2 of group 4 is missing
 
@@ -393,8 +394,8 @@ def _dsv41_shared():
 
 
 def dsv41_kv_caches(shared):
-    """Group 4's members as vLLM registers them: packed from byte 0 of each
-    block."""
+    """Group 4's members as vLLM registers them: one after another from
+    byte 0 of each block."""
     caches, at = {}, 0
     for name, size in DSV41_MEMBERS.items():
         caches[name] = torch.as_strided(
@@ -417,9 +418,11 @@ def _cache_of(worker, group_id):
     return next(c for c in worker._group_caches if c.group.group_id == group_id)
 
 
-def test_dsv41_registers_only_the_opaque_group_as_blocks():
+def test_dsv41_registers_only_the_mla_group_as_blocks():
     shared = _dsv41_shared()
-    worker = _dsv41_worker(dsv41_kv_caches(shared))  # no window or ring tensors
+    worker = _dsv41_worker(
+        dsv41_kv_caches(shared)
+    )  # no sliding-window or circular-buffer tensors
     (cache,) = worker._group_caches
     (blocks,) = cache.tensors
     assert cache.group.group_id == DSV41_GROUP
@@ -431,19 +434,19 @@ def test_dsv41_registers_only_the_opaque_group_as_blocks():
     assert bool((shared[5 * DSV41_BLOCK_BYTES :][:DSV41_PAGE] == 7).all())
 
 
-def test_dsv41_page_is_the_opaque_object():
+def test_dsv41_page_is_the_mla_group_object():
     worker = _dsv41_worker(dsv41_kv_caches(_dsv41_shared()))
     assert worker._page_size_bytes == 2 * DSV41_PAGE
 
 
-def test_opaque_blocks_must_share_one_buffer():
+def test_mla_group_layers_must_share_one_buffer():
     caches = dsv41_kv_caches(_dsv41_shared())
     caches["layers.20.attn.indexer"] = caches["layers.20.attn.indexer"].clone()
     with pytest.raises(ValueError, match="one buffer"):
         _dsv41_worker(caches)
 
 
-def test_opaque_blocks_must_share_one_block_stride():
+def test_mla_group_layers_must_share_one_block_stride():
     shared = _dsv41_shared()
     caches = dsv41_kv_caches(shared)
     caches["layers.20.attn.indexer"] = torch.as_strided(
@@ -456,13 +459,13 @@ def test_opaque_blocks_must_share_one_block_stride():
         _dsv41_worker(caches)
 
 
-def test_opaque_members_must_fit_the_group_page():
+def test_mla_group_layers_must_fit_at_the_start_of_each_block():
     shared = _dsv41_shared()
     caches = dsv41_kv_caches(shared)
     caches["layers.20.attn.indexer"] = torch.as_strided(
         shared, (DSV41_NUM_BLOCKS, DSV41_BLOCK, 16), (DSV41_BLOCK_BYTES, 16, 1), 2600
     )
-    with pytest.raises(ValueError, match="group page"):
+    with pytest.raises(ValueError, match="do not fit in the first"):
         _dsv41_worker(caches)
 
 
@@ -526,7 +529,7 @@ def _dsv41_keys(tokens, chunk, num_chunks, layerwise):
 
 
 def _dsv41_spans():
-    """(offset, bytes) of each layer in a block's group page."""
+    """(offset, bytes) of each layer in a block's bytes for group 4."""
     spans, at = [], 0
     for size in DSV41_MEMBERS.values():
         spans.append((at, DSV41_BLOCK * size))
