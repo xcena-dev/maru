@@ -1,0 +1,63 @@
+(vllm-model-support)=
+# Supported Models
+
+Whether MaruKVConnector can store and reuse a model's KV cache in vLLM depends
+on the structure of the KV cache that vLLM builds for the model. This page
+lists the structures it stores and the ones it refuses; a structure or setting
+that is not listed has not been tested. Support for a range of models on
+SGLang HiCache and NVIDIA Dynamo, as on vLLM, is planned.
+
+On the CXL storage backend (the default):
+
+```{eval-rst}
+.. table::
+   :class: maru-supported-models
+   :widths: auto
+
+   +--------------------------------+------------------------------------+-----------------------------------+----------------+
+   | KV cache structure             | Models                             | Supported status                  | Tested with    |
+   |                                |                                    +-----------------+-----------------+                |
+   |                                |                                    | Single GPU      | Tensor parallel |                |
+   +================================+====================================+=================+=================+================+
+   | Full attention (MHA, GQA), one | Qwen3 (dense and MoE), GLM-4.5,    | 🟢              | 🟢              | Llama-3.1-8B   |
+   | KV cache group                 | GLM-4.6                            |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | gpt-oss-20b    |
+   | attention                      |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢              | 🟢              | Qwen3.5-0.8B   |
+   | full attention                 | Qwen3-Next                         |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |                |
+   | heads differ in count or size  |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |                |
+   | cache                          |                                    |                 |                 |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | MLA with other kinds of group  | GLM-5.3-Flash, DeepSeek-V4.1-Flash | ❌              | ❌              |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+   | Chunked local + full attention | Llama 4                            | ❌              | ❌              |                |
+   +--------------------------------+------------------------------------+-----------------+-----------------+----------------+
+
+```
+
+🟢 means that Maru stores and loads the KV cache of such models, and ❌ that
+the connector refuses them at startup. Models other than the one in "Tested
+with" share their row's KV cache structure but have not been run. Models with
+several KV cache groups also need the settings in {ref}`vllm-hybrid-models`.
+
+Pipeline parallelism and decode or prefill context parallelism are refused at
+startup. See {ref}`vllm-tensor-parallelism` for how each rank stores its part
+of the KV cache.
+
+## Storage backends
+
+The table holds for the `cxl` backend. The `cpu`, `mixed` and `remote_cxl`
+backends take only text-only models with one KV cache group and without MLA,
+at TP=1 and without data parallelism, and refuse LoRA and quantized KV caches.
+
+## Reporting results
+
+If you run a model that this page does not list, please
+[open an issue](https://github.com/xcena-dev/maru/issues) with the model, the
+versions of vLLM and Maru, the parallel settings and the result.
