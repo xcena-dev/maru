@@ -53,9 +53,9 @@ of the KV cache.
 ## Storage backends
 
 The table holds for the `cxl` and `remote_cxl` backends, except that
-`remote_cxl` takes no MLA model and no data parallelism. `remote_cxl` was
-tested with gpt-oss-20b and Qwen3.5-0.8B on a single GPU and at TP=2, and with
-Llama-3.1-8B at TP=2. The `cpu` and `mixed` backends take only text-only models
+`remote_cxl` takes no MLA model. `remote_cxl` was tested with gpt-oss-20b and
+Qwen3.5-0.8B on a single GPU and at TP=2, with Llama-3.1-8B at TP=2, and with
+all three at DP=2. The `cpu` and `mixed` backends take only text-only models
 with one KV cache group and without MLA, at TP=1 and without data parallelism.
 The `remote_cxl`, `cpu` and `mixed` backends refuse LoRA and quantized KV
 caches.

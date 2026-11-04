@@ -265,7 +265,8 @@ stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
 memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`
-(each TP rank adds `-tp<rank>`; see {ref}`vllm-tensor-parallelism`), an
+(each TP rank adds `-tp<rank>`, and data-parallel replica `d` > 0 adds
+`-dp<d>`; see {ref}`vllm-tensor-parallelism`), an
 immutable-weights `maru_cache_namespace`,
 `maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
 default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
@@ -698,10 +699,22 @@ Each worker process connects its own MaruHandler:
   the id unset already gives every process its own UUID.
 - On the remote_cxl backend each rank opens its own storage session, with
   its own RDMA staging buffer, and `maru_engine_id` becomes
-  `<id>-tp<rank>` the same way: maru-server keeps one open session per engine
-  id. Every session of the namespace reads the regions of the others, so a
-  rank that only loads replicated heads reads them from the rank that stored
-  them. The scheduler looks keys up as rank 0's session (`<id>-tp0`).
+  `<id>-tp<rank>` (`<id>-dp<d>-tp<rank>` on replica `d` > 0) the same way:
+  maru-server keeps one open session per engine id. Every session of the
+  namespace reads the regions of the others, so a rank that only loads
+  replicated heads reads them from the rank that stored them, and a replica
+  reads what the other replicas stored. The scheduler looks keys up as rank
+  0's session of its replica (`<id>-tp0`, or `<id>-dp<d>-tp0`).
+
+Under TP the scheduler's process loads no model, and a model can change its
+config where a worker loads it, as vLLM's Transformers backend does with the
+dtype. So on the remote_cxl backend the scheduler looks keys up in the cache
+namespace that the workers report through vLLM's KV connector handshake.
+vLLM's `MultiConnector` passes the first handshake that any sub-connector
+returns to all of them, and `NixlConnector` refuses any but its own: above
+TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps
+the namespace it computes itself, and a model that changes its config where
+the workers load it misses every lookup.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
 startup: a pipeline stage would have to address its layers locally in the

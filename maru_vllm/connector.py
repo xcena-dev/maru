@@ -683,19 +683,23 @@ def _cpu_engine_config(
     ):
         raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
     parallel = config.parallel_config
-    # Each remote_cxl TP rank opens its own session and stores its own slice;
-    # every session of a namespace reads the others' regions.
+    # Each remote_cxl TP rank of each data-parallel replica opens its own
+    # session (_rank_scoped_extra) and stores its own slice; every session of
+    # a namespace reads the others' regions. CPU M1 takes one worker of one
+    # engine. vLLM runs each replica of a model without MoE layers as its own
+    # engine with data_parallel_size=1, so _dp_index tells such a replica.
     single: tuple[str, ...] = (
         "pipeline_parallel_size",
-        "data_parallel_size",
         "decode_context_parallel_size",
         "prefill_context_parallel_size",
     )
     if not remote_cxl:
-        single = ("tensor_parallel_size", *single)
-    if any(getattr(parallel, name, 1) != 1 for name in single):
+        single = ("tensor_parallel_size", "data_parallel_size", *single)
+    if any(getattr(parallel, name, 1) != 1 for name in single) or (
+        not remote_cxl and _dp_index(config) > 0
+    ):
         raise ValueError(
-            "Remote CXL storage requires PP=DP=1 and context parallel sizes of 1"
+            "Remote CXL storage requires PP=1 and context parallel sizes of 1"
             if remote_cxl
             else "CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1"
         )
@@ -1597,6 +1601,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         tp_size, total_kv_heads = _tp_geometry(vllm_config)
         if tp_size > 1:
             extra = _tensor_parallel_defaults(extra, tp_size)
+        # Only a storage session above TP=1, which remote_cxl alone runs, has
+        # a scheduler in another process than the model (take_worker_namespace).
+        self._namespace_handshake = (
+            extra.get("maru_storage_backend") == "remote_cxl" and tp_size > 1
+        )
         attention_by_rank = _names_attention_by_rank(
             self._kv_groups, tp_size, total_kv_heads
         )
@@ -1908,21 +1917,26 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         return self._worker.take_failed_load_blocks()
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
-        """The worker's storage-session namespace, for the scheduler.
+        """The worker's storage-session namespace, for the scheduler, on the
+        remote_cxl backend above TP=1; None elsewhere.
 
         vLLM collects it from every worker after their KV caches are
         registered and hands it to ``set_xfer_handshake_metadata`` before the
-        scheduler takes a request.
+        scheduler takes a request. vLLM's MultiConnector hands every
+        sub-connector the first metadata any of them returns, and
+        NixlConnector refuses any but its own, so the connector sends none
+        where its scheduler does not need it.
         """
-        if self._worker is None:
+        if self._worker is None or not self._namespace_handshake:
             return None
         return self._worker.handshake_metadata()
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
     ) -> None:
-        """Look keys up in the namespace the workers store in."""
-        if self._scheduler is not None:
+        """Look keys up in the namespace the workers store in (remote_cxl
+        above TP=1)."""
+        if self._scheduler is not None and self._namespace_handshake:
             self._scheduler.take_worker_namespace(metadata)
 
     def shutdown(self):
@@ -2118,9 +2132,10 @@ class MaruSchedulerConnector:
                 # vLLM's MultiConnector passes on one connector's metadata.
                 logger.warning(
                     "Maru: the workers sent another connector's handshake "
-                    "metadata instead of their cache namespace; under TP the "
-                    "scheduler may look keys up in another namespace than "
-                    "the workers store in"
+                    "metadata instead of their cache namespace, so the "
+                    "scheduler looks keys up in the namespace it computed; a "
+                    "model that changes its config where the workers load it "
+                    "misses every lookup"
                 )
             return
         if len(namespaces) > 1:
@@ -2185,38 +2200,12 @@ class MaruSchedulerConnector:
         if not keys:
             return 0
 
-        if self._cpu_mode:
-            self._ensure_handler()
-            if self._handler is None:
-                return 0
-            # Every slice of a chunk, as below; the request's pool is picked
-            # by its bare first chunk key, whichever rank stored the slice.
-            slices = len(self._shard_suffixes)
-            probe = [key + suffix for key in keys for suffix in self._shard_suffixes]
-            try:
-                results = list(
-                    self._handler.batch_exists(
-                        probe, **_session_route(self._cpu_mode, keys)
-                    )
-                )
-            except Exception:
-                return 0
-            # A short reply leaves the rest missing.
-            results += [False] * (len(probe) - len(results))
-            # Re-probe each time: CPU residency is tied to a live worker session.
-            return next(
-                (
-                    i
-                    for i in range(len(keys))
-                    if not all(results[i * slices : (i + 1) * slices])
-                ),
-                len(keys),
-            )
-
         # A chunk counts once its "_DONE" marker is stored (written after all
         # layers, so a partial layer store failure is no false positive) for
         # every slice in _shard_suffixes. Known markers are tried first; the
-        # unknown ones go in one batch_exists.
+        # unknown ones go in one batch_exists. CPU mode knows none, and asks
+        # in the pool of the request's bare first chunk key, whichever rank
+        # stored the slice (_stored_keys).
         sentinels = [
             [self._chunk_exists_key(key + suffix) for suffix in self._shard_suffixes]
             for key in keys
@@ -2235,7 +2224,12 @@ class MaruSchedulerConnector:
         hits = leading(self._known_keys)
         if hits == len(keys):
             return hits
-        return leading(self._stored_keys([s for chunk in sentinels for s in chunk]))
+        return leading(
+            self._stored_keys(
+                [s for chunk in sentinels for s in chunk],
+                _session_route(self._cpu_mode, keys),
+            )
+        )
 
     def _note_failed_load(self, request: Request) -> None:
         """Record a failed load when vLLM asks about a request again after it.
@@ -3906,9 +3900,7 @@ class MaruWorkerConnector:
             return None
         hit, plan, keys = planned
         try:
-            infos = self._batch_retrieve_all(
-                keys, route_key=self._route(req_meta).get("route_key")
-            )
+            infos = self._batch_retrieve_all(keys)
         except Exception as e:
             self._fail_load(req_meta, e)
             return None

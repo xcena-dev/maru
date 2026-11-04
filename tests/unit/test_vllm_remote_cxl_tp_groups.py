@@ -268,6 +268,24 @@ def test_the_cxl_backend_sends_no_namespace(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("extra", [remote_cxl_extra, cpu_extra], ids=["remote", "cpu"])
+def test_tp1_sends_no_namespace_and_takes_none(caplog, extra):
+    """vLLM's MultiConnector hands every sub-connector the first handshake
+    metadata any of them returns, and NixlConnector refuses any but its own.
+    At TP=1 the scheduler runs in the model's process and needs none."""
+    import logging
+
+    config = remote_vllm_config(1, 8, extra=extra())
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER)
+    assert worker.get_handshake_metadata() is None
+    scheduler = MaruKVConnector(config, KVConnectorRole.SCHEDULER)
+    ours = scheduler._scheduler._extra_config["maru_cache_namespace"]
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        scheduler.set_xfer_handshake_metadata({0: object()})
+    assert "handshake" not in caplog.text
+    assert scheduler._scheduler._extra_config["maru_cache_namespace"] == ours
+
+
 def test_tp1_keeps_its_engine_id(monkeypatch):
     def no_rank():
         raise AssertionError("TP=1 must not query the TP group")
@@ -280,11 +298,47 @@ def test_tp1_keeps_its_engine_id(monkeypatch):
     assert scheduler._extra_config["maru_engine_id"] == "worker-0"
 
 
+@pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize(
-    "parallel", [{"pipeline_parallel_size": 2}, {"data_parallel_size": 2}]
+    "parallel",
+    [
+        # A model without MoE layers: vLLM runs each replica as its own
+        # engine with data_parallel_size=1 and keeps its index.
+        {"data_parallel_size": 1, "data_parallel_rank": 0, "data_parallel_index": 1},
+        # A MoE model: one engine of several replicas.
+        {"data_parallel_size": 2, "data_parallel_rank": 1, "data_parallel_index": 1},
+    ],
 )
-def test_remote_cxl_still_refuses_pipeline_and_data_parallelism(parallel):
-    with pytest.raises(ValueError, match="PP=DP=1"):
+def test_each_data_parallel_replica_opens_its_own_sessions(
+    monkeypatch, tp_size, parallel
+):
+    """Replicas store in one namespace, each under its own engine ids, and
+    every session of the namespace reads what any of them stored."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: tp_size - 1)
+    config = remote_vllm_config(tp_size, 8, **parallel)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER)._worker
+    scheduler = MaruKVConnector(config, KVConnectorRole.SCHEDULER)._scheduler
+    rank = "-tp1" if tp_size > 1 else ""
+    assert worker._extra_config["maru_engine_id"] == f"worker-0-dp1{rank}"
+    assert scheduler._extra_config["maru_engine_id"] == (
+        f"worker-0-dp1{'-tp0' if tp_size > 1 else ''}"
+    )
+    first = MaruKVConnector(
+        remote_vllm_config(tp_size, 8), KVConnectorRole.SCHEDULER
+    )._scheduler
+    assert (
+        scheduler._extra_config["maru_cache_namespace"]
+        == first._extra_config["maru_cache_namespace"]
+        == worker._extra_config["maru_cache_namespace"]
+    )
+
+
+@pytest.mark.parametrize(
+    "parallel",
+    [{"pipeline_parallel_size": 2}, {"prefill_context_parallel_size": 2}],
+)
+def test_remote_cxl_still_refuses_pipeline_and_context_parallelism(parallel):
+    with pytest.raises(ValueError, match="PP=1"):
         MaruKVConnector(remote_vllm_config(2, 8, **parallel), KVConnectorRole.SCHEDULER)
 
 

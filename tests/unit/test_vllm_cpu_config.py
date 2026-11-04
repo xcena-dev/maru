@@ -117,6 +117,17 @@ def test_multiple_workers_are_rejected(name):
         _cpu_engine_config(extra(), config)
 
 
+def test_a_data_parallel_replica_is_rejected():
+    """vLLM runs each replica of a model without MoE layers as its own engine
+    with data_parallel_size=1; its data_parallel_index still tells it."""
+    config = engine_config()
+    config.parallel_config.data_parallel_index = 0
+    _cpu_engine_config(extra(), config)
+    config.parallel_config.data_parallel_index = 1
+    with pytest.raises(ValueError, match="TP=PP=DP"):
+        _cpu_engine_config(extra(), config)
+
+
 def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
     a = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
