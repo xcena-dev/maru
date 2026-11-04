@@ -3136,7 +3136,7 @@ class MaruWorkerConnector:
             # One object per (chunk, layer) of an MLA group, the only kind
             # several groups store in this format.
             self._page_size_bytes = max(
-                self._kv_chunk_tokens // c.group.block_size * size
+                c.group.stored_blocks(self._kv_chunk_tokens) * size
                 for c in self._group_caches
                 for _, size in c.spans
             )
@@ -3622,7 +3622,7 @@ class MaruWorkerConnector:
             group = cache.group
             if group.kind == GROUP_MAMBA:
                 chunks: range = range(hit - 1, hit)
-            elif group.kind == GROUP_SLIDING_WINDOW:
+            elif group.windowed:
                 window = window_chunks(group, hit * ct, ct)
                 chunks = range(max(window.start, first), window.stop)
             else:
@@ -3812,9 +3812,11 @@ class MaruWorkerConnector:
         """Write an MLA group's object into the chunk's blocks.
 
         ``layer`` names the layer of a layerwise object; None for a chunkwise
-        object, which holds every layer's bytes of each block. Skips the
-        blocks before ``start``, which vLLM's prefix cache already holds
-        (possibly shared with running requests).
+        object, which holds every layer's bytes of each block. The object
+        holds the chunk's last ``stored_blocks`` blocks. Skips the blocks
+        before ``start``, which vLLM's prefix cache already holds (possibly
+        shared with running requests), and for a sliding window the null
+        blocks vLLM gives the tokens its window has left behind.
 
         Raises:
             RuntimeError: ``start`` falls inside a block, whose tokens from
@@ -3828,25 +3830,27 @@ class MaruWorkerConnector:
             )
         (blocks,) = cache.tensors
         per = self._kv_chunk_tokens // group.block_size
+        stored = group.stored_blocks(self._kv_chunk_tokens)
         offset, width = (
             (0, group.group_page_bytes) if layer is None else cache.spans[layer]
         )
         src = (
-            torch.frombuffer(info.view[: per * width], dtype=torch.uint8)
+            torch.frombuffer(info.view[: stored * width], dtype=torch.uint8)
             .to(device, non_blocking=True)
-            .view(per, width)
+            .view(stored, width)
         )
-        for j in range(per):
-            position = chunk * per + j
+        for j in range(stored):
+            position = (chunk + 1) * per - stored + j
             if position * group.block_size < start:
                 continue
-            if position >= len(block_ids) or block_ids[position] == 0:
+            block = block_ids[position] if position < len(block_ids) else None
+            if block == 0 and group.windowed:
+                continue
+            if not block:
                 raise RuntimeError(
                     f"group {group.group_id} has no block at position {position}"
                 )
-            blocks[block_ids[position], offset : offset + width].copy_(
-                src[j], non_blocking=True
-            )
+            blocks[block, offset : offset + width].copy_(src[j], non_blocking=True)
 
     def _try_submit_deferred_load(self, req_meta: MaruReqMeta) -> bool:
         """Hand a deferred load to the background loader thread.
@@ -6423,9 +6427,12 @@ class MaruWorkerConnector:
         KV format (DeepSeek-V4.1's compressed KV and indexer keys). Layerwise,
         the i-th layer of the group gets its own object, keyed
         ``<object key>_L<i>``, with that layer's bytes of the chunk's blocks,
-        and the object key goes into ``markers`` for its ``_DONE`` marker. A
-        chunk with a block missing or null is not stored. Appends to the
-        caller's ``keys`` and ``handles``.
+        and the object key goes into ``markers`` for its ``_DONE`` marker.
+        For a sliding window only the chunk's last ``stored_blocks`` blocks
+        go in, the ones a hit at its end needs: a chunk this step completed
+        still has them, since they lie inside the window when the step ends.
+        A chunk with one of those blocks missing or null is not stored.
+        Appends to the caller's ``keys`` and ``handles``.
         """
         handler = self._handler
         assert handler is not None
@@ -6433,6 +6440,7 @@ class MaruWorkerConnector:
         (blocks,) = cache.tensors
         ct = self._kv_chunk_tokens
         per = ct // group.block_size
+        stored = group.stored_blocks(ct)
         spans = cache.spans if self._use_layerwise else ((0, group.group_page_bytes),)
         queued = set(keys)  # the keys already queued, for constant-time lookups
         for req_meta in self._store_entries(metadata):
@@ -6452,8 +6460,8 @@ class MaruWorkerConnector:
                         # Its layers are in but its marker failed: retry it.
                         markers[base] = object_keys
                     continue
-                ids = block_ids[ci * per : (ci + 1) * per]
-                if len(ids) < per or 0 in ids:
+                ids = block_ids[(ci + 1) * per - stored : (ci + 1) * per]
+                if len(ids) < stored or 0 in ids:
                     logger.error(
                         "Maru group store: req %s lacks a block of chunk %d of "
                         "group %d (blocks %s); skipping",
@@ -6467,12 +6475,14 @@ class MaruWorkerConnector:
                 for key, (offset, size) in zip(object_keys, spans, strict=True):
                     if self._is_stored(key) or key in queued:
                         continue
-                    nbytes = per * size
+                    nbytes = stored * size
                     handle = None
                     try:
                         handle = handler.alloc(nbytes)
                         obj = torch.frombuffer(handle.buf[:nbytes], dtype=torch.uint8)
-                        obj.view(per, size).copy_(blocks[index, offset : offset + size])
+                        obj.view(stored, size).copy_(
+                            blocks[index, offset : offset + size]
+                        )
                     except Exception as e:
                         logger.error("Maru group store error: %s: %s", key, e)
                         if handle is not None:
