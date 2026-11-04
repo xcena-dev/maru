@@ -268,10 +268,10 @@ def _detect_block_kv_layout(
     """Resolve a paged KV tensor of ``block_size``-token blocks, or of the
     kernel blocks vLLM splits them into.
 
-    An attention backend that cannot take a block whole (FlashInfer takes at
-    most 64 tokens, FlashAttention 4 with head size 256 one fixed size) gets
-    each block as ``k`` consecutive kernel blocks, each a dense part of the
-    block's page: block ``b`` is kernel blocks ``b * k`` to ``b * k + k - 1``.
+    An attention backend that cannot take a block whole, such as FlashInfer
+    with a 544-token block, gets each block as ``k`` consecutive kernel
+    blocks, each a dense part of the block's page: block ``b`` is kernel
+    blocks ``b * k`` to ``b * k + k - 1``.
     The layout then describes the kernel blocks. Slots built from vLLM's
     block ids and ``block_size`` stay right: slot ``b * block_size + t`` is
     token ``t % kernel`` of kernel block ``b * k + t // kernel``, which is
