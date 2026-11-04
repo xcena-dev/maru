@@ -360,10 +360,19 @@ def test_mamba_states_in_one_uniform_group_are_refused():
         _check_dsv41(config)
 
 
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_an_mla_group_slot_is_one_layer_on_either_side(side):
+    """slot_bytes is one layer's page on both sides; only the worker, which
+    sees every member, knows the bytes a block holds for the whole group."""
+    group = describe_kv_groups(dsv41_config(side=side))[DSV41_GROUP]
+    assert group.slot_bytes == DSV41_BLOCK * 24  # layers.2.attn.kv
+    assert group.group_page_bytes == (2_560 if side == "worker" else 0)
+
+
 def test_an_mla_group_object_holds_each_block_once():
     groups = describe_kv_groups(dsv41_config())
     page = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
-    assert groups[DSV41_GROUP].slot_bytes == page
+    assert groups[DSV41_GROUP].group_page_bytes == page
     assert groups[DSV41_GROUP].object_bytes(DSV41_BLOCK) == page
     assert groups[DSV41_GROUP].object_bytes(2 * DSV41_BLOCK) == 2 * page
     assert groups[0].object_bytes(2 * DSV41_BLOCK) == 0
@@ -420,9 +429,8 @@ def _cache_of(worker, group_id):
 
 def test_dsv41_registers_only_the_mla_group_as_blocks():
     shared = _dsv41_shared()
-    worker = _dsv41_worker(
-        dsv41_kv_caches(shared)
-    )  # no sliding-window or circular-buffer tensors
+    # No sliding-window or circular-buffer tensors: Maru registers none.
+    worker = _dsv41_worker(dsv41_kv_caches(shared))
     (cache,) = worker._group_caches
     (blocks,) = cache.tensors
     assert cache.group.group_id == DSV41_GROUP
@@ -467,6 +475,28 @@ def test_mla_group_layers_must_fit_at_the_start_of_each_block():
     )
     with pytest.raises(ValueError, match="do not fit in the first"):
         _dsv41_worker(caches)
+
+
+def test_an_mla_group_with_a_tensor_per_layer_is_refused():
+    """Without UniformTypeKVCacheSpecs, vLLM gives each layer of the group a
+    tensor of its own, so a block has no single range of bytes to copy."""
+    config = dsv41_config()
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=DSV41_BLOCK, num_kv_heads=1, head_size=24, dtype=torch.uint8
+        )
+        for name in DSV41_MEMBERS
+    }
+    config.kv_cache_groups[DSV41_GROUP] = KVCacheGroupSpec(
+        list(mla), next(iter(mla.values()))
+    )
+    worker = _worker(config, 2 * DSV41_BLOCK)
+    caches = {
+        name: torch.zeros(DSV41_NUM_BLOCKS, DSV41_BLOCK, 24, dtype=torch.uint8)
+        for name in DSV41_MEMBERS
+    }
+    with pytest.raises(ValueError, match="one after another"):
+        worker.register_kv_caches(caches)
 
 
 DSV41_BLOCKS_A = [5, 2, 7, 9]  # request A's group-4 blocks for tokens 0-63
@@ -568,6 +598,21 @@ def test_dsv41_chunk_without_all_its_blocks_is_not_stored(extra):
     tokens = list(range(80))
     worker.wait_for_save(_store_meta(tokens, _dsv41_blocks([5, 2, 0, 9]), 0, 72))
     assert set(store) == _dsv41_keys(tokens, 32, 1, bool(extra))
+
+
+@DSV41_FORMATS
+def test_dsv41_requests_completing_the_same_chunks_queue_them_once(extra):
+    """Two requests whose step completes the same chunks store each object
+    once."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=extra)
+    tokens = list(range(80))
+    worker.wait_for_save(
+        _store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64, req_ids=("r1", "r2"))
+    )
+    for call in worker._handler.batch_store.call_args_list:
+        keys = call.args[0]
+        assert len(keys) == len(set(keys))
+    assert set(store) == _dsv41_keys(tokens, 32, 2, bool(extra))
 
 
 def _refusing(worker, store, refused):
@@ -705,6 +750,27 @@ def test_dsv41_load_skips_blocks_vllms_cache_holds(per, extra):
     assert _block_bytes(worker, DSV41_BLOCKS_B[0]) == bytes(DSV41_PAGE)
     for a, b in zip(DSV41_BLOCKS_A[1:], DSV41_BLOCKS_B[1:], strict=True):
         assert _block_bytes(worker, b) == _block_bytes(stored, a)
+
+
+@DSV41_FORMATS
+def test_dsv41_load_fails_when_it_starts_inside_a_block(extra):
+    """vLLM's prefix cache holding tokens 0-7 puts the load's start inside the
+    first block, whose later tokens nothing would load; the load fails and
+    vLLM recomputes."""
+    chunk = 2 * DSV41_BLOCK
+    _, store = _dsv41_stored(chunk, extra_config=extra)
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)),
+        _dsv41_blocks(DSV41_BLOCKS_B),
+        64 // chunk,
+        computed=8,
+        deferred_load=True,
+        load_start_token=8,
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    # A parked load of several groups fails by its request, not its blocks.
+    assert _reported_failures(worker) == (set(), {"b"}, {"b"})
 
 
 @DSV41_FORMATS

@@ -331,6 +331,15 @@ def _chunk_layer_key(base_key: str, layer_idx: int) -> str:
     return f"{base_key}_L{layer_idx}"
 
 
+def _chunk_done_key(base_key: str) -> str:
+    """Key of a layerwise chunk's completion marker.
+
+    The single owner of the ``_DONE`` suffix: the store registers it after
+    every layer of the chunk, and the scheduler's lookup asks for it.
+    """
+    return f"{base_key}_DONE"
+
+
 def _load_keys(
     chunk_keys: list[str],
     num_chunks: int,
@@ -1946,7 +1955,7 @@ class MaruSchedulerConnector:
         Layerwise: a separate ``_DONE`` marker is written after the last
         per-layer object.
         """
-        return base_key if not self._use_layerwise else f"{base_key}_DONE"
+        return _chunk_done_key(base_key) if self._use_layerwise else base_key
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -3618,22 +3627,22 @@ class MaruWorkerConnector:
                 chunks = range(max(window.start, first), window.stop)
             else:
                 chunks = range(first, hit)
-            parts: list[int | None] = (
+            layers: list[int | None] = (
                 list(range(len(cache.spans)))
                 if self._use_layerwise and group.kind == GROUP_MLA
                 else [None]
             )
-            plan += [(cache, ci, part) for ci in chunks for part in parts]
+            plan += [(cache, ci, layer) for ci in chunks for layer in layers]
         chunk_keys = {
             c.group.group_id: self._slice_chunk_keys(req_meta, c.group)
             for c in self._group_caches
         }
         keys = []
-        for c, ci, part in plan:
+        for c, ci, layer in plan:
             key = group_object_key(
                 chunk_keys[c.group.group_id][ci], c.group.group_id, ct
             )
-            keys.append(key if part is None else _chunk_layer_key(key, part))
+            keys.append(key if layer is None else _chunk_layer_key(key, layer))
         try:
             infos = self._batch_retrieve_all(keys)
         except Exception as e:
@@ -3647,7 +3656,8 @@ class MaruWorkerConnector:
             )
             return None
         return hit, [
-            (c, ci, part, info) for (c, ci, part), info in zip(plan, infos, strict=True)
+            (c, ci, layer, info)
+            for (c, ci, layer), info in zip(plan, infos, strict=True)
         ]
 
     def _place_group_objects(
@@ -3664,13 +3674,13 @@ class MaruWorkerConnector:
         as a parked load must (see ``_place_chunk``).
         """
         hit, placed = objects
-        for cache, ci, part, info in placed:
+        for cache, ci, layer, info in placed:
             block_ids = req_meta.group_block_ids[cache.group.group_id]
             if cache.group.kind == GROUP_MAMBA:
                 self._place_state(cache, info, block_ids, req_meta, hit, device)
             elif cache.group.kind == GROUP_MLA:
                 self._place_group_blocks(
-                    cache, ci, info, block_ids, req_meta.load_start_token, device, part
+                    cache, ci, info, block_ids, req_meta.load_start_token, device, layer
                 )
             else:
                 self._place_chunk(
@@ -3805,11 +3815,22 @@ class MaruWorkerConnector:
         object, which holds every layer's bytes of each block. Skips the
         blocks before ``start``, which vLLM's prefix cache already holds
         (possibly shared with running requests).
+
+        Raises:
+            RuntimeError: ``start`` falls inside a block, whose tokens from
+                ``start`` on nothing would load; or the chunk lacks a block.
         """
         group = cache.group
+        if start % group.block_size:
+            raise RuntimeError(
+                f"group {group.group_id}: the load starts at token {start}, "
+                f"inside a {group.block_size}-token block"
+            )
         (blocks,) = cache.tensors
         per = self._kv_chunk_tokens // group.block_size
-        offset, width = (0, group.slot_bytes) if layer is None else cache.spans[layer]
+        offset, width = (
+            (0, group.group_page_bytes) if layer is None else cache.spans[layer]
+        )
         src = (
             torch.frombuffer(info.view[: per * width], dtype=torch.uint8)
             .to(device, non_blocking=True)
@@ -6163,11 +6184,11 @@ class MaruWorkerConnector:
         self._register_done_markers(markers)
 
     def _register_done_markers(self, markers: dict[str, list[str]]) -> None:
-        """Register the ``_DONE`` marker of each layerwise (chunk, group)
-        whose layers are all stored, in one ``batch_store`` after theirs.
+        """Register the ``_DONE`` marker of each chunk whose layers are stored.
 
-        The scheduler looks a layerwise chunk up by its marker, so a marker
-        never names a chunk with a layer missing.
+        The markers go in one ``batch_store`` after the layers' own. The
+        scheduler looks a layerwise chunk up by its marker, so a marker never
+        names a chunk with a layer missing.
         """
         handler = self._handler
         assert handler is not None
@@ -6182,7 +6203,7 @@ class MaruWorkerConnector:
             except Exception as e:
                 logger.warning("Maru _DONE marker alloc failed for %s: %s", base, e)
                 continue
-            keys.append(f"{base}_DONE")
+            keys.append(_chunk_done_key(base))
             handles.append(handle)
         self._register_objects(keys, handles, "layerwise marker")
 
@@ -6412,27 +6433,30 @@ class MaruWorkerConnector:
         (blocks,) = cache.tensors
         ct = self._kv_chunk_tokens
         per = ct // group.block_size
-        spans = cache.spans if self._use_layerwise else ((0, group.slot_bytes),)
+        spans = cache.spans if self._use_layerwise else ((0, group.group_page_bytes),)
+        queued = set(keys)  # the keys already queued, for constant-time lookups
         for req_meta in self._store_entries(metadata):
             chunk_keys = self._slice_chunk_keys(req_meta, group)
             block_ids = req_meta.group_block_ids[group.group_id]
             for ci in _step_chunks(req_meta, ct, len(chunk_keys)):
                 base = group_object_key(chunk_keys[ci], group.group_id, ct)
-                part_keys = (
+                object_keys = (
                     [_chunk_layer_key(base, i) for i in range(len(spans))]
                     if self._use_layerwise
                     else [base]
                 )
-                if all(self._is_stored(k) or k in keys for k in part_keys):
-                    if self._use_layerwise and not self._is_stored(f"{base}_DONE"):
+                if all(self._is_stored(k) or k in queued for k in object_keys):
+                    if self._use_layerwise and not self._is_stored(
+                        _chunk_done_key(base)
+                    ):
                         # Its layers are in but its marker failed: retry it.
-                        markers[base] = part_keys
+                        markers[base] = object_keys
                     continue
                 ids = block_ids[ci * per : (ci + 1) * per]
                 if len(ids) < per or 0 in ids:
                     logger.error(
-                        "Maru group store: req %s has no block for every part of "
-                        "chunk %d of group %d (blocks %s); skipping",
+                        "Maru group store: req %s lacks a block of chunk %d of "
+                        "group %d (blocks %s); skipping",
                         req_meta.req_id,
                         ci,
                         group.group_id,
@@ -6440,8 +6464,8 @@ class MaruWorkerConnector:
                     )
                     continue
                 index = torch.tensor(ids, device=blocks.device)
-                for key, (offset, size) in zip(part_keys, spans, strict=True):
-                    if self._is_stored(key) or key in keys:
+                for key, (offset, size) in zip(object_keys, spans, strict=True):
+                    if self._is_stored(key) or key in queued:
                         continue
                     nbytes = per * size
                     handle = None
@@ -6456,8 +6480,9 @@ class MaruWorkerConnector:
                         continue
                     keys.append(key)
                     handles.append(handle)
+                    queued.add(key)
                 if self._use_layerwise:
-                    markers[base] = part_keys
+                    markers[base] = object_keys
 
     def _packed_store_kernel_ctx(self, attn_metadata: Any) -> tuple | None:
         """Kernel ctx for the coalesced packed store, or None for the fallback.
@@ -7057,7 +7082,7 @@ class MaruWorkerConnector:
         handler = self._handler
         if handler is None:
             return
-        done_key = f"{base_key}_DONE"
+        done_key = _chunk_done_key(base_key)
         done_h = None
         try:
             done_h = handler.alloc(1)

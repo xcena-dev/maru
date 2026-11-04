@@ -56,8 +56,14 @@ class KVGroup:
             differ between groups.
         block_size: Tokens per block for this group.
         slot_bytes: Bytes one layer uses for one block (``page_size_bytes``).
-            For an MLA group on the worker, the whole group's bytes per
-            block, since vLLM's ``UniformTypeKVCacheSpecs`` sums its members.
+            For a ``UniformTypeKVCacheSpecs`` group, its first member's: the
+            scheduler sees such a group as that member alone.
+        group_page_bytes: Bytes one block holds for all the group's layers
+            when vLLM lays them out one after another in the block: a
+            ``UniformTypeKVCacheSpecs``'s page (the sum of its members'), or
+            a one-layer group's page. 0 when that is not known: the scheduler
+            sees a ``UniformTypeKVCacheSpecs`` group as its first member, and
+            each layer of a plain group of several keeps a tensor of its own.
         sliding_window: Window in tokens for a sliding-window group.
         mamba_cache_mode: Mamba state caching mode (``"align"`` etc.).
         state_bytes: For a Mamba group, bytes of one layer's state in one
@@ -78,6 +84,7 @@ class KVGroup:
     layer_names: tuple[str, ...]
     block_size: int
     slot_bytes: int
+    group_page_bytes: int = 0
     sliding_window: int | None = None
     mamba_cache_mode: str | None = None
     state_bytes: int = 0
@@ -94,7 +101,7 @@ class KVGroup:
         if self.kind == GROUP_SKIP:
             return 0
         if self.kind == GROUP_MLA:
-            return chunk_tokens // self.block_size * self.slot_bytes
+            return chunk_tokens // self.block_size * self.group_page_bytes
         blocks = 1 if self.kind == GROUP_MAMBA else chunk_tokens // self.block_size
         return len(self.layer_names) * self.slot_bytes * blocks
 
@@ -162,6 +169,9 @@ def describe_kv_groups(
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
         kind = _group_kind(spec)
+        members = getattr(spec, "kv_cache_specs", None)
+        uniform = isinstance(members, dict) and bool(members)
+        layer_spec = next(iter(members.values())) if uniform else spec
         groups.append(
             KVGroup(
                 group_id=group_id,
@@ -169,7 +179,12 @@ def describe_kv_groups(
                 spec_name=type(spec).__name__,
                 layer_names=tuple(group.layer_names),
                 block_size=int(spec.block_size),
-                slot_bytes=int(spec.page_size_bytes),
+                slot_bytes=int(layer_spec.page_size_bytes),
+                group_page_bytes=(
+                    int(spec.page_size_bytes)
+                    if uniform or len(group.layer_names) == 1
+                    else 0
+                ),
                 sliding_window=getattr(spec, "sliding_window", None),
                 mamba_cache_mode=(
                     getattr(spec, "mamba_cache_mode", None) or default_mamba_cache_mode
@@ -385,11 +400,12 @@ def check_multi_group_support(
             "alongside other groups; supported are "
             f"{', '.join([*_SUPPORTED_SPECS, *sorted(_MLA_SPECS)])}"
             + (
-                # vLLM prefix-caches DeepSeek-V4.1's sliding window only when
-                # bounded replay is off (V1 model runner, ROCm, or the flag).
-                ". DeepSeek-V4.1's sliding window must stay out of vLLM's "
-                "prefix cache: keep --swa-bounded-replay on and vLLM's V2 "
-                "model runner (both the default on CUDA)"
+                # vLLM prefix-caches a sliding-window MLA group (DeepSeek-V4.1's)
+                # only when bounded replay is off (V1 model runner, ROCm, or
+                # the flag).
+                ". A sliding-window MLA group must stay out of vLLM's prefix "
+                "cache: keep --swa-bounded-replay on and vLLM's V2 model "
+                "runner (both the default on CUDA)"
                 if windowed
                 else one_group_hint(groups)
             )
@@ -492,8 +508,9 @@ class GroupCache:
             share one shape, dtype and strides. For a Mamba group, each
             layer's state as a ``uint8`` view of shape ``[num_blocks,
             state_bytes]``: row ``b`` is block ``b``'s state. For an MLA
-            group, one ``uint8`` view of shape ``[num_blocks, slot_bytes]``
-            over every layer at once: row ``b`` is block ``b``.
+            group, one ``uint8`` view of shape ``[num_blocks,
+            group_page_bytes]`` over every layer at once: row ``b`` is block
+            ``b``.
         layout: Paged KV layout of an attention group; None for Mamba and
             MLA groups.
         spans: For an MLA group, each layer's ``(offset, bytes)`` inside a
@@ -561,17 +578,17 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
 def group_block_view(
     group: KVGroup, kv_caches: dict[str, Any]
 ) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
-    """An MLA group's blocks as ``uint8 [num_blocks, slot_bytes]``.
+    """An MLA group's blocks as ``uint8 [num_blocks, group_page_bytes]``.
 
-    For DeepSeek-V4.1, vLLM keeps every KV cache group in one buffer that
-    gives each block id one range of bytes, and stores a group's layers one
-    after another from the start of that range: a block's compressed KV and
-    indexer keys sit side by side there. Row ``b`` of the view is block
-    ``b``'s bytes for this group. It aliases vLLM's memory: writing a row
-    writes that block of every layer in the group.
+    vLLM can keep every KV cache group in one buffer that gives each block id
+    one range of bytes, each group laying its layers out one after another
+    from the start of that range (DeepSeek-V4.1's block holds its compressed
+    KV and indexer keys side by side this way). Row ``b`` of the view is
+    block ``b``'s bytes for this group. It aliases vLLM's memory: writing a
+    row writes that block of every layer in the group.
 
     Args:
-        group: An MLA group; ``slot_bytes`` is its bytes per block.
+        group: An MLA group; ``group_page_bytes`` is its bytes per block.
         kv_caches: ``register_kv_caches``' argument, holding every layer of
             the group.
 
@@ -580,9 +597,17 @@ def group_block_view(
         group's layer order.
 
     Raises:
-        ValueError: The layers do not share one buffer and block stride, or
-            do not fit in the first ``slot_bytes`` bytes of each block.
+        ValueError: The layers keep a tensor each (``group_page_bytes`` is
+            0), do not share one buffer and block stride, or do not fit in
+            the first ``group_page_bytes`` bytes of each block.
     """
+    page = group.group_page_bytes
+    if not page:
+        raise ValueError(
+            f"MaruKVConnector: the layers of KV cache group {group.group_id} "
+            "keep a tensor each; Maru copies an MLA group only when vLLM lays "
+            "its layers out one after another in each block"
+        )
     tensors = [kv_caches[n] for n in group.layer_names]
     first = tensors[0]
     storage = first.untyped_storage()
@@ -611,16 +636,15 @@ def group_block_view(
             not 0 <= offset < stride or not t[0].is_contiguous()
             for offset, t in zip(offsets, tensors, strict=True)
         )
-        or max(ends) - start > group.slot_bytes
-        or start + group.slot_bytes > stride
+        or max(ends) - start > page
+        or start + page > stride
     ):
         raise ValueError(
             f"MaruKVConnector: the layers of KV cache group {group.group_id} "
-            f"do not fit in the first {group.slot_bytes} bytes of each "
-            f"{stride}-byte block"
+            f"do not fit in the first {page} bytes of each {stride}-byte block"
         )
     view = torch.empty(0, dtype=torch.uint8, device=first.device)
-    view.set_(storage, start, (first.shape[0], group.slot_bytes), (stride, 1))
+    view.set_(storage, start, (first.shape[0], page), (stride, 1))
     spans = tuple(
         (offset - start, end - offset)
         for offset, end in zip(offsets, ends, strict=True)
