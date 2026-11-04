@@ -2,17 +2,18 @@
 //
 // Python bindings for Maru's paged-KV placement kernels.
 //
-// The kernels themselves are vendored from LMCache (see ../VENDOR.md); this
-// binding layer is Maru's own and exposes only the entry points the Maru
-// connectors call. The unexposed kernels in the vendored translation units are
-// still compiled — they are left untouched so the vendored sources stay
+// Most kernels are vendored from LMCache (see ../VENDOR.md); this binding
+// layer is Maru's own and exposes only the entry points the Maru connectors
+// call. The unexposed kernels in the vendored translation units are still
+// compiled — they are left untouched so the vendored sources stay
 // byte-identical to their upstream revision, which is what makes a refresh a
-// plain file copy.
+// plain file copy. The logical-page kernel is Maru's own as well.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include "logical_page_kernels.cuh"
 #include "mem_kernels.cuh"
 #include "mp_mem_kernels.cuh"
 
@@ -60,6 +61,39 @@ PYBIND11_MODULE(_C, m) {
         py::arg("page_buffer_size"), py::arg("direction"),
         py::arg("engine_kv_format"), py::arg("block_size") = 0,
         py::arg("head_size") = 0, py::arg("skip_prefix_n_tokens") = 0,
+        py::call_guard<py::gil_scoped_release>());
+
+  // vLLM 0.29+'s logical page, which no EngineKVFormat describes for Maru's
+  // K/V-major slab: the page is told by its strides instead.
+  py::class_<LogicalPageFormat>(m, "LogicalPageFormat", py::module_local())
+      .def(py::init([](int64_t block_stride, int64_t head_stride,
+                       int64_t token_stride, int64_t num_heads) {
+             return LogicalPageFormat{block_stride, head_stride, token_stride,
+                                      num_heads};
+           }),
+           py::arg("block_stride"), py::arg("head_stride"),
+           py::arg("token_stride"), py::arg("num_heads"))
+      .def_readonly("block_stride", &LogicalPageFormat::block_stride)
+      .def_readonly("head_stride", &LogicalPageFormat::head_stride)
+      .def_readonly("token_stride", &LogicalPageFormat::token_stride)
+      .def_readonly("num_heads", &LogicalPageFormat::num_heads)
+      .def("__repr__", [](const LogicalPageFormat& f) {
+        return "LogicalPageFormat(block_stride=" +
+               std::to_string(f.block_stride) +
+               ", head_stride=" + std::to_string(f.head_stride) +
+               ", token_stride=" + std::to_string(f.token_stride) +
+               ", num_heads=" + std::to_string(f.num_heads) + ")";
+      });
+
+  // The same entry point for a LogicalPageFormat, so a connector holds either
+  // kind of format and makes one call. pybind11 picks the overload by the
+  // format's type; block_size and head_size are required here.
+  m.def("multi_layer_kv_transfer", &logical_page_kv_transfer,
+        py::arg("key_value"), py::arg("key_value_ptrs"),
+        py::arg("slot_mapping"), py::arg("paged_memory_device"),
+        py::arg("page_buffer_size"), py::arg("direction"),
+        py::arg("engine_kv_format"), py::arg("block_size"),
+        py::arg("head_size"), py::arg("skip_prefix_n_tokens") = 0,
         py::call_guard<py::gil_scoped_release>());
 
   // Token-granular placement for one layer. Used by the layer-overlap load,

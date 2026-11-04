@@ -135,7 +135,7 @@ class TestVendorProvenance:
         assert actual == recorded[name], (
             f"{name} does not match the digest in VENDOR.md. Refresh the table "
             "(and the revision above it) with: cd maru_kv_ops/csrc && "
-            "sha256sum *.h *.cu *.cuh"
+            "the sha256sum command VENDOR.md gives"
         )
 
     @staticmethod
@@ -216,6 +216,23 @@ class TestBindingSurface:
         doc = maru_kv_ops.multi_layer_kv_transfer.__doc__
         for keyword in ("block_size", "head_size", "skip_prefix_n_tokens"):
             assert keyword in doc
+
+    def test_logical_page_format_is_bound(self):
+        """vLLM 0.29+ pages are described by strides, not an enum member."""
+        fmt = maru_kv_ops.LogicalPageFormat(
+            block_stride=4096, head_stride=256, token_stride=2048, num_heads=8
+        )
+        assert (
+            fmt.block_stride,
+            fmt.head_stride,
+            fmt.token_stride,
+            fmt.num_heads,
+        ) == (4096, 256, 2048, 8)
+
+    def test_multi_layer_takes_either_kind_of_format(self):
+        """One entry point; the connector's call sites do not branch."""
+        doc = maru_kv_ops.multi_layer_kv_transfer.__doc__
+        assert "EngineKVFormat" in doc and "LogicalPageFormat" in doc
 
     def test_shape_desc_exposes_every_field(self):
         desc = maru_kv_ops.PageBufferShapeDesc()

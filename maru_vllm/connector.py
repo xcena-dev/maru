@@ -1185,9 +1185,17 @@ def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> r
     return range(start // chunk_tokens, min(end // chunk_tokens, num_chunks))
 
 
-# Attention backends the placement kernels do not serve: the same ones
-# _packed_load_kernel_ctx refuses by their metadata (MLA, Triton).
-_NO_KERNEL_BACKENDS = ("MLA", "TRITON")
+def _kernel_refused_by(backend: str, layout: KVLayout | None) -> bool:
+    """Whether attention backend ``backend`` keeps its pages off the kernels.
+
+    The same refusals ``_packed_load_kernel_ctx`` makes by metadata type. An
+    MLA latent has no K/V planes. Triton's rank-5 page of vLLM < 0.29 may pad
+    each head with an inline scale; its 0.29+ logical page is the Flash page,
+    ``[K|V]`` per head, which ``kv_packed`` (exactly two heads wide) confirms.
+    """
+    if "MLA" in backend:
+        return True
+    return "TRITON" in backend and not (layout is not None and layout.kv_packed)
 
 
 def _attention_backend(layers: dict[str, Any] | None, name: str) -> str | None:
@@ -1205,6 +1213,46 @@ def _is_dense(t: torch.Tensor) -> bool:
     """
     span = 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride(), strict=True))
     return span == t.numel()
+
+
+# Layouts whose missing kernel format was already logged, once per process.
+_kv_format_warned: set[str] = set()
+
+
+def _logical_page_format(
+    format_type: Any, pages: list[torch.Tensor], layout: KVLayout
+) -> Any | None:
+    """The kernel format of vLLM 0.29+ logical pages, or None.
+
+    The pages' physical order shows only in their strides, so the format is
+    the strides themselves, which the kernel shares across every layer of
+    the pointer table. Refused when the layers do not share them, when K|V
+    content is not the innermost run, or when a page's base is not 16-byte
+    aligned (the kernel may move 16 bytes per access).
+
+    Args:
+        format_type: ``maru_kv_ops.LogicalPageFormat``, or None when the
+            extension was built before it existed.
+        pages: The layers' logical pages ``[B, H, N, K|V]``, in table order.
+        layout: Their resolved layout; ``kv_packed`` must be set.
+    """
+    if format_type is None or not pages:
+        return None
+    strides = {tuple(page.stride()) for page in pages}
+    if len(strides) != 1 or any(tuple(page.shape) != layout.shape for page in pages):
+        return None
+    (stride,) = strides
+    if layout.kv_axis is None or stride[layout.kv_axis] != 1:
+        return None
+    if any(page.data_ptr() % 16 for page in pages):
+        return None
+    head_axis = ({0, 1, 2} - {layout.block_axis, layout.token_axis}).pop()
+    return format_type(
+        block_stride=stride[layout.block_axis],
+        head_stride=stride[head_axis],
+        token_stride=stride[layout.token_axis],
+        num_heads=layout.num_heads,
+    )
 
 
 def _validate_deferred_loading(enabled: bool) -> None:
@@ -3124,7 +3172,7 @@ class MaruWorkerConnector:
                 continue  # decided at first use, from the attention metadata
             self._group_kernels[cache.group.group_id] = (
                 None
-                if any(name in backend for name in _NO_KERNEL_BACKENDS)
+                if _kernel_refused_by(backend, cache.layout)
                 else self._build_group_kernel(cache, None)
             )
         logger.info(
@@ -5558,7 +5606,9 @@ class MaruWorkerConnector:
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration,
         or from ``layout`` for one KV cache group's layers, whose third tuple
-        item is then the layer's position in the group.
+        item is then the layer's position in the group. vLLM 0.29+'s logical
+        page has no ``EngineKVFormat``; its format is the pages' strides
+        (``maru_kv_ops.LogicalPageFormat``), which the same entry point takes.
         """
         if self._cpu_mode and not self._lease_buffers_gpu_accessible():
             # CPU pools are pageable; the remote_cxl staging buffer is page-locked
@@ -5570,10 +5620,11 @@ class MaruWorkerConnector:
         # No resolved layout, or one with no kernel form (the fused orders),
         # means we must not hand raw pointers to the kernel.
         layout = layout or self._kv_layout
-        if layout is None or layout.format_name is None:
+        if layout is None or (layout.format_name is None and not layout.kv_packed):
             return None
-        # Flash layout only (exclude MLA/Triton). An MLA latent has no K/V
-        # planes for the kernel, also when no metadata says MLA yet.
+        # No MLA, and no Triton but on a logical page (see _kernel_refused_by).
+        # An MLA latent has no K/V planes for the kernel, also when no
+        # metadata says MLA yet.
         if self._use_mla:
             return None
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -5586,7 +5637,9 @@ class MaruWorkerConnector:
             if isinstance(attn_metadata, dict)
             else attn_metadata
         )
-        if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
+        if isinstance(layer_meta, MLACommonMetadata):
+            return None
+        if isinstance(layer_meta, TritonAttentionMetadata) and not layout.kv_packed:
             return None
         # Resolve the placement kernels lazily.
         if self._kv_ops is None:
@@ -5606,13 +5659,24 @@ class MaruWorkerConnector:
         ops = self._kv_ops
         # A kernel build predating a format cannot place it; take the per-layer
         # fallback rather than raising out of the load path.
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
-        if kv_format is None:
-            logger.warning(
-                "Maru packed load: kernel has no format %s; using per-layer "
-                "inject fallback",
-                layout.format_name,
+        if layout.kv_packed:
+            kv_format = _logical_page_format(
+                getattr(ops, "LogicalPageFormat", None),
+                [kv_cache_layer for _, kv_cache_layer, _ in layers],
+                layout,
             )
+        else:
+            assert layout.format_name is not None  # refused above otherwise
+            kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        if kv_format is None:
+            what = layout.format_name or f"logical page {layout.shape}"
+            if what not in _kv_format_warned:  # an inline load asks every step
+                _kv_format_warned.add(what)
+                logger.warning(
+                    "Maru packed load: kernel has no format for %s; using "
+                    "per-layer inject fallback",
+                    what,
+                )
             return None
         return (
             ops,
@@ -6144,10 +6208,12 @@ class MaruWorkerConnector:
 
         The pointer table is indexed by each layer's position in the group,
         which is its plane in the group's slab. A tensor with padding between
-        its blocks (a padded page) gets none: the kernel would read the
-        padding as KV.
+        its blocks (a padded page) gets none from a format kernel, which would
+        read the padding as KV. A logical page is addressed by its strides,
+        which step over the padding, so it keeps the kernel.
         """
-        if not _is_dense(cache.tensors[0]):
+        packed = cache.layout is not None and cache.layout.kv_packed
+        if not packed and not _is_dense(cache.tensors[0]):
             return None
         layers = [
             (name, tensor, i)
@@ -6167,9 +6233,10 @@ class MaruWorkerConnector:
     ) -> None:
         """Gather an attention group's completed chunks without the kernel.
 
-        Used where ``maru_kv_ops`` has no format for the layout (vLLM 0.30's
-        fused K/V, for one), the pages are padded, or there is no CUDA
-        device. Each chunk's layers are gathered into one slab on their
+        Used where ``maru_kv_ops`` has no format for the layout (a fused K/V
+        row that does not split into two heads, for one), the attention
+        backend is refused (see ``_kernel_refused_by``), a format kernel's
+        pages are padded, or there is no CUDA device. Each chunk's layers are gathered into one slab on their
         device and copied to CXL at once. Appends to the caller's ``keys``
         and ``handles``.
         """
@@ -7171,7 +7238,7 @@ class MaruWorkerConnector:
         logger.info(
             "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d "
             "num_heads=%d head_size=%d K/V=%s",
-            layout.format_name or "per-layer",
+            layout.format_name or ("logical page" if layout.kv_packed else "per-layer"),
             kv_layout,
             layout.num_blocks,
             layout.block_size,
