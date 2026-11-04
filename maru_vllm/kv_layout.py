@@ -258,6 +258,39 @@ def _detect_kv_layout(
     return best
 
 
+def _detect_block_kv_layout(
+    shape: tuple[int, ...],
+    block_size: int,
+    kv_layout: str | None,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
+) -> KVLayout | None:
+    """Resolve a paged KV tensor of ``block_size``-token blocks, or of the
+    kernel blocks vLLM splits them into.
+
+    An attention backend that cannot take a block whole (FlashInfer takes at
+    most 64 tokens, FlashAttention 4 with head size 256 one fixed size) gets
+    each block as ``k`` consecutive kernel blocks, each a dense part of the
+    block's page: block ``b`` is kernel blocks ``b * k`` to ``b * k + k - 1``.
+    The layout then describes the kernel blocks. Slots built from vLLM's
+    block ids and ``block_size`` stay right: slot ``b * block_size + t`` is
+    token ``t % kernel`` of kernel block ``b * k + t // kernel``, which is
+    ``divmod(slot, kernel)``.
+
+    Arguments and return value as for :func:`_detect_kv_layout`.
+    """
+    layout = _detect_kv_layout(shape, block_size, kv_layout, num_kv_heads, head_size)
+    if layout is not None:
+        return layout
+    for kernel in range(block_size // 2, 0, -1):
+        if block_size % kernel:
+            continue
+        layout = _detect_kv_layout(shape, kernel, kv_layout, num_kv_heads, head_size)
+        if layout is not None:
+            return layout
+    return None
+
+
 def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
     """Return a view of ``t`` with axes reordered to ``[2?, NB, BS, ...]``.
 

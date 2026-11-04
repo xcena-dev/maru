@@ -69,7 +69,7 @@ from maru_vllm.kv_groups import (
 )
 from maru_vllm.kv_layout import (
     KVLayout,
-    _detect_kv_layout,
+    _detect_block_kv_layout,
     _gather_kv,
     _is_logical_page_layout,
     _layout_fits,
@@ -3093,7 +3093,9 @@ class MaruWorkerConnector:
                 "chunk_tokens": self._kv_chunk_tokens,
                 "heads": layout.num_heads,
                 "head_size": layout.head_size,
-                "block_size": layout.block_size,
+                # vLLM's block, not a kernel block the layout may describe:
+                # the objects are the same either way.
+                "block_size": self._block_size,
             }
             self._extra_config = {
                 **self._extra_config,
@@ -7185,7 +7187,7 @@ class MaruWorkerConnector:
         layout = self._kv_layout
         if layout is not None and _layout_fits(layout, shape):
             return layout
-        return _detect_kv_layout(
+        return _detect_block_kv_layout(
             shape,
             self._block_size,
             self._cache_layout,
@@ -7212,7 +7214,7 @@ class MaruWorkerConnector:
         if not hasattr(sample, "shape"):
             return None
         kv_layout = self._cache_layout = _vllm_kv_cache_layout(self._cache_config)
-        layout = _detect_kv_layout(
+        layout = _detect_block_kv_layout(
             tuple(sample.shape),
             self._block_size,
             kv_layout,

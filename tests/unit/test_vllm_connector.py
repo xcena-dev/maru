@@ -393,15 +393,25 @@ class TestChunkObjectBytes:
         assert worker._chunk_object_bytes() is None
 
     def test_block_size_mismatch_keeps_default(self):
-        """A layout whose block axis disagrees with vLLM's configured block
-        size means the axes were misread, so refuse rather than size a page
-        from a plausible-looking wrong number."""
+        """A block axis that neither is vLLM's configured block size nor
+        divides it, as kernel blocks do, means the axes were misread, so
+        refuse rather than size a page from a plausible-looking wrong number."""
+        worker = self._with_caches(
+            self._make_worker(block_size=24),
+            torch.empty(8, 2, 16, 4, 2, dtype=torch.float16),
+        )
+
+        assert worker._chunk_object_bytes() is None
+
+    def test_kernel_blocks_size_the_page_as_whole_blocks(self):
+        """An attention backend that takes 16-token blocks gets vLLM's 32-token
+        blocks as kernel blocks of 16. A token takes the same bytes."""
         worker = self._with_caches(
             self._make_worker(block_size=32),
             torch.empty(8, 2, 16, 4, 2, dtype=torch.float16),
         )
 
-        assert worker._chunk_object_bytes() is None
+        assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
 
 
 class TestDetectKVLayout:

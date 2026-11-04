@@ -28,7 +28,7 @@ from typing import Any
 
 import torch
 
-from maru_vllm.kv_layout import KVLayout, _detect_kv_layout
+from maru_vllm.kv_layout import KVLayout, _detect_block_kv_layout
 
 GROUP_FULL = "full"
 GROUP_SLIDING_WINDOW = "sliding_window"
@@ -461,28 +461,6 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
     return view
 
 
-def _kernel_block_size(
-    shape: tuple[int, ...],
-    block_size: int,
-    kv_layout: str,
-    num_kv_heads: int,
-    head_size: int | None,
-) -> int | None:
-    """Kernel block size, when vLLM split each block for the attention kernel.
-
-    A backend that cannot take the group's block size whole (FlashInfer, or
-    FlashAttention 4 with head size 256) gets each block as several
-    consecutive kernel blocks, so the tensor's token axis is a divisor of the
-    block size.
-    """
-    for kernel in range(block_size // 2, 0, -1):
-        if block_size % kernel == 0 and _detect_kv_layout(
-            shape, kernel, kv_layout, num_kv_heads, head_size
-        ):
-            return kernel
-    return None
-
-
 def group_caches(
     groups: list[KVGroup],
     kv_caches: dict[str, Any],
@@ -496,9 +474,11 @@ def group_caches(
     Every layer a group lists must be registered. Layers that no group lists
     (none for the supported models) are left alone. An attention group's
     layout comes from its first layer, and every layer of the group must
-    share its shape, dtype and strides. A block of KV may not exceed the
-    group's ``slot_bytes``, which the object sizes are computed from; it is
-    smaller when vLLM pads the page.
+    share its shape, dtype and strides. When the attention backend takes
+    smaller blocks, the layout describes the kernel blocks vLLM splits each
+    block into (see ``_detect_block_kv_layout``). A block of KV may not
+    exceed the group's ``slot_bytes``, which the object sizes are computed
+    from; it is smaller when vLLM pads the page.
 
     Args:
         groups: The model's KV cache groups.
@@ -510,8 +490,8 @@ def group_caches(
         head_size: Width of one head, when known.
 
     Raises:
-        ValueError: A layer is missing, its tensor does not match the
-            group's spec, or the attention kernel split the blocks.
+        ValueError: A layer is missing, or its tensor does not match the
+            group's spec.
     """
     caches = []
     for g in groups:
@@ -546,27 +526,21 @@ def group_caches(
                 f"MaruKVConnector: layers of KV cache group {g.group_id} differ "
                 "in shape, dtype or strides"
             )
-        layout = _detect_kv_layout(
+        layout = _detect_block_kv_layout(
             shape, g.block_size, kv_layout, num_kv_heads, head_size
         )
         if layout is None:
-            kernel = _kernel_block_size(
-                shape, g.block_size, kv_layout, num_kv_heads, head_size
-            )
-            if kernel is not None:
-                raise ValueError(
-                    "MaruKVConnector does not support attention kernels that "
-                    f"split blocks: group {g.group_id} uses {g.block_size}-token "
-                    f"blocks, laid out as {kernel}-token kernel blocks. Pick an "
-                    "attention backend that keeps whole blocks, such as "
-                    "TRITON_ATTN, or FLASH_ATTN except FlashAttention 4 with "
-                    "head size 256 (compute capability 10.x/11.x)."
-                )
             raise ValueError(
                 f"MaruKVConnector cannot read the KV layout {shape} of group "
                 f"{g.group_id}"
             )
-        block_bytes = first.numel() * first.element_size() // layout.num_blocks
+        # Per token, so that a block split into kernel blocks counts them all.
+        block_bytes = (
+            first.numel()
+            * first.element_size()
+            * g.block_size
+            // layout.page_buffer_size
+        )
         if block_bytes > g.slot_bytes:
             raise ValueError(
                 f"MaruKVConnector: a block of group {g.group_id} holds "
