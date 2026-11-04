@@ -1,10 +1,12 @@
 # marufs — Shared Filesystem Mode
 
-> **Status**: Under active development, release coming soon.
+> **Status**: Design proposal. This page is not a shipping backend configuration or a release-date commitment.
 
 ## Motivation
 
-Maru's architecture separates the **data plane** (direct zero-copy access to CXL shared memory) from the **control plane** (KV metadata registry and region lifecycle management). The control plane is pluggable — its implementation can change without affecting how data is read or written.
+This page describes the directly mapped `cxl` data plane and its proposed filesystem control plane. Here **Remote mode** means metadata RPC to MaruServer/Resource Manager; it does not mean the `remote_cxl` storage backend, whose payload path includes CPU staging and RDMA.
+
+For `cxl`, Maru separates direct access to mapped CXL memory from KV metadata and region lifecycle management. A CPU consumer can view mapped bytes without another host copy, while GPU transfers still copy bytes. The filesystem proposal changes the control plane for that directly mapped path.
 
 The first control plane implementation, **Remote mode**, uses a centralized MaruServer and Maru Resource Manager communicating over RPC:
 
@@ -25,7 +27,7 @@ While functional, this design carries operational burdens:
 | **User-space access control** | Memory access control is enforced in user-space RPC, which is weaker than kernel-level enforcement |
 | **IPC complexity** | Multi-hop RPC protocol between MaruServer and Resource Manager is hard to debug and maintain |
 
-**Shared Filesystem mode (marufs)** is the second control plane implementation. It replaces all server-side processes with a single Linux kernel filesystem module (`marufs.ko`), enforcing memory access control at the kernel level for stronger security than user-space RPC.
+The proposed **Shared Filesystem mode (marufs)** would replace the CXL control-plane processes with a kernel filesystem module (`marufs.ko`). The intended VFS checks below are design goals, not measured proof of stronger isolation or a replacement for remote CXL's staging/RDMA path.
 
 ```
 ┌─────────────┐   VFS + ioctl   ┌─────────────────┐
@@ -55,11 +57,12 @@ Deployment is as simple as loading `marufs.ko` and mounting. No server processes
 
 ### 2. Kernel-level Access Control
 
-Remote mode enforces memory access control in user-space via RPC — any process that can reach the server can potentially bypass authorization. Filesystem mode moves access control into the kernel:
+The current CXL path uses RM handles and local DAX permissions. The proposal
+would move region-management and metadata permission checks to the VFS layer:
 
 - **Permission flags** (`PERM_READ`, `PERM_WRITE`, `PERM_DELETE`, `PERM_ADMIN`, `PERM_IOCTL`) are enforced at the VFS layer
 - **Default permissions** are set at region creation via `perm_set_default`
-- The kernel mediates all region access — no way to bypass without kernel privilege
+- Mapping and metadata operations would be mediated by the kernel module; platform/device access still needs its own controls
 
 ### 3. Kernel-managed Global KV Index
 
@@ -105,7 +108,7 @@ sequenceDiagram
     H->>ORM: allocate()
     ORM-->>H: (region_name, page_index)
 
-    Note over H,CXL: Step 1 — Write to CXL (zero-copy, same as Remote mode)
+    Note over H,CXL: Step 1 — Write into mapped CXL (same as RPC control mode)
     H->>XM: get_buffer_view(region_name, offset, size)
     XM-->>H: memoryview slice
     H->>CXL: buf[:] = data
@@ -147,7 +150,7 @@ sequenceDiagram
     XM->>XC: open_region(name, readonly=True)
     XM->>XC: mmap_region(fd, size)
 
-    Note over H,CXL: Step 4 — Read from CXL (zero-copy, same as Remote mode)
+    Note over H,CXL: Step 4 — View mapped CXL (same as RPC control mode)
     H->>XM: get_buffer_view(region_name, offset, size)
     XM-->>H: memoryview
     H-->>C: MemoryInfo(view)
@@ -226,7 +229,11 @@ Filesystem mode introduces three components that replace their Remote mode count
 
 ## Concurrency Guarantees
 
-All components are thread-safe. Write operations (store, delete, region map/unmap, allocation/free) are serialized. Read operations (retrieve, buffer view access) are lock-free. This follows the same concurrency model as Remote mode.
+The proposal serializes mutations such as store, delete, region map/unmap and
+allocation/free, while permitting reads to overlap where their lifetimes allow.
+It does not establish formal lock-free execution or validate the behavior of a
+shipping filesystem backend. The current RPC Handler's reads can still wait on
+RPC, mapping and synchronization.
 
 > **See also:** [Consistency and Safety](consistency_and_safety.md)
 

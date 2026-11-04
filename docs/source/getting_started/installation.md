@@ -15,6 +15,11 @@ Maru consists of two server components and a client library. A deployment with G
 
 In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler. With the default `cxl` backend, MaruHandler connects to both the Resource Manager and Metadata Server over the network. With the `remote_cxl` backend, it connects to the Metadata Server and to the remote CXL agent of each memory node instead; the remote CXL agents reach the Resource Manager, which runs on a memory node.
 
+The native worker-private `cpu` backend is different: `maru-server --cpu-only`
+needs neither CXL nor the Resource Manager. `mixed` needs local CXL and CPU
+pools. Use the {doc}`quick-start path selection <quick_start>` before applying
+the CXL/RDMA platform-service instructions below.
+
 ## Prerequisites
 
 - OS: Ubuntu 24.04 LTS+
@@ -25,7 +30,7 @@ In a single-node setup, all components run on the same machine. In a multi-node 
 - [uv](https://docs.astral.sh/uv/) — recommended Python package installer
 - CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
   - **Multi-node:** All nodes that share the pool over CXL must be connected to the shared CXL memory pool (e.g., via CXL switch). GPU nodes without CXL reach it over RDMA instead (`remote_cxl` backend).
-- For the `remote_cxl` backend: an RDMA NIC (RoCE or InfiniBand) on every worker and memory node, a route from the maru-server node to the remote CXL agents on the memory nodes' RDMA network addresses, and NIXL in the same environment, installed before `./install.sh` (`uv pip install nixl`, or `pip install nixl` without uv)
+- For `remote_cxl`: an RDMA NIC on every worker and memory node, a route from maru-server to the memory-node agents, and a compatible NIXL stack before `./install.sh` (see {ref}`nixl-stack`)
 
 See {doc}`bios_setup` for platform BIOS settings and DEV_DAX verification, and {doc}`../design_doc/consistency_and_safety` for the cache-visibility requirements of cross-host sharing.
 
@@ -64,6 +69,32 @@ source .venv/bin/activate
 > engine (vLLM, SGLang) was built against. Without it, uv may pick any
 > interpreter satisfying `requires-python >= 3.12`.
 
+(nixl-stack)=
+#### NIXL stack
+
+For `remote_cxl`, select the engine, Torch, CUDA and NIXL wheels together.
+Installing the latest NIXL alone does not validate the serving stack. From
+the Maru source root, the provided **vLLM 0.22.1 / Torch 2.11.0 / CUDA 13**
+example uses this command on GPU workers:
+
+```bash
+uv pip install -c examples/vllm/remote_cxl/constraints-vllm022.txt \
+    "vllm==0.22.1" nixl
+```
+
+Memory nodes that do not run vLLM install the constrained runtime only:
+
+```bash
+uv pip install -c examples/vllm/remote_cxl/constraints-vllm022.txt nixl
+```
+
+Use `pip install` instead of `uv pip install` without uv. These constraints
+select NIXL 1.2.0 for that particular serving example, not every Torch/CUDA
+version. Newer NIXL API/transfer checks do not prove that its optional plugins
+import with an older Torch. See the
+[example's compatibility notes](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md#requirements)
+before changing the stack.
+
 Install all components (Python package + Resource Manager):
 
 ```bash
@@ -78,7 +109,7 @@ To install **without the Resource Manager** (e.g., on nodes that only run LLM in
 
 > **Note:** With the default `cxl` backend, client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager. Workers that use the `remote_cxl` backend need no CXL device: they reach the CXL memory of the memory nodes over RDMA.
 
-With NIXL installed (`uv pip install nixl` before `./install.sh`), the
+With a compatible NIXL runtime installed before `./install.sh`, the
 installer also sets up the remote CXL agent as `maru-remote-cxl-agent.service`, which
 starts and stops with the Resource Manager, and creates the remote CXL agent key
 `/etc/maru/remote-cxl-agent.key`. Set the node's RDMA NIC in
@@ -129,7 +160,12 @@ Check the result at any time:
 python -c "import maru_kv_ops; print(maru_kv_ops.is_available(), maru_kv_ops.import_error())"
 ```
 
-`True None` means the connector takes the kernel path. Anything else prints why it cannot, and `MARU_SKIP_KV_OPS=1` skips the build outright when that is what you want.
+`True None` means the extension can be imported, not that every request uses
+its packed kernel. The resolved KV layout, chunk completeness and buffer
+registration also select the path. In particular, vLLM 0.29+ logical layouts
+(tested with 0.32) use per-layer copies in this version. Check the engine's
+transfer-path logs as well. Other output reports the import failure;
+`MARU_SKIP_KV_OPS=1` skips the build explicitly.
 
 <br/>
 

@@ -2,14 +2,14 @@
 
 ## Overview
 
-We evaluated Maru against the existing LMCache p2p backend in order to understand the performance impact of different remote KV storage paths.
+This benchmark compares Maru's directly mapped **`cxl` backend** with the LMCache P2P backend in the **single-node** configuration listed below. The P2P baseline is configured with NIXL/UCX and TCP loopback (`UCX_TLS=cuda_ipc,cuda_copy,tcp`). It is not an RDMA P2P comparison or a measurement of Maru's `remote_cxl` backend.
 
-The primary difference between the two approaches lies in how KV cache data is accessed and transferred. The LMCache p2p backend relies on CPU DRAM and network-based data transfer, whereas Maru leverages CXL-attached memory together with the Maru meta server to manage remote KV access. As a result, the two systems differ mainly in the memory tier used for KV storage and the data transfer path involved in retrieving cached KV blocks.
+The two configurations use different storage tiers and payload paths: CPU DRAM with P2P transfers, and a directly mapped CXL pool with Maru metadata RPC. GPU loads and stores still copy bytes in the CXL configuration. Maru's separate `remote_cxl` backend uses worker-side CPU staging and RDMA; its transport, buffer and registration costs require their own measurements. All "Maru" results on this page refer to the reported `cxl` configuration and software versions, not every Maru backend or current connector version.
 
 ![Figure 1: TTFT P50 comparison](image/ttft_p50_comparison.png)
 *Figure 1: TTFT (P50) comparison between Maru and the LMCache p2p backend across context sizes during warmup (first KV transfer) and query (KV reuse). Maru consistently achieves lower latency, with larger gains for bigger KV cache sizes.*
 
-Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). Across all context sizes, Maru consistently achieves lower TTFT compared to the p2p backend. The gap becomes increasingly pronounced as the context size grows, indicating that the Maru remote connector handles larger KV transfers more efficiently.
+Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). The reported `cxl` configuration has lower TTFT across the plotted context sizes. The figure compares those complete configurations; it does not isolate a transport-only effect or evaluate `remote_cxl`.
 
 ## Concurrency Scaling
 
@@ -18,7 +18,7 @@ Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first
 
 To further evaluate scalability, we measured cache-hit TTFT under different concurrency levels (Figure 2). Even as concurrency increases, Maru maintains significantly lower latency. Depending on the context size and concurrency level, Maru reduces TTFT by approximately **2.7×–4.2×** compared to the p2p backend.
 
-These results suggest that reducing CPU-mediated network transfers and utilizing CXL-backed remote memory can significantly improve KV cache reuse latency. In particular, Maru demonstrates better scaling behavior as both context size and request concurrency increase, making it well-suited for high-throughput inference workloads with large KV cache footprints.
+These measurements show the scaling behavior of the two tested configurations at the plotted context sizes and concurrency levels. They do not establish the same ratios for multi-node serving, an RDMA P2P baseline or `remote_cxl`.
 
 ## Power Efficiency
 
@@ -27,26 +27,26 @@ These results suggest that reducing CPU-mediated network transfers and utilizing
 
 Figure 3 compares the full power timeline for both backends during a 128K-context P2P benchmark. The populate phase (where GPU0 performs prefill and stores KV cache) is nearly identical in both duration and power draw, confirming that the two systems share the same computation workload.
 
-The key difference emerges during the KV retrieval phase: the LMCache p2p backend requires 103 seconds for GPU1 to retrieve cached KV blocks over the network, during which GPU1 remains largely underutilized — waiting on data transfer rather than performing useful computation.
+The reported KV retrieval phase lasts 103 seconds for LMCache P2P, with lower GPU1 utilization in the trace. This phase timing is a workload measurement, not an isolated NIC transfer-time measurement.
 
-In contrast, Maru completes retrieval in 53 seconds, a 49% reduction, because GPU1 can access KV data directly from CXL shared memory via zero-copy mmap without network round-trips.
+The reported Maru `cxl` configuration completes this phase in 53 seconds, a 49% reduction. GPU1 loads from the mapped CXL pool rather than requesting a P2P payload transfer. GPU copies and metadata RPC remain part of that path, so the difference cannot be attributed to "no data movement" or "no network round-trips."
 
 Notably, Maru draws slightly higher instantaneous power during retrieval (1,365W vs. 1,260W), which reflects higher GPU utilization — the GPU is actively computing rather than idling on network transfers. Despite the higher power draw, Maru consumes 44% less total energy for KV retrieval (20.1 Wh vs. 36.1 Wh), as the shorter retrieval time more than compensates for the increased power.
 
-This has a direct implication for serving efficiency: by completing KV retrieval in roughly half the time, Maru frees GPU cycles sooner, allowing the system to begin processing subsequent requests earlier. In high-concurrency deployments, this means higher effective throughput — the GPU spends less time stalled on data movement and more time on useful inference computation.
+The shorter measured phase reduces energy for this workload. Throughput and energy under other concurrency levels, transports or backends require measurements under those conditions.
 
 ## Energy Efficiency
 
-| Length | Recompute | Maru | LMCache P2P | Maru / LMCache P2P |
+| Length | Recompute | Maru (`cxl`) | LMCache P2P | Maru / LMCache P2P |
 |--------|-----------|------|-------------|---------------------|
 | 16K    | 19.7      | 59.8 | 50.7        | 1.18                |
 | 32K    | 22        | 101.2| 73.2        | 1.38                |
 | 64K    | 18.2      | 130.5| 83          | 1.57                |
 | 128K   | 13.6      | 173.7| 121.7       | 1.43                |
 
-*Table 1: Tokens / Joule (active energy) at 128K. Maru can generate 18~43% more tokens using the same amount of active energy than LMCache p2p backend.*
+*Table 1: Tokens per joule (active energy) at the listed context lengths in this setup. The reported Maru / LMCache P2P ratios range from 1.18 to 1.57; the 128K ratio is 1.43.*
 
-Both Maru and the LMCache p2p backend become more energy-efficient as context size grows — Maru rises from 59.8 to 173.7 tokens/J and the p2p backend from 50.7 to 121.7 — because the energy overhead of KV transfer scales sublinearly relative to context length. This contrasts with recompute, which becomes less efficient at larger contexts (19.7 → 13.6 tokens/J) due to linearly increasing computation cost. Notably, Maru's efficiency advantage over the p2p backend widens with context size, peaking at 1.57× for 64K before slightly relaxing to 1.43× at 128K, indicating that the zero-copy CXL path benefits most when large KV transfers would otherwise bottleneck on CPU-mediated network I/O.
+In these measurements, Maru `cxl` rises from 59.8 to 173.7 tokens/J and the P2P backend from 50.7 to 121.7, while recompute falls from 19.7 to 13.6. The relative ratio peaks at 1.57 for 64K and is 1.43 at 128K. These are observed energy results for the listed configurations; they do not establish the cause of each difference or an energy advantage for `remote_cxl` or over RDMA-based systems.
 
 ---
 
@@ -62,7 +62,7 @@ Both Maru and the LMCache p2p backend become more energy-efficient as context si
   - Single-node
   - 2 GPUs on separate NUMA nodes (GPU0→NUMA0, GPU1→NUMA1)
   - PCIe Gen5 x16
-- **Transfer**: Cross-Node NIXL TCP (UCX_TLS=cuda_ipc,cuda_copy,tcp)
+- **P2P transport configuration**: NIXL/UCX with TCP loopback on the same host (`UCX_TLS=cuda_ipc,cuda_copy,tcp`)
 
 ### Software
 
@@ -71,9 +71,9 @@ Both Maru and the LMCache p2p backend become more energy-efficient as context si
 - **LMCache Version**: 0.3.13.dev97
 - **NIXL Version**: 0.10.1
 - **Transfer Methods**:
-  - **Maru**:
+  - **Maru (`cxl` backend)**:
     - CXL shared memory pool (200 GB, /dev/dax)
-    - Zero-copy mmap between vLLM instances via maru_meta_server
+    - Each instance maps the shared pool; GPU transfers copy bytes to/from that mapping, while the metadata server records keys and locations
   - **LMCache P2P backend (NIXL)**:
     - UCX transport (cuda_ipc,cuda_copy,tcp) over TCP loopback
     - CPU DRAM storage (200 GB)

@@ -40,7 +40,8 @@ class MaruConfig:
         server_url: URL of the MaruServer (e.g., "tcp://localhost:5555")
         instance_id: Unique identifier for this client instance
         pool_size: Default pool size to request (in bytes)
-        auto_connect: Whether to automatically connect on initialization
+        auto_connect: Whether to connect on Handler context-manager entry;
+            construction alone does not connect
     """
 
     server_url: str = "tcp://localhost:5555"

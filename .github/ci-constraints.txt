@@ -1,0 +1,32 @@
+# CI environment snapshot from the successful Python matrix:
+# https://github.com/xcena-dev/maru/actions/runs/39901349275
+# Refresh against a green matrix and downloadable artifacts in the runner's
+# package proxy; newly advertised versions can have unavailable wheels.
+# This constrains resolution; it does not install unused packages.
+ast-serialize==0.13.1
+cfgv==3.5.0
+coverage==7.16.2
+dacite==1.9.2
+distlib==0.4.4
+filelock==4.2.4
+identify==2.6.20
+iniconfig==2.3.1
+librt==0.16.0
+msgpack==1.2.3
+mypy==2.4.0
+mypy-extensions==1.1.0
+nodeenv==1.11.0
+packaging==26.3
+pathspec==1.1.1
+platformdirs==4.13.5
+pluggy==1.7.0
+pre-commit==4.7.0
+pygments==2.21.0
+pytest==9.1.1
+pytest-cov==7.1.0
+python-discovery==1.6.4
+pyyaml==6.0.3
+pyzmq==27.2.0
+ruff==0.17.1
+typing-extensions==4.16.0
+virtualenv==21.14.12

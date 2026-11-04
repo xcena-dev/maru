@@ -1,14 +1,26 @@
 # Quick Start
 
-Start the services for your setup, then run the same Python producer and
-consumer below. No GPU or inference engine is required.
+Choose the storage path first. The Python producer/consumer below exercise
+the default **`cxl` backend**, using direct DAX mappings; they require no GPU
+or inference engine. They are not an RDMA worker setup.
+
+| Intended setup | Start here |
+|---|---|
+| Directly mapped CXL, one or several hosts | The producer/consumer instructions below |
+| GPU workers without CXL sharing memory-node CXL over RDMA | {doc}`vLLM examples <examples/vllm/index>` and the [remote CXL launch guide](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md) |
+| Worker-private CPU DRAM cache, without CXL or RM | [CPU example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md) |
+| Worker-private CPU and CXL pools together | [Mixed example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md) |
+
+CPU storage still serves a model running on a GPU; it does not mean CPU model
+execution. These backends have different lease, sharing and capacity rules;
+see {doc}`../design_doc/memory_model`.
 
 | Setup | Required environment | Where the clients run |
 |-------|----------------------|-----------------------|
 | {ref}`Single-host <quickstart-single-host>` | One x86 host with a CXL DEV_DAX device | Two terminals on the same host |
 | {ref}`Multi-host <quickstart-multi-host>` | Two x86 hosts connected to shared CXL memory through a CXL switch/fabric | Producer on Node A, consumer on Node B |
 
-Complete {doc}`bios_setup` and {doc}`installation` first. Activate the Maru
+For the CXL producer/consumer, complete {doc}`bios_setup` and {doc}`installation` first. Activate the Maru
 Python environment in each terminal. Both setups use port `9850` for the
 Resource Manager and `5555` for MaruServer.
 

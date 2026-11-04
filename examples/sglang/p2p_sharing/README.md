@@ -36,8 +36,10 @@ bash p2p_example.sh stop
 
 ## Verifying Cache Hits
 
-Check the benchmark output for `cache_hit: true` and TTFT speedup > 1.5x.
-Alternatively, inspect Instance 2 logs for Maru retrieval messages.
+Check the reported cache hit together with Instance 2's completed external
+restore and generated output. A successful request alone can include fallback
+recompute. Measure TTFT separately under controlled cold/warm conditions;
+there is no fixed speedup threshold that proves correctness.
 
 ## Files
 

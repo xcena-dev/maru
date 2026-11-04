@@ -76,7 +76,7 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv pip install -c .github/ci-constraints.txt -e ".[dev]"
 
       - name: Install vLLM
         # The vLLM connector tests import torch and vLLM, and pytest skips
@@ -96,7 +96,7 @@ jobs:
         run: |
           # Resolved together with Maru's own requirements, so that neither set
           # silently replaces a version the other needs.
-          uv pip install -e ".[dev]" "vllm==0.32.0"
+          uv pip install -c .github/ci-constraints.txt -e ".[dev]" "vllm==0.32.0"
           # An install that cannot be imported would turn those modules back
           # into collection skips and leave the job green.
           python -c "import torch, vllm; print(f'torch {torch.__version__}, vllm {vllm.__version__}')"

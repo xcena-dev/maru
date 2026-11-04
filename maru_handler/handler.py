@@ -48,12 +48,15 @@ class MaruHandler:
     - Memory mapping via DaxMapper
     - KV store/retrieve operations
 
-    Thread-safety:
+    The architecture and locking below describe the default ``cxl`` backend.
+    ``cpu``, ``mixed`` and ``remote_cxl`` delegate to storage-session clients;
+    remote CXL uses worker staging and RDMA rather than a local DAX mapping.
+
+    Thread-safety (``cxl``):
     - Read operations (exists, retrieve, batch_exists, batch_retrieve) are
-      lock-free — they rely on RpcAsyncClient (already thread-safe) and
-      DaxMapper's internal lock for lazy mapping.
+      outside ``_write_lock`` but may wait on RPC, mapping and other locks.
     - Write operations (store, batch_store, delete) are serialized by
-      ``_write_lock`` to guarantee atomicity of allocate-write-register.
+      ``_write_lock``. Callers must complete payload writes before store.
     - ``close()`` sets ``_closing`` event to reject new operations, then
       acquires ``_write_lock`` to wait for in-flight writes before teardown.
 
@@ -70,7 +73,10 @@ class MaruHandler:
     """
 
     def __init__(self, config: MaruConfig | None = None):
-        """Initialize MaruHandler.
+        """Initialize an unconnected MaruHandler.
+
+        Call ``connect()`` explicitly or enter its context manager with
+        ``auto_connect=True``.
 
         Args:
             config: Configuration object. If None, uses defaults.
@@ -427,10 +433,12 @@ class MaruHandler:
             self._flush_stats()
 
     def close(self) -> None:
-        """Close the connection and return all allocations.
+        """Close this client's connections and end its buffer access.
 
-        Sets ``_closing`` event to reject new operations, then acquires
-        ``_write_lock`` to wait for in-flight writes before teardown.
+        The cxl path sets ``_closing`` and waits on ``_write_lock`` before
+        teardown. Storage-session backends delegate to their client: remote
+        CXL can hand regions with keys to the server's keeper, and uncertain
+        native transfers can retain staging until cleanup is confirmed.
         """
         if self._cpu is not None:
             self._cpu.close()
@@ -499,8 +507,10 @@ class MaruHandler:
     ) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
-        The caller writes directly to ``handle.buf``, then passes the handle
-        to ``store(key, handle)`` to register without copying.
+        The caller finishes writing ``handle.buf`` before ``store(key, handle)``.
+        With cxl the handle views a mapped page and store registers metadata.
+        Remote CXL instead allocates staging and store also sends an RDMA WRITE.
+        CPU/mixed use their worker-private allocation clients.
 
         Args:
             size: Required bytes (must be <= chunk_size)
@@ -508,7 +518,7 @@ class MaruHandler:
                 pools it picks the pool; other backends ignore it.
 
         Returns:
-            AllocHandle with writable memoryview and allocation metadata
+            A backend-specific handle with a writable buffer
 
         Raises:
             RuntimeError: If not connected or closing
@@ -623,14 +633,15 @@ class MaruHandler:
         key: str,
         handle: AllocHandle | CpuAllocation,
     ) -> bool:
-        """Register a pre-written page in the KV cache (zero-copy).
+        """Store a key using a pre-written allocation from this backend.
 
-        Data must already be written to the page via ``handle.buf``.
-        This method only performs duplicate check + metadata registration.
+        Complete payload writes via ``handle.buf`` first. The cxl path only
+        checks duplicates and registers metadata; remote CXL also completes
+        an RDMA WRITE from worker staging before publishing the key.
 
         Args:
             key: The chunk key string
-            handle: AllocHandle from alloc()
+            handle: Backend-specific allocation returned by alloc()
 
         Returns:
             True if successful
@@ -707,12 +718,13 @@ class MaruHandler:
         return store_ok
 
     def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
-        """Retrieve a zero-copy MemoryInfo from the KV cache.
+        """Retrieve a mapped view or a backend-specific read lease.
 
-        CPU storage returns a CpuReadLease instead. Explicitly release it
-        after the final read/copy, or use it as a context manager.
+        CPU, mixed and remote CXL return read leases. Release them after the
+        final CPU read or GPU copy; remote CXL leases protect worker staging
+        populated by RDMA, not a worker-side mapping of remote CXL.
 
-        Returns a MemoryInfo with a memoryview slice of the mmap region.
+        The cxl path returns MemoryInfo over a directly mapped region.
         Works for both owned (RW) and shared (RO) regions.
 
         WARNING: The returned memoryview is only valid while the region
@@ -722,7 +734,7 @@ class MaruHandler:
             key: The chunk key string
 
         Returns:
-            MemoryInfo with memoryview, or None if not found
+            MemoryInfo, a storage-session read lease, or None on a miss
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -887,10 +899,11 @@ class MaruHandler:
         return result
 
     def healthcheck(self) -> bool:
-        """Check if the handler and MaruServer are healthy.
+        """Check the local connection and metadata heartbeat.
 
         Verifies local connection state and sends a heartbeat RPC
-        to confirm the MaruServer is responsive.
+        to confirm the MaruServer is responsive. This does not prove an RDMA
+        transfer, DAX payload access or GPU restore completed.
 
         Returns:
             True if connected and server responded to heartbeat
@@ -958,19 +971,18 @@ class MaruHandler:
     def batch_retrieve(
         self, keys: list[str], route_key: str | None = None
     ) -> list[MemoryInfo | CpuReadLease | None]:
-        """Retrieve multiple values as MemoryInfo in batch.
+        """Retrieve mapped views or storage-session read leases in batch.
 
-        CPU results are CpuReadLease objects; release every non-None result
-        after the final read/copy (or call release_retrieved on the list).
+        CPU, mixed and remote CXL results carry read leases; release every
+        non-None result after the final read/copy via release_retrieved.
 
-        Uses a single batch RPC call for lookup, returns zero-copy
-        memoryview slices for both owned (RW) and shared (RO) regions.
+        The cxl path uses one batch lookup RPC and returns views of owned
+        (RW) or shared (RO) mappings without an additional host payload copy.
 
         WARNING: Returned memoryviews are only valid while regions remain mapped.
 
-        On RPC failure, allocated pages are freed but data already written to
-        those pages is not zeroed. This is safe because the pages are never
-        registered with the server and will be overwritten on reuse.
+        A failed cxl lookup RPC returns misses. Storage-session clients follow
+        their own transfer, lease and failure rules.
 
         Args:
             keys: List of chunk key strings
@@ -1072,14 +1084,18 @@ class MaruHandler:
         keys: list[str],
         handles: list[AllocHandle | CpuAllocation],
     ) -> list[bool]:
-        """Register multiple pre-written pages in batch (zero-copy).
+        """Store multiple pre-written allocations in the selected backend.
+
+        The cxl path registers metadata over mapped pages. Storage-session
+        clients implement their own commit and lease rules; remote CXL
+        completes staging-to-CXL RDMA WRITEs before publishing keys.
 
         Data must already be written to each page via ``handle.buf``.
-        Uses a single batch RPC call for metadata registration.
+        The cxl path uses a batch RPC for metadata registration.
 
         Args:
             keys: List of chunk key strings
-            handles: List of AllocHandle from alloc()
+            handles: Backend-specific allocations from alloc()
 
         Returns:
             One bool per key. True means the key is registered in the pool
@@ -1494,7 +1510,7 @@ class MaruHandler:
         )
 
     def release_retrieved(self, infos: list) -> None:
-        """Release CPU read leases after the last read/GPU copy has completed."""
+        """Release storage-session read leases after the final read/GPU copy."""
         if self._cpu is not None:
             for info in infos:
                 if info is not None:

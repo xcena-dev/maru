@@ -1,9 +1,17 @@
 # MaruServer Architecture
 
-The `MaruServer` is a **metadata-only server** that coordinates CXL memory allocation and KV metadata across clients. It never directly accesses KV data — all actual reads and writes happen through CXL shared memory by the clients themselves.
+The `MaruServer` coordinates metadata, capacity and region ownership. KV payloads bypass it: workers access local CPU/CXL storage or transfer between worker staging and memory-node CXL over RDMA.
+
+The component diagram and sections 1–5 below describe the legacy `cxl` registry
+(`KVManager` plus `AllocationManager`). Storage-session backends use
+`ReplicaDirectory`: `cpu` and the current `mixed` mode expose worker-private
+replicas, while `remote_cxl` allows compatible sessions of one pool/namespace
+to reuse remote regions. Section 6 describes the remote CXL keeper. These
+directories are separate; the same physical device does not imply that keys
+are interchangeable across backends.
 
 **Responsibilities:**
-- CXL memory allocation and deallocation (via the resource manager)
+- CXL region allocation and deallocation via the Resource Manager, and worker CPU capacity grants for storage sessions
 - KV metadata management (key → region, offset, length)
 - Brokering KV location information between clients
 
@@ -109,7 +117,8 @@ For `lookup_kv`, the server reads the KV entry and retrieves the corresponding h
 
 ## 5. RPC Interface
 
-The server exposes the following message types:
+The legacy `cxl` registry exposes these message types. Storage sessions use
+their `open`/`commit`/`probe`/`acquire`/`release` operations instead (section 6).
 
 | MessageType | Operation |
 |-------------|-----------|
@@ -129,8 +138,9 @@ The server exposes the following message types:
 | `BATCH_UNPIN_KV` | Batch unpin multiple entries |
 | `GET_STATS` | Retrieve server statistics |
 | `HEARTBEAT` | Connection health check |
-| `HANDSHAKE` | Reserved — initial client-server handshake |
+| `HANDSHAKE` | Advertise server epoch, backend capabilities, RM and remote-agent endpoints |
 | `SHUTDOWN` | Reserved — graceful server shutdown |
+| `STORAGE` | Storage-session `open`, `commit`, `probe`, `acquire`, `release` and related operations |
 
 Batch operations allow clients to reduce RPC round-trips when operating on multiple keys.
 
@@ -140,9 +150,9 @@ Batch operations allow clients to reduce RPC round-trips when operating on multi
 ## 6. Remote CXL Regions
 
 For `remote_cxl` workers, MaruServer keeps storage sessions (`ReplicaDirectory`).
-A session gets regions from the Resource Manager as a cxl Handler does
+A remote CXL session gets regions from the Resource Manager as a cxl Handler does
 (`open`, then `expand`), and MaruServer indexes every session's keys, so any
-session of the same namespace can lease and read them. A session opens only if
+compatible remote CXL session of that namespace and pool can lease and read them. A session opens only if
 its schema and page size match those of the namespace's other sessions and of
 the regions kept for workers that left, since it may read their keys. A session
 may hold no region for a while (its only region went back) and asks for one

@@ -7,6 +7,11 @@ The remaining milestones require separate implementation and review.
 See the [vLLM integration guide](../integration/vllm.md) for settings that are
 actually supported; conceptual APIs in this RFC are not a compatibility promise.
 
+The separate `remote_cxl` backend now shares memory-node CXL over RDMA. That
+does not implement this RFC's future cross-engine sharing of typed `mixed`
+pools, automatic replication or SSD support. Keep those backend contracts
+separate when reading the milestones below.
+
 The initial implementation is based on upstream
 `3182e2014fc8f04f1dccc8f5b155c46011c9f68a`
 (`feat(maru_vllm): own the paged-KV placement kernels (#85)`).

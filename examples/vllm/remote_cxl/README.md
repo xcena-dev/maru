@@ -6,8 +6,9 @@ RDMA. Resources flow as for local CXL: the resource manager gives regions to
 maru-server, and maru-server gives them to each worker's MaruHandler. What
 moves to the memory node is the mapping: a remote CXL agent on every memory node
 maps the regions Handlers ask for and registers them with that node's NIC. The
-worker then reads and writes them with one-sided RDMA; the bytes do not pass
-through any Maru process.
+worker then reads and writes them with one-sided RDMA. MaruServer and the
+memory-node agent do not relay the payload; the worker's connector still
+copies between GPU cache and CPU staging.
 
 ```
 worker node (any number)          metadata node              memory node (each node of the pool)
@@ -55,8 +56,10 @@ asynchronous scheduling on. Setting both to `false` (`MARU_SYNC=1` on the
 launcher) runs them on the engine thread, and synchronous loads need
 `--no-async-scheduling`, which the launcher then passes. The KV moves
 between the GPU and the worker's staging buffer, host memory registered with
-the NIC and with CUDA; with `maru_kv_ops` built, one copy kernel per chunk
-moves it, as for the cxl backend.
+the NIC, with CUDA registration when supported. Packed copies also require a
+supported layout and complete chunks, not just a built `maru_kv_ops` extension.
+Otherwise per-layer copies are used, including the vLLM 0.29+ logical layouts
+in this version. Check actual engine transfer logs before interpreting timing.
 
 ## Requirements
 
@@ -70,8 +73,10 @@ moves it, as for the cxl backend.
   node of the pool, and the resource manager on one of them, as for a local CXL
   deployment. Use a devdax device. Install Maru with NIXL (NIXL first,
   then `./install.sh` from the Maru source tree): the installer also
-  sets up the remote CXL agent as a system service that starts and stops with the
-  resource manager, so a memory node runs it without a separate step.
+  installs the remote CXL agent service and its pairing with the resource
+  manager. Installing/enabling units does not start them: start the resource
+  manager on its single node, and start standalone agents on the other memory
+  nodes as shown below. NIXL and a usable RDMA device are required to run an agent.
 - Every worker must reach maru-server and each memory node's remote CXL agent and
   NIC, and so must maru-server reach the remote CXL agents.
 - A pool that several memory nodes share: apply the multi-host settings of
@@ -140,8 +145,8 @@ engine to the socket of its GPU and NIC.
 ## Several nodes (step by step)
 
 Three roles start the processes, in this order: the platform operator runs
-the resource manager on each memory node, which starts the remote CXL agent with
-it (step 1); the app launcher starts maru-server (step 2) and then vLLM on each
+one resource manager per pool and a remote CXL agent on every memory node
+(step 1); the app launcher starts maru-server (step 2) and then vLLM on each
 worker node (step 3); the app's users send requests (step 4). A prompt stored
 by one worker is then loaded by any other worker of the app.
 
@@ -152,8 +157,9 @@ workers on another node. Replace the addresses, NICs and DAX device.
 
 ### 1. Memory nodes
 
-Each memory node of the pool runs a remote CXL agent, a platform service like the
-resource manager: one per memory node, shared by every app that uses the pool.
+Each memory node runs a remote CXL agent shared by the pool's apps. Only one
+node runs the Resource Manager for a shared pool; agent-only nodes point at
+that RM with the standalone service configuration below.
 With Maru installed with NIXL, `./install.sh` installs it as
 `maru-remote-cxl-agent.service`, which starts and stops with the resource
 manager. Set the node's RDMA NIC in `/etc/maru/remote-cxl-agent.env`; the defaults
