@@ -1165,8 +1165,10 @@ def test_a_write_unconfirmed_at_close_stops_the_data_path_once_released(world):
     original = a._stop_data_path
 
     def stop():
-        stopped.append(1)
+        # Mark once the data path has stopped: the loop below then reads its
+        # state from another thread.
         original()
+        stopped.append(1)
 
     a._stop_data_path = stop
     a.close()
