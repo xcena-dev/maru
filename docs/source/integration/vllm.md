@@ -13,8 +13,11 @@ and `LBHNC`) and hands every layer the logical page
 resolved layout from the engine and splits each head's row into its K and V
 halves, so for dense attention a chunk object holds the same K/V-major bytes as
 a rank-5 cache of vLLM v0.25 and earlier, and the CPU and mixed backends accept
-these pages. The packed placement kernels have no format for them, so chunk
-transfers use per-layer copies on these versions. Tested with v0.32.
+these pages. Chunk transfers place these pages with a `maru_kv_ops` kernel that
+reads the page's strides, so every physical order takes the kernel path. Pages
+whose content does not split into two heads (MLA, uneven K/V widths, inline
+quantization scales) use per-layer copies. Tested with
+v0.32.
 
 **Storing a hybrid model as several KV cache groups requires vLLM v0.30.0+.** A model whose layers keep different kinds of KV cache, such as sliding-window or Mamba-type layers next to full attention, has several KV cache groups; see {ref}`vllm-hybrid-models`. On older versions the connector does not declare hybrid support: vLLM then runs sliding-window models as one KV cache group and refuses Mamba hybrids at startup.
 
@@ -739,7 +742,7 @@ On B200 or GB200, add `--attention-backend TRITON_ATTN`.
 - **Chunk size.** A Mamba-type group keeps its state only at block ends, so with such a group a chunk is one vLLM block (544 tokens for Qwen3.5-0.8B) and `maru_kv_chunk_tokens` is overridden with a warning. Without one, `maru_kv_chunk_tokens` works as before.
 - **Hits** end at a chunk boundary: a 1,024-token gpt-oss prompt hits 768 tokens, where one group would hit 1,008. A Mamba-type group can resume only from a chunk where an earlier request's prefill step ended, because vLLM keeps the state only at step ends. For example, with `--max-num-batched-tokens 2048` a 2,300-token Qwen3.5-0.8B request running alone is prefilled in steps that end at 1,632, 2,176 and 2,300 tokens; only the first two are chunk ends. A later request that shares its first 1,700 tokens hits 1,632 tokens; one that shares its first 1,500 tokens hits nothing.
 - **With a Mamba-type group, a repeated prompt can hit nothing.** A hit stops short of the prompt's last token. A prompt whose length is a multiple of the chunk and that was prefilled in one step keeps its only state at its last chunk, which the hit cannot include, so sending it again hits nothing. Benchmarks whose prompt length is a multiple of the chunk show this as stores without hits.
-- **Stores** run right after the forward. Sliding-window and Mamba-type objects are always stored before the step ends, because vLLM frees those blocks while the request runs. `maru_async_store` defers only full-attention objects that use the `maru_kv_ops` kernel; vLLM 0.30's attention layouts have no kernel format, so on vLLM 0.30 every object is stored before the step ends.
+- **Stores** run right after the forward. Sliding-window and Mamba-type objects are always stored before the step ends, because vLLM frees those blocks while the request runs. `maru_async_store` defers only full-attention objects that use the `maru_kv_ops` kernel; objects of a group whose pages take per-layer copies (content that does not split into two heads, such as inline quantization scales) are stored before the step ends.
 - **Loads.** `maru_overlap_load_with_compute` is turned off with a warning for any model with several groups: Mamba-type state must be complete before the forward, and per-layer overlap of the attention groups alone is not implemented.
 - **CXL space.** All groups share one pool and one page size, that of the largest (chunk, group) object. A chunk takes one page per attention group, plus one page per Mamba-type group at chunks where a prefill step ended. For gpt-oss-20b that is two 12-layer pages instead of one 24-layer page, so `maru_pool_size` estimates stay about the same. For Qwen3.5-0.8B a step-end chunk takes four pages, because its three Gated DeltaNet groups hold three times the chunk's attention KV; other chunks take one.
 

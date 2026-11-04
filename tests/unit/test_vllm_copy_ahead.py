@@ -197,7 +197,12 @@ class TestRing:
 
 @requires_cuda
 class TestLoadRoundtrip:
-    """Loads of vLLM 0.29+ logical pages through the per-layer fallback."""
+    """Loads of vLLM 0.29+ logical pages through the per-layer fallback.
+
+    The logical-page kernel places these pages when it can; the fallback is
+    what pages it refuses (pages that do not split into two heads, a CPU
+    pool, an unbuilt extension) take, so the reader turns the kernel off.
+    """
 
     BLOCK, CHUNK, PROMPT = 4, 8, 64  # 8 chunks: every ring wraps
     LAYERS, HEADS, HEAD_SIZE = 3, 2, 3
@@ -268,6 +273,7 @@ class TestLoadRoundtrip:
             )
         )
         reader = self._worker(dst, {"maru_load_copy_ahead": depth})
+        reader._packed_load_kernel_ctx = lambda *args: None
         reader._handler = MagicMock()
         reader._handler.batch_retrieve.side_effect = lambda keys: [
             SimpleNamespace(
