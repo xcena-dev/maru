@@ -746,7 +746,7 @@ On B200 or GB200, add `--attention-backend TRITON_ATTN`.
 (vllm-deepseek-v41)=
 ### DeepSeek-V4.1-Flash
 
-Tested with DeepSeek-V4.1-Flash-1017 on vLLM 0.33.0 with `--language-model-only`, at TP=4 with expert parallelism on 4x RTX PRO 6000 (SM120). On SM120, vLLM 0.33.0 cannot start the model without [vllm-project/vllm#65356](https://github.com/vllm-project/vllm/pull/65356).
+Use vLLM 0.33.0. On SM120 GPUs such as the RTX PRO 6000, vLLM 0.33.0 cannot start the model without [vllm-project/vllm#65356](https://github.com/vllm-project/vllm/pull/65356).
 
 vLLM splits the model's KV cache into several groups, how many depending on the GPU, and the connector handles them as follows:
 
