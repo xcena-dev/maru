@@ -1137,12 +1137,21 @@ class RegionMapService:
             m.addr = addr
             m.registration = registration
             m.metadata = metadata
-            reset = self.boot != boot
+            # A generation still unknown at the end is refused even when it
+            # was already unknown at the start (both boots read ":unknown"):
+            # it may have turned unknown after map() checked it. A boot known
+            # at the end differs from an unknown one read at the start.
+            unknown = self._generation_unknown
+            reset = unknown or self.boot != boot
             if reset:
                 # The memory was reset (or its generation became unknown)
                 # while this map ran: what the extension saw is gone.
                 m.error = NotMapped(
-                    f"region {h.region_id}: the memory was reset while it was mapped"
+                    f"region {h.region_id}: the memory generation became "
+                    "unknown while it was mapped"
+                    if unknown
+                    else f"region {h.region_id}: the memory was reset while "
+                    "it was mapped"
                 )
                 m.ready.set()
                 if not self._release_locked(h.region_id, m):
