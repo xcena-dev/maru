@@ -2387,8 +2387,21 @@ class MaruSchedulerConnector:
             self._hints_handler = handler
         return self._hints_enabled
 
-    def _hint(self, request_id: str, keys: list[str], *, arrival: bool = False) -> None:
-        """Give storage the read hint of ``request_id`` once."""
+    def _hint(
+        self,
+        request_id: str,
+        keys: list[str],
+        *,
+        route_keys: list[str] | None = None,
+        arrival: bool = False,
+    ) -> None:
+        """Give storage the read hint of ``request_id`` once.
+
+        ``route_keys`` are the request's chunk keys from its first chunk,
+        which pick the pool its load reads (``_session_route``); ``keys``
+        may start later, past what vLLM's own prefix cache holds. Without
+        them ``keys`` route the hint.
+        """
         handler = self._handler
         if handler is None or not keys:
             return
@@ -2402,7 +2415,9 @@ class MaruSchedulerConnector:
             self._hinted[request_id] = None
             try:
                 handler.hint_read(
-                    request_id, keys, **_session_route(self._cpu_mode, keys)
+                    request_id,
+                    keys,
+                    **_session_route(self._cpu_mode, route_keys or keys),
                 )
             except Exception:
                 logger.debug("Maru: read hint failed", exc_info=True)
@@ -2785,7 +2800,8 @@ class MaruSchedulerConnector:
             if keys is None:
                 keys = _chunk_keys(token_ids, ct)
             first, last = num_computed_tokens // ct, -(-matched_tokens // ct)
-            self._hint(request.request_id, keys[first:last])
+            # Routed by the first chunk, as the load is.
+            self._hint(request.request_id, keys[first:last], route_keys=keys)
 
         return new_matched, self._deferred_loading
 
