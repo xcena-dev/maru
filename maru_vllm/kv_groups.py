@@ -282,8 +282,8 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window and Mamba (``align``) groups whose attention
     groups share one KV shape, with parked loads, without speculative
-    decoding. The CPU, mixed and remote_cxl backends reject several groups
-    on their own, in ``MaruKVConnector``.
+    decoding. The CPU and mixed backends reject several groups on their
+    own, in ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.
