@@ -52,12 +52,15 @@ class KVLayout:
             compares against it, so a hybrid model's differently-shaped layer
             can never be read through another layer's geometry.
         format_name: ``maru_kv_ops.EngineKVFormat`` member, or None when
-            this layout has no kernel form and must use per-layer transfers.
-            Read only by the packed-kernel path, which walks memory itself.
+            this layout has none. Read only by the packed-kernel path, which
+            walks memory itself. A layout with neither this nor ``kv_packed``
+            must use per-layer transfers.
         kv_packed: True when K and V are the two halves of the last dimension,
             K first, as in vLLM 0.29+'s ``[B, H, N, K|V]`` page. ``kv_axis``
             then names that dimension, which ``_canonical_paged_view`` splits
-            into ``(2, head_size)``, so transfers see a real K/V axis.
+            into ``(2, head_size)``, so transfers see a real K/V axis. The
+            packed-kernel path places such a page by its strides
+            (``maru_kv_ops.LogicalPageFormat``), whatever its physical order.
     """
 
     num_blocks: int
@@ -132,8 +135,11 @@ def _kv_layout_candidates(
         # That needs C to be exactly two heads wide: diffkv's uneven split,
         # packed quantized content, and MLA's single latent (no head_size is
         # passed) keep the fused reading, whose halves are a storage
-        # convention. Both readings are stride-agnostic. Neither has a kernel
-        # format: the *_TWO_HS formats move whole token rows as one plane.
+        # convention. Both readings are stride-agnostic. Neither has an
+        # EngineKVFormat: the *_TWO_HS formats move whole token rows as one
+        # plane. The split reading (kv_packed) is placed by maru_kv_ops'
+        # logical-page kernel, which takes the page's strides; the fused one
+        # stays on per-layer copies.
         if head_size is not None and shape[3] == 2 * head_size:
             add(3, 0, 2, shape[1], head_size, packed=True)
         elif shape[3] % 2 == 0:

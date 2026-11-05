@@ -42,6 +42,7 @@ those up is a separate step that needs its own on-device comparison.
 | `csrc/mem_kernels.cuh` / `.cu` | Token-granular placement, all layers or one |
 | `csrc/mp_mem_kernels.cuh` / `.cu` | Block-granular placement |
 | `csrc/pybind.cpp` | **Maru's own.** Binds the three entry points Maru calls |
+| `csrc/logical_page_kernels.cuh` / `.cu` | **Maru's own.** Places vLLM 0.29+'s logical page by its strides, which no vendored format describes for Maru's K/V-major slab; bound as a second overload of `multi_layer_kv_transfer` |
 
 `mem_kernels.cu` also defines four entry points Maru never calls (two SGLang
 variants and two the upstream header marks deprecated), and `mp_mem_kernels.cu`
@@ -68,12 +69,13 @@ the suite instead of passing as the recorded revision.
 Regenerate with:
 
 ```bash
-cd maru_kv_ops/csrc && sha256sum *.h *.cu *.cuh
+cd maru_kv_ops/csrc && sha256sum engine_kv_format.h kv_transfer_types.h \
+  mem_kernels.cu mem_kernels.cuh mp_mem_kernels.cu mp_mem_kernels.cuh
 ```
 
 ## Refreshing
 
-1. Copy the files listed above, minus `pybind.cpp`, from the target revision.
+1. Copy the files listed above, minus Maru's own (`pybind.cpp`, `logical_page_kernels.*`), from the target revision.
 2. Re-read `pybind.cpp` against the new headers: a signature or enum change
    upstream shows up here as a compile error, which is the intent.
 3. Update the revision table above, including what moved and why, and
