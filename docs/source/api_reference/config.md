@@ -161,8 +161,8 @@ apply to that backend only:
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
-| `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
-| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
+| `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server. Under tensor parallelism each rank's session is `<id>-tp<rank>`, and data-parallel replica `d` > 0 adds `-dp<d>` (`<id>-dp<d>-tp<rank>`, or `<id>-dp<d>` at TP=1) |
+| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace, model shape and quantization share KV, whichever path they load the weights from |
 | `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
 | `maru_remote_cxl_agent_key_file` | `str` | `~/.maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |

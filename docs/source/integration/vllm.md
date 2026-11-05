@@ -264,7 +264,9 @@ Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The
 stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
-memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`, an
+memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`
+(each TP rank adds `-tp<rank>`, and data-parallel replica `d` > 0 adds
+`-dp<d>`; see {ref}`vllm-tensor-parallelism`), an
 immutable-weights `maru_cache_namespace`,
 `maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
 default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
@@ -305,8 +307,9 @@ region back when the resource manager is full. A region goes back only after
 its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
 instead of landing in the next owner's KV.
 
-The backend stores KV chunkwise and needs `--enforce-eager`,
-`kv_load_failure_policy="recompute"` and one worker per engine. It turns on
+The backend stores KV chunkwise and needs `--enforce-eager` and
+`kv_load_failure_policy="recompute"`; {doc}`supported_models` lists the models
+and parallel settings it takes. It turns on
 `maru_async_load` and `maru_async_store` unless they are set: loads run
 between steps and stores after the forward, so an RDMA transfer that waits for
 a slow memory node does not hold up the engine, and asynchronous loads run with
@@ -606,12 +609,12 @@ Example (Llama 7B, fp16):
 (vllm-tensor-parallelism)=
 ## Tensor parallelism
 
-The CXL backend supports tensor parallelism for the KV cache structures listed
-in {ref}`Supported Models <vllm-model-support>`. vLLM starts one connector per
-TP worker, and each worker stores and loads only the KV it holds. Every rank
-hashes a prompt to the same chunk keys, so a key must also name the slice: if
-all ranks registered their heads under one key, the server would keep the
-first and every other rank would load heads that are not its own.
+The CXL and remote_cxl backends support tensor parallelism for the KV cache
+structures listed in {ref}`Supported Models <vllm-model-support>`. vLLM starts
+one connector per TP worker, and each worker stores and loads only the KV it
+holds. Every rank hashes a prompt to the same chunk keys, so a key must also
+name the slice: if all ranks registered their heads under one key, the server
+would keep the first and every other rank would load heads that are not its own.
 
 Chunk keys therefore name a slice by what it holds:
 
@@ -650,7 +653,10 @@ share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
 TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
 slice is never read as a different set of heads. Mamba-type states differ
 for every TP size, so a model with such a group hits only on chunks that an
-engine of the same TP size stored.
+engine of the same TP size stored. On the remote_cxl backend engines of
+different TP sizes share nothing: the TP size enters the cache namespace, as
+maru-server lets the sessions of a namespace read each other's regions only
+when their objects have one size and layout.
 
 The scheduler reports a chunk as cached only when every slice that the hit
 needs is stored, so no rank is asked to load a slice the lookup did not
@@ -691,11 +697,29 @@ Each worker process connects its own MaruHandler:
   sees each rank as its own owner. With data parallelism, replica `d` > 0
   adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving
   the id unset already gives every process its own UUID.
+- On the remote_cxl backend each rank opens its own storage session, with
+  its own RDMA staging buffer, and `maru_engine_id` becomes
+  `<id>-tp<rank>` (`<id>-dp<d>-tp<rank>` on replica `d` > 0) the same way:
+  maru-server keeps one open session per engine id. Every session of the
+  namespace reads the regions of the others, so a rank that only loads
+  replicated heads reads them from the rank that stored them, and a replica
+  reads what the other replicas stored. The scheduler looks keys up as rank
+  0's session of its replica (`<id>-tp0`, or `<id>-dp<d>-tp0`).
+
+Under TP the scheduler's process loads no model, and a model can change its
+config where a worker loads it, as vLLM's Transformers backend does with the
+dtype. So on the remote_cxl backend the scheduler looks keys up in the cache
+namespace that the workers report through vLLM's KV connector handshake.
+vLLM's `MultiConnector` passes the first handshake that any sub-connector
+returns to all of them, and `NixlConnector` refuses any but its own: above
+TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps
+the namespace it computes itself, and a model that changes its config where
+the workers load it misses every lookup.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
 startup: a pipeline stage would have to address its layers locally in the
-slab and the placement kernel, which index them globally. The CPU, mixed and
-remote_cxl backends still require TP=1.
+slab and the placement kernel, which index them globally. The CPU and mixed
+backends still require TP=1.
 
 (vllm-hybrid-models)=
 ## Hybrid models
@@ -710,7 +734,7 @@ The key names the chunk length because a chunk key hashes the prompt only up to 
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default). The CPU, mixed and remote_cxl backends take one group only.
+- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only.
 - `maru_use_layerwise` is `false` (the default). Several groups are stored in chunkwise format only.
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
