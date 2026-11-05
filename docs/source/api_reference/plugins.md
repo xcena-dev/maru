@@ -43,17 +43,40 @@ exception raised inside one is logged and swallowed.
 | `on_init(handler)` | end of `MaruHandler.__init__` (not yet connected — `mapper` is `None`) | cheap setup only |
 | `on_batch_retrieve(handler, keys, batch_resp)` | end of `batch_retrieve`, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
 | `on_close(handler)` | during `close`, while regions are still mapped and RPC is live | release resources tied to mapped memory |
+| `on_memory_hint(handler, message)` | on the handler's hint thread, for each read hint, read hint end and read promote of the `cxl` backend whose action the plugin's `hint_actions` names | prepare the bytes a load will read before it starts |
 | `contribute_stats() -> dict \| None` | during `get_stats` | returns a dict merged under `stats["plugins"][<PluginClassName>]` |
 
 In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A
 found entry exposes a `handle` (region/offset) whose region is already mapped,
 so a plugin can act on real memory addresses.
 
+### Memory hints of the `cxl` backend
+
+With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM
+connector) or `read_promotes` (a vLLM worker's handler with
+`maru_async_load`), a handler of the `cxl` backend gives the plugins the hint
+messages that the `remote_cxl` backend sends to a remote CXL agent's region
+extension ({doc}`../design_doc/read_hints`), in the same form:
+
+| `message["action"]` | Sent when | `message["ranges"]` |
+|------|------|------|
+| `read_hint` | the scheduler expects the request to load soon (on arrival, or at its first lookup) | the leading hit keys' bytes, in read order: `{"handle": {"region_id", "offset", "length"}, "offset", "length"}`; the bytes are at `handle["offset"] + offset` in the DAX device |
+| `read_hint_end` | the request ended | empty |
+| `read_promote` | the worker starts the load of a request its scheduler hinted | empty |
+
+`message["request"]` is vLLM's request id; the worker's promote names the id
+the scheduler hinted. A plugin takes hints by naming their actions in a class
+attribute `hint_actions` (for example `("read_hint", "read_hint_end",
+"read_promote")`) and implementing `on_memory_hint`. The hook runs on one
+background thread in the order the hints were given; it never delays a load,
+and a slow hook only delays the next hints. Write hints stay with the
+`remote_cxl` backend.
+
 ## Stable accessor surface
 
 ```{admonition} Contract — do not break without deprecation
 :class: warning
-The following `MaruHandler` methods, together with the four hook signatures
+The following `MaruHandler` methods, together with the hook signatures
 above, are the **public, stable plugin API**. Plugins live in separate
 packages on independent release cycles, so renaming, removing, or changing the
 behaviour of any of these is a breaking change for every plugin in the field

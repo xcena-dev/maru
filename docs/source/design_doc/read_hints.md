@@ -201,6 +201,15 @@ existing reboot handling does the rest.
 
 ## Scope
 
-Read hints are sent on the `remote_cxl` backend. A CXL-SSD attached to the GPU
-node's own host has the same need; there no agent sits between Maru and the
-device, and hints would reach the device software through a handler plugin.
+Read hints are sent on the `remote_cxl` and `cxl` backends. A CXL-SSD
+attached to the GPU node's own host has the same need; there no agent sits
+between Maru and the device, so a handler of the `cxl` backend gives the same
+read hints, read hint ends and read promotes to the handler plugins that take
+them (`on_memory_hint`, {doc}`../api_reference/plugins`), and the plugin
+passes them to the device software. The vLLM side is the same as above. Write
+hints and memory resets (the boot that carries a memory generation) are
+`remote_cxl` only: the `cxl` backend has no agent to carry a generation.
+
+![Five panels measured on one GPU server with a CXL-SSD on the cxl backend. (a) Mean reuse-turn TTFT per run in measurement order: read hints off 194, 335, 193, 323 ms; read hints on 159, 178, 153, 165 ms; all KV in the device DRAM cache 104 and 102 ms. (b) Distribution of one reuse request's load time: all-DRAM leftmost, hints on in the middle, hints off to the right with a long tail. (c) One reuse request with hints on: the read hint reaches the device software at 13 ms and two device workers prefetch that request until 97 ms; the load runs from 23 to 101 ms; first token at 238 ms. (d) The same request with hints off: the load runs from 23 to 120 ms; first token at 252 ms. (e) The same request with all KV in DRAM: the load runs from 23 to 65 ms; first token at 201 ms](../image/cxl_read_hints_measured.png)
+
+*Read hints on the `cxl` backend, measured with a device plugin that prefetches on them (one H200 GPU and one CXL-SSD in one server, vLLM 0.22.1, Llama-3.1-8B-Instruct, 35.9 GiB of KV per run; hints off and on with a 16 GiB device DRAM cache, all-DRAM with it at 231 GiB). Times in (c) to (e) are from the replay sending the request. With hints the load runs alongside the request's prefetch and ends just after the last one: shorter than without hints, but about twice the all-DRAM load, because here the GPU copies faster than the device prefetches from flash. The time from load end to the first token is the same in all three.*

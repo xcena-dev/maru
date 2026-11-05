@@ -137,6 +137,37 @@ class MaruHandlerPlugin(Protocol):
         """
         ...
 
+    #: Hint actions this plugin takes in :meth:`on_memory_hint` (for example
+    #: ``("read_hint", "read_hint_end", "read_promote")``). A plugin that
+    #: names none gets no hints.
+    hint_actions: tuple[str, ...] = ()
+
+    def on_memory_hint(self, handler: MaruHandler, message: dict) -> None:
+        """Take one memory hint of the ``cxl`` backend.
+
+        With ``read_hints`` or ``read_promotes`` on, a handler of the ``cxl``
+        backend gives its hints to the plugins whose :attr:`hint_actions` name
+        the hint's action. ``message`` has the form a remote CXL agent's
+        region extension gets (:mod:`maru_handler.storage.remote_cxl.hints`):
+
+        - ``action``: ``"read_hint"`` (``request`` will read ``ranges`` soon,
+          in this order), ``"read_hint_end"`` (``request`` ended; what was
+          prepared for it may go) or ``"read_promote"`` (the load of
+          ``request``, which another process hinted, starts now);
+        - ``request``: the serving engine's request id;
+        - ``ranges``: for ``read_hint``, the leading hit keys' bytes, each a
+          ``{"handle": {"region_id", "offset", "length"}, "offset",
+          "length"}`` map: ``length`` bytes at ``offset`` in the region whose
+          mmap offset in the DAX device is ``handle["offset"]``. Empty for
+          the other actions.
+
+        Called on the handler's hint thread, in the order the hints were
+        given, never on the caller's path. A hint is advice: the load reads
+        every key either way. Keep it short; a slow plugin delays the next
+        hints, not the loads.
+        """
+        ...
+
     def contribute_stats(self) -> dict | None:
         """Return a JSON-serializable stats dict merged into ``get_stats``.
 
