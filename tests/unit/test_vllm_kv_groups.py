@@ -1243,6 +1243,20 @@ def test_a_split_attention_block_may_not_exceed_the_spec():
         _registered_worker(kv_caches)
 
 
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_a_split_attention_layer_holds_k_kernel_blocks_per_block(version):
+    """vLLM numbers kernel block j of block b as b x k + j only when the tensor
+    holds k of them per block, which is what Maru's slots resolve to."""
+    kv_caches = tiny_kv_caches(version, _shared(), kernel_block=TINY_BLOCK // 2)
+    layout = _engine_layout(kv_caches)
+    _worker(kv_cache_layout=layout, num_blocks=TINY_BLOCKS).register_kv_caches(
+        kv_caches
+    )
+    worker = _worker(kv_cache_layout=layout, num_blocks=TINY_BLOCKS + 1)
+    with pytest.raises(ValueError, match="24 kernel blocks of 8 tokens"):
+        worker.register_kv_caches(kv_caches)
+
+
 def test_attention_layout_needs_the_head_count():
     worker = _worker(num_kv_heads=None)
     with pytest.raises(ValueError, match="KV head count"):
@@ -2762,6 +2776,14 @@ def test_tp1_several_groups_keep_bare_keys(monkeypatch):
     worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
     assert worker._worker._kv_shard == WHOLE_MODEL
     assert worker._worker._state_shard == WHOLE_MODEL
+
+
+def test_the_worker_takes_vllms_block_count():
+    """It checks a tensor in kernel blocks against it (see
+    ``_detect_block_kv_layout``)."""
+    config = _tp_connector_config(16, 1, 8)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._num_blocks == NUM_BLOCKS
 
 
 class _FillOps:

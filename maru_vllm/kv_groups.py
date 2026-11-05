@@ -468,6 +468,7 @@ def group_caches(
     kv_layout: str | None,
     num_kv_heads: int | None,
     head_size: int | None,
+    num_blocks: int | None = None,
 ) -> list[GroupCache]:
     """Map the worker's registered tensors onto the KV cache groups.
 
@@ -488,6 +489,8 @@ def group_caches(
         num_kv_heads: KV heads per rank. Required for attention groups: a
             fused layout read without it can take the head axis for K/V.
         head_size: Width of one head, when known.
+        num_blocks: vLLM's block count, when known; a tensor in kernel blocks
+            must hold ``k`` of them for each block.
 
     Raises:
         ValueError: A layer is missing, or its tensor does not match the
@@ -527,7 +530,7 @@ def group_caches(
                 "in shape, dtype or strides"
             )
         layout = _detect_block_kv_layout(
-            shape, g.block_size, kv_layout, num_kv_heads, head_size
+            shape, g.block_size, kv_layout, num_kv_heads, head_size, num_blocks
         )
         if layout is None:
             raise ValueError(

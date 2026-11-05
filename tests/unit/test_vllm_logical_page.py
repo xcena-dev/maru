@@ -417,6 +417,29 @@ class TestPackedSlab:
         for layer in self._names():
             torch.testing.assert_close(self._whole_blocks(dst[layer]), src[layer])
 
+    @pytest.mark.parametrize("name", SPLIT_LAYOUTS)
+    def test_split_kernel_blocks_need_k_per_block(self, name):
+        """The path for one KV cache group checks the count at registration
+        too: 8 blocks of 4 tokens are 16 kernel blocks of 2, not 18."""
+        k, v = self._kv()
+        split = [self._kernel_blocks(t) for t in k], [self._kernel_blocks(t) for t in v]
+        caches = dict(zip(self._names(), logical_pages(name, *split), strict=True))
+
+        def worker(num_blocks):
+            return make_worker(
+                block_size=self.BLOCK,
+                kv_chunk_tokens=self.CHUNK,
+                num_kv_heads=self.HEADS,
+                head_size=self.HEAD_SIZE,
+                kv_cache_layout=name,
+                num_blocks=num_blocks,
+            )
+
+        layout = worker(self.NUM_BLOCKS)._resolve_kv_layout(caches)
+        assert layout.block_size == self.BLOCK // self.SPLIT
+        with pytest.raises(ValueError, match="16 kernel blocks of 2 tokens"):
+            worker(self.NUM_BLOCKS + 1)._resolve_kv_layout(caches)
+
     def test_split_kernel_blocks_keep_the_cpu_storage_schema(self):
         """The cpu, mixed and remote_cxl backends name the objects' format in
         a schema. Engines whose attention backends split blocks differently

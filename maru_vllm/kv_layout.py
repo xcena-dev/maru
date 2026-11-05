@@ -264,6 +264,7 @@ def _detect_block_kv_layout(
     kv_layout: str | None,
     num_kv_heads: int | None = None,
     head_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> KVLayout | None:
     """Resolve a paged KV tensor of ``block_size``-token blocks, or of the
     kernel blocks vLLM splits them into.
@@ -277,17 +278,41 @@ def _detect_block_kv_layout(
     token ``t % kernel`` of kernel block ``b * k + t // kernel``, which is
     ``divmod(slot, kernel)``.
 
-    Arguments and return value as for :func:`_detect_kv_layout`.
+    That holds only when the tensor has ``k`` kernel blocks for each of
+    vLLM's ``num_blocks`` blocks. vLLM numbers them ``b * stride + j`` with a
+    larger stride when other layers' pages sit between them (a packed
+    cache), and an axis misread as the token axis rarely gives the count, so
+    a tensor in kernel blocks is checked against it when it is known.
+
+    Arguments and return value as for :func:`_detect_kv_layout`, plus
+    ``num_blocks``, vLLM's block count (``KVCacheConfig.num_blocks``).
+
+    Raises:
+        ValueError: The tensor reads as kernel blocks, but not ``k`` of them
+            for each block.
     """
     layout = _detect_kv_layout(shape, block_size, kv_layout, num_kv_heads, head_size)
     if layout is not None:
         return layout
+    miscounted: KVLayout | None = None
     for kernel in range(block_size // 2, 0, -1):
         if block_size % kernel:
             continue
         layout = _detect_kv_layout(shape, kernel, kv_layout, num_kv_heads, head_size)
-        if layout is not None:
+        if layout is None:
+            continue
+        if num_blocks is None or layout.num_blocks == num_blocks * (
+            block_size // kernel
+        ):
             return layout
+        miscounted = miscounted or layout
+    if miscounted is not None:
+        k = block_size // miscounted.block_size
+        raise ValueError(
+            f"Maru: the KV tensor {tuple(shape)} holds {miscounted.num_blocks} "
+            f"kernel blocks of {miscounted.block_size} tokens, not {k} for each "
+            f"of vLLM's {num_blocks} blocks of {block_size} tokens"
+        )
     return None
 
 

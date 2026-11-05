@@ -1759,6 +1759,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                         getattr(vllm_config, "model_config", None), "use_mla", False
                     )
                 ),
+                num_blocks=(
+                    kv_cache_config.num_blocks if kv_cache_config is not None else None
+                ),
             )
 
     @property
@@ -2902,9 +2905,11 @@ class MaruWorkerConnector:
 
     _cpu_mode = False
     _remote_cxl_mode = False
-    # Read by the layout paths; a worker built with __new__ knows no layout.
+    # Read by the layout paths; a worker built with __new__ knows no layout
+    # and no block count.
     _cache_config: Any = None
     _cache_layout: str | None = None
+    _num_blocks: int | None = None
     # A worker built with __new__ holds all KV, as at TP=1, of a model
     # without MLA.
     _kv_shard: KVShard = WHOLE_MODEL
@@ -2924,6 +2929,7 @@ class MaruWorkerConnector:
         kv_shard: KVShard = WHOLE_MODEL,
         state_shard: KVShard = WHOLE_MODEL,
         use_mla: bool = False,
+        num_blocks: int | None = None,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -2947,6 +2953,9 @@ class MaruWorkerConnector:
         # block_size, but cannot separate the two rank-4 fused orders.
         self._num_kv_heads = num_kv_heads
         self._head_size = head_size
+        # vLLM's block count, when it hands over its KV cache config: a tensor
+        # in kernel blocks must hold the same number of them for every block.
+        self._num_blocks = num_blocks
         # Where vLLM 0.29+ records the KV cache layout it resolved; read in
         # register_kv_caches into _cache_layout (see _vllm_kv_cache_layout).
         self._cache_config = cache_config
@@ -3343,6 +3352,7 @@ class MaruWorkerConnector:
             kv_layout=self._cache_layout,
             num_kv_heads=self._num_kv_heads,
             head_size=self._head_size,
+            num_blocks=self._num_blocks,
         )
         self._page_size_bytes = max(
             g.object_bytes(self._kv_chunk_tokens) for g in self._kv_groups
@@ -7577,6 +7587,7 @@ class MaruWorkerConnector:
             self._cache_layout,
             self._num_kv_heads,
             self._head_size,
+            self._num_blocks,
         )
 
     def _resolve_kv_layout(self, kv_caches: dict[str, torch.Tensor]) -> KVLayout | None:
@@ -7604,6 +7615,7 @@ class MaruWorkerConnector:
             kv_layout,
             self._num_kv_heads,
             self._head_size,
+            self._num_blocks,
         )
         if layout is None:
             logger.warning(

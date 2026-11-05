@@ -571,6 +571,49 @@ class TestDetectKVLayout:
         assert _detect_kv_layout((3, 5), self.BS, "NHD") is None
 
 
+class TestDetectBlockKVLayout:
+    """A tensor in kernel blocks is read only when it holds ``k`` of them for
+    each of vLLM's blocks: kernel block ``j`` of block ``b`` is then
+    ``b * k + j``, the one Maru's slots resolve to."""
+
+    NB, BS, KERNEL, NH, HS = 4, 128, 64, 8, 128
+
+    def _detect(self, kernel_blocks, num_blocks):
+        from maru_vllm.kv_layout import _detect_block_kv_layout
+
+        # vLLM 0.30+ logical page: (blocks, KV heads, tokens, K|V)
+        shape = (kernel_blocks, self.NH, self.KERNEL, 2 * self.HS)
+        return _detect_block_kv_layout(
+            shape,
+            self.BS,
+            "LBNHC",
+            num_kv_heads=self.NH,
+            head_size=self.HS,
+            num_blocks=num_blocks,
+        )
+
+    def test_k_kernel_blocks_per_block_are_read(self):
+        got = self._detect(2 * self.NB, self.NB)
+        assert (got.num_blocks, got.block_size) == (2 * self.NB, self.KERNEL)
+
+    def test_another_kernel_block_count_is_refused(self):
+        with pytest.raises(ValueError, match="9 kernel blocks of 64 tokens"):
+            self._detect(2 * self.NB + 1, self.NB)
+
+    def test_kernel_blocks_spread_by_a_larger_stride_are_refused(self):
+        """A packed cache keeps other layers' pages between the kernel blocks
+        of one block, so vLLM numbers them ``b * stride + j`` and views
+        ``(NB - 1) * stride + k`` of them."""
+        stride = 2 * 2
+        with pytest.raises(ValueError, match="14 kernel blocks of 64 tokens"):
+            self._detect((self.NB - 1) * stride + 2, self.NB)
+
+    def test_without_the_block_count_kernel_blocks_are_read(self):
+        """vLLM before 0.30 does not hand the connector its block count."""
+        got = self._detect(2 * self.NB + 1, None)
+        assert got.block_size == self.KERNEL
+
+
 class TestRegisterKVCaches:
     def test_eagerly_connects_after_deriving_packed_page_size(self):
         """Keep expensive CXL mapping off the first populate request path."""
