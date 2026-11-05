@@ -165,7 +165,7 @@ sequenceDiagram
   closes, so it can end what that connection's hints started.
 
 The message formats and the extension's hooks, locks and failure outcomes are
-documented in `maru_handler/storage/remote_cxl/hints.py`,
+documented in `maru_handler/hints.py`,
 `maru_remote/region_map.py` and `maru_remote_cxl_agent/extension.py`.
 
 ## Memory resets

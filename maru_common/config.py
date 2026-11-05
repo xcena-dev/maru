@@ -87,7 +87,7 @@ class MaruConfig:
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
     # Send read hints (remote_cxl only): before a load starts, the remote CXL
     # agents whose region extension takes them hear which bytes it will read
-    # (maru_handler.storage.remote_cxl.hints). Advice; the data path is the same.
+    # (maru_handler.hints). Advice; the data path is the same.
     read_hints: bool = False
     # Send write hints (remote_cxl only): a store's pages are named to the
     # remote CXL agents whose region extension takes them before its WRITEs,

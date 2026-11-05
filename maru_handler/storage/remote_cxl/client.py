@@ -22,10 +22,10 @@ from maru_common.storage_types import (
     StorageUnavailableError,
 )
 
+from ...hints import MemoryHints
 from ..cpu import CpuReadLease
 from ..staging import StagingBuffer
 from .datapath import REPLY_TIMEOUT_MIN_S, RdmaDataPath
-from .hints import MemoryHints
 from .lifecycle import RegionLifecycle
 from .region import (
     REMOTE_CXL,
