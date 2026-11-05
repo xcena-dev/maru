@@ -62,6 +62,20 @@ int recordOpen(const char *path) {
     return 0;
 }
 
+// On scope exit (a failed ASSERT included): release a stalled open and wait
+// until pm's I/O on path has finished. Otherwise the stalled thread wakes up to
+// 30 s later, after TearDown cleared fakeRoot, and fake_dax_fs.cpp aborts the
+// process on its /dev path.
+struct HangGuard {
+    PoolManager &pm;
+    std::string path;
+    ~HangGuard() {
+        releaseHang();
+        for (int i = 0; i < 1000 && PoolManagerTestPeer::slotHeld(pm, path); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+};
+
 TEST_F(HeaderRecoveryTest, FreshPoolInitializesHeaderAfterValidation) {
     addDevice(0, false);
     PoolManager pm(state);
@@ -1079,8 +1093,13 @@ TEST_F(HeaderRecoveryTest, NormalReaperReturnsOnlyDataRange) {
 
 TEST_F(HeaderRecoveryTest, UnresponsiveDeviceDoesNotBlockOtherPools) {
     addDevice(0);
+    // The deadline covers every device I/O, not only the stalled one, and a
+    // header write's msync waits for the journal behind other writers on a
+    // shared CI disk (up to ~0.35 s seen). Only the stalled I/O waits it out.
+    constexpr int kIoTimeoutMs = 3000;
     PoolManager pm(state);
-    PoolManagerTestPeer::setDeviceIoTimeout(pm, 200);
+    HangGuard pmGuard{pm, dev(1)};
+    PoolManagerTestPeer::setDeviceIoTimeout(pm, kIoTimeoutMs);
     ASSERT_EQ(pm.loadPools(), 0);
     auto waitIdle = [&] {
         for (int i = 0; i < 500 && PoolManagerTestPeer::slotHeld(pm, dev(1)); ++i)
@@ -1098,7 +1117,7 @@ TEST_F(HeaderRecoveryTest, UnresponsiveDeviceDoesNotBlockOtherPools) {
         armHang(dev(1), nth);
         const auto started = std::chrono::steady_clock::now();
         EXPECT_EQ(pm.rescanDevices(), 0);
-        EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(5));
+        EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(20));
         EXPECT_EQ(PoolManagerTestPeer::unserved(pm, dev(1)).rfind("busy", 0), 0u);
         Handle h{};
         ASSERT_EQ(allocate(pm, h), 0); // Other pools carry on meanwhile.
@@ -1134,7 +1153,8 @@ TEST_F(HeaderRecoveryTest, UnresponsiveDeviceDoesNotBlockOtherPools) {
     // the device can be excluded while only its timed-out read holds it.
     armHang(dev(1), 0);
     PoolManager restarted(state);
-    PoolManagerTestPeer::setDeviceIoTimeout(restarted, 200);
+    HangGuard restartedGuard{restarted, dev(1)};
+    PoolManagerTestPeer::setDeviceIoTimeout(restarted, kIoTimeoutMs);
     ASSERT_EQ(restarted.loadPools(), 0);
     EXPECT_TRUE(restarted.hasPools());
     EXPECT_EQ(PoolManagerTestPeer::unserved(restarted, dev(1)).rfind("busy", 0), 0u);
