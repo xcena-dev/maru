@@ -117,6 +117,17 @@ def test_multiple_workers_are_rejected(name):
         _cpu_engine_config(extra(), config)
 
 
+def test_a_data_parallel_replica_is_rejected():
+    """vLLM runs each replica of a model without MoE layers as its own engine
+    with data_parallel_size=1; its data_parallel_index still tells it."""
+    config = engine_config()
+    config.parallel_config.data_parallel_index = 0
+    _cpu_engine_config(extra(), config)
+    config.parallel_config.data_parallel_index = 1
+    with pytest.raises(ValueError, match="TP=PP=DP"):
+        _cpu_engine_config(extra(), config)
+
+
 def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
     a = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
@@ -126,6 +137,46 @@ def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
     config.cache_config.cache_dtype = "float32"
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+
+
+def test_engine_namespace_tracks_the_quantization_vllm_runs():
+    """--quantization fp8 on an unquantized checkpoint computes other KV
+    from the same hf_config; an engine without one keeps its namespace."""
+    config = engine_config()
+    plain = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    config.model_config.quantization = None
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] == plain
+    config.model_config.quantization = "fp8"
+    fp8 = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    assert fp8 != plain
+    config.model_config.quantization = "mxfp4"
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] not in (
+        plain,
+        fp8,
+    )
+
+
+def test_engine_namespace_tracks_the_quantization_settings():
+    """--quantization-config (per-layer specs, ignore lists) changes the
+    weights' math without changing the method's name."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class Spec:
+        linear: str | None = None
+        ignore: tuple[str, ...] = ()
+
+    config = engine_config()
+    config.model_config.quantization = "fp8"
+
+    def namespace(settings):
+        config.model_config.quantization_config = settings
+        return _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+
+    plain = namespace(None)
+    assert namespace({"ignore": ["lm_head"]}) not in (plain, namespace({}))
+    assert namespace(Spec("fp8")) == namespace(Spec("fp8"))
+    assert namespace(Spec("fp8")) != namespace(Spec("fp8", ("lm_head",)))
 
 
 def test_engines_of_different_storage_backends_never_share_a_namespace():

@@ -416,8 +416,9 @@ def check_multi_group_support(
     an MLA group may use another (DeepSeek-V4.1's 64-token MLA blocks beside
     its 32-token windows); the chunk then holds whole blocks of each
     (``chunk_unit``). Groups vLLM does not prefix-cache are skipped and take
-    no part in the checks. The CPU, mixed and remote_cxl backends reject several
-    groups on their own, in ``MaruKVConnector``.
+    no part in the checks. The CPU and mixed backends reject several groups,
+    and the remote_cxl backend MLA models, on their own, in
+    ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.

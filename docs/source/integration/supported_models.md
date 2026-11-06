@@ -7,7 +7,7 @@ lists the structures it stores and the ones it refuses; a structure or setting
 that is not listed has not been tested. Support for a range of models on
 SGLang HiCache and NVIDIA Dynamo, as on vLLM, is planned.
 
-On the CXL storage backend (the default):
+On the `cxl` storage backend (the default) and the `remote_cxl` backend:
 
 ```{eval-rst}
 .. table::
@@ -58,9 +58,13 @@ of the KV cache.
 
 ## Storage backends
 
-The table holds for the `cxl` backend. The `cpu`, `mixed` and `remote_cxl`
-backends take only text-only models with one KV cache group and without MLA,
-at TP=1 and without data parallelism, and refuse LoRA and quantized KV caches.
+The table holds for the `cxl` and `remote_cxl` backends, except that
+`remote_cxl` takes no MLA model. `remote_cxl` was tested with gpt-oss-20b and
+Qwen3.5-0.8B on a single GPU and at TP=2, with Llama-3.1-8B at TP=2, and with
+all three at DP=2. The `cpu` and `mixed` backends take only text-only models
+with one KV cache group and without MLA, at TP=1 and without data parallelism.
+The `remote_cxl`, `cpu` and `mixed` backends refuse LoRA and quantized KV
+caches.
 
 ## Reporting results
 

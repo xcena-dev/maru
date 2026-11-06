@@ -10,10 +10,12 @@ the connector stores the same K/V-major slab a rank-5 flash cache did, that
 it reads the resolved layout name rather than assuming NHD, and that it keeps
 the step ordering its layerwise loads rely on.
 
-CPU only: the packed kernel has no format for these pages, so every transfer
-takes the per-layer path.
+The packed tests run on the CPU, where every transfer takes the per-layer
+path, and on a device with a built ``maru_kv_ops``, where the logical-page
+kernel places the pages and must store and load the same bytes.
 """
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -24,7 +26,8 @@ pytest.importorskip("vllm")
 
 import torch
 
-from maru_vllm.connector import _chunk_keys
+import maru_kv_ops
+from maru_vllm.connector import _chunk_keys, _logical_page_format
 from maru_vllm.kv_layout import _detect_kv_layout, _vllm_kv_cache_layout
 from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
@@ -75,6 +78,14 @@ def logical_pages(layout: str, k: list, v: list, device: str = "cpu") -> list:
         view[..., :hs] = key.permute(0, 2, 1, 3).to(device)
         view[..., hs:] = value.permute(0, 2, 1, 3).to(device)
     return views
+
+
+requires_kernel = pytest.mark.skipif(
+    not torch.cuda.is_available() or not maru_kv_ops.is_available(),
+    reason="needs a CUDA device and a built maru_kv_ops extension",
+)
+# cpu: per-layer copies. cuda: the logical-page kernel, unless refused.
+DEVICES = ["cpu", pytest.param("cuda", marks=requires_kernel)]
 
 
 def triton_metadata() -> MagicMock:
@@ -130,6 +141,88 @@ class TestDetection:
         assert unknown.format_name is None
         hnd = _detect_kv_layout(shape, self.BS, "HND", self.NH, self.HS)
         assert hnd.format_name == "NL_X_NB_TWO_NH_BS_HS"
+
+
+class TestKernelFormat:
+    """The logical-page kernel is handed the pages' own strides, or nothing."""
+
+    NB, BS, NH, HS, LAYERS = 5, 4, 3, 2, 2
+    # Physical order of [L, B, H, N, C], as vllm.v1.kv_cache_layout lists it.
+    ORDERS = {
+        "LBHNC": (0, 1, 2, 3, 4),
+        "LBNHC": (0, 1, 3, 2, 4),
+        "LHBNC": (0, 2, 1, 3, 4),
+        "BLHNC": (1, 0, 2, 3, 4),
+        "BLNHC": (1, 0, 3, 2, 4),
+        "BHLNC": (1, 2, 0, 3, 4),
+    }
+
+    def _pages(self, name):
+        order = self.ORDERS[name]
+        logical = (self.LAYERS, self.NB, self.NH, self.BS, 2 * self.HS)
+        raw = torch.zeros(tuple(logical[d] for d in order), dtype=torch.bfloat16)
+        view = raw.permute(tuple(order.index(d) for d in range(5)))
+        return [view[i] for i in range(self.LAYERS)]
+
+    def _layout(self, name):
+        shape = (self.NB, self.NH, self.BS, 2 * self.HS)
+        return _detect_kv_layout(shape, self.BS, name, self.NH, self.HS)
+
+    @staticmethod
+    def _record(**strides):
+        return strides
+
+    @pytest.mark.parametrize("name", list(ORDERS))
+    def test_strides_come_from_the_pages(self, name):
+        pages = self._pages(name)
+        got = _logical_page_format(self._record, pages, self._layout(name))
+        block, head, token, content = pages[0].stride()
+        assert content == 1
+        assert got == {
+            "block_stride": block,
+            "head_stride": head,
+            "token_stride": token,
+            "num_heads": self.NH,
+        }
+
+    def test_lbnhc_is_token_major_inside_a_block(self):
+        """The default layout, spelled out: [B, N, H, C] in memory."""
+        got = _logical_page_format(
+            self._record, self._pages("LBNHC"), self._layout("LBNHC")
+        )
+        c = 2 * self.HS
+        assert got == {
+            "block_stride": self.BS * self.NH * c,
+            "head_stride": c,
+            "token_stride": self.NH * c,
+            "num_heads": self.NH,
+        }
+
+    def test_layers_with_different_strides_get_none(self):
+        """One stride set serves the whole pointer table."""
+        mixed = [self._pages("LBHNC")[0], self._pages("LBNHC")[1]]
+        assert _logical_page_format(self._record, mixed, self._layout("LBNHC")) is None
+
+    def test_content_that_is_not_innermost_gets_none(self):
+        layout = self._layout("LBHNC")
+        raw = torch.zeros(self.NB, self.NH, 2 * self.HS, self.BS, dtype=torch.bfloat16)
+        page = raw.transpose(2, 3)
+        assert page.shape == layout.shape and page.stride()[3] != 1
+        assert _logical_page_format(self._record, [page], layout) is None
+
+    def test_a_misaligned_page_gets_none(self):
+        layout = self._layout("LBHNC")
+        flat = torch.zeros(
+            self.NB * self.NH * self.BS * 2 * self.HS + 1, dtype=torch.bfloat16
+        )
+        page = flat[1:].view(layout.shape)
+        assert page.data_ptr() % 16
+        assert _logical_page_format(self._record, [page], layout) is None
+
+    def test_an_extension_without_the_format_gets_none(self):
+        """A build predating the logical-page kernel keeps the fallback."""
+        name = "LBNHC"
+        assert _logical_page_format(None, self._pages(name), self._layout(name)) is None
 
 
 class TestReadLayout:
@@ -215,21 +308,26 @@ class TestPackedSlab:
         meta = attn_metadata or make_flash_attn_metadata()
         for name, cache in caches.items():
             writer.save_kv_layer(name, cache, meta, metadata)
-        return stored, token_ids
+        return stored, token_ids, writer
 
+    @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("name", LAYOUTS)
-    def test_slab_bytes_match_a_rank5_cache(self, name):
+    def test_slab_bytes_match_a_rank5_cache(self, name, device):
         """The pool holds the KV_2LTD bytes a vLLM 0.23-0.25 flash cache of
         the same K and V stored, so engines on either side can share it."""
         k, v = self._kv()
-        logical = dict(zip(self._names(), logical_pages(name, k, v), strict=True))
+        logical = dict(
+            zip(self._names(), logical_pages(name, k, v, device), strict=True)
+        )
         rank5 = {
             layer: torch.stack([key, value], dim=1)
             for layer, key, value in zip(self._names(), k, v, strict=True)
         }
 
-        stored, token_ids = self._store(logical, name)
-        expected, _ = self._store(rank5, "NHD")
+        stored, token_ids, writer = self._store(logical, name)
+        expected, _, _ = self._store(rank5, "NHD")
+        # The kernel stored it on a device, the per-layer copies on the CPU.
+        assert (writer._store_kernel_ctx is not None) == (device == "cuda")
 
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
         assert set(stored) == set(chunk_keys)
@@ -247,19 +345,33 @@ class TestPackedSlab:
                             src[li][block, offset].reshape(self.HIDDEN),
                         )
 
+    @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("triton", [False, True], ids=["flash", "triton"])
     @pytest.mark.parametrize("name", LAYOUTS)
-    def test_roundtrip_restores_every_layer(self, name, triton):
+    def test_roundtrip_restores_every_layer(self, name, triton, device):
         """Triton metadata must not reach the legacy rank-4 Triton branch,
-        whose token-major rows do not match the chunk slab."""
+        whose token-major rows do not match the chunk slab. On a device its
+        logical page takes the kernel, as Flash's does."""
         meta = triton_metadata() if triton else make_flash_attn_metadata()
         k, v = self._kv()
-        src = dict(zip(self._names(), logical_pages(name, k, v), strict=True))
-        stored, token_ids = self._store(src, name, meta)
+        src = dict(zip(self._names(), logical_pages(name, k, v, device), strict=True))
+        stored, token_ids, writer = self._store(src, name, meta)
+        kernel = device == "cuda"
+        assert (writer._store_kernel_ctx is not None) == kernel
 
         zeros = [torch.zeros_like(t) for t in k]
-        dst = dict(zip(self._names(), logical_pages(name, zeros, zeros), strict=True))
+        dst = dict(
+            zip(self._names(), logical_pages(name, zeros, zeros, device), strict=True)
+        )
         reader = self._worker(dst, name)
+        contexts = []
+        build = reader._packed_load_kernel_ctx
+
+        def recording(*args):
+            contexts.append(build(*args))
+            return contexts[-1]
+
+        reader._packed_load_kernel_ctx = recording
         reader._handler = MagicMock()
         reader._handler.batch_retrieve.side_effect = lambda keys: [
             SimpleNamespace(view=memoryview(stored[key]), region_id=0, page_index=i)
@@ -280,10 +392,132 @@ class TestPackedSlab:
             ),
         )
 
-        assert reader.get_finished_loading() == {"r1"}
+        # A device load completes on its stream; poll as vLLM does each step.
+        deadline = time.monotonic() + 30
+        finished = reader.get_finished_loading()
+        while finished is None and device == "cuda" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            finished = reader.get_finished_loading()
+        assert finished == {"r1"}
         assert reader.take_failed_load_blocks() == set()
+        assert contexts and all((c is not None) == kernel for c in contexts)
         for layer in self._names():
             torch.testing.assert_close(dst[layer], src[layer])
+
+    @requires_kernel
+    @pytest.mark.parametrize("name", LAYOUTS)
+    def test_kernel_writes_and_reads_pinned_slabs_in_place(self, name):
+        """Pinned host slabs, as a CUDA-registered CXL mapping hands them out:
+        the store kernel writes them and an inline load's kernel reads them,
+        with no device copy in between."""
+        k, v = self._kv()
+        src = dict(zip(self._names(), logical_pages(name, k, v, "cuda"), strict=True))
+        writer = self._worker(src, name)
+        stored: dict[str, torch.Tensor] = {}
+
+        def alloc(nbytes, **_):
+            slab = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+            return SimpleNamespace(buf=memoryview(slab.numpy()), slab=slab)
+
+        def batch_store(keys, handles):
+            stored.update({key: h.slab for key, h in zip(keys, handles, strict=True)})
+            return [True] * len(keys)
+
+        writer._handler = MagicMock()
+        writer._handler.alloc.side_effect = alloc
+        writer._handler.batch_store.side_effect = batch_store
+        meta = make_flash_attn_metadata()
+        handed: list[tuple[str, bool]] = []
+
+        def spying(ctx):
+            ops, *rest = ctx
+
+            def transfer(slab, *args, **kwargs):
+                handed.append((slab.device.type, slab.is_pinned()))
+                return ops.multi_layer_kv_transfer(slab, *args, **kwargs)
+
+            spy = SimpleNamespace(
+                multi_layer_kv_transfer=transfer,
+                TransferDirection=ops.TransferDirection,
+            )
+            return (spy, *rest)
+
+        writer._store_kernel_ctx = spying(writer._packed_store_kernel_ctx(meta))
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(self.NUM_BLOCKS)),
+            num_scheduled_tokens=self.PROMPT,
+        )
+        for layer, cache in src.items():
+            writer.save_kv_layer(layer, cache, meta, metadata)
+        chunks = len(_chunk_keys(token_ids, self.CHUNK))
+        assert len(stored) == chunks
+        assert handed == [("cpu", True)] * chunks
+
+        zeros = [torch.zeros_like(t) for t in k]
+        dst = dict(
+            zip(self._names(), logical_pages(name, zeros, zeros, "cuda"), strict=True)
+        )
+        reader = self._worker(dst, name)
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(
+                view=memoryview(stored[key].numpy()), region_id=0, page_index=i
+            )
+            for i, key in enumerate(keys)
+        ]
+        build = reader._packed_load_kernel_ctx
+        reader._packed_load_kernel_ctx = lambda *a: spying(build(*a))
+        handed.clear()
+        reader.start_load_kv(
+            SimpleNamespace(
+                no_compile_layers={
+                    layer: SimpleNamespace(kv_cache=t) for layer, t in dst.items()
+                },
+                attn_metadata=meta,
+            ),
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(self.NUM_BLOCKS)),
+                num_matched_chunks=chunks,
+                deferred_load=False,
+            ),
+        )
+        torch.cuda.synchronize()
+        assert reader.take_failed_load_blocks() == set()
+        assert handed == [("cpu", True)] * chunks
+        for layer in self._names():
+            torch.testing.assert_close(dst[layer], src[layer])
+
+
+@requires_kernel
+@pytest.mark.parametrize(
+    ("layout", "kernel"), [("LBNHC", True), ("NHD", False)], ids=["logical", "rank5"]
+)
+def test_triton_keeps_the_kernel_only_on_a_logical_page(layout, kernel):
+    """vLLM < 0.29's Triton page may pad each head with an inline scale, so
+    its rank-5 page stays off the kernel; the 0.29+ page is Flash's."""
+    nb, bs, nh, hs = 4, 4, 2, 8
+    if layout == "NHD":
+        page = torch.zeros(nb, 2, bs, nh, hs, device="cuda")
+    else:
+        page = torch.zeros(nb, bs, nh, 2 * hs, device="cuda").permute(0, 2, 1, 3)
+    worker = make_worker(
+        block_size=bs,
+        kv_chunk_tokens=bs,
+        num_kv_heads=nh,
+        head_size=hs,
+        kv_cache_layout=layout,
+    )
+    worker._kv_caches = {"model.layers.0.self_attn": page}
+    worker._num_layers = 1
+    worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+    layers = [("model.layers.0.self_attn", page, 0)]
+    triton = worker._packed_load_kernel_ctx(layers, triton_metadata())
+    flash = worker._packed_load_kernel_ctx(layers, make_flash_attn_metadata())
+    assert flash is not None
+    assert (triton is not None) == kernel
 
 
 def test_mla_registered_and_bound_pages_agree():

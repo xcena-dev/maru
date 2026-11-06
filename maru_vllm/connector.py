@@ -28,12 +28,13 @@ import time
 from collections import deque
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
@@ -100,6 +101,7 @@ DEFAULT_KV_CHUNK_TOKENS = 256
 _NODE_LOCAL_CONFIG_FIELDS = frozenset(
     {"_name_or_path", "name_or_path", "transformers_version", "_commit_hash"}
 )
+
 
 # Knobs renamed to name the axis the deployer actually chooses, mapped to the
 # name each one replaced. The former names stay accepted for one release so
@@ -366,8 +368,10 @@ def _session_route(cpu_mode: bool, chunk_keys: list[str]) -> dict[str, str]:
     """Routing kwargs for a storage-session call made for one request.
 
     Every chunk of a request goes to the pool chosen by its first chunk key,
-    so a request's prefix is stored and found in one pool. The shared-memory
-    paths take no route key.
+    so a request's prefix is stored and found in one pool. ``chunk_keys`` are
+    the bare keys, without a TP slice or KV cache group suffix, so every
+    rank's and group's objects of a request share that pool. The
+    shared-memory paths take no route key.
     """
     if cpu_mode and chunk_keys and chunk_keys[0]:
         return {"route_key": chunk_keys[0]}
@@ -642,7 +646,9 @@ def _tensor_parallel_defaults(extra: dict[str, Any], tp_size: int) -> dict[str, 
     return {**extra, knob: True}
 
 
-def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
+def _cpu_engine_config(
+    extra: dict[str, Any], config: Any, kv_groups: Sequence[KVGroup] = ()
+) -> dict[str, Any]:
     """Bind a caller-supplied model revision namespace to engine geometry.
 
     Engines that compute the same digest share keys (remote_cxl) or reuse
@@ -652,12 +658,23 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     ``maru_cache_namespace`` tells different weights apart. The storage
     backend enters it: a CPU or mixed engine cannot load a remote CXL
     engine's keys, so engines of different backends never share a namespace.
-    remote_cxl defaults to asynchronous loads and stores
-    (``_remote_cxl_defaults``).
+    So does the quantization vLLM runs the weights with, when there is one.
+    So do the TP size above TP=1 and several KV cache groups (remote_cxl
+    only): a rank's objects hold its own slice and its page is sized by it,
+    and a model stored by group holds other objects than the same model
+    stored as one group. MaruServer refuses a session whose objects differ
+    from those of its namespace, so such engines must not share one. A
+    one-group TP=1 engine keeps its digest. remote_cxl defaults to
+    asynchronous loads and stores (``_remote_cxl_defaults``).
+
+    Each process computes the digest from its own config, and a model can
+    change its hf_config where a worker loads it, so under TP the scheduler
+    takes the workers' digest (``MaruHandshakeMetadata``).
     """
     extra = _remote_cxl_defaults(extra)
+    remote_cxl = extra.get("maru_storage_backend") == "remote_cxl"
     if (
-        extra.get("maru_storage_backend") == "remote_cxl"
+        remote_cxl
         and not _get_knob(extra, "maru_async_load")
         and getattr(
             getattr(config, "scheduler_config", None), "async_scheduling", False
@@ -678,17 +695,27 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
     ):
         raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
     parallel = config.parallel_config
-    if any(
-        getattr(parallel, name, 1) != 1
-        for name in (
-            "tensor_parallel_size",
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "decode_context_parallel_size",
-            "prefill_context_parallel_size",
-        )
+    # Each remote_cxl TP rank of each data-parallel replica opens its own
+    # session (_rank_scoped_extra) and stores its own slice; every session of
+    # a namespace reads the others' regions. CPU M1 takes one worker of one
+    # engine. vLLM runs each replica of a model without MoE layers as its own
+    # engine with data_parallel_size=1, so _dp_index tells such a replica.
+    single: tuple[str, ...] = (
+        "pipeline_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+    )
+    if not remote_cxl:
+        single = ("tensor_parallel_size", "data_parallel_size", *single)
+    if any(getattr(parallel, name, 1) != 1 for name in single) or (
+        not remote_cxl and _dp_index(config) > 0
     ):
-        raise ValueError("CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1")
+        raise ValueError(
+            "Remote CXL storage requires PP=1 and context parallel sizes of 1"
+            if remote_cxl
+            else "CPU M1 requires TP=PP=DP=1 and context parallel sizes of 1"
+        )
+    tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
     model = config.model_config
     if not getattr(model, "enforce_eager", False):
         raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
@@ -701,10 +728,18 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
         raise ValueError("CPU M1 does not support quantized KV caches")
     if (
         getattr(config, "lora_config", None) is not None
-        or getattr(model, "is_multimodal_model", False)
         or getattr(model, "use_mla", False)
+        # A request with multimodal inputs neither loads nor stores on any
+        # backend (_uncacheable_request), so remote_cxl serves the text
+        # requests of a multimodal model, such as Qwen3.5's, as cxl does.
+        # CPU M1 stays text-only by scope.
+        or (getattr(model, "is_multimodal_model", False) and not remote_cxl)
     ):
-        raise ValueError("CPU M1 supports text-only models without LoRA or MLA")
+        raise ValueError(
+            "Remote CXL storage supports models without LoRA or MLA"
+            if remote_cxl
+            else "CPU M1 supports text-only models without LoRA or MLA"
+        )
     model_config = {
         k: v
         for k, v in model.hf_config.to_dict().items()
@@ -721,6 +756,24 @@ def _cpu_engine_config(extra: dict[str, Any], config: Any) -> dict[str, Any]:
         "chunk_tokens": extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS),
         "format": "maru-KV_2LTD-v1",
     }
+    # The method vLLM runs the weights with and its settings, which hf_config
+    # does not name when it quantizes them at load (--quantization fp8,
+    # --quantization-config): the same checkpoint then computes other KV.
+    quantization = getattr(model, "quantization", None)
+    if quantization is not None:
+        identity["quantization"] = str(quantization)
+    quantization_config = getattr(model, "quantization_config", None)
+    if quantization_config is not None:
+        identity["quantization_config"] = (
+            asdict(quantization_config)
+            if is_dataclass(quantization_config)
+            and not isinstance(quantization_config, type)
+            else quantization_config
+        )
+    if tp_size > 1:
+        identity["tensor_parallel_size"] = tp_size
+    if len(kv_groups) > 1:
+        identity["kv_groups"] = [asdict(group) for group in kv_groups]
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode()
     ).hexdigest()
@@ -876,28 +929,59 @@ def _dp_index(vllm_config: VllmConfig) -> int:
     return int(index or 0)
 
 
+def _rank_scoped_id(value: str, tp_rank: int, tp_size: int, dp_index: int) -> str:
+    """``value`` for one worker process: ``-dp<index>`` names a data-parallel
+    replica after the first, and ``-tp<rank>`` a rank above TP=1."""
+    if dp_index > 0:
+        value = f"{value}-dp{dp_index}"
+    if tp_size > 1:
+        value = f"{value}-tp{tp_rank}"
+    return value
+
+
 def _rank_scoped_extra(
     extra_config: dict[str, Any], tp_rank: int, tp_size: int, dp_index: int = 0
 ) -> dict[str, Any]:
-    """Give each worker process its own ``maru_instance_id``.
+    """Give each worker process its own ``maru_instance_id`` and ``maru_engine_id``.
 
     Every worker process connects its own MaruHandler and owns its own CXL
     pool. Under one configured id the server would see the processes as a
     single owner: pre-mapping skips the siblings' regions, usage is merged,
     and owner-scoped cleanup would reach regions a sibling still uses. A
-    data-parallel replica runs its own TP group, so ``-dp<index>`` tells
-    replicas apart and ``-tp<rank>`` the ranks of one; replica 0 keeps the
-    id it has without data parallelism. Without a configured id each process
-    already draws its own UUID.
+    storage session (remote_cxl) is opened per ``maru_engine_id``, and
+    MaruServer refuses a second one while the first is open, so each rank
+    needs its own engine id too. A data-parallel replica runs its own TP
+    group, so ``-dp<index>`` tells replicas apart and ``-tp<rank>`` the ranks
+    of one; replica 0 keeps the ids it has without data parallelism. Without
+    a configured instance id each process already draws its own UUID.
     """
-    instance_id = extra_config.get("maru_instance_id")
-    if not instance_id or (tp_size == 1 and dp_index == 0):
+    if tp_size == 1 and dp_index == 0:
         return extra_config
-    if dp_index > 0:
-        instance_id = f"{instance_id}-dp{dp_index}"
-    if tp_size > 1:
-        instance_id = f"{instance_id}-tp{tp_rank}"
-    return {**extra_config, "maru_instance_id": instance_id}
+    out = dict(extra_config)
+    for name in ("maru_instance_id", "maru_engine_id"):
+        if extra_config.get(name):
+            out[name] = _rank_scoped_id(extra_config[name], tp_rank, tp_size, dp_index)
+    return out
+
+
+def _scheduler_scoped_extra(
+    extra_config: dict[str, Any], tp_size: int, dp_index: int = 0
+) -> dict[str, Any]:
+    """Look keys up as rank 0's storage session.
+
+    MaruServer answers a storage-session lookup for the engine id of an open
+    session (``probe``), and the scheduler opens none. Every session of a
+    namespace finds every key stored in it, so rank 0's engine id finds what
+    any rank stored. A rank whose session is not open fails its load, and
+    vLLM recomputes the request on every rank.
+    """
+    engine_id = extra_config.get("maru_engine_id")
+    if not engine_id or (tp_size == 1 and dp_index == 0):
+        return extra_config
+    return {
+        **extra_config,
+        "maru_engine_id": _rank_scoped_id(engine_id, 0, tp_size, dp_index),
+    }
 
 
 def _vllm_version_at_least(minimum: str) -> bool:
@@ -977,8 +1061,8 @@ def _create_maru_handler(
     Args:
         extra_config: vLLM kv_connector_extra_config dict.
         pool_size_override: If set, use this pool size instead of the
-            configured value. Used by the scheduler to avoid wasting
-            CXL memory on a metadata-only connection.
+            configured value (on a storage-session backend, its region or
+            pool size). A TP rank that stores nothing takes one page.
     """
     from maru import MaruConfig, MaruHandler
 
@@ -992,7 +1076,7 @@ def _create_maru_handler(
     chunk_size = _parse_size(extra_config.get("maru_chunk_size", 4 * 1024 * 1024))
     instance_id = extra_config.get("maru_instance_id")
     eager_map = extra_config.get("maru_eager_map", True)
-    if cpu_mode:
+    if cpu_mode and pool_size_override is None:
         pool_size = _parse_size(extra_config[_session_pool_key(extra_config)])
     if metadata_only:
         pool_size = 0
@@ -1197,9 +1281,17 @@ def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> r
     return range(start // chunk_tokens, min(end // chunk_tokens, num_chunks))
 
 
-# Attention backends the placement kernels do not serve: the same ones
-# _packed_load_kernel_ctx refuses by their metadata (MLA, Triton).
-_NO_KERNEL_BACKENDS = ("MLA", "TRITON")
+def _kernel_refused_by(backend: str, layout: KVLayout | None) -> bool:
+    """Whether attention backend ``backend`` keeps its pages off the kernels.
+
+    The same refusals ``_packed_load_kernel_ctx`` makes by metadata type. An
+    MLA latent has no K/V planes. Triton's rank-5 page of vLLM < 0.29 may pad
+    each head with an inline scale; its 0.29+ logical page is the Flash page,
+    ``[K|V]`` per head, which ``kv_packed`` (exactly two heads wide) confirms.
+    """
+    if "MLA" in backend:
+        return True
+    return "TRITON" in backend and not (layout is not None and layout.kv_packed)
 
 
 def _attention_backend(layers: dict[str, Any] | None, name: str) -> str | None:
@@ -1217,6 +1309,46 @@ def _is_dense(t: torch.Tensor) -> bool:
     """
     span = 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride(), strict=True))
     return span == t.numel()
+
+
+# Layouts whose missing kernel format was already logged, once per process.
+_kv_format_warned: set[str] = set()
+
+
+def _logical_page_format(
+    format_type: Any, pages: list[torch.Tensor], layout: KVLayout
+) -> Any | None:
+    """The kernel format of vLLM 0.29+ logical pages, or None.
+
+    The pages' physical order shows only in their strides, so the format is
+    the strides themselves, which the kernel shares across every layer of
+    the pointer table. Refused when the layers do not share them, when K|V
+    content is not the innermost run, or when a page's base is not 16-byte
+    aligned (the kernel may move 16 bytes per access).
+
+    Args:
+        format_type: ``maru_kv_ops.LogicalPageFormat``, or None when the
+            extension was built before it existed.
+        pages: The layers' logical pages ``[B, H, N, K|V]``, in table order.
+        layout: Their resolved layout; ``kv_packed`` must be set.
+    """
+    if format_type is None or not pages:
+        return None
+    strides = {tuple(page.stride()) for page in pages}
+    if len(strides) != 1 or any(tuple(page.shape) != layout.shape for page in pages):
+        return None
+    (stride,) = strides
+    if layout.kv_axis is None or stride[layout.kv_axis] != 1:
+        return None
+    if any(page.data_ptr() % 16 for page in pages):
+        return None
+    head_axis = ({0, 1, 2} - {layout.block_axis, layout.token_axis}).pop()
+    return format_type(
+        block_stride=stride[layout.block_axis],
+        head_stride=stride[head_axis],
+        token_stride=stride[layout.token_axis],
+        num_heads=layout.num_heads,
+    )
 
 
 def _validate_deferred_loading(enabled: bool) -> None:
@@ -1255,6 +1387,21 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # forward consumes their CXL views layer-by-layer, so layer k+1 H2D can
     # overlap layer k compute regardless of the storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
+
+
+@dataclass
+class MaruHandshakeMetadata(KVConnectorHandshakeMetadata):
+    """What a worker tells the scheduler once its KV caches are registered.
+
+    Attributes:
+        cache_namespace: The storage-session namespace the worker stores in
+            (``_cpu_engine_config``). A model can change its hf_config where
+            a worker loads it (vLLM's Transformers backend writes the dtype
+            it runs), and under TP the scheduler's process loads none, so the
+            scheduler looks keys up in this namespace rather than its own.
+    """
+
+    cache_namespace: str
 
 
 # ============================================================================
@@ -1452,10 +1599,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             )
         extra = self._kv_transfer_config.kv_connector_extra_config
         if _validate_storage_config(extra):
-            extra = _cpu_engine_config(extra, vllm_config)
+            extra = _cpu_engine_config(extra, vllm_config, self._kv_groups)
             if (
                 kv_cache_config is not None
                 and len(kv_cache_config.kv_cache_groups) != 1
+                and extra.get("maru_storage_backend") != "remote_cxl"
             ):
                 raise ValueError(
                     "CPU M1 requires one KV cache group"
@@ -1470,6 +1618,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         tp_size, total_kv_heads = _tp_geometry(vllm_config)
         if tp_size > 1:
             extra = _tensor_parallel_defaults(extra, tp_size)
+        # Only a storage session above TP=1, which remote_cxl alone runs, has
+        # a scheduler in another process than the model (take_worker_namespace).
+        self._namespace_handshake = (
+            extra.get("maru_storage_backend") == "remote_cxl" and tp_size > 1
+        )
         attention_by_rank = _names_attention_by_rank(
             self._kv_groups, tp_size, total_kv_heads
         )
@@ -1523,7 +1676,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             self._scheduler = MaruSchedulerConnector(
                 block_size=self._block_size,
                 kv_chunk_tokens=self._kv_chunk_tokens,
-                extra_config=extra,
+                extra_config=_scheduler_scoped_extra(
+                    extra, tp_size, _dp_index(vllm_config)
+                ),
                 num_gpu_blocks=_async_load_budget(
                     kv_cache_config, vllm_config, lookahead
                 ),
@@ -1780,6 +1935,29 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         assert self._worker is not None
         return self._worker.take_failed_load_blocks()
 
+    def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+        """The worker's storage-session namespace, for the scheduler, on the
+        remote_cxl backend above TP=1; None elsewhere.
+
+        vLLM collects it from every worker after their KV caches are
+        registered and hands it to ``set_xfer_handshake_metadata`` before the
+        scheduler takes a request. vLLM's MultiConnector hands every
+        sub-connector the first metadata any of them returns, and
+        NixlConnector refuses any but its own, so the connector sends none
+        where its scheduler does not need it.
+        """
+        if self._worker is None or not self._namespace_handshake:
+            return None
+        return self._worker.handshake_metadata()
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Look keys up in the namespace the workers store in (remote_cxl
+        above TP=1)."""
+        if self._scheduler is not None and self._namespace_handshake:
+            self._scheduler.take_worker_namespace(metadata)
+
     def shutdown(self):
         if self._worker is not None:
             self._worker.shutdown()
@@ -1950,6 +2128,62 @@ class MaruSchedulerConnector:
         # Opt-in per-request phase timing (diagnostics only).
         self._timing = bool(extra_config.get("maru_log_timing", False))
 
+    def take_worker_namespace(self, metadata: dict[int, Any]) -> None:
+        """Look keys up in the namespace the workers store in.
+
+        Every process computes the namespace from its own config, and a
+        model can change its hf_config where a worker loads it. At TP=1 the
+        scheduler shares that process; under TP it loads no model and can
+        compute another namespace, where every lookup would miss.
+
+        Args:
+            metadata: ``MaruHandshakeMetadata`` by TP rank, from vLLM.
+
+        Raises:
+            ValueError: If the ranks store in different namespaces.
+        """
+        namespaces = {
+            m.cache_namespace
+            for m in metadata.values()
+            if isinstance(m, MaruHandshakeMetadata)
+        }
+        if not self._cpu_mode:
+            return
+        if not namespaces:
+            if metadata:
+                # vLLM's MultiConnector passes on one connector's metadata.
+                logger.warning(
+                    "Maru: the workers sent another connector's handshake "
+                    "metadata instead of their cache namespace, so the "
+                    "scheduler looks keys up in the namespace it computed; a "
+                    "model that changes its config where the workers load it "
+                    "misses every lookup"
+                )
+            return
+        if len(namespaces) > 1:
+            raise ValueError(
+                "Maru: the TP ranks store in different cache namespaces "
+                f"({', '.join(sorted(namespaces))})"
+            )
+        (namespace,) = namespaces
+        if namespace == self._extra_config.get("maru_cache_namespace"):
+            return
+        logger.info(
+            "Maru cache namespace %s taken from the workers (the scheduler's "
+            "was %s: the model changed its config where the workers loaded it)",
+            namespace[:16],
+            str(self._extra_config.get("maru_cache_namespace"))[:16],
+        )
+        self._extra_config = {**self._extra_config, "maru_cache_namespace": namespace}
+        self._known_keys.clear()
+        if self._handler is not None:
+            # Opened under the other namespace; the next lookup reopens it.
+            try:
+                self._handler.close()
+            except Exception as e:
+                logger.warning("Maru: could not close the scheduler handler: %s", e)
+            self._handler = None
+
     def _chunk_exists_key(self, base_key: str) -> str:
         """Key whose presence means a chunk is fully stored across layers.
 
@@ -1988,23 +2222,12 @@ class MaruSchedulerConnector:
         if not keys:
             return 0
 
-        if self._cpu_mode:
-            self._ensure_handler()
-            if self._handler is None:
-                return 0
-            try:
-                results = self._handler.batch_exists(
-                    keys, **_session_route(self._cpu_mode, keys)
-                )
-            except Exception:
-                return 0
-            # Re-probe each time: CPU residency is tied to a live worker session.
-            return next((i for i, hit in enumerate(results) if not hit), len(results))
-
         # A chunk counts once its "_DONE" marker is stored (written after all
         # layers, so a partial layer store failure is no false positive) for
         # every slice in _shard_suffixes. Known markers are tried first; the
-        # unknown ones go in one batch_exists.
+        # unknown ones go in one batch_exists. CPU mode knows none, and asks
+        # in the pool of the request's bare first chunk key, whichever rank
+        # stored the slice (_stored_keys).
         sentinels = [
             [self._chunk_exists_key(key + suffix) for suffix in self._shard_suffixes]
             for key in keys
@@ -2023,7 +2246,12 @@ class MaruSchedulerConnector:
         hits = leading(self._known_keys)
         if hits == len(keys):
             return hits
-        return leading(self._stored_keys([s for chunk in sentinels for s in chunk]))
+        return leading(
+            self._stored_keys(
+                [s for chunk in sentinels for s in chunk],
+                _session_route(self._cpu_mode, keys),
+            )
+        )
 
     def _note_failed_load(self, request: Request) -> None:
         """Record a failed load when vLLM asks about a request again after it.
@@ -2050,20 +2278,24 @@ class MaruSchedulerConnector:
         self._load_preemptions.pop(request.request_id, None)
         self._failed_load_req_ids.discard(request.request_id)
 
-    def _stored_keys(self, keys: list[str]) -> set[str]:
+    def _stored_keys(
+        self, keys: list[str], route: dict[str, str] | None = None
+    ) -> set[str]:
         """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
 
         Remembers positives until a reported load failure clears them
-        (``update_connector_output``). CPU mode does not come here: its
-        residency is tied to a live worker session, so it re-probes.
+        (``update_connector_output``). CPU mode remembers none: its residency
+        is tied to a live worker session, so it re-probes, in the pool
+        ``route`` picks (``_session_route``).
         """
-        unknown = [k for k in keys if k not in self._known_keys]
+        known: set[str] = set() if self._cpu_mode else self._known_keys
+        unknown = [k for k in keys if k not in known]
         if unknown:
             self._ensure_handler()
         if unknown and self._handler is not None:
             try:
                 _t0 = time.monotonic()
-                results = self._handler.batch_exists(unknown)
+                results = self._handler.batch_exists(unknown, **(route or {}))
                 if self._timing:
                     _emit_timing(
                         f"lookup batch_exists {len(unknown)} keys = "
@@ -2073,10 +2305,10 @@ class MaruSchedulerConnector:
                 logger.warning("Maru batch_exists failed: %s", e)
             else:
                 # A short reply leaves the rest unknown, i.e. a miss.
-                self._known_keys.update(
+                known.update(
                     k for k, exists in zip(unknown, results, strict=False) if exists
                 )
-        return {k for k in keys if k in self._known_keys}
+        return {k for k in keys if k in known}
 
     def _count_matched_group_chunks(self, req_id: str, token_ids: list[int]) -> int:
         """Chunks to load for a model with several KV cache groups.
@@ -2087,9 +2319,9 @@ class MaruSchedulerConnector:
         holds the window that ends at its chunk's end, while earlier tokens
         of the chunk may have left the GPU before the store. Keys already
         known to exist are tried first; when they fall short of every chunk,
-        all groups' remaining keys go in one RPC. See ``kv_groups.hit_chunks``.
-        Under TP a (chunk, group) counts only when every rank's slice of it
-        is stored.
+        all groups' remaining keys go in one RPC. CPU mode knows no keys and
+        always asks. See ``kv_groups.hit_chunks``. Under TP a (chunk, group)
+        counts only when every rank's slice of it is stored.
         """
         chunk_tokens = self._kv_chunk_tokens
         num_chunks = (len(token_ids) - 1) // chunk_tokens
@@ -2120,7 +2352,7 @@ class MaruSchedulerConnector:
                 lambda i, g: all(key in stored for key in object_keys(i, g)),
             )
 
-        hit, prefix = hit_among(self._known_keys)
+        hit, prefix = hit_among(set() if self._cpu_mode else self._known_keys)
         if hit < len(chunk_keys):
             hit, prefix = hit_among(
                 self._stored_keys(
@@ -2130,7 +2362,8 @@ class MaruSchedulerConnector:
                         for g in self._kv_groups
                         if g.kind != GROUP_SKIP
                         for key in object_keys(i, g)
-                    ]
+                    ],
+                    _session_route(self._cpu_mode, chunk_keys),
                 )
             )
         if hit < prefix:
@@ -2992,10 +3225,13 @@ class MaruWorkerConnector:
             )
             max_model_len = extra_config.get("_maru_max_model_len")
             if self._cpu_mode and max_model_len:
-                extra_config = {
-                    **extra_config,
-                    "_maru_request_chunks": -(-max_model_len // self._kv_chunk_tokens),
-                }
+                chunks = -(-max_model_len // self._kv_chunk_tokens)
+                if self._multi_group:
+                    # Staging slots, one per object: every attention group's
+                    # object of each chunk, and one state per Mamba group.
+                    states = sum(g.kind == GROUP_MAMBA for g in self._kv_groups)
+                    chunks = chunks * (len(self._kv_groups) - states) + states
+                extra_config = {**extra_config, "_maru_request_chunks": chunks}
             if self._stores_anything():
                 self._handler = _create_maru_handler(extra_config)
             else:
@@ -3153,16 +3389,36 @@ class MaruWorkerConnector:
                 f"maru_chunk_size {configured} cannot hold one (chunk, group) "
                 f"object of {self._page_size_bytes} bytes"
             )
+        if self._cpu_mode:
+            # MaruServer lets a session read the regions of its namespace
+            # only when it stores the same objects in them.
+            pool_key = _session_pool_key(self._extra_config)
+            if _parse_size(self._extra_config[pool_key]) < max(
+                _parse_size(configured or 0), self._page_size_bytes
+            ):
+                raise ValueError(f"{pool_key} cannot hold one cache page")
+            schema = {
+                "format": "KV_GROUPS-v1",
+                "chunk_tokens": self._kv_chunk_tokens,
+                "groups": [asdict(g) for g in self._kv_groups],
+            }
+            self._extra_config = {
+                **self._extra_config,
+                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+            }
         self._group_kernels = {}
         for cache in self._group_caches:
             if cache.group.kind in (GROUP_MAMBA, GROUP_MLA):
                 continue
             backend = _attention_backend(layers, cache.group.layer_names[0])
-            if backend is None:
-                continue  # decided at first use, from the attention metadata
+            if backend is None or (self._cpu_mode and self._handler is None):
+                # Decided at first use, from the attention metadata; on a
+                # storage-session backend also once the handler says whether
+                # its buffers are page-locked for the kernel.
+                continue
             self._group_kernels[cache.group.group_id] = (
                 None
-                if any(name in backend for name in _NO_KERNEL_BACKENDS)
+                if _kernel_refused_by(backend, cache.layout)
                 else self._build_group_kernel(cache, None)
             )
         logger.info(
@@ -3344,7 +3600,7 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
-            route = _session_route(self._cpu_mode, chunk_keys)
+            route = self._route(req_meta)
             if self._cpu_mode:
                 start, end = self._cpu_load_range(req_meta)
                 first_chunk = start // self._kv_chunk_tokens
@@ -3496,24 +3752,33 @@ class MaruWorkerConnector:
         try:
             with stream_ctx:
                 for req_meta in inline:
-                    objects = self._retrieve_group_objects(req_meta)
-                    if objects is None:
-                        continue
-                    retained.append(objects)
-                    try:
-                        self._place_group_objects(
-                            req_meta, objects, device, stage=False
+                    if self._cpu_mode:
+                        loaded = self._load_group_leased(
+                            req_meta, device, stream, offthread=False
                         )
-                    except Exception as e:
-                        self._fail_load(req_meta, e)
-                        continue
+                        if loaded is None:
+                            continue
+                        hit, count = loaded
+                    else:
+                        objects = self._retrieve_group_objects(req_meta)
+                        if objects is None:
+                            continue
+                        retained.append(objects)
+                        try:
+                            self._place_group_objects(
+                                req_meta, objects, device, stage=False
+                            )
+                        except Exception as e:
+                            self._fail_load(req_meta, e)
+                            continue
+                        hit, count = objects[0], len(objects[1])
                     if req_meta.deferred_load:
                         with self._deferred_lock:
                             self._deferred_done.add(req_meta.req_id)
                     logger.info(
                         "Maru: loaded %d objects (%d chunks) for req %s",
-                        len(objects[1]),
-                        objects[0],
+                        count,
+                        hit,
                         req_meta.req_id,
                     )
         finally:
@@ -3555,12 +3820,16 @@ class MaruWorkerConnector:
 
         Copies run on the deferred stream after ``queued``, the compute
         stream's work at submission; ``get_finished_loading`` reports the
-        request once its own event fires, and vLLM resumes it then.
+        request once its own event fires, and vLLM resumes it then. A
+        storage-session load waits for its copies here, batch by batch
+        (``_load_group_leased``), and is reported once it returns.
         """
         try:
-            objects = self._retrieve_group_objects(req_meta)
-            if objects is None:
-                return
+            objects = None
+            if not self._cpu_mode:
+                objects = self._retrieve_group_objects(req_meta)
+                if objects is None:
+                    return
             torch.cuda.set_device(device)
             if self._deferred_stream is None or self._deferred_stream_device != device:
                 self._deferred_stream = torch.cuda.Stream(device=device, priority=-1)
@@ -3569,6 +3838,21 @@ class MaruWorkerConnector:
             if self._load_admission_window > 0:
                 self._wait_for_load_admission(req_meta.req_id)
             stream.wait_event(queued)
+            if objects is None:
+                with torch.cuda.stream(stream):
+                    loaded = self._load_group_leased(
+                        req_meta, device, stream, offthread=True
+                    )
+                if loaded is not None:
+                    with self._deferred_lock:
+                        self._deferred_done.add(req_meta.req_id)
+                    logger.info(
+                        "Maru: deferred-loaded %d objects (%d chunks) for req %s",
+                        loaded[1],
+                        loaded[0],
+                        req_meta.req_id,
+                    )
+                return
             with torch.cuda.stream(stream):
                 self._place_group_objects(req_meta, objects, device, stage=True)
                 event = torch.cuda.Event()
@@ -3595,24 +3879,22 @@ class MaruWorkerConnector:
                 self._inflight_deferred_req_ids.discard(req_meta.req_id)
                 self._abandoned_req_ids.discard(req_meta.req_id)
 
-    def _retrieve_group_objects(
+    def _group_load_plan(
         self, req_meta: MaruReqMeta
-    ) -> tuple[int, list[tuple[GroupCache, int, int | None, Any]]] | None:
-        """Fetch every object the request's hit needs, in one batch.
+    ) -> tuple[int, list[tuple[GroupCache, int, int | None]], list[str]] | None:
+        """The objects the request's hit needs, and their keys.
 
         The scheduler's hit rule decides which: full attention and MLA
         groups every hit chunk, sliding window the chunks its window covers
         at the hit's end, Mamba the last hit chunk. Chunks wholly before
         ``load_start_token``, which vLLM's prefix cache already holds, are
-        skipped. An MLA group in layerwise format has one object per
-        layer of each chunk. All or nothing: an object missing since the
-        scheduler's lookup fails the load, and vLLM recomputes.
+        skipped. An MLA group in layerwise format has one object per layer
+        of each chunk.
 
         Returns:
-            ``(hit chunks, [(group, chunk index, layer, object info)])``,
-            where layer is the layer's position in an MLA group stored
-            layerwise and None otherwise; or None after reporting the
-            failure.
+            ``(hit chunks, [(group, chunk index, layer)], keys)``, where
+            layer is the layer's position in an MLA group stored layerwise
+            and None otherwise; or None after reporting the failure.
         """
         ct = self._kv_chunk_tokens
         hit = min(req_meta.num_matched_chunks, len(req_meta.token_ids) // ct)
@@ -3646,6 +3928,25 @@ class MaruWorkerConnector:
                 chunk_keys[c.group.group_id][ci], c.group.group_id, ct
             )
             keys.append(key if layer is None else _chunk_layer_key(key, layer))
+        return hit, plan, keys
+
+    def _retrieve_group_objects(
+        self, req_meta: MaruReqMeta
+    ) -> tuple[int, list[tuple[GroupCache, int, int | None, Any]]] | None:
+        """Fetch every object the request's hit needs, in one batch.
+
+        The objects are those of ``_group_load_plan``. All or nothing: an
+        object missing since the scheduler's lookup fails the load, and vLLM
+        recomputes.
+
+        Returns:
+            ``(hit chunks, [(group, chunk index, layer, object info)])``, or
+            None after reporting the failure.
+        """
+        planned = self._group_load_plan(req_meta)
+        if planned is None:
+            return None
+        hit, plan, keys = planned
         try:
             infos = self._batch_retrieve_all(keys)
         except Exception as e:
@@ -3662,6 +3963,75 @@ class MaruWorkerConnector:
             (c, ci, layer, info)
             for (c, ci, layer), info in zip(plan, infos, strict=True)
         ]
+
+    def _load_group_leased(
+        self,
+        req_meta: MaruReqMeta,
+        device: torch.device,
+        stream: torch.cuda.Stream | None,
+        offthread: bool,
+    ) -> tuple[int, int] | None:
+        """Load a storage-session request's objects in leased batches.
+
+        A read lease holds its bytes (on remote_cxl, a staging slot) until it
+        is released, so each batch is placed on ``stream``, its copies are
+        waited for, and its leases go back before the next batch is read. A
+        batch takes at most the slots ``retrieve_capacity`` reports; on the
+        loader thread (``offthread``) a load that finds none free waits
+        briefly for one, and its slabs are staged on the device first (see
+        ``_place_chunk``). All or nothing, as ``_retrieve_group_objects``: a
+        batch that cannot be read or placed fails the request, and vLLM
+        recomputes it over every block of the load. The leases of a batch
+        whose copies cannot be waited for are kept, as a copy may still read
+        them.
+
+        Returns:
+            ``(hit chunks, objects placed)``, or None after reporting the
+            failure.
+        """
+        planned = self._group_load_plan(req_meta)
+        if planned is None:
+            return None
+        hit, plan, keys = planned
+        handler = self._handler
+        assert handler is not None
+        route = self._route(req_meta)
+        start = 0
+        while start < len(keys):
+            n = min(
+                self._leased_batch_size(handler, len(keys) - start, offthread),
+                len(keys) - start,
+            )
+            if n <= 0:
+                self._fail_load(req_meta, RuntimeError("no staging slot free"))
+                return None
+            batch = slice(start, start + n)
+            infos: list[Any] = []
+            try:
+                infos = list(self._batch_retrieve_all(keys[batch], **route))
+                missing = n - sum(info is not None for info in infos)
+                if len(infos) != n or missing:
+                    raise RuntimeError(f"{missing} of {n} objects missing")
+                placed = list(zip(plan[batch], infos, strict=True))
+                self._place_group_objects(
+                    req_meta,
+                    (
+                        hit,
+                        [(c, ci, layer, info) for (c, ci, layer), info in placed],
+                    ),
+                    device,
+                    stage=offthread,
+                )
+                if stream is not None:
+                    stream.synchronize()
+            except Exception as e:
+                if self._drain_load_stream(stream):
+                    handler.release_retrieved(infos)
+                self._fail_load(req_meta, e)
+                return None
+            handler.release_retrieved(infos)
+            start += n
+        return hit, len(keys)
 
     def _place_group_objects(
         self,
@@ -3963,9 +4333,7 @@ class MaruWorkerConnector:
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
 
             _t0 = time.monotonic()
-            infos = self._batch_retrieve_all(
-                keys, **_session_route(self._cpu_mode, chunk_keys)
-            )
+            infos = self._batch_retrieve_all(keys, **self._route(req_meta))
             if self._timing:
                 _emit_timing(
                     f"deferred retrieve batch {len(keys)} keys = "
@@ -4666,7 +5034,7 @@ class MaruWorkerConnector:
             chunk_keys[first_chunk:last_chunk],
             slot_mapping,
             attn_metadata,
-            _session_route(self._cpu_mode, chunk_keys),
+            self._route(req_meta),
             stream,
         )
 
@@ -4999,7 +5367,8 @@ class MaruWorkerConnector:
         self._note_failed_inline_load(req_meta)
         with self._deferred_lock:
             blocks = self._loaded_blocks(req_meta)
-            if self._cpu_mode:
+            # Several groups' blocks are already those of the load range.
+            if self._cpu_mode and not req_meta.group_block_ids:
                 start, end = self._cpu_load_range(req_meta)
                 blocks = blocks[
                     start // self._block_size : (end + self._block_size - 1)
@@ -5291,6 +5660,15 @@ class MaruWorkerConnector:
             failed = self._failed_recv_req_ids & finished
             self._failed_recv_req_ids -= failed
         return failed
+
+    def handshake_metadata(self) -> MaruHandshakeMetadata | None:
+        """The namespace this worker stores in, on a storage-session backend.
+
+        The cxl backend has no namespace, and sends nothing.
+        """
+        if not self._cpu_mode:
+            return None
+        return MaruHandshakeMetadata(self._extra_config["maru_cache_namespace"])
 
     def _load_sync(
         self,
@@ -5666,7 +6044,9 @@ class MaruWorkerConnector:
         Works with whatever paged axis order vLLM chose: dimensions and the
         engine KV format both come from the layout resolved at registration,
         or from ``layout`` for one KV cache group's layers, whose third tuple
-        item is then the layer's position in the group.
+        item is then the layer's position in the group. vLLM 0.29+'s logical
+        page has no ``EngineKVFormat``; its format is the pages' strides
+        (``maru_kv_ops.LogicalPageFormat``), which the same entry point takes.
         """
         if self._cpu_mode and not self._lease_buffers_gpu_accessible():
             # CPU pools are pageable; the remote_cxl staging buffer is page-locked
@@ -5678,10 +6058,11 @@ class MaruWorkerConnector:
         # No resolved layout, or one with no kernel form (the fused orders),
         # means we must not hand raw pointers to the kernel.
         layout = layout or self._kv_layout
-        if layout is None or layout.format_name is None:
+        if layout is None or (layout.format_name is None and not layout.kv_packed):
             return None
-        # Flash layout only (exclude MLA/Triton). An MLA latent has no K/V
-        # planes for the kernel, also when no metadata says MLA yet.
+        # No MLA, and no Triton but on a logical page (see _kernel_refused_by).
+        # An MLA latent has no K/V planes for the kernel, also when no
+        # metadata says MLA yet.
         if self._use_mla:
             return None
         from vllm.model_executor.layers.attention.mla_attention import (
@@ -5694,7 +6075,9 @@ class MaruWorkerConnector:
             if isinstance(attn_metadata, dict)
             else attn_metadata
         )
-        if isinstance(layer_meta, (MLACommonMetadata, TritonAttentionMetadata)):
+        if isinstance(layer_meta, MLACommonMetadata):
+            return None
+        if isinstance(layer_meta, TritonAttentionMetadata) and not layout.kv_packed:
             return None
         # Resolve the placement kernels lazily.
         if self._kv_ops is None:
@@ -5714,13 +6097,24 @@ class MaruWorkerConnector:
         ops = self._kv_ops
         # A kernel build predating a format cannot place it; take the per-layer
         # fallback rather than raising out of the load path.
-        kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
-        if kv_format is None:
-            logger.warning(
-                "Maru packed load: kernel has no format %s; using per-layer "
-                "inject fallback",
-                layout.format_name,
+        if layout.kv_packed:
+            kv_format = _logical_page_format(
+                getattr(ops, "LogicalPageFormat", None),
+                [kv_cache_layer for _, kv_cache_layer, _ in layers],
+                layout,
             )
+        else:
+            assert layout.format_name is not None  # refused above otherwise
+            kv_format = getattr(ops.EngineKVFormat, layout.format_name, None)
+        if kv_format is None:
+            what = layout.format_name or f"logical page {layout.shape}"
+            if what not in _kv_format_warned:  # an inline load asks every step
+                _kv_format_warned.add(what)
+                logger.warning(
+                    "Maru packed load: kernel has no format for %s; using "
+                    "per-layer inject fallback",
+                    what,
+                )
             return None
         return (
             ops,
@@ -5930,9 +6324,7 @@ class MaruWorkerConnector:
                     nbytes = kv_contig.nelement() * kv_contig.element_size()
 
                     # Zero-copy path: alloc CXL page, GPU→CXL direct copy
-                    handle = self._handler.alloc(
-                        nbytes, **_session_route(self._cpu_mode, chunk_keys)
-                    )
+                    handle = self._handler.alloc(nbytes, **self._route(req_meta))
                     dst = torch.frombuffer(
                         handle.buf[:nbytes], dtype=kv_contig.dtype
                     ).reshape(kv_contig.shape)
@@ -6093,7 +6485,7 @@ class MaruWorkerConnector:
                     if pending is None:
                         handle = handler.alloc(
                             layer_bytes * self._num_layers,
-                            **_session_route(self._cpu_mode, chunk_keys),
+                            **self._route(req_meta),
                         )
                         written: set[int] = set()
                         self._pending_slabs[base_key] = (handle, written)
@@ -6148,7 +6540,9 @@ class MaruWorkerConnector:
         blocks stay until the request finishes. Everything stored now is
         registered with one ``batch_store``, including what a group gathered
         before it failed, unless its copies could not be confirmed
-        (``_gather_packed_slabs``).
+        (``_gather_packed_slabs``). On remote_cxl with ``maru_async_store``
+        that ``batch_store``, which writes the staged objects by RDMA, runs
+        on the write-behind thread (``_register_objects_behind``).
         """
         if not self._multi_group or not self._group_caches:
             return
@@ -6187,7 +6581,10 @@ class MaruWorkerConnector:
                 logger.error(
                     "Maru store of KV cache group %d failed: %s", group.group_id, e
                 )
-        self._register_objects(keys, handles, "group")
+        if self._remote_cxl_mode and self._write_behind:
+            self._register_objects_behind(keys, handles)
+        else:
+            self._register_objects(keys, handles, "group")
         self._register_done_markers(markers)
 
     def _register_done_markers(self, markers: dict[str, list[str]]) -> None:
@@ -6213,6 +6610,44 @@ class MaruWorkerConnector:
             keys.append(_chunk_done_key(base))
             handles.append(handle)
         self._register_objects(keys, handles, "layerwise marker")
+
+    def _register_objects_behind(self, keys: list[str], handles: list) -> None:
+        """Register objects already copied to staging on the write-behind thread.
+
+        A remote_cxl ``batch_store`` places their pages and writes them by
+        RDMA on the calling thread, where one transfer may wait up to
+        ``maru_rdma_timeout_s``. No request waits for these objects: their
+        blocks may go back to vLLM once the copies to staging are done.
+        Until registered they count as pending, so a later step does not
+        store them again (``_store_pending``).
+        """
+        if not keys:
+            return
+        with self._store_lock:
+            self._pending_store_keys.update(keys)
+        if self._store_executor is None:
+            self._store_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-write-behind"
+            )
+        try:
+            self._store_executor.submit(
+                self._finish_write_behind_store, None, keys, handles, []
+            )
+        except Exception as e:
+            logger.error("Maru write-behind submit failed: %s", e)
+            self._free_handles_best_effort(handles)
+            self._complete_write_behind_keys(keys, [False] * len(keys))
+
+    def _store_pending(self, key: str) -> bool:
+        """Whether ``key`` is registered or queued for registration.
+
+        Pending first: the write-behind thread commits a key before it
+        leaves the pending set, so no key is seen as neither.
+        """
+        with self._store_lock:
+            if key in self._pending_store_keys:
+                return True
+        return self._is_stored(key)
 
     def _group_target(self, cache: GroupCache) -> _SlabTarget:
         """The slab of one attention group: its layers, in group order."""
@@ -6259,6 +6694,17 @@ class MaruWorkerConnector:
             req_meta, self._kv_chunk_tokens, self._slice(group).suffix
         )
 
+    def _route(self, req_meta: MaruReqMeta) -> dict[str, str]:
+        """Routing kwargs of the request's storage-session calls.
+
+        Every slice and KV cache group of a request goes to the pool its bare
+        first chunk key picks, which is the key the scheduler looks the
+        request up by, whichever rank or group stores or loads it.
+        """
+        return _session_route(
+            self._cpu_mode, _req_chunk_keys(req_meta, self._kv_chunk_tokens, "")
+        )
+
     def _group_kernel(self, cache: GroupCache) -> tuple | None:
         """Kernel ctx for an attention group's stores and loads.
 
@@ -6283,10 +6729,12 @@ class MaruWorkerConnector:
 
         The pointer table is indexed by each layer's position in the group,
         which is its plane in the group's slab. A tensor with padding between
-        its blocks (a padded page) gets none: the kernel would read the
-        padding as KV.
+        its blocks (a padded page) gets none from a format kernel, which would
+        read the padding as KV. A logical page is addressed by its strides,
+        which step over the padding, so it keeps the kernel.
         """
-        if not _is_dense(cache.tensors[0]):
+        packed = cache.layout is not None and cache.layout.kv_packed
+        if not packed and not _is_dense(cache.tensors[0]):
             return None
         layers = [
             (name, tensor, i)
@@ -6306,9 +6754,10 @@ class MaruWorkerConnector:
     ) -> None:
         """Gather an attention group's completed chunks without the kernel.
 
-        Used where ``maru_kv_ops`` has no format for the layout (vLLM 0.30's
-        fused K/V, for one), the pages are padded, or there is no CUDA
-        device. Each chunk's layers are gathered into one slab on their
+        Used where ``maru_kv_ops`` has no format for the layout (a fused K/V
+        row that does not split into two heads, for one), the attention
+        backend is refused (see ``_kernel_refused_by``), a format kernel's
+        pages are padded, or there is no CUDA device. Each chunk's layers are gathered into one slab on their
         device and copied to CXL at once. Appends to the caller's ``keys``
         and ``handles``.
         """
@@ -6337,11 +6786,11 @@ class MaruWorkerConnector:
                 continue
             for ci in chunks:
                 key = target.key(chunk_keys[ci])
-                if self._is_stored(key) or key in keys:
+                if self._store_pending(key) or key in keys:
                     continue
                 handle = None
                 try:
-                    handle = handler.alloc(slab_bytes)
+                    handle = handler.alloc(slab_bytes, **self._route(req_meta))
                     slab = torch.frombuffer(
                         handle.buf[:slab_bytes], dtype=target.dtype
                     ).view(2, target.num_layers, ct, -1)
@@ -6353,7 +6802,7 @@ class MaruWorkerConnector:
                         )
                     )
                 except Exception as e:
-                    logger.error("Maru group store error: %s: %s", key, e)
+                    self._note_store_skip(key, e, "group store")
                     if handle is not None:
                         self._free_handles_best_effort([handle])
                     continue
@@ -6398,17 +6847,17 @@ class MaruWorkerConnector:
                 group.group_id,
                 ct,
             )
-            if self._is_stored(key) or key in keys:
+            if self._store_pending(key) or key in keys:
                 continue
             handle = None
             try:
-                handle = handler.alloc(size)
+                handle = handler.alloc(size, **self._route(req_meta))
                 obj = torch.frombuffer(handle.buf[:size], dtype=torch.uint8)
                 obj.view(len(cache.tensors), group.slot_bytes)[
                     :, : group.state_bytes
                 ].copy_(torch.stack([states[block] for states in cache.tensors]))
             except Exception as e:
-                logger.error("Maru Mamba state store error: %s: %s", key, e)
+                self._note_store_skip(key, e, "Mamba state store")
                 if handle is not None:
                     self._free_handles_best_effort([handle])
                 continue
@@ -6665,14 +7114,12 @@ class MaruWorkerConnector:
 
                     for ci in chunks:
                         base_key = slab_target.key(chunk_keys[ci])
-                        if self._is_stored(base_key) or base_key in seen_keys:
+                        if self._store_pending(base_key) or base_key in seen_keys:
                             continue
                         seen_keys.add(base_key)
                         handle = None
                         try:
-                            handle = handler.alloc(
-                                slab_bytes, **_session_route(self._cpu_mode, chunk_keys)
-                            )
+                            handle = handler.alloc(slab_bytes, **self._route(req_meta))
                             slab_host = torch.frombuffer(
                                 handle.buf[:slab_bytes], dtype=dtype
                             ).view(2, num_layers, ct, -1)
@@ -6805,7 +7252,7 @@ class MaruWorkerConnector:
                 continue
             # Several storage-session pools: a request's chunks go to the pool
             # its first chunk key picks.
-            route = _session_route(self._cpu_mode, chunk_keys)
+            route = self._route(req_meta)
             for ci in chunks:
                 base_key = target.key(chunk_keys[ci])
                 chunk_slots = slot_mapping[ci * ct : (ci + 1) * ct]
@@ -6921,19 +7368,23 @@ class MaruWorkerConnector:
 
     def _finish_write_behind_store(
         self,
-        event: torch.cuda.Event,
+        event: torch.cuda.Event | None,
         keys: list[str],
         handles: list[Any],
         refs: list[Any],
     ) -> None:
-        """Wait for D2H and register a write-behind batch off-thread."""
+        """Wait for D2H and register a write-behind batch off-thread.
+
+        ``event`` is None for objects the engine thread already copied.
+        """
         handler = self._handler
         if handler is None:
             logger.error("Maru write-behind completion: handler unavailable")
             self._complete_write_behind_keys(keys, [False] * len(keys))
             return
         try:
-            event.synchronize()
+            if event is not None:
+                event.synchronize()
         except Exception as e:
             logger.error("Maru write-behind D2H failed: %s", e)
             self._free_handles_best_effort(handles)
@@ -6979,13 +7430,16 @@ class MaruWorkerConnector:
                     if not pending:
                         del self._request_pending_store_keys[req_id]
 
-    def _note_store_skip(self, base_key: str, exc: Exception) -> None:
+    def _note_store_skip(
+        self, base_key: str, exc: Exception, what: str = "packed save"
+    ) -> None:
         """Report a chunk whose store fails in this step.
 
         On the remote_cxl backend a full staging buffer or an unavailable pool is
         expected while loads hold the slots or the pool recovers: the chunk
         is skipped for the rest of the step and logged at most once a
-        minute. Other errors, and other backends, log every chunk.
+        minute. Other errors, and other backends, log every chunk, as a
+        ``what`` error.
         """
         if self._remote_cxl_mode and isinstance(
             exc, MemoryError | StorageUnavailableError
@@ -6999,7 +7453,7 @@ class MaruWorkerConnector:
                     exc,
                 )
             return
-        logger.error("Maru packed save error: %s: %s", base_key, exc)
+        logger.error("Maru %s error: %s: %s", what, base_key, exc)
 
     def _discard_pending_slab(self, base_key: str) -> None:
         """Drop a half-filled slab entry after an error and free its handle.
@@ -7392,7 +7846,7 @@ class MaruWorkerConnector:
         logger.info(
             "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d "
             "num_heads=%d head_size=%d K/V=%s",
-            layout.format_name or "per-layer",
+            layout.format_name or ("logical page" if layout.kv_packed else "per-layer"),
             kv_layout,
             layout.num_blocks,
             layout.block_size,
