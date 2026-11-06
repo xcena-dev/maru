@@ -201,6 +201,15 @@ existing reboot handling does the rest.
 
 ## Scope
 
+In vLLM, the scheduler's read hint (at its first lookup of a request, or on
+arrival) names the request's chunk keys. With tensor parallelism above one or
+several KV cache groups, `remote_cxl` stores each chunk under its key plus a
+slice or group suffix, so the hint finds no stored chunk and none is sent. For
+now, scheduler read hints apply at TP = 1 with one KV cache group; a later
+change makes the hint name the objects the load reads. Loads are the same in
+every setup, and so are the hints a worker sends as a load starts, read
+promotes and write hints, which name the stored objects or the request only.
+
 Read hints are sent on the `remote_cxl` backend. A CXL-SSD attached to the GPU
 node's own host has the same need; there no agent sits between Maru and the
 device, and hints would reach the device software through a handler plugin.
