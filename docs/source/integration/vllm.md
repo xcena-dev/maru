@@ -626,8 +626,10 @@ Chunk keys therefore name a slice by what it holds:
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
-appends `_c<chunk_tokens>_g<group_id>` and names the KV heads of each
-attention group, full or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
+appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by
+`_b<block_size>`, since its objects keep vLLM's block layout (see
+{ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full
+or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
 `kv_<hash>_h0-1_c544_g3` on rank 0.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
@@ -734,11 +736,12 @@ The key names the chunk length because a chunk key hashes the prompt only up to 
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only.
-- `maru_use_layerwise` is `false` (the default). Several groups are stored in chunkwise format only.
+- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1.
+- `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
-- Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
+- The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
+- Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
 - Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
@@ -766,6 +769,34 @@ vllm serve Qwen/Qwen3.5-0.8B \
 - **Stores** run right after the forward. Sliding-window and Mamba-type objects are always stored before the step ends, because vLLM frees those blocks while the request runs. `maru_async_store` defers only full-attention objects that use the `maru_kv_ops` kernel; objects of a group whose pages take per-layer copies (content that does not split into two heads, such as inline quantization scales) are stored before the step ends.
 - **Loads.** `maru_overlap_load_with_compute` is turned off with a warning for any model with several groups: Mamba-type state must be complete before the forward, and per-layer overlap of the attention groups alone is not implemented.
 - **CXL space.** All groups share one pool and one page size, that of the largest (chunk, group) object. A chunk takes one page per attention group, plus one page per Mamba-type group at chunks where a prefill step ended. For gpt-oss-20b that is two 12-layer pages instead of one 24-layer page, so `maru_pool_size` estimates stay about the same. For Qwen3.5-0.8B a step-end chunk takes four pages, because its three Gated DeltaNet groups hold three times the chunk's attention KV; other chunks take one.
+
+(vllm-deepseek-v41)=
+### DeepSeek-V4.1-Flash
+
+Use vLLM 0.33.0. On SM120 GPUs such as the RTX PRO 6000, vLLM 0.33.0 cannot start the model without [vllm-project/vllm#65356](https://github.com/vllm-project/vllm/pull/65356).
+
+vLLM splits the model's KV cache into several groups, how many depending on the GPU, and the connector handles them as follows:
+
+- **The MLA group** holds the compressed KV and the indexer keys of four layers: eight KV caches of different sizes. Maru copies it block by block, keeping the layout vLLM gives each block rather than laying out each token's KV in its own format, so the stored objects follow the GPU's KV layout. Engines share them only when their layouts match: the object key names the block size, which differs between SM100 (128 tokens) and SM90 or SM120 (64), and a load of an object of another size, such as one stored with another KV cache dtype, fails and vLLM recomputes the request.
+- **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
+- **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
+
+Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding, which runs the DSpark draft layers in the model's checkpoint, is not supported yet, as for any model with several groups; it is planned in [#149](https://github.com/xcena-dev/maru/issues/149).
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --tensor-parallel-size 4 --enable-expert-parallel --language-model-only \
+    --kv-transfer-config '{
+        "kv_connector": "MaruKVConnector",
+        "kv_connector_module_path": "maru_vllm",
+        "kv_role": "kv_both",
+        "kv_load_failure_policy": "recompute",
+        "kv_connector_extra_config": {
+            "maru_server_url": "tcp://localhost:5555",
+            "maru_pool_size": "32G"
+        }
+    }'
+```
 
 (vllm-load-failures)=
 ### Load failures
@@ -821,10 +852,10 @@ Increase `maru_pool_size` or restart maru-server to free memory.
 ### chunk_tokens Alignment Warning
 
 ```
-WARNING: maru_kv_chunk_tokens 300 not aligned to block_size 16, adjusted to 288
+WARNING: maru_kv_chunk_tokens 300 not aligned to 16-token blocks, adjusted to 288
 ```
 
-Normal behavior. Automatically adjusted to a multiple of vLLM's block_size.
+Normal behavior. Automatically adjusted to a multiple of vLLM's block_size, and with several KV cache groups of every group's block size.
 
 ### BFloat16 Store Errors
 
