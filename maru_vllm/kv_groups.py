@@ -15,8 +15,8 @@ same bytes per block slot in every group (Mamba state is padded up to it), so
 a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
 a Mamba group keeps only the state at the chunk's last block. An MLA group
-(DeepSeek-V4.1's compressed KV and indexer keys) keeps the bytes vLLM stores
-for the group in each block, copied as they are. A group vLLM does not
+(DeepSeek-V4.1's compressed KV and indexer keys) keeps the chunk's blocks,
+copied block by block in the layout vLLM gives them. A group vLLM does not
 prefix-cache is not stored. A model with one group keeps the bare chunk key;
 with several, each object is keyed ``<chunk key>_c<chunk tokens>_g<group id>``
 (see :func:`group_object_key`).

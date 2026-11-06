@@ -6896,9 +6896,10 @@ class MaruWorkerConnector:
     ) -> None:
         """Copy the blocks of every chunk an MLA group's step completed.
 
-        Chunkwise, the object holds the chunk's blocks in order, each as the
-        bytes vLLM stores for the group in that block, without reading the
-        KV format (DeepSeek-V4.1's compressed KV and indexer keys). Layerwise,
+        Chunkwise, the object holds the chunk's blocks in order, each in the
+        layout vLLM gives the group in that block (DeepSeek-V4.1's compressed
+        KV and indexer keys side by side), not laid out token by token.
+        Layerwise,
         the i-th layer of the group gets its own object, keyed
         ``<object key>_L<i>``, with that layer's bytes of the chunk's blocks,
         and the object key goes into ``markers`` for its ``_DONE`` marker.
