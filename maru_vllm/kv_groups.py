@@ -151,10 +151,11 @@ def _spec_kind(spec_cls: type) -> str:
     return _SUPPORTED_SPECS.get(spec_cls.__name__, GROUP_UNSUPPORTED)
 
 
-# Spec classes whose blocks the connector copies byte for byte, without
-# reading the KV format: an MLA group, alone or in a UniformTypeKVCacheSpecs
-# with others of its class (DeepSeek-V4.1's compressed KV and indexer keys,
-# and its sliding windows when vLLM prefix-caches them).
+# Spec classes whose groups the connector copies block by block, keeping
+# vLLM's block layout rather than laying out each token's KV in its own
+# format: an MLA spec, alone or in a UniformTypeKVCacheSpecs with others of
+# its class (DeepSeek-V4.1's compressed KV and indexer keys, and its sliding
+# windows when vLLM prefix-caches them).
 _MLA_SPECS = frozenset({"MLAAttentionSpec", "SlidingWindowMLASpec"})
 
 
