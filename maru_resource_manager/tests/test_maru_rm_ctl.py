@@ -32,7 +32,7 @@ class FakeAdminSocket:
     def _serve(self):
         try:
             conn, _ = self.server.accept()
-        except OSError:  # Timed out, or closed by close().
+        except OSError:  # Timed out: neither the ctl nor close() came.
             # A ctl that connects later is refused at once instead of waiting
             # for a reply that never comes (120 s, or forever for wipe).
             self.server.close()
@@ -45,13 +45,18 @@ class FakeAdminSocket:
                     break
                 data += chunk
             self.request = data.decode()
-            conn.sendall(self.reply.encode())
+            try:
+                conn.sendall(self.reply.encode())
+            except OSError:  # close() woke the accept; nobody reads the reply
+                pass
 
     def close(self):
-        try:  # Wakes an accept() that is still waiting (the ctl never came).
-            self.server.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        if self.thread.is_alive():
+            try:  # Wakes an accept() still waiting: the ctl never came.
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.connect(str(self.path))
+            except OSError:  # Already closed after its own timeout.
+                pass
         self.thread.join(timeout=30)
         self.server.close()
         self.path.unlink()
