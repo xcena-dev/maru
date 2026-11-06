@@ -410,15 +410,15 @@ def check_multi_group_support(
     A model with one group passes (``check_one_group_support`` checks it).
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
-    attention groups share one KV shape, with parked loads, without
-    speculative decoding; in layerwise format only when every stored group
-    is an MLA group (DeepSeek-V4.1). Every group uses vLLM's block size, but
-    an MLA group may use another (DeepSeek-V4.1's 64-token MLA blocks beside
-    its 32-token windows); the chunk then holds whole blocks of each
-    (``chunk_unit``). Groups vLLM does not prefix-cache are skipped and take
-    no part in the checks. The CPU and mixed backends reject several groups,
-    and the remote_cxl backend MLA models, on their own, in
-    ``MaruKVConnector``.
+    attention groups share one KV shape, but not a Mamba group beside an MLA
+    group, with parked loads, without speculative decoding; in layerwise
+    format only when every stored group is an MLA group (DeepSeek-V4.1).
+    Every group uses vLLM's block size, but an MLA group may use another
+    (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
+    chunk then holds whole blocks of each (``chunk_unit``). Groups vLLM does
+    not prefix-cache are skipped and take no part in the checks. The CPU and
+    mixed backends reject several groups, and the remote_cxl backend MLA
+    models, on their own, in ``MaruKVConnector``.
 
     Args:
         groups: The model's KV cache groups.
@@ -472,6 +472,15 @@ def check_multi_group_support(
         raise ValueError(
             "MaruKVConnector does not support speculative decoding with models "
             f"that have several KV cache groups{one_group_hint(groups)}"
+        )
+    kinds = {g.kind for g in stored}
+    if {GROUP_MAMBA, GROUP_MLA} <= kinds:
+        # A Mamba group pins the chunk to one block (chunk_tokens_for_groups),
+        # which holds no whole block of an MLA group with larger blocks, and
+        # the pair has not been run with equal ones either.
+        raise ValueError(
+            "MaruKVConnector does not support a model with both a Mamba-type "
+            "and an MLA KV cache group, such as GLM-5.3-Flash"
         )
     for g in stored:
         if g.kind == GROUP_MAMBA and g.mamba_cache_mode != "align":

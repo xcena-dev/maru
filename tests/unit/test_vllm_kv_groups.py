@@ -377,6 +377,32 @@ def test_connector_starts_with_dsv41_without_bounded_replay(setting, chunk, laye
     assert connector._scheduler._kv_chunk_tokens == chunk
 
 
+@pytest.mark.parametrize("ratio", [1, 2], ids=["same-block", "larger-block"])
+def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
+    """A Mamba group pins the chunk to one block, which holds no whole block
+    of an MLA group with larger blocks. The pair (GLM-5.3-Flash's Kimi Delta
+    Attention states and DSA caches) is refused whatever the block sizes."""
+    mamba = dataclasses.replace(_mamba_spec(), block_size=DSV41_BLOCK)
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=ratio * DSV41_BLOCK,
+            num_kv_heads=1,
+            head_size=size,
+            dtype=torch.uint8,
+        )
+        for name, size in DSV41_MEMBERS.items()
+    }
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layers.0.kda", "layers.1.kda"], mamba),
+            _group(mla, "worker"),
+        ],
+        num_blocks=NUM_BLOCKS,
+    )
+    with pytest.raises(ValueError, match="Mamba-type and an MLA"):
+        _check_dsv41(config)
+
+
 def test_a_group_mixing_mla_and_window_layers_is_refused():
     """A hit needs a window group only near its end but an MLA group whole, so
     one group cannot hold both kinds of layer."""
@@ -843,6 +869,28 @@ def test_dsv41_load_fails_when_it_starts_inside_a_block(extra):
     worker.start_load_kv(_FORWARD, meta)
     # A parked load of several groups fails by its request, not its blocks.
     assert _reported_failures(worker) == (set(), {"b"}, {"b"})
+
+
+@DSV41_FORMATS
+@pytest.mark.parametrize("change", [-8, 8], ids=["smaller", "larger"])
+def test_dsv41_load_fails_on_an_object_of_another_size(change, extra):
+    """An engine with another KV cache layout (DeepSeek-V4.1 writes 528-byte
+    records on SM100 and 584-byte ones elsewhere) stores objects of another
+    size under the same keys. Loading one fails and vLLM recomputes, rather
+    than reading its first bytes as this engine's blocks."""
+    chunk = 2 * DSV41_BLOCK
+    _, store = _dsv41_stored(chunk, extra_config=extra)
+    for key in [k for k in store if not k.endswith("_DONE")]:
+        data = bytes(store[key])
+        store[key] = data[:change] if change < 0 else data + bytes(change)
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _reported_failures(worker) == (set(), {"b"}, {"b"})
+    for block in DSV41_BLOCKS_B:
+        assert _block_bytes(worker, block) == bytes(DSV41_PAGE)
 
 
 @DSV41_FORMATS

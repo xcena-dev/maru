@@ -4193,7 +4193,11 @@ class MaruWorkerConnector:
 
         Raises:
             RuntimeError: ``start`` falls inside a block, whose tokens from
-                ``start`` on nothing would load; or the chunk lacks a block.
+                ``start`` on nothing would load; the object's size differs
+                from the bytes this engine's blocks hold, as when an engine
+                with another KV cache layout (GPU architecture or KV cache
+                dtype) stored it under the same key; or the chunk lacks a
+                block.
         """
         group = cache.group
         if start % group.block_size:
@@ -4207,8 +4211,14 @@ class MaruWorkerConnector:
         offset, width = (
             (0, group.group_page_bytes) if layer is None else cache.spans[layer]
         )
+        if info.view.nbytes != stored * width:
+            raise RuntimeError(
+                f"group {group.group_id}: the object holds {info.view.nbytes} "
+                f"bytes, not the {stored * width} this engine's blocks hold; "
+                "an engine with another KV cache layout stored it"
+            )
         src = (
-            torch.frombuffer(info.view[: stored * width], dtype=torch.uint8)
+            torch.frombuffer(info.view, dtype=torch.uint8)
             .to(device, non_blocking=True)
             .view(stored, width)
         )
