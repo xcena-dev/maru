@@ -777,7 +777,7 @@ Use vLLM 0.33.0. On SM120 GPUs such as the RTX PRO 6000, vLLM 0.33.0 cannot star
 
 vLLM splits the model's KV cache into several groups, how many depending on the GPU, and the connector handles them as follows:
 
-- **The MLA group** holds the compressed KV and the indexer keys of four layers: eight KV caches of different sizes. Maru copies it block by block, keeping the layout vLLM gives each block rather than laying out each token's KV in its own format, so the stored objects follow the GPU's KV layout, and engines on GPUs of different architectures (SM100 against SM90 or SM120) must not share a MaruServer.
+- **The MLA group** holds the compressed KV and the indexer keys of four layers: eight KV caches of different sizes. Maru copies it block by block, keeping the layout vLLM gives each block rather than laying out each token's KV in its own format, so the stored objects follow the GPU's KV layout. Engines share them only when their layouts match: the object key names the block size, which differs between SM100 (128 tokens) and SM90 or SM120 (64), and a load of an object of another size, such as one stored with another KV cache dtype, fails and vLLM recomputes the request.
 - **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
 - **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
 
