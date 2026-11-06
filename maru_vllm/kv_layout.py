@@ -311,7 +311,9 @@ def _detect_block_kv_layout(
         raise ValueError(
             f"Maru: the KV tensor {tuple(shape)} holds {miscounted.num_blocks} "
             f"kernel blocks of {miscounted.block_size} tokens, not {k} for each "
-            f"of vLLM's {num_blocks} blocks of {block_size} tokens"
+            f"of vLLM's {num_blocks} blocks of {block_size} tokens. Use an "
+            "attention backend that keeps whole blocks, such as "
+            "--attention-backend TRITON_ATTN"
         )
     return None
 

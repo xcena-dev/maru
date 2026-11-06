@@ -7576,6 +7576,10 @@ class MaruWorkerConnector:
         a hybrid model's odd layers must be re-detected, not assumed. The
         detection fallback also covers caches attached without
         register_kv_caches.
+
+        Raises:
+            ValueError: As for :meth:`_resolve_kv_layout`, when ``kv_layer`` is
+                detected here and holds the wrong number of kernel blocks.
         """
         shape = tuple(kv_layer.shape)
         layout = self._kv_layout
@@ -7602,6 +7606,12 @@ class MaruWorkerConnector:
             The resolved layout, or None when it is unrecognized. Callers then
             keep the default CXL page size and per-layer copies, exactly as
             before this detection existed.
+
+        Raises:
+            ValueError: The tensor holds kernel blocks, but not ``k`` of them
+                for each of vLLM's blocks (see :func:`_detect_block_kv_layout`).
+                Registration then fails instead of falling back to per-layer
+                copies, which would read the wrong tokens.
         """
         if not kv_caches:
             return None
@@ -7633,13 +7643,20 @@ class MaruWorkerConnector:
             kv = "split from the last dimension"
         else:
             kv = f"axis {layout.kv_axis}"
+        kernel = (
+            ""
+            if layout.block_size == self._block_size
+            else f" (kernel blocks, {self._block_size // layout.block_size} per "
+            f"vLLM block of {self._block_size} tokens)"
+        )
         logger.info(
-            "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d "
+            "MaruWorkerConnector: KV layout %s (%s) num_blocks=%d block_size=%d%s "
             "num_heads=%d head_size=%d K/V=%s",
             layout.format_name or ("logical page" if layout.kv_packed else "per-layer"),
             kv_layout,
             layout.num_blocks,
             layout.block_size,
+            kernel,
             layout.num_heads,
             layout.head_size,
             kv,

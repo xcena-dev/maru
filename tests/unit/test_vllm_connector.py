@@ -413,6 +413,19 @@ class TestChunkObjectBytes:
 
         assert worker._chunk_object_bytes() == 2 * 4 * 2 * 256 * 2
 
+    def test_kernel_blocks_are_logged_as_parts_of_vllm_blocks(self, caplog):
+        """``block_size=16`` alone would read as vLLM's configured size."""
+        with caplog.at_level("INFO"):
+            self._with_caches(
+                self._make_worker(block_size=32),
+                torch.empty(8, 2, 16, 4, 2, dtype=torch.float16),
+            )
+
+        assert (
+            "num_blocks=8 block_size=16 (kernel blocks, 2 per vLLM block of "
+            "32 tokens)" in caplog.text
+        )
+
 
 class TestDetectKVLayout:
     """``_detect_kv_layout`` is pure, so every axis order is checkable here.
@@ -600,6 +613,10 @@ class TestDetectBlockKVLayout:
         with pytest.raises(ValueError, match="9 kernel blocks of 64 tokens"):
             self._detect(2 * self.NB + 1, self.NB)
 
+    def test_the_refusal_names_a_backend_that_keeps_whole_blocks(self):
+        with pytest.raises(ValueError, match="--attention-backend TRITON_ATTN"):
+            self._detect(2 * self.NB + 1, self.NB)
+
     def test_kernel_blocks_spread_by_a_larger_stride_are_refused(self):
         """A packed cache keeps other layers' pages between the kernel blocks
         of one block, so vLLM numbers them ``b * stride + j`` and views
@@ -609,7 +626,8 @@ class TestDetectBlockKVLayout:
             self._detect((self.NB - 1) * stride + 2, self.NB)
 
     def test_without_the_block_count_kernel_blocks_are_read(self):
-        """vLLM before 0.30 does not hand the connector its block count."""
+        """A worker built without vLLM's KV cache config, as in most of these
+        tests, has no block count to check against."""
         got = self._detect(2 * self.NB + 1, None)
         assert got.block_size == self.KERNEL
 
