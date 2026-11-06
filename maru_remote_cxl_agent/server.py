@@ -143,7 +143,10 @@ def handle_request(
                 raise ValueError(
                     f"nixl_agent must be a name of 1 to {MAX_NIXL_AGENT_NAME} characters"
                 )
-            reply = service.map(conn, message.get("handle"), nixl_agent)
+            fresh = message.get("fresh", False)
+            if type(fresh) is not bool:
+                raise ValueError("fresh must be true or false")
+            reply = service.map(conn, message.get("handle"), nixl_agent, fresh)
             return {"ok": True, **reply}
         if op == "unmap":
             region_id = message.get("region_id")
@@ -154,6 +157,8 @@ def handle_request(
         if op == "release":
             service.release(message.get("handle"))
             return {"ok": True, "released": True}
+        if op == "extension":
+            return {**service.hint(conn, message), "ok": True}
         return {"ok": False, "error": f"unknown op {op!r}", "code": "invalid"}
     except MapDenied as exc:
         return {"ok": False, "error": str(exc), "code": "denied"}
