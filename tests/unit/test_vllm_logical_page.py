@@ -328,10 +328,13 @@ class TestPackedSlab:
         expected, _, _ = self._store(rank5, "NHD")
         # The kernel stored it on a device, the per-layer copies on the CPU.
         assert (writer._store_kernel_ctx is not None) == (device == "cuda")
+        assert stored == expected
+        self._check_slabs(stored, token_ids, k, v)
 
+    def _check_slabs(self, stored, token_ids, k, v):
+        """Every chunk object holds the K/V-major slab of ``k`` and ``v``."""
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
         assert set(stored) == set(chunk_keys)
-        assert stored == expected
         for ci, base_key in enumerate(chunk_keys):
             slab = torch.frombuffer(stored[base_key], dtype=torch.float32).view(
                 2, self.LAYERS, self.CHUNK, self.HIDDEN
@@ -344,6 +347,124 @@ class TestPackedSlab:
                             slab[plane, li, ti],
                             src[li][block, offset].reshape(self.HIDDEN),
                         )
+
+    # vLLM splits blocks into kernel blocks only where each block is one dense
+    # page of one layer; block-outermost layouts keep whole blocks.
+    SPLIT_LAYOUTS = ["LBNHC", "LBHNC"]
+    SPLIT = 2
+
+    def _kernel_blocks(self, t):
+        """``[blocks, tokens, heads, head_size]`` as kernel blocks: block b's
+        tokens are kernel blocks b * SPLIT onward, in order."""
+        return t.reshape(-1, self.BLOCK // self.SPLIT, *t.shape[2:])
+
+    def _whole_blocks(self, page):
+        """A logical page in kernel blocks ``[B * SPLIT, H, N / SPLIT, C]`` read
+        back as whole blocks ``[B, H, N, C]``."""
+        return page.unflatten(0, (-1, self.SPLIT)).transpose(1, 2).flatten(2, 3)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("name", SPLIT_LAYOUTS)
+    def test_split_kernel_blocks_store_each_block_in_token_order(self, name, device):
+        """FlashInfer takes at most 64-token blocks, so vLLM views a larger
+        block as consecutive kernel blocks. The chunk objects are the same."""
+        k, v = self._kv()
+        pages = logical_pages(
+            name,
+            [self._kernel_blocks(t) for t in k],
+            [self._kernel_blocks(t) for t in v],
+            device,
+        )
+        stored, token_ids, writer = self._store(
+            dict(zip(self._names(), pages, strict=True)), name
+        )
+        assert (writer._store_kernel_ctx is not None) == (device == "cuda")
+        self._check_slabs(stored, token_ids, k, v)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("name", SPLIT_LAYOUTS)
+    def test_a_load_fills_split_kernel_blocks(self, name, device):
+        k, v = self._kv()
+        src = dict(zip(self._names(), logical_pages(name, k, v, device), strict=True))
+        stored, token_ids, _ = self._store(src, name)
+        zeros = [self._kernel_blocks(torch.zeros_like(t)) for t in k]
+        dst = dict(
+            zip(self._names(), logical_pages(name, zeros, zeros, device), strict=True)
+        )
+        reader = self._worker(dst, name)
+        reader._handler = MagicMock()
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(view=memoryview(stored[key]), region_id=0, page_index=i)
+            for i, key in enumerate(keys)
+        ]
+        reader.start_load_kv(
+            SimpleNamespace(
+                no_compile_layers={
+                    layer: SimpleNamespace(kv_cache=t) for layer, t in dst.items()
+                },
+                attn_metadata=make_flash_attn_metadata(),
+            ),
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(self.NUM_BLOCKS)),
+                num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
+                deferred_load=False,
+            ),
+        )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        assert reader.take_failed_load_blocks() == set()
+        for layer in self._names():
+            torch.testing.assert_close(self._whole_blocks(dst[layer]), src[layer])
+
+    @pytest.mark.parametrize("name", SPLIT_LAYOUTS)
+    def test_split_kernel_blocks_need_k_per_block(self, name):
+        """The path for one KV cache group checks the count at registration
+        too: 8 blocks of 4 tokens are 16 kernel blocks of 2, not 18."""
+        k, v = self._kv()
+        split = [self._kernel_blocks(t) for t in k], [self._kernel_blocks(t) for t in v]
+        caches = dict(zip(self._names(), logical_pages(name, *split), strict=True))
+
+        def worker(num_blocks):
+            return make_worker(
+                block_size=self.BLOCK,
+                kv_chunk_tokens=self.CHUNK,
+                num_kv_heads=self.HEADS,
+                head_size=self.HEAD_SIZE,
+                kv_cache_layout=name,
+                num_blocks=num_blocks,
+            )
+
+        layout = worker(self.NUM_BLOCKS)._resolve_kv_layout(caches)
+        assert layout.block_size == self.BLOCK // self.SPLIT
+        with pytest.raises(ValueError, match="16 kernel blocks of 2 tokens"):
+            worker(self.NUM_BLOCKS + 1)._resolve_kv_layout(caches)
+
+    def test_split_kernel_blocks_keep_the_cpu_storage_schema(self):
+        """The cpu, mixed and remote_cxl backends name the objects' format in
+        a schema. Engines whose attention backends split blocks differently
+        store the same objects, so they name the same schema."""
+        k, v = self._kv()
+        split = [self._kernel_blocks(t) for t in k], [self._kernel_blocks(t) for t in v]
+        schemas = []
+        for pages in (logical_pages("LBNHC", k, v), logical_pages("LBNHC", *split)):
+            worker = make_worker(
+                block_size=self.BLOCK,
+                kv_chunk_tokens=self.CHUNK,
+                extra_config={
+                    "maru_storage_backend": "cpu",
+                    "maru_cpu_pool_size": "1M",
+                    "maru_engine_id": "one",
+                    "maru_cache_namespace": "model-revision-1",
+                },
+                num_kv_heads=self.HEADS,
+                head_size=self.HEAD_SIZE,
+                kv_cache_layout="LBNHC",
+            )
+            worker._ensure_handler = MagicMock()
+            worker.register_kv_caches(dict(zip(self._names(), pages, strict=True)))
+            schemas.append(worker._extra_config["_maru_storage_schema"])
+        assert schemas[0] == schemas[1]
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("triton", [False, True], ids=["flash", "triton"])
