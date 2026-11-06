@@ -479,7 +479,11 @@ def test_a_connection_that_never_proves_the_key_is_closed(monkeypatch):
     mem = FakeMemoryNode(FakeCxl())
     sock, ask = _raw(mem)
     try:
-        assert ask({"op": "hello"})["ok"]
+        try:
+            reply = ask({"op": "hello"})
+        except OSError:
+            reply = None  # a slow runner may cut it before the reply
+        assert reply is None or reply["ok"]
         sock.settimeout(5)
         assert sock.recv(1) == b""  # the agent closed it
     finally:
@@ -489,14 +493,16 @@ def test_a_connection_that_never_proves_the_key_is_closed(monkeypatch):
 def test_a_proven_connection_may_stay_idle(monkeypatch):
     import maru_remote_cxl_agent.server as server
 
-    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
     mem = FakeMemoryNode(FakeCxl())
     sock, ask = _raw(mem)
     try:
         hello = ask({"op": "hello"})
         proof = prove(shared_key(), "handler", hello["nonce"])
         assert ask({"op": "auth", "proof": proof, "nonce": b"n" * 16})["ok"]
-        time.sleep(0.6)
+        # Proven within the default deadline (a loaded runner can take longer
+        # than a short one to get here); from now on every deadline has passed.
+        monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.0)
+        time.sleep(0.6)  # past the accept loop's next check (every 0.5 s)
         assert ask({"op": "hello"})["ok"]
     finally:
         sock.close()

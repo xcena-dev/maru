@@ -27,6 +27,12 @@ META_HEADER = struct.Struct("<IIIIQQ")
 EXTENT = struct.Struct("<QQ")
 WAL_NAME = "maru-resource-manager.wal"
 CTL = Path(__file__).resolve().parents[1] / "tools/maru_rm_ctl.py"
+# Wall-clock limits on a shared CI runner, where every WAL append and
+# checkpoint waits for fdatasync behind other jobs' writes. They only bound a
+# hang (CTest's TIMEOUT ends the run); a passing test never waits them out.
+START_S = 30
+REQUEST_S = 30
+STOP_S = 30
 
 
 class ProcessRecoveryTest(unittest.TestCase):
@@ -71,7 +77,7 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.connection = None
         if self.process and self.process.poll() is None:
             self.process.kill()
-            self.process.wait(timeout=10)
+            self.process.wait(timeout=STOP_S)
 
     def start(self, expected_failure=False, checkpoint_fault=None):
         self.assertTrue(self.process is None or self.process.poll() is not None)
@@ -87,18 +93,18 @@ class ProcessRecoveryTest(unittest.TestCase):
                 [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
             )
         if expected_failure:
-            self.assertEqual(self.process.wait(timeout=10), 1, self.log.read_text())
+            self.assertEqual(self.process.wait(timeout=STOP_S), 1, self.log.read_text())
             self.assertNotIn("ready — listening", self.log.read_text())
             self.assertFalse((self.root / "port").exists(), "bound a port on failure")
             return
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + START_S
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.fail(f"Daemon exited: {self.log.read_text()}")
             if "ready — listening" in self.log.read_text():
                 port = int((self.root / "port").read_text())
                 self.connection = socket.create_connection(
-                    ("127.0.0.1", port), timeout=5
+                    ("127.0.0.1", port), timeout=REQUEST_S
                 )
                 return
             time.sleep(0.01)
@@ -113,7 +119,9 @@ class ProcessRecoveryTest(unittest.TestCase):
             if sig == signal.SIGTERM
             else -signal.SIGKILL
         )
-        self.assertEqual(self.process.wait(timeout=10), expected, self.log.read_text())
+        self.assertEqual(
+            self.process.wait(timeout=STOP_S), expected, self.log.read_text()
+        )
         self.connection.close()
         self.connection = None
 
@@ -444,7 +452,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         code, output = self.ctl("discard", "dax1.0", "--confirm", "--force")
         self.assertEqual(code, 0, output)
         self.process.send_signal(signal.SIGHUP)  # Rescan now.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + START_S
         while set(self.stats()) != {"/dev/dax0.0", "/dev/dax1.0"}:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.1)
@@ -527,12 +535,16 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(self.connection.recv(1), b"")
         self.connection.close()
         port = int((self.root / "port").read_text())
-        self.connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.connection = socket.create_connection(
+            ("127.0.0.1", port), timeout=REQUEST_S
+        )
         response = self.request(17, expected_kind=255)
         self.assertEqual(struct.unpack_from("<i", response)[0], -errno.ENOSYS)
         self.assertEqual(self.connection.recv(1), b"")
         self.connection.close()
-        self.connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.connection = socket.create_connection(
+            ("127.0.0.1", port), timeout=REQUEST_S
+        )
         self.free(other)
         self.stop()
         self.checkpoint(0)
@@ -542,7 +554,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         handle = self.allocate()
         env = dict(os.environ, MARU_TEST_DAX_ROOT=str(self.root))
         second = subprocess.run(
-            [str(DAEMON)], env=env, capture_output=True, text=True, timeout=10
+            [str(DAEMON)], env=env, capture_output=True, text=True, timeout=START_S
         )
         self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
         self.assertIn("cannot lock", second.stdout + second.stderr)
