@@ -741,7 +741,6 @@ The connector refuses to start a model with several groups unless:
 - The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
-- The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
 - Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
 
@@ -759,8 +758,6 @@ vllm serve Qwen/Qwen3.5-0.8B \
         }
     }'
 ```
-
-On B200 or GB200, add `--attention-backend TRITON_ATTN`.
 
 ### What differs from a model with one group
 
