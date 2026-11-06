@@ -62,6 +62,7 @@ from maru_vllm.kv_groups import (
     check_multi_group_support,
     check_one_group_support,
     chunk_tokens_for_groups,
+    chunk_unit,
     describe_kv_groups,
     group_caches,
     group_object_key,
@@ -1476,18 +1477,20 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
 
-        # Ensure chunk_tokens is a multiple of block_size
-        if self._kv_chunk_tokens % self._block_size != 0:
+        # Ensure chunk_tokens is a multiple of block_size, and with several
+        # groups of every group's block size.
+        unit = (
+            chunk_unit(self._kv_groups, self._block_size)
+            if len(self._kv_groups) > 1
+            else self._block_size
+        )
+        if self._kv_chunk_tokens % unit != 0:
             old = self._kv_chunk_tokens
-            self._kv_chunk_tokens = (
-                self._kv_chunk_tokens // self._block_size
-            ) * self._block_size
-            if self._kv_chunk_tokens == 0:
-                self._kv_chunk_tokens = self._block_size
+            self._kv_chunk_tokens = max(unit, self._kv_chunk_tokens // unit * unit)
             logger.warning(
-                "maru_kv_chunk_tokens %d not aligned to block_size %d, adjusted to %d",
+                "maru_kv_chunk_tokens %d not aligned to %d-token blocks, adjusted to %d",
                 old,
-                self._block_size,
+                unit,
                 self._kv_chunk_tokens,
             )
 

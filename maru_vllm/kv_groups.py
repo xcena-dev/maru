@@ -337,6 +337,21 @@ def hit_chunks(
     return 0, prefix
 
 
+def chunk_unit(groups: list[KVGroup], block_size: int) -> int:
+    """Tokens a chunk is a multiple of, so it holds whole blocks of each group.
+
+    vLLM schedules a model with several groups in the least common multiple
+    of their block sizes, while ``cache_config.block_size`` is only the
+    smallest block size it prefix-caches: 32 for DeepSeek-V4.1's sliding
+    windows when bounded replay is off, beside its MLA group's 64.
+
+    Args:
+        groups: The model's KV cache groups.
+        block_size: ``cache_config.block_size``.
+    """
+    return math.lcm(block_size, *(g.block_size for g in groups))
+
+
 def chunk_tokens_for_groups(
     groups: list[KVGroup], chunk_tokens: int, block_size: int
 ) -> int:
@@ -350,7 +365,8 @@ def chunk_tokens_for_groups(
 
     Args:
         groups: The model's KV cache groups.
-        chunk_tokens: Configured chunk size, already a multiple of block_size.
+        chunk_tokens: Configured chunk size, already a multiple of
+            ``chunk_unit``.
         block_size: vLLM block size in tokens.
     """
     if any(g.kind == GROUP_MAMBA for g in groups):
@@ -397,9 +413,10 @@ def check_multi_group_support(
     attention groups share one KV shape, with parked loads, without
     speculative decoding; in layerwise format only when every stored group
     is an MLA group (DeepSeek-V4.1). Every group uses vLLM's block size, but
-    an MLA group may use one that divides it (DeepSeek-V4.1's 32-token
-    windows). Groups vLLM does not prefix-cache are skipped and take no part
-    in the checks. The CPU, mixed and remote_cxl backends reject several
+    an MLA group may use another (DeepSeek-V4.1's 64-token MLA blocks beside
+    its 32-token windows); the chunk then holds whole blocks of each
+    (``chunk_unit``). Groups vLLM does not prefix-cache are skipped and take
+    no part in the checks. The CPU, mixed and remote_cxl backends reject several
     groups on their own, in ``MaruKVConnector``.
 
     Args:
@@ -465,15 +482,12 @@ def check_multi_group_support(
                 "'align', the default with prefix caching "
                 f"(--mamba-cache-mode align; got {g.mamba_cache_mode!r})"
             )
-    # A chunk is a multiple of block_size, so an MLA group's object holds whole
-    # blocks of its own whenever its block size divides block_size.
-    if any(
-        block_size % g.block_size if g.kind == GROUP_MLA else g.block_size != block_size
-        for g in stored
-    ):
+    # An MLA group is copied block by block, and a chunk (a multiple of
+    # chunk_unit) holds whole blocks of it whatever its block size.
+    if any(g.kind != GROUP_MLA and g.block_size != block_size for g in stored):
         raise ValueError(
-            "MaruKVConnector needs every KV cache group to use the block size "
-            f"{block_size}, or an MLA group one that divides it (got "
+            "MaruKVConnector needs every KV cache group other than an MLA group "
+            f"to use the block size {block_size} (got "
             f"{sorted({g.block_size for g in stored})}){one_group_hint(groups)}"
         )
     if inline_loads:

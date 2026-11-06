@@ -711,7 +711,7 @@ The connector refuses to start a model with several groups unless:
 - `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
-- Every group uses vLLM's one `block_size`, except that an MLA group may use a block size that divides it, as DeepSeek-V4.1's 32-token sliding windows do. vLLM normally sets the groups up this way.
+- Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
 - The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
@@ -825,10 +825,10 @@ Increase `maru_pool_size` or restart maru-server to free memory.
 ### chunk_tokens Alignment Warning
 
 ```
-WARNING: maru_kv_chunk_tokens 300 not aligned to block_size 16, adjusted to 288
+WARNING: maru_kv_chunk_tokens 300 not aligned to 16-token blocks, adjusted to 288
 ```
 
-Normal behavior. Automatically adjusted to a multiple of vLLM's block_size.
+Normal behavior. Automatically adjusted to a multiple of vLLM's block_size, and with several KV cache groups of every group's block size.
 
 ### BFloat16 Store Errors
 

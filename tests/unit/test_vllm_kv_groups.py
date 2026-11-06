@@ -345,15 +345,35 @@ def test_dsv41_without_bounded_replay_stores_its_windows(side):
 
 @pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
 def test_dsv41_without_bounded_replay_passes_the_support_check(layerwise):
-    """The windows' 4-token blocks divide the 16-token block of vLLM."""
+    """vLLM's block size is then the windows' 4-token one, the smallest of the
+    groups it prefix-caches, below the MLA group's 16-token blocks."""
     window = _window_mla(DSV41_BLOCK // 4, bounded_replay=False)
     check_multi_group_support(
         describe_kv_groups(dsv41_config(window=window)),
-        block_size=DSV41_BLOCK,
+        block_size=DSV41_BLOCK // 4,
         use_layerwise=layerwise,
         speculative=False,
         inline_loads=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("setting", "chunk"), [(None, 256), (96, 64), (32, 64), (320, 320)]
+)
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+def test_connector_starts_with_dsv41_without_bounded_replay(setting, chunk, layerwise):
+    """vLLM sets its block size to the windows' 32 tokens, but schedules in 64:
+    a chunk is rounded to whole blocks of every group."""
+    extra = {} if setting is None else {"maru_kv_chunk_tokens": setting}
+    connector = MaruKVConnector(
+        _connector_config(32, maru_use_layerwise=layerwise, **extra),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(
+            block=64, side="scheduler", window=_window_mla(32, bounded_replay=False)
+        ),
+    )
+    assert connector._kv_chunk_tokens == chunk
+    assert connector._scheduler._kv_chunk_tokens == chunk
 
 
 def test_a_group_mixing_mla_and_window_layers_is_refused():
