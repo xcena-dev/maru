@@ -120,6 +120,22 @@ class KVGroup:
         reach = -(-(self.sliding_window - 1) // self.block_size)
         return min(blocks, max(1, reach))
 
+    def object_key(self, chunk_key: str, chunk_tokens: int) -> str:
+        """Key of this group's object for one chunk (:func:`group_object_key`).
+
+        An MLA group's key also names its block size. Its objects keep the
+        layout vLLM gives each block, which another block size lays out
+        differently even when an object's bytes add up to the same total:
+        DeepSeek-V4.1 uses 64-token blocks on SM90 and SM120 and 128-token
+        ones on SM100. Other groups' objects are laid out token by token.
+
+        Args:
+            chunk_key: The chunk's key, with this rank's slice suffix.
+            chunk_tokens: Tokens per Maru chunk.
+        """
+        key = group_object_key(chunk_key, self.group_id, chunk_tokens)
+        return f"{key}_b{self.block_size}" if self.kind == GROUP_MLA else key
+
     def object_bytes(self, chunk_tokens: int) -> int:
         """Bytes of this group's object for one chunk; 0 for a skipped group.
 

@@ -66,7 +66,6 @@ from maru_vllm.kv_groups import (
     chunk_unit,
     describe_kv_groups,
     group_caches,
-    group_object_key,
     hit_chunks,
     one_group_hint,
     window_chunks,
@@ -1243,7 +1242,7 @@ class _SlabTarget:
     def key(self, chunk_key: str) -> str:
         if self.group is None:
             return chunk_key
-        return group_object_key(chunk_key, self.group.group_id, self.chunk_tokens)
+        return self.group.object_key(chunk_key, self.chunk_tokens)
 
     def block_ids(self, req_meta: MaruReqMeta) -> list[int]:
         """Block ids to read this step's completed chunks from.
@@ -1630,6 +1629,19 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             extra.get("maru_kv_chunk_tokens", DEFAULT_KV_CHUNK_TOKENS)
         )
 
+        # The support checks first: a model they refuse gets no warning
+        # about its chunk size.
+        check_one_group_support(self._kv_groups)
+        if len(self._kv_groups) > 1:
+            extra = _several_group_defaults(extra, self._kv_groups)
+            check_multi_group_support(
+                self._kv_groups,
+                block_size=self._block_size,
+                use_layerwise=bool(extra.get("maru_use_layerwise", False)),
+                speculative=vllm_config.speculative_config is not None,
+                inline_loads=not _get_knob(extra, "maru_async_load"),
+            )
+
         # Ensure chunk_tokens is a multiple of block_size, and with several
         # groups of every group's block size.
         unit = (
@@ -1647,16 +1659,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_chunk_tokens,
             )
 
-        check_one_group_support(self._kv_groups)
         if len(self._kv_groups) > 1:
-            extra = _several_group_defaults(extra, self._kv_groups)
-            check_multi_group_support(
-                self._kv_groups,
-                block_size=self._block_size,
-                use_layerwise=bool(extra.get("maru_use_layerwise", False)),
-                speculative=vllm_config.speculative_config is not None,
-                inline_loads=not _get_knob(extra, "maru_async_load"),
-            )
             chunk_tokens = chunk_tokens_for_groups(
                 self._kv_groups, self._kv_chunk_tokens, self._block_size
             )
@@ -2342,7 +2345,7 @@ class MaruSchedulerConnector:
             )
             return [
                 self._chunk_exists_key(
-                    group_object_key(chunk_keys[i] + suffix, g.group_id, chunk_tokens)
+                    g.object_key(chunk_keys[i] + suffix, chunk_tokens)
                 )
                 for suffix in suffixes
             ]
@@ -3936,9 +3939,7 @@ class MaruWorkerConnector:
         }
         keys = []
         for c, ci, layer in plan:
-            key = group_object_key(
-                chunk_keys[c.group.group_id][ci], c.group.group_id, ct
-            )
+            key = c.group.object_key(chunk_keys[c.group.group_id][ci], ct)
             keys.append(key if layer is None else _chunk_layer_key(key, layer))
         return hit, plan, keys
 
@@ -6864,9 +6865,8 @@ class MaruWorkerConnector:
             if position >= len(block_ids) or block_ids[position] == 0:
                 continue
             block = block_ids[position]
-            key = group_object_key(
+            key = group.object_key(
                 self._slice_chunk_keys(req_meta, group)[end // ct - 1],
-                group.group_id,
                 ct,
             )
             if self._store_pending(key) or key in keys:
@@ -6899,15 +6899,19 @@ class MaruWorkerConnector:
         Chunkwise, the object holds the chunk's blocks in order, each in the
         layout vLLM gives the group in that block (DeepSeek-V4.1's compressed
         KV and indexer keys side by side), not laid out token by token.
-        Layerwise,
-        the i-th layer of the group gets its own object, keyed
+        Layerwise, the i-th layer of the group gets its own object, keyed
         ``<object key>_L<i>``, with that layer's bytes of the chunk's blocks,
         and the object key goes into ``markers`` for its ``_DONE`` marker.
+
         For a sliding window only the chunk's last ``stored_blocks`` blocks
-        go in, the ones a hit at its end needs: a chunk this step completed
-        still has them, since they lie inside the window when the step ends.
-        A chunk with one of those blocks missing or null is not stored.
-        Appends to the caller's ``keys`` and ``handles``.
+        go in, the ones a hit at its end needs. The request still holds them
+        here even when the window has moved past them: vLLM allocates every
+        block a step's tokens need, and frees the ones behind the window only
+        when it schedules a later step, whose forward may then write another
+        request's KV into them. The copy must therefore finish before the
+        next forward, so it cannot move to a write-behind thread. A chunk
+        with one of those blocks missing or null is not stored. Appends to
+        the caller's ``keys`` and ``handles``.
         """
         handler = self._handler
         assert handler is not None
@@ -6922,7 +6926,7 @@ class MaruWorkerConnector:
             chunk_keys = self._slice_chunk_keys(req_meta, group)
             block_ids = req_meta.group_block_ids[group.group_id]
             for ci in _step_chunks(req_meta, ct, len(chunk_keys)):
-                base = group_object_key(chunk_keys[ci], group.group_id, ct)
+                base = group.object_key(chunk_keys[ci], ct)
                 object_keys = (
                     [_chunk_layer_key(base, i) for i in range(len(spans))]
                     if self._use_layerwise
@@ -6953,7 +6957,7 @@ class MaruWorkerConnector:
                     nbytes = stored * size
                     handle = None
                     try:
-                        handle = handler.alloc(nbytes)
+                        handle = handler.alloc(nbytes, **self._route(req_meta))
                         obj = torch.frombuffer(handle.buf[:nbytes], dtype=torch.uint8)
                         obj.view(stored, size).copy_(
                             blocks[index, offset : offset + size]

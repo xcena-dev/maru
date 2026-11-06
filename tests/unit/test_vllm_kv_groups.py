@@ -50,6 +50,7 @@ from maru_vllm.kv_groups import (
     GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
+    KVGroup,
     _spec_kind,
     check_multi_group_support,
     check_one_group_support,
@@ -326,6 +327,29 @@ def test_connector_starts_with_dsv41(setting, chunk):
     assert connector._scheduler._multi_group
 
 
+def test_an_mla_object_key_names_its_block_size():
+    """An MLA group's objects keep the layout vLLM gives each block, which
+    another block size lays out differently even when an object's bytes add
+    up to the same total (DeepSeek-V4.1 uses 64-token blocks on SM90 and
+    SM120 and 128-token ones on SM100). Other groups' objects are laid out
+    token by token, and their keys stay as they were."""
+    small, large = (
+        describe_kv_groups(dsv41_config(block=b))[DSV41_GROUP]
+        for b in (DSV41_BLOCK, 2 * DSV41_BLOCK)
+    )
+    assert small.object_key("kv_x", 64) == "kv_x_c64_g4_b16"
+    assert large.object_key("kv_x", 64) == "kv_x_c64_g4_b32"
+    full = KVGroup(
+        group_id=1,
+        kind=GROUP_FULL,
+        spec_name="FullAttentionSpec",
+        layer_names=("layers.0.attn",),
+        block_size=16,
+        slot_bytes=8,
+    )
+    assert full.object_key("kv_x", 64) == group_object_key("kv_x", 1, 64)
+
+
 def test_a_model_with_only_skipped_groups_is_refused():
     config = dsv41_config()
     del config.kv_cache_groups[DSV41_GROUP]
@@ -401,6 +425,21 @@ def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
     )
     with pytest.raises(ValueError, match="Mamba-type and an MLA"):
         _check_dsv41(config)
+
+
+def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
+    """The support checks run before the chunk is rounded, so a model they
+    refuse leaves no warning about its chunk size."""
+    config = _connector_config(128, maru_kv_chunk_tokens=200)
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        with pytest.raises(ValueError, match="speculative decoding"):
+            MaruKVConnector(
+                config,
+                KVConnectorRole.SCHEDULER,
+                dsv41_config(block=128, side="scheduler"),
+            )
+    assert not [r for r in caplog.records if "not aligned" in r.getMessage()]
 
 
 def test_a_group_mixing_mla_and_window_layers_is_refused():
@@ -624,16 +663,30 @@ def test_dsv41_step_stores_each_whole_chunk_as_its_blocks(per):
     worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(ids), 0, 72))
     keys = _chunk_keys(tokens, chunk)
     done = 72 // chunk  # the chunks this step completed
-    assert set(store) == {
-        group_object_key(keys[c], DSV41_GROUP, chunk) for c in range(done)
-    }
+    assert set(store) == {_mla_key(keys[c], DSV41_GROUP, chunk) for c in range(done)}
     for c in range(done):
         expected = b"".join(
             _block_bytes(worker, b) for b in ids[c * per : (c + 1) * per]
         )
-        assert store[group_object_key(keys[c], DSV41_GROUP, chunk)] == expected
+        assert store[_mla_key(keys[c], DSV41_GROUP, chunk)] == expected
     assert worker._page_size_bytes == per * DSV41_PAGE
     assert worker._handler.batch_store.call_count == 1
+
+
+def test_dsv41_store_allocates_in_the_requests_pool():
+    """Every store path allocates in the pool the request's route names, the
+    MLA group's too."""
+    worker, _ = _dsv41_storing_worker(_dsv41_shared())
+    worker._route = lambda req_meta: {"route_key": f"pool-of-{req_meta.req_id}"}
+    worker._handler.alloc.side_effect = lambda nbytes, **kw: SimpleNamespace(
+        buf=memoryview(bytearray(nbytes))
+    )
+    worker.wait_for_save(
+        _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64)
+    )
+    calls = worker._handler.alloc.call_args_list
+    assert len(calls) == 2
+    assert all(c.kwargs == {"route_key": "pool-of-r1"} for c in calls)
 
 
 LAYERWISE = {"maru_use_layerwise": True}
@@ -642,12 +695,17 @@ DSV41_FORMATS = pytest.mark.parametrize(
 )
 
 
-def _dsv41_keys(tokens, chunk, num_chunks, layerwise):
+def _mla_key(chunk_key, group_id, chunk, block=DSV41_BLOCK):
+    """An MLA group's object key, which also names the group's block size."""
+    return f"{group_object_key(chunk_key, group_id, chunk)}_b{block}"
+
+
+def _dsv41_keys(tokens, chunk, num_chunks, layerwise, block=DSV41_BLOCK):
     """Keys the first ``num_chunks`` chunks store: one object per chunk, or
     one per layer and a ``_DONE`` marker."""
     keys = set()
     for key in _chunk_keys(tokens, chunk)[:num_chunks]:
-        base = group_object_key(key, DSV41_GROUP, chunk)
+        base = _mla_key(key, DSV41_GROUP, chunk, block)
         if layerwise:
             keys |= {f"{base}_L{i}" for i in range(len(DSV41_MEMBERS))}
             keys.add(f"{base}_DONE")
@@ -676,7 +734,7 @@ def test_dsv41_layerwise_stores_each_layer_and_then_marks_the_chunk(per):
     assert set(store) == _dsv41_keys(tokens, chunk, 64 // chunk, layerwise=True)
     blocks = _cache_of(worker, DSV41_GROUP).tensors[0]
     for c, key in enumerate(_chunk_keys(tokens, chunk)[: 64 // chunk]):
-        base = group_object_key(key, DSV41_GROUP, chunk)
+        base = _mla_key(key, DSV41_GROUP, chunk)
         ids = DSV41_BLOCKS_A[c * per : (c + 1) * per]
         for i, (offset, size) in enumerate(_dsv41_spans()):
             expected = b"".join(
@@ -744,7 +802,7 @@ def test_dsv41_layerwise_marks_no_chunk_with_a_layer_missing():
     """A chunk whose layer failed to register gets no _DONE marker. The next
     request with the prefix stores that layer alone, then the marker."""
     worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
-    k0, k1 = (group_object_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    k0, k1 = (_mla_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
     refused = {f"{k0}_L3"}
     _refusing(worker, store, refused)
     _dsv41_layerwise_step(worker, "r1")
@@ -758,7 +816,7 @@ def test_dsv41_layerwise_retries_a_marker_that_failed():
     """Every layer is in but the marker did not register: the next request
     with the prefix registers the marker alone."""
     worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
-    k0, _ = (group_object_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    k0, _ = (_mla_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
     refused = {f"{k0}_DONE"}
     _refusing(worker, store, refused)
     _dsv41_layerwise_step(worker, "r1")
@@ -939,7 +997,7 @@ def _dsv41_scheduler(stored, chunk=256, **extra):
 def test_dsv41_layerwise_lookup_asks_for_the_done_markers():
     a = list(range(1100))
     markers = [
-        group_object_key(k, DSV41_GROUP, 256) + "_DONE" for k in _chunk_keys(a, 256)
+        _mla_key(k, DSV41_GROUP, 256, 128) + "_DONE" for k in _chunk_keys(a, 256)
     ]
     sched = _dsv41_scheduler(set(markers), **LAYERWISE)
     assert _hit(sched, a) == 1024
@@ -950,25 +1008,25 @@ def test_dsv41_layerwise_lookup_asks_for_the_done_markers():
 def test_dsv41_layerwise_chunk_without_its_marker_is_a_miss():
     """Its layers may be stored only in part."""
     a = list(range(1100))
-    stored = _dsv41_keys(a, 256, 4, layerwise=True)
-    stored.remove(group_object_key(_chunk_keys(a, 256)[2], DSV41_GROUP, 256) + "_DONE")
+    stored = _dsv41_keys(a, 256, 4, layerwise=True, block=128)
+    stored.remove(_mla_key(_chunk_keys(a, 256)[2], DSV41_GROUP, 256, 128) + "_DONE")
     assert _hit(_dsv41_scheduler(stored, **LAYERWISE), a) == 512
 
 
 def test_dsv41_lookup_asks_only_for_the_stored_group():
     a = list(range(1100))
-    sched = _dsv41_scheduler(_stored_by(a, 256, [DSV41_GROUP], [], []))
+    sched = _dsv41_scheduler(
+        {_mla_key(k, DSV41_GROUP, 256, 128) for k in _chunk_keys(a, 256)}
+    )
     assert _hit(sched, a) == 1024
     (query,) = sched._handler.queries
-    assert query == [group_object_key(k, DSV41_GROUP, 256) for k in _chunk_keys(a, 256)]
+    assert query == [_mla_key(k, DSV41_GROUP, 256, 128) for k in _chunk_keys(a, 256)]
 
 
 def test_dsv41_hit_needs_every_chunk_of_the_stored_group():
     a = list(range(1100))
     keys = _chunk_keys(a, 256)
-    stored = {
-        group_object_key(k, DSV41_GROUP, 256) for i, k in enumerate(keys) if i != 2
-    }
+    stored = {_mla_key(k, DSV41_GROUP, 256, 128) for i, k in enumerate(keys) if i != 2}
     assert _hit(_dsv41_scheduler(stored), a) == 512
 
 
@@ -976,7 +1034,8 @@ def _dsv41_loaded(b, chunk):
     """B shares A's first 1,100 tokens; Maru holds A's chunks up to token
     1,024."""
     a = list(range(1100))
-    sched = _dsv41_scheduler(_stored_by(a, chunk, [DSV41_GROUP], [], []), chunk)
+    stored = {_mla_key(k, DSV41_GROUP, chunk, 128) for k in _chunk_keys(a, chunk)}
+    sched = _dsv41_scheduler(stored, chunk)
     request = SimpleNamespace(request_id="b", prompt_token_ids=b, num_preemptions=0)
     assert _load_given(sched, request) == 1024
     return sched
@@ -1083,7 +1142,7 @@ def _unbounded_keys(tokens, num_chunks, layerwise):
     keys = _dsv41_keys(tokens, 32, num_chunks, layerwise)
     for key in _chunk_keys(tokens, 32)[:num_chunks]:
         for g in range(4):
-            base = group_object_key(key, g, 32)
+            base = _mla_key(key, g, 32, UNBOUNDED_BLOCK)
             if layerwise:
                 keys |= {f"{base}_L{i}" for i in range(UNBOUNDED_LAYERS)}
                 keys.add(f"{base}_DONE")
@@ -1120,7 +1179,7 @@ def test_dsv41_unbounded_step_stores_the_windows_last_blocks():
     for c in range(2):
         last = UNBOUNDED_WINDOW_A[8 * c + 6 : 8 * c + 8]
         for g in range(4):
-            assert store[group_object_key(keys[c], g, 32)] == _window_rows(
+            assert store[_mla_key(keys[c], g, 32, UNBOUNDED_BLOCK)] == _window_rows(
                 window[g], last
             )
     assert worker._page_size_bytes == 2 * DSV41_PAGE  # group 4's chunk is largest
@@ -1135,7 +1194,7 @@ def test_dsv41_unbounded_layerwise_stores_each_window_layers_last_blocks():
     last = UNBOUNDED_WINDOW_A[14:16]
     for g in range(4):
         for layer in range(UNBOUNDED_LAYERS):
-            key = f"{group_object_key(base, g, 32)}_L{layer}"
+            key = f"{_mla_key(base, g, 32, UNBOUNDED_BLOCK)}_L{layer}"
             assert store[key] == _window_rows(window[g], last, layer)
 
 
@@ -1148,7 +1207,7 @@ def test_dsv41_unbounded_load_restores_the_window_at_the_hit_end(extra):
     stored, store = _unbounded_stored(window, extra_config=extra)
     chunk0 = _chunk_keys(list(range(80)), 32)[0]
     for g in range(4):
-        prefix = group_object_key(chunk0, g, 32)
+        prefix = _mla_key(chunk0, g, 32, UNBOUNDED_BLOCK)
         for key in [k for k in store if k.startswith(prefix)]:
             del store[key]
     targets = [
@@ -1270,8 +1329,8 @@ def test_dsv41_unbounded_lookup_needs_each_windows_chunk_at_the_hit_end():
     after chunk 2: one more chunk would need chunk 3's windows."""
     a = list(range(1100))
     keys = _chunk_keys(a, 256)
-    stored = {group_object_key(k, DSV41_GROUP, 256) for k in keys}
-    stored |= {group_object_key(k, g, 256) for k in keys[:3] for g in range(4)}
+    stored = {_mla_key(k, DSV41_GROUP, 256, 128) for k in keys}
+    stored |= {_mla_key(k, g, 256, 32) for k in keys[:3] for g in range(4)}
     assert _hit(_dsv41_unbounded_scheduler(stored), a) == 768
 
 

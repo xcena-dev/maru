@@ -626,8 +626,10 @@ Chunk keys therefore name a slice by what it holds:
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
-appends `_c<chunk_tokens>_g<group_id>` and names the KV heads of each
-attention group, full or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
+appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by
+`_b<block_size>`, since its objects keep vLLM's block layout (see
+{ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full
+or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
 `kv_<hash>_h0-1_c544_g3` on rank 0.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
