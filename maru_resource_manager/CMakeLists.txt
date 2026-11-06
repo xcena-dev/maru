@@ -145,7 +145,8 @@ if(MARU_BUILD_TESTS)
         add_test(NAME ProcessRecovery.${scenario}
             COMMAND ${Python3_EXECUTABLE} ${PROCESS_TEST}
                 $<TARGET_FILE:maru_rm_process_test_daemon> ProcessRecoveryTest.test_${scenario} -v)
-        set_tests_properties(ProcessRecovery.${scenario} PROPERTIES TIMEOUT 60)
+        # Each scenario starts and stops the daemon several times.
+        set_tests_properties(ProcessRecovery.${scenario} PROPERTIES TIMEOUT 180)
     endforeach()
 
     # Tests of the repair, inspection and maru-rm-ctl tools (Python only).

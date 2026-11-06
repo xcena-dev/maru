@@ -722,7 +722,9 @@ TEST_F(DeviceExclusionTest, IsolatedWipeSurvivesFaultsAndStopsOnCancel) {
     // Mapping past the end of a file faults like an unbound device-dax mapping:
     // SIGBUS kills the child only.
     EXPECT_EQ(wipeDeviceIsolated(dev(1), 2 * B, H), -EIO);
-    EXPECT_EQ(wipeDeviceIsolated(dev(1), B, H, [] { return true; }), -ECANCELED);
+    // A child that stalls in open() is still running when the cancel is seen;
+    // one wiping a file can finish first, and a finished wipe is not cancelled.
+    EXPECT_EQ(wipeDeviceIsolated("/dev/dax-hang", B, H, [] { return true; }), -ECANCELED);
     EXPECT_EQ(wipeDeviceIsolated("/dev/dax9.0", B, H), -ENOENT);
     EXPECT_EQ(wipeDeviceIsolated(dev(1), B, H), 0);
 }
@@ -827,6 +829,19 @@ TEST_F(DeviceExclusionTest, WipeChildDiesWithTheRmAndHoldsNoDescriptors) {
         children >> wipe;
         if (wipe == 0) ::usleep(20 * 1000);
     }
+    // The child is listed from fork() on, before it arms PR_SET_PDEATHSIG; an
+    // RM killed in between leaves it to exit with ECANCELED instead. It
+    // closes what it inherited right after arming, and then stalls in open():
+    // kill the RM once it holds only fds 0-2.
+    auto armed = [&] {
+        std::error_code ec;
+        size_t fds = 0;
+        for (fs::directory_iterator it("/proc/" + std::to_string(wipe) + "/fd", ec), end;
+             !ec && it != end; it.increment(ec))
+            ++fds;
+        return !ec && fds <= 3;
+    };
+    for (int i = 0; wipe > 0 && i < 250 && !armed(); ++i) ::usleep(20 * 1000);
     if (rm > 0) {
         ::kill(rm, SIGKILL); // The RM dies mid-wipe.
         ::waitpid(rm, nullptr, 0);
