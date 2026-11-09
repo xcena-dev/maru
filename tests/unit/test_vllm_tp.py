@@ -461,7 +461,7 @@ def test_worker_trace_lines_end_with_the_tp_rank(monkeypatch, capsys, tp_size, r
     )
     worker = connector._worker
     poller = worker._trace_poller
-    monkeypatch.setattr(poller, "_ensure_thread", lambda: None)
+    poller._clock = SimpleNamespace(to_mono=lambda event: 1.0, error_ms=0.0)
     landed = MagicMock()
     landed.query.return_value = True
     landed.elapsed_time.return_value = 1.0
@@ -491,6 +491,13 @@ def test_worker_trace_lines_end_with_the_tp_rank(monkeypatch, capsys, tp_size, r
             "hold_ms",
             "gate_mono",
             "end_mono",
+            "start_mono",
+            "attempt",
+            "tp_size",
+            "req_encoding",
+            "clock_error_ms",
+            "scope",
+            "dp_rank",
             "rank",
         ],
         "STEP-GPU": [
@@ -500,9 +507,24 @@ def test_worker_trace_lines_end_with_the_tp_rank(monkeypatch, capsys, tp_size, r
             "layer_wait_ms",
             "waits",
             "end_mono",
+            "step",
+            "start_mono",
+            "clock_error_ms",
+            "dp_rank",
             "rank",
         ],
-        "REQ-TRACE recv_reported": ["req", "mono", "wall", "batch", "rank"],
+        "REQ-TRACE recv_reported": [
+            "req",
+            "mono",
+            "wall",
+            "req_encoding",
+            "batch",
+            "success",
+            "attempt",
+            "tp_size",
+            "dp_rank",
+            "rank",
+        ],
     }
 
 

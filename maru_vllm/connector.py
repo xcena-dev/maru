@@ -79,6 +79,18 @@ from maru_vllm.kv_layout import (
     _scatter_kv,
     _vllm_kv_cache_layout,
 )
+from maru_vllm.trace import (
+    _best_effort,
+    _clock_fields,
+    _CopyTiming,
+    _emit_timing,
+    _emit_trace,
+    _LayerLoadEvents,
+    _mono_ms,
+    _StepTiming,
+    _trace_req,
+    _TracePoller,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -229,238 +241,6 @@ def _get_knob(extra_config: dict[str, Any], key: str, default: Any = False) -> A
         )
         return extra_config[legacy]
     return default
-
-
-_STDERR_LOCK = threading.Lock()
-
-
-def _write_stderr_line(line: str) -> None:
-    """Write ``line`` and its newline to stderr in one call, under a lock.
-
-    ``print`` writes the text and the newline separately, so lines from the
-    scheduler, worker, loader and trace-poller threads could interleave in
-    the middle of a line.
-    """
-    import sys
-
-    with _STDERR_LOCK:
-        sys.stderr.write(line + "\n")
-        sys.stderr.flush()
-
-
-def _emit_timing(msg: str) -> None:
-    """Write a diagnostic timing line to stderr.
-
-    The connector's vLLM logger (``maru_vllm.connector``) sits outside the
-    ``vllm.*`` handler namespace, so its records are never captured in the
-    engine logs. Timing diagnostics therefore go straight to stderr, which
-    the process log does capture.
-    """
-    _write_stderr_line(f"Maru timing: {msg}")
-
-
-def _emit_trace(line: str) -> None:
-    """Write one request-trace line to stderr, the ``_emit_timing`` channel.
-
-    ``maru_log_timing`` also emits these lines. They carry no ``Maru timing:``
-    prefix and follow the ``REQ-TRACE`` / ``GPU-LOAD-QOS`` / ``STEP-TRACE`` /
-    ``STEP-GPU`` format of request-timeline log parsers: whitespace-separated
-    ``key=value`` fields, with ``mono`` in milliseconds of
-    ``time.monotonic()``, one clock for every process on the host, and on
-    REQ-TRACE and STEP-TRACE lines ``wall`` in Unix seconds.
-    """
-    _write_stderr_line(line)
-
-
-def _mono_ms() -> float:
-    """``time.monotonic()`` in milliseconds, the clock of every trace line."""
-    return time.monotonic() * 1000.0
-
-
-def _clock_fields() -> str:
-    """``mono=<ms> wall=<s>`` read together.
-
-    ``wall`` is Unix time in seconds. A parser maps the ``mono`` values of
-    lines that carry no ``wall`` (GPU-LOAD-QOS, STEP-GPU) onto wall-clock time
-    with the pairs on the lines that do, as it would with a logger's
-    timestamp prefix.
-    """
-    return f"mono={_mono_ms():.3f} wall={time.time():.6f}"
-
-
-def _trace_req(event: str, req_id: str, **fields: Any) -> None:
-    """Emit ``REQ-TRACE <event> req=<id> mono=<ms> wall=<s>`` plus ``fields``."""
-    extra = "".join(f" {key}={value}" for key, value in fields.items())
-    _emit_trace(f"REQ-TRACE {event} req={req_id} {_clock_fields()}{extra}")
-
-
-class _TracePoller:
-    """Stamp the GPU completion of traced loads and forwards with host time.
-
-    A CUDA event gives only the time between two events, so the host time of
-    a GPU point is the moment a poll first sees its event complete; polls
-    wait a millisecond between passes. Scheduling and registration can add
-    delay, so that interval does not bound timestamp error.
-    A load is reported as ``GPU-LOAD-QOS`` once its
-    last layer has landed, a forward as ``STEP-GPU`` once it has finished.
-    Only ``maru_log_timing`` creates one, and its thread starts with the
-    first record.
-
-    Every line ends with ``rank``, the worker's tensor-parallel rank: above
-    TP=1 each rank loads its own slice of a request and runs its own forward,
-    so the lines of different ranks otherwise share a request id or step.
-    """
-
-    _PERIOD_S = 0.001
-
-    def __init__(self, rank: int = 0) -> None:
-        self._rank = rank
-        self._lock = threading.Lock()
-        self._loads: list[dict[str, Any]] = []
-        self._steps: list[dict[str, Any]] = []
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-
-    def add_load(
-        self,
-        req_id: str,
-        start: Any,
-        gate: Any,
-        end: Any,
-        nbytes: int,
-        gate_layer: int,
-    ) -> None:
-        """Track one load: copies from ``start`` to ``end``, released at ``gate``.
-
-        Args:
-            req_id: Request whose KV the copies carry.
-            start: Timing event recorded before the first copy.
-            gate: Timing event whose completion reports the load to vLLM.
-            end: Timing event recorded after the last copy.
-            nbytes: Bytes the copies move.
-            gate_layer: Layers copied when ``gate`` completes.
-        """
-        with self._lock:
-            if self._stop_event.is_set():
-                return
-            self._loads.append(
-                {
-                    "req": req_id,
-                    "start": start,
-                    "gate": gate,
-                    "end": end,
-                    "bytes": nbytes,
-                    "gate_layer": gate_layer,
-                    "gate_mono": None,
-                }
-            )
-            self._ensure_thread()
-
-    def add_step(
-        self, wstep: int, mono: float, start: Any, end: Any, waits: list[Any]
-    ) -> None:
-        """Track one forward from ``start`` to ``end`` and its layer waits.
-
-        Args:
-            wstep: Worker-side step number.
-            mono: Host time the step's ``start_load_kv`` ran.
-            start: Timing event recorded on the model stream before the forward.
-            end: Timing event recorded on the model stream after it.
-            waits: ``(before, after)`` timing events around each layer wait.
-        """
-        with self._lock:
-            if self._stop_event.is_set():
-                return
-            self._steps.append(
-                {
-                    "wstep": wstep,
-                    "mono": mono,
-                    "start": start,
-                    "end": end,
-                    "waits": waits,
-                }
-            )
-            self._ensure_thread()
-
-    def _ensure_thread(self) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(
-                target=self._run, name="maru-trace-poller", daemon=True
-            )
-            self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self.poll()
-            self._stop_event.wait(self._PERIOD_S)
-
-    def shutdown(self) -> None:
-        """Stop polling and flush completed records after the worker drains CUDA.
-
-        Incomplete records are discarded without synchronizing the device.
-        No new records are accepted after shutdown.
-        """
-        with self._lock:
-            self._stop_event.set()
-            thread = self._thread
-        if thread is not None:
-            thread.join()
-        self.poll()
-        with self._lock:
-            self._loads.clear()
-            self._steps.clear()
-
-    def poll(self) -> None:
-        """Emit a line for every tracked load or forward whose last event completed."""
-        lines: list[str] = []
-        with self._lock:
-            loads: list[dict[str, Any]] = []
-            for load in self._loads:
-                try:
-                    if load["gate_mono"] is None and load["gate"].query():
-                        load["gate_mono"] = _mono_ms()
-                    if not load["end"].query():
-                        loads.append(load)
-                        continue
-                    end_mono = _mono_ms()
-                    gate_mono = (
-                        end_mono if load["gate_mono"] is None else load["gate_mono"]
-                    )
-                    dur = load["start"].elapsed_time(load["end"])
-                    hold = load["start"].elapsed_time(load["gate"])
-                except Exception as e:
-                    logger.warning("Maru trace: dropped load %s: %s", load["req"], e)
-                    continue
-                gbps = load["bytes"] / (dur * 1e6) if dur > 0 else 0.0
-                lines.append(
-                    f"GPU-LOAD-QOS bytes={load['bytes']} dur_ms={dur:.3f} "
-                    f"GBps={gbps:.3f} req={load['req']} gate_layer={load['gate_layer']} "
-                    f"hold_ms={hold:.3f} gate_mono={gate_mono:.3f} end_mono={end_mono:.3f} "
-                    f"rank={self._rank}"
-                )
-            self._loads = loads
-            steps: list[dict[str, Any]] = []
-            for step in self._steps:
-                try:
-                    if not step["end"].query():
-                        steps.append(step)
-                        continue
-                    end_mono = _mono_ms()
-                    fwd = step["start"].elapsed_time(step["end"])
-                    wait = sum(
-                        before.elapsed_time(after) for before, after in step["waits"]
-                    )
-                except Exception as e:
-                    logger.warning("Maru trace: dropped step %s: %s", step["wstep"], e)
-                    continue
-                lines.append(
-                    f"STEP-GPU wstep={step['wstep']} mono={step['mono']:.3f} "
-                    f"fwd_ms={fwd:.3f} layer_wait_ms={wait:.3f} "
-                    f"waits={len(step['waits'])} end_mono={end_mono:.3f} rank={self._rank}"
-                )
-            self._steps = steps
-        for line in lines:
-            _emit_trace(line)
 
 
 def _drain_events(events: Iterable[Any]) -> None:
@@ -1409,6 +1189,7 @@ class MaruReqMeta:
     # vLLM's group order, each accumulated like block_ids (whose list is the
     # first entry). Empty for a single-group model.
     group_block_ids: tuple[list[int], ...] = ()
+    trace_attempt: int = 0
     # Per-step memo of _chunk_keys(token_ids), by the slice suffix appended
     # ("" for the bare keys). The same MaruReqMeta object is shared across a
     # step's per-layer save_kv_layer calls (and the step's start_load_kv), so
@@ -1616,6 +1397,8 @@ class MaruConnectorMetadata(KVConnectorMetadata):
     # forward consumes their CXL views layer-by-layer, so layer k+1 H2D can
     # overlap layer k compute regardless of the storage format.
     layerwise_load_req_ids: set[str] = field(default_factory=set)
+    trace_step: int = 0
+    trace_attempts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1917,6 +1700,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     )
                 ],
                 state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
+                dp_rank=_dp_index(vllm_config),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -2004,7 +1788,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 num_blocks=(
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
-                tp_rank=tp_rank,
+                dp_rank=_dp_index(vllm_config),
             )
 
     @property
@@ -2062,6 +1846,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         # The layer waits must run on every replay, between graph pieces.
         return bool(_get_knob(extra_config, "maru_overlap_load_with_compute"))
+
+    def finish_forward(self) -> None:
+        # V2 calls this before logits/sampling and speculative drafting.
+        assert self._worker is not None
+        self._worker.trace_forward_end()
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -2292,8 +2081,10 @@ class MaruSchedulerConnector:
         kv_groups: list[KVGroup] | None = None,
         shard_suffixes: Sequence[str] = ("",),
         state_suffixes: Sequence[str] = ("",),
+        dp_rank: int = 0,
     ):
         self._block_size = block_size
+        self._dp_rank = dp_rank
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._kv_groups = list(kv_groups or ())
@@ -2461,6 +2252,7 @@ class MaruSchedulerConnector:
         # hits already reported as waiting for the parked-block budget, and
         # the step count STEP-TRACE lines carry.
         self._trace_loads: set[str] = set()
+        self._trace_attempts: dict[str, int] = {}
         self._trace_budget_waits: set[str] = set()
         self._trace_step = 0
 
@@ -2891,9 +2683,16 @@ class MaruSchedulerConnector:
                     hit=num_computed_tokens + matched,
                     load=matched,
                     async_load=int(load_async),
+                    attempt=self._trace_attempts.get(request.request_id, 0) + 1,
+                    dp_rank=self._dp_rank,
                 )
             else:
-                _trace_req("lookup_miss", request.request_id)
+                _trace_req(
+                    "lookup_miss",
+                    request.request_id,
+                    dp_rank=self._dp_rank,
+                    attempt=self._trace_attempts.get(request.request_id, 0) + 1,
+                )
         # A request let through keeps its place until vLLM gives it blocks
         # (update_state_after_alloc): with running requests holding blocks,
         # vLLM can still refuse it this step and ask again next step.
@@ -2903,7 +2702,7 @@ class MaruSchedulerConnector:
         """Report, once per request, that a hit waits for the parked-block budget."""
         if self._timing and req_id not in self._trace_budget_waits:
             self._trace_budget_waits.add(req_id)
-            _trace_req("lookup_defer", req_id)
+            _trace_req("lookup_defer", req_id, dp_rank=self._dp_rank)
 
     def _admit_parked(self, request: Request) -> bool:
         """Whether ``request`` may park while its load runs.
@@ -3087,6 +2886,9 @@ class MaruSchedulerConnector:
             request, "num_preemptions", 0
         )
         if self._timing:
+            self._trace_attempts[request.request_id] = (
+                self._trace_attempts.get(request.request_id, 0) + 1
+            )
             self._trace_loads.add(request.request_id)
         if self._cpu_mode or self._multi_group:
             start = self._load_starts.pop(request.request_id, 0)
@@ -3405,6 +3207,17 @@ class MaruSchedulerConnector:
             # waits on per-layer events that start_load_kv registers, so the
             # step must start loads first, as vLLM's own HiSparse does.
             scheduler_output.has_sync_kv_loads = True
+        if self._timing:
+            meta.trace_step = self._trace_step
+            ids = set(scheduler_output.num_scheduled_tokens)
+            ids.update(req.req_id for req in meta.requests if not req.is_store)
+            meta.trace_attempts = {
+                rid: self._trace_attempts[rid]
+                for rid in ids
+                if rid in self._trace_attempts
+            }
+            for req_meta in meta.requests:
+                req_meta.trace_attempt = self._trace_attempts.get(req_meta.req_id, 0)
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -3427,6 +3240,7 @@ class MaruSchedulerConnector:
             # later, more with async scheduling) can still fail once.
             self._known_keys.clear()
 
+    @_best_effort
     def _trace_schedule_step(self, scheduler_output: SchedulerOutput) -> None:
         """Emit ``prefill_sched`` for loaded requests in this step, then STEP-TRACE.
 
@@ -3440,8 +3254,7 @@ class MaruSchedulerConnector:
             - self._pending_deferred_loads.keys()
             - self._requests_need_load.keys(),
         )
-        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        cached_req_ids = getattr(cached, "req_ids", None) or ()
+        cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
         scheduled_req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
         # The original model runner sends preempted requests through the
         # cached list when they resume, including after a deferred reload.
@@ -3453,13 +3266,15 @@ class MaruSchedulerConnector:
                     "prefill_sched",
                     req_id,
                     step=self._trace_step,
+                    attempt=self._trace_attempts.get(req_id, 0),
+                    dp_rank=self._dp_rank,
                     tokens=scheduler_output.num_scheduled_tokens.get(req_id, 0),
                 )
         _emit_trace(
             f"STEP-TRACE step={self._trace_step} {_clock_fields()} "
             f"new={len(scheduler_output.scheduled_new_reqs)} cached={len(cached_req_ids)} "
             f"tokens={scheduler_output.total_num_scheduled_tokens} "
-            f"loading={len(self._trace_loads)}"
+            f"loading={len(self._trace_loads)} dp_rank={self._dp_rank}"
         )
 
     def request_finished(
@@ -3472,6 +3287,7 @@ class MaruSchedulerConnector:
         self._forget_load_history(request)
         self._trace_loads.discard(request.request_id)
         self._trace_budget_waits.discard(request.request_id)
+        self._trace_attempts.pop(request.request_id, None)
         if request.request_id in self._awaiting_deferred_recv:
             # vLLM already retains a parked request's blocks until its receive
             # completes. Claiming send ownership too produces a second free.
@@ -3489,6 +3305,10 @@ class MaruWorkerConnector:
     """Worker-side: transfers GPU KV chunks to/from the selected memory backend."""
 
     _cpu_mode = False
+    _timing = False
+    _trace_poller: _TracePoller | None = None
+    _trace_fwd: _StepTiming | None = None
+    _dp_rank = 0
     _remote_cxl_mode = False
     # Read by the layout paths; a worker built with __new__ knows no layout
     # and no block count.
@@ -3499,7 +3319,6 @@ class MaruWorkerConnector:
     # without MLA.
     _kv_shard: KVShard = WHOLE_MODEL
     _state_shard: KVShard = WHOLE_MODEL
-    _tp_rank = 0
     _use_mla = False
     _kv_planes = 2
 
@@ -3516,7 +3335,7 @@ class MaruWorkerConnector:
         state_shard: KVShard = WHOLE_MODEL,
         use_mla: bool = False,
         num_blocks: int | None = None,
-        tp_rank: int = 0,
+        dp_rank: int = 0,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -3555,7 +3374,7 @@ class MaruWorkerConnector:
         self._state_shard = state_shard
         # This worker's tensor-parallel rank (0 at TP=1). The worker-side
         # trace lines end with it: every rank loads its own slice of a request.
-        self._tp_rank = tp_rank
+        self._dp_rank = dp_rank
         # An MLA model's paged KV is one latent per token, which a chunkwise
         # slab holds as one plane where K and V take two. Taken from the
         # model config: a parked load can run before the first forward, with
@@ -3775,10 +3594,16 @@ class MaruWorkerConnector:
         # completion, the start event and byte count of each load whose
         # copies are queued but not yet handed to the poller, and the forward
         # traced in this step.
-        self._trace_poller = _TracePoller(tp_rank) if self._timing else None
-        self._trace_copy_starts: dict[str, tuple[torch.cuda.Event, int]] = {}
+        self._trace_poller = (
+            _TracePoller(self._state_shard.part, self._state_shard.parts, dp_rank)
+            if self._timing
+            else None
+        )
         self._trace_wstep = 0
-        self._trace_fwd: dict[str, Any] | None = None
+        self._trace_fwd: _StepTiming | None = None
+        self._trace_attempts: dict[str, int] = {}
+        self._trace_failed: set[tuple[str, int]] = set()
+        self._trace_step = 0
 
     def _ensure_handler(self):
         if self._handler is not None:
@@ -4074,6 +3899,14 @@ class MaruWorkerConnector:
         self._store_layers_seen.clear()
         self._reclaim_stale_pending_slabs()
         self._trace_fwd = None
+        if self._timing:
+            self._trace_step = metadata.trace_step
+            self._trace_attempts.update(metadata.trace_attempts)
+            self._trace_attempts.update(
+                (req.req_id, req.trace_attempt)
+                for req in metadata.requests
+                if not req.is_store
+            )
 
         self._ensure_handler()
         if self._handler is None:
@@ -4786,9 +4619,9 @@ class MaruWorkerConnector:
         the request's blocks through ``take_failed_load_blocks`` so vLLM
         recomputes instead of consuming unloaded KV.
         """
-        if self._timing:
-            self._trace_worker_req("job_start", req_meta.req_id)
         try:
+            if self._timing:
+                self._trace_worker_req("job_start", req_meta.req_id)
             handler = self._handler
             if self._remote_cxl_mode:
                 # Batches of leased staging slots: each batch is released once
@@ -4970,13 +4803,12 @@ class MaruWorkerConnector:
             stream = self._deferred_stream
 
             if self._load_admission_window > 0:
-                _t_admit = time.monotonic()
-                self._wait_for_load_admission(req_meta.req_id)
+                wait_ms = self._wait_for_load_admission(req_meta.req_id)
                 if self._timing:
                     self._trace_worker_req(
                         "admit",
                         req_meta.req_id,
-                        wait_ms=f"{(time.monotonic() - _t_admit) * 1000:.3f}",
+                        wait_ms=f"{wait_ms:.3f}",
                     )
 
             attn = self._last_attn_metadata
@@ -4986,19 +4818,17 @@ class MaruWorkerConnector:
             dtype = layers[0][1].dtype
             ct = self._kv_chunk_tokens
             num_layers = len(layers)
-            trace_start: torch.cuda.Event | None = None
+            copy_timing = _CopyTiming() if self._timing else None
             nbytes = 0
             with torch.cuda.stream(stream):
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
-                if self._timing:
-                    trace_start = torch.cuda.Event(enable_timing=True)
-                    trace_start.record(stream)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
                         self._kv_planes, num_layers, ct, -1
                     )
-                    nbytes += slab_host.numel() * slab_host.element_size()
+                    if self._timing:
+                        nbytes += slab_host.numel() * slab_host.element_size()
                     if kernel is not None:
                         # Stage the slab through the copy engine (async DMA —
                         # the CXL mapping is cudaHostRegister'ed by the
@@ -5011,6 +4841,8 @@ class MaruWorkerConnector:
                         # while MP's media-invariant TPOT shows its bulk
                         # bytes ride the copy engine).
                         ops, ptrs, pbs, block_size, head_size, fmt = kernel
+                        if copy_timing is not None:
+                            copy_timing.begin(self._trace_poller, stream)
                         slab_dev = slab_host.to(device, non_blocking=True)
                         ops.multi_layer_kv_transfer(
                             slab_dev,
@@ -5032,16 +4864,18 @@ class MaruWorkerConnector:
                             chunk_slots,
                             attn,
                             non_blocking=True,
+                            trace=copy_timing,
                         )
-                event = torch.cuda.Event(enable_timing=self._timing)
-                event.record(stream)
-            if trace_start is not None and self._trace_poller is not None:
-                self._trace_worker_req(
-                    "enqueue", req_meta.req_id, layers=num_layers, bytes=nbytes
+                event = (
+                    self._trace_poller.event(stream, reusable=False)
+                    if self._timing
+                    else None
                 )
-                self._trace_poller.add_load(
-                    req_meta.req_id, trace_start, event, event, nbytes, num_layers
-                )
+                if event is None:
+                    event = torch.cuda.Event()
+                    event.record(stream)
+            if copy_timing is not None and copy_timing.start is not None:
+                self._trace_whole_load(req_meta, copy_timing, event, nbytes, num_layers)
             # Publish completion only after enqueue is traced: the engine
             # can immediately observe a completed copy on another thread.
             with self._deferred_lock:
@@ -5076,7 +4910,7 @@ class MaruWorkerConnector:
                 self._inflight_deferred_req_ids.discard(req_meta.req_id)
                 self._abandoned_req_ids.discard(req_meta.req_id)
 
-    def _wait_for_load_admission(self, req_id: str) -> None:
+    def _wait_for_load_admission(self, req_id: str) -> float:
         """Block until fewer than the admission window of loads are in flight.
 
         Runs on the loader thread just before a request's GPU enqueue. Counts
@@ -5103,11 +4937,10 @@ class MaruWorkerConnector:
                 break
             waited = True
             pending[0].synchronize()
+        wait_ms = (time.monotonic() - wait_t0) * 1000
         if self._timing and waited:
-            _emit_timing(
-                f"admission wait {(time.monotonic() - wait_t0) * 1000:.2f} ms "
-                f"(req {req_id})"
-            )
+            _emit_timing(f"admission wait {wait_ms:.2f} ms (req {req_id})")
+        return wait_ms
 
     def _unpark_gate_event(
         self,
@@ -5140,14 +4973,34 @@ class MaruWorkerConnector:
         count = min(self._release_after, len(ordered))
         return events[ordered[count - 1]]
 
+    @_best_effort
+    def _trace_whole_load(self, req_meta, copy_timing, event, nbytes, num_layers):
+        self._trace_worker_req(
+            "enqueue", req_meta.req_id, layers=num_layers, bytes=nbytes
+        )
+        self._trace_poller.add_load(
+            req_meta.req_id,
+            copy_timing.start,
+            event,
+            event,
+            nbytes,
+            num_layers,
+            attempt=req_meta.trace_attempt,
+        )
+
+    @_best_effort
     def _trace_worker_req(self, event: str, req_id: str, **fields: Any) -> None:
         """``_trace_req`` with this worker's TP rank appended as ``rank``.
 
         Above TP=1 every rank loads its own slice of a request, so each writes
         the worker-side events of the same request id.
         """
-        _trace_req(event, req_id, **fields, rank=self._tp_rank)
+        fields.setdefault("attempt", self._trace_attempts.get(req_id, 0))
+        fields.setdefault("tp_size", self._state_shard.parts)
+        fields.setdefault("dp_rank", self._dp_rank)
+        _trace_req(event, req_id, **fields, rank=self._state_shard.part)
 
+    @_best_effort
     def _trace_queued_load(
         self,
         req_id: str,
@@ -5163,7 +5016,7 @@ class MaruWorkerConnector:
             layers: (layer_name, kv tensor, layer index) for every layer.
             gate: The event ``_unpark_gate_event`` picked to release the request.
         """
-        start, nbytes = self._trace_copy_starts.pop(req_id, (None, 0))
+        start, nbytes = getattr(events, "start", None), getattr(events, "nbytes", 0)
         if start is None or self._trace_poller is None:
             return
         ordered = [
@@ -5177,7 +5030,13 @@ class MaruWorkerConnector:
         )
         self._trace_worker_req("enqueue", req_id, layers=len(ordered), bytes=nbytes)
         self._trace_poller.add_load(
-            req_id, start, gate, events[ordered[-1]], nbytes, gate_layer
+            req_id,
+            start,
+            gate,
+            next(reversed(events.values())),
+            nbytes,
+            gate_layer,
+            attempt=self._trace_attempts.get(req_id, 0),
         )
 
     def _layerwise_stream_for(self, device: torch.device) -> torch.cuda.Stream:
@@ -5242,14 +5101,17 @@ class MaruWorkerConnector:
             attn = self._last_attn_metadata
             tokens = num_chunks * self._kv_chunk_tokens
             _t0 = time.monotonic()
-            events: dict[str, torch.cuda.Event] = {}
+            events = _LayerLoadEvents()
             nbytes = 0
+            ordered_layers = sorted(layers, key=lambda item: item[2])
+            gate_index = min(self._release_after, len(ordered_layers)) - 1
             with torch.cuda.stream(stream):
                 slot_gpu = pinned.to(device, non_blocking=True)
                 if self._timing:
-                    trace_start = torch.cuda.Event(enable_timing=True)
-                    trace_start.record(stream)
-                for layer_name, kv_cache_layer, true_idx in layers:
+                    events.start = self._trace_poller.event(stream)
+                for li, (layer_name, kv_cache_layer, true_idx) in enumerate(
+                    ordered_layers
+                ):
                     if self._use_layerwise:
                         layer_dev = self._copy_layerwise_layer_to_device(
                             infos[true_idx], num_chunks, kv_cache_layer
@@ -5266,12 +5128,19 @@ class MaruWorkerConnector:
                         layer_name,
                         num_chunks=num_chunks,
                     )
-                    nbytes += layer_dev.numel() * layer_dev.element_size()
-                    event = torch.cuda.Event(enable_timing=self._timing)
-                    event.record(stream)
+                    if self._timing:
+                        nbytes += layer_dev.numel() * layer_dev.element_size()
+                    event = (
+                        self._trace_poller.event(stream, reusable=False)
+                        if self._timing and li in (gate_index, len(ordered_layers) - 1)
+                        else None
+                    )
+                    if event is None:
+                        event = torch.cuda.Event()
+                        event.record(stream)
                     events[layer_name] = event
             if self._timing:
-                self._trace_copy_starts[req_meta.req_id] = (trace_start, nbytes)
+                events.nbytes = nbytes
             # The CXL views and slot mappings must outlive the queued copies;
             # release rides on the last layer's completion.
             done_event = torch.cuda.Event()
@@ -5886,6 +5755,7 @@ class MaruWorkerConnector:
         WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads also report errors,
         but only for their externally allocated blocks.
         """
+        self._trace_load_failed(req_meta)
         self._note_failed_inline_load(req_meta)
         if self._cpu_mode and not req_meta.is_store:
             self._fail_load(
@@ -5949,6 +5819,7 @@ class MaruWorkerConnector:
         is the contract the refusal was designed for; a deferred request is
         additionally marked done so it unparks.
         """
+        self._trace_load_failed(req_meta)
         logger.error(
             "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
         )
@@ -6105,9 +5976,51 @@ class MaruWorkerConnector:
                     del self._deferred_events[req_id]
                     self._deferred_refs.pop(req_id, None)
         if self._timing:
+            self._poll_trace()
             for req_id in done:
-                self._trace_worker_req("recv_reported", req_id, batch=len(done))
+                key = (req_id, self._trace_attempts.get(req_id, 0))
+                self._trace_worker_req(
+                    "recv_reported",
+                    req_id,
+                    batch=len(done),
+                    success=int(key not in self._trace_failed),
+                )
+                self._trace_failed.discard(key)
+                self._trace_attempts.pop(req_id, None)
         return done or None
+
+    @_best_effort
+    def _trace_forget_finished(self, finished_req_ids):
+        if not self._timing:
+            return
+        with self._deferred_lock:
+            active = (
+                self._inflight_deferred_req_ids
+                | self._deferred_events.keys()
+                | self._deferred_done
+            )
+        stale = finished_req_ids - active
+        for req_id in stale:
+            self._trace_attempts.pop(req_id, None)
+        self._trace_failed.difference_update(
+            {key for key in self._trace_failed if key[0] in stale}
+        )
+
+    @_best_effort
+    def _poll_trace(self):
+        if self._trace_poller is not None:
+            self._trace_poller.poll()
+
+    @_best_effort
+    def _trace_load_failed(self, req_meta: MaruReqMeta) -> None:
+        if not self._timing or req_meta.is_store:
+            return
+        key = (req_meta.req_id, req_meta.trace_attempt)
+        if key not in self._trace_failed:
+            self._trace_failed.add(key)
+            self._trace_worker_req(
+                "load_failed", req_meta.req_id, attempt=req_meta.trace_attempt
+            )
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
         """Return finished requests whose write-behind stores have drained.
@@ -6119,6 +6032,7 @@ class MaruWorkerConnector:
         release the request: they make that cache entry unavailable, but must
         never leak GPU blocks.
         """
+        self._trace_forget_finished(finished_req_ids)
         recv_only = self._recv_only_finished_req_ids & finished_req_ids
         self._recv_only_finished_req_ids.difference_update(recv_only)
         finished_req_ids = finished_req_ids - recv_only
@@ -6499,6 +6413,7 @@ class MaruWorkerConnector:
         attn_metadata: Any,
         non_blocking: bool,
         copied_ahead: set[_CopyAhead] | None = None,
+        trace: _CopyTiming | None = None,
     ) -> bool:
         """Copy one chunk slab to the device and inject it layer by layer.
 
@@ -6524,6 +6439,13 @@ class MaruWorkerConnector:
             Whether the slab was copied ahead.
         """
         ahead = self._copy_ahead_for(device, slab_host, load_stream)
+        if trace is not None:
+            trace.begin(
+                self._trace_poller,
+                ahead.stream
+                if ahead is not None
+                else load_stream or torch.cuda.current_stream(device),
+            )
         if ahead is None:
             slab_dev = slab_host.to(device, non_blocking=non_blocking)
             slot = None
@@ -6784,38 +6706,40 @@ class MaruWorkerConnector:
             return
         stream = torch.cuda.current_stream()
         trace = self._trace_fwd
-        if trace is not None:
-            before = torch.cuda.Event(enable_timing=True)
-            before.record(stream)
+        before = self._trace_wait_start(trace, events, stream)
         for event in events:
             stream.wait_event(event)
-        if trace is not None:
-            after = torch.cuda.Event(enable_timing=True)
-            after.record(stream)
-            trace["waits"].append((before, after))
+        if trace is not None and before is not None:
+            after = self._trace_poller.event(stream)
+            if before is not None and after is not None:
+                trace.waits.append((before, after))
 
+    @_best_effort
+    def _trace_wait_start(self, trace, events, stream):
+        # An already complete copy cannot block the later model stream.
+        if trace is not None and any(not event.query() for event in events):
+            return self._trace_poller.event(stream)
+        return None
+
+    @_best_effort
     def _trace_forward_start(self) -> None:
         """Start tracing this step's forward: it waits for layers still in flight."""
         self._trace_wstep += 1
-        start = torch.cuda.Event(enable_timing=True)
-        start.record(torch.cuda.current_stream())
-        self._trace_fwd = {
-            "wstep": self._trace_wstep,
-            "mono": _mono_ms(),
-            "start": start,
-            "waits": [],
-        }
+        start = self._trace_poller.event(torch.cuda.current_stream())
+        if start is None:
+            return
+        self._trace_fwd = _StepTiming(
+            self._trace_wstep, self._trace_step, _mono_ms(), start, None, []
+        )
 
+    @_best_effort
     def trace_forward_end(self) -> None:
         """Hand this step's traced forward to the poller; runs after the forward."""
         fwd, self._trace_fwd = self._trace_fwd, None
         if fwd is None or self._trace_poller is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record(torch.cuda.current_stream())
-        self._trace_poller.add_step(
-            fwd["wstep"], fwd["mono"], fwd["start"], end, fwd["waits"]
-        )
+        fwd.end = self._trace_poller.event(torch.cuda.current_stream())
+        self._trace_poller.add_forward(fwd)
 
     def _release_completed_load_refs(self) -> None:
         """Drop load-batch refs whose queued copies have completed.
@@ -8128,8 +8052,10 @@ class MaruWorkerConnector:
         self._layerwise_streams = []
         self._layerwise_stream_device = None
         if self._trace_poller is not None:
-            self._trace_poller.shutdown()
-        self._trace_copy_starts.clear()
+            try:
+                self._trace_poller.shutdown()
+            except Exception:
+                pass
         self._trace_fwd = None
         self._layer_load_events.clear()
         self._active_load_refs.clear()

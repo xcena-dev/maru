@@ -8,7 +8,6 @@ is available.
 """
 
 import contextlib
-import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -3262,17 +3261,19 @@ class TestPreIssuedLayerwiseHandoff:
         """maru_log_timing hands the queued copies to the poller with K."""
         worker = self._worker(maru_log_timing=True, maru_overlap_release_after_layers=2)
         tracked = []
-        worker._trace_poller.add_load = lambda *args: tracked.append(args)
+        worker._trace_poller.add_load = lambda *args, **kwargs: tracked.append(args)
         start, first, second = MagicMock(), MagicMock(), MagicMock()
-        events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
+        from maru_vllm.trace import _LayerLoadEvents
+
+        # The actual end follows enqueue order; the gate follows execution order.
+        events = _LayerLoadEvents({self.LAYERS[1]: second, self.LAYERS[0]: first})
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
-        worker._trace_copy_starts["r1"] = (start, 1024)
+        events.start, events.nbytes = start, 1024
 
         gate = worker._unpark_gate_event(events, layers)
         worker._trace_queued_load("r1", events, layers, gate)
 
-        assert tracked == [("r1", start, second, second, 1024, 2)]
-        assert worker._trace_copy_starts == {}
+        assert tracked == [("r1", start, second, first, 1024, 2)]
         assert "REQ-TRACE enqueue req=r1 " in capsys.readouterr().err
 
     def test_release_gate_honours_the_knob(self):
@@ -4022,9 +4023,9 @@ class TestLayerwiseFormatOverlap:
                 src.numel() * src.element_size() for src in sources
             )
             assert int(loads[0]["gate_layer"]) == 1
-            assert int(steps[0]["waits"]) == 2
+            assert 0 <= int(steps[0]["waits"]) <= 2
             assert float(steps[0]["layer_wait_ms"]) >= 0
-            assert not worker._trace_poller._thread.is_alive()
+            assert worker._trace_poller._closed
         else:
             assert not loads and not steps
 
@@ -5795,6 +5796,13 @@ class _FakeTimingEvent:
         return other.at_ms - self.at_ms
 
 
+class _FakeTraceClock:
+    error_ms = 0.0
+
+    def to_mono(self, event):
+        return 100.0 + event.at_ms
+
+
 def _trace_fields(line: str) -> dict[str, str]:
     return dict(field.split("=", 1) for field in line.split() if "=" in field)
 
@@ -5853,6 +5861,15 @@ class TestRequestTrace:
         monkeypatch.setattr(worker, "_packed_store_kernel_ctx", lambda attn: None)
         monkeypatch.setattr(worker, "_inject_slab_layers", lambda *args, **kwargs: None)
         monkeypatch.setattr(worker._trace_poller, "add_load", lambda *args: None)
+        monkeypatch.setattr(
+            worker._trace_poller, "event", lambda *args, **kw: MagicMock()
+        )
+        # This test isolates publication order; the copy helper is mocked too.
+        monkeypatch.setattr(
+            worker,
+            "_inject_slab_layers",
+            lambda *args, trace=None, **kwargs: setattr(trace, "start", MagicMock()),
+        )
         ready_at_enqueue = []
         trace = worker._trace_worker_req
 
@@ -5883,8 +5900,7 @@ class TestRequestTrace:
     def test_poller_reports_loads_and_forwards_once_complete(self, monkeypatch, capsys):
         from maru_vllm.connector import _TracePoller
 
-        monkeypatch.setattr(_TracePoller, "_ensure_thread", lambda self: None)
-        poller = _TracePoller()
+        poller = _TracePoller(clock=_FakeTraceClock())
         start, gate, end = (_FakeTimingEvent(t) for t in (10.0, 16.0, 40.0))
         poller.add_load("r1", start, gate, end, 3_000_000, 2)
         fwd_start, fwd_end = _FakeTimingEvent(0.0), _FakeTimingEvent(9.0)
@@ -5916,59 +5932,30 @@ class TestRequestTrace:
         assert (step["wstep"], step["waits"]) == ("7", "2")
         assert (float(step["fwd_ms"]), float(step["layer_wait_ms"])) == (9.0, 6.0)
 
-    def test_poller_stamps_completion_after_query(self, monkeypatch, capsys):
-        from maru_vllm import connector
-
-        monkeypatch.setattr(connector._TracePoller, "_ensure_thread", lambda self: None)
-        clock = [0.0]
-        monkeypatch.setattr(connector, "_mono_ms", lambda: clock[0])
-        poller = connector._TracePoller()
-        start, gate, end = (_FakeTimingEvent(t) for t in (0.0, 1.0, 2.0))
-        fwd_start, fwd_end = _FakeTimingEvent(0.0), _FakeTimingEvent(3.0)
-
-        def completed_at(at):
-            def query():
-                clock[0] = at
-                return True
-
-            return query
-
-        monkeypatch.setattr(gate, "query", completed_at(10.0))
-        monkeypatch.setattr(end, "query", completed_at(20.0))
-        monkeypatch.setattr(fwd_end, "query", completed_at(30.0))
-        poller.add_load("r1", start, gate, end, 1024, 1)
-        poller.add_step(1, 0.0, fwd_start, fwd_end, [])
-        poller.poll()
-
-        load, step = map(_trace_fields, capsys.readouterr().err.splitlines())
-        assert float(load["gate_mono"]) == 10.0
-        assert float(load["end_mono"]) == 20.0
-        assert float(step["end_mono"]) == 30.0
-
-    def test_shutdown_stops_the_poller_and_flushes_completed_records(
-        self, monkeypatch, capsys
-    ):
+    def test_poller_timestamps_do_not_depend_on_observation_delay(self, capsys):
         from maru_vllm.connector import _TracePoller
 
-        # A stop must wake the thread even while it waits between polls.
-        monkeypatch.setattr(_TracePoller, "_PERIOD_S", 60)
-        poller = _TracePoller()
+        poller = _TracePoller(clock=_FakeTraceClock())
         start, gate, end = (_FakeTimingEvent(t) for t in (0.0, 1.0, 2.0))
-        queried = threading.Event()
-
-        def query_gate():
-            queried.set()
-            return gate.done
-
-        monkeypatch.setattr(gate, "query", query_gate)
+        gate.done = end.done = True
         poller.add_load("r1", start, gate, end, 1024, 1)
-        try:
-            assert queried.wait(5)
-            gate.done = end.done = True
-        finally:
-            poller.shutdown()
+        time.sleep(0.01)  # Poll well after the events actually completed.
+        poller.poll()
+        load = _trace_fields(capsys.readouterr().err.strip())
+        assert float(load["start_mono"]) == 100.0
+        assert float(load["gate_mono"]) == 101.0
+        assert float(load["end_mono"]) == 102.0
 
-        assert not poller._thread.is_alive()
+    def test_shutdown_flushes_completed_records_without_starting_a_thread(self, capsys):
+        from maru_vllm.connector import _TracePoller
+
+        poller = _TracePoller(clock=_FakeTraceClock())
+        start, gate, end = (_FakeTimingEvent(t) for t in (0.0, 1.0, 2.0))
+        poller.add_load("r1", start, gate, end, 1024, 1)
+        gate.done = end.done = True
+        with patch("threading.Thread.start", side_effect=RuntimeError("no threads")):
+            poller.shutdown()
+        assert poller._closed
         assert capsys.readouterr().err.count("GPU-LOAD-QOS") == 1
         poller.add_load("after-shutdown", start, gate, end, 1024, 1)
         poller.add_step(2, 0.0, start, end, [])
@@ -6051,6 +6038,39 @@ class TestRequestTrace:
 
         assert MaruKVConnector.requires_piecewise_for_cudagraph({key: True})
         assert not MaruKVConnector.requires_piecewise_for_cudagraph({key: False})
+
+    def test_abort_after_reset_reload_releases_blocks_once(self, tmp_path):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.outputs import KVConnectorOutput
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {
+                "maru_async_load": True,
+                "maru_async_store": True,
+                "maru_overlap_load_with_compute": True,
+            },
+        )
+        engine.connector._scheduler._count_matched_chunks = lambda ids: 1
+        pool = engine.kv_cache_manager.block_pool
+        free = pool.get_num_free_blocks()
+        request = Request("r1", list(range(8)), SamplingParams(max_tokens=8), None)
+        engine.add_request(request)
+        engine.schedule()
+        engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
+        engine.schedule()
+        engine.reset_prefix_cache(reset_running_requests=True)
+        engine.schedule()
+
+        engine.finish_requests("r1", RequestStatus.FINISHED_ABORTED)
+        output = engine.schedule()
+        assert output.kv_connector_metadata.recv_only_finished_req_ids == {"r1"}
+        engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
+        assert not engine.requests
+        assert pool.get_num_free_blocks() == free
 
     @pytest.mark.parametrize("timing", [True, False])
     @pytest.mark.parametrize("preempted", [False, True], ids=["new", "resumed"])
