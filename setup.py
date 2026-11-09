@@ -9,6 +9,7 @@ from setuptools import Extension, setup
 _KV_OPS_NAME = "maru_kv_ops._C"
 _KV_OPS_SOURCES = [
     "maru_kv_ops/csrc/pybind.cpp",
+    "maru_kv_ops/csrc/logical_page_kernels.cu",
     "maru_kv_ops/csrc/mem_kernels.cu",
     "maru_kv_ops/csrc/mp_mem_kernels.cu",
 ]

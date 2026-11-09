@@ -16,6 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Where the unit is installed; tests point it at a temporary directory.
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
 
 def _find_resource_manager_source() -> Path:
     """Locate the maru_resource_manager source directory relative to this file.
@@ -75,7 +78,7 @@ def _do_uninstall(prefix: str) -> int:
         fprintf(sys.stderr, "  Removed: %s\n", binary)
         removed = True
 
-    service = Path("/etc/systemd/system/maru-resource-manager.service")
+    service = SYSTEMD_DIR / "maru-resource-manager.service"
     if service.exists():
         try:
             service.unlink()
@@ -167,7 +170,7 @@ def _do_install(args: argparse.Namespace) -> int:
 
     # -- install systemd service -----------------------------------------------
     service_src = rm_src / "maru-resource-manager.service"
-    systemd_dir = Path("/etc/systemd/system")
+    systemd_dir = SYSTEMD_DIR
     if service_src.is_file() and systemd_dir.is_dir():
         import shutil as _shutil
 
