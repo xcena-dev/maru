@@ -6002,6 +6002,56 @@ class TestRequestTrace:
         assert scheduler._trace_loads == {"waiting"}
         assert _trace_fields(capsys.readouterr().err.strip())["loading"] == "1"
 
+    @pytest.mark.parametrize("timing", [False, True])
+    def test_reset_and_reload_in_one_step_keeps_the_new_load(
+        self, tmp_path, capsys, timing
+    ):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.outputs import KVConnectorOutput
+        from vllm.v1.request import Request, RequestStatus
+
+        engine = make_vllm_scheduler(
+            tmp_path,
+            4,
+            8,
+            {
+                "maru_async_load": True,
+                "maru_overlap_load_with_compute": True,
+                "maru_log_timing": timing,
+            },
+        )
+        scheduler = engine.connector._scheduler
+        scheduler._count_matched_chunks = lambda ids: 1
+        request = Request("r1", list(range(8)), SamplingParams(max_tokens=8), None)
+        engine.add_request(request)
+        engine.schedule()
+        engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
+        engine.schedule()
+        assert request.status == RequestStatus.RUNNING
+
+        engine.reset_prefix_cache(reset_running_requests=True)
+        reloading = engine.schedule()
+        assert reloading.preempted_req_ids == {"r1"}
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert "r1" in scheduler._awaiting_deferred_recv
+        assert "r1" in scheduler._deferred_layerwise_waiting
+        capsys.readouterr()
+
+        engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
+        resumed = engine.schedule()
+        assert resumed.kv_connector_metadata.layerwise_load_req_ids == {"r1"}
+        lines = capsys.readouterr().err
+        assert ("REQ-TRACE prefill_sched req=r1 " in lines) is timing
+
+    @pytest.mark.parametrize(
+        "key", ["maru_overlap_load_with_compute", "maru_enable_layerwise_overlap"]
+    )
+    def test_overlap_requests_piecewise_cuda_graphs(self, key):
+        from maru_vllm.connector import MaruKVConnector
+
+        assert MaruKVConnector.requires_piecewise_for_cudagraph({key: True})
+        assert not MaruKVConnector.requires_piecewise_for_cudagraph({key: False})
+
     @pytest.mark.parametrize("timing", [True, False])
     @pytest.mark.parametrize("preempted", [False, True], ids=["new", "resumed"])
     def test_scheduler_traces_a_deferred_load(

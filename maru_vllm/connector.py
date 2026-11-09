@@ -2058,6 +2058,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             kv_caches, getattr(compilation, "static_forward_context", None)
         )
 
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        # The layer waits must run on every replay, between graph pieces.
+        return bool(_get_knob(extra_config, "maru_overlap_load_with_compute"))
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self._worker is not None
         metadata = self._get_connector_metadata()
@@ -3160,6 +3165,14 @@ class MaruSchedulerConnector:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
+        # A reset can preempt and re-admit the same request in this step.
+        # Allocation has already installed its new load state; the trailing
+        # stale-id cleanup must only remove the previous attempt's state.
+        live_load_ids = (
+            self._pending_deferred_loads.keys() | self._requests_need_load.keys()
+        )
+        rescheduled_ids = scheduler_output.num_scheduled_tokens.keys()
+        live_ids = live_load_ids | rescheduled_ids
         if self._timing:
             self._trace_schedule_step(scheduler_output)
         meta = MaruConnectorMetadata(
@@ -3356,7 +3369,7 @@ class MaruSchedulerConnector:
         # unbounded memory growth during long-running deployments.
         stale_ids = scheduler_output.finished_req_ids
         if scheduler_output.preempted_req_ids:
-            stale_ids = stale_ids | scheduler_output.preempted_req_ids
+            stale_ids = stale_ids | (scheduler_output.preempted_req_ids - live_ids)
         for rid in stale_ids:
             self._load_starts.pop(rid, None)
             self._load_ranges.pop(rid, None)
@@ -3376,7 +3389,7 @@ class MaruSchedulerConnector:
             self._maru_hits.pop(rid, None)
         for rid in scheduler_output.finished_req_ids:
             self._requests_need_store.pop(rid, None)
-        for rid in scheduler_output.preempted_req_ids or ():
+        for rid in (scheduler_output.preempted_req_ids or set()) - rescheduled_ids:
             entry = self._requests_need_store.get(rid)
             if entry is not None:
                 # Its blocks are freed; it stores on when it resumes.
@@ -3423,7 +3436,9 @@ class MaruSchedulerConnector:
         self._trace_step += 1
         self._trace_loads.difference_update(
             scheduler_output.finished_req_ids,
-            scheduler_output.preempted_req_ids or (),
+            (scheduler_output.preempted_req_ids or set())
+            - self._pending_deferred_loads.keys()
+            - self._requests_need_load.keys(),
         )
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         cached_req_ids = getattr(cached, "req_ids", None) or ()
