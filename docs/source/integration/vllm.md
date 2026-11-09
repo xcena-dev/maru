@@ -437,6 +437,13 @@ the `*_mono` fields of `GPU-LOAD-QOS` and `STEP-GPU` lag the GPU by up to
 that period. The thread, the timing events and these lines exist only while
 `maru_log_timing` is on.
 
+The lines a worker writes (`GPU-LOAD-QOS`, `STEP-GPU` and the worker's
+`REQ-TRACE` events) end with `rank`, the worker's tensor-parallel rank, `0`
+at TP=1. Above TP=1 every rank loads its own slice of each request and runs
+its own forward, so each rank writes these lines for the same request:
+`bytes` is the size of that rank's slice, and `wstep` counts that rank's
+forwards.
+
 #### Renamed parameters
 
 These three knobs were renamed to name the axis a deployer chooses. The

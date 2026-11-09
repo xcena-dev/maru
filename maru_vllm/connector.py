@@ -303,11 +303,16 @@ class _TracePoller:
     last layer has landed, a forward as ``STEP-GPU`` once it has finished.
     Only ``maru_log_timing`` creates one, and its thread starts with the
     first record.
+
+    Every line ends with ``rank``, the worker's tensor-parallel rank: above
+    TP=1 each rank loads its own slice of a request and runs its own forward,
+    so the lines of different ranks otherwise share a request id or step.
     """
 
     _PERIOD_S = 0.001
 
-    def __init__(self) -> None:
+    def __init__(self, rank: int = 0) -> None:
+        self._rank = rank
         self._lock = threading.Lock()
         self._loads: list[dict[str, Any]] = []
         self._steps: list[dict[str, Any]] = []
@@ -405,7 +410,8 @@ class _TracePoller:
                 lines.append(
                     f"GPU-LOAD-QOS bytes={load['bytes']} dur_ms={dur:.3f} "
                     f"GBps={gbps:.3f} req={load['req']} gate_layer={load['gate_layer']} "
-                    f"hold_ms={hold:.3f} gate_mono={gate_mono:.3f} end_mono={now:.3f}"
+                    f"hold_ms={hold:.3f} gate_mono={gate_mono:.3f} end_mono={now:.3f} "
+                    f"rank={self._rank}"
                 )
             self._loads = loads
             steps: list[dict[str, Any]] = []
@@ -424,7 +430,7 @@ class _TracePoller:
                 lines.append(
                     f"STEP-GPU wstep={step['wstep']} mono={step['mono']:.3f} "
                     f"fwd_ms={fwd:.3f} layer_wait_ms={wait:.3f} "
-                    f"waits={len(step['waits'])} end_mono={now:.3f}"
+                    f"waits={len(step['waits'])} end_mono={now:.3f} rank={self._rank}"
                 )
             self._steps = steps
         for line in lines:
@@ -1972,6 +1978,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 num_blocks=(
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
+                tp_rank=tp_rank,
             )
 
     @property
@@ -3443,6 +3450,7 @@ class MaruWorkerConnector:
     # without MLA.
     _kv_shard: KVShard = WHOLE_MODEL
     _state_shard: KVShard = WHOLE_MODEL
+    _tp_rank = 0
     _use_mla = False
     _kv_planes = 2
 
@@ -3459,6 +3467,7 @@ class MaruWorkerConnector:
         state_shard: KVShard = WHOLE_MODEL,
         use_mla: bool = False,
         num_blocks: int | None = None,
+        tp_rank: int = 0,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -3495,6 +3504,9 @@ class MaruWorkerConnector:
         # writer only loads it.
         self._kv_shard = kv_shard
         self._state_shard = state_shard
+        # This worker's tensor-parallel rank (0 at TP=1). The worker-side
+        # trace lines end with it: every rank loads its own slice of a request.
+        self._tp_rank = tp_rank
         # An MLA model's paged KV is one latent per token, which a chunkwise
         # slab holds as one plane where K and V take two. Taken from the
         # model config: a parked load can run before the first forward, with
@@ -3714,7 +3726,7 @@ class MaruWorkerConnector:
         # completion, the start event and byte count of each load whose
         # copies are queued but not yet handed to the poller, and the forward
         # traced in this step.
-        self._trace_poller = _TracePoller() if self._timing else None
+        self._trace_poller = _TracePoller(tp_rank) if self._timing else None
         self._trace_copy_starts: dict[str, tuple[torch.cuda.Event, int]] = {}
         self._trace_wstep = 0
         self._trace_fwd: dict[str, Any] | None = None
@@ -4705,7 +4717,7 @@ class MaruWorkerConnector:
             self._deferred_load_job, req_meta, layers, device
         )
         if self._timing:
-            _trace_req("retrieve_submit", req_meta.req_id)
+            self._trace_worker_req("retrieve_submit", req_meta.req_id)
         return True
 
     def _deferred_load_job(
@@ -4726,7 +4738,7 @@ class MaruWorkerConnector:
         recomputes instead of consuming unloaded KV.
         """
         if self._timing:
-            _trace_req("job_start", req_meta.req_id)
+            self._trace_worker_req("job_start", req_meta.req_id)
         try:
             handler = self._handler
             if self._remote_cxl_mode:
@@ -4785,7 +4797,7 @@ class MaruWorkerConnector:
                     f"deferred retrieve batch {len(keys)} keys = "
                     f"{rpc_ms:.2f} ms (req {req_meta.req_id})"
                 )
-                _trace_req(
+                self._trace_worker_req(
                     "maru_rpc", req_meta.req_id, keys=len(keys), rpc_ms=f"{rpc_ms:.3f}"
                 )
             if len(infos) != len(keys):
@@ -4912,7 +4924,7 @@ class MaruWorkerConnector:
                 _t_admit = time.monotonic()
                 self._wait_for_load_admission(req_meta.req_id)
                 if self._timing:
-                    _trace_req(
+                    self._trace_worker_req(
                         "admit",
                         req_meta.req_id,
                         wait_ms=f"{(time.monotonic() - _t_admit) * 1000:.3f}",
@@ -4982,7 +4994,9 @@ class MaruWorkerConnector:
                     slot_gpu,
                 ]
             if trace_start is not None and self._trace_poller is not None:
-                _trace_req("enqueue", req_meta.req_id, layers=num_layers, bytes=nbytes)
+                self._trace_worker_req(
+                    "enqueue", req_meta.req_id, layers=num_layers, bytes=nbytes
+                )
                 self._trace_poller.add_load(
                     req_meta.req_id, trace_start, event, event, nbytes, num_layers
                 )
@@ -5075,6 +5089,14 @@ class MaruWorkerConnector:
         count = min(self._release_after, len(ordered))
         return events[ordered[count - 1]]
 
+    def _trace_worker_req(self, event: str, req_id: str, **fields: Any) -> None:
+        """``_trace_req`` with this worker's TP rank appended as ``rank``.
+
+        Above TP=1 every rank loads its own slice of a request, so each writes
+        the worker-side events of the same request id.
+        """
+        _trace_req(event, req_id, **fields, rank=self._tp_rank)
+
     def _trace_queued_load(
         self,
         req_id: str,
@@ -5102,7 +5124,7 @@ class MaruWorkerConnector:
             (i + 1 for i, name in enumerate(ordered) if events[name] is gate),
             len(ordered),
         )
-        _trace_req("enqueue", req_id, layers=len(ordered), bytes=nbytes)
+        self._trace_worker_req("enqueue", req_id, layers=len(ordered), bytes=nbytes)
         self._trace_poller.add_load(
             req_id, start, gate, events[ordered[-1]], nbytes, gate_layer
         )
@@ -6033,7 +6055,7 @@ class MaruWorkerConnector:
                     self._deferred_refs.pop(req_id, None)
         if self._timing:
             for req_id in done:
-                _trace_req("recv_reported", req_id, batch=len(done))
+                self._trace_worker_req("recv_reported", req_id, batch=len(done))
         return done or None
 
     def get_finished_saving(self, finished_req_ids: set[str]) -> set[str] | None:
