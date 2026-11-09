@@ -298,8 +298,10 @@ class _TracePoller:
     """Stamp the GPU completion of traced loads and forwards with host time.
 
     A CUDA event gives only the time between two events, so the host time of
-    a GPU point is the moment a poll first sees its event complete; a poll
-    runs every millisecond. A load is reported as ``GPU-LOAD-QOS`` once its
+    a GPU point is the moment a poll first sees its event complete; polls
+    wait a millisecond between passes. Scheduling and registration can add
+    delay, so that interval does not bound timestamp error.
+    A load is reported as ``GPU-LOAD-QOS`` once its
     last layer has landed, a forward as ``STEP-GPU`` once it has finished.
     Only ``maru_log_timing`` creates one, and its thread starts with the
     first record.
@@ -317,6 +319,7 @@ class _TracePoller:
         self._loads: list[dict[str, Any]] = []
         self._steps: list[dict[str, Any]] = []
         self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
     def add_load(
         self,
@@ -338,6 +341,8 @@ class _TracePoller:
             gate_layer: Layers copied when ``gate`` completes.
         """
         with self._lock:
+            if self._stop_event.is_set():
+                return
             self._loads.append(
                 {
                     "req": req_id,
@@ -364,6 +369,8 @@ class _TracePoller:
             waits: ``(before, after)`` timing events around each layer wait.
         """
         with self._lock:
+            if self._stop_event.is_set():
+                return
             self._steps.append(
                 {
                     "wstep": wstep,
@@ -383,24 +390,42 @@ class _TracePoller:
             self._thread.start()
 
     def _run(self) -> None:
-        while True:
+        while not self._stop_event.is_set():
             self.poll()
-            time.sleep(self._PERIOD_S)
+            self._stop_event.wait(self._PERIOD_S)
+
+    def shutdown(self) -> None:
+        """Stop polling and flush completed records after the worker drains CUDA.
+
+        Incomplete records are discarded without synchronizing the device.
+        No new records are accepted after shutdown.
+        """
+        with self._lock:
+            self._stop_event.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join()
+        self.poll()
+        with self._lock:
+            self._loads.clear()
+            self._steps.clear()
 
     def poll(self) -> None:
         """Emit a line for every tracked load or forward whose last event completed."""
-        now = _mono_ms()
         lines: list[str] = []
         with self._lock:
             loads: list[dict[str, Any]] = []
             for load in self._loads:
                 try:
                     if load["gate_mono"] is None and load["gate"].query():
-                        load["gate_mono"] = now
+                        load["gate_mono"] = _mono_ms()
                     if not load["end"].query():
                         loads.append(load)
                         continue
-                    gate_mono = now if load["gate_mono"] is None else load["gate_mono"]
+                    end_mono = _mono_ms()
+                    gate_mono = (
+                        end_mono if load["gate_mono"] is None else load["gate_mono"]
+                    )
                     dur = load["start"].elapsed_time(load["end"])
                     hold = load["start"].elapsed_time(load["gate"])
                 except Exception as e:
@@ -410,7 +435,7 @@ class _TracePoller:
                 lines.append(
                     f"GPU-LOAD-QOS bytes={load['bytes']} dur_ms={dur:.3f} "
                     f"GBps={gbps:.3f} req={load['req']} gate_layer={load['gate_layer']} "
-                    f"hold_ms={hold:.3f} gate_mono={gate_mono:.3f} end_mono={now:.3f} "
+                    f"hold_ms={hold:.3f} gate_mono={gate_mono:.3f} end_mono={end_mono:.3f} "
                     f"rank={self._rank}"
                 )
             self._loads = loads
@@ -420,6 +445,7 @@ class _TracePoller:
                     if not step["end"].query():
                         steps.append(step)
                         continue
+                    end_mono = _mono_ms()
                     fwd = step["start"].elapsed_time(step["end"])
                     wait = sum(
                         before.elapsed_time(after) for before, after in step["waits"]
@@ -430,7 +456,7 @@ class _TracePoller:
                 lines.append(
                     f"STEP-GPU wstep={step['wstep']} mono={step['mono']:.3f} "
                     f"fwd_ms={fwd:.3f} layer_wait_ms={wait:.3f} "
-                    f"waits={len(step['waits'])} end_mono={now:.3f} rank={self._rank}"
+                    f"waits={len(step['waits'])} end_mono={end_mono:.3f} rank={self._rank}"
                 )
             self._steps = steps
         for line in lines:
@@ -3391,24 +3417,32 @@ class MaruSchedulerConnector:
     def _trace_schedule_step(self, scheduler_output: SchedulerOutput) -> None:
         """Emit ``prefill_sched`` for loaded requests in this step, then STEP-TRACE.
 
-        ``loading`` counts the loads still waiting for their prefill step,
-        which for an asynchronous load is its time in WAITING_FOR_REMOTE_KVS.
+        ``loading`` counts loads still waiting for their next scheduled
+        forward, including those received but not yet scheduled.
         """
         self._trace_step += 1
-        for new_req in scheduler_output.scheduled_new_reqs:
-            if new_req.req_id in self._trace_loads:
-                self._trace_loads.discard(new_req.req_id)
+        self._trace_loads.difference_update(
+            scheduler_output.finished_req_ids,
+            scheduler_output.preempted_req_ids or (),
+        )
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        cached_req_ids = getattr(cached, "req_ids", None) or ()
+        scheduled_req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        # The original model runner sends preempted requests through the
+        # cached list when they resume, including after a deferred reload.
+        scheduled_req_ids.extend(cached_req_ids)
+        for req_id in scheduled_req_ids:
+            if req_id in self._trace_loads:
+                self._trace_loads.discard(req_id)
                 _trace_req(
                     "prefill_sched",
-                    new_req.req_id,
+                    req_id,
                     step=self._trace_step,
-                    tokens=scheduler_output.num_scheduled_tokens.get(new_req.req_id, 0),
+                    tokens=scheduler_output.num_scheduled_tokens.get(req_id, 0),
                 )
-        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        num_cached = len(getattr(cached, "req_ids", None) or ())
         _emit_trace(
             f"STEP-TRACE step={self._trace_step} {_clock_fields()} "
-            f"new={len(scheduler_output.scheduled_new_reqs)} cached={num_cached} "
+            f"new={len(scheduler_output.scheduled_new_reqs)} cached={len(cached_req_ids)} "
             f"tokens={scheduler_output.total_num_scheduled_tokens} "
             f"loading={len(self._trace_loads)}"
         )
@@ -4713,11 +4747,11 @@ class MaruWorkerConnector:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
             if self._remote_cxl_mode:
                 self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
+        if self._timing:
+            self._trace_worker_req("retrieve_submit", req_meta.req_id)
         self._deferred_executor.submit(
             self._deferred_load_job, req_meta, layers, device
         )
-        if self._timing:
-            self._trace_worker_req("retrieve_submit", req_meta.req_id)
         return True
 
     def _deferred_load_job(
@@ -4986,13 +5020,6 @@ class MaruWorkerConnector:
                         )
                 event = torch.cuda.Event(enable_timing=self._timing)
                 event.record(stream)
-            with self._deferred_lock:
-                self._deferred_events[req_meta.req_id] = event
-                self._deferred_refs[req_meta.req_id] = [
-                    infos,
-                    slot_mapping,
-                    slot_gpu,
-                ]
             if trace_start is not None and self._trace_poller is not None:
                 self._trace_worker_req(
                     "enqueue", req_meta.req_id, layers=num_layers, bytes=nbytes
@@ -5000,6 +5027,15 @@ class MaruWorkerConnector:
                 self._trace_poller.add_load(
                     req_meta.req_id, trace_start, event, event, nbytes, num_layers
                 )
+            # Publish completion only after enqueue is traced: the engine
+            # can immediately observe a completed copy on another thread.
+            with self._deferred_lock:
+                self._deferred_events[req_meta.req_id] = event
+                self._deferred_refs[req_meta.req_id] = [
+                    infos,
+                    slot_mapping,
+                    slot_gpu,
+                ]
             logger.info(
                 "Maru: deferred-load scheduled %d layers x %d chunks "
                 "(%d tokens) for req %s (packed, off-thread)",
@@ -8076,6 +8112,10 @@ class MaruWorkerConnector:
                 logger.error("Error synchronizing Maru layerwise stream: %s", e)
         self._layerwise_streams = []
         self._layerwise_stream_device = None
+        if self._trace_poller is not None:
+            self._trace_poller.shutdown()
+        self._trace_copy_starts.clear()
+        self._trace_fwd = None
         self._layer_load_events.clear()
         self._active_load_refs.clear()
         with self._deferred_lock:

@@ -3,9 +3,12 @@
 """Unit tests for maru_vllm.connector utilities.
 
 Tests pure functions and layout helpers without requiring CXL hardware,
-a running MaruServer, or GPU. All tensors are CPU-only.
+a running MaruServer. Most tests use CPU tensors; CUDA tests run when a GPU
+is available.
 """
 
+import contextlib
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -3052,8 +3055,9 @@ class TestAsyncDeferredPackedLoad:
         assert worker._deferred_layerwise_loads == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-    def test_offthread_load_completes_via_event(self):
-        worker = self._make_worker()
+    @pytest.mark.parametrize("timing", [False, True])
+    def test_offthread_load_completes_via_event(self, timing, capsys):
+        worker = make_worker(4, self.CHUNK, {"maru_log_timing": timing})
         # 4-dim layer keeps _packed_load_kernel_ctx unusable (dim != 5), so
         # the job takes the per-layer inject fallback that plain host
         # bytearrays support.
@@ -3077,6 +3081,18 @@ class TestAsyncDeferredPackedLoad:
         assert worker.take_failed_load_blocks() == set()
         torch.cuda.synchronize()
         assert kv.abs().sum() > 0  # KV was actually injected
+        worker.shutdown()
+        lines = capsys.readouterr().err.splitlines()
+        loads = [
+            _trace_fields(line) for line in lines if line.startswith("GPU-LOAD-QOS")
+        ]
+        if timing:
+            assert len(loads) == 1
+            assert loads[0]["req"] == "r1"
+            assert int(loads[0]["bytes"]) == 8 * slab_bytes
+            assert float(loads[0]["dur_ms"]) >= 0
+        else:
+            assert not loads
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_offthread_load_retains_pinned_slot_source_until_event(self):
@@ -3928,7 +3944,8 @@ class TestLayerwiseFormatOverlap:
         torch.testing.assert_close(kv1, sources[1].view_as(kv1))
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-    def test_offthread_overlap_end_to_end_on_cuda(self):
+    @pytest.mark.parametrize("timing", [False, True])
+    def test_offthread_overlap_end_to_end_on_cuda(self, timing, capsys):
         """Loader thread queues per-layer copies from layerwise objects, the
         gate unparks the request, and the resumed forward waits per layer."""
         import time as _time
@@ -3936,7 +3953,9 @@ class TestLayerwiseFormatOverlap:
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = make_worker(
-            block_size=4, kv_chunk_tokens=4, extra_config=dict(self.CONFIG)
+            block_size=4,
+            kv_chunk_tokens=4,
+            extra_config={**self.CONFIG, "maru_log_timing": timing},
         )
         kv0 = torch.zeros(2, 2, 4, 1, device="cuda")
         kv1 = torch.zeros_like(kv0)
@@ -3987,9 +4006,27 @@ class TestLayerwiseFormatOverlap:
         assert set(worker._layer_load_events) == set(worker._kv_caches)
         for name in worker._kv_caches:
             worker.wait_for_layer_load(name)
+        worker.trace_forward_end()
         torch.cuda.synchronize()
         torch.testing.assert_close(kv0.cpu(), sources[0].permute(1, 0, 2, 3))
         torch.testing.assert_close(kv1.cpu(), sources[1].permute(1, 0, 2, 3))
+        worker.shutdown()
+        lines = capsys.readouterr().err.splitlines()
+        loads = [
+            _trace_fields(line) for line in lines if line.startswith("GPU-LOAD-QOS")
+        ]
+        steps = [_trace_fields(line) for line in lines if line.startswith("STEP-GPU")]
+        if timing:
+            assert len(loads) == len(steps) == 1
+            assert int(loads[0]["bytes"]) == sum(
+                src.numel() * src.element_size() for src in sources
+            )
+            assert int(loads[0]["gate_layer"]) == 1
+            assert int(steps[0]["waits"]) == 2
+            assert float(steps[0]["layer_wait_ms"]) >= 0
+            assert not worker._trace_poller._thread.is_alive()
+        else:
+            assert not loads and not steps
 
 
 class _FakeAdmissionEvent:
@@ -5765,6 +5802,84 @@ def _trace_fields(line: str) -> dict[str, str]:
 class TestRequestTrace:
     """maru_log_timing also writes request-timeline lines to stderr."""
 
+    @pytest.mark.parametrize("timing", [True, False])
+    def test_submission_is_traced_before_the_loader_can_start(
+        self, monkeypatch, capsys, timing
+    ):
+        worker = make_worker(4, 8, {"maru_log_timing": timing})
+        worker._kv_caches = {"l0": SimpleNamespace(device=torch.device("cuda:0"))}
+        worker._num_layers = 1
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        class ImmediateExecutor:
+            def submit(self, job, *args):
+                # A real executor may start the job before submit returns.
+                job(*args)
+
+        worker._deferred_executor = ImmediateExecutor()
+
+        def job(req_meta, layers, device):
+            if timing:
+                worker._trace_worker_req("job_start", req_meta.req_id)
+
+        monkeypatch.setattr(worker, "_deferred_load_job", job)
+        req_meta = deferred_req_meta(
+            token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
+        )
+        assert worker._try_submit_deferred_load(req_meta)
+        events = [line.split()[1] for line in capsys.readouterr().err.splitlines()]
+        assert events == (["retrieve_submit", "job_start"] if timing else [])
+
+    def test_enqueue_is_traced_before_a_completed_load_can_be_reported(
+        self, monkeypatch, capsys
+    ):
+        worker = make_worker(4, 8, {"maru_log_timing": True})
+        worker._num_layers = 1
+        worker._handler = MagicMock()
+        worker._handler.batch_retrieve.return_value = [
+            SimpleNamespace(view=memoryview(bytearray(2 * 8 * 4)))
+        ]
+        device = torch.device("cpu")
+        worker._deferred_stream = MagicMock()
+        worker._deferred_stream_device = device
+        monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+        monkeypatch.setattr(
+            torch.cuda, "stream", lambda stream: contextlib.nullcontext()
+        )
+        monkeypatch.setattr(torch.cuda, "Event", MagicMock)
+        monkeypatch.setattr(
+            worker, "_pin_slot_mapping_for_async_h2d", lambda slots: slots
+        )
+        monkeypatch.setattr(worker, "_packed_store_kernel_ctx", lambda attn: None)
+        monkeypatch.setattr(worker, "_inject_slab_layers", lambda *args, **kwargs: None)
+        monkeypatch.setattr(worker._trace_poller, "add_load", lambda *args: None)
+        ready_at_enqueue = []
+        trace = worker._trace_worker_req
+
+        def trace_req(event, req_id, **fields):
+            if event == "enqueue":
+                # Simulate the engine polling as soon as the copy completes.
+                ready_at_enqueue.append(worker.get_finished_loading())
+            trace(event, req_id, **fields)
+
+        monkeypatch.setattr(worker, "_trace_worker_req", trace_req)
+        req_meta = deferred_req_meta(
+            token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
+        )
+        worker._deferred_load_job(
+            req_meta, [("l0", torch.zeros(2, 2, 4, 1), 0)], device
+        )
+
+        assert ready_at_enqueue == [None]
+        assert worker.take_failed_load_blocks() == set()
+        assert worker.get_finished_loading() == {"r1"}
+        events = [
+            line.split()[1]
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("REQ-TRACE")
+        ]
+        assert events == ["job_start", "maru_rpc", "enqueue", "recv_reported"]
+
     def test_poller_reports_loads_and_forwards_once_complete(self, monkeypatch, capsys):
         from maru_vllm.connector import _TracePoller
 
@@ -5801,8 +5916,97 @@ class TestRequestTrace:
         assert (step["wstep"], step["waits"]) == ("7", "2")
         assert (float(step["fwd_ms"]), float(step["layer_wait_ms"])) == (9.0, 6.0)
 
+    def test_poller_stamps_completion_after_query(self, monkeypatch, capsys):
+        from maru_vllm import connector
+
+        monkeypatch.setattr(connector._TracePoller, "_ensure_thread", lambda self: None)
+        clock = [0.0]
+        monkeypatch.setattr(connector, "_mono_ms", lambda: clock[0])
+        poller = connector._TracePoller()
+        start, gate, end = (_FakeTimingEvent(t) for t in (0.0, 1.0, 2.0))
+        fwd_start, fwd_end = _FakeTimingEvent(0.0), _FakeTimingEvent(3.0)
+
+        def completed_at(at):
+            def query():
+                clock[0] = at
+                return True
+
+            return query
+
+        monkeypatch.setattr(gate, "query", completed_at(10.0))
+        monkeypatch.setattr(end, "query", completed_at(20.0))
+        monkeypatch.setattr(fwd_end, "query", completed_at(30.0))
+        poller.add_load("r1", start, gate, end, 1024, 1)
+        poller.add_step(1, 0.0, fwd_start, fwd_end, [])
+        poller.poll()
+
+        load, step = map(_trace_fields, capsys.readouterr().err.splitlines())
+        assert float(load["gate_mono"]) == 10.0
+        assert float(load["end_mono"]) == 20.0
+        assert float(step["end_mono"]) == 30.0
+
+    def test_shutdown_stops_the_poller_and_flushes_completed_records(
+        self, monkeypatch, capsys
+    ):
+        from maru_vllm.connector import _TracePoller
+
+        # A stop must wake the thread even while it waits between polls.
+        monkeypatch.setattr(_TracePoller, "_PERIOD_S", 60)
+        poller = _TracePoller()
+        start, gate, end = (_FakeTimingEvent(t) for t in (0.0, 1.0, 2.0))
+        queried = threading.Event()
+
+        def query_gate():
+            queried.set()
+            return gate.done
+
+        monkeypatch.setattr(gate, "query", query_gate)
+        poller.add_load("r1", start, gate, end, 1024, 1)
+        try:
+            assert queried.wait(5)
+            gate.done = end.done = True
+        finally:
+            poller.shutdown()
+
+        assert not poller._thread.is_alive()
+        assert capsys.readouterr().err.count("GPU-LOAD-QOS") == 1
+        poller.add_load("after-shutdown", start, gate, end, 1024, 1)
+        poller.add_step(2, 0.0, start, end, [])
+        poller.shutdown()
+        assert capsys.readouterr().err == ""
+
+    def test_worker_shutdown_drains_copies_before_closing_the_poller(self):
+        worker = make_worker(4, 8, {"maru_log_timing": True})
+        order = []
+        stream = MagicMock()
+        stream.synchronize.side_effect = lambda: order.append("drain")
+        worker._layerwise_streams = [stream]
+        worker._trace_poller.shutdown = lambda: order.append("trace")
+        worker._handler = MagicMock()
+        worker._handler.close.side_effect = lambda: order.append("unmap")
+
+        worker.shutdown()
+
+        assert order == ["drain", "trace", "unmap"]
+
+    def test_scheduler_drops_finished_and_preempted_loads(self, capsys):
+        scheduler = make_scheduler(4, 8, {"maru_log_timing": True})
+        scheduler._trace_loads.update(("finished", "preempted", "waiting"))
+        output = fake_scheduler_output()
+        output.total_num_scheduled_tokens = 0
+        output.finished_req_ids = {"finished"}
+        output.preempted_req_ids = {"preempted"}
+
+        scheduler.build_connector_meta(output)
+
+        assert scheduler._trace_loads == {"waiting"}
+        assert _trace_fields(capsys.readouterr().err.strip())["loading"] == "1"
+
     @pytest.mark.parametrize("timing", [True, False])
-    def test_scheduler_traces_a_deferred_load(self, tmp_path, capsys, timing):
+    @pytest.mark.parametrize("preempted", [False, True], ids=["new", "resumed"])
+    def test_scheduler_traces_a_deferred_load(
+        self, tmp_path, capsys, timing, preempted
+    ):
         from vllm.sampling_params import SamplingParams
         from vllm.v1.outputs import KVConnectorOutput
         from vllm.v1.request import Request, RequestStatus
@@ -5813,14 +6017,22 @@ class TestRequestTrace:
             "maru_log_timing": timing,
         }
         engine = make_vllm_scheduler(tmp_path, 4, 8, config)
+        engine.use_v2_model_runner = False
         engine.connector._scheduler._count_matched_chunks = lambda token_ids: 1
         request = Request("r1", list(range(8)), SamplingParams(max_tokens=1), None)
+        if preempted:
+            request.status = RequestStatus.PREEMPTED
+            request.num_preemptions = 1
         engine.add_request(request)
         engine.schedule()
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
         output = engine.schedule()
-        assert [r.req_id for r in output.scheduled_new_reqs] == ["r1"]
+        if preempted:
+            assert output.scheduled_cached_reqs.resumed_req_ids == {"r1"}
+            assert output.scheduled_new_reqs == []
+        else:
+            assert [r.req_id for r in output.scheduled_new_reqs] == ["r1"]
 
         lines = [
             x

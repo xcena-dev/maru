@@ -424,25 +424,36 @@ can place every line, including the `*_mono` fields, on wall-clock time.
 | Line | Written by | When |
 |------|------------|------|
 | `REQ-TRACE lookup_hit` / `lookup_miss` / `lookup_defer` | scheduler | the cache lookup answers; `lookup_defer` once when a hit waits for the parked-block budget |
-| `STEP-TRACE` | scheduler | every scheduler step: scheduled new and running requests, tokens, loads still parked |
-| `REQ-TRACE prefill_sched` | scheduler | a loaded request reaches its prefill step |
+| `STEP-TRACE` | scheduler | every scheduler step: scheduled new and running requests, tokens, loads awaiting their next scheduled forward (including received loads) |
+| `REQ-TRACE prefill_sched` | scheduler | a loaded request reaches its next forward, including a preempted request resuming after a reload |
 | `REQ-TRACE retrieve_submit` / `job_start` / `maru_rpc` / `admit` / `enqueue` | worker | an asynchronous load is handed to the loader thread, starts, resolves its keys, passes the admission window (without overlap), and has queued its copies |
 | `GPU-LOAD-QOS` | worker | the last layer of a load landed on the GPU: bytes, copy time, the layer that released the request (`gate_layer`) and the copy time up to it (`hold_ms`) |
 | `REQ-TRACE recv_reported` | worker | the load is reported complete to vLLM |
 | `STEP-GPU` | worker | a forward that waited for layers still in flight finished: forward time and the time spent in those waits |
 
-GPU times come from CUDA timing events. A background thread checks them
-every millisecond and stamps the host time it first sees each complete, so
-the `*_mono` fields of `GPU-LOAD-QOS` and `STEP-GPU` lag the GPU by up to
-that period. The thread, the timing events and these lines exist only while
-`maru_log_timing` is on.
+GPU copy records cover successful off-thread CUDA loads for one KV cache
+group with the `cxl`, `cpu` and `mixed` storage backends. Inline loads and
+synchronous fallbacks have no GPU copy record. `remote_cxl` loads emit
+`retrieve_submit`, `job_start` and `recv_reported` only; models with several
+KV cache groups emit `recv_reported` only on the worker. A request that is
+preempted and reloads can emit another sequence under the same request id.
+
+GPU durations come from CUDA timing events. A background thread waits one
+millisecond between polls and stamps the host time after it first observes
+each event complete. The completion fields (`gate_mono` and `end_mono`)
+are host observations rather than exact GPU timestamps: thread scheduling,
+event registration and polling can add delay beyond one millisecond.
+`STEP-GPU mono` is the host time the traced forward began. The thread,
+timing events and these lines exist only while `maru_log_timing` is on.
+Worker shutdown drains its copy streams, stops the thread and flushes
+completed records.
 
 The lines a worker writes (`GPU-LOAD-QOS`, `STEP-GPU` and the worker's
 `REQ-TRACE` events) end with `rank`, the worker's tensor-parallel rank, `0`
 at TP=1. Above TP=1 every rank loads its own slice of each request and runs
 its own forward, so each rank writes these lines for the same request:
 `bytes` is the size of that rank's slice, and `wstep` counts that rank's
-forwards.
+traced forwards.
 
 #### Renamed parameters
 
