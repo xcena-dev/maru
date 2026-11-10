@@ -72,8 +72,8 @@ private:
     int maxClients_;
     std::atomic<int> activeClients_{0};
 
-    // Idempotency cache for alloc/free requests.
-    // Maps request_id -> (response MsgType, serialized payload).
+    // Idempotency cache for alloc, free and node requests.
+    // Maps cacheKey() -> (response MsgType, serialized payload).
     // Prevents duplicate side effects when client retries after response loss.
     using SteadyClock = std::chrono::steady_clock;
     struct CachedResponse {
@@ -81,7 +81,8 @@ private:
         std::vector<uint8_t> payload;
         SteadyClock::time_point insertedAt;
     };
-    // Cache key: "client_id:request_id" to prevent cross-client collisions
+    // Cache key: the request type, request id and client_id, and for a node
+    // request its node ID and epoch (see cacheKey).
     std::mutex cacheMutex_;
     std::unordered_map<std::string, CachedResponse> idempotencyCache_;
     std::deque<std::string> cacheOrder_;  // insertion order for eviction
@@ -89,9 +90,10 @@ private:
     static constexpr int kCacheTtlSec = 60;
     void cacheEvictExpired();
 
-    static std::string cacheKey(const std::string &clientId, uint64_t requestId);
-    bool cacheLookup(const std::string &clientId, uint64_t requestId, int clientFd);
-    void cacheInsert(const std::string &clientId, uint64_t requestId,
+    static std::string cacheKey(MsgType type, const std::string &clientId, uint64_t requestId,
+                                const std::string &nodeId = "", const std::string &epoch = "");
+    bool cacheLookup(const std::string &key, uint64_t requestId, int clientFd);
+    void cacheInsert(const std::string &key, uint64_t requestId,
                      uint16_t type, const void *payload, size_t payloadSize);
 };
 

@@ -111,6 +111,8 @@ class MaruRmCtlTest(unittest.TestCase):
             (["wipe", "dax2.0", "--confirm"], "wipe dax2.0 --confirm\n"),
             (["drop-holds", "node-a"], "drop-holds node-a\n"),
             (["drop-holds", "node-a", "--confirm"], "drop-holds node-a --confirm\n"),
+            (["release-node", "gb1"], "release-node gb1\n"),
+            (["release-node", "gb1", "--confirm"], "release-node gb1 --confirm\n"),
         ]
         for argv, expected in cases:
             code, request, out, _ = self.run_ctl("OK\nbody\n", *argv)
@@ -182,6 +184,10 @@ class MaruRmCtlTest(unittest.TestCase):
             ["drop-holds", ""],
             ["drop-holds", "n" * 129],
             ["drop-holds", "node-a", "--force"],
+            ["release-node"],
+            ["release-node", "node a"],
+            ["release-node", "n" * 122],
+            ["release-node", "gb1", "--force"],
         ):
             with (
                 self.assertRaises(SystemExit),

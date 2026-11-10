@@ -15,6 +15,7 @@ struct ServerConfig {
     int numWorkers = 32;
     int gracePeriodSec = 30;
     int maxClients = 256;
+    int nodeLeaseSec = 900;
 };
 
 ServerConfig parseArgs(int argc, char **argv);

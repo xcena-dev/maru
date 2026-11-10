@@ -52,6 +52,10 @@ extern "C" int __wrap_main(int, char **) {
         "maru_rm_process_test_daemon", "--state-dir", fakeRoot + "/state",
         "--host", "127.0.0.1", "--port", "1", "--num-workers", "2",
         "--grace-period", "300"};
+    if (const char *lease = std::getenv("MARU_TEST_NODE_LEASE")) {
+        args.push_back("--node-lease");
+        args.push_back(lease);
+    }
     std::vector<char *> argv;
     for (auto &arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);

@@ -100,6 +100,8 @@ void printUsage(const char *prog) {
         "  -w, --num-workers N       Worker thread pool size (default: 32)\n"
         "  -g, --grace-period SEC    Disconnect grace period in seconds (default: 30)\n"
         "  -m, --max-clients N       Maximum concurrent client connections (default: 256)\n"
+        "  -N, --node-lease SEC      Free a node's regions after SEC seconds without a claim,\n"
+        "                            alloc or renew from its current run (default: 900)\n"
         "  -h, --help                Show this help\n",
         prog);
 }
@@ -114,12 +116,13 @@ ServerConfig parseArgs(int argc, char **argv) {
         {"num-workers",  required_argument, nullptr, 'w'},
         {"grace-period", required_argument, nullptr, 'g'},
         {"max-clients",  required_argument, nullptr, 'm'},
+        {"node-lease",   required_argument, nullptr, 'N'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:N:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': {
@@ -158,6 +161,15 @@ ServerConfig parseArgs(int argc, char **argv) {
                 std::exit(1);
             }
             cfg.maxClients = m;
+            break;
+        }
+        case 'N': {
+            int n = std::atoi(optarg);
+            if (n <= 0) {
+                std::fprintf(stderr, "invalid node-lease: %s (must be >= 1)\n", optarg);
+                std::exit(1);
+            }
+            cfg.nodeLeaseSec = n;
             break;
         }
         case 'h': printUsage(argv[0]); std::exit(0);

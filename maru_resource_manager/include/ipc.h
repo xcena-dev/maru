@@ -31,6 +31,18 @@ enum class MsgType : uint16_t {
   UNHOLD_RESP = 14,
   RESET_HOLDS_REQ = 15,
   RESET_HOLDS_RESP = 16,
+  // Node ownership (a StorageService owns regions as its node). An RM
+  // without it answers -ENOSYS.
+  NODE_CLAIM_REQ = 17,
+  NODE_CLAIM_RESP = 18,
+  NODE_ALLOC_REQ = 19,
+  NODE_ALLOC_RESP = 20,
+  NODE_FREE_REQ = 21,
+  NODE_FREE_RESP = 22,
+  NODE_RENEW_REQ = 23,
+  NODE_RENEW_RESP = 24,
+  NODE_RELEASE_REQ = 25,
+  NODE_RELEASE_RESP = 26,
   ERROR_RESP = 255
 };
 
@@ -107,6 +119,62 @@ struct ResetHoldsResp {
   uint32_t dropped;
 };
 
+// Node requests. Each is followed by the node ID bytes, the epoch bytes (and
+// for NODE_ALLOC the DAX path bytes), then client_id and request id as
+// GET_ACCESS_REQ appends them. client_id is required: its host part binds the
+// node, and with the request id it keys the retransmit cache.
+
+/// NODE_CLAIM, NODE_RENEW and NODE_RELEASE.
+struct NodeReq {
+  uint32_t nodeIdLen;
+  uint32_t epochLen;
+};
+
+/// Answered with an AllocResp payload (NODE_ALLOC_RESP), as ALLOC.
+struct NodeAllocReq {
+  uint64_t size;
+  uint32_t nodeIdLen;
+  uint32_t epochLen;
+  uint32_t daxPathLen;
+  uint32_t reserved;
+};
+
+/// Answered with a FreeResp payload (NODE_FREE_RESP).
+struct NodeFreeReq {
+  Handle handle;
+  uint32_t nodeIdLen;
+  uint32_t epochLen;
+};
+
+/// Followed by the RM ID bytes, then numRegions NodeRegionInfo entries.
+struct NodeClaimResp {
+  int32_t status;
+  uint32_t rmIdLen;
+  uint64_t leaseMs;
+  uint32_t numRegions;
+  uint32_t reserved;
+};
+
+/// Followed by the device path bytes, then the device UUID bytes. Both are
+/// empty while the region's pool is not served.
+struct NodeRegionInfo {
+  Handle handle;
+  uint64_t requestedSize;
+  uint32_t pathLen;
+  uint32_t uuidLen;
+};
+
+struct NodeRenewResp {
+  int32_t status;
+  uint32_t reserved;
+  uint64_t leaseMs;
+};
+
+struct NodeReleaseResp {
+  int32_t status;
+  uint32_t released;
+};
+
 struct StatsRespHeader {
   uint32_t numPools;
 };
@@ -133,6 +201,13 @@ static_assert(sizeof(UnholdReq) == 40, "UnholdReq must be 40 bytes (fixed part)"
 static_assert(sizeof(UnholdResp) == 4, "UnholdResp must be 4 bytes");
 static_assert(sizeof(ResetHoldsReq) == 8, "ResetHoldsReq must be 8 bytes (fixed part)");
 static_assert(sizeof(ResetHoldsResp) == 8, "ResetHoldsResp must be 8 bytes");
+static_assert(sizeof(NodeReq) == 8, "NodeReq must be 8 bytes (fixed part)");
+static_assert(sizeof(NodeAllocReq) == 24, "NodeAllocReq must be 24 bytes (fixed part)");
+static_assert(sizeof(NodeFreeReq) == 40, "NodeFreeReq must be 40 bytes (fixed part)");
+static_assert(sizeof(NodeClaimResp) == 24, "NodeClaimResp must be 24 bytes (fixed part)");
+static_assert(sizeof(NodeRegionInfo) == 48, "NodeRegionInfo must be 48 bytes (fixed part)");
+static_assert(sizeof(NodeRenewResp) == 16, "NodeRenewResp must be 16 bytes");
+static_assert(sizeof(NodeReleaseResp) == 8, "NodeReleaseResp must be 8 bytes");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
 static_assert(sizeof(ErrorResp) == 8, "ErrorResp must be 8 bytes");
 

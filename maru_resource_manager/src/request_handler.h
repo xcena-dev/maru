@@ -66,6 +66,16 @@ public:
     UnholdResp handleUnhold(const UnholdReq &req, const std::string &holder,
                             const std::string &instance);
     ResetHoldsResp handleResetHolds(const std::string &holder, const std::string &instance);
+    /// Node ownership. clientId is the connection's "hostname:pid"; only its
+    /// host part is used (NODE_CLAIM binds the node to it).
+    std::vector<uint8_t> handleNodeClaim(const std::string &nodeId, const std::string &epoch,
+                                         const std::string &clientId);
+    AllocResult handleNodeAlloc(const NodeAllocReq &req, const std::string &nodeId,
+                                const std::string &epoch, const std::string &daxPath);
+    FreeResp handleNodeFree(const NodeFreeReq &req, const std::string &nodeId,
+                            const std::string &epoch);
+    NodeRenewResp handleNodeRenew(const std::string &nodeId, const std::string &epoch);
+    NodeReleaseResp handleNodeRelease(const std::string &nodeId, const std::string &epoch);
 
 private:
     PoolManager &pm_;

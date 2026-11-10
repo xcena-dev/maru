@@ -31,7 +31,7 @@ static constexpr size_t kMaxClientIdLen = 128;
 struct Allocation
 {
     Handle handle;
-    char clientId[kMaxClientIdLen];  // "hostname:pid" — null-terminated
+    char clientId[kMaxClientIdLen];  // "hostname:pid" or "@node:<id>" — null-terminated
     uint64_t requestedSize;
     uint64_t allocLength;
     uint64_t nonce;       // Server-side nonce for auth token computation
@@ -79,11 +79,15 @@ class PoolManager
     using SteadyClockPoint = SteadyClock::time_point;
 
 public:
-    explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30);
+    explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30,
+                         int nodeLeaseSec = 900);
     ~PoolManager();
 
     const std::string &stateDir() const { return stateDir_; }
     int gracePeriodSec() const { return gracePeriodSec_; }
+    uint64_t nodeLeaseMs() const;
+    /// The RM's own ID (rm_domain), set by loadPools.
+    std::string rmId() const;
     uint32_t allocationCount() const;
 
     int loadPools();
@@ -112,6 +116,27 @@ public:
     /// Drop every hold of the holder made by another instance (that process
     /// and its registrations are gone).
     int resetHolds(const std::string &holder, const std::string &instance, uint32_t &dropped);
+
+    /// Node ownership (pool_nodes.cpp): a StorageService owns regions as its
+    /// node, never reaped by the PID check or the grace period. Each request
+    /// whose epoch is not the node's current run is -ESTALE.
+    struct NodeRegion
+    {
+        Handle handle;
+        uint64_t requestedSize;
+        std::string devPath;     // "" while the region's pool is not served
+        std::string deviceUuid;
+    };
+    /// Make `epoch` the node's current run and list its regions. -EEXIST if
+    /// the node is bound to another host.
+    int nodeClaim(const std::string &nodeId, const std::string &epoch, const std::string &host,
+                  std::vector<NodeRegion> &regions);
+    int nodeAlloc(const std::string &nodeId, const std::string &epoch, uint64_t size,
+                  const std::string &daxPath, NodeRegion &out);
+    int nodeFree(const Handle &handle, const std::string &nodeId, const std::string &epoch);
+    int nodeRenew(const std::string &nodeId, const std::string &epoch);
+    /// Free every region of the node and forget it.
+    int nodeRelease(const std::string &nodeId, const std::string &epoch, uint32_t &released);
 
     void getStats(std::vector<PoolState> &out);
     /// Lightweight check: returns true if at least one pool is loaded.
@@ -160,6 +185,10 @@ public:
     /// List a holder's holds; once the operator confirmed that node's agent
     /// is gone for good, drop them.
     int adminDropHolds(const std::string &holder, bool confirmed, std::string &out);
+    /// List a node's regions; once the operator confirmed that its
+    /// StorageService and workers no longer map them, free them and forget
+    /// the node.
+    int adminReleaseNode(const std::string &nodeId, bool confirmed, std::string &out);
     /// Zero all of an excluded device, header included. Runs without holding
     /// the pool lock; stops between chunks once `cancel` is set.
     int adminWipe(const std::string &device, bool confirmed, std::string &out,
@@ -223,6 +252,11 @@ private:
     PoolState *findPoolById(uint32_t poolId);
     PoolState *findPoolByPath(const std::string &devPath);
     PoolState *findPoolForRegion(uint64_t regionId);
+    // The path a client opens for the region (FS_DAX: its file).
+    std::string regionPath(const PoolState &pool, uint64_t regionId) const;
+    int allocLocked(uint64_t size, const std::string &owner, Handle &out, std::string &devPath,
+                    std::string &deviceUuid, const std::string &daxPath,
+                    uint64_t &requestedSizeOut);
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
@@ -255,6 +289,29 @@ private:
     // Free draining regions without holds; save the file if anything changed
     // or `save` is set. Returns the number freed.
     size_t finishDrainingLocked(bool save);
+
+    // Node ownership (pool_nodes.cpp). Caller MUST hold mu_.
+    struct NodeState
+    {
+        std::string epoch;  // "" until claimed (regions found without a record)
+        std::string host;   // "" until claimed: any host may claim
+        SteadyClockPoint seen;
+        bool fenced{false}; // Lease expired: its regions are being freed
+    };
+    // The node whose current run is `epoch`, or null.
+    NodeState *currentNode(const std::string &nodeId, const std::string &epoch);
+    bool nodeOnThisHost(const char *clientId) const;
+    // Save the node table (claimed nodes only); syncRc as saveHoldsLocked.
+    int saveNodesLocked(int &syncRc);
+    // 0 once the table last renamed into place is durable, else sync again.
+    int confirmNodesDurableLocked();
+    // Read the table, then give in-memory records to node-owned regions
+    // without one so that their lease frees them.
+    int loadNodesLocked();
+    // Free (held: drain) every region of the node, then forget it. Stops at
+    // the first failure, leaving the node in place for a retry.
+    int releaseNodeLocked(const std::string &nodeId, uint32_t &released);
+    void expireNodeLeasesLocked();
 
     mutable std::mutex mu_;
     std::string stateDir_;
@@ -310,6 +367,10 @@ private:
     std::set<uint64_t> draining_;
     // -errno while the last holds file renamed into place is not synced.
     int holdsSyncRc_{0};
+    std::map<std::string, NodeState> nodes_;
+    int nodesSyncRc_{0};
+    std::chrono::milliseconds nodeLease_;
+    std::string rmId_;
     uint64_t nextRegionId_{1};
 
     // client_id → {pid, start_time} for reaper PID-reuse detection (in-memory only)

@@ -37,6 +37,11 @@ own user only):
                                holds; --confirm drops those holds once that
                                node's agent is gone for good, releasing the
                                regions freed while held
+  release-node NODE [--confirm]
+                               list the regions node NODE's StorageService
+                               owns; --confirm frees them (held ones drain)
+                               and forgets the node, once its StorageService
+                               is stopped and no worker maps them
 
 Exit codes: 0 = done, 1 = refused by the RM, 2 = RM unreachable,
 3 = sent but no reply in time (the command may still complete; run status),
@@ -56,6 +61,8 @@ DEFAULT_STATE_DIR = "/var/lib/maru-resourced"
 DEVICE = re.compile(r"(?:/dev/)?(dax(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
 # A remote agent's node ID, as the RM records it: printable ASCII, no spaces.
 HOLDER = re.compile(r"[\x21-\x7e]{1,128}")
+# A StorageService's node ID: the same, up to 121 characters.
+NODE = re.compile(r"[\x21-\x7e]{1,121}")
 
 
 def device_name(text: str) -> str:
@@ -69,6 +76,14 @@ def holder_name(text: str) -> str:
     if not HOLDER.fullmatch(text):
         raise argparse.ArgumentTypeError(
             f"expected 1-128 printable characters without spaces: {text!r}"
+        )
+    return text
+
+
+def node_name(text: str) -> str:
+    if not NODE.fullmatch(text):
+        raise argparse.ArgumentTypeError(
+            f"expected 1-121 printable characters without spaces: {text!r}"
         )
     return text
 
@@ -100,6 +115,8 @@ def request_line(args: argparse.Namespace) -> str:
         return f"wipe {args.device}" + (" --confirm" if args.confirm else "")
     if args.command == "drop-holds":
         return f"drop-holds {args.holder}" + (" --confirm" if args.confirm else "")
+    if args.command == "release-node":
+        return f"release-node {args.node}" + (" --confirm" if args.confirm else "")
     return (
         f"release {args.region}"
         + (" --confirm" if args.confirm else "")
@@ -213,6 +230,18 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="the agent of that node is gone for good, and its NIC registrations "
         "with it",
+    )
+    node = commands.add_parser(
+        "release-node",
+        help="list or free the regions a node's StorageService owns",
+        description="List the regions node NODE owns. --confirm frees them "
+        "(held ones drain) and forgets the node.",
+    )
+    node.add_argument("node", type=node_name)
+    node.add_argument(
+        "--confirm",
+        action="store_true",
+        help="the node's StorageService is stopped and no worker maps its regions",
     )
     return root
 

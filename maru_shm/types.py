@@ -182,3 +182,26 @@ class MaruPoolInfo:
             f"<MaruPoolInfo dax_path={self.dax_path!r} dax_type={self.dax_type.name} "
             f"total_size={self.total_size} free_size={self.free_size}>"
         )
+
+
+@dataclass
+class NodeRegion:
+    """A region a node owns (NODE_CLAIM, NODE_ALLOC).
+
+    ``dax_path`` and ``device_uuid`` are as the resource manager reports them;
+    both are empty while the region's pool is not served.
+    """
+
+    handle: MaruHandle
+    requested_size: int = 0
+    dax_path: str = ""
+    device_uuid: str = ""
+
+
+@dataclass
+class NodeClaim:
+    """Result of NODE_CLAIM: the RM's own ID, the lease, the node's regions."""
+
+    rm_domain: str
+    lease_s: float
+    regions: list[NodeRegion]

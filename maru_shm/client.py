@@ -27,13 +27,19 @@ from .ipc import (
     HoldReq,
     MsgHeader,
     MsgType,
+    NodeAllocReq,
+    NodeClaimResp,
+    NodeFreeReq,
+    NodeReleaseResp,
+    NodeRenewResp,
+    NodeReq,
     ResetHoldsReq,
     ResetHoldsResp,
     StatsReq,
     StatsResp,
     UnholdReq,
 )
-from .types import MaruHandle, MaruPoolInfo
+from .types import MaruHandle, MaruPoolInfo, NodeClaim, NodeRegion
 from .uds_helpers import read_full, write_full
 
 logger = logging.getLogger(__name__)
@@ -51,6 +57,29 @@ class HoldsUnsupportedError(HoldRefusedError):
     """The resource manager predates region holds (restart it with this Maru)."""
 
 
+class StaleNodeEpochError(RuntimeError):
+    """The epoch is not the node's current run (-ESTALE).
+
+    Another run claimed the node, its lease ran out, or it was released: stop
+    using its regions. A NODE_RELEASE whose reply was lost also ends here.
+    """
+
+
+class NodeHostConflictError(RuntimeError):
+    """The node is bound to another host (-EEXIST); an operator releases it first."""
+
+
+class NodeOwnershipUnsupportedError(RuntimeError):
+    """The resource manager predates node ownership (restart it with this Maru)."""
+
+
+class RetryableNodeError(RuntimeError):
+    """The RM could not complete the request now (e.g. -EIO, -ENOSPC, -EAGAIN).
+
+    Send the same request again; a claim is not in effect until one succeeds.
+    """
+
+
 def _make_client_id() -> str:
     """Build a client_id string: 'hostname:pid'."""
     import platform
@@ -60,16 +89,19 @@ def _make_client_id() -> str:
 
 # Module-level request ID counter shared across all MaruShmClient instances.
 # Prevents idempotency cache collisions when multiple instances in the same
-# process have the same client_id (hostname:pid).
-_request_id_counter = 0
+# process have the same client_id (hostname:pid). Seeded at random, so that a
+# later process with the same hostname:pid (PID 1 in a container) does not
+# reuse an earlier one's IDs while the RM still caches their replies.
+_request_id_counter = int.from_bytes(os.urandom(8), "little")
 _request_id_lock = threading.Lock()
+_MAX_REQUEST_ID = (1 << 64) - 1
 
 
 def _next_request_id() -> int:
-    """Generate a monotonically increasing request ID (process-global)."""
+    """Next request ID: a nonzero u64, increasing, wrapping (process-global)."""
     global _request_id_counter
     with _request_id_lock:
-        _request_id_counter += 1
+        _request_id_counter = _request_id_counter % _MAX_REQUEST_ID + 1
         return _request_id_counter
 
 
@@ -252,16 +284,7 @@ class MaruShmClient:
             raise RuntimeError(f"Alloc failed with status {resp.status}")
 
         handle = resp.handle
-        if resp.dax_path:
-            # The allocation stands either way: an unknown device fails at
-            # mmap time instead, where nothing is lost.
-            try:
-                path = self._resolve_device_path(resp.dax_path, resp.device_uuid)
-            except RuntimeError as exc:
-                logger.warning("alloc(region_id=%d): %s", handle.region_id, exc)
-            else:
-                with self._lock:
-                    self._path_cache[handle.region_id] = path
+        self._cache_path(handle, resp.dax_path, resp.device_uuid, "alloc")
 
         logger.debug(
             "alloc(size=%d, dax_path=%s) -> region_id=%d path=%s",
@@ -406,6 +429,150 @@ class MaruShmClient:
             if err.status == -errno.EACCES:
                 raise HoldRefusedError(f"{context} ({err.status}): {err.message}")
             raise RuntimeError(f"{context} ({err.status}): {err.message}")
+
+    def _cache_path(
+        self, handle: MaruHandle, rm_path: str, device_uuid: str, context: str
+    ) -> None:
+        """Remember the local device path of a region the RM just reported."""
+        if not rm_path:
+            return
+        # The region stands either way: an unknown device fails at mmap time
+        # instead, where nothing is lost.
+        try:
+            path = self._resolve_device_path(rm_path, device_uuid)
+        except RuntimeError as exc:
+            logger.warning("%s(region_id=%d): %s", context, handle.region_id, exc)
+        else:
+            with self._lock:
+                self._path_cache[handle.region_id] = path
+
+    # =========================================================================
+    # Node ownership: a StorageService owns regions as its node. Each run has
+    # its own node_epoch; requests of any other run fail with
+    # StaleNodeEpochError.
+    # =========================================================================
+
+    def node_claim(self, node_id: str, node_epoch: str) -> NodeClaim:
+        """Make ``node_epoch`` the node's current run and take over its regions.
+
+        Re-sending the same epoch returns the same result.
+
+        Raises:
+            NodeHostConflictError: if the node is bound to another host.
+            NodeOwnershipUnsupportedError: if the RM predates node ownership.
+            RetryableNodeError: if the RM could not complete it now (e.g. the
+                claim is not durable yet); send it again.
+        """
+        req = NodeReq(
+            node_id=node_id,
+            node_epoch=node_epoch,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_CLAIM_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node claim failed")
+        resp = NodeClaimResp.unpack(payload)
+        self._check_node_status(resp.status, "Node claim failed", retryable=True)
+        regions = resp.regions or []
+        for r in regions:
+            self._cache_path(r.handle, r.dax_path, r.device_uuid, "node_claim")
+        return NodeClaim(
+            rm_domain=resp.rm_domain, lease_s=resp.lease_ms / 1000, regions=regions
+        )
+
+    def node_alloc(
+        self, node_id: str, node_epoch: str, size: int, dax_path: str = ""
+    ) -> NodeRegion:
+        """Allocate a region owned by the node, as :meth:`alloc` does."""
+        req = NodeAllocReq(
+            size=size,
+            node_id=node_id,
+            node_epoch=node_epoch,
+            dax_path=dax_path,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_ALLOC_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node alloc failed")
+        resp = AllocResp.unpack(payload)
+        self._check_node_status(resp.status, "Node alloc failed")
+        if resp.handle is None:
+            raise RuntimeError("Node alloc failed: the RM sent no handle")
+        self._cache_path(resp.handle, resp.dax_path, resp.device_uuid, "node_alloc")
+        return NodeRegion(
+            handle=resp.handle,
+            requested_size=resp.requested_size,
+            dax_path=resp.dax_path,
+            device_uuid=resp.device_uuid,
+        )
+
+    def node_free(self, node_id: str, node_epoch: str, handle: MaruHandle) -> None:
+        """Free a region of the node."""
+        req = NodeFreeReq(
+            handle=handle,
+            node_id=node_id,
+            node_epoch=node_epoch,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_FREE_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node free failed")
+        self._check_node_status(FreeResp.unpack(payload).status, "Node free failed")
+        with self._lock:
+            self._close_region_locked(handle.region_id)
+
+    def node_renew(self, node_id: str, node_epoch: str) -> float:
+        """Start the node's lease again. Returns the lease in seconds."""
+        req = NodeReq(
+            node_id=node_id,
+            node_epoch=node_epoch,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_RENEW_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node renew failed")
+        resp = NodeRenewResp.unpack(payload)
+        self._check_node_status(resp.status, "Node renew failed", retryable=True)
+        return resp.lease_ms / 1000
+
+    def node_release(self, node_id: str, node_epoch: str) -> int:
+        """Free every region of the node and forget it (``leave``).
+
+        Returns:
+            How many regions were freed (held ones drain).
+        """
+        req = NodeReq(
+            node_id=node_id,
+            node_epoch=node_epoch,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_RELEASE_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node release failed")
+        resp = NodeReleaseResp.unpack(payload)
+        self._check_node_status(resp.status, "Node release failed", retryable=True)
+        return resp.released
+
+    def _check_node_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
+        if hdr.msg_type == MsgType.ERROR_RESP:
+            err = ErrorResp.unpack(payload)
+            if err.status == -errno.ENOSYS:
+                raise NodeOwnershipUnsupportedError(
+                    "the resource manager does not support node ownership; "
+                    "restart it with this Maru version"
+                )
+            raise RuntimeError(f"{context} ({err.status}): {err.message}")
+
+    @staticmethod
+    def _check_node_status(status: int, context: str, retryable: bool = False) -> None:
+        if status == -errno.ESTALE:
+            raise StaleNodeEpochError(f"{context}: not the node's current run")
+        if status == -errno.EEXIST:
+            raise NodeHostConflictError(f"{context}: node is bound to another host")
+        if retryable and status not in (0, -errno.ENOSYS, -errno.EINVAL, -errno.EACCES):
+            raise RetryableNodeError(f"{context} with status {status}")
+        if status != 0:
+            raise RuntimeError(f"{context} with status {status}")
 
     def _resolve_device_path(self, rm_path: str, device_uuid: str) -> str:
         """Map the RM's device (path, UUID) to this host's device path.

@@ -16,6 +16,7 @@
 #include "device_exclusion.h"
 #include "log.h"
 #include "metadata.h"
+#include "node_owners.h"
 #include "pool_validation.h"
 #include "server_config.h"
 #include "util.h"
@@ -755,13 +756,15 @@ int PoolManager::finishBootMarker()
 {
     if (previousBoot_)
     {
-        // Every local owner in the ledger ran in an earlier boot. A region a
-        // remote agent holds drains instead: the agent outlived the reboot.
+        // Every local owner in the ledger ran in an earlier boot, and so did
+        // the runs of nodes bound to this host (their records stay, binding
+        // the node to this host). A region a remote agent holds drains
+        // instead: the agent outlived the reboot.
         std::vector<uint64_t> frees;
         size_t drains = 0;
         for (const auto &[id, a] : allocations_)
         {
-            if (!isLocalClientId(a.clientId)) continue;
+            if (!isLocalClientId(a.clientId) && !nodeOnThisHost(a.clientId)) continue;
             if (!isHeld(id) && !isDraining(id)) frees.push_back(id);
             else if (draining_.insert(id).second) ++drains;
         }
@@ -786,7 +789,8 @@ int PoolManager::finishBootMarker()
             }
             for (uint64_t id : frees) allocations_.erase(id);
             logf(LogLevel::Warn,
-                 "released %zu allocation(s) of local processes from an earlier boot",
+                 "released %zu allocation(s) of local processes and nodes from an earlier "
+                 "boot",
                  frees.size());
         }
         previousBoot_ = false;
@@ -867,6 +871,30 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
     size_t staleHolds = 0;
     rc = loadHoldsLocked(staleHolds);
     if (rc != 0) return rc;
+    rc = loadNodesLocked();
+    if (rc != 0) return rc;
+    rc = loadRmId(stateDir_, rmId_);
+    if (rc != 0) return rc;
+    // Nodes name their CXL pools after the RM ID: a new one would make their
+    // regions look like another RM's. Refuse, as initSecret does.
+    bool nodeState = !nodes_.empty();
+    for (const auto &[id, a] : allocations_) nodeState |= !nodeIdOfOwner(a.clientId).empty();
+    if (rmId_.empty() && nodeState)
+    {
+        logf(LogLevel::Error,
+             "%s/rm_id is missing, but nodes own regions here: restore it from a backup",
+             stateDir_.c_str());
+        return -ENOKEY;
+    }
+    // An earlier RM may have renamed these into place without syncing them:
+    // no claim succeeds until they are durable.
+    if (nodeState || !rmId_.empty())
+    {
+        nodesSyncRc_ = syncDirectory(stateDir_);
+        if (nodesSyncRc_ != 0)
+            logf(LogLevel::Warn, "the node table and RM ID in %s are not durable yet: %s",
+                 stateDir_.c_str(), std::strerror(-nodesSyncRc_));
+    }
 
     loadBootMarker();
     std::vector<DeviceInfo> devices;
@@ -886,6 +914,17 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
     // Initialize the persisted secret before recomputing restored tokens.
     rc = initSecret(stateDir_, !allocations_.empty());
     if (rc != 0) return rc;
+    if (rmId_.empty())
+    {
+        rc = createRmId(stateDir_, rmId_);
+        if (rc != 0)
+        {
+            logf(LogLevel::Error, "cannot create %s/rm_id: %s", stateDir_.c_str(),
+                 std::strerror(-rc));
+            return rc;
+        }
+        logf(LogLevel::Info, "RM ID %s created", rmId_.c_str());
+    }
     for (auto &[regionId, alloc] : allocations_)
         alloc.handle.authToken =
             computeAuthToken(alloc.handle, alloc.nonce, std::string(alloc.clientId));
