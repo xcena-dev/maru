@@ -831,6 +831,8 @@ _ENV_SETTINGS = (
     "MARU_REMOTE_CXL_AGENT_UCX_DEVICE",
     "MARU_REMOTE_CXL_AGENT_LOCK_FILE",
     "MARU_REMOTE_CXL_AGENT_KEY_FILE",
+    "MARU_REMOTE_CXL_AGENT_REGION_EXTENSION",
+    "MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG",
 )
 
 
@@ -845,6 +847,8 @@ def test_the_command_line_defaults(monkeypatch):
         args.ucx_device,
         args.lock_file,
         args.key_file,
+        args.region_extension,
+        args.region_extension_config,
         args.allow_unchecked_transport,
     ) == (
         "127.0.0.1:9850",
@@ -853,6 +857,8 @@ def test_the_command_line_defaults(monkeypatch):
         "",
         None,
         "/etc/maru/remote-cxl-agent.key",
+        "",
+        "",
         False,
     )
 
@@ -861,7 +867,16 @@ def test_the_service_settings_come_from_the_environment(monkeypatch):
     # The system service passes its settings file as the environment.
     for name, value in zip(
         _ENV_SETTINGS,
-        ["mem1:9850", "", "9870", "mlx5_1:1", "/run/maru/x.lock", "/etc/k"],
+        [
+            "mem1:9850",
+            "",
+            "9870",
+            "mlx5_1:1",
+            "/run/maru/x.lock",
+            "/etc/k",
+            "ext",
+            "/etc/ext.toml",
+        ],
         strict=True,
     ):
         monkeypatch.setenv(name, value)
@@ -873,7 +888,18 @@ def test_the_service_settings_come_from_the_environment(monkeypatch):
         args.ucx_device,
         args.lock_file,
         args.key_file,
-    ) == ("mem1:9850", "", 9870, "mlx5_1:1", "/run/maru/x.lock", "/etc/k")
+        args.region_extension,
+        args.region_extension_config,
+    ) == (
+        "mem1:9850",
+        "",
+        9870,
+        "mlx5_1:1",
+        "/run/maru/x.lock",
+        "/etc/k",
+        "ext",
+        "/etc/ext.toml",
+    )
     # A command-line option still wins.
     assert cli.build_parser().parse_args(["--port", "9861"]).port == 9861
 
@@ -1027,3 +1053,70 @@ def test_a_worker_refuses_an_agent_without_a_boot_id():
             client.map(cxl.reserve("owner", 4096).to_dict())
     finally:
         mem.stop()
+
+
+def test_main_refuses_to_start_when_its_region_extension_cannot_load(
+    monkeypatch, tmp_path
+):
+    import maru_remote_cxl_agent.extension as extension
+
+    def refuse(name, epoch, config):
+        raise ValueError(f"no package registers region extension {name!r}")
+
+    monkeypatch.setattr(extension, "load_region_extension", refuse)
+    monkeypatch.setenv("UCX_TLS", "rc")
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    argv += ["--key-file", key_file(), "--host", "127.0.0.1"]
+    assert cli.main([*argv, "--region-extension", "device"]) == 1
+    # The node lock went with the failed start: another agent may take it.
+    lock_fd = cli.hold_node_lock(str(tmp_path / "lock"))
+    import os
+
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    "option", [["--max-hint-requests", "0"], ["--memory-generation-poll-s", "0"]]
+)
+def test_the_command_line_refuses_a_hint_limit_or_poll_of_zero(option):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(option)
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([option[0], "-1"])
+
+
+def test_main_closes_the_extension_when_the_service_cannot_start(monkeypatch, tmp_path):
+    import maru_remote.transport
+    import maru_remote_cxl_agent.extension
+    import maru_shm
+
+    class Extension:
+        closed = False
+
+        def close(self):
+            Extension.closed = True
+
+    class Closable:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the region extension cannot tell its generation")
+
+    monkeypatch.setenv("UCX_TLS", "rc")
+    monkeypatch.setattr(
+        maru_remote_cxl_agent.extension,
+        "load_region_extension",
+        lambda *args: Extension(),
+    )
+    monkeypatch.setattr(maru_remote.transport, "NixlTransport", Closable)
+    monkeypatch.setattr(maru_shm, "MaruShmClient", Closable)
+    monkeypatch.setattr(cli, "RegionMapService", refuse)
+    argv = ["--rm-address", "mem1:9850", "--lock-file", str(tmp_path / "lock")]
+    argv += ["--key-file", key_file(), "--host", "127.0.0.1"]
+    argv += ["--region-extension", "fake"]
+    assert cli.main(argv) == 1
+    assert Extension.closed
