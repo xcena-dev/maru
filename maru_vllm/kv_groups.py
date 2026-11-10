@@ -18,14 +18,17 @@ a Mamba group keeps only the state at the chunk's last block. An MLA group
 (DeepSeek-V4.1's compressed KV and indexer keys) keeps the chunk's blocks,
 copied block by block in the layout vLLM gives them. A group vLLM does not
 prefix-cache is not stored. A model with one group keeps the bare chunk key;
-with several, each object is keyed ``<chunk key>_c<chunk tokens>_g<group id>``
-(see :func:`group_object_key`).
+with several, each object is keyed
+``<chunk key>_c<chunk tokens>_g<group id>_l<layer names digest>`` (see
+:func:`group_object_key`).
 """
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -133,7 +136,7 @@ class KVGroup:
             chunk_key: The chunk's key, with this rank's slice suffix.
             chunk_tokens: Tokens per Maru chunk.
         """
-        key = group_object_key(chunk_key, self.group_id, chunk_tokens)
+        key = group_object_key(chunk_key, self.group_id, chunk_tokens, self.layer_names)
         return f"{key}_b{self.block_size}" if self.kind == GROUP_MLA else key
 
     def object_bytes(self, chunk_tokens: int) -> int:
@@ -278,7 +281,23 @@ def _group_label(group: KVGroup) -> str:
     return group.spec_name
 
 
-def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
+@functools.lru_cache(maxsize=256)
+def layer_names_digest(layer_names: tuple[str, ...]) -> str:
+    """Hex digest of a group's layer names, in vLLM's order.
+
+    vLLM numbers groups by position, and another configuration of the same
+    model can deal other layers into the group of the same id, in objects of
+    the same size: DSpark's draft layers make vLLM split DeepSeek-V4.1's
+    sliding windows into one more group. The order also fixes where each
+    layer's bytes lie in a block, since vLLM lays a group's layers out from
+    this list and their specs.
+    """
+    return hashlib.blake2b("\n".join(layer_names).encode(), digest_size=8).hexdigest()
+
+
+def group_object_key(
+    chunk_key: str, group_id: int, chunk_tokens: int, layer_names: Sequence[str]
+) -> str:
     """Key of the (chunk, group) object for a model with several groups.
 
     A chunk key hashes the tokens from the prompt's start to the chunk's
@@ -286,9 +305,11 @@ def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
     does. It varies between engines: with a Mamba group a chunk is one vLLM
     block, sized from the per-rank Mamba state and attention page, so
     Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token ones at TP=4,
-    where rank 0 holds the same KV head and names it alike.
+    where rank 0 holds the same KV head and names it alike. The key also
+    names the group's layers (:func:`layer_names_digest`).
     """
-    return f"{chunk_key}_c{chunk_tokens}_g{group_id}"
+    layers = layer_names_digest(tuple(layer_names))
+    return f"{chunk_key}_c{chunk_tokens}_g{group_id}_l{layers}"
 
 
 def window_chunks(group: KVGroup, end: int, chunk_tokens: int) -> range:

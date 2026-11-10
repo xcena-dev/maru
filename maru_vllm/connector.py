@@ -1253,9 +1253,9 @@ class _SlabTarget:
 
     A single-group model stores every layer under the chunk key. With
     several KV cache groups each attention group is its own target, keyed
-    ``<chunk key>_c<chunk tokens>_g<group id>`` and reading that group's
-    block ids. Either way the chunk key names the slice this rank holds
-    (``MaruWorkerConnector._slice_chunk_keys``).
+    ``<chunk key>_c<chunk tokens>_g<group id>_l<layer names digest>`` and
+    reading that group's block ids. Either way the chunk key names the slice
+    this rank holds (``MaruWorkerConnector._slice_chunk_keys``).
 
     Attributes:
         num_layers: Layers in the slab.

@@ -622,15 +622,18 @@ Chunk keys therefore name a slice by what it holds:
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
-| Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0` on rank 0 |
+| Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>_l<layers>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0_l<layers>` on rank 0 |
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
-appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by
+appends `_c<chunk_tokens>_g<group_id>_l<layers>`, followed for an MLA group by
 `_b<block_size>`, since its objects keep vLLM's block layout (see
-{ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full
-or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
-`kv_<hash>_h0-1_c544_g3` on rank 0.
+{ref}`vllm-deepseek-v41`). `<layers>` is a 16-digit hex hash of the group's
+layer names in vLLM's order: vLLM numbers groups by position, and another
+configuration of the same model can put other layers in the group of the same
+number, as DSpark speculative decoding does on DeepSeek-V4.1-Flash. It names
+the KV heads of each attention group, full or sliding window, as above:
+Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_c544_g3_l<layers>` on rank 0.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
 heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
@@ -726,7 +729,7 @@ backends still require TP=1.
 (vllm-hybrid-models)=
 ## Hybrid models
 
-vLLM puts layers that keep different kinds of KV cache into separate KV cache groups, for example sliding-window and full-attention layers, or Gated DeltaNet (Mamba-type) and full-attention layers. On vLLM 0.30+ the connector stores each group's part of a chunk as its own CXL object, keyed `<chunk_key>_c<chunk_tokens>_g<group_id>`, and reports a hit only for chunks that every group can resume from. A model with one group is stored as before.
+vLLM puts layers that keep different kinds of KV cache into separate KV cache groups, for example sliding-window and full-attention layers, or Gated DeltaNet (Mamba-type) and full-attention layers. On vLLM 0.30+ the connector stores each group's part of a chunk as its own CXL object, keyed `<chunk_key>_c<chunk_tokens>_g<group_id>_l<layers>` (see {ref}`vllm-tensor-parallelism` for `<layers>`), and reports a hit only for chunks that every group can resume from. A model with one group is stored as before.
 
 The key names the chunk length because a chunk key hashes the prompt only up to the chunk's end. With a Mamba-type group a chunk is one vLLM block, and vLLM sizes that block from the per-rank state and attention page, so engines with different TP sizes (or KV cache dtypes) can use different chunks: Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token chunks at TP=4. Their objects for the same prompt prefix then get different keys, and neither engine loads the other's.
 
