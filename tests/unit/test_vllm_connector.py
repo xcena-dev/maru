@@ -6007,6 +6007,10 @@ class TestRequestTrace:
                 "maru_log_timing": timing,
             },
         )
+        # Older schedulers do not report reset preemptions in the next output,
+        # so they cannot exercise this same-step cleanup regression.
+        if not hasattr(engine, "reset_preempted_req_ids"):
+            pytest.skip("vLLM scheduler does not report reset preemptions")
         scheduler = engine.connector._scheduler
         scheduler._count_matched_chunks = lambda ids: 1
         request = Request("r1", list(range(8)), SamplingParams(max_tokens=8), None)
