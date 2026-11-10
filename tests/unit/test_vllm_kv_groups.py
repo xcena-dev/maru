@@ -495,6 +495,49 @@ def test_connector_starts_with_dsv41_and_dspark():
     assert connector._scheduler._num_lookahead_tokens == 5
 
 
+def _dspark_scheduler(in_flight=2048):
+    """DeepSeek-V4.1 with DSpark as on the GPU: eight 32-token window groups,
+    the 64-token MLA group and the 8-token ring, 5 lookahead tokens, and a
+    model length of 4096."""
+    config = _connector_config(64)
+    config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=5
+    )
+    config.num_lookahead_tokens = 5
+    config.max_in_flight_tokens = in_flight
+    window = _window_mla(32)
+    connector = MaruKVConnector(
+        config,
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=64, side="scheduler", window=window, drafts=True, windows=8),
+    )
+    return connector._scheduler, window
+
+
+def _prompt(tokens):
+    return SimpleNamespace(
+        request_id="r", prompt_token_ids=list(range(tokens)), num_tokens=tokens
+    )
+
+
+def test_dspark_admission_counts_the_blocks_of_every_group():
+    """vLLM allocates every group's blocks from one pool, the groups Maru
+    skips included, so a parked request needs the blocks of all of them for
+    its prompt and lookahead: 1,005 tokens take 16 MLA blocks, 32 blocks in
+    each window group, and the ring's one block."""
+    sched, _ = _dspark_scheduler()
+    assert sched._resume_blocks(_prompt(1000)) == 16 + 8 * 32 + 1
+
+
+def test_dspark_admission_caps_the_window_groups_as_vllm_does():
+    """A window group holds at most vLLM's per-request admission cap, the
+    window plus the tokens in flight, however long the prompt."""
+    sched, window = _dspark_scheduler()
+    cap = window.max_admission_blocks_per_request(2048, 4096)
+    assert cap < -(-4005 // 32)
+    assert sched._resume_blocks(_prompt(4000)) == 63 + 8 * cap + 1
+
+
 @pytest.mark.parametrize(
     ("setting", "chunk"), [(None, 256), (96, 64), (32, 64), (320, 320)]
 )

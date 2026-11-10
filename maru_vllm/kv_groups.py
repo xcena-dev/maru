@@ -375,6 +375,33 @@ def hit_chunks(
     return 0, prefix
 
 
+@dataclass(frozen=True)
+class GroupAdmission:
+    """The blocks vLLM gives one request in one KV cache group.
+
+    vLLM allocates the blocks of every group, the groups Maru skips included,
+    from one block pool, so a parked load is admitted against their sum.
+
+    Attributes:
+        block_size: Tokens per block in the group.
+        cap: vLLM's per-request admission cap for a sliding-window group
+            (``max_admission_blocks_per_request``), None for no cap.
+        fixed: Blocks a request holds whatever its length, as a circular
+            buffer's one block; None otherwise.
+    """
+
+    block_size: int
+    cap: int | None = None
+    fixed: int | None = None
+
+    def blocks(self, tokens: int) -> int:
+        """Blocks a request of ``tokens`` tokens holds in this group."""
+        if self.fixed is not None:
+            return self.fixed
+        blocks = -(-tokens // self.block_size)
+        return blocks if self.cap is None else min(blocks, self.cap)
+
+
 def chunk_unit(groups: list[KVGroup], block_size: int) -> int:
     """Tokens a chunk is a multiple of, so it holds whole blocks of each group.
 
