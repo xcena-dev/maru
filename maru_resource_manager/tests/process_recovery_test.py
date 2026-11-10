@@ -79,7 +79,13 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.process.kill()
             self.process.wait(timeout=STOP_S)
 
-    def start(self, expected_failure=False, checkpoint_fault=None, node_lease=None):
+    def start(
+        self,
+        expected_failure=False,
+        checkpoint_fault=None,
+        node_lease=None,
+        hold_grace=None,
+    ):
         self.assertTrue(self.process is None or self.process.poll() is not None)
         self.starts += 1
         self.log = self.root / f"daemon-{self.starts}.log"
@@ -87,10 +93,13 @@ class ProcessRecoveryTest(unittest.TestCase):
         env = dict(os.environ, MARU_TEST_DAX_ROOT=str(self.root))
         env.pop("MARU_TEST_CHECKPOINT_FAILURE", None)
         env.pop("MARU_TEST_NODE_LEASE", None)
+        env.pop("MARU_TEST_HOLD_GRACE", None)
         if checkpoint_fault is not None:
             env["MARU_TEST_CHECKPOINT_FAILURE"] = checkpoint_fault
         if node_lease is not None:
             env["MARU_TEST_NODE_LEASE"] = str(node_lease)
+        if hold_grace is not None:
+            env["MARU_TEST_HOLD_GRACE"] = str(hold_grace)
         with self.log.open("wb") as log:
             self.process = subprocess.Popen(
                 [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -569,15 +578,26 @@ class ProcessRecoveryTest(unittest.TestCase):
         offset += rm_id_len
         regions = []
         for _ in range(count):
-            *handle, requested, path_len, uuid_len = struct.unpack_from(
-                "<QQQQQII", response, offset
+            *handle, requested, path_len, uuid_len, holder_count, _ = (
+                struct.unpack_from("<QQQQQIIII", response, offset)
             )
-            offset += 48
+            offset += 56
             path = response[offset : offset + path_len].decode()
             offset += path_len
             uuid_text = response[offset : offset + uuid_len].decode()
             offset += uuid_len
-            regions.append((tuple(handle), requested, path, uuid_text))
+            holders = []
+            for _ in range(holder_count):
+                *lengths, pid, _, start, ns = struct.unpack_from(
+                    "<IIIIIIQQ", response, offset
+                )
+                offset += 40
+                texts = []
+                for length in lengths:
+                    texts.append(response[offset : offset + length].decode())
+                    offset += length
+                holders.append((*texts, pid, start, ns))
+            regions.append((tuple(handle), requested, path, uuid_text, holders))
         self.assertEqual(offset, len(response))
         return status, rm_id, lease_ms, regions
 
@@ -689,6 +709,83 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(self.node_alloc(b"node-a", b"e2", 8), second)  # Retransmit.
         self.check_stats({"/dev/dax0.0": 2})
         self.assertEqual(self.node_status(23, b"node-a", b"e2", 7), 0)
+        self.stop()
+
+    @staticmethod
+    def pid_start(pid):
+        """Field 22 of /proc/<pid>/stat, as the RM reads it."""
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat[stat.rindex(")") + 2 :].split()[19])
+
+    def node_hold(
+        self, node, epoch, handle, holder, request_id, pid=2147483647, start=1
+    ):
+        """A worker on this host, in this boot and pid namespace; by default
+        one whose process is gone. Returns the status and the reply."""
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip().encode()
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        fixed = HANDLE.pack(*handle) + struct.pack(
+            "<IIIIIIQQ",
+            len(node),
+            len(epoch),
+            len(holder),
+            len(boot),
+            pid,
+            0,
+            start,
+            ns,
+        )
+        payload = fixed + node + epoch + holder + boot + self.client_id
+        response = self.request(27, payload + struct.pack("<Q", request_id))
+        return struct.unpack_from("<i", response)[0], response
+
+    def test_node_hold_over_tcp(self):
+        self.start(hold_grace=1)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        handle = self.node_alloc(b"node-a", b"e1", 2)
+        me = (os.getpid(), self.pid_start(os.getpid()))
+        status, reply = self.node_hold(b"node-a", b"e1", handle, b"w1", 3, *me)
+        self.assertEqual(status, 0)
+        path_len = struct.unpack_from("<I", reply, 4)[0]
+        self.assertEqual(reply[8 : 8 + path_len], b"/dev/dax0.0")
+        self.assertEqual(struct.unpack_from("<QQ", reply, 8 + path_len), handle[1:3])
+        # A retransmit is answered from the cache, never applied twice.
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.assertEqual(
+            self.node_hold(b"node-a", b"e1", handle, b"w1", 3, *me), (0, reply)
+        )
+        self.assertIn("holds=0 ", self.ctl("status")[1])
+
+        # A new run sees who maps the region; the earlier run holds no more.
+        self.assertEqual(self.node_hold(b"node-a", b"e1", handle, b"w1", 4, *me)[0], 0)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", handle, b"w2", 5)[0], 0)
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 6)
+        self.assertEqual(status, 0)
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        self.assertEqual(
+            sorted(regions[0][4]),
+            [
+                ("w1", "e1", socket.gethostname(), boot, *me, ns),
+                ("w2", "e1", socket.gethostname(), boot, 2147483647, 1, ns),
+            ],
+        )
+        status = self.node_hold(b"node-a", b"e1", handle, b"w3", 7)[0]
+        self.assertEqual(status, -errno.ESTALE)
+
+        # Freed while held: out of use until the reaper drops w2 (gone) and
+        # w1 unholds.
+        free = HANDLE.pack(*handle)
+        self.assertEqual(self.node_status(21, b"node-a", b"e2", 8, free), 0)
+        deadline = time.monotonic() + START_S
+        while "w2[" in self.ctl("allocations")[1]:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.2)
+        self.assertIn("hold of w2 dropped", self.log.read_text())
+        self.check_stats({"/dev/dax0.0": 1})
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.check_stats()
         self.stop()
 
     def test_node_lease_expires(self):

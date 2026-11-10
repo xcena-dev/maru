@@ -5,7 +5,8 @@ Commands talk to the running RM over <state-dir>/admin.sock (root or the RM's
 own user only):
 
   status                       pools, excluded devices, checkpoint state
-  allocations [daxN.M]         live allocations and whether their owner runs
+  allocations [daxN.M]         live allocations, whether their owner runs,
+                               and who holds them (a worker with its identity)
   exclude daxN.M               stop using a device for good (e.g. for ROOF);
                                refused while any allocation on it is live.
                                Hand the device over only once this exits 0:

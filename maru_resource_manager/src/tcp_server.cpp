@@ -711,15 +711,18 @@ bool TcpServer::handleOneRequest(int clientFd) {
         }
     } else if (type == MsgType::NODE_CLAIM_REQ || type == MsgType::NODE_ALLOC_REQ ||
                type == MsgType::NODE_FREE_REQ || type == MsgType::NODE_RENEW_REQ ||
-               type == MsgType::NODE_RELEASE_REQ) {
+               type == MsgType::NODE_RELEASE_REQ || type == MsgType::NODE_HOLD_REQ) {
         // Node ID and epoch follow the fixed part (NODE_ALLOC: then the DAX
-        // path), then client_id and request id. Every response is cached so
-        // that a retransmit is never applied twice.
+        // path; NODE_HOLD: the holder and boot ID), then client_id and
+        // request id. Every response is cached so that a retransmit is never
+        // applied twice.
         size_t fixedSize = sizeof(NodeReq);
         if (type == MsgType::NODE_ALLOC_REQ) {
             fixedSize = sizeof(NodeAllocReq);
         } else if (type == MsgType::NODE_FREE_REQ) {
             fixedSize = sizeof(NodeFreeReq);
+        } else if (type == MsgType::NODE_HOLD_REQ) {
+            fixedSize = sizeof(NodeHoldReq);
         }
         if (payload.size() < fixedSize) {
             sendError(clientFd, -EPROTO, "bad node req");
@@ -728,8 +731,13 @@ bool TcpServer::handleOneRequest(int clientFd) {
         NodeReq nodeReq{};
         NodeAllocReq allocReq{};
         NodeFreeReq freeReq{};
+        NodeHoldReq holdReq{};
         uint32_t nodeIdLen = 0, epochLen = 0;
-        if (type == MsgType::NODE_ALLOC_REQ) {
+        if (type == MsgType::NODE_HOLD_REQ) {
+            std::memcpy(&holdReq, payload.data(), sizeof(holdReq));
+            nodeIdLen = holdReq.nodeIdLen;
+            epochLen = holdReq.epochLen;
+        } else if (type == MsgType::NODE_ALLOC_REQ) {
             std::memcpy(&allocReq, payload.data(), sizeof(allocReq));
             nodeIdLen = allocReq.nodeIdLen;
             epochLen = allocReq.epochLen;
@@ -746,6 +754,13 @@ bool TcpServer::handleOneRequest(int clientFd) {
         size_t namesEnd = 0;
         if (!parseHoldNames(payload, fixedSize, nodeIdLen, epochLen, nodeId, epoch, namesEnd)) {
             sendError(clientFd, -EPROTO, "bad node req: node ID or epoch truncated");
+            return false;
+        }
+        std::string holder, bootId;
+        if (type == MsgType::NODE_HOLD_REQ &&
+            !parseHoldNames(payload, namesEnd, holdReq.holderLen, holdReq.bootIdLen, holder,
+                            bootId, namesEnd)) {
+            sendError(clientFd, -EPROTO, "bad node hold req: holder or boot ID truncated");
             return false;
         }
         std::string daxPath;
@@ -786,6 +801,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
         } else if (type == MsgType::NODE_FREE_REQ) {
             auto r = handler_.handleNodeFree(freeReq, nodeId, epoch);
             resp.assign(reinterpret_cast<uint8_t *>(&r), reinterpret_cast<uint8_t *>(&r + 1));
+        } else if (type == MsgType::NODE_HOLD_REQ) {
+            auto r = handler_.handleNodeHold(holdReq, nodeId, epoch, holder, bootId, cid);
+            resp = serializeGetAccessResp(r.status, r.devicePath, r.offset, r.length,
+                                          r.deviceUuid);
         } else if (type == MsgType::NODE_RENEW_REQ) {
             auto r = handler_.handleNodeRenew(nodeId, epoch);
             resp.assign(reinterpret_cast<uint8_t *>(&r), reinterpret_cast<uint8_t *>(&r + 1));

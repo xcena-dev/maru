@@ -56,6 +56,10 @@ extern "C" int __wrap_main(int, char **) {
         args.push_back("--node-lease");
         args.push_back(lease);
     }
+    if (const char *grace = std::getenv("MARU_TEST_HOLD_GRACE")) {
+        args.push_back("--hold-grace");
+        args.push_back(grace);
+    }
     std::vector<char *> argv;
     for (auto &arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);

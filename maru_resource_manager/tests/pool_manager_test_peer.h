@@ -79,11 +79,27 @@ public:
         std::lock_guard<std::mutex> lock(pm.mu_);
         return pm.nodes_.size();
     }
+    static void setHoldGrace(PoolManager &pm, std::chrono::milliseconds grace) {
+        pm.holdGrace_ = grace;
+    }
+    // As if every gone worker was first seen gone `by` earlier.
+    static void ageGoneHolders(PoolManager &pm, std::chrono::milliseconds by) {
+        std::lock_guard<std::mutex> lock(pm.mu_);
+        for (auto &[key, since] : pm.holdGoneSince_) since -= by;
+    }
+    static std::vector<std::string> holders(PoolManager &pm, uint64_t regionId) {
+        std::lock_guard<std::mutex> lock(pm.mu_);
+        std::vector<std::string> names;
+        auto it = pm.holds_.find(regionId);
+        if (it != pm.holds_.end())
+            for (const auto &[holder, hold] : it->second) names.push_back(holder);
+        return names;
+    }
     // A hold that arrives while the pool lock is released (in memory only).
     static void addHold(PoolManager &pm, uint64_t regionId, const std::string &holder,
                         const std::string &instance) {
         std::lock_guard<std::mutex> lock(pm.mu_);
-        pm.holds_[regionId][holder] = instance;
+        pm.holds_[regionId][holder].instance = instance;
     }
 };
 } // namespace maru

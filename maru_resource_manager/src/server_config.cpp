@@ -102,6 +102,8 @@ void printUsage(const char *prog) {
         "  -m, --max-clients N       Maximum concurrent client connections (default: 256)\n"
         "  -N, --node-lease SEC      Free a node's regions after SEC seconds without a claim,\n"
         "                            alloc or renew from its current run (default: 900)\n"
+        "  -G, --hold-grace SEC      Drop a worker's hold SEC seconds after its process is\n"
+        "                            seen gone on this host (default: 5)\n"
         "  -h, --help                Show this help\n",
         prog);
 }
@@ -117,12 +119,13 @@ ServerConfig parseArgs(int argc, char **argv) {
         {"grace-period", required_argument, nullptr, 'g'},
         {"max-clients",  required_argument, nullptr, 'm'},
         {"node-lease",   required_argument, nullptr, 'N'},
+        {"hold-grace",   required_argument, nullptr, 'G'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:N:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "H:p:d:l:w:g:m:N:G:h", longOpts, nullptr)) != -1) {
         switch (opt) {
         case 'H': cfg.host = optarg; break;
         case 'p': {
@@ -170,6 +173,15 @@ ServerConfig parseArgs(int argc, char **argv) {
                 std::exit(1);
             }
             cfg.nodeLeaseSec = n;
+            break;
+        }
+        case 'G': {
+            int g = std::atoi(optarg);
+            if (g < 0) {
+                std::fprintf(stderr, "invalid hold-grace: %s (must be >= 0)\n", optarg);
+                std::exit(1);
+            }
+            cfg.holdGraceSec = g;
             break;
         }
         case 'h': printUsage(argv[0]); std::exit(0);

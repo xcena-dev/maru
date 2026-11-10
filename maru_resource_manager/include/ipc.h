@@ -43,6 +43,8 @@ enum class MsgType : uint16_t {
   NODE_RENEW_RESP = 24,
   NODE_RELEASE_REQ = 25,
   NODE_RELEASE_RESP = 26,
+  NODE_HOLD_REQ = 27,
+  NODE_HOLD_RESP = 28,
   ERROR_RESP = 255
 };
 
@@ -146,6 +148,22 @@ struct NodeFreeReq {
   uint32_t epochLen;
 };
 
+/// A worker maps a node's region. Followed by the node ID, epoch, holder
+/// (the worker incarnation) and boot ID bytes. pidStart is field 22 of
+/// /proc/<pid>/stat, pidNs the inode of /proc/<pid>/ns/pid. Answered with a
+/// GetAccessResp payload (NODE_HOLD_RESP), as HOLD.
+struct NodeHoldReq {
+  Handle handle;
+  uint32_t nodeIdLen;
+  uint32_t epochLen;
+  uint32_t holderLen;
+  uint32_t bootIdLen;
+  uint32_t pid;
+  uint32_t reserved;
+  uint64_t pidStart;
+  uint64_t pidNs;
+};
+
 /// Followed by the RM ID bytes, then numRegions NodeRegionInfo entries.
 struct NodeClaimResp {
   int32_t status;
@@ -155,13 +173,28 @@ struct NodeClaimResp {
   uint32_t reserved;
 };
 
-/// Followed by the device path bytes, then the device UUID bytes. Both are
-/// empty while the region's pool is not served.
+/// Followed by the device path bytes, the device UUID bytes (both empty
+/// while the region's pool is not served), then numHolders NodeHolderInfo.
 struct NodeRegionInfo {
   Handle handle;
   uint64_t requestedSize;
   uint32_t pathLen;
   uint32_t uuidLen;
+  uint32_t numHolders;
+  uint32_t reserved;
+};
+
+/// One hold of the region. Followed by the holder, node epoch, host and boot
+/// ID bytes; a remote agent's hold has only the holder.
+struct NodeHolderInfo {
+  uint32_t holderLen;
+  uint32_t epochLen;
+  uint32_t hostLen;
+  uint32_t bootIdLen;
+  uint32_t pid;
+  uint32_t reserved;
+  uint64_t pidStart;
+  uint64_t pidNs;
 };
 
 struct NodeRenewResp {
@@ -205,7 +238,9 @@ static_assert(sizeof(NodeReq) == 8, "NodeReq must be 8 bytes (fixed part)");
 static_assert(sizeof(NodeAllocReq) == 24, "NodeAllocReq must be 24 bytes (fixed part)");
 static_assert(sizeof(NodeFreeReq) == 40, "NodeFreeReq must be 40 bytes (fixed part)");
 static_assert(sizeof(NodeClaimResp) == 24, "NodeClaimResp must be 24 bytes (fixed part)");
-static_assert(sizeof(NodeRegionInfo) == 48, "NodeRegionInfo must be 48 bytes (fixed part)");
+static_assert(sizeof(NodeHoldReq) == 72, "NodeHoldReq must be 72 bytes (fixed part)");
+static_assert(sizeof(NodeRegionInfo) == 56, "NodeRegionInfo must be 56 bytes (fixed part)");
+static_assert(sizeof(NodeHolderInfo) == 40, "NodeHolderInfo must be 40 bytes (fixed part)");
 static_assert(sizeof(NodeRenewResp) == 16, "NodeRenewResp must be 16 bytes");
 static_assert(sizeof(NodeReleaseResp) == 8, "NodeReleaseResp must be 8 bytes");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");

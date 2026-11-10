@@ -76,6 +76,9 @@ public:
                             const std::string &epoch);
     NodeRenewResp handleNodeRenew(const std::string &nodeId, const std::string &epoch);
     NodeReleaseResp handleNodeRelease(const std::string &nodeId, const std::string &epoch);
+    GetAccessResult handleNodeHold(const NodeHoldReq &req, const std::string &nodeId,
+                                   const std::string &epoch, const std::string &holder,
+                                   const std::string &bootId, const std::string &clientId);
 
 private:
     PoolManager &pm_;

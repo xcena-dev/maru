@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "log.h"
+#include "region_holds.h"
 #include "types.h"
 
 namespace maru
@@ -80,7 +81,7 @@ class PoolManager
 
 public:
     explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30,
-                         int nodeLeaseSec = 900);
+                         int nodeLeaseSec = 900, int holdGraceSec = 5);
     ~PoolManager();
 
     const std::string &stateDir() const { return stateDir_; }
@@ -126,6 +127,7 @@ public:
         uint64_t requestedSize;
         std::string devPath;     // "" while the region's pool is not served
         std::string deviceUuid;
+        std::vector<std::pair<std::string, HoldRecord>> holders;  // NODE_CLAIM only
     };
     /// Make `epoch` the node's current run and list its regions. -EEXIST if
     /// the node is bound to another host.
@@ -137,6 +139,11 @@ public:
     int nodeRenew(const std::string &nodeId, const std::string &epoch);
     /// Free every region of the node and forget it.
     int nodeRelease(const std::string &nodeId, const std::string &epoch, uint32_t &released);
+    /// A worker (holder: its incarnation) maps the node's region: hold it as
+    /// HOLD does, recording who.nodeEpoch (the node's current run) and the
+    /// worker's identity. UNHOLD with instance = holder drops it.
+    int nodeHold(const Handle &handle, const std::string &nodeId, const std::string &holder,
+                 const HoldRecord &who, std::string &outPath);
 
     void getStats(std::vector<PoolState> &out);
     /// Lightweight check: returns true if at least one pool is loaded.
@@ -289,6 +296,11 @@ private:
     // Free draining regions without holds; save the file if anything changed
     // or `save` is set. Returns the number freed.
     size_t finishDrainingLocked(bool save);
+    // Drop the holds of workers known to be gone: on this host, in this boot
+    // and pid namespace, process gone for holdGrace_ (or an earlier boot).
+    void reapDeadHoldersLocked();
+    enum class HolderFate { Unknown, Alive, Gone, EarlierBoot };
+    HolderFate holderFate(const HoldRecord &hold) const;
 
     // Node ownership (pool_nodes.cpp). Caller MUST hold mu_.
     struct NodeState
@@ -361,12 +373,16 @@ private:
     std::map<uint64_t, Allocation> allocations_;
     // Remote agents' holds: region -> holder -> instance. Every region here
     // is in allocations_.
-    std::map<uint64_t, std::map<std::string, std::string>> holds_;
+    RegionHolds holds_;
     // Freed while held: still in allocations_, so its range stays out of the
     // free list and survives a restart, but freed for everyone else.
     std::set<uint64_t> draining_;
     // -errno while the last holds file renamed into place is not synced.
     int holdsSyncRc_{0};
+    // (region, holder) -> when its worker was first seen gone.
+    std::map<std::pair<uint64_t, std::string>, SteadyClockPoint> holdGoneSince_;
+    std::chrono::milliseconds holdGrace_;
+    uint64_t ownPidNs_{0};
     std::map<std::string, NodeState> nodes_;
     int nodesSyncRc_{0};
     std::chrono::milliseconds nodeLease_;

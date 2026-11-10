@@ -363,10 +363,14 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
-PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec, int nodeLeaseSec)
+PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec, int nodeLeaseSec,
+                         int holdGraceSec)
     : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec),
-      slots_(std::make_shared<DeviceSlots>()), nodeLease_(std::chrono::seconds(nodeLeaseSec))
+      slots_(std::make_shared<DeviceSlots>()), holdGrace_(std::chrono::seconds(holdGraceSec)),
+      nodeLease_(std::chrono::seconds(nodeLeaseSec))
 {
+    struct stat ns{};
+    if (::stat("/proc/self/ns/pid", &ns) == 0) ownPidNs_ = ns.st_ino;
     metadata_ = std::make_unique<MetadataStore>(stateDir);
     wal_ = std::make_unique<WalStore>(stateDir);
 }
@@ -1225,6 +1229,7 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
         }
     }
     expireNodeLeasesLocked();
+    reapDeadHoldersLocked();
     // Retry a drained region whose release failed when its last hold went.
     finishDrainingLocked(false);
 }

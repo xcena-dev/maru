@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -36,6 +37,33 @@ static bool parseRegionId(const std::string &text, uint64_t &out) {
     return true;
 }
 
+static bool parseNumber(const std::string &text, uint64_t max, uint64_t &out) {
+    if (text.empty() || text.size() > 20) return false;
+    for (char c : text)
+        if (c < '0' || c > '9') return false;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (errno != 0 || *end != '\0' || value > max) return false;
+    out = value;
+    return true;
+}
+
+// " <node_epoch> <host> <boot_id|-> <pid> <pid_start> <pid_ns>" of a worker.
+static bool parseWorkerFields(const std::vector<std::string> &fields, HoldRecord &hold) {
+    uint64_t pid = 0;
+    if (!validHoldName(fields[4]) || !validHoldName(fields[5]) || !validHoldName(fields[6]) ||
+        !parseNumber(fields[7], UINT32_MAX, pid) ||
+        !parseNumber(fields[8], UINT64_MAX, hold.pidStart) ||
+        !parseNumber(fields[9], UINT64_MAX, hold.pidNs))
+        return false;
+    hold.nodeEpoch = fields[4];
+    hold.host = fields[5];
+    hold.bootId = fields[6] == "-" ? "" : fields[6];
+    hold.pid = static_cast<uint32_t>(pid);
+    return true;
+}
+
 int loadRegionHolds(const std::string &stateDir, RegionHolds &holds,
                     std::set<uint64_t> &draining) {
     const std::string path = stateDir + "/" + kHoldsFile;
@@ -64,12 +92,18 @@ int loadRegionHolds(const std::string &stateDir, RegionHolds &holds,
         for (std::string word; words >> word;) fields.push_back(word);
         uint64_t region = 0;
         bool valid = false;
+        HoldRecord hold;
         // One record per region and holder; this file is only ever written whole.
-        if (fields.size() == 4 && fields[0] == "hold" && parseRegionId(fields[1], region) &&
-            validHoldName(fields[2]) && validHoldName(fields[3]))
-            valid = loadedHolds[region].emplace(fields[2], fields[3]).second;
-        else if (fields.size() == 2 && fields[0] == "draining" && parseRegionId(fields[1], region))
+        if ((fields.size() == 4 || fields.size() == 10) && fields[0] == "hold" &&
+            parseRegionId(fields[1], region) && validHoldName(fields[2]) &&
+            validHoldName(fields[3])) {
+            hold.instance = fields[3];
+            valid = fields.size() == 4 || parseWorkerFields(fields, hold);
+            valid = valid && loadedHolds[region].emplace(fields[2], hold).second;
+        } else if (fields.size() == 2 && fields[0] == "draining" &&
+                   parseRegionId(fields[1], region)) {
             valid = loadedDraining.insert(region).second;
+        }
         if (!valid) {
             logf(LogLevel::Error,
                  "%s:%zu: malformed record '%s'; fix or restore the file (removing a hold "
@@ -90,8 +124,15 @@ int saveRegionHolds(const std::string &stateDir, const RegionHolds &holds,
     const std::string tmp = path + ".tmp";
     std::string text;
     for (const auto &[region, holders] : holds)
-        for (const auto &[holder, instance] : holders)
-            text += "hold " + std::to_string(region) + " " + holder + " " + instance + "\n";
+        for (const auto &[holder, hold] : holders) {
+            text += "hold " + std::to_string(region) + " " + holder + " " + hold.instance;
+            if (hold.worker())
+                text += " " + hold.nodeEpoch + " " + hold.host + " " +
+                        (hold.bootId.empty() ? "-" : hold.bootId) + " " +
+                        std::to_string(hold.pid) + " " + std::to_string(hold.pidStart) + " " +
+                        std::to_string(hold.pidNs);
+            text += "\n";
+        }
     for (uint64_t region : draining) text += "draining " + std::to_string(region) + "\n";
 
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);

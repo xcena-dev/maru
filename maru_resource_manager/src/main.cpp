@@ -55,6 +55,7 @@ int main(int argc, char **argv) {
     maru::logf(maru::LogLevel::Info, "  grace period: %ds", cfg.gracePeriodSec);
     maru::logf(maru::LogLevel::Info, "  max clients : %d", cfg.maxClients);
     maru::logf(maru::LogLevel::Info, "  node lease  : %ds", cfg.nodeLeaseSec);
+    maru::logf(maru::LogLevel::Info, "  hold grace  : %ds", cfg.holdGraceSec);
 
     // Signal handlers
     std::signal(SIGINT, onSignal);
@@ -63,7 +64,7 @@ int main(int argc, char **argv) {
     std::signal(SIGPIPE, SIG_IGN);
 
     // Initialize components with explicit config injection
-    maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec, cfg.nodeLeaseSec);
+    maru::PoolManager pm(cfg.stateDir, cfg.gracePeriodSec, cfg.nodeLeaseSec, cfg.holdGraceSec);
     int rc = pm.loadPools();
     if (rc != 0) {
         maru::logf(maru::LogLevel::Error,

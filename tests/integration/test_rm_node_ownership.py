@@ -11,6 +11,8 @@ Uses the CMake test-only daemon (maru_rm_process_test_daemon), which redirects
 
 import os
 import re
+import socket
+import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -23,11 +25,12 @@ from maru_shm.client import (
     NodeHostConflictError,
     StaleNodeEpochError,
 )
+from maru_shm.types import RegionHolder
 
 pytestmark = pytest.mark.integration
 
 ALIGN = 2 << 20
-SIZE = 16 << 20
+SIZE = 160 << 20  # Sparse: room for 64 regions
 LEASE_S = 2
 
 
@@ -52,7 +55,10 @@ def rm_address(tmp_path):
         stream.truncate(SIZE)
     log = root / "daemon.log"
     env = dict(
-        os.environ, MARU_TEST_DAX_ROOT=str(root), MARU_TEST_NODE_LEASE=str(LEASE_S)
+        os.environ,
+        MARU_TEST_DAX_ROOT=str(root),
+        MARU_TEST_NODE_LEASE=str(LEASE_S),
+        MARU_TEST_HOLD_GRACE="1",
     )
     with log.open("wb") as out:
         proc = subprocess.Popen([daemon], env=env, stdout=out, stderr=subprocess.STDOUT)
@@ -139,3 +145,69 @@ def test_restarted_run_reusing_ids_is_not_answered_from_cache(rm_address, monkey
         _client(rm_address, "h:8").node_renew("n1", "e1")
     assert second.node_renew("n1", "e2") == LEASE_S
     second.close()
+
+
+def _identity(pid=None):
+    """This host's boot and pid namespace; by default a process that is gone."""
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    ns = os.stat("/proc/self/ns/pid").st_ino
+    if pid is None:
+        return {"boot_id": boot, "pid": 2147483647, "pid_start": 1, "pid_ns": ns}
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    start = int(stat[stat.rindex(")") + 2 :].split()[19])
+    return {"boot_id": boot, "pid": pid, "pid_start": start, "pid_ns": ns}
+
+
+def test_worker_holds_are_listed_fenced_and_reaped(rm_address):
+    run = _client(rm_address)
+    run.node_claim("gb1", "e1")
+    region = run.node_alloc("gb1", "e1", ALIGN)
+    me = _identity(os.getpid())
+    access = run.node_hold("gb1", "e1", region.handle, "w1", **me)
+    assert (access.dax_path, access.offset) == ("/dev/dax0.0", region.handle.offset)
+    run.node_hold("gb1", "e1", region.handle, "gone", **_identity())
+
+    second = _client(rm_address)
+    claim = second.node_claim("gb1", "e2")
+    host = socket.gethostname()
+    assert sorted(claim.regions[0].holders, key=lambda h: h.holder) == [
+        RegionHolder("gone", "e1", host, me["boot_id"], 2147483647, 1, me["pid_ns"]),
+        RegionHolder("w1", "e1", host, *me.values()),
+    ]
+    with pytest.raises(StaleNodeEpochError):
+        run.node_hold("gb1", "e1", region.handle, "late", **me)
+
+    # Freed while held: out of use until w1 unholds and the RM drops "gone"
+    # (its process is gone, after the grace).
+    second.node_free("gb1", "e2", region.handle)
+    run.unhold(region.handle, "w1", "w1")
+    run.unhold(region.handle, "w1", "w1")  # Twice is harmless.
+    assert run.stats()[0].free_size == SIZE - 2 * ALIGN
+    deadline = time.monotonic() + 30
+    while run.stats()[0].free_size != SIZE - ALIGN:
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+    run.unhold(region.handle, "gone", "gone")  # After the reaper: a no-op.
+    run.close()
+    second.close()
+
+
+def test_node_hold_timing(rm_address):
+    """64 sequential NODE_HOLDs, each made durable before its reply."""
+    client = _client(rm_address)
+    client.node_claim("gb1", "e1")
+    handles = [client.node_alloc("gb1", "e1", ALIGN).handle for _ in range(64)]
+    me = _identity(os.getpid())
+    for label in ("new", "again"):  # again: already held, nothing to write
+        times = []
+        for i, handle in enumerate(handles):
+            t0 = time.perf_counter()
+            client.node_hold("gb1", "e1", handle, f"w{i}", **me)
+            times.append((time.perf_counter() - t0) * 1000)
+        times.sort()
+        print(
+            f"NODE_HOLD x64 ({label}): total {sum(times):.1f} ms, "
+            f"median {statistics.median(times):.2f} ms, "
+            f"p95 {times[60]:.2f} ms, max {times[-1]:.2f} ms"
+        )
+    client.close()

@@ -7,7 +7,7 @@ shared between the Maru Resource Manager (C++) and maru_shm clients.
 """
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
@@ -184,18 +184,39 @@ class MaruPoolInfo:
         )
 
 
+@dataclass(frozen=True)
+class RegionHolder:
+    """A hold of a node's region, as NODE_CLAIM lists it.
+
+    A worker's NODE_HOLD: ``holder`` is its incarnation, ``node_epoch`` the
+    node's run it held under, then who it is: ``pid_start`` is field 22 of
+    /proc/<pid>/stat, ``pid_ns`` the inode of /proc/<pid>/ns/pid. A remote
+    agent's hold has the holder only (empty strings, zeros).
+    """
+
+    holder: str
+    node_epoch: str
+    host: str
+    boot_id: str
+    pid: int
+    pid_start: int
+    pid_ns: int
+
+
 @dataclass
 class NodeRegion:
     """A region a node owns (NODE_CLAIM, NODE_ALLOC).
 
     ``dax_path`` and ``device_uuid`` are as the resource manager reports them;
-    both are empty while the region's pool is not served.
+    both are empty while the region's pool is not served. ``holders`` (NODE_CLAIM
+    only) are the holds on the region when the claim switched the run.
     """
 
     handle: MaruHandle
     requested_size: int = 0
     dax_path: str = ""
     device_uuid: str = ""
+    holders: list[RegionHolder] = field(default_factory=list)
 
 
 @dataclass
@@ -205,3 +226,26 @@ class NodeClaim:
     rm_domain: str
     lease_s: float
     regions: list[NodeRegion]
+
+
+class StaleNodeEpochError(RuntimeError):
+    """The epoch is not the node's current run (-ESTALE).
+
+    Another run claimed the node, its lease ran out, or it was released: stop
+    using its regions. A NODE_RELEASE whose reply was lost also ends here.
+    """
+
+
+class NodeHostConflictError(RuntimeError):
+    """The node is bound to another host (-EEXIST); an operator releases it first."""
+
+
+class NodeOwnershipUnsupportedError(RuntimeError):
+    """The resource manager predates node ownership (restart it with this Maru)."""
+
+
+class RetryableNodeError(RuntimeError):
+    """The RM could not complete the request now (e.g. -EIO, -ENOSPC, -EAGAIN).
+
+    Send the same request again; a claim is not in effect until one succeeds.
+    """

@@ -201,13 +201,17 @@ int PoolManager::nodeClaim(const std::string &nodeId, const std::string &epoch,
     for (const auto &[id, a] : allocations_)
     {
         if (owner != a.clientId || isDraining(id)) continue;
-        NodeRegion r{a.handle, a.requestedSize, "", ""};
+        NodeRegion r{a.handle, a.requestedSize, "", "", {}};
         // Unserved: its device is not confirmed, so the run gets no path.
         if (const PoolState *pool = findPoolById(a.poolId))
         {
             r.devPath = regionPath(*pool, id);
             r.deviceUuid = pool->deviceUuid;
         }
+        // Taken with the epoch switch: a hold of an earlier run is listed
+        // here, or is refused (-ESTALE) from now on.
+        auto held = holds_.find(id);
+        if (held != holds_.end()) r.holders.assign(held->second.begin(), held->second.end());
         regions.push_back(r);
     }
     return 0;
@@ -258,6 +262,72 @@ int PoolManager::nodeFree(const Handle &handle, const std::string &nodeId,
         return -EPERM;
     }
     return doFreeAllocation(handle.regionId);
+}
+
+int PoolManager::nodeHold(const Handle &handle, const std::string &nodeId,
+                          const std::string &holder, const HoldRecord &who, std::string &outPath)
+{
+    if (!validNodeId(nodeId) || !validHoldName(who.nodeEpoch) || !validHoldName(holder) ||
+        !validHoldName(who.host) ||
+        (!who.bootId.empty() && (!validHoldName(who.bootId) || who.bootId == "-")))
+    {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = allocations_.find(handle.regionId);
+    if (it == allocations_.end())
+    {
+        return -ENOENT;
+    }
+    const Allocation &a = it->second;
+    if (handle.authToken != computeAuthToken(handle, a.nonce, std::string(a.clientId)))
+    {
+        return -EACCES;
+    }
+    if (nodeOwnerId(nodeId) != a.clientId)
+    {
+        return -EPERM;
+    }
+    if (!currentNode(nodeId, who.nodeEpoch))
+    {
+        return -ESTALE;
+    }
+    const PoolState *pool = findPoolById(a.poolId);
+    if (isDraining(handle.regionId) || !pool)
+    {
+        return -ENOENT;
+    }
+    HoldRecord hold = who;
+    hold.instance = holder;
+    auto &holders = holds_[handle.regionId];
+    auto previous = holders.find(holder);
+    if (previous != holders.end() && previous->second == hold)
+    {
+        // The same worker again: succeed only once its hold is durable.
+        const int rc = confirmHoldsDurableLocked();
+        if (rc == 0) outPath = regionPath(*pool, handle.regionId);
+        return rc;
+    }
+    const bool replacing = previous != holders.end();
+    const HoldRecord replaced = replacing ? previous->second : HoldRecord{};
+    holders[holder] = hold;
+    int syncRc = 0;
+    const int rc = saveHoldsLocked(syncRc);
+    if (rc != 0)
+    {
+        if (replacing) holders[holder] = replaced;
+        else holders.erase(holder);
+        if (holders.empty()) holds_.erase(handle.regionId);
+        return rc;
+    }
+    logf(LogLevel::Debug, "region %llu held by worker %s (node %s run %s, pid %u)",
+         static_cast<unsigned long long>(handle.regionId), holder.c_str(), nodeId.c_str(),
+         who.nodeEpoch.c_str(), who.pid);
+    // Kept (the file has it), but the worker must not map the region until
+    // a retry finds it durable.
+    if (syncRc != 0) return syncRc;
+    outPath = regionPath(*pool, handle.regionId);
+    return 0;
 }
 
 int PoolManager::nodeRenew(const std::string &nodeId, const std::string &epoch)

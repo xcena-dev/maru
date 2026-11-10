@@ -30,6 +30,7 @@ from .ipc import (
     NodeAllocReq,
     NodeClaimResp,
     NodeFreeReq,
+    NodeHoldReq,
     NodeReleaseResp,
     NodeRenewResp,
     NodeReq,
@@ -39,7 +40,16 @@ from .ipc import (
     StatsResp,
     UnholdReq,
 )
-from .types import MaruHandle, MaruPoolInfo, NodeClaim, NodeRegion
+from .types import (
+    MaruHandle,
+    MaruPoolInfo,
+    NodeClaim,
+    NodeHostConflictError,
+    NodeOwnershipUnsupportedError,
+    NodeRegion,
+    RetryableNodeError,
+    StaleNodeEpochError,
+)
 from .uds_helpers import read_full, write_full
 
 logger = logging.getLogger(__name__)
@@ -57,27 +67,15 @@ class HoldsUnsupportedError(HoldRefusedError):
     """The resource manager predates region holds (restart it with this Maru)."""
 
 
-class StaleNodeEpochError(RuntimeError):
-    """The epoch is not the node's current run (-ESTALE).
-
-    Another run claimed the node, its lease ran out, or it was released: stop
-    using its regions. A NODE_RELEASE whose reply was lost also ends here.
-    """
-
-
-class NodeHostConflictError(RuntimeError):
-    """The node is bound to another host (-EEXIST); an operator releases it first."""
-
-
-class NodeOwnershipUnsupportedError(RuntimeError):
-    """The resource manager predates node ownership (restart it with this Maru)."""
-
-
-class RetryableNodeError(RuntimeError):
-    """The RM could not complete the request now (e.g. -EIO, -ENOSPC, -EAGAIN).
-
-    Send the same request again; a claim is not in effect until one succeeds.
-    """
+# Refusals: sending the same request again gets the same answer.
+_NOT_RETRYABLE = (
+    0,
+    -errno.ENOSYS,
+    -errno.EINVAL,
+    -errno.EACCES,
+    -errno.EPERM,
+    -errno.ENOENT,
+)
 
 
 def _make_client_id() -> str:
@@ -553,6 +551,54 @@ class MaruShmClient:
         self._check_node_status(resp.status, "Node release failed", retryable=True)
         return resp.released
 
+    def node_hold(
+        self,
+        node_id: str,
+        node_epoch: str,
+        handle: MaruHandle,
+        holder: str,
+        *,
+        boot_id: str,
+        pid: int,
+        pid_start: int,
+        pid_ns: int,
+    ) -> GetAccessResp:
+        """Hold a region of the node that this worker maps, as :meth:`hold_access`.
+
+        ``holder`` names this worker incarnation (unique per process); drop the
+        hold with ``unhold(handle, holder, holder)``. The RM keeps the region
+        out of reuse until every holder drops its hold, and drops the hold
+        itself once it sees the process gone (same host, boot and pid
+        namespace): ``pid_start`` is field 22 of /proc/<pid>/stat, ``pid_ns``
+        the inode of /proc/<pid>/ns/pid.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            StaleNodeEpochError: if ``node_epoch`` is not the node's current run.
+            RetryableNodeError: if the RM could not make the hold durable now.
+            RuntimeError: on any other refusal (bad token, not the node's
+                region, region freed).
+        """
+        req = NodeHoldReq(
+            handle=handle,
+            node_id=node_id,
+            node_epoch=node_epoch,
+            holder=holder,
+            boot_id=boot_id,
+            pid=pid,
+            pid_start=pid_start,
+            pid_ns=pid_ns,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_HOLD_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node hold failed")
+        resp = GetAccessResp.unpack(payload)
+        self._check_node_status(resp.status, "Node hold failed", retryable=True)
+        return resp
+
     def _check_node_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
         if hdr.msg_type == MsgType.ERROR_RESP:
             err = ErrorResp.unpack(payload)
@@ -569,7 +615,7 @@ class MaruShmClient:
             raise StaleNodeEpochError(f"{context}: not the node's current run")
         if status == -errno.EEXIST:
             raise NodeHostConflictError(f"{context}: node is bound to another host")
-        if retryable and status not in (0, -errno.ENOSYS, -errno.EINVAL, -errno.EACCES):
+        if retryable and status not in _NOT_RETRYABLE:
             raise RetryableNodeError(f"{context} with status {status}")
         if status != 0:
             raise RuntimeError(f"{context} with status {status}")
