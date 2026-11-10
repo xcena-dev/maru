@@ -250,9 +250,15 @@ def _group(specs, side):
     return KVCacheGroupSpec(list(specs), spec)
 
 
-def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
+def dsv41_config(block=DSV41_BLOCK, side="worker", window=None, drafts=False):
     """DSV4.1-Flash's six groups: four sliding windows, the compressed KV and
-    indexer keys, and the KV compressor's circular buffer."""
+    indexer keys, and the KV compressor's circular buffer.
+
+    With ``drafts``, DSpark's draft layers 40-42 each add a sliding window like
+    the target's, and vLLM deals the windows into one more group, as it does on
+    the GPU (seven groups to eight), so a window group of the same id holds
+    other layers.
+    """
     window = window or _window_mla(block // 4)
     mla = {
         name: MLAAttentionSpec(
@@ -260,9 +266,11 @@ def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
         )
         for name, size in DSV41_MEMBERS.items()
     }
+    layers = range(43 if drafts else 40)
+    windows = 5 if drafts else 4
     groups = [
-        _group({f"layers.{i}.attn.swa": window for i in range(g, 40, 4)}, side)
-        for g in range(4)
+        _group({f"layers.{i}.attn.swa": window for i in layers[g::windows]}, side)
+        for g in range(windows)
     ]
     groups.append(_group(mla, side))
     ring = _ring(8)
@@ -275,7 +283,7 @@ def _check_dsv41(config):
         describe_kv_groups(config),
         block_size=DSV41_BLOCK,
         use_layerwise=False,
-        speculative=False,
+        speculative_method=None,
         inline_loads=False,
     )
 
@@ -296,7 +304,7 @@ def test_dsv41_passes_the_support_check_in_the_layerwise_format():
         describe_kv_groups(dsv41_config()),
         block_size=DSV41_BLOCK,
         use_layerwise=True,
-        speculative=False,
+        speculative_method=None,
         inline_loads=False,
     )
 
@@ -377,9 +385,52 @@ def test_dsv41_without_bounded_replay_passes_the_support_check(layerwise):
         describe_kv_groups(dsv41_config(window=window)),
         block_size=DSV41_BLOCK // 4,
         use_layerwise=layerwise,
-        speculative=False,
+        speculative_method=None,
         inline_loads=False,
     )
+
+
+@pytest.mark.parametrize("bounded_replay", [True, False], ids=["replay", "no-replay"])
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+def test_dsv41_with_dspark_passes_the_support_check(bounded_replay, layerwise):
+    """DSpark's draft layers keep sliding windows like the target's, in the
+    target's window groups, which Maru skips or copies block by block."""
+    block = DSV41_BLOCK // 4
+    window = _window_mla(block, bounded_replay=bounded_replay)
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config(window=window, drafts=True)),
+        block_size=DSV41_BLOCK if bounded_replay else block,
+        use_layerwise=layerwise,
+        speculative_method="dspark",
+        inline_loads=False,
+    )
+
+
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
+def test_dsv41_with_another_speculative_method_is_refused(method):
+    with pytest.raises(ValueError, match="speculative decoding"):
+        check_multi_group_support(
+            describe_kv_groups(dsv41_config(drafts=True)),
+            block_size=DSV41_BLOCK,
+            use_layerwise=False,
+            speculative_method=method,
+            inline_loads=False,
+        )
+
+
+def test_connector_starts_with_dsv41_and_dspark():
+    config = _connector_config(128)
+    config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=5
+    )
+    config.num_lookahead_tokens = 5
+    connector = MaruKVConnector(
+        config,
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler", drafts=True),
+    )
+    assert connector._scheduler._multi_group
+    assert connector._scheduler._num_lookahead_tokens == 5
 
 
 @pytest.mark.parametrize(
@@ -431,7 +482,9 @@ def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
     """The support checks run before the chunk is rounded, so a model they
     refuse leaves no warning about its chunk size."""
     config = _connector_config(128, maru_kv_chunk_tokens=200)
-    config.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    config.speculative_config = SimpleNamespace(
+        method="ngram", num_speculative_tokens=1
+    )
     with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
         with pytest.raises(ValueError, match="speculative decoding"):
             MaruKVConnector(
@@ -1340,13 +1393,17 @@ def test_dsv41_unbounded_lookup_needs_each_windows_chunk_at_the_hit_end():
 
 
 def _check(
-    groups, block_size, use_layerwise=False, speculative=False, inline_loads=False
+    groups,
+    block_size,
+    use_layerwise=False,
+    speculative_method=None,
+    inline_loads=False,
 ):
     check_multi_group_support(
         groups,
         block_size=block_size,
         use_layerwise=use_layerwise,
-        speculative=speculative,
+        speculative_method=speculative_method,
         inline_loads=inline_loads,
     )
 
@@ -1358,7 +1415,7 @@ def test_supported_multi_group_models_pass():
 
 def test_single_group_is_always_accepted():
     single = describe_kv_groups(qwen35_config())[3:]
-    _check(single, 16, use_layerwise=True, speculative=True)
+    _check(single, 16, use_layerwise=True, speculative_method="eagle3")
 
 
 def test_subclass_of_a_supported_spec_is_rejected():
@@ -1381,9 +1438,10 @@ def test_layerwise_is_rejected():
         _check(describe_kv_groups(gpt_oss_config()), 16, use_layerwise=True)
 
 
-def test_speculative_decoding_is_rejected():
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "draft_model"])
+def test_speculative_decoding_is_rejected(method):
     with pytest.raises(ValueError, match="speculative decoding"):
-        _check(describe_kv_groups(gpt_oss_config()), 16, speculative=True)
+        _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
 
 
 @pytest.mark.parametrize("mode", ["none", "all"])

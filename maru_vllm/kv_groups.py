@@ -419,7 +419,7 @@ def check_multi_group_support(
     *,
     block_size: int,
     use_layerwise: bool,
-    speculative: bool,
+    speculative_method: str | None,
     inline_loads: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
@@ -428,8 +428,12 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads, without speculative decoding; in layerwise
-    format only when every stored group is an MLA group (DeepSeek-V4.1).
+    group, with parked loads, without speculative decoding other than
+    DeepSeek-V4.1's DSpark; in layerwise format only when every stored group
+    is an MLA group (DeepSeek-V4.1). DSpark's draft layers keep sliding
+    windows like the target's and vLLM puts them in the target's window
+    groups, and the drafter writes a token's draft KV in the step that
+    computes the token, before the connector stores it.
     Every group uses vLLM's block size, but an MLA group may use another
     (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
     chunk then holds whole blocks of each (``chunk_unit``). Groups vLLM does
@@ -441,7 +445,8 @@ def check_multi_group_support(
         groups: The model's KV cache groups.
         block_size: ``cache_config.block_size``, which the connector uses.
         use_layerwise: ``maru_use_layerwise``.
-        speculative: Whether speculative decoding is configured.
+        speculative_method: The speculative decoding method configured, or
+            None without speculative decoding.
         inline_loads: Whether loads run inline (``maru_async_load`` set to
             false; ``MaruKVConnector`` turns it on for several groups unless
             set).
@@ -485,10 +490,12 @@ def check_multi_group_support(
             "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
             f"maru_use_layerwise=false{one_group_hint(groups)}"
         )
-    if speculative:
+    if speculative_method is not None and speculative_method != "dspark":
         raise ValueError(
-            "MaruKVConnector does not support speculative decoding with models "
-            f"that have several KV cache groups{one_group_hint(groups)}"
+            f"MaruKVConnector does not support speculative decoding method "
+            f"{speculative_method!r} with models that have several KV cache "
+            "groups; it supports only 'dspark' on DeepSeek-V4.1-Flash"
+            f"{one_group_hint(groups)}"
         )
     kinds = {g.kind for g in stored}
     if {GROUP_MAMBA, GROUP_MLA} <= kinds:

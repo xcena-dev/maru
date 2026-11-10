@@ -998,6 +998,18 @@ def _vllm_version_at_least(minimum: str) -> bool:
         return False
 
 
+def _speculative_method(vllm_config: VllmConfig) -> str | None:
+    """The speculative decoding method vLLM runs, or None without one.
+
+    A config that names no method reads as an unknown one, so the support
+    checks refuse it rather than take it for no speculative decoding.
+    """
+    spec = vllm_config.speculative_config
+    if spec is None:
+        return None
+    return str(getattr(spec, "method", None) or "unknown")
+
+
 def _scheduler_lookahead_tokens(vllm_config: VllmConfig) -> int:
     """Read vLLM's slot margin, with the pre-property scheduler rules as fallback."""
     lookahead = getattr(vllm_config, "num_lookahead_tokens", None)
@@ -1660,7 +1672,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_groups,
                 block_size=self._block_size,
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
-                speculative=vllm_config.speculative_config is not None,
+                speculative_method=_speculative_method(vllm_config),
                 inline_loads=not _get_knob(extra, "maru_async_load"),
             )
 
