@@ -665,6 +665,7 @@ def _cpu_engine_config(
     """
     extra = _remote_cxl_defaults(extra)
     remote_cxl = extra.get("maru_storage_backend") == "remote_cxl"
+    backend_label = "Remote CXL storage" if remote_cxl else "CPU M1"
     if (
         remote_cxl
         and not _get_knob(extra, "maru_async_load")
@@ -685,7 +686,7 @@ def _cpu_engine_config(
         getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
         != "recompute"
     ):
-        raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
+        raise ValueError(f"{backend_label} requires kv_load_failure_policy='recompute'")
     parallel = config.parallel_config
     # Each remote_cxl TP rank of each data-parallel replica opens its own
     # session (_rank_scoped_extra) and stores its own slice; every session of
@@ -710,14 +711,16 @@ def _cpu_engine_config(
     tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
     model = config.model_config
     if not getattr(model, "enforce_eager", False):
-        raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
+        raise ValueError(
+            f"{backend_label} requires enforce_eager=True (--enforce-eager)"
+        )
     if config.cache_config.cache_dtype not in {
         "auto",
         "float16",
         "bfloat16",
         "float32",
     }:
-        raise ValueError("CPU M1 does not support quantized KV caches")
+        raise ValueError(f"{backend_label} does not support quantized KV caches")
     if (
         getattr(config, "lora_config", None) is not None
         or getattr(model, "use_mla", False)
@@ -1083,6 +1086,7 @@ def _create_maru_handler(
         metadata_only=metadata_only,
         engine_id=extra_config.get("maru_engine_id"),
         cache_namespace=extra_config.get("maru_cache_namespace"),
+        auto_expand=bool(extra_config.get("maru_auto_expand", True)),
         node_id=extra_config.get("maru_node_id"),
         storage_schema=extra_config.get("_maru_storage_schema", "opaque-bytes-v1"),
         cxl_pool_size=(
@@ -1164,15 +1168,15 @@ class MaruReqMeta:
     # and tokens computed before it.
     num_scheduled_tokens: int = 0
     num_computed_tokens: int = 0
-    # For store: where the request's stores start. Its num_computed_tokens in
-    # its first step since it was scheduled or resumed, or the end of the
-    # chunks its lookup found in Maru if later: a fully cached prompt holds
-    # one block back for vLLM to compute, inside a chunk Maru already has.
-    # The tokens before it are in Maru or vLLM's own prefix cache. Write-behind,
-    # which stores a prompt in its last prefill step, starts at the chunk
-    # holding this token; per-step stores at the later of it and
-    # num_computed_tokens.
+    # First token the request needs to store. Full-attention prefix-cache
+    # hits can cover tokens that Maru does not hold, so this may precede
+    # num_computed_tokens. A full Maru hit still skips its held-back block.
+    # Write-behind keeps this start until the prompt's last prefill step.
     store_start_token: int = 0
+    # This admission step also stores the prefix-cached chunks before its
+    # compute range. Later synchronous steps store only their own range.
+    # Stateful/windowed groups cannot reconstruct every historical chunk.
+    store_cached_prefix: bool = False
     # CPU/mixed external-token interval, excluding GPU hits and compute tail.
     # None retains compatibility with metadata constructed without explicit bounds.
     load_start_token: int = 0
@@ -1287,7 +1291,9 @@ def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> r
     if req_meta.num_scheduled_tokens <= 0:
         return range(num_chunks)
     end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-    start = max(req_meta.num_computed_tokens, req_meta.store_start_token)
+    start = req_meta.store_start_token
+    if not req_meta.store_cached_prefix:
+        start = max(req_meta.num_computed_tokens, start)
     return range(start // chunk_tokens, min(end // chunk_tokens, num_chunks))
 
 
@@ -2940,6 +2946,18 @@ class MaruSchedulerConnector:
         hit = self._maru_hits.pop(req_id, None)
         if hit is not None and num_computed >= hit[1]:
             store_start = max(store_start, hit[0] * ct)
+        # vLLM's prefix cache can retain generated tokens that no earlier
+        # prompt stored in Maru. Its full-attention blocks still cover those
+        # tokens on admission. Fill that gap before storing the new suffix,
+        # or a later lookup will stop at the first turn's prompt forever.
+        # Do not rewind stateful/windowed groups: their old states or blocks
+        # may no longer exist. Preempted requests retain their original start.
+        full_history = all(
+            g.kind == GROUP_FULL and g.sliding_window is None for g in self._kv_groups
+        )
+        if preempted is None and full_history:
+            maru_end = hit[0] * ct if hit is not None and num_computed >= hit[1] else 0
+            store_start = min(store_start, maru_end)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)
         # Tracked until the prompt is computed, not only its full chunks: a
@@ -2960,6 +2978,7 @@ class MaruSchedulerConnector:
             num_scheduled_tokens=num_scheduled,
             num_computed_tokens=num_computed,
             store_start_token=store_start,
+            store_cached_prefix=full_history and store_start < num_computed,
             group_block_ids=self._group_block_ids(block_ids),
         )
 
@@ -7647,8 +7666,8 @@ class MaruWorkerConnector:
             # every chunk the request computed from the full accumulated block
             # list. This avoids competing with the remaining prefill and
             # coalesces all chunks into one write-behind batch. The chunks
-            # before store_start_token were loaded or are vLLM's own prefix
-            # cache.
+            # before store_start_token are already covered by the Maru hit;
+            # a GPU prefix-cache hit alone does not establish that coverage.
             if end_chunk < len(chunk_keys):
                 continue
             start_chunk = req_meta.store_start_token // ct
