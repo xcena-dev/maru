@@ -2353,8 +2353,7 @@ class TestStoreStartsPastTheHit:
         computed = self._admit(sched, 20, cached_chunks=0, local=8)
         assert computed == 8
         (store,) = self._step(sched, 20, 8, 8, "new")
-        # The prefix-cached chunk is not in Maru; store it with the new one.
-        assert list(_step_chunks(store, self.CHUNK, 2)) == [0, 1]
+        assert list(_step_chunks(store, self.CHUNK, 2)) == [1]
         # Every full chunk is in: the tail stores nothing, but stays tracked.
         assert self._step(sched, 20, 16, 2, "cached") == []
         assert "r1" in sched._requests_need_store

@@ -161,25 +161,6 @@ Instance B:
   → Loads chunk 0, 1 from CXL, computes the rest
 ```
 
-### GPU prefix caching and external stores
-
-A vLLM prefix-cache hit does not mean that the same KV exists in Maru. In a
-multi-turn conversation, a previous turn's generated tokens may be present
-only in the GPU cache. For full-attention caches, the first store of the
-next turn starts at the end of the prefix found in Maru, copying those
-missing chunks together with the new prompt suffix. A later lookup can
-then reuse them after vLLM evicts the conversation.
-
-Synchronous stores include the missing cached prefix on the admission
-step; later prefill steps store only their new chunks. Asynchronous stores
-retain the original start until the prompt finishes. Full Maru hits still
-avoid storing already present chunks, including a held-back compute block.
-
-This repair applies when every KV group retains full attention history.
-Mamba and sliding-window groups keep their existing store rules because
-historical states or blocks may already be gone; missing history in those
-groups can still require recomputation.
-
 ### Requests Maru does not cache
 
 Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and vLLM's own prefix cache, when enabled (the default), still applies to them because it hashes these inputs. Keying such requests so they can hit is tracked in [#116](https://github.com/xcena-dev/maru/issues/116).
