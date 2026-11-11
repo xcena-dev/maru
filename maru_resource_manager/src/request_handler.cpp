@@ -152,23 +152,9 @@ static std::string hostOf(const std::string &clientId) {
     return colon == std::string::npos ? "" : clientId.substr(0, colon);
 }
 
-std::vector<uint8_t> RequestHandler::handleNodeClaim(const std::string &nodeId,
-                                                     const std::string &epoch,
-                                                     const std::string &clientId) {
-    std::vector<PoolManager::NodeRegion> regions;
-    NodeClaimResp resp{};
-    resp.status = pm_.nodeClaim(nodeId, epoch, hostOf(clientId), regions);
-    const std::string rmId = resp.status == 0 ? pm_.rmId() : "";
-    resp.rmIdLen = static_cast<uint32_t>(rmId.size());
-    resp.leaseMs = pm_.nodeLeaseMs();
-    resp.numRegions = static_cast<uint32_t>(regions.size());
-    if (resp.status != 0) {
-        logf(LogLevel::Warn, "[NODE_CLAIM] node=%s epoch=%s client=%s -> FAILED (status=%d)",
-             nodeId.c_str(), epoch.c_str(), clientId.c_str(), resp.status);
-    }
-    std::vector<uint8_t> buf;
-    appendBytes(buf, &resp, sizeof(resp));
-    appendBytes(buf, rmId.data(), rmId.size());
+// NodeRegionInfo entries, each with its path, UUID and holders.
+static void appendRegions(std::vector<uint8_t> &buf,
+                          const std::vector<PoolManager::NodeRegion> &regions) {
     for (const auto &r : regions) {
         NodeRegionInfo info{};
         info.handle = r.handle;
@@ -195,6 +181,42 @@ std::vector<uint8_t> RequestHandler::handleNodeClaim(const std::string &nodeId,
             appendText(buf, hold.bootId);
         }
     }
+}
+
+std::vector<uint8_t> RequestHandler::handleNodeClaim(const std::string &nodeId,
+                                                     const std::string &epoch,
+                                                     const std::string &clientId) {
+    std::vector<PoolManager::NodeRegion> regions;
+    NodeClaimResp resp{};
+    resp.status = pm_.nodeClaim(nodeId, epoch, hostOf(clientId), regions);
+    const std::string rmId = resp.status == 0 ? pm_.rmId() : "";
+    resp.rmIdLen = static_cast<uint32_t>(rmId.size());
+    resp.leaseMs = pm_.nodeLeaseMs();
+    resp.numRegions = static_cast<uint32_t>(regions.size());
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_CLAIM] node=%s epoch=%s client=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), clientId.c_str(), resp.status);
+    }
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    appendBytes(buf, rmId.data(), rmId.size());
+    appendRegions(buf, regions);
+    return buf;
+}
+
+std::vector<uint8_t> RequestHandler::handleNodeHolds(const std::string &nodeId,
+                                                     const std::string &epoch) {
+    std::vector<PoolManager::NodeRegion> regions;
+    NodeHoldsResp resp{};
+    resp.status = pm_.nodeHolds(nodeId, epoch, regions);
+    resp.numRegions = static_cast<uint32_t>(regions.size());
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_HOLDS] node=%s epoch=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), resp.status);
+    }
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    appendRegions(buf, regions);
     return buf;
 }
 

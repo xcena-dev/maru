@@ -186,12 +186,13 @@ class MaruPoolInfo:
 
 @dataclass(frozen=True)
 class RegionHolder:
-    """A hold of a node's region, as NODE_CLAIM lists it.
+    """A hold of a node's region, as NODE_CLAIM and NODE_HOLDS list it.
 
-    A worker's NODE_HOLD: ``holder`` is its incarnation, ``node_epoch`` the
-    node's run it held under, then who it is: ``pid_start`` is field 22 of
-    /proc/<pid>/stat, ``pid_ns`` the inode of /proc/<pid>/ns/pid. A remote
-    agent's hold has the holder only (empty strings, zeros).
+    A NODE_HOLD (a worker's or the StorageService's own): ``holder`` names it
+    for one run, ``node_epoch`` is the node's run it held under, then who it
+    is: ``pid_start`` is field 22 of /proc/<pid>/stat, ``pid_ns`` the inode of
+    /proc/<pid>/ns/pid. A remote agent's hold has the holder only (empty
+    strings, zeros).
     """
 
     holder: str
@@ -208,8 +209,8 @@ class NodeRegion:
     """A region a node owns (NODE_CLAIM, NODE_ALLOC).
 
     ``dax_path`` and ``device_uuid`` are as the resource manager reports them;
-    both are empty while the region's pool is not served. ``holders`` (NODE_CLAIM
-    only) are the holds on the region when the claim switched the run.
+    both are empty while the region's pool is not served. ``holders``
+    (NODE_CLAIM, NODE_HOLDS) are the holds on the region at that request.
     """
 
     handle: MaruHandle
@@ -234,6 +235,12 @@ class StaleNodeEpochError(RuntimeError):
     Another run claimed the node, its lease ran out, or it was released: stop
     using its regions. A NODE_RELEASE whose reply was lost also ends here.
     """
+
+
+class NodeLeaseExpiredError(StaleNodeEpochError):
+    """NODE_RENEW: the run's lease ran out or the node was released, and no
+    other run claimed the node since (-EKEYEXPIRED). The run is over; a new
+    run of this node may claim it."""
 
 
 class NodeHostConflictError(RuntimeError):

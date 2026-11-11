@@ -45,6 +45,8 @@ enum class MsgType : uint16_t {
   NODE_RELEASE_RESP = 26,
   NODE_HOLD_REQ = 27,
   NODE_HOLD_RESP = 28,
+  NODE_HOLDS_REQ = 29,
+  NODE_HOLDS_RESP = 30,
   ERROR_RESP = 255
 };
 
@@ -126,7 +128,7 @@ struct ResetHoldsResp {
 // GET_ACCESS_REQ appends them. client_id is required: its host part binds the
 // node, and with the request id it keys the retransmit cache.
 
-/// NODE_CLAIM, NODE_RENEW and NODE_RELEASE.
+/// NODE_CLAIM, NODE_RENEW, NODE_RELEASE and NODE_HOLDS.
 struct NodeReq {
   uint32_t nodeIdLen;
   uint32_t epochLen;
@@ -148,8 +150,8 @@ struct NodeFreeReq {
   uint32_t epochLen;
 };
 
-/// A worker maps a node's region. Followed by the node ID, epoch, holder
-/// (the worker incarnation) and boot ID bytes. pidStart is field 22 of
+/// A process maps a node's region. Followed by the node ID, epoch, holder
+/// (that process's name in this run) and boot ID bytes. pidStart is field 22 of
 /// /proc/<pid>/stat, pidNs the inode of /proc/<pid>/ns/pid. Answered with a
 /// GetAccessResp payload (NODE_HOLD_RESP), as HOLD.
 struct NodeHoldReq {
@@ -197,10 +199,19 @@ struct NodeHolderInfo {
   uint64_t pidNs;
 };
 
+/// -EKEYEXPIRED: the run's lease ran out or the node was released, and no
+/// other run claimed it since; -ESTALE: another run claimed the node.
 struct NodeRenewResp {
   int32_t status;
   uint32_t reserved;
   uint64_t leaseMs;
+};
+
+/// The node's regions and their holds now, read only (no lease renewal).
+/// Followed by numRegions NodeRegionInfo entries, as in NODE_CLAIM_RESP.
+struct NodeHoldsResp {
+  int32_t status;
+  uint32_t numRegions;
 };
 
 struct NodeReleaseResp {
@@ -243,6 +254,7 @@ static_assert(sizeof(NodeRegionInfo) == 56, "NodeRegionInfo must be 56 bytes (fi
 static_assert(sizeof(NodeHolderInfo) == 40, "NodeHolderInfo must be 40 bytes (fixed part)");
 static_assert(sizeof(NodeRenewResp) == 16, "NodeRenewResp must be 16 bytes");
 static_assert(sizeof(NodeReleaseResp) == 8, "NodeReleaseResp must be 8 bytes");
+static_assert(sizeof(NodeHoldsResp) == 8, "NodeHoldsResp must be 8 bytes (fixed part)");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
 static_assert(sizeof(ErrorResp) == 8, "ErrorResp must be 8 bytes");
 

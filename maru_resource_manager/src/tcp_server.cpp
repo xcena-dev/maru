@@ -711,11 +711,12 @@ bool TcpServer::handleOneRequest(int clientFd) {
         }
     } else if (type == MsgType::NODE_CLAIM_REQ || type == MsgType::NODE_ALLOC_REQ ||
                type == MsgType::NODE_FREE_REQ || type == MsgType::NODE_RENEW_REQ ||
-               type == MsgType::NODE_RELEASE_REQ || type == MsgType::NODE_HOLD_REQ) {
+               type == MsgType::NODE_RELEASE_REQ || type == MsgType::NODE_HOLD_REQ ||
+               type == MsgType::NODE_HOLDS_REQ) {
         // Node ID and epoch follow the fixed part (NODE_ALLOC: then the DAX
         // path; NODE_HOLD: the holder and boot ID), then client_id and
-        // request id. Every response is cached so that a retransmit is never
-        // applied twice.
+        // request id. Every response but NODE_HOLDS's (read only) is cached
+        // so that a retransmit is never applied twice.
         size_t fixedSize = sizeof(NodeReq);
         if (type == MsgType::NODE_ALLOC_REQ) {
             fixedSize = sizeof(NodeAllocReq);
@@ -784,6 +785,10 @@ bool TcpServer::handleOneRequest(int clientFd) {
         if (!trackClientId(clientFd, cid)) {
             sendError(clientFd, -EPERM, "client_id mismatch on connection");
             return false;
+        }
+        if (type == MsgType::NODE_HOLDS_REQ) {
+            auto resp = handler_.handleNodeHolds(nodeId, epoch);
+            return sendResp(clientFd, MsgType::NODE_HOLDS_RESP, resp.data(), resp.size()) == 0;
         }
         uint64_t requestId = parseRequestId(payload, cidEnd);
         const std::string key = cacheKey(type, cid, requestId, nodeId, epoch);

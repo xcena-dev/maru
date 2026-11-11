@@ -334,3 +334,54 @@ TEST_F(NodeHoldTest, HoldsFileKeepsOldLinesAndRefusesBadOnes) {
         expectRecoveryRefused(-EINVAL);
     }
 }
+
+TEST_F(NodeHoldTest, NodeHoldsListsTheHoldsNowAndChangesNothing) {
+    auto pm = start();
+    claim(*pm, "e1");
+    const Handle a = nodeAlloc(*pm, "e1");
+    const Handle b = nodeAlloc(*pm, "e1");
+    const Handle gone = nodeAlloc(*pm, "e1");
+    ASSERT_EQ(hold(*pm, a, "w1@e1", worker("e1")), 0);
+    std::string path;
+    ASSERT_EQ(pm->hold(b, "agent-1", "i1", path), 0);
+    ASSERT_EQ(pm->hold(gone, "agent-1", "i1", path), 0);
+    ASSERT_EQ(pm->nodeFree(gone, "n1", "e1"), 0);  // Draining: not listed.
+    claim(*pm, "e2");
+    ASSERT_EQ(hold(*pm, a, "w1@e2", worker("e2")), 0);
+    const std::string holdsFile = bytes(state + "/holds");
+    const std::string nodesFile = bytes(state + "/nodes");
+
+    std::vector<PoolManager::NodeRegion> regions;
+    ASSERT_EQ(pm->nodeHolds("n1", "e2", regions), 0);
+    ASSERT_EQ(regions.size(), 2u);
+    EXPECT_EQ(regions[0].handle.regionId, a.regionId);
+    EXPECT_EQ(regions[0].devPath, dev(0));
+    std::map<std::string, std::string> epochs;
+    for (const auto &[holder, h] : regions[0].holders) epochs[holder] = h.nodeEpoch;
+    EXPECT_EQ(epochs, (std::map<std::string, std::string>{{"w1@e1", "e1"}, {"w1@e2", "e2"}}));
+    ASSERT_EQ(regions[1].holders.size(), 1u);
+    EXPECT_EQ(regions[1].holders[0].first, "agent-1");
+    EXPECT_EQ(regions[1].holders[0].second.nodeEpoch, "");
+    EXPECT_EQ(bytes(state + "/holds"), holdsFile);
+    EXPECT_EQ(bytes(state + "/nodes"), nodesFile);
+
+    // The earlier run's hold goes: listed no more.
+    ASSERT_EQ(pm->unhold(a, "w1@e1", "w1@e1"), 0);
+    ASSERT_EQ(pm->nodeHolds("n1", "e2", regions), 0);
+    EXPECT_EQ(regions[0].holders.size(), 1u);
+
+    // Only the current run asks; names are checked.
+    EXPECT_EQ(pm->nodeHolds("n1", "e1", regions), -ESTALE);
+    EXPECT_TRUE(regions.empty());
+    EXPECT_EQ(pm->nodeHolds("n9", "e2", regions), -ESTALE);
+    EXPECT_EQ(pm->nodeHolds("n 1", "e2", regions), -EINVAL);
+    EXPECT_EQ(pm->nodeHolds("n1", "", regions), -EINVAL);
+
+    // It does not renew the lease, and a fenced run may not ask.
+    PoolManagerTestPeer::ageNode(*pm, "n1", milliseconds(899000));
+    ASSERT_EQ(pm->nodeHolds("n1", "e2", regions), 0);
+    PoolManagerTestPeer::ageNode(*pm, "n1", milliseconds(1000));
+    reap(*pm);
+    EXPECT_EQ(PoolManagerTestPeer::nodeCount(*pm), 0u);
+    EXPECT_EQ(pm->nodeHolds("n1", "e2", regions), -ESTALE);
+}

@@ -8,9 +8,9 @@
 namespace maru {
 
 /// One hold. A remote agent's HOLD has a holder (its node ID) and an
-/// instance (its epoch) only. A worker's NODE_HOLD (instance == holder, a
-/// worker incarnation) also records who it is, so that the RM can tell when
-/// that process is gone; empty or zero fields are unknown.
+/// instance (its epoch) only. A NODE_HOLD (instance == holder, a process's
+/// name in one node run) also records who it is, so that the RM can tell
+/// when that process is gone; empty or zero fields are unknown.
 struct HoldRecord {
     std::string instance;
     std::string nodeEpoch;  // The node's run the hold was made under

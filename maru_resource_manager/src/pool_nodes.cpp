@@ -197,6 +197,15 @@ int PoolManager::nodeClaim(const std::string &nodeId, const std::string &epoch,
         // run retries the claim.
         if (syncRc != 0) return syncRc;
     }
+    // Taken with the epoch switch: a hold of an earlier run is listed here,
+    // or is refused (-ESTALE) from now on.
+    regions = nodeRegionsLocked(nodeId);
+    return 0;
+}
+
+std::vector<PoolManager::NodeRegion> PoolManager::nodeRegionsLocked(const std::string &nodeId)
+{
+    std::vector<NodeRegion> regions;
     const std::string owner = nodeOwnerId(nodeId);
     for (const auto &[id, a] : allocations_)
     {
@@ -208,13 +217,11 @@ int PoolManager::nodeClaim(const std::string &nodeId, const std::string &epoch,
             r.devPath = regionPath(*pool, id);
             r.deviceUuid = pool->deviceUuid;
         }
-        // Taken with the epoch switch: a hold of an earlier run is listed
-        // here, or is refused (-ESTALE) from now on.
         auto held = holds_.find(id);
         if (held != holds_.end()) r.holders.assign(held->second.begin(), held->second.end());
         regions.push_back(r);
     }
-    return 0;
+    return regions;
 }
 
 int PoolManager::nodeAlloc(const std::string &nodeId, const std::string &epoch, uint64_t size,
@@ -340,9 +347,31 @@ int PoolManager::nodeRenew(const std::string &nodeId, const std::string &epoch)
     NodeState *node = currentNode(nodeId, epoch);
     if (!node)
     {
-        return -ESTALE;
+        // Fenced (lease ran out) or forgotten, with no other run since: the
+        // run is over but may start a new one. Another run's claim: -ESTALE.
+        auto it = nodes_.find(nodeId);
+        const bool fenced = it == nodes_.end() || it->second.epoch.empty() ||
+                            it->second.epoch == epoch;
+        return fenced ? -EKEYEXPIRED : -ESTALE;
     }
     node->seen = SteadyClock::now();
+    return 0;
+}
+
+int PoolManager::nodeHolds(const std::string &nodeId, const std::string &epoch,
+                           std::vector<NodeRegion> &regions)
+{
+    regions.clear();
+    if (!validNodeId(nodeId) || !validHoldName(epoch))
+    {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!currentNode(nodeId, epoch))
+    {
+        return -ESTALE;
+    }
+    regions = nodeRegionsLocked(nodeId);
     return 0;
 }
 

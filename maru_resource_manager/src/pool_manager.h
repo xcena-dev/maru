@@ -120,14 +120,15 @@ public:
 
     /// Node ownership (pool_nodes.cpp): a StorageService owns regions as its
     /// node, never reaped by the PID check or the grace period. Each request
-    /// whose epoch is not the node's current run is -ESTALE.
+    /// whose epoch is not the node's current run is -ESTALE (NODE_RENEW:
+    /// -EKEYEXPIRED if no other run claimed the node since).
     struct NodeRegion
     {
         Handle handle;
         uint64_t requestedSize;
         std::string devPath;     // "" while the region's pool is not served
         std::string deviceUuid;
-        std::vector<std::pair<std::string, HoldRecord>> holders;  // NODE_CLAIM only
+        std::vector<std::pair<std::string, HoldRecord>> holders;  // NODE_CLAIM, NODE_HOLDS
     };
     /// Make `epoch` the node's current run and list its regions. -EEXIST if
     /// the node is bound to another host.
@@ -137,11 +138,16 @@ public:
                   const std::string &daxPath, NodeRegion &out);
     int nodeFree(const Handle &handle, const std::string &nodeId, const std::string &epoch);
     int nodeRenew(const std::string &nodeId, const std::string &epoch);
+    /// The node's regions with their holds, as NODE_CLAIM lists them. Read
+    /// only: the lease is not renewed.
+    int nodeHolds(const std::string &nodeId, const std::string &epoch,
+                  std::vector<NodeRegion> &regions);
     /// Free every region of the node and forget it.
     int nodeRelease(const std::string &nodeId, const std::string &epoch, uint32_t &released);
-    /// A worker (holder: its incarnation) maps the node's region: hold it as
-    /// HOLD does, recording who.nodeEpoch (the node's current run) and the
-    /// worker's identity. UNHOLD with instance = holder drops it.
+    /// A process (holder: its name in this run, e.g. a worker incarnation)
+    /// maps the node's region: hold it as HOLD does, recording who.nodeEpoch
+    /// (the node's current run) and the process's identity. UNHOLD with
+    /// instance = holder drops it.
     int nodeHold(const Handle &handle, const std::string &nodeId, const std::string &holder,
                  const HoldRecord &who, std::string &outPath);
 
@@ -312,6 +318,8 @@ private:
     };
     // The node whose current run is `epoch`, or null.
     NodeState *currentNode(const std::string &nodeId, const std::string &epoch);
+    // The node's regions (not draining) with their holds.
+    std::vector<NodeRegion> nodeRegionsLocked(const std::string &nodeId);
     bool nodeOnThisHost(const char *clientId) const;
     // Save the node table (claimed nodes only); syncRc as saveHoldsLocked.
     int saveNodesLocked(int &syncRc);

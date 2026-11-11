@@ -23,6 +23,7 @@ from maru_shm import client as client_module
 from maru_shm.client import (
     MaruShmClient,
     NodeHostConflictError,
+    NodeLeaseExpiredError,
     StaleNodeEpochError,
 )
 from maru_shm.types import RegionHolder
@@ -96,15 +97,16 @@ def test_claim_takeover_and_release(rm_address):
     second = _client(rm_address)
     again = second.node_claim("gb1", "e2")
     assert (again.rm_domain, again.regions) == (claim.rm_domain, [region])
-    with pytest.raises(StaleNodeEpochError):
+    with pytest.raises(StaleNodeEpochError) as info:
         second.node_renew("gb1", "e1")
+    assert not isinstance(info.value, NodeLeaseExpiredError)  # e2 claimed it
     with pytest.raises(StaleNodeEpochError):
         second.node_free("gb1", "e1", region.handle)
     with pytest.raises(NodeHostConflictError):
         _client(rm_address, "other-host:1").node_claim("gb1", "e3")
     assert second.node_renew("gb1", "e2") == LEASE_S
     assert second.node_release("gb1", "e2") == 1
-    with pytest.raises(StaleNodeEpochError):
+    with pytest.raises(NodeLeaseExpiredError):
         second.node_renew("gb1", "e2")
     assert second.stats()[0].free_size == SIZE - ALIGN
     second.close()
@@ -119,8 +121,10 @@ def test_lease_expiry_frees_and_forgets(rm_address):
     while client.stats()[0].free_size != SIZE - ALIGN:
         assert time.monotonic() < deadline
         time.sleep(0.2)
-    with pytest.raises(StaleNodeEpochError):
+    with pytest.raises(NodeLeaseExpiredError):
         client.node_renew("gb1", "e1")
+    with pytest.raises(StaleNodeEpochError):
+        client.node_holds("gb1", "e1")
     # Forgotten: any host may claim the node now.
     other = _client(rm_address, "other-host:1")
     assert other.node_claim("gb1", "e2").regions == []
@@ -188,6 +192,30 @@ def test_worker_holds_are_listed_fenced_and_reaped(rm_address):
         assert time.monotonic() < deadline
         time.sleep(0.1)
     run.unhold(region.handle, "gone", "gone")  # After the reaper: a no-op.
+    run.close()
+    second.close()
+
+
+def test_node_holds_lists_the_holds_now(rm_address):
+    run = _client(rm_address)
+    run.node_claim("gb1", "e1")
+    region = run.node_alloc("gb1", "e1", ALIGN)
+    me = _identity(os.getpid())
+    run.node_hold("gb1", "e1", region.handle, "w1@e1", **me)
+    second = _client(rm_address)
+    second.node_claim("gb1", "e2")
+    second.node_hold("gb1", "e2", region.handle, "w1@e2", **me)
+    (listed,) = second.node_holds("gb1", "e2")
+    assert listed.handle == region.handle and listed.dax_path == "/dev/dax0.0"
+    assert sorted((h.holder, h.node_epoch) for h in listed.holders) == [
+        ("w1@e1", "e1"),
+        ("w1@e2", "e2"),
+    ]
+    run.unhold(region.handle, "w1@e1", "w1@e1")
+    (listed,) = second.node_holds("gb1", "e2")
+    assert [h.holder for h in listed.holders] == ["w1@e2"]
+    with pytest.raises(StaleNodeEpochError):
+        run.node_holds("gb1", "e1")
     run.close()
     second.close()
 

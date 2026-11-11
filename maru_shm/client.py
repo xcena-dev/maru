@@ -31,6 +31,7 @@ from .ipc import (
     NodeClaimResp,
     NodeFreeReq,
     NodeHoldReq,
+    NodeHoldsResp,
     NodeReleaseResp,
     NodeRenewResp,
     NodeReq,
@@ -45,6 +46,7 @@ from .types import (
     MaruPoolInfo,
     NodeClaim,
     NodeHostConflictError,
+    NodeLeaseExpiredError,
     NodeOwnershipUnsupportedError,
     NodeRegion,
     RetryableNodeError,
@@ -520,7 +522,13 @@ class MaruShmClient:
             self._close_region_locked(handle.region_id)
 
     def node_renew(self, node_id: str, node_epoch: str) -> float:
-        """Start the node's lease again. Returns the lease in seconds."""
+        """Start the node's lease again. Returns the lease in seconds.
+
+        Raises:
+            NodeLeaseExpiredError: if the run's lease ran out (or the node was
+                released) and no other run claimed the node since.
+            StaleNodeEpochError: if another run claimed the node.
+        """
         req = NodeReq(
             node_id=node_id,
             node_epoch=node_epoch,
@@ -530,8 +538,32 @@ class MaruShmClient:
         hdr, payload = self._rpc(MsgType.NODE_RENEW_REQ, req.pack())
         self._check_node_error(hdr, payload, "Node renew failed")
         resp = NodeRenewResp.unpack(payload)
+        if resp.status == -errno.EKEYEXPIRED:
+            raise NodeLeaseExpiredError(
+                "Node renew failed: the lease of this run ran out"
+            )
         self._check_node_status(resp.status, "Node renew failed", retryable=True)
         return resp.lease_ms / 1000
+
+    def node_holds(self, node_id: str, node_epoch: str) -> list[NodeRegion]:
+        """The node's regions with their holds now. Read only: the lease is
+        not renewed.
+
+        Raises:
+            StaleNodeEpochError: if ``node_epoch`` is not the node's current,
+                unfenced run.
+        """
+        req = NodeReq(
+            node_id=node_id,
+            node_epoch=node_epoch,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.NODE_HOLDS_REQ, req.pack())
+        self._check_node_error(hdr, payload, "Node holds failed")
+        resp = NodeHoldsResp.unpack(payload)
+        self._check_node_status(resp.status, "Node holds failed", retryable=True)
+        return resp.regions or []
 
     def node_release(self, node_id: str, node_epoch: str) -> int:
         """Free every region of the node and forget it (``leave``).
@@ -563,10 +595,10 @@ class MaruShmClient:
         pid_start: int,
         pid_ns: int,
     ) -> GetAccessResp:
-        """Hold a region of the node that this worker maps, as :meth:`hold_access`.
+        """Hold a region of the node that this process maps, as :meth:`hold_access`.
 
-        ``holder`` names this worker incarnation (unique per process); drop the
-        hold with ``unhold(handle, holder, holder)``. The RM keeps the region
+        ``holder`` names this process's hold in this run (unique per process
+        and run); drop it with ``unhold(handle, holder, holder)``. The RM keeps the region
         out of reuse until every holder drops its hold, and drops the hold
         itself once it sees the process gone (same host, boot and pid
         namespace): ``pid_start`` is field 22 of /proc/<pid>/stat, ``pid_ns``

@@ -95,7 +95,7 @@ TEST_F(NodeOwnershipTest, ClaimAllocFreeRenewRelease) {
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
     EXPECT_EQ(nodesFile(), "");
     // Forgotten: the run is over, and any host may claim the node.
-    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
     EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ESTALE);
     EXPECT_TRUE(claim(pm, "node-a", "e2", "host-b").empty());
     EXPECT_EQ(pm.checkpoint(), 0);
@@ -119,10 +119,10 @@ TEST_F(NodeOwnershipTest, EarlierRunIsFenced) {
     EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ESTALE);
     EXPECT_EQ(released, 0u);
     EXPECT_EQ(access(pm, a), dev(0));
-    // A node without a record has no current run.
+    // A node without a record has no current run; no other run claimed it.
     nodeAlloc(pm, "node-z", "e1", -ESTALE);
     EXPECT_EQ(pm.nodeFree(a, "node-z", "e1"), -ESTALE);
-    EXPECT_EQ(pm.nodeRenew("node-z", "e1"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-z", "e1"), -EKEYEXPIRED);
     // Another node's region, or a process's, is not this node's to free.
     claim(pm, "node-b", "e1");
     EXPECT_EQ(pm.nodeFree(a, "node-b", "e1"), -EPERM);
@@ -187,7 +187,7 @@ TEST_F(NodeOwnershipTest, LeaseExpiryFreesAndForgets) {
     EXPECT_EQ(pm.allocationCount(), 2u);
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 1u);
     EXPECT_EQ(nodesFile(), "node node-b e1 host-a\n");
-    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
     nodeAlloc(pm, "node-a", "e1", -ESTALE);
     EXPECT_TRUE(claim(pm, "node-a", "e2", "host-b").empty());
     EXPECT_EQ(access(pm, b), dev(0));
@@ -200,7 +200,7 @@ TEST_F(NodeOwnershipTest, LeaseExpiryFreesAndForgets) {
     reap(pm);
     checkpoint_fault::clear();
     EXPECT_EQ(pm.allocationCount(), 3u);
-    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
     nodeAlloc(pm, "node-a", "e2", -ESTALE);
     reap(pm);
     EXPECT_EQ(pm.allocationCount(), 2u);
@@ -473,7 +473,7 @@ TEST_F(NodeOwnershipTest, AdminShowsAndReleasesNodes) {
     EXPECT_NE(admin(pm, "allocations").find("node=node-a epoch=- held_by=agent-1 draining\n"),
               npos);
     EXPECT_EQ(admin(pm, "release-node node-a").rfind("ERR 2 ", 0), 0u);
-    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
     for (const std::string &bad : std::vector<std::string>{
              "release-node", "release-node node-a --force", "release-node a b --confirm"})
         EXPECT_EQ(admin(pm, bad).rfind("ERR 22 ", 0), 0u) << bad;
@@ -569,11 +569,12 @@ TEST_F(NodeOwnershipTest, FailedClaimLeavesAFencedRunFenced) {
     checkpoint_fault::arm(state + "/maru-resource-manager.wal",
                           checkpoint_fault::Operation::Write, ENOSPC);
     reap(pm);
-    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);  // e2 claimed after it
     // The same run's retry fails again: still fenced, lease not renewed.
     checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
     claim(pm, "node-a", "e2", "host-a", -EIO);
-    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
     checkpoint_fault::clear();
     reap(pm);
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);

@@ -13,6 +13,7 @@ from maru_shm import client as client_module
 from maru_shm.client import MaruShmClient as RealShmClient  # before conftest's patch
 from maru_shm.client import (
     NodeHostConflictError,
+    NodeLeaseExpiredError,
     NodeOwnershipUnsupportedError,
     RetryableNodeError,
     StaleNodeEpochError,
@@ -28,6 +29,7 @@ from maru_shm.ipc import (
     NodeClaimResp,
     NodeFreeReq,
     NodeHoldReq,
+    NodeHoldsResp,
     NodeReleaseResp,
     NodeRenewResp,
     NodeReq,
@@ -54,7 +56,9 @@ class TestNodeMessages:
             MsgType.NODE_RELEASE_RESP,
             MsgType.NODE_HOLD_REQ,
             MsgType.NODE_HOLD_RESP,
-        ] == list(range(17, 29))
+            MsgType.NODE_HOLDS_REQ,
+            MsgType.NODE_HOLDS_RESP,
+        ] == list(range(17, 31))
 
     def test_node_req_layout(self):
         data = NodeReq(
@@ -165,6 +169,21 @@ class TestNodeMessages:
             with pytest.raises(ValueError):
                 NodeClaimResp.unpack(data[:cut])
 
+    def test_holds_resp_lists_regions_as_the_claim_does(self):
+        worker = RegionHolder("w-1@e1", "e1", "gb1", "b" * 36, 4242, 99, 7)
+        regions = [
+            NodeRegion(HANDLE, 3 << 20, "/dev/dax2.0", "u" * 36, [worker]),
+            NodeRegion(MaruHandle(region_id=8), 1, "", ""),
+        ]
+        data = NodeHoldsResp(status=0, regions=regions).pack()
+        assert struct.unpack_from("<iI", data) == (0, 2)
+        claim = NodeClaimResp(status=0, rm_domain="", regions=regions).pack()
+        assert data[8:] == claim[24:]  # the same region list
+        assert NodeHoldsResp.unpack(data) == NodeHoldsResp(0, regions)
+        for cut in (4, 8 + 50, len(data) - 1):
+            with pytest.raises(ValueError, match="NodeHoldsResp"):
+                NodeHoldsResp.unpack(data[:cut])
+
     def test_types_live_in_types_and_client_reexports_them(self):
         from maru_shm import client, types
 
@@ -172,6 +191,7 @@ class TestNodeMessages:
             "NodeClaim",
             "NodeRegion",
             "StaleNodeEpochError",
+            "NodeLeaseExpiredError",
             "NodeHostConflictError",
             "NodeOwnershipUnsupportedError",
             "RetryableNodeError",
@@ -305,6 +325,9 @@ class TestNodeClient:
                 MsgType.NODE_HOLD_REQ: _reply(
                     MsgType.NODE_HOLD_RESP, GetAccessResp(status=status).pack()
                 ),
+                MsgType.NODE_HOLDS_REQ: _reply(
+                    MsgType.NODE_HOLDS_RESP, NodeHoldsResp(status).pack()
+                ),
             }
         )
         client._rpc = rm
@@ -314,6 +337,7 @@ class TestNodeClient:
                 lambda: client.node_hold("gb1", "e1", HANDLE, "w", **hold),
                 retryable_error,
             ),
+            (lambda: client.node_holds("gb1", "e1"), retryable_error),
             (lambda: client.node_claim("gb1", "e1"), retryable_error),
             (lambda: client.node_alloc("gb1", "e1", 1), error),
             (lambda: client.node_free("gb1", "e1", HANDLE), error),
@@ -325,6 +349,20 @@ class TestNodeClient:
                 call()
             assert type(info.value) is expected  # Not one of the others.
             assert isinstance(info.value, RuntimeError)
+
+    def test_renew_tells_a_fenced_run_from_another_runs_claim(self, client):
+        status = [-errno.EKEYEXPIRED]
+        client._rpc = lambda *a: _reply(
+            MsgType.NODE_RENEW_RESP, struct.pack("<iIQ", status[0], 0, 0)
+        )
+        with pytest.raises(NodeLeaseExpiredError, match="lease"):
+            client.node_renew("gb1", "e1")
+        status[0] = -errno.ESTALE
+        with pytest.raises(StaleNodeEpochError) as info:
+            client.node_renew("gb1", "e1")
+        assert type(info.value) is StaleNodeEpochError
+        # A fenced run is still not the current one
+        assert issubclass(NodeLeaseExpiredError, StaleNodeEpochError)
 
     def test_an_rm_without_node_ownership_is_named(self, client):
         err = ErrorResp(status=-errno.ENOSYS, message="unknown request").pack()
@@ -338,6 +376,7 @@ class TestNodeClient:
             lambda: client.node_hold(
                 "gb1", "e1", HANDLE, "w", boot_id="b", pid=1, pid_start=2, pid_ns=3
             ),
+            lambda: client.node_holds("gb1", "e1"),
         ):
             with pytest.raises(NodeOwnershipUnsupportedError, match="does not support"):
                 call()
@@ -370,6 +409,25 @@ class TestNodeHold:
         assert payload[72:81] == b"gb1e1w-1b"
         with pytest.raises(TypeError):
             client.node_hold("gb1", "e1", HANDLE, "w-1", "b", 7, 8, 9)  # keyword-only
+
+
+class TestNodeHolds:
+    def test_node_holds_sends_the_run_and_returns_the_regions(self, client):
+        holder = RegionHolder("w@e0", "e0", "gb1", "b", 7, 8, 9)
+        region = NodeRegion(HANDLE, 3 << 20, "/dev/dax2.0", "", [holder])
+        rm = FakeRm(
+            {
+                MsgType.NODE_HOLDS_REQ: _reply(
+                    MsgType.NODE_HOLDS_RESP, NodeHoldsResp(0, [region]).pack()
+                )
+            }
+        )
+        client._rpc = rm
+        assert client.node_holds("gb1", "e1") == [region]
+        ((msg_type, payload),) = rm.sent
+        assert msg_type == MsgType.NODE_HOLDS_REQ
+        assert struct.unpack_from("<II", payload) == (3, 2)
+        assert payload[8:13] == b"gb1e1"
 
 
 class TestRequestIds:

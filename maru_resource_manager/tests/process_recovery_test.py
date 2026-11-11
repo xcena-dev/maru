@@ -669,7 +669,8 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertIn(f"region={handle[0]} ", output)
         code, output = self.ctl("release-node", "node-a", "--confirm")
         self.assertEqual(code, 0, output)
-        self.assertEqual(self.node_status(23, b"node-a", b"e2", 9), -errno.ESTALE)
+        # Released, and no other run claimed it since: fenced, not stale.
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 9), -errno.EKEYEXPIRED)
         self.check_stats()
 
         # NODE_RELEASE frees every region and forgets the node.
@@ -799,7 +800,7 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, self.log.read_text())
             time.sleep(0.1)
         self.assertIn("did not renew", self.log.read_text())
-        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.EKEYEXPIRED)
         self.stop()
 
     def test_second_instance_is_refused(self):
