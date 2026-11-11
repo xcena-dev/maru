@@ -509,6 +509,7 @@ def fake_scheduler_output(
         scheduled_new_reqs=list(new_reqs),
         scheduled_cached_reqs=fake_cached_reqs() if cached is None else cached,
         num_scheduled_tokens=dict(num_scheduled_tokens or {}),
+        total_num_scheduled_tokens=sum((num_scheduled_tokens or {}).values()),
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )
