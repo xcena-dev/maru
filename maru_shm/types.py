@@ -238,9 +238,10 @@ class StaleNodeEpochError(RuntimeError):
 
 
 class NodeLeaseExpiredError(StaleNodeEpochError):
-    """NODE_RENEW: the run's lease ran out or the node was released, and no
-    other run claimed the node since (-EKEYEXPIRED). The run is over; a new
-    run of this node may claim it."""
+    """NODE_RENEW: the run's lease ran out, or the node record is gone (it was
+    released, also by an admin release-node), and no other run claimed the
+    node since (-EKEYEXPIRED). The run is over; the StorageService starts a
+    new run, which claims the node again."""
 
 
 class NodeHostConflictError(RuntimeError):

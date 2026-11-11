@@ -525,8 +525,9 @@ class MaruShmClient:
         """Start the node's lease again. Returns the lease in seconds.
 
         Raises:
-            NodeLeaseExpiredError: if the run's lease ran out (or the node was
-                released) and no other run claimed the node since.
+            NodeLeaseExpiredError: if the run's lease ran out, or the node
+                record is gone (released), and no other run claimed the node
+                since.
             StaleNodeEpochError: if another run claimed the node.
         """
         req = NodeReq(

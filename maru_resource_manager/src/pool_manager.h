@@ -121,7 +121,8 @@ public:
     /// Node ownership (pool_nodes.cpp): a StorageService owns regions as its
     /// node, never reaped by the PID check or the grace period. Each request
     /// whose epoch is not the node's current run is -ESTALE (NODE_RENEW:
-    /// -EKEYEXPIRED if no other run claimed the node since).
+    /// -EKEYEXPIRED, lease expired, when the run is fenced or the node record
+    /// is gone and no other run claimed the node since).
     struct NodeRegion
     {
         Handle handle;

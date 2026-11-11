@@ -347,8 +347,10 @@ int PoolManager::nodeRenew(const std::string &nodeId, const std::string &epoch)
     NodeState *node = currentNode(nodeId, epoch);
     if (!node)
     {
-        // Fenced (lease ran out) or forgotten, with no other run since: the
-        // run is over but may start a new one. Another run's claim: -ESTALE.
+        // Lease expired: fenced (the lease ran out), or the node record is
+        // gone (NODE_RELEASE or an admin release-node), and no other run
+        // claimed the node since. The run is over; the StorageService starts
+        // a new run and claims again. Another run's claim: -ESTALE.
         auto it = nodes_.find(nodeId);
         const bool fenced = it == nodes_.end() || it->second.epoch.empty() ||
                             it->second.epoch == epoch;

@@ -199,8 +199,10 @@ struct NodeHolderInfo {
   uint64_t pidNs;
 };
 
-/// -EKEYEXPIRED: the run's lease ran out or the node was released, and no
-/// other run claimed it since; -ESTALE: another run claimed the node.
+/// -EKEYEXPIRED (lease expired): the run's lease ran out, or the node record
+/// is gone (NODE_RELEASE or an admin release-node), and no other run claimed
+/// the node since; the StorageService starts a new run and claims again.
+/// -ESTALE: another run claimed the node.
 struct NodeRenewResp {
   int32_t status;
   uint32_t reserved;
