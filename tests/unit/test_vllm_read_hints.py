@@ -61,8 +61,9 @@ def test_the_first_hit_hints_the_keys_the_load_reads_once():
     assert load_async and matched > 0
     sched.get_num_new_matched_tokens(request, 8)
     (hint,) = sched._handler.hints
-    # Computed tokens 0-7 are chunk 0: the load reads chunks 1-4.
-    assert hint == ("r1", keys[1:5], keys[1])
+    # Computed tokens 0-7 are chunk 0: the load reads chunks 1-4, from the
+    # pool of the request's first chunk key, where the load goes too.
+    assert hint == ("r1", keys[1:5], keys[0])
     sched.request_finished(request, [])
     assert sched._handler.ends == ["r1"]
 

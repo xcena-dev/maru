@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Prefix-cache hits must not leave holes in the external conversation KV."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
+import torch
+
+import maru
+from maru_vllm.connector import (
+    _chunk_keys,
+    _cpu_engine_config,
+    _create_maru_handler,
+    _step_chunks,
+)
+from maru_vllm.kv_groups import GROUP_FULL, GROUP_MAMBA, GROUP_SLIDING_WINDOW, KVGroup
+from tests.unit.test_vllm_cpu_config import engine_config
+from tests.unit.vllm_connector_helpers import (
+    attach_capturing_handler,
+    fake_cached_reqs,
+    fake_new_request_data,
+    fake_scheduler_output,
+    make_flash_attn_metadata,
+    make_scheduler,
+    make_worker,
+)
+
+BLOCK = 4
+CHUNK = 8
+
+
+def test_a_generated_prefix_is_stored_and_reused_after_gpu_eviction():
+    """Two turns copy real CPU tensor bytes; a third lookup must cross O1."""
+    scheduler = make_scheduler(BLOCK, CHUNK)
+    worker = make_worker(BLOCK, CHUNK)
+    layer = "model.layers.0.self_attn"
+    kv = torch.arange(2 * 12 * BLOCK, dtype=torch.float32).reshape(2, 12, BLOCK, 1)
+    worker._kv_caches = {layer: kv}
+    worker._num_layers = 1
+    worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+    stored = attach_capturing_handler(worker, capture=bytearray)
+    scheduler._handler = MagicMock()
+    scheduler._handler.batch_exists.side_effect = lambda keys: [
+        k in stored for k in keys
+    ]
+
+    for rid, tokens, local, expected_start in [("t1", 16, 0, 0), ("t2", 32, 24, 16)]:
+        request = SimpleNamespace(request_id=rid, prompt_token_ids=list(range(tokens)))
+        assert scheduler.get_num_new_matched_tokens(request, local) == (0, False)
+        new = fake_new_request_data(
+            prompt_token_ids=request.prompt_token_ids,
+            block_ids=list(range(tokens // BLOCK)),
+            num_computed_tokens=local,
+            req_id=rid,
+        )
+        meta = scheduler.build_connector_meta(
+            fake_scheduler_output([new], None, {rid: tokens - local})
+        )
+        (entry,) = meta.requests
+        assert entry.store_start_token == expected_start
+        worker.save_kv_layer(layer, kv, make_flash_attn_metadata(), meta)
+        assert set(stored) == set(_chunk_keys(request.prompt_token_ids, CHUNK))
+
+    # The former decode output occupies [16,24); its exact K/V bytes survive.
+    generated = torch.frombuffer(
+        stored[_chunk_keys(list(range(32)), CHUNK)[2]], dtype=torch.float32
+    )
+    expected = torch.stack((kv[0].reshape(-1)[16:24], kv[1].reshape(-1)[16:24]))
+    torch.testing.assert_close(generated, expected.reshape(-1))
+    scheduler._known_keys.clear()
+    after_eviction = SimpleNamespace(request_id="t3", prompt_token_ids=list(range(40)))
+    assert scheduler.get_num_new_matched_tokens(after_eviction, 0) == (32, False)
+
+
+@pytest.mark.parametrize("write_behind", [False, True])
+@pytest.mark.parametrize("maru_chunks", [0, 2])
+def test_prefix_repair_survives_chunked_prefill_without_recopying_sync_steps(
+    write_behind, maru_chunks
+):
+    scheduler = make_scheduler(BLOCK, CHUNK, {"maru_async_store": write_behind})
+    if maru_chunks:
+        scheduler._maru_hits["r"] = (maru_chunks, 24)
+    first = scheduler._store_meta("r", list(range(48)), (list(range(8)),), 24, 8)
+    assert first.store_start_token == maru_chunks * CHUNK
+    assert list(_step_chunks(first, CHUNK, 6)) == list(range(maru_chunks, 4))
+    meta = scheduler.build_connector_meta(
+        fake_scheduler_output(
+            [], fake_cached_reqs(["r"], [([8, 9, 10, 11],)], [32]), {"r": 16}
+        )
+    )
+    (last,) = meta.requests
+    assert last.store_start_token == maru_chunks * CHUNK  # write-behind starts here
+    assert not last.store_cached_prefix
+    assert list(_step_chunks(last, CHUNK, 6)) == [4, 5]
+
+
+@pytest.mark.parametrize("kind", [GROUP_FULL, GROUP_MAMBA, GROUP_SLIDING_WINDOW])
+def test_only_groups_with_complete_history_rewind_their_store(kind):
+    groups = [
+        KVGroup(0, GROUP_FULL, "FullAttentionSpec", ("a",), BLOCK, 32),
+        KVGroup(1, kind, "FullAttentionSpec", ("b",), BLOCK, 32),
+    ]
+    scheduler = make_scheduler(BLOCK, CHUNK, kv_groups=groups)
+    scheduler._maru_hits["r"] = (2, 24)
+    meta = scheduler._store_meta(
+        "r", list(range(32)), (list(range(8)), list(range(8))), 24, 8
+    )
+    assert meta.store_start_token == (16 if kind == GROUP_FULL else 24)
+    assert meta.store_cached_prefix is (kind == GROUP_FULL)
+
+
+@pytest.mark.parametrize("backend", ["cxl", "remote_cxl"])
+@pytest.mark.parametrize(
+    "setting,expected",
+    [
+        ({}, True),
+        ({"maru_auto_expand": False}, False),
+        ({"maru_auto_expand": True}, True),
+    ],
+)
+def test_vllm_passes_pool_expansion_policy_to_the_handler(
+    monkeypatch, backend, setting, expected
+):
+    configs = []
+
+    class Handler:
+        def __init__(self, config):
+            configs.append(config)
+
+        def connect(self):
+            return True
+
+    monkeypatch.setattr(maru, "MaruHandler", Handler)
+    _create_maru_handler(
+        {
+            "maru_storage_backend": backend,
+            "maru_pool_size": "16M",
+            "maru_engine_id": "e",
+            "maru_cache_namespace": "n",
+            **setting,
+        }
+    )
+    assert configs[0].auto_expand is expected
+
+
+@pytest.mark.parametrize("failure", ["policy", "eager", "dtype"])
+def test_remote_config_errors_name_the_remote_backend(failure):
+    config = engine_config()
+    if failure == "policy":
+        config.kv_transfer_config.kv_load_failure_policy = "fail"
+    elif failure == "eager":
+        config.model_config.enforce_eager = False
+    else:
+        config.cache_config.cache_dtype = "fp8"
+    with pytest.raises(ValueError, match="Remote CXL storage"):
+        _cpu_engine_config({"maru_storage_backend": "remote_cxl"}, config)

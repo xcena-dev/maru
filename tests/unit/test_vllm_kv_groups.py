@@ -41,6 +41,7 @@ from maru_vllm.connector import (
     MaruKVConnector,
     MaruReqMeta,
     _chunk_keys,
+    _is_dense,
 )
 from maru_vllm.kv_groups import (
     GROUP_FULL,
@@ -1088,26 +1089,30 @@ def _gdn_tensor(region, version):
 
 def _attn_tensor(region, version, kernel_block=TINY_BLOCK):
     """An attention layer: 0.23 flash (NB, 2, BS, NH, HS); 0.30 fused K/V
-    (NB, NH, BS, 2 HS), split into kernel blocks when ``kernel_block`` is
-    smaller than a block."""
+    (NB, NH, BS, 2 HS). With ``kernel_block`` smaller than a block, as vLLM
+    views the pages for an attention backend that takes smaller blocks:
+    block b is kernel blocks b * split to b * split + split - 1, each a dense
+    part of its page."""
+    split = TINY_BLOCK // kernel_block
     if version == "0.30":
-        split = TINY_BLOCK // kernel_block
         return torch.as_strided(
             region.view(torch.bfloat16),
             (TINY_BLOCKS * split, 2, kernel_block, 16),
             (TINY_SLOT // 2 // split, 16, 32, 1),
         )
-    return region.view(torch.bfloat16).view(TINY_BLOCKS, 2, 16, 2, 8)
+    return region.view(torch.bfloat16).view(TINY_BLOCKS * split, 2, kernel_block, 2, 8)
 
 
-def tiny_kv_caches(version, shared, gdn=TINY_GDN, attn=TINY_ATTN):
+def tiny_kv_caches(
+    version, shared, gdn=TINY_GDN, attn=TINY_ATTN, kernel_block=TINY_BLOCK
+):
     caches = {
         f"layers.{i}.linear_attn": _gdn_tensor(_region(shared, p), version)
         for layers in gdn
         for p, i in enumerate(layers)
     }
     caches |= {
-        f"layers.{i}.attn": _attn_tensor(_region(shared, p), version)
+        f"layers.{i}.attn": _attn_tensor(_region(shared, p), version, kernel_block)
         for p, i in enumerate(attn)
     }
     return caches
@@ -1209,15 +1214,47 @@ def test_attention_object_spans_the_chunk():
     assert worker._page_size_bytes == 2 * 4 * TINY_SLOT
 
 
-def test_split_kernel_blocks_are_refused():
-    shared = _shared()
-    kv_caches = tiny_kv_caches("0.30", shared)
-    for p, i in enumerate(TINY_ATTN):
-        kv_caches[f"layers.{i}.attn"] = _attn_tensor(
-            _region(shared, p), "0.30", kernel_block=8
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_a_store_reads_split_kernel_blocks_in_token_order(version):
+    """An attention backend that takes smaller blocks (FlashInfer takes at
+    most 64 tokens) gets each block as consecutive kernel blocks: block b is
+    kernel blocks 2b and 2b + 1 here. Each chunk object still holds its
+    block's tokens in order."""
+    worker, store = _storing_worker(tiny_kv_caches(version, _shared(), kernel_block=8))
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    attn = worker._group_caches[3].tensors
+    for key, block in zip(_chunk_keys(tokens, TINY_BLOCK), (4, 5), strict=True):
+        expected = _expected_slab(attn, [block], version, kernel_block=8)
+        assert torch.equal(
+            _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
         )
-    with pytest.raises(ValueError, match="16-token blocks, laid out as 8-token"):
+
+
+def test_a_split_attention_block_may_not_exceed_the_spec():
+    """A block's bytes are those of all its kernel blocks: two 1,024 B kernel
+    blocks make a 2,048 B block, too big for the spec's 1,024 B slot."""
+    kv_caches = tiny_kv_caches("0.23", _shared())
+    for i in TINY_ATTN:
+        kv_caches[f"layers.{i}.attn"] = torch.zeros(
+            TINY_BLOCKS * 2, 2, 8, 2, 16, dtype=torch.bfloat16
+        )
+    with pytest.raises(ValueError, match="2048 B on the GPU, more than"):
         _registered_worker(kv_caches)
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_a_split_attention_layer_holds_k_kernel_blocks_per_block(version):
+    """vLLM numbers kernel block j of block b as b x k + j only when the tensor
+    holds k of them per block, which is what Maru's slots resolve to."""
+    kv_caches = tiny_kv_caches(version, _shared(), kernel_block=TINY_BLOCK // 2)
+    layout = _engine_layout(kv_caches)
+    _worker(kv_cache_layout=layout, num_blocks=TINY_BLOCKS).register_kv_caches(
+        kv_caches
+    )
+    worker = _worker(kv_cache_layout=layout, num_blocks=TINY_BLOCKS + 1)
+    with pytest.raises(ValueError, match="24 kernel blocks of 8 tokens"):
+        worker.register_kv_caches(kv_caches)
 
 
 def test_attention_layout_needs_the_head_count():
@@ -1314,25 +1351,37 @@ def _store_meta(tokens, group_block_ids, computed, scheduled, req_ids=("r1",)):
     )
 
 
-def _token_rows(kv, block, version):
+def _token_rows(kv, block, version, kernel_block=TINY_BLOCK):
     """One block's KV as ``[2, block_size, row]``, the order Maru stores.
 
     0.23's flash layout has a K/V axis. 0.30's page ``[B, H, N, K|V]`` holds
-    each head's K and V as the halves of its last axis, which Maru splits.
+    each head's K and V as the halves of its last axis, which Maru splits. A
+    tensor in kernel blocks of ``kernel_block`` tokens holds the block as
+    its kernel blocks block * split onward, in token order.
     """
-    if version == "0.30":
-        heads = kv[block].unflatten(-1, (2, -1))  # [H, N, 2, D]
-        return heads.permute(2, 1, 0, 3).reshape(2, TINY_BLOCK, -1)
-    return kv[block].reshape(2, TINY_BLOCK, -1)
+    split = TINY_BLOCK // kernel_block
+    rows = []
+    for page in kv[block * split : (block + 1) * split]:
+        if version == "0.30":
+            heads = page.unflatten(-1, (2, -1))  # [H, N, 2, D]
+            rows.append(heads.permute(2, 1, 0, 3).reshape(2, kernel_block, -1))
+        else:
+            rows.append(page.reshape(2, kernel_block, -1))
+    return torch.cat(rows, dim=1)
 
 
-def _expected_slab(tensors, blocks, version):
+def _expected_slab(tensors, blocks, version, kernel_block=TINY_BLOCK):
     """KV_2LTD slab ``[2, layers, tokens, row]`` of ``blocks`` for each layer."""
     return torch.stack(
         [
             torch.stack(
                 [
-                    torch.cat([_token_rows(kv, b, version)[plane] for b in blocks])
+                    torch.cat(
+                        [
+                            _token_rows(kv, b, version, kernel_block)[plane]
+                            for b in blocks
+                        ]
+                    )
                     for kv in tensors
                 ]
             )
@@ -1547,23 +1596,47 @@ def test_padded_pages_store_without_the_kernel():
     assert dense._build_group_kernel(dense._group_caches[3], None) == ("ops",) * 6
 
 
-def _kernel_worker(extra=None):
+def test_padded_logical_pages_keep_the_kernel():
+    """A logical page is placed by its strides, which step over the padding,
+    so a padded one still takes the kernel (vLLM 0.29+)."""
+    padded = _shared(positions=4)
+    caches = tiny_kv_caches("0.30", _shared())
+    for p, i in enumerate(TINY_ATTN):
+        region = padded[p * TINY_LAYER_BYTES :][: TINY_LAYER_BYTES + TINY_SLOT]
+        caches[f"layers.{i}.attn"] = torch.as_strided(
+            region.view(torch.bfloat16),
+            (TINY_BLOCKS, 2, TINY_BLOCK, 16),
+            (TINY_SLOT // 2 + 64, 16, 32, 1),
+        )
+    worker = _registered_worker(caches)
+    cache = worker._group_caches[3]
+    assert cache.layout.kv_packed and not _is_dense(cache.tensors[0])
+    worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
+    assert worker._build_group_kernel(cache, None) == ("ops",) * 6
+
+
+# 0.23: a rank-5 flash page and a vendored format. 0.30: vLLM 0.29+'s logical
+# page, which the kernel addresses by its strides.
+KERNEL_VERSIONS = ["0.23", "0.30"]
+
+
+def _kernel_worker(extra=None, version="0.23"):
     """A worker on CUDA whose attention group stores through maru_kv_ops."""
     from maru_vllm.connector import _resolve_kv_ops
 
     if not torch.cuda.is_available() or _resolve_kv_ops() is None:
         pytest.skip("needs CUDA and the maru_kv_ops kernels")
     shared = _shared().cuda()
-    worker, store = _storing_worker(tiny_kv_caches("0.23", shared), extra=extra)
+    worker, store = _storing_worker(tiny_kv_caches(version, shared), extra=extra)
     worker._last_attn_metadata = make_flash_attn_metadata()
     return worker, store, shared
 
 
-def _check_qwen_objects(worker, store, shared, tokens):
+def _check_qwen_objects(worker, store, shared, tokens, version="0.23"):
     k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
     attn = [t.cpu() for t in worker._group_caches[3].tensors]
     for key, block in ((k0, 4), (k1, 5)):
-        expected = _expected_slab(attn, [block], "0.23")
+        expected = _expected_slab(attn, [block], version)
         assert torch.equal(
             _slab(store[group_object_key(key, 3, TINY_BLOCK)], expected), expected
         )
@@ -1575,20 +1648,22 @@ def _check_qwen_objects(worker, store, shared, tokens):
             assert obj[p * TINY_SLOT :][:TINY_STATE] == bytes(state)
 
 
-def test_kernel_store_uses_the_group_pointer_table():
-    worker, store, shared = _kernel_worker()
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_store_uses_the_group_pointer_table(version):
+    worker, store, shared = _kernel_worker(version=version)
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     assert worker._group_kernels[3] is not None
     assert len(store) == 5
-    _check_qwen_objects(worker, store, shared, tokens)
+    _check_qwen_objects(worker, store, shared, tokens, version)
 
 
-def test_kernel_store_registers_no_group_object_whose_copy_failed():
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_store_registers_no_group_object_whose_copy_failed(version):
     """The attention group's slabs, whose copies could not be confirmed, are
     freed instead of registered; the Mamba states, copied synchronously,
     still are."""
-    worker, store, shared = _kernel_worker()
+    worker, store, shared = _kernel_worker(version=version)
     worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(shared.device))
     worker._sync_store_stream_device = shared.device
     tokens = list(range(40))
@@ -1598,25 +1673,27 @@ def test_kernel_store_registers_no_group_object_whose_copy_failed():
     assert worker._handler.free.call_count == 2  # the two attention slabs
 
 
-def test_kernel_write_behind_stores_attention_later_and_states_now():
-    worker, store, shared = _kernel_worker({"maru_async_store": True})
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_write_behind_stores_attention_later_and_states_now(version):
+    worker, store, shared = _kernel_worker({"maru_async_store": True}, version)
     tokens = list(range(40))
     worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
     k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
     assert all(group_object_key(k1, g, TINY_BLOCK) in store for g in range(3))
     worker._store_executor.shutdown(wait=True)
     assert len(store) == 5
-    _check_qwen_objects(worker, store, shared, tokens)
+    _check_qwen_objects(worker, store, shared, tokens, version)
 
 
-def test_kernel_store_reads_the_null_block_behind_the_window():
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_store_reads_the_null_block_behind_the_window(version):
     from maru_vllm.connector import _resolve_kv_ops
 
     if not torch.cuda.is_available() or _resolve_kv_ops() is None:
         pytest.skip("needs CUDA and the maru_kv_ops kernels")
     shared = _shared().cuda()
     kv_caches = {
-        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.23")
+        f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), version)
         for i in range(4)
     }
     worker, store = _storing_worker(kv_caches, tiny_swa_config(), chunk=64)
@@ -1627,7 +1704,7 @@ def test_kernel_store_reads_the_null_block_behind_the_window():
 
     (k0,) = _chunk_keys(tokens, 64)
     swa = [t.cpu() for t in worker._group_caches[0].tensors]
-    expected = _expected_slab(swa, [0, 8, 9, 10], "0.23")
+    expected = _expected_slab(swa, [0, 8, 9, 10], version)
     assert torch.equal(_slab(store[group_object_key(k0, 0, 64)], expected), expected)
 
 
@@ -1746,6 +1823,27 @@ def test_an_inline_load_restores_every_group(version):
                     _state(target, layer, b_block), _state(source, layer, a_block)
                 )
     assert worker.take_failed_load_blocks() == set()
+
+
+@pytest.mark.parametrize("version", ["0.23", "0.30"])
+def test_a_load_fills_split_kernel_blocks(version):
+    """Objects stored from whole blocks load into an engine whose attention
+    backend splits each block into two kernel blocks."""
+    _, stored, store = _stored_qwen(version)
+    target = torch.zeros_like(_shared())
+    worker, _ = _storing_worker(tiny_kv_caches(version, target, kernel_block=8))
+    _serve(worker, store)
+    worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
+
+    assert worker.take_failed_load_blocks() == set()
+    src = stored._group_caches[3].tensors
+    dst = worker._group_caches[3].tensors
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, version, kernel_block=8),
+                _token_rows(a, a_block, version),
+            )
 
 
 def test_a_parked_load_writes_the_state_only_where_the_hit_ends():
@@ -1901,25 +1999,25 @@ def test_several_groups_load_each_request_whole():
     assert make_scheduler(16, 32, extra)._layerwise_overlap
 
 
-def _cuda_loading_worker(store):
+def _cuda_loading_worker(store, version="0.23"):
     from maru_vllm.connector import _resolve_kv_ops
 
     if not torch.cuda.is_available() or _resolve_kv_ops() is None:
         pytest.skip("needs CUDA and the maru_kv_ops kernels")
     target = torch.zeros_like(_shared()).cuda()
-    worker, _ = _storing_worker(tiny_kv_caches("0.23", target))
+    worker, _ = _storing_worker(tiny_kv_caches(version, target))
     worker._last_attn_metadata = make_flash_attn_metadata()
     _serve(worker, store)
     return worker, target
 
 
-def _check_loaded(stored, worker, source, target, in_place):
+def _check_loaded(stored, worker, source, target, in_place, version="0.23"):
     src = [t.cpu() for t in stored._group_caches[3].tensors]
     dst = [t.cpu() for t in worker._group_caches[3].tensors]
     for a_block, b_block in ((4, 7), (5, 8)):
         for a, b in zip(src, dst, strict=True):
             assert torch.equal(
-                _token_rows(b, b_block, "0.23"), _token_rows(a, a_block, "0.23")
+                _token_rows(b, b_block, version), _token_rows(a, a_block, version)
             )
     for g in range(3):
         b_blocks = B_BLOCKS[g][1:] if in_place else B_BLOCKS[g][1:2]
@@ -1931,27 +2029,62 @@ def _check_loaded(stored, worker, source, target, in_place):
                 )
 
 
-def test_kernel_load_restores_every_group():
-    stored, store, source = _kernel_worker()
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_load_restores_every_group(version):
+    stored, store, source = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
-    worker, target = _cuda_loading_worker(store)
+    worker, target = _cuda_loading_worker(store, version)
     worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
     assert worker._group_kernels[3] is not None
     assert worker.take_failed_load_blocks() == set()
-    _check_loaded(stored, worker, source, target, in_place=True)
+    _check_loaded(stored, worker, source, target, in_place=True, version=version)
 
 
-def test_a_parked_load_runs_on_the_loader_thread():
-    stored, store, source = _kernel_worker()
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_a_parked_load_runs_on_the_loader_thread(version):
+    stored, store, source = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
-    worker, target = _cuda_loading_worker(store)
+    worker, target = _cuda_loading_worker(store, version)
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)
     worker._deferred_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert worker.get_finished_loading() == {"b"}
     assert worker.take_failed_load_blocks() == set()
-    _check_loaded(stored, worker, source, target, in_place=False)
+    _check_loaded(stored, worker, source, target, in_place=False, version=version)
+
+
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_round_trip_between_different_kernel_blocks(version):
+    """Stored through maru_kv_ops from 8-token kernel blocks and loaded through
+    it into 4-token ones: the object does not depend on how either engine's
+    attention backend splits its blocks."""
+    from maru_vllm.connector import _resolve_kv_ops
+
+    if not torch.cuda.is_available() or _resolve_kv_ops() is None:
+        pytest.skip("needs CUDA and the maru_kv_ops kernels")
+    source = _shared().cuda()
+    stored, store = _storing_worker(tiny_kv_caches(version, source, kernel_block=8))
+    stored._last_attn_metadata = make_flash_attn_metadata()
+    stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
+    target = torch.zeros_like(source)
+    worker, _ = _storing_worker(tiny_kv_caches(version, target, kernel_block=4))
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    _serve(worker, store)
+    worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
+    torch.cuda.synchronize()
+
+    assert stored._group_kernels[3] is not None
+    assert worker._group_kernels[3] is not None
+    assert worker.take_failed_load_blocks() == set()
+    src = [t.cpu() for t in stored._group_caches[3].tensors]
+    dst = [t.cpu() for t in worker._group_caches[3].tensors]
+    for a_block, b_block in ((4, 7), (5, 8)):
+        for a, b in zip(src, dst, strict=True):
+            assert torch.equal(
+                _token_rows(b, b_block, version, kernel_block=4),
+                _token_rows(a, a_block, version, kernel_block=8),
+            )
 
 
 # =============================================================================
@@ -2032,15 +2165,16 @@ def _spy_kernel_sources(worker):
     return sources
 
 
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
 @pytest.mark.parametrize(
     ("parked", "source"), [(False, "cpu"), (True, "cuda")], ids=["inline", "parked"]
 )
-def test_only_a_parked_load_stages_slabs_before_the_kernel(parked, source):
+def test_only_a_parked_load_stages_slabs_before_the_kernel(parked, source, version):
     """Inline: the kernel reads pinned CXL in place. Parked: the copy engine
     moves the slab first, so the kernel does not hold SMs during the read."""
-    stored, store, original = _kernel_worker()
+    stored, store, original = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
-    worker, target = _cuda_loading_worker(store)
+    worker, target = _cuda_loading_worker(store, version)
     _serve_pinned(worker, store)
     sources = _spy_kernel_sources(worker)
     if parked:
@@ -2052,7 +2186,9 @@ def test_only_a_parked_load_stages_slabs_before_the_kernel(parked, source):
         worker._deferred_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert sources == [source, source]
-    _check_loaded(stored, worker, original, target, in_place=not parked)
+    _check_loaded(
+        stored, worker, original, target, in_place=not parked, version=version
+    )
 
 
 def _backend_layers(name):
@@ -2064,15 +2200,21 @@ def _backend_layers(name):
 
 
 @pytest.mark.parametrize(
-    ("backend", "builds"), [("TRITON_ATTN", False), ("FLASH_ATTN", True)]
+    ("backend", "version", "builds"),
+    [
+        ("TRITON_ATTN", "0.23", False),
+        ("TRITON_ATTN", "0.30", True),
+        ("FLASH_ATTN", "0.23", True),
+        ("FLASH_ATTN", "0.30", True),
+    ],
 )
-def test_registration_decides_the_kernel_from_the_backend(backend, builds):
-    """Decided before any forward, so the first load already uses it."""
-    worker = _worker()
+def test_registration_decides_the_kernel_from_the_backend(backend, version, builds):
+    """Decided before any forward, so the first load already uses it. Triton
+    keeps the kernel only on vLLM 0.29+'s logical page, which is Flash's."""
+    caches = tiny_kv_caches(version, _shared())
+    worker = _worker(kv_cache_layout=_engine_layout(caches))
     worker._packed_load_kernel_ctx = MagicMock(return_value=("ops",) * 6)
-    worker.register_kv_caches(
-        tiny_kv_caches("0.23", _shared()), _backend_layers(backend)
-    )
+    worker.register_kv_caches(caches, _backend_layers(backend))
     expected = ("ops",) * 6 if builds else None
     assert worker._group_kernels == {3: expected}
     assert worker._packed_load_kernel_ctx.call_count == int(builds)
@@ -2103,14 +2245,14 @@ def test_connector_hands_the_models_layers_to_the_worker():
     connector._worker.register_kv_caches.assert_called_once_with({}, layers)
 
 
-def test_the_first_parked_load_uses_the_kernel_before_any_forward():
-    stored, store, original = _kernel_worker()
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_the_first_parked_load_uses_the_kernel_before_any_forward(version):
+    stored, store, original = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     target = torch.zeros_like(_shared()).cuda()
-    worker = _worker(kv_cache_layout="NHD")
-    worker.register_kv_caches(
-        tiny_kv_caches("0.23", target), _backend_layers("FLASH_ATTN")
-    )
+    caches = tiny_kv_caches(version, target)
+    worker = _worker(kv_cache_layout=_engine_layout(caches))
+    worker.register_kv_caches(caches, _backend_layers("FLASH_ATTN"))
     attach_capturing_handler(worker)
     assert worker._last_attn_metadata is None
     assert worker._group_kernels[3] is not None
@@ -2122,7 +2264,7 @@ def test_the_first_parked_load_uses_the_kernel_before_any_forward():
     worker._deferred_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert sources == ["cuda", "cuda"]
-    _check_loaded(stored, worker, original, target, in_place=False)
+    _check_loaded(stored, worker, original, target, in_place=False, version=version)
 
 
 # =============================================================================
@@ -2212,7 +2354,8 @@ def test_vllm_scheduler_gives_a_parked_mamba_load_the_hits_last_block(tmp_path, 
     assert new_req.block_ids[0][5] == mamba[5] and new_req.block_ids[0][6]
 
 
-def test_kernel_sliding_window_round_trip_skips_null_blocks():
+@pytest.mark.parametrize("version", KERNEL_VERSIONS)
+def test_kernel_sliding_window_round_trip_skips_null_blocks(version):
     from maru_vllm.connector import _resolve_kv_ops
 
     if not torch.cuda.is_available() or _resolve_kv_ops() is None:
@@ -2220,7 +2363,7 @@ def test_kernel_sliding_window_round_trip_skips_null_blocks():
 
     def swa_caches(shared):
         return {
-            f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), "0.23")
+            f"layers.{i}.attn": _attn_tensor(_region(shared, i // 2), version)
             for i in range(4)
         }
 
@@ -2244,13 +2387,13 @@ def test_kernel_sliding_window_round_trip_skips_null_blocks():
     for a_block, b_block in ((9, 1), (10, 2)):
         for a, b in zip(swa_src, swa_dst, strict=True):
             assert torch.equal(
-                _token_rows(b, b_block, "0.23"), _token_rows(a, a_block, "0.23")
+                _token_rows(b, b_block, version), _token_rows(a, a_block, version)
             )
-    assert not _token_rows(swa_dst[0], 0, "0.23").any()
+    assert not _token_rows(swa_dst[0], 0, version).any()
     for block in (3, 4, 5, 6):
         for a, b in zip(full_src, full_dst, strict=True):
             assert torch.equal(
-                _token_rows(b, block, "0.23"), _token_rows(a, block, "0.23")
+                _token_rows(b, block, version), _token_rows(a, block, version)
             )
 
 
@@ -2633,6 +2776,14 @@ def test_tp1_several_groups_keep_bare_keys(monkeypatch):
     worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
     assert worker._worker._kv_shard == WHOLE_MODEL
     assert worker._worker._state_shard == WHOLE_MODEL
+
+
+def test_the_worker_takes_vllms_block_count():
+    """It checks a tensor in kernel blocks against it (see
+    ``_detect_block_kv_layout``)."""
+    config = _tp_connector_config(16, 1, 8)
+    worker = MaruKVConnector(config, KVConnectorRole.WORKER, gpt_oss_config())
+    assert worker._worker._num_blocks == NUM_BLOCKS
 
 
 class _FillOps:

@@ -148,7 +148,7 @@ class MaruHandlerPlugin(Protocol):
         With ``read_hints`` or ``read_promotes`` on, a handler of the ``cxl``
         backend gives its hints to the plugins whose :attr:`hint_actions` name
         the hint's action. ``message`` has the form a remote CXL agent's
-        region extension gets (:mod:`maru_handler.storage.remote_cxl.hints`):
+        region extension gets (:mod:`maru_handler.hints`):
 
         - ``action``: ``"read_hint"`` (``request`` will read ``ranges`` soon,
           in this order), ``"read_hint_end"`` (``request`` ended; what was

@@ -52,12 +52,15 @@ class KVLayout:
             compares against it, so a hybrid model's differently-shaped layer
             can never be read through another layer's geometry.
         format_name: ``maru_kv_ops.EngineKVFormat`` member, or None when
-            this layout has no kernel form and must use per-layer transfers.
-            Read only by the packed-kernel path, which walks memory itself.
+            this layout has none. Read only by the packed-kernel path, which
+            walks memory itself. A layout with neither this nor ``kv_packed``
+            must use per-layer transfers.
         kv_packed: True when K and V are the two halves of the last dimension,
             K first, as in vLLM 0.29+'s ``[B, H, N, K|V]`` page. ``kv_axis``
             then names that dimension, which ``_canonical_paged_view`` splits
-            into ``(2, head_size)``, so transfers see a real K/V axis.
+            into ``(2, head_size)``, so transfers see a real K/V axis. The
+            packed-kernel path places such a page by its strides
+            (``maru_kv_ops.LogicalPageFormat``), whatever its physical order.
     """
 
     num_blocks: int
@@ -132,8 +135,11 @@ def _kv_layout_candidates(
         # That needs C to be exactly two heads wide: diffkv's uneven split,
         # packed quantized content, and MLA's single latent (no head_size is
         # passed) keep the fused reading, whose halves are a storage
-        # convention. Both readings are stride-agnostic. Neither has a kernel
-        # format: the *_TWO_HS formats move whole token rows as one plane.
+        # convention. Both readings are stride-agnostic. Neither has an
+        # EngineKVFormat: the *_TWO_HS formats move whole token rows as one
+        # plane. The split reading (kv_packed) is placed by maru_kv_ops'
+        # logical-page kernel, which takes the page's strides; the fused one
+        # stays on per-layer copies.
         if head_size is not None and shape[3] == 2 * head_size:
             add(3, 0, 2, shape[1], head_size, packed=True)
         elif shape[3] % 2 == 0:
@@ -250,6 +256,66 @@ def _detect_kv_layout(
             [c.kv_axis for c in rivals],
         )
     return best
+
+
+def _detect_block_kv_layout(
+    shape: tuple[int, ...],
+    block_size: int,
+    kv_layout: str | None,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
+    num_blocks: int | None = None,
+) -> KVLayout | None:
+    """Resolve a paged KV tensor of ``block_size``-token blocks, or of the
+    kernel blocks vLLM splits them into.
+
+    An attention backend that cannot take a block whole, such as FlashInfer
+    with a 544-token block, gets each block as ``k`` consecutive kernel
+    blocks, each a dense part of the block's page: block ``b`` is kernel
+    blocks ``b * k`` to ``b * k + k - 1``.
+    The layout then describes the kernel blocks. Slots built from vLLM's
+    block ids and ``block_size`` stay right: slot ``b * block_size + t`` is
+    token ``t % kernel`` of kernel block ``b * k + t // kernel``, which is
+    ``divmod(slot, kernel)``.
+
+    That holds only when the tensor has ``k`` kernel blocks for each of
+    vLLM's ``num_blocks`` blocks. vLLM numbers them ``b * stride + j`` with a
+    larger stride when other layers' pages sit between them (a packed
+    cache), and an axis misread as the token axis rarely gives the count, so
+    a tensor in kernel blocks is checked against it when it is known.
+
+    Arguments and return value as for :func:`_detect_kv_layout`, plus
+    ``num_blocks``, vLLM's block count (``KVCacheConfig.num_blocks``).
+
+    Raises:
+        ValueError: The tensor reads as kernel blocks, but not ``k`` of them
+            for each block.
+    """
+    layout = _detect_kv_layout(shape, block_size, kv_layout, num_kv_heads, head_size)
+    if layout is not None:
+        return layout
+    miscounted: KVLayout | None = None
+    for kernel in range(block_size // 2, 0, -1):
+        if block_size % kernel:
+            continue
+        layout = _detect_kv_layout(shape, kernel, kv_layout, num_kv_heads, head_size)
+        if layout is None:
+            continue
+        if num_blocks is None or layout.num_blocks == num_blocks * (
+            block_size // kernel
+        ):
+            return layout
+        miscounted = miscounted or layout
+    if miscounted is not None:
+        k = block_size // miscounted.block_size
+        raise ValueError(
+            f"Maru: the KV tensor {tuple(shape)} holds {miscounted.num_blocks} "
+            f"kernel blocks of {miscounted.block_size} tokens, not {k} for each "
+            f"of vLLM's {num_blocks} blocks of {block_size} tokens. Use an "
+            "attention backend that keeps whole blocks, such as "
+            "--attention-backend TRITON_ATTN"
+        )
+    return None
 
 
 def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:

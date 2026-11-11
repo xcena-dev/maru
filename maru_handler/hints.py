@@ -29,6 +29,13 @@ WRITEs. Memory that would otherwise fill each written page from its slow
 tier on the first WRITE can prepare the pages instead. A write hint has no
 end; it never gives the memory side leave to change the pages.
 
+:class:`MemoryHints` holds what does not depend on a backend: the
+background thread, the queue and its drop policy, and the bookkeeping that
+ends each hinted request at the targets it reached. A backend gives it two
+callables: where the hinted keys are (``locate``) and how a message reaches
+the memory side (``send``). The ``remote_cxl`` backend sends to the remote
+CXL agents of the keys' regions, as described above.
+
 All of it runs on one background thread per client, in the order hints were
 given, so the caller (an engine's input thread or its scheduler) never waits
 for a lookup, a connection or a reply. A hint is advice: one that is late,
@@ -61,16 +68,20 @@ MAX_OPEN_HINTS = 4096
 
 
 class MemoryHints:
-    """Sends read and write hints to remote CXL agents on one background thread.
+    """Sends read and write hints to the memory side on one background thread.
+
+    A target is whatever ``send`` delivers to; on ``remote_cxl`` it is the
+    remote CXL agent that maps a region.
 
     Args:
         locate: ``keys -> [(agent, ranges)]``: the leading hit keys, per
-            agent that maps their regions, each range a
+            target (agent) that holds their regions, each range a
             ``{"handle", "offset", "length"}`` map in key order. Called on
             the hint thread (it may ask MaruServer).
-        send: ``(agent, message) -> bool`` over a connection of this
-            process to that agent; False if the agent's region extension
-            does not take the message's action (it was not sent).
+        send: ``(agent, message) -> bool`` to that target (on
+            ``remote_cxl``, over a connection of this process to the agent);
+            False if the target does not take the message's action (it was
+            not sent).
     """
 
     def __init__(

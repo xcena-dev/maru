@@ -13,8 +13,11 @@ and `LBHNC`) and hands every layer the logical page
 resolved layout from the engine and splits each head's row into its K and V
 halves, so for dense attention a chunk object holds the same K/V-major bytes as
 a rank-5 cache of vLLM v0.25 and earlier, and the CPU and mixed backends accept
-these pages. The packed placement kernels have no format for them, so chunk
-transfers use per-layer copies on these versions. Tested with v0.32.
+these pages. Chunk transfers place these pages with a `maru_kv_ops` kernel that
+reads the page's strides, so every physical order takes the kernel path. Pages
+whose content does not split into two heads (MLA, uneven K/V widths, inline
+quantization scales) use per-layer copies. Tested with
+v0.32.
 
 **Storing a hybrid model as several KV cache groups requires vLLM v0.30.0+.** A model whose layers keep different kinds of KV cache, such as sliding-window or Mamba-type layers next to full attention, has several KV cache groups; see {ref}`vllm-hybrid-models`. On older versions the connector does not declare hybrid support: vLLM then runs sliding-window models as one KV cache group and refuses Mamba hybrids at startup.
 
@@ -25,29 +28,11 @@ uv pip install vllm
 See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
 for GPU-specific options.
 
-(vllm-model-support)=
 ## Model support
 
-Whether MaruKVConnector can store a model's KV cache depends on the KV cache
-structure that vLLM builds for the model. On the CXL backend (the default),
-at any tensor parallel size:
-
-| KV cache structure | Example models | Status |
-|---|---|---|
-| Full attention (MHA, GQA, MQA), one KV cache group | Llama-3.1-8B | Supported |
-| MLA, one KV cache group | DeepSeek-V2-Lite | Supported; above TP=1, rank 0 alone stores the latent that every rank holds |
-| Sliding window + full attention | gpt-oss-20b | Supported: as several KV cache groups on vLLM 0.30+, or as one group (see {ref}`vllm-hybrid-one-group`) |
-| Mamba-type + full attention | Qwen3.5-0.8B | Supported on vLLM 0.30+ |
-| Attention groups whose KV heads differ in count or size | MiMo-V2, Inkling | Refused at startup: vLLM gives such groups different block sizes, while the connector stores every group with one block size and one KV shape |
-| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | Refused at startup: vLLM 0.32 keeps the latent and the indexer cache, which differ in shape, in one group, while the connector stores every layer of a one-group model in the first layer's shape |
-| MLA with other kinds of group | GLM-5.3-Flash | Refused at startup: the connector stores several groups only for full attention, sliding window and Mamba-type layers |
-
-GPU tests of the supported structures ran with the example models on vLLM
-0.32, at tensor parallel sizes 1 and 2. Structures not listed are not tested.
-Models without attention layers, such as Mamba, are refused above TP=1.
-Models with several KV cache groups have settings and limits of their own;
-see {ref}`vllm-hybrid-models`. The CPU, mixed and remote_cxl backends take
-only models with one KV cache group, at TP=1.
+{doc}`supported_models` lists the KV cache structures and models the connector
+stores, the structures it refuses at startup, and the models that the CPU,
+mixed and remote_cxl backends take.
 
 ## Integration Architecture
 
@@ -176,6 +161,25 @@ Instance B:
   → Loads chunk 0, 1 from CXL, computes the rest
 ```
 
+### GPU prefix caching and external stores
+
+A vLLM prefix-cache hit does not mean that the same KV exists in Maru. In a
+multi-turn conversation, a previous turn's generated tokens may be present
+only in the GPU cache. For full-attention caches, the first store of the
+next turn starts at the end of the prefix found in Maru, copying those
+missing chunks together with the new prompt suffix. A later lookup can
+then reuse them after vLLM evicts the conversation.
+
+Synchronous stores include the missing cached prefix on the admission
+step; later prefill steps store only their new chunks. Asynchronous stores
+retain the original start until the prompt finishes. Full Maru hits still
+avoid storing already present chunks, including a held-back compute block.
+
+This repair applies when every KV group retains full attention history.
+Mamba and sliding-window groups keep their existing store rules because
+historical states or blocks may already be gone; missing history in those
+groups can still require recomputation.
+
 ### Requests Maru does not cache
 
 Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and vLLM's own prefix cache, when enabled (the default), still applies to them because it hashes these inputs. Keying such requests so they can hit is tracked in [#116](https://github.com/xcena-dev/maru/issues/116).
@@ -279,7 +283,9 @@ Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The
 stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
 and writes it with one-sided RDMA, and only control messages go to maru-server
 and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
-memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`, an
+memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`
+(each TP rank adds `-tp<rank>`, and data-parallel replica `d` > 0 adds
+`-dp<d>`; see {ref}`vllm-tensor-parallelism`), an
 immutable-weights `maru_cache_namespace`,
 `maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
 default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
@@ -320,8 +326,9 @@ region back when the resource manager is full. A region goes back only after
 its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
 instead of landing in the next owner's KV.
 
-The backend stores KV chunkwise and needs `--enforce-eager`,
-`kv_load_failure_policy="recompute"` and one worker per engine. It turns on
+The backend stores KV chunkwise and needs `--enforce-eager` and
+`kv_load_failure_policy="recompute"`; {doc}`supported_models` lists the models
+and parallel settings it takes. It turns on
 `maru_async_load` and `maru_async_store` unless they are set: loads run
 between steps and stores after the forward, so an RDMA transfer that waits for
 a slow memory node does not hold up the engine, and asynchronous loads run with
@@ -421,7 +428,7 @@ operation:
 | `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open, unless a CPU pool is larger than the memory available; `false` keeps them pageable |
 | `maru_load_copy_ahead` | int | `2` | Chunk slabs a load without a placement kernel (vLLM 0.29+ layouts) copies to the GPU ahead of its per-layer injects, on a side stream; `0` copies each slab in line. Each thread and stream that loads keeps this many slabs of GPU memory for the life of the worker, each `2 × layers × chunk tokens × KV hidden size × dtype size` (32 MiB for Llama 3.1 8B at 256-token chunks). They are allocated on the first load, after vLLM has sized its KV cache, so `gpu_memory_utilization` does not account for them |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
-| `maru_log_timing` | bool | `false` | Emit per-request timing diagnostics to stderr |
+| `maru_log_timing` | bool | `false` | Emit per-request CPU timing and request timeline logs to stderr |
 
 #### Renamed parameters
 
@@ -621,12 +628,12 @@ Example (Llama 7B, fp16):
 (vllm-tensor-parallelism)=
 ## Tensor parallelism
 
-The CXL backend supports tensor parallelism for the KV cache structures in
-{ref}`vllm-model-support`. vLLM starts one connector per TP worker, and each
-worker stores and loads only the KV it holds. Every rank
-hashes a prompt to the same chunk keys, so a key must also name the slice: if
-all ranks registered their heads under one key, the server would keep the
-first and every other rank would load heads that are not its own.
+The CXL and remote_cxl backends support tensor parallelism for the KV cache
+structures listed in {ref}`Supported Models <vllm-model-support>`. vLLM starts
+one connector per TP worker, and each worker stores and loads only the KV it
+holds. Every rank hashes a prompt to the same chunk keys, so a key must also
+name the slice: if all ranks registered their heads under one key, the server
+would keep the first and every other rank would load heads that are not its own.
 
 Chunk keys therefore name a slice by what it holds:
 
@@ -665,7 +672,10 @@ share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
 TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
 slice is never read as a different set of heads. Mamba-type states differ
 for every TP size, so a model with such a group hits only on chunks that an
-engine of the same TP size stored.
+engine of the same TP size stored. On the remote_cxl backend engines of
+different TP sizes share nothing: the TP size enters the cache namespace, as
+maru-server lets the sessions of a namespace read each other's regions only
+when their objects have one size and layout.
 
 The scheduler reports a chunk as cached only when every slice that the hit
 needs is stored, so no rank is asked to load a slice the lookup did not
@@ -706,11 +716,29 @@ Each worker process connects its own MaruHandler:
   sees each rank as its own owner. With data parallelism, replica `d` > 0
   adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving
   the id unset already gives every process its own UUID.
+- On the remote_cxl backend each rank opens its own storage session, with
+  its own RDMA staging buffer, and `maru_engine_id` becomes
+  `<id>-tp<rank>` (`<id>-dp<d>-tp<rank>` on replica `d` > 0) the same way:
+  maru-server keeps one open session per engine id. Every session of the
+  namespace reads the regions of the others, so a rank that only loads
+  replicated heads reads them from the rank that stored them, and a replica
+  reads what the other replicas stored. The scheduler looks keys up as rank
+  0's session of its replica (`<id>-tp0`, or `<id>-dp<d>-tp0`).
+
+Under TP the scheduler's process loads no model, and a model can change its
+config where a worker loads it, as vLLM's Transformers backend does with the
+dtype. So on the remote_cxl backend the scheduler looks keys up in the cache
+namespace that the workers report through vLLM's KV connector handshake.
+vLLM's `MultiConnector` passes the first handshake that any sub-connector
+returns to all of them, and `NixlConnector` refuses any but its own: above
+TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps
+the namespace it computes itself, and a model that changes its config where
+the workers load it misses every lookup.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
 startup: a pipeline stage would have to address its layers locally in the
-slab and the placement kernel, which index them globally. The CPU, mixed and
-remote_cxl backends still require TP=1.
+slab and the placement kernel, which index them globally. The CPU and mixed
+backends still require TP=1.
 
 (vllm-hybrid-models)=
 ## Hybrid models
@@ -719,34 +747,18 @@ vLLM puts layers that keep different kinds of KV cache into separate KV cache gr
 
 The key names the chunk length because a chunk key hashes the prompt only up to the chunk's end. With a Mamba-type group a chunk is one vLLM block, and vLLM sizes that block from the per-rank state and attention page, so engines with different TP sizes (or KV cache dtypes) can use different chunks: Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token chunks at TP=4. Their objects for the same prompt prefix then get different keys, and neither engine loads the other's.
 
-### Supported models
-
-| Model | KV cache groups | Status |
-|---|---|---|
-| Qwen3.5 (tested: Qwen3.5-0.8B) | Gated DeltaNet (Mamba-type) + full attention | Supported; tested on vLLM 0.30 and 0.32 |
-| gpt-oss (tested: gpt-oss-20b) | sliding window + full attention | Supported; tested on vLLM 0.30 and 0.32 |
-| Other models whose groups are only full attention (`FullAttentionSpec`), sliding window (`SlidingWindowSpec`) or Mamba-type (`MambaSpec`), with one KV head count and head size in every attention group | | Pass the connector's group check; not tested |
-| MiMo-V2, Inkling | sliding window + full attention, the sliding-window layers with KV heads of their own | Not supported yet; refused at startup |
-| DeepSeek-V3.2, GLM-5 (DSA) | MLA latent + indexer cache, which vLLM 0.32 puts in one group | Not supported yet; refused at startup |
-| GLM-5.3-Flash | MLA, indexer cache, `CircularBufferSpec` (`KpoolTailSpec` in vLLM 0.30), KDA (Mamba-type) | Not supported yet |
-| Llama 4 | chunked local + full attention | Not supported yet |
-| Other models with several groups where a group uses another type: MLA, static sink-token attention (`SinkFullAttentionSpec`), cross attention, or a subclass of a supported type such as `RSWASpec` | | Not supported yet |
-
-The connector checks the group types and the attention groups' KV shapes at startup and refuses an unsupported model with what it found. It also refuses one group whose layers keep different KV cache specs (vLLM's `UniformTypeKVCacheSpecs`), as the DSA models' does: a one-group model is stored in its first layer's shape. A model that passes these checks can still be refused when the worker registers its KV cache, if the tensors do not match the groups' specs. A model whose extra groups are sliding-window or chunked-local attention can run as one group instead; see {ref}`vllm-hybrid-one-group`.
-
-Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`); GPU tests of hybrid models ran at tensor parallel size 1, and at size 2 on vLLM 0.32. Hybrid models are supported on this connector only, not on the LMCache path.
+{doc}`supported_models` lists the hybrid models the connector stores and the ones it refuses at startup. Tensor parallelism is supported (see {ref}`vllm-tensor-parallelism`). Hybrid models are supported on this connector only, not on the LMCache path.
 
 ### Required settings
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default). The CPU, mixed and remote_cxl backends take one group only.
+- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only.
 - `maru_use_layerwise` is `false` (the default). Several groups are stored in chunkwise format only.
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - Every group uses vLLM's one `block_size`. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
-- The attention backend keeps whole blocks. FlashInfer, and FlashAttention 4 with head size 256 on compute capability 10.x/11.x, split each block into smaller kernel blocks; FlashInfer is vLLM 0.30's default on B200 and GB200. This affects Gated DeltaNet models such as Qwen3.5 and Qwen3-Next, whose blocks are large. Use `--attention-backend TRITON_ATTN`, or `FLASH_ATTN` outside the FlashAttention 4 case. Sliding-window models with 16-token blocks, such as gpt-oss, are not affected.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
 - Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
 
@@ -765,14 +777,12 @@ vllm serve Qwen/Qwen3.5-0.8B \
     }'
 ```
 
-On B200 or GB200, add `--attention-backend TRITON_ATTN`.
-
 ### What differs from a model with one group
 
 - **Chunk size.** A Mamba-type group keeps its state only at block ends, so with such a group a chunk is one vLLM block (544 tokens for Qwen3.5-0.8B) and `maru_kv_chunk_tokens` is overridden with a warning. Without one, `maru_kv_chunk_tokens` works as before.
 - **Hits** end at a chunk boundary: a 1,024-token gpt-oss prompt hits 768 tokens, where one group would hit 1,008. A Mamba-type group can resume only from a chunk where an earlier request's prefill step ended, because vLLM keeps the state only at step ends. For example, with `--max-num-batched-tokens 2048` a 2,300-token Qwen3.5-0.8B request running alone is prefilled in steps that end at 1,632, 2,176 and 2,300 tokens; only the first two are chunk ends. A later request that shares its first 1,700 tokens hits 1,632 tokens; one that shares its first 1,500 tokens hits nothing.
 - **With a Mamba-type group, a repeated prompt can hit nothing.** A hit stops short of the prompt's last token. A prompt whose length is a multiple of the chunk and that was prefilled in one step keeps its only state at its last chunk, which the hit cannot include, so sending it again hits nothing. Benchmarks whose prompt length is a multiple of the chunk show this as stores without hits.
-- **Stores** run right after the forward. Sliding-window and Mamba-type objects are always stored before the step ends, because vLLM frees those blocks while the request runs. `maru_async_store` defers only full-attention objects that use the `maru_kv_ops` kernel; vLLM 0.30's attention layouts have no kernel format, so on vLLM 0.30 every object is stored before the step ends.
+- **Stores** run right after the forward. Sliding-window and Mamba-type objects are always stored before the step ends, because vLLM frees those blocks while the request runs. `maru_async_store` defers only full-attention objects that use the `maru_kv_ops` kernel; objects of a group whose pages take per-layer copies (content that does not split into two heads, such as inline quantization scales) are stored before the step ends.
 - **Loads.** `maru_overlap_load_with_compute` is turned off with a warning for any model with several groups: Mamba-type state must be complete before the forward, and per-layer overlap of the attention groups alone is not implemented.
 - **CXL space.** All groups share one pool and one page size, that of the largest (chunk, group) object. A chunk takes one page per attention group, plus one page per Mamba-type group at chunks where a prefill step ended. For gpt-oss-20b that is two 12-layer pages instead of one 24-layer page, so `maru_pool_size` estimates stay about the same. For Qwen3.5-0.8B a step-end chunk takes four pages, because its three Gated DeltaNet groups hold three times the chunk's attention KV; other chunks take one.
 

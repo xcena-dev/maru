@@ -89,7 +89,7 @@ class MaruConfig:
     # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
     remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
     # Send read hints (remote_cxl and cxl): before a load starts, the memory
-    # side hears which bytes it will read (maru_handler.storage.remote_cxl.hints).
+    # side hears which bytes it will read (maru_handler.hints).
     # remote_cxl sends them to the remote CXL agents whose region extension
     # takes them; cxl gives them to the handler plugins that take them
     # (MaruHandlerPlugin.on_memory_hint). Advice; the data path is the same.

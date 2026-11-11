@@ -153,6 +153,7 @@ vllm serve <model> --kv-transfer-config '{
 | --- | --- | --- | --- |
 | `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
 | `maru_pool_size` | `str \| int` | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, or integer bytes): its first allocation, and each further one when its memory is full. Required with `remote_cxl`, where each allocation is one region; `cpu` and `mixed` use `maru_cpu_pool_size` and `maru_cxl_pool_size` |
+| `maru_auto_expand` | `bool` | `true` | Allow the handler to acquire additional regions when its current allocation fills. Set `false` to keep the existing capacity; the backend's full-pool policy then applies (`remote_cxl` evicts, `cxl` can fail allocation) |
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
@@ -169,14 +170,14 @@ apply to that backend only:
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
-| `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server |
-| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace and model shape share KV, whichever path they load the weights from |
+| `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server. Under tensor parallelism each rank's session is `<id>-tp<rank>`, and data-parallel replica `d` > 0 adds `-dp<d>` (`<id>-dp<d>-tp<rank>`, or `<id>-dp<d>` at TP=1) |
+| `maru_cache_namespace` | `str` | required | Sharing scope: engines with the same namespace, model shape and quantization share KV, whichever path they load the weights from |
 | `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
 | `maru_remote_cxl_agent_key_file` | `str` | `~/.maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
 | `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
 | `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
 | `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
-| `maru_read_hints` | `bool` | `false` | The scheduler tells the memory nodes which pages each load will read before it starts, so a device with a cache in front of slower media can prefetch them, and the worker tells them when each such load starts; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise). Also taken by the `cxl` backend, whose handler gives the hints to handler plugins ([Handler Plugins](plugins.md)) |
+| `maru_read_hints` | `bool` | `false` | The scheduler sends advisory read ranges before each load, and the worker announces its load start; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise). The `cxl` backend delivers these messages to [handler plugins](plugins.md). Scheduler hints currently apply at TP = 1 with one KV cache group ({ref}`read-hint-scope`) |
 | `maru_write_hints` | `bool` | `maru_read_hints` | The worker names each store's pages to the memory nodes before it writes them, so such a device can prepare them instead of filling each from slower media on its first write. Follows `maru_read_hints` unless set; `remote_cxl` only |
 | `maru_write_wait_ms` | `int` | `50` | How long a store waits for the memory node to prepare its pages before writing them (with write hints, where the region extension takes it); `0` never waits |
 | `maru_read_hint_on_arrival` | `bool` | `false` | Send the read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` (off with a warning otherwise) |

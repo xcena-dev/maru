@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-import maru_handler.storage.remote_cxl.hints as hints_module
+import maru_handler.hints as hints_module
 from maru_remote.region_map import RegionMapClient, read_handle
 from maru_remote_cxl_agent.service import MapDenied, NotMapped
 from tests.unit.remote_fakes import shared_key

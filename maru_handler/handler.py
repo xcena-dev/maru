@@ -140,7 +140,7 @@ class MaruHandler:
             self._config.read_hints or self._config.read_promotes
         ):
             if self._hint_plugins:
-                from .storage.remote_cxl.hints import MemoryHints
+                from .hints import MemoryHints
 
                 self._local_hints = MemoryHints(
                     self._local_hint_locate, self._local_hint_send

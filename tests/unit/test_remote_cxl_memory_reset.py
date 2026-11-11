@@ -235,3 +235,42 @@ def test_a_map_the_memory_reset_under_fails():
             client.close()
     finally:
         w.close()
+
+
+def test_a_map_whose_generation_turns_unknown_before_it_establishes_fails():
+    # map() checks the generation, then the generation turns unknown before
+    # _establish reads the boot: both boots read ":unknown", yet the map must
+    # be refused and nothing may stay registered through the unknown period.
+    w, ext = _memory_reset_world(generation_grace_s=0.0)
+    service = w.node.service
+    establish = service._map  # noqa: SLF001 (the step after the check)
+
+    def turn_unknown_then_map(conn, handle, fresh):
+        if ext.generation_error is None and service.boot.endswith(":g1"):
+            ext.generation_error = RuntimeError("device service away")
+            service._check_generation()  # noqa: SLF001
+            assert service.boot == f"{service.boot_id}:unknown"
+        return establish(conn, handle, fresh)
+
+    service._map = turn_unknown_then_map  # noqa: SLF001
+    try:
+        client = RegionMapClient(w.node.address, timeout_s=5, key=shared_key())
+        try:
+            handle = w.cxl.reserve("owner", PAGE).to_dict()
+            with pytest.raises(RegionMapError, match="became unknown"):
+                client.map(handle)
+            assert service.holders() == {}
+            assert not w.node.agent.registered
+            # Still unknown: refused before mapping, nothing registered.
+            with pytest.raises(RegionMapError, match="generation is unknown"):
+                client.map(handle)
+            service.sweep()
+            assert not w.node.agent.registered
+            # Known again: mapped under the new boot.
+            ext.generation_error = None
+            reply = client.map(handle)
+            assert reply.boot == f"{service.boot_id}:g1~1"
+        finally:
+            client.close()
+    finally:
+        w.close()

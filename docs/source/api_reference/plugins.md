@@ -61,7 +61,7 @@ extension ({doc}`../design_doc/read_hints`), in the same form:
 | `message["action"]` | Sent when | `message["ranges"]` |
 |------|------|------|
 | `read_hint` | the scheduler expects the request to load soon (on arrival, or at its first lookup) | the leading hit keys' bytes, in read order: `{"handle": {"region_id", "offset", "length"}, "offset", "length"}`; the bytes are at `handle["offset"] + offset` in the DAX device |
-| `read_hint_end` | the request ended | empty |
+| `read_hint_end` | the load ended, or the request finished first | empty |
 | `read_promote` | the worker starts the load of a request its scheduler hinted | empty |
 
 `message["request"]` is vLLM's request id; the worker's promote names the id

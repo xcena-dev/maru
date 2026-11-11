@@ -26,6 +26,31 @@ from maru_common.resource_manager_installer import (
 
 
 @pytest.fixture(autouse=True)
+def _no_host_systemd(monkeypatch, tmp_path):
+    """Keep every test away from this host's systemd and /etc/systemd.
+
+    The uninstall and install paths call systemctl and look at the unit in
+    /etc/systemd/system; on a host where the resource manager is installed
+    they would stop and disable it. systemctl answers as it does where systemd
+    is not running, and the unit directory is a temporary one.
+    """
+    import maru_common.resource_manager_installer as installer
+
+    calls = []
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if list(cmd)[:1] == ["systemctl"]:
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(installer.subprocess, "run", run)
+    monkeypatch.setattr(installer, "SYSTEMD_DIR", tmp_path / "systemd")
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def _no_remote_cxl_agent_service(monkeypatch):
     """Keep the remote CXL agent installer away from the real /etc/systemd."""
     from maru_remote_cxl_agent import installer as remote_cxl_agent_installer
