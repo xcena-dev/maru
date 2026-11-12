@@ -5,13 +5,15 @@ example a CXL device's prefetch/pin hints — does not live in the Maru tree.
 Instead it ships as a **separate package** that registers a
 `maru.handler_plugins` [entry point](https://packaging.python.org/en/latest/specifications/entry-points/).
 `MaruHandler` discovers those packages when it is constructed and calls them at
-a few well-defined lifecycle seams. Maru never imports a plugin directly.
+a few lifecycle seams. DAX mapping hooks describe the legacy `cxl` path;
+storage-session backends do not provide the same mapping callbacks.
 
 The model deliberately follows [vLLM's plugin system](https://blog.vllm.ai/2025/05/12/hardware-plugin.html)
 (soft-fail) rather than PyTorch's device-backend autoload (hard-fail): a Maru
 plugin is an *optional optimization*. A plugin that fails to load — or whose
-hook raises — is **logged and skipped, never propagated**, so a missing or
-broken plugin can never break KV-cache operation.
+hook raises an ordinary exception — is logged and skipped. Plugins still run
+inside the Handler process and must respect buffer lifetimes and execution
+costs; exception handling does not make arbitrary plugin behavior harmless.
 
 ## Registering a plugin
 
@@ -41,13 +43,21 @@ exception raised inside one is logged and swallowed.
 | Hook | When it runs | Purpose |
 |------|--------------|---------|
 | `on_init(handler)` | end of `MaruHandler.__init__` (not yet connected — `mapper` is `None`) | cheap setup only |
-| `on_batch_retrieve(handler, keys, batch_resp)` | end of `batch_retrieve`, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
-| `on_close(handler)` | during `close`, while regions are still mapped and RPC is live | release resources tied to mapped memory |
+| `on_batch_retrieve(handler, keys, batch_resp)` | legacy `cxl` batch path, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
+| `on_close(handler)` | connected legacy `cxl` close, while regions are mapped and RPC is live | release resources tied to mapped memory |
 | `contribute_stats() -> dict \| None` | during `get_stats` | returns a dict merged under `stats["plugins"][<PluginClassName>]` |
 
 In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A
 found entry exposes a `handle` (region/offset) whose region is already mapped,
 so a plugin can act on real memory addresses.
+
+`cpu`, `mixed` and `remote_cxl` delegate retrieval and close to storage clients
+before these two DAX hooks. `on_init` still runs at construction and stats
+contributions can run in `get_stats`; keep initialization cheap and do not
+assume that a DAX close callback will follow for every backend. In particular,
+a remote CXL staging buffer is not the worker's mapping of the memory node's
+DAX device. Device hints on that remote CXL range need an integration on the
+memory node; this plugin API does not provide one automatically.
 
 ## Stable accessor surface
 

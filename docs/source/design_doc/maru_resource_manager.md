@@ -69,7 +69,7 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
 
-Every allocation returns a **Handle** containing the region ID (globally unique), mmap offset, allocation length, and a cryptographic auth token. The Handle serves as both the allocation identifier and the authorization credential — clients must present it for free and access operations.
+Every allocation returns a **Handle** containing a region ID unique within this Resource Manager, mmap offset, allocation length and an auth token. Independent RMs can issue the same numeric ID; keep the RM/pool identity with it. Clients present the handle for free and access operations.
 
 ### Memory access via device path
 
@@ -165,7 +165,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 **Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. Note that `client_id` is self-reported by the client; it provides ownership tracking rather than authentication. The auth token is cryptographically bound to the `client_id`, so forging a valid token requires knowing both the Handle fields and the server-side secret.
 
-**PID reuse safety:** A new process may receive the same PID as a terminated one, but it cannot access the old allocations — the Handle (including auth token) existed only in the old process's memory. The Reaper detects PID reuse by comparing cached process start times (local clients) or via TCP disconnect grace period (remote clients). See §5 for details.
+**PID reuse tracking:** The Reaper compares local process start times and uses a disconnect grace period for remote clients. This controls allocation ownership; valid handles may also be held by metadata services or readers. NIC registrations have the separate RM hold/draining lifetime described in §5.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 

@@ -12,9 +12,12 @@ backend. HiCache organizes KV cache in three tiers:
 | **L3** | **CXL Shared Memory** | **Maru** |
 
 When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3.
-On cache hit, pages flow back up.  Because Maru's L3 is shared memory, **all
-SGLang instances on the same node can read each other's KV cache** — enabling
-P2P sharing without network transfer.
+On cache hit, pages flow back up. In this guide the Maru adapter uses the
+directly mapped `cxl` backend, so SGLang instances on the same node can reuse
+the shared L3 without a P2P network payload transfer. Cache hits still copy
+bytes from CXL to host DRAM and then to GPU memory. This configuration does
+not select the `remote_cxl` backend; see the {doc}`vLLM guide <vllm>` for that
+backend's staging and RDMA path.
 
 ## Prerequisites
 
@@ -135,7 +138,7 @@ bash run_simple_query.sh
 bash run_benchmark.sh
 ```
 
-See [examples/sglang/single/README.md](../../../examples/sglang/single/README.md)
+See [examples/sglang/single/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/single/README.md)
 for details.
 
 ## P2P Sharing: Two Instances
@@ -153,9 +156,9 @@ bash run_benchmark.sh     # TTFT measurement
 
 **Success criteria:**
 - Instance 2 logs show `batch_get_v1 result: N/N hits` (100% cache hit)
-- Benchmark reports TTFT speedup > 1.5×
+- Compare outputs with a recompute baseline and record TTFT under the actual model, prompt and hardware configuration. A fixed speedup is not a correctness condition.
 
-See [examples/sglang/p2p_sharing/README.md](../../../examples/sglang/p2p_sharing/README.md)
+See [examples/sglang/p2p_sharing/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/p2p_sharing/README.md)
 for details on the write-through flush mechanism.
 
 ## Troubleshooting
@@ -165,7 +168,7 @@ for details on the write-through flush mechanism.
 | `RuntimeError: Failed to connect MaruHandler` | MaruServer not running | Start `maru-server --port 5555` |
 | No cache hits on Instance 2 | Write-through not flushed | Send two queries to Instance 1 first (hit-count threshold) and wait ~3s |
 | `ImportError: maru_sglang` | Package not installed | Run `uv pip install -e .` from `maru/` root |
-| Low TTFT speedup (< 1.5×) | Prompt too short for meaningful prefill savings | Use longer prompts (> 500 tokens) |
+| Cache hits without a TTFT improvement | Transfer, prompt length, scheduling or compute costs can dominate | Check the actual restore path and compare matching requests before attributing the cause |
 
 > **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
 > [LMCache](lmcache.md),

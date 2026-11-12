@@ -173,3 +173,28 @@ table.maru-supported-models tbody td:nth-child(4) {
 table.maru-supported-models tbody td:nth-child(5) {
     white-space: nowrap;
 }
+
+/* Keep generated index columns scrollable inside a narrow content area. */
+.genindextable {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+/* Long API/page names must fit mobile breadcrumbs and next-page links. */
+.navigation-next,
+.navigation-prev {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.navigation .page-info,
+.sy-breadcrumbs ol,
+.sy-breadcrumbs li {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.sy-breadcrumbs ol {
+    flex-wrap: wrap;
+}
