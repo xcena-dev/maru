@@ -162,9 +162,9 @@ python -c "import maru_kv_ops; print(maru_kv_ops.is_available(), maru_kv_ops.imp
 
 `True None` means the extension can be imported, not that every request uses
 its packed kernel. The resolved KV layout, chunk completeness and buffer
-registration also select the path. In particular, vLLM 0.29+ logical layouts
-(tested with 0.32) use per-layer copies in this version. Check the engine's
-transfer-path logs as well. Other output reports the import failure;
+registration also select the path. vLLM 0.29+ logical pages use the stride-based
+placement bindings when available; otherwise transfers use per-layer copies.
+Check the engine's transfer-path logs as well. Other output reports the import failure;
 `MARU_SKIP_KV_OPS=1` skips the build explicitly.
 
 <br/>

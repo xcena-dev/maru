@@ -10,9 +10,11 @@ pytest.importorskip("vllm")
 
 import torch
 
+import maru
 from maru_vllm.connector import (
-    _cpu_bypass_request,
     _cpu_engine_config,
+    _create_maru_handler,
+    _uncacheable_request,
     _validate_storage_config,
 )
 from tests.unit.vllm_connector_helpers import make_scheduler, make_worker
@@ -115,6 +117,17 @@ def test_multiple_workers_are_rejected(name):
         _cpu_engine_config(extra(), config)
 
 
+def test_a_data_parallel_replica_is_rejected():
+    """vLLM runs each replica of a model without MoE layers as its own engine
+    with data_parallel_size=1; its data_parallel_index still tells it."""
+    config = engine_config()
+    config.parallel_config.data_parallel_index = 0
+    _cpu_engine_config(extra(), config)
+    config.parallel_config.data_parallel_index = 1
+    with pytest.raises(ValueError, match="TP=PP=DP"):
+        _cpu_engine_config(extra(), config)
+
+
 def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
     a = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
@@ -124,6 +137,46 @@ def test_engine_namespace_tracks_revision_and_geometry():
     config = engine_config()
     config.cache_config.cache_dtype = "float32"
     assert a != _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+
+
+def test_engine_namespace_tracks_the_quantization_vllm_runs():
+    """--quantization fp8 on an unquantized checkpoint computes other KV
+    from the same hf_config; an engine without one keeps its namespace."""
+    config = engine_config()
+    plain = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    config.model_config.quantization = None
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] == plain
+    config.model_config.quantization = "fp8"
+    fp8 = _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+    assert fp8 != plain
+    config.model_config.quantization = "mxfp4"
+    assert _cpu_engine_config(extra(), config)["maru_cache_namespace"] not in (
+        plain,
+        fp8,
+    )
+
+
+def test_engine_namespace_tracks_the_quantization_settings():
+    """--quantization-config (per-layer specs, ignore lists) changes the
+    weights' math without changing the method's name."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class Spec:
+        linear: str | None = None
+        ignore: tuple[str, ...] = ()
+
+    config = engine_config()
+    config.model_config.quantization = "fp8"
+
+    def namespace(settings):
+        config.model_config.quantization_config = settings
+        return _cpu_engine_config(extra(), config)["maru_cache_namespace"]
+
+    plain = namespace(None)
+    assert namespace({"ignore": ["lm_head"]}) not in (plain, namespace({}))
+    assert namespace(Spec("fp8")) == namespace(Spec("fp8"))
+    assert namespace(Spec("fp8")) != namespace(Spec("fp8", ("lm_head",)))
 
 
 def test_engines_of_different_storage_backends_never_share_a_namespace():
@@ -188,9 +241,9 @@ def test_cpu_requires_eager_hooks_and_unquantized_kv():
 
 
 def test_embeddings_are_bypassed_without_tensor_truth_conversion():
-    assert _cpu_bypass_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
-    assert _cpu_bypass_request(SimpleNamespace(cache_salt=""))
-    assert not _cpu_bypass_request(SimpleNamespace(mm_features=[]))
+    assert _uncacheable_request(SimpleNamespace(prompt_embeds=torch.ones(2, 2)))
+    assert _uncacheable_request(SimpleNamespace(cache_salt=""))
+    assert not _uncacheable_request(SimpleNamespace(mm_features=[]))
 
 
 def test_cpu_mode_never_dispatches_pageable_memory_to_direct_cuda_kernel():
@@ -205,3 +258,30 @@ def test_cpu_scheduler_does_not_trust_legacy_known_keys():
     assert scheduler._count_matched_chunks(list(range(8))) == 1
     scheduler._handler.batch_exists = lambda _, **route: [False, False]
     assert scheduler._count_matched_chunks(list(range(8))) == 0
+
+
+@pytest.mark.parametrize(
+    "setting,pinned", [({}, True), ({"maru_pin_pools": False}, False)]
+)
+def test_the_handler_pins_its_pools_unless_told_not_to(monkeypatch, setting, pinned):
+    seen = {}
+
+    class FakeHandler:
+        def __init__(self, cfg):
+            seen["cfg"] = cfg
+
+        def connect(self):
+            return True
+
+    monkeypatch.setattr(maru, "MaruHandler", FakeHandler)
+    _create_maru_handler({**extra(), "maru_chunk_size": "1M", **setting})
+    assert seen["cfg"].pin_pools is pinned
+    assert _validate_storage_config(mixed_extra(**setting))
+
+
+@pytest.mark.parametrize("backend", ["cxl", "remote_cxl"])
+def test_pin_pools_applies_only_to_the_cpu_and_mixed_pools(backend):
+    with pytest.raises(ValueError, match="maru_pin_pools"):
+        _validate_storage_config(
+            {"maru_storage_backend": backend, "maru_pin_pools": False}
+        )

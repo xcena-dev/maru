@@ -32,7 +32,8 @@ The remote CXL, CPU and mixed examples have their own environment requirements.
   falls back to a transfer per layer without them, which is materially slower.
   `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks
   importability only. The engine's layout and transfer logs determine the
-  actual path; vLLM 0.29+ logical layouts still use per-layer copies here.
+  actual path. Logical pages can use the stride-based placement bindings;
+  unsupported layouts or unavailable bindings use per-layer copies.
 - vLLM v0.14+ installed
 - `maru-server` binary available
 

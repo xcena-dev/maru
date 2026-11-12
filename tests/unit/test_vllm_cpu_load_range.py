@@ -43,7 +43,7 @@ def test_load_only_external_tokens(config, start, end, failure):
         load_start_token=start,
         load_end_token=end,
     )
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     slabs = [
         torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1) + i * 100
         for i in range(2)
@@ -104,6 +104,7 @@ def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
             )
         ],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={"load": 8},
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )

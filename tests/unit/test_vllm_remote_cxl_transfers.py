@@ -66,7 +66,7 @@ def test_loads_go_in_batches_the_staging_buffer_can_hold(capacity):
     """Each batch is released before the next one is retrieved."""
     worker, cache = _worker(capacity)
     meta = _load_meta()
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     slabs = {key: _slab(i) for i, key in enumerate(keys)}
     held = []
 
@@ -87,10 +87,29 @@ def test_loads_go_in_batches_the_staging_buffer_can_hold(capacity):
         torch.testing.assert_close(value, slabs[keys[token // 8]][:, 0, token % 8, 0])
 
 
+def test_a_load_promotes_its_request_once_before_its_first_read():
+    worker, cache = _worker(1)  # three batches
+    meta = _load_meta()
+    keys = _req_chunk_keys(meta, 8, "")
+    calls = []
+    worker._handler.promote_read.side_effect = lambda rid, **route: calls.append(
+        ("promote", rid, route)
+    )
+
+    def retrieve(requested, route_key=None):
+        calls.append(("read", requested[0]))
+        return [_view(_slab()) for _ in requested]
+
+    worker._batch_retrieve_all = retrieve
+    worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    assert calls[0] == ("promote", "load", {"route_key": keys[0]})
+    assert [c[0] for c in calls] == ["promote", "read", "read", "read"]
+
+
 def test_a_missing_later_batch_fails_only_from_that_batch():
     worker, cache = _worker(1)
     meta = _load_meta()
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     worker._batch_retrieve_all = lambda req, route_key=None: (
         [None] if req[0] == keys[1] else [_view(_slab())]
     )
@@ -111,7 +130,7 @@ def test_a_failed_batch_copy_stops_the_later_batches():
     worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
     # One batch of one chunk was read; the later batches are not.
-    assert requested == [_req_chunk_keys(meta, 8)[:1]]
+    assert requested == [_req_chunk_keys(meta, 8, "")[:1]]
     assert worker._handler.release_retrieved.call_count == 1
 
 
@@ -148,7 +167,7 @@ def test_a_failed_deferred_batch_unparks_for_recompute():
     worker, cache = _worker(1)
     worker._last_attn_metadata = make_flash_attn_metadata()
     meta = _load_meta(deferred_load=True)
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     worker._batch_retrieve_all = lambda req, route_key=None: (
         [None] if req[0] == keys[1] else [_view(_slab())]
     )
@@ -241,7 +260,7 @@ def _kernel_worker(monkeypatch, log, start=0, stream_fails=False):
     )
     meta = _load_meta()
     meta.load_start_token = start
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     worker._batch_retrieve_all = lambda req, route_key=None: [
         _view(_slab(keys.index(k))) for k in req
     ]
@@ -302,7 +321,7 @@ def _pipelined(
     monkeypatch.setattr(connector, "_LOAD_PIPELINE_CHUNKS", chunks)
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log)
     meta.deferred_load = deferred
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     held = [0]
 
     def retrieve(requested, route_key=None):
@@ -670,7 +689,7 @@ def test_an_async_store_allocates_in_the_pool_of_its_request(monkeypatch):
         ]
     )
     worker._store_packed_slabs_write_behind(kernel, meta)
-    first_key = _req_chunk_keys(meta.requests[0], 8)[0]
+    first_key = _req_chunk_keys(meta.requests[0], 8, "")[0]
     assert allocs == [first_key, first_key]  # both chunks, one route key
     worker.shutdown()
 
@@ -715,7 +734,7 @@ def _loaded_store_worker(monkeypatch, *, tokens=24, start=0, end=16, missing=Non
         load_start_token=start,
         load_end_token=end,
     )
-    keys = _req_chunk_keys(load, 8)
+    keys = _req_chunk_keys(load, 8, "")
     worker._batch_retrieve_all = lambda requested, route_key=None: [
         None if keys.index(key) == missing else _view(_slab(keys.index(key)))
         for key in requested
@@ -779,7 +798,16 @@ def test_a_failed_remote_load_keeps_recomputed_prefix_storable(monkeypatch, miss
     )
     handler = worker._handler
     assert worker.take_failed_load_blocks()
+    assert not worker._loaded_request_keys[load.req_id][1]
+    # The failed request itself stores nothing: its forward ran over blocks
+    # the load never filled (#111).
     worker._store_packed_slabs_write_behind(kernel, _resumed_store(load, computed=0))
+    assert not allocs
+    # A later request with the prefix recomputes and stores all of it.
+    worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={load.req_id}))
+    worker._store_packed_slabs_write_behind(
+        kernel, _resumed_store(load, request_id="later", computed=0)
+    )
     worker.shutdown()
     assert len(allocs) == kernel[0].multi_layer_kv_transfer.call_count == 3
     assert handler.batch_store.call_args.args[0] == keys
@@ -796,7 +824,34 @@ def test_write_behind_still_coalesces_prefill_without_a_remote_load(monkeypatch)
     worker._store_packed_slabs_write_behind(kernel, _resumed_store(load, computed=8))
     worker.shutdown()
     assert len(allocs) == 3
-    assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8)
+    assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8, "")
+
+
+def test_write_behind_starts_at_the_first_chunk_the_request_computed(monkeypatch):
+    """The chunks before it were loaded or are vLLM's prefix cache (#111)."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("hit", list(range(24)), list(range(6)), False)
+    metadata = _resumed_store(load, computed=12)
+    metadata.requests[0].store_start_token = 12
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, metadata)
+    worker.shutdown()
+    # Chunk 1 holds token 12: the request computed part of it.
+    assert len(allocs) == 2
+    assert handler.batch_store.call_args.args[0] == _req_chunk_keys(load, 8, "")[1:]
+
+
+def test_write_behind_skips_the_chunk_a_full_hit_holds_back(monkeypatch):
+    """vLLM computes the held-back block again, but Maru has its chunk."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    load = MaruReqMeta("hit", list(range(24)), list(range(6)), False)
+    metadata = _resumed_store(load, computed=20)
+    metadata.requests[0].store_start_token = 24
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, metadata)
+    worker.shutdown()
+    assert not allocs
+    handler.batch_store.assert_not_called()
 
 
 @pytest.mark.parametrize("request_id", ["another", "loaded"])

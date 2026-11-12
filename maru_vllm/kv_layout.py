@@ -52,12 +52,15 @@ class KVLayout:
             compares against it, so a hybrid model's differently-shaped layer
             can never be read through another layer's geometry.
         format_name: ``maru_kv_ops.EngineKVFormat`` member, or None when
-            this layout has no kernel form and must use per-layer transfers.
-            Read only by the packed-kernel path, which walks memory itself.
+            this layout has none. Read only by the packed-kernel path, which
+            walks memory itself. A layout with neither this nor ``kv_packed``
+            must use per-layer transfers.
         kv_packed: True when K and V are the two halves of the last dimension,
             K first, as in vLLM 0.29+'s ``[B, H, N, K|V]`` page. ``kv_axis``
             then names that dimension, which ``_canonical_paged_view`` splits
-            into ``(2, head_size)``, so transfers see a real K/V axis.
+            into ``(2, head_size)``, so transfers see a real K/V axis. The
+            packed-kernel path places such a page by its strides
+            (``maru_kv_ops.LogicalPageFormat``), whatever its physical order.
     """
 
     num_blocks: int
@@ -132,8 +135,11 @@ def _kv_layout_candidates(
         # That needs C to be exactly two heads wide: diffkv's uneven split,
         # packed quantized content, and MLA's single latent (no head_size is
         # passed) keep the fused reading, whose halves are a storage
-        # convention. Both readings are stride-agnostic. Neither has a kernel
-        # format: the *_TWO_HS formats move whole token rows as one plane.
+        # convention. Both readings are stride-agnostic. Neither has an
+        # EngineKVFormat: the *_TWO_HS formats move whole token rows as one
+        # plane. The split reading (kv_packed) is placed by maru_kv_ops'
+        # logical-page kernel, which takes the page's strides; the fused one
+        # stays on per-layer copies.
         if head_size is not None and shape[3] == 2 * head_size:
             add(3, 0, 2, shape[1], head_size, packed=True)
         elif shape[3] % 2 == 0:
@@ -252,6 +258,66 @@ def _detect_kv_layout(
     return best
 
 
+def _detect_block_kv_layout(
+    shape: tuple[int, ...],
+    block_size: int,
+    kv_layout: str | None,
+    num_kv_heads: int | None = None,
+    head_size: int | None = None,
+    num_blocks: int | None = None,
+) -> KVLayout | None:
+    """Resolve a paged KV tensor of ``block_size``-token blocks, or of the
+    kernel blocks vLLM splits them into.
+
+    An attention backend that cannot take a block whole, such as FlashInfer
+    with a 544-token block, gets each block as ``k`` consecutive kernel
+    blocks, each a dense part of the block's page: block ``b`` is kernel
+    blocks ``b * k`` to ``b * k + k - 1``.
+    The layout then describes the kernel blocks. Slots built from vLLM's
+    block ids and ``block_size`` stay right: slot ``b * block_size + t`` is
+    token ``t % kernel`` of kernel block ``b * k + t // kernel``, which is
+    ``divmod(slot, kernel)``.
+
+    That holds only when the tensor has ``k`` kernel blocks for each of
+    vLLM's ``num_blocks`` blocks. vLLM numbers them ``b * stride + j`` with a
+    larger stride when other layers' pages sit between them (a packed
+    cache), and an axis misread as the token axis rarely gives the count, so
+    a tensor in kernel blocks is checked against it when it is known.
+
+    Arguments and return value as for :func:`_detect_kv_layout`, plus
+    ``num_blocks``, vLLM's block count (``KVCacheConfig.num_blocks``).
+
+    Raises:
+        ValueError: The tensor reads as kernel blocks, but not ``k`` of them
+            for each block.
+    """
+    layout = _detect_kv_layout(shape, block_size, kv_layout, num_kv_heads, head_size)
+    if layout is not None:
+        return layout
+    miscounted: KVLayout | None = None
+    for kernel in range(block_size // 2, 0, -1):
+        if block_size % kernel:
+            continue
+        layout = _detect_kv_layout(shape, kernel, kv_layout, num_kv_heads, head_size)
+        if layout is None:
+            continue
+        if num_blocks is None or layout.num_blocks == num_blocks * (
+            block_size // kernel
+        ):
+            return layout
+        miscounted = miscounted or layout
+    if miscounted is not None:
+        k = block_size // miscounted.block_size
+        raise ValueError(
+            f"Maru: the KV tensor {tuple(shape)} holds {miscounted.num_blocks} "
+            f"kernel blocks of {miscounted.block_size} tokens, not {k} for each "
+            f"of vLLM's {num_blocks} blocks of {block_size} tokens. Use an "
+            "attention backend that keeps whole blocks, such as "
+            "--attention-backend TRITON_ATTN"
+        )
+    return None
+
+
 def _canonical_paged_view(t: torch.Tensor, layout: KVLayout) -> torch.Tensor:
     """Return a view of ``t`` with axes reordered to ``[2?, NB, BS, ...]``.
 
@@ -278,6 +344,64 @@ def _mla_pages(t: torch.Tensor) -> torch.Tensor:
     if t.dim() == 4 and t.shape[1] == 1:
         return t.squeeze(1)
     return t
+
+
+def _gather_kv(
+    paged: torch.Tensor, layout: KVLayout, slots: torch.Tensor
+) -> torch.Tensor:
+    """Gather ``slots`` of a paged KV tensor as ``[2, ntok, row]``.
+
+    The order Maru stores a layer's KV in, whatever the paged axis order.
+    A layout without a K/V axis keeps K and V in one row per token; its row
+    is halved instead, a bijection the inject side reverses, which says
+    nothing about where K ends (diffkv splits it unevenly).
+
+    Raises:
+        RuntimeError: A fused row of odd width, which cannot be halved.
+    """
+    canon = _canonical_paged_view(paged, layout)
+    blocks = slots // layout.block_size
+    offsets = slots % layout.block_size
+    if layout.kv_axis is not None:
+        gathered = canon[:, blocks, offsets]  # [2, ntok, ...]
+        return gathered.reshape(2, gathered.shape[1], -1)
+    if canon.shape[2:].numel() % 2:
+        # No shipped backend produces one, but refuse cleanly rather than
+        # fail inside the reshape.
+        raise RuntimeError(
+            "Maru: cannot extract KV for layout "
+            f"{tuple(paged.shape)}; odd fused K/V row width"
+        )
+    gathered = canon[blocks, offsets]  # [ntok, ...]
+    return gathered.reshape(gathered.shape[0], 2, -1).transpose(0, 1)
+
+
+def _scatter_kv(
+    paged: torch.Tensor, layout: KVLayout, slots: torch.Tensor, kv: torch.Tensor
+) -> None:
+    """Write ``kv`` (``[2, ntok, row]``) into ``slots`` of a paged KV tensor.
+
+    The inverse of :func:`_gather_kv`, through a view, so the writes land in
+    ``paged`` itself.
+
+    Raises:
+        RuntimeError: A fused row of odd width, which cannot be halved.
+    """
+    canon = _canonical_paged_view(paged, layout)
+    blocks = slots // layout.block_size
+    offsets = slots % layout.block_size
+    ntok = slots.shape[0]
+    if layout.kv_axis is not None:
+        canon[:, blocks, offsets] = kv.reshape(2, ntok, *canon.shape[3:])
+        return
+    if canon.shape[2:].numel() % 2:
+        raise RuntimeError(
+            "Maru: cannot inject KV for layout "
+            f"{tuple(paged.shape)}; odd fused K/V row width"
+        )
+    # Undo the gather side's halving of each token's row.
+    merged = kv.transpose(0, 1).reshape(ntok, -1)
+    canon[blocks, offsets] = merged.reshape(ntok, *canon.shape[2:])
 
 
 _kv_cache_layout_warned = False

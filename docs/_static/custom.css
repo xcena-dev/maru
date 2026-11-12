@@ -160,3 +160,41 @@ html.dark .admonition.docutils {
     --color-3: #5a8fbf;                /* lighter steel blue for visibility */
     --color-4: #7ab0d8;                /* light blue title text */
 }
+
+/* Supported Models: center the support marks and their headers */
+table.maru-supported-models thead th[colspan],
+table.maru-supported-models thead tr:nth-child(2) th,
+table.maru-supported-models tbody td:nth-child(3),
+table.maru-supported-models tbody td:nth-child(4) {
+    text-align: center;
+}
+
+/* Supported Models: keep model names in "Tested with" on one line */
+table.maru-supported-models tbody td:nth-child(5) {
+    white-space: nowrap;
+}
+
+/* Keep generated index columns scrollable inside a narrow content area. */
+.genindextable {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+/* Long API/page names must fit mobile breadcrumbs and next-page links. */
+.navigation-next,
+.navigation-prev {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.navigation .page-info,
+.sy-breadcrumbs ol,
+.sy-breadcrumbs li {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.sy-breadcrumbs ol {
+    flex-wrap: wrap;
+}

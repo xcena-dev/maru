@@ -98,9 +98,9 @@ class TestIsRunning:
         finally:
             server.stop()
 
-    def test_false_when_no_server(self):
+    def test_false_when_no_server(self, refused_address):
         """is_running() returns False when no server is listening."""
-        client = MaruShmClient(address="127.0.0.1:19999")
+        client = MaruShmClient(address=refused_address)
         assert client.is_running() is False
 
 
@@ -146,9 +146,9 @@ class TestEnsureConn:
         finally:
             server.stop()
 
-    def test_raises_connection_error_when_not_running(self):
+    def test_raises_connection_error_when_not_running(self, refused_address):
         """_ensure_conn raises ConnectionError when server is not running."""
-        client = MaruShmClient(address="127.0.0.1:19999")
+        client = MaruShmClient(address=refused_address)
         with client._conn_lock:
             with pytest.raises(
                 ConnectionError, match="Resource manager is not running"

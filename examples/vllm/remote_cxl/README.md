@@ -47,7 +47,7 @@ owner and maru-server can take a region away.
 > sees region handles and remote keys. Keep the RDMA network to the hosts of
 > the deployment, as the CXL fabric is.
 
-The backend stores KV chunkwise and needs `TP=PP=DP=1`, `--enforce-eager`,
+The backend stores KV chunkwise and needs `PP=1`, `--enforce-eager`,
 unquantized KV and `kv_load_failure_policy="recompute"`. By default the
 backend loads cache hits between steps (`maru_async_load`) and stores after
 the forward (`maru_async_store`), so an RDMA transfer that waits for a slow
@@ -58,8 +58,9 @@ launcher) runs them on the engine thread, and synchronous loads need
 between the GPU and the worker's staging buffer, host memory registered with
 the NIC, with CUDA registration when supported. Packed copies also require a
 supported layout and complete chunks, not just a built `maru_kv_ops` extension.
-Otherwise per-layer copies are used, including the vLLM 0.29+ logical layouts
-in this version. Check actual engine transfer logs before interpreting timing.
+Otherwise per-layer copies are used. The stride-based placement extension also
+supports vLLM 0.29+ logical pages when its bindings are available. Check actual
+engine transfer logs before interpreting timing.
 
 ## Requirements
 
@@ -290,11 +291,15 @@ vllm serve <model> --enforce-eager --enable-prompt-tokens-details \
   }'
 ```
 
-`maru_cache_namespace` is the sharing scope: engines share KV when it and the
-model shape match, whichever path each node loads the weights from, so use a
+`maru_cache_namespace` is the sharing scope: engines share KV when it, the
+model shape and the quantization vLLM runs (`--quantization`) match, whichever
+path each node loads the weights from, so use a
 namespace that identifies the exact weights.
 `maru_engine_id` names the engine's storage session and must be unique among
 the engines of one maru-server; the launcher uses `<hostname>-<instance>`.
+Under tensor parallelism each rank opens its own session, `<id>-tp<rank>`;
+data-parallel replica `d` > 0 adds `-dp<d>` (`<id>-dp<d>-tp<rank>`, or
+`<id>-dp<d>` at TP=1).
 `maru_pool_size` is the CXL memory the engine gets at a time (one region), as
 with the cxl backend. `--enable-prompt-tokens-details` only
 makes vLLM report cached tokens per request, which the test scripts read.

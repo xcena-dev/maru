@@ -120,6 +120,7 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 - {doc}`Installation <source/getting_started/installation>`
 - {doc}`Quick Start <source/getting_started/quick_start>` — Single-host and multi-host KV sharing
 - {doc}`Examples <source/getting_started/examples/index>`
+- {doc}`Supported Models <source/integration/supported_models>` — Models Maru stores with vLLM, by KV cache structure
 - {doc}`Architecture Overview <source/design_doc/architecture_overview>`
 
 ```{toctree}
@@ -142,6 +143,7 @@ Architecture Overview <source/design_doc/architecture_overview>
 Memory Model <source/design_doc/memory_model>
 KV Cache Management <source/design_doc/kv_cache_management>
 Consistency and Safety <source/design_doc/consistency_and_safety>
+Prefetch Hints (Read and Write) <source/design_doc/read_hints>
 CPU/CXL L1 and SSD L2 (Proposal) <source/design_doc/tiered_kv_cache>
 ```
 
@@ -150,6 +152,7 @@ CPU/CXL L1 and SSD L2 (Proposal) <source/design_doc/tiered_kv_cache>
 :caption: Integration
 :hidden:
 
+Supported Models <source/integration/supported_models>
 LMCache <source/integration/lmcache>
 vLLM <source/integration/vllm>
 NVIDIA Dynamo <source/integration/dynamo>

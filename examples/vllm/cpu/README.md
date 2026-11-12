@@ -19,9 +19,10 @@ In an environment with a compatible vLLM installed, install this checkout:
 MARU_SKIP_KV_OPS=1 uv pip install -e .
 ```
 
-M1 uses synchronous pageable host copies, so it does not require the optional
-`maru_kv_ops` CUDA extension. This is a correctness baseline, not the final
-pinned-memory performance path.
+M1 uses synchronous host copies, so it does not require the optional
+`maru_kv_ops` CUDA extension. The worker page-locks the pool when it opens
+(`maru_pin_pools`, default `true`), so these copies run at the DMA rate; this
+locks the whole pool in memory and adds seconds to startup for tens of GB.
 
 Start the metadata server:
 

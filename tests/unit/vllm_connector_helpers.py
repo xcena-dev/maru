@@ -42,12 +42,14 @@ def make_worker(
     num_kv_heads: int | None = None,
     head_size: int | None = None,
     kv_cache_layout: str | None = None,
+    **kwargs: Any,
 ) -> MaruWorkerConnector:
     """Construct a MaruWorkerConnector (no CXL hardware or GPU required).
 
     ``kv_cache_layout`` is the layout the engine reports: a vLLM 0.29+
     ``KVCacheLayout`` name such as "LBNHC", or "NHD"/"HND" as older vLLM
-    reports it. None leaves the worker to read vLLM's own.
+    reports it. None leaves the worker to read vLLM's own. Other kwargs go
+    to its constructor.
     """
     from maru_vllm.connector import MaruWorkerConnector
 
@@ -58,6 +60,7 @@ def make_worker(
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         cache_config=resolved_cache_config(kv_cache_layout),
+        **kwargs,
     )
 
 
@@ -110,14 +113,16 @@ def make_scheduler(
     block_size: int,
     kv_chunk_tokens: int,
     extra_config: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> MaruSchedulerConnector:
-    """Construct a MaruSchedulerConnector."""
+    """Construct a MaruSchedulerConnector; kwargs go to its constructor."""
     from maru_vllm.connector import MaruSchedulerConnector
 
     return MaruSchedulerConnector(
         block_size=block_size,
         kv_chunk_tokens=kv_chunk_tokens,
         extra_config={} if extra_config is None else extra_config,
+        **kwargs,
     )
 
 
@@ -148,6 +153,8 @@ def make_vllm_scheduler(
     speculative_method: Literal["draft_model", "eagle", "ngram"] | None = None,
     num_speculative_tokens: int = 16,
     max_model_len: int = 512,
+    kv_cache_groups: list[Any] | None = None,
+    kv_load_failure_policy: str = "recompute",
 ) -> Any:
     """Build a real vLLM Scheduler whose KV connector is MaruKVConnector.
 
@@ -165,6 +172,9 @@ def make_vllm_scheduler(
         speculative_method: Optional draft-model, EAGLE or ngram configuration.
         num_speculative_tokens: Draft tokens when speculation is enabled.
         max_model_len: Token limit used by the model and scheduler.
+        kv_cache_groups: ``KVCacheGroupSpec`` list replacing the default single
+            full-attention group, for models with several groups.
+        kv_load_failure_policy: vLLM's policy for a failed KV load.
 
     Returns:
         The ``vllm.v1.core.sched.scheduler.Scheduler``; its
@@ -237,7 +247,7 @@ def make_vllm_scheduler(
             kv_connector="MaruKVConnector",
             kv_connector_module_path="maru_vllm",
             kv_role="kv_both",
-            kv_load_failure_policy="recompute",
+            kv_load_failure_policy=kv_load_failure_policy,
             kv_connector_extra_config={
                 "maru_kv_chunk_tokens": kv_chunk_tokens,
                 **(extra_config or {}),
@@ -249,7 +259,8 @@ def make_vllm_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[
+        kv_cache_groups=kv_cache_groups
+        or [
             KVCacheGroupSpec(
                 ["layer"],
                 FullAttentionSpec(
@@ -284,6 +295,24 @@ def make_flash_attn_metadata() -> MagicMock:
 # =============================================================================
 # Handler mock that captures stored objects
 # =============================================================================
+
+
+class FailingSyncStream:
+    """A CUDA stream whose ``synchronize`` reports a failed copy.
+
+    It waits for the queued work first, so the CUDA context stays usable,
+    and then raises as an asynchronous copy error would.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def synchronize(self) -> None:
+        self.stream.synchronize()
+        raise RuntimeError("injected asynchronous copy failure")
 
 
 def capture_bytes(buf: Any) -> bytes:
@@ -324,6 +353,69 @@ def attach_capturing_handler(
     worker._handler.alloc.side_effect = _alloc
     worker._handler.batch_store.side_effect = _batch_store
     return store
+
+
+class FirstWinsServer:
+    """In-memory MaruServer: the first registrant of a key wins, and a losing
+    register still reports success, as MaruServer and batch_store do. TP
+    ranks that wrote under one key would load each other's KV here."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def _register(self, key: str, handle) -> None:
+        self.objects.setdefault(key, bytes(handle.buf))
+
+    def handler(self) -> MagicMock:
+        """A MaruHandler stand-in for one worker process."""
+        from maru_handler.memory.types import MemoryInfo
+
+        handler = MagicMock()
+        handler.alloc.side_effect = lambda nbytes: SimpleNamespace(
+            buf=memoryview(bytearray(max(nbytes, 1)))
+        )
+
+        def batch_store(keys, handles):
+            for key, handle in zip(keys, handles, strict=True):
+                self._register(key, handle)
+            # A losing register still reports the key as stored.
+            return [True] * len(keys)
+
+        def batch_retrieve(keys):
+            return [
+                MemoryInfo(
+                    view=memoryview(bytearray(self.objects[key])),
+                    region_id=index,
+                    page_index=0,
+                )
+                if key in self.objects
+                else None
+                for index, key in enumerate(keys)
+            ]
+
+        handler.batch_store.side_effect = batch_store
+        handler.store.side_effect = self._register
+        handler.batch_retrieve.side_effect = batch_retrieve
+        handler.batch_exists.side_effect = lambda keys: [
+            key in self.objects for key in keys
+        ]
+        return handler
+
+
+def tp_model_config(
+    total_kv_heads: int, *, use_mla: bool = False, head_size: int = 64
+) -> SimpleNamespace:
+    """The parts of vLLM's ModelConfig the connector reads under TP.
+
+    ``get_num_kv_heads`` follows vLLM: ``max(1, heads // TP)`` per rank.
+    """
+    return SimpleNamespace(
+        use_mla=use_mla,
+        max_model_len=4096,
+        get_total_num_kv_heads=lambda: total_kv_heads,
+        get_num_kv_heads=lambda pc: max(1, total_kv_heads // pc.tensor_parallel_size),
+        get_head_size=lambda: head_size,
+    )
 
 
 # =============================================================================
@@ -417,6 +509,7 @@ def fake_scheduler_output(
         scheduled_new_reqs=list(new_reqs),
         scheduled_cached_reqs=fake_cached_reqs() if cached is None else cached,
         num_scheduled_tokens=dict(num_scheduled_tokens or {}),
+        total_num_scheduled_tokens=sum((num_scheduled_tokens or {}).values()),
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )
@@ -426,13 +519,17 @@ def fake_new_request_data(
     prompt_token_ids: list[int],
     block_ids: list[int],
     req_id: str = "r1",
+    num_computed_tokens: int = 0,
 ) -> SimpleNamespace:
     """Stand-in for a SchedulerOutput.scheduled_new_reqs entry.
 
     ``block_ids`` is wrapped in the single-KV-group tuple vLLM passes.
+    ``num_computed_tokens`` counts tokens already covered before this step,
+    including an external hit the connector loads in it.
     """
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=prompt_token_ids,
         block_ids=(list(block_ids),),
+        num_computed_tokens=num_computed_tokens,
     )
