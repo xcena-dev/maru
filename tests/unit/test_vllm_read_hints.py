@@ -281,3 +281,35 @@ def test_shutdown_stops_arrival_hints_and_creates_no_new_handler(monkeypatch):
     sched._ensure_handler()
     assert sched._arrival_pool is None and sched._handler is None
     assert created == []
+
+
+def test_the_cxl_backend_takes_read_hints_and_no_write_hints(monkeypatch):
+    from maru_vllm.connector import _validate_storage_config
+
+    seen = []
+
+    class Recorder:
+        def __init__(self, config):
+            seen.append(config)
+
+        def connect(self):
+            return True
+
+    monkeypatch.setattr(maru, "MaruHandler", Recorder)
+    config = {
+        "maru_storage_backend": "cxl",
+        "maru_pool_size": "16M",
+        "maru_read_hints": True,
+        "maru_async_load": True,
+    }
+    assert _validate_storage_config(config) is False
+    _create_maru_handler(config, metadata_only=True)
+    _create_maru_handler(config, metadata_only=False)
+    # Its hints go to handler plugins: the scheduler hints, the worker
+    # promotes; write hints stay with remote_cxl.
+    assert [c.read_hints for c in seen] == [True, False]
+    assert [c.read_promotes for c in seen] == [False, True]
+    assert [c.write_hints for c in seen] == [False, False]
+    for knob in ("maru_write_hints", "maru_rdma_device"):
+        with pytest.raises(ValueError, match="remote_cxl"):
+            _validate_storage_config({**config, knob: True})
