@@ -22,16 +22,16 @@ These measurements show the scaling behavior of the two tested configurations at
 
 ## Power Efficiency
 
-![Figure 3: Power comparison](image/128k_power_comparison.png)
-*Figure 3: System-level power traces during P2P KV cache reuse (128K context). The LMCache p2p backend exhibits a prolonged KV retrieval phase (103s) with low GPU utilization, while Maru completes retrieval in 53s with higher GPU utilization throughout.*
+![Figure 3: Reported retrieval-phase duration and energy](image/retrieval_phase_summary.svg)
+*Figure 3: Historical retrieval-phase totals for the reported single-node 128K-context configuration. Duration is 103 s for LMCache P2P and 53 s for Maru cxl; energy is 36.1 Wh and 20.1 Wh respectively. Lower is better. The figure is redrawn from previously reported values, with no new measurements.*
 
-Figure 3 compares the full power timeline for both backends during a 128K-context P2P benchmark. The populate phase (where GPU0 performs prefill and stores KV cache) is nearly identical in both duration and power draw, confirming that the two systems share the same computation workload.
+Figure 3 summarizes the reported retrieval phase. The [original annotated power trace](image/128k_power_comparison.png) is preserved as historical source material. Its old "zero-copy mmap, no wait" annotation should be read using the current path definition above: GPU copies and metadata RPC remain. Its "49% faster" label denotes the shorter phase duration, not a measured throughput increase. The two reductions are approximately 49% in duration and 44% in energy, calculated from the reported totals. The [plot source](https://github.com/xcena-dev/maru/blob/main/docs/source/performance/plot_retrieval_summary.py) reproduces this display.
 
 The reported KV retrieval phase lasts 103 seconds for LMCache P2P, with lower GPU1 utilization in the trace. This phase timing is a workload measurement, not an isolated NIC transfer-time measurement.
 
 The reported Maru `cxl` configuration completes this phase in 53 seconds, a 49% reduction. GPU1 loads from the mapped CXL pool rather than requesting a P2P payload transfer. GPU copies and metadata RPC remain part of that path, so the difference cannot be attributed to "no data movement" or "no network round-trips."
 
-Notably, Maru draws slightly higher instantaneous power during retrieval (1,365W vs. 1,260W), which reflects higher GPU utilization — the GPU is actively computing rather than idling on network transfers. Despite the higher power draw, Maru consumes 44% less total energy for KV retrieval (20.1 Wh vs. 36.1 Wh), as the shorter retrieval time more than compensates for the increased power.
+The reported retrieval power values are 1,365 W for Maru and 1,260 W for LMCache P2P, while the reported phase energy is lower for Maru (20.1 Wh versus 36.1 Wh). These complete-phase values do not isolate the cause of GPU utilization differences or the time spent in a NIC transfer.
 
 The shorter measured phase reduces energy for this workload. Throughput and energy under other concurrency levels, transports or backends require measurements under those conditions.
 
