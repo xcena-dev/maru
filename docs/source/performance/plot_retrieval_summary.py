@@ -15,6 +15,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+matplotlib.rcParams["svg.fonttype"] = "none"
+matplotlib.rcParams["svg.hashsalt"] = "maru-retrieval-summary"
+
 LABELS = ["LMCache P2P", "Maru (cxl)"]
 DURATION_S = [103, 53]
 ENERGY_WH = [36.1, 20.1]
@@ -41,6 +44,9 @@ def main() -> None:
         ax.grid(axis="x", alpha=0.2)
     target = Path(__file__).parent / "image" / "retrieval_phase_summary.svg"
     fig.savefig(target, metadata={"Date": None})
+    target.write_text(
+        "\n".join(line.rstrip() for line in target.read_text().splitlines()) + "\n"
+    )
     plt.close(fig)
 
 
