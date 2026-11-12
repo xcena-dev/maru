@@ -650,6 +650,42 @@ def _dsv41_storing_worker(shared, **kwargs):
     return worker, attach_capturing_handler(worker)
 
 
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_dsv41_prefix_repair_stores_generated_token_bytes(write_behind):
+    """Bounded-replay groups are skipped; the retained MLA bytes fill the gap."""
+    chunk = 2 * DSV41_BLOCK
+    extra = {"maru_async_store": write_behind}
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=extra)
+    groups = describe_kv_groups(dsv41_config(side="scheduler"))
+    scheduler = make_scheduler(DSV41_BLOCK, chunk, extra, kv_groups=groups)
+    scheduler._handler = MagicMock()
+    scheduler._handler.batch_exists.side_effect = lambda keys: [
+        key in store for key in keys
+    ]
+    ids = DSV41_BLOCKS_A + [11, 3, 6, 8]
+    for rid, end, computed in [("t1", 64, 0), ("t2", 128, 96)]:
+        tokens = list(range(end))
+        request = SimpleNamespace(request_id=rid, prompt_token_ids=tokens)
+        assert scheduler.get_num_new_matched_tokens(request, computed) == (0, False)
+        entry = scheduler._store_meta(
+            rid,
+            tokens,
+            _dsv41_blocks(ids[: end // DSV41_BLOCK]),
+            computed,
+            end - computed,
+        )
+        assert entry.store_start_token == (64 if computed else 0)
+        worker.wait_for_save(MaruConnectorMetadata(requests=[entry]))
+        assert set(store) == _dsv41_keys(tokens, chunk, end // chunk, False)
+
+    # Tokens [64,96) came from the preceding decode, not this turn's prefill.
+    key = _mla_key(_chunk_keys(list(range(128)), chunk)[2], DSV41_GROUP, chunk)
+    assert store[key] == b"".join(_block_bytes(worker, b) for b in ids[4:6])
+    scheduler._known_keys.clear()
+    assert _hit(scheduler, list(range(160))) == 128
+    worker.shutdown()
+
+
 def _block_bytes(worker, block):
     return bytes(_cache_of(worker, DSV41_GROUP).tensors[0][block].numpy())
 
@@ -4004,6 +4040,18 @@ def _one_attention_group(**spec):
         ],
         num_blocks=NUM_BLOCKS,
     )
+
+
+def test_promoted_full_attention_repairs_prefix_despite_window_metadata():
+    """Disabling the hybrid manager retains FullAttentionSpec's window field."""
+    groups = describe_kv_groups(_one_attention_group(sliding_window=128))
+    assert groups[0].kind == GROUP_FULL
+    assert groups[0].sliding_window == 128
+    scheduler = make_scheduler(16, 32, kv_groups=groups)
+    scheduler._maru_hits["r"] = (2, 96)
+    entry = scheduler._store_meta("r", list(range(128)), (list(range(8)),), 96, 32)
+    assert entry.store_start_token == 64
+    assert entry.store_cached_prefix
 
 
 def test_tp_names_attention_by_rank_in_one_group_with_a_sliding_window(monkeypatch):

@@ -2982,13 +2982,24 @@ class MaruSchedulerConnector:
         # prompt stored in Maru. Its full-attention blocks still cover those
         # tokens on admission. Fill that gap before storing the new suffix,
         # or a later lookup will stop at the first turn's prompt forever.
-        # Do not rewind stateful/windowed groups: their old states or blocks
-        # may no longer exist. Preempted requests retain their original start.
+        # FullAttentionManager retains every block even if a promoted spec
+        # carries sliding_window metadata. Non-windowed MLA groups retain
+        # their blocks too; skipped/replayed groups have nothing to store.
+        # Stateful/windowed groups may have lost history. Preempted requests
+        # retain their original start.
         full_history = all(
-            g.kind == GROUP_FULL and g.sliding_window is None for g in self._kv_groups
+            g.kind in {GROUP_FULL, GROUP_SKIP}
+            or (g.kind == GROUP_MLA and g.sliding_window is None)
+            for g in self._kv_groups
         )
         if preempted is None and full_history:
-            maru_end = hit[0] * ct if hit is not None and num_computed >= hit[1] else 0
+            # A bounded replay resumes before the loaded hit to rebuild its
+            # skipped window. Those MLA chunks are already present in Maru.
+            maru_end = (
+                hit[0] * ct
+                if hit is not None and num_computed + self._replay_tokens >= hit[1]
+                else 0
+            )
             store_start = min(store_start, maru_end)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)

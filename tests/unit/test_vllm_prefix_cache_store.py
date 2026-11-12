@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefix-cache hits must not leave holes in the external conversation KV."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -13,12 +14,21 @@ import torch
 
 import maru
 from maru_vllm.connector import (
+    MaruConnectorMetadata,
     _chunk_keys,
     _cpu_engine_config,
     _create_maru_handler,
     _step_chunks,
 )
-from maru_vllm.kv_groups import GROUP_FULL, GROUP_MAMBA, GROUP_SLIDING_WINDOW, KVGroup
+from maru_vllm.kv_groups import (
+    GROUP_FULL,
+    GROUP_MAMBA,
+    GROUP_MLA,
+    GROUP_SKIP,
+    GROUP_SLIDING_WINDOW,
+    GroupCache,
+    KVGroup,
+)
 from tests.unit.test_vllm_cpu_config import engine_config
 from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
@@ -34,15 +44,84 @@ BLOCK = 4
 CHUNK = 8
 
 
-def test_a_generated_prefix_is_stored_and_reused_after_gpu_eviction():
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_retained_mla_blocks_fill_the_generated_prefix(write_behind):
+    """Exercise the MLA worker copy even on vLLM without bounded-replay specs."""
+    group = KVGroup(
+        1, GROUP_MLA, "MLAAttentionSpec", ("kv",), BLOCK, 16, group_page_bytes=16
+    )
+    groups = [
+        KVGroup(
+            0,
+            GROUP_SKIP,
+            "SlidingWindowMLASpec",
+            ("swa",),
+            BLOCK,
+            16,
+            sliding_window=128,
+        ),
+        group,
+    ]
+    extra = {"maru_async_store": write_behind}
+    scheduler = make_scheduler(BLOCK, CHUNK, extra, kv_groups=groups)
+    worker = make_worker(BLOCK, CHUNK, extra, kv_groups=groups)
+    blocks = torch.arange(12 * 16, dtype=torch.uint8).reshape(12, 16)
+    worker._group_caches = (GroupCache(group, (blocks,)),)
+    stored = attach_capturing_handler(worker)
+    scheduler._handler = MagicMock()
+    scheduler._handler.batch_exists.side_effect = lambda keys: [
+        key in stored for key in keys
+    ]
+    for rid, end, computed in [("t1", 16, 0), ("t2", 32, 24)]:
+        tokens = list(range(end))
+        request = SimpleNamespace(request_id=rid, prompt_token_ids=tokens)
+        assert scheduler.get_num_new_matched_tokens(request, computed) == (0, False)
+        ids = list(range(1, end // BLOCK + 1))
+        entry = scheduler._store_meta(
+            rid, tokens, ([0] * len(ids), ids), computed, end - computed
+        )
+        assert entry.store_start_token == (16 if computed else 0)
+        worker.wait_for_save(MaruConnectorMetadata(requests=[entry]))
+        assert set(stored) == {
+            group.object_key(key, CHUNK) for key in _chunk_keys(tokens, CHUNK)
+        }
+    generated_key = group.object_key(_chunk_keys(list(range(32)), CHUNK)[2], CHUNK)
+    assert stored[generated_key] == bytes(blocks[5:7].numpy())
+    scheduler._known_keys.clear()
+    request = SimpleNamespace(request_id="t3", prompt_token_ids=list(range(40)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, False)
+    worker.shutdown()
+
+
+@pytest.mark.parametrize("write_behind", [False, True])
+def test_a_generated_prefix_is_stored_and_reused_after_gpu_eviction(
+    monkeypatch, write_behind
+):
     """Two turns copy real CPU tensor bytes; a third lookup must cross O1."""
-    scheduler = make_scheduler(BLOCK, CHUNK)
-    worker = make_worker(BLOCK, CHUNK)
+    extra = {"maru_async_store": write_behind}
+    scheduler = make_scheduler(BLOCK, CHUNK, extra)
+    worker = make_worker(BLOCK, CHUNK, extra)
     layer = "model.layers.0.self_attn"
     kv = torch.arange(2 * 12 * BLOCK, dtype=torch.float32).reshape(2, 12, BLOCK, 1)
     worker._kv_caches = {layer: kv}
     worker._num_layers = 1
     worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
+    if write_behind:
+        # Execute the real worker gather/copy/completion path on CPU tensors;
+        # only CUDA ordering objects and the placement kernel are simulated.
+        monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: MagicMock())
+        monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: MagicMock())
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: MagicMock())
+        monkeypatch.setattr(torch.cuda, "stream", lambda *args: nullcontext())
+
+        def transfer(slab, ptrs, slots, *args, **kwargs):
+            slab[:, 0] = kv.reshape(2, -1, 1)[:, slots]
+
+        ops = SimpleNamespace(
+            TransferDirection=SimpleNamespace(D2H="D2H"),
+            multi_layer_kv_transfer=transfer,
+        )
+        kernel = (ops, torch.tensor([kv.data_ptr()]), 48, BLOCK, 1, "FMT")
     stored = attach_capturing_handler(worker, capture=bytearray)
     scheduler._handler = MagicMock()
     scheduler._handler.batch_exists.side_effect = lambda keys: [
@@ -63,7 +142,17 @@ def test_a_generated_prefix_is_stored_and_reused_after_gpu_eviction():
         )
         (entry,) = meta.requests
         assert entry.store_start_token == expected_start
-        worker.save_kv_layer(layer, kv, make_flash_attn_metadata(), meta)
+        if write_behind:
+            worker._store_packed_slabs_write_behind(kernel, meta)
+            # Wait for registration on the real completion thread before lookup.
+            import time
+
+            deadline = time.monotonic() + 3
+            while worker.get_finished_saving({rid}) != {rid}:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+        else:
+            worker.save_kv_layer(layer, kv, make_flash_attn_metadata(), meta)
         assert set(stored) == set(_chunk_keys(request.prompt_token_ids, CHUNK))
 
     # The former decode output occupies [16,24); its exact K/V bytes survive.
@@ -75,6 +164,7 @@ def test_a_generated_prefix_is_stored_and_reused_after_gpu_eviction():
     scheduler._known_keys.clear()
     after_eviction = SimpleNamespace(request_id="t3", prompt_token_ids=list(range(40)))
     assert scheduler.get_num_new_matched_tokens(after_eviction, 0) == (32, False)
+    worker.shutdown()
 
 
 @pytest.mark.parametrize("write_behind", [False, True])
@@ -112,6 +202,31 @@ def test_only_groups_with_complete_history_rewind_their_store(kind):
     )
     assert meta.store_start_token == (16 if kind == GROUP_FULL else 24)
     assert meta.store_cached_prefix is (kind == GROUP_FULL)
+
+
+@pytest.mark.parametrize(
+    "kind,window,eligible",
+    [
+        (GROUP_FULL, 128, True),
+        (GROUP_MLA, None, True),
+        (GROUP_MLA, 128, False),
+        (GROUP_SKIP, 128, True),
+        (GROUP_MAMBA, None, False),
+        (GROUP_SLIDING_WINDOW, 128, False),
+    ],
+)
+def test_prefix_repair_follows_retained_blocks(kind, window, eligible):
+    groups = [
+        KVGroup(0, GROUP_FULL, "FullAttentionSpec", ("a",), BLOCK, 32),
+        KVGroup(1, kind, "Spec", ("b",), BLOCK, 32, sliding_window=window),
+    ]
+    scheduler = make_scheduler(BLOCK, CHUNK, kv_groups=groups)
+    scheduler._maru_hits["r"] = (2, 24)
+    entry = scheduler._store_meta(
+        "r", list(range(32)), ([1, 2, 3, 4, 5, 6, 7, 8],) * 2, 24, 8
+    )
+    assert entry.store_start_token == (16 if eligible else 24)
+    assert entry.store_cached_prefix is eligible
 
 
 @pytest.mark.parametrize("backend", ["cxl", "remote_cxl"])

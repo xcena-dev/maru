@@ -165,7 +165,7 @@ Instance B:
 
 A vLLM prefix-cache hit does not mean that the same KV exists in Maru. In a
 multi-turn conversation, a previous turn's generated tokens may be present
-only in the GPU cache. For full-attention caches, the first store of the
+only in the GPU cache. For caches retaining the full prefix, the first store of the
 next turn starts at the end of the prefix found in Maru, copying those
 missing chunks together with the new prompt suffix. A later lookup can
 then reuse them after vLLM evicts the conversation.
@@ -175,10 +175,15 @@ step; later prefill steps store only their new chunks. Asynchronous stores
 retain the original start until the prompt finishes. Full Maru hits still
 avoid storing already present chunks, including a held-back compute block.
 
-This repair applies when every KV group retains full attention history.
-Mamba and sliding-window groups keep their existing store rules because
-historical states or blocks may already be gone; missing history in those
-groups can still require recomputation.
+The repair applies when every stored group retains all prefix blocks:
+full-attention groups (including promoted groups with a `sliding_window`
+field) and non-windowed MLA groups. Bounded-replay and other skipped groups
+do not store KV and do not restrict the repair. Replaying a window before a
+confirmed Maru hit preserves the hit's store boundary.
+
+Mamba and stored sliding-window groups keep their existing store rules
+because historical states or blocks may already be gone; missing history
+in those groups can still require recomputation.
 
 ### Requests Maru does not cache
 
