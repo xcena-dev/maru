@@ -46,8 +46,11 @@ from maru_vllm.connector import (
 from maru_vllm.kv_groups import (
     GROUP_FULL,
     GROUP_MAMBA,
+    GROUP_MLA,
+    GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
+    KVGroup,
     _spec_kind,
     check_multi_group_support,
     check_one_group_support,
@@ -186,6 +189,1149 @@ def test_chunk_is_one_block_with_a_mamba_group():
     assert chunk_tokens_for_groups(qwen, 1088, QWEN35_BLOCK) == QWEN35_BLOCK
     gpt = describe_kv_groups(gpt_oss_config())
     assert chunk_tokens_for_groups(gpt, 256, 16) == 256
+
+
+# =============================================================================
+# DeepSeek-V4.1
+# =============================================================================
+
+DSV41_BLOCK = 16  # tiny geometry; scheduler tests pass block=128
+DSV41_GROUP = 4
+# The kv-source layers' compressed KV and indexer K: name -> bytes per state.
+DSV41_MEMBERS = {
+    "layers.2.attn.kv": 24,
+    "layers.8.attn.kv": 24,
+    "layers.14.attn.kv": 24,
+    "layers.2.attn.indexer": 8,
+    "layers.8.attn.indexer": 8,
+    "layers.14.attn.indexer": 8,
+    "layers.20.attn.kv": 48,
+    "layers.20.attn.indexer": 16,
+}
+
+
+def _window_mla(block, bounded_replay=True, window=128, row=584):
+    """DeepSeek-V4.1's sliding-window cache, ``row`` bytes per token; bounded
+    replay keeps it out of vLLM's prefix cache."""
+    window_mla = getattr(kv_cache_interface, "SlidingWindowMLASpec", None)
+    if window_mla is None or "bounded_replay" not in {
+        f.name for f in dataclasses.fields(window_mla)
+    }:
+        pytest.skip("this vLLM has no bounded replay")
+    return window_mla(
+        block_size=block,
+        num_kv_heads=1,
+        head_size=row,
+        dtype=torch.uint8,
+        sliding_window=window,
+        bounded_replay=bounded_replay,
+    )
+
+
+def _ring(block):
+    """DeepSeek-V4.1's KV compressor state, a circular buffer that vLLM never
+    prefix-caches."""
+    ring = getattr(kv_cache_interface, "CircularBufferSpec", None)
+    if ring is None:
+        pytest.skip("this vLLM has no CircularBufferSpec")
+    return ring(block_size=block, num_kv_heads=1, head_size=8, dtype=torch.uint8)
+
+
+def _group(specs, side):
+    """A group as vLLM 0.33 hands it over: for DeepSeek-V4.1 it wraps every
+    group in UniformTypeKVCacheSpecs for the worker, and the scheduler sees
+    the first member."""
+    first = next(iter(specs.values()))
+    spec = (
+        UniformTypeKVCacheSpecs(block_size=first.block_size, kv_cache_specs=specs)
+        if side == "worker"
+        else first
+    )
+    return KVCacheGroupSpec(list(specs), spec)
+
+
+def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
+    """DSV4.1-Flash's six groups: four sliding windows, the compressed KV and
+    indexer keys, and the KV compressor's circular buffer."""
+    window = window or _window_mla(block // 4)
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=block, num_kv_heads=1, head_size=size, dtype=torch.uint8
+        )
+        for name, size in DSV41_MEMBERS.items()
+    }
+    groups = [
+        _group({f"layers.{i}.attn.swa": window for i in range(g, 40, 4)}, side)
+        for g in range(4)
+    ]
+    groups.append(_group(mla, side))
+    ring = _ring(8)
+    groups.append(_group({f"layers.{i}.attn.ring": ring for i in (2, 8, 14)}, side))
+    return SimpleNamespace(kv_cache_groups=groups, num_blocks=NUM_BLOCKS)
+
+
+def _check_dsv41(config):
+    check_multi_group_support(
+        describe_kv_groups(config),
+        block_size=DSV41_BLOCK,
+        use_layerwise=False,
+        speculative=False,
+        inline_loads=False,
+    )
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_dsv41_groups_skip_what_vllm_does_not_prefix_cache(side):
+    groups = describe_kv_groups(dsv41_config(side=side))
+    assert [g.kind for g in groups] == [GROUP_SKIP] * 4 + [GROUP_MLA, GROUP_SKIP]
+    assert [g.replay_tokens for g in groups] == [128] * 4 + [0, 0]
+
+
+def test_dsv41_passes_the_support_check():
+    _check_dsv41(dsv41_config())
+
+
+def test_dsv41_passes_the_support_check_in_the_layerwise_format():
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config()),
+        block_size=DSV41_BLOCK,
+        use_layerwise=True,
+        speculative=False,
+        inline_loads=False,
+    )
+
+
+def test_connector_starts_with_dsv41_in_the_layerwise_format():
+    connector = MaruKVConnector(
+        _connector_config(128, maru_use_layerwise=True),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler"),
+    )
+    assert connector._scheduler._use_layerwise
+
+
+@pytest.mark.parametrize(
+    ("setting", "chunk"), [(None, 256), (128, 128), (512, 512), (200, 128)]
+)
+def test_connector_starts_with_dsv41(setting, chunk):
+    """The chunk stays configurable: no Mamba group pins it to one block, and
+    it is only rounded down to a multiple of the block."""
+    extra = {} if setting is None else {"maru_kv_chunk_tokens": setting}
+    connector = MaruKVConnector(
+        _connector_config(128, **extra),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler"),
+    )
+    assert connector._kv_chunk_tokens == chunk
+    assert connector._scheduler._kv_chunk_tokens == chunk
+    assert connector._scheduler._multi_group
+
+
+def test_an_mla_object_key_names_its_block_size():
+    """An MLA group's objects keep the layout vLLM gives each block, which
+    another block size lays out differently even when an object's bytes add
+    up to the same total (DeepSeek-V4.1 uses 64-token blocks on SM90 and
+    SM120 and 128-token ones on SM100). Other groups' objects are laid out
+    token by token, and their keys stay as they were."""
+    small, large = (
+        describe_kv_groups(dsv41_config(block=b))[DSV41_GROUP]
+        for b in (DSV41_BLOCK, 2 * DSV41_BLOCK)
+    )
+    assert small.object_key("kv_x", 64) == "kv_x_c64_g4_b16"
+    assert large.object_key("kv_x", 64) == "kv_x_c64_g4_b32"
+    full = KVGroup(
+        group_id=1,
+        kind=GROUP_FULL,
+        spec_name="FullAttentionSpec",
+        layer_names=("layers.0.attn",),
+        block_size=16,
+        slot_bytes=8,
+    )
+    assert full.object_key("kv_x", 64) == group_object_key("kv_x", 1, 64)
+
+
+def test_a_model_with_only_skipped_groups_is_refused():
+    config = dsv41_config()
+    del config.kv_cache_groups[DSV41_GROUP]
+    with pytest.raises(ValueError, match="prefix-cache"):
+        _check_dsv41(config)
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_dsv41_without_bounded_replay_stores_its_windows(side):
+    """With bounded replay off vLLM prefix-caches the sliding windows, so Maru
+    stores them too, as MLA groups that a hit needs only near its end."""
+    window = _window_mla(DSV41_BLOCK // 4, bounded_replay=False)
+    groups = describe_kv_groups(dsv41_config(side=side, window=window))
+    assert [g.kind for g in groups] == [GROUP_MLA] * 5 + [GROUP_SKIP]
+    assert [g.sliding_window for g in groups] == [128] * 4 + [None, None]
+    assert [g.replay_tokens for g in groups] == [0] * 6
+
+
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+def test_dsv41_without_bounded_replay_passes_the_support_check(layerwise):
+    """vLLM's block size is then the windows' 4-token one, the smallest of the
+    groups it prefix-caches, below the MLA group's 16-token blocks."""
+    window = _window_mla(DSV41_BLOCK // 4, bounded_replay=False)
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config(window=window)),
+        block_size=DSV41_BLOCK // 4,
+        use_layerwise=layerwise,
+        speculative=False,
+        inline_loads=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("setting", "chunk"), [(None, 256), (96, 64), (32, 64), (320, 320)]
+)
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+def test_connector_starts_with_dsv41_without_bounded_replay(setting, chunk, layerwise):
+    """vLLM sets its block size to the windows' 32 tokens, but schedules in 64:
+    a chunk is rounded to whole blocks of every group."""
+    extra = {} if setting is None else {"maru_kv_chunk_tokens": setting}
+    connector = MaruKVConnector(
+        _connector_config(32, maru_use_layerwise=layerwise, **extra),
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(
+            block=64, side="scheduler", window=_window_mla(32, bounded_replay=False)
+        ),
+    )
+    assert connector._kv_chunk_tokens == chunk
+    assert connector._scheduler._kv_chunk_tokens == chunk
+
+
+@pytest.mark.parametrize("ratio", [1, 2], ids=["same-block", "larger-block"])
+def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
+    """A Mamba group pins the chunk to one block, which holds no whole block
+    of an MLA group with larger blocks. The pair (GLM-5.3-Flash's Kimi Delta
+    Attention states and DSA caches) is refused whatever the block sizes."""
+    mamba = dataclasses.replace(_mamba_spec(), block_size=DSV41_BLOCK)
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=ratio * DSV41_BLOCK,
+            num_kv_heads=1,
+            head_size=size,
+            dtype=torch.uint8,
+        )
+        for name, size in DSV41_MEMBERS.items()
+    }
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layers.0.kda", "layers.1.kda"], mamba),
+            _group(mla, "worker"),
+        ],
+        num_blocks=NUM_BLOCKS,
+    )
+    with pytest.raises(ValueError, match="Mamba-type and an MLA"):
+        _check_dsv41(config)
+
+
+def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
+    """The support checks run before the chunk is rounded, so a model they
+    refuse leaves no warning about its chunk size."""
+    config = _connector_config(128, maru_kv_chunk_tokens=200)
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        with pytest.raises(ValueError, match="speculative decoding"):
+            MaruKVConnector(
+                config,
+                KVConnectorRole.SCHEDULER,
+                dsv41_config(block=128, side="scheduler"),
+            )
+    assert not [r for r in caplog.records if "not aligned" in r.getMessage()]
+
+
+def test_a_group_mixing_mla_and_window_layers_is_refused():
+    """A hit needs a window group only near its end but an MLA group whole, so
+    one group cannot hold both kinds of layer."""
+    members = {
+        "layers.2.attn.kv": MLAAttentionSpec(
+            block_size=DSV41_BLOCK, num_kv_heads=1, head_size=24, dtype=torch.uint8
+        ),
+        "layers.3.attn.swa": _window_mla(DSV41_BLOCK, bounded_replay=False),
+    }
+    config = dsv41_config()
+    config.kv_cache_groups[DSV41_GROUP] = KVCacheGroupSpec(
+        list(members),
+        UniformTypeKVCacheSpecs(block_size=DSV41_BLOCK, kv_cache_specs=members),
+    )
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        _check_dsv41(config)
+
+
+def test_mamba_states_in_one_uniform_group_are_refused():
+    """vLLM wraps GLM-5.3-Flash's KDA states this way."""
+    names = ["layers.0.kda", "layers.1.kda"]
+    states = UniformTypeKVCacheSpecs(
+        block_size=DSV41_BLOCK, kv_cache_specs={n: _mamba_spec() for n in names}
+    )
+    config = dsv41_config()
+    config.kv_cache_groups[5] = KVCacheGroupSpec(names, states)
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        _check_dsv41(config)
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_an_mla_group_slot_is_one_layer_on_either_side(side):
+    """slot_bytes is one layer's page on both sides; only the worker, which
+    sees every member, knows the bytes a block holds for the whole group."""
+    group = describe_kv_groups(dsv41_config(side=side))[DSV41_GROUP]
+    assert group.slot_bytes == DSV41_BLOCK * 24  # layers.2.attn.kv
+    assert group.group_page_bytes == (2_560 if side == "worker" else 0)
+
+
+def test_an_mla_group_object_holds_each_block_once():
+    groups = describe_kv_groups(dsv41_config())
+    page = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
+    assert groups[DSV41_GROUP].group_page_bytes == page
+    assert groups[DSV41_GROUP].object_bytes(DSV41_BLOCK) == page
+    assert groups[DSV41_GROUP].object_bytes(2 * DSV41_BLOCK) == 2 * page
+    assert groups[0].object_bytes(2 * DSV41_BLOCK) == 0
+
+
+def test_hit_counts_an_mla_group_like_full_attention():
+    groups = describe_kv_groups(dsv41_config())
+    stored = {0, 1, 3}  # chunk 2 of group 4 is missing
+
+    def has(i, g):
+        return g.group_id == DSV41_GROUP and i in stored
+
+    assert hit_chunks(groups, 4, 2 * DSV41_BLOCK, has) == (2, 2)
+
+
+def test_a_window_group_object_holds_the_blocks_its_window_reaches():
+    """A hit at a chunk's end needs the window's other 127 tokens: with 32-token
+    blocks, the last 4 of the chunk's 8 blocks, as LMCache keeps by default."""
+    window = _window_mla(32, bounded_replay=False)
+    group = describe_kv_groups(dsv41_config(block=128, window=window))[0]
+    page = 10 * 32 * 584  # ten window layers of 584-byte rows
+    assert group.group_page_bytes == page
+    assert group.object_bytes(256) == 4 * page
+    assert group.object_bytes(64) == 2 * page  # a chunk shorter than the window
+
+
+def test_hit_needs_a_window_group_only_where_its_window_ends():
+    """Group 4 holds chunks 0-3, the windows only chunk 2: a hit of 3 chunks
+    ends inside chunk 2's reach, one of 4 would need chunk 3's."""
+    window = _window_mla(32, bounded_replay=False)
+    groups = describe_kv_groups(
+        dsv41_config(block=128, side="scheduler", window=window)
+    )
+
+    def has(i, g):
+        return g.group_id == DSV41_GROUP or i == 2
+
+    assert hit_chunks(groups, 4, 256, has) == (3, 4)
+
+
+# vLLM's bytes per block: a wider group (the window) sets it above 2,560.
+DSV41_BLOCK_BYTES = 3072
+DSV41_NUM_BLOCKS = 12
+DSV41_PAGE = DSV41_BLOCK * sum(DSV41_MEMBERS.values())  # 2,560 B
+
+
+def _dsv41_shared():
+    return (
+        torch.arange(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+    )
+
+
+def dsv41_kv_caches(shared):
+    """Group 4's members as vLLM registers them: one after another from
+    byte 0 of each block."""
+    caches, at = {}, 0
+    for name, size in DSV41_MEMBERS.items():
+        caches[name] = torch.as_strided(
+            shared,
+            (DSV41_NUM_BLOCKS, DSV41_BLOCK, size),
+            (DSV41_BLOCK_BYTES, size, 1),
+            at,
+        )
+        at += DSV41_BLOCK * size
+    return caches
+
+
+def _dsv41_worker(kv_caches, chunk=2 * DSV41_BLOCK, **kwargs):
+    worker = _worker(dsv41_config(), chunk, **kwargs)
+    worker.register_kv_caches(kv_caches)
+    return worker
+
+
+def _cache_of(worker, group_id):
+    return next(c for c in worker._group_caches if c.group.group_id == group_id)
+
+
+def test_dsv41_registers_only_the_mla_group_as_blocks():
+    shared = _dsv41_shared()
+    # No sliding-window or circular-buffer tensors: Maru registers none.
+    worker = _dsv41_worker(dsv41_kv_caches(shared))
+    (cache,) = worker._group_caches
+    (blocks,) = cache.tensors
+    assert cache.group.group_id == DSV41_GROUP
+    assert blocks.dtype == torch.uint8
+    assert blocks.shape == (DSV41_NUM_BLOCKS, DSV41_PAGE)
+    assert blocks.stride() == (DSV41_BLOCK_BYTES, 1)
+    assert blocks.data_ptr() == shared.data_ptr()
+    blocks[5].fill_(7)
+    assert bool((shared[5 * DSV41_BLOCK_BYTES :][:DSV41_PAGE] == 7).all())
+
+
+def test_dsv41_page_is_the_mla_group_object():
+    worker = _dsv41_worker(dsv41_kv_caches(_dsv41_shared()))
+    assert worker._page_size_bytes == 2 * DSV41_PAGE
+
+
+def test_mla_group_layers_must_share_one_buffer():
+    caches = dsv41_kv_caches(_dsv41_shared())
+    caches["layers.20.attn.indexer"] = caches["layers.20.attn.indexer"].clone()
+    with pytest.raises(ValueError, match="one buffer"):
+        _dsv41_worker(caches)
+
+
+def test_mla_group_layers_must_share_one_block_stride():
+    shared = _dsv41_shared()
+    caches = dsv41_kv_caches(shared)
+    caches["layers.20.attn.indexer"] = torch.as_strided(
+        shared,
+        (DSV41_NUM_BLOCKS, DSV41_BLOCK, 16),
+        (DSV41_BLOCK_BYTES - 512, 16, 1),
+        2304,
+    )
+    with pytest.raises(ValueError, match="block stride"):
+        _dsv41_worker(caches)
+
+
+def test_mla_group_layers_must_fit_at_the_start_of_each_block():
+    shared = _dsv41_shared()
+    caches = dsv41_kv_caches(shared)
+    caches["layers.20.attn.indexer"] = torch.as_strided(
+        shared, (DSV41_NUM_BLOCKS, DSV41_BLOCK, 16), (DSV41_BLOCK_BYTES, 16, 1), 2600
+    )
+    with pytest.raises(ValueError, match="do not fit in the first"):
+        _dsv41_worker(caches)
+
+
+def test_an_mla_group_with_a_tensor_per_layer_is_refused():
+    """Without UniformTypeKVCacheSpecs, vLLM gives each layer of the group a
+    tensor of its own, so a block has no single range of bytes to copy."""
+    config = dsv41_config()
+    mla = {
+        name: MLAAttentionSpec(
+            block_size=DSV41_BLOCK, num_kv_heads=1, head_size=24, dtype=torch.uint8
+        )
+        for name in DSV41_MEMBERS
+    }
+    config.kv_cache_groups[DSV41_GROUP] = KVCacheGroupSpec(
+        list(mla), next(iter(mla.values()))
+    )
+    worker = _worker(config, 2 * DSV41_BLOCK)
+    caches = {
+        name: torch.zeros(DSV41_NUM_BLOCKS, DSV41_BLOCK, 24, dtype=torch.uint8)
+        for name in DSV41_MEMBERS
+    }
+    with pytest.raises(ValueError, match="one after another"):
+        worker.register_kv_caches(caches)
+
+
+DSV41_BLOCKS_A = [5, 2, 7, 9]  # request A's group-4 blocks for tokens 0-63
+
+
+def _dsv41_blocks(ids):
+    """Every group's block ids; Maru reads only group 4's."""
+    ids = list(ids)
+    return tuple(ids if g == DSV41_GROUP else [0] * len(ids) for g in range(6))
+
+
+def _dsv41_storing_worker(shared, **kwargs):
+    worker = _dsv41_worker(dsv41_kv_caches(shared), **kwargs)
+    return worker, attach_capturing_handler(worker)
+
+
+def _block_bytes(worker, block):
+    return bytes(_cache_of(worker, DSV41_GROUP).tensors[0][block].numpy())
+
+
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_step_stores_each_whole_chunk_as_its_blocks(per):
+    """maru_kv_chunk_tokens sets how many blocks one object holds."""
+    chunk = per * DSV41_BLOCK
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk)
+    tokens, ids = list(range(80)), DSV41_BLOCKS_A + [11]  # blocks for tokens 0-79
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(ids), 0, 72))
+    keys = _chunk_keys(tokens, chunk)
+    done = 72 // chunk  # the chunks this step completed
+    assert set(store) == {_mla_key(keys[c], DSV41_GROUP, chunk) for c in range(done)}
+    for c in range(done):
+        expected = b"".join(
+            _block_bytes(worker, b) for b in ids[c * per : (c + 1) * per]
+        )
+        assert store[_mla_key(keys[c], DSV41_GROUP, chunk)] == expected
+    assert worker._page_size_bytes == per * DSV41_PAGE
+    assert worker._handler.batch_store.call_count == 1
+
+
+def test_dsv41_store_allocates_in_the_requests_pool():
+    """Every store path allocates in the pool the request's route names, the
+    MLA group's too."""
+    worker, _ = _dsv41_storing_worker(_dsv41_shared())
+    worker._route = lambda req_meta: {"route_key": f"pool-of-{req_meta.req_id}"}
+    worker._handler.alloc.side_effect = lambda nbytes, **kw: SimpleNamespace(
+        buf=memoryview(bytearray(nbytes))
+    )
+    worker.wait_for_save(
+        _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64)
+    )
+    calls = worker._handler.alloc.call_args_list
+    assert len(calls) == 2
+    assert all(c.kwargs == {"route_key": "pool-of-r1"} for c in calls)
+
+
+LAYERWISE = {"maru_use_layerwise": True}
+DSV41_FORMATS = pytest.mark.parametrize(
+    "extra", [{}, LAYERWISE], ids=["chunkwise", "layerwise"]
+)
+
+
+def _mla_key(chunk_key, group_id, chunk, block=DSV41_BLOCK):
+    """An MLA group's object key, which also names the group's block size."""
+    return f"{group_object_key(chunk_key, group_id, chunk)}_b{block}"
+
+
+def _dsv41_keys(tokens, chunk, num_chunks, layerwise, block=DSV41_BLOCK):
+    """Keys the first ``num_chunks`` chunks store: one object per chunk, or
+    one per layer and a ``_DONE`` marker."""
+    keys = set()
+    for key in _chunk_keys(tokens, chunk)[:num_chunks]:
+        base = _mla_key(key, DSV41_GROUP, chunk, block)
+        if layerwise:
+            keys |= {f"{base}_L{i}" for i in range(len(DSV41_MEMBERS))}
+            keys.add(f"{base}_DONE")
+        else:
+            keys.add(base)
+    return keys
+
+
+def _dsv41_spans():
+    """(offset, bytes) of each layer in a block's bytes for group 4."""
+    spans, at = [], 0
+    for size in DSV41_MEMBERS.values():
+        spans.append((at, DSV41_BLOCK * size))
+        at += DSV41_BLOCK * size
+    return spans
+
+
+@pytest.mark.parametrize("per", [1, 2], ids=["1-block", "2-blocks"])
+def test_dsv41_layerwise_stores_each_layer_and_then_marks_the_chunk(per):
+    chunk = per * DSV41_BLOCK
+    worker, store = _dsv41_storing_worker(
+        _dsv41_shared(), chunk=chunk, extra_config=LAYERWISE
+    )
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+    assert set(store) == _dsv41_keys(tokens, chunk, 64 // chunk, layerwise=True)
+    blocks = _cache_of(worker, DSV41_GROUP).tensors[0]
+    for c, key in enumerate(_chunk_keys(tokens, chunk)[: 64 // chunk]):
+        base = _mla_key(key, DSV41_GROUP, chunk)
+        ids = DSV41_BLOCKS_A[c * per : (c + 1) * per]
+        for i, (offset, size) in enumerate(_dsv41_spans()):
+            expected = b"".join(
+                bytes(blocks[b, offset : offset + size].numpy()) for b in ids
+            )
+            assert store[f"{base}_L{i}"] == expected
+    # The markers go in a second RPC, once every layer of their chunk is in.
+    first, second = worker._handler.batch_store.call_args_list
+    assert not any(k.endswith("_DONE") for k in first.args[0])
+    assert all(k.endswith("_DONE") for k in second.args[0])
+    assert worker._page_size_bytes == per * DSV41_BLOCK * max(DSV41_MEMBERS.values())
+
+
+@DSV41_FORMATS
+def test_dsv41_chunk_without_all_its_blocks_is_not_stored(extra):
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=extra)
+    tokens = list(range(80))
+    worker.wait_for_save(_store_meta(tokens, _dsv41_blocks([5, 2, 0, 9]), 0, 72))
+    assert set(store) == _dsv41_keys(tokens, 32, 1, bool(extra))
+
+
+@DSV41_FORMATS
+def test_dsv41_requests_completing_the_same_chunks_queue_them_once(extra):
+    """Two requests whose step completes the same chunks store each object
+    once."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=extra)
+    tokens = list(range(80))
+    worker.wait_for_save(
+        _store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64, req_ids=("r1", "r2"))
+    )
+    for call in worker._handler.batch_store.call_args_list:
+        keys = call.args[0]
+        assert len(keys) == len(set(keys))
+    assert set(store) == _dsv41_keys(tokens, 32, 2, bool(extra))
+
+
+def _refusing(worker, store, refused):
+    """Make ``worker``'s batch_store refuse the keys in ``refused``, a set the
+    caller can change between steps."""
+
+    def batch_store(keys, handles):
+        results = []
+        for key, handle in zip(keys, handles, strict=True):
+            if key not in refused:
+                store[key] = bytes(handle.buf)
+            results.append(key not in refused)
+        return results
+
+    worker._handler.batch_store.side_effect = batch_store
+
+
+def _dsv41_layerwise_step(worker, req_id):
+    """One step storing tokens 0-63 (chunks 0 and 1); the keys of each
+    batch_store it makes."""
+    calls = len(worker._handler.batch_store.call_args_list)
+    worker.wait_for_save(
+        _store_meta(
+            list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64, req_ids=(req_id,)
+        )
+    )
+    return [c.args[0] for c in worker._handler.batch_store.call_args_list[calls:]]
+
+
+def test_dsv41_layerwise_marks_no_chunk_with_a_layer_missing():
+    """A chunk whose layer failed to register gets no _DONE marker. The next
+    request with the prefix stores that layer alone, then the marker."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
+    k0, k1 = (_mla_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    refused = {f"{k0}_L3"}
+    _refusing(worker, store, refused)
+    _dsv41_layerwise_step(worker, "r1")
+    assert f"{k0}_DONE" not in store
+    assert f"{k1}_DONE" in store
+    refused.clear()
+    assert _dsv41_layerwise_step(worker, "r2") == [[f"{k0}_L3"], [f"{k0}_DONE"]]
+
+
+def test_dsv41_layerwise_retries_a_marker_that_failed():
+    """Every layer is in but the marker did not register: the next request
+    with the prefix registers the marker alone."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), extra_config=LAYERWISE)
+    k0, _ = (_mla_key(k, DSV41_GROUP, 32) for k in _chunk_keys(range(80), 32))
+    refused = {f"{k0}_DONE"}
+    _refusing(worker, store, refused)
+    _dsv41_layerwise_step(worker, "r1")
+    assert f"{k0}_DONE" not in store
+    refused.clear()
+    assert _dsv41_layerwise_step(worker, "r2") == [[f"{k0}_DONE"]]
+
+
+@DSV41_FORMATS
+def test_dsv41_only_the_writer_rank_stores_the_blocks(extra):
+    """Every rank holds the same MLA bytes, so only rank 0 stores them, under
+    keys without a slice suffix."""
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    chunk = 2 * DSV41_BLOCK
+    workers = []
+    for rank in range(4):
+        worker = _tp_worker(
+            dsv41_kv_caches(_dsv41_shared()),
+            _tp_shards(rank, 4, 1),
+            server,
+            dsv41_config(),
+            chunk,
+            extra_config=extra,
+        )
+        worker.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+        workers.append(worker)
+    assert _registered_keys(workers[0]) == _dsv41_keys(tokens, chunk, 2, bool(extra))
+    for worker in workers[1:]:
+        assert _registered_keys(worker) == set()
+
+
+DSV41_BLOCKS_B = [3, 8, 1, 6]  # request B's group-4 blocks for the same tokens
+
+
+def _dsv41_stored(chunk=2 * DSV41_BLOCK, **kwargs):
+    """Request A's objects for tokens 0-63."""
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk, **kwargs)
+    worker.wait_for_save(
+        _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A), 0, 64)
+    )
+    return worker, store
+
+
+def _dsv41_loading_worker(store, chunk=2 * DSV41_BLOCK, **kwargs):
+    target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+    worker, _ = _dsv41_storing_worker(target, chunk=chunk, **kwargs)
+    _serve(worker, store)
+    return worker
+
+
+@DSV41_FORMATS
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_parked_load_restores_the_blocks(per, extra):
+    chunk = per * DSV41_BLOCK
+    stored, store = _dsv41_stored(chunk, extra_config=extra)
+    assert set(store) == _dsv41_keys(list(range(80)), chunk, 64 // chunk, bool(extra))
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads inline
+    for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
+        assert _block_bytes(worker, b) == _block_bytes(stored, a)
+    assert worker.take_failed_load_blocks() == set()
+
+
+@DSV41_FORMATS
+@pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
+def test_dsv41_load_skips_blocks_vllms_cache_holds(per, extra):
+    """vLLM's prefix cache holds tokens 0-15, and that block may be shared.
+    With one block per chunk the whole first chunk is skipped; with more,
+    only the first block of the first chunk."""
+    chunk = per * DSV41_BLOCK
+    stored, store = _dsv41_stored(chunk, extra_config=extra)
+    assert set(store) == _dsv41_keys(list(range(80)), chunk, 64 // chunk, bool(extra))
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)),
+        _dsv41_blocks(DSV41_BLOCKS_B),
+        64 // chunk,
+        computed=16,
+        deferred_load=True,
+        load_start_token=16,
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _block_bytes(worker, DSV41_BLOCKS_B[0]) == bytes(DSV41_PAGE)
+    for a, b in zip(DSV41_BLOCKS_A[1:], DSV41_BLOCKS_B[1:], strict=True):
+        assert _block_bytes(worker, b) == _block_bytes(stored, a)
+
+
+@DSV41_FORMATS
+def test_dsv41_load_fails_when_it_starts_inside_a_block(extra):
+    """vLLM's prefix cache holding tokens 0-7 puts the load's start inside the
+    first block, whose later tokens nothing would load; the load fails and
+    vLLM recomputes."""
+    chunk = 2 * DSV41_BLOCK
+    _, store = _dsv41_stored(chunk, extra_config=extra)
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)),
+        _dsv41_blocks(DSV41_BLOCKS_B),
+        64 // chunk,
+        computed=8,
+        deferred_load=True,
+        load_start_token=8,
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    # A parked load of several groups fails by its request, not its blocks.
+    assert _reported_failures(worker) == (set(), {"b"}, {"b"})
+
+
+@DSV41_FORMATS
+@pytest.mark.parametrize("change", [-8, 8], ids=["smaller", "larger"])
+def test_dsv41_load_fails_on_an_object_of_another_size(change, extra):
+    """An engine with another KV cache layout (DeepSeek-V4.1 writes 528-byte
+    records on SM100 and 584-byte ones elsewhere) stores objects of another
+    size under the same keys. Loading one fails and vLLM recomputes, rather
+    than reading its first bytes as this engine's blocks."""
+    chunk = 2 * DSV41_BLOCK
+    _, store = _dsv41_stored(chunk, extra_config=extra)
+    for key in [k for k in store if not k.endswith("_DONE")]:
+        data = bytes(store[key])
+        store[key] = data[:change] if change < 0 else data + bytes(change)
+    worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
+    meta = _load_meta(
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _reported_failures(worker) == (set(), {"b"}, {"b"})
+    for block in DSV41_BLOCKS_B:
+        assert _block_bytes(worker, block) == bytes(DSV41_PAGE)
+
+
+@DSV41_FORMATS
+def test_dsv41_every_rank_loads_the_writers_blocks(extra):
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    chunk = 2 * DSV41_BLOCK
+    writer = _tp_worker(
+        dsv41_kv_caches(_dsv41_shared()),
+        _tp_shards(0, 4, 1),
+        server,
+        dsv41_config(),
+        chunk,
+        extra_config=extra,
+    )
+    writer.wait_for_save(_store_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_A), 0, 64))
+    assert _registered_keys(writer) == _dsv41_keys(tokens, chunk, 2, bool(extra))
+    for rank in range(1, 4):
+        target = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+        worker = _tp_worker(
+            dsv41_kv_caches(target),
+            _tp_shards(rank, 4, 1),
+            server,
+            dsv41_config(),
+            chunk,
+            extra_config=extra,
+        )
+        meta = _load_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_B), 2, deferred_load=True)
+        worker.start_load_kv(_FORWARD, meta)
+        assert worker.take_failed_load_blocks() == set()
+        for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
+            assert _block_bytes(worker, b) == _block_bytes(writer, a)
+
+
+def _dsv41_scheduler(stored, chunk=256, **extra):
+    sched = make_scheduler(
+        128,
+        chunk,
+        {"maru_async_load": True, **extra},
+        kv_groups=describe_kv_groups(dsv41_config(block=128, side="scheduler")),
+    )
+    sched._handler = _Store(stored)
+    return sched
+
+
+def test_dsv41_layerwise_lookup_asks_for_the_done_markers():
+    a = list(range(1100))
+    markers = [
+        _mla_key(k, DSV41_GROUP, 256, 128) + "_DONE" for k in _chunk_keys(a, 256)
+    ]
+    sched = _dsv41_scheduler(set(markers), **LAYERWISE)
+    assert _hit(sched, a) == 1024
+    (query,) = sched._handler.queries
+    assert query == markers
+
+
+def test_dsv41_layerwise_chunk_without_its_marker_is_a_miss():
+    """Its layers may be stored only in part."""
+    a = list(range(1100))
+    stored = _dsv41_keys(a, 256, 4, layerwise=True, block=128)
+    stored.remove(_mla_key(_chunk_keys(a, 256)[2], DSV41_GROUP, 256, 128) + "_DONE")
+    assert _hit(_dsv41_scheduler(stored, **LAYERWISE), a) == 512
+
+
+def test_dsv41_lookup_asks_only_for_the_stored_group():
+    a = list(range(1100))
+    sched = _dsv41_scheduler(
+        {_mla_key(k, DSV41_GROUP, 256, 128) for k in _chunk_keys(a, 256)}
+    )
+    assert _hit(sched, a) == 1024
+    (query,) = sched._handler.queries
+    assert query == [_mla_key(k, DSV41_GROUP, 256, 128) for k in _chunk_keys(a, 256)]
+
+
+def test_dsv41_hit_needs_every_chunk_of_the_stored_group():
+    a = list(range(1100))
+    keys = _chunk_keys(a, 256)
+    stored = {_mla_key(k, DSV41_GROUP, 256, 128) for i, k in enumerate(keys) if i != 2}
+    assert _hit(_dsv41_scheduler(stored), a) == 512
+
+
+def _dsv41_loaded(b, chunk):
+    """B shares A's first 1,100 tokens; Maru holds A's chunks up to token
+    1,024."""
+    a = list(range(1100))
+    stored = {_mla_key(k, DSV41_GROUP, chunk, 128) for k in _chunk_keys(a, chunk)}
+    sched = _dsv41_scheduler(stored, chunk)
+    request = SimpleNamespace(request_id="b", prompt_token_ids=b, num_preemptions=0)
+    assert _load_given(sched, request) == 1024
+    return sched
+
+
+@pytest.mark.parametrize("chunk", [128, 256, 512])
+def test_bounded_replay_does_not_store_the_last_hit_chunk_again(chunk):
+    """vLLM resumes a loaded request 128 tokens early to rebuild the window,
+    whatever the chunk size."""
+    b = list(range(1100)) + _other(1000)
+    sched = _dsv41_loaded(b, chunk)
+    meta = sched._store_meta("b", b, _dsv41_blocks(range(17)), 1024 - 128, 2100 - 896)
+    assert meta.store_start_token == 1024
+
+
+@pytest.mark.parametrize("chunk", [128, 256, 512])
+def test_a_failed_load_with_bounded_replay_stores_from_where_it_resumes(chunk):
+    b = list(range(1100)) + _other(1000)
+    sched = _dsv41_loaded(b, chunk)
+    meta = sched._store_meta("b", b, _dsv41_blocks(range(17)), 0, 2100)
+    assert meta.store_start_token == 0
+
+
+# DeepSeek-V4.1 without bounded replay: Maru stores the window groups too.
+# Tiny geometry: 4-token window blocks and a 9-token window, so a hit at a
+# 32-token chunk's end reaches back over the chunk's last 2 of 8 window blocks.
+UNBOUNDED_BLOCK = DSV41_BLOCK // 4
+UNBOUNDED_WINDOW = 9
+UNBOUNDED_ROW = 8  # bytes per token in a window layer
+UNBOUNDED_LAYERS = 10  # dsv41_config gives each window group ten layers
+UNBOUNDED_LAYER_PAGE = UNBOUNDED_BLOCK * UNBOUNDED_ROW  # 32 B
+UNBOUNDED_PAGE = UNBOUNDED_LAYERS * UNBOUNDED_LAYER_PAGE  # 320 B
+UNBOUNDED_STRIDE = 512
+UNBOUNDED_NUM_BLOCKS = 20
+# Request A's window blocks for tokens 0-63, the same in every window group.
+UNBOUNDED_WINDOW_A = [3, 1, 4, 15, 9, 2, 6, 5, 13, 8, 11, 7, 10, 12, 14, 16]
+
+
+def _unbounded_shared():
+    """One buffer per window group, each with bytes of its own."""
+    return [
+        (
+            torch.arange(UNBOUNDED_NUM_BLOCKS * UNBOUNDED_STRIDE, dtype=torch.int64)
+            * (g + 2)
+            + g
+        )
+        .remainder(251)
+        .to(torch.uint8)
+        for g in range(4)
+    ]
+
+
+def unbounded_kv_caches(mla_shared, window_shared):
+    """Group 4's members and each window group's ten layers, one after
+    another from byte 0 of each block."""
+    caches = dsv41_kv_caches(mla_shared)
+    for g, shared in enumerate(window_shared):
+        for j, i in enumerate(range(g, 40, 4)):
+            caches[f"layers.{i}.attn.swa"] = torch.as_strided(
+                shared,
+                (UNBOUNDED_NUM_BLOCKS, UNBOUNDED_BLOCK, UNBOUNDED_ROW),
+                (UNBOUNDED_STRIDE, UNBOUNDED_ROW, 1),
+                j * UNBOUNDED_LAYER_PAGE,
+            )
+    return caches
+
+
+def _unbounded_config(reach=UNBOUNDED_WINDOW):
+    """dsv41_config without bounded replay, its windows ``reach`` tokens long."""
+    window = _window_mla(
+        UNBOUNDED_BLOCK, bounded_replay=False, window=reach, row=UNBOUNDED_ROW
+    )
+    return dsv41_config(window=window)
+
+
+def _unbounded_worker(kv_caches, reach=UNBOUNDED_WINDOW, **kwargs):
+    worker = _worker(_unbounded_config(reach), 2 * DSV41_BLOCK, **kwargs)
+    worker.register_kv_caches(kv_caches)
+    return worker
+
+
+def _unbounded_blocks(mla_ids, window_ids):
+    """Every group's block ids: the window groups', group 4's, and none of the
+    circular buffer, which Maru skips."""
+    return (*[list(window_ids)] * 4, list(mla_ids), [])
+
+
+def _window_rows(shared, ids, layer=None):
+    """A window group's bytes in blocks ``ids``, block after block: every
+    layer's, or one layer's."""
+    offset, size = (
+        (0, UNBOUNDED_PAGE)
+        if layer is None
+        else (layer * UNBOUNDED_LAYER_PAGE, UNBOUNDED_LAYER_PAGE)
+    )
+    return b"".join(
+        bytes(shared[b * UNBOUNDED_STRIDE + offset :][:size].numpy()) for b in ids
+    )
+
+
+def _unbounded_keys(tokens, num_chunks, layerwise):
+    """Keys the first ``num_chunks`` 32-token chunks store: group 4's and each
+    window group's."""
+    keys = _dsv41_keys(tokens, 32, num_chunks, layerwise)
+    for key in _chunk_keys(tokens, 32)[:num_chunks]:
+        for g in range(4):
+            base = _mla_key(key, g, 32, UNBOUNDED_BLOCK)
+            if layerwise:
+                keys |= {f"{base}_L{i}" for i in range(UNBOUNDED_LAYERS)}
+                keys.add(f"{base}_DONE")
+            else:
+                keys.add(base)
+    return keys
+
+
+def _unbounded_stored(shared, reach=UNBOUNDED_WINDOW, **kwargs):
+    """Request A's objects for tokens 0-63."""
+    worker = _unbounded_worker(
+        unbounded_kv_caches(_dsv41_shared(), shared), reach, **kwargs
+    )
+    store = attach_capturing_handler(worker)
+    worker.wait_for_save(
+        _store_meta(
+            list(range(80)),
+            _unbounded_blocks(DSV41_BLOCKS_A, UNBOUNDED_WINDOW_A),
+            0,
+            64,
+        )
+    )
+    return worker, store
+
+
+def test_dsv41_unbounded_step_stores_the_windows_last_blocks():
+    """Each chunk keeps its last 2 window blocks, the ones a hit at its end
+    reaches back over, beside group 4's whole chunk."""
+    window = _unbounded_shared()
+    worker, store = _unbounded_stored(window)
+    tokens = list(range(80))
+    assert set(store) == _unbounded_keys(tokens, 2, layerwise=False)
+    keys = _chunk_keys(tokens, 32)
+    for c in range(2):
+        last = UNBOUNDED_WINDOW_A[8 * c + 6 : 8 * c + 8]
+        for g in range(4):
+            assert store[_mla_key(keys[c], g, 32, UNBOUNDED_BLOCK)] == _window_rows(
+                window[g], last
+            )
+    assert worker._page_size_bytes == 2 * DSV41_PAGE  # group 4's chunk is largest
+
+
+def test_dsv41_unbounded_layerwise_stores_each_window_layers_last_blocks():
+    window = _unbounded_shared()
+    _, store = _unbounded_stored(window, extra_config=LAYERWISE)
+    tokens = list(range(80))
+    assert set(store) == _unbounded_keys(tokens, 2, layerwise=True)
+    base = _chunk_keys(tokens, 32)[1]
+    last = UNBOUNDED_WINDOW_A[14:16]
+    for g in range(4):
+        for layer in range(UNBOUNDED_LAYERS):
+            key = f"{_mla_key(base, g, 32, UNBOUNDED_BLOCK)}_L{layer}"
+            assert store[key] == _window_rows(window[g], last, layer)
+
+
+@DSV41_FORMATS
+def test_dsv41_unbounded_load_restores_the_window_at_the_hit_end(extra):
+    """vLLM holds only the window's blocks of the hit (positions 14 and 15 of
+    16); Maru fills them from chunk 1 and writes nothing else. Chunk 0's
+    window objects are gone: the hit needs none of them."""
+    window = _unbounded_shared()
+    stored, store = _unbounded_stored(window, extra_config=extra)
+    chunk0 = _chunk_keys(list(range(80)), 32)[0]
+    for g in range(4):
+        prefix = _mla_key(chunk0, g, 32, UNBOUNDED_BLOCK)
+        for key in [k for k in store if k.startswith(prefix)]:
+            del store[key]
+    targets = [
+        torch.zeros(UNBOUNDED_NUM_BLOCKS * UNBOUNDED_STRIDE, dtype=torch.uint8)
+        for _ in range(4)
+    ]
+    mla = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+    worker = _unbounded_worker(unbounded_kv_caches(mla, targets), extra_config=extra)
+    attach_capturing_handler(worker)
+    _serve(worker, store)
+    held = [0] * 14 + [17, 18]
+    meta = _load_meta(
+        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _reported_failures(worker) == (set(), {"b"}, set())
+    for g in range(4):
+        assert _window_rows(targets[g], [17, 18]) == _window_rows(
+            window[g], UNBOUNDED_WINDOW_A[14:16]
+        )
+        assert not targets[g][: 17 * UNBOUNDED_STRIDE].any()  # block 0 included
+    for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
+        assert _block_bytes(worker, b) == _block_bytes(stored, a)
+
+
+@DSV41_FORMATS
+def test_dsv41_unbounded_load_skips_blocks_a_long_window_left_behind(extra):
+    """A 41-token window reaches back over chunk 1 and 2 blocks of chunk 0, so
+    the objects hold whole chunks; vLLM gives the blocks before token 24 the
+    null block, which Maru leaves alone."""
+    window = _unbounded_shared()
+    _, store = _unbounded_stored(window, reach=41, extra_config=extra)
+    targets = [
+        torch.zeros(UNBOUNDED_NUM_BLOCKS * UNBOUNDED_STRIDE, dtype=torch.uint8)
+        for _ in range(4)
+    ]
+    mla = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+    worker = _unbounded_worker(
+        unbounded_kv_caches(mla, targets), reach=41, extra_config=extra
+    )
+    attach_capturing_handler(worker)
+    _serve(worker, store)
+    held = [0] * 6 + [17, 18, 19, 1, 2, 5, 7, 9, 10, 11]
+    meta = _load_meta(
+        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+    )
+    worker.start_load_kv(_FORWARD, meta)
+    assert _reported_failures(worker) == (set(), {"b"}, set())
+    for g in range(4):
+        assert _window_rows(targets[g], held[6:]) == _window_rows(
+            window[g], UNBOUNDED_WINDOW_A[6:]
+        )
+        assert not targets[g][:UNBOUNDED_STRIDE].any()  # the null block
+
+
+@DSV41_FORMATS
+def test_dsv41_unbounded_every_rank_loads_the_writers_windows(extra):
+    """Every rank holds the same windows, so rank 0 alone stores them and the
+    other ranks load its objects."""
+    server = FirstWinsServer()
+    tokens = list(range(80))
+    window = _unbounded_shared()
+    config = _unbounded_config()
+    blocks_a = _unbounded_blocks(DSV41_BLOCKS_A, UNBOUNDED_WINDOW_A)
+    writer = _tp_worker(
+        unbounded_kv_caches(_dsv41_shared(), window),
+        _tp_shards(0, 4, 1),
+        server,
+        config,
+        2 * DSV41_BLOCK,
+        extra_config=extra,
+    )
+    writer.wait_for_save(_store_meta(tokens, blocks_a, 0, 64))
+    assert _registered_keys(writer) == _unbounded_keys(tokens, 2, bool(extra))
+    for rank in range(1, 4):
+        targets = [
+            torch.zeros(UNBOUNDED_NUM_BLOCKS * UNBOUNDED_STRIDE, dtype=torch.uint8)
+            for _ in range(4)
+        ]
+        mla = torch.zeros(DSV41_NUM_BLOCKS * DSV41_BLOCK_BYTES, dtype=torch.uint8)
+        worker = _tp_worker(
+            unbounded_kv_caches(mla, targets),
+            _tp_shards(rank, 4, 1),
+            server,
+            config,
+            2 * DSV41_BLOCK,
+            extra_config=extra,
+        )
+        worker.wait_for_save(_store_meta(tokens, blocks_a, 0, 64))
+        assert _registered_keys(worker) == set()
+        held = [0] * 14 + [17, 18]
+        meta = _load_meta(
+            tokens, _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+        )
+        worker.start_load_kv(_FORWARD, meta)
+        assert _reported_failures(worker) == (set(), {"b"}, set())
+        for g in range(4):
+            assert _window_rows(targets[g], [17, 18]) == _window_rows(
+                window[g], UNBOUNDED_WINDOW_A[14:16]
+            )
+
+
+def _dsv41_unbounded_scheduler(stored, **extra):
+    window = _window_mla(32, bounded_replay=False)
+    sched = make_scheduler(
+        128,
+        256,
+        {"maru_async_load": True, **extra},
+        kv_groups=describe_kv_groups(
+            dsv41_config(block=128, side="scheduler", window=window)
+        ),
+    )
+    sched._handler = _Store(stored)
+    return sched
+
+
+def test_dsv41_unbounded_lookup_needs_each_windows_chunk_at_the_hit_end():
+    """Group 4 holds every chunk and the windows chunks 0-2, so the hit ends
+    after chunk 2: one more chunk would need chunk 3's windows."""
+    a = list(range(1100))
+    keys = _chunk_keys(a, 256)
+    stored = {_mla_key(k, DSV41_GROUP, 256, 128) for k in keys}
+    stored |= {_mla_key(k, g, 256, 32) for k in keys[:3] for g in range(4)}
+    assert _hit(_dsv41_unbounded_scheduler(stored), a) == 768
 
 
 # =============================================================================
