@@ -208,6 +208,23 @@ static uint64_t parseRequestId(const std::vector<uint8_t> &payload,
     return requestId;
 }
 
+/// Extract the holder and instance bytes that follow a hold request's fixed
+/// part. False if they run past the payload. Their content is judged by
+/// PoolManager (-EINVAL), which keeps the connection.
+static bool parseHoldNames(const std::vector<uint8_t> &payload, size_t fixedSize,
+                           uint32_t holderLen, uint32_t instanceLen,
+                           std::string &holder, std::string &instance, size_t &outEnd) {
+    const uint64_t end = static_cast<uint64_t>(fixedSize) + holderLen + instanceLen;
+    if (end > payload.size()) {
+        return false;
+    }
+    const auto *base = reinterpret_cast<const char *>(payload.data()) + fixedSize;
+    holder.assign(base, holderLen);
+    instance.assign(base + holderLen, instanceLen);
+    outEnd = static_cast<size_t>(end);
+    return true;
+}
+
 // =============================================================================
 // Event loop — epoll-based I/O multiplexing for listen + idle connections
 // =============================================================================
@@ -609,6 +626,82 @@ bool TcpServer::handleOneRequest(int clientFd) {
         if (sendResp(clientFd, MsgType::GET_ACCESS_RESP,
                      respPayload.data(), respPayload.size()) != 0) {
             return false;
+        }
+    } else if (type == MsgType::HOLD_REQ || type == MsgType::UNHOLD_REQ ||
+               type == MsgType::RESET_HOLDS_REQ) {
+        // Holder and instance follow the fixed part; client_id is optional,
+        // as for GET_ACCESS. Holds are idempotent, so no response is cached.
+        // RESET_HOLDS carries no handle: the RM trusts its network for it, as
+        // for ALLOC.
+        size_t fixedSize = sizeof(ResetHoldsReq);
+        uint32_t holderLen = 0, instanceLen = 0;
+        HoldReq hold{};
+        UnholdReq unhold{};
+        if (type == MsgType::HOLD_REQ) {
+            fixedSize = sizeof(HoldReq);
+        } else if (type == MsgType::UNHOLD_REQ) {
+            fixedSize = sizeof(UnholdReq);
+        }
+        if (payload.size() < fixedSize) {
+            sendError(clientFd, -EPROTO, "bad hold req");
+            return false;
+        }
+        if (type == MsgType::HOLD_REQ) {
+            std::memcpy(&hold, payload.data(), sizeof(hold));
+            holderLen = hold.holderLen;
+            instanceLen = hold.instanceLen;
+        } else if (type == MsgType::UNHOLD_REQ) {
+            std::memcpy(&unhold, payload.data(), sizeof(unhold));
+            holderLen = unhold.holderLen;
+            instanceLen = unhold.instanceLen;
+        } else {
+            ResetHoldsReq reset{};
+            std::memcpy(&reset, payload.data(), sizeof(reset));
+            holderLen = reset.holderLen;
+            instanceLen = reset.instanceLen;
+        }
+        std::string holder, instance;
+        size_t namesEnd = 0;
+        if (!parseHoldNames(payload, fixedSize, holderLen, instanceLen, holder, instance,
+                            namesEnd)) {
+            sendError(clientFd, -EPROTO, "bad hold req: holder or instance truncated");
+            return false;
+        }
+
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, namesEnd, cidEnd);
+        if (!cid.empty() && !trackClientId(clientFd, cid)) {
+            sendError(clientFd, -EPERM, "client_id mismatch on connection");
+            return false;
+        }
+
+        if (type == MsgType::HOLD_REQ) {
+            auto result = handler_.handleHold(hold, holder, instance);
+            if (result.status == -EACCES) {
+                sendError(clientFd, -EACCES, "invalid auth token");
+                return true;  // protocol error, but keep connection open
+            }
+            auto respPayload = serializeGetAccessResp(
+                result.status, result.devicePath, result.offset, result.length,
+                result.deviceUuid);
+            if (sendResp(clientFd, MsgType::HOLD_RESP,
+                         respPayload.data(), respPayload.size()) != 0) {
+                return false;
+            }
+        } else if (type == MsgType::UNHOLD_REQ) {
+            auto resp = handler_.handleUnhold(unhold, holder, instance);
+            if (resp.status == -EACCES) {
+                sendError(clientFd, -EACCES, "invalid auth token");
+                return true;  // protocol error, but keep connection open
+            }
+            if (sendResp(clientFd, MsgType::UNHOLD_RESP, &resp, sizeof(resp)) != 0) {
+                return false;
+            }
+        } else {
+            auto resp = handler_.handleResetHolds(holder, instance);
+            if (sendResp(clientFd, MsgType::RESET_HOLDS_RESP, &resp, sizeof(resp)) != 0) {
+                return false;
+            }
         }
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");

@@ -53,6 +53,19 @@ The {doc}`../getting_started/quick_start` producer and consumer follow this patt
 
 For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 
+For `remote_cxl`, the remote agent defaults to
+`UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`. RC/DC remains the remote
+DRAM payload path whose NIC checks the remote key. `cuda_copy` enables local
+CUDA memory-type support required by NIXL 1.5 on NVIDIA GPU hosts, including
+hosts where Maru registers only DRAM. Its UCX interface requires its own
+interface identity and does not support host-to-host copies; it is not an
+alternative cross-process payload route. The CLI accepts it only alongside
+a primary RC/DC transport. It still rejects the broader `cuda` alias,
+`cuda_ipc`, TCP and shared-memory transports. Explicit UCX filters on worker
+processes also need `cuda_copy` on such hosts. Verify actual RC/DC selection
+and late-WRITE rejection on the deployed NIXL/UCX version; allowing the local
+helper is not evidence that the device validation passed.
+
 > **See also:** [MaruHandler Architecture](maru_handler.md)
 
 ---
@@ -115,20 +128,15 @@ sequenceDiagram
     Note over RM: Resource Manager restart detected
 
     rect rgb(240, 248, 255)
-        RM->>RM: Load last checkpoint (free lists + allocation map)
+        RM->>RM: Load last checkpoint (allocation map)
         RM->>RM: Replay WAL entries since checkpoint
-        RM->>RM: Recompute free sizes from reconstituted state
+        RM->>RM: Derive each pool's free list from its device and allocations
         RM->>RM: Verify CRC32 integrity on all metadata
         Note over RM: Resource Manager ready
     end
 ```
 
-**Resource Manager** persists every allocation and free operation to a
-write-ahead log (WAL) before modifying in-memory state. Every 100 operations,
-a checkpoint is taken: free lists and the global allocation map are saved with
-CRC32 integrity verification. On restart, the last checkpoint is loaded and
-any subsequent WAL entries are replayed, fully reconstructing the allocation
-state.
+**Resource Manager** persists every allocation and free operation to a write-ahead log (WAL) before modifying in-memory state. Every 100 operations, a checkpoint is taken: the global allocation map of every pool, served or not, is saved with CRC32 integrity verification. On restart, the last checkpoint is loaded and any subsequent WAL entries are replayed, fully reconstructing the allocation state; each pool's free list is its device's data range minus its allocations. See the Resource Manager design document, §4, for how each device is then judged.
 
 ### 3.2 Client Crash Recovery
 

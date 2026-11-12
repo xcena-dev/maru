@@ -2,34 +2,36 @@
   <img src="docs/source/image/maru.png" alt="Maru" height="120">
 </p>
 
-<h3 align="center">Maru: High-Performance KV Cache Storage Engine on CXL Shared Memory</h3>
+<h3 align="center">Maru: High-Performance KV Cache Storage Engine on CXL and RDMA Memory Pools</h3>
 
 <p align="center">
   <a href="https://xcena-dev.github.io/maru/"><img src="https://img.shields.io/badge/docs-live-blue" alt="Documentation"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="License"></a>
 </p>
 
-**Maru** is a high-performance **KV cache storage engine built on CXL shared memory**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency.
+**Maru** is a high-performance **KV cache storage engine built on shared memory pools**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency. Maru supports two kinds of pool. A **CXL memory pool** is CXL memory that nodes attached to CXL reach through a CXL switch. An **RDMA memory pool** is the CXL memory of memory nodes, which GPU nodes without CXL reach over an RDMA network.
 
-Every existing KV cache sharing solution assumes that sharing means transferring — copying data across the network, byte by byte. As models get larger and contexts get longer, that assumption becomes a structural bottleneck. Maru rejects the premise entirely: **don't move data, share the memory.** Instances read and write KV cache data directly in CXL shared memory. Only lightweight metadata (tens of bytes) travels between components.
+Transfer-based sharing copies the KV across the network to every node that reuses it, byte by byte. As models get larger and contexts get longer, those copies become a structural bottleneck. On nodes attached to CXL, Maru takes the opposite approach: **don't move data, share the memory.** Instances on those nodes read and write KV cache data directly in CXL shared memory, and only lightweight metadata (tens of bytes) travels between components. GPU nodes without CXL reach the CXL memory of memory nodes with one-sided RDMA: the NICs move the bytes, and no process on the memory node handles them.
 
-The left shows how KV cache is shared without Maru; the right shows how it works with Maru. No copies — just direct access to CXL shared memory.
+Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the `remote_cxl` backend for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
 
 <p align="center">
-  <img src="docs/_static/kvcache_all.gif" alt="KV Cache Sharing: Without Maru (left) vs With Maru (right)" width="720">
+  <img src="docs/source/image/maru_shared_kv_cache.png" alt="Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network">
 </p>
 
 | [**Documentation**](https://xcena-dev.github.io/maru/) |
 
 ## Why Maru?
 
-- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization.
+- **Zero-Copy Sharing** — Transfer-based systems — whether CPU-mediated or GPU-direct — require the receiver to allocate staging buffers and move data across an interconnect. On nodes attached to CXL, Maru eliminates this entire path: every instance reads from the same shared memory region directly. No buffer allocation, no data copy, no serialization. Nodes that reach the pool over RDMA move KV through a host staging buffer: the GPU copies it to and from the buffer, and the NIC moves it to and from the CXL memory with one-sided RDMA.
 
-- **Scales with Context Length and Concurrency** — Network-based sharing degrades as contexts grow and more consumers hit the same KV. Maru never fans out KV payloads — scaling is bounded by shared-memory bandwidth, not network transfer.
+- **Scales with Context Length and Concurrency** — Network-based sharing degrades as contexts grow and more consumers hit the same KV. On nodes attached to CXL, Maru never fans out KV payloads — scaling is bounded by shared-memory bandwidth, not network transfer.
 
-- **Higher Hardware Utilization** — Instead of duplicating KV caches per instance, all instances draw from a shared CXL pool. Less duplication means more usable memory and higher effective cache capacity.
+- **Higher Hardware Utilization** — Instead of duplicating KV caches per instance, all instances on a pool draw from one shared KV cache, held in a CXL memory pool or an RDMA memory pool. Less duplication means more usable memory and higher effective cache capacity.
 
-- **Lower System Energy** — Eliminating bulk data transfer cuts NIC and CPU power draw. Shorter data paths also reduce GPU idle time per request.
+- **Lower System Energy** — On nodes attached to CXL, eliminating bulk data transfer cuts NIC and CPU power draw, and shorter data paths reduce GPU idle time per request.
+
+- **GPU Nodes without CXL** — With the `remote_cxl` storage backend, vLLM workers on GPU nodes without CXL keep their KV in an RDMA memory pool, the CXL memory of memory nodes. A remote CXL agent on each memory node maps regions and registers them with the node's NIC, and workers read and write them with one-sided RDMA. An RDMA memory pool can span several memory nodes that share the same CXL memory, and a worker can use several RDMA memory pools. See the [remote CXL example](examples/vllm/remote_cxl/README.md).
 
 ## Overview
 ```mermaid
@@ -66,19 +68,22 @@ flowchart TB
 
 > **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
 >
-> **Data Plane** (solid arrows) — direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+> **Data Plane** (solid arrows) — on nodes attached to CXL, direct access to CXL shared memory, zero-copy. The data path is identical regardless of control plane mode.
+
+GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in an RDMA memory pool, the CXL memory of memory nodes: a remote CXL agent on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). The agent is needed because one-sided RDMA reaches only memory that a process on the memory node has mapped and registered with its NIC, and a worker without CXL cannot map the region itself. Only control messages go to maru-server and the remote CXL agent. See [Remote CXL](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html#remote-cxl-cxl-memory-of-other-nodes-over-rdma) in the architecture overview.
 
 ## Quick Start
 
 ### System Components
 
-Maru consists of two server components and a client library:
+Maru consists of two server components and a client library. A deployment with GPU nodes without CXL adds a remote CXL agent on each memory node:
 
 | Component | Role | Package |
 |-----------|------|---------|
-| **Resource Manager** | Manages the CXL memory pool | `maru-resource-manager` (C++) |
+| **Resource Manager** | Manages the CXL memory of a memory pool | `maru-resource-manager` (C++) |
 | **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
 | **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
+| **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |
 
 All components run on the same machine in a single-node setup. For multi-node deployment, see the [installation guide](https://xcena-dev.github.io/maru/source/getting_started/installation.html#multi-node-configuration).
 
@@ -89,7 +94,10 @@ All components run on the same machine in a single-node setup. For multi-node de
 - Python: 3.12+
 - gcc: 13.3.0+, cmake: 3.28.3+
 - [uv](https://docs.astral.sh/uv/) (recommended; `install.sh` falls back to pip)
-- CXL DAX device (`/dev/dax*`) or emulation environment
+- CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
+- For the `remote_cxl` backend:
+  - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node; the maru-server node must reach the remote CXL agents on the memory nodes' RDMA network addresses
+  - NIXL in the same environment, before `./install.sh`: `uv pip install nixl` (`pip install nixl` without uv)
 
 ```bash
 sudo apt-get update
@@ -195,6 +203,23 @@ maru_pool_size: 4
 ```
 
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
+
+LMCache integration uses a CXL memory pool (`cxl` backend); GPU nodes without CXL use the vLLM connector with `maru_storage_backend: "remote_cxl"`.
+
+## vLLM Integration
+
+`MaruKVConnector` is a KV connector that plugs Maru into vLLM directly, without LMCache. vLLM loads it from the `maru_vllm` package, and its settings go in `kv_connector_extra_config`. Requires vLLM v0.14 or later.
+
+```bash
+vllm serve <model> --kv-transfer-config '{
+    "kv_connector": "MaruKVConnector",
+    "kv_connector_module_path": "maru_vllm",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {"maru_server_url": "tcp://localhost:5555", "maru_pool_size": "4G"}
+}'
+```
+
+On GPU nodes without CXL, set `"maru_storage_backend": "remote_cxl"` to keep the KV in the CXL memory of memory nodes; the [remote CXL example](examples/vllm/remote_cxl/README.md) lists the settings it needs. For details, see the [vLLM guide](https://xcena-dev.github.io/maru/source/integration/vllm.html).
 
 
 ## Plugins

@@ -17,12 +17,34 @@ from collections.abc import Generator
 
 import pytest
 
+import maru_handler.plugin
 from maru_shm import MaruHandle
 
 
 def _make_handle(region_id: int, length: int = 4096) -> MaruHandle:
     """Create a MaruHandle for testing (shared across test modules)."""
     return MaruHandle(region_id=region_id, offset=0, length=length, auth_token=12345)
+
+
+# =============================================================================
+# Plugin Isolation
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_handler_plugins(monkeypatch):
+    """Keep installed out-of-tree handler plugins out of every test.
+
+    MaruHandler loads every package registered under ``maru.handler_plugins``.
+    A vendor plugin installed in the test environment would send its device
+    hints to the DAX path a test reports (the unit mock reports
+    ``/dev/dax0.0``), which can be a real device that another job is using.
+    The allowlist env is cleared too, so a value exported by the developer's
+    shell cannot change what the loader tests see. Loader tests pass their own
+    entry points.
+    """
+    monkeypatch.delenv(maru_handler.plugin.PLUGIN_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setattr(maru_handler.plugin, "_discover_entry_points", lambda: [])
 
 
 # =============================================================================

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "maru"
 version = "0.1.0"
-description = "Maru - A high-performance KV cache manager for CXL shared memory"
+description = "Maru - A high-performance KV cache manager on CXL and RDMA memory pools"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
@@ -34,6 +34,10 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
+# NIXL for the remote_cxl storage backend and the remote CXL agent (maru-remote-cxl-agent)
+rdma = [
+    "nixl>=1.2.0,<2",
+]
 docs = [
     "sphinx>=7.0",
     "shibuya",
@@ -45,7 +49,9 @@ docs = [
 [project.scripts]
 maru-server = "maru_server.server:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
+install-maru-remote-cxl-agent = "maru_remote_cxl_agent.installer:main"
 marutop = "maru_tools.cli:main"
+maru-remote-cxl-agent = "maru_remote_cxl_agent.cli:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"

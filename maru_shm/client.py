@@ -6,6 +6,7 @@ Communicates with the resource manager over a persistent TCP connection
 using the binary IPC protocol defined in maru_shm.ipc.
 """
 
+import errno
 import logging
 import mmap as mmap_module
 import os
@@ -13,6 +14,7 @@ import socket
 import threading
 
 from .constants import DEFAULT_ADDRESS
+from .device_scanner import read_device_uuid, scan_dax_devices
 from .ipc import (
     HEADER_SIZE,
     AllocReq,
@@ -22,15 +24,31 @@ from .ipc import (
     FreeResp,
     GetAccessReq,
     GetAccessResp,
+    HoldReq,
     MsgHeader,
     MsgType,
+    ResetHoldsReq,
+    ResetHoldsResp,
     StatsReq,
     StatsResp,
+    UnholdReq,
 )
 from .types import MaruHandle, MaruPoolInfo
 from .uds_helpers import read_full, write_full
 
 logger = logging.getLogger(__name__)
+
+
+class HoldRefusedError(RuntimeError):
+    """The resource manager refused a hold request; it recorded nothing.
+
+    A bad token, a region that is not allocated (or is draining), or a
+    malformed holder name. Other failures leave the outcome unknown.
+    """
+
+
+class HoldsUnsupportedError(HoldRefusedError):
+    """The resource manager predates region holds (restart it with this Maru)."""
 
 
 def _make_client_id() -> str:
@@ -72,7 +90,9 @@ class MaruShmClient:
         device_table: dict[str, str] | None = None,
     ):
         self._address = address or DEFAULT_ADDRESS
-        self._device_table = device_table or {}  # uuid -> local_dax_path
+        self._device_table = dict(device_table or {})  # uuid -> local_dax_path
+        # A client given a table (even an empty one) resolves devices by UUID.
+        self._resolve_by_uuid = device_table is not None
         self._path_cache: dict[int, str] = {}  # region_id -> device path
         self._mmap_cache: dict[int, mmap_module.mmap] = {}  # region_id -> mmap
         self._lock = threading.Lock()
@@ -233,14 +253,15 @@ class MaruShmClient:
 
         handle = resp.handle
         if resp.dax_path:
-            path = resp.dax_path
-            # Client-side UUID resolution: use local device table
-            if resp.device_uuid and self._device_table:
-                local = self._device_table.get(resp.device_uuid)
-                if local:
-                    path = local
-            with self._lock:
-                self._path_cache[handle.region_id] = path
+            # The allocation stands either way: an unknown device fails at
+            # mmap time instead, where nothing is lost.
+            try:
+                path = self._resolve_device_path(resp.dax_path, resp.device_uuid)
+            except RuntimeError as exc:
+                logger.warning("alloc(region_id=%d): %s", handle.region_id, exc)
+            else:
+                with self._lock:
+                    self._path_cache[handle.region_id] = path
 
         logger.debug(
             "alloc(size=%d, dax_path=%s) -> region_id=%d path=%s",
@@ -272,6 +293,153 @@ class MaruShmClient:
         with self._lock:
             self._close_region_locked(handle.region_id)
         logger.debug("free(region_id=%d)", handle.region_id)
+
+    def get_access(self, handle: MaruHandle) -> GetAccessResp:
+        """Check a handle with the resource manager and get its device.
+
+        Always asks the resource manager (``GET_ACCESS``), unlike :meth:`mmap`,
+        which reuses a device path it saw before for the same region.
+
+        Args:
+            handle: Handle of the region.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            RuntimeError: if the resource manager refuses the handle.
+        """
+        return self._request_access(handle)
+
+    def hold_access(
+        self, handle: MaruHandle, holder: str, instance: str
+    ) -> GetAccessResp:
+        """Check a handle as :meth:`get_access` does and hold the region.
+
+        While ``holder`` holds the region, the resource manager keeps its
+        range out of use after it is freed, until :meth:`unhold`.
+
+        Args:
+            handle: Handle of the region.
+            holder: Who registers the region (a remote CXL agent's node).
+            instance: The holder's process instance; :meth:`reset_holds` drops
+                the holds of the others.
+
+        Returns:
+            The device path, device UUID, offset and length of the region.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the handle.
+        """
+        req = HoldReq(
+            handle=handle,
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.HOLD_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Hold failed")
+        resp = GetAccessResp.unpack(payload)
+        if resp.status in (-errno.ENOENT, -errno.EINVAL):
+            raise HoldRefusedError(f"Hold failed with status {resp.status}")
+        if resp.status != 0:
+            raise RuntimeError(f"Hold failed with status {resp.status}")
+        return resp
+
+    def unhold(self, handle: MaruHandle, holder: str, instance: str) -> None:
+        """Tell the resource manager that ``holder`` released a region.
+
+        Unholding a region that is not held, or no longer allocated, succeeds.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the request.
+        """
+        req = UnholdReq(
+            handle=handle,
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.UNHOLD_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Unhold failed")
+        resp = FreeResp.unpack(payload)
+        if resp.status == -errno.EINVAL:
+            raise HoldRefusedError(f"Unhold failed with status {resp.status}")
+        if resp.status != 0:
+            raise RuntimeError(f"Unhold failed with status {resp.status}")
+
+    def reset_holds(self, holder: str, instance: str) -> int:
+        """Drop the holds of ``holder``'s other instances; they have ended.
+
+        Returns:
+            How many holds were dropped.
+
+        Raises:
+            HoldsUnsupportedError: if the resource manager predates holds.
+            RuntimeError: if the resource manager refuses the request.
+        """
+        req = ResetHoldsReq(
+            holder=holder,
+            instance=instance,
+            client_id=self._client_id,
+            request_id=_next_request_id(),
+        )
+        hdr, payload = self._rpc(MsgType.RESET_HOLDS_REQ, req.pack())
+        self._check_hold_error(hdr, payload, "Reset holds failed")
+        resp = ResetHoldsResp.unpack(payload)
+        if resp.status != 0:
+            raise RuntimeError(f"Reset holds failed with status {resp.status}")
+        return resp.dropped
+
+    def _check_hold_error(self, hdr: MsgHeader, payload: bytes, context: str) -> None:
+        if hdr.msg_type == MsgType.ERROR_RESP:
+            err = ErrorResp.unpack(payload)
+            if err.status == -errno.ENOSYS:
+                raise HoldsUnsupportedError(
+                    "the resource manager does not support region holds; "
+                    "restart it with this Maru version"
+                )
+            if err.status == -errno.EACCES:
+                raise HoldRefusedError(f"{context} ({err.status}): {err.message}")
+            raise RuntimeError(f"{context} ({err.status}): {err.message}")
+
+    def _resolve_device_path(self, rm_path: str, device_uuid: str) -> str:
+        """Map the RM's device (path, UUID) to this host's device path.
+
+        The RM's path can name a different device on this host, so a client
+        built with a device table never opens it unless the UUID matches.
+
+        Raises:
+            RuntimeError: If the UUID cannot be found on this host.
+        """
+        if not device_uuid or not self._resolve_by_uuid:
+            return rm_path
+        with self._lock:
+            local = self._device_table.get(device_uuid)
+        if local:
+            return local
+
+        # Unknown UUID: the table may predate the device, so rescan once.
+        # Merge, so a device whose header read fails now keeps its entry.
+        table = dict(scan_dax_devices())
+        with self._lock:
+            self._device_table.update(table)
+        local = table.get(device_uuid)
+        if local:
+            return local
+
+        # Sysfs may be invisible (e.g. a single-host setup in a container).
+        found = read_device_uuid(rm_path)
+        if found == device_uuid:
+            return rm_path
+        raise RuntimeError(
+            f"device UUID {device_uuid} (RM path {rm_path}) not found on this "
+            f"host; header at {rm_path} has UUID {found}"
+        )
 
     def _request_access(self, handle: MaruHandle) -> GetAccessResp:
         """Request access info from the resource manager via GET_ACCESS_REQ."""
@@ -305,12 +473,9 @@ class MaruShmClient:
         # Slow path: network RPC outside lock
         if path is None:
             access_resp = self._request_access(handle)
-            path = access_resp.dax_path
-            # Client-side UUID resolution: use local device table
-            if access_resp.device_uuid and self._device_table:
-                local = self._device_table.get(access_resp.device_uuid)
-                if local:
-                    path = local
+            path = self._resolve_device_path(
+                access_resp.dax_path, access_resp.device_uuid
+            )
 
         # Create mmap and update cache
         with self._lock:

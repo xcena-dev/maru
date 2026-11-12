@@ -16,6 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Where the unit is installed; tests point it at a temporary directory.
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
 
 def _find_resource_manager_source() -> Path:
     """Locate the maru_resource_manager source directory relative to this file.
@@ -75,7 +78,7 @@ def _do_uninstall(prefix: str) -> int:
         fprintf(sys.stderr, "  Removed: %s\n", binary)
         removed = True
 
-    service = Path("/etc/systemd/system/maru-resource-manager.service")
+    service = SYSTEMD_DIR / "maru-resource-manager.service"
     if service.exists():
         try:
             service.unlink()
@@ -88,6 +91,11 @@ def _do_uninstall(prefix: str) -> int:
                 "  Warning: cannot remove %s (permission denied). Run with sudo.\n",
                 service,
             )
+
+    from maru_remote_cxl_agent import installer as remote_cxl_agent_installer
+
+    if remote_cxl_agent_installer.uninstall():
+        removed = True
 
     if not removed:
         fprintf(sys.stderr, "Nothing to remove.\n")
@@ -162,7 +170,7 @@ def _do_install(args: argparse.Namespace) -> int:
 
     # -- install systemd service -----------------------------------------------
     service_src = rm_src / "maru-resource-manager.service"
-    systemd_dir = Path("/etc/systemd/system")
+    systemd_dir = SYSTEMD_DIR
     if service_src.is_file() and systemd_dir.is_dir():
         import shutil as _shutil
 
@@ -173,6 +181,12 @@ def _do_install(args: argparse.Namespace) -> int:
             ["systemctl", "daemon-reload"],
             capture_output=True,
         )
+
+    # -- remote CXL agent service (remote workers over RDMA) ----------------------
+    if not getattr(args, "no_remote_cxl_agent", False):
+        from maru_remote_cxl_agent import installer as remote_cxl_agent_installer
+
+        remote_cxl_agent_installer.install()
 
     fprintf(sys.stderr, "Installation complete!\n")
     fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
@@ -220,7 +234,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="remove the installed resource manager",
+        help="remove the installed resource manager and remote CXL agent service",
+    )
+    parser.add_argument(
+        "--no-remote-cxl-agent",
+        action="store_true",
+        help="do not install the remote CXL agent service, which starts with the "
+        "resource manager and serves remote workers (installed only if NIXL is)",
     )
     args = parser.parse_args(argv)
 

@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass
 
+from maru_remote.region_map import MAX_WRITE_WAIT_MS
+
 from .storage_policy import validate_order
 
 
@@ -65,6 +67,46 @@ class MaruConfig:
     cxl_pool_size: int | None = None  # Fixed CXL budget in mixed mode
     write_order: tuple[str, ...] = ("cpu", "cxl")
     read_order: tuple[str, ...] = ("cpu", "cxl")
+    # cpu and mixed: fault the pools in and register them with CUDA when they
+    # open, as the cxl backend's regions are; False keeps them pageable
+    pin_pools: bool = True
+    # Remote CXL storage: pool_size is the size of one region in a memory node's CXL;
+    # the session gets one more region whenever all of its regions are full
+    rdma_device: str = ""  # RDMA NIC for NIXL/UCX, e.g. "mlx5_0:1"; empty = default
+    rdma_staging_size: int | None = None  # Host staging buffer; None = derived
+    rdma_timeout_s: float = 30.0  # Deadline of one RDMA batch
+    # Share of staging slots that stores leave free for loads; set when loads
+    # and stores run on separate threads (asynchronous transfers)
+    rdma_load_reserve: float = 0.0
+    # alloc is called from a thread that must not wait (vLLM's engine thread):
+    # it takes only a staging slot, the store gives the remote page, and a
+    # background thread gets more room ahead of the stores
+    rdma_nonblocking_alloc: bool = False
+    # Key the remote CXL agents of the pool require (a copy of the memory node's
+    # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
+    remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
+    # Send read hints (remote_cxl only): before a load starts, the remote CXL
+    # agents whose region extension takes them hear which bytes it will read
+    # (maru_handler.hints). Advice; the data path is the same.
+    read_hints: bool = False
+    # Send write hints (remote_cxl only): a store's pages are named to the
+    # remote CXL agents whose region extension takes them before its WRITEs,
+    # so memory that fills a written page from a slow tier can prepare it.
+    write_hints: bool = False
+    # With write hints, how long a store waits (ms) for an agent whose
+    # region extension takes ``write_wait`` to prepare its pages before it
+    # posts the WRITEs; the WRITEs go either way. 0: never wait.
+    write_wait_ms: int = 50
+    # Send read promotes (remote_cxl only): when a load starts for a request
+    # another process hinted (a vLLM worker loads what its scheduler
+    # hinted), the remote CXL agents whose region extension takes them hear
+    # that this request is loading now.
+    read_promotes: bool = False
+
+    @property
+    def server_urls(self) -> list[str]:
+        """MaruServer URLs; the remote_cxl backend uses one pool per URL."""
+        return [url.strip() for url in self.server_url.split(",") if url.strip()]
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -86,8 +128,10 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
-        if self.storage_backend not in {"cpu", "cxl", "mixed"}:
-            raise ValueError("storage_backend must be 'cpu', 'cxl' or 'mixed'")
+        if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
+            raise ValueError(
+                "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
+            )
         if self.storage_backend == "mixed":
             if (
                 type(self.cxl_pool_size) is not int
@@ -106,16 +150,54 @@ class MaruConfig:
                 setattr(self, name, validate_order(getattr(self, name)))
         elif self.cxl_pool_size is not None:
             raise ValueError("cxl_pool_size is only supported by mixed storage")
-        if self.storage_backend in {"cpu", "mixed"}:
+        if self.storage_backend in {"cpu", "mixed", "remote_cxl"}:
             if not self.engine_id or not self.cache_namespace:
-                raise ValueError("CPU storage requires engine_id and cache_namespace")
+                raise ValueError(
+                    "Storage sessions require engine_id and cache_namespace"
+                )
             if self.expand_size is not None:
-                raise ValueError("CPU M1 uses a fixed pool; expand_size is unsupported")
+                raise ValueError(
+                    "Remote CXL regions grow by pool_size; expand_size is unsupported"
+                    if self.storage_backend == "remote_cxl"
+                    else "CPU M1 uses a fixed pool; expand_size is unsupported"
+                )
             if (
                 not self.metadata_only
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.read_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("read_hints is supported by the remote_cxl backend")
+        if self.write_hints and self.storage_backend != "remote_cxl":
+            raise ValueError("write_hints is supported by the remote_cxl backend")
+        if (
+            type(self.write_wait_ms) is not int
+            or not 0 <= self.write_wait_ms <= MAX_WRITE_WAIT_MS
+        ):
+            raise ValueError(
+                f"write_wait_ms must be an integer from 0 to {MAX_WRITE_WAIT_MS}"
+            )
+        if self.read_promotes and self.storage_backend != "remote_cxl":
+            raise ValueError("read_promotes is supported by the remote_cxl backend")
+        if "," in self.server_url and self.storage_backend != "remote_cxl":
+            raise ValueError("Several MaruServer URLs require the remote_cxl backend")
+        if self.storage_backend == "remote_cxl":
+            if self.rdma_timeout_s <= 0:
+                raise ValueError("rdma_timeout_s must be positive")
+            if not 0 <= self.rdma_load_reserve < 1:
+                raise ValueError("rdma_load_reserve must be in [0, 1)")
+            if (
+                self.rdma_staging_size is not None
+                and self.rdma_staging_size < self.chunk_size_bytes
+            ):
+                raise ValueError("rdma_staging_size must hold at least one page")
+        elif (
+            self.rdma_staging_size is not None
+            or self.rdma_device
+            or self.rdma_load_reserve
+            or self.rdma_nonblocking_alloc
+        ):
+            raise ValueError("RDMA settings require the remote_cxl storage backend")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
         if not self.metadata_only and self.pool_size < self.chunk_size_bytes:

@@ -75,15 +75,15 @@ def render_table(usage: GetUsageResponse, ts: str) -> str:
         lines.extend(
             [
                 "",
-                "  L1 CPU DRAM / CXL (process-local pools)",
-                f"  {'engine_id':<28}  {'medium':<6}  {'state':<8}  {'capacity':>9}  "
+                "  L1 storage pools (CPU DRAM, CXL, remote CXL)",
+                f"  {'engine_id':<28}  {'medium':<10}  {'state':<8}  {'capacity':>9}  "
                 f"{'allocated':>9}  {'KV bytes':>9}  {'uncertain':>9}",
             ]
         )
         for pool in sorted(cpu_pools, key=lambda p: (p["engine_id"], p["pool_id"])):
             state = "active" if pool["active"] else "expired"
             lines.append(
-                f"  {pool['engine_id']:<28}  {pool.get('medium', 'cpu'):<6}  {state:<8}  "
+                f"  {pool['engine_id']:<28}  {pool.get('medium', 'cpu'):<10}  {state:<8}  "
                 f"{fmt_size(pool['capacity_bytes']):>9}  "
                 f"{fmt_size(pool['allocated_bytes']):>9}  "
                 f"{fmt_size(pool['ready_bytes']):>9}  "

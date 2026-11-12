@@ -4,7 +4,9 @@
 import logging
 import socket
 import threading
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict
 
 from maru_common.storage_types import (
@@ -95,6 +97,11 @@ class CpuStorageClient:
                         else CpuPool(grant["pool_id"], capacity, page_size)
                     )
                     interval = grant["session_ttl"] / 3
+                    if self.config.pin_pools:
+                        # Once every pool has mapped: a CXL pool that fails
+                        # to map makes the worker retry, which would repeat
+                        # the CPU pool's prefault.
+                        self.pool.page_lock(self._keepalive(interval))
                     self._thread = threading.Thread(
                         target=self._heartbeat_loop,
                         args=(interval,),
@@ -126,15 +133,41 @@ class CpuStorageClient:
         if data and self.pool is None:
             raise RuntimeError("A metadata-only client cannot access CPU buffers")
 
+    def _heartbeat(self) -> None:
+        with self._lock:
+            self._sequence += 1
+            self._call("heartbeat", sequence=self._sequence, **self.pool.usage())
+            self._resolve_pending()
+
+    def _keepalive(self, interval: float) -> Callable[[], None]:
+        """Heartbeats for the steps of opening the pool, ``interval`` apart.
+
+        The heartbeat thread needs the lock that connect() holds, so it starts
+        only once connect() returns, and its first heartbeat comes
+        ``interval`` later: a page-lock longer than twice that (a pool of
+        about 90 GiB at the default 30 s TTL) would outlast the session.
+        """
+        last = time.monotonic()
+
+        def keepalive() -> None:
+            nonlocal last
+            if time.monotonic() - last < interval:
+                return
+            last = time.monotonic()
+            try:
+                self._heartbeat()
+            except StorageError:
+                raise
+            except Exception:
+                # As in _heartbeat_loop: not proof of a lost session.
+                logger.warning("CPU cache heartbeat failed", exc_info=True)
+
+        return keepalive
+
     def _heartbeat_loop(self, interval: float) -> None:
         while not self._stop.wait(interval):
             try:
-                with self._lock:
-                    self._sequence += 1
-                    self._call(
-                        "heartbeat", sequence=self._sequence, **self.pool.usage()
-                    )
-                    self._resolve_pending()
+                self._heartbeat()
             except StorageError:
                 # A new epoch/expired session is not reconnectable with the
                 # old allocations. Fail closed until this worker restarts.
@@ -150,7 +183,7 @@ class CpuStorageClient:
                 # not proof of a lost session, nor permission to free memory.
                 logger.warning("CPU cache heartbeat failed", exc_info=True)
 
-    def alloc(self, size: int) -> CpuAllocation:
+    def alloc(self, size: int, route_key: str | None = None) -> CpuAllocation:
         with self._lock:
             self._ensure()
             return self.pool.alloc(size)
@@ -241,7 +274,7 @@ class CpuStorageClient:
                 result = self._call("commit", op_id=op_id, entries=entries)
                 self._finish_commit(op_id, result.get("statuses", []))
 
-    def batch_exists(self, keys: list[str]) -> list[bool]:
+    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
         self._ensure(data=False)
         out = []
         for i in range(0, len(keys), MAX_STORAGE_BATCH):
@@ -261,7 +294,9 @@ class CpuStorageClient:
                 out.extend([False] * len(batch))
         return out
 
-    def batch_retrieve(self, keys: list[str]) -> list[CpuReadLease | None]:
+    def batch_retrieve(
+        self, keys: list[str], route_key: str | None = None
+    ) -> list[CpuReadLease | None]:
         if len(keys) > MAX_STORAGE_BATCH:
             out = []
             try:

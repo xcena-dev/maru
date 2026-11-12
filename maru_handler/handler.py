@@ -76,25 +76,22 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        if self._config.use_async_rpc:
-            from .rpc_async_client import RpcAsyncClient
-
-            self._rpc = RpcAsyncClient(
-                self._config.server_url,
-                timeout_ms=self._config.timeout_ms,
-                max_inflight=self._config.max_inflight,
-            )
-        else:
-            self._rpc = RpcClient(
-                self._config.server_url,
-                timeout_ms=self._config.timeout_ms,
-            )
+        self._rpc = self._make_rpc(self._config.server_urls[0])
         self._mapper: DaxMapper | None = None
         self._cpu = None
         if self._config.storage_backend in {"cpu", "mixed"}:
             from .storage.client import CpuStorageClient
 
             self._cpu = CpuStorageClient(self._config, self._rpc)
+        elif self._config.storage_backend == "remote_cxl":
+            from .storage.remote_cxl import PoolRouter, RemoteCxlStorageClient
+
+            urls = self._config.server_urls
+            if len(urls) == 1:
+                self._cpu = RemoteCxlStorageClient(self._config, self._rpc)
+            else:
+                rpcs = [self._rpc] + [self._make_rpc(url) for url in urls[1:]]
+                self._cpu = PoolRouter(self._config, rpcs, urls)
 
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
@@ -128,6 +125,18 @@ class MaruHandler:
         logger.debug("Created MaruHandler with config: %s", self._config)
 
         self._dispatch_plugins("on_init", self)
+
+    def _make_rpc(self, url: str):
+        """RPC client for one MaruServer URL."""
+        if self._config.use_async_rpc:
+            from .rpc_async_client import RpcAsyncClient
+
+            return RpcAsyncClient(
+                url,
+                timeout_ms=self._config.timeout_ms,
+                max_inflight=self._config.max_inflight,
+            )
+        return RpcClient(url, timeout_ms=self._config.timeout_ms)
 
     def _dispatch_plugins(self, hook: str, *args) -> None:
         """Invoke ``hook`` on every loaded plugin, isolating failures.
@@ -485,7 +494,9 @@ class MaruHandler:
     # KV Operations
     # =========================================================================
 
-    def alloc(self, size: int) -> AllocHandle | CpuAllocation:
+    def alloc(
+        self, size: int, route_key: str | None = None
+    ) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
         The caller writes directly to ``handle.buf``, then passes the handle
@@ -493,6 +504,8 @@ class MaruHandler:
 
         Args:
             size: Required bytes (must be <= chunk_size)
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             AllocHandle with writable memoryview and allocation metadata
@@ -502,7 +515,7 @@ class MaruHandler:
             ValueError: If size exceeds chunk_size or allocation fails
         """
         if self._cpu is not None:
-            return self._cpu.alloc(size)
+            return self._cpu.alloc(size, route_key=route_key)
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
@@ -942,7 +955,9 @@ class MaruHandler:
     # Batch Operations
     # =========================================================================
 
-    def batch_retrieve(self, keys: list[str]) -> list[MemoryInfo | CpuReadLease | None]:
+    def batch_retrieve(
+        self, keys: list[str], route_key: str | None = None
+    ) -> list[MemoryInfo | CpuReadLease | None]:
         """Retrieve multiple values as MemoryInfo in batch.
 
         CPU results are CpuReadLease objects; release every non-None result
@@ -959,6 +974,8 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             List of MemoryInfo (None for keys not found)
@@ -966,7 +983,7 @@ class MaruHandler:
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
         if self._cpu is not None:
-            return self._cpu.batch_retrieve(keys)
+            return self._cpu.batch_retrieve(keys, route_key=route_key)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1065,7 +1082,35 @@ class MaruHandler:
             handles: List of AllocHandle from alloc()
 
         Returns:
-            List of booleans indicating success for each key
+            One bool per key. True means the key is registered in the pool
+            after this call: either this call registered it, or it already
+            existed (in the local map, on the server, or registered by
+            another client while this call ran). The page of a key that
+            already existed or lost the register race is freed. False
+            means the register RPC failed, in which case every page is
+            freed, or that the server's response had no result for the
+            key. The server may still have registered that key's page, so
+            the page is retained (allocated, untracked) until the handler
+            closes.
+
+        Raises:
+            RuntimeError: If the handler is metadata-only, not connected, or
+                closing.
+            ValueError: If keys and handles differ in length, or (CPU path)
+                a key or handle is invalid.
+            StorageUnavailableError: (CPU path) If the cache session is
+                unavailable.
+
+        Note:
+            Handle ownership passes to this call. On the CXL path every
+            exception above is raised before any handle is consumed, so the
+            caller still owns every handle and must free them. After a
+            normal return the caller must not free any handle: each page
+            was registered, freed, or retained here. On the CPU path a batch
+            larger than MAX_STORAGE_BATCH is committed in chunks, so a later
+            chunk can raise after earlier chunks were committed. Freeing
+            those earlier handles again either does nothing or raises
+            ValueError, and never releases committed data.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -1144,10 +1189,40 @@ class MaruHandler:
 
                 batch_idx = 0
                 for i in range(len(keys)):
-                    if results[i] and i in allocations:
-                        if batch_idx < len(batch_resp.results):
-                            results[i] = batch_resp.results[batch_idx]
-                        batch_idx += 1
+                    if i not in allocations:
+                        continue
+                    if batch_idx >= len(batch_resp.results):
+                        # No result for this entry: the server may or may not
+                        # have registered it. Report failure, but keep the
+                        # page allocated, since freeing it could hand out a
+                        # page the server's metadata still points to.
+                        rid, pidx = allocations.pop(i)
+                        results[i] = False
+                        logger.error(
+                            "batch_store: no register result for key=%s, "
+                            "keeping page untracked (region=%d, page=%d)",
+                            keys[i],
+                            rid,
+                            pidx,
+                        )
+                        continue
+                    is_new = batch_resp.results[batch_idx]
+                    batch_idx += 1
+                    if is_new:
+                        continue
+                    # Another client registered the key between the
+                    # existence check and this RPC. The key is in the pool,
+                    # so it counts as stored (as store() reports it); the
+                    # page written here is referenced by nobody and goes
+                    # back to the allocator.
+                    rid, pidx = allocations.pop(i)
+                    self._owned.free(rid, pidx)
+                    logger.debug(
+                        "batch_store: key=%s lost register race, freed page (region=%d, page=%d)",
+                        keys[i],
+                        rid,
+                        pidx,
+                    )
 
             # Track
             for i, key in enumerate(keys):
@@ -1165,19 +1240,21 @@ class MaruHandler:
         self._record_stats("batch_store", total_bytes, (time.monotonic() - t0) * 1e6)
         return results
 
-    def batch_exists(self, keys: list[str]) -> list[bool]:
+    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
         """Check if multiple keys exist.
 
         Uses a single batch RPC call instead of N individual calls.
 
         Args:
             keys: List of chunk key strings
+            route_key: The request's first chunk key. With several remote_cxl
+                pools it picks the pool; other backends ignore it.
 
         Returns:
             List of booleans indicating existence for each key
         """
         if self._cpu is not None:
-            return self._cpu.batch_exists(keys)
+            return self._cpu.batch_exists(keys, route_key=route_key)
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -1194,6 +1271,52 @@ class MaruHandler:
             result="hit" if hits == len(keys) else ("partial" if hits > 0 else "miss"),
         )
         return batch_resp.results
+
+    def read_hints_enabled(self) -> bool:
+        """Whether storage sends read hints (:meth:`hint_read` does anything)."""
+        return bool(getattr(self._cpu, "read_hints_enabled", False))
+
+    def hint_read(
+        self, request_id: str, keys: list[str], route_key: str | None = None
+    ) -> None:
+        """Tell storage that ``request_id`` will read ``keys`` soon, in order.
+
+        Returns at once. Storage that sends read hints looks the keys up and
+        tells the memory side where their bytes are, so it can prepare them
+        before the load starts; other storage ignores it. The load still
+        reads every key.
+
+        Args:
+            request_id: The serving engine's request id.
+            keys: Chunk keys the request's load will read, in order.
+            route_key: The request's first chunk key (picks the pool, as in
+                :meth:`batch_exists`).
+        """
+        hint = getattr(self._cpu, "hint_read", None)
+        if hint is not None:
+            hint(request_id, keys, route_key=route_key)
+
+    def promote_read(self, request_id: str, route_key: str | None = None) -> None:
+        """The load of ``request_id`` starts now; returns at once.
+
+        Storage that sends read promotes tells the memory side, so it brings
+        in that request's hinted bytes ahead of other hinted ones. For a
+        process that loads what another process hinted (a vLLM worker loads
+        what its scheduler hinted with :meth:`hint_read`).
+
+        Args:
+            request_id: The serving engine's request id, as hinted.
+            route_key: The request's first chunk key (picks the pool).
+        """
+        promote = getattr(self._cpu, "promote_read", None)
+        if promote is not None:
+            promote(request_id, route_key=route_key)
+
+    def end_read_hint(self, request_id: str) -> None:
+        """``request_id`` ended; storage may drop what it prepared for it."""
+        end = getattr(self._cpu, "end_read_hint", None)
+        if end is not None:
+            end(request_id)
 
     def batch_pin(self, keys: list[str]) -> list[bool]:
         """Check existence and pin multiple keys in a single RPC call.
@@ -1387,6 +1510,26 @@ class MaruHandler:
             mapped_count,
             len(response.allocations),
         )
+
+    def retrieve_capacity(self) -> int | None:
+        """How many keys the next ``batch_retrieve`` should ask for at most.
+
+        Returns:
+            The read buffer slots a load may use now (remote_cxl backend), or None
+            when retrieves are not bounded by a read buffer.
+        """
+        capacity = getattr(self._cpu, "retrieve_capacity", None)
+        return capacity() if capacity is not None else None
+
+    def storage_gpu_accessible(self) -> bool:
+        """Whether retrieved and allocated buffers are page-locked for the GPU.
+
+        Returns:
+            True when GPU copy kernels may read and write those buffers
+            directly (the remote_cxl backend's staging buffer registered with CUDA).
+        """
+        accessible = getattr(self._cpu, "storage_gpu_accessible", None)
+        return bool(accessible()) if accessible is not None else False
 
     def has_local(self, key: str) -> bool:
         """Whether this handler still owns a committed CPU replica."""

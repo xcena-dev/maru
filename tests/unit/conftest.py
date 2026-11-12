@@ -3,6 +3,7 @@
 """Unit test configuration — MockShmClient for tests without a running resource manager."""
 
 import mmap
+import socket
 from unittest.mock import patch
 
 import pytest
@@ -79,6 +80,12 @@ def _mock_shm_client():
         patch("maru_shm.MaruShmClient", MockShmClient),
         patch("maru_server.allocation_manager.MaruShmClient", MockShmClient),
         patch("maru_handler.memory.mapper.MaruShmClient", MockShmClient),
+        # MaruHandler.connect and the mixed backend's CXL pool scan the host's
+        # DAX devices; on a CXL host that reads the real device headers. A
+        # unit test sees none, as in CI. Tests of the scanner patch os calls,
+        # and tests that need a table patch these names themselves.
+        patch("maru_shm.device_scanner.scan_dax_devices", lambda: []),
+        patch("maru_shm.client.scan_dax_devices", lambda: []),
     ):
         yield
 
@@ -89,3 +96,15 @@ def _mock_shm_client():
         except Exception:
             pass
     _mmap_objects = []
+
+
+@pytest.fixture
+def refused_address():
+    """A loopback host:port that refuses connections while the test runs.
+
+    The port is bound but never listened on, so a connect gets ECONNREFUSED
+    whatever else runs on the host (a fixed port may be in use there).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        yield f"127.0.0.1:{s.getsockname()[1]}"

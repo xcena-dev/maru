@@ -25,6 +25,9 @@ bool rejects(const std::string &devName) {
 
 }  // namespace
 
+// The index comes from the device name: the sysfs link target of an
+// hmem-backed device ("../../../devices/platform/hmem.0/dax0.0") has no
+// "region<N>" component. The recovery fixtures register devices that way.
 TEST(DaxRegionIndexTest, ParsesRegionIndexFromDeviceName) {
     EXPECT_EQ(indexOf("dax0.0"), 0u);
     EXPECT_EQ(indexOf("dax0.1"), 0u);
@@ -41,15 +44,4 @@ TEST(DaxRegionIndexTest, RejectsMalformedNames) {
     EXPECT_TRUE(rejects("dax_region"));   // attribute group dir, not a device
     EXPECT_TRUE(rejects("pmem0"));
     EXPECT_TRUE(rejects(""));
-}
-
-// Regression: an hmem-backed device resolves to
-// "../../../devices/platform/hmem.0/dax0.0", which carries no "region<N>"
-// component, so deriving the index from the sysfs link target cannot work and
-// the device used to be skipped, leaving the daemon with no pools.
-TEST(DaxRegionIndexTest, ResolvesHmemDeviceWhoseLinkTargetHasNoRegion) {
-    const std::string hmemTarget = "../../../devices/platform/hmem.0/dax0.0";
-    ASSERT_EQ(hmemTarget.find("region"), std::string::npos);
-
-    EXPECT_EQ(indexOf("dax0.0"), 0u);
 }

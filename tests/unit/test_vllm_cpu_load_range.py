@@ -12,6 +12,7 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
 from tests.unit.test_vllm_cpu_config import extra, mixed_extra
+from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
@@ -19,7 +20,7 @@ from tests.unit.vllm_connector_helpers import (
 )
 
 
-@pytest.mark.parametrize("config", [extra(), mixed_extra()])
+@pytest.mark.parametrize("config", [extra(), mixed_extra(), remote_cxl_extra()])
 @pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
 @pytest.mark.parametrize(
     "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]
@@ -30,6 +31,9 @@ def test_load_only_external_tokens(config, start, end, failure):
     worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
     worker._ensure_handler = lambda: None
     worker._handler = Mock() if failure != "handler" else None
+    if worker._handler is not None:
+        worker._handler.retrieve_capacity.return_value = None
+        worker._handler.storage_gpu_accessible.return_value = False
     meta = MaruReqMeta(
         "load",
         list(range(16)),
@@ -39,14 +43,16 @@ def test_load_only_external_tokens(config, start, end, failure):
         load_start_token=start,
         load_end_token=end,
     )
-    keys = _req_chunk_keys(meta, 8)
+    keys = _req_chunk_keys(meta, 8, "")
     slabs = [
         torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1) + i * 100
         for i in range(2)
     ]
 
-    def retrieve(requested):
+    def retrieve(requested, route_key=None):
         assert requested == keys[start // 8 : 2]
+        # A load that starts mid-request still routes by the request's first key.
+        assert route_key == keys[0]
         if failure == "retrieve":
             raise RuntimeError("lost replica")
         if failure == "truncated":
@@ -98,8 +104,7 @@ def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
             )
         ],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
-        # vLLM always fills this; the step computes the held-back block.
-        num_scheduled_tokens={"load": 4},
+        num_scheduled_tokens={"load": 8},
         finished_req_ids=set(),
         preempted_req_ids=set(),
     )
@@ -141,7 +146,8 @@ def test_real_scheduler_preserves_other_request_sharing_prefix(
     assert manager.allocate_slots(decoding, 17) is not None
     decoding.num_computed_tokens = 17
     manager.cache_blocks(decoding, 16)
-    blocks, hit = manager.get_computed_blocks(loading)
+    # Newer vLLM appends a shared-prefix boundary to the returned pair.
+    blocks, hit = manager.get_computed_blocks(loading)[:2]
     assert hit == 4
     assert (
         manager.allocate_slots(

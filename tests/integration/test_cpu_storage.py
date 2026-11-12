@@ -128,8 +128,9 @@ def test_metadata_only_cxl_client_does_not_allocate(cpu_server, monkeypatch):
         handler.close()
 
 
+@pytest.mark.parametrize("layout", ["NHD", "LBNHC"])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_connector_roundtrip_and_lost_hit_recomputes(cpu_server, device):
+def test_connector_roundtrip_and_lost_hit_recomputes(cpu_server, device, layout):
     torch = pytest.importorskip("torch")
     pytest.importorskip("vllm")
     if device == "cuda" and not torch.cuda.is_available():
@@ -149,15 +150,19 @@ def test_connector_roundtrip_and_lost_hit_recomputes(cpu_server, device):
         "maru_cache_namespace": "test-model-v1",
         "maru_cpu_pool_size": "1K",
     }
-    worker = make_worker(4, 4, extra, num_kv_heads=2, head_size=8)
+    worker = make_worker(
+        4, 4, extra, num_kv_heads=2, head_size=8, kv_cache_layout=layout
+    )
     scheduler = make_scheduler(4, 4, extra)
-    caches = {
-        f"model.layers.{i}.self_attn": torch.arange(
-            8 * 2 * 4 * 2 * 8, device=device, dtype=torch.float32
-        ).reshape(8, 2, 4, 2, 8)
-        + i * 2048
-        for i in range(2)
-    }
+
+    def cache(i):
+        values = torch.arange(8 * 2 * 4 * 2 * 8, device=device, dtype=torch.float32)
+        if layout == "NHD":  # vLLM 0.23-0.25 flash: (NB, 2, BS, NH, HS)
+            return values.reshape(8, 2, 4, 2, 8) + i * 2048
+        # vLLM 0.29+ logical page (NB, NH, BS, K|V) over token-major memory
+        return values.reshape(8, 4, 2, 16).permute(0, 2, 1, 3) + i * 2048
+
+    caches = {f"model.layers.{i}.self_attn": cache(i) for i in range(2)}
     originals = {name: tensor.clone() for name, tensor in caches.items()}
     attn = make_flash_attn_metadata()
     tokens = list(range(5))  # One full chunk plus one token of compute.

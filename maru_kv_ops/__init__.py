@@ -16,6 +16,9 @@ Attributes:
         object). Present only when the extension is available.
     EngineKVFormat: Paged-cache axis order the kernels index with. Present only
         when the extension is available.
+    LogicalPageFormat: Strides of vLLM 0.29+'s logical page, the other kind of
+        format ``multi_layer_kv_transfer`` takes. Present only when the
+        extension is available.
 """
 
 # Standard
@@ -24,6 +27,7 @@ from typing import Any
 
 __all__ = [
     "EngineKVFormat",
+    "LogicalPageFormat",
     "PageBufferShapeDesc",
     "TransferDirection",
     "import_error",
@@ -57,6 +61,10 @@ except Exception as exc:  # pragma: no cover - depends on build environment
     _IMPORT_ERROR = exc
 else:
     EngineKVFormat = _C.EngineKVFormat
+    # None from an extension built before the logical-page kernel existed (an
+    # editable install updated without a rebuild): the connector then keeps
+    # its per-layer path for vLLM 0.29+ pages instead of failing to import.
+    LogicalPageFormat = getattr(_C, "LogicalPageFormat", None)
     PageBufferShapeDesc = _C.PageBufferShapeDesc
     TransferDirection = _C.TransferDirection
     multi_layer_block_kv_transfer = _C.multi_layer_block_kv_transfer

@@ -7,20 +7,7 @@
 #include <unistd.h>
 
 #include "pool_manager.h"
-
-namespace maru {
-class PoolManagerTestPeer {
-public:
-    static int build(PoolManager &pm, const std::string &path, DaxType type) {
-        PoolState pool{};
-        return pm.buildPoolFromDevice(0, path, type, pool);
-    }
-    static void scan(PoolManager &pm) {
-        std::vector<PoolManager::DeviceInfo> devices;
-        pm.scanDevices(devices);
-    }
-};
-} // namespace maru
+#include "pool_manager_test_peer.h"
 
 using namespace maru;
 

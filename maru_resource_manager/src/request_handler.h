@@ -60,6 +60,12 @@ public:
     FreeResult handleFree(const FreeReq &req, const RequestContext &ctx);
     GetAccessResult handleGetAccess(const GetAccessReq &req, const RequestContext &ctx);
     StatsResult handleStats();
+    /// Region holds of a remote agent: holder = node ID, instance = epoch.
+    GetAccessResult handleHold(const HoldReq &req, const std::string &holder,
+                               const std::string &instance);
+    UnholdResp handleUnhold(const UnholdReq &req, const std::string &holder,
+                            const std::string &instance);
+    ResetHoldsResp handleResetHolds(const std::string &holder, const std::string &instance);
 
 private:
     PoolManager &pm_;

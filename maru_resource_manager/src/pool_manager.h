@@ -1,10 +1,14 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -45,10 +49,18 @@ struct PoolState
     uint64_t alignBytes;
     DaxType type;
     std::vector<Extent> freeList;
+    // Runtime bounds from the device, never trusted from checkpoint metadata.
+    uint64_t dataBegin{0};
+    uint64_t dataEnd{0};
 };
 
 class MetadataStore;
 class WalStore;
+struct Ledger;
+struct PoolRecord;
+struct DeviceProbe;
+struct DevicePlan;
+class DeviceSlots;
 
 /// Extract the dax_region index from a dev_dax device name ("dax3.7" -> 3).
 ///
@@ -63,6 +75,9 @@ bool isDeviceDaxBound(const std::string &sysfsDevicePath);
 
 class PoolManager
 {
+    using SteadyClock = std::chrono::steady_clock;
+    using SteadyClockPoint = SteadyClock::time_point;
+
 public:
     explicit PoolManager(const std::string &stateDir, int gracePeriodSec = 30);
     ~PoolManager();
@@ -82,6 +97,22 @@ public:
     /// Atomically verify auth token and get device path. Returns -EACCES on bad token.
     int verifyAndGetPath(const Handle &handle, std::string &outPath);
 
+    /// Region holds of remote agents (holder = node ID, instance = the agent
+    /// process's epoch). A region freed while held drains: it stays out of
+    /// the free list, and reads as freed, until its last hold is dropped.
+    ///
+    /// Verify the token as verifyAndGetPath, record the hold (replacing an
+    /// older instance of the holder) and return the device path. -ENOENT if
+    /// the region is absent or draining, -EINVAL for a bad name.
+    int hold(const Handle &handle, const std::string &holder, const std::string &instance,
+             std::string &outPath);
+    /// Drop the holder's hold if it is this instance's. The token is verified
+    /// as by hold (-EACCES); 0 if the region or the hold is gone.
+    int unhold(const Handle &handle, const std::string &holder, const std::string &instance);
+    /// Drop every hold of the holder made by another instance (that process
+    /// and its registrations are gone).
+    int resetHolds(const std::string &holder, const std::string &instance, uint32_t &dropped);
+
     void getStats(std::vector<PoolState> &out);
     /// Lightweight check: returns true if at least one pool is loaded.
     bool hasPools() const;
@@ -92,12 +123,47 @@ public:
     std::string getDeviceUuidForRegion(uint64_t regionId);
 
     void reapExpired(uint64_t &reapedCount);
-    void checkpoint();
+    int checkpoint();
 
     /// Notify that a client has disconnected. Starts the grace period timer.
     void clientDisconnected(const std::string &clientId);
     /// Notify that a client has reconnected. Cancels the grace period timer.
     void clientReconnected(const std::string &clientId);
+
+    /// maru-rm-ctl commands. Each returns 0 or -errno and fills `out` with
+    /// key=value lines, or with the reason on failure.
+    int adminStatus(std::string &out);
+    int adminAllocations(const std::string &device, std::string &out);
+    /// Returned by adminExclude when the device is excluded (the RM no longer
+    /// uses it) but the list is not on disk yet, so a power loss could undo it.
+    static constexpr int kAdminIncomplete = 1;
+    /// Stop using a device for good (e.g. to hand it to ROOF). Refused while
+    /// any allocation on it is live. kAdminIncomplete until the list is on
+    /// disk; calling it again retries the sync.
+    int adminExclude(const std::string &device, std::string &out);
+    /// How `include` may treat the device's identity.
+    enum class IncludeMode
+    {
+        Judge,          // The normal rules (an excluded pool must have a record)
+        Adopt,          // Accept the Maru header of an excluded device without a record
+        Reinit,         // Start the pool over with a new UUID, even over a foreign header
+        RestoreHeader,  // Write the recorded UUID back when the identity tags match
+    };
+    /// Use an excluded, refused or skipped device again.
+    int adminInclude(const std::string &device, IncludeMode mode, std::string &out);
+    /// Return one allocation whose owner the caller verified has exited.
+    /// `force` skips the running-owner check (a PID reused after a reboot).
+    int adminRelease(uint64_t regionId, bool confirmed, bool force, std::string &out);
+    /// Return every allocation of a device's pool, without opening the device.
+    int adminDiscard(const std::string &device, bool confirmed, bool force,
+                     std::string &out);
+    /// List a holder's holds; once the operator confirmed that node's agent
+    /// is gone for good, drop them.
+    int adminDropHolds(const std::string &holder, bool confirmed, std::string &out);
+    /// Zero all of an excluded device, header included. Runs without holding
+    /// the pool lock; stops between chunks once `cancel` is set.
+    int adminWipe(const std::string &device, bool confirmed, std::string &out,
+                  const std::function<bool()> &cancelled = {});
 
 private:
     friend class PoolManagerTestPeer;
@@ -109,22 +175,49 @@ private:
     };
 
     int scanDevices(std::vector<DeviceInfo> &outDevices);
-    // Pure builder: constructs a PoolState from device without touching pools_.
-    // Caller decides when to commit. Disk side effects (UUID header init) may
-    // still happen and are idempotent.
-    int buildPoolFromDevice(uint32_t poolId, const std::string &path,
-                            DaxType type, PoolState &out);
+    // Read-only facts about one device (sysfs, header, identity tags). Runs
+    // without mu_; failures are logged once per change of reason.
+    int probeDevice(const DeviceInfo &dev, DeviceProbe &out);
+    // Log a probe failure once per change, or the device's recovery.
+    int reportProbe(const DeviceProbe &probe);
     int poolBuildFailed(const std::string &path, const char *stage, int error);
     // Suppress only identical failures; every scan still retries the device.
     std::map<std::string, std::pair<std::string, int>> failedDevices_;
-    int loadPoolFromDevice(uint32_t poolId, const std::string &path,
-                           DaxType type);
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);
-    int loadPoolsLocked();
-    int rescanDevicesLocked();
-    void recomputeFreeSize(PoolState &pool);
+    int loadPoolsLocked(std::unique_lock<std::mutex> &lock);
 
-    void coalesceFreeList(PoolState &pool);
+    // Recovery (pool_recovery.cpp)
+    struct DecideContext;
+    void decide(const DeviceProbe &probe, const PoolRecord &record,
+                const DecideContext &ctx, DevicePlan &plan) const;
+    // A local owner whose process is gone (or ran in an earlier boot).
+    bool ownerGone(const Allocation &a) const;
+    std::vector<Allocation> poolAllocations(uint32_t poolId) const;
+    // Probe devices that are neither served nor excluded and decide what to
+    // do with each. With a `target` (include), `mode` and `wasExcluded` apply
+    // to it alone, and the caller acts only on its plan. Device and
+    // state-file reads run with `lock` released.
+    std::vector<DevicePlan> probeAndDecide(std::unique_lock<std::mutex> &lock,
+                                           const std::vector<DeviceInfo> &devices,
+                                           IncludeMode mode, bool wasExcluded, bool startup,
+                                           const std::string &target = "");
+    // Carry out plans: ledger, record and device writes, then publish. Device
+    // writes run with `lock` released. Returns the first write error.
+    int executePlans(std::unique_lock<std::mutex> &lock, std::vector<DevicePlan> &plans);
+    void publishPlan(DevicePlan &plan);
+    void markUnserved(const DevicePlan &plan);
+    // Free list = data range minus the pool's allocations in the ledger.
+    void rebuildFreeList(PoolState &pool) const;
+    void loadBootMarker();
+    int finishBootMarker();
+    void recountClients();
+
+    int checkpointLocked();
+    void setCheckpointBlock(std::string reason);
+    void removeOrphanFsDaxFiles(const PoolState &pool);
+    bool isExcluded(const std::string &devPath) const;
+    int checkExcludedFileLocked(std::string &out);
+
     void insertExtentSorted(PoolState &pool, uint64_t offset, uint64_t length);
     bool allocateFromPool(PoolState &pool, uint64_t size, Allocation &outAlloc);
     PoolState *findPoolById(uint32_t poolId);
@@ -133,8 +226,35 @@ private:
     /// Free without auth token verification (internal use only).
     int free(const Handle &handle, const std::string &clientId);
     /// Core deallocation logic shared by free/verifyAndFree/reapExpired.
-    /// Caller MUST hold mu_.
+    /// A held region drains instead. Caller MUST hold mu_.
     int doFreeAllocation(uint64_t regionId);
+    /// Log the free and return the range. Caller MUST hold mu_.
+    int releaseAllocation(uint64_t regionId);
+    void dropClientRef(const char *clientId);
+
+    int verifyAndGetPathLocked(const Handle &handle, std::string &outPath);
+
+    // Region holds (pool_holds.cpp). Caller MUST hold mu_.
+    bool isHeld(uint64_t regionId) const { return holds_.count(regionId) != 0; }
+    bool isDraining(uint64_t regionId) const { return draining_.count(regionId) != 0; }
+    // " held_by=a,b draining" for maru-rm-ctl; "" for a plain allocation.
+    std::string holdState(uint64_t regionId) const;
+    // Rewrite the holds file. Nonzero: the file is unchanged, so the caller
+    // undoes its change. Zero: the file has the new state, so memory keeps it
+    // even if `syncRc` says the directory sync failed; a change that adds
+    // protection then reports syncRc, one that removes it succeeds (a power
+    // loss brings back the older file, which only holds more).
+    int saveHoldsLocked(int &syncRc);
+    // 0 once the holds file last renamed into place is known durable; else
+    // sync the directory again and return the result. An idempotent request
+    // (a retried HOLD or FREE) must not report success before this does.
+    int confirmHoldsDurableLocked();
+    // Read the holds file and drop records of regions not in the ledger,
+    // counted in `stale`.
+    int loadHoldsLocked(size_t &stale);
+    // Free draining regions without holds; save the file if anything changed
+    // or `save` is set. Returns the number freed.
+    size_t finishDrainingLocked(bool save);
 
     mutable std::mutex mu_;
     std::string stateDir_;
@@ -142,6 +262,39 @@ private:
     std::vector<PoolState> pools_;
     uint64_t opCount_{0};
     uint64_t checkpointInterval_{100};
+    // Empty when checkpoints are allowed; set until recovery completes.
+    std::string checkpointBlock_{"recovery has not completed"};
+    std::chrono::steady_clock::time_point nextSkippedCheckpointLog_{};
+
+    // Devices that are present but not served, with the reason (status).
+    enum class DeviceState { Refused, Skipped, Busy };
+    struct UnservedDevice
+    {
+        uint32_t poolId;
+        DaxType type;
+        DeviceState state;
+        std::string reason;
+        size_t live{0};
+        size_t ownersAlive{0};
+    };
+    std::map<std::string, UnservedDevice> unserved_;
+    // One operation per device at a time; shared with detached I/O threads.
+    std::shared_ptr<DeviceSlots> slots_;
+    // Local owners recorded in an earlier boot are gone (startup only).
+    bool previousBoot_{false};
+    // Write retries after a failed device or record write.
+    std::map<std::string, std::pair<SteadyClockPoint, int>> retryAfter_;
+    // Resets that wrote an archive copy in this run (no copy on retry).
+    std::set<uint32_t> archivedResets_;
+    std::string bootIdPath_{"/proc/sys/kernel/random/boot_id"};
+    std::string bootIdNow_;
+    int deviceIoTimeoutMs_{10000};
+    // Devices handed to another owner (daxN.M): never opened or registered.
+    std::set<std::string> excluded_;
+    // -errno while the last list renamed into place has not been synced: a
+    // power loss could bring the previous list back, so no excluded device
+    // may be handed over yet. 0 once the list is durable.
+    int excludedSyncRc_{0};
 
     std::unique_ptr<MetadataStore> metadata_;
     std::unique_ptr<WalStore> wal_;
@@ -149,6 +302,14 @@ private:
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;
+    // Remote agents' holds: region -> holder -> instance. Every region here
+    // is in allocations_.
+    std::map<uint64_t, std::map<std::string, std::string>> holds_;
+    // Freed while held: still in allocations_, so its range stays out of the
+    // free list and survives a restart, but freed for everyone else.
+    std::set<uint64_t> draining_;
+    // -errno while the last holds file renamed into place is not synced.
+    int holdsSyncRc_{0};
     uint64_t nextRegionId_{1};
 
     // client_id → {pid, start_time} for reaper PID-reuse detection (in-memory only)
@@ -159,8 +320,13 @@ private:
 
     // Disconnected remote clients pending reap after grace period.
     // Maps client_id -> time of disconnection.
-    using SteadyClock = std::chrono::steady_clock;
     std::map<std::string, SteadyClock::time_point> disconnectedClients_;
+    // Expired clients whose free could not be logged; retried every pass.
+    std::set<std::string> reapRetries_;
+
+    // Rate-limited: the reaper retries failed frees every second.
+    void logWalAppendFailure(const char *operation, int error);
+    SteadyClock::time_point nextWalFailureLog_{};
 
 };
 

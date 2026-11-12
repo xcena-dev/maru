@@ -263,18 +263,19 @@ class RpcHandlerMixin:
     def _handle_handshake(self, req: Any) -> dict:
         from maru_common.storage_types import (
             MIXED_STORAGE_CAPABILITY,
+            REMOTE_CXL_STORAGE_CAPABILITY,
             STORAGE_CAPABILITY,
         )
 
+        cxl = self._server.replica_directory.supports_mixed
+        remote_cxl_agents = list(getattr(self._server, "remote_cxl_agents", []))
         return {
             "success": True,
             "rm_address": self._server.rm_address,
+            "remote_cxl_agents": remote_cxl_agents,
             "capabilities": [STORAGE_CAPABILITY]
-            + (
-                [MIXED_STORAGE_CAPABILITY]
-                if self._server.replica_directory.supports_mixed
-                else []
-            ),
+            + ([MIXED_STORAGE_CAPABILITY] if cxl else [])
+            + ([REMOTE_CXL_STORAGE_CAPABILITY] if cxl and remote_cxl_agents else []),
             "server_epoch": self._server.replica_directory.server_epoch,
         }
 

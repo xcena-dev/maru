@@ -99,6 +99,45 @@ GetAccessResult RequestHandler::handleGetAccess(const GetAccessReq &req,
     return result;
 }
 
+GetAccessResult RequestHandler::handleHold(const HoldReq &req, const std::string &holder,
+                                           const std::string &instance) {
+    GetAccessResult result;
+    std::string pathToOpen;
+    result.status = pm_.hold(req.handle, holder, instance, pathToOpen);
+    if (result.status == 0) {
+        result.devicePath = pathToOpen;
+        result.deviceUuid = pm_.getDeviceUuidForRegion(req.handle.regionId);
+        result.offset = req.handle.offset;
+        result.length = req.handle.length;
+    } else {
+        logf(LogLevel::Warn, "[HOLD] region_id=%llu holder=%s -> FAILED (status=%d)",
+             (unsigned long long)req.handle.regionId, holder.c_str(), result.status);
+    }
+    return result;
+}
+
+UnholdResp RequestHandler::handleUnhold(const UnholdReq &req, const std::string &holder,
+                                        const std::string &instance) {
+    UnholdResp resp{};
+    resp.status = pm_.unhold(req.handle, holder, instance);
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[UNHOLD] region_id=%llu holder=%s -> FAILED (status=%d)",
+             (unsigned long long)req.handle.regionId, holder.c_str(), resp.status);
+    }
+    return resp;
+}
+
+ResetHoldsResp RequestHandler::handleResetHolds(const std::string &holder,
+                                                const std::string &instance) {
+    ResetHoldsResp resp{};
+    resp.status = pm_.resetHolds(holder, instance, resp.dropped);
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[RESET_HOLDS] holder=%s -> FAILED (status=%d)", holder.c_str(),
+             resp.status);
+    }
+    return resp;
+}
+
 StatsResult RequestHandler::handleStats() {
     StatsResult result;
 

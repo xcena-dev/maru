@@ -145,3 +145,28 @@ class TestUsageMonitorRendering:
         assert "cpu-engine" in table
         assert "expired" in table
         assert "4.0K" in table
+
+    def test_remote_cxl_regions_are_listed_under_their_engine(self):
+        usage = _FakeClient(
+            {
+                "l1_storage": {
+                    "pools": [
+                        {
+                            "pool_id": "region-pool",
+                            "engine_id": "worker-1",
+                            "medium": "remote_cxl",
+                            "active": True,
+                            "capacity_bytes": 4096,
+                            "allocated_bytes": 2048,
+                            "ready_bytes": 1000,
+                            "quarantined_bytes": 0,
+                        }
+                    ]
+                }
+            }
+        ).get_usage()
+        lines = usage_monitor.render_table(usage, "now").splitlines()
+        header = next(line for line in lines if "engine_id" in line)
+        row = next(line for line in lines if line.lstrip().startswith("worker-1"))
+        assert "remote_cxl" in row
+        assert row.index("active") == header.index("state")

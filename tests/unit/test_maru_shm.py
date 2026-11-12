@@ -9,9 +9,12 @@ Tests cover:
 """
 
 import socket
+import struct
 
 import pytest
 
+from maru_shm.client import HoldsUnsupportedError
+from maru_shm.client import MaruShmClient as RealShmClient  # before conftest's patch
 from maru_shm.constants import (
     MAP_PRIVATE,
     MAP_SHARED,
@@ -31,10 +34,14 @@ from maru_shm.ipc import (
     FreeResp,
     GetAccessReq,
     GetAccessResp,
+    HoldReq,
     MsgHeader,
     MsgType,
+    ResetHoldsReq,
+    ResetHoldsResp,
     StatsReq,
     StatsResp,
+    UnholdReq,
 )
 from maru_shm.types import DaxType, MaruHandle, MaruPoolInfo
 from maru_shm.uds_helpers import (
@@ -276,6 +283,48 @@ class TestGetAccessReqResp:
         assert resp2.dax_path == "/dev/dax0.0"
         assert resp2.offset == 0
         assert resp2.length == 4096
+
+
+class TestHoldMessages:
+    """Byte layout the resource manager parses (include/ipc.h)."""
+
+    def test_hold_req_layout(self):
+        h = MaruHandle(region_id=7, offset=100, length=500, auth_token=42)
+        data = HoldReq(
+            handle=h, holder="node-a", instance="e1", client_id="host:1", request_id=9
+        ).pack()
+        assert data[:32] == h.pack()
+        assert struct.unpack_from("<II", data, 32) == (6, 2)
+        assert data[40:48] == b"node-ae1"
+        assert struct.unpack_from("<H", data, 48) == (6,)
+        assert data[50:56] == b"host:1"
+        assert struct.unpack_from("<Q", data, 56) == (9,)
+        assert len(data) == 64
+
+    def test_unhold_req_layout(self):
+        h = MaruHandle(region_id=7, offset=100, length=500, auth_token=42)
+        data = UnholdReq(handle=h, holder="n", instance="e", client_id="c").pack()
+        assert data[:32] == h.pack()
+        assert struct.unpack_from("<II", data, 32) == (1, 1)
+        assert data[40:42] == b"ne"
+        assert struct.unpack_from("<H", data, 42) == (1,)
+
+    def test_reset_holds_req_and_resp(self):
+        data = ResetHoldsReq(holder="node-a", instance="e2", client_id="c").pack()
+        assert struct.unpack_from("<II", data) == (6, 2)
+        assert data[8:16] == b"node-ae2"
+        resp = ResetHoldsResp.unpack(struct.pack("<iI", 0, 3))
+        assert (resp.status, resp.dropped) == (0, 3)
+
+    def test_an_rm_without_holds_is_named(self):
+        client = RealShmClient(address="127.0.0.1:1")
+        err = ErrorResp(status=-38, message="unknown request").pack()
+        hdr = MsgHeader(msg_type=MsgType.ERROR_RESP, payload_len=len(err))
+        client._rpc = lambda *a: (hdr, err)
+        with pytest.raises(HoldsUnsupportedError, match="does not support"):
+            client.reset_holds("node-a", "e1")
+        with pytest.raises(HoldsUnsupportedError):
+            client.hold_access(MaruHandle(), "node-a", "e1")
 
 
 class TestStatsReqResp:

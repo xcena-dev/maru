@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 STORAGE_CAPABILITY = "cpu_storage_v1"
 MIXED_STORAGE_CAPABILITY = "mixed_storage_v1"
+REMOTE_CXL_STORAGE_CAPABILITY = "remote_cxl_storage_v1"
 MAX_STORAGE_BATCH = 1024
 
 

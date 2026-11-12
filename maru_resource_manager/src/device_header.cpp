@@ -1,6 +1,7 @@
 // Copyright 2026 XCENA Inc.
 #include "device_header.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -90,6 +91,88 @@ int writeDeviceHeader(const std::string &devPath, const DeviceHeader &hdr,
     flushCacheRange(ptr, sizeof(hdr));
     // Best effort, for regular-file backing (tests); DEV_DAX rejects msync.
     ::msync(ptr, sizeof(hdr), MS_SYNC);
+    ::munmap(ptr, mapSize);
+    return 0;
+}
+
+uint64_t deviceTagAreaEnd(uint64_t mapSize) {
+    return std::min(mapSize, kDeviceTagAreaLimit);
+}
+
+int readDeviceIdentity(const std::string &devPath, uint64_t mapSize,
+                       DeviceIdentity &out) {
+    int fd = ::open(devPath.c_str(), O_RDONLY);
+    if (fd < 0)
+        return -errno;
+
+    void *ptr = ::mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
+    int err = errno;
+    ::close(fd);
+    if (ptr == MAP_FAILED)
+        return -err;
+
+    const uint64_t end = deviceTagAreaEnd(mapSize);
+    // Drop locally cached lines first: another host may have rewritten them.
+    flushCacheRange(ptr, end);
+    const auto *base = static_cast<const uint8_t *>(ptr);
+    std::memcpy(&out.header, base, sizeof(out.header));
+    out.headerRc = std::memcmp(out.header.magic, kDeviceHeaderMagic,
+                               sizeof(out.header.magic)) == 0
+                       ? 0
+                       : -ENODATA;
+
+    bool any = false, all = true, first = true;
+    for (uint64_t off = kDeviceTagStride; off + sizeof(DeviceTag) <= end;
+         off += kDeviceTagStride) {
+        DeviceTag tag{};
+        std::memcpy(&tag, base + off, sizeof(tag));
+        const bool present =
+            std::memcmp(tag.magic, kDeviceTagMagic, sizeof(tag.magic)) == 0;
+        any = any || present;
+        if (!present || tag.offset != off) {
+            all = false;
+            continue;
+        }
+        if (first) {
+            std::memcpy(out.tagUuid, tag.uuid, sizeof(out.tagUuid));
+            first = false;
+        } else if (std::memcmp(out.tagUuid, tag.uuid, sizeof(out.tagUuid)) != 0) {
+            all = false;
+        }
+    }
+    ::munmap(ptr, mapSize);
+    out.tags = !any ? TagState::Absent
+                    : (all && !first ? TagState::Consistent : TagState::Inconsistent);
+    return 0;
+}
+
+int writeDeviceIdentity(const std::string &devPath, uint64_t mapSize,
+                        const DeviceHeader *hdr, const uint8_t uuid[16]) {
+    int fd = ::open(devPath.c_str(), O_RDWR);
+    if (fd < 0)
+        return -errno;
+
+    void *ptr =
+        ::mmap(nullptr, mapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    int err = errno;
+    ::close(fd);
+    if (ptr == MAP_FAILED)
+        return -err;
+
+    auto *base = static_cast<uint8_t *>(ptr);
+    const uint64_t end = deviceTagAreaEnd(mapSize);
+    for (uint64_t off = kDeviceTagStride; off + sizeof(DeviceTag) <= end;
+         off += kDeviceTagStride) {
+        DeviceTag tag{};
+        std::memcpy(tag.magic, kDeviceTagMagic, sizeof(tag.magic));
+        std::memcpy(tag.uuid, uuid, sizeof(tag.uuid));
+        tag.offset = off;
+        std::memcpy(base + off, &tag, sizeof(tag));
+    }
+    if (hdr) std::memcpy(base, hdr, sizeof(*hdr));
+    // See writeDeviceHeader: make the stores visible to other hosts.
+    flushCacheRange(base, end);
+    ::msync(base, end, MS_SYNC);
     ::munmap(ptr, mapSize);
     return 0;
 }

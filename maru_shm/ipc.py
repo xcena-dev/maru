@@ -36,6 +36,12 @@ class MsgType(IntEnum):
     STATS_RESP = 6
     GET_ACCESS_REQ = 9
     GET_ACCESS_RESP = 10
+    HOLD_REQ = 11
+    HOLD_RESP = 12
+    UNHOLD_REQ = 13
+    UNHOLD_RESP = 14
+    RESET_HOLDS_REQ = 15
+    RESET_HOLDS_RESP = 16
     ERROR_RESP = 255
 
 
@@ -370,6 +376,106 @@ class GetAccessResp:
             offset=offset,
             length=length,
         )
+
+
+def _holder_tail(holder: str, instance: str, client_id: str, request_id: int) -> bytes:
+    """Holder and instance bytes, then client_id (u16 len + bytes) and request_id."""
+    id_bytes = client_id.encode("utf-8")
+    return (
+        holder.encode("ascii")
+        + instance.encode("ascii")
+        + struct.pack("<H", len(id_bytes))
+        + id_bytes
+        + struct.pack("<Q", request_id)
+    )
+
+
+# HoldReq: Handle(32) + holderLen(u32) + instanceLen(u32), then holder, instance,
+# client_id and request_id. The response is a GetAccessResp (HOLD_RESP).
+@dataclass
+class HoldReq:
+    """Check a handle like GET_ACCESS and record that ``holder`` registers it.
+
+    The resource manager keeps a freed region's range out of use until every
+    holder has sent UNHOLD for it.
+    """
+
+    handle: MaruHandle | None = None
+    holder: str = ""
+    instance: str = ""
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        h = self.handle or MaruHandle()
+        return (
+            h.pack()
+            + struct.pack("<II", len(self.holder), len(self.instance))
+            + _holder_tail(self.holder, self.instance, self.client_id, self.request_id)
+        )
+
+
+# UnholdReq: Handle(32) + holderLen(u32) + instanceLen(u32), then holder,
+# instance, client_id and request_id. The response is a FreeResp-shaped status.
+@dataclass
+class UnholdReq:
+    """``holder`` (this ``instance`` of it) no longer registers the region.
+
+    The handle proves the request as it does for HOLD.
+    """
+
+    handle: MaruHandle | None = None
+    holder: str = ""
+    instance: str = ""
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        h = self.handle or MaruHandle()
+        return (
+            h.pack()
+            + struct.pack("<II", len(self.holder), len(self.instance))
+            + _holder_tail(self.holder, self.instance, self.client_id, self.request_id)
+        )
+
+
+# ResetHoldsReq: holderLen(u32) + instanceLen(u32), then holder, instance,
+# client_id and request_id.
+@dataclass
+class ResetHoldsReq:
+    """Drop the holds of ``holder``'s other instances (they ended)."""
+
+    holder: str = ""
+    instance: str = ""
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        return struct.pack("<II", len(self.holder), len(self.instance)) + _holder_tail(
+            self.holder, self.instance, self.client_id, self.request_id
+        )
+
+
+# ResetHoldsResp: status(i32) + dropped(u32) = 8 bytes
+_RESET_HOLDS_RESP_FORMAT = "<iI"
+_RESET_HOLDS_RESP_SIZE = struct.calcsize(_RESET_HOLDS_RESP_FORMAT)
+
+
+@dataclass
+class ResetHoldsResp:
+    """Status and the number of holds dropped."""
+
+    status: int = 0
+    dropped: int = 0
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ResetHoldsResp":
+        if len(data) < _RESET_HOLDS_RESP_SIZE:
+            raise ValueError("ResetHoldsResp too short")
+        status, dropped = struct.unpack(
+            _RESET_HOLDS_RESP_FORMAT, data[:_RESET_HOLDS_RESP_SIZE]
+        )
+        return cls(status=status, dropped=dropped)
 
 
 # StatsReq: empty payload (0 bytes)

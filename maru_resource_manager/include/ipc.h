@@ -24,6 +24,13 @@ enum class MsgType : uint16_t {
   STATS_RESP = 6,
   GET_ACCESS_REQ = 9,
   GET_ACCESS_RESP = 10,
+  // Region holds of remote agents. An RM without them answers -ENOSYS.
+  HOLD_REQ = 11,
+  HOLD_RESP = 12,
+  UNHOLD_REQ = 13,
+  UNHOLD_RESP = 14,
+  RESET_HOLDS_REQ = 15,
+  RESET_HOLDS_RESP = 16,
   ERROR_RESP = 255
 };
 
@@ -65,6 +72,41 @@ struct GetAccessResp {
   // Followed by: path bytes (pathLen), offset(u64), length(u64)
 };
 
+// A hold keeps a region's range out of use, even after its owner frees it,
+// until every holder has unheld it. Each request below is followed by the
+// holder bytes, the instance bytes, then client_id and request id as
+// GET_ACCESS_REQ appends them.
+
+/// Answered as GET_ACCESS (HOLD_RESP carries a GetAccessResp payload).
+struct HoldReq {
+  Handle handle;
+  uint32_t holderLen;
+  uint32_t instanceLen;
+};
+
+/// The handle proves the caller was given the region, as for HOLD_REQ.
+struct UnholdReq {
+  Handle handle;
+  uint32_t holderLen;
+  uint32_t instanceLen;
+};
+
+struct UnholdResp {
+  int32_t status;
+};
+
+/// Drop every hold of the holder made by another instance. It carries no
+/// handle: the RM trusts its network for it, as for ALLOC_REQ.
+struct ResetHoldsReq {
+  uint32_t holderLen;
+  uint32_t instanceLen;
+};
+
+struct ResetHoldsResp {
+  int32_t status;
+  uint32_t dropped;
+};
+
 struct StatsRespHeader {
   uint32_t numPools;
 };
@@ -86,6 +128,11 @@ static_assert(sizeof(FreeReq) == 32, "FreeReq must be 32 bytes (Handle)");
 static_assert(sizeof(FreeResp) == 4, "FreeResp must be 4 bytes");
 static_assert(sizeof(GetAccessReq) == 32, "GetAccessReq must be 32 bytes (Handle)");
 static_assert(sizeof(GetAccessResp) == 8, "GetAccessResp must be 8 bytes (fixed part)");
+static_assert(sizeof(HoldReq) == 40, "HoldReq must be 40 bytes (fixed part)");
+static_assert(sizeof(UnholdReq) == 40, "UnholdReq must be 40 bytes (fixed part)");
+static_assert(sizeof(UnholdResp) == 4, "UnholdResp must be 4 bytes");
+static_assert(sizeof(ResetHoldsReq) == 8, "ResetHoldsReq must be 8 bytes (fixed part)");
+static_assert(sizeof(ResetHoldsResp) == 8, "ResetHoldsResp must be 8 bytes");
 static_assert(sizeof(StatsRespHeader) == 4, "StatsRespHeader must be 4 bytes");
 static_assert(sizeof(ErrorResp) == 8, "ErrorResp must be 8 bytes");
 

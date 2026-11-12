@@ -1,0 +1,30 @@
+%%{init: {"theme":"base", "themeVariables":{"fontFamily":"Arial, sans-serif","fontSize":"20px"}, "flowchart":{"nodeSpacing":26,"rankSpacing":38,"wrappingWidth":225}}}%%
+flowchart TB
+  subgraph W["One worker: pool clients share one data path, staging buffer and NIXL agent"]
+    direction TB
+    subgraph PY["Python loader: active transfers only"]
+      direction LR
+      Q["Query status"] --> N["NativeNixlAgent<br/>Public C++ status API<br/>Also progresses UCX"]
+      N -->|"DONE"| D["Transfer complete"]
+      N -->|"In progress"| S["Pause 200 µs"]
+      S --> Q
+    end
+    subgraph CPP["Worker progress ON: independent NIXL C++ thread"]
+      direction LR
+      P["Progress UCX"] --> A{"arm"}
+      A -->|"Work pending"| P
+      A -->|"Wait ready"| E["UCX event FD / poll<br/>1 ms timeout setting<br/>NIC event wakes early"]
+      E -->|"Event or timeout"| P
+    end
+    PY ~~~ CPP
+  end
+  M["Memory agent: background progress OFF<br/>Bounded ConnectProgress during connection"]
+  W ~~~ M
+  classDef api fill:#e8eef9,stroke:#6b85b5,color:#17345c;
+  classDef run fill:#e2f0ed,stroke:#3f7b6d,color:#163b31;
+  classDef wait fill:#fff0d9,stroke:#a27626,color:#332b1d;
+  classDef note fill:#f5f6f8,stroke:#cbd5e1,color:#526071,font-size:16px;
+  class Q,N api;
+  class D,P,A run;
+  class S,E wait;
+  class M note;
