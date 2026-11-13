@@ -160,7 +160,7 @@ pre-commit install
 Then run the unit tests (these need neither a CXL device nor a running service):
 
 ```bash
-pytest -m "not integration" --ignore=tests/sglang
+pytest -m "not integration"
 ```
 
 To reproduce the lint job exactly, run the hooks against the whole tree. This

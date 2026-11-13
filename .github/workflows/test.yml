@@ -104,7 +104,6 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           pytest -m "not integration" \
-            --ignore=tests/sglang \
             --cov=maru_handler \
             --cov=maru_server \
             --cov=maru_common \
