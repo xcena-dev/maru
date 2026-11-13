@@ -31,7 +31,7 @@ from maru_vllm.connector import (
     _cpu_engine_config,
     _create_maru_handler,
 )
-from maru_vllm.kv_groups import describe_kv_groups, group_object_key
+from maru_vllm.kv_groups import describe_kv_groups
 from tests.unit.test_vllm_cpu_config import engine_config
 from tests.unit.test_vllm_cpu_config import extra as cpu_extra
 from tests.unit.test_vllm_kv_groups import (
@@ -40,6 +40,7 @@ from tests.unit.test_vllm_kv_groups import (
     FAILED_PARKED,
     QWEN_BLOCKS,
     TINY_BLOCK,
+    _gkey,
     _HeldExecutor,
     _load_meta,
     _reported_failures,
@@ -546,7 +547,7 @@ def test_a_group_load_reads_what_staging_holds_and_releases_it(slots):
 def test_a_missing_group_object_fails_the_parked_load_and_frees_its_slots():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
-    del store[group_object_key(k1, 2, TINY_BLOCK)]
+    del store[_gkey(tiny_config(), k1, 2, TINY_BLOCK)]
     worker, target = session_group_worker(SessionServer(store), 64)
     meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
     worker.start_load_kv(_FORWARD, meta)

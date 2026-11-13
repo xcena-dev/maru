@@ -18,14 +18,17 @@ a Mamba group keeps only the state at the chunk's last block. An MLA group
 (DeepSeek-V4.1's compressed KV and indexer keys) keeps the chunk's blocks,
 copied block by block in the layout vLLM gives them. A group vLLM does not
 prefix-cache is not stored. A model with one group keeps the bare chunk key;
-with several, each object is keyed ``<chunk key>_c<chunk tokens>_g<group id>``
-(see :func:`group_object_key`).
+with several, each object is keyed
+``<chunk key>_c<chunk tokens>_g<group id>_l<layer names digest>`` (see
+:func:`group_object_key`).
 """
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -133,7 +136,7 @@ class KVGroup:
             chunk_key: The chunk's key, with this rank's slice suffix.
             chunk_tokens: Tokens per Maru chunk.
         """
-        key = group_object_key(chunk_key, self.group_id, chunk_tokens)
+        key = group_object_key(chunk_key, self.group_id, chunk_tokens, self.layer_names)
         return f"{key}_b{self.block_size}" if self.kind == GROUP_MLA else key
 
     def object_bytes(self, chunk_tokens: int) -> int:
@@ -278,7 +281,23 @@ def _group_label(group: KVGroup) -> str:
     return group.spec_name
 
 
-def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
+@functools.lru_cache(maxsize=256)
+def layer_names_digest(layer_names: tuple[str, ...]) -> str:
+    """Hex digest of a group's layer names, in vLLM's order.
+
+    vLLM numbers groups by position, and another configuration of the same
+    model can deal other layers into the group of the same id, in objects of
+    the same size: DSpark's draft layers make vLLM split DeepSeek-V4.1's
+    sliding windows into one more group. The order also fixes where each
+    layer's bytes lie in a block, since vLLM lays a group's layers out from
+    this list and their specs.
+    """
+    return hashlib.blake2b("\n".join(layer_names).encode(), digest_size=8).hexdigest()
+
+
+def group_object_key(
+    chunk_key: str, group_id: int, chunk_tokens: int, layer_names: Sequence[str]
+) -> str:
     """Key of the (chunk, group) object for a model with several groups.
 
     A chunk key hashes the tokens from the prompt's start to the chunk's
@@ -286,9 +305,11 @@ def group_object_key(chunk_key: str, group_id: int, chunk_tokens: int) -> str:
     does. It varies between engines: with a Mamba group a chunk is one vLLM
     block, sized from the per-rank Mamba state and attention page, so
     Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token ones at TP=4,
-    where rank 0 holds the same KV head and names it alike.
+    where rank 0 holds the same KV head and names it alike. The key also
+    names the group's layers (:func:`layer_names_digest`).
     """
-    return f"{chunk_key}_c{chunk_tokens}_g{group_id}"
+    layers = layer_names_digest(tuple(layer_names))
+    return f"{chunk_key}_c{chunk_tokens}_g{group_id}_l{layers}"
 
 
 def window_chunks(group: KVGroup, end: int, chunk_tokens: int) -> range:
@@ -352,6 +373,33 @@ def hit_chunks(
         if all(resumable(k, g) for g in groups):
             return k, prefix
     return 0, prefix
+
+
+@dataclass(frozen=True)
+class GroupAdmission:
+    """The blocks vLLM gives one request in one KV cache group.
+
+    vLLM allocates the blocks of every group, the groups Maru skips included,
+    from one block pool, so a parked load is admitted against their sum.
+
+    Attributes:
+        block_size: Tokens per block in the group.
+        cap: vLLM's per-request admission cap for a sliding-window group
+            (``max_admission_blocks_per_request``), None for no cap.
+        fixed: Blocks a request holds whatever its length, as a circular
+            buffer's one block; None otherwise.
+    """
+
+    block_size: int
+    cap: int | None = None
+    fixed: int | None = None
+
+    def blocks(self, tokens: int) -> int:
+        """Blocks a request of ``tokens`` tokens holds in this group."""
+        if self.fixed is not None:
+            return self.fixed
+        blocks = -(-tokens // self.block_size)
+        return blocks if self.cap is None else min(blocks, self.cap)
 
 
 def chunk_unit(groups: list[KVGroup], block_size: int) -> int:
@@ -419,7 +467,7 @@ def check_multi_group_support(
     *,
     block_size: int,
     use_layerwise: bool,
-    speculative: bool,
+    speculative_method: str | None,
     inline_loads: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
@@ -428,8 +476,12 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads, without speculative decoding; in layerwise
-    format only when every stored group is an MLA group (DeepSeek-V4.1).
+    group, with parked loads, without speculative decoding other than
+    DeepSeek-V4.1's DSpark; in layerwise format only when every stored group
+    is an MLA group (DeepSeek-V4.1). DSpark's draft layers keep sliding
+    windows like the target's and vLLM puts them in the target's window
+    groups, and the drafter writes a token's draft KV in the step that
+    computes the token, before the connector stores it.
     Every group uses vLLM's block size, but an MLA group may use another
     (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
     chunk then holds whole blocks of each (``chunk_unit``). Groups vLLM does
@@ -441,7 +493,8 @@ def check_multi_group_support(
         groups: The model's KV cache groups.
         block_size: ``cache_config.block_size``, which the connector uses.
         use_layerwise: ``maru_use_layerwise``.
-        speculative: Whether speculative decoding is configured.
+        speculative_method: The speculative decoding method configured, or
+            None without speculative decoding.
         inline_loads: Whether loads run inline (``maru_async_load`` set to
             false; ``MaruKVConnector`` turns it on for several groups unless
             set).
@@ -485,10 +538,12 @@ def check_multi_group_support(
             "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
             f"maru_use_layerwise=false{one_group_hint(groups)}"
         )
-    if speculative:
+    if speculative_method is not None and speculative_method != "dspark":
         raise ValueError(
-            "MaruKVConnector does not support speculative decoding with models "
-            f"that have several KV cache groups{one_group_hint(groups)}"
+            f"MaruKVConnector does not support speculative decoding method "
+            f"{speculative_method!r} with models that have several KV cache "
+            "groups; it supports only 'dspark' on DeepSeek-V4.1-Flash"
+            f"{one_group_hint(groups)}"
         )
     kinds = {g.kind for g in stored}
     if {GROUP_MAMBA, GROUP_MLA} <= kinds:

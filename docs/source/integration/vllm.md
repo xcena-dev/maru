@@ -454,7 +454,12 @@ or EAGLE decoding), Maru retains its budget: the upstream reservation counts
 prompt tails but can leave too little room for the oldest request's lookahead.
 Methods without lookahead slots, such as ngram, use the ordinary version rule.
 vLLM 0.31+ reserves the draft slots of every speculative method itself, so a
-load Maru admits can still wait for vLLM's own reservation.
+load Maru admits can still wait for vLLM's own reservation. With several KV
+cache groups, the budget counts a request's blocks in every group, the groups
+Maru does not store included, because vLLM allocates them all from one pool: a
+block per `block_size` tokens in a full-attention or MLA group, at most vLLM's
+per-request admission cap in a sliding-window group, and one block in a
+circular buffer.
 
 This budget counts GPU blocks; `maru_load_admission_window` below counts loads
 in flight.
@@ -622,15 +627,18 @@ Chunk keys therefore name a slice by what it holds:
 |---|---|---|
 | Every KV head: TP=1, or an MLA latent that each rank holds in full | `kv_<hash>` | Unchanged from earlier releases |
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
-| Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0` on rank 0 |
+| Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>_l<layers>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0_l<layers>` on rank 0 |
 
 The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
 slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
-appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by
+appends `_c<chunk_tokens>_g<group_id>_l<layers>`, followed for an MLA group by
 `_b<block_size>`, since its objects keep vLLM's block layout (see
-{ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full
-or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
-`kv_<hash>_h0-1_c544_g3` on rank 0.
+{ref}`vllm-deepseek-v41`). `<layers>` is a 16-digit hex hash of the group's
+layer names in vLLM's order: vLLM numbers groups by position, and another
+configuration of the same model can put other layers in the group of the same
+number, as DSpark speculative decoding does on DeepSeek-V4.1-Flash. It names
+the KV heads of each attention group, full or sliding window, as above:
+Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_c544_g3_l<layers>` on rank 0.
 
 Ranks that hold identical KV share one slice name: the MLA latent, and the
 heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
@@ -726,7 +734,7 @@ backends still require TP=1.
 (vllm-hybrid-models)=
 ## Hybrid models
 
-vLLM puts layers that keep different kinds of KV cache into separate KV cache groups, for example sliding-window and full-attention layers, or Gated DeltaNet (Mamba-type) and full-attention layers. On vLLM 0.30+ the connector stores each group's part of a chunk as its own CXL object, keyed `<chunk_key>_c<chunk_tokens>_g<group_id>`, and reports a hit only for chunks that every group can resume from. A model with one group is stored as before.
+vLLM puts layers that keep different kinds of KV cache into separate KV cache groups, for example sliding-window and full-attention layers, or Gated DeltaNet (Mamba-type) and full-attention layers. On vLLM 0.30+ the connector stores each group's part of a chunk as its own CXL object, keyed `<chunk_key>_c<chunk_tokens>_g<group_id>_l<layers>` (see {ref}`vllm-tensor-parallelism` for `<layers>`), and reports a hit only for chunks that every group can resume from. A model with one group is stored as before.
 
 The key names the chunk length because a chunk key hashes the prompt only up to the chunk's end. With a Mamba-type group a chunk is one vLLM block, and vLLM sizes that block from the per-rank state and attention page, so engines with different TP sizes (or KV cache dtypes) can use different chunks: Qwen3.5-0.8B has 544-token chunks at TP=2 and 272-token chunks at TP=4. Their objects for the same prompt prefix then get different keys, and neither engine loads the other's.
 
@@ -738,7 +746,7 @@ The connector refuses to start a model with several groups unless:
 
 - `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1.
 - `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
-- Speculative decoding is off.
+- Speculative decoding is off, except DSpark (`"method": "dspark"`) on DeepSeek-V4.1-Flash (see {ref}`vllm-deepseek-v41`).
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
@@ -781,7 +789,7 @@ vLLM splits the model's KV cache into several groups, how many depending on the 
 - **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
 - **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
 
-Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding, which runs the DSpark draft layers in the model's checkpoint, is not supported yet, as for any model with several groups.
+Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding works with the DSpark draft layers in the model's checkpoint (`--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`; vLLM 0.33.0 does not start without `num_speculative_tokens`); the connector refuses every other method. Each draft layer keeps a sliding window like the target's, and vLLM deals the draft windows into the target's sliding-window groups, splitting the windows into one more group, so Maru skips or stores them with the target's windows. Because the groups then hold other layers, objects stored with DSpark off are not found with it on, and the other way around.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \

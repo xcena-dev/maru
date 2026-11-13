@@ -59,6 +59,7 @@ from maru_vllm.kv_groups import (
     GROUP_MLA,
     GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
+    GroupAdmission,
     GroupCache,
     KVGroup,
     check_multi_group_support,
@@ -997,6 +998,18 @@ def _vllm_version_at_least(minimum: str) -> bool:
         return False
 
 
+def _speculative_method(vllm_config: VllmConfig) -> str | None:
+    """The speculative decoding method vLLM runs, or None without one.
+
+    A config that names no method reads as an unknown one, so the support
+    checks refuse it rather than take it for no speculative decoding.
+    """
+    spec = vllm_config.speculative_config
+    if spec is None:
+        return None
+    return str(getattr(spec, "method", None) or "unknown")
+
+
 def _scheduler_lookahead_tokens(vllm_config: VllmConfig) -> int:
     """Read vLLM's slot margin, with the pre-property scheduler rules as fallback."""
     lookahead = getattr(vllm_config, "num_lookahead_tokens", None)
@@ -1028,6 +1041,38 @@ def _async_load_budget(
         else vllm_config.cache_config.num_gpu_blocks
     )
     return total - 1 if total else None  # vLLM sets one null block aside.
+
+
+def _group_admission(
+    kv_cache_config: KVCacheConfig, vllm_config: VllmConfig
+) -> tuple[GroupAdmission, ...]:
+    """The blocks vLLM gives one request in each KV cache group.
+
+    A full-attention or MLA group holds a block per ``block_size`` tokens; a
+    sliding-window group at most vLLM's per-request admission cap, the
+    window plus the tokens in flight; a circular buffer one block.
+    """
+    max_model_len = vllm_config.model_config.max_model_len
+    in_flight = getattr(vllm_config, "max_in_flight_tokens", None)
+    admission = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        members = getattr(spec, "kv_cache_specs", None)
+        if isinstance(members, dict) and members:
+            spec = next(iter(members.values()))
+        if type(spec).__name__ == "CircularBufferSpec":
+            admission.append(GroupAdmission(int(spec.block_size), fixed=1))
+            continue
+        cap = getattr(spec, "max_admission_blocks_per_request", None)
+        admission.append(
+            GroupAdmission(
+                int(spec.block_size),
+                cap=int(cap(in_flight, max_model_len))
+                if cap is not None and in_flight
+                else None,
+            )
+        )
+    return tuple(admission)
 
 
 def _uncacheable_request(request: Any) -> str | None:
@@ -1241,9 +1286,9 @@ class _SlabTarget:
 
     A single-group model stores every layer under the chunk key. With
     several KV cache groups each attention group is its own target, keyed
-    ``<chunk key>_c<chunk tokens>_g<group id>`` and reading that group's
-    block ids. Either way the chunk key names the slice this rank holds
-    (``MaruWorkerConnector._slice_chunk_keys``).
+    ``<chunk key>_c<chunk tokens>_g<group id>_l<layer names digest>`` and
+    reading that group's block ids. Either way the chunk key names the slice
+    this rank holds (``MaruWorkerConnector._slice_chunk_keys``).
 
     Attributes:
         num_layers: Layers in the slab.
@@ -1663,7 +1708,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_groups,
                 block_size=self._block_size,
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
-                speculative=vllm_config.speculative_config is not None,
+                speculative_method=_speculative_method(vllm_config),
                 inline_loads=not _get_knob(extra, "maru_async_load"),
             )
 
@@ -1713,6 +1758,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 num_lookahead_tokens=lookahead,
                 max_model_len=vllm_config.model_config.max_model_len,
                 kv_groups=self._kv_groups,
+                group_admission=(
+                    _group_admission(kv_cache_config, vllm_config)
+                    if kv_cache_config is not None and len(self._kv_groups) > 1
+                    else ()
+                ),
                 shard_suffixes=[
                     shard.suffix
                     for shard in (
@@ -2103,6 +2153,7 @@ class MaruSchedulerConnector:
         kv_groups: list[KVGroup] | None = None,
         shard_suffixes: Sequence[str] = ("",),
         state_suffixes: Sequence[str] = ("",),
+        group_admission: Sequence[GroupAdmission] = (),
         dp_rank: int = 0,
     ):
         self._block_size = block_size
@@ -2118,6 +2169,9 @@ class MaruSchedulerConnector:
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
         self._max_model_len = max_model_len
+        # With several KV cache groups, the blocks one request takes in each
+        # (_resume_blocks); empty for one group.
+        self._group_admission = tuple(group_admission)
         self._bypass_requests: set[str] = set()
         # Key suffix of every distinct KV slice the engine's workers hold
         # (one "" at TP=1). Each worker stores only its own slice, so a chunk
@@ -2765,13 +2819,19 @@ class MaruSchedulerConnector:
         return False
 
     def _resume_blocks(self, request: Request) -> int:
-        """Prompt plus resume lookahead, capped as in vLLM's slot allocation."""
+        """Prompt plus resume lookahead, capped as in vLLM's slot allocation.
+
+        With several KV cache groups, the sum over every group, since vLLM
+        allocates them all from one block pool (``GroupAdmission``).
+        """
         tokens = getattr(request, "num_tokens", None)
         if tokens is None:
             tokens = len(request.prompt_token_ids or ())
         tokens = int(tokens) + self._num_lookahead_tokens
         if self._max_model_len is not None:
             tokens = min(tokens, self._max_model_len)
+        if self._group_admission:
+            return sum(group.blocks(tokens) for group in self._group_admission)
         return -(-tokens // self._block_size)
 
     def _group_block_ids(
