@@ -449,6 +449,85 @@ def test_tp1_worker_is_unchanged(monkeypatch):
     assert worker._extra_config["maru_instance_id"] == "inst1"
 
 
+@pytest.mark.parametrize(("tp_size", "rank"), [(1, 0), (2, 1)])
+def test_worker_trace_lines_end_with_the_tp_rank(monkeypatch, capsys, tp_size, rank):
+    """Every rank loads its own slice of a request and writes its own
+    maru_log_timing lines for it, so the worker's lines end with ``rank``,
+    after the fields they had before."""
+    monkeypatch.setattr(connector_module, "_tp_rank", lambda: rank)
+    connector = MaruKVConnector(
+        fake_vllm_config(tp_size, 8, extra={"maru_log_timing": True}),
+        KVConnectorRole.WORKER,
+    )
+    worker = connector._worker
+    poller = worker._trace_poller
+    poller._clock = SimpleNamespace(to_mono=lambda event: 1.0, error_ms=0.0)
+    landed = MagicMock()
+    landed.query.return_value = True
+    landed.elapsed_time.return_value = 1.0
+    poller.add_load("r1", landed, landed, landed, 1024, NUM_LAYERS)
+    poller.add_step(1, 0.0, landed, landed, [])
+    worker._deferred_done.add("r1")
+
+    poller.poll()
+    assert worker.get_finished_loading() == {"r1"}
+
+    keys = {}
+    for line in capsys.readouterr().err.splitlines():
+        if not line.startswith(("GPU-LOAD-QOS", "STEP-GPU", "REQ-TRACE")):
+            continue
+        tag, *fields = line.split()
+        if tag == "REQ-TRACE":
+            tag = f"{tag} {fields.pop(0)}"
+        keys[tag] = [field.split("=", 1)[0] for field in fields]
+        assert fields[-1] == f"rank={rank}", line
+    assert keys == {
+        "GPU-LOAD-QOS": [
+            "bytes",
+            "dur_ms",
+            "GBps",
+            "req",
+            "gate_layer",
+            "hold_ms",
+            "gate_mono",
+            "end_mono",
+            "start_mono",
+            "attempt",
+            "tp_size",
+            "req_encoding",
+            "clock_error_ms",
+            "scope",
+            "dp_rank",
+            "rank",
+        ],
+        "STEP-GPU": [
+            "wstep",
+            "mono",
+            "fwd_ms",
+            "layer_wait_ms",
+            "waits",
+            "end_mono",
+            "step",
+            "start_mono",
+            "clock_error_ms",
+            "dp_rank",
+            "rank",
+        ],
+        "REQ-TRACE recv_reported": [
+            "req",
+            "mono",
+            "wall",
+            "req_encoding",
+            "batch",
+            "success",
+            "attempt",
+            "tp_size",
+            "dp_rank",
+            "rank",
+        ],
+    }
+
+
 def test_attention_free_model_is_refused_under_tp():
     """vLLM reports 0 KV heads for an attention-free model such as Mamba."""
     with pytest.raises(ValueError, match="attention-free"):
