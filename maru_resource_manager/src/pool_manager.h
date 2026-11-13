@@ -125,10 +125,14 @@ public:
     void reapExpired(uint64_t &reapedCount);
     int checkpoint();
 
-    /// Notify that a client has disconnected. Starts the grace period timer.
+    /// Notify that a connection bound itself to this client_id (its first
+    /// request that names one). Cancels the grace period timer.
+    void clientConnected(const std::string &clientId);
+    /// Notify that a connection bound to this client_id closed. The grace
+    /// period timer starts only when it was the client's last one: a process
+    /// shares one client_id across its connections, and it is still there
+    /// while any of them is open.
     void clientDisconnected(const std::string &clientId);
-    /// Notify that a client has reconnected. Cancels the grace period timer.
-    void clientReconnected(const std::string &clientId);
 
     /// maru-rm-ctl commands. Each returns 0 or -errno and fills `out` with
     /// key=value lines, or with the reason on failure.
@@ -318,8 +322,11 @@ private:
     // client_id allocation refcount for O(1) reaper cleanup
     std::map<std::string, uint32_t> clientAllocCounts_;
 
-    // Disconnected remote clients pending reap after grace period.
-    // Maps client_id -> time of disconnection.
+    // Open connections per client_id (in-memory only). A client is
+    // disconnected once this reaches zero, not when any one of them closes.
+    std::map<std::string, uint32_t> clientConnections_;
+    // Disconnected clients pending reap after grace period.
+    // Maps client_id -> time its last connection closed.
     std::map<std::string, SteadyClock::time_point> disconnectedClients_;
     // Expired clients whose free could not be logged; retried every pass.
     std::set<std::string> reapRetries_;

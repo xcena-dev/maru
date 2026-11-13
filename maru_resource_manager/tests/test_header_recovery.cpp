@@ -942,6 +942,49 @@ TEST_F(HeaderRecoveryTest, ReaperRetriesFreeAfterWalFailure) {
     EXPECT_EQ(pm.allocationCount(), 1u);
 }
 
+// A process shares one client_id across its connections. Closing one of them
+// must not start the grace period while another is open (#114).
+TEST_F(HeaderRecoveryTest, ReaperWaitsForLastConnectionOfClient) {
+    addDevice(0);
+    PoolManager pm(state, 0);
+    ASSERT_EQ(pm.loadPools(), 0);
+    const std::string client = "offline-test-owner";
+    Handle h{};
+    ASSERT_EQ(allocate(pm, h), 0);
+    uint64_t reaped = 0;
+
+    pm.clientConnected(client);
+    pm.clientConnected(client);
+    pm.clientDisconnected(client);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 0u);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+
+    // A reconnect whose old connection closes after the new one bound.
+    pm.clientConnected(client);
+    pm.clientDisconnected(client);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 0u);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+
+    // The last one closing starts the grace period (0 s here).
+    pm.clientDisconnected(client);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 1u);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+
+    // A connection bound after the last one closed cancels the grace period,
+    // and the count starts over with it.
+    ASSERT_EQ(allocate(pm, h), 0);
+    pm.clientDisconnected(client);
+    pm.clientConnected(client);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 0u);
+    pm.clientDisconnected(client);
+    pm.reapExpired(reaped);
+    EXPECT_EQ(reaped, 1u);
+}
+
 TEST_F(HeaderRecoveryTest, RefusedRescanPreservesLivePool) {
     addDevice(0);
     PoolManager pm(state);

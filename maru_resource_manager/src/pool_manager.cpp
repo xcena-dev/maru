@@ -1250,23 +1250,11 @@ int PoolManager::checkpoint()
     return checkpointLocked();
 }
 
-void PoolManager::clientDisconnected(const std::string &clientId)
+void PoolManager::clientConnected(const std::string &clientId)
 {
     if (clientId.empty()) return;
     std::lock_guard<std::mutex> lock(mu_);
-    // Only track if this client actually has allocations
-    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
-    {
-        disconnectedClients_[clientId] = SteadyClock::now();
-        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
-             clientId.c_str(), gracePeriodSec_);
-    }
-}
-
-void PoolManager::clientReconnected(const std::string &clientId)
-{
-    if (clientId.empty()) return;
-    std::lock_guard<std::mutex> lock(mu_);
+    ++clientConnections_[clientId];
     reapRetries_.erase(clientId);
     auto it = disconnectedClients_.find(clientId);
     if (it != disconnectedClients_.end())
@@ -1274,6 +1262,34 @@ void PoolManager::clientReconnected(const std::string &clientId)
         disconnectedClients_.erase(it);
         logf(LogLevel::Debug, "client reconnected: %s (grace period cancelled)",
              clientId.c_str());
+    }
+}
+
+void PoolManager::clientDisconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Every connection of a process carries the same client_id (hostname:pid),
+    // so one of them closing says nothing while another is open: the process
+    // is running and may be using its regions through that one.
+    auto conn = clientConnections_.find(clientId);
+    if (conn != clientConnections_.end())
+    {
+        if (conn->second > 1)
+        {
+            --conn->second;
+            logf(LogLevel::Debug, "client %s closed a connection (%u still open)",
+                 clientId.c_str(), conn->second);
+            return;
+        }
+        clientConnections_.erase(conn);
+    }
+    // Only track if this client actually has allocations
+    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
+    {
+        disconnectedClients_[clientId] = SteadyClock::now();
+        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
+             clientId.c_str(), gracePeriodSec_);
     }
 }
 
