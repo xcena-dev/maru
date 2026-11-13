@@ -149,7 +149,7 @@ To defend against **PID reuse**, the server caches each client's process start t
 
 Allocations of a pool that is not served (absent, refused or excluded device) are reclaimed only when a local owner is gone; the grace period below does not apply to them, because a remote owner cut off by the network may still be running.
 
-For **remote clients** (different hostname), the server monitors TCP connection state. When a remote client disconnects, a grace period begins (configurable via `--grace-period`, default 30 seconds). If the client reconnects within the grace period, the timer is cancelled and allocations are preserved. If not, its allocations are reclaimed.
+For **remote clients** (different hostname), the server monitors TCP connection state. A process shares one `client_id` across its connections, so a client counts as disconnected only once the last connection that named its `client_id` has closed. A grace period then begins (configurable via `--grace-period`, default 30 seconds). If the client reconnects within the grace period, the timer is cancelled and allocations are preserved. If not, its allocations are reclaimed.
 
 Local vs. remote is determined by comparing the client's hostname (from `client_id`) against the server's hostname. TCP keepalive (idle 10s, interval 5s, count 3) detects dead connections in ~25 seconds, after which the grace period starts — so a crashed remote client's allocations are reclaimed after ~55 seconds total.
 

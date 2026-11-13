@@ -379,8 +379,9 @@ bool TcpServer::trackClientId(int fd, const std::string &clientId) {
     std::lock_guard<std::mutex> lk(fdClientMutex_);
     auto [it, inserted] = fdClientMap_.emplace(fd, clientId);
     if (inserted) {
-        // First request on this connection — record and cancel any pending grace period
-        pm_.clientReconnected(clientId);
+        // First request on this connection — count it for the client and
+        // cancel any pending grace period
+        pm_.clientConnected(clientId);
         return true;
     }
     // Connection already has a pinned client_id — reject if different
