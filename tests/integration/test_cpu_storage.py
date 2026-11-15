@@ -113,9 +113,9 @@ def test_cpu_handler_without_rm_or_dax(cpu_server, async_rpc, monkeypatch):
 
 
 @pytest.mark.parametrize("async_rpc", [False, True])
-def test_concurrent_engines_on_the_server_worker_pool(cpu_server, async_rpc):
-    """maru-server handles requests on several worker threads: engines
-    storing, probing and reading at once each see exactly their own KV."""
+def test_concurrent_engines_each_see_their_own_kv(cpu_server, async_rpc):
+    """Engines storing, probing and reading at once against the real
+    maru-server each see exactly their own KV."""
     engines, keys = 8, 32
     barrier = threading.Barrier(engines)
     errors: list[BaseException] = []

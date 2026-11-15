@@ -12,14 +12,6 @@ from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager
 from .kv_manager import DeleteResult, KVManager
-from .ms_service import (
-    DEFAULT_NODE_GIVE_UP_S,
-    DEFAULT_SESSION_TTL_S,
-    MsService,
-    PolicyError,
-    load_policy,
-)
-from .op_ledger import DEFAULT_OP_BYTES_MAX, DEFAULT_OP_WINDOW
 from .stats_manager import StatsManager
 
 logger = logging.getLogger(__name__)
@@ -43,12 +35,6 @@ class MaruServer:
         cpu_session_ttl: float = 30,
         remote_cxl_agents: list[str] | None = None,
         remote_cxl_agent_key: bytes | None = None,
-        session_ttl_s: float = DEFAULT_SESSION_TTL_S,
-        heartbeat_s: float | None = None,
-        node_give_up_s: float = DEFAULT_NODE_GIVE_UP_S,
-        op_window: int = DEFAULT_OP_WINDOW,
-        op_bytes_max: int = DEFAULT_OP_BYTES_MAX,
-        policy_file: str | None = None,
     ):
         self._rm_address = rm_address or "127.0.0.1:9850"
         # Remote CXL agents of the pool's memory nodes, handed to remote CXL workers in
@@ -71,16 +57,6 @@ class MaruServer:
             release_cxl=self._release_storage_region if enable_cxl else None,
             largest_cxl_pool=self._largest_storage_pool if enable_cxl else None,
         )
-        # multi-storage; one server_epoch per MaruServer run
-        self.ms_service = MsService(
-            server_epoch=self.replica_directory.server_epoch,
-            session_ttl_s=session_ttl_s,
-            heartbeat_s=heartbeat_s,
-            node_give_up_s=node_give_up_s,
-            op_window=op_window,
-            op_bytes_max=op_bytes_max,
-            policy_file=policy_file,
-        )
         self._region_keeper = None
         if enable_cxl and self._remote_cxl_agents:
             from .region_keeper import RegionKeeper
@@ -89,9 +65,9 @@ class MaruServer:
                 self.replica_directory, self._remote_cxl_agents, remote_cxl_agent_key
             )
             self._region_keeper.start()
-        # TODO (legacy KVManager path only): a PinMonitor that force-unpins
-        # entries past a TTL, against pin leaks from crashed clients. The
-        # multi-storage pins (MsService) never expire by time.
+        # TODO: Add PinMonitor daemon thread when eviction is implemented.
+        # Periodically force-unpin entries that exceed a TTL to prevent
+        # pin leaks from crashed clients.
 
         if self._dax_paths:
             self._validate_dax_paths()
@@ -489,7 +465,6 @@ class MaruServer:
 
     def close(self) -> None:
         """Shutdown the server and release resources."""
-        self.ms_service.stop()
         if self._region_keeper is not None:
             self._region_keeper.stop()
         self._stats_manager.close()
@@ -515,7 +490,7 @@ def setup_logging(level: str) -> None:
 def main() -> None:
     """Main entry point for the server."""
     # Import here to avoid circular import
-    from .rpc_async_server import RpcAsyncServer
+    from .rpc_server import RpcServer
 
     parser = argparse.ArgumentParser(
         description="MaruServer - Central metadata server for Maru shared memory KV cache"
@@ -586,89 +561,7 @@ def main() -> None:
             f"{DEFAULT_COPY_FILE}); used with --remote-cxl-agent"
         ),
     )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help=(
-            "RPC worker threads in each lane: legacy requests and multi-storage "
-            "requests are served by separate threads (default: 4)"
-        ),
-    )
-    parser.add_argument(
-        "--session-ttl-s",
-        type=float,
-        default=DEFAULT_SESSION_TTL_S,
-        help=(
-            "Multi-storage node and worker session TTL in seconds; pins do not "
-            f"expire with it (default: {DEFAULT_SESSION_TTL_S:g})"
-        ),
-    )
-    parser.add_argument(
-        "--heartbeat-s",
-        type=float,
-        default=None,
-        help=(
-            "Heartbeat interval given to multi-storage nodes and workers "
-            "(default: session TTL / 3)"
-        ),
-    )
-    parser.add_argument(
-        "--node-give-up-s",
-        type=float,
-        default=DEFAULT_NODE_GIVE_UP_S,
-        help=(
-            "Seconds an expired StorageService may stay away before its "
-            f"locations are removed (default: {DEFAULT_NODE_GIVE_UP_S:g})"
-        ),
-    )
-    parser.add_argument(
-        "--op-window",
-        type=int,
-        default=DEFAULT_OP_WINDOW,
-        help=(
-            "Unacknowledged op results kept per origin; more get BUSY "
-            f"(default: {DEFAULT_OP_WINDOW})"
-        ),
-    )
-    parser.add_argument(
-        "--op-bytes-max",
-        type=int,
-        default=DEFAULT_OP_BYTES_MAX,
-        help=(
-            "Bytes of unacknowledged op results kept per origin; more get BUSY "
-            f"(default: {DEFAULT_OP_BYTES_MAX})"
-        ),
-    )
-    parser.add_argument(
-        "--policy-file",
-        default=None,
-        help=(
-            'Multi-storage policy JSON, e.g. {"preserve": [{"namespace": "ns", '
-            '"key": "k"}]}; reloaded when it changes'
-        ),
-    )
     args = parser.parse_args()
-    if args.policy_file is not None:
-        try:
-            load_policy(args.policy_file)
-        except PolicyError as exc:
-            parser.error(str(exc))
-    if args.op_bytes_max < 1:
-        parser.error("--op-bytes-max must be at least 1")
-    if args.workers < 1:
-        parser.error("--workers must be at least 1")
-    if not args.session_ttl_s > 0:
-        parser.error("--session-ttl-s must be positive")
-    heartbeat_s = (
-        args.session_ttl_s / 3 if args.heartbeat_s is None else args.heartbeat_s
-    )
-    if not 0 < heartbeat_s < args.session_ttl_s:
-        parser.error("--heartbeat-s must be positive and below --session-ttl-s")
-    if not args.node_give_up_s > 0:
-        parser.error("--node-give-up-s must be positive")
-    if args.op_window < 1:
-        parser.error("--op-window must be at least 1")
     if args.cpu_only and args.dax_paths:
         parser.error("--cpu-only cannot be combined with --dax-path")
     remote_cxl_agents = [
@@ -696,16 +589,8 @@ def main() -> None:
         cpu_capacity_limit=args.cpu_capacity_limit,
         remote_cxl_agents=remote_cxl_agents,
         remote_cxl_agent_key=remote_cxl_agent_key,
-        session_ttl_s=args.session_ttl_s,
-        heartbeat_s=heartbeat_s,
-        node_give_up_s=args.node_give_up_s,
-        op_window=args.op_window,
-        op_bytes_max=args.op_bytes_max,
-        policy_file=args.policy_file,
     )
-    rpc_server = RpcAsyncServer(
-        server, host=args.host, port=args.port, num_workers=args.workers
-    )
+    rpc_server = RpcServer(server, host=args.host, port=args.port)
 
     # Setup signal handlers
     def signal_handler(signum, frame):

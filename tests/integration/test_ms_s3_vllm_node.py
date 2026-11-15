@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """MaruKVConnector on maru_node against the real MaruServer.
 
-MaruServer runs as ``python -m maru_server --cpu-only`` and the StorageService
+MaruServer runs as ``python -m maru_server.node_server`` and the StorageService
 in-process; a scheduler (probe) and workers run in this process, as vLLM runs
 them at TP=1. CPU tensors only.
 """

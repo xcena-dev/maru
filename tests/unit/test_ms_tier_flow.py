@@ -21,8 +21,8 @@ from maru_common.config import MaruConfig
 from maru_common.protocol import MessageType
 from maru_common.storage_types import ItemResult, Key, Location, PoolKind
 from maru_handler import MaruHandler
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_storage_service import service as service_module
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.config_fields import TierSpec
@@ -171,9 +171,9 @@ def fake():
 
 @pytest.fixture
 def real_server():
-    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = _free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     wait_until(lambda: accepting(port), what="MaruServer listening")

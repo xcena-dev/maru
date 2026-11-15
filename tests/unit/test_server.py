@@ -44,7 +44,7 @@ class TestMain:
             patch("sys.argv", ["maru-server"]),
             patch("maru_server.server.setup_logging") as mock_setup,
             patch("maru_server.server.MaruServer") as mock_server_cls,
-            patch("maru_server.rpc_async_server.RpcAsyncServer") as mock_rpc_server_cls,
+            patch("maru_server.rpc_server.RpcServer") as mock_rpc_server_cls,
             patch("signal.signal") as mock_signal,
         ):
             mock_server_instance = MagicMock()
@@ -62,7 +62,7 @@ class TestMain:
 
             # Verify RPC server created with defaults
             mock_rpc_server_cls.assert_called_once_with(
-                mock_server_instance, host="127.0.0.1", port=5555, num_workers=4
+                mock_server_instance, host="127.0.0.1", port=5555
             )
 
             # Verify signal handlers registered
@@ -88,7 +88,7 @@ class TestMain:
             ),
             patch("maru_server.server.setup_logging") as mock_setup,
             patch("maru_server.server.MaruServer") as mock_server_cls,
-            patch("maru_server.rpc_async_server.RpcAsyncServer") as mock_rpc_server_cls,
+            patch("maru_server.rpc_server.RpcServer") as mock_rpc_server_cls,
             patch("signal.signal"),
         ):
             mock_server_instance = MagicMock()
@@ -103,7 +103,7 @@ class TestMain:
 
             # Verify custom host/port
             mock_rpc_server_cls.assert_called_once_with(
-                mock_server_instance, host="127.0.0.1", port=9999, num_workers=4
+                mock_server_instance, host="127.0.0.1", port=9999
             )
 
             mock_rpc.start.assert_called_once()
@@ -114,7 +114,7 @@ class TestMain:
             patch("sys.argv", ["maru-server"]),
             patch("maru_server.server.setup_logging"),
             patch("maru_server.server.MaruServer"),
-            patch("maru_server.rpc_async_server.RpcAsyncServer") as mock_rpc_server_cls,
+            patch("maru_server.rpc_server.RpcServer") as mock_rpc_server_cls,
             patch("signal.signal") as mock_signal,
         ):
             mock_rpc = MagicMock()
@@ -147,7 +147,7 @@ class TestMain:
             patch("sys.argv", ["maru-server"]),
             patch("maru_server.server.setup_logging"),
             patch("maru_server.server.MaruServer"),
-            patch("maru_server.rpc_async_server.RpcAsyncServer") as mock_rpc_server_cls,
+            patch("maru_server.rpc_server.RpcServer") as mock_rpc_server_cls,
             patch("signal.signal") as mock_signal,
         ):
             mock_rpc = MagicMock()
@@ -177,7 +177,7 @@ class TestMain:
             patch("sys.argv", ["maru-server"]),
             patch("maru_server.server.setup_logging"),
             patch("maru_server.server.MaruServer"),
-            patch("maru_server.rpc_async_server.RpcAsyncServer"),
+            patch("maru_server.rpc_server.RpcServer"),
             patch("signal.signal") as mock_signal,
         ):
             main()
@@ -194,7 +194,7 @@ class TestMain:
             patch("sys.argv", ["maru-server", "--port", "8080"]),
             patch("maru_server.server.setup_logging"),
             patch("maru_server.server.MaruServer") as mock_server_cls,
-            patch("maru_server.rpc_async_server.RpcAsyncServer") as mock_rpc_server_cls,
+            patch("maru_server.rpc_server.RpcServer") as mock_rpc_server_cls,
             patch("signal.signal"),
         ):
             mock_server_instance = MagicMock()
@@ -221,7 +221,7 @@ class TestMain:
             patch("sys.argv", ["maru-server"]),
             patch("maru_server.server.setup_logging", side_effect=track_setup_logging),
             patch("maru_server.server.MaruServer") as mock_server_cls,
-            patch("maru_server.rpc_async_server.RpcAsyncServer"),
+            patch("maru_server.rpc_server.RpcServer"),
             patch("signal.signal"),
         ):
 

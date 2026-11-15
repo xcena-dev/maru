@@ -15,6 +15,8 @@ import threading
 from enum import Enum
 from typing import Any
 
+from maru_common import gc_freeze
+
 from .config import NodeConfig, NodeConfigError, load_node_config
 
 EXIT_CONFIG = 2
@@ -134,6 +136,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
             node.stop()
 
     threading.Thread(target=stop_on_signal, name="maru-signal", daemon=True).start()
+    gc_freeze.start_freezer()
     previous = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
     }

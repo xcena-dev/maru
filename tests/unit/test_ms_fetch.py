@@ -43,8 +43,8 @@ from maru_common.storage_types import (
 from maru_handler import MaruHandler
 from maru_handler.client import pool_maps
 from maru_server.catalog import PoolState
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_storage_service.drivers.ssd_alignment import aligned_buffer
 from maru_storage_service.fetch_manager import CANCEL_MARKS, FLIGHT_WAITERS
 from maru_storage_service.pool_manager import PageState
@@ -82,9 +82,9 @@ def ssd_dir():
 
 @pytest.fixture
 def real_server():
-    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = _free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)

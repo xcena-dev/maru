@@ -50,7 +50,7 @@ from maru_common.storage_types import (
     make_generation,
 )
 from maru_server.ms_service import MsService
-from maru_server.rpc_handler_mixin import RpcHandlerMixin
+from maru_server.node_rpc import ms_handlers
 
 PAGE = 4096
 POOL_PAGES = 4096
@@ -75,18 +75,13 @@ def make_service(clock: FakeClock | None = None, **kwargs) -> MsService:
     )
 
 
-class _Dispatch(RpcHandlerMixin):
-    def __init__(self, service: MsService):
-        self._server = type("S", (), {"ms_service": service})()
-
-
 class Wire:
     """In-process transport through the serializer."""
 
     def __init__(self, service: MsService):
         self.service = service
         self.serializer = Serializer()
-        self.handlers = _Dispatch(service)._get_ms_handlers()
+        self.handlers = ms_handlers(service)
 
     def call(self, code: MessageType, request: Any) -> Any:
         frame = self.serializer.encode(code, request)

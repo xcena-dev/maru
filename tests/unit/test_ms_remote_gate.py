@@ -26,8 +26,8 @@ from maru_common.storage_types import (
     MissReason,
     PoolKind,
 )
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_storage_service.page_table import PageState
 from tests.unit.ms_node_helpers import PAGE, wait_until
 from tests.unit.ms_remote_helpers import NS, Gate, sentinel, state
@@ -39,9 +39,9 @@ from tests.unit.test_ms_remote_tier import free_port
 
 @pytest.fixture
 def ms():
-    server = MaruServer(enable_cxl=False, session_ttl_s=6, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6, heartbeat_s=0.3)
     port = free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     wait_until(

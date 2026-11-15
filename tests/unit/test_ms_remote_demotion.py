@@ -12,8 +12,8 @@ import pytest
 
 from maru_common.storage_types import Key, PoolKind
 from maru_server.catalog import PoolState
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.pool_manager import PageState
 from tests.unit.ms_node_helpers import (
@@ -41,9 +41,9 @@ def _fresh_agents():
 @pytest.fixture
 def ms():
     """A real MaruServer on a loopback port."""
-    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)

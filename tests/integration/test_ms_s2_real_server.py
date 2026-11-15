@@ -2,7 +2,7 @@
 # Copyright 2026 XCENA Inc.
 """StorageService scenarios against the real MaruServer (no RM needed).
 
-MaruServer runs as ``python -m maru_server --cpu-only``, the StorageService
+MaruServer runs as ``python -m maru_server.node_server``, the StorageService
 in-process (or as ``maru-storage``), workers as separate processes through
 MaruHandler(maru_node=...).
 """
@@ -56,7 +56,7 @@ def subprocess_env() -> dict:
 
 
 class RealMaruServer:
-    """``python -m maru_server --cpu-only`` in its own process, on a port it
+    """``python -m maru_server.node_server`` in its own process, on a port it
     is seen binding (a lost free_port() race starts again on another, unless
     ``port`` is given: a restart on the same port)."""
 
@@ -73,10 +73,10 @@ class RealMaruServer:
             chosen = port or free_port()
             self.url = f"tcp://127.0.0.1:{chosen}"
             self.log_path = os.path.join(
-                workdir, f"maru-server-{chosen}-{os.urandom(3).hex()}.log"
+                workdir, f"maru-node-server-{chosen}-{os.urandom(3).hex()}.log"
             )
             self._log = open(self.log_path, "wb")
-            args = [sys.executable, "-m", "maru_server", "--cpu-only"]
+            args = [sys.executable, "-m", "maru_server.node_server"]
             args += ["--host", "127.0.0.1", "--port", str(chosen), "--workers", "2"]
             args += ["--session-ttl-s", str(ttl_s), "--heartbeat-s", str(heartbeat_s)]
             if policy is not None:

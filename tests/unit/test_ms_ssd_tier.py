@@ -30,8 +30,8 @@ from maru_common.storage_types import (
 )
 from maru_handler.client import pool_maps
 from maru_server.catalog import PoolState
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.drivers.io_executor import IOQueueFullError
 from maru_storage_service.drivers.ssd import (
@@ -761,9 +761,9 @@ def _free_port() -> int:
 
 @pytest.fixture
 def real_server():
-    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = _free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)
@@ -835,9 +835,9 @@ def test_the_same_boot_adopts_the_file_and_a_reboot_empties_it(
 
 
 def _maru_server():
-    server = MaruServer(enable_cxl=False, session_ttl_s=6.0, heartbeat_s=0.3)
+    server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = _free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)

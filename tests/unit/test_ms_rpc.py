@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Multi-storage requests over real ZMQ round trips, on both RPC servers."""
+"""The node server's RPC: multi-storage requests over real ZMQ round trips,
+HANDSHAKE, refused storage-backend requests, the request queue and its
+workers."""
 
 import socket
 import struct
@@ -15,13 +17,15 @@ from maru_common.protocol import (
     HEADER_FORMAT,
     PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
+    HandshakeRequest,
     MessageType,
+    ProbeRequest,
     StorageRequest,
 )
+from maru_common.serializer import Serializer
 from maru_common.storage_types import Status
-from maru_server.rpc_async_server import RpcAsyncServer
-from maru_server.rpc_server import RpcServer
-from maru_server.server import MaruServer
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from tests.unit.ms_fakes import FakeNode, FakeWorker, RpcWire, admin_delete, key
 
 
@@ -31,23 +35,38 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(params=["async", "sync"])
-def served(request):
-    server = MaruServer(enable_cxl=False)
-    port = free_port()
-    if request.param == "async":
-        rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
-    else:
-        rpc = RpcServer(server, host="127.0.0.1", port=port)
-    thread = threading.Thread(target=rpc.start, daemon=True)
-    thread.start()
-    time.sleep(0.2)
-    wire = RpcWire(f"tcp://127.0.0.1:{port}", server.ms_service)
-    yield server, wire
-    wire.close()
-    rpc.stop()
-    thread.join(5)
-    server.close()
+class _Served:
+    """A NodeRpcServer serving on a thread, and REQ wires to it."""
+
+    def __init__(self, server=None, **kwargs):
+        self.server = server or NodeServer()
+        port = free_port()
+        self.address = f"tcp://127.0.0.1:{port}"
+        kwargs.setdefault("num_workers", 2)
+        self.rpc = NodeRpcServer(self.server, host="127.0.0.1", port=port, **kwargs)
+        self.thread = threading.Thread(target=self.rpc.start, daemon=True)
+        self.thread.start()
+        self.wires = []
+
+    def wire(self, timeout_ms=5000):
+        wire = RpcWire(self.address, self.server.ms_service, timeout_ms=timeout_ms)
+        self.wires.append(wire)
+        return wire
+
+    def close(self):
+        for wire in self.wires:
+            wire.close()
+        self.rpc.stop()
+        self.thread.join(5)
+        self.server.close()
+        assert not self.thread.is_alive()
+
+
+@pytest.fixture
+def served():
+    s = _Served()
+    yield s.server, s.wire()
+    s.close()
 
 
 def raw_frame(code: int, payload, seq: int = 77) -> bytes:
@@ -129,39 +148,42 @@ def test_a_started_server_answers_miss_at_once(served):
     assert [i.result.value for i in lookup.items] == ["HIT", "MISS"]
 
 
-def test_legacy_requests_keep_their_path(served):
+def test_handshake_tells_the_runs_epoch(served):
     server, wire = served
     header, response = wire.exchange(
+        wire.serializer.encode(MessageType.HANDSHAKE, HandshakeRequest(), seq=5)
+    )
+    assert header.msg_type == MessageType.HANDSHAKE | 0x80 and header.sequence == 5
+    assert response.success is True
+    assert response.server_epoch == server.server_epoch
+
+
+def test_storage_backend_requests_are_refused(served):
+    _, wire = served
+    wire.socket.send(
         wire.serializer.encode(MessageType.STORAGE, StorageRequest(action="usage"))
     )
+    header, reply = wire.serializer.decode(wire.socket.recv())
     assert header.msg_type == MessageType.STORAGE | 0x80
-    assert response.success is True
-    # a broken legacy payload is still answered the old way
-    wire.socket.send(raw_frame(MessageType.STORAGE, ["x"]))
-    reply = wire.serializer.decode(wire.socket.recv())[1]
-    assert "error" in reply
+    assert "maru-server" in reply["error"]
+    # the server keeps serving
+    assert FakeNode(wire, "n1").open().status == Status.OK
 
 
-def test_a_failing_handler_answers_rejected(monkeypatch):
-    from maru_common.serializer import Serializer
-    from maru_server.rpc_handler_mixin import RpcHandlerMixin
-
-    server = MaruServer(enable_cxl=False)
-
-    class Dispatch(RpcHandlerMixin):
-        _server = server
+def test_a_failing_handler_answers_rejected():
+    server = NodeServer()
+    rpc = NodeRpcServer(server, port=free_port(), num_workers=1)
 
     def boom(request, payload):
         raise RuntimeError("boom")
 
-    dispatch = Dispatch()
-    dispatch._get_ms_handlers()[MessageType.PROBE] = boom
+    rpc._get_ms_handlers()[MessageType.PROBE] = boom
     serializer = Serializer()
     frame = raw_frame(
         MessageType.PROBE, {"session": "s", "server_epoch": "e", "items": []}, seq=9
     )
     header, response = serializer.decode_response(
-        dispatch._process_ms_frame(serializer, frame)
+        rpc._process_ms_frame(serializer, frame)
     )
     assert header.msg_type == MessageType.PROBE | 0x80 and header.sequence == 9
     assert response.status == Status.REJECTED and "boom" in response.error
@@ -211,24 +233,17 @@ def test_admin_cli_reports_an_unreachable_server(capsys):
 
 
 def test_stop_while_multi_storage_requests_are_in_flight():
-    server = MaruServer(enable_cxl=False)
-    port = free_port()
-    rpc = RpcAsyncServer(server, host="127.0.0.1", port=port, num_workers=2)
-    serving = threading.Thread(target=rpc.start, daemon=True)
-    serving.start()
-    time.sleep(0.2)
-    address = f"tcp://127.0.0.1:{port}"
-    setup = RpcWire(address, server.ms_service)
+    served = _Served()
+    setup = served.wire()
     node = FakeNode(setup, "n1")
     node.open()
     keys = [key(f"k{i}") for i in range(64)]
     node.commit(*[(k, node.loc(node.dram(), i)) for i, k in enumerate(keys)])
-    setup.close()
     stop = threading.Event()
     answered = []
 
     def client():
-        wire = RpcWire(address, server.ms_service, timeout_ms=1000)
+        wire = RpcWire(served.address, served.server.ms_service, timeout_ms=1000)
         worker = FakeWorker(wire, node)
         try:
             worker.open()
@@ -246,14 +261,11 @@ def test_stop_while_multi_storage_requests_are_in_flight():
     while len(answered) < 20:
         time.sleep(0.01)
     started = time.monotonic()
-    rpc.stop()
-    serving.join(5)
+    served.close()
     stop.set()
     for t in clients:
         t.join(5)
-    server.close()
     assert time.monotonic() - started < 5
-    assert not serving.is_alive()
     assert not any(t.is_alive() for t in clients)
 
 
@@ -263,45 +275,52 @@ class _ProxyHarness:
     def __init__(self, queue_max=2):
         from unittest.mock import MagicMock
 
-        from maru_common.serializer import Serializer
-
-        self.server = MaruServer(enable_cxl=False)
-        self.rpc = RpcAsyncServer(
-            self.server, port=5556, num_workers=1, lane_queue_max=queue_max
+        self.server = NodeServer()
+        self.rpc = NodeRpcServer(
+            self.server, port=5556, num_workers=1, queue_max=queue_max
         )
         self.rpc._frontend = MagicMock()
-        self.rpc._backend = MagicMock()
-        self.rpc._ms_backend = MagicMock()
+        self.rpc._replies = MagicMock()
+        for sock in (self.rpc._frontend, self.rpc._replies):
+            sock.getsockopt.return_value = 0  # one frame per poll
         self.serializer = Serializer()
-        self.inbox = []
 
     def frame(self, code, request, seq):
         return [b"id", b"", self.serializer.encode(code, request, seq=seq)]
 
-    def run(self, rounds):
-        """rounds: list of (incoming frame or None, {socket: events})."""
+    def run(self, rounds, unpolled=()):
+        """rounds: (socket, message) pairs, one readable socket per poll;
+        ``unpolled``: frames the frontend has after those, with no poll."""
         from unittest.mock import MagicMock, patch
 
-        frames = [f for f, _ in rounds if f is not None]
-        self.rpc._frontend.recv_multipart.side_effect = frames
+        self.rpc._replies.recv_multipart.side_effect = [
+            m for s, m in rounds if s is self.rpc._replies
+        ]
+        self.rpc._frontend.recv_multipart.side_effect = [
+            *(m for s, m in rounds if s is self.rpc._frontend),
+            *unpolled,
+        ]
         script = iter(rounds)
 
         def poll(_timeout):
             try:
-                frame, events = next(script)
+                sock, _ = next(script)
             except StopIteration:
                 self.rpc._running = False
                 return []
-            ready = dict(events)
-            if frame is not None:
-                ready[self.rpc._frontend] = zmq.POLLIN
-            return list(ready.items())
+            return [(sock, zmq.POLLIN)]
 
         poller = MagicMock()
         poller.poll.side_effect = poll
         self.rpc._running = True
         with patch.object(zmq, "Poller", return_value=poller):
             self.rpc._proxy_routine()
+
+    def queued(self):
+        out = []
+        while not self.rpc._requests.empty():
+            out.append(self.rpc._requests.get())
+        return out
 
     def replies(self):
         return [
@@ -314,74 +333,61 @@ class _ProxyHarness:
 
 
 def _probe(seq):
-    from maru_common.protocol import ProbeRequest
-
     return MessageType.PROBE, ProbeRequest(session="s", server_epoch="e", items=[]), seq
 
 
-def _legacy(seq):
-    return MessageType.STORAGE, StorageRequest(action="usage"), seq
-
-
-def test_a_busy_lane_queues_then_answers_busy_on_overflow():
+def test_a_full_queue_answers_busy():
     h = _ProxyHarness(queue_max=2)
-    h.rpc._ms_backend.send_multipart.side_effect = zmq.Again()
-    h.run([(h.frame(*_probe(seq)), {}) for seq in (1, 2, 3)])
+    front = h.rpc._frontend
+    probes = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
+    h.run([(front, p) for p in probes])
     # two frames wait in the queue; the third overflows and gets BUSY
     ((header, reply),) = h.replies()
     assert header.sequence == 3 and reply.status == Status.BUSY
-    assert h.rpc._ms_backend.send_multipart.call_count == 1  # then queued
+    assert h.queued() == probes[:2]
     h.close()
 
 
-def test_a_queued_lane_flushes_in_order_when_writable():
+def test_requests_wait_in_order():
     h = _ProxyHarness(queue_max=10)
-    sent = []
-    attempts = [0]
-
-    def send(msg):
-        attempts[0] += 1
-        if attempts[0] == 1:
-            raise zmq.Again()
-        sent.append(msg)
-
-    h.rpc._backend.send_multipart.side_effect = send
-    first, second = h.frame(*_legacy(1)), h.frame(*_legacy(2))
-    h.run([(first, {}), (second, {}), (None, {h.rpc._backend: zmq.POLLOUT})])
-    assert sent == [first, second]  # queued, not refused, and in order
-    assert h.replies() == []
+    front = h.rpc._frontend
+    frames = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
+    h.run([(front, f) for f in frames])
+    assert h.queued() == frames and h.replies() == []
     h.close()
 
 
-def test_a_full_legacy_lane_does_not_hold_back_multi_storage():
+def test_replies_go_back_with_their_envelope():
+    h = _ProxyHarness()
+    answer = [b"id", b"", b"answer"]
+    h.run([(h.rpc._replies, answer)])
+    h.rpc._frontend.send_multipart.assert_called_once_with(answer)
+    h.close()
+
+
+def test_the_proxy_moves_every_ready_frame_before_it_polls_again():
     h = _ProxyHarness(queue_max=10)
-    h.rpc._backend.send_multipart.side_effect = zmq.Again()
-    probe = h.frame(*_probe(2))
-    h.run([(h.frame(*_legacy(1)), {}), (probe, {})])
-    h.rpc._ms_backend.send_multipart.assert_called_once_with(probe)
+    front = h.rpc._frontend
+    frames = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
+    front.getsockopt.side_effect = [zmq.POLLIN, zmq.POLLIN, 0]
+    h.run([(front, frames[0])], unpolled=frames[1:])
+    assert h.queued() == frames
     h.close()
 
 
 def test_a_request_sent_before_workers_connect_is_served():
-    class SlowWorkers(RpcAsyncServer):
-        def _worker_routine(self, worker_id, endpoint=None):
+    class SlowWorkers(NodeRpcServer):
+        def _worker_routine(self, worker_id):
             time.sleep(0.5)
-            if endpoint is None:
-                super()._worker_routine(worker_id)
-            else:
-                super()._worker_routine(worker_id, endpoint)
+            super()._worker_routine(worker_id)
 
-    server = MaruServer(enable_cxl=False)
+    server = NodeServer()
     port = free_port()
     rpc = SlowWorkers(server, host="127.0.0.1", port=port, num_workers=2)
     serving = threading.Thread(target=rpc.start, daemon=True)
     serving.start()
     wire = RpcWire(f"tcp://127.0.0.1:{port}", server.ms_service)
     try:
-        header, response = wire.exchange(
-            wire.serializer.encode(MessageType.STORAGE, StorageRequest(action="usage"))
-        )
-        assert response.success is True
         assert FakeNode(wire, "n1").open().status == Status.OK
     finally:
         wire.close()
@@ -393,8 +399,8 @@ def test_a_request_sent_before_workers_connect_is_served():
 def test_stop_leaves_a_running_proxys_sockets_to_it():
     from unittest.mock import MagicMock
 
-    server = MaruServer(enable_cxl=False)
-    rpc = RpcAsyncServer(server, port=5556, num_workers=1)
+    server = NodeServer()
+    rpc = NodeRpcServer(server, port=5556, num_workers=1)
     rpc._owns_sockets = True  # as after start()
     frontend, context = MagicMock(), MagicMock()
     rpc._frontend, rpc._context = frontend, context
@@ -408,11 +414,11 @@ def test_stop_leaves_a_running_proxys_sockets_to_it():
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_start_gives_up_when_workers_never_connect():
-    class DeadWorkers(RpcAsyncServer):
-        def _worker_routine(self, worker_id, endpoint=None):
+    class DeadWorkers(NodeRpcServer):
+        def _worker_routine(self, worker_id):
             raise RuntimeError("worker died before connecting")
 
-    server = MaruServer(enable_cxl=False)
+    server = NodeServer()
     rpc = DeadWorkers(server, port=free_port(), num_workers=1, connect_timeout_s=0.5)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="did not connect"):
@@ -420,3 +426,65 @@ def test_start_gives_up_when_workers_never_connect():
     assert time.monotonic() - started < 5
     assert rpc._context is None and rpc._frontend is None and not rpc._running
     server.close()
+
+
+def _block_slow_probes(server):
+    """A PROBE of session "slow" holds its worker until ``release`` is set."""
+    entered, release = threading.Event(), threading.Event()
+    probe = server.ms_service.probe
+
+    def slow_probe(request, payload):
+        if request.session == "slow":
+            entered.set()
+            release.wait(10)
+        return probe(request, payload)
+
+    server.ms_service.probe = slow_probe
+    return entered, release
+
+
+def _probe_frame(session="s"):
+    request = ProbeRequest(session=session, server_epoch="e", items=[])
+    return Serializer().encode(MessageType.PROBE, request)
+
+
+def test_a_slow_request_does_not_delay_one_an_idle_worker_can_take():
+    server = NodeServer()
+    entered, release = _block_slow_probes(server)
+    served = _Served(server, num_workers=2)
+    try:
+        slow = served.wire()
+        slow.socket.send(_probe_frame("slow"))
+        assert entered.wait(5)
+        fast = served.wire(timeout_ms=2000)
+        for _ in range(8):
+            started = time.monotonic()
+            fast.exchange(_probe_frame())
+            assert time.monotonic() - started < 1.0
+        release.set()
+        slow.socket.recv()
+    finally:
+        release.set()
+        served.close()
+
+
+def test_with_every_worker_busy_a_full_queue_answers_busy():
+    server = NodeServer()
+    entered, release = _block_slow_probes(server)
+    served = _Served(server, num_workers=1, queue_max=1)
+    try:
+        slow, queued, refused = served.wire(), served.wire(), served.wire(2000)
+        slow.socket.send(_probe_frame("slow"))
+        assert entered.wait(5)
+        queued.socket.send(_probe_frame())
+        time.sleep(0.2)  # queued before the next one arrives
+        refused.socket.send(_probe_frame())
+        data = refused.socket.recv()
+        assert refused.serializer.decode_response(data)[1].status == Status.BUSY
+        release.set()
+        reply = queued.serializer.decode_response(queued.socket.recv())[1]
+        assert reply.status != Status.BUSY
+        slow.socket.recv()
+    finally:
+        release.set()
+        served.close()

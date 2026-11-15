@@ -39,9 +39,9 @@ from maru_common.storage_types import (
 )
 from maru_handler import MaruHandler
 from maru_handler.client import pool_maps
+from maru_server.node_rpc import NodeRpcServer
+from maru_server.node_server import NodeServer
 from maru_server.pin_manager import HolderKind
-from maru_server.rpc_server import RpcServer
-from maru_server.server import MaruServer
 from maru_shm.client import MaruShmClient
 from maru_shm.types import NodeLeaseExpiredError, StaleNodeEpochError
 from maru_storage_service import service as service_module
@@ -111,8 +111,8 @@ def metadata():
     servers = []
 
     def make(port=None):
-        server = MaruServer(enable_cxl=False, session_ttl_s=60, heartbeat_s=0.1)
-        rpc = RpcServer(server, port=port or free_port())
+        server = NodeServer(session_ttl_s=60, heartbeat_s=0.1)
+        rpc = NodeRpcServer(server, port=port or free_port(), num_workers=2)
         thread = threading.Thread(target=rpc.start, daemon=True)
         thread.start()
         servers.append((server, rpc, thread))

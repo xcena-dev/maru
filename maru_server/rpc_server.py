@@ -10,7 +10,7 @@ import zmq
 
 from maru_common import MessageHeader, Serializer
 
-from .rpc_handler_mixin import RpcHandlerMixin, is_ms_frame
+from .rpc_handler_mixin import RpcHandlerMixin
 
 if TYPE_CHECKING:
     from .server import MaruServer
@@ -60,11 +60,6 @@ class RpcServer(RpcHandlerMixin):
 
                 # Receive and decode request
                 raw_data = self._socket.recv()
-                if is_ms_frame(raw_data):
-                    # Multi-storage: strict decode with the raw payload
-                    response_data = self._process_ms_frame(self._serializer, raw_data)
-                    self._socket.send(response_data)
-                    continue
                 header, request = self._serializer.decode_request(raw_data)
 
                 # Handle the message

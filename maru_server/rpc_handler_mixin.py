@@ -5,21 +5,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from maru_common import MessageType
-from maru_common.protocol import HEADER_SIZE, MS_MESSAGE_CLASSES
-from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
-from maru_common.storage_types import Status
 
 if TYPE_CHECKING:
     from .server import MaruServer
 
 logger = logging.getLogger(__name__)
-
-_MS_CODES = frozenset(int(code) for code in MS_MESSAGE_CLASSES)
-
-
-def is_ms_frame(frame: bytes) -> bool:
-    """A multi-storage request (0x40-0x5F), by its header's msg_type byte."""
-    return len(frame) >= HEADER_SIZE and frame[3] in _MS_CODES
 
 
 class RpcHandlerMixin:
@@ -31,7 +21,6 @@ class RpcHandlerMixin:
 
     _server: "MaruServer"
     _handlers: dict[int, Callable[[Any], dict]] | None = None
-    _ms_handlers: dict[int, Callable[[Any, dict], Any]] | None = None
 
     def _get_handlers(self) -> dict[int, Callable[[Any], dict]]:
         """Return cached handler dispatch dict (built once per instance)."""
@@ -69,68 +58,6 @@ class RpcHandlerMixin:
             return {"error": f"Unknown message type: {msg_type}"}
 
         return handler(request)
-
-    # =========================================================================
-    # Multi-storage (0x40 - 0x5F)
-    # =========================================================================
-
-    def _get_ms_handlers(self) -> dict[int, Callable[[Any, dict], Any]]:
-        """Handlers take (request, raw payload) and return the response."""
-        if self._ms_handlers is None:
-            ms = self._server.ms_service
-            self._ms_handlers = {
-                MessageType.NODE_OPEN.value: ms.node_open,
-                MessageType.NODE_HEARTBEAT.value: ms.node_heartbeat,
-                MessageType.NODE_CLOSE.value: ms.node_close,
-                MessageType.NODE_RECOVER_LIST.value: ms.node_recover_list,
-                MessageType.WORKER_EXIT.value: ms.worker_exit,
-                MessageType.ADMIN_DELETE.value: ms.admin_delete,
-                MessageType.WORKER_OPEN.value: ms.worker_open,
-                MessageType.WORKER_HEARTBEAT.value: ms.worker_heartbeat,
-                MessageType.WORKER_CLOSE.value: ms.worker_close,
-                MessageType.PROBE.value: ms.probe,
-                MessageType.LOOKUP_AND_PIN.value: ms.lookup_and_pin,
-                MessageType.UNPIN.value: ms.unpin,
-                MessageType.SOURCE_PIN.value: ms.source_pin,
-                MessageType.COMMIT.value: ms.commit,
-                MessageType.RETIRE.value: ms.retire,
-                MessageType.FINALIZE_MOVE.value: ms.finalize_move,
-                MessageType.FETCH_COMPLETE.value: ms.fetch_complete,
-            }
-        return self._ms_handlers
-
-    def _handle_ms_message(self, decoded: DecodedRequest) -> Any:
-        self._server.ms_service.ensure_started()
-        handler = self._get_ms_handlers()[decoded.header.msg_type]
-        return handler(decoded.request, decoded.payload)
-
-    def _process_ms_frame(self, serializer: Serializer, raw_data: bytes) -> bytes:
-        """Strict decode; a malformed payload or a failed handler gets the
-        request's response with REJECTED. Raises only for an
-        unreadable header."""
-        try:
-            decoded = serializer.decode_request_payload(raw_data)
-        except MessageDecodeError as e:
-            if e.header is None or e.header.msg_type not in _MS_CODES:
-                raise
-            logger.debug("rejecting a malformed request: %s", e)
-            _, response_cls = MS_MESSAGE_CLASSES[MessageType(e.header.msg_type)]
-            return serializer.encode_response(
-                e.header, response_cls(status=Status.REJECTED, error=str(e))
-            )
-        try:
-            response = self._handle_ms_message(decoded)
-        except Exception as e:
-            logger.error(
-                "multi-storage request 0x%02X failed",
-                decoded.header.msg_type,
-                exc_info=True,
-            )
-            _, response_cls = MS_MESSAGE_CLASSES[MessageType(decoded.header.msg_type)]
-            response = response_cls(
-                status=Status.REJECTED, error=str(e) or "internal server error"
-            )
-        return serializer.encode_response(decoded.header, response)
 
     # =========================================================================
     # Allocation Handlers
