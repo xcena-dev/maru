@@ -631,7 +631,7 @@ def test_unknown_finalize_next_node_run_adopts_copies_and_drops_finalizers(
         first.manager._demote(
             PoolKind.DRAM,
             [first.tier("dram").pool.pool_id],
-            PoolKind.CXL,
+            (PoolKind.CXL,),
             [ref],
             [KeyLocation(Key("ns", "copied"), source)],
         )
