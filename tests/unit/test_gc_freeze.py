@@ -79,3 +79,25 @@ def test_the_freezer_reclaims_every_reclaim_s():
             if thread.name == "maru-gc-freeze":
                 thread.join(5)
         gc.unfreeze()
+
+
+def test_reclaim_freezes_the_survivors_only_while_a_freezer_runs():
+    import maru_common.gc_freeze as gc_freeze
+
+    reclaim()
+    base = gc.get_freeze_count()  # what the interpreter keeps frozen
+    kept = [_Cycle() for _ in range(100)]
+    reclaim()
+    assert gc.get_freeze_count() == base  # no freezer: nothing more frozen
+    stop = start_freezer(interval_s=10)
+    try:
+        assert gc_freeze._freezing
+        reclaim()
+        assert gc.get_freeze_count() >= base + len(kept)
+    finally:
+        stop.set()
+        for thread in threading.enumerate():
+            if thread.name == "maru-gc-freeze":
+                thread.join(5)
+        gc.unfreeze()
+    assert not gc_freeze._freezing

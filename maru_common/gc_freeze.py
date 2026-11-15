@@ -17,9 +17,21 @@ import time
 
 FREEZE_INTERVAL_S = 0.25
 
-# One freeze pass or reclaim at a time: a freeze between a reclaim's
-# unfreeze and its collection would keep the garbage frozen
+# One pass at a time: a freeze between a reclaim's unfreeze and its
+# collection would keep the garbage frozen
 _lock = threading.Lock()
+# A freezer runs: a reclaim freezes what survives at once, as its next pass
+# would (and that pass walks no full graph again)
+_freezing = False
+
+
+def _collect(full: bool) -> None:
+    with _lock:
+        if full:
+            gc.unfreeze()
+        gc.collect()
+        if _freezing:
+            gc.freeze()
 
 
 def start_freezer(
@@ -27,18 +39,20 @@ def start_freezer(
 ) -> threading.Event:
     """Collect and freeze now and every ``interval_s`` on a daemon thread,
     and reclaim every ``reclaim_s``; set the returned event to stop it."""
+    global _freezing
+    _freezing = True
     stop = threading.Event()
 
     def run() -> None:
+        global _freezing
         reclaimed = time.monotonic()
         while True:
-            if reclaim_s is not None and time.monotonic() - reclaimed >= reclaim_s:
-                reclaim()
+            full = reclaim_s is not None and time.monotonic() - reclaimed >= reclaim_s
+            _collect(full)
+            if full:
                 reclaimed = time.monotonic()
-            with _lock:
-                gc.collect()
-                gc.freeze()
             if stop.wait(interval_s):
+                _freezing = False
                 return
 
     threading.Thread(target=run, name="maru-gc-freeze", daemon=True).start()
@@ -47,8 +61,6 @@ def start_freezer(
 
 def reclaim() -> None:
     """Collect the frozen objects that became garbage in cycles: unfreeze
-    and run a full collection (a pause as long as one without the freezer);
-    the freezer freezes what survives on its next pass."""
-    with _lock:
-        gc.unfreeze()
-        gc.collect()
+    and run a full collection (a pause as long as one without the freezer),
+    then freeze the survivors again if a freezer runs."""
+    _collect(full=True)
