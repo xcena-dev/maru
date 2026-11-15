@@ -375,13 +375,13 @@ answers.
 
 ### Node StorageService (maru_node, experimental)
 
-With `maru_node`, the connector uses the node's StorageService instead of a storage backend: every vLLM instance on the node shares the pools the StorageService owns, and MaruServer keeps which KV exists. The [Node StorageService design](../design_doc/node_storage_service.md) describes its tiers and node config. Start MaruServer, then `maru-storage --config node.json`, then vLLM:
+With `maru_node`, the connector uses the node's StorageService instead of a storage backend: every vLLM instance on the node shares the pools the StorageService owns, and MaruServer keeps which KV exists. On this path MaruServer is `maru-node-server` (default port 5556), a process apart from the storage backends' `maru-server`. The [Node StorageService design](../design_doc/node_storage_service.md) describes its tiers and node config. Start `maru-node-server`, then `maru-storage --config node.json`, then vLLM:
 
 ```json
 {
   "node_id": "gpu-a",
   "socket": "/run/maru/node.sock",
-  "server": "tcp://127.0.0.1:5555",
+  "server": "tcp://127.0.0.1:5556",
   "page_size": "32M",
   "tiers": [{"store": "dram", "size": "64G"}]
 }
@@ -418,7 +418,7 @@ vllm serve <model> \
 
 A memory node is a StorageService with `role: memory`; GPU nodes on other hosts use its DRAM, CXL and SSD as their `remote` tier over RDMA.
 
-1. Run one MaruServer that every node reaches: `maru-server --cpu-only --host 10.0.0.10 --port 5555`.
+1. Run one `maru-node-server` that every node reaches: `maru-node-server --host 10.0.0.10`.
 2. Put the same key file on every GPU node and memory node: one line of at least 32 hex digits that other users cannot read, e.g. `openssl rand -hex 32 > /var/lib/maru/maru.key && chmod 600 /var/lib/maru/maru.key`.
 3. Give every node the same `server` and `page_size`. Each node registers its whole DRAM and CXL pools with the NIC, so allow it (`ulimit -l unlimited`), and give the `dram` tier huge pages or set `"hugepage": false`.
 4. On the memory node, `maru-storage --config mem.json`:
@@ -427,7 +427,7 @@ A memory node is a StorageService with `role: memory`; GPU nodes on other hosts 
 {
   "node_id": "mem-1",
   "role": "memory",
-  "server": "tcp://10.0.0.10:5555",
+  "server": "tcp://10.0.0.10:5556",
   "page_size": "32M",
   "remote_server": {"listen": "10.0.0.21:5600", "rdma_device": "mlx5_0", "key_file": "/var/lib/maru/maru.key"},
   "tiers": [
@@ -443,7 +443,7 @@ A memory node is a StorageService with `role: memory`; GPU nodes on other hosts 
 {
   "node_id": "gpu-a",
   "socket": "/run/maru/node.sock",
-  "server": "tcp://10.0.0.10:5555",
+  "server": "tcp://10.0.0.10:5556",
   "page_size": "32M",
   "tiers": [
     {"store": "dram", "size": "64G"},
@@ -452,7 +452,7 @@ A memory node is a StorageService with `role: memory`; GPU nodes on other hosts 
 }
 ```
 
-Start MaruServer, the memory nodes, then the GPU nodes and vLLM. Other orders also work: a GPU node connects to its memory nodes again every 5 s, and a memory node restarted on the same boot keeps its CXL and SSD KV.
+Start `maru-node-server`, the memory nodes, then the GPU nodes and vLLM. Other orders also work: a GPU node connects to its memory nodes again every 5 s, and a memory node restarted on the same boot keeps its CXL and SSD KV.
 
 ### Connector settings
 

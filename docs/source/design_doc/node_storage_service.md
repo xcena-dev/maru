@@ -12,7 +12,7 @@ A **StorageService** (`maru-storage`, package `maru_storage_service`) runs once 
 - **Memory nodes.** A GPU node's L2 can be the DRAM, CXL and SSD of memory nodes, reached with one-sided RDMA that only the GPU node's StorageService posts. A local SSD may follow them and takes what they cannot.
 - **Opt-in.** A vLLM instance takes this path when its connector sets `maru_node` (the StorageService socket), else `maru_storage_backend` as before.
 
-**Coexistence.** The node path runs beside the storage backends selected by `maru_storage_backend` (`cxl`, `cpu`, `mixed`, `remote_cxl`). One MaruServer process serves both on separate request lanes, but the Catalog (messages `0x40`–`0x5F`) and the `KVManager` of the storage backends are separate: a key stored on one path is not visible on the other. Sharing CXL memory across hosts uses the `cxl` backend.
+**Coexistence.** The node path runs beside the storage backends selected by `maru_storage_backend` (`cxl`, `cpu`, `mixed`, `remote_cxl`), each with its own server process: `maru-server` serves the storage backends and their `KVManager`, `maru-node-server` the node path's Catalog (messages `0x40`–`0x5F`). In this document MaruServer means `maru-node-server`. A key stored on one path is not visible on the other. Sharing CXL memory across hosts uses the `cxl` backend.
 
 ---
 
@@ -89,7 +89,7 @@ The vLLM connector calls `MaruHandler`, which on `maru_node` delegates to `MaruC
 
 `MsService` holds the `Catalog` (key → locations: pool, allocation, generation, offset, length, kind), the `NodeRegistry` (node, worker and probe sessions), the `PinManager` (pins on exact locations, never expiring by time) and an `OpLedger` (replay records). A lookup returns per key the cheapest location the requester **maps** (`HIT`, pinned for the worker), else the cheapest its node can **fetch** with both StorageServices up (`FETCH` with a plan, no pin), else `MISS` (`offline` if the key still has a location, else `absent`). Cost order: own DRAM < own CXL < memory node DRAM/CXL < own SSD < memory node SSD. A worker maps its node's DRAM and CXL of the run it attached to; it can fetch its node's SSD, a memory node's DRAM and CXL when its node has `remote_v1` and the owner `memory_v1`, and a memory node's SSD when both also have `stage_v1`. Hits MaruServer sees are reported to the owning node in heartbeat replies, for its LRU.
 
-The node path needs no RM at MaruServer (`--cpu-only` serves it). Its settings are `--session-ttl-s` (30 s), `--heartbeat-s` (a third of the TTL), `--node-give-up-s` (600 s), `--op-window`, `--op-bytes-max` and `--policy-file` (keys preserved from eviction); `python -m maru_server.ms_admin delete` removes keys through their nodes.
+`maru-node-server` listens on port 5556 by default and needs no RM. A proxy thread queues requests for `--workers` threads (4): a slow request delays only the requests that find every thread busy, and a full queue answers `BUSY`. Its other settings are `--session-ttl-s` (30 s), `--heartbeat-s` (a third of the TTL), `--node-give-up-s` (600 s), `--op-window`, `--op-bytes-max` and `--policy-file` (keys preserved from eviction); `python -m maru_server.ms_admin delete --server <address>` removes keys through their nodes. It and the StorageService freeze what survives a collection every 0.25 s, so a cycle collection walks only recent objects and its pauses stay short with a large Catalog.
 
 ### 2.4 Resource Manager: node-owned regions
 
@@ -299,7 +299,7 @@ Every state-changing request carries an op: origin, sequence, payload digest and
 | `node_id` | required | Letters, digits, `.`, `_`, `-`; starts with a letter or digit |
 | `role` | `gpu` | `gpu` or `memory` |
 | `socket`, `socket_group` | `/run/maru/node.sock`, — | Workers' UDS (GPU node) and its group |
-| `server` | required | MaruServer's ZMQ address, e.g. `tcp://host:5555` |
+| `server` | required | MaruServer's (`maru-node-server`) ZMQ address, e.g. `tcp://host:5556` |
 | `page_size` | required | Holds one object: a chunk of every layer of a rank's KV, or one layer with layerwise storage |
 | `tiers` | required | Ordered, top first |
 | `budgets` | derived | Below |
@@ -329,7 +329,7 @@ A GPU node with DRAM (writing through), CXL and SSD:
 {
   "node_id": "gpu-a",
   "socket": "/run/maru/node.sock",
-  "server": "tcp://maru-server:5555",
+  "server": "tcp://node-server:5556",
   "page_size": "32M",
   "tiers": [
     {"store": "dram", "size": "64G", "demotion": "through"},
@@ -344,7 +344,7 @@ A GPU node whose DRAM demotes to memory nodes, and a memory node:
 ```json
 {
   "node_id": "gpu-b",
-  "server": "tcp://maru-server:5555",
+  "server": "tcp://node-server:5556",
   "page_size": "32M",
   "tiers": [
     {"store": "dram", "size": "64G"},
@@ -357,7 +357,7 @@ A GPU node whose DRAM demotes to memory nodes, and a memory node:
 {
   "node_id": "mem-1",
   "role": "memory",
-  "server": "tcp://maru-server:5555",
+  "server": "tcp://node-server:5556",
   "page_size": "32M",
   "remote_server": {"listen": "0.0.0.0:5600", "key_file": "~/.maru/remote-cxl-agent.key"},
   "tiers": [
