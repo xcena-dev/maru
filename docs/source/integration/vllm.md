@@ -412,7 +412,47 @@ vllm serve <model> \
 - A load whose KV is unavailable (MaruServer or the node down) or gone is computed again; the connector logs both counts apart when it shuts down.
 - Foreground PROBE and LOOKUP_AND_PIN calls wait up to `maru_lookup_timeout_ms` (default 100 ms). A timeout counts as `probe_unavailable` or `retrieve_unavailable`; further calls miss without an RPC until a heartbeat recovers. The resolver resends an unresolved lookup with the same op and releases any late pins. Heartbeats, session opens, unpins, node calls and background work keep the 2 s client timeout.
 - MaruServer and the StorageService may restart while vLLM runs. A MaruServer started again at the same address knows no KV: every key is computed again, and each node starts a new run in the same process (a new DRAM pool; its CXL regions are reused once no access of the earlier run is left). A restarted StorageService starts with an empty DRAM tier and keeps the CXL KV, and the SSD KV of the same boot, that MaruServer still lists. Either way the workers attach to the new run without a vLLM restart; one it refuses (its page is now too small) logs an error and runs without Maru until vLLM restarts.
-- A node serves `dram`, `cxl` or both on top, optionally followed by one `ssd` tier or one `remote` tier of memory nodes reached over RDMA.
+- A node serves `dram`, `cxl` or both on top, optionally followed by a `remote` tier of memory nodes reached over RDMA, a local `ssd` tier, or both in that order: then KV leaving the memory tiers goes to the memory nodes first and to the SSD only when they cannot take it.
+
+#### Memory nodes on other hosts
+
+A memory node is a StorageService with `role: memory`; GPU nodes on other hosts use its DRAM, CXL and SSD as their `remote` tier over RDMA.
+
+1. Run one MaruServer that every node reaches: `maru-server --cpu-only --host 10.0.0.10 --port 5555`.
+2. Put the same key file on every GPU node and memory node: one line of at least 32 hex digits that other users cannot read, e.g. `openssl rand -hex 32 > /var/lib/maru/maru.key && chmod 600 /var/lib/maru/maru.key`.
+3. Give every node the same `server` and `page_size`. Each node registers its whole DRAM and CXL pools with the NIC, so allow it (`ulimit -l unlimited`), and give the `dram` tier huge pages or set `"hugepage": false`.
+4. On the memory node, `maru-storage --config mem.json`:
+
+```json
+{
+  "node_id": "mem-1",
+  "role": "memory",
+  "server": "tcp://10.0.0.10:5555",
+  "page_size": "32M",
+  "remote_server": {"listen": "10.0.0.21:5600", "rdma_device": "mlx5_0", "key_file": "/var/lib/maru/maru.key"},
+  "tiers": [
+    {"store": "dram", "size": "256G"},
+    {"store": "ssd", "size": "4T", "path": "/var/lib/maru/mem.ssd"}
+  ]
+}
+```
+
+5. On each GPU node, `maru-storage --config node.json`, then vLLM as above:
+
+```json
+{
+  "node_id": "gpu-a",
+  "socket": "/run/maru/node.sock",
+  "server": "tcp://10.0.0.10:5555",
+  "page_size": "32M",
+  "tiers": [
+    {"store": "dram", "size": "64G"},
+    {"store": "remote", "url": ["10.0.0.21:5600"], "rdma_device": "mlx5_0", "key_file": "/var/lib/maru/maru.key"}
+  ]
+}
+```
+
+Start MaruServer, the memory nodes, then the GPU nodes and vLLM. Other orders also work: a GPU node connects to its memory nodes again every 5 s, and a memory node restarted on the same boot keeps its CXL and SSD KV.
 
 ### Connector settings
 
