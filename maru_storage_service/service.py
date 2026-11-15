@@ -37,6 +37,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 
+from maru_common import gc_freeze
 from maru_common.node_protocol import Budgets
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
@@ -942,6 +943,10 @@ class Node:
             logger.warning(
                 "starting a new run in %.1f s after: %s", pause, service.ended
             )
+            # The ended run's objects: its cycles were frozen while it ran
+            self.service = None
+            del service
+            gc_freeze.reclaim()
             if self._stop.wait(pause):
                 return True
             pause = min(pause * 2, self.max_pause_s)

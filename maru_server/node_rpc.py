@@ -211,11 +211,11 @@ class NodeRpcServer:
         poller.register(replies, zmq.POLLIN)
 
         def more(sock: zmq.Socket) -> bool:
-            return bool(sock.getsockopt(zmq.EVENTS) & zmq.POLLIN)
+            return bool(int(sock.getsockopt(zmq.EVENTS)) & zmq.POLLIN)
 
         while self._running:
             try:
-                socks = dict(poller.poll(100))
+                socks: dict[Any, int] = dict(poller.poll(100))
             except zmq.ZMQError:
                 break
             try:
@@ -315,17 +315,20 @@ class NodeRpcServer:
 
     def _process_ms_frame(self, serializer: Serializer, raw_data: bytes) -> bytes:
         """Strict decode; a malformed payload or a failed handler gets the
-        request's response with REJECTED. Raises only for an unreadable
-        header."""
+        request's response with REJECTED. Raises only for a header that is
+        not a valid Maru header."""
         try:
             decoded = serializer.decode_request_payload(raw_data)
         except MessageDecodeError as e:
-            if e.header is None or e.header.msg_type not in _MS_CODES:
+            # A payload that is no MessagePack, or shorter than its header
+            # says, comes without the header: read it here
+            header = e.header or MessageHeader.unpack(raw_data[:HEADER_SIZE])
+            if not header.validate() or header.msg_type not in _MS_CODES:
                 raise
             logger.debug("rejecting a malformed request: %s", e)
-            _, response_cls = MS_MESSAGE_CLASSES[MessageType(e.header.msg_type)]
+            _, response_cls = MS_MESSAGE_CLASSES[MessageType(header.msg_type)]
             return serializer.encode_response(
-                e.header, response_cls(status=Status.REJECTED, error=str(e))
+                header, response_cls(status=Status.REJECTED, error=str(e))
             )
         try:
             self._server.ms_service.ensure_started()

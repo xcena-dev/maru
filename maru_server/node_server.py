@@ -9,7 +9,9 @@ own server epoch: a node or worker that sees another one starts a new session.
 
 import argparse
 import logging
+import os
 import signal
+import threading
 import uuid
 
 from maru_common import gc_freeze
@@ -169,17 +171,41 @@ def main() -> None:
         op_bytes_max=args.op_bytes_max,
         policy_file=args.policy_file,
     )
-    rpc = NodeRpcServer(server, host=args.host, port=args.port, num_workers=args.workers)
+    rpc = NodeRpcServer(
+        server, host=args.host, port=args.port, num_workers=args.workers
+    )
+    # Only a write in the handler: stop() sets an Event start() waits in, and
+    # that would deadlock if the signal landed while it held the Event's lock
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
 
     def on_signal(signum, frame):
-        rpc.stop()
+        try:
+            os.write(wfd, b"x")
+        except OSError:  # a full pipe: a stop is pending already
+            pass
 
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
+    def stop_on_signal() -> None:
+        try:
+            woken = os.read(rfd, 1)
+        finally:
+            os.close(rfd)
+        if woken:  # empty: main() ended
+            rpc.stop()
+
+    stopper = threading.Thread(target=stop_on_signal, name="maru-signal", daemon=True)
+    stopper.start()
+    previous = {
+        sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)
+    }
     logger.info("Starting maru-node-server on %s:%d", args.host, args.port)
     try:
         rpc.start()
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        os.close(wfd)  # the signal thread's read ends
+        stopper.join(10)  # a stop it began ends first
         server.close()
 
 

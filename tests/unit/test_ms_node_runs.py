@@ -113,6 +113,20 @@ def logged(caplog, logger: str):
 # =============================================================================
 
 
+def test_the_ended_run_is_dropped_and_reclaimed_before_the_next(monkeypatch):
+    seen = []
+    node = fake_node([FakeRun("x"), FakeRun("x")], pause_s=0.01, max_pause_s=0.01)
+    monkeypatch.setattr(
+        service_module.gc_freeze, "reclaim", lambda: seen.append(node.service)
+    )
+    thread = threading.Thread(target=node.run)
+    thread.start()
+    wait_until(lambda: node.runs == 3, what="three runs")
+    node.stop()
+    thread.join(10)
+    assert seen == [None, None]  # once per new run, the ended one let go
+
+
 def test_the_pause_between_runs_grows_and_a_long_run_resets_it(caplog, monkeypatch):
     log = logged(caplog, "maru_storage_service.service")
     try:

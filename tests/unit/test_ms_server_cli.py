@@ -2,11 +2,22 @@
 # Copyright 2026 XCENA Inc.
 """maru-node-server options, and a run's own server epoch."""
 
+import gc
+import signal
+import socket
+import subprocess
+import sys
+import weakref
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from maru_server.node_server import NodeServer, main
+from tests.unit.ms_fakes import FakeNode, Wire, key
+from tests.unit.ms_node_helpers import wait_until
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 def run_main(*argv):
@@ -110,3 +121,58 @@ def test_policy_file_is_checked_at_start(tmp_path):
         with pytest.raises(SystemExit) as info:
             run_main("--policy-file", str(path))
         assert info.value.code == 2
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["TERM", "INT"])
+def test_a_signal_stops_the_server_process(sig, tmp_path):
+    log = tmp_path / "server.log"
+    port = _free_port()
+    with log.open("wb") as out:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "maru_server.node_server", "--port", str(port)],
+            cwd=REPO,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        wait_until(
+            lambda: "started on" in log.read_text() or proc.poll() is not None,
+            timeout=30,
+            what="maru-node-server start",
+        )
+        assert proc.poll() is None, log.read_text()
+        proc.send_signal(sig)
+        assert proc.wait(timeout=15) == 0, log.read_text()
+        assert "node server RPC stopped" in log.read_text()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_what_the_catalog_removes_is_freed_while_frozen():
+    """The freezer collects no frozen cycle: what the Catalog removes must
+    go by reference counting."""
+    server = NodeServer()
+    node = FakeNode(Wire(server.ms_service), "n1")
+    node.open()
+    loc = node.loc(node.dram(), 1)
+    node.commit((key("k"), loc))
+    with server.ms_service.lock:
+        (entry,) = server.ms_service.catalog.locations(key("k"))
+    ref = weakref.ref(entry)
+    del entry
+    gc.collect()
+    gc.freeze()
+    try:
+        assert node.retire((key("k"), loc)).items[0].result == "RETIRED"
+        assert ref() is None
+    finally:
+        gc.unfreeze()
+        server.close()

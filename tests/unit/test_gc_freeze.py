@@ -8,7 +8,7 @@ import time
 import weakref
 
 # bound before the autouse fixture replaces it for every other test
-from maru_common.gc_freeze import start_freezer
+from maru_common.gc_freeze import reclaim, start_freezer
 
 
 class _Cycle:
@@ -44,3 +44,18 @@ def test_the_freezer_collects_garbage_and_freezes_the_rest():
                 thread.join(5)
         gc.unfreeze()
     assert not any(t.name == "maru-gc-freeze" for t in threading.enumerate())
+
+
+def test_reclaim_collects_cycles_frozen_while_alive():
+    kept = _Cycle()
+    ref = weakref.ref(kept)
+    gc.collect()
+    gc.freeze()
+    try:
+        del kept
+        gc.collect()
+        assert ref() is not None  # frozen: no collection walks it
+        reclaim()
+        assert ref() is None
+    finally:
+        gc.unfreeze()

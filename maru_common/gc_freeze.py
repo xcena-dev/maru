@@ -7,7 +7,8 @@ pauses the process for tens of milliseconds. A thread collects the garbage
 of the objects created since its last pass and freezes the survivors, so
 every collection, full ones too, walks only what one interval created.
 Reference counting still frees frozen objects; a reference cycle among them
-is never collected.
+is collected only after reclaim(), which a process calls once a large object
+graph with cycles has ended (maru-storage: between two runs).
 """
 
 import gc
@@ -30,3 +31,11 @@ def start_freezer(interval_s: float = FREEZE_INTERVAL_S) -> threading.Event:
 
     threading.Thread(target=run, name="maru-gc-freeze", daemon=True).start()
     return stop
+
+
+def reclaim() -> None:
+    """Collect the frozen objects that became garbage in cycles: unfreeze
+    and run a full collection (a pause as long as one without the freezer);
+    the freezer freezes what survives on its next pass."""
+    gc.unfreeze()
+    gc.collect()

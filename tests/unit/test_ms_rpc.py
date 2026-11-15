@@ -135,6 +135,32 @@ def test_malformed_request_is_rejected_with_its_header(served, code, payload):
     assert FakeNode(wire, "n1").open().status == Status.OK
 
 
+@pytest.mark.parametrize("body", [b"\xc1", None], ids=["not-msgpack", "truncated"])
+def test_a_payload_that_cannot_be_read_is_rejected_with_its_header(served, body):
+    _, wire = served
+    if body is None:  # the header says one byte more than follows
+        frame = raw_frame(MessageType.NODE_OPEN, {"session": "s"}, seq=42)[:-1]
+    else:
+        header = struct.pack(
+            HEADER_FORMAT,
+            PROTOCOL_MAGIC,
+            PROTOCOL_VERSION,
+            MessageType.NODE_OPEN,
+            0,
+            0,
+            0,
+            0,
+            42,
+            len(body),
+        )
+        frame = header + body
+    header, response = wire.exchange(frame)
+    assert header.msg_type == MessageType.NODE_OPEN | 0x80
+    assert header.sequence == 42
+    assert response.status == Status.REJECTED and response.error
+    assert FakeNode(wire, "n1").open().status == Status.OK
+
+
 def test_a_started_server_answers_miss_at_once(served):
     _, wire = served
     node = FakeNode(wire, "n1")
