@@ -31,7 +31,7 @@ def run_main(*argv):
     ):
         rpc_cls.return_value = MagicMock()
         main()
-    freeze.start_freezer.assert_called_once()
+    freeze.start_freezer.assert_called_once_with(reclaim_s=3600.0)
     return server_cls, rpc_cls
 
 

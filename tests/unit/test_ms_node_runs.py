@@ -249,6 +249,30 @@ def test_a_start_failure_with_a_failed_teardown_exits_failed(monkeypatch):
     assert serve(config()) == EXIT_FAILED
 
 
+def test_serve_starts_the_gc_freezer_before_the_node_runs(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from maru_common import gc_freeze
+
+    freezer = MagicMock()
+    monkeypatch.setattr(gc_freeze, "start_freezer", freezer)
+
+    class Served:
+        def __init__(self, config):
+            self.failed, self.ended = None, None
+
+        def run(self):
+            freezer.assert_called_once_with(reclaim_s=300.0)
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(service_module, "Node", Served)
+    assert serve(config()) == 0
+    freezer.assert_called_once_with(reclaim_s=300.0)
+
+
 def test_the_signal_handler_only_writes_to_the_pipe():
     rfd, wfd = os.pipe()
     os.set_blocking(wfd, False)

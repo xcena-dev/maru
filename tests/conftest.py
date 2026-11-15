@@ -52,7 +52,9 @@ def _no_installed_handler_plugins(monkeypatch):
 def _no_gc_freezer(monkeypatch):
     """Service entry points run in the test process too: keep its collector
     as it is (a frozen object's cycles are never collected)."""
-    monkeypatch.setattr(maru_common.gc_freeze, "start_freezer", threading.Event)
+    monkeypatch.setattr(
+        maru_common.gc_freeze, "start_freezer", lambda *a, **kw: threading.Event()
+    )
 
 
 # =============================================================================

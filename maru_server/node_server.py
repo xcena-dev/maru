@@ -30,6 +30,9 @@ from .server import setup_logging
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 5556
+# What the Catalog removes goes by reference counting; a full collection an
+# hour takes what anything else left in frozen cycles
+GC_RECLAIM_S = 3600.0
 
 
 class NodeServer:
@@ -162,7 +165,7 @@ def main() -> None:
         parser.error("--op-bytes-max must be at least 1")
 
     setup_logging(args.log_level)
-    gc_freeze.start_freezer()
+    gc_freeze.start_freezer(reclaim_s=GC_RECLAIM_S)
     server = NodeServer(
         session_ttl_s=args.session_ttl_s,
         heartbeat_s=heartbeat_s,

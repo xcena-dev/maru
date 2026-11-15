@@ -59,3 +59,23 @@ def test_reclaim_collects_cycles_frozen_while_alive():
         assert ref() is None
     finally:
         gc.unfreeze()
+
+
+def test_the_freezer_reclaims_every_reclaim_s():
+    kept = _Cycle()
+    ref = weakref.ref(kept)
+    gc.collect()
+    gc.freeze()
+    del kept
+    stop = start_freezer(interval_s=0.01, reclaim_s=0.05)
+    try:
+        deadline = time.monotonic() + 5
+        while ref() is not None:
+            assert time.monotonic() < deadline, "a frozen cycle never reclaimed"
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for thread in threading.enumerate():
+            if thread.name == "maru-gc-freeze":
+                thread.join(5)
+        gc.unfreeze()

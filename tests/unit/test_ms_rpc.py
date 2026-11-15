@@ -422,6 +422,34 @@ def test_a_request_sent_before_workers_connect_is_served():
         server.close()
 
 
+def test_a_stop_before_the_start_is_kept():
+    server = NodeServer()
+    port = free_port()
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=1)
+    rpc.stop()  # e.g. a signal while the process starts
+    serving = threading.Thread(target=rpc.start, daemon=True)
+    serving.start()
+    serving.join(5)
+    assert not serving.is_alive() and rpc._context is None
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", port))  # never bound
+    server.close()
+
+
+def test_a_port_in_use_fails_the_start_and_leaves_nothing_open():
+    server = NodeServer()
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=1)
+        with pytest.raises(zmq.ZMQError):
+            rpc.start()
+    assert rpc._context is None and rpc._frontend is None and rpc._replies is None
+    assert not rpc._worker_threads
+    server.close()
+
+
 def test_stop_leaves_a_running_proxys_sockets_to_it():
     from unittest.mock import MagicMock
 

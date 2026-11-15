@@ -89,6 +89,11 @@ def main(argv: list[str] | None = None) -> int:
     return serve(config, args.log_level)
 
 
+# Requests, fetches, timers and connections leave cycles frozen while they
+# lived: a full collection every 5 minutes takes them
+GC_RECLAIM_S = 300.0
+
+
 def _signal_handler(wfd: int):
     """A handler that only wakes the thread that stops the node."""
 
@@ -136,7 +141,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
             node.stop()
 
     threading.Thread(target=stop_on_signal, name="maru-signal", daemon=True).start()
-    gc_freeze.start_freezer()
+    gc_freeze.start_freezer(reclaim_s=GC_RECLAIM_S)
     previous = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)
     }

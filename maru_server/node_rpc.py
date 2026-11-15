@@ -107,35 +107,47 @@ class NodeRpcServer:
         self._connected = threading.Semaphore(0)  # one release per worker
         self._requests: queue.Queue[list[bytes]] = queue.Queue()
         self._ms_handlers: dict[int, Callable[[Any, dict], Any]] | None = None
+        # start() and stop() change these together; a stop before the start
+        # is kept, so a signal during start-up is not lost
+        self._state = threading.Lock()
+        self._stop_requested = False
 
     @property
     def address(self) -> str:
         return f"tcp://{self._host}:{self._port}"
 
     def start(self) -> None:
-        """Serve until stop() is called."""
-        self._context = zmq.Context()
-        self._frontend = self._context.socket(zmq.ROUTER)
-        self._frontend.setsockopt(zmq.LINGER, 0)
-        self._frontend.bind(self.address)
-        self._replies = self._context.socket(zmq.PULL)
-        self._replies.setsockopt(zmq.LINGER, 0)
-        self._replies.bind(_REPLY_ENDPOINT)
-
-        self._owns_sockets = True
-        self._running = True
-        self._stop_event.clear()
-        self._connected = threading.Semaphore(0)
-        self._requests = queue.Queue()
-        for i in range(self._num_workers):
-            t = threading.Thread(
-                target=self._worker_routine,
-                args=(i,),
-                name=f"node-rpc-worker-{i}",
-                daemon=True,
-            )
-            self._worker_threads.append(t)
-            t.start()
+        """Serve until stop() is called; after a stop() it returns at once."""
+        with self._state:
+            if self._stop_requested:
+                return
+            self._context = zmq.Context()
+            try:
+                self._frontend = self._context.socket(zmq.ROUTER)
+                self._frontend.setsockopt(zmq.LINGER, 0)
+                self._frontend.bind(self.address)
+                self._replies = self._context.socket(zmq.PULL)
+                self._replies.setsockopt(zmq.LINGER, 0)
+                self._replies.bind(_REPLY_ENDPOINT)
+            except BaseException:
+                self._close_sockets()
+                self._context.term()
+                self._context = None
+                raise
+            self._owns_sockets = True
+            self._running = True
+            self._stop_event.clear()
+            self._connected = threading.Semaphore(0)
+            self._requests = queue.Queue()
+            for i in range(self._num_workers):
+                t = threading.Thread(
+                    target=self._worker_routine,
+                    args=(i,),
+                    name=f"node-rpc-worker-{i}",
+                    daemon=True,
+                )
+                self._worker_threads.append(t)
+                t.start()
 
         # Forward only once every worker is connected; requests wait at the
         # frontend meanwhile
@@ -162,7 +174,9 @@ class NodeRpcServer:
         self._stop_event.wait()
 
     def stop(self) -> None:
-        self._running = False
+        with self._state:
+            self._stop_requested = True
+            self._running = False
         for t in self._worker_threads:
             if t.is_alive():
                 t.join(timeout=2.0)
