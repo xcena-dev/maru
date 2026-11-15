@@ -5,11 +5,12 @@
 Start order: claim the socket, open the tiers in config order (DRAM pool,
 SSD file), then claim the leased ones (the node's CXL regions from the RM),
 NODE_OPEN, adopted ledgers, quarantine of the regions an earlier run still
-holds, heartbeat, then accept on the UDS. A GPU node with [dram],
-[cxl], [dram, cxl], [dram, ssd], [cxl, ssd] or [dram, cxl, ssd] is served;
+holds, heartbeat, then accept on the UDS. A GPU node with one or two L1
+tiers (dram, then cxl) and up to two L2 tiers (remote, then ssd) is served;
 other configs are refused. The top tier gives credit; each tier makes room by
-demoting its pages to the tier below (write-back), the last one by dropping
-its own. Workers never see the SSD pool: only this process reads and writes
+demoting its pages to the tier below (write-back; the bottom L1 tier to
+remote first, to ssd what remote cannot take), the last one by dropping its
+own. Workers never see the SSD pool: only this process reads and writes
 its file, and it keeps the file's lock until all of its I/O has ended. A
 worker that agreed fetch_v1 FETCHes SSD pages into the top tier
 (FetchManager).
@@ -99,14 +100,16 @@ DRAM_LOG_S = 30.0
 
 
 def _served_tiers() -> tuple[list[str], ...]:
-    """One or more served L1 stores in registry order, then at most one
-    served L2 store; those without an L2 first."""
+    """One or more served L1 stores in registry order, then up to two
+    served L2 stores: one, or another node's (remote) then a local one
+    (ssd). Those without an L2 first, then each L2 alone, then the pairs."""
     l1 = [s.store for s in TIERS.values() if s.served and s.level is Level.L1]
-    l2 = [s.store for s in TIERS.values() if s.served and s.level is Level.L2]
+    l2 = [s for s in TIERS.values() if s.served and s.level is Level.L2]
     tops = [
         list(c) for n in range(1, len(l1) + 1) for c in itertools.combinations(l1, n)
     ]
-    belows: list[list[str]] = [[], *([s] for s in l2)]
+    pairs = [[a.store, b.store] for a in l2 if not a.local for b in l2 if b.local]
+    belows: list[list[str]] = [[], *([s.store] for s in l2), *pairs]
     return tuple(top + below for below in belows for top in tops)
 
 
@@ -382,7 +385,7 @@ class StorageService:
         traits = config.traits()
         if (
             self.memory
-            or any(t.demotes_to is not None for t in traits.values())
+            or any(t.demotes_to for t in traits.values())
             or any(isinstance(t, L2Tier) for t in tiers.values())
         ):
             self.transfers = TransferEngine(self.transfer_bytes_per_s)
@@ -777,10 +780,11 @@ class StorageService:
             self.manager.stop()
             stats = self.manager.stats()
             logger.info(
-                "this run removed pages: retire %s, demotion %s; credit came "
-                "short (by cause, MiB): %s",
+                "this run removed pages: retire %s, demotion %s (MiB %s); "
+                "credit came short (by cause, MiB): %s",
                 stats["retire_results"] or "none",
                 stats["demotions"] or "none",
+                {k: v >> 20 for k, v in stats["moved_bytes"].items()} or "none",
                 {k: v >> 20 for k, v in stats["credit_short_bytes"].items()} or "never",
             )
         kept: set[str] = set()

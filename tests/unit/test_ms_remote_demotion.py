@@ -21,6 +21,7 @@ from tests.unit.ms_node_helpers import (
     remove_tree,
     short_tmpdir,
     start_node,
+    wait_demotions_applied,
     wait_until,
 )
 from tests.unit.remote_fakes import key_file, reset_fake_agents
@@ -258,7 +259,7 @@ def test_the_remote_tier_takes_demotions(ms):
     p = Pair(server, url)
     try:
         traits = p.gpu.config.traits()
-        assert traits["dram"].demotes_to == "remote"
+        assert traits["dram"].demotes_to == ("remote",)
         assert not traits["remote"].evicts and not traits["remote"].credit
         assert p.gpu.manager.remote == {"remote": p.remote}
         assert threading.active_count() > 0
@@ -295,6 +296,7 @@ def test_write_through_copies_to_the_memory_node_at_once(ms, workers):
                 lambda i=i: mem_pool in {loc.pool_id for loc in p.locations(f"k{i}")},
                 what="a copy on the memory node",
             )
+        wait_demotions_applied(p.gpu.manager)
         stats = p.gpu.manager.through_results
         assert stats["COMMIT:ADDED"] >= 3
         assert len(p.gpu.manager._remote_copies) >= 3

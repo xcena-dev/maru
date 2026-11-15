@@ -485,9 +485,9 @@ class TestInterfaces:
         staged = Staged("mem1", "e1", 3, _location())
         assert dataclasses.replace(staged) == staged
 
-    def test_remote_tier_is_served_last_on_gpu_nodes(self):
+    def test_remote_tier_is_served_on_gpu_nodes(self):
         assert peer.SPEC.store == RemoteTier.name
-        assert peer.SPEC.served and peer.SPEC.last_only and peer.SPEC.gpu_only
+        assert peer.SPEC.served and not peer.SPEC.last_only and peer.SPEC.gpu_only
         assert not peer.SPEC.local and peer.SPEC.kind is None
 
     def test_exporter_stub(self):

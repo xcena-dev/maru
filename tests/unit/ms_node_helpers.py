@@ -46,6 +46,38 @@ def wait_until(pred, timeout: float = 10.0, interval: float = 0.01, what: str = 
         time.sleep(interval)
 
 
+def wait_demotions_applied(manager, timeout: float = 10.0) -> None:
+    """Waits until no demotion write is in flight or waits for its result,
+    then for two eviction passes to end: every result is applied (COMMIT,
+    FINALIZE_MOVE)."""
+    passes = getattr(manager, "_test_passes", None)
+    if passes is None:
+        passes = manager._test_passes = [0]
+        ended = manager._remote_writes_ended  # once a pass, on its thread
+
+        def counted():
+            try:
+                ended()
+            finally:
+                passes[0] += 1
+
+        manager._remote_writes_ended = counted
+
+    def idle() -> bool:
+        with manager._lock:
+            return not (
+                manager._writing
+                or manager._remote_writing
+                or manager._written
+                or manager._remote_written
+                or manager._remote_settled
+            )
+
+    wait_until(idle, timeout, what="demotion writes ended")
+    seen = passes[0]
+    wait_until(lambda: passes[0] >= seen + 2, timeout, what="eviction passes")
+
+
 def listening(path: str) -> bool:
     """A probe connect succeeds (the file exists before listen())."""
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

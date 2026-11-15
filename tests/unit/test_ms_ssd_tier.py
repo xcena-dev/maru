@@ -257,11 +257,11 @@ def _config(stores, **top):
 @pytest.mark.parametrize(
     "stores, demotes",
     [
-        (["dram", "ssd"], {PoolKind.DRAM: PoolKind.SSD}),
-        (["cxl", "ssd"], {PoolKind.CXL: PoolKind.SSD}),
+        (["dram", "ssd"], {PoolKind.DRAM: (PoolKind.SSD,)}),
+        (["cxl", "ssd"], {PoolKind.CXL: (PoolKind.SSD,)}),
         (
             ["dram", "cxl", "ssd"],
-            {PoolKind.DRAM: PoolKind.CXL, PoolKind.CXL: PoolKind.SSD},
+            {PoolKind.DRAM: (PoolKind.CXL,), PoolKind.CXL: (PoolKind.SSD,)},
         ),
     ],
 )
@@ -275,7 +275,7 @@ def test_the_tiers_over_an_ssd_demote_into_it(stores, demotes):
         False,
         False,
         True,
-        None,
+        (),
     )
     assert ssd.io_only and not any(t.io_only for t in traits.values())
 

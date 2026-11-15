@@ -210,10 +210,11 @@ class TestRules:
         raw["tiers"] = [{"store": "ssd", "size": "1T", "path": "/x"}]
         rejects(raw, "first tier")
 
-    def test_remote_is_last_and_gpu_only(self):
+    def test_remote_is_an_l2_tier_and_gpu_only(self):
         raw = copy.deepcopy(GPU_NODE)
         raw["tiers"].insert(1, {"store": "remote", "url": "tcp://m:1"})
-        rejects(raw, "remote must be the last")
+        with pytest.raises(NotServableError, match="serving the tiers"):
+            check_servable(parse_node_config(raw))
         raw = copy.deepcopy(MEMORY_NODE)
         raw["tiers"][-1]["demotion"] = "back"
         raw["tiers"].append({"store": "remote", "url": "tcp://m:1"})
@@ -506,7 +507,7 @@ class TestRegistry:
             ("remote", Level.L2, False, None),
         ]
 
-    def test_served_tiers_are_the_nine_combinations_in_order(self):
+    def test_served_tiers_are_the_twelve_combinations_in_order(self):
         assert SERVED_TIERS == (
             ["dram"],
             ["cxl"],
@@ -517,6 +518,9 @@ class TestRegistry:
             ["dram", "remote"],
             ["cxl", "remote"],
             ["dram", "cxl", "remote"],
+            ["dram", "remote", "ssd"],
+            ["cxl", "remote", "ssd"],
+            ["dram", "cxl", "remote", "ssd"],
         )
 
     def test_servable_checks_keep_their_order(self):
@@ -557,6 +561,70 @@ class TestRegistry:
         with pytest.raises(TypeError):
             tier.options["a"] = 2  # type: ignore[index]
         assert TierConfig(store="dram").options == {}
+
+
+def two_l2(stores, **top):
+    """GPU_NODE's tiers in the order of ``stores``, with a remote tier."""
+    by_store = {t["store"]: t for t in copy.deepcopy(GPU_NODE)["tiers"]}
+    by_store["remote"] = {"store": "remote", "url": "tcp://mem-1:5600"}
+    tiers = [by_store[s] for s in stores]
+    tiers[0].update(top)
+    return edit(GPU_NODE, tiers=tiers)
+
+
+class TestRemoteThenSsd:
+    @pytest.mark.parametrize(
+        "stores",
+        [["dram", "remote", "ssd"], ["cxl", "remote", "ssd"]],
+    )
+    def test_the_bottom_l1_tier_demotes_to_remote_then_ssd(self, stores):
+        config = parse_node_config(two_l2(stores))
+        check_servable(config)
+        top, remote, ssd = config.traits().values()
+        assert top.demotes_to == ("remote", "ssd") and top.copies_to == ()
+        assert (remote.evicts, remote.credit, remote.demotes_to) == (False, False, ())
+        assert (ssd.evicts, ssd.credit, ssd.demotes_to) == (True, False, ())
+        assert remote.io_only and ssd.io_only
+
+    def test_over_cxl_only_cxl_demotes_to_both(self):
+        config = parse_node_config(two_l2(["dram", "cxl", "remote", "ssd"]))
+        check_servable(config)
+        traits = config.traits()
+        assert traits["dram"].demotes_to == ("cxl",)
+        assert traits["cxl"].demotes_to == ("remote", "ssd")
+        assert traits["ssd"].evicts and not traits["remote"].evicts
+
+    def test_write_through_copies_to_remote_then_ssd(self):
+        config = parse_node_config(
+            two_l2(["dram", "remote", "ssd"], demotion="through")
+        )
+        check_servable(config)
+        dram = config.traits()["dram"]
+        assert dram.copies_to == dram.demotes_to == ("remote", "ssd")
+
+    @pytest.mark.parametrize(
+        "stores",
+        [
+            ["dram", "ssd", "remote"],
+            ["dram", "cxl", "ssd", "remote"],
+            ["dram", "remote", "cxl", "ssd"],
+        ],
+    )
+    def test_other_orders_are_refused_at_start(self, stores):
+        config = parse_node_config(two_l2(stores))
+        with pytest.raises(NotServableError, match="serving the tiers"):
+            check_servable(config)
+
+    def test_neither_l2_tier_takes_a_demotion(self):
+        raw = two_l2(["dram", "remote", "ssd"])
+        rejects(with_tier(raw, 2, demotion="back"), "last tier")
+        rejects(with_tier(raw, 1, demotion="back"), "unknown keys")
+
+    def test_one_l2_keeps_its_traits(self):
+        for below in ("remote", "ssd"):
+            traits = parse_node_config(two_l2(["dram", below])).traits()
+            assert traits["dram"].demotes_to == (below,)
+            assert traits[below].evicts == (below == "ssd")
 
 
 def _fake_spec(**changes):
@@ -609,7 +677,7 @@ class TestAStoreFromTheRegistry:
         traits = parse_node_config(raw).traits()
         fake = traits["fake"]
         assert fake.kind is None and not fake.credit and not fake.evicts
-        assert traits["ssd"].demotes_to == "fake"
+        assert traits["ssd"].demotes_to == ("fake",)
 
 
 class TestTierConfigCopies:

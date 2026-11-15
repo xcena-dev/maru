@@ -236,7 +236,7 @@ def test_a_memory_node_is_servable_write_through_too():
     raw = copy.deepcopy(raw)
     raw["tiers"][0]["demotion"] = "through"
     traits = Node(parse_node_config(raw)).config.traits()
-    assert traits["dram"].copies_to == traits["dram"].demotes_to == "ssd"
+    assert traits["dram"].copies_to == traits["dram"].demotes_to == ("ssd",)
     raw["tiers"].insert(0, {"store": "ssd", "size": 16 * PAGE, "path": "/x"})
     with pytest.raises((NotServableError, NodeConfigError)):
         Node(parse_node_config(raw))

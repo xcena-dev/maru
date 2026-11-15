@@ -259,14 +259,14 @@ def _config(stores, **tier):
 def test_dram_over_cxl_demotes_and_cxl_drops():
     traits = _config(["dram", "cxl"]).traits()
     dram, cxl = traits[PoolKind.DRAM], traits[PoolKind.CXL]
-    assert (dram.credit, dram.evicts, dram.demotes_to) == (True, True, PoolKind.CXL)
-    assert (cxl.credit, cxl.evicts, cxl.demotes_to) == (False, True, None)
+    assert (dram.credit, dram.evicts, dram.demotes_to) == (True, True, ("cxl",))
+    assert (cxl.credit, cxl.evicts, cxl.demotes_to) == (False, True, ())
 
 
 def test_one_tier_nodes_drop_as_before():
     for store in ("dram", "cxl"):
         (only,) = _config([store]).traits().values()
-        assert (only.credit, only.evicts, only.demotes_to) == (True, True, None)
+        assert (only.credit, only.evicts, only.demotes_to) == (True, True, ())
 
 
 def test_write_through_is_served():
@@ -274,7 +274,7 @@ def test_write_through_is_served():
     config = _config(["dram", "cxl"], demotion="through")
     check_servable(config)
     dram = config.traits()["dram"]
-    assert dram.demotes_to == dram.copies_to == "cxl"
+    assert dram.demotes_to == dram.copies_to == ("cxl",)
     assert dram.through_max_inflight == 256 << 20
 
 

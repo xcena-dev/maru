@@ -6,6 +6,7 @@ Unknown keys are errors so a typo never falls back to a default.
 """
 
 import grp
+import itertools
 import json
 import os
 import re
@@ -104,10 +105,12 @@ class TierTraits:
     kind: PoolKind | None  # the wire kind of its pools
     credit: bool  # workers get credit from it (the top tier)
     evicts: bool  # pressure makes room: by demotion if it demotes, else by retiring
-    # Demotion back and through: pressure moves its pages to that tier
-    demotes_to: str | None = None
-    # Demotion through: pages that become READY here are copied there at once
-    copies_to: str | None = None
+    # Demotion back and through: pressure moves its pages to these tiers, in
+    # order: each takes what the ones before cannot
+    demotes_to: tuple[str, ...] = ()
+    # Demotion through: pages that become READY here are copied at once, to
+    # the first of these tiers that takes them
+    copies_to: tuple[str, ...] = ()
     # Workers get the credit the tiers above lack from it
     credit_fallback: bool = False
     # Bytes of those copies in flight at once; past it a page is skipped
@@ -160,12 +163,14 @@ class NodeConfig:
     def traits(self) -> dict[str, TierTraits]:
         """Traits of each tier, by store name in config order. The top tier
         gives credit, and a tier with credit_fallback the credit the tiers
-        above lack. A tier with demotion "back" evicts by moving its pages to
-        the tier below; a tier that gets new pages (credit or demotion) and
-        demotes nowhere evicts by dropping. Another node's tier (remote)
-        takes the pages demoted to it and never evicts: its owner does."""
+        above lack. A tier with demotion "back" evicts by moving its pages
+        down: an L1 tier over L2 tiers to those, in order (remote, then ssd),
+        any other tier to the tier below. A tier that gets new pages (credit
+        or demotion) and demotes nowhere evicts by dropping. Another node's
+        tier (remote) takes the pages demoted to it and never evicts: its
+        owner does."""
         out: dict[str, TierTraits] = {}
-        receives = True  # the top tier gets the writes
+        receives = {self.tiers[0].store}  # the top tier gets the writes
         for i, t in enumerate(self.tiers):
             spec = TIERS[t.store]
             if not spec.local:
@@ -176,24 +181,27 @@ class NodeConfig:
                     credit=False,
                     evicts=False,
                 )
-                receives = False
                 continue
-            below = self.tiers[i + 1] if i + 1 < len(self.tiers) else None
-            demotes = t.demotion in DEMOTIONS and below is not None
-            through = t.demotion == "through" and below is not None
+            below = self.tiers[i + 1 :]
+            targets: tuple[str, ...] = ()
+            if t.demotion in DEMOTIONS and below:
+                l2 = itertools.takewhile(lambda b: not b.is_memory, below)
+                if spec.level is Level.L1:
+                    targets = tuple(b.store for b in l2)
+                targets = targets or (below[0].store,)
             fallback = i > 0 and t.credit_fallback
             out[t.store] = TierTraits(
                 name=t.store,
                 level=spec.level,
                 kind=spec.kind,
                 credit=i == 0,
-                evicts=receives or fallback,
-                demotes_to=below.store if demotes and below else None,
-                copies_to=below.store if through and below else None,
+                evicts=t.store in receives or fallback,
+                demotes_to=targets,
+                copies_to=targets if t.demotion == "through" else (),
                 credit_fallback=fallback,
                 through_max_inflight=t.through_max_inflight or 0,
             )
-            receives = demotes
+            receives.update(targets)
         return out
 
     def transfer_defaults(self) -> TransferDefaults:

@@ -737,7 +737,8 @@ class NixlRemoteTier(RemoteTier):
 
     def reserve(self, keys: list[Key]) -> list[Location | None]:
         """A credited page per key, from the ready memory nodes with the most
-        room, each asked once; None where none was given."""
+        room, each asked once, no more than fit under quarantine_max; None
+        where none was given."""
         out: list[Location | None] = [None] * len(keys)
         if not keys or not self._usable():
             return out
@@ -748,8 +749,11 @@ class NixlRemoteTier(RemoteTier):
                 if node is None:
                     break
                 tried.add(node.node_id)
+                fits = self._fits()
+                if fits <= 0:
+                    break
                 slots = IO_DEPTH_PER_NODE - node.writes - len(node.credits)
-                want = min(len(keys) - given, MAX_BATCH, max(0, slots))
+                want = min(len(keys) - given, MAX_BATCH, max(0, slots), fits)
                 if want <= 0:
                     continue
                 node.reserved += want * self.page_size
@@ -990,6 +994,13 @@ class NixlRemoteTier(RemoteTier):
         held = self._kept_bytes + self._running * self.page_size
         return held + self.page_size > self.quarantine_max
 
+    def _fits(self) -> int:
+        """Caller holds the lock: the transfers that still fit under the
+        cap, less the credits given and not written yet."""
+        held = self._kept_bytes + self._running * self.page_size
+        given = sum(len(node.credits) for node in self._nodes)
+        return (self.quarantine_max - held) // self.page_size - given
+
     def submit_store(
         self,
         src: Span,
@@ -1200,7 +1211,8 @@ def _make(tier: TierConfig, env: TierEnv) -> NixlRemoteTier:
     return NixlRemoteTier(tier, env)
 
 
-# The memory nodes' pools: not this node's, and of their own kinds
+# The memory nodes' pools: not this node's, and of their own kinds. The first
+# L2 tier: an ssd tier below it takes what it cannot
 SPEC = TierSpec(
     store="remote",
     level=Level.L2,
@@ -1210,7 +1222,6 @@ SPEC = TierSpec(
         {"store", "url", "rdma_device", "timeout_s", "key_file", "quarantine_max"}
     ),
     common=False,
-    last_only=True,
     gpu_only=True,
     parse=_parse,
     make=_make,
