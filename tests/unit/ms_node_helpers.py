@@ -47,9 +47,9 @@ def wait_until(pred, timeout: float = 10.0, interval: float = 0.01, what: str = 
 
 
 def wait_demotions_applied(manager, timeout: float = 10.0) -> None:
-    """Waits until no demotion write is in flight or waits for its result,
-    then for two eviction passes to end: every result is applied (COMMIT,
-    FINALIZE_MOVE)."""
+    """Waits until demotions are quiet: no write in flight or waiting for
+    its result at the start and the end of two eviction passes, and no
+    result applied in between (COMMIT, FINALIZE_MOVE, RETIRE)."""
     passes = getattr(manager, "_test_passes", None)
     if passes is None:
         passes = manager._test_passes = [0]
@@ -73,9 +73,29 @@ def wait_demotions_applied(manager, timeout: float = 10.0) -> None:
                 or manager._remote_settled
             )
 
-    wait_until(idle, timeout, what="demotion writes ended")
-    seen = passes[0]
-    wait_until(lambda: passes[0] >= seen + 2, timeout, what="eviction passes")
+    def applied() -> tuple[int, ...]:
+        with manager._lock:
+            return tuple(
+                sum(c.values())
+                for c in (
+                    manager.move_results,
+                    manager.through_results,
+                    manager.retire_results,
+                )
+            )
+
+    deadline = time.monotonic() + timeout
+    while True:
+        left = max(0.1, deadline - time.monotonic())
+        wait_until(idle, left, what="demotion writes ended")
+        before, seen = applied(), passes[0]
+        wait_until(
+            lambda seen=seen: passes[0] >= seen + 2, left, what="eviction passes"
+        )
+        if idle() and applied() == before:
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError("demotions did not settle")
 
 
 def listening(path: str) -> bool:
