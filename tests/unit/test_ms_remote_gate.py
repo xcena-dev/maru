@@ -41,13 +41,10 @@ from tests.unit.test_ms_remote_tier import free_port
 def ms():
     server = NodeServer(session_ttl_s=6, heartbeat_s=0.3)
     port = free_port()
-    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
-    wait_until(
-        lambda: rpc._proxy_thread is not None and rpc._proxy_thread.is_alive(),
-        what="MaruServer listening",
-    )
+    wait_until(lambda: rpc._running, what="MaruServer listening")
     try:
         yield server, f"tcp://127.0.0.1:{port}"
     finally:

@@ -112,7 +112,7 @@ def metadata():
 
     def make(port=None):
         server = NodeServer(session_ttl_s=60, heartbeat_s=0.1)
-        rpc = NodeRpcServer(server, port=port or free_port(), num_workers=2)
+        rpc = NodeRpcServer(server, port=port or free_port())
         thread = threading.Thread(target=rpc.start, daemon=True)
         thread.start()
         servers.append((server, rpc, thread))

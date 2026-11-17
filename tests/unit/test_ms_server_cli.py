@@ -45,8 +45,7 @@ def test_defaults():
     assert kwargs["op_bytes_max"] == 64 << 20
     assert kwargs["policy_file"] is None
     rpc_kwargs = rpc_cls.call_args.kwargs
-    assert (rpc_kwargs["host"], rpc_kwargs["port"]) == ("127.0.0.1", 5556)
-    assert rpc_kwargs["num_workers"] == 4
+    assert rpc_kwargs == {"host": "127.0.0.1", "port": 5556}
     rpc_cls.return_value.start.assert_called_once()
     server_cls.return_value.close.assert_called_once()
 
@@ -57,8 +56,6 @@ def test_options_reach_the_server():
         "0.0.0.0",
         "--port",
         "6000",
-        "--workers",
-        "8",
         "--session-ttl-s",
         "12",
         "--heartbeat-s",
@@ -72,14 +69,13 @@ def test_options_reach_the_server():
     assert (kwargs["session_ttl_s"], kwargs["heartbeat_s"]) == (12, 3)
     assert (kwargs["node_give_up_s"], kwargs["op_window"]) == (60, 100)
     rpc_kwargs = rpc_cls.call_args.kwargs
-    assert (rpc_kwargs["host"], rpc_kwargs["port"]) == ("0.0.0.0", 6000)
-    assert rpc_kwargs["num_workers"] == 8
+    assert rpc_kwargs == {"host": "0.0.0.0", "port": 6000}
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--workers", "0"],
+        ["--workers", "4"],  # one thread serves
         ["--session-ttl-s", "0"],
         ["--heartbeat-s", "30"],
         ["--heartbeat-s", "0"],

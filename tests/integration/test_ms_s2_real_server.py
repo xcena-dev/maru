@@ -77,7 +77,7 @@ class RealMaruServer:
             )
             self._log = open(self.log_path, "wb")
             args = [sys.executable, "-m", "maru_server.node_server"]
-            args += ["--host", "127.0.0.1", "--port", str(chosen), "--workers", "2"]
+            args += ["--host", "127.0.0.1", "--port", str(chosen)]
             args += ["--session-ttl-s", str(ttl_s), "--heartbeat-s", str(heartbeat_s)]
             if policy is not None:
                 args += ["--policy-file", policy]

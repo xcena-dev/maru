@@ -84,7 +84,7 @@ def ssd_dir():
 def real_server():
     server = NodeServer(session_ttl_s=6.0, heartbeat_s=0.3)
     port = _free_port()
-    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)

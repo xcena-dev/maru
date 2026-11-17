@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 """The node server's RPC: multi-storage requests over real ZMQ round trips,
-HANDSHAKE, refused storage-backend requests, the request queue and its
-workers."""
+HANDSHAKE, refused storage-backend requests, frames it cannot read, the order
+requests are answered in, and start and stop."""
 
 import socket
 import struct
@@ -15,6 +15,7 @@ import zmq
 
 from maru_common.protocol import (
     HEADER_FORMAT,
+    HEADER_SIZE,
     PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
     HandshakeRequest,
@@ -42,7 +43,6 @@ class _Served:
         self.server = server or NodeServer()
         port = free_port()
         self.address = f"tcp://127.0.0.1:{port}"
-        kwargs.setdefault("num_workers", 2)
         self.rpc = NodeRpcServer(self.server, host="127.0.0.1", port=port, **kwargs)
         self.thread = threading.Thread(target=self.rpc.start, daemon=True)
         self.thread.start()
@@ -198,7 +198,7 @@ def test_storage_backend_requests_are_refused(served):
 
 def test_a_failing_handler_answers_rejected():
     server = NodeServer()
-    rpc = NodeRpcServer(server, port=free_port(), num_workers=1)
+    rpc = NodeRpcServer(server, port=free_port())
 
     def boom(request, payload):
         raise RuntimeError("boom")
@@ -295,195 +295,35 @@ def test_stop_while_multi_storage_requests_are_in_flight():
     assert not any(t.is_alive() for t in clients)
 
 
-class _ProxyHarness:
-    """Drives _proxy_routine with mock sockets and a scripted poller."""
-
-    def __init__(self, queue_max=2):
-        from unittest.mock import MagicMock
-
-        self.server = NodeServer()
-        self.rpc = NodeRpcServer(
-            self.server, port=5556, num_workers=1, queue_max=queue_max
-        )
-        self.rpc._frontend = MagicMock()
-        self.rpc._replies = MagicMock()
-        for sock in (self.rpc._frontend, self.rpc._replies):
-            sock.getsockopt.return_value = 0  # one frame per poll
-        self.serializer = Serializer()
-
-    def frame(self, code, request, seq):
-        return [b"id", b"", self.serializer.encode(code, request, seq=seq)]
-
-    def run(self, rounds, unpolled=()):
-        """rounds: (socket, message) pairs, one readable socket per poll;
-        ``unpolled``: frames the frontend has after those, with no poll."""
-        from unittest.mock import MagicMock, patch
-
-        self.rpc._replies.recv_multipart.side_effect = [
-            m for s, m in rounds if s is self.rpc._replies
-        ]
-        self.rpc._frontend.recv_multipart.side_effect = [
-            *(m for s, m in rounds if s is self.rpc._frontend),
-            *unpolled,
-        ]
-        script = iter(rounds)
-
-        def poll(_timeout):
-            try:
-                sock, _ = next(script)
-            except StopIteration:
-                self.rpc._running = False
-                return []
-            return [(sock, zmq.POLLIN)]
-
-        poller = MagicMock()
-        poller.poll.side_effect = poll
-        self.rpc._running = True
-        with patch.object(zmq, "Poller", return_value=poller):
-            self.rpc._proxy_routine()
-
-    def queued(self):
-        out = []
-        while not self.rpc._requests.empty():
-            out.append(self.rpc._requests.get())
-        return out
-
-    def replies(self):
-        return [
-            self.serializer.decode_response(call.args[0][2])
-            for call in self.rpc._frontend.send_multipart.call_args_list
-        ]
-
-    def close(self):
-        self.server.close()
-
-
-def _probe(seq):
-    return MessageType.PROBE, ProbeRequest(session="s", server_epoch="e", items=[]), seq
-
-
-def test_a_full_queue_answers_busy():
-    h = _ProxyHarness(queue_max=2)
-    front = h.rpc._frontend
-    probes = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
-    h.run([(front, p) for p in probes])
-    # two frames wait in the queue; the third overflows and gets BUSY
-    ((header, reply),) = h.replies()
-    assert header.sequence == 3 and reply.status == Status.BUSY
-    assert h.queued() == probes[:2]
-    h.close()
-
-
-def test_requests_wait_in_order():
-    h = _ProxyHarness(queue_max=10)
-    front = h.rpc._frontend
-    frames = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
-    h.run([(front, f) for f in frames])
-    assert h.queued() == frames and h.replies() == []
-    h.close()
-
-
-def test_replies_go_back_with_their_envelope():
-    h = _ProxyHarness()
-    answer = [b"id", b"", b"answer"]
-    h.run([(h.rpc._replies, answer)])
-    h.rpc._frontend.send_multipart.assert_called_once_with(answer)
-    h.close()
-
-
-def test_the_proxy_moves_every_ready_frame_before_it_polls_again():
-    h = _ProxyHarness(queue_max=10)
-    front = h.rpc._frontend
-    frames = [h.frame(*_probe(seq)) for seq in (1, 2, 3)]
-    front.getsockopt.side_effect = [zmq.POLLIN, zmq.POLLIN, 0]
-    h.run([(front, frames[0])], unpolled=frames[1:])
-    assert h.queued() == frames
-    h.close()
-
-
-def test_a_request_sent_before_workers_connect_is_served():
-    class SlowWorkers(NodeRpcServer):
-        def _worker_routine(self, worker_id):
-            time.sleep(0.5)
-            super()._worker_routine(worker_id)
-
-    server = NodeServer()
-    port = free_port()
-    rpc = SlowWorkers(server, host="127.0.0.1", port=port, num_workers=2)
-    serving = threading.Thread(target=rpc.start, daemon=True)
-    serving.start()
-    wire = RpcWire(f"tcp://127.0.0.1:{port}", server.ms_service)
-    try:
-        assert FakeNode(wire, "n1").open().status == Status.OK
-    finally:
-        wire.close()
-        rpc.stop()
-        serving.join(5)
-        server.close()
-
-
 def test_a_stop_before_the_start_is_kept():
     server = NodeServer()
     port = free_port()
-    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=1)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port)
     rpc.stop()  # e.g. a signal while the process starts
     serving = threading.Thread(target=rpc.start, daemon=True)
     serving.start()
     serving.join(5)
-    assert not serving.is_alive() and rpc._context is None
+    assert not serving.is_alive()
     with socket.socket() as s:
         s.bind(("127.0.0.1", port))  # never bound
     server.close()
 
 
-def test_a_port_in_use_fails_the_start_and_leaves_nothing_open():
+def test_a_port_in_use_fails_the_start():
     server = NodeServer()
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
         taken.listen()
         port = taken.getsockname()[1]
-        rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=1)
+        rpc = NodeRpcServer(server, host="127.0.0.1", port=port)
         with pytest.raises(zmq.ZMQError):
             rpc.start()
-    assert rpc._context is None and rpc._frontend is None and rpc._replies is None
-    assert not rpc._worker_threads
-    server.close()
-
-
-def test_stop_leaves_a_running_proxys_sockets_to_it():
-    from unittest.mock import MagicMock
-
-    server = NodeServer()
-    rpc = NodeRpcServer(server, port=5556, num_workers=1)
-    rpc._owns_sockets = True  # as after start()
-    frontend, context = MagicMock(), MagicMock()
-    rpc._frontend, rpc._context = frontend, context
-    rpc._proxy_thread = MagicMock()
-    rpc._proxy_thread.is_alive.return_value = True  # join timed out
-    rpc.stop()
-    frontend.close.assert_not_called()
-    context.term.assert_not_called()
-    server.close()
-
-
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_start_gives_up_when_workers_never_connect():
-    class DeadWorkers(NodeRpcServer):
-        def _worker_routine(self, worker_id):
-            raise RuntimeError("worker died before connecting")
-
-    server = NodeServer()
-    rpc = DeadWorkers(server, port=free_port(), num_workers=1, connect_timeout_s=0.5)
-    started = time.monotonic()
-    with pytest.raises(RuntimeError, match="did not connect"):
-        rpc.start()
-    assert time.monotonic() - started < 5
-    assert rpc._context is None and rpc._frontend is None and not rpc._running
+    assert not rpc._running
     server.close()
 
 
 def _block_slow_probes(server):
-    """A PROBE of session "slow" holds its worker until ``release`` is set."""
+    """A PROBE of session "slow" is held until ``release`` is set."""
     entered, release = threading.Event(), threading.Event()
     probe = server.ms_service.probe
 
@@ -502,43 +342,44 @@ def _probe_frame(session="s"):
     return Serializer().encode(MessageType.PROBE, request)
 
 
-def test_a_slow_request_does_not_delay_one_an_idle_worker_can_take():
+def test_requests_are_answered_one_at_a_time_in_order():
     server = NodeServer()
     entered, release = _block_slow_probes(server)
-    served = _Served(server, num_workers=2)
+    served = _Served(server)
     try:
-        slow = served.wire()
+        slow, later = served.wire(), served.wire()
         slow.socket.send(_probe_frame("slow"))
         assert entered.wait(5)
-        fast = served.wire(timeout_ms=2000)
-        for _ in range(8):
-            started = time.monotonic()
-            fast.exchange(_probe_frame())
-            assert time.monotonic() - started < 1.0
+        later.socket.send(_probe_frame())
+        # waits behind the slow one; never refused BUSY
+        assert not later.socket.poll(300)
         release.set()
         slow.socket.recv()
-    finally:
-        release.set()
-        served.close()
-
-
-def test_with_every_worker_busy_a_full_queue_answers_busy():
-    server = NodeServer()
-    entered, release = _block_slow_probes(server)
-    served = _Served(server, num_workers=1, queue_max=1)
-    try:
-        slow, queued, refused = served.wire(), served.wire(), served.wire(2000)
-        slow.socket.send(_probe_frame("slow"))
-        assert entered.wait(5)
-        queued.socket.send(_probe_frame())
-        time.sleep(0.2)  # queued before the next one arrives
-        refused.socket.send(_probe_frame())
-        data = refused.socket.recv()
-        assert refused.serializer.decode_response(data)[1].status == Status.BUSY
-        release.set()
-        reply = queued.serializer.decode_response(queued.socket.recv())[1]
+        reply = later.serializer.decode_response(later.socket.recv())[1]
         assert reply.status != Status.BUSY
-        slow.socket.recv()
     finally:
         release.set()
         served.close()
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"short",
+        # a multi-storage code with a bad magic and no readable payload
+        bytes([0, 0, 0, MessageType.PROBE]) + bytes(HEADER_SIZE - 4) + b"\xc1",
+    ],
+    ids=["shorter-than-a-header", "bad-magic"],
+)
+def test_a_frame_without_a_valid_header_gets_no_answer(served, frame):
+    server, wire = served
+    dealer = zmq.Context.instance().socket(zmq.DEALER)
+    dealer.setsockopt(zmq.LINGER, 0)
+    dealer.connect(wire.socket.getsockopt_string(zmq.LAST_ENDPOINT))
+    try:
+        dealer.send_multipart([b"", frame])
+        assert not dealer.poll(300)
+    finally:
+        dealer.close()
+    # the server keeps serving
+    assert FakeNode(wire, "n1").open().status == Status.OK

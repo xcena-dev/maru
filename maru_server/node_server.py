@@ -23,7 +23,7 @@ from .ms_service import (
     PolicyError,
     load_policy,
 )
-from .node_rpc import WORKERS, NodeRpcServer
+from .node_rpc import NodeRpcServer
 from .op_ledger import DEFAULT_OP_BYTES_MAX, DEFAULT_OP_WINDOW
 from .server import setup_logging
 
@@ -87,12 +87,6 @@ def main() -> None:
         help="Logging level (default: INFO)",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=WORKERS,
-        help=f"RPC worker threads (default: {WORKERS})",
-    )
-    parser.add_argument(
         "--session-ttl-s",
         type=float,
         default=DEFAULT_SESSION_TTL_S,
@@ -148,8 +142,6 @@ def main() -> None:
             load_policy(args.policy_file)
         except PolicyError as exc:
             parser.error(str(exc))
-    if args.workers < 1:
-        parser.error("--workers must be at least 1")
     if not args.session_ttl_s > 0:
         parser.error("--session-ttl-s must be positive")
     heartbeat_s = (
@@ -174,11 +166,9 @@ def main() -> None:
         op_bytes_max=args.op_bytes_max,
         policy_file=args.policy_file,
     )
-    rpc = NodeRpcServer(
-        server, host=args.host, port=args.port, num_workers=args.workers
-    )
-    # Only a write in the handler: stop() sets an Event start() waits in, and
-    # that would deadlock if the signal landed while it held the Event's lock
+    rpc = NodeRpcServer(server, host=args.host, port=args.port)
+    # Only a write in the handler: stop() takes the lock start() holds while
+    # it binds, which would deadlock if the signal landed then
     rfd, wfd = os.pipe()
     os.set_blocking(wfd, False)
 

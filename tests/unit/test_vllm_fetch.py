@@ -73,7 +73,7 @@ def real_server():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    rpc = NodeRpcServer(server, host="127.0.0.1", port=port, num_workers=2)
+    rpc = NodeRpcServer(server, host="127.0.0.1", port=port)
     thread = threading.Thread(target=rpc.start, daemon=True)
     thread.start()
     time.sleep(0.2)
