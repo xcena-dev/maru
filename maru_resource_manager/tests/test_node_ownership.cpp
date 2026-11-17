@@ -93,10 +93,11 @@ TEST_F(NodeOwnershipTest, ClaimAllocFreeRenewRelease) {
     EXPECT_EQ(released, 1u);
     EXPECT_EQ(pm.allocationCount(), 0u);
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
-    EXPECT_EQ(nodesFile(), "");
-    // Forgotten: the run is over, and any host may claim the node.
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
+    // Forgotten: the run is over for good, and any host may claim the node.
     EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
     EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ESTALE);
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
     EXPECT_TRUE(claim(pm, "node-a", "e2", "host-b").empty());
     EXPECT_EQ(pm.checkpoint(), 0);
 }
@@ -110,7 +111,10 @@ TEST_F(NodeOwnershipTest, EarlierRunIsFenced) {
     Regions regions = claim(pm, "node-a", "e2");
     ASSERT_EQ(regions.size(), 1u);
     EXPECT_TRUE(same(regions[0].handle, a));
-    EXPECT_EQ(nodesFile(), "node node-a e2 host-a\n");
+    EXPECT_EQ(nodesFile(), "node node-a e2 host-a\nended node-a e1\n");
+    // Its claim does not take the node back.
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), 0);
 
     uint32_t released = 7;
     nodeAlloc(pm, "node-a", "e1", -ESTALE);
@@ -157,7 +161,7 @@ TEST_F(NodeOwnershipTest, ClaimFromAnotherHostIsRefused) {
     EXPECT_EQ(pm.adminReleaseNode("node-a", true, out), 0) << out;
     EXPECT_EQ(access(pm, a), "error " + std::to_string(-ENOENT));
     EXPECT_TRUE(claim(pm, "node-a", "e3", "host-b").empty());
-    EXPECT_EQ(nodesFile(), "node node-a e3 host-b\n");
+    EXPECT_EQ(nodesFile(), "node node-a e3 host-b\nended node-a e1\n");
 }
 
 TEST_F(NodeOwnershipTest, LeaseExpiryFreesAndForgets) {
@@ -186,7 +190,7 @@ TEST_F(NodeOwnershipTest, LeaseExpiryFreesAndForgets) {
     reap(pm);
     EXPECT_EQ(pm.allocationCount(), 2u);
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 1u);
-    EXPECT_EQ(nodesFile(), "node node-b e1 host-a\n");
+    EXPECT_EQ(nodesFile(), "node node-b e1 host-a\nended node-a e1\n");
     EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
     nodeAlloc(pm, "node-a", "e1", -ESTALE);
     EXPECT_TRUE(claim(pm, "node-a", "e2", "host-b").empty());
@@ -290,7 +294,8 @@ TEST_F(NodeOwnershipTest, RestartKeepsOwnersAndRestartsLeases) {
                 ASSERT_EQ(pm.checkpoint(), 0);
             }
         }
-        EXPECT_EQ(nodesFile(), "node node-a e2 host-a\nnode node-b e1 host-b\n");
+        EXPECT_EQ(nodesFile(),
+                  "node node-a e2 host-a\nnode node-b e1 host-b\nended node-a e1\n");
         PoolManager pm(state);
         ASSERT_EQ(pm.loadPools(), 0);
         EXPECT_EQ(pm.rmId(), rmId);
@@ -300,6 +305,9 @@ TEST_F(NodeOwnershipTest, RestartKeepsOwnersAndRestartsLeases) {
         EXPECT_EQ(reap(pm), 0u);
         EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 2u);
         nodeAlloc(pm, "node-a", "e1", -ESTALE);
+        // The cache of an earlier start is gone; the ended run still is.
+        claim(pm, "node-a", "e1", "host-a", -ESTALE);
+        EXPECT_EQ(pm.nodeRenew("node-a", "e2"), 0);
         claim(pm, "node-b", "e2", "host-a", -EEXIST);
         Regions regions = claim(pm, "node-a", "e3");
         ASSERT_EQ(regions.size(), 1u);
@@ -325,7 +333,15 @@ TEST_F(NodeOwnershipTest, NodeTableFileRules) {
     }
     // A malformed table stops the start before anything is decided.
     for (const char *text : {"node node-a e1\n", "node node-a e1 host-a x\n", "bogus\n", "\n",
-                             "node node-a e1 host-a\nnode node-a e2 host-a\n"}) {
+                             "node node-a e1 host-a\nnode node-a e2 host-a\n", "ended node-a\n",
+                             "ended node-a e0 x\n", "ended node-a e0\nended node-a e0\n",
+                             "node node-a e1 host-a\nended node-a e1\n",
+                             "ended node-a e0\nnode node-a e1 host-a\n",
+                             "releasing node-a e0 host-a\n",
+                             "ended node-a e0\nended node-a e1\nreleasing node-a e0 host-a\n",
+                             "node node-a e1 host-a\nended node-a e0\nreleasing node-a e0 host-a\n",
+                             "ended node-a e0\nreleasing node-a e0\n",
+                             "ended node-a e0\nreleasing node-a e0 host-a\nended node-a e1\n"}) {
         SCOPED_TRACE(text);
         std::ofstream(state + "/nodes") << text;
         expectRecoveryRefused(-EINVAL);
@@ -367,15 +383,25 @@ TEST_F(NodeOwnershipTest, NodeTableFileRules) {
     claim(pm, "node-a", "e1", "host-a", -EIO);
     checkpoint_fault::clear();
     claim(pm, "node-a", "e1", "host-a");
-    // Forgetting is in effect once written, durable or not.
+    // A release that cannot write the end of the run changes nothing. Once
+    // written the run is over, and its regions are freed once that is durable.
+    nodeAlloc(pm, "node-a", "e1");
     checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Fsync, EIO);
     uint32_t released = 0;
     EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -EIO);
     EXPECT_EQ(pm.nodeRenew("node-a", "e1"), 0);
     checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
-    EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), 0);
+    EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -EIO);
+    EXPECT_EQ(released, 0u);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
+    reap(pm);
+    EXPECT_EQ(pm.allocationCount(), 1u);
     checkpoint_fault::clear();
-    EXPECT_EQ(nodesFile(), "");
+    reap(pm);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
 }
 
 TEST_F(NodeOwnershipTest, RebootFreesNodesOfThisHost) {
@@ -514,7 +540,7 @@ TEST_F(NodeOwnershipTest, MissingRmIdWithNodeStateRefusesStart) {
         ASSERT_EQ(pm.nodeRelease("node-a", "e1", released), 0);
         EXPECT_EQ(pm.allocationCount(), 1u);
     }
-    EXPECT_EQ(nodesFile(), "");
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
     fs::remove(state + "/rm_id");
     expectRecoveryRefused(-ENOKEY);
     std::ofstream(state + "/rm_id") << rmId;
@@ -571,12 +597,226 @@ TEST_F(NodeOwnershipTest, FailedClaimLeavesAFencedRunFenced) {
     reap(pm);
     EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
     EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);  // e2 claimed after it
-    // The same run's retry fails again: still fenced, lease not renewed.
-    checkpoint_fault::arm(state, checkpoint_fault::Operation::Fsync, EIO);
-    claim(pm, "node-a", "e2", "host-a", -EIO);
+    // The same run's retry is refused: its run has ended, lease not renewed.
+    claim(pm, "node-a", "e2", "host-a", -ESTALE);
     EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
     checkpoint_fault::clear();
     reap(pm);
     EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
     EXPECT_EQ(pm.allocationCount(), 0u);
+}
+
+TEST_F(NodeOwnershipTest, AnEndedRunStaysEndedAcrossARestart) {
+    addDevice(0);
+    Handle a{};
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        claim(pm, "node-a", "e1");
+        a = nodeAlloc(pm, "node-a", "e1");
+        // The table cannot be written: the run is fenced, its regions kept.
+        PoolManagerTestPeer::ageNode(pm, "node-a", hours(1));
+        checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Write, ENOSPC);
+        reap(pm);
+        checkpoint_fault::clear();
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(nodesFile(), "node node-a e1 host-a\n");
+        // Written, but the region cannot be freed: the run has ended.
+        checkpoint_fault::arm(state + "/maru-resource-manager.wal",
+                              checkpoint_fault::Operation::Write, ENOSPC);
+        reap(pm);
+        checkpoint_fault::clear();
+        EXPECT_EQ(pm.allocationCount(), 1u);
+        EXPECT_EQ(nodesFile(), "ended node-a e1\nreleasing node-a e1 host-a\n");
+    }
+    // The RM stops before it retries: the next start finishes the release
+    // before it serves, and never brings the run back.
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
+    EXPECT_EQ(access(pm, a), "error " + std::to_string(-ENOENT));
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -EKEYEXPIRED);
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
+    nodeAlloc(pm, "node-a", "e1", -ESTALE);
+    EXPECT_TRUE(claim(pm, "node-a", "e2").empty());
+    EXPECT_EQ(nodesFile(), "node node-a e2 host-a\nended node-a e1\n");
+}
+
+TEST_F(NodeOwnershipTest, EndedRunsAreBounded) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    for (size_t i = 0; i <= kMaxEndedRuns + 1; ++i) claim(pm, "node-a", "e" + std::to_string(i));
+    // The newest ended runs are kept, oldest first; e0 is forgotten.
+    std::string expected = "node node-a e" + std::to_string(kMaxEndedRuns + 1) + " host-a\n";
+    for (size_t i = 1; i <= kMaxEndedRuns; ++i)
+        expected += "ended node-a e" + std::to_string(i) + "\n";
+    EXPECT_EQ(nodesFile(), expected);
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e1"), -ESTALE);
+    // Once the last run ends, renew still tells it from the runs it
+    // replaced, forgotten e0 too.
+    const std::string last = "e" + std::to_string(kMaxEndedRuns + 1);
+    uint32_t released = 0;
+    ASSERT_EQ(pm.nodeRelease("node-a", last, released), 0);
+    EXPECT_EQ(pm.nodeRenew("node-a", last), -EKEYEXPIRED);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e0"), -ESTALE);
+    // Beyond the bound an ended run is no longer known: its claim is new.
+    EXPECT_TRUE(claim(pm, "node-a", "e0").empty());
+    // More ended lines than the bound are trimmed when read.
+    std::string many;
+    for (size_t i = 0; i < kMaxEndedRuns + 5; ++i)
+        many += "ended node-b x" + std::to_string(i) + "\n";
+    std::ofstream(state + "/nodes") << many;
+    PoolManager again(state);
+    ASSERT_EQ(again.loadPools(), 0);
+    claim(again, "node-b", "x4", "host-a", 0);  // dropped
+    claim(again, "node-b", "x5", "host-a", -ESTALE);  // kept
+}
+
+TEST_F(NodeOwnershipTest, AnUnfinishedReleaseIsFinishedBeforeAnythingElse) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    claim(pm, "node-a", "e1");
+    const Handle a = nodeAlloc(pm, "node-a", "e1");
+    const Handle b = nodeAlloc(pm, "node-a", "e1");
+    std::string path;
+    ASSERT_EQ(pm.hold(b, "agent-1", "i1", path), 0);
+    const std::string wal = state + "/maru-resource-manager.wal";
+    // The end is written, the regions cannot be freed yet.
+    checkpoint_fault::arm(wal, checkpoint_fault::Operation::Write, ENOSPC);
+    uint32_t released = 0;
+    EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ENOSPC);
+    EXPECT_EQ(nodesFile(), "ended node-a e1\nreleasing node-a e1 host-a\n");
+    EXPECT_NE(admin(pm, "allocations").find("node=node-a epoch=e1 releasing"), npos);
+    // Still bound to its host; a new run waits for the release to finish.
+    claim(pm, "node-a", "e2", "host-b", -EEXIST);
+    claim(pm, "node-a", "e2", "host-a", -ENOSPC);
+    nodeAlloc(pm, "node-a", "e1", -ESTALE);
+    EXPECT_EQ(pm.allocationCount(), 2u);
+    // The run's own retry continues the release.
+    checkpoint_fault::clear();
+    EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), 0);
+    EXPECT_EQ(released, 2u);
+    EXPECT_EQ(pm.allocationCount(), 1u);  // b drains
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
+    EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ESTALE);
+
+    // A new run's claim finishes a pending release first: no region of the
+    // ended run reaches it.
+    claim(pm, "node-a", "e2", "host-a");
+    const Handle c = nodeAlloc(pm, "node-a", "e2");
+    checkpoint_fault::arm(wal, checkpoint_fault::Operation::Write, ENOSPC);
+    EXPECT_EQ(pm.nodeRelease("node-a", "e2", released), -ENOSPC);
+    checkpoint_fault::clear();
+    EXPECT_TRUE(claim(pm, "node-a", "e3", "host-a").empty());
+    EXPECT_EQ(access(pm, c), "error " + std::to_string(-ENOENT));
+    EXPECT_EQ(nodesFile(), "node node-a e3 host-a\nended node-a e1\nended node-a e2\n");
+    ASSERT_EQ(pm.unhold(b, "agent-1", "i1"), 0);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    EXPECT_EQ(access(pm, a), "error " + std::to_string(-ENOENT));
+}
+
+TEST_F(NodeOwnershipTest, AReleaseThatCannotEndTheRunChangesNothing) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    claim(pm, "node-a", "e1");
+    claim(pm, "node-a", "e2");
+    const Handle a = nodeAlloc(pm, "node-a", "e2");
+    checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Write, ENOSPC);
+    uint32_t released = 0;
+    EXPECT_EQ(pm.nodeRelease("node-a", "e2", released), -ENOSPC);
+    checkpoint_fault::clear();
+    EXPECT_EQ(released, 0u);
+    EXPECT_EQ(access(pm, a).find("error"), npos);
+    EXPECT_EQ(nodesFile(), "node node-a e2 host-a\nended node-a e1\n");
+    // Still the current run, not ended: it renews and claims again.
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), 0);
+    claim(pm, "node-a", "e2");
+    claim(pm, "node-b", "f1");
+    EXPECT_EQ(nodesFile(), "node node-a e2 host-a\nnode node-b f1 host-a\nended node-a e1\n");
+}
+
+TEST_F(NodeOwnershipTest, AReleaseNotFinishedAtStartIsLeftToTheReaper) {
+    addDevice(0);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        claim(pm, "node-a", "e1");
+        nodeAlloc(pm, "node-a", "e1");
+        checkpoint_fault::arm(state + "/maru-resource-manager.wal",
+                              checkpoint_fault::Operation::Write, ENOSPC);
+        uint32_t released = 0;
+        EXPECT_EQ(pm.nodeRelease("node-a", "e1", released), -ENOSPC);
+        checkpoint_fault::clear();
+    }
+    // The region is freed at start, but the record cannot be dropped yet.
+    checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Write, ENOSPC);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+    EXPECT_EQ(nodesFile(), "ended node-a e1\nreleasing node-a e1 host-a\n");
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
+    checkpoint_fault::clear();
+    reap(pm);
+    EXPECT_EQ(PoolManagerTestPeer::nodeCount(pm), 0u);
+    EXPECT_EQ(nodesFile(), "ended node-a e1\n");
+}
+
+TEST_F(NodeOwnershipTest, OnlyARecordedReleaseIsFinishedAtStart) {
+    addDevice(0);
+    {
+        PoolManager pm(state);
+        ASSERT_EQ(pm.loadPools(), 0);
+        claim(pm, "node-a", "e1");
+        uint32_t released = 0;
+        ASSERT_EQ(pm.nodeRelease("node-a", "e1", released), 0);
+        claim(pm, "node-a", "e2");
+        nodeAlloc(pm, "node-a", "e2");
+    }
+    // A table restored from before e2's claim: e2's region has no record,
+    // which is the lost-record case (the lease frees it), not a release.
+    std::ofstream(state + "/nodes") << "ended node-a e1\n";
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    reap(pm);
+    EXPECT_EQ(pm.allocationCount(), 1u);
+    PoolManagerTestPeer::ageNode(pm, "node-a", hours(1));
+    reap(pm);
+    EXPECT_EQ(pm.allocationCount(), 0u);
+}
+
+TEST_F(NodeOwnershipTest, EndedRunAndFailedTakeoverEdges) {
+    addDevice(0);
+    PoolManager pm(state);
+    ASSERT_EQ(pm.loadPools(), 0);
+    // An ended run's claim is -ESTALE even after the node moved hosts.
+    claim(pm, "node-a", "e1", "host-a");
+    uint32_t released = 0;
+    ASSERT_EQ(pm.nodeRelease("node-a", "e1", released), 0);
+    claim(pm, "node-a", "e2", "host-b");
+    claim(pm, "node-a", "e1", "host-a", -ESTALE);
+    // A takeover that cannot be written changes nothing, the ended list too.
+    checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Write, ENOSPC);
+    claim(pm, "node-a", "e3", "host-b", -ENOSPC);
+    checkpoint_fault::clear();
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), 0);
+    EXPECT_EQ(nodesFile(), "node node-a e2 host-b\nended node-a e1\n");
+    claim(pm, "node-a", "e2", "host-b");
+    // A lease that ran out while its end cannot be written: the run has
+    // ended all the same, from any host, and a new run finishes the release.
+    PoolManagerTestPeer::ageNode(pm, "node-a", hours(1));
+    checkpoint_fault::arm(state + "/nodes.tmp", checkpoint_fault::Operation::Write, ENOSPC);
+    reap(pm);
+    claim(pm, "node-a", "e2", "host-b", -ESTALE);
+    claim(pm, "node-a", "e2", "host-a", -ESTALE);
+    EXPECT_EQ(pm.nodeRenew("node-a", "e2"), -EKEYEXPIRED);
+    checkpoint_fault::clear();
+    EXPECT_TRUE(claim(pm, "node-a", "e4", "host-b").empty());
+    EXPECT_EQ(nodesFile(), "node node-a e4 host-b\nended node-a e1\nended node-a e2\n");
 }

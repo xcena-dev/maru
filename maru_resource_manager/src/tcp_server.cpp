@@ -429,13 +429,21 @@ bool TcpServer::cacheLookup(const std::string &key, uint64_t requestId, int clie
     return true;
 }
 
-bool TcpServer::cacheHas(const std::string &key, uint64_t requestId) {
+bool TcpServer::cachedClaimSucceeded(const std::string &key, uint64_t requestId) {
     if (requestId == 0) return false;
     std::lock_guard<std::mutex> lk(cacheMutex_);
     auto it = idempotencyCache_.find(key);
-    return it != idempotencyCache_.end() &&
-           std::chrono::duration_cast<std::chrono::seconds>(
-               SteadyClock::now() - it->second.insertedAt).count() < kCacheTtlSec;
+    if (it == idempotencyCache_.end() ||
+        std::chrono::duration_cast<std::chrono::seconds>(
+            SteadyClock::now() - it->second.insertedAt).count() >= kCacheTtlSec)
+        return false;
+    const auto &payload = it->second.payload;
+    if (it->second.type != static_cast<uint16_t>(MsgType::NODE_CLAIM_RESP) ||
+        payload.size() < sizeof(NodeClaimResp))
+        return false;
+    NodeClaimResp resp{};
+    std::memcpy(&resp, payload.data(), sizeof(resp));
+    return resp.status == 0;
 }
 
 void TcpServer::cacheEvictExpired() {
@@ -801,18 +809,19 @@ bool TcpServer::handleOneRequest(int clientFd) {
         }
         uint64_t requestId = parseRequestId(payload, cidEnd);
         const std::string key = cacheKey(type, cid, requestId, nodeId, epoch);
-        // A reply is replayed only while its run is the node's current run:
-        // a resend of an ended run gets what a new request of it gets, and a
-        // resent claim does not claim again. NODE_RELEASE ends the run itself.
-        const int run = type == MsgType::NODE_RELEASE_REQ
-                            ? 0
-                            : handler_.nodeRunStatus(nodeId, epoch);
-        if (run == 0) {
+        // A reply is replayed only while its run is the node's current run;
+        // a resend of another run gets what a new request of it gets, except
+        // that a claim that took the node is refused rather than run again
+        // (the node table may no longer list the run as ended). NODE_RELEASE
+        // ends the run itself.
+        const bool current = type == MsgType::NODE_RELEASE_REQ ||
+                             handler_.nodeRunStatus(nodeId, epoch) == 0;
+        if (current) {
             if (cacheLookup(key, requestId, clientFd)) {
                 return true;
             }
-        } else if (type == MsgType::NODE_CLAIM_REQ && cacheHas(key, requestId)) {
-            auto resp = handler_.refuseNodeClaim(run);
+        } else if (type == MsgType::NODE_CLAIM_REQ && cachedClaimSucceeded(key, requestId)) {
+            auto resp = handler_.refuseNodeClaim();
             return sendResp(clientFd, MsgType::NODE_CLAIM_RESP, resp.data(), resp.size()) == 0;
         }
 

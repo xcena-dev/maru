@@ -20,6 +20,7 @@ from pathlib import Path
 
 DAEMON = None
 ALIGN = 2 << 20
+MAX_ENDED_RUNS = 64  # kMaxEndedRuns
 SIZE = 16 << 20
 WIRE_HEADER = struct.Struct("<IHHI")
 HANDLE = struct.Struct("<QQQQ")
@@ -715,24 +716,70 @@ class ProcessRecoveryTest(unittest.TestCase):
     def test_a_resend_of_an_ended_run_is_not_replayed(self):
         """A reply is replayed only while its run is the node's current run;
         a resent claim of an ended run claims nothing."""
-        self.start()
+        self.start(hold_grace=1)
         self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
         first = self.node_alloc(b"node-a", b"e1", 2)
         self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), 0)
+        held = self.node_alloc(b"node-a", b"e1", 10)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", held, b"w1", 11)[0], 0)
+        free = HANDLE.pack(*self.node_alloc(b"node-a", b"e1", 12))
+        self.assertEqual(self.node_status(21, b"node-a", b"e1", 13, free), 0)
         status, _, _, regions = self.node_claim(b"node-a", b"e2", 4)
-        self.assertEqual((status, [r[0] for r in regions]), (0, [first]))
+        self.assertEqual(status, 0)
+        self.assertEqual(sorted(r[0] for r in regions), sorted([first, held]))
         # Run e1's requests again, as after lost replies.
-        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.ESTALE)
-        self.node_alloc(b"node-a", b"e1", 2, -errno.ESTALE)
+        stale = -errno.ESTALE
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), stale)
+        self.node_alloc(b"node-a", b"e1", 2, stale)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", held, b"w1", 11)[0], stale)
+        self.assertEqual(self.node_status(21, b"node-a", b"e1", 13, free), stale)
         self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.ESTALE)
         self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # still e2's
         self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # replayed
+        # After a restart the cache is gone; run e1 has still ended.
+        self.stop(signal.SIGKILL)
+        self.start(hold_grace=1)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 7), 0)
         # A released run's release is replayed; its other resends are refused.
         released = self.node_request(25, b"node-a", b"e2", 6)
-        self.assertEqual(struct.unpack("<iI", released), (0, 1))
+        self.assertEqual(struct.unpack("<iI", released), (0, 2))
         self.assertEqual(self.node_request(25, b"node-a", b"e2", 6), released)
         self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), -errno.EKEYEXPIRED)
-        self.assertEqual(self.node_claim(b"node-a", b"e2", 4)[0], -errno.EKEYEXPIRED)
+        self.assertEqual(self.node_claim(b"node-a", b"e2", 4)[0], -errno.ESTALE)
+        # The held region drains until the RM drops its gone holder.
+        deadline = time.monotonic() + START_S
+        while self.stats()["/dev/dax0.0"][2] != SIZE - ALIGN:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.check_stats()
+        self.stop()
+
+    def test_a_resent_failed_claim_runs_again(self):
+        """A claim that failed took nothing: its resend is a new claim."""
+        self.start()
+        (self.state / "nodes.tmp").mkdir()  # the table cannot be written
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.EISDIR)
+        (self.state / "nodes.tmp").rmdir()
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 2), 0)
+        self.check_stats()
+        self.stop()
+
+    def test_a_resent_claim_of_a_forgotten_run_is_refused(self):
+        """A claim already handled is not run again for a run that is not the
+        node's current one, even once the table no longer lists it."""
+        self.start()
+        self.assertEqual(self.node_claim(b"node-a", b"e0", 1)[0], 0)
+        self.node_alloc(b"node-a", b"e0", 2)
+        self.assertEqual(self.node_status(25, b"node-a", b"e0", 3), 0)
+        for i in range(1, MAX_ENDED_RUNS + 2):  # e0 drops out of the table
+            self.assertEqual(self.node_claim(b"node-a", b"e%d" % i, 10 + i)[0], 0)
+        last = b"e%d" % (MAX_ENDED_RUNS + 1)
+        self.assertNotIn("ended node-a e0\n", (self.state / "nodes").read_text())
+        self.assertEqual(self.node_claim(b"node-a", b"e0", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", last, 1000), 0)
+        self.node_alloc(b"node-a", b"e0", 2, -errno.ESTALE)
         self.check_stats()
         self.stop()
 

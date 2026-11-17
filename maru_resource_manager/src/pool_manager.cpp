@@ -1611,7 +1611,7 @@ int PoolManager::adminAllocations(const std::string &device, std::string &out)
         auto it = nodes_.find(nodeId);
         if (it == nodes_.end() || it->second.epoch.empty()) return " node=" + nodeId + " epoch=-";
         return " node=" + nodeId + " epoch=" + it->second.epoch +
-               (it->second.fenced ? " lease=expired" : "");
+               (it->second.releasing ? " releasing" : it->second.fenced ? " lease=expired" : "");
     };
     for (const auto &[id, a] : allocations_)
         if (device.empty() || a.poolId == poolFilter)
