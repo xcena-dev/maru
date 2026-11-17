@@ -712,6 +712,30 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertEqual(self.node_status(23, b"node-a", b"e2", 7), 0)
         self.stop()
 
+    def test_a_resend_of_an_ended_run_is_not_replayed(self):
+        """A reply is replayed only while its run is the node's current run;
+        a resent claim of an ended run claims nothing."""
+        self.start()
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        first = self.node_alloc(b"node-a", b"e1", 2)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), 0)
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 4)
+        self.assertEqual((status, [r[0] for r in regions]), (0, [first]))
+        # Run e1's requests again, as after lost replies.
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.ESTALE)
+        self.node_alloc(b"node-a", b"e1", 2, -errno.ESTALE)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # still e2's
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # replayed
+        # A released run's release is replayed; its other resends are refused.
+        released = self.node_request(25, b"node-a", b"e2", 6)
+        self.assertEqual(struct.unpack("<iI", released), (0, 1))
+        self.assertEqual(self.node_request(25, b"node-a", b"e2", 6), released)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), -errno.EKEYEXPIRED)
+        self.assertEqual(self.node_claim(b"node-a", b"e2", 4)[0], -errno.EKEYEXPIRED)
+        self.check_stats()
+        self.stop()
+
     @staticmethod
     def pid_start(pid):
         """Field 22 of /proc/<pid>/stat, as the RM reads it."""
@@ -794,13 +818,16 @@ class ProcessRecoveryTest(unittest.TestCase):
         status, _, lease_ms, _ = self.node_claim(b"node-a", b"e1", 1)
         self.assertEqual((status, lease_ms), (0, 1000))
         self.node_alloc(b"node-a", b"e1", 2)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), 0)
         self.check_stats({"/dev/dax0.0": 1})
         deadline = time.monotonic() + START_S
         while self.stats()["/dev/dax0.0"][2] != SIZE - ALIGN:
             self.assertLess(time.monotonic(), deadline, self.log.read_text())
             time.sleep(0.1)
         self.assertIn("did not renew", self.log.read_text())
+        # A resend of the renewal is not replayed once the lease ran out.
         self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.EKEYEXPIRED)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 4), -errno.EKEYEXPIRED)
         self.stop()
 
     def test_second_instance_is_refused(self):

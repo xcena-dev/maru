@@ -139,6 +139,9 @@ public:
                   const std::string &daxPath, NodeRegion &out);
     int nodeFree(const Handle &handle, const std::string &nodeId, const std::string &epoch);
     int nodeRenew(const std::string &nodeId, const std::string &epoch);
+    /// What NODE_RENEW would answer for this run (0, -ESTALE, -EKEYEXPIRED),
+    /// without renewing the lease.
+    int nodeRunStatus(const std::string &nodeId, const std::string &epoch);
     /// The node's regions with their holds, as NODE_CLAIM lists them. Read
     /// only: the lease is not renewed.
     int nodeHolds(const std::string &nodeId, const std::string &epoch,
@@ -319,6 +322,8 @@ private:
     };
     // The node whose current run is `epoch`, or null.
     NodeState *currentNode(const std::string &nodeId, const std::string &epoch);
+    // 0 for the node's current run, else -EKEYEXPIRED or -ESTALE (nodeRenew).
+    int runStatusLocked(const std::string &nodeId, const std::string &epoch);
     // The node's regions (not draining) with their holds.
     std::vector<NodeRegion> nodeRegionsLocked(const std::string &nodeId);
     bool nodeOnThisHost(const char *clientId) const;

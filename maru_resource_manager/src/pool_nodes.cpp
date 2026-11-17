@@ -344,20 +344,32 @@ int PoolManager::nodeRenew(const std::string &nodeId, const std::string &epoch)
         return -EINVAL;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    NodeState *node = currentNode(nodeId, epoch);
-    if (!node)
+    const int status = runStatusLocked(nodeId, epoch);
+    if (status == 0) currentNode(nodeId, epoch)->seen = SteadyClock::now();
+    return status;
+}
+
+int PoolManager::nodeRunStatus(const std::string &nodeId, const std::string &epoch)
+{
+    if (!validNodeId(nodeId) || !validHoldName(epoch))
     {
-        // Lease expired: fenced (the lease ran out), or the node record is
-        // gone (NODE_RELEASE or an admin release-node), and no other run
-        // claimed the node since. The run is over; the StorageService starts
-        // a new run and claims again. Another run's claim: -ESTALE.
-        auto it = nodes_.find(nodeId);
-        const bool fenced = it == nodes_.end() || it->second.epoch.empty() ||
-                            it->second.epoch == epoch;
-        return fenced ? -EKEYEXPIRED : -ESTALE;
+        return -EINVAL;
     }
-    node->seen = SteadyClock::now();
-    return 0;
+    std::lock_guard<std::mutex> lock(mu_);
+    return runStatusLocked(nodeId, epoch);
+}
+
+int PoolManager::runStatusLocked(const std::string &nodeId, const std::string &epoch)
+{
+    if (currentNode(nodeId, epoch)) return 0;
+    // Lease expired: fenced (the lease ran out), or the node record is gone
+    // (NODE_RELEASE or an admin release-node), and no other run claimed the
+    // node since. The run is over; the StorageService starts a new run and
+    // claims again. Another run's claim: -ESTALE.
+    auto it = nodes_.find(nodeId);
+    const bool fenced =
+        it == nodes_.end() || it->second.epoch.empty() || it->second.epoch == epoch;
+    return fenced ? -EKEYEXPIRED : -ESTALE;
 }
 
 int PoolManager::nodeHolds(const std::string &nodeId, const std::string &epoch,
