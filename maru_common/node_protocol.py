@@ -283,7 +283,7 @@ class FetchCancelResponse:
 
 @dataclass
 class LocalPinRequest:
-    """LOCAL_PIN (0x20) - Not supported yet (answered with DISABLED)."""
+    """LOCAL_PIN (0x20) - Answered with DISABLED."""
 
     items: list[KeyLocation] = field(default_factory=list)
 
@@ -297,7 +297,7 @@ class LocalPinResponse:
 
 @dataclass
 class LocalUnpinRequest:
-    """LOCAL_UNPIN (0x21) - Not supported yet (answered with DISABLED)."""
+    """LOCAL_UNPIN (0x21) - Answered with DISABLED."""
 
     pin_ids: list[str] = field(default_factory=list)
 

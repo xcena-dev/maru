@@ -500,9 +500,7 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         raise NodeConfigError("config.page_size: must be positive")
     local_pin = _bool(raw, "local_pin", "config", False)
     if local_pin:
-        raise NodeConfigError(
-            "config.local_pin: the local pin path is not supported yet"
-        )
+        raise NodeConfigError("config.local_pin: local pins are not supported")
 
     raw_tiers = raw.get("tiers")
     if not isinstance(raw_tiers, list) or not raw_tiers:

@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 _LISTEN_BACKLOG = 128
 _DISABLED = {
-    NodeMessageType.LOCAL_PIN: "local pins are not supported yet",
-    NodeMessageType.LOCAL_UNPIN: "local pins are not supported yet",
+    NodeMessageType.LOCAL_PIN: "local pins are not supported",
+    NodeMessageType.LOCAL_UNPIN: "local pins are not supported",
 }
 # Served only to a worker that agreed fetch_v1, by a node with an SSD tier
 _FETCH = (NodeMessageType.FETCH, NodeMessageType.FETCH_CANCEL)

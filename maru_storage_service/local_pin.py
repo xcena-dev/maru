@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Local pin block and reopen. Local pins are not issued yet, but every removal
-still blocks first so the order holds once they are."""
+"""Local pin blocks. The node gives no local pins (LOCAL_PIN answers
+DISABLED); a removal still blocks its pages first and reopens them by the
+KEPT cause."""
 
 import threading
 from collections.abc import Iterable

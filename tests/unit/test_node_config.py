@@ -271,7 +271,7 @@ class TestRules:
         )
         rejects(with_tier(GPU_NODE, 1, visibility="fenced"), "visibility")
 
-    def test_local_pin_is_not_supported_yet(self):
+    def test_local_pin_is_rejected(self):
         rejects(edit(GPU_NODE, local_pin=True), "local pin")
 
     def test_role(self):

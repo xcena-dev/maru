@@ -224,7 +224,7 @@ class TestPlacement:
 
 
 class TestLocalPins:
-    def test_off_in_v1_but_blocks_are_tracked(self):
+    def test_off_but_blocks_are_tracked(self):
         pins = LocalPins()
         assert pins.enabled is False
         pins.block([ref(1), ref(2)])
