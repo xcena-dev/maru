@@ -476,11 +476,11 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads, without speculative decoding other than
-    DeepSeek-V4.1's DSpark; in layerwise format only when every stored group
-    is an MLA group (DeepSeek-V4.1). DSpark's draft layers keep sliding
-    windows like the target's and vLLM puts them in the target's window
-    groups, and the drafter writes a token's draft KV in the step that
+    group, with parked loads; in layerwise format only when every stored
+    group is an MLA group (DeepSeek-V4.1). Speculative decoding is supported
+    without a Mamba group: vLLM puts the drafter's layers in groups like any
+    other layer (DeepSeek-V4.1's DSpark windows in the target's window
+    groups), and the drafter writes a token's draft KV in the step that
     computes the token, before the connector stores it.
     Every group uses vLLM's block size, but an MLA group may use another
     (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
@@ -538,14 +538,19 @@ def check_multi_group_support(
             "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
             f"maru_use_layerwise=false{one_group_hint(groups)}"
         )
-    if speculative_method is not None and speculative_method != "dspark":
-        raise ValueError(
-            f"MaruKVConnector does not support speculative decoding method "
-            f"{speculative_method!r} with models that have several KV cache "
-            "groups; it supports only 'dspark' on DeepSeek-V4.1-Flash"
-            f"{one_group_hint(groups)}"
-        )
     kinds = {g.kind for g in stored}
+    if speculative_method is not None and GROUP_MAMBA in kinds:
+        # In align mode vLLM keeps a block per draft token at the end of a
+        # request's Mamba block list and moves one into place when a state
+        # lands there, but a connector learns only the blocks appended. The
+        # block list the scheduler tracks can then name, at a chunk's end, a
+        # block no kernel wrote, and Maru would store it as the chunk's state.
+        raise ValueError(
+            "MaruKVConnector does not support speculative decoding "
+            f"({speculative_method!r}) with a Mamba-type KV cache group: vLLM "
+            "moves a Mamba state block within the request's last blocks "
+            "without telling the connector"
+        )
     if {GROUP_MAMBA, GROUP_MLA} <= kinds:
         # A Mamba group pins the chunk to one block (chunk_tokens_for_groups),
         # which holds no whole block of an MLA group with larger blocks, and

@@ -469,15 +469,16 @@ def test_dsv41_with_dspark_passes_the_support_check(bounded_replay, layerwise):
 
 
 @pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
-def test_dsv41_with_another_speculative_method_is_refused(method):
-    with pytest.raises(ValueError, match="speculative decoding"):
-        check_multi_group_support(
-            describe_kv_groups(dsv41_config(drafts=True)),
-            block_size=DSV41_BLOCK,
-            use_layerwise=False,
-            speculative_method=method,
-            inline_loads=False,
-        )
+def test_dsv41_with_another_speculative_method_passes_the_support_check(method):
+    """No method is named: a drafter's layers sit in groups like the
+    target's, which the other checks cover."""
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config()),
+        block_size=DSV41_BLOCK,
+        use_layerwise=False,
+        speculative_method=method,
+        inline_loads=False,
+    )
 
 
 def test_connector_starts_with_dsv41_and_dspark():
@@ -586,12 +587,9 @@ def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
 def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
     """The support checks run before the chunk is rounded, so a model they
     refuse leaves no warning about its chunk size."""
-    config = _connector_config(128, maru_kv_chunk_tokens=200)
-    config.speculative_config = SimpleNamespace(
-        method="ngram", num_speculative_tokens=1
-    )
+    config = _connector_config(128, maru_kv_chunk_tokens=200, maru_async_load=False)
     with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
-        with pytest.raises(ValueError, match="speculative decoding"):
+        with pytest.raises(ValueError, match="maru_async_load=false"):
             MaruKVConnector(
                 config,
                 KVConnectorRole.SCHEDULER,
@@ -1550,9 +1548,21 @@ def test_layerwise_is_rejected():
 
 
 @pytest.mark.parametrize("method", ["ngram", "eagle3", "draft_model"])
-def test_speculative_decoding_is_rejected(method):
-    with pytest.raises(ValueError, match="speculative decoding"):
-        _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
+def test_speculative_decoding_passes_without_a_mamba_group(method):
+    _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
+
+
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
+def test_speculative_decoding_is_rejected_with_a_mamba_group(method):
+    """vLLM moves an align-mode Mamba state block among a request's last
+    blocks without telling the connector, so a stored state could be a block
+    no kernel wrote."""
+    with pytest.raises(ValueError, match=f"speculative decoding \\('{method}'\\)"):
+        _check(
+            describe_kv_groups(qwen35_config()),
+            QWEN35_BLOCK,
+            speculative_method=method,
+        )
 
 
 @pytest.mark.parametrize("mode", ["none", "all"])

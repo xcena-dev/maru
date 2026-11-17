@@ -1002,7 +1002,7 @@ def _speculative_method(vllm_config: VllmConfig) -> str | None:
     """The speculative decoding method vLLM runs, or None without one.
 
     A config that names no method reads as an unknown one, so the support
-    checks refuse it rather than take it for no speculative decoding.
+    checks take it for speculative decoding rather than for none.
     """
     spec = vllm_config.speculative_config
     if spec is None:
