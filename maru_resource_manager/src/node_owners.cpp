@@ -4,7 +4,9 @@
 #include <openssl/rand.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -65,26 +67,55 @@ static int replaceFile(const std::string &stateDir, const char *name, const std:
     return 0;
 }
 
-int loadNodeOwners(const std::string &stateDir, NodeOwners &nodes) {
+int loadNodeOwners(const std::string &stateDir, NodeOwners &nodes, NodeOwners &releasing,
+                   EndedRuns &ended) {
     const std::string path = stateDir + "/" + kNodesFile;
     std::string text;
     const int rc = readSmallFile(path, text);
     if (rc == -ENOENT) {
         nodes.clear();
+        releasing.clear();
+        ended.clear();
         return 0;
     }
     if (rc != 0) return rc;
 
-    NodeOwners loaded;
+    NodeOwners loaded, loadedReleasing;
+    EndedRuns loadedEnded;
+    auto endedOf = [&](const std::string &id) -> const std::vector<std::string> * {
+        auto it = loadedEnded.find(id);
+        return it == loadedEnded.end() ? nullptr : &it->second;
+    };
+    auto listed = [](const std::vector<std::string> *runs, const std::string &epoch) {
+        return runs && std::find(runs->begin(), runs->end(), epoch) != runs->end();
+    };
     std::istringstream lines(text);
     std::string line;
     for (size_t number = 1; std::getline(lines, line); ++number) {
         std::istringstream words(line);
         std::vector<std::string> fields;
         for (std::string word; words >> word;) fields.push_back(word);
-        const bool valid = fields.size() == 4 && fields[0] == "node" && validNodeId(fields[1]) &&
-                           validHoldName(fields[2]) && validHoldName(fields[3]) &&
-                           loaded.emplace(fields[1], NodeOwner{fields[2], fields[3]}).second;
+        bool valid = false;
+        if (fields.size() == 4 && fields[0] == "node") {
+            valid = validNodeId(fields[1]) && validHoldName(fields[2]) &&
+                    validHoldName(fields[3]) && loadedEnded.empty() && loadedReleasing.empty() &&
+                    loaded.emplace(fields[1], NodeOwner{fields[2], fields[3]}).second;
+        } else if (fields.size() == 3 && fields[0] == "ended") {
+            // An ended run is not the current one, and is listed once.
+            auto current = loaded.find(fields[1]);
+            valid = validNodeId(fields[1]) && validHoldName(fields[2]) &&
+                    loadedReleasing.empty() &&
+                    (current == loaded.end() || current->second.epoch != fields[2]) &&
+                    !listed(endedOf(fields[1]), fields[2]);
+            if (valid) loadedEnded[fields[1]].push_back(fields[2]);
+        } else if (fields.size() == 4 && fields[0] == "releasing") {
+            // The node's last run, ended, and the node has no current run.
+            const auto *runs = endedOf(fields[1]);
+            valid = validNodeId(fields[1]) && validHoldName(fields[2]) &&
+                    validHoldName(fields[3]) && !loaded.count(fields[1]) && runs &&
+                    runs->back() == fields[2] &&
+                    loadedReleasing.emplace(fields[1], NodeOwner{fields[2], fields[3]}).second;
+        }
         if (!valid) {
             logf(LogLevel::Error,
                  "%s:%zu: malformed record '%s'; fix or restore the file (a lost record lets "
@@ -93,14 +124,24 @@ int loadNodeOwners(const std::string &stateDir, NodeOwners &nodes) {
             return -EINVAL;
         }
     }
+    for (auto &[id, runs] : loadedEnded)
+        if (runs.size() > kMaxEndedRuns)
+            runs.erase(runs.begin(), runs.end() - static_cast<std::ptrdiff_t>(kMaxEndedRuns));
     nodes = std::move(loaded);
+    releasing = std::move(loadedReleasing);
+    ended = std::move(loadedEnded);
     return 0;
 }
 
-int saveNodeOwners(const std::string &stateDir, const NodeOwners &nodes, int &syncRc) {
+int saveNodeOwners(const std::string &stateDir, const NodeOwners &nodes,
+                   const NodeOwners &releasing, const EndedRuns &ended, int &syncRc) {
     std::string text;
     for (const auto &[id, node] : nodes)
         text += "node " + id + " " + node.epoch + " " + node.host + "\n";
+    for (const auto &[id, runs] : ended)
+        for (const auto &epoch : runs) text += "ended " + id + " " + epoch + "\n";
+    for (const auto &[id, node] : releasing)
+        text += "releasing " + id + " " + node.epoch + " " + node.host + "\n";
     return replaceFile(stateDir, kNodesFile, text, syncRc);
 }
 

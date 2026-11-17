@@ -93,8 +93,9 @@ private:
     static std::string cacheKey(MsgType type, const std::string &clientId, uint64_t requestId,
                                 const std::string &nodeId = "", const std::string &epoch = "");
     bool cacheLookup(const std::string &key, uint64_t requestId, int clientFd);
-    // Whether a live reply is cached for the key; answers nothing.
-    bool cacheHas(const std::string &key, uint64_t requestId);
+    // Whether a live successful NODE_CLAIM reply is cached for the key;
+    // answers nothing.
+    bool cachedClaimSucceeded(const std::string &key, uint64_t requestId);
     void cacheInsert(const std::string &key, uint64_t requestId,
                      uint16_t type, const void *payload, size_t payloadSize);
 };

@@ -953,6 +953,8 @@ int PoolManager::loadPoolsLocked(std::unique_lock<std::mutex> &lock)
     // Holds dropped while the RM was down (or a release that failed) leave
     // draining regions without holds.
     finishDrainingLocked(staleHolds != 0);
+    // Releases cut short before this start end before anything is served.
+    finishReleasesLocked();
     return 0;
 }
 

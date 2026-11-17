@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "log.h"
+#include "node_owners.h"
 #include "region_holds.h"
 #include "types.h"
 
@@ -131,8 +132,9 @@ public:
         std::string deviceUuid;
         std::vector<std::pair<std::string, HoldRecord>> holders;  // NODE_CLAIM, NODE_HOLDS
     };
-    /// Make `epoch` the node's current run and list its regions. -EEXIST if
-    /// the node is bound to another host.
+    /// Make `epoch` the node's current run and list its regions. -ESTALE if
+    /// the run has ended, -EEXIST if the node is bound to another host. A
+    /// release still freeing the node's regions is finished first.
     int nodeClaim(const std::string &nodeId, const std::string &epoch, const std::string &host,
                   std::vector<NodeRegion> &regions);
     int nodeAlloc(const std::string &nodeId, const std::string &epoch, uint64_t size,
@@ -318,7 +320,8 @@ private:
         std::string epoch;  // "" until claimed (regions found without a record)
         std::string host;   // "" until claimed: any host may claim
         SteadyClockPoint seen;
-        bool fenced{false}; // Lease expired: its regions are being freed
+        bool fenced{false};     // No current run: its regions are being freed
+        bool releasing{false};  // The run (epoch) has ended on disk too
     };
     // The node whose current run is `epoch`, or null.
     NodeState *currentNode(const std::string &nodeId, const std::string &epoch);
@@ -327,17 +330,29 @@ private:
     // The node's regions (not draining) with their holds.
     std::vector<NodeRegion> nodeRegionsLocked(const std::string &nodeId);
     bool nodeOnThisHost(const char *clientId) const;
-    // Save the node table (claimed nodes only); syncRc as saveHoldsLocked.
+    // Save the node table (claimed nodes and ended runs); syncRc as
+    // saveHoldsLocked.
     int saveNodesLocked(int &syncRc);
     // 0 once the table last renamed into place is durable, else sync again.
     int confirmNodesDurableLocked();
     // Read the table, then give in-memory records to node-owned regions
-    // without one so that their lease frees them.
+    // without one so that their lease frees them. A release the table shows
+    // unfinished is finished by finishReleasesLocked.
     int loadNodesLocked();
-    // Free (held: drain) every region of the node, then forget it. Stops at
-    // the first failure, leaving the node in place for a retry.
+    // Finish the releases the table shows unfinished; a failed one is left
+    // to the reaper.
+    void finishReleasesLocked();
+    // End the node's run durably ("releasing"), then free (held: drain)
+    // every region of the node and forget it. Stops at the first failure,
+    // leaving the node releasing for a retry.
     int releaseNodeLocked(const std::string &nodeId, uint32_t &released);
     void expireNodeLeasesLocked();
+    // Record `epoch` among the node's ended runs.
+    void endRunLocked(const std::string &nodeId, const std::string &epoch);
+    bool runEndedLocked(const std::string &nodeId, const std::string &epoch) const;
+    // The node's ended runs, to put back with restoreEndedLocked.
+    std::vector<std::string> endedRunsOf(const std::string &nodeId) const;
+    void restoreEndedLocked(const std::string &nodeId, std::vector<std::string> runs);
 
     mutable std::mutex mu_;
     std::string stateDir_;
@@ -398,6 +413,7 @@ private:
     std::chrono::milliseconds holdGrace_;
     uint64_t ownPidNs_{0};
     std::map<std::string, NodeState> nodes_;
+    EndedRuns endedRuns_;
     int nodesSyncRc_{0};
     std::chrono::milliseconds nodeLease_;
     std::string rmId_;

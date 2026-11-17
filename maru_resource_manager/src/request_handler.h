@@ -77,8 +77,8 @@ public:
     NodeRenewResp handleNodeRenew(const std::string &nodeId, const std::string &epoch);
     /// What NODE_RENEW would answer for this run, without renewing.
     int nodeRunStatus(const std::string &nodeId, const std::string &epoch);
-    /// A NodeClaimResp with only `status` (a resent claim of an ended run).
-    std::vector<uint8_t> refuseNodeClaim(int status);
+    /// A NodeClaimResp refusing a resent claim of a run that is not current.
+    std::vector<uint8_t> refuseNodeClaim();
     NodeReleaseResp handleNodeRelease(const std::string &nodeId, const std::string &epoch);
     /// NodeHoldsResp and the node's regions with their holds (read only).
     std::vector<uint8_t> handleNodeHolds(const std::string &nodeId, const std::string &epoch);

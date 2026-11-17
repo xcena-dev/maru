@@ -455,9 +455,13 @@ class MaruShmClient:
     def node_claim(self, node_id: str, node_epoch: str) -> NodeClaim:
         """Make ``node_epoch`` the node's current run and take over its regions.
 
-        Re-sending the same epoch returns the same result.
+        Re-sending the same epoch returns the same result while it is the
+        node's run. A run that has ended (another run claimed the node, it was
+        released or its lease ran out) is refused: the RM keeps the node's
+        last 64 ended runs, so every run takes a new epoch.
 
         Raises:
+            StaleNodeEpochError: if the run has ended.
             NodeHostConflictError: if the node is bound to another host.
             NodeOwnershipUnsupportedError: if the RM predates node ownership.
             RetryableNodeError: if the RM could not complete it now (e.g. the
@@ -568,6 +572,9 @@ class MaruShmClient:
 
     def node_release(self, node_id: str, node_epoch: str) -> int:
         """Free every region of the node and forget it (``leave``).
+
+        A release that fails part way is finished by the RM; one that fails
+        before it starts leaves the run as it was.
 
         Returns:
             How many regions were freed (held ones drain).
