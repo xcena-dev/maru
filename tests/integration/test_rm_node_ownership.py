@@ -84,10 +84,10 @@ def _client(address, client_id=None):
 
 def test_claim_takeover_and_release(rm_address):
     first = _client(rm_address)
-    claim = first.node_claim("gb1", "e1")
+    claim = first.node_claim("n01", "e1")
     assert re.fullmatch(r"[0-9a-f]{32}", claim.rm_domain)
     assert (claim.lease_s, claim.regions) == (LEASE_S, [])
-    region = first.node_alloc("gb1", "e1", ALIGN, "/dev/dax0.0")
+    region = first.node_alloc("n01", "e1", ALIGN, "/dev/dax0.0")
     assert (region.dax_path, region.requested_size) == ("/dev/dax0.0", ALIGN)
     assert len(region.device_uuid) == 36
     assert first.get_access(region.handle).dax_path == "/dev/dax0.0"
@@ -95,39 +95,39 @@ def test_claim_takeover_and_release(rm_address):
 
     # The next run of the node, from another process on this host.
     second = _client(rm_address)
-    again = second.node_claim("gb1", "e2")
+    again = second.node_claim("n01", "e2")
     assert (again.rm_domain, again.regions) == (claim.rm_domain, [region])
     with pytest.raises(StaleNodeEpochError) as info:
-        second.node_renew("gb1", "e1")
+        second.node_renew("n01", "e1")
     assert not isinstance(info.value, NodeLeaseExpiredError)  # e2 claimed it
     with pytest.raises(StaleNodeEpochError):
-        second.node_free("gb1", "e1", region.handle)
+        second.node_free("n01", "e1", region.handle)
     with pytest.raises(NodeHostConflictError):
-        _client(rm_address, "other-host:1").node_claim("gb1", "e3")
-    assert second.node_renew("gb1", "e2") == LEASE_S
-    assert second.node_release("gb1", "e2") == 1
+        _client(rm_address, "other-host:1").node_claim("n01", "e3")
+    assert second.node_renew("n01", "e2") == LEASE_S
+    assert second.node_release("n01", "e2") == 1
     with pytest.raises(NodeLeaseExpiredError):
-        second.node_renew("gb1", "e2")
+        second.node_renew("n01", "e2")
     assert second.stats()[0].free_size == SIZE - ALIGN
     second.close()
 
 
 def test_lease_expiry_frees_and_forgets(rm_address):
     client = _client(rm_address)
-    client.node_claim("gb1", "e1")
-    client.node_alloc("gb1", "e1", ALIGN)
+    client.node_claim("n01", "e1")
+    client.node_alloc("n01", "e1", ALIGN)
     assert client.stats()[0].free_size == SIZE - 2 * ALIGN
     deadline = time.monotonic() + 30
     while client.stats()[0].free_size != SIZE - ALIGN:
         assert time.monotonic() < deadline
         time.sleep(0.2)
     with pytest.raises(NodeLeaseExpiredError):
-        client.node_renew("gb1", "e1")
+        client.node_renew("n01", "e1")
     with pytest.raises(StaleNodeEpochError):
-        client.node_holds("gb1", "e1")
+        client.node_holds("n01", "e1")
     # Forgotten: any host may claim the node now.
     other = _client(rm_address, "other-host:1")
-    assert other.node_claim("gb1", "e2").regions == []
+    assert other.node_claim("n01", "e2").regions == []
     other.close()
     client.close()
 
@@ -164,26 +164,26 @@ def _identity(pid=None):
 
 def test_worker_holds_are_listed_fenced_and_reaped(rm_address):
     run = _client(rm_address)
-    run.node_claim("gb1", "e1")
-    region = run.node_alloc("gb1", "e1", ALIGN)
+    run.node_claim("n01", "e1")
+    region = run.node_alloc("n01", "e1", ALIGN)
     me = _identity(os.getpid())
-    access = run.node_hold("gb1", "e1", region.handle, "w1", **me)
+    access = run.node_hold("n01", "e1", region.handle, "w1", **me)
     assert (access.dax_path, access.offset) == ("/dev/dax0.0", region.handle.offset)
-    run.node_hold("gb1", "e1", region.handle, "gone", **_identity())
+    run.node_hold("n01", "e1", region.handle, "gone", **_identity())
 
     second = _client(rm_address)
-    claim = second.node_claim("gb1", "e2")
+    claim = second.node_claim("n01", "e2")
     host = socket.gethostname()
     assert sorted(claim.regions[0].holders, key=lambda h: h.holder) == [
         RegionHolder("gone", "e1", host, me["boot_id"], 2147483647, 1, me["pid_ns"]),
         RegionHolder("w1", "e1", host, *me.values()),
     ]
     with pytest.raises(StaleNodeEpochError):
-        run.node_hold("gb1", "e1", region.handle, "late", **me)
+        run.node_hold("n01", "e1", region.handle, "late", **me)
 
     # Freed while held: out of use until w1 unholds and the RM drops "gone"
     # (its process is gone, after the grace).
-    second.node_free("gb1", "e2", region.handle)
+    second.node_free("n01", "e2", region.handle)
     run.unhold(region.handle, "w1", "w1")
     run.unhold(region.handle, "w1", "w1")  # Twice is harmless.
     assert run.stats()[0].free_size == SIZE - 2 * ALIGN
@@ -198,24 +198,24 @@ def test_worker_holds_are_listed_fenced_and_reaped(rm_address):
 
 def test_node_holds_lists_the_holds_now(rm_address):
     run = _client(rm_address)
-    run.node_claim("gb1", "e1")
-    region = run.node_alloc("gb1", "e1", ALIGN)
+    run.node_claim("n01", "e1")
+    region = run.node_alloc("n01", "e1", ALIGN)
     me = _identity(os.getpid())
-    run.node_hold("gb1", "e1", region.handle, "w1@e1", **me)
+    run.node_hold("n01", "e1", region.handle, "w1@e1", **me)
     second = _client(rm_address)
-    second.node_claim("gb1", "e2")
-    second.node_hold("gb1", "e2", region.handle, "w1@e2", **me)
-    (listed,) = second.node_holds("gb1", "e2")
+    second.node_claim("n01", "e2")
+    second.node_hold("n01", "e2", region.handle, "w1@e2", **me)
+    (listed,) = second.node_holds("n01", "e2")
     assert listed.handle == region.handle and listed.dax_path == "/dev/dax0.0"
     assert sorted((h.holder, h.node_epoch) for h in listed.holders) == [
         ("w1@e1", "e1"),
         ("w1@e2", "e2"),
     ]
     run.unhold(region.handle, "w1@e1", "w1@e1")
-    (listed,) = second.node_holds("gb1", "e2")
+    (listed,) = second.node_holds("n01", "e2")
     assert [h.holder for h in listed.holders] == ["w1@e2"]
     with pytest.raises(StaleNodeEpochError):
-        run.node_holds("gb1", "e1")
+        run.node_holds("n01", "e1")
     run.close()
     second.close()
 
@@ -223,14 +223,14 @@ def test_node_holds_lists_the_holds_now(rm_address):
 def test_node_hold_timing(rm_address):
     """64 sequential NODE_HOLDs, each made durable before its reply."""
     client = _client(rm_address)
-    client.node_claim("gb1", "e1")
-    handles = [client.node_alloc("gb1", "e1", ALIGN).handle for _ in range(64)]
+    client.node_claim("n01", "e1")
+    handles = [client.node_alloc("n01", "e1", ALIGN).handle for _ in range(64)]
     me = _identity(os.getpid())
     for label in ("new", "again"):  # again: already held, nothing to write
         times = []
         for i, handle in enumerate(handles):
             t0 = time.perf_counter()
-            client.node_hold("gb1", "e1", handle, f"w{i}", **me)
+            client.node_hold("n01", "e1", handle, f"w{i}", **me)
             times.append((time.perf_counter() - t0) * 1000)
         times.sort()
         print(

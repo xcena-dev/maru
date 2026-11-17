@@ -62,10 +62,10 @@ class TestNodeMessages:
 
     def test_node_req_layout(self):
         data = NodeReq(
-            node_id="gb1", node_epoch="e1", client_id="host:1", request_id=9
+            node_id="n01", node_epoch="e1", client_id="host:1", request_id=9
         ).pack()
         assert struct.unpack_from("<II", data) == (3, 2)
-        assert data[8:13] == b"gb1e1"
+        assert data[8:13] == b"n01e1"
         assert struct.unpack_from("<H", data, 13) == (6,)
         assert data[15:21] == b"host:1"
         assert struct.unpack_from("<Q", data, 21) == (9,)
@@ -74,31 +74,31 @@ class TestNodeMessages:
     def test_node_alloc_req_layout(self):
         data = NodeAllocReq(
             size=1 << 30,
-            node_id="gb1",
+            node_id="n01",
             node_epoch="e1",
             dax_path="/dev/dax2.0",
             client_id="h:1",
             request_id=3,
         ).pack()
         assert struct.unpack_from("<QIIII", data) == (1 << 30, 3, 2, 11, 0)
-        assert data[24:40] == b"gb1e1/dev/dax2.0"
+        assert data[24:40] == b"n01e1/dev/dax2.0"
         assert struct.unpack_from("<H", data, 40) == (3,)
         assert data[42:45] == b"h:1"
         assert struct.unpack_from("<Q", data, 45) == (3,)
 
     def test_node_free_req_layout(self):
         data = NodeFreeReq(
-            handle=HANDLE, node_id="gb1", node_epoch="e1", client_id="h:1"
+            handle=HANDLE, node_id="n01", node_epoch="e1", client_id="h:1"
         ).pack()
         assert data[:32] == HANDLE.pack()
         assert struct.unpack_from("<II", data, 32) == (3, 2)
-        assert data[40:45] == b"gb1e1"
+        assert data[40:45] == b"n01e1"
         assert struct.unpack_from("<H", data, 45) == (3,)
 
     def test_node_hold_req_layout(self):
         data = NodeHoldReq(
             handle=HANDLE,
-            node_id="gb1",
+            node_id="n01",
             node_epoch="e1",
             holder="w-1",
             boot_id="b" * 36,
@@ -119,7 +119,7 @@ class TestNodeMessages:
             99,
             4026531836,
         )
-        assert data[72:80] == b"gb1e1w-1"
+        assert data[72:80] == b"n01e1w-1"
         assert data[80:116] == b"b" * 36
         assert struct.unpack_from("<H", data, 116) == (3,)
         assert data[118:121] == b"h:1"
@@ -127,7 +127,7 @@ class TestNodeMessages:
         assert len(data) == 129
 
     def test_claim_resp_roundtrip(self):
-        worker = RegionHolder("w-1", "e1", "gb1", "b" * 36, 4242, 99, 7)
+        worker = RegionHolder("w-1", "e1", "n01", "b" * 36, 4242, 99, 7)
         agent = RegionHolder("agent", "", "", "", 0, 0, 0)
         regions = [
             NodeRegion(HANDLE, 3 << 20, "/dev/dax2.0", "u" * 36, [worker, agent]),
@@ -163,14 +163,14 @@ class TestNodeMessages:
             99,
             7,
         )
-        assert data[off + 40 : off + 48] == b"w-1e1gb1"
+        assert data[off + 40 : off + 48] == b"w-1e1n01"
         assert NodeClaimResp.unpack(data) == resp
         for cut in (10, 40, 24 + 32 + 50, off + 20, off + 45, len(data) - 1):
             with pytest.raises(ValueError):
                 NodeClaimResp.unpack(data[:cut])
 
     def test_holds_resp_lists_regions_as_the_claim_does(self):
-        worker = RegionHolder("w-1@e1", "e1", "gb1", "b" * 36, 4242, 99, 7)
+        worker = RegionHolder("w-1@e1", "e1", "n01", "b" * 36, 4242, 99, 7)
         regions = [
             NodeRegion(HANDLE, 3 << 20, "/dev/dax2.0", "u" * 36, [worker]),
             NodeRegion(MaruHandle(region_id=8), 1, "", ""),
@@ -262,16 +262,16 @@ class TestNodeClient:
             }
         )
         client._rpc = rm
-        claim = client.node_claim("gb1", "e1")
+        claim = client.node_claim("n01", "e1")
         assert claim.rm_domain == "ab" * 16
         assert claim.lease_s == 900.0
         assert claim.regions == [region]
         assert client.get_dax_path(HANDLE.region_id) == "/dev/dax2.0"
-        assert client.node_alloc("gb1", "e1", 3 << 20, "/dev/dax2.0") == region
-        client.node_free("gb1", "e1", HANDLE)
+        assert client.node_alloc("n01", "e1", 3 << 20, "/dev/dax2.0") == region
+        client.node_free("n01", "e1", HANDLE)
         assert client.get_dax_path(HANDLE.region_id) is None
-        assert client.node_renew("gb1", "e1") == 900.0
-        assert client.node_release("gb1", "e1") == 2
+        assert client.node_renew("n01", "e1") == 900.0
+        assert client.node_release("n01", "e1") == 2
 
         types = [t for t, _ in rm.sent]
         assert types == [
@@ -334,15 +334,15 @@ class TestNodeClient:
         hold = {"boot_id": "b", "pid": 1, "pid_start": 2, "pid_ns": 3}
         calls = [
             (
-                lambda: client.node_hold("gb1", "e1", HANDLE, "w", **hold),
+                lambda: client.node_hold("n01", "e1", HANDLE, "w", **hold),
                 retryable_error,
             ),
-            (lambda: client.node_holds("gb1", "e1"), retryable_error),
-            (lambda: client.node_claim("gb1", "e1"), retryable_error),
-            (lambda: client.node_alloc("gb1", "e1", 1), error),
-            (lambda: client.node_free("gb1", "e1", HANDLE), error),
-            (lambda: client.node_renew("gb1", "e1"), retryable_error),
-            (lambda: client.node_release("gb1", "e1"), retryable_error),
+            (lambda: client.node_holds("n01", "e1"), retryable_error),
+            (lambda: client.node_claim("n01", "e1"), retryable_error),
+            (lambda: client.node_alloc("n01", "e1", 1), error),
+            (lambda: client.node_free("n01", "e1", HANDLE), error),
+            (lambda: client.node_renew("n01", "e1"), retryable_error),
+            (lambda: client.node_release("n01", "e1"), retryable_error),
         ]
         for call, expected in calls:
             with pytest.raises(expected) as info:
@@ -356,10 +356,10 @@ class TestNodeClient:
             MsgType.NODE_RENEW_RESP, struct.pack("<iIQ", status[0], 0, 0)
         )
         with pytest.raises(NodeLeaseExpiredError, match="lease"):
-            client.node_renew("gb1", "e1")
+            client.node_renew("n01", "e1")
         status[0] = -errno.ESTALE
         with pytest.raises(StaleNodeEpochError) as info:
-            client.node_renew("gb1", "e1")
+            client.node_renew("n01", "e1")
         assert type(info.value) is StaleNodeEpochError
         # A fenced run is still not the current one
         assert issubclass(NodeLeaseExpiredError, StaleNodeEpochError)
@@ -368,15 +368,15 @@ class TestNodeClient:
         err = ErrorResp(status=-errno.ENOSYS, message="unknown request").pack()
         client._rpc = lambda *a: _reply(MsgType.ERROR_RESP, err)
         for call in (
-            lambda: client.node_claim("gb1", "e1"),
-            lambda: client.node_alloc("gb1", "e1", 1),
-            lambda: client.node_free("gb1", "e1", HANDLE),
-            lambda: client.node_renew("gb1", "e1"),
-            lambda: client.node_release("gb1", "e1"),
+            lambda: client.node_claim("n01", "e1"),
+            lambda: client.node_alloc("n01", "e1", 1),
+            lambda: client.node_free("n01", "e1", HANDLE),
+            lambda: client.node_renew("n01", "e1"),
+            lambda: client.node_release("n01", "e1"),
             lambda: client.node_hold(
-                "gb1", "e1", HANDLE, "w", boot_id="b", pid=1, pid_start=2, pid_ns=3
+                "n01", "e1", HANDLE, "w", boot_id="b", pid=1, pid_start=2, pid_ns=3
             ),
-            lambda: client.node_holds("gb1", "e1"),
+            lambda: client.node_holds("n01", "e1"),
         ):
             with pytest.raises(NodeOwnershipUnsupportedError, match="does not support"):
                 call()
@@ -385,7 +385,7 @@ class TestNodeClient:
         err = ErrorResp(status=-errno.EPROTO, message="bad node req").pack()
         client._rpc = lambda *a: _reply(MsgType.ERROR_RESP, err)
         with pytest.raises(RuntimeError, match="bad node req") as info:
-            client.node_claim("gb1", "e1")
+            client.node_claim("n01", "e1")
         assert type(info.value) is RuntimeError
 
 
@@ -399,21 +399,21 @@ class TestNodeHold:
         )
         client._rpc = rm
         got = client.node_hold(
-            "gb1", "e1", HANDLE, "w-1", boot_id="b", pid=7, pid_start=8, pid_ns=9
+            "n01", "e1", HANDLE, "w-1", boot_id="b", pid=7, pid_start=8, pid_ns=9
         )
         assert got == access
         ((msg_type, payload),) = rm.sent
         assert msg_type == MsgType.NODE_HOLD_REQ
         assert payload[:32] == HANDLE.pack()
         assert struct.unpack_from("<IIIIIIQQ", payload, 32) == (3, 2, 3, 1, 7, 0, 8, 9)
-        assert payload[72:81] == b"gb1e1w-1b"
+        assert payload[72:81] == b"n01e1w-1b"
         with pytest.raises(TypeError):
-            client.node_hold("gb1", "e1", HANDLE, "w-1", "b", 7, 8, 9)  # keyword-only
+            client.node_hold("n01", "e1", HANDLE, "w-1", "b", 7, 8, 9)  # keyword-only
 
 
 class TestNodeHolds:
     def test_node_holds_sends_the_run_and_returns_the_regions(self, client):
-        holder = RegionHolder("w@e0", "e0", "gb1", "b", 7, 8, 9)
+        holder = RegionHolder("w@e0", "e0", "n01", "b", 7, 8, 9)
         region = NodeRegion(HANDLE, 3 << 20, "/dev/dax2.0", "", [holder])
         rm = FakeRm(
             {
@@ -423,11 +423,11 @@ class TestNodeHolds:
             }
         )
         client._rpc = rm
-        assert client.node_holds("gb1", "e1") == [region]
+        assert client.node_holds("n01", "e1") == [region]
         ((msg_type, payload),) = rm.sent
         assert msg_type == MsgType.NODE_HOLDS_REQ
         assert struct.unpack_from("<II", payload) == (3, 2)
-        assert payload[8:13] == b"gb1e1"
+        assert payload[8:13] == b"n01e1"
 
 
 class TestRequestIds:
