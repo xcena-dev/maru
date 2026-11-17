@@ -2,6 +2,8 @@
 # Copyright 2026 XCENA Inc.
 """Unit tests for serializer module."""
 
+from dataclasses import dataclass
+
 import pytest
 
 from maru_common.protocol import (
@@ -15,7 +17,7 @@ from maru_common.protocol import (
     RegisterKVRequest,
     RequestAllocRequest,
 )
-from maru_common.serializer import Serializer, create_serializer
+from maru_common.serializer import Serializer, create_serializer, op_digest
 from maru_shm.types import MaruHandle
 
 
@@ -404,3 +406,39 @@ class TestSerializerEdgeCases:
 
         with pytest.raises(ValueError, match="Unknown message type"):
             serializer.decode_response(encoded)
+
+
+@dataclass
+class _Renamed:
+    x: int
+
+    def to_dict(self):
+        return {"wire_x": self.x}
+
+
+@dataclass
+class _Envelope:
+    inner: _Renamed
+    many: list[_Renamed]
+
+
+def test_a_dataclass_inside_another_goes_by_its_fields():
+    """As asdict() did: to_dict() only for the object handed in."""
+    request = _Envelope(_Renamed(1), [_Renamed(2)])
+    _, payload = Serializer().decode(Serializer().encode(1, request, seq=42))
+    assert payload == {"inner": {"x": 1}, "many": [{"x": 2}]}
+    assert op_digest(request) == op_digest({"inner": {"x": 1}, "many": [{"x": 2}]})
+    _, payload = Serializer().decode(Serializer().encode(1, _Renamed(3), seq=42))
+    assert payload == {"wire_x": 3}
+
+
+class _WireStr(str):
+    def to_dict(self):
+        return {"wire": str(self)}
+
+
+def test_a_str_subclass_is_digested_as_it_is_encoded():
+    request = {"key": _WireStr("k")}
+    _, payload = Serializer().decode(Serializer().encode(1, request, seq=42))
+    assert payload == {"key": "k"}
+    assert op_digest(request) == op_digest(payload)

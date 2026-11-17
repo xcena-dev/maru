@@ -9,12 +9,12 @@ import hashlib
 import itertools
 import logging
 import threading
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any, TypeVar
 
 import msgpack
-from dacite import Config, DaciteError, from_dict
+from dacite import Config, from_dict
 
 from maru_shm.types import MaruHandle, MaruPoolInfo
 
@@ -28,6 +28,7 @@ from .protocol import (
     MessageHeader,
     MessageType,
 )
+from .strict_codec import decoder_for
 
 T = TypeVar("T")
 
@@ -63,45 +64,68 @@ class DecodedRequest:
     payload: dict[str, Any]
 
 
-def _reject_bool(value: Any) -> Any:
-    if isinstance(value, bool):
-        raise ValueError(f"expected a number, got {value!r}")
-    return value
+# Type -> its dataclass field names, or None for any other type
+_FIELD_NAMES: dict[type, tuple[str, ...] | None] = {}
 
 
-def _number_as_float(value: Any) -> Any:
-    _reject_bool(value)
-    return float(value) if isinstance(value, int) else value
+# Values encoded as they are; an Enum (a str or int subclass) is not one
+_PLAIN = frozenset({str, bytes, int, float, bool, type(None)})
 
 
-def _to_serializable(obj: Any) -> Any:
-    """Convert object to serializable format, handling nested objects with to_dict()."""
+def _field_names(obj: Any) -> tuple[str, ...] | None:
+    """Field names of a dataclass instance, else None."""
+    tp = type(obj)
+    try:
+        return _FIELD_NAMES[tp]
+    except KeyError:
+        names = None
+        if is_dataclass(obj) and not isinstance(obj, type):
+            names = tuple(f.name for f in fields(obj))
+        return _FIELD_NAMES.setdefault(tp, names)
+
+
+def _to_serializable(obj: Any, nested: bool = False) -> Any:
+    """Plain values for MessagePack. A dataclass goes by its fields, inside
+    another dataclass (``nested``) always, as asdict() did, else only without
+    to_dict()."""
     if obj is None or isinstance(obj, str | bytes | int | float):
         return obj  # the common case first (enums are str or int)
     if isinstance(obj, dict):
-        return {k: _to_serializable(v) for k, v in obj.items()}
+        return {k: _to_serializable(v, nested) for k, v in obj.items()}
     if isinstance(obj, list | tuple):
-        return [_to_serializable(item) for item in obj]
+        return [_to_serializable(item, nested) for item in obj]
+    names = _field_names(obj)
+    if names is not None and (nested or not hasattr(obj, "to_dict")):
+        out = {}
+        for name in names:
+            value = getattr(obj, name)
+            out[name] = (
+                value if type(value) in _PLAIN else _to_serializable(value, True)
+            )
+        return out
     if hasattr(obj, "to_dict"):
         return _to_serializable(obj.to_dict())
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _to_serializable(v) for k, v in asdict(obj).items()}
     return obj
 
 
-def _canonical(obj: Any) -> Any:
-    """Plain values with dict keys sorted at every level."""
-    return _sorted(_to_serializable(obj))
-
-
-def _sorted(obj: Any) -> Any:
-    """Caller converted ``obj`` to plain values (one pass, not per level)."""
-    if isinstance(obj, dict):
-        return {k: _sorted(obj[k]) for k in sorted(obj)}
-    if isinstance(obj, list):
-        return [_sorted(item) for item in obj]
+def _canonical(obj: Any, nested: bool = False) -> Any:
+    """What _to_serializable() gives, with dict keys sorted at every level and
+    enums as their values, in one pass."""
+    if type(obj) in _PLAIN:
+        return obj
     if isinstance(obj, Enum):
         return obj.value
+    if isinstance(obj, str | bytes | int | float):
+        return obj  # a subclass, kept as _to_serializable() keeps it
+    if isinstance(obj, dict):
+        return {k: _canonical(obj[k], nested) for k in sorted(obj)}
+    if isinstance(obj, list | tuple):
+        return [_canonical(item, nested) for item in obj]
+    names = _field_names(obj)
+    if names is not None and (nested or not hasattr(obj, "to_dict")):
+        return {name: _canonical(getattr(obj, name), True) for name in sorted(names)}
+    if hasattr(obj, "to_dict"):
+        return _canonical(obj.to_dict())
     return obj
 
 
@@ -151,16 +175,6 @@ class Serializer:
             ),
         }
         self._dacite_config = Config(check_types=False, type_hooks=maru_shm_hooks)
-        # Enums travel as values and tuples as lists; an int is a valid float
-        self._strict_config = Config(
-            check_types=True,
-            cast=[Enum, tuple],
-            type_hooks={
-                **maru_shm_hooks,
-                float: _number_as_float,
-                int: _reject_bool,
-            },
-        )
 
     def _next_seq(self) -> int:
         """Next header sequence: wraps at 32 bits, skips 0 (NOTIFY)."""
@@ -179,8 +193,8 @@ class Serializer:
                 header,
             )
         try:
-            return from_dict(data_class=cls, data=payload, config=self._strict_config)
-        except (DaciteError, ValueError, TypeError) as e:
+            return decoder_for(cls)(payload)
+        except (ValueError, TypeError) as e:
             raise MessageDecodeError(f"{cls.__name__}: {e}", header) from e
 
     # =========================================================================
