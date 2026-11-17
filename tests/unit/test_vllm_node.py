@@ -1802,6 +1802,8 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
     event = MagicMock()
     monkeypatch.setattr(torch.cuda, "Event", event)
+    # Page-locked memory needs a GPU; the slot mapping stays as it is
+    monkeypatch.setattr(worker, "_pin_slot_mapping_for_async_h2d", lambda slots: slots)
     reads = []
 
     def retrieve(keys, **route):
