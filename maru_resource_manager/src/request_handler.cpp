@@ -204,6 +204,19 @@ std::vector<uint8_t> RequestHandler::handleNodeClaim(const std::string &nodeId,
     return buf;
 }
 
+int RequestHandler::nodeRunStatus(const std::string &nodeId, const std::string &epoch) {
+    return pm_.nodeRunStatus(nodeId, epoch);
+}
+
+std::vector<uint8_t> RequestHandler::refuseNodeClaim(int status) {
+    NodeClaimResp resp{};
+    resp.status = status;
+    resp.leaseMs = pm_.nodeLeaseMs();
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    return buf;
+}
+
 std::vector<uint8_t> RequestHandler::handleNodeHolds(const std::string &nodeId,
                                                      const std::string &epoch) {
     std::vector<PoolManager::NodeRegion> regions;

@@ -132,6 +132,26 @@ def test_lease_expiry_frees_and_forgets(rm_address):
     client.close()
 
 
+def test_a_resend_of_a_run_taken_over_is_refused(rm_address, monkeypatch):
+    """A renewal sent again with its request id after another run claimed the
+    node is refused, not answered with the reply cached for it."""
+    first = _client(rm_address)
+    first.node_claim("n01", "e1")
+    monkeypatch.setattr(client_module, "_next_request_id", lambda: 4242)
+    assert first.node_renew("n01", "e1") == LEASE_S
+    monkeypatch.undo()
+    second = _client(rm_address)
+    second.node_claim("n01", "e2")
+    monkeypatch.setattr(client_module, "_next_request_id", lambda: 4242)
+    with pytest.raises(StaleNodeEpochError) as info:
+        first.node_renew("n01", "e1")
+    assert not isinstance(info.value, NodeLeaseExpiredError)
+    monkeypatch.undo()
+    assert second.node_renew("n01", "e2") == LEASE_S
+    first.close()
+    second.close()
+
+
 def test_restarted_run_reusing_ids_is_not_answered_from_cache(rm_address, monkeypatch):
     # Two runs of the node with the same hostname:pid (PID 1 in a container)
     # whose request IDs start at the same value.
