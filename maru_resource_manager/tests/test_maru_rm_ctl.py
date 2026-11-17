@@ -112,7 +112,10 @@ class MaruRmCtlTest(unittest.TestCase):
             (["drop-holds", "node-a"], "drop-holds node-a\n"),
             (["drop-holds", "node-a", "--confirm"], "drop-holds node-a --confirm\n"),
             (["release-node", "node-a"], "release-node node-a\n"),
-            (["release-node", "node-a", "--confirm"], "release-node node-a --confirm\n"),
+            (
+                ["release-node", "node-a", "--confirm"],
+                "release-node node-a --confirm\n",
+            ),
         ]
         for argv, expected in cases:
             code, request, out, _ = self.run_ctl("OK\nbody\n", *argv)
