@@ -1241,8 +1241,9 @@ def test_a_chunk_short_of_credit_is_dropped_whole(fake, nodes_small, caplog):
     client = writer._handler._cpu
     try:
         wait_until(lambda: client.credits.unused_bytes >= 3 * PAGE)
-        save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
-        drain(writer)
+        with caplog.at_level("WARNING", logger="maru_vllm.connector"):
+            save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
+            drain(writer)
         assert fake.keys() == set()  # no layer of a dropped chunk
         assert not writer._pending_layer_objects
         assert client.local_stats()["allocations"] == 0  # every page back
