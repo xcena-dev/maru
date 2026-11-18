@@ -17,8 +17,9 @@ sessions (`cpu`, `mixed`, `remote_cxl`) use `ReplicaDirectory` instead of
 For storage sessions, `cache_namespace` must identify the exact immutable
 weights revision. Equal token text and model shape are insufficient if weights
 differ. The schema/layout and chunk geometry must also match. A multi-pool
-`remote_cxl` request uses the same first-chunk `route_key` for stores and reads;
-there is no global search or replication across independent pools.
+`remote_cxl` request allocates, looks up and reads with the same first-chunk
+`route_key`, and each store goes to the pool its allocation came from; there is
+no global search or replication across independent pools.
 
 Region IDs are assigned within one Resource Manager, not across every Maru
 deployment. Keep the pool/server identity with a location. Reusing the same

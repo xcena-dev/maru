@@ -55,8 +55,10 @@ For `remote_cxl`, retain the returned read lease until the last CPU read or GPU 
 | `release_retrieved` | No storage-session lease to release | Release each non-None result after its final read or GPU copy |
 
 For multiple `remote_cxl` pools, pass the request's first chunk key as the same
-`route_key` to allocation, store, lookup and retrieve batch calls. A region ID
-alone is not an identifier across independent Resource Managers.
+`route_key` to `alloc()`, `batch_exists()` and `batch_retrieve()`. `store()` and
+`batch_store()` take no route key: each allocation is stored in the pool its
+handle was allocated from. A region ID alone is not an identifier across
+independent Resource Managers.
 
 `healthcheck()` checks the metadata connection/heartbeat. It does not establish
 that RDMA, a DAX payload read or a GPU restore completed successfully.
