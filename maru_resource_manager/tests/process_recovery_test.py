@@ -84,6 +84,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         self,
         expected_failure=False,
         checkpoint_fault=None,
+        grace_period=None,
         node_lease=None,
         hold_grace=None,
     ):
@@ -97,6 +98,9 @@ class ProcessRecoveryTest(unittest.TestCase):
         env.pop("MARU_TEST_HOLD_GRACE", None)
         if checkpoint_fault is not None:
             env["MARU_TEST_CHECKPOINT_FAILURE"] = checkpoint_fault
+        env.pop("MARU_TEST_GRACE_PERIOD", None)
+        if grace_period is not None:
+            env["MARU_TEST_GRACE_PERIOD"] = str(grace_period)
         if node_lease is not None:
             env["MARU_TEST_NODE_LEASE"] = str(node_lease)
         if hold_grace is not None:
@@ -561,6 +565,46 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.free(other)
         self.stop()
         self.checkpoint(0)
+
+    def test_grace_period_waits_for_last_connection(self):
+        # A process shares one client_id across its connections (#114). The
+        # owner is named as a remote client, so only the grace period, not the
+        # PID check of local clients, decides.
+        client_id = b"another-host:4242"
+        self.client_id = struct.pack("<H", len(client_id)) + client_id
+        self.start(grace_period=1)
+        port = int((self.root / "port").read_text())
+        handle = self.allocate()
+        first = self.connection
+
+        # A second connection binds itself to the client_id and closes.
+        self.connection = socket.create_connection(
+            ("127.0.0.1", port), timeout=REQUEST_S
+        )
+        self.access(handle)
+        self.connection.close()
+        self.connection = first
+        # Well past the grace period and the reaper's one-second pass.
+        time.sleep(4)
+        self.access(handle)
+        self.assertNotIn("reaping disconnected client", self.log.read_text())
+        self.check_stats({"/dev/dax0.0": 1})
+
+        # Once the last connection closes, the grace period runs out.
+        first.close()
+        deadline = time.monotonic() + REQUEST_S
+        while "reaping disconnected client" not in self.log.read_text():
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.connection = socket.create_connection(
+            ("127.0.0.1", port), timeout=REQUEST_S
+        )
+        deadline = time.monotonic() + REQUEST_S
+        while self.stats()["/dev/dax0.0"][2] != SIZE - ALIGN:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.free(handle, -errno.ENOENT)
+        self.stop()
 
     def node_request(self, kind, node, epoch, request_id, head=b"", path=b""):
         """Fixed part (head, then the lengths), node ID, epoch, path, client_id
