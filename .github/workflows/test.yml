@@ -115,7 +115,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          pytest -m "not integration" \
+          pytest -x -m "not integration" \
             --cov=maru_handler \
             --cov=maru_server \
             --cov=maru_common \
