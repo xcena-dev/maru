@@ -2,13 +2,15 @@
 
 ## Integration Architecture
 
+This guide describes LMCache's directly mapped `cxl` integration. Its memoryview and allocator diagrams refer to that path. The `remote_cxl` storage backend and its CPU staging/RDMA path are documented for the native {doc}`vLLM connector <vllm>`; the configuration below does not select that backend.
+
 The full stack from inference engine to shared memory:
 
 ![System-level architecture](../image/lmcache_arch.png)
 
 > **Control Plane** (dashed arrows) — metadata RPC: KV registration, region claim/release.
 >
-> **Data Plane** (solid arrows) — mmap direct CXL read/write, zero-copy.
+> **Data Plane** (solid arrows) — directly mapped CXL read/write with the `cxl` backend. A CPU consumer can view the mapping without another host copy; moving KV into or out of GPU memory still copies bytes.
 
 ### Component Architecture
 

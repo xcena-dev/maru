@@ -34,8 +34,11 @@ connector's store/load paths would never run.
   environment that already has PyTorch and the CUDA toolkit. The direct
   connector carries its own CUDA kernels for the coalesced multi-layer
   transfers and falls back to a transfer per layer without them, which is
-  materially slower. Check with
-  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"`.
+  materially slower.
+  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks
+  importability only. The engine's layout and transfer logs determine the
+  actual path. vLLM 0.29+ logical pages use the stride-based placement
+  bindings; unsupported layouts or unavailable bindings use per-layer copies.
 - vLLM v0.14+ installed
 - maru-server binary available
 

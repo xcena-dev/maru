@@ -462,6 +462,90 @@ def _session_route(cpu_mode: bool, chunk_keys: list[str]) -> dict[str, str]:
     return {}
 
 
+def _slab_rows(
+    src_kv_data: torch.Tensor, num_chunks: int, half_width: int, ntok: int
+) -> torch.Tensor:
+    """Return the first ``ntok`` token rows of a slab as ``[2, ntok, half_width]``.
+
+    Args:
+        src_kv_data: One layer's KV for ``num_chunks`` chunks, chunk-major
+            ``[num_chunks, 2, tokens, half_width]`` in any shape with that
+            element order (a single chunk may be ``[2, tokens, half_width]``).
+        num_chunks: Chunks in ``src_kv_data``.
+        half_width: Elements of one token's K (or V) row.
+        ntok: Slots to fill, at most the slab's token count.
+
+    Returns:
+        The K/V rows of the leading ``ntok`` tokens in token order.
+
+    Raises:
+        RuntimeError: If the slab holds fewer than ``ntok`` tokens or does not
+            split evenly into ``num_chunks`` chunks.
+
+    Stored chunks are always whole, while a load can need fewer tokens than it
+    read: when a fully cached prompt is an exact multiple of the chunk size,
+    one block is held back for the engine to compute, so the last chunk is
+    only partly injected.
+    """
+    per_token = 2 * half_width
+    src_tokens = src_kv_data.numel() // per_token if per_token else 0
+    if (
+        num_chunks <= 0
+        or ntok < 0
+        or per_token <= 0
+        or src_tokens * per_token != src_kv_data.numel()
+        or src_tokens % num_chunks
+        or src_tokens < ntok
+    ):
+        raise RuntimeError(
+            f"Maru: slab of {src_kv_data.numel()} elements does not hold "
+            f"{ntok} tokens of {num_chunks} chunk(s) at K/V row width {half_width}"
+        )
+    tokens_per_chunk = src_tokens // num_chunks
+    return (
+        src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, half_width)
+        .permute(1, 0, 2, 3)
+        .reshape(2, src_tokens, half_width)[:, :ntok]
+    )
+
+
+def _token_rows(
+    src_kv_data: torch.Tensor, row_shape: tuple[int, ...], ntok: int
+) -> torch.Tensor:
+    """Return the first ``ntok`` rows of a token-major slab.
+
+    Args:
+        src_kv_data: KV for whole chunks laid out one row per token in token
+            order, as the MLA and legacy rank-4 Triton extracts write it.
+        row_shape: Shape of one token's row.
+        ntok: Slots to fill, at most the slab's token count.
+
+    Returns:
+        ``[ntok, *row_shape]``.
+
+    Raises:
+        RuntimeError: If the slab is not a whole number of rows or holds
+            fewer than ``ntok`` of them.
+
+    Like :func:`_slab_rows`, the slab can hold more rows than there are
+    slots when one block of a fully cached prompt is held back.
+    """
+    row = 1
+    for dim in row_shape:
+        row *= dim
+    if (
+        ntok < 0
+        or row <= 0
+        or src_kv_data.numel() % row
+        or src_kv_data.numel() // row < ntok
+    ):
+        raise RuntimeError(
+            f"Maru: slab of {src_kv_data.numel()} elements does not hold "
+            f"{ntok} token rows of shape {tuple(row_shape)}"
+        )
+    return src_kv_data.reshape(-1, *row_shape)[:ntok]
+
+
 def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     """Generate maru keys for each chunk of the token prefix.
 
@@ -767,6 +851,7 @@ def _cpu_engine_config(
     """
     extra = _remote_cxl_defaults(extra)
     remote_cxl = extra.get("maru_storage_backend") == "remote_cxl"
+    backend_label = "Remote CXL storage" if remote_cxl else "CPU M1"
     if (
         remote_cxl
         and not _get_knob(extra, "maru_async_load")
@@ -787,7 +872,7 @@ def _cpu_engine_config(
         getattr(config.kv_transfer_config, "kv_load_failure_policy", None)
         != "recompute"
     ):
-        raise ValueError("CPU M1 requires kv_load_failure_policy='recompute'")
+        raise ValueError(f"{backend_label} requires kv_load_failure_policy='recompute'")
     parallel = config.parallel_config
     # Each remote_cxl TP rank of each data-parallel replica opens its own
     # session (_rank_scoped_extra) and stores its own slice; every session of
@@ -812,14 +897,16 @@ def _cpu_engine_config(
     tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
     model = config.model_config
     if not getattr(model, "enforce_eager", False):
-        raise ValueError("CPU M1 requires enforce_eager=True (--enforce-eager)")
+        raise ValueError(
+            f"{backend_label} requires enforce_eager=True (--enforce-eager)"
+        )
     if config.cache_config.cache_dtype not in {
         "auto",
         "float16",
         "bfloat16",
         "float32",
     }:
-        raise ValueError("CPU M1 does not support quantized KV caches")
+        raise ValueError(f"{backend_label} does not support quantized KV caches")
     if (
         getattr(config, "lora_config", None) is not None
         or getattr(model, "use_mla", False)
@@ -1185,6 +1272,7 @@ def _create_maru_handler(
         metadata_only=metadata_only,
         engine_id=extra_config.get("maru_engine_id"),
         cache_namespace=extra_config.get("maru_cache_namespace"),
+        auto_expand=bool(extra_config.get("maru_auto_expand", True)),
         node_id=extra_config.get("maru_node_id"),
         storage_schema=extra_config.get("_maru_storage_schema", "opaque-bytes-v1"),
         cxl_pool_size=(
@@ -1267,15 +1355,15 @@ class MaruReqMeta:
     # and tokens computed before it.
     num_scheduled_tokens: int = 0
     num_computed_tokens: int = 0
-    # For store: where the request's stores start. Its num_computed_tokens in
-    # its first step since it was scheduled or resumed, or the end of the
-    # chunks its lookup found in Maru if later: a fully cached prompt holds
-    # one block back for vLLM to compute, inside a chunk Maru already has.
-    # The tokens before it are in Maru or vLLM's own prefix cache. Write-behind,
-    # which stores a prompt in its last prefill step, starts at the chunk
-    # holding this token; per-step stores at the later of it and
-    # num_computed_tokens.
+    # First token the request needs to store. Full-attention prefix-cache
+    # hits can cover tokens that Maru does not hold, so this may precede
+    # num_computed_tokens. A full Maru hit still skips its held-back block.
+    # Write-behind keeps this start until the prompt's last prefill step.
     store_start_token: int = 0
+    # This admission step also stores the prefix-cached chunks before its
+    # compute range. Later synchronous steps store only their own range.
+    # Stateful/windowed groups cannot reconstruct every historical chunk.
+    store_cached_prefix: bool = False
     # CPU/mixed external-token interval, excluding GPU hits and compute tail.
     # None retains compatibility with metadata constructed without explicit bounds.
     load_start_token: int = 0
@@ -1390,7 +1478,9 @@ def _step_chunks(req_meta: MaruReqMeta, chunk_tokens: int, num_chunks: int) -> r
     if req_meta.num_scheduled_tokens <= 0:
         return range(num_chunks)
     end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
-    start = max(req_meta.num_computed_tokens, req_meta.store_start_token)
+    start = req_meta.store_start_token
+    if not req_meta.store_cached_prefix:
+        start = max(req_meta.num_computed_tokens, start)
     return range(start // chunk_tokens, min(end // chunk_tokens, num_chunks))
 
 
@@ -3153,6 +3243,29 @@ class MaruSchedulerConnector:
         hit = self._maru_hits.pop(req_id, None)
         if hit is not None and num_computed + self._replay_tokens >= hit[1]:
             store_start = max(store_start, hit[0] * ct)
+        # vLLM's prefix cache can retain generated tokens that no earlier
+        # prompt stored in Maru. Its full-attention blocks still cover those
+        # tokens on admission. Fill that gap before storing the new suffix,
+        # or a later lookup will stop at the first turn's prompt forever.
+        # FullAttentionManager retains every block even if a promoted spec
+        # carries sliding_window metadata. Non-windowed MLA groups retain
+        # their blocks too; skipped/replayed groups have nothing to store.
+        # Stateful/windowed groups may have lost history. Preempted requests
+        # retain their original start.
+        full_history = all(
+            g.kind in {GROUP_FULL, GROUP_SKIP}
+            or (g.kind == GROUP_MLA and g.sliding_window is None)
+            for g in self._kv_groups
+        )
+        if preempted is None and full_history:
+            # A bounded replay resumes before the loaded hit to rebuild its
+            # skipped window. Those MLA chunks are already present in Maru.
+            maru_end = (
+                hit[0] * ct
+                if hit is not None and num_computed + self._replay_tokens >= hit[1]
+                else 0
+            )
+            store_start = min(store_start, maru_end)
         num_full_chunks = len(token_ids) // ct
         end_chunk = min((num_computed + num_scheduled) // ct, num_full_chunks)
         # Tracked until the prompt is computed, not only its full chunks: a
@@ -3173,6 +3286,7 @@ class MaruSchedulerConnector:
             num_scheduled_tokens=num_scheduled,
             num_computed_tokens=num_computed,
             store_start_token=store_start,
+            store_cached_prefix=full_history and store_start < num_computed,
             group_block_ids=self._group_block_ids(block_ids),
         )
 
@@ -4253,7 +4367,7 @@ class MaruWorkerConnector:
                 logger.error(
                     "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(req_meta, e)
                 continue
 
             if len(infos) != len(keys):
@@ -4268,7 +4382,9 @@ class MaruWorkerConnector:
                     len(keys),
                     req_meta.req_id,
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(
+                    req_meta, RuntimeError("retrieve response count mismatch")
+                )
                 continue
 
             # All-or-nothing: a miss (chunk evicted between the scheduler's
@@ -4283,7 +4399,9 @@ class MaruWorkerConnector:
                     keys[miss],
                     req_meta.req_id,
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(
+                    req_meta, RuntimeError(f"retrieved chunk missing: {keys[miss]}")
+                )
                 continue
 
             # Packed (default): keep the per-chunk slab infos whole (num_chunks
@@ -8074,8 +8192,8 @@ class MaruWorkerConnector:
             # every chunk the request computed from the full accumulated block
             # list. This avoids competing with the remaining prefill and
             # coalesces all chunks into one write-behind batch. The chunks
-            # before store_start_token were loaded or are vLLM's own prefix
-            # cache.
+            # before store_start_token are already covered by the Maru hit;
+            # a GPU prefix-cache hit alone does not establish that coverage.
             if end_chunk < len(chunk_keys):
                 continue
             start_chunk = req_meta.store_start_token // ct
@@ -8557,7 +8675,9 @@ class MaruWorkerConnector:
         if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
-            src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
+            src = _token_rows(
+                src_kv_data, tuple(pages.shape[2:]), slot_mapping.shape[0]
+            )
             pages[slot_mapping // page_size, slot_mapping % page_size] = src
         elif (
             isinstance(layer_meta, TritonAttentionMetadata)
@@ -8569,7 +8689,11 @@ class MaruWorkerConnector:
             # axis and would misplace rank-5's K/V axis.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
-            src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
+            src = _token_rows(
+                src_kv_data,
+                (dst_kv_cache.shape[1], dst_kv_cache.shape[3]),
+                slot_mapping.shape[0],
+            )
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
             layout = self._layout_for(dst_kv_cache)
@@ -8580,16 +8704,13 @@ class MaruWorkerConnector:
                     f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
                 )
             ntok = slot_mapping.shape[0]
-            # Slab ordering, independent of the paged axis order.
-            if num_chunks == 1:
-                src = src_kv_data.reshape(2, ntok, -1)
-            else:
-                tokens_per_chunk = ntok // num_chunks
-                src = (
-                    src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, -1)
-                    .permute(1, 0, 2, 3)
-                    .reshape(2, ntok, -1)
-                )
+            # Derive row width from the registered cache, independently of
+            # the number of slots this load needs to fill. Whole stored
+            # chunks may include a final block the engine will recompute.
+            row_width = dst_kv_cache.numel() // layout.page_buffer_size
+            if row_width % 2:
+                raise RuntimeError("Maru: cannot inject KV; odd fused K/V row width")
+            src = _slab_rows(src_kv_data, num_chunks, row_width // 2, ntok)
             _scatter_kv(dst_kv_cache, layout, slot_mapping, src)
 
     def _extract_kv_from_layer(
