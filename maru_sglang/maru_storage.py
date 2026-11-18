@@ -9,9 +9,8 @@ Blocker: HiCache slot lifecycle (protect freed slots from remote reads).
 
 TODO(KV-split-pool): Non-MLA models keep K and V in separate host buffer
 pools (non-contiguous).  Maru stores one contiguous block per key, so
-batch_set_v1 must concat-copy K+V into a temp buffer before passing to
-batch_store.  Adding separate K/V CXL pools would let each key map to
-two regions, eliminating this intermediate copy.
+batch_set_v1 copies K and V one after the other into the key's Maru page.
+Adding separate K/V CXL pools would let each key map to two regions.
 See: _design/sglang-hicache-maru/260326_kv-memory-layout-mla-vs-non-mla.md
 
 Usage (SGLang dynamic backend):
@@ -27,6 +26,7 @@ Usage (SGLang dynamic backend):
         }'
 """
 
+import ctypes
 import logging
 from typing import Any
 
@@ -122,6 +122,96 @@ class MaruStorage(HiCacheStorage):
     # Abstract method implementations (Legacy API)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Writing pages
+    # ------------------------------------------------------------------
+
+    def _free_pages(self, handles: list) -> None:
+        """Give back pages that were allocated but not handed to a store.
+
+        Args:
+            handles: Handles from ``MaruHandler.alloc``.
+        """
+        for handle in handles:
+            try:
+                self._handler.free(handle)
+            except Exception as e:
+                # Already released by the handler; nothing is left to free.
+                logger.debug("page was already released: %s", e)
+
+    def _write_pages(self, payloads: list[list[tuple[int, int]]]) -> list:
+        """Allocate one Maru page per payload and copy the payload into it.
+
+        ``MaruHandler.store`` and ``batch_store`` register pages whose data is
+        already written, so every write starts here.
+
+        Args:
+            payloads: Per key, the ``(address, size)`` source ranges to place
+                one after the other in that key's page.
+
+        Returns:
+            One handle per payload, in order, each holding its payload.
+
+        Raises:
+            Exception: Whatever ``alloc`` raised. The pages allocated before it
+                are freed first.
+        """
+        handles: list = []
+        try:
+            for chunks in payloads:
+                total = sum(size for _, size in chunks)
+                handle = self._handler.alloc(total)
+                handles.append(handle)
+                if total == 0:
+                    continue
+                dst = ctypes.addressof(ctypes.c_char.from_buffer(handle.buf))
+                offset = 0
+                for address, size in chunks:
+                    ctypes.memmove(dst + offset, address, size)
+                    offset += size
+        except Exception:
+            self._free_pages(handles)
+            raise
+        return handles
+
+    def _store_pages(
+        self, full_keys: list[str], payloads: list[list[tuple[int, int]]]
+    ) -> list[bool]:
+        """Write each payload to a Maru page and register the pages.
+
+        Args:
+            full_keys: Maru keys, one per payload.
+            payloads: As for ``_write_pages``.
+
+        Returns:
+            One bool per key: True once the key is in Maru.
+
+        Raises:
+            Exception: Whatever ``alloc`` or ``batch_store`` raised. No page of
+                this call is left allocated.
+        """
+        handles = self._write_pages(payloads)
+        try:
+            return self._handler.batch_store(full_keys, handles)
+        except Exception:
+            # batch_store raises before it takes over the handles.
+            self._free_pages(handles)
+            raise
+
+    @staticmethod
+    def _tensor_payload(value: torch.Tensor) -> tuple[Any, list[tuple[int, int]]]:
+        """Describe a tensor's bytes as a payload for ``_write_pages``.
+
+        Args:
+            value: Tensor to store.
+
+        Returns:
+            The byte array that keeps the source alive while it is copied, and
+            its one ``(address, size)`` range.
+        """
+        src = value.contiguous().view(torch.uint8).numpy()
+        return src, [(src.ctypes.data, src.nbytes)]
+
     def exists(self, key: str) -> bool:
         if not self._ensure_connected():
             return False
@@ -194,13 +284,12 @@ class MaruStorage(HiCacheStorage):
             return False
         full_key = self._make_key(key)
         try:
-            src = value.contiguous().view(torch.uint8).numpy()
-            mv = memoryview(src)
-            ok = self._handler.store(full_key, data=mv)
+            src, payload = self._tensor_payload(value)
+            ok = self._store_pages([full_key], [payload])[0]
         except Exception as e:
             logger.error("set failed: %s", e)
             return False
-        logger.debug("set %s key=%s, %d bytes", "OK" if ok else "FAIL", key, len(mv))
+        logger.debug("set %s key=%s, %d bytes", "OK" if ok else "FAIL", key, src.nbytes)
         return ok
 
     def batch_get(
@@ -256,11 +345,9 @@ class MaruStorage(HiCacheStorage):
             len(full_keys),
         )
         try:
-            infos = []
-            for v in values:
-                src = v.contiguous().view(torch.uint8).numpy()
-                infos.append(memoryview(src))
-            results = self._handler.batch_store(full_keys, infos)
+            # The byte arrays stay referenced until the copy is done.
+            sources = [self._tensor_payload(v) for v in values]
+            results = self._store_pages(full_keys, [payload for _, payload in sources])
         except Exception as e:
             logger.error("batch_set failed: %s", e)
             return False
@@ -308,8 +395,6 @@ class MaruStorage(HiCacheStorage):
             logger.error("batch_get_v1 failed: %s", e)
             return [False] * len(keys)
 
-        import ctypes
-
         host_ptrs, host_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
 
         # Determine chunks-per-key ratio (non-MLA: 2 for K+V, MLA: 1).
@@ -355,13 +440,11 @@ class MaruStorage(HiCacheStorage):
     ) -> list[bool]:
         """Store KV pages from host memory pool into Maru.
 
-        Collects host page data as zero-copy memoryviews and delegates
-        to batch_store for a single batch RPC.
+        Copies each key's host page (K then V for a non-MLA model) into a Maru
+        page and registers all of them with one batch RPC.
         """
         if not self._ensure_connected() or not keys:
             return [False] * len(keys)
-
-        import ctypes
 
         full_keys = [self._make_key(k) for k in keys]
         try:
@@ -387,31 +470,12 @@ class MaruStorage(HiCacheStorage):
                 expected,
             )
 
-        # Collect host page data as memoryviews for batch_store.
-        # MLA (1 chunk/key): zero-copy view from host page.
-        # Non-MLA (K+V in separate buffer pools): concatenate into owned buffer.
-        infos: list[memoryview] = []
-        for key_idx in range(n_keys):
-            base = key_idx * chunks_per_key
-            if chunks_per_key == 1:
-                src_size = host_sizes[base]
-                src_view = (ctypes.c_char * src_size).from_address(host_ptrs[base])
-                infos.append(memoryview(src_view))
-            else:
-                total_size = sum(host_sizes[base + c] for c in range(chunks_per_key))
-                dst_buf = (ctypes.c_char * total_size)()
-                dst_offset = 0
-                for c in range(chunks_per_key):
-                    src_ptr = host_ptrs[base + c]
-                    src_size = host_sizes[base + c]
-                    ctypes.memmove(
-                        ctypes.addressof(dst_buf) + dst_offset, src_ptr, src_size
-                    )
-                    dst_offset += src_size
-                infos.append(memoryview(dst_buf))
-
+        payloads = [
+            [(host_ptrs[base + c], host_sizes[base + c]) for c in range(chunks_per_key)]
+            for base in range(0, n_keys * chunks_per_key, chunks_per_key)
+        ]
         try:
-            results = self._handler.batch_store(full_keys, infos)
+            results = self._store_pages(full_keys, payloads)
         except Exception as e:
             logger.error("batch_set_v1 batch_store failed: %s", e)
             return [False] * len(keys)

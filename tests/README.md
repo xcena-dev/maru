@@ -15,7 +15,7 @@ To reproduce a CI test run locally, choose a version from the matrix:
 ```bash
 uv venv --python 3.13 .venv-3.13
 uv pip install --python .venv-3.13/bin/python -e ".[dev]"
-.venv-3.13/bin/python -m pytest -m "not integration" --ignore=tests/sglang
+.venv-3.13/bin/python -m pytest -m "not integration"
 ```
 
 ```bash
