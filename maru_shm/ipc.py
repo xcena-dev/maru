@@ -15,7 +15,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from .types import DaxType, MaruHandle, MaruPoolInfo
+from .types import DaxType, MaruHandle, MaruPoolInfo, NodeRegion, RegionHolder
 
 # Protocol constants
 PROTOCOL_MAGIC = 0x4D415255  # 'MARU' in ASCII
@@ -42,6 +42,20 @@ class MsgType(IntEnum):
     UNHOLD_RESP = 14
     RESET_HOLDS_REQ = 15
     RESET_HOLDS_RESP = 16
+    NODE_CLAIM_REQ = 17
+    NODE_CLAIM_RESP = 18
+    NODE_ALLOC_REQ = 19
+    NODE_ALLOC_RESP = 20  # AllocResp payload
+    NODE_FREE_REQ = 21
+    NODE_FREE_RESP = 22  # FreeResp payload
+    NODE_RENEW_REQ = 23
+    NODE_RENEW_RESP = 24
+    NODE_RELEASE_REQ = 25
+    NODE_RELEASE_RESP = 26
+    NODE_HOLD_REQ = 27
+    NODE_HOLD_RESP = 28  # GetAccessResp payload
+    NODE_HOLDS_REQ = 29  # NodeReq payload
+    NODE_HOLDS_RESP = 30
     ERROR_RESP = 255
 
 
@@ -476,6 +490,349 @@ class ResetHoldsResp:
             _RESET_HOLDS_RESP_FORMAT, data[:_RESET_HOLDS_RESP_SIZE]
         )
         return cls(status=status, dropped=dropped)
+
+
+def _node_fields(node_id: str, node_epoch: str) -> tuple[bytes, bytes, bytes]:
+    """Node ID and epoch bytes, and their lengths (u32 each)."""
+    node = node_id.encode("utf-8")
+    epoch = node_epoch.encode("utf-8")
+    return struct.pack("<II", len(node), len(epoch)), node, epoch
+
+
+def _client_tail(client_id: str, request_id: int) -> bytes:
+    """client_id (u16 len + bytes) and request_id (u64)."""
+    id_bytes = client_id.encode("utf-8")
+    return struct.pack("<H", len(id_bytes)) + id_bytes + struct.pack("<Q", request_id)
+
+
+# NodeReq: nodeIdLen(u32) + epochLen(u32), then node ID, epoch, client_id and
+# request_id. Used by NODE_CLAIM, NODE_RENEW, NODE_RELEASE and NODE_HOLDS.
+@dataclass
+class NodeReq:
+    """A request of one run (``node_epoch``) of a node."""
+
+    node_id: str = ""
+    node_epoch: str = ""
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        lengths, node, epoch = _node_fields(self.node_id, self.node_epoch)
+        return lengths + node + epoch + _client_tail(self.client_id, self.request_id)
+
+
+# NodeAllocReq: size(u64) + nodeIdLen(u32) + epochLen(u32) + daxPathLen(u32) +
+# reserved(u32) = 24 bytes, then node ID, epoch, DAX path, client_id and
+# request_id. The response is an AllocResp (NODE_ALLOC_RESP).
+@dataclass
+class NodeAllocReq:
+    """Allocate a region owned by the node."""
+
+    size: int = 0
+    node_id: str = ""
+    node_epoch: str = ""
+    dax_path: str = ""  # "" = any pool
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        _, node, epoch = _node_fields(self.node_id, self.node_epoch)
+        path = self.dax_path.encode("utf-8")
+        return (
+            struct.pack("<QIIII", self.size, len(node), len(epoch), len(path), 0)
+            + node
+            + epoch
+            + path
+            + _client_tail(self.client_id, self.request_id)
+        )
+
+
+# NodeFreeReq: Handle(32) + nodeIdLen(u32) + epochLen(u32), then node ID,
+# epoch, client_id and request_id. The response is a FreeResp (NODE_FREE_RESP).
+@dataclass
+class NodeFreeReq:
+    """Free a region of the node."""
+
+    handle: MaruHandle | None = None
+    node_id: str = ""
+    node_epoch: str = ""
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        lengths, node, epoch = _node_fields(self.node_id, self.node_epoch)
+        h = self.handle or MaruHandle()
+        return (
+            h.pack()
+            + lengths
+            + node
+            + epoch
+            + _client_tail(self.client_id, self.request_id)
+        )
+
+
+# NodeHoldReq: Handle(32) + nodeIdLen(u32) + epochLen(u32) + holderLen(u32) +
+# bootIdLen(u32) + pid(u32) + reserved(u32) + pidStart(u64) + pidNs(u64) =
+# 72 bytes, then node ID, epoch, holder, boot ID, client_id and request_id.
+# The response is a GetAccessResp (NODE_HOLD_RESP).
+_NODE_HOLD_REQ_FORMAT = "<IIIIIIQQ"
+
+
+@dataclass
+class NodeHoldReq:
+    """A worker (``holder``, its incarnation) maps a region of the node."""
+
+    handle: MaruHandle | None = None
+    node_id: str = ""
+    node_epoch: str = ""
+    holder: str = ""
+    boot_id: str = ""
+    pid: int = 0
+    pid_start: int = 0
+    pid_ns: int = 0
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        _, node, epoch = _node_fields(self.node_id, self.node_epoch)
+        holder = self.holder.encode("utf-8")
+        boot = self.boot_id.encode("utf-8")
+        h = self.handle or MaruHandle()
+        return (
+            h.pack()
+            + struct.pack(
+                _NODE_HOLD_REQ_FORMAT,
+                len(node),
+                len(epoch),
+                len(holder),
+                len(boot),
+                self.pid,
+                0,
+                self.pid_start,
+                self.pid_ns,
+            )
+            + node
+            + epoch
+            + holder
+            + boot
+            + _client_tail(self.client_id, self.request_id)
+        )
+
+
+# NodeClaimResp: status(i32) + rmIdLen(u32) + leaseMs(u64) + numRegions(u32) +
+# reserved(u32) = 24 bytes, then the RM ID, then numRegions entries of
+# Handle(32) + requestedSize(u64) + pathLen(u32) + uuidLen(u32) +
+# numHolders(u32) + reserved(u32), path, UUID, then numHolders entries of
+# holderLen, epochLen, hostLen, bootIdLen, pid, reserved (u32 each) +
+# pidStart(u64) + pidNs(u64), holder, epoch, host, boot ID.
+_NODE_CLAIM_RESP_FORMAT = "<iIQII"
+_NODE_CLAIM_RESP_SIZE = struct.calcsize(_NODE_CLAIM_RESP_FORMAT)
+_NODE_REGION_FORMAT = "<QQQQQIIII"
+_NODE_REGION_SIZE = struct.calcsize(_NODE_REGION_FORMAT)
+_NODE_HOLDER_FORMAT = "<IIIIIIQQ"
+_NODE_HOLDER_SIZE = struct.calcsize(_NODE_HOLDER_FORMAT)
+
+
+def _take(data: bytes, off: int, length: int, field: str, what: str) -> tuple[str, int]:
+    if off + length > len(data):
+        raise ValueError(f"{what} {field} truncated")
+    return data[off : off + length].decode("utf-8"), off + length
+
+
+def _pack_regions(regions: list[NodeRegion]) -> list[bytes]:
+    parts = []
+    for r in regions:
+        path = r.dax_path.encode("utf-8")
+        uuid = r.device_uuid.encode("utf-8")
+        h = r.handle
+        parts.append(
+            struct.pack(
+                _NODE_REGION_FORMAT,
+                h.region_id,
+                h.offset,
+                h.length,
+                h.auth_token,
+                r.requested_size,
+                len(path),
+                len(uuid),
+                len(r.holders),
+                0,
+            )
+            + path
+            + uuid
+        )
+        for holder in r.holders:
+            texts = [
+                t.encode("utf-8")
+                for t in (
+                    holder.holder,
+                    holder.node_epoch,
+                    holder.host,
+                    holder.boot_id,
+                )
+            ]
+            parts.append(
+                struct.pack(
+                    _NODE_HOLDER_FORMAT,
+                    *(len(t) for t in texts),
+                    holder.pid,
+                    0,
+                    holder.pid_start,
+                    holder.pid_ns,
+                )
+                + b"".join(texts)
+            )
+    return parts
+
+
+def _unpack_regions(data: bytes, off: int, count: int, what: str) -> list[NodeRegion]:
+    """``count`` regions with their holders from ``off``."""
+    regions = []
+    for _ in range(count):
+        if off + _NODE_REGION_SIZE > len(data):
+            raise ValueError(f"{what} truncated")
+        *handle, requested, path_len, uuid_len, holder_count, _ = struct.unpack_from(
+            _NODE_REGION_FORMAT, data, off
+        )
+        off += _NODE_REGION_SIZE
+        path, off = _take(data, off, path_len, "region path", what)
+        uuid, off = _take(data, off, uuid_len, "region UUID", what)
+        holders = []
+        for _ in range(holder_count):
+            if off + _NODE_HOLDER_SIZE > len(data):
+                raise ValueError(f"{what} holder truncated")
+            *lengths, pid, _, pid_start, pid_ns = struct.unpack_from(
+                _NODE_HOLDER_FORMAT, data, off
+            )
+            off += _NODE_HOLDER_SIZE
+            texts = []
+            for length in lengths:
+                text, off = _take(data, off, length, "holder", what)
+                texts.append(text)
+            holders.append(RegionHolder(*texts, pid, pid_start, pid_ns))
+        regions.append(
+            NodeRegion(
+                handle=MaruHandle(*handle),
+                requested_size=requested,
+                dax_path=path,
+                device_uuid=uuid,
+                holders=holders,
+            )
+        )
+    return regions
+
+
+@dataclass
+class NodeClaimResp:
+    """Status, the RM's own ID, the lease, and every region the node owns."""
+
+    status: int = 0
+    rm_domain: str = ""
+    lease_ms: int = 0
+    regions: list[NodeRegion] | None = None
+
+    def pack(self) -> bytes:
+        rm_id = self.rm_domain.encode("utf-8")
+        regions = self.regions or []
+        parts = [
+            struct.pack(
+                _NODE_CLAIM_RESP_FORMAT,
+                self.status,
+                len(rm_id),
+                self.lease_ms,
+                len(regions),
+                0,
+            ),
+            rm_id,
+        ]
+        parts += _pack_regions(regions)
+        return b"".join(parts)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "NodeClaimResp":
+        if len(data) < _NODE_CLAIM_RESP_SIZE:
+            raise ValueError("NodeClaimResp too short")
+        status, rm_id_len, lease_ms, count, _ = struct.unpack_from(
+            _NODE_CLAIM_RESP_FORMAT, data
+        )
+        off = _NODE_CLAIM_RESP_SIZE
+        if off + rm_id_len > len(data):
+            raise ValueError("NodeClaimResp rm_domain truncated")
+        rm_domain = data[off : off + rm_id_len].decode("utf-8")
+        off += rm_id_len
+        regions = _unpack_regions(data, off, count, "NodeClaimResp")
+        return cls(
+            status=status, rm_domain=rm_domain, lease_ms=lease_ms, regions=regions
+        )
+
+
+# NodeHoldsResp: status(i32) + numRegions(u32) = 8 bytes, then the regions as
+# in NodeClaimResp.
+_NODE_HOLDS_RESP_FORMAT = "<iI"
+_NODE_HOLDS_RESP_SIZE = struct.calcsize(_NODE_HOLDS_RESP_FORMAT)
+
+
+@dataclass
+class NodeHoldsResp:
+    """Status and the node's regions with their holds now."""
+
+    status: int = 0
+    regions: list[NodeRegion] | None = None
+
+    def pack(self) -> bytes:
+        regions = self.regions or []
+        return b"".join(
+            [struct.pack(_NODE_HOLDS_RESP_FORMAT, self.status, len(regions))]
+            + _pack_regions(regions)
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "NodeHoldsResp":
+        if len(data) < _NODE_HOLDS_RESP_SIZE:
+            raise ValueError("NodeHoldsResp too short")
+        status, count = struct.unpack_from(_NODE_HOLDS_RESP_FORMAT, data)
+        regions = _unpack_regions(data, _NODE_HOLDS_RESP_SIZE, count, "NodeHoldsResp")
+        return cls(status=status, regions=regions)
+
+
+# NodeRenewResp: status(i32) + reserved(u32) + leaseMs(u64) = 16 bytes
+_NODE_RENEW_RESP_FORMAT = "<iIQ"
+_NODE_RENEW_RESP_SIZE = struct.calcsize(_NODE_RENEW_RESP_FORMAT)
+
+
+@dataclass
+class NodeRenewResp:
+    """Status and the lease the RM applies."""
+
+    status: int = 0
+    lease_ms: int = 0
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "NodeRenewResp":
+        if len(data) < _NODE_RENEW_RESP_SIZE:
+            raise ValueError("NodeRenewResp too short")
+        status, _, lease_ms = struct.unpack_from(_NODE_RENEW_RESP_FORMAT, data)
+        return cls(status=status, lease_ms=lease_ms)
+
+
+# NodeReleaseResp: status(i32) + released(u32) = 8 bytes
+_NODE_RELEASE_RESP_FORMAT = "<iI"
+_NODE_RELEASE_RESP_SIZE = struct.calcsize(_NODE_RELEASE_RESP_FORMAT)
+
+
+@dataclass
+class NodeReleaseResp:
+    """Status and the number of regions freed (or left draining)."""
+
+    status: int = 0
+    released: int = 0
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "NodeReleaseResp":
+        if len(data) < _NODE_RELEASE_RESP_SIZE:
+            raise ValueError("NodeReleaseResp too short")
+        status, released = struct.unpack_from(_NODE_RELEASE_RESP_FORMAT, data)
+        return cls(status=status, released=released)
 
 
 # StatsReq: empty payload (0 bytes)

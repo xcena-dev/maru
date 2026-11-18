@@ -24,7 +24,8 @@ Devices are named `daxN.M` or `/dev/daxN.M`. The RM serves device `daxN.M` as po
 | `discard daxN.M [--confirm [--force]]` | Release every allocation of the device's pool without opening the device. Without `--confirm` it only lists them |
 | `release REGION --confirm [--force]` | Release one allocation, e.g. of a remote owner that died while the RM was down |
 | `wipe daxN.M --confirm` | Zero all of an excluded device, header included. Waits until done, which can take minutes; Ctrl-C stops it and leaves the device partly zeroed |
-| `drop-holds NODE [--confirm]` | List the regions the remote CXL agent of memory node NODE holds. A freed region stays out of use while held; `--confirm` drops the holds once that node's agent is gone for good |
+| `drop-holds HOLDER [--confirm]` | List the regions HOLDER holds: the remote CXL agent of a memory node (its node name), or a worker or StorageService of one run of a GPU node (`<name>@<node_epoch>`, as the StorageService logs it). A region stays out of use while held; `--confirm` drops the holds once that holder is gone for good. The RM drops a hold itself once it sees the process gone, but not one in another host or pid namespace |
+| `release-node NODE [--confirm]` | Free every region of GPU node NODE and forget the node; stop its StorageService first. One still running sees its lease expired at its next renewal and starts a new run, which claims regions again |
 
 `discard` and `release` refuse while a local owner process is still running. `--force` releases anyway, for a PID that is running but is not the owner, such as a PID reused after a reboot. Before either command, stop every process that maps the regions on every host: the RM cannot see remote owners.
 

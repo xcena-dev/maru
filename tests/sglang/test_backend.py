@@ -6,11 +6,13 @@ Uses MockMaruHandler to test without a live Maru server or SGLang.
 
 from unittest.mock import patch
 
-import torch
+import pytest
 
-from maru_sglang.maru_storage import MaruStorage
+torch = pytest.importorskip("torch")
 
-from .conftest import MockHiCacheStorageConfig, MockMaruHandler
+from maru_sglang.maru_storage import MaruStorage  # noqa: E402
+
+from .conftest import MockHiCacheStorageConfig, MockMaruHandler  # noqa: E402
 
 
 def _make_backend(
