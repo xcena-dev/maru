@@ -379,8 +379,9 @@ bool TcpServer::trackClientId(int fd, const std::string &clientId) {
     std::lock_guard<std::mutex> lk(fdClientMutex_);
     auto [it, inserted] = fdClientMap_.emplace(fd, clientId);
     if (inserted) {
-        // First request on this connection — record and cancel any pending grace period
-        pm_.clientReconnected(clientId);
+        // First request on this connection — count it for the client and
+        // cancel any pending grace period
+        pm_.clientConnected(clientId);
         return true;
     }
     // Connection already has a pinned client_id — reject if different
@@ -397,16 +398,22 @@ bool TcpServer::trackClientId(int fd, const std::string &clientId) {
 // Idempotency cache — prevents duplicate alloc/free on client retry
 // =============================================================================
 
-std::string TcpServer::cacheKey(const std::string &clientId,
-                                 uint64_t requestId) {
-    // "hostname:pid:requestId" — unique per client per request
-    return clientId + ":" + std::to_string(requestId);
+// "<type>:<request_id>:<len>:<client_id>[:<len>:<node_id>:<len>:<epoch>]".
+// A process restarted with the same hostname:pid may reuse request ids, so a
+// node request is also keyed by its run: a new run's request is never
+// answered with an earlier run's reply. The lengths keep the key unambiguous.
+std::string TcpServer::cacheKey(MsgType type, const std::string &clientId,
+                                uint64_t requestId, const std::string &nodeId,
+                                const std::string &epoch) {
+    auto field = [](const std::string &s) { return std::to_string(s.size()) + ":" + s; };
+    std::string key = std::to_string(static_cast<uint16_t>(type)) + ":" +
+                      std::to_string(requestId) + ":" + field(clientId);
+    if (!nodeId.empty() || !epoch.empty()) key += ":" + field(nodeId) + ":" + field(epoch);
+    return key;
 }
 
-bool TcpServer::cacheLookup(const std::string &clientId,
-                             uint64_t requestId, int clientFd) {
+bool TcpServer::cacheLookup(const std::string &key, uint64_t requestId, int clientFd) {
     if (requestId == 0) return false;
-    std::string key = cacheKey(clientId, requestId);
     std::lock_guard<std::mutex> lk(cacheMutex_);
     auto it = idempotencyCache_.find(key);
     if (it == idempotencyCache_.end()) return false;
@@ -421,6 +428,23 @@ bool TcpServer::cacheLookup(const std::string &clientId,
     sendResp(clientFd, static_cast<MsgType>(it->second.type),
              it->second.payload.data(), it->second.payload.size());
     return true;
+}
+
+bool TcpServer::cachedClaimSucceeded(const std::string &key, uint64_t requestId) {
+    if (requestId == 0) return false;
+    std::lock_guard<std::mutex> lk(cacheMutex_);
+    auto it = idempotencyCache_.find(key);
+    if (it == idempotencyCache_.end() ||
+        std::chrono::duration_cast<std::chrono::seconds>(
+            SteadyClock::now() - it->second.insertedAt).count() >= kCacheTtlSec)
+        return false;
+    const auto &payload = it->second.payload;
+    if (it->second.type != static_cast<uint16_t>(MsgType::NODE_CLAIM_RESP) ||
+        payload.size() < sizeof(NodeClaimResp))
+        return false;
+    NodeClaimResp resp{};
+    std::memcpy(&resp, payload.data(), sizeof(resp));
+    return resp.status == 0;
 }
 
 void TcpServer::cacheEvictExpired() {
@@ -441,11 +465,9 @@ void TcpServer::cacheEvictExpired() {
     }
 }
 
-void TcpServer::cacheInsert(const std::string &clientId,
-                             uint64_t requestId, uint16_t type,
-                             const void *payload, size_t payloadSize) {
+void TcpServer::cacheInsert(const std::string &key, uint64_t requestId, uint16_t type,
+                            const void *payload, size_t payloadSize) {
     if (requestId == 0) return;
-    std::string key = cacheKey(clientId, requestId);
     std::lock_guard<std::mutex> lk(cacheMutex_);
     // Evict expired entries first, then enforce size limit
     cacheEvictExpired();
@@ -539,7 +561,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache
-        if (cacheLookup(cid, requestId, clientFd)) {
+        const std::string key = cacheKey(type, cid, requestId);
+        if (cacheLookup(key, requestId, clientFd)) {
             return true;
         }
 
@@ -547,7 +570,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
         auto result = handler_.handleAlloc(req, ctx);
 
         auto respPayload = serializeAllocResp(result.resp, result.devicePath, result.deviceUuid);
-        cacheInsert(cid, requestId, static_cast<uint16_t>(MsgType::ALLOC_RESP),
+        cacheInsert(key, requestId, static_cast<uint16_t>(MsgType::ALLOC_RESP),
                     respPayload.data(), respPayload.size());
         if (sendResp(clientFd, MsgType::ALLOC_RESP,
                      respPayload.data(), respPayload.size()) != 0) {
@@ -574,7 +597,8 @@ bool TcpServer::handleOneRequest(int clientFd) {
         uint64_t requestId = parseRequestId(payload, cidEnd);
 
         // Check idempotency cache
-        if (cacheLookup(cid, requestId, clientFd)) {
+        const std::string key = cacheKey(type, cid, requestId);
+        if (cacheLookup(key, requestId, clientFd)) {
             return true;
         }
 
@@ -584,7 +608,7 @@ bool TcpServer::handleOneRequest(int clientFd) {
             sendError(clientFd, -EACCES, "invalid authToken");
             return true;  // protocol error, but keep connection open
         }
-        cacheInsert(cid, requestId, static_cast<uint16_t>(MsgType::FREE_RESP),
+        cacheInsert(key, requestId, static_cast<uint16_t>(MsgType::FREE_RESP),
                     &result.resp, sizeof(result.resp));
         if (sendResp(clientFd, MsgType::FREE_RESP,
                      &result.resp, sizeof(result.resp)) != 0) {
@@ -702,6 +726,130 @@ bool TcpServer::handleOneRequest(int clientFd) {
             if (sendResp(clientFd, MsgType::RESET_HOLDS_RESP, &resp, sizeof(resp)) != 0) {
                 return false;
             }
+        }
+    } else if (type == MsgType::NODE_CLAIM_REQ || type == MsgType::NODE_ALLOC_REQ ||
+               type == MsgType::NODE_FREE_REQ || type == MsgType::NODE_RENEW_REQ ||
+               type == MsgType::NODE_RELEASE_REQ || type == MsgType::NODE_HOLD_REQ ||
+               type == MsgType::NODE_HOLDS_REQ) {
+        // Node ID and epoch follow the fixed part (NODE_ALLOC: then the DAX
+        // path; NODE_HOLD: the holder and boot ID), then client_id and
+        // request id. Every response but NODE_HOLDS's (read only) is cached
+        // so that a retransmit is never applied twice.
+        size_t fixedSize = sizeof(NodeReq);
+        if (type == MsgType::NODE_ALLOC_REQ) {
+            fixedSize = sizeof(NodeAllocReq);
+        } else if (type == MsgType::NODE_FREE_REQ) {
+            fixedSize = sizeof(NodeFreeReq);
+        } else if (type == MsgType::NODE_HOLD_REQ) {
+            fixedSize = sizeof(NodeHoldReq);
+        }
+        if (payload.size() < fixedSize) {
+            sendError(clientFd, -EPROTO, "bad node req");
+            return false;
+        }
+        NodeReq nodeReq{};
+        NodeAllocReq allocReq{};
+        NodeFreeReq freeReq{};
+        NodeHoldReq holdReq{};
+        uint32_t nodeIdLen = 0, epochLen = 0;
+        if (type == MsgType::NODE_HOLD_REQ) {
+            std::memcpy(&holdReq, payload.data(), sizeof(holdReq));
+            nodeIdLen = holdReq.nodeIdLen;
+            epochLen = holdReq.epochLen;
+        } else if (type == MsgType::NODE_ALLOC_REQ) {
+            std::memcpy(&allocReq, payload.data(), sizeof(allocReq));
+            nodeIdLen = allocReq.nodeIdLen;
+            epochLen = allocReq.epochLen;
+        } else if (type == MsgType::NODE_FREE_REQ) {
+            std::memcpy(&freeReq, payload.data(), sizeof(freeReq));
+            nodeIdLen = freeReq.nodeIdLen;
+            epochLen = freeReq.epochLen;
+        } else {
+            std::memcpy(&nodeReq, payload.data(), sizeof(nodeReq));
+            nodeIdLen = nodeReq.nodeIdLen;
+            epochLen = nodeReq.epochLen;
+        }
+        std::string nodeId, epoch;
+        size_t namesEnd = 0;
+        if (!parseHoldNames(payload, fixedSize, nodeIdLen, epochLen, nodeId, epoch, namesEnd)) {
+            sendError(clientFd, -EPROTO, "bad node req: node ID or epoch truncated");
+            return false;
+        }
+        std::string holder, bootId;
+        if (type == MsgType::NODE_HOLD_REQ &&
+            !parseHoldNames(payload, namesEnd, holdReq.holderLen, holdReq.bootIdLen, holder,
+                            bootId, namesEnd)) {
+            sendError(clientFd, -EPROTO, "bad node hold req: holder or boot ID truncated");
+            return false;
+        }
+        std::string daxPath;
+        if (type == MsgType::NODE_ALLOC_REQ && allocReq.daxPathLen > 0) {
+            if (allocReq.daxPathLen > PATH_MAX || namesEnd + allocReq.daxPathLen > payload.size() ||
+                std::memchr(payload.data() + namesEnd, '\0', allocReq.daxPathLen) != nullptr) {
+                sendError(clientFd, -EPROTO, "bad node alloc req: pool path");
+                return false;
+            }
+            daxPath.assign(reinterpret_cast<const char *>(payload.data()) + namesEnd,
+                           allocReq.daxPathLen);
+            namesEnd += allocReq.daxPathLen;
+        }
+
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, namesEnd, cidEnd);
+        if (cid.empty()) {
+            sendError(clientFd, -EINVAL, "missing client_id");
+            return true;
+        }
+        if (!trackClientId(clientFd, cid)) {
+            sendError(clientFd, -EPERM, "client_id mismatch on connection");
+            return false;
+        }
+        if (type == MsgType::NODE_HOLDS_REQ) {
+            auto resp = handler_.handleNodeHolds(nodeId, epoch);
+            return sendResp(clientFd, MsgType::NODE_HOLDS_RESP, resp.data(), resp.size()) == 0;
+        }
+        uint64_t requestId = parseRequestId(payload, cidEnd);
+        const std::string key = cacheKey(type, cid, requestId, nodeId, epoch);
+        // A reply is replayed only while its run is the node's current run;
+        // a resend of another run gets what a new request of it gets, except
+        // that a claim that took the node is refused rather than run again
+        // (the node table may no longer list the run as ended). NODE_RELEASE
+        // ends the run itself.
+        const bool current = type == MsgType::NODE_RELEASE_REQ ||
+                             handler_.nodeRunStatus(nodeId, epoch) == 0;
+        if (current) {
+            if (cacheLookup(key, requestId, clientFd)) {
+                return true;
+            }
+        } else if (type == MsgType::NODE_CLAIM_REQ && cachedClaimSucceeded(key, requestId)) {
+            auto resp = handler_.refuseNodeClaim();
+            return sendResp(clientFd, MsgType::NODE_CLAIM_RESP, resp.data(), resp.size()) == 0;
+        }
+
+        MsgType respType = static_cast<MsgType>(hdr.type + 1);
+        std::vector<uint8_t> resp;
+        if (type == MsgType::NODE_CLAIM_REQ) {
+            resp = handler_.handleNodeClaim(nodeId, epoch, cid);
+        } else if (type == MsgType::NODE_ALLOC_REQ) {
+            auto result = handler_.handleNodeAlloc(allocReq, nodeId, epoch, daxPath);
+            resp = serializeAllocResp(result.resp, result.devicePath, result.deviceUuid);
+        } else if (type == MsgType::NODE_FREE_REQ) {
+            auto r = handler_.handleNodeFree(freeReq, nodeId, epoch);
+            resp.assign(reinterpret_cast<uint8_t *>(&r), reinterpret_cast<uint8_t *>(&r + 1));
+        } else if (type == MsgType::NODE_HOLD_REQ) {
+            auto r = handler_.handleNodeHold(holdReq, nodeId, epoch, holder, bootId, cid);
+            resp = serializeGetAccessResp(r.status, r.devicePath, r.offset, r.length,
+                                          r.deviceUuid);
+        } else if (type == MsgType::NODE_RENEW_REQ) {
+            auto r = handler_.handleNodeRenew(nodeId, epoch);
+            resp.assign(reinterpret_cast<uint8_t *>(&r), reinterpret_cast<uint8_t *>(&r + 1));
+        } else {
+            auto r = handler_.handleNodeRelease(nodeId, epoch);
+            resp.assign(reinterpret_cast<uint8_t *>(&r), reinterpret_cast<uint8_t *>(&r + 1));
+        }
+        cacheInsert(key, requestId, static_cast<uint16_t>(respType), resp.data(), resp.size());
+        if (sendResp(clientFd, respType, resp.data(), resp.size()) != 0) {
+            return false;
         }
     } else {
         sendError(clientFd, -ENOSYS, "unknown request");

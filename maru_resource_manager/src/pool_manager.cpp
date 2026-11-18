@@ -27,6 +27,7 @@
 #include "device_header.h"
 #include "device_wipe.h"
 #include "metadata.h"
+#include "node_owners.h"
 #include "pool_recovery.h"
 #include "pool_validation.h"
 #include "server_config.h"
@@ -362,10 +363,14 @@ static bool getRegionIndexForPmem(const std::string &blockName,
     return false;
 }
 
-PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec)
+PoolManager::PoolManager(const std::string &stateDir, int gracePeriodSec, int nodeLeaseSec,
+                         int holdGraceSec)
     : stateDir_(stateDir), gracePeriodSec_(gracePeriodSec),
-      slots_(std::make_shared<DeviceSlots>())
+      slots_(std::make_shared<DeviceSlots>()), holdGrace_(std::chrono::seconds(holdGraceSec)),
+      nodeLease_(std::chrono::seconds(nodeLeaseSec))
 {
+    struct stat ns{};
+    if (::stat("/proc/self/ns/pid", &ns) == 0) ownPidNs_ = ns.st_ino;
     metadata_ = std::make_unique<MetadataStore>(stateDir);
     wal_ = std::make_unique<WalStore>(stateDir);
 }
@@ -661,10 +666,13 @@ int PoolManager::reportProbe(const DeviceProbe &probe)
 
 bool isLocalClientId(const char *clientId) { return isLocalClient(clientId); }
 
+bool isLocalHostName(const std::string &host) { return host == localHostname(); }
+
 std::string baseNameOf(const std::string &path) { return baseName(path); }
 
 bool PoolManager::ownerGone(const Allocation &a) const
 {
+    if (!nodeIdOfOwner(a.clientId).empty()) return previousBoot_ && nodeOnThisHost(a.clientId);
     if (!isLocalClient(a.clientId)) return false;
     if (previousBoot_) return true;
     const pid_t pid = pidFromClientId(a.clientId);
@@ -674,9 +682,10 @@ bool PoolManager::ownerGone(const Allocation &a) const
 void PoolManager::recountClients()
 {
     clientAllocCounts_.clear();
-    // A draining region was freed by its owner.
+    // A draining region was freed by its owner. Nodes are not clients: no
+    // PID or disconnect applies to them.
     for (const auto &[id, a] : allocations_)
-        if (!isDraining(id)) ++clientAllocCounts_[a.clientId];
+        if (!isDraining(id) && nodeIdOfOwner(a.clientId).empty()) ++clientAllocCounts_[a.clientId];
     // A PID that owns nothing now may be reused: its next owner must not be
     // compared with the old start time (the reaper would take it for reuse).
     std::set<pid_t> owners;
@@ -924,10 +933,19 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
                        std::string &devPath, std::string &deviceUuid,
                        const std::string &daxPath, uint64_t &requestedSizeOut)
 {
-    if (clientId.empty())
+    // A node's regions are allocated by NODE_ALLOC only.
+    if (clientId.empty() || !nodeIdOfOwner(clientId.c_str()).empty())
     {
         return -EINVAL;
     }
+    std::lock_guard<std::mutex> lock(mu_);
+    return allocLocked(size, clientId, out, devPath, deviceUuid, daxPath, requestedSizeOut);
+}
+
+int PoolManager::allocLocked(uint64_t size, const std::string &clientId, Handle &out,
+                             std::string &devPath, std::string &deviceUuid,
+                             const std::string &daxPath, uint64_t &requestedSizeOut)
+{
     // Reject zero or unreasonably large sizes to prevent alignUp() overflow
     // and nonsensical allocations. 256 TiB is well beyond any CXL device.
     if (size == 0 || size > (1ULL << 48))
@@ -935,7 +953,6 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
         return -EINVAL;
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
     if (pools_.empty())
     {
         return -ENODEV;
@@ -1004,7 +1021,7 @@ int PoolManager::alloc(uint64_t size, const std::string &clientId, Handle &out,
     }
 
     // Cache owner PID start time for reaper PID-reuse detection (local only)
-    if (!clientId.empty())
+    if (nodeIdOfOwner(clientId.c_str()).empty())
     {
         ++clientAllocCounts_[clientId];
         if (isLocalClient(clientId))
@@ -1078,6 +1095,12 @@ bool PoolManager::hasExistingAllocations()
     return !allocations_.empty();
 }
 
+std::string PoolManager::regionPath(const PoolState &pool, uint64_t regionId) const
+{
+    return pool.type == DaxType::FS_DAX ? makeFsDaxFilePath(pool.devPath, regionId)
+                                        : pool.devPath;
+}
+
 int PoolManager::getPathForHandle(const Handle &handle, std::string &outPath)
 {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1137,8 +1160,9 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
     for (const auto &kv : allocations_)
     {
         const char *cid = kv.second.clientId;
-        // A draining region was freed already; its holders release it.
-        if (cid[0] == '\0' || isDraining(kv.first))
+        // A draining region was freed already; its holders release it. A
+        // node's regions go with its lease only.
+        if (cid[0] == '\0' || isDraining(kv.first) || !nodeIdOfOwner(cid).empty())
         {
             continue;
         }
@@ -1204,6 +1228,8 @@ void PoolManager::reapExpired(uint64_t &reapedCount)
             reapRetries_.insert(cid);
         }
     }
+    expireNodeLeasesLocked();
+    reapDeadHoldersLocked();
     // Retry a drained region whose release failed when its last hold went.
     finishDrainingLocked(false);
 }
@@ -1250,23 +1276,11 @@ int PoolManager::checkpoint()
     return checkpointLocked();
 }
 
-void PoolManager::clientDisconnected(const std::string &clientId)
+void PoolManager::clientConnected(const std::string &clientId)
 {
     if (clientId.empty()) return;
     std::lock_guard<std::mutex> lock(mu_);
-    // Only track if this client actually has allocations
-    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
-    {
-        disconnectedClients_[clientId] = SteadyClock::now();
-        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
-             clientId.c_str(), gracePeriodSec_);
-    }
-}
-
-void PoolManager::clientReconnected(const std::string &clientId)
-{
-    if (clientId.empty()) return;
-    std::lock_guard<std::mutex> lock(mu_);
+    ++clientConnections_[clientId];
     reapRetries_.erase(clientId);
     auto it = disconnectedClients_.find(clientId);
     if (it != disconnectedClients_.end())
@@ -1274,6 +1288,34 @@ void PoolManager::clientReconnected(const std::string &clientId)
         disconnectedClients_.erase(it);
         logf(LogLevel::Debug, "client reconnected: %s (grace period cancelled)",
              clientId.c_str());
+    }
+}
+
+void PoolManager::clientDisconnected(const std::string &clientId)
+{
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Every connection of a process carries the same client_id (hostname:pid),
+    // so one of them closing says nothing while another is open: the process
+    // is running and may be using its regions through that one.
+    auto conn = clientConnections_.find(clientId);
+    if (conn != clientConnections_.end())
+    {
+        if (conn->second > 1)
+        {
+            --conn->second;
+            logf(LogLevel::Debug, "client %s closed a connection (%u still open)",
+                 clientId.c_str(), conn->second);
+            return;
+        }
+        clientConnections_.erase(conn);
+    }
+    // Only track if this client actually has allocations
+    if (clientAllocCounts_.find(clientId) != clientAllocCounts_.end())
+    {
+        disconnectedClients_[clientId] = SteadyClock::now();
+        logf(LogLevel::Debug, "client disconnected: %s (grace period %ds)",
+             clientId.c_str(), gracePeriodSec_);
     }
 }
 
@@ -1301,8 +1343,9 @@ int PoolManager::verifyAndFree(const Handle &handle, const std::string &clientId
         return -EACCES;
     }
 
-    // Verify ownership
-    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0)
+    // Verify ownership; a node's regions are freed by NODE_FREE only.
+    if (std::strcmp(alloc.clientId, clientId.c_str()) != 0 ||
+        !nodeIdOfOwner(alloc.clientId).empty())
     {
         return -EPERM;
     }
@@ -1502,6 +1545,7 @@ static bool localOwnerAlive(const char *clientId)
 
 static const char *ownerState(const char *clientId)
 {
+    if (!nodeIdOfOwner(clientId).empty()) return "node";
     if (!isLocalClient(clientId)) return "remote";
     return localOwnerAlive(clientId) ? "running" : "exited";
 }
@@ -1549,6 +1593,7 @@ int PoolManager::adminStatus(std::string &out)
     size_t holds = 0;
     for (const auto &[id, holders] : holds_) holds += holders.size();
     appendf(out, "holds=%zu draining=%zu\n", holds, draining_.size());
+    appendf(out, "rm_id=%s nodes=%zu\n", rmId_.empty() ? "-" : rmId_.c_str(), nodes_.size());
     if (checkpointBlock_.empty())
         out += "checkpoints=enabled\n";
     else
@@ -1575,13 +1620,23 @@ int PoolManager::adminAllocations(const std::string &device, std::string &out)
                 return path + " (" + unservedStateName(static_cast<int>(u.state)) + ")";
         return "(not present)";
     };
+    // A node owner shows its current run ("-" if none).
+    auto nodeOf = [&](const char *clientId) -> std::string {
+        const std::string nodeId = nodeIdOfOwner(clientId);
+        if (nodeId.empty()) return "";
+        auto it = nodes_.find(nodeId);
+        if (it == nodes_.end() || it->second.epoch.empty()) return " node=" + nodeId + " epoch=-";
+        return " node=" + nodeId + " epoch=" + it->second.epoch +
+               (it->second.releasing ? " releasing" : it->second.fenced ? " lease=expired" : "");
+    };
     for (const auto &[id, a] : allocations_)
         if (device.empty() || a.poolId == poolFilter)
             out += "region=" + std::to_string(a.handle.regionId) +
                    " pool=" + std::to_string(a.poolId) + " device=" + deviceOf(a.poolId) +
                    " size=" + std::to_string(a.allocLength) +
                    " offset=" + std::to_string(a.realOffset) + " client=" + a.clientId +
-                   " owner=" + ownerState(a.clientId) + holdState(id) + "\n";
+                   " owner=" + ownerState(a.clientId) + nodeOf(a.clientId) + holdState(id) +
+                   "\n";
     return 0;
 }
 
