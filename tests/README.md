@@ -18,6 +18,24 @@ uv pip install --python .venv-3.13/bin/python -e ".[dev]"
 .venv-3.13/bin/python -m pytest -m "not integration" --ignore=tests/sglang
 ```
 
+SSD tests share a filesystem probe that checks alignment reporting,
+preallocation, and an actual `O_DIRECT` write/read roundtrip. By default they
+try pytest's temporary directory, `/data`, and `/var/tmp`, and skip if none
+supports these operations. To require SSD coverage on a particular filesystem:
+
+```bash
+mkdir -p /path/on/local-disk/maru-tests
+export MARU_TEST_SSD_ROOT=/path/on/local-disk/maru-tests
+PYTHONPATH="$PWD" python tests/ssd_test_storage.py "$MARU_TEST_SSD_ROOT"
+pytest tests/unit/test_ms_ssd_driver.py tests/unit/test_ms_ssd_tier.py
+```
+
+An explicitly configured root must pass the probe; it never falls back or skips.
+CI uses the host-mounted `RUNNER_TEMP` directory and runs the probe before the
+suite. If this step fails, check that runner's kernel and filesystem support
+direct I/O alignment queries and reads/writes. Each test uses its own temporary
+pool directory under the verified root.
+
 ```bash
 # Unit tests only
 pytest -v tests/ -m "not integration"

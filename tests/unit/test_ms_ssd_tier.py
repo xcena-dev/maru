@@ -3,17 +3,15 @@
 """The SSD tier: [dram, ssd], [cxl, ssd] and [dram, cxl, ssd] nodes demote
 into one locked file through the I/O executor (write, then COMMIT with a
 finalizer, then FINALIZE_MOVE). A restart on the same boot adopts the file;
-a reboot starts it empty. Workers do not fetch yet. The files live under
-/var/tmp, a local filesystem with direct I/O."""
+a reboot starts it empty. Workers do not fetch yet. The files live on a filesystem
+verified to support direct I/O."""
 
 import dataclasses
 import errno
 import fcntl
 import mmap
 import os
-import shutil
 import socket
-import tempfile
 import threading
 import time
 
@@ -72,7 +70,6 @@ from tests.unit.test_ms_demotion import (
 from tests.unit.test_ms_new_run import SERVICE_OPTIONS, new_run
 
 NS = "ns"
-SSD_ROOT = "/var/tmp"
 
 
 @pytest.fixture
@@ -87,13 +84,6 @@ def sockdir():
     path = short_tmpdir()
     yield path
     remove_tree(path)
-
-
-@pytest.fixture
-def ssd_dir():
-    path = tempfile.mkdtemp(prefix="maru-ssd-tier-", dir=SSD_ROOT)
-    yield path
-    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture

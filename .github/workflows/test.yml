@@ -78,6 +78,16 @@ jobs:
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
 
+      - name: Verify the SSD test filesystem
+        run: |
+          # RUNNER_TEMP is already bind-mounted from the host by Actions.
+          # Container /var/tmp lives on the container filesystem instead.
+          # Fail here if the host filesystem cannot run the SSD tests.
+          ssd_test_root="$RUNNER_TEMP/maru-ssd-tests"
+          mkdir -p "$ssd_test_root"
+          PYTHONPATH="$PWD" python tests/ssd_test_storage.py "$ssd_test_root"
+          echo "MARU_TEST_SSD_ROOT=$ssd_test_root" >> "$GITHUB_ENV"
+
       - name: Install vLLM
         # The vLLM connector tests import torch and vLLM, and pytest skips
         # their modules at collection when either is missing. One interpreter

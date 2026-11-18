@@ -32,10 +32,10 @@ class TestDramDriver:
             assert pool.pool_id == "dram:n1:e1"
             assert pool.capacity == 8 * M  # whole pages
             assert os.fstat(pool.fd).st_size == 8 * M
-            seals = fcntl.fcntl(pool.fd, fcntl.F_GET_SEALS)
-            assert seals & fcntl.F_SEAL_SHRINK and seals & fcntl.F_SEAL_GROW
             with pytest.raises(PermissionError):
                 os.ftruncate(pool.fd, M)
+            with pytest.raises(PermissionError):
+                os.ftruncate(pool.fd, 9 * M)
             assert fcntl.fcntl(pool.fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
             info = pool.info()
             assert (info.capacity, info.page_size, info.pool_generation) == (

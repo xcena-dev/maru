@@ -84,9 +84,9 @@ def real_server():
 
 
 @pytest.fixture
-def nodes(real_server):
+def nodes(real_server, ssd_root):
     sockdir = short_tmpdir()
-    ssd_dir = tempfile.mkdtemp(prefix="maru-vllm-fetch-", dir="/var/tmp")
+    ssd_dir = tempfile.mkdtemp(prefix="maru-vllm-fetch-", dir=ssd_root)
     made = []
 
     def make(**budgets):

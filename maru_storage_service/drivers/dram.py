@@ -21,6 +21,14 @@ from ..tiers import L1Pool, L1Tier, Level, TierEnv
 from . import PoolAccess
 
 _MEMINFO = "/proc/meminfo"
+# Linux UAPI (include/uapi/linux/fcntl.h). Some Python builds omit these
+# names even on kernels supporting memfd seals. Keep the actual kernel check.
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_SIZE_SEALS = (
+    getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+    | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+    | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+)
 
 
 class DramPoolError(RuntimeError):
@@ -151,11 +159,12 @@ def create_dram_pool(
             ) from e
         # No holder of the fd may resize it under the others' mappings
 
-        fcntl.fcntl(
-            fd,
-            fcntl.F_ADD_SEALS,
-            fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL,
-        )
+        try:
+            fcntl.fcntl(fd, _F_ADD_SEALS, _SIZE_SEALS)
+        except OSError as e:
+            raise DramPoolError(
+                f"cannot seal the dram pool against resizing: {e}"
+            ) from e
     except BaseException:
         os.close(fd)
         raise

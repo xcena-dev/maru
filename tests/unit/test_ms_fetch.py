@@ -10,8 +10,6 @@ import dataclasses
 import errno
 import mmap
 import os
-import shutil
-import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -71,13 +69,6 @@ def sockdir():
     path = short_tmpdir()
     yield path
     remove_tree(path)
-
-
-@pytest.fixture
-def ssd_dir():
-    path = tempfile.mkdtemp(prefix="maru-fetch-", dir="/var/tmp")
-    yield path
-    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture

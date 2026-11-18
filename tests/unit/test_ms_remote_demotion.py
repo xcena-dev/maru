@@ -315,13 +315,13 @@ def test_write_through_copies_to_the_memory_node_at_once(ms, workers):
         p.close()
 
 
-def test_a_memory_node_writes_remote_ingress_through_to_its_ssd(ms, workers):
+def test_a_memory_node_writes_remote_ingress_through_to_its_ssd(ms, workers, ssd_root):
     import dataclasses
     import shutil
     import tempfile
 
     server, url = ms
-    ssd_dir = tempfile.mkdtemp(prefix="maru-mem-ssd-", dir="/var/tmp")
+    ssd_dir = tempfile.mkdtemp(prefix="maru-mem-ssd-", dir=ssd_root)
     p = Pair.__new__(Pair)
     p.server = server
     p.sockdir = short_tmpdir()

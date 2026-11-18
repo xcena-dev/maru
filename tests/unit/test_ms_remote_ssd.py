@@ -93,10 +93,10 @@ class Trio:
     """A memory node (64 pages) and a GPU node [dram, remote, ssd] on one
     MaruServer."""
 
-    def __init__(self, server, url, *, memory=True, wide=True, **gpu):
+    def __init__(self, server, url, *, ssd_root, memory=True, wide=True, **gpu):
         self.server, self.url, self.wide = server, url, wide
         self.sockdir = short_tmpdir()
-        self.ssd_dir = tempfile.mkdtemp(prefix="maru-l2-", dir="/var/tmp")
+        self.ssd_dir = tempfile.mkdtemp(prefix="maru-l2-", dir=ssd_root)
         self.port = free_port()
         self.memory = None
         if memory:
@@ -183,12 +183,12 @@ class Trio:
 
 
 @pytest.fixture
-def trio(ms):
+def trio(ms, ssd_root):
     server, url = ms
     made: list[Trio] = []
 
     def make(**kwargs) -> Trio:
-        made.append(Trio(server, url, **kwargs))
+        made.append(Trio(server, url, ssd_root=ssd_root, **kwargs))
         return made[-1]
 
     yield make

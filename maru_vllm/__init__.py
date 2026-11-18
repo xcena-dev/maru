@@ -14,6 +14,24 @@ Usage with vLLM:
     }'
 """
 
-from maru_vllm.connector import MaruKVConnector
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from maru_vllm.connector import MaruKVConnector
 
 __all__ = ["MaruKVConnector"]
+
+
+def __getattr__(name: str):
+    # Utilities such as copy_tracker do not need torch or vLLM. Load the
+    # connector only when requested, then use normal attribute lookup.
+    if name == "MaruKVConnector":
+        from maru_vllm.connector import MaruKVConnector
+
+        globals()[name] = MaruKVConnector
+        return MaruKVConnector
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

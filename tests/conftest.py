@@ -9,6 +9,7 @@ from pathlib import Path
 # in subdirectories under importlib import mode.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import os
 import socket
 import tempfile
 import threading
@@ -16,15 +17,48 @@ import time
 from collections.abc import Generator
 
 import pytest
+from ssd_test_storage import probe_direct_io
 
 import maru_common.gc_freeze
 import maru_handler.plugin
 from maru_shm import MaruHandle
+from maru_storage_service.drivers.ssd_alignment import SsdAlignmentError
 
 
 def _make_handle(region_id: int, length: int = 4096) -> MaruHandle:
     """Create a MaruHandle for testing (shared across test modules)."""
     return MaruHandle(region_id=region_id, offset=0, length=length, auth_token=12345)
+
+
+@pytest.fixture(scope="session")
+def ssd_root(tmp_path_factory):
+    """A verified filesystem; an explicitly configured CI root must work."""
+    configured = os.environ.get("MARU_TEST_SSD_ROOT")
+    parents = (
+        [Path(configured)]
+        if configured
+        else [tmp_path_factory.getbasetemp(), Path("/data"), Path("/var/tmp")]
+    )
+    reasons = []
+    for parent in parents:
+        try:
+            probe_direct_io(parent)
+        except (OSError, SsdAlignmentError) as error:
+            reasons.append(f"{parent}: {error}")
+            continue
+        with tempfile.TemporaryDirectory(prefix="maru-ssd-", dir=parent) as path:
+            yield Path(path)
+        return
+    message = f"no direct I/O test filesystem (kernel {os.uname().release}): {reasons}"
+    if configured:
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
+@pytest.fixture
+def ssd_dir(ssd_root):
+    with tempfile.TemporaryDirectory(prefix="pool-", dir=ssd_root) as path:
+        yield path
 
 
 # =============================================================================

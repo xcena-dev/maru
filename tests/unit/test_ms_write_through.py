@@ -45,14 +45,14 @@ def fake():
 
 
 @pytest.fixture
-def env(fake, monkeypatch):
+def env(fake, monkeypatch, ssd_root):
     """Builds nodes from tier lists; closes them and their handlers."""
     from maru_common.config import MaruConfig
     from maru_handler import MaruHandler
     from maru_handler.client import pool_maps
 
     sockdir = short_tmpdir()
-    ssd_dir = tempfile.mkdtemp(prefix="maru-through-", dir="/var/tmp")
+    ssd_dir = tempfile.mkdtemp(prefix="maru-through-", dir=ssd_root)
     regions = Regions()
     monkeypatch.setattr(pool_maps, "CxlRegionMapping", regions.worker_map)
     made, handlers = [], []

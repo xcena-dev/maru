@@ -44,9 +44,9 @@ def server(workdir):
 
 
 @pytest.fixture
-def nodes(server, workdir):
+def nodes(server, workdir, ssd_root):
     reset_fake_agents()
-    ssd_dir = tempfile.mkdtemp(prefix="maru-l2-", dir="/var/tmp")
+    ssd_dir = tempfile.mkdtemp(prefix="maru-l2-", dir=ssd_root)
     port = free_port()
     started = []
     try:

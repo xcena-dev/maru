@@ -9,7 +9,6 @@ import os
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -31,53 +30,14 @@ from maru_storage_service.drivers.ssd_alignment import (
     aligned_buffer,
     buffer_address,
     direct_alignment,
-    round_up,
 )
 
 PAGE = 16 << 10
 
 
-@pytest.fixture(scope="module")
-def local_root(tmp_path_factory):
-    reasons = []
-    for parent in (tmp_path_factory.getbasetemp(), Path("/data"), Path("/var/tmp")):
-        try:
-            directory = tempfile.TemporaryDirectory(prefix="maru-ssd-", dir=parent)
-        except OSError as e:
-            reasons.append(str(e))
-            continue
-        try:
-            path = Path(directory.name) / "direct-probe"
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o600)
-            try:
-                alignment = direct_alignment(fd)
-                size = round_up(4096, alignment.step)
-                os.posix_fallocate(fd, 0, size)
-                with aligned_buffer(size, alignment.memory) as view:
-                    view[:] = b"p" * size
-                    assert os.pwritev(fd, [view], 0) == size
-                    view[:] = b"\0" * size
-                    assert os.preadv(fd, [view], 0) == size
-                    assert bytes(view) == b"p" * size
-            finally:
-                os.close(fd)
-            path.unlink()
-        except (OSError, SsdAlignmentError) as e:
-            directory.cleanup()
-            reasons.append(f"{parent}: {e}")
-            continue
-        try:
-            yield Path(directory.name)
-        finally:
-            directory.cleanup()
-        return
-    pytest.skip(f"no local direct I/O filesystem: {reasons}")
-
-
 @pytest.fixture
-def directory(local_root):
-    with tempfile.TemporaryDirectory(prefix="pool-", dir=local_root) as path:
-        yield Path(path)
+def directory(ssd_dir):
+    return Path(ssd_dir)
 
 
 @pytest.fixture

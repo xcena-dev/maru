@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Process death during real O_DIRECT I/O on the local /var/tmp filesystem.
+"""Process death during real O_DIRECT I/O on a verified local filesystem.
 
 A returned write means that every requested byte transferred; those bytes can
 be read after a process restart. It does not promise power-loss durability or
@@ -39,9 +39,8 @@ WAIT = 30
 
 
 @pytest.fixture
-def directory():
-    # Never use pytest's possibly tmpfs-backed basetemp for direct I/O.
-    with tempfile.TemporaryDirectory(prefix="maru-ssd-kill-", dir="/var/tmp") as path:
+def directory(ssd_root):
+    with tempfile.TemporaryDirectory(prefix="maru-ssd-kill-", dir=ssd_root) as path:
         yield Path(path)
 
 
