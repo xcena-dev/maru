@@ -1834,6 +1834,309 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
     assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
 
 
+# =============================================================================
+# A parked load does not hold the loader thread for its copies
+# =============================================================================
+
+
+class Copies:
+    """The event after a batch's copies on a fake loader stream: they end
+    when ``ended`` is set or once waited for. ``error`` fails any question
+    about them, ``wait_error`` only a wait."""
+
+    def __init__(self, log: list[str], name: str):
+        self.log, self.name = log, name
+        self.ended = False
+        self.error: Exception | None = None
+        self.wait_error: Exception | None = None
+
+    def query(self) -> bool:
+        if self.error is not None:
+            raise self.error
+        return self.ended
+
+    def synchronize(self) -> None:
+        self.log.append(f"wait {self.name}")
+        error = self.error or self.wait_error
+        if error is not None:
+            raise error
+        self.ended = True
+
+
+class LoaderStream:
+    def __init__(self, log: list[str]):
+        self.log = log
+        self.events: list[Copies] = []
+
+    def record_event(self) -> Copies:
+        self.events.append(Copies(self.log, f"e{len(self.events)}"))
+        return self.events[-1]
+
+    def synchronize(self) -> None:
+        for event in self.events:
+            event.synchronize()
+
+
+def parked_loader(monkeypatch, slots: int | None = None, window: int = 0):
+    """A maru_node worker whose loader thread reads one chunk per batch and
+    copies it on a fake stream; ``slots`` bounds the reads it may hold, and
+    ``window`` is its ``maru_load_admission_window``.
+
+    Returns:
+        The worker, its loader stream, the log, and every read in order.
+    """
+    monkeypatch.setattr(connector_module, "_LOAD_PIPELINE_CHUNKS", 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    log: list[str] = []
+    stream = LoaderStream(log)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None, priority=0: stream)
+    worker = pinning_worker()
+    worker._load_admission_window = window
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    worker._pin_slot_mapping_for_async_h2d = lambda slots: slots
+    reads: list[CpuReadLease] = []
+
+    def retrieve(keys, **route):
+        log.append(f"read {len(reads)}")
+        reads.extend(lease(key) for key in keys)
+        return reads[-len(keys) :]
+
+    def copy(layers, entries, attn, stream=None, wait=True):
+        log.append(f"copy {entries[0][0].req_id}")
+        return set()
+
+    worker._batch_retrieve_all = retrieve
+    worker._load_packed = copy
+    handler = worker._handler
+    handler.release_retrieved.side_effect = lambda infos: log.append(
+        f"release {[reads.index(info) for info in infos]}"
+    )
+    handler.retrieve_capacity.side_effect = lambda: (
+        None if slots is None else slots - len(reads) + len(released(worker))
+    )
+    return worker, stream, log, reads
+
+
+def park(worker, req_id: str) -> MaruReqMeta:
+    """Run the parked load of two whole chunks of ``req_id`` as the loader
+    thread does."""
+    meta = MaruReqMeta(
+        req_id=req_id,
+        token_ids=list(range(PROMPT)),
+        block_ids=list(range(NUM_BLOCKS)),
+        is_store=False,
+        num_matched_chunks=2,
+        load_end_token=PROMPT,
+        deferred_load=True,
+    )
+    worker._deferred_load_job(meta, [("layer", torch.zeros(1), 0)], torch.device("cpu"))
+    return meta
+
+
+def test_the_next_parked_load_starts_while_the_copies_of_the_last_run(monkeypatch):
+    worker, stream, log, reads = parked_loader(monkeypatch)
+    park(worker, "r1")
+    park(worker, "r2")
+    # Nothing waited for r1's copies before r2 was read and copied
+    assert log == [
+        *("read 0", "copy r1", "read 1", "copy r1"),
+        *("read 2", "copy r2", "read 3", "copy r2"),
+    ]
+    assert not worker._deferred_done
+    worker._handler.release_retrieved.assert_not_called()
+    for event in stream.events:
+        event.ended = True
+    assert worker.get_finished_loading() == {"r1", "r2"}
+    assert released(worker) == reads
+
+
+def test_a_parked_load_gives_back_each_batch_once_its_copies_end(monkeypatch):
+    """And is reported, its chunks loaded, once its last batch's copies did."""
+    worker, stream, log, reads = parked_loader(monkeypatch)
+    meta = park(worker, "r1")
+    first, last = stream.events
+    first.ended = True
+    assert worker.get_finished_loading() is None
+    assert released(worker) == reads[:1]
+    assert not worker._loaded_request_keys["r1"][1]
+    last.ended = True
+    assert worker.get_finished_loading() == {"r1"}
+    assert released(worker) == reads
+    assert worker._loaded_request_keys["r1"][1] == set(worker._slice_chunk_keys(meta))
+    assert not worker._parked_loads
+
+
+def test_a_load_short_of_slots_waits_for_the_oldest_parked_batch(monkeypatch):
+    """Two slots: each batch of r2 is read once a batch of r1 gave its slot
+    back, and r1 is reported once its last one did."""
+    worker, stream, log, reads = parked_loader(monkeypatch, slots=2)
+    park(worker, "r1")
+    park(worker, "r2")
+    assert log[4:] == [
+        *("wait e0", "release [0]", "read 2", "copy r2"),
+        *("wait e1", "release [1]", "read 3", "copy r2"),
+    ]
+    assert worker.get_finished_loading() == {"r1"}
+    assert not worker._failed_load_blocks
+
+
+@pytest.mark.parametrize("asked", ["query", "wait"])
+def test_a_parked_batch_whose_copies_cannot_be_confirmed_stops_the_worker(
+    monkeypatch, asked
+):
+    """Asked about by vLLM's poll, or waited for by the next load short of
+    slots: r1's batches keep their reads and r1 is not reported."""
+    worker, stream, log, reads = parked_loader(monkeypatch, slots=2)
+    park(worker, "r1")
+    first, _ = stream.events
+    if asked == "query":
+        first.error = RuntimeError("CUDA error")
+        with pytest.raises(_UnconfirmedLoadError, match="req r1"):
+            worker.get_finished_loading()
+    else:
+        first.wait_error = RuntimeError("CUDA error")
+        park(worker, "r2")
+        assert "wait e0" in log and "read 2" not in log
+    worker._handler.release_retrieved.assert_not_called()
+    (kept,) = worker._copies.kept
+    assert [batch for _, batch in kept.owner[0]] == [reads[:1], reads[1:]]
+    assert not worker._deferred_done and not worker._failed_load_blocks
+    assert stopped(worker, "req r1")
+
+
+def test_a_request_aborted_while_parked_keeps_its_reads_until_its_copies_end(
+    monkeypatch,
+):
+    """vLLM frees its blocks once its load is reported, after the copies
+    writing them ended."""
+    worker, stream, log, reads = parked_loader(monkeypatch)
+    park(worker, "r1")
+    worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
+    assert worker.get_finished_loading() is None
+    worker._handler.release_retrieved.assert_not_called()
+    for event in stream.events:
+        event.ended = True
+    assert worker.get_finished_loading() == {"r1"}
+    assert released(worker) == reads
+    assert "r1" not in worker._loaded_request_keys
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_shutdown_gives_back_parked_reads_only_once_their_copies_drained(
+    monkeypatch, drained
+):
+    worker, stream, log, reads = parked_loader(monkeypatch)
+    park(worker, "r1")
+    handler = worker._handler
+    if not drained:
+        stream.events[-1].wait_error = RuntimeError("CUDA error")
+    worker.shutdown()
+    if drained:
+        handler.release_retrieved.assert_called_once_with(reads)
+        handler.close.assert_called_once()
+    else:
+        handler.release_retrieved.assert_not_called()
+        handler.close.assert_not_called()
+        (parked,) = worker._copies.kept[-1].owner[2]
+        assert [batch for _, batch in parked] == [reads[:1], reads[1:]]
+
+
+@pytest.mark.parametrize("window", [0, 1, 2])
+def test_an_admission_window_bounds_the_parked_loads_in_flight(monkeypatch, window):
+    """A load starts once fewer than ``window`` parked loads are copying, the
+    oldest one's batches waited for first; 0 never waits."""
+    worker, stream, log, reads = parked_loader(monkeypatch, window=window)
+    for req_id in ("r1", "r2", "r3"):
+        park(worker, req_id)
+    r1, r2, r3 = (
+        [f"read {i}", f"copy {r}", f"read {i + 1}", f"copy {r}"]
+        for i, r in ((0, "r1"), (2, "r2"), (4, "r3"))
+    )
+    drain_r1 = ["wait e0", "release [0]", "wait e1", "release [1]"]
+    drain_r2 = ["wait e2", "release [2]", "wait e3", "release [3]"]
+    expected = {
+        0: [*r1, *r2, *r3],
+        1: [*r1, *drain_r1, *r2, *drain_r2, *r3],
+        2: [*r1, *r2, *drain_r1, *r3],
+    }
+    assert log == expected[window]
+    assert worker._deferred_done == [set(), {"r1", "r2"}, {"r1"}][window]
+
+
+def test_the_loader_and_vllms_poll_give_back_each_batch_once(monkeypatch):
+    """vLLM's poll gives back r1's batches while the loader waits for the
+    oldest one: no batch goes back twice, and r1 is reported once."""
+    worker, stream, log, reads = parked_loader(monkeypatch, slots=2)
+    park(worker, "r1")
+    first, last = stream.events
+    waiting, resume = threading.Event(), threading.Event()
+    wait = first.synchronize
+
+    def held_wait():
+        waiting.set()
+        assert resume.wait(5)
+        wait()
+
+    first.synchronize = held_wait
+    loader = threading.Thread(target=park, args=(worker, "r2"))
+    loader.start()
+    try:
+        assert waiting.wait(5)
+        first.ended = last.ended = True
+        assert worker.get_finished_loading() == {"r1"}
+    finally:
+        resume.set()
+        loader.join(5)
+    assert not loader.is_alive()
+    assert released(worker) == reads[:2]
+    assert log[-5:] == ["wait e0", "read 2", "copy r2", "read 3", "copy r2"]
+    for event in stream.events:
+        event.ended = True
+    assert worker.get_finished_loading() == {"r2"}
+    assert released(worker) == reads
+
+
+def kept_reads(worker) -> list[CpuReadLease]:
+    """The reads kept for copies not known to have ended."""
+    found: list[CpuReadLease] = []
+
+    def walk(item) -> None:
+        if isinstance(item, CpuReadLease):
+            found.append(item)
+        elif isinstance(item, list | tuple):
+            for each in item:
+                walk(each)
+
+    for record in worker._copies.kept:
+        walk(record.owner)
+    return found
+
+
+@pytest.mark.parametrize("r2", ["loading", "parked"])
+def test_a_failed_parked_batch_keeps_the_reads_of_the_loads_behind_it(monkeypatch, r2):
+    """r2's batches are queued behind r1's on the stream: once r1's copies
+    cannot be confirmed ended, neither can r2's."""
+    worker, stream, log, reads = parked_loader(
+        monkeypatch, slots=3 if r2 == "loading" else None
+    )
+    park(worker, "r1")
+    first, _ = stream.events
+    if r2 == "loading":
+        # r2 copies a batch on the free slot, then waits for r1's oldest
+        first.wait_error = RuntimeError("CUDA error")
+        park(worker, "r2")
+        assert log[4:] == ["read 2", "copy r2", "wait e0"]
+    else:
+        park(worker, "r2")
+        first.error = RuntimeError("CUDA error")
+        with pytest.raises(_UnconfirmedLoadError, match="req r1"):
+            worker.get_finished_loading()
+    worker._handler.release_retrieved.assert_not_called()
+    assert {id(r) for r in kept_reads(worker)} == {id(r) for r in reads}
+    assert not worker._parked_loads and not worker._deferred_done
+    assert stopped(worker, "req r1")
+
+
 def cuda_load_stream(monkeypatch, worker, stream) -> torch.device:
     """Have ``worker`` load on ``stream`` as if on a CUDA device."""
     device = torch.device("cuda")

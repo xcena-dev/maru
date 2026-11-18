@@ -463,6 +463,17 @@ def test_a_deferred_load_is_done_only_after_its_last_batch(monkeypatch):
     assert worker._loaded_request_keys["load"][1] == set(keys)
 
 
+def test_a_remote_cxl_loader_waits_for_its_last_batches_before_the_next_load(
+    monkeypatch,
+):
+    """Only maru_node leaves a parked load's last copies to vLLM's poll."""
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, deferred=True)
+    assert log.count("loader event sync") == 3
+    assert log[-3:] == ["loader event sync", "release 1", "done False"]
+    assert worker._deferred_done == {"load"} and not worker._parked_loads
+
+
 def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
     # The stream drained: every batch goes back, and chunk 2 is recomputed.
     log = []
