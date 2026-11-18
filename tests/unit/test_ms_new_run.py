@@ -338,6 +338,10 @@ def test_a_session_lost_during_the_start_starts_a_new_run(fake, runs, monkeypatc
 
     monkeypatch.setattr(StorageService, "_start", lose_once)
     node = runs()
+    # The first run can already listen before _start raises. Wait for its
+    # replacement, rather than treating that brief listening state as run 2.
+    first = wait_until(lambda: calls and calls[0], what="the failed start")
+    new_run(node, first)
     assert node.runs == 2 and calls[0].ended and calls[0].new_run
 
 

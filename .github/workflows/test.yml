@@ -123,6 +123,7 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --junitxml=pytest.xml \
+            --durations=20 \
             -v
       - name: Upload coverage artifacts
         if: always()

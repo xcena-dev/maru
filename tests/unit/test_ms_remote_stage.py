@@ -310,12 +310,16 @@ def test_lost_stage_answer_sends_not_posted_and_frees_answered_page(routed):
             assert response.staging is not None
             staging.append(response.staging)
             lost.set()
+            # Lose the answer after the memory node allocated its page.
+            # A 150 ms fetch deadline could instead expire before STAGE
+            # ran, testing no lost answer and no allocated-page cleanup.
+            callback(ConnectionError("the STAGE answer was lost"))
 
         return submit(conn, code, request, discard)
 
     env.gate.monkeypatch.setattr(RemoteConnection, "submit", send)
     _, tickets = observe_posts(env.gate, env.remote, "submit_load")
-    answer = env.reader.fetch("staged", deadline_ms=150).items[0]
+    answer = env.reader.fetch("staged").items[0]
     assert lost.is_set() and answer.result == ItemResult.MISS
     wait_until(lambda: calls, what="UNSTAGE not_posted")
     assert calls[0][1] == TransferEnd.NOT_POSTED

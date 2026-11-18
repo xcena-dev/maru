@@ -881,27 +881,43 @@ def test_a_flight_takes_a_bounded_number_of_waiters(env, monkeypatch):
     server, make = env
     node, keys = make()
     a, b = Loader(node, server), Loader(node, server, tp_rank=1)
-    reads = Reads(node, monkeypatch).hold()
+    reads = Reads(node, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    tier = node.tier("ssd")
+    submit = tier.submit_load
+
+    def hold_before_io(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return submit(*args, **kwargs)
+
+    # Filling the waiter list deliberately stalls this flight. Hold it
+    # before submission so that wait is outside the SSD's 1 s I/O budget.
+    monkeypatch.setattr(tier, "submit_load", hold_before_io)
     first = a.send(a.request(a.items(keys[0])))
-    assert reads.entered.wait(5)
-    items = b.items(keys[0])
-    fetches = node.manager.fetches
-    # cancelled waiters leave the flight
-    for i in range(FLIGHT_WAITERS + 6):
-        request = b.request(items)
-        reply = b.send(request)
-        wait_until(lambda i=i: fetches.results["joined"] == i + 1, "joined")
-        assert b.cancel(request).status == Status.OK
-        assert reply.result(10).items[0] == miss()
-    with fetches._lock:
-        (flight,) = fetches._flights.values()
-        assert flight.waiters == []
-    waiting = [b.send(b.request(items)) for _ in range(FLIGHT_WAITERS)]
-    over = b.send(b.request(items)).result(10).items[0]
-    assert over == miss(MissReason.BUSY)
-    reads.release()
+    try:
+        assert entered.wait(5)
+        items = b.items(keys[0])
+        fetches = node.manager.fetches
+        # cancelled waiters leave the flight
+        for i in range(FLIGHT_WAITERS + 6):
+            request = b.request(items)
+            reply = b.send(request)
+            wait_until(lambda i=i: fetches.results["joined"] == i + 1, "joined")
+            assert b.cancel(request).status == Status.OK
+            assert reply.result(10).items[0] == miss()
+        with fetches._lock:
+            (flight,) = fetches._flights.values()
+            assert flight.waiters == []
+        waiting = [b.send(b.request(items)) for _ in range(FLIGHT_WAITERS)]
+        over = b.send(b.request(items)).result(10).items[0]
+        assert over == miss(MissReason.BUSY)
+        assert reads.calls == 0
+    finally:
+        release.set()
     hits = [f.result(10).items[0] for f in [first, *waiting]]
-    assert all(h.result == ItemResult.HIT for h in hits) and reads.calls == 1
+    assert all(h.result == ItemResult.HIT for h in hits), hits
+    assert reads.calls == 1
     a.unpin(hits[0].pin_id)
     b.unpin(*[h.pin_id for h in hits[1:]])
     wait_until(lambda: pins(server, keys[0], hits[0].location) == 0, "pins gone")

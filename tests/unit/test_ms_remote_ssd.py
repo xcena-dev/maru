@@ -456,6 +456,10 @@ def test_an_unanswered_write_done_keeps_its_sources_from_the_ssd(
     def lose_answer(items):
         outcomes = write_done(items)  # the memory node commits them
         if not lost and items[0].end == TransferEnd.DONE:
+            # Start observing retries on the eviction thread, before it
+            # releases these sources. Clearing later can erase a retry
+            # that already removed a DRAM source under pressure.
+            offered.clear()
             lost.update(item.key.key for item in items)
             t.remote.quarantine_max = 0  # and this node posts nothing more
             raise TimeoutError("the answer is lost")
@@ -468,8 +472,6 @@ def test_an_unanswered_write_done_keeps_its_sources_from_the_ssd(
     assert all("memory" in t.where(k) for k in lost)
     # Pressure takes the sources again: the remote tier cannot, and the SSD
     # must not (they may be on the memory node already)
-    time.sleep(t.gpu.kept_backoff_s)
-    offered.clear()
     put_all(h, 12, 8)
     wait_until(lambda: m.moved_bytes[TO_SSD] > 0, what="others on the SSD")
 
