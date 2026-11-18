@@ -47,18 +47,27 @@ extern "C" int __wrap_main(int, char **) {
                                  : checkpoint_fault::Operation::Fsync,
             error, bytes);
     }
+    // Tests of the disconnect grace period shorten it; nothing else may.
+    std::string grace = "300";
+    if (const char *seconds = std::getenv("MARU_TEST_GRACE_PERIOD")) {
+        grace = seconds;
+        if (grace != "1") {
+            std::fprintf(stderr, "Invalid grace period specification\n");
+            return 2;
+        }
+    }
     // Do not accept caller-supplied state directories or listening addresses.
     std::vector<std::string> args{
         "maru_rm_process_test_daemon", "--state-dir", fakeRoot + "/state",
         "--host", "127.0.0.1", "--port", "1", "--num-workers", "2",
-        "--grace-period", "300"};
+        "--grace-period", grace};
     if (const char *lease = std::getenv("MARU_TEST_NODE_LEASE")) {
         args.push_back("--node-lease");
         args.push_back(lease);
     }
-    if (const char *grace = std::getenv("MARU_TEST_HOLD_GRACE")) {
+    if (const char *holdGrace = std::getenv("MARU_TEST_HOLD_GRACE")) {
         args.push_back("--hold-grace");
-        args.push_back(grace);
+        args.push_back(holdGrace);
     }
     std::vector<char *> argv;
     for (auto &arg : args) argv.push_back(arg.data());
