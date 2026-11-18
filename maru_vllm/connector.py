@@ -377,6 +377,90 @@ def _session_route(cpu_mode: bool, chunk_keys: list[str]) -> dict[str, str]:
     return {}
 
 
+def _slab_rows(
+    src_kv_data: torch.Tensor, num_chunks: int, half_width: int, ntok: int
+) -> torch.Tensor:
+    """Return the first ``ntok`` token rows of a slab as ``[2, ntok, half_width]``.
+
+    Args:
+        src_kv_data: One layer's KV for ``num_chunks`` chunks, chunk-major
+            ``[num_chunks, 2, tokens, half_width]`` in any shape with that
+            element order (a single chunk may be ``[2, tokens, half_width]``).
+        num_chunks: Chunks in ``src_kv_data``.
+        half_width: Elements of one token's K (or V) row.
+        ntok: Slots to fill, at most the slab's token count.
+
+    Returns:
+        The K/V rows of the leading ``ntok`` tokens in token order.
+
+    Raises:
+        RuntimeError: If the slab holds fewer than ``ntok`` tokens or does not
+            split evenly into ``num_chunks`` chunks.
+
+    Stored chunks are always whole, while a load can need fewer tokens than it
+    read: when a fully cached prompt is an exact multiple of the chunk size,
+    one block is held back for the engine to compute, so the last chunk is
+    only partly injected.
+    """
+    per_token = 2 * half_width
+    src_tokens = src_kv_data.numel() // per_token if per_token else 0
+    if (
+        num_chunks <= 0
+        or ntok < 0
+        or per_token <= 0
+        or src_tokens * per_token != src_kv_data.numel()
+        or src_tokens % num_chunks
+        or src_tokens < ntok
+    ):
+        raise RuntimeError(
+            f"Maru: slab of {src_kv_data.numel()} elements does not hold "
+            f"{ntok} tokens of {num_chunks} chunk(s) at K/V row width {half_width}"
+        )
+    tokens_per_chunk = src_tokens // num_chunks
+    return (
+        src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, half_width)
+        .permute(1, 0, 2, 3)
+        .reshape(2, src_tokens, half_width)[:, :ntok]
+    )
+
+
+def _token_rows(
+    src_kv_data: torch.Tensor, row_shape: tuple[int, ...], ntok: int
+) -> torch.Tensor:
+    """Return the first ``ntok`` rows of a token-major slab.
+
+    Args:
+        src_kv_data: KV for whole chunks laid out one row per token in token
+            order, as the MLA and legacy rank-4 Triton extracts write it.
+        row_shape: Shape of one token's row.
+        ntok: Slots to fill, at most the slab's token count.
+
+    Returns:
+        ``[ntok, *row_shape]``.
+
+    Raises:
+        RuntimeError: If the slab is not a whole number of rows or holds
+            fewer than ``ntok`` of them.
+
+    Like :func:`_slab_rows`, the slab can hold more rows than there are
+    slots when one block of a fully cached prompt is held back.
+    """
+    row = 1
+    for dim in row_shape:
+        row *= dim
+    if (
+        ntok < 0
+        or row <= 0
+        or src_kv_data.numel() % row
+        or src_kv_data.numel() // row < ntok
+    ):
+        raise RuntimeError(
+            f"Maru: slab of {src_kv_data.numel()} elements does not hold "
+            f"{ntok} token rows of shape {tuple(row_shape)}"
+        )
+    return src_kv_data.reshape(-1, *row_shape)[:ntok]
+
+
 def _chunk_keys(token_ids: list[int], chunk_tokens: int) -> list[str]:
     """Generate maru keys for each chunk of the token prefix.
 
@@ -4072,7 +4156,7 @@ class MaruWorkerConnector:
                 logger.error(
                     "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(req_meta, e)
                 continue
 
             if len(infos) != len(keys):
@@ -4087,7 +4171,9 @@ class MaruWorkerConnector:
                     len(keys),
                     req_meta.req_id,
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(
+                    req_meta, RuntimeError("retrieve response count mismatch")
+                )
                 continue
 
             # All-or-nothing: a miss (chunk evicted between the scheduler's
@@ -4102,7 +4188,9 @@ class MaruWorkerConnector:
                     keys[miss],
                     req_meta.req_id,
                 )
-                self._fail_deferred_load(req_meta)
+                self._fail_load(
+                    req_meta, RuntimeError(f"retrieved chunk missing: {keys[miss]}")
+                )
                 continue
 
             # Packed (default): keep the per-chunk slab infos whole (num_chunks
@@ -8369,7 +8457,9 @@ class MaruWorkerConnector:
         if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
-            src = src_kv_data.reshape(slot_mapping.shape[0], *pages.shape[2:])
+            src = _token_rows(
+                src_kv_data, tuple(pages.shape[2:]), slot_mapping.shape[0]
+            )
             pages[slot_mapping // page_size, slot_mapping % page_size] = src
         elif (
             isinstance(layer_meta, TritonAttentionMetadata)
@@ -8381,7 +8471,11 @@ class MaruWorkerConnector:
             # axis and would misplace rank-5's K/V axis.
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
-            src = src_kv_data.reshape(slot_mapping.shape[0], dst_kv_cache.shape[1], -1)
+            src = _token_rows(
+                src_kv_data,
+                (dst_kv_cache.shape[1], dst_kv_cache.shape[3]),
+                slot_mapping.shape[0],
+            )
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
             layout = self._layout_for(dst_kv_cache)
@@ -8392,16 +8486,13 @@ class MaruWorkerConnector:
                     f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
                 )
             ntok = slot_mapping.shape[0]
-            # Slab ordering, independent of the paged axis order.
-            if num_chunks == 1:
-                src = src_kv_data.reshape(2, ntok, -1)
-            else:
-                tokens_per_chunk = ntok // num_chunks
-                src = (
-                    src_kv_data.reshape(num_chunks, 2, tokens_per_chunk, -1)
-                    .permute(1, 0, 2, 3)
-                    .reshape(2, ntok, -1)
-                )
+            # Derive row width from the registered cache, independently of
+            # the number of slots this load needs to fill. Whole stored
+            # chunks may include a final block the engine will recompute.
+            row_width = dst_kv_cache.numel() // layout.page_buffer_size
+            if row_width % 2:
+                raise RuntimeError("Maru: cannot inject KV; odd fused K/V row width")
+            src = _slab_rows(src_kv_data, num_chunks, row_width // 2, ntok)
             _scatter_kv(dst_kv_cache, layout, slot_mapping, src)
 
     def _extract_kv_from_layer(
