@@ -462,14 +462,21 @@ class MaruHandler:
         ``_write_lock`` to wait for in-flight writes before teardown.
         """
         if self._local_hints is not None:
-            # The hints already queued go out (or time out) first.
-            self._local_hints.close()
+            # The hints already queued go out (or time out) first, then the
+            # end of every request still open: a hint plugin keeps no
+            # connection whose close would end them.
+            self._local_hints.close(end_open=True)
         if self._cpu is not None:
             self._cpu.close()
             self._connected = False
             return
         if self._config.metadata_only:
             if self._connected:
+                # A scheduler's handler maps no region, but its plugins may
+                # hold state for the hints they took: let them release it
+                # while the RPC connection is live, as a data handler does.
+                if self._plugins:
+                    self._dispatch_plugins("on_close", self)
                 self._rpc.close()
             self._connected = False
             return
@@ -1322,7 +1329,8 @@ class MaruHandler:
 
         Args:
             request_id: The serving engine's request id.
-            keys: Chunk keys the request's load will read, in order.
+            keys: Keys of the stored objects the request's load will read
+                (with any TP slice or layer suffix), in order.
             route_key: The request's first chunk key (picks the pool, as in
                 :meth:`batch_exists`).
         """

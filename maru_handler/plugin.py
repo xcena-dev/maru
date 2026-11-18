@@ -129,7 +129,10 @@ class MaruHandlerPlugin(Protocol):
         so a plugin can safely release resources tied to mapped memory (e.g.
         unpin device ranges) here. Fires **only if the handler was connected** —
         a handler that is constructed but never connected does not invoke this
-        hook (see :meth:`on_init`).
+        hook (see :meth:`on_init`). A ``metadata_only`` handler (a vLLM
+        scheduler's) maps no region; it calls this hook before it closes its
+        RPC connection, after the ``read_hint_end`` of every request it hinted
+        and did not end (see :meth:`on_memory_hint`).
 
         Dispatched while holding the handler's write lock, so a slow or
         blocking implementation stalls ``close()`` and every concurrent writer:
@@ -162,7 +165,9 @@ class MaruHandlerPlugin(Protocol):
           the other actions.
 
         Called on the handler's hint thread, in the order the hints were
-        given, never on the caller's path. A hint is advice: the load reads
+        given, never on the caller's path. When the handler closes, every
+        request it hinted and did not end gets its ``read_hint_end`` before
+        :meth:`on_close`. A hint is advice: the load reads
         every key either way. Keep it short; a slow plugin delays the next
         hints, not the loads.
         """

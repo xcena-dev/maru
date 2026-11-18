@@ -89,8 +89,9 @@ should return promptly and expire request state independently. Callback
 exceptions are logged and isolated from other plugins and KV transfers.
 
 On `cxl`, enabling hints without an accepting plugin logs a warning and
-sends no hints. Closing the handler drains its hint thread before closing
-plugins. On `remote_cxl`, agents advertise accepted actions and only those
+sends no hints. Closing the handler drains its hint thread, sends
+`read_hint_end` for every request still open, and then calls the plugins'
+`on_close`, also on a vLLM scheduler's metadata-only handler. On `remote_cxl`, agents advertise accepted actions and only those
 actions are sent. `write_wait` is bounded by `write_wait_ms` (default 50 ms,
 0 disables waiting), plus the reply timeout if the agent does not answer;
 the write proceeds after the wait.
@@ -118,9 +119,11 @@ and `cxl`. Write hints and memory-generation handling remain
 `remote_cxl` only. Installing a handler plugin does not add either feature
 to `cxl`.
 
-In vLLM, scheduler hints name chunk keys without tensor-parallel slice or
-KV-group suffixes. They currently apply at TP = 1 with one KV cache group;
-when keys do not match, no hint is sent and the normal load still runs.
+In vLLM, a scheduler hint names the stored objects the workers load: each
+tensor-parallel slice of a chunk, each layer's object in layerwise format,
+and each KV cache group's object that the hit needs. A chunk's objects come
+before the next chunk's, so a hint sent on arrival stops at the first chunk
+with an object missing. The scheduler builds these keys on its hint thread.
 
 Message transport is implemented in `maru_handler/hints.py`. Remote range
 validation and extension contracts are in `maru_remote/region_map.py` and

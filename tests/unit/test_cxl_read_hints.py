@@ -168,12 +168,32 @@ def test_a_hint_plugin_hears_nothing_unless_the_config_asks(monkeypatch):
     assert plugin.messages == []
 
 
-def test_close_sends_the_hints_already_queued(monkeypatch):
-    plugin = HintPlugin()
-    handler = _handler(monkeypatch, [plugin], metadata_only=True, read_hints=True)
-    handler._rpc.close = lambda: None
+def test_close_ends_the_open_hints_then_closes_the_plugins(monkeypatch):
+    events = []
+
+    class Closing(HintPlugin):
+        def on_memory_hint(self, handler, message):
+            events.append((message["action"], message["request"]))
+
+        def on_close(self, handler):
+            events.append(("on_close", handler._connected))
+
+    handler = _handler(monkeypatch, [Closing()], metadata_only=True, read_hints=True)
+    handler._rpc.close = lambda: events.append(("rpc_close", None))
     handler.hint_read("r1", ["hit0"])
+    handler.hint_read("r2", ["hit0"])
+    handler.end_read_hint("r1")
     handler.close()
-    assert [m["action"] for m in plugin.messages] == ["read_hint"]
-    handler.hint_read("r2", ["hit0"])  # after close: ignored
-    assert len(plugin.messages) == 1
+    # The queued hints go out, then the end of r2, still open; the plugins
+    # close while the scheduler's RPC connection is live.
+    assert events == [
+        ("read_hint", "r1"),
+        ("read_hint", "r2"),
+        ("read_hint_end", "r1"),
+        ("read_hint_end", "r2"),
+        ("on_close", True),
+        ("rpc_close", None),
+    ]
+    handler.hint_read("r3", ["hit0"])  # after close: ignored
+    handler.close()  # once only
+    assert len(events) == 6

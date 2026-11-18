@@ -139,9 +139,17 @@ class MemoryHints:
         if request_id:
             self._put(("end", request_id, []))
 
-    def close(self, timeout_s: float = 5.0) -> bool:
+    def close(self, timeout_s: float = 5.0, *, end_open: bool = False) -> bool:
         """Stop the thread after the hints already queued; hints after this
         are ignored.
+
+        Args:
+            timeout_s: How long to wait for the thread.
+            end_open: Also send ``read_hint_end`` for every request still
+                open, after the queued hints, so a target that keeps state
+                per request can drop it. A target that ends a closed
+                connection's requests itself (a remote CXL agent) does not
+                need it.
 
         Returns:
             True if the thread ended (or never started) within
@@ -152,6 +160,8 @@ class MemoryHints:
             thread, self._thread = self._thread, None
         if thread is None:
             return True
+        if end_open:
+            self._queue.put(("end_open", "", []))
         self._queue.put(None)
         thread.join(timeout=timeout_s)
         if thread.is_alive():
@@ -196,7 +206,7 @@ class MemoryHints:
             if item is None:
                 return
             kind, request_id, payload = item
-            if kind != "end":
+            if kind not in ("end", "end_open"):
                 with self._lock:
                     self._pending -= 1
             try:
@@ -210,6 +220,9 @@ class MemoryHints:
                     self._send_all(
                         "read_promote", request_id, [(a, []) for a in payload]
                     )
+                elif kind == "end_open":
+                    for open_request in list(self._agents):
+                        self._finish(open_request)
                 else:
                     self._finish(request_id)
             except Exception:

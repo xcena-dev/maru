@@ -27,7 +27,7 @@ import re
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -361,6 +361,91 @@ def _load_keys(
             for ci in range(num_chunks)
         ]
     return [chunk_keys[ci] for ci in range(num_chunks)]
+
+
+def _call_quietly(call: Callable[..., Any], *args: Any) -> None:
+    """Run a read hint call; a hint is advice, so a failure is only logged."""
+    try:
+        call(*args)
+    except Exception:
+        logger.debug("Maru: read hint call failed", exc_info=True)
+
+
+def _layer_index_in_name(layer_name: str) -> int | None:
+    """The layer index a vLLM layer name carries (``...layers.<n>...``).
+
+    The layerwise format keys each layer's object by it (``_chunk_layer_key``):
+    the worker, which names what it stores and loads, and the scheduler,
+    which names what it hints, read it alike.
+    """
+    match = re.search(r"layers\.(\d+)", layer_name)
+    return int(match.group(1)) if match else None
+
+
+def _scheduler_layer_indices(kv_groups: list[KVGroup], vllm_config: Any) -> list[int]:
+    """The layer indices a worker keys its per-layer objects by, for a model
+    with one KV cache group (layerwise format), as the scheduler can see
+    them: from the group's layer names, as the worker reads its own (a name
+    without an index counts by position), or else the model's layer count.
+    Empty when unknown.
+    """
+    if len(kv_groups) == 1:
+        indices = [_layer_index_in_name(name) for name in kv_groups[0].layer_names]
+        return [
+            position if index is None else index
+            for position, index in enumerate(indices)
+        ]
+    if kv_groups:
+        return []  # several groups name their layers by position
+    try:
+        count = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    except Exception:
+        return []
+    return list(range(int(count)))
+
+
+def _group_load_items(
+    groups: Sequence[KVGroup],
+    first: int,
+    hit: int,
+    chunk_tokens: int,
+    layers_of: Callable[[KVGroup], int],
+) -> list[tuple[KVGroup, int, int | None]]:
+    """The (group, chunk, layer) objects a hit of ``hit`` chunks loads.
+
+    The scheduler's hit rule decides which: full attention and MLA groups
+    every hit chunk, sliding window the chunks its window covers at the
+    hit's end, Mamba the last hit chunk. Chunks before ``first``, which
+    vLLM's prefix cache already holds, are skipped. The worker loads these
+    objects and the scheduler hints them, so both take them from here.
+
+    Args:
+        groups: The model's KV cache groups; skipped groups load nothing.
+        first: First chunk to load.
+        hit: Hit chunks (at least 1).
+        chunk_tokens: Tokens per Maru chunk.
+        layers_of: A group's object count per chunk when it keeps one object
+            per layer (an MLA group stored layerwise), else 0.
+
+    Returns:
+        ``[(group, chunk index, layer)]``, group by group, where layer is the
+        layer's position in the group, or None for a whole-chunk object.
+    """
+    items: list[tuple[KVGroup, int, int | None]] = []
+    for group in groups:
+        if group.kind == GROUP_SKIP:
+            continue
+        if group.kind == GROUP_MAMBA:
+            chunks: range = range(hit - 1, hit)
+        elif group.windowed:
+            window = window_chunks(group, hit * chunk_tokens, chunk_tokens)
+            chunks = range(max(window.start, first), window.stop)
+        else:
+            chunks = range(first, hit)
+        count = layers_of(group)
+        layers: list[int | None] = list(range(count)) if count else [None]
+        items += [(group, ci, layer) for ci in chunks for layer in layers]
+    return items
 
 
 def _session_route(cpu_mode: bool, chunk_keys: list[str]) -> dict[str, str]:
@@ -1730,6 +1815,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 ],
                 state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
                 dp_rank=_dp_index(vllm_config),
+                layer_indices=_scheduler_layer_indices(self._kv_groups, vllm_config),
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -2111,9 +2197,14 @@ class MaruSchedulerConnector:
         shard_suffixes: Sequence[str] = ("",),
         state_suffixes: Sequence[str] = ("",),
         dp_rank: int = 0,
+        layer_indices: Sequence[int] = (),
     ):
         self._block_size = block_size
         self._dp_rank = dp_rank
+        # The model's layer indices, which name a chunk's per-layer objects in
+        # layerwise format with one KV cache group (_chunk_layer_key): its
+        # read hints name those objects. Empty when unknown.
+        self._layer_indices = tuple(layer_indices)
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
         self._kv_groups = list(kv_groups or ())
@@ -2145,7 +2236,10 @@ class MaruSchedulerConnector:
         # request arrives with maru_read_hint_on_arrival. One hint per load,
         # ended once: when vLLM reports the load done (finished_recving), or
         # when the request finishes if that comes first. All of it runs
-        # only for storage that sends hints (_read_hints_on).
+        # only for storage that sends hints (_read_hints_on). A hint names
+        # the objects the workers load (_hint_object_keys). The storage calls
+        # run on one hint thread, in order, so a hint's end never passes it
+        # and the scheduler never waits to build an object key list.
         # Both are bounded by _MAX_HINTED_REQUESTS (oldest first out).
         self._hinted: OrderedDict[str, None] = OrderedDict()
         self._arrived: OrderedDict[str, None] = OrderedDict()
@@ -2153,7 +2247,7 @@ class MaruSchedulerConnector:
         self._arrival_keys: dict[str, list[str]] = {}
         self._hint_lock = threading.Lock()
         self._handler_lock = threading.Lock()
-        self._arrival_pool: ThreadPoolExecutor | None = None
+        self._hint_pool: ThreadPoolExecutor | None = None
         # Set by shutdown(): no arrival hint and no new handler after it
         self._shut_down = False
         self._hints_handler: Any = None
@@ -2355,18 +2449,20 @@ class MaruSchedulerConnector:
         return _chunk_done_key(base_key) if self._use_layerwise else base_key
 
     def shutdown(self) -> None:
-        """Stop the arrival hints, then close the scheduler's MaruHandler.
+        """Stop the read hints, then close the scheduler's MaruHandler.
 
-        A request that arrives afterwards is not hinted and creates no new
-        handler.
+        The hints and ends already given reach storage first; the handler
+        then ends the requests still hinted as it closes. A request that
+        arrives afterwards is not hinted and creates no new handler.
         """
         with self._handler_lock:
             self._shut_down = True
         with self._hint_lock:
-            pool, self._arrival_pool = self._arrival_pool, None
+            pool, self._hint_pool = self._hint_pool, None
         if pool is not None:
-            # An arrival hint under way may still use the handler.
-            pool.shutdown(wait=True, cancel_futures=True)
+            # The hint thread may still use the handler; the arrival hints
+            # still queued return at once.
+            pool.shutdown(wait=True)
         with self._handler_lock:
             handler, self._handler = self._handler, None
         if handler is not None:
@@ -2415,14 +2511,11 @@ class MaruSchedulerConnector:
             while len(self._arrived) > _MAX_HINTED_REQUESTS:
                 old, _ = self._arrived.popitem(last=False)
                 self._arrival_keys.pop(old, None)
-            if self._arrival_pool is None:
-                self._arrival_pool = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="maru-arrival-hint"
-                )
-            # Under the lock: shutdown() takes the pool only after this.
-            self._arrival_pool.submit(self._hint_on_arrival, request)
+            self._submit_hint(self._hint_on_arrival, request)
 
     def _hint_on_arrival(self, request: Request) -> None:
+        if self._shut_down:
+            return
         try:
             token_ids = list(request.prompt_token_ids or [])
             if len(token_ids) < self._kv_chunk_tokens:
@@ -2452,41 +2545,114 @@ class MaruSchedulerConnector:
         request_id: str,
         keys: list[str],
         *,
-        route_keys: list[str] | None = None,
+        first: int = 0,
+        hit: int | None = None,
         arrival: bool = False,
     ) -> None:
         """Give storage the read hint of ``request_id`` once.
 
-        ``route_keys`` are the request's chunk keys from its first chunk,
-        which pick the pool its load reads (``_session_route``); ``keys``
-        may start later, past what vLLM's own prefix cache holds. Without
-        them ``keys`` route the hint.
+        ``keys`` are the request's chunk keys from its first chunk; they pick
+        the pool its load reads (``_session_route``). The hint names the
+        objects the workers load for chunks ``first`` to ``hit``
+        (``_hint_object_keys``); an arrival hint, which comes before the
+        lookup, names every chunk's. The hint thread builds their keys and
+        gives them to storage.
         """
         handler = self._handler
         if handler is None or not keys:
             return
         with self._hint_lock:
-            if request_id in self._hinted:
+            if self._shut_down or request_id in self._hinted:
                 return
             if arrival:
                 if request_id not in self._arrived:
                     return  # it ended before the hint was ready
                 self._arrival_keys[request_id] = keys
             self._hinted[request_id] = None
-            try:
-                handler.hint_read(
-                    request_id,
-                    keys,
-                    **_session_route(self._cpu_mode, route_keys or keys),
-                )
-            except Exception:
-                logger.debug("Maru: read hint failed", exc_info=True)
+            self._submit_hint(self._send_hint, handler, request_id, keys, first, hit)
             while len(self._hinted) > _MAX_HINTED_REQUESTS:
                 old, _ = self._hinted.popitem(last=False)
-                try:
-                    handler.end_read_hint(old)
-                except Exception:
-                    logger.debug("Maru: read hint end failed", exc_info=True)
+                self._submit_hint(handler.end_read_hint, old)
+
+    def _send_hint(
+        self,
+        handler: Any,
+        request_id: str,
+        keys: list[str],
+        first: int,
+        hit: int | None,
+    ) -> None:
+        """Give storage one read hint (on the hint thread)."""
+        objects = self._hint_object_keys(keys, first, hit)
+        if objects:
+            handler.hint_read(
+                request_id, objects, **_session_route(self._cpu_mode, keys)
+            )
+
+    def _hint_object_keys(
+        self, keys: list[str], first: int, hit: int | None
+    ) -> list[str]:
+        """Keys of the objects the workers load for chunks ``first`` to ``hit``.
+
+        Each worker stores its own TP slice of a chunk, under the chunk key
+        and the slice's suffix; the layerwise format keeps one object per
+        layer, and several KV cache groups one object per group (see
+        ``_group_load_items``). Storage finds a hint's bytes by these keys.
+
+        Chunk by chunk, every object of a chunk before the next chunk's: the
+        storage hints the leading keys it holds, so an arrival hint ends at
+        the first chunk with an object missing. The load reads the same
+        objects, layer by layer in layerwise format.
+
+        Args:
+            keys: The request's chunk keys from its first chunk.
+            first: First chunk to load.
+            hit: Hit chunks; None before the lookup (an arrival hint): every
+                chunk, of the groups that load every hit chunk.
+        """
+        ct = self._kv_chunk_tokens
+        end = len(keys) if hit is None else min(hit, len(keys))
+        if end <= first:
+            return []
+        if not self._multi_group:
+            if not self._use_layerwise:
+                return [
+                    keys[ci] + suffix
+                    for ci in range(first, end)
+                    for suffix in self._shard_suffixes
+                ]
+            return [
+                _chunk_layer_key(keys[ci] + suffix, layer)
+                for ci in range(first, end)
+                for layer in self._layer_indices
+                for suffix in self._shard_suffixes
+            ]
+        groups = self._kv_groups
+        if hit is None:
+            # Which Mamba state and sliding-window chunks load depends on
+            # the hit; the lookup does not hint again.
+            groups = [g for g in groups if g.kind != GROUP_MAMBA and not g.windowed]
+        items = _group_load_items(
+            groups,
+            first,
+            end,
+            ct,
+            lambda g: (
+                len(g.layer_names) if self._use_layerwise and g.kind == GROUP_MLA else 0
+            ),
+        )
+        items.sort(key=lambda item: item[1])  # chunk by chunk, stable
+        objects: list[str] = []
+        for group, ci, layer in items:
+            suffixes = (
+                self._state_suffixes
+                if group.kind == GROUP_MAMBA
+                else self._shard_suffixes
+            )
+            for suffix in suffixes:
+                key = group.object_key(keys[ci] + suffix, ct)
+                objects.append(key if layer is None else _chunk_layer_key(key, layer))
+        return objects
 
     def _end_hint(self, request_id: str) -> None:
         with self._hint_lock:
@@ -2496,11 +2662,19 @@ class MaruSchedulerConnector:
                 return
             del self._hinted[request_id]
             handler = self._handler
-            if handler is not None:
-                try:
-                    handler.end_read_hint(request_id)
-                except Exception:
-                    logger.debug("Maru: read hint end failed", exc_info=True)
+            if handler is not None and not self._shut_down:
+                self._submit_hint(handler.end_read_hint, request_id)
+
+    def _submit_hint(self, call: Callable[..., Any], *args: Any) -> None:
+        """Run ``call(*args)`` on the hint thread, after the calls before it.
+
+        Called under ``_hint_lock``: shutdown() takes the pool only after.
+        """
+        if self._hint_pool is None:
+            self._hint_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="maru-read-hint"
+            )
+        self._hint_pool.submit(_call_quietly, call, *args)
 
     def _count_matched_chunks(
         self, token_ids: list[int], keys: list[str] | None = None
@@ -2891,7 +3065,7 @@ class MaruSchedulerConnector:
                 keys = _chunk_keys(token_ids, ct)
             first, last = num_computed_tokens // ct, -(-matched_tokens // ct)
             # Routed by the first chunk, as the load is.
-            self._hint(request.request_id, keys[first:last], route_keys=keys)
+            self._hint(request.request_id, keys, first=first, hit=last)
 
         return new_matched, self._deferred_loading
 
@@ -4358,22 +4532,21 @@ class MaruWorkerConnector:
             self._fail_load(req_meta, RuntimeError("no chunk to load"))
             return None
         first = req_meta.load_start_token // ct
-        plan: list[tuple[GroupCache, int, int | None]] = []
-        for cache in self._group_caches:
-            group = cache.group
-            if group.kind == GROUP_MAMBA:
-                chunks: range = range(hit - 1, hit)
-            elif group.windowed:
-                window = window_chunks(group, hit * ct, ct)
-                chunks = range(max(window.start, first), window.stop)
-            else:
-                chunks = range(first, hit)
-            layers: list[int | None] = (
-                list(range(len(cache.spans)))
-                if self._use_layerwise and group.kind == GROUP_MLA
-                else [None]
+        caches = {cache.group.group_id: cache for cache in self._group_caches}
+        plan = [
+            (caches[group.group_id], ci, layer)
+            for group, ci, layer in _group_load_items(
+                [cache.group for cache in self._group_caches],
+                first,
+                hit,
+                ct,
+                lambda g: (
+                    len(caches[g.group_id].spans)
+                    if self._use_layerwise and g.kind == GROUP_MLA
+                    else 0
+                ),
             )
-            plan += [(cache, ci, layer) for ci in chunks for layer in layers]
+        ]
         chunk_keys = {
             c.group.group_id: self._slice_chunk_keys(req_meta, c.group)
             for c in self._group_caches
@@ -8336,9 +8509,9 @@ class MaruWorkerConnector:
 
     def _get_layer_index(self, layer_name: str) -> int:
         """Extract numeric layer index from layer name."""
-        match = re.search(r"layers\.(\d+)", layer_name)
-        if match:
-            return int(match.group(1))
+        index = _layer_index_in_name(layer_name)
+        if index is not None:
+            return index
         for idx, name in enumerate(self._kv_caches):
             if name == layer_name:
                 return idx
