@@ -220,7 +220,9 @@ def test_fetch_reads_staging_bytes_and_eviction_finalizes_onto_ssd(routed):
 def test_maru_handler_fetch_scope_reads_ssd_bytes_through_stage(routed):
     env = routed
     calls = observe_unstages(env)
-    handler = loader_client(env.gpu)
+    # This checks the bytes and cleanup across several RPCs and an SSD read;
+    # deadline behavior has separate tests with deliberately stalled I/O.
+    handler = loader_client(env.gpu, fetch_deadline_ms=5000)
     env.gate.clients.append(handler)
     with handler.fetch_scope("ssd-stage"):
         read = handler.retrieve("staged")

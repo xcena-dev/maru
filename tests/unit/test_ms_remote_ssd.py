@@ -550,6 +550,8 @@ def test_write_through_falls_back_to_the_ssd_and_pressure_finalizes_onto_either(
         lambda: all(t.where(k) == {"dram", "ssd"} for k in first),
         what="copies on the SSD",
     )
+    # Catalog publication precedes the GPU node applying the COMMIT reply.
+    settled(t)
     assert len(m._copies) == 3 and not m._remote_copies
     assert m.through_results["COMMIT:ADDED"] == 3
     # Remote takes copies again; the sources with an SSD copy are only

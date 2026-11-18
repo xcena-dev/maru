@@ -978,7 +978,7 @@ def test_a_late_plan_uses_the_copy_published_before(env, monkeypatch):
 # =============================================================================
 
 
-def loader_client(node) -> MaruHandler:
+def loader_client(node, *, fetch_deadline_ms: int = 250) -> MaruHandler:
     handler = MaruHandler(
         MaruConfig(
             maru_node=node.config.socket,
@@ -991,6 +991,7 @@ def loader_client(node) -> MaruHandler:
             auto_connect=False,
             load_only=True,
             fetch_loads=True,
+            fetch_deadline_ms=fetch_deadline_ms,
         )
     )
     handler.connect()

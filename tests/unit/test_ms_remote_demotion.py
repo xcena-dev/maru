@@ -182,9 +182,13 @@ def test_a_full_dram_moves_its_pages_to_the_memory_node(pair, workers):
     for key in keys:
         assert put(h, key)
     stats = pair.gpu.manager.move_results
-    wait_until(lambda: stats["RETIRED"] >= 3, what="pages demoted")
+    # The memory peer can credit only one batch at a time. Pressure may
+    # end after that batch; unused worker credits determine whether a
+    # further eviction pass is needed.
+    batch = pair.memory.config.budgets.credit_max_bytes // PAGE
+    wait_until(lambda: stats["RETIRED"] >= batch, what="pages demoted")
     moved = [k for k in keys if pair.on_memory(k)]
-    assert len(moved) >= 3
+    assert len(moved) >= batch
     mem = pair.memory
     for key in moved:
         (location,) = pair.locations(key)

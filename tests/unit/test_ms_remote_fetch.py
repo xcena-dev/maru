@@ -9,7 +9,7 @@ import pytest
 
 from maru_common.storage_types import ItemResult, MissReason, PoolKind, Status
 from maru_storage_service.page_table import InvalidTransitionError, PageRef, PageState
-from tests.unit.ms_node_helpers import PAGE, wait_until
+from tests.unit.ms_node_helpers import PAGE, wait_demotions_applied, wait_until
 from tests.unit.remote_fakes import reset_fake_agents
 from tests.unit.test_ms_demotion import put, value_of
 from tests.unit.test_ms_fetch import Loader, loader_client, pins, settled
@@ -42,10 +42,10 @@ def env(ms, workers):
             what="keys demoted to memory",
         )
         writer.close()
-        wait_until(
-            lambda: pair.gpu.manager._remote_writing == 0, what="demotions ended"
-        )
         pair.gpu.manager.placement.set_watermarks("dram", 0.95, 0.9)
+        # An empty write queue alone can precede applying WRITE_DONE and
+        # another eviction pass. Settle both before a test stalls the NIC.
+        wait_demotions_applied(pair.gpu.manager)
         moved = [n for n in names if pair.on_memory(n)]
 
         def loader():
