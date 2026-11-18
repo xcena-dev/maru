@@ -95,10 +95,13 @@ def test_a_removed_policy_file_keeps_the_policy(tmp_path):
     path = tmp_path / "policy.json"
     write(path, preserve("k"))
     service = make_service(FakeClock(), policy_file=str(path))
+    mtime = path.stat().st_mtime_ns
     path.unlink()
     service.check_policy()
     assert service.catalog.is_preserved(key("k"))
     write(path, preserve())
+    # Deletion/recreation within one filesystem clock tick can reuse mtime.
+    os.utime(path, ns=(mtime, mtime))
     service.check_policy()
     assert not service.catalog.is_preserved(key("k"))
     assert service.registry.policy_version == 1

@@ -824,6 +824,9 @@ class MsService:
         try:
             mtime = os.stat(self._policy_file).st_mtime_ns
         except OSError as e:
+            # Keep the loaded policy, but retry a restored file even if its
+            # mtime equals the one seen before it disappeared.
+            self._policy_mtime = None
             if self._policy_failed != -1:
                 logger.error("policy file unreadable, keeping the policy: %s", e)
                 self._policy_failed = -1
