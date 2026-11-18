@@ -85,6 +85,8 @@ jobs:
           # Fail here if the host filesystem cannot run the SSD tests.
           ssd_test_root="$RUNNER_TEMP/maru-ssd-tests"
           mkdir -p "$ssd_test_root"
+          uname -r
+          df -T "$ssd_test_root"
           PYTHONPATH="$PWD" python tests/ssd_test_storage.py "$ssd_test_root"
           echo "MARU_TEST_SSD_ROOT=$ssd_test_root" >> "$GITHUB_ENV"
 

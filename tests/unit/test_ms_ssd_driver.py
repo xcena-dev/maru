@@ -578,6 +578,7 @@ def test_statx_unavailable_uses_xfs_inode_limits(monkeypatch, error):
 
 def test_unknown_alignment_refuses_before_preallocation(directory, monkeypatch):
     monkeypatch.setattr(dio, "_statx_alignment", lambda fd: None)
+    monkeypatch.setattr(dio, "_ext4_alignment", lambda fd: None)
 
     def unsupported(*args):
         raise OSError(errno.ENOTTY, "no filesystem alignment query")

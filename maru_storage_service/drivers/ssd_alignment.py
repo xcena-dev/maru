@@ -15,6 +15,14 @@ from dataclasses import dataclass
 _STATX_DIOALIGN = 0x2000
 _AT_EMPTY_PATH = 0x1000
 _XFS_IOC_DIOINFO = 0x800C581E
+# Linux FS_IOC_GETFLAGS is _IOR('f', 1, long); the returned flags are a u32.
+_FS_IOC_GETFLAGS = 0x80006601 | (ctypes.sizeof(ctypes.c_long) << 16)
+_EXT4_BUFFERED_FLAGS = (
+    0x00000800  # FS_ENCRYPT_FL
+    | 0x00004000  # FS_JOURNAL_DATA_FL
+    | 0x00100000  # FS_VERITY_FL
+    | 0x10000000  # FS_INLINE_DATA_FL
+)
 _LIBC = ctypes.CDLL(None, use_errno=True)
 
 
@@ -61,6 +69,40 @@ def _statx_alignment(fd: int) -> DioAlignment | None:
     return DioAlignment(*struct.unpack_from("=II", result, 0x98))
 
 
+def _mount_info(fd: int) -> tuple[str, set[str]] | None:
+    """Identify the fd's actual mount, including container bind mounts."""
+    with open(f"/proc/self/fdinfo/{fd}") as info:
+        mount_id = next(
+            (line.split()[1] for line in info if line.startswith("mnt_id:")), None
+        )
+    if mount_id is None:
+        return None
+    with open("/proc/self/mountinfo") as mounts:
+        for line in mounts:
+            mount, separator, filesystem = line.partition(" - ")
+            if separator and mount.split()[0] == mount_id:
+                kind, _source, options = filesystem.split()
+                return kind, set(options.split(","))
+    return None
+
+
+def _ext4_alignment(fd: int) -> DioAlignment | None:
+    # Before STATX_DIOALIGN (Linux 6.1), ordinary ext4 files accept DIO
+    # aligned to the filesystem block size, which is a multiple of the
+    # underlying device's logical block size. Query it; do not assume 4 KiB.
+    mount = _mount_info(fd)
+    if mount is None or mount[0] != "ext4":
+        return None
+    flags = struct.unpack_from(
+        "=I", fcntl.ioctl(fd, _FS_IOC_GETFLAGS, bytes(ctypes.sizeof(ctypes.c_long)))
+    )[0]
+    # ext4_dio_supported() on 5.15 sends these files through buffered I/O.
+    if "data=journal" in mount[1] or flags & _EXT4_BUFFERED_FLAGS:
+        raise SsdAlignmentError("this ext4 file does not support direct I/O")
+    block = os.fstatvfs(fd).f_bsize
+    return DioAlignment(block, block)
+
+
 def direct_alignment(fd: int) -> DioAlignment:
     alignment = _statx_alignment(fd)
     if alignment is not None:
@@ -69,6 +111,10 @@ def direct_alignment(fd: int) -> DioAlignment:
     try:
         result = fcntl.ioctl(fd, _XFS_IOC_DIOINFO, bytes(12))
     except OSError as e:
+        if e.errno in (errno.ENOTTY, errno.EINVAL, errno.EOPNOTSUPP):
+            alignment = _ext4_alignment(fd)
+            if alignment is not None:
+                return alignment
         raise SsdAlignmentError(
             "direct I/O alignment is unknown on this filesystem"
         ) from e

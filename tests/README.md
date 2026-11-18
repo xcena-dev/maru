@@ -32,9 +32,13 @@ pytest tests/unit/test_ms_ssd_driver.py tests/unit/test_ms_ssd_tier.py
 
 An explicitly configured root must pass the probe; it never falls back or skips.
 CI uses the host-mounted `RUNNER_TEMP` directory and runs the probe before the
-suite. If this step fails, check that runner's kernel and filesystem support
-direct I/O alignment queries and reads/writes. Each test uses its own temporary
-pool directory under the verified root.
+suite. Linux 6.1+ can report alignment through `statx`; older kernels use XFS
+`DIOINFO` or conservative filesystem-block alignment for ordinary ext4 files.
+The ext4 fallback rejects encrypted, verity, inline-data and data-journaled
+files instead of accepting their buffered-I/O fallback. Unknown filesystems
+still fail. If the probe fails, inspect the logged host kernel and filesystem;
+changing the container image does not change its host kernel. Each test uses
+its own temporary pool directory under the verified root.
 
 ```bash
 # Unit tests only
