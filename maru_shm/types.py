@@ -7,7 +7,7 @@ shared between the Maru Resource Manager (C++) and maru_shm clients.
 """
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
@@ -182,3 +182,78 @@ class MaruPoolInfo:
             f"<MaruPoolInfo dax_path={self.dax_path!r} dax_type={self.dax_type.name} "
             f"total_size={self.total_size} free_size={self.free_size}>"
         )
+
+
+@dataclass(frozen=True)
+class RegionHolder:
+    """A hold of a node's region, as NODE_CLAIM and NODE_HOLDS list it.
+
+    A NODE_HOLD (a worker's or the StorageService's own): ``holder`` names it
+    for one run, ``node_epoch`` is the node's run it held under, then who it
+    is: ``pid_start`` is field 22 of /proc/<pid>/stat, ``pid_ns`` the inode of
+    /proc/<pid>/ns/pid. A remote agent's hold has the holder only (empty
+    strings, zeros).
+    """
+
+    holder: str
+    node_epoch: str
+    host: str
+    boot_id: str
+    pid: int
+    pid_start: int
+    pid_ns: int
+
+
+@dataclass
+class NodeRegion:
+    """A region a node owns (NODE_CLAIM, NODE_ALLOC).
+
+    ``dax_path`` and ``device_uuid`` are as the resource manager reports them;
+    both are empty while the region's pool is not served. ``holders``
+    (NODE_CLAIM, NODE_HOLDS) are the holds on the region at that request.
+    """
+
+    handle: MaruHandle
+    requested_size: int = 0
+    dax_path: str = ""
+    device_uuid: str = ""
+    holders: list[RegionHolder] = field(default_factory=list)
+
+
+@dataclass
+class NodeClaim:
+    """Result of NODE_CLAIM: the RM's own ID, the lease, the node's regions."""
+
+    rm_domain: str
+    lease_s: float
+    regions: list[NodeRegion]
+
+
+class StaleNodeEpochError(RuntimeError):
+    """The epoch is not the node's current run (-ESTALE).
+
+    Another run claimed the node, its lease ran out, or it was released: stop
+    using its regions. A NODE_RELEASE whose reply was lost also ends here.
+    """
+
+
+class NodeLeaseExpiredError(StaleNodeEpochError):
+    """NODE_RENEW: the run's lease ran out, or the node record is gone (it was
+    released, also by an admin release-node), and no other run claimed the
+    node since (-EKEYEXPIRED). The run is over; the StorageService starts a
+    new run, which claims the node again."""
+
+
+class NodeHostConflictError(RuntimeError):
+    """The node is bound to another host (-EEXIST); an operator releases it first."""
+
+
+class NodeOwnershipUnsupportedError(RuntimeError):
+    """The resource manager predates node ownership (restart it with this Maru)."""
+
+
+class RetryableNodeError(RuntimeError):
+    """The RM could not complete the request now (e.g. -EIO, -ENOSPC, -EAGAIN).
+
+    Send the same request again; a claim is not in effect until one succeeds.
+    """
