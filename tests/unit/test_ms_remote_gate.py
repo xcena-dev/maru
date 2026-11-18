@@ -55,14 +55,14 @@ def ms():
 
 
 @pytest.fixture
-def gate(ms, workers, monkeypatch):
+def gate(ms, workers, monkeypatch, ssd_dir):
     import maru_storage_service.drivers.peer as peer
 
     reset_fake_agents()
     monkeypatch.setattr(peer, "PING_S", 0.05)
     monkeypatch.setattr(peer, "RECONNECT_S", 0.05)
     monkeypatch.setattr(peer, "RPC_TIMEOUT_S", 0.4)
-    env = Gate(*ms, workers, monkeypatch)
+    env = Gate(*ms, workers, monkeypatch, ssd_dir)
     try:
         yield env
         env.check()

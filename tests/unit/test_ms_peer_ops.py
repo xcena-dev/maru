@@ -308,9 +308,9 @@ def test_stage_misses_a_credit_and_unstage_is_served(node):
 
 
 @pytest.mark.parametrize("end", [TransferEnd.DONE, TransferEnd.NOT_POSTED])
-def test_stage_loads_a_ready_ssd_page_and_unstage_frees_it(fake, end):
+def test_stage_loads_a_ready_ssd_page_and_unstage_frees_it(fake, end, ssd_dir):
     root = short_tmpdir()
-    service = memory_node(fake, root, Parts([]), ssd=True)
+    service = memory_node(fake, root, Parts([]), ssd_path=ssd_dir)
     try:
         key = Key("ns", "stage")
         ops, seqs = service.peer_ops, Seqs()
@@ -369,9 +369,9 @@ def test_a_refused_op_keeps_the_credits_ttl(node):
     check(node)
 
 
-def test_staging_and_credits_together_stay_within_the_credit_cap(fake):
+def test_staging_and_credits_together_stay_within_the_credit_cap(fake, ssd_dir):
     root = short_tmpdir()
-    service = memory_node(fake, root, Parts([]), ssd=True)
+    service = memory_node(fake, root, Parts([]), ssd_path=ssd_dir)
     try:
         key = Key("ns", "cap")
         ops, seqs = service.peer_ops, Seqs()

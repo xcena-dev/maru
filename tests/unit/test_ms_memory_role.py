@@ -57,12 +57,14 @@ def sockdir():
     remove_tree(path)
 
 
-def memory_raw(url: str, sockdir: str, *, cxl: bool = False, ssd: bool = False):
+def memory_raw(
+    url: str, sockdir: str, *, cxl: bool = False, ssd_path: str | None = None
+):
     tiers = [{"store": "dram", "size": 8 * PAGE, "hugepage": False}]
     if cxl:
         tiers.append({"store": "cxl", "size": 4 * PAGE, "region_size": 2 * PAGE})
-    if ssd:
-        tiers.append({"store": "ssd", "size": 16 * PAGE, "path": f"{sockdir}/ssd"})
+    if ssd_path is not None:
+        tiers.append({"store": "ssd", "size": 16 * PAGE, "path": ssd_path})
     return {
         "node_id": "mem1",
         "role": "memory",
@@ -152,8 +154,10 @@ class Parts:
         return self.made[-1]
 
 
-def memory_node(fake, sockdir, parts, *, cxl=False, ssd=False, **kwargs):
-    config = parse_node_config(memory_raw(fake.url, sockdir, cxl=cxl, ssd=ssd))
+def memory_node(fake, sockdir, parts, *, cxl=False, ssd_path=None, **kwargs):
+    config = parse_node_config(
+        memory_raw(fake.url, sockdir, cxl=cxl, ssd_path=ssd_path)
+    )
     if cxl:
         kwargs.setdefault("region_source", FakeRm())
         kwargs.setdefault("map_region", anon_region)
@@ -231,7 +235,7 @@ def test_only_a_memory_node_has_a_remote_server():
 
 
 def test_a_memory_node_is_servable_write_through_too():
-    raw = memory_raw("tcp://ms:5555", "/tmp/x", ssd=True)
+    raw = memory_raw("tcp://ms:5555", "/tmp/x", ssd_path="/ssd")
     Node(parse_node_config(raw))  # check_servable passes
     raw = copy.deepcopy(raw)
     raw["tiers"][0]["demotion"] = "through"
@@ -285,9 +289,9 @@ def test_the_run_binds_registers_announces_then_serves(fake, sockdir):
     assert closed.mode == CloseMode.RESTART
 
 
-def test_the_ssd_tier_is_announced_but_not_registered(fake, sockdir):
+def test_the_ssd_tier_is_announced_but_not_registered(fake, sockdir, ssd_dir):
     log: list = []
-    node = memory_node(fake, sockdir, Parts(log), ssd=True)
+    node = memory_node(fake, sockdir, Parts(log), ssd_path=ssd_dir)
     try:
         assert announced(fake) == {"dram", "ssd"}
         assert log == ["remote start", "attach dram", "remote ready"]

@@ -170,10 +170,11 @@ class Peer:
 
 
 class Gate:
-    def __init__(self, server, url, workers, monkeypatch):
+    def __init__(self, server, url, workers, monkeypatch, ssd_dir):
         self.server, self.url = server, url
         self.workers, self.monkeypatch = workers, monkeypatch
         self.root = short_tmpdir()
+        self.ssd_dir = ssd_dir
         self.nodes, self.clients, self.cleanups = [], [], []
         self.values, self.generations = {}, {}
         self.quarantined, self.evidence, self.violations = set(), {}, []
@@ -218,7 +219,7 @@ class Gate:
             elif kind == "cxl":
                 raw.update(region_size=32 * PAGE, rm="127.0.0.1:1")
             else:
-                raw.update(path=f"{self.root}/{node_id}-ssd")
+                raw.update(path=f"{self.ssd_dir}/{node_id}-ssd")
             stores.append(raw)
         raw = {
             "node_id": node_id,
