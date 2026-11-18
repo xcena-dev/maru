@@ -153,6 +153,7 @@ vllm serve <model> --kv-transfer-config '{
 | --- | --- | --- | --- |
 | `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
 | `maru_pool_size` | `str \| int` | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, or integer bytes): its first allocation, and each further one when its memory is full. Required with `remote_cxl`, where each allocation is one region; `cpu` and `mixed` use `maru_cpu_pool_size` and `maru_cxl_pool_size` |
+| `maru_auto_expand` | `bool` | `true` | Allow the handler to acquire additional regions when its current allocation fills. Set `false` to keep the existing capacity; the backend's full-pool policy then applies (`remote_cxl` evicts, `cxl` can fail allocation) |
 | `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
 | `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
