@@ -1,11 +1,11 @@
 # Basic Examples
 
-Demonstrates Maru's core functionality: zero-copy KV store on CXL shared memory.
+Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. The `remote_cxl` backend instead uses host staging and RDMA; see the [remote CXL example](../vllm/remote_cxl/README.md).
 
 ## Prerequisites
 
 - Maru installed (`uv pip install -e .`)
-- Maru Resource Manager running (`systemctl status maru-resourced`)
+- Maru Resource Manager running (`systemctl status maru-resource-manager`)
 - CXL DAX device available (`/dev/dax*`)
 
 For setup instructions, see the [Installation Guide](../../docs/source/getting_started/installation.md).
@@ -26,7 +26,7 @@ python examples/basic/single_instance.py
 
 ### 2. Cross-Instance Sharing (`producer.py` + `consumer.py`)
 
-Two separate processes sharing KV data through CXL shared memory — zero copy.
+Two separate processes using the same CXL mapping. Retrieving a memoryview avoids an additional host copy; converting it to `bytes` copies the payload.
 
 ```bash
 # Terminal 1: start the metadata server

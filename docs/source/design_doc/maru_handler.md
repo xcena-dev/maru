@@ -5,7 +5,7 @@ The `MaruHandler` is the client-side library that applications (e.g., LMCache/vL
 1. **KV cache client** — provides `store`/`retrieve`/`exists`/`delete` APIs.
 2. **Memory manager** — owns CXL memory regions, manages paged allocation within them, and auto-expands when space runs out.
 
-Data flows directly between the handler and CXL shared memory via memory-mapped regions — neither the MaruServer nor the resource manager is involved in the data path.
+With the `cxl` backend, the Handler accesses memory-mapped CXL regions. With `remote_cxl`, it moves KV between worker-side CPU staging and memory-node CXL over RDMA. Neither path relays payload bytes through MaruServer or the Resource Manager. Sections 1–4 below describe `cxl`; section 5 describes the additional components and buffer lifetimes of `remote_cxl`.
 
 ## 1. Component Hierarchy
 
@@ -159,11 +159,7 @@ sequenceDiagram
     participant CP as MaruServer
     participant CXL as CXL Shared Memory
 
-    C->>H: store(key, data)
-    H->>H: Check if key already exists
-    alt Key exists (local cache or server)
-        H-->>C: success (skip, no overwrite)
-    end
+    C->>H: alloc(size)
     H->>ORM: Allocate page
     alt All regions full
         H->>CP: Request new region
@@ -172,13 +168,28 @@ sequenceDiagram
     end
     ORM-->>H: (region, page)
     H->>DM: Get writable buffer view
-    H->>CXL: Write data (zero-copy)
-    H->>CP: Register key → location
-    CP-->>H: OK
-    H-->>C: success
+    H-->>C: writable allocation handle
+    C->>CXL: Complete payload write and required flush
+    C->>H: store(key, handle)
+    H->>H: Check local / server key existence
+    alt Key already exists
+        H->>ORM: Free unused allocation
+        H-->>C: success (skip, no overwrite)
+    else New key
+        H->>CP: Register key → location
+        CP-->>H: Inserted or concurrent duplicate
+        H->>ORM: Free allocation if registration lost race
+        H-->>C: success
+    end
 ```
 
-If the key already exists (in the local cache or on the server), the store is **skipped without overwrite** — same key implies same content (content-addressed). Otherwise, data is written to shared memory **before** the key is registered. Other instances can never observe a partial write — the key only becomes visible after the data is fully committed.
+The caller allocates and finishes the payload write before calling
+`store(key, handle)`. If the key already exists, registration is skipped and
+the unused page is freed. Callers must make equal keys mean equal immutable
+content; Maru treats keys as opaque strings. Readers discover a completed
+payload only if the caller completed its transfer and the platform's required
+visibility operations before registration. Store does not finish a pending
+GPU copy or flush non-coherent CPU cache lines on the caller's behalf.
 
 ### 4.2 Retrieve
 
@@ -197,7 +208,7 @@ sequenceDiagram
         H->>DM: Map shared region
     end
     H->>DM: Get buffer view
-    H->>CXL: Direct read (zero-copy)
+    H->>CXL: View mapped payload
     H-->>C: data
 ```
 
@@ -242,7 +253,7 @@ reaches the region with one-sided RDMA.
 | `RemoteCxlStorageClient` | The storage session: regions, pages, stores, loads, eviction |
 | `RdmaDataPath` | The worker's staging buffer, its NIXL agent and its connections to the remote CXL agents |
 | `RegionMapClient` | One connection to a remote CXL agent: proves the remote CXL agent key, then `map`, `unmap`, `release` |
-| `StagingBuffer` | Host memory registered with the NIC and with CUDA; KV moves GPU ↔ staging by copy, staging ↔ region by RDMA |
+| `StagingBuffer` | Worker host memory registered with the NIC; CUDA registration is best effort. KV moves GPU ↔ staging by copy, staging ↔ region by RDMA |
 | `PoolRouter` | Several pools (one MaruServer each): routes a request to one pool by its first chunk key |
 
 **Store.** The Handler takes a staging slot and a free page of an own region,

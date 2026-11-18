@@ -107,7 +107,7 @@ sequenceDiagram
   W->>E: load done
   E->>S: load done
   S-)A: read_hint_end(request)
-  Note over W: the request decodes; its new KV is stored
+  Note over W: Decode and store
   W->>A: write_wait(store, pages in write order)
   A-->>W: pages ready (or the wait ran out)
   W->>D: RDMA WRITE
