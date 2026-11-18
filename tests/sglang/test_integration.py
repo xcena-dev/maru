@@ -9,11 +9,12 @@ import ctypes
 from unittest.mock import patch
 
 import pytest
-import torch
 
-from maru_sglang.maru_storage import MaruStorage
+torch = pytest.importorskip("torch")
 
-from .conftest import MockHiCacheStorageConfig, MockMaruHandler
+from maru_sglang.maru_storage import MaruStorage  # noqa: E402
+
+from .conftest import MockHiCacheStorageConfig, MockMaruHandler  # noqa: E402
 
 
 def _make_backend(
