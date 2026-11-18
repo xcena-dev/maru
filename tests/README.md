@@ -8,7 +8,7 @@
 
 ## Running
 
-CI runs the core unit tests on Python 3.12, 3.13, and 3.14. Each version uploads its own coverage report; Python 3.12 retains the `coverage-report` artifact name for PR comments, while newer versions use a version suffix. SGLang tests and integration tests are excluded, and tests requiring optional dependencies may be skipped.
+CI runs the core unit tests on Python 3.12, 3.13, and 3.14. Each version uploads its own coverage report; Python 3.12 retains the `coverage-report` artifact name for PR comments, while newer versions use a version suffix. Integration tests are excluded, and connector tests requiring optional dependencies may be skipped.
 
 To reproduce a CI test run locally, choose a version from the matrix:
 
@@ -39,6 +39,12 @@ files instead of accepting their buffered-I/O fallback. Unknown filesystems
 still fail. If the probe fails, inspect the logged host kernel and filesystem;
 changing the container image does not change its host kernel. Each test uses
 its own temporary pool directory under the verified root.
+
+The maintenance latency benchmark runs separately, without coverage and on an
+otherwise idle host: `python -m pytest benchmarks/test_ms_maintenance.py -q`.
+It retains the 10 ms p99 increase limit. The unit suite checks the corresponding
+concurrency guarantees deterministically: bounded cleanup batches release the
+lock and allow real lookups to complete between them.
 
 ```bash
 # Unit tests only

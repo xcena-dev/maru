@@ -1387,7 +1387,8 @@ def test_published_copies_are_pinned_in_turn_too(env, monkeypatch):
     b_items = b.items(*cached, a_names[-1])  # planned before the copies
     warm = a.fetch(*cached)
     assert [o.result for o in warm.items] == [ItemResult.HIT] * 4
-    a.unpin(*[o.pin_id for o in warm.items])
+    # Keep these copies alive until b has joined the room queue. Otherwise
+    # background eviction may remove them before the cached-flight assertion.
     wait_until(lambda: settled(node, server), "the copies published")
     writer = RawWorker(node.config.socket)
     writer.attach()
@@ -1430,6 +1431,7 @@ def test_published_copies_are_pinned_in_turn_too(env, monkeypatch):
             flights = list(fetches._flights.values())
         led = [f for f in flights if f.leader.op.origin == b.raw.incarnation]
         assert len(led) == 4 and all(f.cached for f in led)
+        a.unpin(*[o.pin_id for o in warm.items])
         go.set()
         for reply, count in ((first_reply, 11), (second, 5)):
             outcomes = [(o.result, o.reason) for o in reply.result(10).items]

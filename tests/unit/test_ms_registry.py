@@ -1314,7 +1314,13 @@ class TestMaintenanceThread:
         assert len(service.pins) == 0 and ("worker", "w0") not in service.ledger
         assert not any(count for count, _ in left())
 
-    def test_large_forced_sweep_keeps_lookup_p99_low(self):
+    def test_large_forced_sweep_allows_lookup_between_batches(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        from queue import Queue
+
+        from maru_server.ms_service import MAINTENANCE_YIELD_S
+
+        assert MAINTENANCE_YIELD_S > 0
         service = make_service(clock=time.monotonic, maintenance_interval_s=0.01)
         wire = Wire(service)
         reader = FakeNode(wire, "reader")
@@ -1333,32 +1339,48 @@ class TestMaintenanceThread:
 
         def lookup():
             response = worker.lookup(*keys)
+            assert all(item.result.value == "HIT" for item in response.items)
             worker.unpin(*[item.pin_id for item in response.items])
 
-        def p99(samples):
-            return sorted(samples)[int(len(samples) * 0.99)]
+        # Pause at real maintenance yields so scheduler load and coverage
+        # cannot decide whether a request gets to run between the batches.
+        # The wall-clock p99 check lives in benchmarks/test_ms_maintenance.py.
+        batches = Queue()
+        resume = Queue()
+        controlled = True
+        wait = service._stop.wait
 
-        def measure(n):
-            samples = []
-            for _ in range(n):
-                t0 = time.perf_counter()
-                lookup()
-                samples.append(time.perf_counter() - t0)
-            return samples
+        def checkpoint(timeout):
+            if controlled and timeout == MAINTENANCE_YIELD_S:
+                batches.put(len(pool.entries))
+                resume.get(timeout=10)
+            return wait(timeout)
 
-        base = measure(300)
+        monkeypatch.setattr(service._stop, "wait", checkpoint)
         big.close(CloseMode.LEAVE)
-        service.ensure_started()
-        try:
-            loaded = measure(300)
-            assert len(pool.entries) < size  # the sweep ran meanwhile
-            deadline = time.monotonic() + 30
-            while pool.entries and time.monotonic() < deadline:
-                loaded += measure(20)
-        finally:
-            service.stop()
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            service.ensure_started()
+            try:
+                previous = size
+                for step in range(3):
+                    remaining = batches.get(timeout=10)
+                    assert 0 < previous - remaining <= service.maintenance_budget
+                    # A lock held across batches would block this real lookup
+                    # until resume, and fail instead of passing on a fast CPU.
+                    requests.submit(lookup).result(timeout=10)
+                    assert len(pool.entries) == remaining
+                    previous = remaining
+                    if step == 2:
+                        controlled = False
+                    resume.put(None)
+                deadline = time.monotonic() + 30
+                while pool.entries and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                controlled = False
+                resume.put(None)
+                service.stop()
         assert not pool.entries
-        assert p99(loaded) < p99(base) + 0.010, (p99(base), p99(loaded))
 
 
 def test_pin_manager_keeps_cxl_pins_apart():
