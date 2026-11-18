@@ -66,6 +66,25 @@ public:
     UnholdResp handleUnhold(const UnholdReq &req, const std::string &holder,
                             const std::string &instance);
     ResetHoldsResp handleResetHolds(const std::string &holder, const std::string &instance);
+    /// Node ownership. clientId is the connection's "hostname:pid"; only its
+    /// host part is used (NODE_CLAIM binds the node to it).
+    std::vector<uint8_t> handleNodeClaim(const std::string &nodeId, const std::string &epoch,
+                                         const std::string &clientId);
+    AllocResult handleNodeAlloc(const NodeAllocReq &req, const std::string &nodeId,
+                                const std::string &epoch, const std::string &daxPath);
+    FreeResp handleNodeFree(const NodeFreeReq &req, const std::string &nodeId,
+                            const std::string &epoch);
+    NodeRenewResp handleNodeRenew(const std::string &nodeId, const std::string &epoch);
+    /// What NODE_RENEW would answer for this run, without renewing.
+    int nodeRunStatus(const std::string &nodeId, const std::string &epoch);
+    /// A NodeClaimResp refusing a resent claim of a run that is not current.
+    std::vector<uint8_t> refuseNodeClaim();
+    NodeReleaseResp handleNodeRelease(const std::string &nodeId, const std::string &epoch);
+    /// NodeHoldsResp and the node's regions with their holds (read only).
+    std::vector<uint8_t> handleNodeHolds(const std::string &nodeId, const std::string &epoch);
+    GetAccessResult handleNodeHold(const NodeHoldReq &req, const std::string &nodeId,
+                                   const std::string &epoch, const std::string &holder,
+                                   const std::string &bootId, const std::string &clientId);
 
 private:
     PoolManager &pm_;

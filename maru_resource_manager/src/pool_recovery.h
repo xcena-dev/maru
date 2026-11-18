@@ -72,6 +72,7 @@ struct DevicePlan
 
 /// "hostname:pid" names a process on this host.
 bool isLocalClientId(const char *clientId);
+bool isLocalHostName(const std::string &host);
 /// Last path component.
 std::string baseNameOf(const std::string &path);
 

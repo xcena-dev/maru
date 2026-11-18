@@ -20,6 +20,7 @@ from pathlib import Path
 
 DAEMON = None
 ALIGN = 2 << 20
+MAX_ENDED_RUNS = 64  # kMaxEndedRuns
 SIZE = 16 << 20
 WIRE_HEADER = struct.Struct("<IHHI")
 HANDLE = struct.Struct("<QQQQ")
@@ -79,18 +80,31 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.process.kill()
             self.process.wait(timeout=STOP_S)
 
-    def start(self, expected_failure=False, checkpoint_fault=None, grace_period=None):
+    def start(
+        self,
+        expected_failure=False,
+        checkpoint_fault=None,
+        grace_period=None,
+        node_lease=None,
+        hold_grace=None,
+    ):
         self.assertTrue(self.process is None or self.process.poll() is not None)
         self.starts += 1
         self.log = self.root / f"daemon-{self.starts}.log"
         (self.root / "port").unlink(missing_ok=True)
         env = dict(os.environ, MARU_TEST_DAX_ROOT=str(self.root))
         env.pop("MARU_TEST_CHECKPOINT_FAILURE", None)
+        env.pop("MARU_TEST_NODE_LEASE", None)
+        env.pop("MARU_TEST_HOLD_GRACE", None)
         if checkpoint_fault is not None:
             env["MARU_TEST_CHECKPOINT_FAILURE"] = checkpoint_fault
         env.pop("MARU_TEST_GRACE_PERIOD", None)
         if grace_period is not None:
             env["MARU_TEST_GRACE_PERIOD"] = str(grace_period)
+        if node_lease is not None:
+            env["MARU_TEST_NODE_LEASE"] = str(node_lease)
+        if hold_grace is not None:
+            env["MARU_TEST_HOLD_GRACE"] = str(hold_grace)
         with self.log.open("wb") as log:
             self.process = subprocess.Popen(
                 [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -531,7 +545,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.assertIn("holds=0 draining=0", output)
 
         # Truncated names close the connection; so does an unknown type, which
-        # is how a client learns that an RM has no holds.
+        # is how a client learns that an RM lacks a request (holds, nodes).
         truncated = HANDLE.pack(*other) + struct.pack("<II", 100, 1) + b"x"
         response = self.request(13, truncated, expected_kind=255)
         self.assertEqual(struct.unpack_from("<i", response)[0], -errno.EPROTO)
@@ -541,7 +555,7 @@ class ProcessRecoveryTest(unittest.TestCase):
         self.connection = socket.create_connection(
             ("127.0.0.1", port), timeout=REQUEST_S
         )
-        response = self.request(17, expected_kind=255)
+        response = self.request(99, expected_kind=255)
         self.assertEqual(struct.unpack_from("<i", response)[0], -errno.ENOSYS)
         self.assertEqual(self.connection.recv(1), b"")
         self.connection.close()
@@ -590,6 +604,321 @@ class ProcessRecoveryTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, self.log.read_text())
             time.sleep(0.1)
         self.free(handle, -errno.ENOENT)
+        self.stop()
+
+    def node_request(self, kind, node, epoch, request_id, head=b"", path=b""):
+        """Fixed part (head, then the lengths), node ID, epoch, path, client_id
+        and request id."""
+        lengths = struct.pack("<II", len(node), len(epoch))
+        if kind == 19:  # NodeAllocReq: the path's length and a reserved word
+            lengths += struct.pack("<II", len(path), 0)
+        payload = head + lengths + node + epoch + path + self.client_id
+        return self.request(kind, payload + struct.pack("<Q", request_id))
+
+    def node_claim(self, node, epoch, request_id):
+        response = self.node_request(17, node, epoch, request_id)
+        status, rm_id_len, lease_ms, count, _ = struct.unpack_from("<iIQII", response)
+        offset = 24
+        rm_id = response[offset : offset + rm_id_len].decode()
+        offset += rm_id_len
+        regions = []
+        for _ in range(count):
+            *handle, requested, path_len, uuid_len, holder_count, _ = (
+                struct.unpack_from("<QQQQQIIII", response, offset)
+            )
+            offset += 56
+            path = response[offset : offset + path_len].decode()
+            offset += path_len
+            uuid_text = response[offset : offset + uuid_len].decode()
+            offset += uuid_len
+            holders = []
+            for _ in range(holder_count):
+                *lengths, pid, _, start, ns = struct.unpack_from(
+                    "<IIIIIIQQ", response, offset
+                )
+                offset += 40
+                texts = []
+                for length in lengths:
+                    texts.append(response[offset : offset + length].decode())
+                    offset += length
+                holders.append((*texts, pid, start, ns))
+            regions.append((tuple(handle), requested, path, uuid_text, holders))
+        self.assertEqual(offset, len(response))
+        return status, rm_id, lease_ms, regions
+
+    def node_alloc(self, node, epoch, request_id, status=0):
+        path = b"/dev/dax0.0"
+        response = self.node_request(
+            19, node, epoch, request_id, struct.pack("<Q", ALIGN), path
+        )
+        self.assertEqual(struct.unpack_from("<i", response)[0], status)
+        handle = HANDLE.unpack_from(response, 8)
+        if status == 0:
+            path_len = struct.unpack_from("<I", response, 48)[0]
+            self.assertEqual(response[52 : 52 + path_len], path)
+        return handle
+
+    def node_status(self, kind, node, epoch, request_id, head=b""):
+        response = self.node_request(kind, node, epoch, request_id, head)
+        return struct.unpack_from("<i", response)[0]
+
+    def test_node_ownership_over_tcp(self):
+        self.start()
+        status, rm_id, lease_ms, regions = self.node_claim(b"node-a", b"e1", 1)
+        self.assertEqual((status, len(rm_id), lease_ms, regions), (0, 32, 900000, []))
+        handle = self.node_alloc(b"node-a", b"e1", 2)
+        # A retransmit is answered from the cache, never applied twice.
+        self.assertEqual(self.node_alloc(b"node-a", b"e1", 2), handle)
+        self.check_stats({"/dev/dax0.0": 1})
+        self.access(handle)
+
+        # A new run takes the node over; the earlier one is fenced.
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 3)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            [(r[0], r[1], r[2]) for r in regions], [(handle, ALIGN, "/dev/dax0.0")]
+        )
+        self.assertEqual(len(regions[0][3]), 36)
+        self.node_alloc(b"node-a", b"e1", 4, -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 5), -errno.ESTALE)
+        renew = self.node_request(23, b"node-a", b"e2", 6)
+        self.assertEqual(struct.unpack("<iIQ", renew), (0, 0, 900000))
+        free = HANDLE.pack(*handle)
+        self.assertEqual(self.node_status(21, b"node-a", b"e1", 7, free), -errno.ESTALE)
+        # A node is bound to the host of its first claim.
+        other = socket.create_connection(
+            ("127.0.0.1", int((self.root / "port").read_text())), timeout=REQUEST_S
+        )
+        mine, self.connection = self.connection, other
+        my_id, self.client_id = self.client_id, struct.pack("<H", 12) + b"other-host:1"
+        try:
+            self.assertEqual(self.node_status(17, b"node-a", b"e3", 1), -errno.EEXIST)
+        finally:
+            other.close()
+            self.connection, self.client_id = mine, my_id
+
+        # The node outlives its process, its connection and the RM.
+        self.stop(signal.SIGKILL)
+        self.start()
+        status, rm_id_again, _, regions = self.node_claim(b"node-a", b"e2", 8)
+        self.assertEqual((status, rm_id_again), (0, rm_id))
+        self.assertEqual(regions[0][0], handle)
+        self.access(handle)
+        code, output = self.ctl("allocations")
+        self.assertEqual(code, 0, output)
+        self.assertIn("client=@node:node-a owner=node node=node-a epoch=e2", output)
+        code, output = self.ctl("status")
+        self.assertIn(f"rm_id={rm_id} nodes=1", output)
+        code, output = self.ctl("release-node", "node-a")
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"region={handle[0]} ", output)
+        code, output = self.ctl("release-node", "node-a", "--confirm")
+        self.assertEqual(code, 0, output)
+        # Released, and no other run claimed it since: fenced, not stale.
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 9), -errno.EKEYEXPIRED)
+        self.check_stats()
+
+        # NODE_RELEASE frees every region and forgets the node.
+        self.assertEqual(self.node_claim(b"node-b", b"e1", 10)[0], 0)
+        self.node_alloc(b"node-b", b"e1", 11)
+        self.node_alloc(b"node-b", b"e1", 12)
+        released = self.node_request(25, b"node-b", b"e1", 13)
+        self.assertEqual(struct.unpack("<iI", released), (0, 2))
+        self.assertEqual(self.node_request(25, b"node-b", b"e1", 13), released)
+        self.assertEqual(self.node_status(25, b"node-b", b"e1", 14), -errno.ESTALE)
+        self.check_stats()
+        self.stop()
+        self.checkpoint(0)
+
+    def test_retransmit_cache_keys(self):
+        """A reply is replayed only for the same request: same type, client,
+        request id and, for a node request, the same run."""
+        self.start()
+        path = b"/dev/dax0.0"
+        alloc = struct.pack("<QII", ALIGN, len(path), 0) + path + self.client_id
+        response = self.request(1, alloc + struct.pack("<Q", 5))
+        handle = HANDLE.unpack_from(response, 8)
+        # Another type with the same request id is a new request.
+        free = HANDLE.pack(*handle) + self.client_id + struct.pack("<Q", 5)
+        self.assertEqual(struct.unpack("<i", self.request(3, free)), (0,))
+        self.check_stats()
+
+        # A restarted run (same hostname:pid, request ids from the start
+        # again) is never answered with the earlier run's replies.
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 7)[0], 0)
+        first = self.node_alloc(b"node-a", b"e1", 8)
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 7)
+        self.assertEqual((status, [r[0] for r in regions]), (0, [first]))
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 9), -errno.ESTALE)
+        second = self.node_alloc(b"node-a", b"e2", 8)
+        self.assertNotEqual(second, first)
+        self.assertEqual(self.node_alloc(b"node-a", b"e2", 8), second)  # Retransmit.
+        self.check_stats({"/dev/dax0.0": 2})
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 7), 0)
+        self.stop()
+
+    def test_a_resend_of_an_ended_run_is_not_replayed(self):
+        """A reply is replayed only while its run is the node's current run;
+        a resent claim of an ended run claims nothing."""
+        self.start(hold_grace=1)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        first = self.node_alloc(b"node-a", b"e1", 2)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), 0)
+        held = self.node_alloc(b"node-a", b"e1", 10)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", held, b"w1", 11)[0], 0)
+        free = HANDLE.pack(*self.node_alloc(b"node-a", b"e1", 12))
+        self.assertEqual(self.node_status(21, b"node-a", b"e1", 13, free), 0)
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 4)
+        self.assertEqual(status, 0)
+        self.assertEqual(sorted(r[0] for r in regions), sorted([first, held]))
+        # Run e1's requests again, as after lost replies.
+        stale = -errno.ESTALE
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), stale)
+        self.node_alloc(b"node-a", b"e1", 2, stale)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", held, b"w1", 11)[0], stale)
+        self.assertEqual(self.node_status(21, b"node-a", b"e1", 13, free), stale)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # still e2's
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), 0)  # replayed
+        # After a restart the cache is gone; run e1 has still ended.
+        self.stop(signal.SIGKILL)
+        self.start(hold_grace=1)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 7), 0)
+        # A released run's release is replayed; its other resends are refused.
+        released = self.node_request(25, b"node-a", b"e2", 6)
+        self.assertEqual(struct.unpack("<iI", released), (0, 2))
+        self.assertEqual(self.node_request(25, b"node-a", b"e2", 6), released)
+        self.assertEqual(self.node_status(23, b"node-a", b"e2", 5), -errno.EKEYEXPIRED)
+        self.assertEqual(self.node_claim(b"node-a", b"e2", 4)[0], -errno.ESTALE)
+        # The held region drains until the RM drops its gone holder.
+        deadline = time.monotonic() + START_S
+        while self.stats()["/dev/dax0.0"][2] != SIZE - ALIGN:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.check_stats()
+        self.stop()
+
+    def test_a_resent_failed_claim_runs_again(self):
+        """A claim that failed took nothing: its resend is a new claim."""
+        self.start()
+        (self.state / "nodes.tmp").mkdir()  # the table cannot be written
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], -errno.EISDIR)
+        (self.state / "nodes.tmp").rmdir()
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 2), 0)
+        self.check_stats()
+        self.stop()
+
+    def test_a_resent_claim_of_a_forgotten_run_is_refused(self):
+        """A claim already handled is not run again for a run that is not the
+        node's current one, even once the table no longer lists it."""
+        self.start()
+        self.assertEqual(self.node_claim(b"node-a", b"e0", 1)[0], 0)
+        self.node_alloc(b"node-a", b"e0", 2)
+        self.assertEqual(self.node_status(25, b"node-a", b"e0", 3), 0)
+        for i in range(1, MAX_ENDED_RUNS + 2):  # e0 drops out of the table
+            self.assertEqual(self.node_claim(b"node-a", b"e%d" % i, 10 + i)[0], 0)
+        last = b"e%d" % (MAX_ENDED_RUNS + 1)
+        self.assertNotIn("ended node-a e0\n", (self.state / "nodes").read_text())
+        self.assertEqual(self.node_claim(b"node-a", b"e0", 1)[0], -errno.ESTALE)
+        self.assertEqual(self.node_status(23, b"node-a", last, 1000), 0)
+        self.node_alloc(b"node-a", b"e0", 2, -errno.ESTALE)
+        self.check_stats()
+        self.stop()
+
+    @staticmethod
+    def pid_start(pid):
+        """Field 22 of /proc/<pid>/stat, as the RM reads it."""
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat[stat.rindex(")") + 2 :].split()[19])
+
+    def node_hold(
+        self, node, epoch, handle, holder, request_id, pid=2147483647, start=1
+    ):
+        """A worker on this host, in this boot and pid namespace; by default
+        one whose process is gone. Returns the status and the reply."""
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip().encode()
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        fixed = HANDLE.pack(*handle) + struct.pack(
+            "<IIIIIIQQ",
+            len(node),
+            len(epoch),
+            len(holder),
+            len(boot),
+            pid,
+            0,
+            start,
+            ns,
+        )
+        payload = fixed + node + epoch + holder + boot + self.client_id
+        response = self.request(27, payload + struct.pack("<Q", request_id))
+        return struct.unpack_from("<i", response)[0], response
+
+    def test_node_hold_over_tcp(self):
+        self.start(hold_grace=1)
+        self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)
+        handle = self.node_alloc(b"node-a", b"e1", 2)
+        me = (os.getpid(), self.pid_start(os.getpid()))
+        status, reply = self.node_hold(b"node-a", b"e1", handle, b"w1", 3, *me)
+        self.assertEqual(status, 0)
+        path_len = struct.unpack_from("<I", reply, 4)[0]
+        self.assertEqual(reply[8 : 8 + path_len], b"/dev/dax0.0")
+        self.assertEqual(struct.unpack_from("<QQ", reply, 8 + path_len), handle[1:3])
+        # A retransmit is answered from the cache, never applied twice.
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.assertEqual(
+            self.node_hold(b"node-a", b"e1", handle, b"w1", 3, *me), (0, reply)
+        )
+        self.assertIn("holds=0 ", self.ctl("status")[1])
+
+        # A new run sees who maps the region; the earlier run holds no more.
+        self.assertEqual(self.node_hold(b"node-a", b"e1", handle, b"w1", 4, *me)[0], 0)
+        self.assertEqual(self.node_hold(b"node-a", b"e1", handle, b"w2", 5)[0], 0)
+        status, _, _, regions = self.node_claim(b"node-a", b"e2", 6)
+        self.assertEqual(status, 0)
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        self.assertEqual(
+            sorted(regions[0][4]),
+            [
+                ("w1", "e1", socket.gethostname(), boot, *me, ns),
+                ("w2", "e1", socket.gethostname(), boot, 2147483647, 1, ns),
+            ],
+        )
+        status = self.node_hold(b"node-a", b"e1", handle, b"w3", 7)[0]
+        self.assertEqual(status, -errno.ESTALE)
+
+        # Freed while held: out of use until the reaper drops w2 (gone) and
+        # w1 unholds.
+        free = HANDLE.pack(*handle)
+        self.assertEqual(self.node_status(21, b"node-a", b"e2", 8, free), 0)
+        deadline = time.monotonic() + START_S
+        while "w2[" in self.ctl("allocations")[1]:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.2)
+        self.assertIn("hold of w2 dropped", self.log.read_text())
+        self.check_stats({"/dev/dax0.0": 1})
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.assertEqual(self.unhold(handle, b"w1", b"w1"), 0)
+        self.check_stats()
+        self.stop()
+
+    def test_node_lease_expires(self):
+        self.start(node_lease=1)
+        status, _, lease_ms, _ = self.node_claim(b"node-a", b"e1", 1)
+        self.assertEqual((status, lease_ms), (0, 1000))
+        self.node_alloc(b"node-a", b"e1", 2)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), 0)
+        self.check_stats({"/dev/dax0.0": 1})
+        deadline = time.monotonic() + START_S
+        while self.stats()["/dev/dax0.0"][2] != SIZE - ALIGN:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.assertIn("did not renew", self.log.read_text())
+        # A resend of the renewal is not replayed once the lease ran out.
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 3), -errno.EKEYEXPIRED)
+        self.assertEqual(self.node_status(23, b"node-a", b"e1", 4), -errno.EKEYEXPIRED)
         self.stop()
 
     def test_second_instance_is_refused(self):

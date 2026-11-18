@@ -138,6 +138,186 @@ ResetHoldsResp RequestHandler::handleResetHolds(const std::string &holder,
     return resp;
 }
 
+static void appendBytes(std::vector<uint8_t> &buf, const void *data, size_t size) {
+    const auto *p = static_cast<const uint8_t *>(data);
+    buf.insert(buf.end(), p, p + size);
+}
+
+static void appendText(std::vector<uint8_t> &buf, const std::string &text) {
+    appendBytes(buf, text.data(), text.size());
+}
+
+static std::string hostOf(const std::string &clientId) {
+    const size_t colon = clientId.rfind(':');
+    return colon == std::string::npos ? "" : clientId.substr(0, colon);
+}
+
+// NodeRegionInfo entries, each with its path, UUID and holders.
+static void appendRegions(std::vector<uint8_t> &buf,
+                          const std::vector<PoolManager::NodeRegion> &regions) {
+    for (const auto &r : regions) {
+        NodeRegionInfo info{};
+        info.handle = r.handle;
+        info.requestedSize = r.requestedSize;
+        info.pathLen = static_cast<uint32_t>(r.devPath.size());
+        info.uuidLen = static_cast<uint32_t>(r.deviceUuid.size());
+        info.numHolders = static_cast<uint32_t>(r.holders.size());
+        appendBytes(buf, &info, sizeof(info));
+        appendText(buf, r.devPath);
+        appendText(buf, r.deviceUuid);
+        for (const auto &[holder, hold] : r.holders) {
+            NodeHolderInfo h{};
+            h.holderLen = static_cast<uint32_t>(holder.size());
+            h.epochLen = static_cast<uint32_t>(hold.nodeEpoch.size());
+            h.hostLen = static_cast<uint32_t>(hold.host.size());
+            h.bootIdLen = static_cast<uint32_t>(hold.bootId.size());
+            h.pid = hold.pid;
+            h.pidStart = hold.pidStart;
+            h.pidNs = hold.pidNs;
+            appendBytes(buf, &h, sizeof(h));
+            appendText(buf, holder);
+            appendText(buf, hold.nodeEpoch);
+            appendText(buf, hold.host);
+            appendText(buf, hold.bootId);
+        }
+    }
+}
+
+std::vector<uint8_t> RequestHandler::handleNodeClaim(const std::string &nodeId,
+                                                     const std::string &epoch,
+                                                     const std::string &clientId) {
+    std::vector<PoolManager::NodeRegion> regions;
+    NodeClaimResp resp{};
+    resp.status = pm_.nodeClaim(nodeId, epoch, hostOf(clientId), regions);
+    const std::string rmId = resp.status == 0 ? pm_.rmId() : "";
+    resp.rmIdLen = static_cast<uint32_t>(rmId.size());
+    resp.leaseMs = pm_.nodeLeaseMs();
+    resp.numRegions = static_cast<uint32_t>(regions.size());
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_CLAIM] node=%s epoch=%s client=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), clientId.c_str(), resp.status);
+    }
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    appendBytes(buf, rmId.data(), rmId.size());
+    appendRegions(buf, regions);
+    return buf;
+}
+
+int RequestHandler::nodeRunStatus(const std::string &nodeId, const std::string &epoch) {
+    return pm_.nodeRunStatus(nodeId, epoch);
+}
+
+std::vector<uint8_t> RequestHandler::refuseNodeClaim() {
+    NodeClaimResp resp{};
+    resp.status = -ESTALE;
+    resp.leaseMs = pm_.nodeLeaseMs();
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    return buf;
+}
+
+std::vector<uint8_t> RequestHandler::handleNodeHolds(const std::string &nodeId,
+                                                     const std::string &epoch) {
+    std::vector<PoolManager::NodeRegion> regions;
+    NodeHoldsResp resp{};
+    resp.status = pm_.nodeHolds(nodeId, epoch, regions);
+    resp.numRegions = static_cast<uint32_t>(regions.size());
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_HOLDS] node=%s epoch=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), resp.status);
+    }
+    std::vector<uint8_t> buf;
+    appendBytes(buf, &resp, sizeof(resp));
+    appendRegions(buf, regions);
+    return buf;
+}
+
+GetAccessResult RequestHandler::handleNodeHold(const NodeHoldReq &req, const std::string &nodeId,
+                                               const std::string &epoch,
+                                               const std::string &holder,
+                                               const std::string &bootId,
+                                               const std::string &clientId) {
+    GetAccessResult result;
+    HoldRecord who;
+    who.nodeEpoch = epoch;
+    who.host = hostOf(clientId);
+    who.bootId = bootId;
+    who.pid = req.pid;
+    who.pidStart = req.pidStart;
+    who.pidNs = req.pidNs;
+    std::string path;
+    result.status = pm_.nodeHold(req.handle, nodeId, holder, who, path);
+    if (result.status == 0) {
+        result.devicePath = path;
+        result.deviceUuid = pm_.getDeviceUuidForRegion(req.handle.regionId);
+        result.offset = req.handle.offset;
+        result.length = req.handle.length;
+    } else {
+        logf(LogLevel::Warn, "[NODE_HOLD] node=%s region_id=%llu holder=%s -> FAILED (status=%d)",
+             nodeId.c_str(), (unsigned long long)req.handle.regionId, holder.c_str(),
+             result.status);
+    }
+    return result;
+}
+
+AllocResult RequestHandler::handleNodeAlloc(const NodeAllocReq &req, const std::string &nodeId,
+                                            const std::string &epoch,
+                                            const std::string &daxPath) {
+    AllocResult result;
+    PoolManager::NodeRegion region{};
+    result.resp.status = pm_.nodeAlloc(nodeId, epoch, req.size, daxPath, region);
+    result.resp.accessType = static_cast<uint32_t>(AccessType::LOCAL);
+    if (result.resp.status == 0) {
+        result.resp.handle = region.handle;
+        result.resp.requestedSize = region.requestedSize;
+        result.devicePath = region.devPath;
+        result.deviceUuid = region.deviceUuid;
+        logf(LogLevel::Debug, "[NODE_ALLOC] node=%s size=%llu pool=%s -> region_id=%llu",
+             nodeId.c_str(), (unsigned long long)req.size, daxPath.c_str(),
+             (unsigned long long)region.handle.regionId);
+    } else {
+        logf(LogLevel::Warn, "[NODE_ALLOC] node=%s size=%llu pool=%s -> FAILED (status=%d)",
+             nodeId.c_str(), (unsigned long long)req.size, daxPath.c_str(),
+             result.resp.status);
+    }
+    return result;
+}
+
+FreeResp RequestHandler::handleNodeFree(const NodeFreeReq &req, const std::string &nodeId,
+                                        const std::string &epoch) {
+    FreeResp resp{};
+    resp.status = pm_.nodeFree(req.handle, nodeId, epoch);
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_FREE] node=%s region_id=%llu -> FAILED (status=%d)",
+             nodeId.c_str(), (unsigned long long)req.handle.regionId, resp.status);
+    }
+    return resp;
+}
+
+NodeRenewResp RequestHandler::handleNodeRenew(const std::string &nodeId,
+                                              const std::string &epoch) {
+    NodeRenewResp resp{};
+    resp.status = pm_.nodeRenew(nodeId, epoch);
+    resp.leaseMs = pm_.nodeLeaseMs();
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_RENEW] node=%s epoch=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), resp.status);
+    }
+    return resp;
+}
+
+NodeReleaseResp RequestHandler::handleNodeRelease(const std::string &nodeId,
+                                                  const std::string &epoch) {
+    NodeReleaseResp resp{};
+    resp.status = pm_.nodeRelease(nodeId, epoch, resp.released);
+    if (resp.status != 0) {
+        logf(LogLevel::Warn, "[NODE_RELEASE] node=%s epoch=%s -> FAILED (status=%d)",
+             nodeId.c_str(), epoch.c_str(), resp.status);
+    }
+    return resp;
+}
+
 StatsResult RequestHandler::handleStats() {
     StatsResult result;
 
