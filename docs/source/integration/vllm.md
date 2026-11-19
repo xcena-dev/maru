@@ -468,6 +468,13 @@ in flight.
 the first token of the current step is not delayed by the GPU→CXL copy and
 the metadata registration.
 
+With speculative decoding, a model with one KV cache group stores after the
+drafter runs instead of on the last attention layer, because a drafter's own
+KV cache layers, such as DSpark's on Qwen3, need not call the connector's
+per-layer hook; each chunk then holds the draft layers too. The layerwise
+format still stores layer by layer, so such a model gets no hits in it: use
+the chunkwise format.
+
 `maru_load_admission_window` bounds how many asynchronous loads may be in
 flight at once. The default `0` submits every load immediately. Set a
 positive value only if you need request-level backpressure.
