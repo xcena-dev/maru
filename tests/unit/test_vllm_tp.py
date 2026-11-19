@@ -430,6 +430,21 @@ def test_worker_takes_mla_from_the_model_config():
     assert not gqa._worker._use_mla and gqa._worker._kv_planes == 2
 
 
+def test_worker_stores_after_the_forward_with_a_drafter():
+    """A drafter's KV cache layers need not call save_kv_layer (DSpark)."""
+    plain = MaruKVConnector(fake_vllm_config(1, 8), KVConnectorRole.WORKER)
+    assert not plain._worker.stores_after_forward
+    config = fake_vllm_config(1, 8)
+    config.speculative_config = SimpleNamespace(method="dspark")
+    spec = MaruKVConnector(config, KVConnectorRole.WORKER)
+    assert spec._worker.stores_after_forward
+    layerwise = fake_vllm_config(1, 8, extra={"maru_use_layerwise": True})
+    layerwise.speculative_config = SimpleNamespace(method="dspark")
+    assert not MaruKVConnector(
+        layerwise, KVConnectorRole.WORKER
+    )._worker.stores_after_forward
+
+
 def test_worker_names_its_slice_and_scopes_its_instance_id(monkeypatch):
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
     connector = MaruKVConnector(fake_vllm_config(2, 8), KVConnectorRole.WORKER)

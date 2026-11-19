@@ -1994,6 +1994,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
                 dp_rank=_dp_index(vllm_config),
+                store_after_forward=vllm_config.speculative_config is not None,
             )
 
     @property
@@ -2081,13 +2082,14 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
 
     def wait_for_save(self):
         # A single-group model's synchronous stores complete inside
-        # save_kv_layer. Write-behind stores intentionally outlive this
-        # forward; request/block lifetime is tracked through
+        # save_kv_layer, unless a drafter runs (MaruWorkerConnector.
+        # stores_after_forward). Write-behind stores intentionally outlive
+        # this forward; request/block lifetime is tracked through
         # request_finished() + get_finished(). Several groups store here,
         # after the forward has written every group's KV and state.
-        if len(self._kv_groups) <= 1:
-            return
         assert self._worker is not None
+        if len(self._kv_groups) <= 1 and not self._worker.stores_after_forward:
+            return
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, MaruConnectorMetadata)
         self._worker.wait_for_save(metadata)
@@ -3648,6 +3650,9 @@ class MaruWorkerConnector:
     _state_shard: KVShard = WHOLE_MODEL
     _use_mla = False
     _kv_planes = 2
+    # A single-group chunkwise model stores from save_kv_layer unless a
+    # drafter runs (stores_after_forward).
+    _store_after_forward = False
 
     def __init__(
         self,
@@ -3663,6 +3668,7 @@ class MaruWorkerConnector:
         use_mla: bool = False,
         num_blocks: int | None = None,
         dp_rank: int = 0,
+        store_after_forward: bool = False,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -3825,6 +3831,14 @@ class MaruWorkerConnector:
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
         # objects. The overlap path below works under either format.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
+        # With speculative decoding a single-group chunkwise model stores in
+        # wait_for_save, which vLLM calls after the drafter: a drafter's own
+        # KV cache layers (DSpark's, for one) are registered beside the
+        # target's but need not call save_kv_layer, so a store waiting there
+        # for every registered layer would never run.
+        self._store_after_forward = (
+            store_after_forward and not self._multi_group and not self._use_layerwise
+        )
         async_load = bool(_get_knob(extra_config, "maru_async_load"))
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
@@ -7242,6 +7256,9 @@ class MaruWorkerConnector:
             # key. Skipping here queues nothing, so get_finished_saving still
             # reports this rank's finished requests at once.
             return
+        if self._store_after_forward:
+            # wait_for_save stores every registered layer, the drafter's too.
+            return
 
         if not self._use_layerwise:
             self._save_kv_layer_packed(layer_name, kv_layer, attn_metadata, metadata)
@@ -7525,8 +7542,15 @@ class MaruWorkerConnector:
         (``_gather_packed_slabs``). On remote_cxl with ``maru_async_store``
         that ``batch_store``, which writes the staged objects by RDMA, runs
         on the write-behind thread (``_register_objects_behind``).
+
+        A single-group model stores here only with a drafter
+        (``stores_after_forward``; see ``_store_single_group_after_forward``).
         """
-        if not self._multi_group or not self._group_caches:
+        if not self._multi_group:
+            if self._store_after_forward:
+                self._store_single_group_after_forward(metadata)
+            return
+        if not self._group_caches:
             return
         if not self._store_entries(metadata):
             return
@@ -7568,6 +7592,46 @@ class MaruWorkerConnector:
         else:
             self._register_objects(keys, handles, "group")
         self._register_done_markers(markers)
+
+    @property
+    def stores_after_forward(self) -> bool:
+        """Whether this single-group model stores in ``wait_for_save``."""
+        return self._store_after_forward
+
+    def _store_single_group_after_forward(
+        self, metadata: MaruConnectorMetadata
+    ) -> None:
+        """Store a single-group model's chunks after the forward and the drafter.
+
+        A speculative decoding drafter with its own KV cache layers, such as
+        DSpark's on Qwen3, registers them beside the target's, but vLLM calls
+        ``save_kv_layer`` only from layers on its attention hook path, which
+        the drafter's need not be: the store, which waits for every
+        registered layer, then never runs. vLLM calls ``wait_for_save``
+        after the drafter, so every layer's KV of the step is in the paged
+        buffers here, and each chunk is stored whole, as from the last
+        ``save_kv_layer`` call.
+        """
+        if not self._stores() or not self._store_entries(metadata):
+            return
+        self._ensure_handler()
+        if self._handler is None:
+            return
+        attn_metadata = self._last_attn_metadata
+        kernel = self._packed_store_kernel_ctx(attn_metadata)
+        if kernel is None:
+            # The per-layer fallback fills each chunk's slab layer by layer.
+            for layer_name, kv_layer in self._kv_caches.items():
+                self._save_kv_layer_packed(
+                    layer_name, kv_layer, attn_metadata, metadata
+                )
+        elif self._write_behind:
+            # Launched now rather than queued for get_finished_saving, which
+            # vLLM may already have called this step: it reserves the keys
+            # before the request can be reported finished.
+            self._store_packed_slabs_write_behind(kernel, metadata)
+        else:
+            self._store_packed_slabs(kernel, metadata)
 
     def _register_done_markers(self, markers: dict[str, list[str]]) -> None:
         """Register the ``_DONE`` marker of each chunk whose layers are stored.

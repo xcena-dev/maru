@@ -4265,11 +4265,14 @@ class TestPackedStorage:
     NUM_LAYERS = 3
     PROMPT = 16  # 2 chunks
 
-    def _make_worker(self):
+    def _make_worker(self, store_after_forward: bool = False):
         from maru_vllm.connector import MaruWorkerConnector
 
         worker = MaruWorkerConnector(
-            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={},
+            store_after_forward=store_after_forward,
         )
         assert worker._use_layerwise is False  # default
         worker._num_layers = self.NUM_LAYERS
@@ -4538,6 +4541,103 @@ class TestPackedStorage:
             kernel, metadata
         )
         assert worker._queued_store_batches == []
+
+    def _store_meta(self):
+        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+
+        return MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=list(range(self.PROMPT)),
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+
+    def test_a_drafters_layers_are_stored_after_the_forward(self):
+        """A drafter's KV cache layer that never calls save_kv_layer (DSpark)
+        still lands in each chunk's slab, stored from wait_for_save."""
+        from maru_vllm.connector import _chunk_keys
+
+        worker, store = self._make_worker(store_after_forward=True)
+        kv_layers = self._kv_layers()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        worker._packed_store_kernel_ctx = lambda attn: None  # per-layer fallback
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        # The target's layers call save_kv_layer; the last, the drafter's, not.
+        for name, kv in zip(names[:-1], kv_layers[:-1], strict=True):
+            worker.save_kv_layer(name, kv, attn, meta)
+        assert store == {}
+
+        worker.wait_for_save(meta)
+
+        chunk_keys = _chunk_keys(list(range(self.PROMPT)), self.CHUNK)
+        assert set(store) == set(chunk_keys)
+        assert worker._pending_slabs == {}
+        slots = worker._build_slot_mapping([0, 1, 2, 3], self.PROMPT)
+        for ci, key in enumerate(chunk_keys):
+            slab = torch.frombuffer(bytearray(store[key]), dtype=torch.float32)
+            slab = slab.view(2, self.NUM_LAYERS, self.CHUNK, 1)
+            chunk_slots = slots[ci * self.CHUNK : (ci + 1) * self.CHUNK]
+            for li, kv in enumerate(kv_layers):
+                expected = kv.reshape(2, -1, 1)[:, chunk_slots]
+                assert torch.equal(slab[:, li], expected), f"chunk {ci} layer {li}"
+
+    @pytest.mark.parametrize("write_behind", [False, True])
+    def test_a_drafters_kernel_store_runs_once_after_the_forward(self, write_behind):
+        """Nothing is stored or queued from save_kv_layer; wait_for_save
+        stores the step once, a write-behind store launched at once."""
+        worker, _ = self._make_worker(store_after_forward=True)
+        worker._write_behind = write_behind
+        kernel = ("ops",) * 6
+        worker._packed_store_kernel_ctx = lambda attn: kernel
+        worker._store_packed_slabs = MagicMock()
+        worker._store_packed_slabs_write_behind = MagicMock()
+        attn = self._flash_attn()
+        meta = self._store_meta()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+
+        for name, kv in zip(names, self._kv_layers(), strict=True):
+            worker.save_kv_layer(name, kv, attn, meta)
+        worker._store_packed_slabs.assert_not_called()
+        worker._store_packed_slabs_write_behind.assert_not_called()
+        assert worker._queued_store_batches == []
+
+        worker.wait_for_save(meta)
+
+        used, unused = (
+            worker._store_packed_slabs_write_behind,
+            worker._store_packed_slabs,
+        )
+        if not write_behind:
+            used, unused = unused, used
+        used.assert_called_once_with(kernel, meta)
+        unused.assert_not_called()
+
+    def test_without_a_drafter_wait_for_save_stores_nothing(self):
+        """A single-group model stores from save_kv_layer, as before."""
+        worker, store = self._make_worker()
+        assert not worker.stores_after_forward
+        worker._packed_store_kernel_ctx = lambda attn: None
+        worker._kv_caches = dict(
+            zip(
+                [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)],
+                self._kv_layers(),
+                strict=True,
+            )
+        )
+
+        worker.wait_for_save(self._store_meta())
+
+        assert store == {}
+        worker._handler.alloc.assert_not_called()
 
     def test_kernel_ctx_caching_contract(self):
         """_packed_store_kernel_ctx resolves once and caches the outcome:
