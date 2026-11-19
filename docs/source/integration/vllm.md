@@ -876,6 +876,12 @@ With several groups every load is parked, and Maru reports a failed parked load 
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
+A CUDA error from a GPU copy of a load or a store, or from waiting on or querying its stream or event, stops the worker: such a copy may still be running, and vLLM would reuse the blocks it writes or reads. The next connector call vLLM makes raises, and vLLM fails the engine. The load is not reported as failed. Every other error, such as running out of GPU memory, a rejected cache layout or a miss, is handled as above: the load is reported and recomputed, and a store skips the chunk.
+
+A load that fails after some of its copies were queued is reported only once those copies are known to have ended, on every backend. Until then vLLM gets neither its failed blocks nor its completion.
+
+Once the worker stops it reads, copies, stores and hints nothing more, also at shutdown, and gives nothing back: it frees, releases and closes nothing a copy may still use, even if a later wait succeeds. For a load that is its CXL views or storage-session read leases (on `remote_cxl`, staging slots) and its device buffers; for a store, its pages, the device staging and the requests' GPU blocks, so a write-behind store's requests never finish. The Handler stays open. All of it stays held until the process ends. A synchronous store whose copies cannot be confirmed registers none of their objects and raises in that step, and so does a preemption while store copies may still read the preempted request's blocks. To recover, restart the whole vLLM engine and confirm its old worker processes have exited, as after persistent RDMA transfer errors.
+
 (vllm-hybrid-one-group)=
 ### Running a hybrid model as one group
 
