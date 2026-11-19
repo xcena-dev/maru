@@ -39,6 +39,11 @@ from .storage.cpu import CpuAllocation, CpuReadLease
 
 logger = logging.getLogger(__name__)
 
+#: The one hint target of the cxl backend: this process's hint plugins.
+_LOCAL_HINTS = "handler-plugins"
+#: Seconds close() lets the queued hints of the cxl backend go out.
+_LOCAL_HINT_CLOSE_S = 5.0
+
 
 class MaruHandler:
     """Main interface for Maru shared memory KV cache operations.
@@ -127,6 +132,32 @@ class MaruHandler:
         # unless a package registers a `maru.handler_plugins` entry point;
         # loading is soft-fail so a broken plugin never blocks construction.
         self._plugins = load_handler_plugins()
+
+        # Memory hints of the cxl backend: the read hints, ends and promotes
+        # remote_cxl sends to remote CXL agents go, in the same form, to the
+        # plugins that take them (MaruHandlerPlugin.on_memory_hint), on one
+        # hint thread. None unless the config asks and a plugin takes them.
+        self._local_hints = None
+        self._hint_plugins = [
+            p
+            for p in self._plugins
+            if callable(getattr(p, "on_memory_hint", None))
+            and getattr(p, "hint_actions", ())
+        ]
+        if self._config.storage_backend == "cxl" and (
+            self._config.read_hints or self._config.read_promotes
+        ):
+            if self._hint_plugins:
+                from .hints import MemoryHints
+
+                self._local_hints = MemoryHints(
+                    self._local_hint_locate, self._local_hint_send
+                )
+            else:
+                logger.warning(
+                    "read hints are on, but no handler plugin takes them; "
+                    "no read hints are sent"
+                )
 
         logger.debug("Created MaruHandler with config: %s", self._config)
 
@@ -440,12 +471,29 @@ class MaruHandler:
         CXL can hand regions with keys to the server's keeper, and uncertain
         native transfers can retain staging until cleanup is confirmed.
         """
+        if self._local_hints is not None:
+            # The hints already queued go out first, then the end of every
+            # request still open: a hint plugin keeps no connection whose
+            # close would end them. Plugins hear no hint after on_close:
+            # past the timeout the rest is dropped, and close waits for the
+            # callback under way before it goes on.
+            if not self._local_hints.close(_LOCAL_HINT_CLOSE_S, end_open=True):
+                logger.warning(
+                    "memory hints still queued at close are dropped; waiting "
+                    "for the handler plugin call under way"
+                )
+                self._local_hints.abandon()
         if self._cpu is not None:
             self._cpu.close()
             self._connected = False
             return
         if self._config.metadata_only:
             if self._connected:
+                # A scheduler's handler maps no region, but its plugins may
+                # hold state for the hints they took: let them release it
+                # while the RPC connection is live, as a data handler does.
+                if self._plugins:
+                    self._dispatch_plugins("on_close", self)
                 self._rpc.close()
             self._connected = False
             return
@@ -1290,6 +1338,8 @@ class MaruHandler:
 
     def read_hints_enabled(self) -> bool:
         """Whether storage sends read hints (:meth:`hint_read` does anything)."""
+        if self._local_hints is not None:
+            return bool(self._config.read_hints)
         return bool(getattr(self._cpu, "read_hints_enabled", False))
 
     def hint_read(
@@ -1304,10 +1354,15 @@ class MaruHandler:
 
         Args:
             request_id: The serving engine's request id.
-            keys: Chunk keys the request's load will read, in order.
+            keys: Keys of the stored objects the request's load will read
+                (with any TP slice or layer suffix), in order.
             route_key: The request's first chunk key (picks the pool, as in
                 :meth:`batch_exists`).
         """
+        if self._local_hints is not None:
+            if self._config.read_hints:
+                self._local_hints.hint(request_id, keys)
+            return
         hint = getattr(self._cpu, "hint_read", None)
         if hint is not None:
             hint(request_id, keys, route_key=route_key)
@@ -1324,15 +1379,68 @@ class MaruHandler:
             request_id: The serving engine's request id, as hinted.
             route_key: The request's first chunk key (picks the pool).
         """
+        if self._local_hints is not None:
+            if self._config.read_promotes:
+                self._local_hints.promote(request_id, [_LOCAL_HINTS])
+            return
         promote = getattr(self._cpu, "promote_read", None)
         if promote is not None:
             promote(request_id, route_key=route_key)
 
     def end_read_hint(self, request_id: str) -> None:
         """``request_id`` ended; storage may drop what it prepared for it."""
+        if self._local_hints is not None:
+            if self._config.read_hints:
+                self._local_hints.end(request_id)
+            return
         end = getattr(self._cpu, "end_read_hint", None)
         if end is not None:
             end(request_id)
+
+    def _local_hint_locate(self, keys: list[str]) -> list[tuple[str, list[dict]]]:
+        """The leading hit keys' bytes as hint ranges (cxl backend, on the
+        hint thread); one group, empty if the first key misses.
+
+        The RPC client serializes its calls, so this lookup is safe beside
+        the caller's own.
+        """
+        if not self._connected or self._closing.is_set():
+            return []
+        resp = self._rpc.batch_lookup_kv(keys)
+        ranges: list[dict] = []
+        for entry in resp.entries:
+            if not entry.found or entry.handle is None:
+                break  # the load reads the leading hits only
+            handle = entry.handle
+            ranges.append(
+                {
+                    "handle": {
+                        "region_id": handle.region_id,
+                        "offset": handle.offset,
+                        "length": handle.length,
+                    },
+                    "offset": entry.kv_offset,
+                    "length": entry.kv_length,
+                }
+            )
+        return [(_LOCAL_HINTS, ranges)] if ranges else []
+
+    def _local_hint_send(self, _target: str, message: dict) -> bool:
+        """Give one hint message to the plugins that take its action (cxl
+        backend, on the hint thread); False if none does."""
+        took = False
+        for plugin in self._hint_plugins:
+            if message["action"] not in plugin.hint_actions:
+                continue
+            took = True
+            try:
+                plugin.on_memory_hint(self, message)
+            except Exception:
+                logger.exception(
+                    "handler plugin %s hook on_memory_hint failed",
+                    type(plugin).__name__,
+                )
+        return took
 
     def batch_pin(self, keys: list[str]) -> list[bool]:
         """Check existence and pin multiple keys in a single RPC call.

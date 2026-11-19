@@ -100,6 +100,10 @@ class MemoryHints:
         self._pending = 0
         self._dropped = 0
         self._closed = False
+        # Set by abandon(): the thread drops what is still queued
+        self._discard = threading.Event()
+        # The thread close() stopped waiting for (abandon() joins it)
+        self._closing_thread: threading.Thread | None = None
         # Agents each hinted request reached, for its end, oldest first
         # (hint thread only)
         self._agents: OrderedDict[str, list[str]] = OrderedDict()
@@ -139,9 +143,17 @@ class MemoryHints:
         if request_id:
             self._put(("end", request_id, []))
 
-    def close(self, timeout_s: float = 5.0) -> bool:
+    def close(self, timeout_s: float = 5.0, *, end_open: bool = False) -> bool:
         """Stop the thread after the hints already queued; hints after this
         are ignored.
+
+        Args:
+            timeout_s: How long to wait for the thread.
+            end_open: Also send ``read_hint_end`` for every request still
+                open, after the queued hints, so a target that keeps state
+                per request can drop it. A target that ends a closed
+                connection's requests itself (a remote CXL agent) does not
+                need it.
 
         Returns:
             True if the thread ended (or never started) within
@@ -152,12 +164,35 @@ class MemoryHints:
             thread, self._thread = self._thread, None
         if thread is None:
             return True
+        if end_open:
+            self._queue.put(("end_open", "", []))
         self._queue.put(None)
         thread.join(timeout=timeout_s)
         if thread.is_alive():
             logger.warning("read hint thread still busy after %.0f s", timeout_s)
+            with self._lock:
+                self._closing_thread = thread
             return False
         return True
+
+    def abandon(self, timeout_s: float | None = None) -> bool:
+        """After a :meth:`close` that timed out: drop the messages still
+        queued and wait for the thread, so the call under way (a ``locate``
+        or a ``send``) is the last one.
+
+        Args:
+            timeout_s: How long to wait; None waits until that call returns.
+
+        Returns:
+            True if the thread has ended (or there is none).
+        """
+        self._discard.set()
+        with self._lock:
+            thread = self._closing_thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout_s)
+        return not thread.is_alive()
 
     def _queue_hint(self, item: tuple[str, str, list]) -> None:
         with self._lock:
@@ -196,9 +231,11 @@ class MemoryHints:
             if item is None:
                 return
             kind, request_id, payload = item
-            if kind != "end":
+            if kind not in ("end", "end_open"):
                 with self._lock:
                     self._pending -= 1
+            if self._discard.is_set():
+                continue  # abandoned at close: nothing more goes out
             try:
                 if kind == "hint":
                     self._give(request_id, self._locate(payload))
@@ -210,6 +247,9 @@ class MemoryHints:
                     self._send_all(
                         "read_promote", request_id, [(a, []) for a in payload]
                     )
+                elif kind == "end_open":
+                    for open_request in list(self._agents):
+                        self._finish(open_request)
                 else:
                     self._finish(request_id)
             except Exception:

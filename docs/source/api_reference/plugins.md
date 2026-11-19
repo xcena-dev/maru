@@ -44,7 +44,8 @@ exception raised inside one is logged and swallowed.
 |------|--------------|---------|
 | `on_init(handler)` | end of `MaruHandler.__init__` (not yet connected — `mapper` is `None`) | cheap setup only |
 | `on_batch_retrieve(handler, keys, batch_resp)` | legacy `cxl` batch path, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
-| `on_close(handler)` | connected legacy `cxl` close, while regions are mapped and RPC is live | release resources tied to mapped memory |
+| `on_close(handler)` | connected legacy `cxl` close, while regions are mapped and RPC is live (a metadata-only handler maps none) | release resources tied to mapped memory or to hinted requests |
+| `on_memory_hint(handler, message)` | on the handler's hint thread, for each read hint, read hint end and read promote of the `cxl` backend whose action the plugin's `hint_actions` names | prepare the bytes a load will read before it starts |
 | `contribute_stats() -> dict \| None` | during `get_stats` | returns a dict merged under `stats["plugins"][<PluginClassName>]` |
 
 In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A
@@ -52,18 +53,42 @@ found entry exposes a `handle` (region/offset) whose region is already mapped,
 so a plugin can act on real memory addresses.
 
 `cpu`, `mixed` and `remote_cxl` delegate retrieval and close to storage clients
-before these two DAX hooks. `on_init` still runs at construction and stats
+before the DAX hooks `on_batch_retrieve` and `on_close`. `on_init` still runs at construction and stats
 contributions can run in `get_stats`; keep initialization cheap and do not
 assume that a DAX close callback will follow for every backend. In particular,
 a remote CXL staging buffer is not the worker's mapping of the memory node's
 DAX device. Device hints on that remote CXL range need an integration on the
 memory node; this plugin API does not provide one automatically.
 
+### Memory hints of the `cxl` backend
+
+With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM
+connector) or `read_promotes` (a vLLM worker's handler with
+`maru_async_load`), a handler of the `cxl` backend gives the plugins the hint
+messages that the `remote_cxl` backend sends to a remote CXL agent's region
+extension ({doc}`../design_doc/read_hints`), in the same form:
+
+| `message["action"]` | Sent when | `message["ranges"]` |
+|------|------|------|
+| `read_hint` | the scheduler expects the request to load soon (on arrival, or at its first lookup) | the bytes of the leading stored objects the workers will load (every TP slice and, in layerwise format, every layer of a chunk), chunk by chunk: `{"handle": {"region_id", "offset", "length"}, "offset", "length"}`; the bytes are at `handle["offset"] + offset` in the DAX device |
+| `read_hint_end` | the load ended, or the request finished first | empty |
+| `read_promote` | the worker starts the load of a request its scheduler hinted | empty |
+
+`message["request"]` is vLLM's request id; the worker's promote names the id
+the scheduler hinted. A plugin takes hints by naming their actions in a class
+attribute `hint_actions` (for example `("read_hint", "read_hint_end",
+"read_promote")`) and implementing `on_memory_hint`. The hook runs on one
+background thread in the order the hints were given; it never delays a load,
+and a slow hook only delays the next hints. When the handler closes, every
+request it hinted and did not end gets its `read_hint_end`, and then
+`on_close` runs, on a scheduler's metadata-only handler too. Write hints stay
+with the `remote_cxl` backend.
+
 ## Stable accessor surface
 
 ```{admonition} Contract — do not break without deprecation
 :class: warning
-The following `MaruHandler` methods, together with the four hook signatures
+The following `MaruHandler` methods, together with the hook signatures
 above, are the **public, stable plugin API**. Plugins live in separate
 packages on independent release cycles, so renaming, removing, or changing the
 behaviour of any of these is a breaking change for every plugin in the field

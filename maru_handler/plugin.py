@@ -129,11 +129,53 @@ class MaruHandlerPlugin(Protocol):
         so a plugin can safely release resources tied to mapped memory (e.g.
         unpin device ranges) here. Fires **only if the handler was connected** —
         a handler that is constructed but never connected does not invoke this
-        hook (see :meth:`on_init`).
+        hook (see :meth:`on_init`). A ``metadata_only`` handler (a vLLM
+        scheduler's) maps no region; it calls this hook before it closes its
+        RPC connection, after the ``read_hint_end`` of every request it hinted
+        and did not end (see :meth:`on_memory_hint`).
 
         Dispatched while holding the handler's write lock, so a slow or
         blocking implementation stalls ``close()`` and every concurrent writer:
         keep it cheap and non-blocking, same as the other hooks.
+        """
+        ...
+
+    #: Hint actions this plugin takes in :meth:`on_memory_hint` (for example
+    #: ``("read_hint", "read_hint_end", "read_promote")``). A plugin that
+    #: names none gets no hints.
+    hint_actions: tuple[str, ...] = ()
+
+    def on_memory_hint(self, handler: MaruHandler, message: dict) -> None:
+        """Take one memory hint of the ``cxl`` backend.
+
+        With ``read_hints`` or ``read_promotes`` on, a handler of the ``cxl``
+        backend gives its hints to the plugins whose :attr:`hint_actions` name
+        the hint's action. ``message`` has the form a remote CXL agent's
+        region extension gets (:mod:`maru_handler.hints`):
+
+        - ``action``: ``"read_hint"`` (``request`` will read ``ranges`` soon,
+          in this order), ``"read_hint_end"`` (``request`` ended; what was
+          prepared for it may go) or ``"read_promote"`` (the load of
+          ``request``, which another process hinted, starts now);
+        - ``request``: the serving engine's request id;
+        - ``ranges``: for ``read_hint``, the leading hit keys' bytes, each a
+          ``{"handle": {"region_id", "offset", "length"}, "offset",
+          "length"}`` map: ``length`` bytes at ``offset`` in the region whose
+          mmap offset in the DAX device is ``handle["offset"]``. Empty for
+          the other actions.
+
+        Called on the handler's hint thread, in the order the hints were
+        given, never on the caller's path. When the handler closes, every
+        request it hinted and did not end gets its ``read_hint_end`` before
+        :meth:`on_close`, and no hint comes after it. If the hints still
+        queued take longer than the close timeout (5 s), every message still
+        queued is dropped, ends included, and ``close`` waits without a time
+        limit for the hint thread's call under way (a metadata lookup or a
+        plugin call); :meth:`on_close` then stands for the ends of the
+        requests still open. A
+        hint is advice: the load reads every key either way. Keep it short;
+        a slow plugin delays the next hints and the handler's close, not the
+        loads.
         """
         ...
 
