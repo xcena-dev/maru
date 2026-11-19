@@ -2126,6 +2126,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         # forward; request/block lifetime is tracked through
         # request_finished() + get_finished(). Several groups store here,
         # after the forward has written every group's KV and state.
+        if self._worker is not None:
+            self._worker._raise_if_stopped()
         if len(self._kv_groups) <= 1:
             return
         assert self._worker is not None
@@ -3967,7 +3969,12 @@ class MaruWorkerConnector:
         # copies are queued but not yet handed to the poller, and the forward
         # traced in this step.
         self._trace_poller = (
-            _TracePoller(self._state_shard.part, self._state_shard.parts, dp_rank)
+            _TracePoller(
+                self._state_shard.part,
+                self._state_shard.parts,
+                dp_rank,
+                on_error=self._trace_error,
+            )
             if self._timing
             else None
         )
@@ -4256,7 +4263,12 @@ class MaruWorkerConnector:
             raise ValueError("slot mapping for H2D must be a CPU tensor")
         if slot_mapping.is_pinned():
             return slot_mapping
-        return slot_mapping.pin_memory()
+        try:
+            return slot_mapping.pin_memory()
+        except Exception as e:
+            # A host allocation before the caller's first copy: it fails as
+            # on main, without stopping the worker
+            raise MemoryError(f"could not pin a slot mapping: {e}") from e
 
     def start_load_kv(
         self,
@@ -4510,9 +4522,9 @@ class MaruWorkerConnector:
                 self._note_failed_inline_load(req_meta)
             return
 
-        self._load_sync(layers, inline, attn_metadata)
+        taken = self._load_sync(layers, inline, attn_metadata)
 
-        for req_meta, num_chunks, _, _ in inline:
+        for req_meta, num_chunks, _, _ in inline[:taken]:
             logger.info(
                 "Maru: batch-loaded %d layers x %d chunks (%d tokens) for req %s",
                 len(layers),
@@ -4553,7 +4565,7 @@ class MaruWorkerConnector:
             stream = self._load_stream
             # After vLLM's own pre-forward work on the compute stream, which
             # copies each Mamba state into the block the step ends in.
-            stream.wait_stream(torch.cuda.current_stream(device))
+            self._checked(stream.wait_stream, torch.cuda.current_stream(device))
             stream_ctx = torch.cuda.stream(stream)
         else:
             import contextlib
@@ -4633,7 +4645,7 @@ class MaruWorkerConnector:
         # blocks on the compute stream (copy-on-write copies of a partial
         # prefix hit, say), or that work would overwrite it.
         queued = torch.cuda.Event()
-        queued.record(torch.cuda.current_stream(device))
+        self._checked(queued.record, torch.cuda.current_stream(device))
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
         self._deferred_executor.submit(self._group_load_job, req_meta, device, queued)
@@ -5476,20 +5488,32 @@ class MaruWorkerConnector:
         wait_t0 = time.monotonic()
         waited = False
         while self._stopped is None:
-            try:
-                with self._deferred_lock:
-                    pending = [
-                        event
-                        for event in self._deferred_events.values()
-                        if not event.query()
-                    ]
-                if len(pending) < self._load_admission_window:
+            with self._deferred_lock:
+                pending: list[tuple[str, Any]] = []
+                try:
+                    for queued_id, event in self._deferred_events.items():
+                        if not event.query():
+                            pending.append((queued_id, event))
+                except Exception as e:
+                    # Stopped before the lock goes, so vLLM's poll cannot
+                    # report this load in between
+                    held = self._deferred_refs.get(queued_id)
+                    if not self._stop_if_unconfirmed(e, held, req_id=queued_id):
+                        raise
                     break
-                waited = True
-                pending[0].synchronize()
+            if len(pending) < self._load_admission_window:
+                break
+            waited = True
+            oldest_id, oldest = pending[0]
+            try:
+                oldest.synchronize()
             except Exception as e:
-                if not self._stop_if_unconfirmed(e):
-                    raise
+                # Unless vLLM's poll found its copies ended first: a query that
+                # succeeds means they ended, whichever thread asks
+                with self._deferred_lock:
+                    held = self._deferred_refs.get(oldest_id)
+                    if not self._stop_if_unconfirmed(e, held, req_id=oldest_id):
+                        raise
         wait_ms = (time.monotonic() - wait_t0) * 1000
         if self._timing and waited:
             _emit_timing(f"admission wait {wait_ms:.2f} ms (req {req_id})")
@@ -5771,6 +5795,9 @@ class MaruWorkerConnector:
             # storage format but cannot overlap because there is no common
             # CUDA stream.
             for req_meta, num_chunks, slot_mapping, infos in entries:
+                if self._kept_if_stopped(entries):
+                    return
+                refs: list[Any] = [infos, slot_mapping]  # what the copies use
                 try:
                     for layer_name, kv_cache_layer, true_idx in layers:
                         for ci in range(num_chunks):
@@ -5792,14 +5819,15 @@ class MaruWorkerConnector:
                             chunk_slots = slot_mapping[
                                 chunk_start : chunk_start + self._kv_chunk_tokens
                             ]
+                            src = layer_host.to(kv_cache_layer.device)
+                            slots = chunk_slots.to(kv_cache_layer.device)
+                            refs[2:] = [src, slots]
                             self._inject_kv_into_layer(
-                                kv_cache_layer,
-                                layer_host.to(kv_cache_layer.device),
-                                chunk_slots.to(kv_cache_layer.device),
-                                attn_metadata,
-                                layer_name,
+                                kv_cache_layer, src, slots, attn_metadata, layer_name
                             )
                 except Exception as e:
+                    if self._stop_if_unconfirmed(e, refs, req_id=req_meta.req_id):
+                        raise _UnconfirmedCopyError(self._stopped) from e
                     self._fail_load(req_meta, e)
                     self._unsound_kv_req_ids.add(req_meta.req_id)
             return
@@ -5808,7 +5836,7 @@ class MaruWorkerConnector:
             self._load_stream = torch.cuda.Stream(device=device, priority=-1)
             self._load_stream_device = device
         load_stream = self._load_stream
-        load_stream.wait_stream(torch.cuda.current_stream(device))
+        self._checked(load_stream.wait_stream, torch.cuda.current_stream(device))
         entries = [
             (
                 req_meta,
@@ -6360,6 +6388,14 @@ class MaruWorkerConnector:
         the worker's own state) and the worker are kept until the process
         exits, and every later connector call raises _UnconfirmedCopyError.
 
+        Every copy, kernel launch, event record or query and stream wait goes
+        through here: an except on its path, ``_checked`` where none
+        surrounds it, or ``_trace_error`` for timing events. Calls that queue
+        and wait for nothing need not: stream and event creation,
+        ``set_device``, ``current_stream``, and pinning a slot mapping (a host
+        allocation before the path's first copy, see
+        ``_pin_slot_mapping_for_async_h2d``).
+
         Returns:
             Whether the worker stopped; other errors are the caller's.
         """
@@ -6377,6 +6413,21 @@ class MaruWorkerConnector:
             self._stopped,
         )
         return True
+
+    def _checked(self, call: Callable[..., Any], *args: Any, held: Any = None) -> Any:
+        """``call(*args)``, a CUDA call that no classifying except surrounds;
+        a CUDA error stops the worker and keeps ``held``."""
+        try:
+            return call(*args)
+        except Exception as e:
+            if self._stop_if_unconfirmed(e, held):
+                raise _UnconfirmedCopyError(self._stopped) from e
+            raise
+
+    def _trace_error(self, error: Exception) -> None:
+        """An error a timing call dropped: a CUDA error stops the worker, as
+        the copies before the timing event are unconfirmed."""
+        self._stop_if_unconfirmed(error)
 
     def _kept_if_stopped(self, *objects: Any) -> bool:
         """Gate of everything that gives something back: pages, read leases,
@@ -6658,9 +6709,13 @@ class MaruWorkerConnector:
         """
         self._raise_if_stopped()
         with self._deferred_lock:
+            # Also a stop made while this thread waited for the lock
+            self._raise_if_stopped()
             done = set(self._deferred_done)
             self._deferred_done.clear()
             for req_id, event in list(self._deferred_events.items()):
+                # A query that succeeds means the copies ended, whichever
+                # thread asks: what they used can go
                 if self._copies_ended(event, req_id):
                     done.add(req_id)
                     del self._deferred_events[req_id]
@@ -6894,16 +6949,21 @@ class MaruWorkerConnector:
         layers: list[tuple[str, torch.Tensor, int]],
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]],
         attn_metadata: AttentionMetadata,
-    ) -> None:
+    ) -> int:
         """Inject prepared CXL chunks synchronously on the current stream.
+
+        Returns:
+            How many of the requests it took: the rest once the worker stops.
 
         Raises:
             _UnconfirmedCopyError: A copy raised a CUDA error; the worker
                 stopped.
         """
-        for req_meta, num_chunks, slot_mapping, infos in prepared_requests:
+        for n, (req_meta, num_chunks, slot_mapping, infos) in enumerate(
+            prepared_requests
+        ):
             if self._stopped is not None:
-                return
+                return n
             refs: list[Any] = [infos]  # what the queued copies use
             try:
                 for li, (layer_name, kv_cache_layer, _) in enumerate(layers):
@@ -6927,6 +6987,7 @@ class MaruWorkerConnector:
                 if self._stop_if_unconfirmed(e, refs, req_id=req_meta.req_id):
                     raise _UnconfirmedCopyError(self._stopped) from e
                 self._fail_load(req_meta, e)
+        return len(prepared_requests)
 
     def _load_packed(
         self,
@@ -7003,7 +7064,7 @@ class MaruWorkerConnector:
                     self._load_stream = torch.cuda.Stream(device=dev, priority=-1)
                     self._load_stream_device = dev
                 load_stream = self._load_stream
-                load_stream.wait_stream(torch.cuda.current_stream(dev))
+                self._checked(load_stream.wait_stream, torch.cuda.current_stream(dev))
             stream_ctx = torch.cuda.stream(load_stream)
         else:
             import contextlib
@@ -7019,13 +7080,19 @@ class MaruWorkerConnector:
         # slab in use (one dropped after its copy is queued is reused by the
         # caching allocator only in its stream's order)
         refs: list[Any] = [infos for *_, infos in prepared_requests]
+        if kernel is not None:
+            # Its pointer table: uploaded on the caller's stream, read on the
+            # load stream
+            refs.append(kernel)
         staged_chunks: dict[str, int] = {}
         ahead_chunks: dict[str, int] = {}
         copied_ahead: set[_CopyAhead] = set()
+        taken = 0
         with stream_ctx:
             for req_meta, num_chunks, slot_mapping, slab_infos in prepared_requests:
                 if self._stopped is not None:
                     break
+                taken += 1
                 try:
                     if use_stream:
                         slot_mapping = self._pin_slot_mapping_for_async_h2d(
@@ -7132,7 +7199,7 @@ class MaruWorkerConnector:
             with self._deferred_lock:
                 self._deferred_done.update(ready)
 
-        for req_meta, num_chunks, _, _ in prepared_requests:
+        for req_meta, num_chunks, _, _ in prepared_requests[:taken]:
             staged = staged_chunks.get(req_meta.req_id, 0)
             if kernel is None:
                 mode = "fallback"
@@ -7471,7 +7538,7 @@ class MaruWorkerConnector:
         trace = self._trace_fwd
         before = self._trace_wait_start(trace, events, stream)
         for event in events:
-            stream.wait_event(event)
+            self._checked(stream.wait_event, event)
         if trace is not None and before is not None:
             after = self._trace_poller.event(stream)
             if before is not None and after is not None:
@@ -7632,6 +7699,8 @@ class MaruWorkerConnector:
             pending_bases: list[str] = []
             pending_handles: list = []
             for ci in range(start_chunk, end_chunk):
+                if self._stopped is not None:
+                    break
                 base_key = chunk_keys[ci]
                 maru_key = _chunk_layer_key(base_key, layer_idx)
                 if self._is_stored(maru_key):
@@ -7791,6 +7860,8 @@ class MaruWorkerConnector:
             ready_keys: list[str] = []
             ready_handles: list = []
             for ci in range(start_chunk, end_chunk):
+                if self._stopped is not None:
+                    break
                 base_key = chunk_keys[ci]
                 if self._is_stored(base_key) or base_key in self._skipped_slabs:
                     continue
@@ -7920,6 +7991,8 @@ class MaruWorkerConnector:
                 else:
                     self._gather_packed_slabs(kernel, metadata, target, keys, handles)
             except Exception as e:
+                # Copies of the step may still run: a stop keeps its objects
+                self._stop_if_unconfirmed(e, keys, handles)
                 logger.error(
                     "Maru store of KV cache group %d failed: %s", group.group_id, e
                 )
@@ -8130,6 +8203,8 @@ class MaruWorkerConnector:
                 )
                 continue
             for ci in chunks:
+                if self._stopped is not None:
+                    return
                 key = target.key(chunk_keys[ci])
                 if self._store_pending(key) or key in keys:
                     continue
@@ -8179,6 +8254,8 @@ class MaruWorkerConnector:
         ct = self._kv_chunk_tokens
         size = group.object_bytes(ct)
         for req_meta in self._store_entries(metadata):
+            if self._stopped is not None:
+                return
             if req_meta.num_scheduled_tokens <= 0:
                 continue
             end = req_meta.num_computed_tokens + req_meta.num_scheduled_tokens
@@ -8252,6 +8329,8 @@ class MaruWorkerConnector:
             chunk_keys = self._slice_chunk_keys(req_meta, group)
             block_ids = req_meta.group_block_ids[group.group_id]
             for ci in _step_chunks(req_meta, ct, len(chunk_keys)):
+                if self._stopped is not None:
+                    return
                 base = group.object_key(chunk_keys[ci], ct)
                 object_keys = (
                     [_chunk_layer_key(base, i) for i in range(len(spans))]
@@ -8429,7 +8508,7 @@ class MaruWorkerConnector:
                 self._sync_store_stream = torch.cuda.Stream(device=dev)
                 self._sync_store_stream_device = dev
             stream = self._sync_store_stream
-            stream.wait_stream(torch.cuda.current_stream(dev))
+            self._checked(stream.wait_stream, torch.cuda.current_stream(dev))
             stream_ctx = torch.cuda.stream(stream)
         else:
             import contextlib
@@ -8447,6 +8526,8 @@ class MaruWorkerConnector:
         try:
             with stream_ctx:
                 for req_meta in self._store_entries(metadata):
+                    if self._stopped is not None:
+                        break
                     chunk_keys = self._slice_chunk_keys(req_meta, slab_target.group)
                     if not chunk_keys:
                         continue
@@ -8468,7 +8549,9 @@ class MaruWorkerConnector:
                             req_meta.req_id,
                         )
                         continue
-                    slot_dev = slot_mapping.to(dev)
+                    slot_dev = self._checked(
+                        slot_mapping.to, dev, held=(slot_mapping, staging, slot_devs)
+                    )
                     slot_devs.append(slot_dev)
 
                     for ci in chunks:
@@ -8650,7 +8733,7 @@ class MaruWorkerConnector:
             self._store_stream = torch.cuda.Stream(device=dev)
             self._store_stream_device = dev
         store_stream = self._store_stream
-        store_stream.wait_stream(torch.cuda.current_stream(dev))
+        self._checked(store_stream.wait_stream, torch.cuda.current_stream(dev))
 
         ready_keys: list[str] = []
         ready_handles: list[Any] = []
@@ -8959,16 +9042,16 @@ class MaruWorkerConnector:
         done_h = None
         try:
             done_h = handler.alloc(1)
+            if self._kept_if_stopped(done_h):
+                done_h = None  # stopped meanwhile: not stored, kept
+                return
             handler.store(done_key, handle=done_h)
             done_h = None  # ownership transferred to store
         except Exception as e:
             logger.warning("Failed to store _DONE marker for %s: %s", base_key, e)
         finally:
             if done_h is not None:
-                try:
-                    handler.free(done_h)
-                except Exception:
-                    pass
+                self._free_handles_best_effort([done_h])
 
     def shutdown(self):
         # An exceptional engine exit can skip get_finished() after the final

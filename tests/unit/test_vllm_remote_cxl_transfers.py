@@ -575,7 +575,11 @@ def test_a_failed_copy_ahead_wait_keeps_every_queued_batch(monkeypatch):
 
 def _views(worker):
     """The leases or pages a stopped worker keeps, each once."""
-    kept = [x for x in kept_by(worker) if isinstance(x, SimpleNamespace)]
+    kept = [
+        x
+        for x in kept_by(worker)
+        if isinstance(x, SimpleNamespace) and (hasattr(x, "view") or hasattr(x, "buf"))
+    ]
     return list({id(x): x for x in kept}.values())
 
 
@@ -665,12 +669,21 @@ def test_a_loader_thread_uploads_the_pointer_table_once(monkeypatch):
 
 
 def test_a_copy_error_waits_for_queued_copies_before_releasing(monkeypatch):
+    # The second chunk's launch rejects its arguments (not a CUDA error) once
+    # the first chunk's copy is queued: the slots go back after the drain.
     log = []
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log)
-    worker._packed_load_kernel_ctx = Mock(side_effect=RuntimeError("bad context"))
-    worker._load_stream = _FakeStream(log, "load")
+    launches = []
+
+    def kernel(*args, **kwargs):
+        launches.append(1)
+        if len(launches) == 2:
+            raise RuntimeError("Unsupported EngineKVFormat: 9")
+        log.append("kernel")
+
+    ops.multi_layer_kv_transfer.side_effect = kernel
     worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
-    assert log[-2:] == ["load sync", "release 3"]
+    assert log == ["load waits", "kernel", "load sync", "release 3"]
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
     assert worker._stopped is None
 
@@ -939,14 +952,14 @@ def _store_two_chunks():
 
 
 def test_an_async_store_copies_from_the_staging_it_gathered_to(monkeypatch):
-    """The write-behind thread may drop the staging attribute between a
-    chunk's gather and its D2H: the batch keeps the staging it took."""
+    """A batch takes the staging once: its chunks gather into it and copy
+    from it, whatever the attribute holds meanwhile."""
     worker, kernel, _ = _store_worker(monkeypatch, url_count=1)
     gathered = []
 
     def gather(staging, *args, **kwargs):
         gathered.append(staging)
-        worker._store_staging = None  # as _keep_write_behind may meanwhile
+        worker._store_staging = None  # the batch does not read it again
 
     kernel[0].multi_layer_kv_transfer.side_effect = gather
     handler = worker._handler

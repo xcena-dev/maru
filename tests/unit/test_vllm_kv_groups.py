@@ -2943,6 +2943,56 @@ def test_an_mla_block_copy_that_raises_keeps_its_page(monkeypatch, fails):
     assert len(pages) == 1 and holds(worker, pages[0])
 
 
+def test_a_group_kernel_upload_that_raises_stops_the_step():
+    """A CUDA error outside a group's copy calls (its pointer table upload)
+    also stops the worker: the step stores nothing, not even the states
+    gathered before it, and raises."""
+    worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+    worker._group_kernel = MagicMock(side_effect=cuda_error())
+    tokens = list(range(40))
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert store == {}
+    worker._handler.free.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["state", "slab", "mla"])
+def test_a_group_store_stopped_meanwhile_copies_nothing_more(path):
+    """Another thread stops the worker as the step takes its first page: no
+    later chunk, request or group is copied, nothing is stored and the step
+    raises."""
+    if path == "mla":
+        worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=2 * DSV41_BLOCK)
+        tokens = list(range(80)), list(range(100, 180))
+        blocks, end = _dsv41_blocks(DSV41_BLOCKS_A + [11]), 72
+    else:
+        worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+        tokens = list(range(40)), list(range(100, 140))
+        blocks, end = QWEN_BLOCKS, 32
+        if path == "slab":
+            worker._gather_states = MagicMock()  # the Mamba groups copy nothing
+        else:
+            worker._copy_group_slabs = MagicMock()  # nor the attention groups
+    pages = []
+    alloc = worker._handler.alloc.side_effect
+
+    def stop_meanwhile(n, **route):
+        worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
+        pages.append(alloc(n))
+        return pages[-1]
+
+    worker._handler.alloc.side_effect = stop_meanwhile
+    requests = [
+        *_store_meta(tokens[0], blocks, 0, end).requests,
+        *_store_meta(tokens[1], blocks, 0, end, req_ids=("r2",)).requests,
+    ]
+    with pytest.raises(_UnconfirmedCopyError, match="req r0"):
+        worker.wait_for_save(MaruConnectorMetadata(requests=requests))
+    assert len(pages) == 1 and holds(worker, pages[0])
+    assert store == {}
+    worker._handler.free.assert_not_called()
+
+
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
 def test_kernel_write_behind_stores_attention_later_and_states_now(version):
     worker, store, shared = _kernel_worker({"maru_async_store": True}, version)

@@ -17,13 +17,19 @@ import torch
 
 
 def _best_effort(fn):
+    """Drop ``fn``'s errors, after its owner's ``_trace_error`` (if any) sees
+    them: a worker stops on a CUDA error from a timing event."""
+
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except Exception:
+        except Exception as e:
             # stderr, CUDA diagnostics and allocation of trace records are
             # optional. In particular, never turn queued copies into a failure.
+            seen = getattr(args[0], "_trace_error", None) if args else None
+            if seen is not None:
+                seen(e)
             return None
 
     return wrapped
@@ -155,7 +161,16 @@ class _TracePoller:
     The event clock, rather than the time poll() runs, supplies timestamps.
     """
 
-    def __init__(self, rank: int = 0, tp_size: int = 1, dp_rank: int = 0, clock=None):
+    def __init__(
+        self,
+        rank: int = 0,
+        tp_size: int = 1,
+        dp_rank: int = 0,
+        clock=None,
+        on_error=None,
+    ):
+        # Sees every error a timing event raised (the worker's _trace_error)
+        self._trace_error = on_error
         self._rank = rank
         self._tp_size = tp_size
         self._dp_rank = dp_rank
@@ -203,6 +218,10 @@ class _TracePoller:
             if not self._closed:
                 self._steps.append(record)
 
+    def _seen(self, error):
+        if self._trace_error is not None:
+            self._trace_error(error)
+
     def _recycle(self, events):
         self._free_events.extend(set(events))
 
@@ -218,8 +237,8 @@ class _TracePoller:
             ):
                 try:
                     self._clock = _GpuClock(self._clock.device)
-                except Exception:
-                    pass  # The previous anchor remains usable.
+                except Exception as e:
+                    self._seen(e)  # The previous anchor remains usable.
             loads = []
             for load in self._loads:
                 try:
@@ -241,8 +260,8 @@ class _TracePoller:
                         f"req_encoding=percent clock_error_ms={self._clock.error_ms:.3f} "
                         f"scope=elapsed dp_rank={self._dp_rank} rank={self._rank}"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._seen(e)
                 # Gate/end also protect KV ownership and can still be used
                 # by the engine after this diagnostic record is drained.
                 self._recycle((load.start,))
@@ -263,8 +282,8 @@ class _TracePoller:
                         f"clock_error_ms={self._clock.error_ms:.3f} "
                         f"dp_rank={self._dp_rank} rank={self._rank}"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._seen(e)
                 self._recycle(
                     (step.start, step.end, *(e for pair in step.waits for e in pair))
                 )
