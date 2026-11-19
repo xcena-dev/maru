@@ -312,7 +312,42 @@ class FailingSyncStream:
 
     def synchronize(self) -> None:
         self.stream.synchronize()
-        raise RuntimeError("injected asynchronous copy failure")
+        raise cuda_error("injected asynchronous copy failure")
+
+
+def cuda_error(message: str = "an illegal memory access was encountered") -> Any:
+    """A CUDA error as torch raises it from a failed copy or wait."""
+    import torch
+
+    return getattr(torch, "AcceleratorError", RuntimeError)(f"CUDA error: {message}")
+
+
+def kept_by(worker: Any) -> list[Any]:
+    """What a stopped ``worker`` keeps until the process exits, beyond its
+    own state, flattened through lists, tuples, sets and dicts."""
+    from maru_vllm.connector import _KEPT_UNTIL_EXIT
+
+    found: list[Any] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, list | tuple | set):
+            for each in item:
+                walk(each)
+        elif isinstance(item, dict):
+            for each in item.values():
+                walk(each)
+        else:
+            found.append(item)
+
+    for owner, objects in _KEPT_UNTIL_EXIT:
+        if owner is worker:
+            walk(objects)
+    return found
+
+
+def holds(worker: Any, obj: Any) -> bool:
+    """Whether a stopped ``worker`` keeps ``obj`` (the object itself)."""
+    return any(item is obj for item in kept_by(worker))
 
 
 def capture_bytes(buf: Any) -> bytes:

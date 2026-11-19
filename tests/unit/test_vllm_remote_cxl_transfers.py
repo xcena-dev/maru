@@ -3,7 +3,10 @@
 copy kernel over the staging buffer (design note 3.11)."""
 
 import contextlib
+import gc
 import itertools
+import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -13,9 +16,17 @@ pytest.importorskip("torch")
 pytest.importorskip("vllm")
 import torch
 
-from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta, _req_chunk_keys
+from maru_vllm.connector import (
+    MaruConnectorMetadata,
+    MaruReqMeta,
+    _req_chunk_keys,
+    _UnconfirmedCopyError,
+)
 from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
+    cuda_error,
+    holds,
+    kept_by,
     make_flash_attn_metadata,
     make_scheduler,
     make_worker,
@@ -391,14 +402,41 @@ def test_a_pipelined_miss_fails_from_its_batch_after_the_earlier_copies(monkeypa
     assert worker.take_failed_load_blocks() == {2, 3, 4, 5}
 
 
-def test_unconfirmed_pipelined_copies_keep_their_slots(monkeypatch):
-    # Waiting on a batch's event failed: its copies may still read the slots,
-    # and the request is recomputed from that batch.
+def _stopped(worker):
+    """Every call vLLM makes next raises: the worker stops."""
+    for call in (
+        worker.get_finished_loading,
+        worker.take_failed_load_blocks,
+        lambda: worker.start_load_kv(None, MaruConnectorMetadata()),
+    ):
+        with pytest.raises(_UnconfirmedCopyError, match="req load"):
+            call()
+    return True
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unconfirmed_pipelined_copies_stop_the_worker(monkeypatch, deferred):
+    # Waiting on a batch's event failed: its copies may still write the
+    # request's blocks, so it is not recomputed into them; nor are the slots
+    # they read given back.
     log = []
-    worker, _ = _pipelined(monkeypatch, log, stream_fails=True)
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, deferred=deferred)
     assert "release 1" not in log
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert "load" not in worker._deferred_done
+    assert not worker._failed_load_blocks
     assert not worker._loaded_request_keys["load"][1]
+    assert kept_by(worker)
+    assert _stopped(worker)
+
+
+def test_a_miss_is_recomputed_even_on_a_stream_that_cannot_be_waited_for(
+    monkeypatch,
+):
+    # No copy was queued: a plain miss, whatever the stream.
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, missing=0)
+    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert worker._stopped is None
 
 
 def test_a_short_staging_waits_for_the_oldest_batch(monkeypatch):
@@ -439,14 +477,136 @@ def test_a_failed_copy_fails_from_its_batch_after_the_earlier_ones(monkeypatch):
 
 def test_an_undrained_failed_copy_keeps_every_unconfirmed_slot(monkeypatch):
     # The stream could not be drained: no batch is known to be done, so all
-    # keep their slots and the request is recomputed from its first batch.
+    # keep their slots and the worker stops.
     def stuck(stream):
         stream.fail_sync = True
 
     log = []
     worker, _ = _pipelined(monkeypatch, log, setup=_fail_copy(2, then=stuck))
     assert "release 1" not in log
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
+
+
+def test_a_failed_copy_is_reported_only_once_its_stream_drained(monkeypatch):
+    """The engine thread finds no failed block while the loader still drains
+    the copies queued before the failure."""
+    draining, resume = threading.Event(), threading.Event()
+
+    def held(stream):
+        def synchronize():
+            draining.set()
+            resume.wait(10)
+
+        stream.synchronize = synchronize
+
+    workers = []
+    fail = _fail_copy(2, then=held)
+
+    def setup(worker, ops, stream):
+        workers.append(worker)
+        fail(worker, ops, stream)
+
+    loader = threading.Thread(
+        target=_pipelined, args=(monkeypatch, []), kwargs={"setup": setup}
+    )
+    loader.start()
+    try:
+        assert draining.wait(10)
+        assert workers[0].take_failed_load_blocks() == set()
+    finally:
+        resume.set()
+        loader.join(10)
+    assert workers[0].take_failed_load_blocks() == {4, 5}
+
+
+def test_a_cxl_load_that_cannot_be_waited_for_stops_the_worker(monkeypatch):
+    log = []
+    worker, cache, meta, _ = _kernel_worker(monkeypatch, log, stream_fails=True)
+    # The cxl backend: no session and no read leases
+    worker._cpu_mode = worker._remote_cxl_mode = False
+    with pytest.raises(_UnconfirmedCopyError, match="req load"):
+        worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
+
+
+def test_a_failed_copy_ahead_wait_keeps_every_queued_batch(monkeypatch):
+    """A side-stream copy could not be waited for: the earlier batch, still
+    queued, keeps its leases too."""
+    alive = []
+
+    class Lease:
+        def __init__(self, view):
+            self.view = view
+
+    class Unknown:
+        def synchronize(self):
+            raise RuntimeError("CUDA error")
+
+    def setup(worker, ops, stream):
+        read = worker._batch_retrieve_all
+
+        def retrieve(keys, **route):
+            leases = [Lease(info.view) for info in read(keys, **route)]
+            alive.extend(weakref.ref(lease) for lease in leases)
+            return leases
+
+        injects = []
+
+        def inject(*args, copied_ahead=None, **kwargs):
+            injects.append(1)
+            if len(injects) == 2:
+                copied_ahead.add(Unknown())  # staged, then failed unlinked
+                raise RuntimeError("stage failed")
+            return False
+
+        worker._batch_retrieve_all = retrieve
+        worker._loader_kernel_ctx = lambda *a: None  # injects copied ahead
+        worker._inject_slab_layers = inject
+
+    log = []
+    worker, _ = _pipelined(monkeypatch, log, setup=setup)
+    gc.collect()
+    assert len(alive) == 2 and all(ref() is not None for ref in alive)
+    assert "release 1" not in log
+    assert _stopped(worker)
+
+
+def _views(worker):
+    """The leases or pages a stopped worker keeps, each once."""
+    kept = [x for x in kept_by(worker) if isinstance(x, SimpleNamespace)]
+    return list({id(x): x for x in kept}.values())
+
+
+@pytest.mark.parametrize("during", ["read", "copy"])
+def test_a_leased_load_ends_at_its_next_batch_once_another_stops(monkeypatch, during):
+    """Another load stopped the worker: nothing is given back, neither the
+    queued batch's slot nor that of a batch read since."""
+    log = []
+
+    def setup(worker, ops, stream):
+        def stop(*args, **kwargs):
+            worker._stop_if_unconfirmed(cuda_error(), req_id="other")
+
+        if during == "copy":
+            ops.multi_layer_kv_transfer.side_effect = stop
+            return
+        read = worker._batch_retrieve_all
+
+        def retrieve(keys, **route):
+            infos = read(keys, **route)
+            if "read 1" in log:
+                stop()
+            return infos
+
+        worker._batch_retrieve_all = retrieve
+
+    worker, _ = _pipelined(monkeypatch, log, setup=setup)
+    assert ("read 1" in log) == (during == "read") and "read 2" not in log
+    assert "release 1" not in log
+    # Batch 0, still queued, and on a stop during the read batch 1 unqueued
+    assert len(_views(worker)) == (2 if during == "read" else 1)
 
 
 def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):
@@ -456,7 +616,8 @@ def test_an_event_that_cannot_be_queried_keeps_its_slots(monkeypatch):
     log = []
     worker, _ = _pipelined(monkeypatch, log, setup=stuck)
     assert log == ["read 0", "kernel"]
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
 
 
 def test_an_event_that_cannot_be_recorded_drains_and_releases(monkeypatch):
@@ -511,14 +672,20 @@ def test_a_copy_error_waits_for_queued_copies_before_releasing(monkeypatch):
     worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
     assert log[-2:] == ["load sync", "release 3"]
     assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    assert worker._stopped is None
 
 
-def test_slots_stay_taken_if_queued_copies_cannot_be_waited_for(monkeypatch):
+def test_an_inline_load_that_cannot_be_waited_for_stops_the_step(monkeypatch):
+    # The forward would read blocks the copies may still write: start_load_kv
+    # raises, and the slots stay taken.
     log = []
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log, stream_fails=True)
-    worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
-    assert log[-1] == "release 0"  # nothing given back
-    assert worker.take_failed_load_blocks() == {0, 1, 2, 3, 4, 5}
+    with pytest.raises(_UnconfirmedCopyError, match="req load"):
+        worker.start_load_kv(_context(cache), MaruConnectorMetadata(requests=[meta]))
+    assert not any(line.startswith("release") for line in log)  # nothing back
+    assert len(_views(worker)) == 3
+    assert not worker._failed_load_blocks
+    assert _stopped(worker)
 
 
 def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
@@ -634,7 +801,8 @@ class _FakeCudaEvent:
 
 def _cpu_cuda(monkeypatch):
     """Let the write-behind path run its CUDA stream calls on the CPU."""
-    stream = SimpleNamespace(wait_stream=lambda other: None)
+    # CPU copies end before the call returns: waiting is a no-op
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None, **kw: stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
@@ -692,6 +860,115 @@ def test_an_async_store_allocates_in_the_pool_of_its_request(monkeypatch):
     first_key = _req_chunk_keys(meta.requests[0], 8, "")[0]
     assert allocs == [first_key, first_key]  # both chunks, one route key
     worker.shutdown()
+
+
+def test_an_async_store_whose_copies_cannot_be_tracked_stops_the_worker(
+    monkeypatch,
+):
+    """No event to wait on: the batch's pages and its request's blocks are
+    kept, and the worker stops."""
+    worker, kernel, _ = _store_worker(monkeypatch, url_count=1)
+
+    class NoEvent:
+        def record(self, stream=None):
+            raise cuda_error()
+
+    monkeypatch.setattr(torch.cuda, "Event", NoEvent)
+    meta = MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                "r1",
+                list(range(16)),
+                [0, 1, 2, 3],
+                True,
+                num_scheduled_tokens=16,
+                num_computed_tokens=0,
+            )
+        ]
+    )
+    worker._store_packed_slabs_write_behind(kernel, meta)
+    worker._handler.batch_store.assert_not_called()
+    worker._handler.free.assert_not_called()
+    assert len(_views(worker)) == 2  # both pages
+    assert holds(worker, worker._store_staging)  # the D2H copies read it
+    assert "r1" in worker._request_pending_store_keys
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.get_finished_saving({"r1"})
+
+
+@pytest.mark.parametrize("wait", ["ok", "cuda"])
+def test_a_write_behind_batch_that_cannot_be_submitted_waits_for_its_copies(
+    monkeypatch, wait
+):
+    """The pages are freed once the copies ended, and kept if that wait
+    raises a CUDA error."""
+    worker, kernel, _ = _store_worker(monkeypatch, url_count=1)
+    event = MagicMock()
+    if wait == "cuda":
+        event.synchronize.side_effect = cuda_error()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    worker._store_executor = MagicMock()
+    worker._store_executor.submit.side_effect = RuntimeError("executor down")
+    worker._store_packed_slabs_write_behind(kernel, _store_two_chunks())
+    event.synchronize.assert_called_once_with()
+    worker._handler.batch_store.assert_not_called()
+    if wait == "ok":
+        assert worker._handler.free.call_count == 2
+        assert worker.get_finished_saving({"r1"}) == {"r1"}
+        return
+    worker._handler.free.assert_not_called()
+    assert len(_views(worker)) == 2  # both pages
+    assert "r1" in worker._request_pending_store_keys
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.get_finished_saving({"r1"})
+
+
+def _store_two_chunks():
+    return MaruConnectorMetadata(
+        requests=[
+            MaruReqMeta(
+                "r1",
+                list(range(16)),
+                [0, 1, 2, 3],
+                True,
+                num_scheduled_tokens=16,
+                num_computed_tokens=0,
+            )
+        ]
+    )
+
+
+def test_an_async_store_copies_from_the_staging_it_gathered_to(monkeypatch):
+    """The write-behind thread may drop the staging attribute between a
+    chunk's gather and its D2H: the batch keeps the staging it took."""
+    worker, kernel, _ = _store_worker(monkeypatch, url_count=1)
+    gathered = []
+
+    def gather(staging, *args, **kwargs):
+        gathered.append(staging)
+        worker._store_staging = None  # as _keep_write_behind may meanwhile
+
+    kernel[0].multi_layer_kv_transfer.side_effect = gather
+    handler = worker._handler
+    worker._store_packed_slabs_write_behind(kernel, _store_two_chunks())
+    worker.shutdown()  # the write-behind thread registers the batch
+    handler.free.assert_not_called()
+    assert len(handler.batch_store.call_args.args[0]) == 2
+    assert gathered[0] is gathered[1]
+
+
+def test_an_async_store_copy_that_raises_keeps_its_page_and_stops(monkeypatch):
+    """Its copies may still read the request's blocks and write the page:
+    both are kept, no later chunk is copied, and the worker stops."""
+    worker, kernel, allocs = _store_worker(monkeypatch, url_count=1)
+    kernel[0].multi_layer_kv_transfer.side_effect = cuda_error()
+    worker._store_packed_slabs_write_behind(kernel, _store_two_chunks())
+    assert kernel[0].multi_layer_kv_transfer.call_count == 1 and len(allocs) == 1
+    worker._handler.free.assert_not_called()
+    worker._handler.batch_store.assert_not_called()
+    assert "r1" in worker._request_pending_store_keys
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.get_finished_saving({"r1"})
 
 
 def test_a_full_staging_buffer_skips_the_async_store_quietly(monkeypatch, caplog):

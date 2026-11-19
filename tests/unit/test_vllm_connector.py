@@ -8,6 +8,8 @@ is available.
 """
 
 import contextlib
+import gc
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -26,16 +28,19 @@ from maru_vllm.connector import (
     _get_knob,
     _parse_size,
     _step_chunks,
+    _UnconfirmedCopyError,
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     attach_capturing_handler,
     capture_float32,
+    cuda_error,
     deferred_metadata,
     deferred_req_meta,
     fake_cached_reqs,
     fake_new_request_data,
     fake_scheduler_output,
+    holds,
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
@@ -4187,6 +4192,175 @@ class TestWriteBehindStoreLifecycle:
         assert worker._stored_keys == set()
         assert worker._pending_store_keys == set()
 
+    def test_unconfirmed_copy_keeps_handle_and_request_blocks(self):
+        """The D2H may still read the request's GPU blocks and write the page:
+        the request never finishes, the handle is not freed and the worker
+        stops."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        self._reserve(worker)
+        assert worker.get_finished_saving({"r1"}) is None
+        event = MagicMock()
+        event.synchronize.side_effect = cuda_error()
+        handle = object()
+
+        worker._finish_write_behind_store(event, ["k1"], [handle], [])
+
+        worker._handler.free.assert_not_called()
+        worker._handler.batch_store.assert_not_called()
+        assert "r1" in worker._request_pending_store_keys  # never finishes
+        assert holds(worker, handle)
+        for hook in (
+            lambda: worker.get_finished_saving(set()),
+            worker.get_finished_loading,
+            lambda: worker.handle_preemptions(MaruConnectorMetadata()),
+            lambda: worker.start_load_kv(None, MaruConnectorMetadata()),
+        ):
+            with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+                hook()
+
+    def test_a_failed_d2h_that_is_not_a_cuda_error_frees_as_before(self):
+        worker = self._make_worker()
+        self._reserve(worker)
+        event = MagicMock()
+        event.synchronize.side_effect = RuntimeError("event destroyed")
+        handle = object()
+        worker._finish_write_behind_store(event, ["k1"], [handle], [])
+        worker._handler.free.assert_called_once_with(handle)
+        assert worker.get_finished_saving({"r1"}) == {"r1"}
+        assert worker._stopped is None
+
+    @pytest.mark.parametrize("ended", [True, False])
+    def test_a_batch_without_a_handler_still_waits_for_its_copies(self, ended):
+        """Requests finish only once the copies are known to have ended."""
+        worker = self._make_worker()
+        self._reserve(worker)
+        worker._handler = None
+        event = MagicMock()
+        if not ended:
+            event.synchronize.side_effect = cuda_error()
+        worker._finish_write_behind_store(event, ["k1"], [object()], [])
+        event.synchronize.assert_called_once_with()
+        if ended:
+            assert worker.get_finished_saving({"r1"}) == {"r1"}
+            return
+        assert "r1" in worker._request_pending_store_keys
+        with pytest.raises(_UnconfirmedCopyError):
+            worker.get_finished_saving({"r1"})
+
+    def test_store_copies_of_preempted_requests_that_cannot_be_waited_for_raise(
+        self,
+    ):
+        """The stop persists, and the batch whose copies the stream wait
+        covered registers and frees nothing when its own wait succeeds."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = self._make_worker()
+        self._reserve(worker)
+        staging = torch.zeros(4)
+        worker._store_staging = staging
+        worker._store_stream = MagicMock()
+        worker._store_stream.synchronize.side_effect = cuda_error()
+        with pytest.raises(_UnconfirmedCopyError):
+            worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r"}))
+        assert worker._store_staging is staging and holds(worker, staging)
+        handle, refs = object(), [torch.zeros(2)]
+        worker._finish_write_behind_store(MagicMock(), ["k1"], [handle], refs)
+        worker._handler.batch_store.assert_not_called()
+        worker._handler.free.assert_not_called()
+        assert len(refs) == 1 and holds(worker, handle)
+        assert "r1" in worker._request_pending_store_keys
+        worker._store_stream.synchronize.side_effect = None
+        for hook in (
+            lambda: worker.handle_preemptions(MaruConnectorMetadata()),
+            worker.get_finished_loading,
+            lambda: worker.get_finished_saving({"r1"}),
+        ):
+            with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+                hook()
+
+    def test_a_stop_during_a_batch_wait_keeps_the_batch(self):
+        """Another thread stops the worker while the batch waits: its own
+        wait then succeeds, but it registers, frees and drops nothing."""
+        worker = self._make_worker()
+        self._reserve(worker)
+        event = MagicMock()
+        event.synchronize.side_effect = lambda: worker._stop_if_unconfirmed(
+            cuda_error()
+        )
+        handle, refs = object(), [torch.zeros(2)]
+        worker._finish_write_behind_store(event, ["k1"], [handle], refs)
+        event.synchronize.assert_called_once_with()
+        worker._handler.batch_store.assert_not_called()
+        worker._handler.free.assert_not_called()
+        assert len(refs) == 1 and holds(worker, handle) and holds(worker, refs[0])
+        assert "r1" in worker._request_pending_store_keys
+
+    def test_a_completion_job_after_a_stop_stores_nothing_at_shutdown(self):
+        """Shutdown's drain of the write-behind thread runs a batch queued
+        before the stop: it registers, frees and finishes nothing."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        worker = self._make_worker()
+        handler = worker._handler
+        self._reserve(worker)
+        gate = threading.Event()
+        worker._store_executor = ThreadPoolExecutor(max_workers=1)
+        worker._store_executor.submit(gate.wait, 5)
+        handle = object()
+        worker._store_executor.submit(
+            worker._finish_write_behind_store, MagicMock(), ["k1"], [handle], []
+        )
+        worker._stop_if_unconfirmed(cuda_error())
+        gate.set()
+        worker.shutdown()
+        handler.batch_store.assert_not_called()
+        handler.free.assert_not_called()
+        handler.close.assert_not_called()
+        assert holds(worker, handle)
+        assert "r1" in worker._request_pending_store_keys
+
+    def test_a_kept_copy_outlives_later_drains_shutdowns_and_the_worker(self):
+        """Once a copy's end is unknown, a later wait that succeeds does not
+        give back what it may use: no free, no close of the handler."""
+        from maru_vllm import connector
+
+        worker = self._make_worker()
+        handler = worker._handler
+        self._reserve(worker)
+        event = MagicMock()
+        event.synchronize.side_effect = cuda_error()
+        handle = object()
+        worker._finish_write_behind_store(event, ["k1"], [handle], [])
+        worker.shutdown()  # every stream drains now
+        kept = len(connector._KEPT_UNTIL_EXIT)
+        worker.shutdown()
+        assert len(connector._KEPT_UNTIL_EXIT) == kept  # nothing new to keep
+        handler.free.assert_not_called()
+        handler.close.assert_not_called()
+        assert worker._handler is handler and holds(worker, handle)
+        del worker
+        gc.collect()
+        assert any(holds(owner, handle) for owner, _ in connector._KEPT_UNTIL_EXIT)
+
+    def test_a_failed_shutdown_wait_keeps_load_buffers_and_mappings(self):
+        """A queued copy may still read the CXL views: they and the
+        mapping handler stay until the process ends."""
+        from maru_vllm import connector
+
+        worker = self._make_worker()
+        handler = worker._handler
+        refs = worker._active_load_refs
+        refs.append((MagicMock(), [object()]))
+        worker._load_stream = MagicMock()
+        worker._load_stream.synchronize.side_effect = cuda_error()
+        worker.shutdown()
+        handler.close.assert_not_called()
+        assert worker._active_load_refs is refs and len(refs) == 1
+        assert worker._handler is handler
+        assert any(owner is worker for owner, _ in connector._KEPT_UNTIL_EXIT)
+
     def test_preemption_drains_store_stream_before_block_reuse(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
@@ -4642,8 +4816,9 @@ class TestPackedStorage:
         assert worker._stored_keys == set()
 
     def test_kernel_store_registers_nothing_whose_copy_failed(self):
-        """A slab whose copy cannot be confirmed is freed, not registered:
-        another instance would read incomplete KV as a hit."""
+        """A slab whose copy cannot be confirmed is not registered (another
+        instance would read incomplete KV as a hit) and not freed (the copy
+        may still write it)."""
         if not torch.cuda.is_available():
             pytest.skip("needs CUDA")
         from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
@@ -4682,7 +4857,8 @@ class TestPackedStorage:
         worker._handler.batch_store.assert_not_called()
         assert store == {}
         assert worker._stored_keys == set()
-        assert freed == allocated
+        assert freed == []
+        assert all(holds(worker, h) for h in allocated)
 
     def test_kernel_store_writes_kv2ltd_slab_roundtrip(self):
         """_store_packed_slabs: one kernel D2H per chunk, one key per chunk,
