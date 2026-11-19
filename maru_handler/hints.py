@@ -100,6 +100,10 @@ class MemoryHints:
         self._pending = 0
         self._dropped = 0
         self._closed = False
+        # Set by abandon(): the thread drops what is still queued
+        self._discard = threading.Event()
+        # The thread close() stopped waiting for (abandon() joins it)
+        self._closing_thread: threading.Thread | None = None
         # Agents each hinted request reached, for its end, oldest first
         # (hint thread only)
         self._agents: OrderedDict[str, list[str]] = OrderedDict()
@@ -166,8 +170,29 @@ class MemoryHints:
         thread.join(timeout=timeout_s)
         if thread.is_alive():
             logger.warning("read hint thread still busy after %.0f s", timeout_s)
+            with self._lock:
+                self._closing_thread = thread
             return False
         return True
+
+    def abandon(self, timeout_s: float | None = None) -> bool:
+        """After a :meth:`close` that timed out: drop the messages still
+        queued and wait for the thread, so the call under way (a ``locate``
+        or a ``send``) is the last one.
+
+        Args:
+            timeout_s: How long to wait; None waits until that call returns.
+
+        Returns:
+            True if the thread has ended (or there is none).
+        """
+        self._discard.set()
+        with self._lock:
+            thread = self._closing_thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout_s)
+        return not thread.is_alive()
 
     def _queue_hint(self, item: tuple[str, str, list]) -> None:
         with self._lock:
@@ -209,6 +234,8 @@ class MemoryHints:
             if kind not in ("end", "end_open"):
                 with self._lock:
                     self._pending -= 1
+            if self._discard.is_set():
+                continue  # abandoned at close: nothing more goes out
             try:
                 if kind == "hint":
                     self._give(request_id, self._locate(payload))

@@ -4573,6 +4573,14 @@ class MaruWorkerConnector:
         (``_load_group_leased``), and is reported once it returns.
         """
         try:
+            # The scheduler hinted this load; the memory side hears it starts
+            # now, before the first read (a no-op without read promotes).
+            promote = getattr(self._handler, "promote_read", None)
+            if promote is not None:
+                try:
+                    promote(req_meta.req_id, **self._route(req_meta))
+                except Exception:
+                    logger.debug("Maru: read promote not queued", exc_info=True)
             objects = None
             if not self._cpu_mode:
                 objects = self._retrieve_group_objects(req_meta)

@@ -197,3 +197,34 @@ def test_close_ends_the_open_hints_then_closes_the_plugins(monkeypatch):
     handler.hint_read("r3", ["hit0"])  # after close: ignored
     handler.close()  # once only
     assert len(events) == 6
+
+
+def test_close_waits_for_the_plugin_call_under_way_before_on_close(monkeypatch):
+    """Past the close timeout the hints still queued are dropped, and close
+    waits for the call under way: no hint comes after on_close."""
+    monkeypatch.setattr("maru_handler.handler._LOCAL_HINT_CLOSE_S", 0.05)
+    events = []
+    release = threading.Event()
+
+    class Slow(HintPlugin):
+        def on_memory_hint(self, handler, message):
+            events.append(("start", message["action"], message["request"]))
+            if message["request"] == "r1":
+                release.wait(5)
+            events.append(("done", message["action"], message["request"]))
+
+        def on_close(self, handler):
+            events.append(("on_close",))
+
+    handler = _handler(monkeypatch, [Slow()], metadata_only=True, read_hints=True)
+    handler._rpc.close = lambda: None
+    handler.hint_read("r1", ["hit0"])
+    handler.hint_read("r2", ["hit0"])
+    threading.Timer(0.3, release.set).start()
+    handler.close()
+    # r1's call ran past the timeout; r2 and the ends were dropped.
+    assert events == [
+        ("start", "read_hint", "r1"),
+        ("done", "read_hint", "r1"),
+        ("on_close",),
+    ]

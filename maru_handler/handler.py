@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 #: The one hint target of the cxl backend: this process's hint plugins.
 _LOCAL_HINTS = "handler-plugins"
+#: Seconds close() lets the queued hints of the cxl backend go out.
+_LOCAL_HINT_CLOSE_S = 5.0
 
 
 class MaruHandler:
@@ -470,10 +472,17 @@ class MaruHandler:
         native transfers can retain staging until cleanup is confirmed.
         """
         if self._local_hints is not None:
-            # The hints already queued go out (or time out) first, then the
-            # end of every request still open: a hint plugin keeps no
-            # connection whose close would end them.
-            self._local_hints.close(end_open=True)
+            # The hints already queued go out first, then the end of every
+            # request still open: a hint plugin keeps no connection whose
+            # close would end them. Plugins hear no hint after on_close:
+            # past the timeout the rest is dropped, and close waits for the
+            # callback under way before it goes on.
+            if not self._local_hints.close(_LOCAL_HINT_CLOSE_S, end_open=True):
+                logger.warning(
+                    "memory hints still queued at close are dropped; waiting "
+                    "for the handler plugin call under way"
+                )
+                self._local_hints.abandon()
         if self._cpu is not None:
             self._cpu.close()
             self._connected = False

@@ -514,3 +514,33 @@ def test_the_scheduler_names_layers_as_the_workers_do():
     )
     assert _scheduler_layer_indices([], config) == [0, 1, 2, 3]
     assert _scheduler_layer_indices([], None) == []
+
+
+@pytest.mark.parametrize("cpu_mode", [False, True], ids=["cxl", "storage-session"])
+def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
+    """Several KV cache groups load in _group_load_job; it promotes the
+    hinted request before it reads, as the one-group load does."""
+    import threading
+
+    from maru_vllm.connector import MaruWorkerConnector
+
+    worker = object.__new__(MaruWorkerConnector)
+    calls = []
+    worker._cpu_mode = cpu_mode
+    worker._handler = SimpleNamespace(
+        promote_read=lambda rid, **route: calls.append(("promote", rid, route))
+    )
+    worker._route = lambda meta: {"route_key": "k0"} if cpu_mode else {}
+    worker._retrieve_group_objects = lambda meta: calls.append(("read",))
+    worker._load_group_leased = lambda *a, **k: calls.append(("read",))
+    worker._fail_load = lambda meta, exc: calls.append(("failed",))
+    worker._deferred_stream = None
+    worker._deferred_lock = threading.Lock()
+    worker._inflight_deferred_req_ids = set()
+    worker._abandoned_req_ids = set()
+    meta = SimpleNamespace(req_id="r1")
+    # The storage-session path goes on to CUDA, which this test has none of.
+    worker._group_load_job(meta, None, None)
+    route = {"route_key": "k0"} if cpu_mode else {}
+    assert calls[0] == ("promote", "r1", route)
+    assert calls[1] in {("read",), ("failed",)}

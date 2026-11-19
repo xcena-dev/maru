@@ -167,9 +167,12 @@ class MaruHandlerPlugin(Protocol):
         Called on the handler's hint thread, in the order the hints were
         given, never on the caller's path. When the handler closes, every
         request it hinted and did not end gets its ``read_hint_end`` before
-        :meth:`on_close`. A hint is advice: the load reads
-        every key either way. Keep it short; a slow plugin delays the next
-        hints, not the loads.
+        :meth:`on_close`, and no hint comes after it: if the hints still
+        queued take longer than the close timeout (5 s), the rest are
+        dropped and ``close`` waits for the call under way to return. A
+        hint is advice: the load reads every key either way. Keep it short;
+        a slow plugin delays the next hints and the handler's close, not the
+        loads.
         """
         ...
 
