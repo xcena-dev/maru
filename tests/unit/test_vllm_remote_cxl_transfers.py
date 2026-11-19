@@ -909,6 +909,20 @@ def test_an_async_store_whose_copies_cannot_be_tracked_stops_the_worker(
         worker.get_finished_saving({"r1"})
 
 
+def test_a_write_behind_stream_that_cannot_wait_stops_before_any_copy(
+    monkeypatch,
+):
+    worker, kernel, _ = _store_worker(monkeypatch, url_count=1)
+    stream = torch.cuda.current_stream()
+    stream.wait_stream = MagicMock(side_effect=cuda_error())
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker._store_packed_slabs_write_behind(kernel, _store_two_chunks())
+    kernel[0].multi_layer_kv_transfer.assert_not_called()
+    worker._handler.alloc.assert_not_called()
+    with pytest.raises(_UnconfirmedCopyError):
+        worker.get_finished_saving({"r1"})
+
+
 @pytest.mark.parametrize("wait", ["ok", "cuda"])
 def test_a_write_behind_batch_that_cannot_be_submitted_waits_for_its_copies(
     monkeypatch, wait

@@ -17,19 +17,13 @@ import torch
 
 
 def _best_effort(fn):
-    """Drop ``fn``'s errors, after its owner's ``_trace_error`` (if any) sees
-    them: a worker stops on a CUDA error from a timing event."""
-
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             # stderr, CUDA diagnostics and allocation of trace records are
             # optional. In particular, never turn queued copies into a failure.
-            seen = getattr(args[0], "_trace_error", None) if args else None
-            if seen is not None:
-                seen(e)
             return None
 
     return wrapped
@@ -169,7 +163,8 @@ class _TracePoller:
         clock=None,
         on_error=None,
     ):
-        # Sees every error a timing event raised (the worker's _trace_error)
+        # Sees the errors of timing event records and queries (the worker
+        # stops on a CUDA error); setup errors stay dropped
         self._trace_error = on_error
         self._rank = rank
         self._tp_size = tp_size
@@ -193,8 +188,21 @@ class _TracePoller:
                 if reusable and self._free_events
                 else torch.cuda.Event(enable_timing=True)
             )
-        event.record(stream)
+        try:
+            event.record(stream)
+        except Exception as e:
+            self._seen(e)  # the copies before it are unconfirmed
+            raise
         return event
+
+    def ended(self, *events) -> bool:
+        """Whether every one of ``events`` completed; a failed query is seen
+        before it propagates."""
+        try:
+            return all(event.query() for event in events)
+        except Exception as e:
+            self._seen(e)  # the copies before it are unconfirmed
+            raise
 
     @_best_effort
     def add_load(self, req_id, start, gate, end, nbytes, gate_layer, *, attempt=0):
@@ -237,12 +245,12 @@ class _TracePoller:
             ):
                 try:
                     self._clock = _GpuClock(self._clock.device)
-                except Exception as e:
-                    self._seen(e)  # The previous anchor remains usable.
+                except Exception:
+                    pass  # The previous anchor remains usable.
             loads = []
             for load in self._loads:
                 try:
-                    if not load.end.query() or not load.gate.query():
+                    if not self.ended(load.end, load.gate):
                         loads.append(load)
                         continue
                     start = self._clock.to_mono(load.start)
@@ -260,8 +268,8 @@ class _TracePoller:
                         f"req_encoding=percent clock_error_ms={self._clock.error_ms:.3f} "
                         f"scope=elapsed dp_rank={self._dp_rank} rank={self._rank}"
                     )
-                except Exception as e:
-                    self._seen(e)
+                except Exception:
+                    pass
                 # Gate/end also protect KV ownership and can still be used
                 # by the engine after this diagnostic record is drained.
                 self._recycle((load.start,))
@@ -269,7 +277,7 @@ class _TracePoller:
             steps = []
             for step in self._steps:
                 try:
-                    if not step.end.query():
+                    if not self.ended(step.end):
                         steps.append(step)
                         continue
                     fwd = step.start.elapsed_time(step.end)
@@ -282,8 +290,8 @@ class _TracePoller:
                         f"clock_error_ms={self._clock.error_ms:.3f} "
                         f"dp_rank={self._dp_rank} rank={self._rank}"
                     )
-                except Exception as e:
-                    self._seen(e)
+                except Exception:
+                    pass
                 self._recycle(
                     (step.start, step.end, *(e for pair in step.waits for e in pair))
                 )

@@ -11,6 +11,7 @@ they ended.
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,7 @@ from maru_vllm.connector import (
     _unconfirmed,
     _UnconfirmedCopyError,
 )
-from maru_vllm.trace import _LoadTiming
+from maru_vllm.trace import _GpuClock, _LoadTiming
 from tests.unit.test_vllm_cpu_config import extra as cpu_extra
 from tests.unit.test_vllm_cpu_config import mixed_extra
 from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
@@ -735,6 +736,21 @@ def test_a_load_stopped_meanwhile_takes_and_logs_no_later_request(
     assert len(loaded) == 1 and loaded[0].endswith("for req r1 (kernel)")
 
 
+def test_an_inline_layerwise_step_logs_only_the_loads_it_took(caplog):
+    """Another thread stops the worker during r1's injects: start_load_kv
+    raises, and only r1 is logged as batch-loaded."""
+    worker = worker_of("cxl", maru_use_layerwise=True)
+    worker._batch_retrieve_all = lambda keys, **route: views(keys)
+    worker._inject_kv_into_layer = lambda *a, **k: worker._stop_if_unconfirmed(
+        cuda_error(), req_id="r0"
+    )
+    caplog.set_level(logging.INFO, logger="maru_vllm.connector")
+    with pytest.raises(_UnconfirmedCopyError, match="req r0"):
+        worker.start_load_kv(forward(), three(load_meta()))
+    loaded = [r.getMessage() for r in caplog.records if "batch-loaded" in r.message]
+    assert len(loaded) == 1 and loaded[0].endswith("for req r1")
+
+
 @pytest.mark.parametrize("backend", ["cpu", "mixed"])
 @pytest.mark.parametrize("failure", ["short slab", "oom", "layout", "shape"])
 def test_a_load_failing_without_a_cuda_error_is_recomputed(backend, failure):
@@ -1373,12 +1389,14 @@ def test_an_activation_without_a_common_stream_stops_only_on_a_cuda_error(error)
     layers = [(LAYER, torch.zeros(4, 2, 4, 1, 1), 0)]
     if error == "stopped meanwhile":
         other = dataclasses.replace(meta, req_id="r2")
-        worker._deferred_layerwise_loads["r2"] = (other, 2, slots, views("cd"))
+        later = views("cd")
+        worker._deferred_layerwise_loads["r2"] = (other, 2, slots, later)
         worker._inject_kv_into_layer.side_effect = lambda *a: (
             worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
         )
         worker._schedule_deferred_layerwise_loads(layers, {"r1", "r2"}, None)
         assert worker._inject_kv_into_layer.call_count == 2  # one request's chunks
+        assert holds(worker, reads[0]) and holds(worker, later[0])  # both entries
         assert not worker._failed_load_blocks
         assert stopped(worker, "req r0")
         return
@@ -1394,31 +1412,211 @@ def test_an_activation_without_a_common_stream_stops_only_on_a_cuda_error(error)
     assert stopped(worker, "req r1")
 
 
-@pytest.mark.parametrize("call", ["record", "poll", "layer wait"])
-def test_a_timing_event_that_raises_stops_the_worker(monkeypatch, call):
+class FailedRecord:
+    """An event whose record raises a CUDA error."""
+
+    def __init__(self, **kwargs):
+        pass
+
+    def record(self, stream=None):
+        raise cuda_error()
+
+
+@pytest.mark.parametrize("hook", ["finish_forward", "poll", "layer wait"])
+def test_a_hook_whose_timing_event_raises_raises(monkeypatch, hook):
     """maru_log_timing: a CUDA error from recording or asking about a timing
-    event is not dropped with the timing record."""
+    event stops the worker, and the hook that met it raises rather than
+    returning as if nothing happened."""
     worker = worker_of("cxl", maru_log_timing=True)
     poller = worker._trace_poller
     poller._clock = object()  # no GPU clock to build
-    if call == "record":
-
-        class FailedRecord:
-            def __init__(self, **kwargs):
-                pass
-
-            def record(self, stream=None):
-                raise cuda_error()
-
+    stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    if hook == "finish_forward":
         monkeypatch.setattr(torch.cuda, "Event", FailedRecord)
-        assert poller.event(Done()) is None
-    elif call == "poll":
+        worker._trace_fwd = SimpleNamespace(end=None)
+        connector = MaruKVConnector.__new__(MaruKVConnector)
+        connector._worker = worker
+        call = connector.finish_forward
+    elif hook == "poll":
+        worker._deferred_events["r1"] = Done()  # its own copies ended
         poller._loads.append(
-            _LoadTiming("r1", Done(), FailedQuery(), FailedQuery(), 0, 0, 0)
+            _LoadTiming("r0", Done(), FailedQuery(), FailedQuery(), 0, 0, 0)
         )
-        poller.poll()
+        call = worker.get_finished_loading
     else:
-        assert worker._trace_wait_start(object(), [FailedQuery()], None) is None
+        worker._trace_fwd = SimpleNamespace(waits=[])
+        worker._layer_load_events[LAYER] = [FailedQuery()]
+        call = functools.partial(worker.wait_for_layer_load, LAYER)
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        call()
+    stream.wait_event.assert_not_called()
+    assert stopped(worker)
+
+
+@pytest.mark.parametrize("clock", ["first", "refresh"])
+def test_a_timing_clock_that_cannot_be_set_up_is_dropped_as_on_main(monkeypatch, clock):
+    """Creating the clock's stream is setup, not a copy: its CUDA error is
+    dropped with the timing record, and the worker runs on."""
+    worker = worker_of("cxl", maru_log_timing=True)
+    monkeypatch.setattr(
+        torch.cuda, "Stream", MagicMock(side_effect=cuda_error("out of memory"))
+    )
+    if clock == "first":
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda device=None: SimpleNamespace(device=0)
+        )
+        worker._trace_fwd = SimpleNamespace(end=None)
+        connector = MaruKVConnector.__new__(MaruKVConnector)
+        connector._worker = worker
+        connector.finish_forward()
+    else:
+        stale = _GpuClock.__new__(_GpuClock)
+        stale.device, stale.mono = 0, 0.0  # older than its refresh period
+        worker._trace_poller._clock = stale
+        assert worker.get_finished_loading() is None
+    assert worker._stopped is None
+
+
+# =============================================================================
+# First stream waits, event records and pointer table uploads
+# =============================================================================
+
+
+def kernel_load(monkeypatch, worker, stream):
+    """A cxl worker whose inline packed load takes the placement kernel on
+    ``stream`` (a fake CUDA stream on the CPU); returns the kernel's ops."""
+    stream.wait_stream = getattr(stream, "wait_stream", lambda other: None)
+    worker._load_stream, worker._load_stream_device = stream, torch.device("cpu")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: Done())
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    ops = SimpleNamespace(
+        multi_layer_kv_transfer=MagicMock(),
+        TransferDirection=SimpleNamespace(H2D="H2D"),
+    )
+    kernel = (ops, torch.zeros(1, dtype=torch.int64), None, BLOCK, 1, None)
+    worker._packed_load_kernel_ctx = lambda layers, attn: kernel
+    return ops
+
+
+def packed_load(worker, slots=None):
+    worker._load_packed(
+        [(LAYER, torch.zeros(4, 2, 4, 1, 1), 0)],
+        [
+            (
+                load_meta(),
+                2,
+                torch.arange(PROMPT) if slots is None else slots,
+                views("ab"),
+            )
+        ],
+        make_flash_attn_metadata(),
+    )
+
+
+@pytest.mark.parametrize("error", ["cuda", "other"])
+@pytest.mark.parametrize("path", ["load", "store"])
+def test_a_pointer_table_upload_that_raises_stops_only_on_a_cuda_error(error, path):
+    """The engine thread uploads the kernel's pointer table before any copy:
+    a CUDA error stops the worker, another error propagates as on main."""
+    failure = cuda_error() if error == "cuda" else RuntimeError("bad table")
+    if path == "load":
+        worker = worker_of("cxl")
+        worker._packed_load_kernel_ctx = MagicMock(side_effect=failure)
+        call = functools.partial(packed_load, worker)
+    else:
+        worker, _ = store_worker()
+        worker._num_layers = 1
+        worker._packed_store_kernel_ctx = MagicMock(side_effect=failure)
+        metadata = MaruConnectorMetadata(requests=[store_meta()])
+        call = functools.partial(
+            worker.save_kv_layer, LAYER, torch.zeros(1), None, metadata
+        )
+    if error == "other":
+        with pytest.raises(RuntimeError, match="bad table"):
+            call()
+        assert worker._stopped is None
+        return
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        call()
+    assert stopped(worker)
+
+
+def test_a_load_stream_that_cannot_wait_stops_before_any_copy(monkeypatch):
+    worker = worker_of("cxl")
+    stream = Done()
+    stream.wait_stream = MagicMock(side_effect=cuda_error())
+    ops = kernel_load(monkeypatch, worker, stream)
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        packed_load(worker)
+    ops.multi_layer_kv_transfer.assert_not_called()
+    assert stopped(worker)
+
+
+@pytest.mark.parametrize("path", ["parked", "inline"])
+def test_a_pinned_slot_mapping_is_kept_if_its_own_copy_raises(monkeypatch, path):
+    """The pinned copy is in the load's refs before its H2D is issued."""
+    worker = worker_of("cxl")
+    pinned = failing_slots(cuda_error())  # a tensor other than the caller's
+    if path == "inline":
+        kernel_load(monkeypatch, worker, Done())
+        worker._pin_slot_mapping_for_async_h2d = lambda m: pinned
+        with pytest.raises(_UnconfirmedCopyError, match="req r1"):
+            packed_load(worker)
+    else:
+        monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+        monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: Done())
+        monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+        worker._pin_slot_mapping_for_async_h2d = lambda m: pinned
+        worker._batch_retrieve_all = lambda keys, **route: views(keys)
+        worker._inflight_deferred_req_ids.add("r1")
+        meta = load_meta(deferred_load=True)
+        worker._deferred_load_job(meta, [(LAYER, torch.zeros(1), 0)], "cpu")
+    assert holds(worker, pinned)
+    assert not worker._failed_load_blocks
+    assert stopped(worker, "req r1")
+
+
+def test_a_group_submit_whose_event_cannot_be_recorded_stops_the_worker(
+    monkeypatch,
+):
+    worker = worker_of("cxl")
+    device = fake_cuda(monkeypatch, worker, Done())
+    worker._group_caches = [SimpleNamespace(tensors=[SimpleNamespace(device=device)])]
+    monkeypatch.setattr(torch.cuda, "Event", FailedRecord)
+    worker._deferred_executor = MagicMock()
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        worker._try_submit_group_load(group_meta(deferred_load=True))
+    worker._deferred_executor.submit.assert_not_called()
+    assert "r1" not in worker._inflight_deferred_req_ids
+    assert stopped(worker)
+
+
+def test_an_activation_stream_that_cannot_wait_keeps_its_reads(monkeypatch):
+    worker = worker_of("cxl")
+    stream = Done()
+    device = fake_cuda(monkeypatch, worker, stream)
+    stream.wait_stream = MagicMock(side_effect=cuda_error())
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock())  # not created again
+    reads = views("ab")
+    meta = load_meta(deferred_load=True, layerwise_load=True)
+    worker._deferred_layerwise_loads["r1"] = (meta, 2, torch.arange(PROMPT), reads)
+    layers = [(LAYER, SimpleNamespace(device=device), 0)]
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+    assert holds(worker, reads[0])
+    assert stopped(worker)
+
+
+def test_a_sync_store_stream_that_cannot_wait_stops_before_any_page(monkeypatch):
+    worker, handles, kernel, slots = sync_store(monkeypatch)
+    worker._sync_store_stream.wait_stream = MagicMock(side_effect=cuda_error())
+    metadata = MaruConnectorMetadata(requests=[store_meta()])
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        worker._store_packed_slabs(kernel, metadata)
+    assert not handles
+    kernel[0].multi_layer_kv_transfer.assert_not_called()
     assert stopped(worker)
 
 

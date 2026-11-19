@@ -2096,7 +2096,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
     def finish_forward(self) -> None:
         # V2 calls this before logits/sampling and speculative drafting.
         assert self._worker is not None
+        self._worker._raise_if_stopped()
         self._worker.trace_forward_end()
+        self._worker._raise_if_stopped()  # its timing event may have stopped it
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -5375,8 +5377,9 @@ class MaruWorkerConnector:
             copy_timing = _CopyTiming() if self._timing else None
             nbytes = 0
             with torch.cuda.stream(stream):
+                refs.append(slot_mapping)
                 slot_gpu = slot_mapping.to(device, non_blocking=True)
-                refs += [slot_mapping, slot_gpu]
+                refs.append(slot_gpu)
                 for ci in range(num_chunks):
                     chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
                     slab_host = torch.frombuffer(infos[ci].view, dtype=dtype).view(
@@ -5836,7 +5839,9 @@ class MaruWorkerConnector:
             self._load_stream = torch.cuda.Stream(device=device, priority=-1)
             self._load_stream_device = device
         load_stream = self._load_stream
-        self._checked(load_stream.wait_stream, torch.cuda.current_stream(device))
+        self._checked(
+            load_stream.wait_stream, torch.cuda.current_stream(device), held=entries
+        )
         entries = [
             (
                 req_meta,
@@ -6388,10 +6393,11 @@ class MaruWorkerConnector:
         the worker's own state) and the worker are kept until the process
         exits, and every later connector call raises _UnconfirmedCopyError.
 
-        Every copy, kernel launch, event record or query and stream wait goes
-        through here: an except on its path, ``_checked`` where none
-        surrounds it, or ``_trace_error`` for timing events. Calls that queue
-        and wait for nothing need not: stream and event creation,
+        Every copy, kernel launch, pointer table upload, event record or query
+        and stream wait goes through here: an except on its path, ``_checked``
+        where none surrounds it, or ``_trace_error`` for timing event records
+        and queries. Calls that queue and wait for nothing need not: stream
+        and event creation (the timing clock's setup included),
         ``set_device``, ``current_stream``, and pinning a slot mapping (a host
         allocation before the path's first copy, see
         ``_pin_slot_mapping_for_async_h2d``).
@@ -6425,8 +6431,8 @@ class MaruWorkerConnector:
             raise
 
     def _trace_error(self, error: Exception) -> None:
-        """An error a timing call dropped: a CUDA error stops the worker, as
-        the copies before the timing event are unconfirmed."""
+        """An error a timing event's record or query raised: a CUDA error
+        stops the worker, as the copies before that event are unconfirmed."""
         self._stop_if_unconfirmed(error)
 
     def _kept_if_stopped(self, *objects: Any) -> bool:
@@ -6722,6 +6728,7 @@ class MaruWorkerConnector:
                     self._deferred_refs.pop(req_id, None)
         if self._timing:
             self._poll_trace()
+            self._raise_if_stopped()  # a timing query may have stopped it
             for req_id in done:
                 key = (req_id, self._trace_attempts.get(req_id, 0))
                 self._trace_worker_req(
@@ -7043,7 +7050,7 @@ class MaruWorkerConnector:
         kernel = (
             self._loader_kernel_ctx(layers, attn, stream)
             if stream is not None
-            else self._packed_load_kernel_ctx(layers, attn)
+            else self._checked(self._packed_load_kernel_ctx, layers, attn)
         )
 
         # Queue all per-chunk transfers on a dedicated high-priority stream and
@@ -7098,8 +7105,9 @@ class MaruWorkerConnector:
                         slot_mapping = self._pin_slot_mapping_for_async_h2d(
                             slot_mapping
                         )
+                    refs.append(slot_mapping)
                     slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
-                    refs += [slot_mapping, slot_gpu]
+                    refs.append(slot_gpu)
                     for ci in range(num_chunks):
                         slab_view = slab_infos[ci].view
                         chunk_index = ci
@@ -7537,17 +7545,19 @@ class MaruWorkerConnector:
         stream = torch.cuda.current_stream()
         trace = self._trace_fwd
         before = self._trace_wait_start(trace, events, stream)
+        self._raise_if_stopped()  # a timing query may have stopped it
         for event in events:
             self._checked(stream.wait_event, event)
         if trace is not None and before is not None:
             after = self._trace_poller.event(stream)
             if before is not None and after is not None:
                 trace.waits.append((before, after))
+            self._raise_if_stopped()
 
     @_best_effort
     def _trace_wait_start(self, trace, events, stream):
         # An already complete copy cannot block the later model stream.
-        if trace is not None and any(not event.query() for event in events):
+        if trace is not None and not self._trace_poller.ended(*events):
             return self._trace_poller.event(stream)
         return None
 
@@ -7812,8 +7822,9 @@ class MaruWorkerConnector:
         assert handler is not None
         layer_idx = self._get_layer_index(layer_name)
 
-        kernel = self._packed_store_kernel_ctx(
-            attn_metadata if attn_metadata is not None else self._last_attn_metadata
+        kernel = self._checked(
+            self._packed_store_kernel_ctx,
+            attn_metadata if attn_metadata is not None else self._last_attn_metadata,
         )
         if kernel is not None:
             # Order-independent dispatch (mirrors the fallback's per-slab
