@@ -16,6 +16,7 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,7 +35,7 @@ from maru_vllm.connector import (
     _unconfirmed,
     _UnconfirmedCopyError,
 )
-from maru_vllm.trace import _GpuClock, _LoadTiming
+from maru_vllm.trace import _GpuClock, _LoadTiming, _StepTiming
 from tests.unit.test_vllm_cpu_config import extra as cpu_extra
 from tests.unit.test_vllm_cpu_config import mixed_extra
 from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
@@ -1422,7 +1423,30 @@ class FailedRecord:
         raise cuda_error()
 
 
-@pytest.mark.parametrize("hook", ["finish_forward", "poll", "layer wait"])
+class RecordsOnce:
+    """Events whose second record raises a CUDA error."""
+
+    records = 0
+
+    def __init__(self, **kwargs):
+        pass
+
+    def record(self, stream=None):
+        RecordsOnce.records += 1
+        if RecordsOnce.records == 2:
+            raise cuda_error()
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "finish_forward",
+        "poll (load)",
+        "poll (step)",
+        "layer wait",
+        "layer wait (closing)",
+    ],
+)
 def test_a_hook_whose_timing_event_raises_raises(monkeypatch, hook):
     """maru_log_timing: a CUDA error from recording or asking about a timing
     event stops the worker, and the hook that met it raises rather than
@@ -1432,25 +1456,96 @@ def test_a_hook_whose_timing_event_raises_raises(monkeypatch, hook):
     poller._clock = object()  # no GPU clock to build
     stream = MagicMock()
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    waits = 0
     if hook == "finish_forward":
         monkeypatch.setattr(torch.cuda, "Event", FailedRecord)
         worker._trace_fwd = SimpleNamespace(end=None)
         connector = MaruKVConnector.__new__(MaruKVConnector)
         connector._worker = worker
         call = connector.finish_forward
-    elif hook == "poll":
+    elif hook.startswith("poll"):
         worker._deferred_events["r1"] = Done()  # its own copies ended
-        poller._loads.append(
-            _LoadTiming("r0", Done(), FailedQuery(), FailedQuery(), 0, 0, 0)
-        )
+        if hook == "poll (load)":
+            poller._loads.append(
+                _LoadTiming("r0", Done(), FailedQuery(), FailedQuery(), 0, 0, 0)
+            )
+        else:
+            poller._steps.append(_StepTiming(0, 0, 0.0, Done(), FailedQuery(), []))
         call = worker.get_finished_loading
     else:
         worker._trace_fwd = SimpleNamespace(waits=[])
-        worker._layer_load_events[LAYER] = [FailedQuery()]
+        if hook == "layer wait":
+            worker._layer_load_events[LAYER] = [FailedQuery()]
+        else:
+            # Still copying: the wait is queued between two timing records,
+            # and the second one fails
+            RecordsOnce.records = 0
+            monkeypatch.setattr(torch.cuda, "Event", RecordsOnce)
+            worker._layer_load_events[LAYER] = [Pending()]
+            waits = 1
         call = functools.partial(worker.wait_for_layer_load, LAYER)
     with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
         call()
-    stream.wait_event.assert_not_called()
+    assert stream.wait_event.call_count == waits
+    assert stopped(worker)
+
+
+def test_a_stopped_worker_records_no_forward_timing():
+    """finish_forward raises before it records the forward's end."""
+    worker = worker_of("cxl", maru_log_timing=True)
+    worker._trace_poller._clock = object()
+    worker._trace_fwd = SimpleNamespace(end=None)
+    connector = MaruKVConnector.__new__(MaruKVConnector)
+    connector._worker = worker
+    worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
+    with mock.patch.object(torch.cuda, "Event") as event:
+        with pytest.raises(_UnconfirmedCopyError, match="req r0"):
+            connector.finish_forward()
+    event.assert_not_called()
+    assert worker._trace_fwd is not None  # its end not taken
+
+
+class ClockEvent:
+    """A timing clock's event whose record or wait raises a CUDA error."""
+
+    fails = "record"
+
+    def __init__(self, **kwargs):
+        pass
+
+    def record(self, stream=None):
+        if ClockEvent.fails == "record":
+            raise cuda_error()
+
+    def synchronize(self):
+        if ClockEvent.fails == "synchronize":
+            raise cuda_error()
+
+
+@pytest.mark.parametrize("fails", ["record", "synchronize"])
+@pytest.mark.parametrize("clock", ["first", "refresh"])
+def test_a_timing_clock_whose_event_raises_stops_the_hook(monkeypatch, clock, fails):
+    """The clock's own event record and wait may report a CUDA error of
+    earlier copies: the worker stops, and the hook raises."""
+    worker = worker_of("cxl", maru_log_timing=True)
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock())
+    monkeypatch.setattr(torch.cuda, "Event", ClockEvent)
+    ClockEvent.fails = fails
+    if clock == "first":
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda device=None: SimpleNamespace(device=0)
+        )
+        worker._deferred_layerwise_events["r1"] = {LAYER: Done()}
+        metadata = MaruConnectorMetadata(layerwise_load_req_ids={"r1"})
+        call = functools.partial(worker.start_load_kv, forward(), metadata)
+    else:
+        stale = _GpuClock.__new__(_GpuClock)
+        stale.device, stale.mono = 0, 0.0  # older than its refresh period
+        worker._trace_poller._clock = stale
+        worker._deferred_events["r1"] = Done()
+        call = worker.get_finished_loading
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        call()
     assert stopped(worker)
 
 

@@ -82,17 +82,24 @@ class _GpuClock:
 
     The bracket is calibration uncertainty, rather than a polling delay.
     A separate stream avoids waiting for previously queued model work.
+    ``seen`` gets an error of its event record or wait, which may be one of
+    earlier copies.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, seen=None):
         self.device = device
         stream = torch.cuda.Stream(device=device)
         samples = []
         for _ in range(3):
             ref = torch.cuda.Event(enable_timing=True)
             before = _mono_ms()
-            ref.record(stream)
-            ref.synchronize()
+            try:
+                ref.record(stream)
+                ref.synchronize()
+            except Exception as e:
+                if seen is not None:
+                    seen(e)
+                raise
             after = _mono_ms()
             samples.append((after - before, (before + after) / 2, ref))
         width, self.mono, self.ref = min(samples, key=lambda sample: sample[0])
@@ -163,8 +170,8 @@ class _TracePoller:
         clock=None,
         on_error=None,
     ):
-        # Sees the errors of timing event records and queries (the worker
-        # stops on a CUDA error); setup errors stay dropped
+        # Sees the errors of timing event records, queries and waits (the
+        # worker stops on a CUDA error); setup errors stay dropped
         self._trace_error = on_error
         self._rank = rank
         self._tp_size = tp_size
@@ -182,7 +189,7 @@ class _TracePoller:
             if self._closed:
                 return None
             if self._clock is None:
-                self._clock = _GpuClock(stream.device)
+                self._clock = _GpuClock(stream.device, self._seen)
             event = (
                 self._free_events.pop()
                 if reusable and self._free_events
@@ -244,7 +251,7 @@ class _TracePoller:
                 and _mono_ms() - self._clock.mono > 30_000
             ):
                 try:
-                    self._clock = _GpuClock(self._clock.device)
+                    self._clock = _GpuClock(self._clock.device, self._seen)
                 except Exception:
                     pass  # The previous anchor remains usable.
             loads = []

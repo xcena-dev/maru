@@ -6395,9 +6395,9 @@ class MaruWorkerConnector:
 
         Every copy, kernel launch, pointer table upload, event record or query
         and stream wait goes through here: an except on its path, ``_checked``
-        where none surrounds it, or ``_trace_error`` for timing event records
-        and queries. Calls that queue and wait for nothing need not: stream
-        and event creation (the timing clock's setup included),
+        where none surrounds it, or ``_trace_error`` for timing event records,
+        queries and waits. Calls that queue and wait for nothing need not:
+        stream and event creation (the timing clock's included),
         ``set_device``, ``current_stream``, and pinning a slot mapping (a host
         allocation before the path's first copy, see
         ``_pin_slot_mapping_for_async_h2d``).
@@ -6431,8 +6431,8 @@ class MaruWorkerConnector:
             raise
 
     def _trace_error(self, error: Exception) -> None:
-        """An error a timing event's record or query raised: a CUDA error
-        stops the worker, as the copies before that event are unconfirmed."""
+        """An error a timing event's record, query or wait raised: a CUDA
+        error stops the worker, as earlier copies are unconfirmed."""
         self._stop_if_unconfirmed(error)
 
     def _kept_if_stopped(self, *objects: Any) -> bool:
