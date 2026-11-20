@@ -4557,9 +4557,9 @@ class TestPackedStorage:
             ]
         )
 
-    def test_a_drafters_layers_are_stored_after_the_forward(self):
-        """A drafter's KV cache layer that never calls save_kv_layer (DSpark)
-        still lands in each chunk's slab, stored from wait_for_save."""
+    def test_draft_layers_are_stored_after_the_forward(self):
+        """A DSpark draft layer that never calls save_kv_layer still lands in
+        each chunk's slab, stored from wait_for_save."""
         from maru_vllm.connector import _chunk_keys
 
         worker, store = self._make_worker(store_after_forward=True)
@@ -4590,7 +4590,7 @@ class TestPackedStorage:
                 assert torch.equal(slab[:, li], expected), f"chunk {ci} layer {li}"
 
     @pytest.mark.parametrize("write_behind", [False, True])
-    def test_a_drafters_kernel_store_runs_once_after_the_forward(self, write_behind):
+    def test_dspark_kernel_store_runs_once_after_the_forward(self, write_behind):
         """Nothing is stored or queued from save_kv_layer; wait_for_save
         stores the step once, a write-behind store launched at once."""
         worker, _ = self._make_worker(store_after_forward=True)
@@ -4620,7 +4620,7 @@ class TestPackedStorage:
         used.assert_called_once_with(kernel, meta)
         unused.assert_not_called()
 
-    def test_without_a_drafter_wait_for_save_stores_nothing(self):
+    def test_without_dspark_wait_for_save_stores_nothing(self):
         """A single-group model stores from save_kv_layer, as before."""
         worker, store = self._make_worker()
         assert not worker.stores_after_forward

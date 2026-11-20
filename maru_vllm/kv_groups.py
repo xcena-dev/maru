@@ -43,6 +43,11 @@ GROUP_MLA = "mla"
 GROUP_SKIP = "skip"
 GROUP_UNSUPPORTED = "unsupported"
 
+# vLLM's name for DSpark speculative decoding, the one method the connector
+# supports on a model with several KV cache groups and stores a single-group
+# model's draft layers for.
+DSPARK_METHOD = "dspark"
+
 
 @dataclass(frozen=True)
 class KVGroup:
@@ -477,11 +482,12 @@ def check_multi_group_support(
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
     group, with parked loads; in layerwise format only when every stored
-    group is an MLA group (DeepSeek-V4.1). Speculative decoding is supported
-    without a Mamba group: vLLM puts the drafter's layers in groups like any
-    other layer (DeepSeek-V4.1's DSpark windows in the target's window
-    groups), and the drafter writes a token's draft KV in the step that
-    computes the token, before the connector stores it.
+    group is an MLA group (DeepSeek-V4.1). The one speculative decoding
+    method supported is DSpark (``DSPARK_METHOD``), without a Mamba group:
+    vLLM puts its draft layers in groups like any other layer (DeepSeek-V4.1's
+    draft windows in the target's window groups), and the drafter writes a
+    token's draft KV in the step that computes the token, before the
+    connector stores it.
     Every group uses vLLM's block size, but an MLA group may use another
     (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
     chunk then holds whole blocks of each (``chunk_unit``). Groups vLLM does
@@ -537,6 +543,12 @@ def check_multi_group_support(
             "layerwise format only when every group it stores is an MLA group "
             "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
             f"maru_use_layerwise=false{one_group_hint(groups)}"
+        )
+    if speculative_method is not None and speculative_method != DSPARK_METHOD:
+        raise ValueError(
+            "MaruKVConnector supports speculative decoding on models with "
+            f"several KV cache groups only with DSpark ({DSPARK_METHOD!r}), "
+            f"not {speculative_method!r}{one_group_hint(groups)}"
         )
     kinds = {g.kind for g in stored}
     if speculative_method is not None and GROUP_MAMBA in kinds:

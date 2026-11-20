@@ -468,17 +468,19 @@ def test_dsv41_with_dspark_passes_the_support_check(bounded_replay, layerwise):
     )
 
 
-@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
-def test_dsv41_with_another_speculative_method_passes_the_support_check(method):
-    """No method is named: a drafter's layers sit in groups like the
-    target's, which the other checks cover."""
-    check_multi_group_support(
-        describe_kv_groups(dsv41_config()),
-        block_size=DSV41_BLOCK,
-        use_layerwise=False,
-        speculative_method=method,
-        inline_loads=False,
-    )
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model", "unknown"])
+def test_dsv41_with_another_speculative_method_is_rejected(method):
+    """Only DSpark has been run with several groups."""
+    with pytest.raises(
+        ValueError, match=f"only with DSpark \\('dspark'\\), not '{method}'"
+    ):
+        check_multi_group_support(
+            describe_kv_groups(dsv41_config()),
+            block_size=DSV41_BLOCK,
+            use_layerwise=False,
+            speculative_method=method,
+            inline_loads=False,
+        )
 
 
 def test_connector_starts_with_dsv41_and_dspark():
@@ -1547,21 +1549,27 @@ def test_layerwise_is_rejected():
         _check(describe_kv_groups(gpt_oss_config()), 16, use_layerwise=True)
 
 
-@pytest.mark.parametrize("method", ["ngram", "eagle3", "draft_model"])
-def test_speculative_decoding_passes_without_a_mamba_group(method):
-    _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
+def test_dspark_passes_without_a_mamba_group():
+    _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method="dspark")
 
 
 @pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
-def test_speculative_decoding_is_rejected_with_a_mamba_group(method):
+def test_another_speculative_method_is_rejected_with_several_groups(method):
+    with pytest.raises(
+        ValueError, match=f"only with DSpark \\('dspark'\\), not '{method}'"
+    ):
+        _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
+
+
+def test_dspark_is_rejected_with_a_mamba_group():
     """vLLM moves an align-mode Mamba state block among a request's last
     blocks without telling the connector, so a stored state could be a block
     no kernel wrote."""
-    with pytest.raises(ValueError, match=f"speculative decoding \\('{method}'\\)"):
+    with pytest.raises(ValueError, match="speculative decoding \\('dspark'\\)"):
         _check(
             describe_kv_groups(qwen35_config()),
             QWEN35_BLOCK,
-            speculative_method=method,
+            speculative_method="dspark",
         )
 
 
@@ -2885,7 +2893,7 @@ def test_connector_wait_for_save_hands_several_groups_to_the_worker():
     connector.wait_for_save()
     connector._worker.wait_for_save.assert_not_called()
 
-    # One group with a drafter stores after the forward too.
+    # One group with DSpark stores after the forward too.
     connector._worker.stores_after_forward = True
     connector.wait_for_save()
     connector._worker.wait_for_save.assert_called_once_with(meta)

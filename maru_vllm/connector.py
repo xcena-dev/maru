@@ -54,6 +54,7 @@ from maru_common.kv_shard import (
 )
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
+    DSPARK_METHOD,
     GROUP_FULL,
     GROUP_MAMBA,
     GROUP_MLA,
@@ -1002,7 +1003,8 @@ def _speculative_method(vllm_config: VllmConfig) -> str | None:
     """The speculative decoding method vLLM runs, or None without one.
 
     A config that names no method reads as an unknown one, so the support
-    checks take it for speculative decoding rather than for none.
+    checks refuse it on a model with several groups rather than take it for
+    no speculative decoding.
     """
     spec = vllm_config.speculative_config
     if spec is None:
@@ -1861,7 +1863,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
                 dp_rank=_dp_index(vllm_config),
-                store_after_forward=vllm_config.speculative_config is not None,
+                store_after_forward=_speculative_method(vllm_config) == DSPARK_METHOD,
             )
 
     @property
@@ -1949,7 +1951,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
 
     def wait_for_save(self):
         # A single-group model's synchronous stores complete inside
-        # save_kv_layer, unless a drafter runs (MaruWorkerConnector.
+        # save_kv_layer, unless DSpark runs (MaruWorkerConnector.
         # stores_after_forward). Write-behind stores intentionally outlive
         # this forward; request/block lifetime is tracked through
         # request_finished() + get_finished(). Several groups store here,
@@ -3415,8 +3417,8 @@ class MaruWorkerConnector:
     _state_shard: KVShard = WHOLE_MODEL
     _use_mla = False
     _kv_planes = 2
-    # A single-group chunkwise model stores from save_kv_layer unless a
-    # drafter runs (stores_after_forward).
+    # A single-group chunkwise model stores from save_kv_layer unless DSpark
+    # runs (stores_after_forward).
     _store_after_forward = False
 
     def __init__(
@@ -3596,11 +3598,11 @@ class MaruWorkerConnector:
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
         # objects. The overlap path below works under either format.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
-        # With speculative decoding a single-group chunkwise model stores in
-        # wait_for_save, which vLLM calls after the drafter: a drafter's own
-        # KV cache layers (DSpark's, for one) are registered beside the
-        # target's but need not call save_kv_layer, so a store waiting there
-        # for every registered layer would never run.
+        # With DSpark a single-group chunkwise model stores in wait_for_save,
+        # which vLLM calls after the drafter: DSpark's draft layers are
+        # registered beside the target's, but vLLM's V2 model runner replays
+        # the draft step as a full CUDA graph, which calls no save_kv_layer,
+        # so a store waiting there for every registered layer would never run.
         self._store_after_forward = (
             store_after_forward and not self._multi_group and not self._use_layerwise
         )
@@ -7003,7 +7005,7 @@ class MaruWorkerConnector:
             # reports this rank's finished requests at once.
             return
         if self._store_after_forward:
-            # wait_for_save stores every registered layer, the drafter's too.
+            # wait_for_save stores every registered layer, the draft layers too.
             return
 
         if not self._use_layerwise:
@@ -7289,7 +7291,7 @@ class MaruWorkerConnector:
         that ``batch_store``, which writes the staged objects by RDMA, runs
         on the write-behind thread (``_register_objects_behind``).
 
-        A single-group model stores here only with a drafter
+        A single-group model stores here only with DSpark
         (``stores_after_forward``; see ``_store_single_group_after_forward``).
         """
         if not self._multi_group:
@@ -7347,16 +7349,15 @@ class MaruWorkerConnector:
     def _store_single_group_after_forward(
         self, metadata: MaruConnectorMetadata
     ) -> None:
-        """Store a single-group model's chunks after the forward and the drafter.
+        """Store a single-group model's chunks after the forward and DSpark's drafter.
 
-        A speculative decoding drafter with its own KV cache layers, such as
-        DSpark's on Qwen3, registers them beside the target's, but vLLM calls
-        ``save_kv_layer`` only from layers on its attention hook path, which
-        the drafter's need not be: the store, which waits for every
-        registered layer, then never runs. vLLM calls ``wait_for_save``
-        after the drafter, so every layer's KV of the step is in the paged
-        buffers here, and each chunk is stored whole, as from the last
-        ``save_kv_layer`` call.
+        DSpark's draft layers (on Qwen3, for one) are registered beside the
+        target's. vLLM's V2 model runner replays the draft step as a full
+        CUDA graph unless ``--enforce-eager``, and a replay calls no
+        ``save_kv_layer``, so a store waiting for every registered layer
+        would never run. vLLM calls ``wait_for_save`` after the drafter, so
+        every layer's KV of the step is in the paged buffers here, and each
+        chunk is stored whole, as from the last ``save_kv_layer`` call.
         """
         if not self._stores() or not self._store_entries(metadata):
             return

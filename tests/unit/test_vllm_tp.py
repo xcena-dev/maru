@@ -430,14 +430,20 @@ def test_worker_takes_mla_from_the_model_config():
     assert not gqa._worker._use_mla and gqa._worker._kv_planes == 2
 
 
-def test_worker_stores_after_the_forward_with_a_drafter():
-    """A drafter's KV cache layers need not call save_kv_layer (DSpark)."""
+def test_worker_stores_after_the_forward_with_dspark():
+    """vLLM replays DSpark's draft step as a full CUDA graph, which calls no
+    save_kv_layer for the draft layers. Other methods store as before."""
     plain = MaruKVConnector(fake_vllm_config(1, 8), KVConnectorRole.WORKER)
     assert not plain._worker.stores_after_forward
     config = fake_vllm_config(1, 8)
     config.speculative_config = SimpleNamespace(method="dspark")
     spec = MaruKVConnector(config, KVConnectorRole.WORKER)
     assert spec._worker.stores_after_forward
+    other = fake_vllm_config(1, 8)
+    other.speculative_config = SimpleNamespace(method="eagle3")
+    assert not MaruKVConnector(
+        other, KVConnectorRole.WORKER
+    )._worker.stores_after_forward
     layerwise = fake_vllm_config(1, 8, extra={"maru_use_layerwise": True})
     layerwise.speculative_config = SimpleNamespace(method="dspark")
     assert not MaruKVConnector(
