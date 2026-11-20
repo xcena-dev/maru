@@ -1509,15 +1509,18 @@ class ClockEvent:
     """A timing clock's event whose record or wait raises a CUDA error."""
 
     fails = "record"
+    records = waits = 0
 
     def __init__(self, **kwargs):
         pass
 
     def record(self, stream=None):
+        ClockEvent.records += 1
         if ClockEvent.fails == "record":
             raise cuda_error()
 
     def synchronize(self):
+        ClockEvent.waits += 1
         if ClockEvent.fails == "synchronize":
             raise cuda_error()
 
@@ -1526,11 +1529,12 @@ class ClockEvent:
 @pytest.mark.parametrize("clock", ["first", "refresh"])
 def test_a_timing_clock_whose_event_raises_stops_the_hook(monkeypatch, clock, fails):
     """The clock's own event record and wait may report a CUDA error of
-    earlier copies: the worker stops, and the hook raises."""
+    earlier copies: the clock stops calibrating at that error, the worker
+    stops, and the hook raises."""
     worker = worker_of("cxl", maru_log_timing=True)
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock())
     monkeypatch.setattr(torch.cuda, "Event", ClockEvent)
-    ClockEvent.fails = fails
+    ClockEvent.fails, ClockEvent.records, ClockEvent.waits = fails, 0, 0
     if clock == "first":
         monkeypatch.setattr(
             torch.cuda, "current_stream", lambda device=None: SimpleNamespace(device=0)
@@ -1546,6 +1550,8 @@ def test_a_timing_clock_whose_event_raises_stops_the_hook(monkeypatch, clock, fa
         call = worker.get_finished_loading
     with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
         call()
+    assert ClockEvent.records == 1
+    assert ClockEvent.waits == (1 if fails == "synchronize" else 0)
     assert stopped(worker)
 
 
