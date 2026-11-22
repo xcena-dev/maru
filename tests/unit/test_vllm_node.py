@@ -563,7 +563,7 @@ def test_an_unavailable_maruserver_fails_the_load(fake, node, workers, caplog):
 @pytest.mark.parametrize(
     "reasons, expected",
     [
-        ({"lookup:absent": 1, "fetch:busy": 2, "fetch:over_window": 1}, True),
+        ({"lookup:absent": 1, "reader:transport_busy": 2, "reader:no_slot": 1}, True),
         ({"lookup:offline": 1, "fetch:timeout": 1}, True),
         ({"fetch:io_error": 1}, False),
         ({"lookup:absent": 1, "unknown": 1}, False),
@@ -2269,7 +2269,7 @@ def kept_reads(worker) -> list[CpuReadLease]:
 
     walk(kept_by(worker))
     walk(worker._parked_loads)
-    walk([fetch.load.pending for fetch in worker._node_fetches])
+    walk([fetch.load.pending for fetch in worker._node_reads])
     return found
 
 
@@ -2478,7 +2478,7 @@ class Fetch:
 def fetching_loader(monkeypatch, depth: int = 2, **kwargs):
     """parked_loader whose requests read their two chunks in one batch from
     a node that answers a FETCH once it is waited for; ``depth`` is its
-    ``maru_load_fetch_depth``.
+    ``maru_load_read_depth``.
 
     Returns:
         The worker, its loader stream, the log, every read in order, and
@@ -2486,7 +2486,7 @@ def fetching_loader(monkeypatch, depth: int = 2, **kwargs):
     """
     worker, stream, log, reads = parked_loader(monkeypatch, **kwargs)
     monkeypatch.setattr(connector_module, "_LOAD_PIPELINE_CHUNKS", 2)
-    worker._load_fetch_depth = depth
+    worker._load_read_depth = depth
     fetches: list[Fetch] = []
 
     def start(keys, **route):
@@ -2515,7 +2515,7 @@ def submit(worker, *req_ids: str) -> list[MaruReqMeta]:
 def run(worker, *metas: MaruReqMeta) -> None:
     """Run queued loader jobs in order, on this thread."""
     for meta in metas:
-        worker._in_fetch_scope(
+        worker._run_load_job(
             meta,
             worker._deferred_load_job,
             meta,
@@ -2525,7 +2525,7 @@ def run(worker, *metas: MaruReqMeta) -> None:
 
 
 def in_flight(worker) -> list[str]:
-    return [load.req_meta.req_id for load in worker._node_fetches]
+    return [load.req_meta.req_id for load in worker._node_reads]
 
 
 def loaded(worker, req_id: str) -> bool:
@@ -2533,9 +2533,9 @@ def loaded(worker, req_id: str) -> bool:
 
 
 def test_a_fetch_depth_below_one_is_refused():
-    with pytest.raises(ValueError, match="maru_load_fetch_depth"):
-        make_worker(BLOCK, CHUNK, node_extra(maru_load_fetch_depth=0))
-    assert make_worker(BLOCK, CHUNK, node_extra())._load_fetch_depth == 2
+    with pytest.raises(ValueError, match="maru_load_read_depth"):
+        make_worker(BLOCK, CHUNK, node_extra(maru_load_read_depth=0))
+    assert make_worker(BLOCK, CHUNK, node_extra())._load_read_depth == 2
 
 
 def test_the_next_load_sends_its_fetch_before_the_last_is_answered(monkeypatch):
@@ -2549,7 +2549,7 @@ def test_the_next_load_sends_its_fetch_before_the_last_is_answered(monkeypatch):
     assert "r1" in worker._inflight_deferred_req_ids
     run(worker, r2)
     assert log == ["read 0", "read 2", "wait f0", "copy r1", "wait f1", "copy r2"]
-    assert not worker._node_fetches and not worker._inflight_deferred_req_ids
+    assert not worker._node_reads and not worker._inflight_deferred_req_ids
     for event in stream.events:
         event.ended = True
     assert worker.get_finished_loading() == {"r1", "r2"}
@@ -2638,7 +2638,7 @@ def test_a_stop_keeps_a_fetch_in_flight_unread(monkeypatch):
     assert any(
         f.started is fetches[0] for f in kept_by(worker) if hasattr(f, "started")
     )
-    assert not worker._node_fetches and not worker._deferred_done
+    assert not worker._node_reads and not worker._deferred_done
     assert not worker._inflight_deferred_req_ids
 
 

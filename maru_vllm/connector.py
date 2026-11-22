@@ -19,7 +19,6 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import hashlib
 import inspect
@@ -661,12 +660,26 @@ _KEPT_UNTIL_EXIT: list[Any] = []
 
 # Reasons a maru_node read misses now and then: the key went between the
 # scheduler's lookup and the read, or the node was short of time or room
-_EXPECTED_MISSES = frozenset({"absent", "offline", "busy", "timeout", "over_window"})
+_EXPECTED_MISSES = frozenset(
+    {
+        "absent",
+        "offline",
+        "busy",
+        "timeout",
+        "no_slot",
+        "gate_busy",
+        "transport_busy",
+        "kept_limit",
+        "no_peer",
+        "stale_reg",
+        "generation",
+    }
+)
 
 
 class _LoadMissError(RuntimeError):
     """Keys of a maru_node load not read, with the reasons the handler
-    recorded (``lookup:absent``, ``fetch:busy``, ...). ``expected``: every
+    recorded (``lookup:absent``, ``reader:no_slot``, ...). ``expected``: every
     reason is one of _EXPECTED_MISSES (logged as a warning)."""
 
     def __init__(self, missing: int, total: int, what: str, reasons: dict[str, int]):
@@ -707,9 +720,9 @@ class _LeasedBatch:
 
 
 @dataclass(eq=False)
-class _NodeFetch:
-    """A maru_node load whose last batch's FETCH is in flight: the loader
-    thread takes the answer later (``_finish_node_fetch``) and queues the
+class _NodeRead:
+    """A maru_node load whose last batch's READ is in flight: the loader
+    thread takes the answer later (``_finish_node_read``) and queues the
     batch's copies then. The load's earlier batches stay in ``load``."""
 
     load: _LeasedLoad
@@ -813,10 +826,7 @@ _NODE_KEYS_ELSEWHERE = {
     "maru_write_order": "a node serves one store",
     "maru_read_order": "a node serves one store",
     "maru_chunk_size": "the node config sets the page size",
-    "maru_rdma_device": "the node config holds the RDMA settings",
-    "maru_rdma_timeout_s": "the node config holds the RDMA settings",
     "maru_remote_cxl_agent_key_file": "the node config holds the RDMA settings",
-    "maru_rdma_staging_size": "the StorageService fetches remote KV, without staging",
     "maru_write_hints": "the node config holds the write hint settings",
     "maru_write_wait_ms": "the node config holds the write hint settings",
     "maru_server_url": "the StorageService names MaruServer at ATTACH",
@@ -1174,7 +1184,11 @@ def _node_engine_config(
             "Maru: read hints have no effect on maru_node: the node does not carry them"
         )
     digest = _namespace_digest(extra, config, kv_groups, "maru_node")
-    return {**extra, "maru_cache_namespace": digest}
+    return {
+        **extra,
+        "maru_cache_namespace": digest,
+        "_maru_vllm_instance": getattr(config, "instance_id", None),
+    }
 
 
 _TRANSFER_KNOBS = ("maru_async_load", "maru_async_store")
@@ -1527,7 +1541,7 @@ def _uncacheable_request(request: Any) -> str | None:
 
 def _log_node_counters(handler: Any, role: str) -> None:
     """Log a maru_node handler's outcome counters (unavailable, not_found and
-    fetch apart)."""
+    reader failures apart)."""
     try:
         counters = handler.get_stats()["maru_node"]["counters"]
     except Exception:
@@ -1673,21 +1687,15 @@ def _create_node_handler(
         else int(extra_config.get("_maru_step_objects", 0)),
         credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 0)) / 1000,
         lookup_timeout_ms=int(extra_config.get("maru_lookup_timeout_ms", 100)),
-        # Parked loads fetch what only the node reads in; the probe counts it
-        # only for leased loads, which go window by window
-        fetch_loads=bool(_get_knob(extra_config, "maru_async_load"))
-        and not (
-            metadata_only
-            and bool(
-                extra_config.get("maru_use_layerwise", False)
-                or _get_knob(extra_config, "maru_overlap_load_with_compute")
-            )
-        ),
-        fetch_deadline_ms=int(extra_config.get("maru_fetch_deadline_ms", 250)),
-        # Unset: scaled to the node page
-        fetch_deadline_per_page_ms=None
-        if extra_config.get("maru_fetch_deadline_per_page_ms") is None
-        else float(extra_config["maru_fetch_deadline_per_page_ms"]),
+        instance_id=extra_config.get("_maru_vllm_instance") or None,
+        rdma_device=extra_config.get("maru_rdma_device", ""),
+        rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30)),
+        rdma_staging_size=_parse_size(extra_config["maru_rdma_staging_size"])
+        if "maru_rdma_staging_size" in extra_config
+        else None,
+        rdma_load_reserve=_RDMA_ASYNC_LOAD_RESERVE
+        if _get_knob(extra_config, "maru_async_load")
+        else 0,
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)
@@ -2206,9 +2214,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             bounding same-CUDA-context interference with model steps.
             Default: 0 (submit all loads immediately). Set a positive value
             to enable the cap as a fallback safety guard.
-        maru_load_fetch_depth: int - maru_node: parked loads whose FETCH the
+        maru_load_read_depth: int - maru_node: parked loads whose READ the
             loader thread keeps in flight at once; the next queued load sends
-            its LOOKUP and FETCH while the node reads. 1 takes each answer
+            its LOOKUP and READ while the node reads. 1 takes each answer
             before the next load starts (default: 2)
         maru_log_timing: bool - Emit per-request timing diagnostics to stderr:
             per-stage CPU times and a request timeline (REQ-TRACE,
@@ -4269,7 +4277,7 @@ class MaruWorkerConnector:
             self._cpu_mode and extra_config.get("maru_storage_backend") == "remote_cxl"
         )
         # maru_node: reads are pinned in MaruServer and must be released, as
-        # remote_cxl leases are, from a page-locked pool with no slot bound
+        # remote_cxl leases are; remote reads hold worker staging slots
         self._node_mode = _is_node(extra_config)
         self._leased_mode = self._remote_cxl_mode or self._node_mode
         # Layout cross-checks. Optional; without them detection still verifies
@@ -4348,11 +4356,11 @@ class MaruWorkerConnector:
             str,
             tuple[MaruReqMeta, deque[tuple[Any, list[Any], Any]], list[str], int],
         ] = {}
-        # maru_node loads whose last FETCH is in flight, oldest first (loader
+        # maru_node loads whose last READ is in flight, oldest first (loader
         # thread only), and the loader jobs queued or running
         # (_submit_load_job): a load is left in flight only while another
         # job follows, and the last job takes what is left.
-        self._node_fetches: deque[_NodeFetch] = deque()
+        self._node_reads: deque[_NodeRead] = deque()
         # Submit can run the job on this thread before returning.
         self._loader_jobs_lock = threading.RLock()
         self._loader_jobs = 0
@@ -4402,12 +4410,12 @@ class MaruWorkerConnector:
         self._load_copy_ahead = int(extra_config.get("maru_load_copy_ahead", 2))
         if self._load_copy_ahead < 0:
             raise ValueError("maru_load_copy_ahead must be 0 or more")
-        # maru_node: loads whose FETCH the loader thread keeps in flight at
+        # maru_node: loads whose READ the loader thread keeps in flight at
         # once, the one starting included; 1 takes each answer before the
         # next load starts.
-        self._load_fetch_depth = int(extra_config.get("maru_load_fetch_depth", 2))
-        if self._load_fetch_depth < 1:
-            raise ValueError("maru_load_fetch_depth must be 1 or more")
+        self._load_read_depth = int(extra_config.get("maru_load_read_depth", 2))
+        if self._load_read_depth < 1:
+            raise ValueError("maru_load_read_depth must be 1 or more")
         self._copy_ahead: dict[tuple[torch.device, int, int], _CopyAhead] = {}
         self._copy_ahead_lock = threading.Lock()
         # Overlap loads whose off-thread copy issue failed: the loader thread
@@ -4676,10 +4684,7 @@ class MaruWorkerConnector:
             self._prepare_node_reads(handler)
 
     def _prepare_node_reads(self, handler: Any) -> None:
-        """Ready the threads that read before the first request: each one's
-        Catalog socket is connected and the process's FETCH deadline thread
-        runs. The loader thread does it as its first job, the engine thread
-        now."""
+        """Connect each read thread's Catalog socket before serving requests."""
 
         def prepare() -> None:
             try:
@@ -5390,7 +5395,7 @@ class MaruWorkerConnector:
                 self._loader_jobs += 1
                 try:
                     self._deferred_executor.submit(
-                        self._in_fetch_scope, req_meta, job, *args
+                        self._run_load_job, req_meta, job, *args
                     )
                 except BaseException:
                     self._loader_jobs -= 1
@@ -5399,32 +5404,23 @@ class MaruWorkerConnector:
             self._deferred_load_accounted(req_meta.req_id)
             self._fail_load(req_meta, e)
 
-    def _in_fetch_scope(
+    def _run_load_job(
         self, req_meta: MaruReqMeta, job: Callable[..., None], *args
     ) -> None:
-        """Run a loader job whose retrieves may FETCH for the request (only
-        the loader thread fetches; the engine thread never waits for one).
-        The last job queued takes the answers of the loads left in flight."""
-        handler = self._handler
-        scope = getattr(handler, "fetch_scope", None)
+        """Run one loader job and settle pending reads after the last job."""
         try:
-            with (
-                scope(req_meta.req_id)
-                if scope is not None
-                else contextlib.nullcontext()
-            ):
-                job(*args)
+            job(*args)
         except Exception as e:
             if not self._stop_if_unconfirmed(e, req_id=req_meta.req_id):
                 self._fail_load(req_meta, e)
         finally:
-            if not any(f.req_meta is req_meta for f in self._node_fetches):
+            if not any(f.req_meta is req_meta for f in self._node_reads):
                 self._deferred_load_accounted(req_meta.req_id)
             with self._loader_jobs_lock:
                 self._loader_jobs -= 1
                 last = self._loader_jobs <= 0
             if last:
-                self._finish_node_fetches()
+                self._finish_node_reads()
 
     def _group_load_job(
         self,
@@ -6038,8 +6034,8 @@ class MaruWorkerConnector:
                     stream=self._deferred_stream,
                 )
                 return
-            # Loads left with a FETCH in flight go first
-            self._finish_node_fetches()
+            # Loads left with a READ in flight go first
+            self._finish_node_reads()
             chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
@@ -6338,9 +6334,9 @@ class MaruWorkerConnector:
         except Exception as e:
             self._deferred_load_failed(req_meta, e, refs)
         finally:
-            # One left with a FETCH in flight is accounted for once its answer
-            # is taken (_finish_node_fetch)
-            if not any(f.req_meta is req_meta for f in self._node_fetches):
+            # One left with a READ in flight is accounted for once its answer
+            # is taken (_finish_node_read)
+            if not any(f.req_meta is req_meta for f in self._node_reads):
                 self._deferred_load_accounted(req_meta.req_id)
 
     def _deferred_load_failed(
@@ -6380,9 +6376,9 @@ class MaruWorkerConnector:
         Runs on the loader thread just before a request's GPU enqueue. Counts
         the deferred loads whose completion event has not fired yet, the
         parked maru_node loads whose copies have not all ended and those whose
-        FETCH is in flight, and, while the count is at or above
+        READ is in flight, and, while the count is at or above
         ``maru_load_admission_window``, waits on the oldest one (a parked
-        load's oldest batch first; with none parked, the oldest FETCH in
+        load's oldest batch first; with none parked, the oldest READ in
         flight is taken and its copies queued). The deferred stream is FIFO,
         so dict insertion order is completion order and waiting on the oldest
         event is the shortest wait. The gated GPU work is already enqueued
@@ -6413,12 +6409,12 @@ class MaruWorkerConnector:
                         raise
                     break
                 parked = len(self._parked_loads)
-            fetching = len(self._node_fetches)
+            fetching = len(self._node_reads)
             if len(pending) + parked + fetching < self._load_admission_window:
                 break
             waited = True
             if fetching and not parked:
-                self._finish_node_fetch(self._node_fetches.popleft())
+                self._finish_node_read(self._node_reads.popleft())
                 continue
             if parked:
                 self._settle_parked_loads(wait=True)
@@ -7073,10 +7069,10 @@ class MaruWorkerConnector:
         thread does not wait for the last batches but goes on to the next
         load; their reads go back, and the request is reported, as their
         copies end (``_settle_parked_loads``). Nor does it wait for the last
-        batch's FETCH while another loader job is queued: that job's LOOKUP
-        and FETCH go out while the node reads, with at most
-        ``maru_load_fetch_depth`` loads' FETCHes in flight, and the answer is
-        taken and its copies queued later (``_finish_node_fetches``), with
+        batch's READ while another loader job is queued: that job's LOOKUP
+        and READ go out while the node reads, with at most
+        ``maru_load_read_depth`` loads' READs in flight, and the answer is
+        taken and its copies queued later (``_finish_node_reads``), with
         answered loads first, then the oldest unanswered load when the depth
         requires it.
 
@@ -7131,7 +7127,7 @@ class MaruWorkerConnector:
             req_meta, layers, chunk_keys, slot_mapping, attn_metadata, stream, handler
         )
         pending = load.pending
-        # A maru_node loader thread may leave the last batch's FETCH in flight
+        # A maru_node loader thread may leave the last batch's READ in flight
         fetches = pipelined and self._node_mode
         b = 0
         try:
@@ -7176,7 +7172,7 @@ class MaruWorkerConnector:
                         if self._leave_in_flight(b >= len(chunk_keys)) and not (
                             started.done()
                         ):
-                            self._node_fetches.append(_NodeFetch(load, batch, started))
+                            self._node_reads.append(_NodeRead(load, batch, started))
                             return
                         infos = list(started.result())
                     else:
@@ -7206,14 +7202,14 @@ class MaruWorkerConnector:
             raise
 
     def _leave_in_flight(self, last: bool) -> bool:
-        """After a batch's FETCH went out on the loader thread: whether to
+        """After a batch's READ went out on the loader thread: whether to
         leave it in flight (the load's last batch while another loader job
         is queued), having taken the older loads' answers first, room left
         for this one if it stays."""
         with self._loader_jobs_lock:
             queued = self._loader_jobs > 1
-        leave = last and queued and self._load_fetch_depth > 1
-        self._finish_node_fetches(self._load_fetch_depth - 2 if leave else 0)
+        leave = last and queued and self._load_read_depth > 1
+        self._finish_node_reads(self._load_read_depth - 2 if leave else 0)
         return leave
 
     def _settle_leased(
@@ -7410,35 +7406,35 @@ class MaruWorkerConnector:
     def _free_parked_slots(self, handler: Any, n: int) -> bool:
         """Give back the parked loads' batches whose copies ended and, while
         fewer than ``n`` slots are free, wait for the oldest of them; with
-        none parked, take the oldest FETCH in flight (loader thread). False
+        none parked, take the oldest READ in flight (loader thread). False
         once the worker stopped."""
-        if not (self._parked_loads or self._node_fetches):
+        if not (self._parked_loads or self._node_reads):
             return self._stopped is None
         self._settle_parked_loads()
-        while (self._parked_loads or self._node_fetches) and self._stopped is None:
+        while (self._parked_loads or self._node_reads) and self._stopped is None:
             capacity = handler.retrieve_capacity(n)
             if capacity is None or capacity >= n:
                 break
             if not self._parked_loads:
-                self._finish_node_fetch(self._node_fetches.popleft())
+                self._finish_node_read(self._node_reads.popleft())
             elif not self._settle_parked_loads(wait=True):
                 break
         return self._stopped is None
 
-    def _finish_node_fetches(self, keep: int = 0) -> None:
-        """Take the answers of the loads left with a FETCH in flight (loader
+    def _finish_node_reads(self, keep: int = 0) -> None:
+        """Take the answers of the loads left with a READ in flight (loader
         thread): those answered, then the oldest until ``keep`` are left."""
-        while self._node_fetches:
-            fetch = next((f for f in self._node_fetches if f.started.done()), None)
+        while self._node_reads:
+            fetch = next((f for f in self._node_reads if f.started.done()), None)
             if fetch is None:
-                if len(self._node_fetches) <= keep:
+                if len(self._node_reads) <= keep:
                     return
-                fetch = self._node_fetches[0]
-            self._node_fetches.remove(fetch)
-            self._finish_node_fetch(fetch)
+                fetch = self._node_reads[0]
+            self._node_reads.remove(fetch)
+            self._finish_node_read(fetch)
 
-    def _finish_node_fetch(self, fetch: _NodeFetch) -> None:
-        """Run the rest of a load left with its FETCH in flight, as its loader
+    def _finish_node_read(self, fetch: _NodeRead) -> None:
+        """Run the rest of a load left with its READ in flight, as its loader
         job would have: its copies are queued and it parks, or it fails. A
         stopped worker keeps the fetch and its load's batches unread."""
         load, batch = fetch.load, fetch.batch
@@ -7552,6 +7548,9 @@ class MaruWorkerConnector:
         :data:`_LEASED_SLOT_WAIT_S` for another load to give its slots back;
         on the engine thread it fails at once rather than hold up the step.
         """
+        if self._node_mode:
+            capacity = handler.retrieve_capacity(chunks)
+            return chunks if capacity is None else int(capacity)
         deadline = time.monotonic() + _LEASED_SLOT_WAIT_S
         while True:
             capacity = handler.retrieve_capacity(chunks)
@@ -7611,6 +7610,8 @@ class MaruWorkerConnector:
             if self._stopped is not None:
                 return True
             self._stopped = f"GPU copies{of} could not be confirmed finished ({error})"
+        if self._node_mode and self._handler is not None:
+            self._handler.stop()
         logger.error(
             "Maru: %s; stopping the worker, as vLLM would reuse blocks the copies "
             "may still use (what they use is kept)",

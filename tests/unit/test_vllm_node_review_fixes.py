@@ -334,7 +334,7 @@ def test_shared_group_chunks_are_published_once_with_immediate_replies():
 
 
 @pytest.mark.parametrize("group", [True, False])
-@pytest.mark.parametrize("failure", ["enter", "job", "submit"])
+@pytest.mark.parametrize("failure", ["job", "submit"])
 def test_loader_failures_finish_the_request_and_its_accounting(group, failure):
     worker = pinning_worker()
     worker._multi_group = group
@@ -345,22 +345,14 @@ def test_loader_failures_finish_the_request_and_its_accounting(group, failure):
     worker._abandoned_req_ids.add("r1")
     job = MagicMock()
 
-    @contextlib.contextmanager
-    def scope(req_id):
-        raise StorageUnavailableError("catalog closed")
-        yield
-
     if failure == "submit":
         worker._deferred_executor = MagicMock()
         worker._deferred_executor.submit.side_effect = RuntimeError("executor closed")
         worker._submit_load_job(meta, job)
     else:
         worker._loader_jobs = 1
-        if failure == "enter":
-            worker._handler.fetch_scope.side_effect = scope
-        else:
-            job.side_effect = StorageUnavailableError("catalog closed")
-        worker._in_fetch_scope(meta, job)
+        job.side_effect = StorageUnavailableError("catalog closed")
+        worker._run_load_job(meta, job)
     assert worker._loader_jobs == 0 and not worker._inflight_deferred_req_ids
     assert not worker._abandoned_req_ids and worker._stopped is None
     assert worker.get_finished_loading() == {"r1"}
@@ -370,26 +362,6 @@ def test_loader_failures_finish_the_request_and_its_accounting(group, failure):
         assert worker.take_failed_load_blocks()
     if failure != "job":
         job.assert_not_called()
-
-
-def test_scope_entry_failure_still_finishes_the_last_fetch(monkeypatch):
-    worker, stream, _, _, _ = fetching_loader(monkeypatch)
-    r1, r2 = submit(worker, "r1", "r2")
-    run(worker, r1)
-    assert in_flight(worker) == ["r1"]
-
-    @contextlib.contextmanager
-    def broken(req_id):
-        raise StorageUnavailableError("catalog closed")
-        yield
-
-    worker._handler.fetch_scope.side_effect = broken
-    run(worker, r2)
-    assert not worker._node_fetches and worker._loader_jobs == 0
-    assert not worker._inflight_deferred_req_ids
-    for event in stream.events:
-        event.ended = True
-    assert worker.get_finished_loading() == {"r1", "r2"}
 
 
 @pytest.mark.parametrize("ready", [0, 1, 2])
@@ -578,7 +550,7 @@ def test_answered_fetches_are_copied_before_older_unanswered_fetches(monkeypatch
     r1, r2, _, _ = submit(worker, "r1", "r2", "r3", "r4")
     run(worker, r1, r2)
     fetches[1].answered = True
-    worker._finish_node_fetches(keep=2)
+    worker._finish_node_reads(keep=2)
     assert "copy r2" in log and "copy r1" not in log
     assert in_flight(worker) == ["r1"]
 
