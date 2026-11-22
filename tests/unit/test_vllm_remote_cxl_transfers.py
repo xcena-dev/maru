@@ -351,7 +351,9 @@ def _pipelined(
 
     worker._handler.release_retrieved.side_effect = release
     if slots is not None:
-        worker._handler.retrieve_capacity.side_effect = lambda: slots - held[0]
+        worker._handler.retrieve_capacity.side_effect = lambda _wanted=None: (
+            slots - held[0]
+        )
     worker._batch_retrieve_all = retrieve
     worker._last_attn_metadata = make_flash_attn_metadata()
     own = _FakeStream(log, "loader", fail_sync=stream_fails, done=done)
@@ -706,7 +708,9 @@ def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     monkeypatch.setattr(worker, "_pin_slot_mapping_for_async_h2d", lambda m: m)
     capacities = itertools.chain([0, 0], itertools.repeat(3))
-    worker._handler.retrieve_capacity.side_effect = lambda: next(capacities)
+    worker._handler.retrieve_capacity.side_effect = lambda _wanted=None: next(
+        capacities
+    )
     meta = _load_meta(deferred_load=True)
     worker._batch_retrieve_all = lambda req, route_key=None: [
         _view(_slab()) for _ in req

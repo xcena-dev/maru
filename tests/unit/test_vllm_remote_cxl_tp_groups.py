@@ -133,7 +133,7 @@ class SessionServer:
         handler.batch_exists.side_effect = batch_exists
         handler.batch_retrieve.side_effect = batch_retrieve
         handler.release_retrieved.side_effect = release_retrieved
-        handler.retrieve_capacity.side_effect = lambda: handler.free_slots
+        handler.retrieve_capacity.side_effect = lambda _wanted=None: handler.free_slots
         handler.storage_gpu_accessible.return_value = False
         handler.has_local.side_effect = committed.__contains__
         return handler
