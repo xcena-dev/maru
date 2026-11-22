@@ -42,6 +42,7 @@ from maru_vllm.connector import (
     MaruReqMeta,
     _chunk_keys,
     _is_dense,
+    _UnconfirmedCopyError,
 )
 from maru_vllm.kv_groups import (
     GROUP_FULL,
@@ -65,8 +66,11 @@ from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     FirstWinsServer,
     attach_capturing_handler,
+    cuda_error,
     fake_cached_reqs,
     fake_scheduler_output,
+    holds,
+    kept_by,
     make_flash_attn_metadata,
     make_scheduler,
     make_vllm_scheduler,
@@ -2843,16 +2847,150 @@ def test_kernel_store_uses_the_group_pointer_table(version):
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
 def test_kernel_store_registers_no_group_object_whose_copy_failed(version):
     """The attention group's slabs, whose copies could not be confirmed, are
-    freed instead of registered; the Mamba states, copied synchronously,
-    still are."""
+    neither registered nor freed (a copy may still write them), and the
+    worker stops: nothing of the step is stored, the Mamba states copied
+    before included, and the step fails."""
     worker, store, shared = _kernel_worker(version=version)
     worker._sync_store_stream = FailingSyncStream(torch.cuda.Stream(shared.device))
     worker._sync_store_stream_device = shared.device
     tokens = list(range(40))
-    worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
-    k1 = _chunk_keys(tokens, TINY_BLOCK)[1]
-    assert set(store) == {group_object_key(k1, g, TINY_BLOCK) for g in range(3)}
-    assert worker._handler.free.call_count == 2  # the two attention slabs
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert store == {}
+    worker._handler.free.assert_not_called()
+    pages = {id(h) for h in kept_by(worker) if isinstance(h, SimpleNamespace)}
+    assert len(pages) == 5  # three Mamba states and two attention slabs
+
+
+def test_a_group_whose_store_copies_are_unconfirmed_stores_nothing_of_the_step():
+    """The worker stops: the objects of the groups before it are kept, not
+    registered, and the step raises."""
+    worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+    worker._group_kernel = lambda cache: ("kernel",) * 6
+
+    def unconfirmed(*args, **kwargs):
+        error = cuda_error()
+        worker._stop_if_unconfirmed(error)
+        raise _UnconfirmedCopyError(str(error))
+
+    worker._gather_packed_slabs = unconfirmed
+    tokens = list(range(40))
+    with pytest.raises(_UnconfirmedCopyError):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert store == {}
+    worker._handler.free.assert_not_called()
+
+
+@pytest.mark.parametrize("fails", ["state", "slab"])
+def test_a_group_copy_that_raises_keeps_its_page_and_stops_the_worker(
+    monkeypatch, fails
+):
+    """A blocking copy into a Mamba state or attention slab page may still run:
+    its page is kept, no later group is copied, and the step raises."""
+    worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+    if fails == "slab":
+        worker._gather_states = MagicMock()  # the Mamba groups copy nothing
+    pages = []
+    alloc = worker._handler.alloc.side_effect
+    worker._handler.alloc.side_effect = lambda n, **route: (
+        pages.append(alloc(n)) or pages[-1]
+    )
+
+    def copy_(self, *args, **kwargs):
+        raise cuda_error()
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_)
+    tokens = list(range(40))
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert store == {}
+    worker._handler.free.assert_not_called()
+    assert len(pages) == 1 and holds(worker, pages[0])
+    assert worker._stopped is not None
+
+
+@pytest.mark.parametrize("fails", ["oom", "copy"])
+def test_an_mla_block_copy_that_raises_keeps_its_page(monkeypatch, fails):
+    """A CUDA error from the copy into an MLA object keeps its page and stops
+    the worker; an out-of-memory error before the copy skips the chunk as
+    before."""
+    chunk = 2 * DSV41_BLOCK
+    worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=chunk)
+    meta = _store_meta(list(range(80)), _dsv41_blocks(DSV41_BLOCKS_A + [11]), 0, 72)
+    pages = []
+    alloc = worker._handler.alloc.side_effect
+
+    def allocate(n, **route):
+        if fails == "oom":
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        pages.append(alloc(n))
+        return pages[-1]
+
+    worker._handler.alloc.side_effect = allocate
+    if fails == "oom":
+        worker.wait_for_save(meta)
+        assert store == {} and worker._stopped is None
+        return
+
+    def copy_(self, *args, **kwargs):
+        raise cuda_error()
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_)
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.wait_for_save(meta)
+    assert store == {}
+    worker._handler.free.assert_not_called()
+    assert len(pages) == 1 and holds(worker, pages[0])
+
+
+def test_a_group_kernel_upload_that_raises_stops_the_step():
+    """A CUDA error outside a group's copy calls (its pointer table upload)
+    also stops the worker: the step stores nothing, not even the states
+    gathered before it, and raises."""
+    worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+    worker._group_kernel = MagicMock(side_effect=cuda_error())
+    tokens = list(range(40))
+    with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+        worker.wait_for_save(_store_meta(tokens, QWEN_BLOCKS, 0, 32))
+    assert store == {}
+    worker._handler.free.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["state", "slab", "mla"])
+def test_a_group_store_stopped_meanwhile_copies_nothing_more(path):
+    """Another thread stops the worker as the step takes its first page: no
+    later chunk, request or group is copied, nothing is stored and the step
+    raises."""
+    if path == "mla":
+        worker, store = _dsv41_storing_worker(_dsv41_shared(), chunk=2 * DSV41_BLOCK)
+        tokens = list(range(80)), list(range(100, 180))
+        blocks, end = _dsv41_blocks(DSV41_BLOCKS_A + [11]), 72
+    else:
+        worker, store = _storing_worker(tiny_kv_caches("0.23", _shared()))
+        tokens = list(range(40)), list(range(100, 140))
+        blocks, end = QWEN_BLOCKS, 32
+        if path == "slab":
+            worker._gather_states = MagicMock()  # the Mamba groups copy nothing
+        else:
+            worker._copy_group_slabs = MagicMock()  # nor the attention groups
+    pages = []
+    alloc = worker._handler.alloc.side_effect
+
+    def stop_meanwhile(n, **route):
+        worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
+        pages.append(alloc(n))
+        return pages[-1]
+
+    worker._handler.alloc.side_effect = stop_meanwhile
+    requests = [
+        *_store_meta(tokens[0], blocks, 0, end).requests,
+        *_store_meta(tokens[1], blocks, 0, end, req_ids=("r2",)).requests,
+    ]
+    with pytest.raises(_UnconfirmedCopyError, match="req r0"):
+        worker.wait_for_save(MaruConnectorMetadata(requests=requests))
+    assert len(pages) == 1 and holds(worker, pages[0])
+    assert store == {}
+    worker._handler.free.assert_not_called()
 
 
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
