@@ -1284,8 +1284,7 @@ def test_admin_delete_through_the_fake(fake, nodes):
 
 @pytest.mark.parametrize("store", ["dram", "local_cxl"])
 def test_memory_lru_preserves_a_read_pin_then_reclaims_it(sockdir, store):
-    from maru_common.storage_types import REMOTE_CAPABILITY
-    from tests.unit.ms_fakes import FakeNode, Wire
+    from tests.unit.ms_fakes import FakeNode, FakeWorker, Wire
     from tests.unit.ms_node_helpers import FakeRm, MetadataServer, publish
 
     metadata = MetadataServer()
@@ -1302,16 +1301,20 @@ def test_memory_lru_preserves_a_read_pin_then_reclaims_it(sockdir, store):
         node = start_node(config, region_source=FakeRm())
         assert publish(node, "k0").result is ItemResult.ADDED
         reader = FakeNode(Wire(metadata.server.ms_service), "reader")
-        reader.capabilities = [REMOTE_CAPABILITY]
-        reader.open(pools=[])
+        from maru_common.storage_types import WORKER_RDMA_CAPABILITY
+
+        reader.capabilities = [WORKER_RDMA_CAPABILITY]
+        reader.open(pools=[], pid_ns=101)
+        worker = FakeWorker(reader.wire, reader)
+        worker.open()
         ref, page = page_of(node, "k0")
-        pinned = reader.source_pin((page.key, page.location)).items[0]
+        pinned = worker.lookup(page.key).items[0]
         assert pinned.pin_id
         for i in range(1, 13):
             publish(node, f"k{i}")
         wait_until(lambda: node.manager.retire_results.get("KEPT:PINNED", 0) > 0)
         assert node.pools.page(ref).state is PageState.READY
-        reader.unpin(pinned.pin_id)
+        worker.unpin(pinned.pin_id)
         node.manager.retire([ref], [KeyLocation(page.key, page.location)])
         assert node.pools.page(ref).state is PageState.FREE
         node.pools.check()
@@ -2442,70 +2445,3 @@ class TestFirstConnect:
         listener.bind(path)
         listener.listen()
         return listener
-
-
-@pytest.mark.parametrize("store", ["dram", "local_cxl"])
-def test_local_store_never_uses_fetch_even_inside_fetch_scope(fake, sockdir, store):
-    from maru_common.storage_types import FetchPlan
-    from maru_handler.client import pool_maps
-    from maru_handler.storage.cpu import CpuPool
-    from tests.unit.ms_node_helpers import FakeRm, anon_region
-
-    options = {} if store == "dram" else {"cxl_pages": 16}
-    config = node_config(fake.url, f"{sockdir}/local.sock", **options)
-    node_options = (
-        {}
-        if store == "dram"
-        else {"region_source": FakeRm(), "map_region": anon_region}
-    )
-    node = start_node(config, **node_options)
-    handler = MaruHandler(
-        MaruConfig(
-            maru_node=config.socket,
-            engine_id="local",
-            cache_namespace=NS,
-            chunk_size_bytes=PAGE,
-            pool_size=PAGE,
-            pin_pools=False,
-            timeout_ms=300,
-            auto_connect=False,
-            load_only=True,
-            fetch_loads=True,
-        )
-    )
-    if store == "local_cxl":
-        # No device is opened by this worker mapping.
-        handler._cpu.pools = pool_maps.PoolMaps(
-            pin_pools=False,
-            map_dax=lambda info, dax: CpuPool(
-                info.pool_id, info.capacity, info.page_size, medium="cxl"
-            ),
-        )
-
-    def plan(response):
-        response.items = [
-            ItemOutcome(
-                ItemResult.FETCH,
-                plan=FetchPlan(
-                    Location("cxl:memory:1", "src", 1, 0, PAGE, PoolKind.CXL),
-                    "memory",
-                    PAGE,
-                ),
-            )
-        ]
-        return response
-
-    try:
-        handler.connect()
-        assert not {"fetch_v1", "lease_v1"}.intersection(
-            handler._cpu.attach_info.capabilities
-        )
-        fake.rewrite_responses(MessageType.LOOKUP_AND_PIN, plan)
-        with handler.fetch_scope("local"):
-            assert handler.retrieve_capacity() is None
-            assert handler.batch_retrieve(["planned"]) == [None]
-        assert not handler._cpu._ops.unresolved()
-        assert handler._cpu.stats["retrieve_fetch"] == 1
-    finally:
-        handler.close()
-        node.stop()

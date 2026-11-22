@@ -15,13 +15,11 @@ only.
 """
 
 import collections
-import contextlib
 import dataclasses
 import functools
 import heapq
 import itertools
 import logging
-import math
 import os
 import threading
 import time
@@ -40,24 +38,22 @@ from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
     DetachRequest,
-    FetchItem,
-    FetchReleaseRequest,
-    FetchRequest,
-    FetchResponse,
     GroupLayout,
     NodeMessageType,
     Notify,
+    Peers,
+    ReadJoinRequest,
     UnmapAckRequest,
     WriteDoneItem,
     WriteDoneRequest,
     process_start_time,
 )
+from maru_common.remote_protocol import TransferEnd
 from maru_common.storage_types import (
-    FETCH_CAPABILITY,
     HINT_CAPABILITY,
-    LEASE_CAPABILITY,
     MAX_BATCH,
     MS_PROTOCOL,
+    WORKER_RDMA_CAPABILITY,
     ItemOutcome,
     ItemResult,
     Key,
@@ -81,7 +77,7 @@ from .pool_maps import (
     RegionHolder,
     StaleRunError,
 )
-from .server_conn import ServerConn, WorkerIdentity, plan_pins
+from .server_conn import ServerConn, WorkerIdentity
 from .storage_conn import (
     AttachRefusedError,
     NodeNotListeningError,
@@ -89,6 +85,7 @@ from .storage_conn import (
     StorageConn,
     close_fds,
 )
+from .worker_rdma import WorkerRdma
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +102,6 @@ CONNECT_RETRY_MAX_S = 1.0
 CLOSE_TIMEOUT_S = 5.0
 BUSY_RESEND_S = 0.2
 ATTACH_WARN_S = 30.0
-MAX_UNRESOLVED_FETCHES = 32
-# A FETCH past its deadline is answered by its scope; this bounds a lost one
-FETCH_WAIT_SLACK_S = 1.0
-# The node's cap on a FETCH deadline
-FETCH_DEADLINE_MAX_MS = 60_000
-# Unset fetch_deadline_per_page_ms: a node page is read at 2 GB/s
-FETCH_READ_BYTES_PER_S = 2_000_000_000
-# How long retrieve_capacity waits for lease returns
-FETCH_RELEASE_WAIT_S = 0.02
 
 
 class _DeadlineQueue:
@@ -124,7 +112,7 @@ class _DeadlineQueue:
         self._heap = []
         self._seq = itertools.count()
         self.thread = threading.Thread(
-            target=self._run, name="maru-fetch-deadlines", daemon=True
+            target=self._run, name="maru-client-deadlines", daemon=True
         )
         self.thread.start()
 
@@ -186,8 +174,7 @@ def _deadlines():
 
 
 def _miss_label(source: str, outcome: ItemOutcome) -> str:
-    """``source:reason`` of an item not read: its MISS reason, else its
-    result (``lookup:fetch`` is a plan this thread does not FETCH)."""
+    """Label one lookup miss."""
     if outcome.result == ItemResult.MISS:
         return f"{source}:{outcome.reason.value if outcome.reason else 'miss'}"
     return f"{source}:{outcome.result.value.lower()}"
@@ -216,6 +203,7 @@ class CreditHandle:
     size: int
     # writing -> submitted -> done; or writing -> freed / dropped
     state: str = "writing"
+    remote: object = None
 
 
 @dataclass(eq=False)
@@ -225,30 +213,17 @@ class PinnedRead(CpuReadLease):
     key: str = ""
     pin_id: str = ""
     server_epoch: str = ""
-    fetched: bool = False
-    lease_id: int | None = None
     node_epoch: str | None = None
+    owner: object = None
 
-
-@dataclass(eq=False)
-class _FetchScope:
-    """One FETCH of a parked load: its deadline, cancel and pending op."""
-
-    request_id: str
-    deadline: float
-    node_epoch: str | None
-    cancelled: bool = False
-    reason: MissReason | None = None
-    pending: dict[int, tuple[FetchRequest, Future]] = field(default_factory=dict)
-    # Its caller's reservation counts its slots
-    reserved: bool = False
+    def release(self):
+        if self.owner is None or not self.owner._stopped.is_set():
+            super().release()
 
 
 @dataclass(eq=False)
 class _ChunkRead:
-    """One LOOKUP_AND_PIN of a retrieve, its reads, and the FETCH it sent
-    for the keys only the node can read in (their slots reserved until
-    _take_fetch)."""
+    """One lookup batch and its pending direct reads."""
 
     out: list[PinnedRead | None]
     server: ServerConn | None = None
@@ -256,28 +231,26 @@ class _ChunkRead:
     outcomes: list[ItemOutcome] = field(default_factory=list)
     epoch: str = ""
     node_epoch: str | None = None
-    scope: _FetchScope | None = None
-    wanted: list[int] = field(default_factory=list)
-    reply: Future | None = None
+    remote: dict = field(default_factory=dict)
 
 
 class PendingRetrieve:
-    """A retrieve whose FETCHes may still be in flight (start_retrieve).
-    result() takes their answers on the calling thread; call it once."""
+    """Direct reads started by one retrieve; result transfers ownership once."""
 
-    def __init__(self, client: "MaruClient") -> None:
+    def __init__(self, client):
         self._client = client
-        self.misses: collections.Counter[str] = collections.Counter()
-        self._chunks: list[_ChunkRead] = []
+        self.misses = collections.Counter()
+        self._chunks = []
 
-    def done(self) -> bool:
-        """Every FETCH is answered: result() does not wait for the node."""
-        return all(c.reply is None or c.reply.done() for c in self._chunks)
+    def done(self):
+        return all(r.done() for c in self._chunks for r in c.remote.values())
 
-    def result(self) -> list[PinnedRead | None]:
-        """Read leases in key order; None for keys not read now
-        (``last_retrieve_misses`` tells why)."""
+    def result(self):
         return self._client._finish_retrieve(self)
+
+    def cancel(self):
+        chunks, self._chunks = self._chunks, []
+        self._client._drop_chunks(chunks)
 
 
 class _Throttle:
@@ -358,15 +331,9 @@ class MaruClient:
         self._attaching_epoch: str | None = None
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
-        self._fetch_scopes: set[_FetchScope] = set()
-        # The request a loader thread retrieves for (fetch_scope)
-        self._fetch_local = threading.local()
-        # Why keys of this thread's last retrieve were not read
+        self._rdma: WorkerRdma | None = None
+        self._stopped = threading.Event()
         self._retrieve_local = threading.local()
-        # Window slots of FETCHes whose answer a loader has not taken, and
-        # leases whose return is not confirmed yet: both hold their slots
-        self._fetch_reserved = 0
-        self._fetch_releasing: set[tuple[str, int]] = set()
         self._returns: list[Location] = []
         self._connected = False
         self._closing = threading.Event()
@@ -398,6 +365,20 @@ class MaruClient:
         # Outcomes by class: unavailable, not_found and fetch apart
         self.stats: collections.Counter[str] = collections.Counter()
         self._stats_lock = threading.Lock()
+
+    def stop(self):
+        """Freeze ownership after a CUDA error."""
+        self._stopped.set()
+        self._closing.set()
+        self._refill_wake.set()
+        self._lost.set()
+        with self._sends_cv:
+            self._sends_cv.notify_all()
+        if self._rdma is not None:
+            self._rdma.stop()
+        if self._server is not None:
+            self._server.freeze()
+        self.credits.close()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -610,9 +591,10 @@ class MaruClient:
                 )
             ],
             protocol=MS_PROTOCOL,
-            capabilities=[FETCH_CAPABILITY, LEASE_CAPABILITY, HINT_CAPABILITY]
-            if self.config.fetch_loads
-            else [HINT_CAPABILITY],
+            capabilities=[HINT_CAPABILITY]
+            if self.role == SessionRole.PROBE
+            else [WORKER_RDMA_CAPABILITY, HINT_CAPABILITY],
+            instance=self.config.instance_id,
             role=self.role,
             step_objects=self.config.step_objects if self._writes else 0,
         )
@@ -686,6 +668,22 @@ class MaruClient:
                         100 * self.config.chunk_size_bytes // response.page_size,
                         response.page_size,
                     )
+            if (
+                self.role == SessionRole.WORKER
+                and WORKER_RDMA_CAPABILITY in response.capabilities
+            ):
+                if self._rdma is None:
+                    self._rdma = WorkerRdma(self.config, response.page_size)
+                elif self._rdma.staging.slot_bytes != response.page_size:
+                    raise AttachRefusedError("RDMA page size changed")
+                self._rdma.notify_peers(response.peers)
+                joined = conn.request(
+                    NodeMessageType.READ_JOIN,
+                    ReadJoinRequest(self._rdma.name, self._rdma.transport.metadata()),
+                    self.rpc_timeout_s,
+                )
+                if joined.status != Status.OK:
+                    raise AttachRefusedError("READ_JOIN refused")
             same_run = response.node_epoch == self.node_epoch
             with self._lock:
                 # Its pools are not old ones while they are installed
@@ -722,7 +720,8 @@ class MaruClient:
             closed = self._closing.is_set()
             if not closed:
                 if not same_run:
-                    self._end_fetch_scopes()
+                    if self._rdma is not None:
+                        self._rdma.advance()
                     if self.node_epoch is not None:
                         logger.warning(
                             "the StorageService restarted (node epoch %s -> %s); "
@@ -735,7 +734,6 @@ class MaruClient:
                         self.identity.incarnation, response.node_epoch
                     )
                     self._returns.clear()
-                    self._fetch_releasing.clear()
                     self.credits.reset(response.node_epoch)
                 self.attach_info = response
                 self._storage = conn
@@ -762,11 +760,17 @@ class MaruClient:
         Pools of allocations a copy may still write, and of reads not yet
         released, stay mapped and registered until the process ends, so each
         such close() keeps them."""
+        if self._stopped.is_set():
+            from .worker_rdma import _KEPT_UNTIL_EXIT
+
+            _KEPT_UNTIL_EXIT.append(self)
+            return
         with self._lock:
             if self._closing.is_set():
                 return
             self._closing.set()
-            self._end_fetch_scopes()
+            if self._rdma is not None:
+                self._rdma.advance()
             handles = [h for h in self._handles if h.state == "writing"]
             reads = list(self._reads)
             connecting = self._connecting
@@ -829,13 +833,14 @@ class MaruClient:
             except Exception as e:
                 logger.warning("DETACH before closing failed: %s", e)
         self._teardown(writing=handles, reading=reads)
+        if self._rdma is not None:
+            self._rdma.close()
         reads_seen = {
             name: n
             for name, n in sorted(self._counters().items())
-            if name.startswith(("retrieve_", "fetch_"))
+            if name.startswith("retrieve_")
         }
         if reads_seen:
-            # LOOKUP outcomes (retrieve_*) and FETCH outcomes (fetch_*)
             logger.info(
                 "maru_node worker %s reads: %s", self.identity.incarnation, reads_seen
             )
@@ -855,7 +860,8 @@ class MaruClient:
             self._connected = False
             # A later connect() starts as a new run: its pools get mapped
             self.node_epoch = None
-            self._end_fetch_scopes()
+            if self._rdma is not None:
+                self._rdma.advance()
             self._ops = None
             self.attach_info = None
             for handle in self._handles:
@@ -883,7 +889,7 @@ class MaruClient:
             return self._storage is not None and not self._storage.closed
 
     def _ensure(self, data: bool = True) -> None:
-        if not self.connected:
+        if self._stopped.is_set() or not self.connected:
             raise StorageUnavailableError("the maru_node client is not connected")
 
     def healthcheck(self) -> bool:
@@ -910,6 +916,7 @@ class MaruClient:
                 "allocations": len(self._handles),
                 "pinned_reads": len(self._reads),
                 "pools": self.pools.pool_ids(),
+                "rdma": self._rdma.snapshot() if self._rdma else None,
                 "counters": self._counters(),
             }
 
@@ -927,7 +934,12 @@ class MaruClient:
 
     def storage_gpu_accessible(self) -> bool:
         """Whether every mapped pool is page-locked for GPU copy kernels."""
-        return self.pools.page_locked()
+        mapped = (
+            self.pools.page_locked()
+            if self.pools.pool_ids()
+            else self._rdma is not None
+        )
+        return mapped and (self._rdma is None or self._rdma.staging.cuda_registered)
 
     # ----------------------------------------------------------------- writes
 
@@ -974,8 +986,18 @@ class MaruClient:
         with self._lock:
             if self._demand:
                 self._demand_taken += credit.length
+        remote = None
         try:
-            view = self.pools.view(credit, size, node_epoch=node_epoch)
+            if self._rdma is not None and self._rdma.owns_credit(credit):
+                if node_epoch != self.node_epoch:
+                    raise StaleRunError("credit run ended")
+                remote = self._rdma.alloc_write(credit, size)
+                if remote is None:
+                    self.credits.put([credit], node_epoch)
+                    raise CreditUnavailableError("no remote staging slot")
+                view = remote.view
+            else:
+                view = self.pools.view(credit, size, node_epoch=node_epoch)
         except LocationError as e:
             with self._lock:
                 ended = node_epoch != self.node_epoch
@@ -989,7 +1011,7 @@ class MaruClient:
             self._count("store_skipped_unmapped")
             raise CreditUnavailableError(f"credit of an unmapped pool: {e}") from e
         handle = CreditHandle(
-            buf=view, location=credit, node_epoch=node_epoch, size=size
+            buf=view, location=credit, node_epoch=node_epoch, size=size, remote=remote
         )
         with self._lock:
             # Against Maru turning off (under this lock), which ends the
@@ -1019,6 +1041,8 @@ class MaruClient:
 
     def free(self, handle: CreditHandle) -> None:
         """Give back an unstored allocation; a stored one is left alone."""
+        if self._stopped.is_set():
+            return
         with self._lock:
             if not isinstance(handle, CreditHandle) or handle not in self._handles:
                 return
@@ -1036,7 +1060,11 @@ class MaruClient:
 
     def _finish_handle(self, handle: CreditHandle, state: str) -> None:
         """Caller holds the lock."""
+        if self._stopped.is_set():
+            return
         handle.state = state
+        if handle.remote is not None:
+            self._rdma.release_write(handle.remote)
         _release_view(handle.buf)
         self._handles.discard(handle)
         self._cv.notify_all()
@@ -1140,6 +1168,8 @@ class MaruClient:
                 if not self._sends:
                     return
                 task = self._sends.popleft()
+            if self._stopped.is_set():
+                return
             try:
                 task()
             except Exception:
@@ -1147,6 +1177,9 @@ class MaruClient:
 
     def _send_write_done(self, keys, handles, future: Future) -> None:
         results = [False] * len(keys)
+        if self._stopped.is_set():
+            future.set_result(results)
+            return
         live = []
         returns: list[Location] = []
         with self._lock:
@@ -1170,7 +1203,23 @@ class MaruClient:
         if not live:
             future.set_result(results)
             return
-        assert ops is not None  # set and cleared with the storage connection
+        ends = {}
+        for i in list(live):
+            if self._stopped.is_set():
+                future.set_result(results)
+                return
+            handle = handles[i]
+            if handle.remote is not None:
+                ends[i] = self._rdma.write(handle.remote)
+                if ends[i] == TransferEnd.NOT_POSTED:
+                    live.remove(i)
+                    self._abort([handle.location])
+                    with self._lock:
+                        self._finish_handle(handle, "freed")
+        if self._stopped.is_set() or not live:
+            future.set_result(results)
+            return
+        assert ops is not None
         request = ops.origin.stamp(
             WriteDoneRequest(
                 op=PLACEHOLDER_OP,
@@ -1179,6 +1228,10 @@ class MaruClient:
                         key=Key(self.identity.namespace, keys[i]),
                         credit=handles[i].location,
                         logical_bytes=handles[i].size,
+                        domain=handles[i].remote.agent.domain
+                        if handles[i].remote
+                        else None,
+                        end=ends.get(i, TransferEnd.DONE),
                     )
                     for i in live
                 ],
@@ -1186,6 +1239,7 @@ class MaruClient:
             )
         )
         credits = [handles[i].location for i in live]
+        abortable = [handles[i].location for i in live if handles[i].remote is None]
         with self._lock:
             for i in live:
                 self._finish_handle(handles[i], "done")
@@ -1195,12 +1249,13 @@ class MaruClient:
                 logger.error(
                     "WRITE_DONE refused: %s %s", response.status, response.error
                 )
-                self._abort(credits)
+                self._abort(abortable)
                 return
             rejected = [
                 credit
                 for credit, outcome in zip(credits, response.items, strict=True)
-                if outcome.result not in (ItemResult.ADDED, ItemResult.DUPLICATE)
+                if credit in abortable
+                and outcome.result not in (ItemResult.ADDED, ItemResult.DUPLICATE)
             ]
             if rejected:
                 self._abort(rejected)
@@ -1219,7 +1274,9 @@ class MaruClient:
                 return
             if response.status == Status.OK and len(response.items) == len(live):
                 for i, outcome in zip(live, response.items, strict=True):
-                    results[i] = outcome.result in (
+                    results[i] = ends.get(
+                        i, TransferEnd.DONE
+                    ) == TransferEnd.DONE and outcome.result in (
                         ItemResult.ADDED,
                         ItemResult.DUPLICATE,
                     )
@@ -1257,26 +1314,14 @@ class MaruClient:
         """Send an op, tracked until its result is known; on_result runs once.
         Unknown and BUSY stay tracked: resent after a reconnect or a pause."""
         reply: Future = Future()
+        if self._stopped.is_set():
+            reply.set_exception(StorageUnavailableError("worker stopped"))
+            return reply
         with self._lock:
             if ops is not self._ops:
                 reply.set_exception(StorageUnavailableError("the run ended"))
                 return reply
             if resend:
-                if code == NodeMessageType.FETCH:
-                    scope_deadline = next(
-                        (
-                            s.deadline
-                            for s in self._fetch_scopes
-                            if request.op.seq in s.pending
-                        ),
-                        None,
-                    )
-                    if scope_deadline is not None:
-                        left = int((scope_deadline - time.monotonic()) * 1000)
-                        request = dataclasses.replace(request, deadline_ms=max(1, left))
-                    if deadline is None:
-                        # Recovery sends have their own bounded I/O budget.
-                        deadline = time.monotonic() + self.rpc_timeout_s
                 if not ops.update(request):
                     reply.set_exception(StorageUnavailableError("already resolved"))
                     return reply
@@ -1286,11 +1331,7 @@ class MaruClient:
         if storage is None or storage.closed:
             reply.set_exception(StorageUnavailableError("not connected"))
             return reply
-        reply = (
-            storage.fetch(request, deadline=deadline)
-            if code == NodeMessageType.FETCH
-            else storage.submit(code, request)
-        )
+        reply = storage.submit(code, request)
         seq = request.op.seq
 
         def done(f: Future) -> None:
@@ -1298,16 +1339,7 @@ class MaruClient:
                 response = f.result()
             except Exception:
                 return  # unresolved; resent after reconnecting
-            if code == NodeMessageType.FETCH:
-                self._take_window(ops, response)
             if response.status == Status.BUSY:
-                if code == NodeMessageType.FETCH:
-                    # Not taken: its load misses now; the op is resent until
-                    # resolved, after its cancel
-                    with self._lock:
-                        scopes = [s for s in self._fetch_scopes if seq in s.pending]
-                    for scope in scopes:
-                        self._cancel_fetch_scope(scope, MissReason.BUSY)
                 _deadlines().schedule(
                     time.monotonic() + BUSY_RESEND_S,
                     lambda: self._post(
@@ -1332,11 +1364,6 @@ class MaruClient:
             ops = self._ops
         if ops is None:
             return
-        # Cancels first: a FETCH of a dead scope reads nothing
-        with self._lock:
-            scopes = [s for s in self._fetch_scopes if s.cancelled]
-        for scope in scopes:
-            self._send_fetch_cancels(scope)
         for code, request, on_result in ops.unresolved():
             self._send_op(code, ops.origin.refresh(request), on_result, ops, True)
         with self._lock:
@@ -1406,12 +1433,27 @@ class MaruClient:
                 return
             if not response.credits:
                 return
-            mapped = [c for c in response.credits if self.pools.get(c.pool_id)]
+            remote = getattr(response, "write_agent", None)
+            remote_credits = []
+            if remote is not None and self._rdma is not None:
+                remote_credits = [
+                    c
+                    for c in response.credits
+                    if any(p.pool_id == c.pool_id for p in remote.pools)
+                ]
+                if not self._rdma.bind_credits(
+                    remote_credits, remote, info.node_id, epoch
+                ):
+                    self._count("credit_bad_domain")
+                    return
+            mapped = [
+                c
+                for c in response.credits
+                if self.pools.get(c.pool_id) or c in remote_credits
+            ]
             if len(mapped) < len(response.credits):
                 # A pool this worker could not map: given back at once
-                self._return_credits(
-                    [c for c in response.credits if not self.pools.get(c.pool_id)]
-                )
+                self._return_credits([c for c in response.credits if c not in mapped])
                 self._count("credit_unmapped")
             if not mapped:
                 return
@@ -1502,6 +1544,8 @@ class MaruClient:
                 logger.exception("credit refill failed")
 
     def _return_credits(self, credits: list[Location]) -> None:
+        if self._stopped.is_set():
+            return
         with self._lock:
             storage = self._storage
         if storage is None or storage.closed:
@@ -1525,482 +1569,54 @@ class MaruClient:
 
     # ---------------------------------------------------------- parked fetch
 
-    @contextlib.contextmanager
-    def fetch_scope(self, request_id: str):
-        """Allow this thread's retrieves to FETCH for ``request_id``."""
-        self.prepare_read_thread()
-        previous = getattr(self._fetch_local, "request_id", None)
-        self._fetch_local.request_id = request_id
-        try:
-            yield
-        finally:
-            self._fetch_local.request_id = previous
+    # ------------------------------------------------------------------ reads
 
     def prepare_read_thread(self) -> None:
-        """Connect this read thread's Catalog socket before its first lookup."""
-        _deadlines()
         server = self._server
         if server is not None:
             server.prepare_read_thread()
 
-    def _fetch_window(self) -> int | None:
-        """Pages this worker's fetches may hold at once (the node gives it at
-        ATTACH and with each FETCH answer, within what it can fetch into), or
-        None when this thread fetches nothing."""
-        info = self.attach_info
-        if (
-            getattr(self._fetch_local, "request_id", None) is None
-            or not self.config.fetch_loads
-            or info is None
-            or info.budgets is None
-            or not info.page_size
-            or not {FETCH_CAPABILITY, LEASE_CAPABILITY} <= set(info.capabilities)
-        ):
-            return None
-        return max(1, info.budgets.fetch_request_max_bytes // info.page_size)
+    def retrieve_capacity(self, wanted=None):
+        return self._rdma.capacity() if self._rdma is not None else None
 
-    def _take_window(self, ops: OpTracker, response: FetchResponse) -> None:
-        """The window a FETCH answer of the attached node run carries becomes
-        this worker's share; a smaller one limits new FETCHes only. A worker
-        that sends no FETCH keeps its last window while others come and go."""
-        window = response.window_bytes
-        with self._lock:
-            info = self.attach_info
-            if (
-                window <= 0
-                or ops is not self._ops
-                or info is None
-                or info.budgets is None
-                or info.budgets.fetch_request_max_bytes == window
-            ):
-                return
-            info.budgets = dataclasses.replace(
-                info.budgets, fetch_request_max_bytes=window
-            )
-            self._cv.notify_all()  # a loader waiting for slots looks again
-
-    def _fetch_used(self) -> int:
-        """Caller holds _lock: pending items, reads and unconfirmed returns."""
-        pending = sum(
-            len(request.items)
-            for scope in self._fetch_scopes
-            if not scope.reserved
-            for request, _ in scope.pending.values()
-        )
-        fetched = sum(
-            1
-            for read in self._reads
-            if read.fetched and read.node_epoch == self.node_epoch
-        )
-        return self._fetch_reserved + pending + fetched + len(self._fetch_releasing)
-
-    def retrieve_capacity(self, wanted: int | None = None) -> int | None:
-        """Free fetch slots; wait briefly for pending lease returns."""
-        if self._fetch_window() is None or not self.storage_connected:
-            return None
-
-        def free() -> int:
-            # The window as a FETCH answer last set it
-            return (self._fetch_window() or 0) - self._fetch_used()
-
-        def ready() -> bool:
-            room = free()
-            if wanted is not None and room >= wanted:
-                return True
-            return not self._fetch_releasing
-
-        with self._lock:
-            self._cv.wait_for(ready, FETCH_RELEASE_WAIT_S)
-            return max(0, free())
-
-    def _send_fetch(self, chunk: _ChunkRead) -> None:
-        """Send planned reads within the window; transfer their source pins."""
-        wanted = [
-            i
-            for i, o in enumerate(chunk.outcomes)
-            if o.result == ItemResult.FETCH and o.plan is not None
-        ]
-        info = self.attach_info
-        if not wanted:
-            return
-        assert chunk.server is not None
-        unsent = plan_pins([chunk.outcomes[i] for i in wanted])
-        if info is None:
-            if unsent:
-                chunk.server.unpin(unsent)
-            self._note_miss("unavailable", len(wanted))
-            return
-        window = self._fetch_window()
-        per_page_ms = self.config.fetch_deadline_per_page_ms
-        if per_page_ms is None:
-            per_page_ms = info.page_size * 1000 / FETCH_READ_BYTES_PER_S
-        # Longer for a large FETCH, within the node's cap
-        deadline_ms = min(
-            FETCH_DEADLINE_MAX_MS,
-            max(
-                self.config.fetch_deadline_ms,
-                math.ceil(len(wanted) * per_page_ms),
-            ),
-        )
-        with self._lock:
-            # Checked and taken at once; kept until the reads hold the slots
-            fits = window is not None and len(wanted) <= window - self._fetch_used()
-            if fits:
-                self._fetch_reserved += len(wanted)
-                scope = self._new_fetch_scope(
-                    self._fetch_local.request_id, deadline_ms=deadline_ms
-                )
-                scope.reserved = True
-        if not fits:
-            if unsent:
-                chunk.server.unpin(unsent)
-            self._count("fetch_over_window", len(wanted))
-            self._note_miss("fetch:over_window", len(wanted))
-            return
-        try:
-            items = [
-                FetchItem(
-                    Key(self.identity.namespace, chunk.keys[i]), chunk.outcomes[i].plan
-                )
-                for i in wanted
-            ]
-            chunk.reply = self._fetch(scope, items, len(items) * info.page_size)
-        except BaseException:
-            with self._lock:
-                self._fetch_reserved -= len(wanted)
-                scope.reserved = False
-            raise
-        chunk.scope, chunk.wanted = scope, wanted
-
-    def _take_fetch(self, chunk: _ChunkRead) -> None:
-        """Take lease reads from the reply; misses have no view."""
-        scope, reply, server = chunk.scope, chunk.reply, chunk.server
-        assert scope is not None and reply is not None and server is not None
-        wanted, chunk.reply = chunk.wanted, None
-        reads: list[PinnedRead] = []
-        try:
-            try:
-                # The scope's deadline answers it; this only bounds a lost answer
-                response = reply.result(
-                    max(0.0, scope.deadline - time.monotonic()) + FETCH_WAIT_SLACK_S
-                )
-            except Exception as e:
-                logger.debug("FETCH of %d keys failed: %s", len(wanted), e)
-                self._count("fetch_failed", len(wanted))
-                self._note_miss("fetch:failed", len(wanted))
-                return
-            if response.status != Status.OK:
-                status = response.status.value.lower()
-                self._count(f"fetch_{status}", len(wanted))
-                self._note_miss(f"fetch:{status}", len(wanted))
-                return
-            n = 0
-            try:
-                for n in range(len(wanted)):  # the reply has one outcome each
-                    i, outcome = wanted[n], response.items[n]
-                    if outcome.result != ItemResult.HIT:
-                        self._count_miss("fetch", outcome)
-                        self._note_miss(_miss_label("fetch", outcome))
-                        continue
-                    read = self._take_outcome(
-                        server,
-                        chunk.keys[i],
-                        outcome,
-                        chunk.epoch,
-                        chunk.node_epoch,
-                        "retrieve_fetch",
-                    )
-                    if read is not None:
-                        reads.append(read)
-                        self._count("fetch_hit")
-                    chunk.out[i] = read
-            except BaseException:
-                held = {
-                    r.lease_id for r in self._reads if r.node_epoch == scope.node_epoch
-                }
-                self._release_fetch_leases(
-                    [
-                        o.lease_id
-                        for o in response.items[n:]
-                        if o.lease_id is not None and o.lease_id not in held
-                    ],
-                    scope.node_epoch,
-                )
-                raise
-        finally:
-            with self._lock:
-                # Slots pass to reads, pending returns and unanswered items.
-                self._fetch_reserved -= len(wanted)
-                scope.reserved = False
-                for read in reads:
-                    read.fetched = True
-
-    def _new_fetch_scope(
-        self, request_id: str, *, deadline_ms: int = 250
-    ) -> _FetchScope:
-        """Prepare one request's absolute deadline."""
-        if deadline_ms <= 0:
-            raise ValueError("fetch deadline must be positive")
-        with self._lock:
-            return _FetchScope(
-                request_id, time.monotonic() + deadline_ms / 1000, self.node_epoch
-            )
-
-    def _fetch(
-        self, scope: _FetchScope, items: list[FetchItem], max_bytes: int
-    ) -> Future:
-        """Send on the calling thread; return late HIT leases immediately."""
-        if not 1 <= len(items) <= MAX_BATCH or max_bytes <= 0:
-            raise ValueError("invalid fetch items or byte budget")
-        items = list(items)
-        result: Future = Future()
-        sending = False
-        with self._lock:
-            server, ops, info = self._server, self._ops, self.attach_info
-            remaining_ms = int((scope.deadline - time.monotonic()) * 1000)
-            if remaining_ms <= 0 and not scope.cancelled:
-                self._cancel_fetch_scope(scope, MissReason.TIMEOUT)
-            if scope.cancelled:
-                result.set_result(self._fetch_miss(items, scope.reason))
-            elif (
-                self._closing.is_set()
-                or self.off is not None
-                or self.role != SessionRole.WORKER
-                or ops is None
-                or server is None
-                or not server.session
-                or info is None
-                or not {FETCH_CAPABILITY, LEASE_CAPABILITY} <= set(info.capabilities)
-                or scope.node_epoch != ops.node_epoch
-                or server.session_node_epoch != ops.node_epoch
-            ):
-                result.set_result(FetchResponse(Status.DISABLED))
-            elif (
-                sum(len(s.pending) for s in self._fetch_scopes)
-                >= MAX_UNRESOLVED_FETCHES
-            ):
-                result.set_result(FetchResponse(Status.BUSY))
-            else:
-                sending = True
-                epoch = server.server_epoch
-                request = ops.origin.stamp(
-                    FetchRequest(
-                        PLACEHOLDER_OP,
-                        server.session,
-                        list(items),
-                        max_bytes,
-                        remaining_ms,
-                    )
-                )
-                scope.pending[request.op.seq] = (request, result)
-                self._fetch_scopes.add(scope)
-        if not sending:
-            conn, sources = self._server, plan_pins(items)
-            if sources and conn is not None:
-                conn.unpin(sources)
-            return result
-
-        cancel_deadline = _deadlines().schedule(
-            scope.deadline, lambda: self._cancel_fetch_scope(scope, MissReason.TIMEOUT)
-        )
-        result.add_done_callback(lambda _f: cancel_deadline())
-
-        def on_result(response: FetchResponse) -> None:
-            sources = plan_pins(items)
-            if sources and response.status != Status.OK:
-                # Not run by the node: the source pins stay this worker's
-                if server.server_epoch == epoch:
-                    server.unpin(sources)
-            with self._lock:
-                if time.monotonic() >= scope.deadline and not scope.cancelled:
-                    self._cancel_fetch_scope(scope, MissReason.TIMEOUT)
-                scope.pending.pop(request.op.seq, None)
-                if not scope.pending:
-                    self._fetch_scopes.discard(scope)
-                late = (
-                    result.done()
-                    or scope.cancelled
-                    or self._closing.is_set()
-                    or self.off is not None
-                    or time.monotonic() >= scope.deadline
-                    or ops is not self._ops
-                    or epoch in self._ended_epochs
-                )
-                malformed = response.status == Status.OK and len(response.items) != len(
-                    items
-                )
-                if late or malformed:
-                    leases = [
-                        o.lease_id for o in response.items if o.lease_id is not None
-                    ]
-                    self._release_fetch_leases(leases, scope.node_epoch)
-                    self._count("fetch_late_hit", len(leases))
-                    if not result.done():
-                        if malformed:
-                            result.set_exception(
-                                StorageUnavailableError("bad FETCH reply")
-                            )
-                        else:
-                            result.set_result(self._fetch_miss(items, scope.reason))
-                    return
-                result.set_result(response)
-
-        with self._lock:
-            if request.op.seq in scope.pending and ops is self._ops:
-                ops.track(NodeMessageType.FETCH, request, on_result)
-        sent = self._send_op(
-            NodeMessageType.FETCH,
-            request,
-            on_result,
-            ops,
-            True,
-            deadline=scope.deadline,
-        )
-
-        def send_done(f):
-            if f.exception() is not None:
-                self._cancel_fetch_scope(scope, MissReason.IO_ERROR)
-
-        sent.add_done_callback(send_done)
-        return result
-
-    @staticmethod
-    def _fetch_miss(items: list[FetchItem], reason: MissReason | None) -> FetchResponse:
-        return FetchResponse(
-            Status.OK,
-            items=[ItemOutcome(ItemResult.MISS, reason=reason) for _ in items],
-        )
-
-    def _cancel_fetch_scope(
-        self, scope: _FetchScope, reason: MissReason | None = None
-    ) -> None:
-        with self._lock:
-            if scope.cancelled:
-                return
-            scope.cancelled, scope.reason = True, reason
-            self._count(
-                {
-                    MissReason.TIMEOUT: "fetch_scope_timeout",
-                    MissReason.BUSY: "fetch_scope_busy",
-                }.get(reason, "fetch_cancelled")
-            )
-            for request, result in list(scope.pending.values()):
-                if not result.done():
-                    result.set_result(self._fetch_miss(request.items, reason))
-        self._post(lambda: self._send_fetch_cancels(scope))
-
-    def _send_fetch_cancels(
-        self, scope: _FetchScope, seqs: set[int] | None = None
-    ) -> None:
-        """FETCH_CANCEL the scope's open ops (of ``seqs``); one answered BUSY
-        is sent again while its op is open."""
-        with self._lock:
-            storage = self._storage
-            if storage is None or storage.closed or scope.node_epoch != self.node_epoch:
-                return
-            targets = [
-                request.op
-                for seq, (request, _) in scope.pending.items()
-                if seqs is None or seq in seqs
-            ]
-        for target in targets:
-            storage.fetch_cancel(target).add_done_callback(
-                functools.partial(self._fetch_cancel_answered, scope, target.seq)
-            )
-
-    def _fetch_cancel_answered(self, scope: _FetchScope, seq: int, f: Future) -> None:
-        try:
-            busy = f.result().status == Status.BUSY
-        except Exception:
-            return  # sent again after reconnecting
-        if busy:
-            _deadlines().schedule(
-                time.monotonic() + BUSY_RESEND_S,
-                lambda: self._post(lambda: self._send_fetch_cancels(scope, {seq})),
-            )
-
-    def _end_fetch_scopes(self) -> None:
-        """Caller holds _lock; ended runs cannot recover old fetch results."""
-        for scope in list(self._fetch_scopes):
-            self._cancel_fetch_scope(scope)
-            for seq in scope.pending:
-                if self._ops is not None:
-                    self._ops.resolved(seq)
-            scope.pending.clear()
-        self._fetch_scopes.clear()
-
-    # ------------------------------------------------------------------ reads
-
-    def batch_retrieve(
-        self, keys: list[str], route_key: str | None = None
-    ) -> list[PinnedRead | None]:
-        """Pinned reads; None for keys that cannot be read now
-        (``last_retrieve_misses`` tells why)."""
+    def batch_retrieve(self, keys, route_key=None):
         return self.start_retrieve(keys, route_key).result()
 
-    def start_retrieve(
-        self, keys: list[str], route_key: str | None = None
-    ) -> PendingRetrieve:
-        """batch_retrieve up to its FETCH answers: the lookups and the FETCH
-        sends happen now, and the result() of what it returns takes the
-        answers. A loader thread may start another retrieve meanwhile."""
+    def start_retrieve(self, keys, route_key=None):
         pending = PendingRetrieve(self)
         self._retrieve_local.misses = pending.misses
-        if self.off is not None:
-            self._count("retrieve_off", len(keys))
-            pending.misses["off"] += len(keys)
+        rdma = self._rdma
+        generation = rdma.capture() if rdma is not None else None
+        if (
+            self.off is not None
+            or self._stopped.is_set()
+            or (rdma is not None and generation is None)
+        ):
+            self._count(
+                "retrieve_off" if self.off is not None else "retrieve_unavailable",
+                len(keys),
+            )
             pending._chunks.append(_ChunkRead([None] * len(keys)))
+            pending.misses["unavailable"] += len(keys)
             return pending
         self._ensure()
         try:
             for i in range(0, len(keys), MAX_BATCH):
-                pending._chunks.append(self._start_chunk(keys[i : i + MAX_BATCH]))
+                pending._chunks.append(
+                    self._start_chunk(keys[i : i + MAX_BATCH], generation)
+                )
         except BaseException:
             self._drop_chunks(pending._chunks)
             raise
         return pending
 
-    def _finish_retrieve(self, pending: PendingRetrieve) -> list[PinnedRead | None]:
-        self._retrieve_local.misses = misses = pending.misses
-        chunks, pending._chunks = pending._chunks, []
-        out: list[PinnedRead | None] = []
-        for n, chunk in enumerate(chunks):
-            try:
-                out.extend(self._finish_chunk(chunk))
-            except BaseException:
-                self.release_retrieved(out)
-                self._drop_chunks(chunks[n + 1 :])
-                raise
-        unknown = sum(read is None for read in out) - sum(misses.values())
-        if unknown > 0:
-            misses["unknown"] += unknown
-        return out
-
-    def last_retrieve_misses(self) -> dict[str, int]:
-        """Why keys of this thread's last retrieve were not read, counted
-        by source and reason (``lookup:absent``, ``fetch:busy``, ...)."""
-        return dict(getattr(self._retrieve_local, "misses", {}))
-
-    def _note_miss(self, what: str, n: int = 1) -> None:
-        misses = getattr(self._retrieve_local, "misses", None)
-        if misses is not None:
-            misses[what] += n
-
-    def _start_chunk(self, keys: list[str]) -> _ChunkRead:
-        """LOOKUP_AND_PIN ``keys``, take their HITs and send the FETCH of
-        those only the node can read in (_finish_chunk takes its answer)."""
-        if not keys:
-            return _ChunkRead([])
+    def _start_chunk(self, keys, generation):
         server = self._server
-        if server is None or not self.storage_connected:
-            # Without the node connection its pools are not mapped
+        if not keys or server is None or not self.storage_connected:
             self._count("retrieve_unavailable", len(keys))
-            self._note_miss("unavailable", len(keys))
             return _ChunkRead([None] * len(keys))
-        # A FETCH reads under the source pins its lookup took
-        fetching = self._fetch_window() is not None
         answered = server.lookup_and_pin(
-            [Key(self.identity.namespace, k) for k in keys], pin_sources=fetching
+            [Key(self.identity.namespace, k) for k in keys]
         )
         if answered is None:
             self._count("retrieve_unavailable", len(keys))
@@ -2008,48 +1624,76 @@ class MaruClient:
             return _ChunkRead([None] * len(keys))
         outcomes, epoch, node_epoch = answered
         chunk = _ChunkRead([], server, keys, outcomes, epoch, node_epoch)
-        # Only plans of the run this client is attached to
-        fetch = fetching and node_epoch == self.node_epoch
-        sending = False
         try:
             for key, outcome in zip(keys, outcomes, strict=True):
-                if fetch and outcome.result == ItemResult.FETCH:
-                    chunk.out.append(None)  # FETCHed below
-                    continue
-                chunk.out.append(
-                    self._take_outcome(server, key, outcome, epoch, node_epoch)
-                )
-            if fetch:
-                sending = True  # the FETCH takes or unpins the source pins
-                self._send_fetch(chunk)
+                if (
+                    self._rdma is not None
+                    and outcome.result == ItemResult.HIT
+                    and outcome.location is not None
+                    and self.pools.get(outcome.location.pool_id) is None
+                ):
+                    # The captured lifetime precedes the LOOKUP.
+                    if node_epoch != self.node_epoch or epoch in self._ended_epochs:
+                        outcome_generation = -1
+                    else:
+                        outcome_generation = generation
+                    chunk.remote[len(chunk.out)] = self._rdma.start(
+                        outcome,
+                        outcome_generation,
+                        server.unpin,
+                        current=lambda: (
+                            server.server_epoch == epoch
+                            and self.node_epoch == node_epoch
+                            and not self._closing.is_set()
+                            and self.off is None
+                        ),
+                    )
+                    chunk.out.append(None)
+                else:
+                    chunk.out.append(
+                        self._take_outcome(server, key, outcome, epoch, node_epoch)
+                    )
         except BaseException:
-            self.release_retrieved(chunk.out)
-            rest = outcomes[len(chunk.out) :]
-            pins = [o.pin_id for o in rest if o.pin_id is not None] + plan_pins(rest)
-            if fetch and not sending:
-                pins += plan_pins(outcomes[: len(chunk.out)])  # left for the FETCH
-            if pins:
-                server.unpin(pins)
+            self._drop_chunks([chunk])
+            if not self._stopped.is_set():
+                server.unpin([o.pin_id for o in outcomes[len(chunk.out) :] if o.pin_id])
             raise
         return chunk
 
-    def _finish_chunk(self, chunk: _ChunkRead) -> list[PinnedRead | None]:
-        """The chunk's reads, its FETCH answer taken."""
-        if chunk.reply is not None:
+    def _finish_retrieve(self, pending):
+        self._retrieve_local.misses = misses = pending.misses
+        chunks, pending._chunks = pending._chunks, []
+        out = []
+        for n, chunk in enumerate(chunks):
             try:
-                self._take_fetch(chunk)
+                for index, request in chunk.remote.items():
+                    chunk.out[index] = request.result()
+                    if chunk.out[index] is None:
+                        self._note_miss(f"reader:{request.reason or 'stopped'}")
+                out.extend(chunk.out)
             except BaseException:
-                self.release_retrieved(chunk.out)
+                self.release_retrieved(out + chunk.out)
+                self._drop_chunks(chunks[n + 1 :])
                 raise
-        return chunk.out
+        unknown = sum(read is None for read in out) - sum(misses.values())
+        if unknown > 0:
+            misses["unknown"] += unknown
+        return [None] * len(out) if self._stopped.is_set() else out
 
-    def _drop_chunks(self, chunks: list[_ChunkRead]) -> None:
-        """Give back the reads of chunks never handed out; a FETCH in flight
-        is cancelled (a late HIT is returned)."""
+    def _drop_chunks(self, chunks):
         for chunk in chunks:
-            if chunk.reply is not None and chunk.scope is not None:
-                self._cancel_fetch_scope(chunk.scope)
-            self.release_retrieved(self._finish_chunk(chunk))
+            for request in chunk.remote.values():
+                request.cancel()
+                request.result()
+            self.release_retrieved(chunk.out)
+
+    def last_retrieve_misses(self):
+        return dict(getattr(self._retrieve_local, "misses", {}))
+
+    def _note_miss(self, what, n=1):
+        misses = getattr(self._retrieve_local, "misses", None)
+        if misses is not None:
+            misses[what] += n
 
     def _take_outcome(
         self,
@@ -2060,15 +1704,12 @@ class MaruClient:
         node_epoch: str | None = None,
         prefix: str = "retrieve",
     ) -> PinnedRead | None:
-        """``prefix``: of its counters (``retrieve_fetch`` for a FETCHed key)."""
-        if prefix == "retrieve_fetch":
-            return self._take_lease_outcome(key, outcome, node_epoch)
+        """Take a directly mapped HIT."""
         source = "lookup"
         if outcome.result != ItemResult.HIT:
             self._count_miss(prefix, outcome)
             self._note_miss(_miss_label(source, outcome))
-            # A plan not FETCHed: its source pin goes too
-            pins = plan_pins([outcome])
+            pins = []
             if outcome.pin_id is not None:
                 pins.append(outcome.pin_id)
             if pins:
@@ -2128,6 +1769,7 @@ class MaruClient:
             key=key,
             pin_id=outcome.pin_id,
             server_epoch=server_epoch,
+            owner=self,
         )
         read._release = functools.partial(self._release_reads, [read])
         with self._lock:
@@ -2149,104 +1791,10 @@ class MaruClient:
         self._count(f"{prefix}_hit")
         return read
 
-    def _take_lease_outcome(self, key, outcome, node_epoch):
-        if outcome.result != ItemResult.HIT:
-            self._count_miss("retrieve_fetch", outcome)
-            self._note_miss(_miss_label("fetch", outcome))
-            return None
-        lease = outcome.lease_id
-        with self._lock:
-            if lease is not None and any(
-                r.lease_id == lease and r.node_epoch == node_epoch for r in self._reads
-            ):
-                self._note_miss("fetch:bad_hit")
-                return None
-            valid = (
-                lease is not None
-                and outcome.location is not None
-                and node_epoch == self.node_epoch
-                and not self._closing.is_set()
-                and self.off is None
-            )
-            if valid:
-                try:
-                    view = self.pools.view(outcome.location, node_epoch=node_epoch)
-                except (LocationError, StaleRunError):
-                    valid = False
-            if valid:
-                loc = outcome.location
-                read = PinnedRead(
-                    view=view,
-                    location=StorageLocation(
-                        loc.pool_id,
-                        loc.allocation_id,
-                        loc.generation,
-                        loc.offset,
-                        loc.length,
-                        medium=loc.kind.value,
-                    ),
-                    _release=lambda: None,
-                    key=key,
-                    lease_id=lease,
-                    node_epoch=node_epoch,
-                    fetched=True,
-                )
-                read._release = functools.partial(self._release_reads, [read])
-                self._reads.add(read)
-                self._count("retrieve_fetch_hit")
-                return read
-        self._release_fetch_leases([lease] if lease is not None else [], node_epoch)
-        self._note_miss("fetch:bad_hit")
-        return None
-
-    def _release_fetch_leases(self, lease_ids, node_epoch):
-        """Queue each return once; keep slots until OK or STALE is answered."""
-        with self._lock:
-            if node_epoch != self.node_epoch:
-                return
-            storage = self._storage
-            ids = list(
-                dict.fromkeys(
-                    lease
-                    for lease in lease_ids
-                    if (node_epoch, lease) not in self._fetch_releasing
-                )
-            )
-            self._fetch_releasing.update((node_epoch, lease) for lease in ids)
-        if ids:
-            self._post(lambda: self._send_fetch_releases(storage, ids, node_epoch))
-
-    def _send_fetch_releases(self, storage, ids, node_epoch):
-        with self._lock:
-            if node_epoch != self.node_epoch:
-                return
-        if storage is None or storage.closed:
-            return
-        for i in range(0, len(ids), MAX_BATCH):
-            batch = ids[i : i + MAX_BATCH]
-            future = storage.submit(
-                NodeMessageType.FETCH_RELEASE,
-                FetchReleaseRequest(batch),
-                deadline=time.monotonic() + self.rpc_timeout_s,
-            )
-
-            def answered(f, batch=batch):
-                try:
-                    response = f.result()
-                except Exception:
-                    return
-                if response.status != Status.OK or len(response.items) != len(batch):
-                    return
-                with self._lock:
-                    for lease, item in zip(batch, response.items, strict=True):
-                        if item.result in (ItemResult.OK, ItemResult.STALE):
-                            self._fetch_releasing.discard((node_epoch, lease))
-                    self._cv.notify_all()
-
-            future.add_done_callback(answered)
-
     def release_retrieved(self, infos: list) -> None:
         """Return reads after the caller finished every CPU read or GPU copy."""
+        if self._stopped.is_set():
+            return
         reads = []
         for info in infos:
             if isinstance(info, PinnedRead) and not info._released:
@@ -2258,25 +1806,17 @@ class MaruClient:
         self._release_reads(reads)
 
     def _release_reads(self, reads: list[PinnedRead]) -> None:
-        if not reads:
+        if not reads or self._stopped.is_set():
             return
         with self._lock:
             server = self._server
         epoch = server.server_epoch if server is not None else None
-        unpins = self.pins.release(
-            [r.pin_id for r in reads if r.lease_id is None], epoch
-        )
+        unpins = self.pins.release([r.pin_id for r in reads], epoch)
         if unpins and server is not None:
             server.unpin(unpins)
         with self._lock:
             for read in reads:
                 self._reads.discard(read)
-            by_epoch = {}
-            for read in reads:
-                if read.lease_id is not None:
-                    by_epoch.setdefault(read.node_epoch, []).append(read.lease_id)
-            for node_epoch, leases in by_epoch.items():
-                self._release_fetch_leases(leases, node_epoch)
             self._cv.notify_all()
         self._unmap_unused_old_pools()
         if self.off is not None:
@@ -2284,7 +1824,7 @@ class MaruClient:
 
     def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
         """PROBE each key (a hint, no pin)."""
-        if self.off is not None:
+        if self.off is not None or self._stopped.is_set():
             return [False] * len(keys)
         self._ensure(data=False)
         out: list[bool] = []
@@ -2305,30 +1845,15 @@ class MaruClient:
                 if outcome.result == ItemResult.HIT:
                     self._count("probe_hit")
                     out.append(True)
-                elif self._fetchable(outcome):
-                    self._count("probe_fetch_candidate")
-                    out.append(True)
                 else:
                     self._count_miss("probe", outcome)
                     out.append(False)
         return out
 
-    def _fetchable(self, outcome: ItemOutcome) -> bool:
-        """Whether this node negotiated lease fetches."""
-        info = self.attach_info
-        return (
-            self.config.fetch_loads
-            and outcome.result == ItemResult.FETCH
-            and info is not None
-            and {FETCH_CAPABILITY, LEASE_CAPABILITY} <= set(info.capabilities)
-        )
-
     def _count_miss(self, prefix: str, outcome: ItemOutcome) -> None:
         """Count fetch failures separately from absent and offline keys."""
         result = outcome.result
-        if result == ItemResult.FETCH:
-            self._count(f"{prefix}_fetch")
-        elif result == ItemResult.MISS and outcome.reason in (
+        if result == ItemResult.MISS and outcome.reason in (
             MissReason.BUSY,
             MissReason.TIMEOUT,
             MissReason.IO_ERROR,
@@ -2345,7 +1870,8 @@ class MaruClient:
     def _server_epoch_changed(self, old: str, new: str) -> None:
         with self._lock:
             self._ended_epochs.add(old)
-            self._end_fetch_scopes()
+            if self._rdma is not None:
+                self._rdma.advance()
         dead = self.pins.drop_epoch(old)
         if dead:
             logger.warning(
@@ -2406,7 +1932,8 @@ class MaruClient:
                 return
             self.off = error
             self.refused = error
-            self._end_fetch_scopes()
+            if self._rdma is not None:
+                self._rdma.advance()
         self.credits.close()
         self._refill_wake.set()
         logger.error(
@@ -2449,6 +1976,8 @@ class MaruClient:
             node_epoch,
             info.node_epoch,
         )
+        if self._rdma is not None:
+            self._rdma.advance()
         server.move_to(info.node_epoch, info.pid, info.pid_start)
 
     def _unmap_on_loss(self) -> None:
@@ -2486,6 +2015,12 @@ class MaruClient:
         """A notice of ``conn``; one that acts on pools or credits counts only
         while ``conn`` is the live connection (a late callback of an ended
         run's connection must not touch the new run's)."""
+        if self._stopped.is_set():
+            return
+        if isinstance(notify, Peers):
+            if conn is self._storage and not conn.closed and self._rdma is not None:
+                self._rdma.notify_peers(notify.peers)
+            return
         if notify.kind == NotifyKind.CREDIT_RETURN:
             with self._lock:
                 if conn is not self._storage or conn.closed:
@@ -2538,7 +2073,7 @@ class MaruClient:
                 return  # a new run or connection owns the pool_id now
             # Its credit at hand goes back first: no new write starts in it
             credits = self.credits.remove_pool(pool_id)
-        if credits:
+        if credits and not self._stopped.is_set():
             self._return_credits(credits)
         with self._lock:
             self._cv.wait_for(
@@ -2557,7 +2092,7 @@ class MaruClient:
             ):
                 return
             credits = self.credits.remove_pool(pool_id)
-        if credits:
+        if credits and not self._stopped.is_set():
             self._return_credits(credits)
         if (
             mapped is not None and not self.pools.remove(pool_id, expected=mapped)

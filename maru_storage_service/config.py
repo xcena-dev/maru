@@ -47,8 +47,6 @@ CREDIT_MAX_MIN_BYTES = 512 << 20
 CREDIT_TOTAL_FRACTION = 0.25
 CREDIT_REFILL_LOW_FRACTION = 0.25
 TRANSFER_RESERVE_FRACTION = 0.05
-DEFAULT_FETCH_REQUEST_MAX = 1 << 30
-DEFAULT_FETCH_MAX_INFLIGHT = 4 << 30
 
 _TOP_KEYS = {
     "node_id",
@@ -64,8 +62,6 @@ WORKER_BUDGET_KEYS = {
     "credit_max_bytes",
     "credit_refill_low",
     "credit_refill_high",
-    "fetch_request_max_bytes",
-    "fetch_max_inflight_bytes",
 }
 _BUDGET_KEYS = {
     "credit_max_bytes",
@@ -74,8 +70,6 @@ _BUDGET_KEYS = {
     "credit_refill_high",
     "commit_pending_max_bytes",
     "transfer_reserve_bytes",
-    "fetch_request_max_bytes",
-    "fetch_max_inflight_bytes",
 }
 _REMOTE_SERVER_KEYS = {
     "listen",
@@ -285,9 +279,6 @@ def _parse_budgets(
             )
         reserve[t.store] = default
 
-    fetch_request = size_or("fetch_request_max_bytes", DEFAULT_FETCH_REQUEST_MAX)
-    fetch_inflight = size_or("fetch_max_inflight_bytes", DEFAULT_FETCH_MAX_INFLIGHT)
-
     if credit_max < page_size:
         raise NodeConfigError(
             f"budgets.credit_max_bytes: {credit_max} is smaller than page_size {page_size}"
@@ -319,8 +310,6 @@ def _parse_budgets(
         credit_refill_high=refill_high,
         commit_pending_max_bytes=commit_pending,
         transfer_reserve_bytes=reserve,
-        fetch_request_max_bytes=fetch_request,
-        fetch_max_inflight_bytes=fetch_inflight,
     )
 
 

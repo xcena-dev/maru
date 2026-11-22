@@ -18,7 +18,6 @@ Example:
         result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
-import contextlib
 import logging
 import threading
 import time
@@ -1385,6 +1384,12 @@ class MaruHandler:
             raise RuntimeError("store_async needs maru_node")
         return client.store_async(keys, handles)
 
+    def stop(self):
+        """Freeze node ownership after a CUDA error."""
+        stop = getattr(self._cpu, "stop", None)
+        if stop is not None:
+            stop()
+
     def stop_credit_waits(self) -> None:
         """maru_node: end every wait for credit (``alloc(wait_s=...)``), now
         and later; allocations that find credit go on."""
@@ -1714,21 +1719,16 @@ class MaruHandler:
         """How many keys the next ``batch_retrieve`` should ask for at most.
 
         Args:
-            wanted: Keys the caller would read; a node worker short of them
-                waits briefly for its fetched leases to return (None: for all).
+            wanted: Keys the caller would read; a node worker reports its free staging slots (None: for all).
 
         Returns:
-            The read slots a load may use now (remote_cxl backend, node
-            fetches), or None when retrieves are not bounded.
+            The read slots a load may use now (remote_cxl backend, node direct reads), or None when retrieves are not bounded.
         """
         capacity = getattr(self._cpu, "retrieve_capacity", None)
         return capacity(wanted) if capacity is not None else None
 
     def start_retrieve(self, keys: list[str], route_key: str | None = None):
-        """``batch_retrieve`` up to the node's FETCH answers (maru_node): the
-        lookups and FETCH sends happen now. ``result()`` of what it returns
-        gives the reads and ``done()`` says whether that waits; elsewhere
-        the retrieve happens now."""
+        """Start a node retrieve; result() hands over its read ownership."""
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
         start = getattr(self._cpu, "start_retrieve", None)
@@ -1741,7 +1741,7 @@ class MaruHandler:
     def last_retrieve_misses(self) -> dict[str, int]:
         """Why keys of this thread's last retrieve (``batch_retrieve``, or
         the ``result()`` of ``start_retrieve``) were not read, counted by
-        source and reason (``lookup:absent``, ``fetch:busy``, ...;
+        source and reason (``lookup:absent``, ``reader:no_slot``, ...;
         maru_node); empty elsewhere."""
         misses = getattr(self._cpu, "last_retrieve_misses", None)
         return misses() if misses is not None else {}
@@ -1751,12 +1751,6 @@ class MaruHandler:
         prepare = getattr(self._cpu, "prepare_read_thread", None)
         if prepare is not None:
             prepare()
-
-    def fetch_scope(self, request_id: str):
-        """A context in which retrieves on this thread may FETCH what only
-        the node reads in (maru_node, a parked load); a no-op elsewhere."""
-        scope = getattr(self._cpu, "fetch_scope", None)
-        return scope(request_id) if scope is not None else contextlib.nullcontext()
 
     def storage_gpu_accessible(self) -> bool:
         """Whether retrieved and allocated buffers are page-locked for the GPU.

@@ -709,8 +709,8 @@ class TestMaruOffRaces:
         server = client.server_conn
         lookup = server.lookup_and_pin
 
-        def lookup_then_off(keys, pin_sources=False):
-            answered = lookup(keys, pin_sources)  # pinned at MaruServer
+        def lookup_then_off(keys):
+            answered = lookup(keys)  # pinned at MaruServer
             client._turn_off(AttachRefusedError("refused"))
             wait_until(lambda: fake.requests(MessageType.WORKER_CLOSE), what="close")
             return answered

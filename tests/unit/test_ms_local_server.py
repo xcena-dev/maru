@@ -17,8 +17,6 @@ from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
     DetachRequest,
-    FetchCancelRequest,
-    FetchRequest,
     GroupLayout,
     LocalPinRequest,
     LocalUnpinRequest,
@@ -31,14 +29,12 @@ from maru_common.node_protocol import (
 from maru_common.protocol import MessageType
 from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import (
-    FETCH_CAPABILITY,
-    LEASE_CAPABILITY,
+    HINT_CAPABILITY,
     MAX_BATCH,
     WORKER_RDMA_CAPABILITY,
     ItemResult,
     Key,
     NotifyKind,
-    OpRef,
     PoolKind,
     SessionRole,
     Status,
@@ -138,12 +134,20 @@ class TestAttach:
         assert r.pid == os.getpid()  # SO_PEERCRED, as the node sees it
 
     def test_worker_rdma_attach_requires_the_same_pid_namespace(
-        self, worker, monkeypatch
+        self, node, worker, monkeypatch
     ):
+        node.local.capabilities = frozenset({WORKER_RDMA_CAPABILITY})
         monkeypatch.setattr(local_server, "same_pid_namespace", lambda pid: False)
         with pytest.raises(StorageUnavailableError, match="same pid namespace"):
             worker.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="vllm-1")
         assert worker.fds == []
+
+    def test_local_worker_keeps_cross_namespace_attach_without_rdma(
+        self, worker, monkeypatch
+    ):
+        monkeypatch.setattr(local_server, "same_pid_namespace", lambda pid: False)
+        reply = worker.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="vllm-1")
+        assert reply.capabilities == [] and reply.status == Status.OK
 
     def test_worker_rdma_is_not_negotiated_before_it_is_served(self, worker):
         reply = worker.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="vllm-1")
@@ -175,13 +179,13 @@ class TestAttach:
             finally:
                 w.close()
 
-        asked = [FETCH_CAPABILITY, LEASE_CAPABILITY, "later_v9"]
+        asked = [HINT_CAPABILITY, "later_v9"]
         assert attach(capabilities=asked) == []  # this node serves no FETCH
-        node.local.capabilities = frozenset({FETCH_CAPABILITY, LEASE_CAPABILITY})
-        assert attach(capabilities=asked) == [FETCH_CAPABILITY, LEASE_CAPABILITY]
+        node.local.capabilities = frozenset({HINT_CAPABILITY, HINT_CAPABILITY})
+        assert attach(capabilities=asked) == [HINT_CAPABILITY]
         assert attach() == []
         probe = attach(capabilities=asked, role=SessionRole.PROBE, groups=[])
-        assert probe == [FETCH_CAPABILITY, LEASE_CAPABILITY]
+        assert probe == [HINT_CAPABILITY]
 
     def test_requests_need_an_attach(self, worker):
         ser = Serializer(NODE_MESSAGE_CLASSES)
@@ -451,20 +455,6 @@ class TestOtherRequests:
         [
             (NodeMessageType.LOCAL_PIN, LocalPinRequest()),
             (NodeMessageType.LOCAL_UNPIN, LocalUnpinRequest()),
-            (
-                NodeMessageType.FETCH,
-                FetchRequest(
-                    op=OpRef("o", 1, b"d", 0),
-                    worker_session="s",
-                    items=[],
-                    max_bytes=1,
-                    deadline_ms=1,
-                ),
-            ),
-            (
-                NodeMessageType.FETCH_CANCEL,
-                FetchCancelRequest(target=OpRef("o", 1, b"d", 0)),
-            ),
         ],
     )
     def test_disabled(self, worker, code, request_):

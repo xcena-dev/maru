@@ -153,8 +153,7 @@ class TestReviewEdges:
 
     def test_a_memory_only_node_does_not_check_the_fetch_caps(self):
         raw = edit(GPU_NODE, page_size="2G", tiers=[{"store": "dram", "size": "64G"}])
-        b = parse_node_config(raw).budgets
-        assert (b.fetch_request_max_bytes, b.fetch_max_inflight_bytes) == (G, 4 * G)
+        assert parse_node_config(raw).page_size == 2 * G
 
     def test_nan_in_the_file(self, tmp_path):
         path = tmp_path / "node.json"

@@ -506,3 +506,45 @@ class FakeMemoryNode:
         self.restarts += 1
         self.boots += int(reboot)
         self._start()
+
+
+class FakeStorageControl:
+    """Worker control replies; publication waits for explicit COMMIT completion."""
+
+    closed = False
+
+    def __init__(self, credit_response):
+        self.credit_response = credit_response
+        self.requests = []
+        self.writes = []
+        self.published = set()
+
+    def submit(self, code, request):
+        from concurrent.futures import Future
+
+        from maru_common.node_protocol import NodeMessageType
+
+        self.requests.append((code, request))
+        future = Future()
+        if code == NodeMessageType.CREDIT:
+            future.set_result(self.credit_response)
+        elif code == NodeMessageType.WRITE_DONE:
+            self.writes.append((request, future))
+        else:
+            raise AssertionError(code)
+        return future
+
+    def commit(self):
+        from maru_common.node_protocol import WriteDoneResponse
+        from maru_common.remote_protocol import TransferEnd
+        from maru_common.storage_types import ItemOutcome, ItemResult, Status
+
+        request, future = self.writes.pop(0)
+        items = []
+        for item in request.items:
+            if item.end == TransferEnd.DONE:
+                self.published.add(item.key)
+                items.append(ItemOutcome(ItemResult.ADDED))
+            else:
+                items.append(ItemOutcome(ItemResult.OK))
+        future.set_result(WriteDoneResponse(Status.OK, items=items))

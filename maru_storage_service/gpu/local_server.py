@@ -53,9 +53,6 @@ _LISTEN_BACKLOG = 128
 _DISABLED = {
     NodeMessageType.LOCAL_PIN: "local pins are not supported",
     NodeMessageType.LOCAL_UNPIN: "local pins are not supported",
-    NodeMessageType.FETCH: "fetch is not served",
-    NodeMessageType.FETCH_CANCEL: "fetch is not served",
-    NodeMessageType.FETCH_RELEASE: "fetch is not served",
     NodeMessageType.HINT: "hints are not served",
     NodeMessageType.READ_JOIN: "worker RDMA is not served",
 }
@@ -509,7 +506,12 @@ class LocalServer:
             pid_start = process_start_time(node_pid)
         except OSError as e:
             return reject(f"cannot read the peer process: {e}")
-        if WORKER_RDMA_CAPABILITY in req.capabilities and not same_ns:
+        if (
+            not probe
+            and WORKER_RDMA_CAPABILITY in req.capabilities
+            and WORKER_RDMA_CAPABILITY in self.capabilities
+            and not same_ns
+        ):
             return reject("worker_rdma_v1 needs the same pid namespace")
         if same_ns and (req.pid != node_pid or req.pid_start != pid_start):
             return reject(

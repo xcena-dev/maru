@@ -434,6 +434,70 @@ class NixlTransport:
             return False
         return True
 
+    def post_nowait(self, op, peer, pairs):
+        """Post once without waiting for transport ownership; None means busy."""
+        if not self._lock.acquire(False):
+            return None
+        pending = None
+        try:
+            if peer not in self._peers or peer in self._tainted:
+                raise RuntimeError("RDMA peer is unavailable")
+            local = self._agent.get_xfer_descs(
+                [(la, n, 0) for la, _, n in pairs], "DRAM"
+            )
+            remote = self._agent.get_xfer_descs(
+                [(ra, n, 0) for _, ra, n in pairs], "DRAM"
+            )
+            handle = self._agent.initialize_xfer(op, local, remote, peer)
+            pending = PendingTransfer(self, op, peer, handle)
+            pending.in_flight = False
+            self._pending[id(handle)] = pending
+            pending.direct_state = self._agent.transfer(handle)
+            pending.completed = pending.direct_state == "DONE"
+            return pending
+        except BaseException as exc:
+            if pending is not None:
+                pending.direct_state = None
+                exc.pending_transfer = pending
+            raise
+        finally:
+            self._lock.release()
+
+    def poll_nowait(self, pending):
+        """Observe completion and release a handle with one lock attempt each."""
+        if not self._lock.acquire(False):
+            return False
+        locked = False
+        try:
+            locked = pending._poll_lock.acquire(False)
+            if not locked:
+                return False
+            if pending.finished:
+                return True
+            if pending.in_flight:
+                return False
+            state = getattr(pending, "direct_state", None)
+            try:
+                if state not in ("DONE", "ERR"):
+                    state = self._agent.check_xfer_state(pending.handle)
+                    pending.direct_state = state
+                if state == "PROC":
+                    return False
+                if state == "DONE":
+                    pending.completed = True
+                else:
+                    self._tainted.add(pending.peer)
+                self._agent.release_xfer_handle(pending.handle)
+            except Exception:
+                return False
+            pending.finished = True
+            self._pending.pop(id(pending.handle), None)
+            return True
+        finally:
+            if locked:
+                pending._poll_lock.release()
+            self._lock.release()
+
     def read(
         self,
         peer: str,
