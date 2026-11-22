@@ -18,8 +18,8 @@ from maru_common.remote_protocol import (
     REMOTE_MESSAGE_CLASSES,
     REMOTE_WIRE_VERSION,
     CancelRequest,
+    FenceDomainResponse,
     FenceResult,
-    FenceWorkerResponse,
     HelloRefusal,
     HelloRequest,
     HelloResponse,
@@ -87,6 +87,7 @@ def test_codes_are_unique_and_below_the_response_bit():
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
     # reserved (DROP, STAGE, UNSTAGE): never reused
     assert not {0x13, 0x18, 0x19} & set(CODES)
+    assert RemoteMessageType.FENCE_DOMAIN == 0x14
 
 
 def test_every_code_decodes_strictly():
@@ -105,7 +106,7 @@ def test_ledger_ops_are_the_requests_with_an_op():
         "RESERVE",
         "WRITE_DONE",
         "CANCEL",
-        "FENCE_WORKER",
+        "FENCE_DOMAIN",
     }
 
 
@@ -238,12 +239,16 @@ _BAD: list[tuple[RemoteMessageType, list, object]] = [
     (RemoteMessageType.HINT, ["request"], None),
     (RemoteMessageType.AGENTS, ["add", 0, "agent_metadata"], "not-bytes"),
     (RemoteMessageType.AGENTS, ["remove"], [1]),
-    (RemoteMessageType.FENCE_WORKER, ["domain"], None),
-    (RemoteMessageType.FENCE_WORKER, ["domain", "number"], True),
-    (RemoteMessageType.FENCE_WORKER, ["domain", "incarnation"], _MISSING),
+    (RemoteMessageType.FENCE_DOMAIN, ["domain"], None),
+    (RemoteMessageType.FENCE_DOMAIN, ["domain", "number"], True),
+    (RemoteMessageType.FENCE_DOMAIN, ["domain", "instance"], _MISSING),
+    (RemoteMessageType.FENCE_DOMAIN, ["domain", "instance"], True),
     (RemoteMessageType.RESERVE, ["domain", "number"], "1"),
+    (RemoteMessageType.RESERVE, ["domain", "instance"], None),
     (RemoteMessageType.WRITE_DONE, ["domain", "node_epoch"], 1),
+    (RemoteMessageType.WRITE_DONE, ["domain", "instance"], 1),
     (RemoteMessageType.CANCEL, ["domain", "number"], False),
+    (RemoteMessageType.CANCEL, ["domain", "instance"], b"vllm-1"),
 ]
 
 
@@ -487,14 +492,31 @@ def test_write_domain_is_optional_for_legacy_and_part_of_the_op_digest(code):
     assert op_digest(changed) != op_digest(request)
 
 
-def test_fence_worker_reports_registration_revocation_success_or_failure():
+@pytest.mark.parametrize("code", LEDGER, ids=_name)
+def test_write_domain_names_the_instance_on_the_wire(code):
     ser = _ser()
-    code = RemoteMessageType.FENCE_WORKER
+    request = sample(REMOTE_MESSAGE_CLASSES[code][0])
+    decoded = ser.decode_request_payload(ser.encode(code, request))
+    assert decoded.payload["domain"]["instance"] == request.domain.instance
+    assert "incarnation" not in decoded.payload["domain"]
+    changed = dataclasses.replace(
+        request, domain=dataclasses.replace(request.domain, instance="another-instance")
+    )
+    assert op_digest(changed) != op_digest(request)
+    payload = dataclasses.asdict(request)
+    payload["domain"]["incarnation"] = payload["domain"].pop("instance")
+    with pytest.raises(MessageDecodeError, match="instance"):
+        ser.decode_request_payload(ser.encode(code, payload))
+
+
+def test_fence_domain_reports_registration_revocation_success_or_failure():
+    ser = _ser()
+    code = RemoteMessageType.FENCE_DOMAIN
     header, _ = ser.decode_request(
         ser.encode(code, sample(REMOTE_MESSAGE_CLASSES[code][0]))
     )
     for result in FenceResult:
-        response = FenceWorkerResponse(Status.OK, result=result)
+        response = FenceDomainResponse(Status.OK, result=result)
         assert ser.decode_response(ser.encode_response(header, response))[1] == response
     with pytest.raises(MessageDecodeError):
         ser.decode_response(
@@ -511,7 +533,16 @@ def test_reserve_returns_the_domains_own_agent_registration():
     assert (
         _ser().decode_response(_ser().encode_response(header, response))[1] == response
     )
+    _, payload = _ser().decode(_ser().encode_response(header, response))
+    assert payload["write_agent"]["domain"]["instance"] == (
+        response.write_agent.domain.instance
+    )
+    assert "incarnation" not in payload["write_agent"]["domain"]
     payload = dataclasses.asdict(response)
     payload["write_agent"]["pools"][0]["pool_registration"] = True
     with pytest.raises(MessageDecodeError):
+        _ser().decode_response(_ser().encode_response(header, payload))
+    payload = dataclasses.asdict(response)
+    payload["write_agent"]["domain"]["instance"] = 1
+    with pytest.raises(MessageDecodeError, match="instance"):
         _ser().decode_response(_ser().encode_response(header, payload))

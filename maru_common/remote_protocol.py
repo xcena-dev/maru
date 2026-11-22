@@ -48,7 +48,7 @@ class RemoteMessageType(IntEnum):
     RESERVE = 0x10
     WRITE_DONE = 0x11
     CANCEL = 0x12
-    FENCE_WORKER = 0x14
+    FENCE_DOMAIN = 0x14
     HINT = 0x1A
     # 0x13, 0x18, 0x19: reserved (DROP, STAGE, UNSTAGE)
 
@@ -206,15 +206,15 @@ class AgentsResponse:
 
 
 @dataclass
-class FenceWorkerRequest:
-    """FENCE_WORKER (0x14) - Revoke this domain's write registration."""
+class FenceDomainRequest:
+    """FENCE_DOMAIN (0x14) - Revoke the instance domain's write registration."""
 
     op: OpRef
     domain: WriteDomain
 
 
 @dataclass
-class FenceWorkerResponse:
+class FenceDomainResponse:
     status: Status
     error: str | None = None
     result: FenceResult | None = None
@@ -308,7 +308,7 @@ class RemoteHintResponse:
 
 REMOTE_MESSAGE_CLASSES = {
     RemoteMessageType.AGENTS: (AgentsRequest, AgentsResponse),
-    RemoteMessageType.FENCE_WORKER: (FenceWorkerRequest, FenceWorkerResponse),
+    RemoteMessageType.FENCE_DOMAIN: (FenceDomainRequest, FenceDomainResponse),
     RemoteMessageType.HELLO: (HelloRequest, HelloResponse),
     RemoteMessageType.PING: (PingRequest, PingResponse),
     RemoteMessageType.GOODBYE: (GoodbyeRequest, GoodbyeResponse),
@@ -324,6 +324,6 @@ LEDGER_CODES = frozenset(
         RemoteMessageType.RESERVE,
         RemoteMessageType.WRITE_DONE,
         RemoteMessageType.CANCEL,
-        RemoteMessageType.FENCE_WORKER,
+        RemoteMessageType.FENCE_DOMAIN,
     }
 )

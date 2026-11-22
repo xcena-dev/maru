@@ -19,6 +19,7 @@ from enum import IntEnum, unique
 
 from .protocol import HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION, MessageHeader
 from .storage_types import (
+    WORKER_RDMA_CAPABILITY,
     FetchPlan,
     HintAction,
     ItemOutcome,
@@ -130,6 +131,8 @@ class AttachRequest:
     ``groups`` may be empty. ``step_objects``: how many objects the worker
     may store in one engine step, each taking one credit page (0: unknown);
     the node sizes the worker's credit to hold them.
+    ``instance``: vLLM ``vllm_config.instance_id``, shared by its ranks;
+    required for a worker requesting worker_rdma_v1.
     """
 
     engine_id: str
@@ -144,6 +147,15 @@ class AttachRequest:
     capabilities: list[str] = field(default_factory=list)
     role: SessionRole = SessionRole.WORKER
     step_objects: int = 0
+    instance: str = ""
+
+    def __post_init__(self):
+        if (
+            self.role == SessionRole.WORKER
+            and WORKER_RDMA_CAPABILITY in self.capabilities
+            and not self.instance
+        ):
+            raise ValueError("instance is empty for worker_rdma_v1")
 
 
 @dataclass

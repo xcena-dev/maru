@@ -18,6 +18,7 @@ from maru_common.node_protocol import (
     MAX_NODE_PAYLOAD,
     NODE_MESSAGE_CLASSES,
     NOTIFY_SEQUENCE,
+    AttachRequest,
     AttachResponse,
     FrameError,
     NodeMessageType,
@@ -35,8 +36,12 @@ from maru_common.protocol import (
     MessageType,
     NodeOpenRequest,
 )
-from maru_common.serializer import RESPONSE_BIT, Serializer
-from maru_common.storage_types import NotifyKind
+from maru_common.serializer import RESPONSE_BIT, MessageDecodeError, Serializer
+from maru_common.storage_types import (
+    WORKER_RDMA_CAPABILITY,
+    NotifyKind,
+    SessionRole,
+)
 from tests.unit.ms_samples import sample
 
 CODES = sorted(NODE_MESSAGE_CLASSES)
@@ -66,6 +71,70 @@ def test_round_trip(code):
     response = sample(response_cls)
     _, decoded = ser.decode_response(ser.encode_response(header, response))
     assert decoded == response
+
+
+def test_attach_instance_is_shared_by_ranks_with_distinct_incarnations():
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    request = dataclasses.replace(
+        sample(AttachRequest),
+        role=SessionRole.WORKER,
+        capabilities=[WORKER_RDMA_CAPABILITY],
+        instance="vllm-1",
+    )
+    for rank in range(2):
+        worker = dataclasses.replace(
+            request, tp_rank=rank, incarnation=f"worker-{rank}"
+        )
+        decoded = ser.decode_request_payload(ser.encode(NodeMessageType.ATTACH, worker))
+        assert decoded.request == worker
+        assert decoded.payload["instance"] == "vllm-1"
+        assert decoded.request.incarnation == f"worker-{rank}"
+
+
+@pytest.mark.parametrize("missing", [False, True], ids=["empty", "missing"])
+@pytest.mark.parametrize(
+    "role,capabilities",
+    [
+        (SessionRole.WORKER, []),
+        (SessionRole.PROBE, [WORKER_RDMA_CAPABILITY]),
+    ],
+)
+def test_attach_without_a_write_domain_accepts_an_empty_instance(
+    role, capabilities, missing
+):
+    payload = dataclasses.asdict(sample(AttachRequest))
+    payload.update(role=role, capabilities=capabilities, instance="")
+    if missing:
+        del payload["instance"]
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    _, decoded = ser.decode_request(ser.encode(NodeMessageType.ATTACH, payload))
+    assert decoded.instance == ""
+
+
+@pytest.mark.parametrize("missing", [False, True], ids=["empty", "missing"])
+@pytest.mark.parametrize("decoder", ["decode_request", "decode_request_payload"])
+def test_worker_rdma_attach_requires_an_instance_on_decode(decoder, missing):
+    payload = dataclasses.asdict(sample(AttachRequest))
+    payload.update(
+        role=SessionRole.WORKER, capabilities=[WORKER_RDMA_CAPABILITY], instance=""
+    )
+    if missing:
+        del payload["instance"]
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    frame = ser.encode(NodeMessageType.ATTACH, payload, seq=77)
+    with pytest.raises(MessageDecodeError, match="instance is empty") as info:
+        getattr(ser, decoder)(frame)
+    assert info.value.header.msg_type == NodeMessageType.ATTACH
+    assert info.value.header.sequence == 77
+
+
+@pytest.mark.parametrize("instance", [None, 1, True, b"vllm-1", []])
+def test_attach_instance_decodes_strictly(instance):
+    payload = dataclasses.asdict(sample(AttachRequest))
+    payload["instance"] = instance
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    with pytest.raises(MessageDecodeError, match="instance"):
+        ser.decode_request_payload(ser.encode(NodeMessageType.ATTACH, payload))
 
 
 def test_fetch_contract_on_the_wire():

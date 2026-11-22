@@ -344,11 +344,16 @@ class ReadPeer:
 
 @dataclass(frozen=True)
 class WriteDomain:
-    """One worker's write registration in a GPU node run."""
+    """One vLLM instance's write registration in a GPU node run.
+
+    ``instance`` is the ATTACH instance shared by its ranks; ``number``
+    distinguishes successive registrations. Fencing revokes the registration
+    for every worker in the domain.
+    """
 
     node_id: str
     node_epoch: str
-    incarnation: str
+    instance: str
     number: int
 
 

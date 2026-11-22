@@ -142,11 +142,12 @@ class TestAttach:
     ):
         monkeypatch.setattr(local_server, "same_pid_namespace", lambda pid: False)
         with pytest.raises(StorageUnavailableError, match="same pid namespace"):
-            worker.attach(capabilities=[WORKER_RDMA_CAPABILITY])
+            worker.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="vllm-1")
         assert worker.fds == []
 
     def test_worker_rdma_is_not_negotiated_before_it_is_served(self, worker):
-        assert worker.attach(capabilities=[WORKER_RDMA_CAPABILITY]).capabilities == []
+        reply = worker.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="vllm-1")
+        assert reply.capabilities == []
 
     def test_largest_group_decides(self, worker):
         groups = [GroupLayout(PAGE // 4, "a"), GroupLayout(PAGE, "b")]
