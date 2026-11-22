@@ -128,12 +128,15 @@ class CpuPool:
         *,
         medium: str = "cpu",
         mapping: mmap.mmap | None = None,
+        shared: bool = False,
     ):
         if capacity < page_size or page_size <= 0 or capacity % page_size:
             raise ValueError(
                 "CPU pool capacity must be a positive multiple of page size"
             )
         self.pool_id = pool_id
+        # A mapping other processes write too (a node's memfd pool)
+        self._shared = shared
         self.capacity = capacity
         self.page_size = page_size
         self.medium = medium
@@ -145,8 +148,10 @@ class CpuPool:
         self._allocations: dict[str, CpuAllocation] = {}
         self._lock = RLock()
         self._closed = False
-        # Whether the pool is registered with CUDA (see page_lock)
+        # Whether the pool is registered with CUDA (see page_lock), and whether
+        # unregistering it failed
         self.cuda_registered = False
+        self.unlock_failed = False
         self._cuda_address = 0
 
     def page_lock(self, keepalive: Callable[[], None] | None = None) -> None:
@@ -270,7 +275,12 @@ class CpuPool:
                         )
                         return False
                     populate = False
-            if not populate:
+            if not populate and self._shared:
+                # Another process may write a byte between our read and write
+                # back; the pages are allocated already, so reads suffice
+                for page in range(offset, end, _PAGE_SIZE):
+                    self._mapping[page]
+            elif not populate:
                 # Kernels before 5.14. Writing each page's first byte back
                 # faults it in writable without changing what it holds; a
                 # read would map the shared zero page of an anonymous pool.
@@ -281,7 +291,8 @@ class CpuPool:
         return True
 
     def _page_unlock(self) -> None:
-        """Unregister the pool from CUDA, before its mapping is closed."""
+        """Unregister the pool from CUDA, before its mapping is closed. A
+        failure is kept in ``unlock_failed``: the GPU may still reach it."""
         if not self.cuda_registered:
             return
         self.cuda_registered = False
@@ -293,6 +304,7 @@ class CpuPool:
             rc = _cuda_rc(torch.cuda.cudart().cudaHostUnregister(self._cuda_address))
             if rc != 0:
                 _clear_cuda_sticky_error()
+                self.unlock_failed = True
                 logger.warning(
                     "cudaHostUnregister failed for the %s pool %s: rc=%d",
                     self.medium.upper(),
@@ -300,12 +312,17 @@ class CpuPool:
                     rc,
                 )
         except (ImportError, RuntimeError, OSError) as exc:
+            self.unlock_failed = True
             logger.warning(
                 "cudaHostUnregister failed for the %s pool %s: %s",
                 self.medium.upper(),
                 self.pool_id,
                 exc,
             )
+
+    def view(self, offset: int, length: int) -> memoryview:
+        """Bytes of the mapping at ``offset``; the caller releases the view."""
+        return memoryview(self._mapping)[offset : offset + length]
 
     def alloc(self, size: int) -> CpuAllocation:
         with self._lock:

@@ -179,7 +179,7 @@ class PoolRouter:
                 return
         self.clients[0].free(handle)
 
-    def retrieve_capacity(self) -> int | None:
+    def retrieve_capacity(self, wanted: int | None = None) -> int | None:
         """How many keys the next batch_retrieve should ask for at most (the
         pools share one staging buffer)."""
         staging = self.data.staging

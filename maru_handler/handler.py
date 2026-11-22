@@ -18,10 +18,13 @@ Example:
         result = handler.retrieve(key="12345")  # returns MemoryInfo
 """
 
+import contextlib
 import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
+from typing import cast
 
 from maru_common import MaruConfig
 from maru_shm import MaruHandle
@@ -35,7 +38,8 @@ from .memory import (
 )
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
-from .storage.cpu import CpuAllocation, CpuReadLease
+from .storage.cpu import CpuAllocation
+from .storage.lease import ReadLease
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +94,12 @@ class MaruHandler:
         self._rpc = self._make_rpc(self._config.server_urls[0])
         self._mapper: DaxMapper | None = None
         self._cpu = None
-        if self._config.storage_backend in {"cpu", "mixed"}:
+        if self._config.maru_node:
+            # Same methods as the storage clients below
+            from .client.maru_client import MaruClient
+
+            self._cpu = MaruClient(self._config)
+        elif self._config.storage_backend in {"cpu", "mixed"}:
             from .storage.client import CpuStorageClient
 
             self._cpu = CpuStorageClient(self._config, self._rpc)
@@ -303,12 +312,21 @@ class MaruHandler:
     # Connection Management
     # =========================================================================
 
-    def connect(self) -> bool:
+    def connect(self, wait: bool = True) -> bool:
         """Connect to the server and request a memory allocation.
 
+        Args:
+            wait: maru_node only: False connects in the background, retrying
+                until ``close()``; ``connected`` turns True once done.
+
         Returns:
-            True if successful
+            True if successful (False while a background connect runs)
         """
+        if not wait and self._config.maru_node:
+            client = self._cpu
+            assert client is not None
+            client.connect_background()
+            return client.connected
         if self._cpu is not None:
             self._connected = self._cpu.connect()
             return self._connected
@@ -551,7 +569,11 @@ class MaruHandler:
     # =========================================================================
 
     def alloc(
-        self, size: int, route_key: str | None = None
+        self,
+        size: int,
+        route_key: str | None = None,
+        wait_s: float = 0.0,
+        retry_later: bool = False,
     ) -> AllocHandle | CpuAllocation:
         """Allocate a page and return a handle with a writable memoryview.
 
@@ -564,6 +586,10 @@ class MaruHandler:
             size: Required bytes (must be <= chunk_size)
             route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
+            wait_s: maru_node: how long to wait for credit when none is at
+                hand (never on the engine thread); others ignore it.
+            retry_later: maru_node: the caller retries a miss later, so it
+                counts as deferred, not skipped; others ignore it.
 
         Returns:
             A backend-specific handle with a writable buffer
@@ -572,6 +598,13 @@ class MaruHandler:
             RuntimeError: If not connected or closing
             ValueError: If size exceeds chunk_size or allocation fails
         """
+        if self._cpu is not None and self._config.maru_node:
+            return cast(
+                "AllocHandle | CpuAllocation",
+                self._cpu.alloc(
+                    size, route_key=route_key, wait_s=wait_s, retry_later=retry_later
+                ),
+            )
         if self._cpu is not None:
             return self._cpu.alloc(size, route_key=route_key)
         if self._config.metadata_only:
@@ -630,6 +663,12 @@ class MaruHandler:
 
         self._record_stats("alloc", size, (time.monotonic() - t0) * 1e6)
         return handle
+
+    def want_credit(self, pages: int) -> None:
+        """maru_node: this engine step will store ``pages`` pages; the node is
+        asked for them now. Other backends ignore it."""
+        if self._cpu is not None and self._config.maru_node:
+            self._cpu.want_credit(pages)
 
     def free(self, handle: AllocHandle | CpuAllocation) -> None:
         """Free a page previously obtained via alloc().
@@ -765,10 +804,10 @@ class MaruHandler:
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
 
-    def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
+    def retrieve(self, key: str) -> MemoryInfo | ReadLease | None:
         """Retrieve a mapped view or a backend-specific read lease.
 
-        CPU, mixed and remote CXL return read leases. Release them after the
+        CPU, mixed, remote CXL and node return read leases. Release them after the
         final CPU read or GPU copy; remote CXL leases protect worker staging
         populated by RDMA, not a worker-side mapping of remote CXL.
 
@@ -872,9 +911,7 @@ class MaruHandler:
             True if exists (and was pinned)
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.pin_kv(key)
@@ -893,9 +930,7 @@ class MaruHandler:
             True if unpinned successfully
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         result = self._rpc.unpin(key)
@@ -917,9 +952,7 @@ class MaruHandler:
             True if deleted
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
 
@@ -958,6 +991,8 @@ class MaruHandler:
         """
         if not self._connected or self._closing.is_set():
             return False
+        if self._config.maru_node:
+            return self._cpu.healthcheck()
 
         try:
             return self._rpc.heartbeat()
@@ -968,6 +1003,8 @@ class MaruHandler:
     def get_stats(self) -> dict:
         """Get server statistics."""
         self._ensure_connected()
+        if self._config.maru_node:
+            return {"maru_node": self._cpu.local_stats()}
 
         stats = self._rpc.get_stats()
         result = {
@@ -1018,10 +1055,10 @@ class MaruHandler:
 
     def batch_retrieve(
         self, keys: list[str], route_key: str | None = None
-    ) -> list[MemoryInfo | CpuReadLease | None]:
+    ) -> list[MemoryInfo | ReadLease | None]:
         """Retrieve mapped views or storage-session read leases in batch.
 
-        CPU, mixed and remote CXL results carry read leases; release every
+        CPU, mixed, remote CXL and node results carry read leases; release every
         non-None result after the final read/copy via release_retrieved.
 
         The cxl path uses one batch lookup RPC and returns views of owned
@@ -1336,6 +1373,48 @@ class MaruHandler:
         )
         return batch_resp.results
 
+    def store_async(self, keys: list[str], handles: list) -> Future:
+        """maru_node: ``batch_store`` that never waits; a future of one bool
+        per key, completed on a client thread.
+
+        Raises:
+            RuntimeError: If the handler is not on maru_node.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            raise RuntimeError("store_async needs maru_node")
+        return client.store_async(keys, handles)
+
+    def stop_credit_waits(self) -> None:
+        """maru_node: end every wait for credit (``alloc(wait_s=...)``), now
+        and later; allocations that find credit go on."""
+        stop = getattr(self._cpu, "stop_credit_waits", None)
+        if stop is not None:
+            stop()
+
+    def wait_attached(self, timeout_s: float | None = None) -> bool:
+        """maru_node: wait until a background connect mapped the node's pools
+        (by default up to ``node_connect_timeout_s``).
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            return self.connected
+        return client.wait_attached(timeout_s)
+
+    def wait_connected(self, timeout_s: float) -> bool:
+        """maru_node: wait until a background connect is done.
+
+        Raises:
+            AttachRefusedError: If the node refused this client.
+        """
+        client = self._cpu
+        if not self._config.maru_node or client is None:
+            return self.connected
+        return client.wait_connected(timeout_s)
+
     def read_hints_enabled(self) -> bool:
         """Whether storage sends read hints (:meth:`hint_read` does anything)."""
         if self._local_hints is not None:
@@ -1452,9 +1531,7 @@ class MaruHandler:
             List of booleans — True if key exists (and was pinned).
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_pin_kv(keys).results
@@ -1477,9 +1554,7 @@ class MaruHandler:
             List of booleans — True if successfully unpinned.
         """
         if self._cpu is not None:
-            raise NotImplementedError(
-                "CPU M1 uses read leases and does not support eviction/pinning"
-            )
+            raise NotImplementedError(self._no_pinning())
         self._ensure_connected()
         t0 = time.monotonic()
         results = self._rpc.batch_unpin(keys).results
@@ -1635,15 +1710,53 @@ class MaruHandler:
             len(response.allocations),
         )
 
-    def retrieve_capacity(self) -> int | None:
+    def retrieve_capacity(self, wanted: int | None = None) -> int | None:
         """How many keys the next ``batch_retrieve`` should ask for at most.
 
+        Args:
+            wanted: Keys the caller would read; a node worker short of them
+                waits briefly for its fetched leases to return (None: for all).
+
         Returns:
-            The read buffer slots a load may use now (remote_cxl backend), or None
-            when retrieves are not bounded by a read buffer.
+            The read slots a load may use now (remote_cxl backend, node
+            fetches), or None when retrieves are not bounded.
         """
         capacity = getattr(self._cpu, "retrieve_capacity", None)
-        return capacity() if capacity is not None else None
+        return capacity(wanted) if capacity is not None else None
+
+    def start_retrieve(self, keys: list[str], route_key: str | None = None):
+        """``batch_retrieve`` up to the node's FETCH answers (maru_node): the
+        lookups and FETCH sends happen now. ``result()`` of what it returns
+        gives the reads and ``done()`` says whether that waits; elsewhere
+        the retrieve happens now."""
+        if self._config.metadata_only:
+            raise RuntimeError("A metadata-only handler cannot access stored buffers")
+        start = getattr(self._cpu, "start_retrieve", None)
+        if start is not None:
+            return start(keys, route_key=route_key)
+        retrieved: Future = Future()
+        retrieved.set_result(self.batch_retrieve(keys, route_key=route_key))
+        return retrieved
+
+    def last_retrieve_misses(self) -> dict[str, int]:
+        """Why keys of this thread's last retrieve (``batch_retrieve``, or
+        the ``result()`` of ``start_retrieve``) were not read, counted by
+        source and reason (``lookup:absent``, ``fetch:busy``, ...;
+        maru_node); empty elsewhere."""
+        misses = getattr(self._cpu, "last_retrieve_misses", None)
+        return misses() if misses is not None else {}
+
+    def prepare_read_thread(self) -> None:
+        """Connect the calling node read thread before its first request."""
+        prepare = getattr(self._cpu, "prepare_read_thread", None)
+        if prepare is not None:
+            prepare()
+
+    def fetch_scope(self, request_id: str):
+        """A context in which retrieves on this thread may FETCH what only
+        the node reads in (maru_node, a parked load); a no-op elsewhere."""
+        scope = getattr(self._cpu, "fetch_scope", None)
+        return scope(request_id) if scope is not None else contextlib.nullcontext()
 
     def storage_gpu_accessible(self) -> bool:
         """Whether retrieved and allocated buffers are page-locked for the GPU.
@@ -1664,11 +1777,23 @@ class MaruHandler:
         )
 
     def release_retrieved(self, infos: list) -> None:
-        """Release storage-session read leases after the final read/GPU copy."""
-        if self._cpu is not None:
+        """Release storage-session read leases after the final read/GPU copy has completed."""
+        release = getattr(self._cpu, "release_retrieved", None)
+        if release is not None:
+            # Return the batch together.
+            release(infos)
+        elif self._cpu is not None:
             for info in infos:
                 if info is not None:
                     info.release()
+
+    def _no_pinning(self) -> str:
+        if self._config.maru_node:
+            return (
+                "maru_node handlers pin through retrieve and release_retrieved; "
+                "MaruServer decides eviction"
+            )
+        return "CPU M1 uses read leases and does not support eviction/pinning"
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""

@@ -8,6 +8,7 @@ import dataclasses
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 import zmq
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Stand-in until stamped; op_digest ignores the op field
 PLACEHOLDER_OP = OpRef(origin="", seq=0, digest=b"", ack=0)
 _UNSENT_RETRY_S = 0.01
+_DIRECT = frozenset({MessageType.PROBE, MessageType.LOOKUP_AND_PIN})
 
 
 class RpcUnknownError(Exception):
@@ -121,6 +123,11 @@ class MsRpcClient:
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.IMMEDIATE, 1)
         self._socket.connect(url)
+        self._direct_local = threading.local()
+        self._direct_sockets = []
+        self._direct_spares = collections.deque()
+        self._fill_direct_spares()
+        self.prepare_thread()
         self._thread = threading.Thread(target=self._io_loop, name=name, daemon=True)
         self._thread.start()
 
@@ -131,6 +138,13 @@ class MsRpcClient:
 
         frame = self._serializer.encode(msg_type, request)
         seq = MessageHeader.unpack(frame[:HEADER_SIZE]).sequence
+        if msg_type in _DIRECT:
+            return self._decode(
+                msg_type,
+                self._direct(
+                    frame, seq, self.timeout_s if timeout_s is None else timeout_s
+                ),
+            )
         waiter = _Waiter()
         with self._lock:
             if self._closed:
@@ -149,8 +163,11 @@ class MsRpcClient:
             )
         if waiter.error is not None or waiter.frame is None:
             raise RpcUnknownError(waiter.error or "no response")
+        return self._decode(msg_type, waiter.frame)
+
+    def _decode(self, msg_type, frame):
         try:
-            header, response = self._serializer.decode_response(waiter.frame)
+            header, response = self._serializer.decode_response(frame)
         except (MessageDecodeError, ValueError) as e:
             raise RpcUnknownError(f"undecodable response: {e}") from e
         if header.msg_type != (int(msg_type) | RESPONSE_BIT):
@@ -158,6 +175,66 @@ class MsRpcClient:
                 f"response code 0x{header.msg_type:02X} to request 0x{int(msg_type):02X}"
             )
         return response
+
+    def prepare_thread(self) -> None:
+        """Connect this thread's read socket before it serves requests."""
+        with self._lock:
+            if self._closed:
+                raise RpcUnknownError("the MaruServer connection is closed")
+            if getattr(self._direct_local, "entry", None) is not None:
+                return
+            entry = (
+                self._direct_spares.popleft()
+                if self._direct_spares
+                else self._new_direct_socket()
+            )
+            self._direct_local.entry = entry
+        self._wake()
+
+    def _new_direct_socket(self):
+        sock = self._context.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.IMMEDIATE, 1)
+        sock.connect(self.url)
+        entry = (sock, threading.Lock())
+        self._direct_sockets.append(entry)
+        return entry
+
+    def _fill_direct_spares(self):
+        with self._lock:
+            if not self._closed:
+                while len(self._direct_spares) < 2:
+                    self._direct_spares.append(self._new_direct_socket())
+
+    def _direct(self, frame: bytes, seq: int, timeout_s: float) -> bytes:
+        self.prepare_thread()
+        sock, guard = self._direct_local.entry
+        end = time.monotonic() + timeout_s
+        with guard:
+            try:
+                sent = False
+                while not self._closed:
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        break
+                    events = zmq.POLLIN if sent else zmq.POLLOUT
+                    if not sock.poll(max(1, min(50, int(left * 1000))), events):
+                        continue
+                    if not sent:
+                        try:
+                            sock.send_multipart([b"", frame], flags=zmq.NOBLOCK)
+                        except zmq.Again:
+                            continue
+                        sent = True
+                        continue
+                    reply = sock.recv_multipart()[-1]
+                    if len(reply) < HEADER_SIZE:
+                        raise RpcUnknownError("response shorter than a header")
+                    if MessageHeader.unpack(reply[:HEADER_SIZE]).sequence == seq:
+                        return reply
+            except (zmq.ZMQError, ValueError) as e:
+                raise RpcUnknownError(f"direct RPC failed: {e}") from e
+        raise RpcUnknownError(f"no response from {self.url}")
 
     def close(self) -> None:
         with self._lock:
@@ -172,6 +249,9 @@ class MsRpcClient:
             waiter.event.set()
         self._wake()
         self._thread.join(timeout=5.0)
+        for sock, guard in self._direct_sockets:
+            with guard:
+                sock.close()
         self._socket.close()
         self._context.term()
         os.close(self._wake_r)
@@ -206,6 +286,7 @@ class MsRpcClient:
             if self._socket in events:
                 self._receive_all()
             self._send_all()
+            self._fill_direct_spares()
 
     def _send_all(self) -> None:
         while True:

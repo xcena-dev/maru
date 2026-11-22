@@ -816,7 +816,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         if self._staging is not None:
             self._staging.give(handle.slot)
 
-    def retrieve_capacity(self) -> int | None:
+    def retrieve_capacity(self, wanted: int | None = None) -> int | None:
         """How many keys the next :meth:`batch_retrieve` should ask for at most.
 
         Stores leave the load reserve free, so a batch of this size finds its
