@@ -5123,6 +5123,13 @@ class MaruWorkerConnector:
                     continue
                 chunk_keys = chunk_keys[first_chunk:last_chunk]
                 num_chunks = len(chunk_keys)
+            elif self._node_mode:
+                plan = self._node_load_plan(req_meta, chunk_keys[:num_chunks])
+                if plan is None:
+                    self._fail_deferred_load(req_meta)
+                    continue
+                chunk_keys, slot_mapping = plan
+                num_chunks = len(chunk_keys)
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
@@ -5984,6 +5991,14 @@ class MaruWorkerConnector:
                 logger.debug("Maru: read promote not queued", exc_info=True)
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
+            if self._node_mode:
+                plan = self._node_load_plan(req_meta, chunk_keys[:num_chunks])
+                if plan is None:
+                    self._fail_deferred_load(req_meta)
+                    return
+                chunk_keys, slot_mapping = plan
+                num_chunks = len(chunk_keys)
+                total_tokens = num_chunks * self._kv_chunk_tokens
             # Layerwise keys come back layer-major in this job's own layer
             # order — consumers index the retained dict by true layer index,
             # never by list position.
@@ -6504,7 +6519,7 @@ class MaruWorkerConnector:
             pinned = self._pin_slot_mapping_for_async_h2d(slot_mapping)
             refs.append(pinned)
             attn = self._last_attn_metadata
-            tokens = num_chunks * self._kv_chunk_tokens
+            a, b = self._rows(req_meta, 0, num_chunks * self._kv_chunk_tokens)
             _t0 = time.monotonic()
             events = _LayerLoadEvents()
             nbytes = 0
@@ -6529,10 +6544,11 @@ class MaruWorkerConnector:
                     self._inject_kv_into_layer(
                         kv_cache_layer,
                         layer_dev,
-                        slot_gpu[:tokens],
+                        slot_gpu[a:b],
                         attn,
                         layer_name,
                         num_chunks=num_chunks,
+                        **self._node_rows(a, b),
                     )
                     refs.pop()  # reused by the caching allocator in stream order
                     if self._timing:
@@ -6645,14 +6661,24 @@ class MaruWorkerConnector:
                                     -1,
                                 )[:, true_idx]
                             chunk_start = ci * self._kv_chunk_tokens
+                            a, b = self._rows(
+                                req_meta, chunk_start, self._kv_chunk_tokens
+                            )
+                            if a == b:
+                                continue
                             chunk_slots = slot_mapping[
-                                chunk_start : chunk_start + self._kv_chunk_tokens
+                                chunk_start + a : chunk_start + b
                             ]
                             src = layer_host.to(kv_cache_layer.device)
                             slots = chunk_slots.to(kv_cache_layer.device)
                             refs[2:] = [src, slots]
                             self._inject_kv_into_layer(
-                                kv_cache_layer, src, slots, attn_metadata, layer_name
+                                kv_cache_layer,
+                                src,
+                                slots,
+                                attn_metadata,
+                                layer_name,
+                                **self._node_rows(a, b),
                             )
                 except Exception as e:
                     if self._stop_if_unconfirmed(e, refs, req_id=req_meta.req_id):
@@ -6699,7 +6725,7 @@ class MaruWorkerConnector:
                 ]
                 refs.extend(slot_mappings_gpu)
                 for layer_name, kv_cache_layer, true_idx in layers:
-                    for (_, num_chunks, _, infos), slot_gpu in zip(
+                    for (req_meta, num_chunks, _, infos), slot_gpu in zip(
                         entries, slot_mappings_gpu, strict=True
                     ):
                         if self._use_layerwise:
@@ -6715,13 +6741,17 @@ class MaruWorkerConnector:
                                 load_stream,
                                 refs,
                             )
+                        a, b = self._rows(
+                            req_meta, 0, num_chunks * self._kv_chunk_tokens
+                        )
                         self._inject_kv_into_layer(
                             kv_cache_layer,
                             layer_dev,
-                            slot_gpu[: num_chunks * self._kv_chunk_tokens],
+                            slot_gpu[a:b],
                             attn_metadata,
                             layer_name,
                             num_chunks=num_chunks,
+                            **self._node_rows(a, b),
                         )
                         refs.pop()  # reused only in the stream's order
                     event = torch.cuda.Event()
@@ -7801,18 +7831,23 @@ class MaruWorkerConnector:
                                 run_view, dtype=kv_cache_layer.dtype
                             )
                             token_start = chunk_start * self._kv_chunk_tokens
-                            token_end = (
-                                chunk_start + run_chunks
-                            ) * self._kv_chunk_tokens
+                            a, b = self._rows(
+                                req_meta,
+                                token_start,
+                                run_chunks * self._kv_chunk_tokens,
+                            )
+                            if a == b:
+                                continue
                             src = chunk_tensor.to(device, non_blocking=True)
                             refs.append(src)
                             self._inject_kv_into_layer(
                                 kv_cache_layer,
                                 src,
-                                slot_mapping_gpu[token_start:token_end],
+                                slot_mapping_gpu[token_start + a : token_start + b],
                                 attn_metadata,
                                 layer_name,
                                 num_chunks=run_chunks,
+                                **self._node_rows(a, b),
                             )
                             refs.pop()  # reused only in the stream's order
                     event = torch.cuda.Event()
@@ -8132,14 +8167,20 @@ class MaruWorkerConnector:
                             info.view, dtype=kv_cache_layer.dtype
                         )
                         chunk_start = ci * self._kv_chunk_tokens
-                        chunk_slots = slot_mapping[
-                            chunk_start : chunk_start + self._kv_chunk_tokens
-                        ]
+                        a, b = self._rows(req_meta, chunk_start, self._kv_chunk_tokens)
+                        if a == b:
+                            continue
+                        chunk_slots = slot_mapping[chunk_start + a : chunk_start + b]
                         src = chunk_tensor.to(kv_cache_layer.device)
                         slots = chunk_slots.to(kv_cache_layer.device)
                         refs[1:] = [src, slots]
                         self._inject_kv_into_layer(
-                            kv_cache_layer, src, slots, attn_metadata, layer_name
+                            kv_cache_layer,
+                            src,
+                            slots,
+                            attn_metadata,
+                            layer_name,
+                            **self._node_rows(a, b),
                         )
             except Exception as e:
                 if self._stop_if_unconfirmed(e, refs, req_id=req_meta.req_id):
@@ -8807,6 +8848,38 @@ class MaruWorkerConnector:
                 self._release(reads)
             except Exception as e:
                 logger.warning("Maru: releasing %d reads failed: %s", len(reads), e)
+
+    def _node_load_plan(
+        self, req_meta: MaruReqMeta, chunk_keys: list[str]
+    ) -> tuple[list[str], torch.Tensor] | None:
+        """The chunks holding the external tokens ``[start, end)``, and the
+        slots from the first one's start to ``end``; None if there are none.
+        Only rows ``_rows`` gives are written: vLLM's prefix cache holds the
+        tokens before, and nothing was allocated after."""
+        ct = self._kv_chunk_tokens
+        start, end = self._cpu_load_range(req_meta)
+        first, last = start // ct, -(-end // ct)
+        if end <= start or last > len(chunk_keys):
+            return None
+        slots = self._build_slot_mapping(req_meta.block_ids, end)
+        return chunk_keys[first:last], slots[first * ct :]
+
+    def _rows(self, req_meta: MaruReqMeta, offset: int, count: int) -> tuple[int, int]:
+        """Rows ``[a, b)`` of ``count`` loaded tokens at ``offset`` from the
+        first loaded chunk that a load writes: all on cxl, only the external
+        range on maru_node (``_node_load_plan``). Their slots are at the same
+        offsets of the plan's slot mapping."""
+        if not self._node_mode:
+            return 0, count
+        start, end = self._cpu_load_range(req_meta)
+        base = start - start % self._kv_chunk_tokens + offset
+        a = min(max(start - base, 0), count)
+        return a, max(min(end - base, count), a)
+
+    def _node_rows(self, a: int, b: int) -> dict[str, Any]:
+        """``_inject_kv_into_layer``'s ``rows`` on maru_node; none elsewhere,
+        where a load writes every row it read."""
+        return {"rows": (a, b)} if self._node_mode else {}
 
     def _leased_load(self, req_meta: MaruReqMeta) -> bool:
         """Whether a request loads in leased batches (_load_leased_request):
@@ -10825,8 +10898,13 @@ class MaruWorkerConnector:
         attn_metadata: AttentionMetadata | None,
         layer_name: str,
         num_chunks: int = 1,
+        rows: tuple[int, int] | None = None,
     ) -> None:
         """Inject loaded KV cache data into the paged GPU buffer.
+
+        ``rows``: write only token rows ``[a, b)`` of ``src_kv_data``, which
+        holds ``num_chunks`` whole chunks, into ``slot_mapping`` (one slot per
+        row); by default its leading rows, one per slot.
 
         The exact inverse of ``_extract_kv_from_layer``, branch for branch:
         - MLA: [num_blocks, block_size, ...], for an MLA model also when no
@@ -10848,13 +10926,16 @@ class MaruWorkerConnector:
             if isinstance(attn_metadata, dict)
             else attn_metadata
         )
+        a, b = rows if rows is not None else (0, slot_mapping.shape[0])
+        if b - a != slot_mapping.shape[0]:
+            raise RuntimeError(
+                f"Maru: rows [{a}, {b}) do not match {slot_mapping.shape[0]} slots"
+            )
 
         if self._use_mla or isinstance(layer_meta, MLACommonMetadata):
             pages = _mla_pages(dst_kv_cache)
             page_size = pages.shape[1]
-            src = _token_rows(
-                src_kv_data, tuple(pages.shape[2:]), slot_mapping.shape[0]
-            )
+            src = _token_rows(src_kv_data, tuple(pages.shape[2:]), b)[a:]
             pages[slot_mapping // page_size, slot_mapping % page_size] = src
         elif (
             isinstance(layer_meta, TritonAttentionMetadata)
@@ -10867,10 +10948,8 @@ class MaruWorkerConnector:
             block_idxs = slot_mapping // self._block_size
             offsets = slot_mapping % self._block_size
             src = _token_rows(
-                src_kv_data,
-                (dst_kv_cache.shape[1], dst_kv_cache.shape[3]),
-                slot_mapping.shape[0],
-            )
+                src_kv_data, (dst_kv_cache.shape[1], dst_kv_cache.shape[3]), b
+            )[a:]
             dst_kv_cache[block_idxs, :, offsets] = src
         else:
             layout = self._layout_for(dst_kv_cache)
@@ -10880,14 +10959,13 @@ class MaruWorkerConnector:
                     "Maru: cannot inject KV for layout "
                     f"{tuple(dst_kv_cache.shape)}; unrecognized paged KV tensor"
                 )
-            ntok = slot_mapping.shape[0]
             # Derive row width from the registered cache, independently of
             # the number of slots this load needs to fill. Whole stored
             # chunks may include a final block the engine will recompute.
             row_width = dst_kv_cache.numel() // layout.page_buffer_size
             if row_width % 2:
                 raise RuntimeError("Maru: cannot inject KV; odd fused K/V row width")
-            src = _slab_rows(src_kv_data, num_chunks, row_width // 2, ntok)
+            src = _slab_rows(src_kv_data, num_chunks, row_width // 2, b)[:, a:]
             _scatter_kv(dst_kv_cache, layout, slot_mapping, src)
 
     def _extract_kv_from_layer(
