@@ -36,7 +36,7 @@ from .drivers.cxl import (
 from .drivers.dram import DramPoolError
 from .drivers.registry import TIERS
 from .local_pin import LocalPins
-from .local_server import LocalServer
+from .local_server import LocalServer, NodeOwnership
 from .op_ledger import OP_WINDOW
 from .peer_watcher import PeerWatcher
 from .placement import DEFAULT_KEPT_BACKOFF_S, PlacementPolicy
@@ -148,9 +148,9 @@ class StorageService:
         self.server: ServerClient | None = None
         self.manager: StorageManager | None = None
         self.local: LocalServer | None = None
+        self._ownership = NodeOwnership(config.socket)
+        self._owns_ownership = True
         self.memory = config.role == "memory"
-        # Pools of the run's tiers left out of it (never announced)
-        self._unlisted: set[str] = set()
         # Pools taken over from the run before: adopted or claimed from the RM
         self.adopted: list[str] = []
         self._credit_tiers: set[str] = set()
@@ -237,8 +237,7 @@ class StorageService:
             raise ServerStopped()
 
     def _claim_socket(self) -> None:
-        """The workers' socket, claimed first: a second start must fail
-        before NODE_OPEN."""
+        """Bind the workers' socket under the node's ownership lock."""
         config = self.config
         self.local = LocalServer(
             config.socket,
@@ -252,6 +251,7 @@ class StorageService:
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
             capabilities=frozenset(),
+            ownership=self._ownership,
         )
         self.local.claim()
 
@@ -273,6 +273,7 @@ class StorageService:
             raise NodeConfigError(f"the {top.store} tier needs a size")
         if self._interrupted.is_set():
             raise ServerStopped()
+        self._ownership.claim()
         if not self.memory:
             self._claim_socket()
         for t in config.tiers:
@@ -311,9 +312,6 @@ class StorageService:
         if self._interrupted.is_set():  # before interrupt() could stop it
             raise ServerStopped()
         placement = PlacementPolicy(high, low, kept_backoff_s=self.kept_backoff_s)
-        for t in config.tiers[1:]:
-            if t.high_watermark is not None and t.low_watermark is not None:
-                placement.set_watermarks(t.store, t.high_watermark, t.low_watermark)
         self.manager = StorageManager(
             node_epoch=self.node_epoch,
             pool_manager=self.pools,
@@ -534,6 +532,8 @@ class StorageService:
         try:
             with self._lifecycle:  # a start still running gives up first
                 self._teardown(mode)
+                if self._owns_ownership:
+                    self._ownership.close()
         except Exception as e:
             self.teardown_failed = f"{type(e).__name__}: {e}"
             logger.exception("tearing run %s down failed", self.node_epoch)
@@ -650,6 +650,7 @@ class Node:
         self.pause_s = pause_s
         self.max_pause_s = max_pause_s
         self._stop = threading.Event()
+        self._ownership = NodeOwnership(config.socket)
         self.service: StorageService | None = None
         self.runs = 0
         # Why the last run ended on its own
@@ -669,11 +670,23 @@ class Node:
         """Serve until stop() (True), or until no run may follow (False):
         another run claimed the node, or a teardown failed (``failed``). A
         start that fails otherwise raises."""
+        try:
+            return self._run()
+        finally:
+            service = self.service
+            if service is None or (
+                service.wait_finished(0) and service.teardown_failed is None
+            ):
+                self._ownership.close()
+
+    def _run(self) -> bool:
         pause = self.pause_s
         while True:
             if self._stop.is_set():
                 return True
             service = self._make_service(self.config)
+            service._ownership = self._ownership
+            service._owns_ownership = False
             service.later_run = self.runs > 0
             self.service = service
             self.runs += 1

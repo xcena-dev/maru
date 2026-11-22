@@ -13,11 +13,13 @@ import time
 
 import pytest
 
+from maru_common.protocol import MessageType
 from maru_shm.types import StaleNodeEpochError
 from maru_storage_service import service as service_module
 from maru_storage_service.cli import EXIT_FAILED, _signal_handler, serve
 from maru_storage_service.drivers import dram
 from maru_storage_service.drivers.dram import DramDriver, DramPoolError
+from maru_storage_service.local_server import LocalServerError
 from maru_storage_service.ports import NodeOpenError, ServerStopped
 from maru_storage_service.service import Node, StorageService
 from tests.unit.ms_fake_server import FakeMaruServer
@@ -27,6 +29,7 @@ from tests.unit.ms_node_helpers import (
     node_config,
     remove_tree,
     short_tmpdir,
+    start_node,
     wait_until,
 )
 from tests.unit.test_ms_new_run import new_run
@@ -359,6 +362,41 @@ def runs(fake, sockdir):
     for node, thread in started:
         node.stop()
         thread.join(15)
+
+
+@pytest.mark.parametrize("role", ["gpu", "memory"])
+def test_node_keeps_ownership_between_runs(fake, runs, monkeypatch, role):
+    paused, resume = threading.Event(), threading.Event()
+
+    def reclaim():
+        paused.set()
+        assert resume.wait(10)
+
+    monkeypatch.setattr(service_module.gc_freeze, "reclaim", reclaim)
+    node = runs(role=role)
+    try:
+        wait_until(lambda: fake.requests(MessageType.NODE_HEARTBEAT))
+        fake.restart()
+        assert paused.wait(10)
+        assert node.service is None
+        opens = len(fake.requests(MessageType.NODE_OPEN))
+        with pytest.raises(LocalServerError, match="another StorageService holds"):
+            start_node(node.config)
+        assert len(fake.requests(MessageType.NODE_OPEN)) == opens
+    finally:
+        resume.set()
+    wait_until(
+        lambda: (
+            node.runs == 2
+            and node.service is not None
+            and node.service.server is not None
+            and node.service.server.session is not None
+        )
+    )
+    node.stop()
+    wait_until(lambda: node.kept == [True])
+    replacement = start_node(node.config)
+    replacement.stop()
 
 
 @pytest.fixture

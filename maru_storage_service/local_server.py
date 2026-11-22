@@ -63,6 +63,38 @@ class LocalServerError(RuntimeError):
     """The endpoint cannot start (socket in use, bad path)."""
 
 
+class NodeOwnership:
+    """Exclusive local ownership of a node's socket path."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fd: int | None = None
+
+    def claim(self) -> None:
+        if self._fd is not None:
+            return
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(f"{self.path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o660)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise LocalServerError(
+                f"another StorageService holds {self.path}.lock"
+            ) from None
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
 class Connection:
     """One worker connection."""
 
@@ -274,6 +306,7 @@ class LocalServer:
         transfer_defaults: TransferDefaults | None = None,
         socket_group: str | None = None,
         capabilities: frozenset[str] = frozenset(),
+        ownership: NodeOwnership | None = None,
     ):
         self.path = path
         # ATTACH capabilities this endpoint serves
@@ -292,7 +325,8 @@ class LocalServer:
         self._lock = threading.Lock()
         self._conns: set[Connection] = set()
         self._sock: socket.socket | None = None
-        self._lock_fd: int | None = None
+        self._ownership = ownership or NodeOwnership(path)
+        self._owns_ownership = ownership is None
         self._bound: tuple[int, int] | None = None  # (st_dev, st_ino) we created
         self._accept: threading.Thread | None = None
         self._stopping = False
@@ -300,20 +334,8 @@ class LocalServer:
     # ------------------------------------------------------------- lifecycle
 
     def claim(self) -> None:
-        """Take the socket path before anything else starts: an flock on
-        "<path>.lock", then bind (0660). Accepting starts in start()."""
-        parent = os.path.dirname(self.path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        fd = os.open(f"{self.path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o660)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            raise LocalServerError(
-                f"another StorageService holds {self.path}.lock"
-            ) from None
-        self._lock_fd = fd
+        """Claim local ownership and bind (0660); start() accepts workers."""
+        self._ownership.claim()
         self._remove_stale_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
         try:
@@ -390,9 +412,8 @@ class LocalServer:
             except FileNotFoundError:
                 pass
             self._bound = None
-        if self._lock_fd is not None:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        if self._owns_ownership:
+            self._ownership.close()
 
     def connections(self) -> list[Connection]:
         with self._lock:

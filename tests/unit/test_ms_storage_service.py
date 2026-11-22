@@ -7,6 +7,7 @@ import grp
 import os
 import stat
 import threading
+import time
 
 import pytest
 
@@ -383,6 +384,14 @@ def test_a_full_gpu_store_skips_and_never_retires(fake, sockdir, store):
             )
         before = fake.keys()
         assert worker.credit(PAGE).credits == []
+        fake.pause()
+        try:
+            started = time.monotonic()
+            answer = worker.credit(PAGE)
+            assert answer.status is Status.OK and answer.credits == []
+            assert time.monotonic() - started < node.rpc_timeout_s
+        finally:
+            fake.resume()
         for _ in range(3):
             node.manager._evict_once()
         assert fake.keys() == before and len(before) == 15
@@ -578,7 +587,7 @@ def test_idle_credit_is_asked_back_for_a_waiting_worker(raw):
         second.close()
 
 
-def test_store_without_credit_is_skipped(raw):
+def test_write_done_with_an_invalid_allocation_is_rejected(raw):
     node, worker = raw
     fake_credit = Location(
         node.tier("dram").pool.pool_id, "not-credited", 1, 0, PAGE, PoolKind.DRAM
@@ -829,18 +838,58 @@ def test_admin_delete_skips_closed_nodes(fake, nodes):
     assert item.result == ItemResult.MISS and item.reason == MissReason.OFFLINE
 
 
-def test_second_start_leaves_the_running_node_alone(fake, nodes):
-    node = nodes()
-    second = StorageService(node.config, rpc_timeout_s=0.3)
-    with pytest.raises(LocalServerError):
-        second.start()
-    # nothing reached MaruServer, and the first node still serves
-    assert len(fake.requests(MessageType.NODE_OPEN)) == 1
-    assert os.path.exists(node.config.socket)
-    assert node.manager.ended is None
-    from tests.unit.ms_node_helpers import publish
+@pytest.mark.parametrize("role", ["gpu", "memory"])
+@pytest.mark.parametrize("store", ["dram", "local_cxl"])
+def test_second_start_leaves_the_running_node_alone(sockdir, monkeypatch, role, store):
+    from maru_server.node_server import NodeServer
+    from tests.unit.ms_node_helpers import FakeRm, MetadataServer, publish
 
-    assert publish(node, "still-serving").result is ItemResult.ADDED
+    metadata = MetadataServer(NodeServer(heartbeat_s=0.05))
+    rm = FakeRm()
+    config = node_config(
+        metadata.address,
+        f"{sockdir}/node.sock",
+        role=role,
+        cxl_pages=16 if store == "local_cxl" else None,
+    )
+    node = None
+    try:
+        node = start_node(config, region_source=rm, host_boot_id="boot1")
+        assert publish(node, "existing").result is ItemResult.ADDED
+        catalog = metadata.server.ms_service.catalog
+        registry = metadata.server.ms_service.registry
+        locations = catalog.locations(Key(NS, "existing"))
+        epoch_seq = registry.nodes[config.node_id].epoch_seq
+        session = node.server.session
+        rm_calls = list(rm.calls)
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("second start reached pool creation or NODE_OPEN")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(StorageService, "_make", unexpected)
+            patch.setattr(type(node.server), "open", unexpected)
+            second = StorageService(config, region_source=rm, host_boot_id="boot1")
+            with pytest.raises(LocalServerError, match="another StorageService holds"):
+                second.start()
+        assert second.pools is None and second.server is None
+        assert not second._tiers
+        assert [c for c in rm.calls if c != "renew"] == [
+            c for c in rm_calls if c != "renew"
+        ]
+        assert os.path.exists(config.socket) is (role == "gpu")
+        assert (node.local is None) is (role == "memory")
+        assert publish(node, "still-serving").result is ItemResult.ADDED
+        node.manager.on_heartbeat(node.server.heartbeat(node.pools.usage()))
+        assert not node.wait(0) and node.manager.ended is None
+        assert node.server.session == session
+        assert catalog.locations(Key(NS, "existing")) == locations
+        assert registry.nodes[config.node_id].epoch_seq == epoch_seq == 1
+        assert node.pools.bytes_in(PageState.READY) == 2 * PAGE
+    finally:
+        if node is not None:
+            node.stop()
+        metadata.close()
 
 
 def test_maruserver_stopped_reaches_the_cap_and_comes_back(fake, nodes):
