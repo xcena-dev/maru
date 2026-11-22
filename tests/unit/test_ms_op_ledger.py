@@ -300,7 +300,7 @@ class TestServiceOps:
         assert [e.location for e in service.catalog.locations(key("k0"))] == [locs[0]]
         assert not service.catalog.locations(key("k1"))
 
-    def test_a_failing_pin_is_rolled_back_in_a_partial_run(self, env):
+    def test_a_partial_pin_run_replays_its_first_result(self, env):
         from maru_common.protocol import LookupAndPinRequest
 
         service, wire, node = env
@@ -323,9 +323,48 @@ class TestServiceOps:
         response = wire.call(MessageType.LOOKUP_AND_PIN, request)
         service.pins.pin = original
         assert [i.result for i in response.items] == ["HIT", "REJECTED"]
-        # the item that raised left nothing behind; a resend replays
+        # A resend replays the successful pin and the failed item.
         assert len(service.pins) == 1
         assert wire.call(MessageType.LOOKUP_AND_PIN, request) == response
+        assert len(service.pins) == 1
+
+    def test_a_pin_is_rolled_back_when_record_access_fails(self, env, monkeypatch):
+        from maru_common.protocol import LookupAndPinRequest
+
+        service, wire, node = env
+        keys = [key("k0"), key("k1")]
+        locs = [node.loc(node.dram(), i + 1) for i in range(2)]
+        node.commit(*zip(keys, locs, strict=True))
+        worker = FakeWorker(wire, node)
+        assert worker.open().status == Status.OK
+        original = service.registry.record_access
+        pins = []
+
+        def failing(pool, location):
+            held = service.pins.held_by(worker.token)
+            pins.append(next(p.pin_id for p in held if p.location == location))
+            if len(pins) == 2:
+                assert len(held) == 2
+                assert service.pins.count(keys[1], locs[1]) == 1
+                raise RuntimeError("record_access failed")
+            return original(pool, location)
+
+        request = worker.build(LookupAndPinRequest, **worker.envelope(), items=keys)
+        with monkeypatch.context() as patch:
+            patch.setattr(service.registry, "record_access", failing)
+            first = wire.call(MessageType.LOOKUP_AND_PIN, request)
+
+        assert first.status == Status.OK
+        assert [i.result for i in first.items] == ["HIT", "REJECTED"]
+        assert len(pins) == 2 and first.items[0].pin_id == pins[0]
+        assert service.pins.get(pins[0]).location == locs[0]
+        assert service.pins.get(pins[1]) is None
+        assert service.pins.count(keys[0], locs[0]) == 1
+        assert service.pins.count(keys[1], locs[1]) == 0
+        assert len(service.pins) == 1
+        assert wire.call(MessageType.LOOKUP_AND_PIN, request) == first
+        assert [p.pin_id for p in service.pins.held_by(worker.token)] == [pins[0]]
+        assert service.pins.count(keys[1], locs[1]) == 0
         assert len(service.pins) == 1
 
     def test_closing_a_probe_keeps_the_workers_records(self, env):

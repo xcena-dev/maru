@@ -51,10 +51,9 @@ MS_PROTOCOL = "ms1"
 # takes FETCH_COMPLETE without a copy
 FETCH_CAPABILITY = "fetch_v1"
 # ATTACH capabilities: a FETCH HIT lends a node page by lease (FETCH_RELEASE);
-# the node passes HINT on; it starts a scheduler's PREFETCH
+# the node passes HINT on
 LEASE_CAPABILITY = "lease_v1"
 HINT_CAPABILITY = "hint_v1"
-PREFETCH_CAPABILITY = "prefetch_v1"
 # NODE_OPEN capabilities: the node reads and writes memory nodes' pools over
 # RDMA; it is a memory node
 REMOTE_CAPABILITY = "remote_v1"

@@ -167,6 +167,10 @@ class NodeRpcServer:
                 "server_epoch": self._server.server_epoch,
                 "capabilities": [],
             }
+        elif 0x40 <= header.msg_type <= 0x5F:
+            response = {
+                "error": f"message 0x{header.msg_type:02X} is not served by this release"
+            }
         else:
             response = {
                 "error": f"message 0x{header.msg_type:02X} is not served here: "

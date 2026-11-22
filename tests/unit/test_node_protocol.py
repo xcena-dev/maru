@@ -51,7 +51,7 @@ def pair():
 
 
 def test_codes_are_unique_and_below_the_response_bit():
-    assert len(set(CODES)) == len(CODES) == 15
+    assert len(set(CODES)) == len(CODES) == 14
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
     assert 0x28 not in CODES  # DRAIN_ACK, retired: never reused
 
@@ -169,29 +169,18 @@ def test_a_fetch_hit_is_a_lease_given_back_by_fetch_release():
     assert back == reply
 
 
-def test_hints_and_prefetch_on_the_wire():
-    from maru_common.node_protocol import (
-        HintRequest,
-        PrefetchRequest,
-        PrefetchResponse,
-    )
+def test_hints_on_the_wire():
+    from maru_common.node_protocol import HintRequest
     from maru_common.serializer import MessageDecodeError
     from maru_common.storage_types import (
         HINT_CAPABILITY,
-        PREFETCH_CAPABILITY,
         HintAction,
-        ItemOutcome,
-        ItemResult,
-        Key,
-        KeyLocation,
         Location,
-        MissReason,
         PoolKind,
-        Status,
     )
 
-    assert (HINT_CAPABILITY, PREFETCH_CAPABILITY) == ("hint_v1", "prefetch_v1")
-    assert (NodeMessageType.HINT, NodeMessageType.PREFETCH) == (0x1B, 0x1C)
+    assert HINT_CAPABILITY == "hint_v1"
+    assert NodeMessageType.HINT == 0x1B
     assert [a.value for a in HintAction] == [
         "read_hint",
         "read_hint_end",
@@ -213,19 +202,6 @@ def test_hints_and_prefetch_on_the_wire():
     payload["action"] = "read_soon"
     with pytest.raises(MessageDecodeError):
         ser.decode_request_payload(ser.encode(NodeMessageType.HINT, payload))
-    prefetch = PrefetchRequest("req-1", [KeyLocation(Key("ns", "k"), where)])
-    frame = ser.encode(NodeMessageType.PREFETCH, prefetch)
-    header, decoded = ser.decode_request(frame)
-    assert decoded == prefetch
-    reply = PrefetchResponse(
-        status=Status.OK,
-        items=[
-            ItemOutcome(ItemResult.OK),
-            ItemOutcome(ItemResult.MISS, reason=MissReason.BUSY),
-        ],
-    )
-    _, back = ser.decode_response(ser.encode_response(header, reply))
-    assert back == reply
 
 
 def test_a_wait_this_side_does_not_serve_is_refused():

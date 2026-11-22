@@ -53,7 +53,6 @@ class NodeMessageType(IntEnum):
     FETCH_CANCEL = 0x19
     FETCH_RELEASE = 0x1A
     HINT = 0x1B
-    PREFETCH = 0x1C
     LOCAL_PIN = 0x20
     LOCAL_UNPIN = 0x21
     # 0x28: retired (DRAIN_ACK); never reuse it
@@ -84,8 +83,10 @@ class Budgets:
     credit_refill_high: int
     commit_pending_max_bytes: int
     transfer_reserve_bytes: dict[str, int] = field(default_factory=dict)
-    # Page-rounded bytes of one FETCH, and of the node's fetches until handoff
+    # Page-rounded byte limit for one FETCH.
     fetch_request_max_bytes: int = 0
+    # Node-wide TRANSFER and lent pages, counted until each page's last lease
+    # is returned by FETCH_RELEASE.
     fetch_max_inflight_bytes: int = 0
 
 
@@ -327,27 +328,6 @@ class HintResponse:
 
 
 @dataclass
-class PrefetchRequest:
-    """PREFETCH (0x1C) - A scheduler asks the node to start reading
-    ``request``'s keys now, prefetch_v1 only; ``items`` are the locations
-    its PROBE (with_locations) found. The node pins each source and starts
-    its READ within its read share; a worker's FETCH of the key joins that
-    READ. No op and no lease: a read no FETCH joins goes back after a short
-    time. Items: OK (a READ started or runs already), MISS(reason),
-    REJECTED."""
-
-    request: str
-    items: list[KeyLocation]
-
-
-@dataclass
-class PrefetchResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-
-
-@dataclass
 class LocalPinRequest:
     """LOCAL_PIN (0x20) - Answered with DISABLED."""
 
@@ -422,7 +402,6 @@ NODE_MESSAGE_CLASSES = {
     NodeMessageType.FETCH_CANCEL: (FetchCancelRequest, FetchCancelResponse),
     NodeMessageType.FETCH_RELEASE: (FetchReleaseRequest, FetchReleaseResponse),
     NodeMessageType.HINT: (HintRequest, HintResponse),
-    NodeMessageType.PREFETCH: (PrefetchRequest, PrefetchResponse),
     NodeMessageType.LOCAL_PIN: (LocalPinRequest, LocalPinResponse),
     NodeMessageType.LOCAL_UNPIN: (LocalUnpinRequest, LocalUnpinResponse),
     NodeMessageType.UNMAP_ACK: (UnmapAckRequest, UnmapAckResponse),

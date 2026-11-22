@@ -17,6 +17,7 @@ import zmq
 from maru_common.protocol import (
     HEADER_FORMAT,
     HEADER_SIZE,
+    MS_MESSAGE_CLASSES,
     PROTOCOL_MAGIC,
     PROTOCOL_VERSION,
     CommitItem,
@@ -212,10 +213,14 @@ def test_meanings_of_another_release_are_refused(served):
     assert header.msg_type == MessageType.NODE_OPEN | 0x80 and header.sequence == 9
     assert response.status == Status.REJECTED and "ssd" in response.error
     assert "n1" not in server.ms_service.registry.nodes
-    wire.socket.send(raw_frame(0x5A, {"session": "s", "items": []}, seq=11))
-    header, reply = wire.serializer.decode(wire.socket.recv())
-    assert header.msg_type == 0x5A | 0x80 and header.sequence == 11
-    assert "not served" in reply["error"]
+    for code in range(0x40, 0x60):
+        if code in MS_MESSAGE_CLASSES:
+            continue
+        wire.socket.send(raw_frame(code, {"session": "s", "items": []}, seq=11))
+        header, reply = wire.serializer.decode(wire.socket.recv())
+        assert header.msg_type == code | 0x80 and header.sequence == 11
+        assert reply["error"] == f"message 0x{code:02X} is not served by this release"
+        assert "maru-server" not in reply["error"]
     # the server keeps serving
     assert node.open().status == Status.OK
     k, loc = key("k"), node.loc(node.dram(), 1)
