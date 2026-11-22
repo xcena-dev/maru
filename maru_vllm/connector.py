@@ -2811,8 +2811,8 @@ class MaruSchedulerConnector:
         # bounded-replay sliding window (DeepSeek-V4.1); 0 for most models.
         self._replay_tokens = max((g.replay_tokens for g in self._kv_groups), default=0)
         self._cpu_mode = _validate_storage_config(extra_config)
-        # maru_node: lookups PROBE MaruServer, the directory of record, every
-        # time, and a load fills only the externally allocated tokens
+        # maru_node: PROBE hints last one scheduling pass; loads fill only
+        # the externally allocated tokens.
         self._node_mode = _is_node(extra_config)
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
@@ -2943,6 +2943,11 @@ class MaruSchedulerConnector:
         # and the tokens the request counts as computed once that lookup's
         # load (if any) is in. Its first store never starts inside them.
         self._maru_hits: dict[str, tuple[int, int]] = {}
+        self._request_hashes: dict[str, tuple[tuple[int, ...], list[str]]] = {}
+        self._pass_hashes: dict[tuple[int, ...], list[str]] = {}
+        # GPU prefix matches defer residency checks to store bookkeeping.
+        self._store_lookups: dict[str, int] = {}
+        self._probe_results: dict[tuple, set[str]] = {}
         self._load_starts: dict[str, int] = {}
         self._load_ranges: dict[str, tuple[int, int]] = {}
 
@@ -3056,6 +3061,7 @@ class MaruSchedulerConnector:
                 "maru_cache_namespace": namespace,
             }
             self._known_keys.clear()
+            self._clear_pass_lookups()
             handler = self._handler or self._node_handler
             self._handler = self._node_handler = None
         if handler is not None:
@@ -3087,6 +3093,9 @@ class MaruSchedulerConnector:
         """
         with self._handler_lock:
             self._shut_down = True
+        self._request_hashes.clear()
+        self._store_lookups.clear()
+        self._clear_pass_lookups()
         with self._hint_lock:
             pool, self._hint_pool = self._hint_pool, None
         if pool is not None:
@@ -3429,13 +3438,18 @@ class MaruSchedulerConnector:
     def _stored_keys(
         self, keys: list[str], route: dict[str, str] | None = None
     ) -> set[str]:
-        """Which of ``keys`` Maru holds: known keys, then one batch_exists RPC.
-
-        Remembers positives until a reported load failure clears them
-        (``update_connector_output``). CPU mode remembers none: its residency
-        is tied to a live worker session, so it re-probes, in the pool
-        ``route`` picks (``_session_route``).
-        """
+        """Check residency. Node hints last one pass; CPU retains none."""
+        cache_key = (
+            (
+                self._extra_config.get("maru_cache_namespace"),
+                tuple(sorted((route or {}).items())),
+                tuple(keys),
+            )
+            if self._node_mode
+            else None
+        )
+        if cache_key is not None and cache_key in self._probe_results:
+            return self._probe_results[cache_key]
         known: set[str] = (
             set() if self._cpu_mode or self._node_mode else self._known_keys
         )
@@ -3458,9 +3472,14 @@ class MaruSchedulerConnector:
                 known.update(
                     k for k, exists in zip(unknown, results, strict=False) if exists
                 )
-        return {k for k in keys if k in known}
+        stored = {k for k in keys if k in known}
+        if cache_key is not None:
+            self._probe_results[cache_key] = stored
+        return stored
 
-    def _count_matched_group_chunks(self, req_id: str, token_ids: list[int]) -> int:
+    def _count_matched_group_chunks(
+        self, req_id: str, token_ids: list[int], chunk_keys: list[str] | None = None
+    ) -> int:
         """Chunks to load for a model with several KV cache groups.
 
         Only whole chunks short of the prompt's last token count, since vLLM
@@ -3475,7 +3494,10 @@ class MaruSchedulerConnector:
         """
         chunk_tokens = self._kv_chunk_tokens
         num_chunks = (len(token_ids) - 1) // chunk_tokens
-        chunk_keys = _chunk_keys(token_ids[: num_chunks * chunk_tokens], chunk_tokens)
+        if chunk_keys is None:
+            chunk_keys = _chunk_keys(
+                token_ids[: num_chunks * chunk_tokens], chunk_tokens
+            )
         if not chunk_keys:
             return 0
 
@@ -3664,34 +3686,32 @@ class MaruSchedulerConnector:
     ) -> tuple[int, bool]:
         self._load_starts.pop(request.request_id, None)
         self._maru_hits.pop(request.request_id, None)
+        self._store_lookups.pop(request.request_id, None)
+        self._last_match_result.pop(request.request_id, None)
         reason = _uncacheable_request(request)
         if reason is not None:
             logger.debug("Maru skips request %s: it has %s", request.request_id, reason)
             self._bypass_requests.add(request.request_id)
             return 0, False
-        token_ids = list(request.prompt_token_ids or [])
+        token_ids = request.prompt_token_ids or []
         if len(token_ids) < self._kv_chunk_tokens:
             return 0, False
         self._note_failed_load(request)
         if request.request_id in self._failed_load_req_ids:
             return 0, False
 
+        ct = self._kv_chunk_tokens
+        chunks = (len(token_ids) - int(self._multi_group)) // ct
+        reusable = _align_down(min(chunks * ct, len(token_ids) - 1), self._block_size)
+        if num_computed_tokens >= reusable:
+            self._store_lookups[request.request_id] = num_computed_tokens
+            return 0, False
+
         _t0 = time.monotonic()
-        keys: list[str] | None = None
-        if self._multi_group:
-            num_matched_chunks = self._count_matched_group_chunks(
-                request.request_id, token_ids
-            )
-        else:
-            with self._hint_lock:
-                keys = self._arrival_keys.get(request.request_id)
-            if keys is None and self._read_hints_on():
-                keys = _chunk_keys(token_ids, self._kv_chunk_tokens)  # once, for both
-            num_matched_chunks = (
-                self._count_matched_chunks(token_ids)
-                if keys is None
-                else self._count_matched_chunks(token_ids, keys)
-            )
+        keys = self._request_chunk_keys(request.request_id, token_ids)
+        num_matched_chunks = self._count_request_chunks(
+            request.request_id, token_ids, keys
+        )
         if self._timing:
             _emit_timing(
                 f"get_num_new_matched (incl _chunk_keys) {len(token_ids)} tok = "
@@ -3740,13 +3760,44 @@ class MaruSchedulerConnector:
         if self._read_hints_on():
             # The load waits for vLLM to admit it: tell storage what it reads.
             ct = self._kv_chunk_tokens
-            if keys is None:
-                keys = _chunk_keys(token_ids, ct)
             first, last = num_computed_tokens // ct, -(-matched_tokens // ct)
             # Routed by the first chunk, as the load is.
             self._hint(request.request_id, keys, first=first, hit=last)
 
         return new_matched, self._deferred_loading
+
+    def _request_chunk_keys(self, req_id: str, token_ids: list[int]) -> list[str]:
+        """Reuse hashes of the request's unchanged full chunks."""
+        ct = self._kv_chunk_tokens
+        end = (len(token_ids) - int(self._multi_group)) // ct * ct
+        tokens = tuple(token_ids[:end])
+        cached = self._request_hashes.get(req_id)
+        if cached is not None and cached[0] == tokens:
+            self._pass_hashes[tokens] = cached[1]
+            return cached[1]
+        keys = self._pass_hashes.get(tokens)
+        if keys is None:
+            with self._hint_lock:
+                arrival = self._arrival_keys.get(req_id) if cached is None else None
+            keys = (
+                _chunk_keys(list(tokens), ct)
+                if arrival is None
+                else arrival[: end // ct]
+            )
+            self._pass_hashes[tokens] = keys
+        self._request_hashes[req_id] = (tokens, keys)
+        return keys
+
+    def _clear_pass_lookups(self) -> None:
+        self._pass_hashes.clear()
+        self._probe_results.clear()
+
+    def _count_request_chunks(
+        self, req_id: str, token_ids: list[int], keys: list[str]
+    ) -> int:
+        if self._multi_group:
+            return self._count_matched_group_chunks(req_id, token_ids, keys)
+        return self._count_matched_chunks(token_ids, keys)
 
     def update_state_after_alloc(
         self,
@@ -3819,6 +3870,12 @@ class MaruSchedulerConnector:
         stores from there. None when the step leaves nothing to store.
         """
         ct = self._kv_chunk_tokens
+        computed = self._store_lookups.pop(req_id, None)
+        if computed is not None:
+            keys = self._request_chunk_keys(req_id, token_ids)
+            chunks = self._count_request_chunks(req_id, token_ids, keys)
+            if chunks:
+                self._maru_hits[req_id] = (chunks, computed)
         # A request resumed after a preemption keeps the start it had before:
         # write-behind stores nothing until the prompt's last prefill step, so
         # the chunks it computed before the preemption are not in Maru yet.
@@ -4089,6 +4146,7 @@ class MaruSchedulerConnector:
         if scheduler_output.preempted_req_ids:
             stale_ids = stale_ids | (scheduler_output.preempted_req_ids - live_ids)
         for rid in stale_ids:
+            self._store_lookups.pop(rid, None)
             self._load_starts.pop(rid, None)
             self._load_ranges.pop(rid, None)
             # A preempted request that vLLM asks about again did not fail its
@@ -4107,6 +4165,7 @@ class MaruSchedulerConnector:
             self._maru_hits.pop(rid, None)
         for rid in scheduler_output.finished_req_ids:
             self._requests_need_store.pop(rid, None)
+            self._request_hashes.pop(rid, None)
         for rid in (scheduler_output.preempted_req_ids or set()) - rescheduled_ids:
             entry = self._requests_need_store.get(rid)
             if entry is not None:
@@ -4134,6 +4193,7 @@ class MaruSchedulerConnector:
             }
             for req_meta in meta.requests:
                 req_meta.trace_attempt = self._trace_attempts.get(req_meta.req_id, 0)
+        self._clear_pass_lookups()
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -4155,6 +4215,7 @@ class MaruSchedulerConnector:
             # Requests looked up before the report arrives (a step or two
             # later, more with async scheduling) can still fail once.
             self._known_keys.clear()
+            self._clear_pass_lookups()
 
     @_best_effort
     def _trace_schedule_step(self, scheduler_output: SchedulerOutput) -> None:
@@ -4201,6 +4262,8 @@ class MaruSchedulerConnector:
         """Transfer block ownership to the worker for write-behind stores."""
         self._end_hint(request.request_id)
         self._forget_load_history(request)
+        self._request_hashes.pop(request.request_id, None)
+        self._store_lookups.pop(request.request_id, None)
         self._trace_loads.discard(request.request_id)
         self._trace_budget_waits.discard(request.request_id)
         self._trace_attempts.pop(request.request_id, None)

@@ -34,6 +34,7 @@ import maru_handler.client as client_module
 import maru_vllm.connector as connector_module
 from maru_common.kv_shard import WHOLE_MODEL, tp_kv_shard
 from maru_common.node_protocol import AttachResponse, TransferDefaults
+from maru_common.protocol import MessageType
 from maru_common.storage_types import Key, Status, StorageUnavailableError
 from maru_handler.client import CreditUnavailableError
 from maru_handler.memory.types import MemoryInfo
@@ -94,6 +95,7 @@ from tests.unit.test_vllm_tp import (
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     cuda_error,
+    fake_scheduler_output,
     holds,
     kept_by,
     make_flash_attn_metadata,
@@ -450,13 +452,16 @@ def test_several_kv_cache_groups_are_taken(monkeypatch):
     assert connector._scheduler._deferred_loading
 
 
-def test_the_scheduler_probes_every_lookup():
-    """MaruServer is the directory of record: no key is remembered."""
+def test_the_scheduler_probes_again_after_each_pass():
+    """Residency hints expire with the scheduling pass."""
     tokens = list(range(2 * CHUNK))
     scheduler = make_scheduler(BLOCK, CHUNK, node_extra())
     scheduler._handler = MagicMock()
     scheduler._handler.batch_exists.side_effect = lambda keys, **_: [True] * len(keys)
     assert scheduler._count_matched_chunks(tokens) == 2
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert scheduler._handler.batch_exists.call_count == 1
+    scheduler.build_connector_meta(fake_scheduler_output([], None, {}))
     assert scheduler._count_matched_chunks(tokens) == 2
     assert scheduler._handler.batch_exists.call_count == 2
     assert scheduler._known_keys == set()
@@ -499,6 +504,13 @@ def test_a_gone_key_recomputes_only_the_external_range(fake, node, workers, capl
     writer, reader = workers(), workers()
     kv = rank_kv(1, 2)
     store(writer, kv)
+    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
+    scheduler._handler = reader._handler
+    tokens = list(range(PROMPT))
+    probes = len(fake.requests(MessageType.PROBE))
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert len(fake.requests(MessageType.PROBE)) == probes + 1
     first, second = _chunk_keys(list(range(PROMPT)), CHUNK)
     with fake._lock:
         for entry in fake.catalog.pop(Key("ns", second)):
@@ -510,6 +522,8 @@ def test_a_gone_key_recomputes_only_the_external_range(fake, node, workers, capl
                 ),
                 None,
             )
+    assert scheduler._count_matched_chunks(tokens) == 2
+    assert len(fake.requests(MessageType.PROBE)) == probes + 1
     dst = [torch.zeros_like(layer) for layer in kv]
     forward = SimpleNamespace(
         no_compile_layers={
@@ -1193,19 +1207,23 @@ def test_a_scheduler_lookup_does_not_wait_for_a_maruserver_that_is_down(
     store(writer, rank_kv(1, 2))
     scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
     scheduler.connect_node()
+
+    def lookup():
+        scheduler.build_connector_meta(fake_scheduler_output([], None, {}))
+        return scheduler._count_matched_chunks(list(range(PROMPT)))
+
     try:
-        tokens = list(range(PROMPT))
-        assert scheduler._count_matched_chunks(tokens) == 2
+        assert lookup() == 2
         fake.pause(hold=False)
         try:
-            scheduler._count_matched_chunks(tokens)  # finds it down
+            lookup()  # finds it down
             for _ in range(10):
                 t0 = time.monotonic()
-                assert scheduler._count_matched_chunks(tokens) == 0
+                assert lookup() == 0
                 assert time.monotonic() - t0 < 0.05
         finally:
             fake.resume()
-        wait_until(lambda: scheduler._count_matched_chunks(tokens) == 2, timeout=5)
+        wait_until(lambda: lookup() == 2, timeout=5)
     finally:
         scheduler.shutdown()
 

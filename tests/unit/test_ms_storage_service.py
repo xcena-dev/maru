@@ -9,6 +9,7 @@ import socket
 import stat
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -1784,6 +1785,35 @@ class TestHandlerFacade:
         wait_until(lambda: fake.pin_count() == 0, what="unpinned")
         assert h.retrieve("nope") is None
         node.pools.check()
+
+    @pytest.mark.parametrize("bulk", [False, True])
+    def test_released_reads_drop_ownership_and_each_read_pins_again(
+        self, fake, nodes, handlers, bulk
+    ):
+        h = handlers(nodes())
+        assert put(h, "k")
+        sent = len(fake.requests(MessageType.LOOKUP_AND_PIN))
+        reads = h.batch_retrieve(["k", "k"])
+        assert reads[0] is not reads[1]
+        assert reads[0].pin_id != reads[1].pin_id
+        assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == sent + 1
+        assert fake.pin_count() == 2 and len(h._cpu._reads) == 2
+        ref = weakref.ref(reads[0])
+        old_pin = reads[0].pin_id
+        if bulk:
+            h.release_retrieved(reads)
+        else:
+            reads[0].release()
+            reads[1].release()
+        h.release_retrieved(reads)
+        wait_until(lambda: fake.pin_count() == 0, what="unpinned")
+        assert not h._cpu._reads and not h._cpu.pins
+        del reads
+        assert ref() is None
+        with h.retrieve("k") as fresh:
+            assert fresh.pin_id != old_pin and bytes(fresh.view) == b"k"
+        assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == sent + 2
+        wait_until(lambda: fake.pin_count() == 0, what="unpinned again")
 
     def test_argument_checks(self, nodes, handlers):
         node = nodes()

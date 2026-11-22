@@ -90,7 +90,7 @@ def test_load_only_external_tokens(config, start, end, failure):
 @pytest.mark.parametrize("config", [extra(), mixed_extra()])
 def test_scheduler_keeps_gpu_prefix_and_actual_allocation(config):
     scheduler = make_scheduler(4, 8, config)
-    scheduler._count_matched_chunks = lambda tokens: 2
+    scheduler._count_matched_chunks = lambda tokens, keys=None: 2
     request = SimpleNamespace(request_id="load", prompt_token_ids=list(range(16)))
     # Full Maru hit: hold back a compute block; GPU already has one block.
     assert scheduler.get_num_new_matched_tokens(request, 4) == (8, False)

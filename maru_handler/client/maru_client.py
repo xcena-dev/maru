@@ -16,7 +16,6 @@ only.
 
 import collections
 import dataclasses
-import functools
 import heapq
 import itertools
 import logging
@@ -217,8 +216,10 @@ class PinnedRead(CpuReadLease):
     owner: object = None
 
     def release(self):
-        if self.owner is None or not self.owner._stopped.is_set():
+        if self.owner is None:
             super().release()
+        else:
+            self.owner.release_retrieved([self])
 
 
 @dataclass(eq=False)
@@ -1765,13 +1766,12 @@ class MaruClient:
                 loc.length,
                 medium=loc.kind.value,
             ),
-            _release=lambda: None,
+            _release=None,
             key=key,
             pin_id=outcome.pin_id,
             server_epoch=server_epoch,
             owner=self,
         )
-        read._release = functools.partial(self._release_reads, [read])
         with self._lock:
             # Against a MaruServer restart, whose pins are gone, and against
             # Maru turning off, whose WORKER_CLOSE may have released the pin

@@ -725,7 +725,7 @@ def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
 
 def test_a_failed_async_load_is_recomputed_instead_of_retried():
     scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
-    scheduler._count_matched_chunks = lambda tokens: 2
+    scheduler._count_matched_chunks = lambda tokens, keys=None: 2
     request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)
     blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
@@ -750,7 +750,7 @@ def _empty_output(preempted=()):
 
 def test_a_preempted_request_gets_its_hit_again():
     scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
-    scheduler._count_matched_chunks = lambda tokens: 2
+    scheduler._count_matched_chunks = lambda tokens, keys=None: 2
     request = SimpleNamespace(request_id="r", prompt_token_ids=list(range(16)))
     scheduler.get_num_new_matched_tokens(request, 0)
     blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
@@ -764,7 +764,7 @@ def test_an_async_load_carries_its_external_token_range():
     """Blocks before the range are vLLM's own prefix cache: a deferred load
     must leave them alone, as an inline load does."""
     scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
-    scheduler._count_matched_chunks = lambda tokens: 2
+    scheduler._count_matched_chunks = lambda tokens, keys=None: 2
     request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 4) == (8, True)
     blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
