@@ -166,6 +166,16 @@ _deadline_pid = None
 _deadline_queue = None
 
 
+def _reset_deadlines():
+    global _deadline_lock, _deadline_pid, _deadline_queue
+    _deadline_lock = threading.Lock()
+    _deadline_pid = None
+    _deadline_queue = None
+
+
+os.register_at_fork(after_in_child=_reset_deadlines)
+
+
 def _deadlines():
     global _deadline_pid, _deadline_queue
     with _deadline_lock:
@@ -1241,6 +1251,8 @@ class MaruClient:
         on_result: Callable,
         ops: OpTracker,
         resend: bool = False,
+        *,
+        deadline: float | None = None,
     ) -> Future:
         """Send an op, tracked until its result is known; on_result runs once.
         Unknown and BUSY stay tracked: resent after a reconnect or a pause."""
@@ -1274,7 +1286,7 @@ class MaruClient:
             reply.set_exception(StorageUnavailableError("not connected"))
             return reply
         reply = (
-            storage.fetch(request)
+            storage.fetch(request, deadline=deadline)
             if code == NodeMessageType.FETCH
             else storage.submit(code, request)
         )
@@ -1835,7 +1847,20 @@ class MaruClient:
         with self._lock:
             if request.op.seq in scope.pending and ops is self._ops:
                 ops.track(NodeMessageType.FETCH, request, on_result)
-        self._send_op(NodeMessageType.FETCH, request, on_result, ops, True)
+        sent = self._send_op(
+            NodeMessageType.FETCH,
+            request,
+            on_result,
+            ops,
+            True,
+            deadline=scope.deadline,
+        )
+
+        def send_done(f):
+            if f.exception() is not None:
+                self._cancel_fetch_scope(scope, MissReason.IO_ERROR)
+
+        sent.add_done_callback(send_done)
         return result
 
     @staticmethod

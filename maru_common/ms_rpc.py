@@ -106,6 +106,7 @@ class MsRpcClient:
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
         self.url = url
+        self._pid = os.getpid()
         self.timeout_s = timeout_s
         self._serializer = Serializer(
             MS_MESSAGE_CLASSES if message_classes is None else message_classes,
@@ -125,6 +126,7 @@ class MsRpcClient:
         self._socket.connect(url)
         self._direct_local = threading.local()
         self._direct_sockets = []
+        self._direct_owners = {}
         self._direct_spares = collections.deque()
         self._fill_direct_spares()
         self.prepare_thread()
@@ -136,6 +138,7 @@ class MsRpcClient:
     ) -> Any:
         """Send ``request`` and return the response; RpcUnknownError otherwise."""
 
+        self._check_pid()
         frame = self._serializer.encode(msg_type, request)
         seq = MessageHeader.unpack(frame[:HEADER_SIZE]).sequence
         if msg_type in _DIRECT:
@@ -178,6 +181,7 @@ class MsRpcClient:
 
     def prepare_thread(self) -> None:
         """Connect this thread's read socket before it serves requests."""
+        self._check_pid()
         with self._lock:
             if self._closed:
                 raise RpcUnknownError("the MaruServer connection is closed")
@@ -189,6 +193,7 @@ class MsRpcClient:
                 else self._new_direct_socket()
             )
             self._direct_local.entry = entry
+            self._direct_owners[entry[0]] = threading.current_thread()
         self._wake()
 
     def _new_direct_socket(self):
@@ -203,6 +208,19 @@ class MsRpcClient:
     def _fill_direct_spares(self):
         with self._lock:
             if not self._closed:
+                for sock, guard in list(self._direct_sockets):
+                    owner = self._direct_owners.get(sock)
+                    if (
+                        owner is not None
+                        and not owner.is_alive()
+                        and guard.acquire(False)
+                    ):
+                        try:
+                            sock.close()
+                            self._direct_sockets.remove((sock, guard))
+                            del self._direct_owners[sock]
+                        finally:
+                            guard.release()
                 while len(self._direct_spares) < 2:
                     self._direct_spares.append(self._new_direct_socket())
 
@@ -237,6 +255,7 @@ class MsRpcClient:
         raise RpcUnknownError(f"no response from {self.url}")
 
     def close(self) -> None:
+        self._check_pid()
         with self._lock:
             if self._closed:
                 return
@@ -252,10 +271,17 @@ class MsRpcClient:
         for sock, guard in self._direct_sockets:
             with guard:
                 sock.close()
+        self._direct_sockets.clear()
+        self._direct_spares.clear()
+        self._direct_owners.clear()
         self._socket.close()
         self._context.term()
         os.close(self._wake_r)
         os.close(self._wake_w)
+
+    def _check_pid(self) -> None:
+        if self._pid != os.getpid():
+            raise RpcUnknownError("create a new MaruServer client after fork")
 
     def _wake(self) -> None:
         try:
@@ -272,7 +298,7 @@ class MsRpcClient:
                 if self._closed:
                     return
                 unsent = bool(self._outbox)
-            timeout_ms = int(_UNSENT_RETRY_S * 1000) if unsent else None
+            timeout_ms = int(_UNSENT_RETRY_S * 1000) if unsent else 50
             try:
                 events = dict(poller.poll(timeout_ms))
             except zmq.ZMQError:

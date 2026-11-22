@@ -11,8 +11,10 @@ import collections
 import errno
 import logging
 import os
+import select
 import socket
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
@@ -31,6 +33,7 @@ from maru_common.node_protocol import (
     Notify,
     recv_frame,
     send_frame,
+    send_frame_nowait,
 )
 from maru_common.protocol import HEADER_SIZE, MessageHeader
 from maru_common.serializer import RESPONSE_BIT, MessageDecodeError, Serializer
@@ -188,7 +191,9 @@ class StorageConn:
 
     # -------------------------------------------------------------- requests
 
-    def submit(self, code: NodeMessageType, request: Any) -> Future:
+    def submit(
+        self, code: NodeMessageType, request: Any, *, deadline: float | None = None
+    ) -> Future:
         """Send; the future fails with StorageUnavailableError on a break."""
         future: Future = Future()
         frame = self._serializer.encode(code, request)
@@ -200,11 +205,50 @@ class StorageConn:
                 )
                 return future
             self._pending[seq] = (int(code), future)
+            sock = self._sock
+        sent = 0
+        acquired = False
         try:
-            with self._send_lock:
-                send_frame(self._sock, frame)
+            if deadline is None:
+                with self._send_lock:
+                    send_frame(sock, frame)
+            else:
+                acquired = self._send_lock.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+                if not acquired:
+                    raise TimeoutError("send lock deadline")
+                view = memoryview(frame)
+                while sent < len(frame):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError("send deadline")
+                    try:
+                        count = (
+                            sock.send(view[sent:], socket.MSG_DONTWAIT)
+                            if sent
+                            else send_frame_nowait(sock, frame)
+                        )
+                    except BlockingIOError:
+                        select.select([], [sock], [], left)
+                        continue
+                    if count == 0:
+                        select.select([], [sock], [], left)
+                        continue
+                    sent += count
+        except TimeoutError as e:
+            if sent:
+                self._fail(f"partial send failed: {e}")
+            else:
+                with self._lock:
+                    entry = self._pending.pop(seq, None)
+                if entry is not None:
+                    future.set_exception(StorageUnavailableError(str(e)))
         except (OSError, ValueError) as e:
             self._fail(f"send failed: {e}")
+        finally:
+            if acquired:
+                self._send_lock.release()
         return future
 
     def request(
@@ -213,9 +257,11 @@ class StorageConn:
         """Send and wait for the response."""
         return self.submit(code, request).result(timeout)
 
-    def fetch(self, request: FetchRequest) -> Future:
+    def fetch(self, request: FetchRequest, *, deadline: float | None = None) -> Future:
         """Send FETCH; its late reply remains matched to this future."""
-        return self.submit(NodeMessageType.FETCH, request)
+        if deadline is None:
+            deadline = time.monotonic() + request.deadline_ms / 1000
+        return self.submit(NodeMessageType.FETCH, request, deadline=deadline)
 
     def fetch_cancel(self, target: OpRef) -> Future:
         """Cancel interest in a fetch; this does not release answered leases."""

@@ -1680,6 +1680,44 @@ class TestClientNotify:
 
 
 class TestHandlerFacade:
+    def test_store_without_credit_is_skipped(self, nodes, handlers, monkeypatch):
+        from maru_handler.client.storage_conn import StorageConn
+
+        h = handlers(nodes())
+        wait_credit(h)
+        client = h._cpu
+        monkeypatch.setattr(client.credits, "put", lambda *_: False)
+        client.credits.take_all()
+        client._refill_wake.clear()
+        caller = threading.get_ident()
+        calls = []
+
+        def record(method, *args, **kwargs):
+            if threading.get_ident() == caller:
+                calls.append(method.__name__)
+            return method(*args, **kwargs)
+
+        rpc_call, submit = MsRpcClient.call, StorageConn.submit
+        monkeypatch.setattr(
+            MsRpcClient, "call", lambda *a, **kw: record(rpc_call, *a, **kw)
+        )
+        monkeypatch.setattr(
+            StorageConn, "submit", lambda *a, **kw: record(submit, *a, **kw)
+        )
+
+        def no_wait(*args, **kwargs):
+            raise AssertionError("empty credit allocation waited")
+
+        monkeypatch.setattr(client.credits._added, "wait", no_wait)
+        assert client.config.credit_wait_s == 0
+        before = client.stats["store_skipped_no_credit"]
+        with pytest.raises(CreditUnavailableError) as err:
+            h.alloc(4)
+        assert isinstance(err.value, ValueError)
+        assert client.credits.unused_bytes == 0
+        assert client.stats["store_skipped_no_credit"] == before + 1
+        assert not calls and not client._handles
+
     def test_methods(self, fake, nodes, handlers):
         node = nodes()
         h = handlers(node)
@@ -1923,6 +1961,8 @@ def test_the_credit_cache_keeps_its_byte_total_exact():
     cache = CreditCache()
     cache.reset("e1")
     serial = 0
+    expected = []
+    byte_returns = partial_returns = 0
     for _ in range(3000):
         op = rng.choice(["put", "put", "take", "bytes", "pool", "all", "reset"])
         if op == "put":
@@ -1931,26 +1971,52 @@ def test_the_credit_cache_keeps_its_byte_total_exact():
                 serial += 1
                 credits.append(
                     Location(
-                        f"p{serial % 3}",
-                        PoolKind.DRAM,
-                        serial * PAGE,
-                        rng.choice([PAGE, PAGE // 2]),
-                        make_generation(1, serial),
-                        f"a{serial}",
+                        pool_id=f"p{serial % 3}",
+                        allocation_id=f"a{serial}",
+                        generation=make_generation(1, serial),
+                        offset=serial * PAGE,
+                        length=rng.choice([PAGE, PAGE // 2]),
+                        kind=PoolKind.DRAM,
                     )
                 )
             cache.put(credits, cache.node_epoch or "e1")
+            expected.extend(credits)
         elif op == "take":
-            cache.take()
+            taken = cache.take()
+            assert taken == ((expected.pop(0), cache.node_epoch) if expected else None)
         elif op == "bytes":
-            cache.take_bytes(rng.randint(0, 3 * PAGE))
+            budget = rng.randint(0, 3 * PAGE)
+            total = 0
+            count = 0
+            for credit in expected:
+                if total + credit.length > budget:
+                    break
+                total += credit.length
+                count += 1
+            before = sum(c.length for c in expected)
+            returned = cache.take_bytes(budget)
+            assert returned == expected[:count]
+            assert sum(c.length for c in returned) == total <= budget
+            expected = expected[count:]
+            assert cache.unused_bytes == before - total
+            byte_returns += bool(returned)
+            partial_returns += bool(returned and expected)
         elif op == "pool":
-            cache.remove_pool(f"p{rng.randint(0, 2)}")
+            pool_id = f"p{rng.randint(0, 2)}"
+            assert cache.remove_pool(pool_id) == [
+                c for c in expected if c.pool_id == pool_id
+            ]
+            expected = [c for c in expected if c.pool_id != pool_id]
         elif op == "all" and rng.random() < 0.1:
-            cache.take_all()
+            assert cache.take_all() == expected
+            expected = []
         elif op == "reset" and rng.random() < 0.05:
-            cache.reset(f"e{serial}")
-        assert cache.unused_bytes == sum(c.length for c in cache._credits)
+            epoch = f"e{serial}"
+            if epoch != cache.node_epoch:
+                expected = []
+            cache.reset(epoch)
+        assert cache.unused_bytes == sum(c.length for c in expected)
+    assert byte_returns > 0 and partial_returns > 0
 
 
 class TestCreditCounters:

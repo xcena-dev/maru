@@ -4,6 +4,7 @@
 installed by an attach."""
 
 import threading
+import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -532,9 +533,9 @@ def test_fetch_sends_on_the_loader_without_threads_or_timers(leased, monkeypatch
     storage = handler._cpu._storage
     original = storage.fetch
 
-    def fetch(request):
+    def fetch(request, **kwargs):
         calls.append(threading.get_ident())
-        return original(request)
+        return original(request, **kwargs)
 
     monkeypatch.setattr(storage, "fetch", fetch)
 
@@ -552,6 +553,257 @@ def test_fetch_sends_on_the_loader_without_threads_or_timers(leased, monkeypatch
             handler.release_retrieved(pending.result())
             wait_until(lambda: not service.leases)
         assert calls == [threading.get_ident()] * 3
+
+
+@pytest.mark.parametrize("blocked", ["buffer", "lock", "partial", "closed"])
+def test_fetch_send_obeys_the_scope_deadline_and_preserves_framing(client, blocked):
+    import socket
+
+    from maru_common.node_protocol import FetchItem, recv_frame
+    from maru_common.storage_types import FetchPlan, ItemResult, Key, MissReason
+    from maru_handler.client.storage_conn import OpTracker, StorageConn
+
+    sock, peer = socket.socketpair()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    peer.settimeout(1)
+    conn = StorageConn("unused", on_notify=lambda *_: None, on_lost=lambda *_: None)
+    conn._sock = sock
+    client._storage = conn
+    client.node_epoch = "node"
+    client._ops = OpTracker("worker", "node")
+    client._server = SimpleNamespace(
+        session="session", server_epoch="catalog", session_node_epoch="node"
+    )
+    client.attach_info = AttachResponse(
+        Status.OK, capabilities=["fetch_v1", "lease_v1"]
+    )
+    location = Location("pool", "source", 1, 0, M, PoolKind.CXL)
+    key = "key" if blocked != "partial" else "k" * (128 * 1024)
+    item = FetchItem(Key("ns", key), FetchPlan(location, "memory", M))
+    filled = 0
+    if blocked == "buffer":
+        while True:
+            try:
+                filled += sock.send(b"x" * 4096, socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                break
+    if blocked == "lock":
+        conn._send_lock.acquire()
+    if blocked == "closed":
+        peer.close()
+    results, errors = [], []
+    scope = client._new_fetch_scope(
+        "blocked", deadline_ms=5000 if blocked == "closed" else 80
+    )
+
+    def load():
+        try:
+            results.append(client._fetch(scope, [item], M).result(1))
+        except BaseException as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=load)
+    started = time.monotonic()
+    thread.start()
+    try:
+        thread.join(0.6)
+        assert not thread.is_alive(), "FETCH caller is still blocked in send"
+        assert not errors and time.monotonic() - started < 0.6
+        assert results[0].items[0].result is ItemResult.MISS
+        assert results[0].items[0].reason in (MissReason.TIMEOUT, MissReason.IO_ERROR)
+        unresolved = client._ops.unresolved()
+        assert len(unresolved) == 1
+        request = unresolved[0][1]
+        assert request.op.seq in scope.pending
+        if blocked == "closed":
+            assert conn.closed and results[0].items[0].reason is MissReason.IO_ERROR
+        elif blocked == "partial":
+            assert conn.closed
+            received = bytearray()
+            while chunk := peer.recv(4096):
+                received.extend(chunk)
+            assert (
+                0
+                < len(received)
+                < len(conn._serializer.encode(NodeMessageType.FETCH, request))
+            )
+            assert conn.fetch(request).exception() is not None
+            assert peer.recv(1) == b""
+        else:
+            assert not conn.closed and sock.gettimeout() is None
+            if blocked == "lock":
+                conn._send_lock.release()
+            while filled:
+                filled -= len(peer.recv(filled))
+            peer.settimeout(0.05)
+            with pytest.raises(TimeoutError):
+                peer.recv(1)
+            peer.settimeout(1)
+            conn.fetch(request, deadline=time.monotonic() + 0.5)
+            frame, _ = recv_frame(peer)
+            _, recovered = conn._serializer.decode_request(frame)
+            assert recovered.op == request.op
+            assert recovered.items == request.items
+    finally:
+        conn.close()
+        if blocked == "lock" and conn._send_lock.locked():
+            conn._send_lock.release()
+        thread.join(1)
+        peer.close()
+
+
+def test_catalog_sockets_of_finished_read_threads_are_reaped(leased):
+    import os
+
+    from maru_common.storage_types import Key
+    from tests.unit.ms_node_helpers import wait_until
+
+    handler, _, _ = leased
+    server = handler._cpu.server_conn
+    rpc = server._rpc
+    wait_until(lambda: len(rpc._direct_spares) == 2)
+    baseline = len(rpc._direct_sockets)
+    baseline_fds = len(os.listdir("/proc/self/fd"))
+    live = rpc._direct_local.entry[0]
+    errors, finished = [], []
+
+    def read():
+        try:
+            handler.prepare_read_thread()
+            finished.append(rpc._direct_local.entry[0])
+            assert server.probe([Key("ns", "key")]) is not None
+        except BaseException as e:
+            errors.append(e)
+
+    for _ in range(24):
+        thread = threading.Thread(target=read)
+        thread.start()
+        thread.join(2)
+        assert not thread.is_alive() and not errors
+        wait_until(lambda: finished[-1].closed)
+        wait_until(lambda: len(rpc._direct_spares) == 2)
+        assert len(rpc._direct_sockets) == baseline
+        assert len(rpc._direct_owners) == baseline - 2
+        assert not live.closed
+    assert all(sock.closed for sock in finished)
+    wait_until(lambda: len(os.listdir("/proc/self/fd")) <= baseline_fds)
+
+
+def test_catalog_close_waits_for_a_live_read_socket():
+    from maru_common.ms_rpc import MsRpcClient, RpcUnknownError
+    from maru_common.protocol import MessageType, ProbeRequest
+    from tests.unit.ms_node_helpers import wait_until
+
+    rpc = MsRpcClient("tcp://127.0.0.1:1", timeout_s=5)
+    entries, errors = [], []
+
+    def read():
+        try:
+            rpc.prepare_thread()
+            entries.append(rpc._direct_local.entry)
+            rpc.call(MessageType.PROBE, ProbeRequest("s", "e", []))
+        except BaseException as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=read)
+    thread.start()
+    try:
+        wait_until(lambda: entries and entries[0][1].locked())
+        rpc._fill_direct_spares()
+        assert thread.is_alive() and not entries[0][0].closed
+        rpc.close()
+        thread.join(1)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], RpcUnknownError)
+        assert entries[0][0].closed
+        assert not rpc._direct_sockets and not rpc._direct_owners
+    finally:
+        rpc.close()
+        thread.join(1)
+
+
+@pytest.mark.parametrize(
+    "inherited", [False, True], ids=["new-client", "inherited-client"]
+)
+def test_fork_resets_deadlines_and_rejects_inherited_rpc(inherited):
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import os
+        import signal
+        import sys
+        import threading
+        import time
+
+        from maru_common.ms_rpc import MsRpcClient, RpcUnknownError
+        from maru_common.protocol import MessageType, ProbeRequest
+        from maru_handler.client import maru_client
+
+        rpc = MsRpcClient("tcp://127.0.0.1:1", timeout_s=0.05)
+        parent_queue = maru_client._deadlines()
+        parent_queue.schedule(time.monotonic() + 60, lambda: None)
+        locked, release = threading.Event(), threading.Event()
+
+        def hold():
+            with maru_client._deadline_lock, rpc._lock, rpc._serializer._seq_lock:
+                locked.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        assert locked.wait(2)
+        pid = os.fork()
+        if pid == 0:
+            signal.alarm(3)
+            try:
+                assert maru_client._deadline_queue is None
+                queue = maru_client._deadlines()
+                assert queue is not parent_queue and not queue._heap
+                fired = threading.Event()
+                queue.schedule(time.monotonic(), fired.set)
+                assert fired.wait(1)
+                request = ProbeRequest(session="s", server_epoch="e", items=[])
+                if sys.argv[1] == "True":
+                    for action in (
+                        lambda: rpc.call(MessageType.PROBE, request),
+                        rpc.prepare_thread,
+                        rpc.close,
+                    ):
+                        try:
+                            action()
+                        except RpcUnknownError as e:
+                            assert "after fork" in str(e)
+                        else:
+                            raise AssertionError("inherited RPC accepted")
+                else:
+                    fresh = MsRpcClient(rpc.url, timeout_s=0.05)
+                    try:
+                        fresh.call(MessageType.PROBE, request)
+                    except RpcUnknownError as e:
+                        assert "after fork" not in str(e)
+                    else:
+                        raise AssertionError("offline RPC succeeded")
+                    fresh.close()
+            except BaseException:
+                import traceback
+                traceback.print_exc()
+                os._exit(1)
+            os._exit(0)
+        release.set()
+        holder.join(2)
+        _, status = os.waitpid(pid, 0)
+        rpc.close()
+        assert os.waitstatus_to_exitcode(status) == 0, status
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(inherited)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_one_process_deadline_thread_handles_multiple_clients(leased):
