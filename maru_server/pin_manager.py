@@ -8,10 +8,10 @@ Pins never expire by time. Not thread safe: callers hold the service lock.
 import itertools
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum, unique
 
-from maru_common.storage_types import POOL_KINDS, Key, Location
+from maru_common.storage_types import Key, Location
 
 
 @unique
@@ -33,6 +33,7 @@ class Pin:
     holder_kind: HolderKind
     # (node_id, node_epoch) whose FETCH uses a source pin; it may UNPIN it
     creator: tuple[str, str] | None = None
+    keep_on_departure: bool = True
 
 
 class PinManager:
@@ -41,9 +42,9 @@ class PinManager:
         self._prefix = uuid.uuid4().hex[:12]
         self._counter = itertools.count(1)
         self._pins: dict[str, Pin] = {}
-        # pin ids per holder: CXL apart, as those may outlive their node
+        # Pins retained when their holder leaves its node run are indexed apart.
         self._by_holder: dict[str, set[str]] = {}
-        self._cxl_by_holder: dict[str, set[str]] = {}
+        self._retained_by_holder: dict[str, set[str]] = {}
         # pin ids by the pool of their location: a node given up drops them
         self._by_pool: dict[str, set[str]] = {}
         self._counts: dict[tuple[Key, Location], int] = {}
@@ -60,9 +61,19 @@ class PinManager:
         holder: str,
         holder_kind: HolderKind,
         creator: tuple[str, str] | None = None,
+        *,
+        keep_on_departure: bool = True,
     ) -> str:
         pin_id = f"{self._prefix}-{next(self._counter):x}"
-        pin = Pin(pin_id, key, location, holder, holder_kind, creator)
+        pin = Pin(
+            pin_id,
+            key,
+            location,
+            holder,
+            holder_kind,
+            creator,
+            keep_on_departure and holder_kind == HolderKind.WORKER,
+        )
         self._pins[pin_id] = pin
         self._index(pin).setdefault(holder, set()).add(pin_id)
         self._by_pool.setdefault(location.pool_id, set()).add(pin_id)
@@ -79,16 +90,18 @@ class PinManager:
     def held_by(self, holder: str) -> list[Pin]:
         return [
             self._pins[p]
-            for index in (self._by_holder, self._cxl_by_holder)
+            for index in (self._by_holder, self._retained_by_holder)
             for p in index.get(holder, ())
         ]
 
-    def holds(self, holder: str, cxl: bool = True) -> bool:
-        """``holder`` has pins (with ``cxl`` False: pins not on CXL)."""
-        return holder in self._by_holder or (cxl and holder in self._cxl_by_holder)
+    def holds(self, holder: str, retained: bool = True) -> bool:
+        """Whether the holder has pins, including retained ones if requested."""
+        return holder in self._by_holder or (
+            retained and holder in self._retained_by_holder
+        )
 
-    def holds_cxl(self, holder: str) -> bool:
-        return holder in self._cxl_by_holder
+    def holds_retained(self, holder: str) -> bool:
+        return holder in self._retained_by_holder
 
     def unpin(self, pin_id: str) -> Pin | None:
         pin = self._pins.pop(pin_id, None)
@@ -109,13 +122,14 @@ class PinManager:
         return self._by_pool.pop(pool_id, set())
 
     def release_holder(
-        self, holder: str, limit: int | None = None, keep_cxl: bool = False
+        self, holder: str, limit: int | None = None, keep_retained: bool = False
     ) -> int:
-        """Release a session's pins (but its CXL pins with ``keep_cxl``), at
-        most ``limit``; returns how many."""
+        """Release at most ``limit`` pins, optionally keeping departure pins."""
         released = 0
         indexes = (
-            (self._by_holder,) if keep_cxl else (self._by_holder, self._cxl_by_holder)
+            (self._by_holder,)
+            if keep_retained
+            else (self._by_holder, self._retained_by_holder)
         )
         for index in indexes:
             held = index.get(holder)
@@ -130,25 +144,19 @@ class PinManager:
     def move_holder(self, old: str, new: str) -> int:
         """Give session ``old``'s pins to ``new`` (same-incarnation reopen)."""
         count = 0
-        for index in (self._by_holder, self._cxl_by_holder):
+        for index in (self._by_holder, self._retained_by_holder):
             moved = index.pop(old, set())
             for pin_id in moved:
                 pin = self._pins[pin_id]
-                self._pins[pin_id] = Pin(
-                    pin.pin_id, pin.key, pin.location, new, pin.holder_kind, pin.creator
-                )
+                self._pins[pin_id] = replace(pin, holder=new)
             if moved:
                 index.setdefault(new, set()).update(moved)
             count += len(moved)
         return count
 
     def _index(self, pin: Pin) -> dict[str, set[str]]:
-        # A worker never maps a fetch source: its source pins keep no orphan
-        if (
-            POOL_KINDS[pin.location.kind].rm_region
-            and pin.holder_kind != HolderKind.SOURCE
-        ):
-            return self._cxl_by_holder
+        if pin.keep_on_departure:
+            return self._retained_by_holder
         return self._by_holder
 
     def _drop_count(self, pin: Pin) -> None:

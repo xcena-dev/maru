@@ -4,9 +4,8 @@
 
 One TCP connection per GPU node run, opened by the key proof and HELLO; the
 same header and MessagePack payload as MaruServer (``Serializer(
-REMOTE_MESSAGE_CLASSES)``), responses matched by the header sequence. Only
-the GPU node posts RDMA; the memory node reserves, commits and frees its own
-pages.
+REMOTE_MESSAGE_CLASSES)``), responses matched by the header sequence.
+The memory node reserves, commits and frees its own pages.
 
 Requests in LEDGER_CODES change pages: they carry an OpRef whose origin is
 ``peer_origin`` of the HELLO, and the memory node keeps their results in an
@@ -24,8 +23,10 @@ from .storage_types import (
     Key,
     Location,
     OpRef,
-    PoolKind,
+    RemotePool,
     Status,
+    WriteAgent,
+    WriteDomain,
 )
 
 REMOTE_WIRE_VERSION = 1
@@ -43,9 +44,11 @@ class RemoteMessageType(IntEnum):
     HELLO = 0x01
     PING = 0x02
     GOODBYE = 0x03
+    AGENTS = 0x04
     RESERVE = 0x10
     WRITE_DONE = 0x11
     CANCEL = 0x12
+    FENCE_WORKER = 0x14
     HINT = 0x1A
     # 0x13, 0x18, 0x19: reserved (DROP, STAGE, UNSTAGE)
 
@@ -77,21 +80,23 @@ class RoomLimit(StrEnum):
     QUARANTINE = "quarantine"  # the peer's or the node's quarantine cap
 
 
+@unique
+class FenceResult(StrEnum):
+    """Success proves registration revocation; failure includes unknown."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 # =============================================================================
 # Records
 # =============================================================================
 
 
 @dataclass
-class RemotePool:
-    """A memory node pool its NIC registered for this run."""
-
-    pool_id: str
-    kind: PoolKind
-    pool_generation: int
-    capacity: int
-    base: int  # registered address of the pool's byte 0
-    metadata: bytes  # NIXL partial metadata of the registration
+class AgentMetadata:
+    agent_name: str
+    agent_metadata: bytes
 
 
 @dataclass
@@ -187,6 +192,35 @@ class GoodbyeResponse:
 
 
 @dataclass
+class AgentsRequest:
+    """AGENTS (0x04) - Idempotent read-agent additions and removals by name."""
+
+    add: list[AgentMetadata] = field(default_factory=list)
+    remove: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AgentsResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class FenceWorkerRequest:
+    """FENCE_WORKER (0x14) - Revoke this domain's write registration."""
+
+    op: OpRef
+    domain: WriteDomain
+
+
+@dataclass
+class FenceWorkerResponse:
+    status: Status
+    error: str | None = None
+    result: FenceResult | None = None
+
+
+@dataclass
 class ReserveRequest:
     """RESERVE (0x10) - Credit ``pages`` pages to the sender's run.
 
@@ -200,6 +234,7 @@ class ReserveRequest:
     pages: int
     hint: HintAction | None = None
     wait_ms: int = 0
+    domain: WriteDomain | None = None
 
 
 @dataclass
@@ -211,6 +246,7 @@ class ReserveResponse:
     credits: list[Location] = field(default_factory=list)
     room: int = 0
     limit: RoomLimit | None = None
+    write_agent: WriteAgent | None = None
 
 
 @dataclass
@@ -220,6 +256,7 @@ class RemoteWriteDoneRequest:
 
     op: OpRef
     items: list[Written]
+    domain: WriteDomain | None = None
 
 
 @dataclass
@@ -241,6 +278,7 @@ class CancelRequest:
     op: OpRef
     reserve_seq: int | None = None
     locations: list[Location] = field(default_factory=list)
+    domain: WriteDomain | None = None
 
 
 @dataclass
@@ -269,6 +307,8 @@ class RemoteHintResponse:
 
 
 REMOTE_MESSAGE_CLASSES = {
+    RemoteMessageType.AGENTS: (AgentsRequest, AgentsResponse),
+    RemoteMessageType.FENCE_WORKER: (FenceWorkerRequest, FenceWorkerResponse),
     RemoteMessageType.HELLO: (HelloRequest, HelloResponse),
     RemoteMessageType.PING: (PingRequest, PingResponse),
     RemoteMessageType.GOODBYE: (GoodbyeRequest, GoodbyeResponse),
@@ -284,5 +324,6 @@ LEDGER_CODES = frozenset(
         RemoteMessageType.RESERVE,
         RemoteMessageType.WRITE_DONE,
         RemoteMessageType.CANCEL,
+        RemoteMessageType.FENCE_WORKER,
     }
 )

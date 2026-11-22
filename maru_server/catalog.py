@@ -5,6 +5,7 @@
 Not thread safe: callers hold the service lock.
 """
 
+import itertools
 import logging
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ class PoolRecord:
     info: PoolInfo
     # epoch_seq of the node run that registered it: which workers map it
     since_epoch_seq: int
+    registration: int = 0
     state: PoolState = PoolState.ACTIVE
     force: bool = False  # remove even pinned locations (never for CXL)
     entries: dict[str, "Entry"] = field(default_factory=dict)  # by allocation_id
@@ -85,7 +87,7 @@ class Entry:
 
 @dataclass
 class Requester:
-    """Who looks up: which pools it maps, which its node can fetch, and
+    """Who looks up: which pools it reads directly, which its node can fetch, and
     which StorageServices are up."""
 
     node_id: str
@@ -130,6 +132,7 @@ class Catalog:
         self._preserved: frozenset[Key] = frozenset()
         self._removing: set[PoolRecord] = set()
         self._sweeps: dict[PoolRecord, None] = {}  # REMOVING pools to sweep
+        self._registrations = itertools.count(1)
 
     # ------------------------------------------------------------- registry
 
@@ -143,10 +146,17 @@ class Catalog:
             # a CXL region now with another node: the old record is swept
             # on its own and no longer one of its node's pools
             self._unindex(current)
-        record = PoolRecord(info=info, since_epoch_seq=since_epoch_seq)
+        record = PoolRecord(
+            info=info,
+            since_epoch_seq=since_epoch_seq,
+            registration=next(self._registrations),
+        )
         self._pools[info.pool_id] = record
         self._node_pools.setdefault(info.node_id, set()).add(info.pool_id)
         return record
+
+    def renew_registration(self, pool: PoolRecord) -> None:
+        pool.registration = next(self._registrations)
 
     def pool(self, pool_id: str) -> PoolRecord | None:
         return self._pools.get(pool_id)
@@ -481,7 +491,7 @@ class Catalog:
     # ------------------------------------------------------------- lookup
 
     def select(self, key: Key, requester: Requester) -> Selection:
-        """The cheapest mapped location is a HIT (no StorageService
+        """The cheapest directly readable location is a HIT (no StorageService
         needed); else the cheapest one the requester's node can fetch, with
         both StorageServices up; else MISS, offline if the key still has a
         location, absent if not."""

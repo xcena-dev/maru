@@ -282,9 +282,10 @@ class TestEpochReplacement:
         node.token = new_token
         assert service.pins.get(source_pin) is None
         assert old_epoch not in service.ledger
-        # the worker's pins of the old run go; it reopens on the new run
+        # Only the worker's own run-scoped DRAM pin goes on departure.
         drain(service)
-        assert not any(service.pins.get(p) for p in worker_pins)
+        assert service.pins.get(worker_pins[0]) is None
+        assert service.pins.get(worker_pins[1]) is not None
         assert worker.lookup(keys["d"]).status == Status.EPOCH
         assert worker.open().status == Status.OK
         response = worker.lookup(keys["d"], keys["c"])
@@ -440,14 +441,15 @@ class TestEpochReplacement:
         assert response.status == Status.OK and response.adopted == []
         pool = service.catalog.pool(node.cxl().pool_id)
         assert pool.state == PoolState.ACTIVE and not pool.entries
-        # the next run releases the old run's pins: the old location goes
+        # A new run still needs evidence that the old reader ended.
+        drain(service)
+        assert service.pins.get(pin) is not None
+        node.worker_exit(worker.ref())
         drain(service)
         assert service.pins.get(pin) is None
         assert not service.catalog.locations(keys["c"])
 
-    def test_a_new_run_releases_the_pins_of_its_earlier_runs_workers(self, env):
-        """Holds (CXL) and a new memfd (DRAM) keep the memory safe; the pins
-        of the earlier runs' workers go, also those reopened in time."""
+    def test_a_new_run_releases_only_its_own_dram_pins(self, env):
         clock, service, wire = env
         node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
         node.open(pools=[node.dram(), node.cxl()])
@@ -477,8 +479,10 @@ class TestEpochReplacement:
         assert [p.pool_id for p in response.adopted] == [node.cxl().pool_id]
         assert reopens.open().status == Status.OK  # before maintain runs
         drain(service)
-        for pin in pins[reopens] + pins[stays] + [expired_pin]:
+        for pin in pins[reopens] + [pins[stays][1]]:
             assert service.pins.get(pin) is None
+        assert service.pins.get(pins[stays][0]) is not None
+        assert service.pins.get(expired_pin) is not None
         assert service.pins.held_by(reopens.token) == []
         assert service.pins.get(other_pin) is not None  # another node's
         assert results(reopens.lookup(c)) == ["HIT"]
@@ -546,6 +550,7 @@ class TestNodeClose:
         clock, service, wire = env
         node, other = FakeNode(wire, "n1"), FakeNode(wire, "n2")
         other_pool = other.cxl(region_id=8)
+        node.capabilities = [MEMORY_CAPABILITY]
         node.open(pools=[node.dram(), node.cxl()])
         other.open(pools=[other.dram(), other_pool])
         c, d, f = key("c"), key("d"), key("f")
@@ -587,11 +592,15 @@ class TestNodeClose:
         clock.advance(600)  # pins never go by time
         drain(service)
         assert service.pins.get(foreign) is not None
-        # the node's next run releases its pins; then it expires
+        # The next run still needs evidence that the foreign reader ended.
         node.restart()
         node.open()
         drain(service)
+        assert service.pins.get(foreign) is not None
+        node.worker_exit(worker.ref())
+        drain(service)
         assert service.pins.get(foreign) is None
+        other.open(pools=[other.dram(), other_pool])
         clock.advance(31)
         drain(service)
         assert service.stats()["orphan_sessions"] == 0
@@ -1260,6 +1269,7 @@ class TestMaintenanceThread:
         service = make_service(clock, maintenance_budget=budget)
         registry = service.registry
         node = FakeNode(Wire(service), "big")
+        node.capabilities = [MEMORY_CAPABILITY]
         node.open(pools=[node.dram(), node.cxl()])
         n = 25_000
         target = (key("k"), node.loc(node.dram(), 1))
@@ -1283,7 +1293,9 @@ class TestMaintenanceThread:
                     ),
                     clock(),
                 ).worker_session
-                service.pins.pin(*target, token, HolderKind.WORKER)
+                service.pins.pin(
+                    *target, token, HolderKind.WORKER, keep_on_departure=False
+                )
                 origin = worker_origin(f"w{i}")
                 _, record = service.ledger.begin(
                     origin, OpRef(f"w{i}", 1, b"d", 0), "big"
@@ -1437,7 +1449,7 @@ class TestMaintenanceThread:
         assert not pool.entries
 
 
-def test_pin_manager_keeps_cxl_pins_apart():
+def test_pin_manager_keeps_departure_pins_apart():
     from maru_common.storage_types import Location, PoolKind
     from maru_server.pin_manager import HolderKind, PinManager
 
@@ -1447,14 +1459,20 @@ def test_pin_manager_keeps_cxl_pins_apart():
         return Location(f"{kind.value}:p", f"a{page}", 1, page * PAGE, PAGE, kind)
 
     for page in range(3):
-        pins.pin(key(f"d{page}"), loc(PoolKind.DRAM, page), "w", HolderKind.WORKER)
+        pins.pin(
+            key(f"d{page}"),
+            loc(PoolKind.DRAM, page),
+            "w",
+            HolderKind.WORKER,
+            keep_on_departure=False,
+        )
     cxl = pins.pin(key("c"), loc(PoolKind.CXL, 0), "w", HolderKind.WORKER)
-    assert pins.holds_cxl("w") and pins.holds("w", cxl=False)
+    assert pins.holds_retained("w") and pins.holds("w", retained=False)
     assert pins.move_holder("w", "v") == 4 and not pins.holds("w")
     # keeping CXL pins releases only the others, at most ``limit`` a call
-    assert pins.release_holder("v", 2, keep_cxl=True) == 2
-    assert pins.release_holder("v", 5, keep_cxl=True) == 1
-    assert not pins.holds("v", cxl=False) and pins.holds_cxl("v")
+    assert pins.release_holder("v", 2, keep_retained=True) == 2
+    assert pins.release_holder("v", 5, keep_retained=True) == 1
+    assert not pins.holds("v", retained=False) and pins.holds_retained("v")
     assert [p.pin_id for p in pins.held_by("v")] == [cxl]
     assert pins.unpin(cxl) is not None and not pins.holds("v")
     assert len(pins) == 0

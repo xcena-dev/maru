@@ -48,19 +48,21 @@ class PeerWatcher:
         os.close(self._wake_r)
         os.close(self._wake_w)
 
-    def watch(self, key: str, pid: int, pid_start: int) -> bool:
-        """Watch (pid, pid_start) under ``key``; False if it already ended."""
+    def watch(self, key: str, pid: int, pid_start: int) -> bool | None:
+        """True: watched; False: ended; None: no evidence of either."""
         try:
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
             return False
+        except OSError:
+            return None
         try:
             if process_start_time(pid) != pid_start:
                 os.close(fd)
                 return False
-        except OSError:
+        except (OSError, ValueError, IndexError):
             os.close(fd)
-            return False
+            return None
         with self._lock:
             if self._stopped:
                 os.close(fd)

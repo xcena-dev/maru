@@ -31,6 +31,8 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenRequest,
     NodeOpenResponse,
+    NodeOrphansRequest,
+    NodeOrphansResponse,
     NodeRecoverListRequest,
     NodeRecoverListResponse,
     ProbeRequest,
@@ -362,6 +364,15 @@ class MsService:
                 return rejected
             return self.registry.node_heartbeat(session, req, self._clock())
 
+    def node_orphans(
+        self, req: NodeOrphansRequest, payload: dict
+    ) -> NodeOrphansResponse:
+        with self.lock:
+            session = self._node_session(req, NodeOrphansResponse)
+            if not isinstance(session, NodeSession):
+                return session
+            return self.registry.node_orphans(session, req.cursor)
+
     def node_close(self, req: NodeCloseRequest, payload: dict) -> NodeCloseResponse:
         with self.lock:
             session = self._node_session(req, NodeCloseResponse)
@@ -473,7 +484,12 @@ class MsService:
                     location = selection.entry.location
                 items.append(
                     ItemOutcome(
-                        selection.result, location=location, reason=selection.reason
+                        selection.result,
+                        location=location,
+                        reason=selection.reason,
+                        pool_registration=selection.entry.pool.registration
+                        if location is not None
+                        else 0,
                     )
                 )
             return ProbeResponse(status=Status.OK, items=items)
@@ -517,14 +533,25 @@ class MsService:
         if selection.result == ItemResult.HIT:
             assert entry is not None
             pin_id = self.pins.pin(
-                key, entry.location, session.token, HolderKind.WORKER
+                key,
+                entry.location,
+                session.token,
+                HolderKind.WORKER,
+                keep_on_departure=self.registry.keep_pin_on_departure(
+                    session, entry.pool
+                ),
             )
             try:
                 self.registry.record_access(entry.pool, entry.location)
             except BaseException:
                 self.pins.unpin(pin_id)  # a failed item leaves no pin
                 raise
-            return ItemOutcome(ItemResult.HIT, location=entry.location, pin_id=pin_id)
+            return ItemOutcome(
+                ItemResult.HIT,
+                location=entry.location,
+                pin_id=pin_id,
+                pool_registration=entry.pool.registration,
+            )
         if selection.result == ItemResult.FETCH:
             assert entry is not None
             source_pin = None
@@ -822,7 +849,7 @@ class MsService:
                 "pins": len(self.pins),
                 "nodes": len(self.registry.nodes),
                 "worker_sessions": len(self.registry.worker_sessions()),
-                "orphan_sessions": self.registry.orphan_sessions(),
+                **self.registry.orphan_stats(self._clock()),
                 "blocks_waiting": self.registry.blocks_waiting(),
             }
 

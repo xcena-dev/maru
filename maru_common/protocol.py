@@ -28,6 +28,7 @@ from .storage_types import (
     KeyLocation,
     Location,
     OpRef,
+    OrphanWorker,
     PoolInfo,
     PoolUsage,
     RmDomain,
@@ -86,6 +87,7 @@ class MessageType(IntEnum):
     NODE_RECOVER_LIST = 0x44
     WORKER_EXIT = 0x45
     ADMIN_DELETE = 0x46
+    NODE_ORPHANS = 0x47
     WORKER_OPEN = 0x48
     WORKER_HEARTBEAT = 0x49
     WORKER_CLOSE = 0x4A
@@ -664,6 +666,7 @@ class NodeOpenRequest:
     capabilities: list[str] = field(default_factory=list)
     pools: list[PoolInfo] = field(default_factory=list)
     rm_domains: list[RmDomain] = field(default_factory=list)
+    pid_ns: int = 0
 
 
 @dataclass
@@ -678,6 +681,26 @@ class NodeOpenResponse:
     adopted: list[PoolInfo] = field(default_factory=list)
     # Those of the request MaruServer accepted; none from an older server
     capabilities: list[str] = field(default_factory=list)
+    orphans: list[OrphanWorker] = field(default_factory=list)
+    next_cursor: str | None = None
+    pool_registrations: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class NodeOrphansRequest:
+    """NODE_ORPHANS (0x47) - Pages of this session's orphan listing."""
+
+    session: str
+    server_epoch: str
+    cursor: str | None = None
+
+
+@dataclass
+class NodeOrphansResponse:
+    status: Status
+    error: str | None = None
+    orphans: list[OrphanWorker] = field(default_factory=list)
+    next_cursor: str | None = None
 
 
 @dataclass
@@ -1010,6 +1033,7 @@ MESSAGE_CLASSES = {
 # their codes too
 MS_MESSAGE_CLASSES = {
     MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),
+    MessageType.NODE_ORPHANS: (NodeOrphansRequest, NodeOrphansResponse),
     MessageType.NODE_HEARTBEAT: (NodeHeartbeatRequest, NodeHeartbeatResponse),
     MessageType.NODE_CLOSE: (NodeCloseRequest, NodeCloseResponse),
     MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),

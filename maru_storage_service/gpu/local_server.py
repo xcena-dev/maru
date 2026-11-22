@@ -37,6 +37,7 @@ from maru_common.protocol import MessageHeader
 from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
 from maru_common.storage_types import (
     MS_PROTOCOL,
+    WORKER_RDMA_CAPABILITY,
     PoolDescriptor,
     SessionRole,
     Status,
@@ -56,6 +57,7 @@ _DISABLED = {
     NodeMessageType.FETCH_CANCEL: "fetch is not served",
     NodeMessageType.FETCH_RELEASE: "fetch is not served",
     NodeMessageType.HINT: "hints are not served",
+    NodeMessageType.READ_JOIN: "worker RDMA is not served",
 }
 
 
@@ -421,10 +423,13 @@ class LocalServer:
         header = decoded.header
         code = NodeMessageType(header.msg_type)  # decoding checked the code
         _, response_cls = NODE_MESSAGE_CLASSES[code]
-        if code == NodeMessageType.NOTIFY:
+        if code in (NodeMessageType.NOTIFY, NodeMessageType.PEERS):
             conn.respond(
                 header,
-                {"status": Status.REJECTED.value, "error": "NOTIFY is not a request"},
+                {
+                    "status": Status.REJECTED.value,
+                    "error": f"{code.name} is not a request",
+                },
             )
             return
         if code == NodeMessageType.ATTACH:
@@ -504,6 +509,8 @@ class LocalServer:
             pid_start = process_start_time(node_pid)
         except OSError as e:
             return reject(f"cannot read the peer process: {e}")
+        if WORKER_RDMA_CAPABILITY in req.capabilities and not same_ns:
+            return reject("worker_rdma_v1 needs the same pid namespace")
         if same_ns and (req.pid != node_pid or req.pid_start != pid_start):
             return reject(
                 f"pid {req.pid} (start {req.pid_start}) is not the peer, pid "

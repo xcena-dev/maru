@@ -925,6 +925,6 @@ class TestPlanSourcePins:
         pins = PinManager()
         cxl = Location("cxl:m:rm1:7", "a1", 1, 0, PAGE, PoolKind.CXL)
         pin_id = pins.pin(Key("ns", "k"), cxl, "w", HolderKind.SOURCE, ("n", "e"))
-        assert pins.holds("w") and not pins.holds_cxl("w")
-        assert pins.release_holder("w", keep_cxl=True) == 1
+        assert pins.holds("w") and not pins.holds_retained("w")
+        assert pins.release_holder("w", keep_retained=True) == 1
         assert pins.get(pin_id) is None

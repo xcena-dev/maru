@@ -28,6 +28,7 @@ from .storage_types import (
     NotifyKind,
     OpRef,
     PoolDescriptor,
+    ReadPeer,
     SessionRole,
     Status,
     WaitLevel,
@@ -53,11 +54,13 @@ class NodeMessageType(IntEnum):
     FETCH_CANCEL = 0x19
     FETCH_RELEASE = 0x1A
     HINT = 0x1B
+    READ_JOIN = 0x1C
     LOCAL_PIN = 0x20
     LOCAL_UNPIN = 0x21
     # 0x28: retired (DRAIN_ACK); never reuse it
     UNMAP_ACK = 0x29
     NOTIFY = 0x30
+    PEERS = 0x31
 
 
 # =============================================================================
@@ -162,6 +165,34 @@ class AttachResponse:
     pid: int = 0
     pid_start: int = 0
     capabilities: list[str] = field(default_factory=list)
+    peers: list[ReadPeer] = field(default_factory=list)
+
+
+@dataclass
+class ReadJoinRequest:
+    """READ_JOIN (0x1C) - Register the worker's read agent, by name."""
+
+    agent_name: str
+    agent_metadata: bytes
+
+
+@dataclass
+class ReadJoinResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class Peers:
+    """PEERS (0x31), sequence zero: replaces the current read peer list."""
+
+    peers: list[ReadPeer]
+
+
+@dataclass
+class PeersAck:
+    status: Status
+    error: str | None = None
 
 
 @dataclass
@@ -392,6 +423,8 @@ class NotifyAck:
 
 
 NODE_MESSAGE_CLASSES = {
+    NodeMessageType.READ_JOIN: (ReadJoinRequest, ReadJoinResponse),
+    NodeMessageType.PEERS: (Peers, PeersAck),
     NodeMessageType.ATTACH: (AttachRequest, AttachResponse),
     NodeMessageType.DETACH: (DetachRequest, DetachResponse),
     NodeMessageType.CREDIT: (CreditRequest, CreditResponse),

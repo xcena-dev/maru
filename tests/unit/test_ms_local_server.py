@@ -34,6 +34,7 @@ from maru_common.storage_types import (
     FETCH_CAPABILITY,
     LEASE_CAPABILITY,
     MAX_BATCH,
+    WORKER_RDMA_CAPABILITY,
     ItemResult,
     Key,
     NotifyKind,
@@ -135,6 +136,17 @@ class TestAttach:
         r = worker.attach(pid=4242, pid_start=7)
         assert r.status == Status.OK
         assert r.pid == os.getpid()  # SO_PEERCRED, as the node sees it
+
+    def test_worker_rdma_attach_requires_the_same_pid_namespace(
+        self, worker, monkeypatch
+    ):
+        monkeypatch.setattr(local_server, "same_pid_namespace", lambda pid: False)
+        with pytest.raises(StorageUnavailableError, match="same pid namespace"):
+            worker.attach(capabilities=[WORKER_RDMA_CAPABILITY])
+        assert worker.fds == []
+
+    def test_worker_rdma_is_not_negotiated_before_it_is_served(self, worker):
+        assert worker.attach(capabilities=[WORKER_RDMA_CAPABILITY]).capabilities == []
 
     def test_largest_group_decides(self, worker):
         groups = [GroupLayout(PAGE // 4, "a"), GroupLayout(PAGE, "b")]
@@ -626,3 +638,26 @@ class TestPostedFrames:
         assert conn._rest is not None and conn.send_lock.locked()
         conn.close()
         assert conn._rest is None and not conn.send_lock.locked()
+
+
+def test_unknown_process_watch_never_reports_worker_exit(
+    node, worker, fake, monkeypatch
+):
+    monkeypatch.setattr(node.manager.watcher, "watch", lambda *args: None)
+    with pytest.raises(StorageUnavailableError):
+        worker.attach()
+    assert node.manager.workers.get(worker.incarnation) is None
+    assert all(ref.incarnation != worker.incarnation for ref, _ in fake.worker_exits)
+
+
+def test_direct_read_messages_are_refused_when_not_served(worker):
+    from maru_common.node_protocol import Peers, ReadJoinRequest
+
+    worker.attach()
+    assert (
+        worker.request(
+            NodeMessageType.READ_JOIN, ReadJoinRequest("agent", b"metadata")
+        ).status
+        == Status.DISABLED
+    )
+    assert worker.request(NodeMessageType.PEERS, Peers([])).status == Status.REJECTED

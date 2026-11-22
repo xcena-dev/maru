@@ -58,6 +58,7 @@ HINT_CAPABILITY = "hint_v1"
 # RDMA; it is a memory node
 REMOTE_CAPABILITY = "remote_v1"
 MEMORY_CAPABILITY = "memory_v1"
+WORKER_RDMA_CAPABILITY = "worker_rdma_v1"
 # Items in one multi-storage request
 MAX_BATCH = MAX_STORAGE_BATCH
 # generation = epoch_seq << 40 | counter: a new run always gives higher
@@ -306,6 +307,60 @@ class WorkerRef:
 
 
 @dataclass(frozen=True)
+class OrphanWorker:
+    incarnation: str
+    pid: int
+    pid_start: int
+    host_boot_id: str
+    pid_ns: int
+
+
+@dataclass
+class RemotePool:
+    """One pool registration exported by an RDMA agent."""
+
+    pool_id: str
+    kind: PoolKind
+    pool_generation: int
+    capacity: int
+    base: int
+    metadata: bytes
+    pool_registration: int = 0
+
+
+@dataclass
+class ReadPeer:
+    """Read registrations of one memory node connection."""
+
+    node_id: str
+    node_epoch: str
+    agent_name: str
+    agent_metadata: bytes
+    pools: list[RemotePool]
+    boot: str
+    conn_gen: int
+    generation_known: bool = False
+
+
+@dataclass(frozen=True)
+class WriteDomain:
+    """One worker's write registration in a GPU node run."""
+
+    node_id: str
+    node_epoch: str
+    incarnation: str
+    number: int
+
+
+@dataclass
+class WriteAgent:
+    domain: WriteDomain
+    agent_name: str
+    agent_metadata: bytes
+    pools: list[RemotePool]
+
+
+@dataclass(frozen=True)
 class FetchPlan:
     source: Location
     source_node: str
@@ -329,6 +384,8 @@ class ItemOutcome:
     key: Key | None = None
     # A FETCH HIT: the node page is lent until FETCH_RELEASE of this id
     lease_id: int | None = None
+    # Registration of the HIT location's pool in its owning node run.
+    pool_registration: int = 0
 
 
 @dataclass(frozen=True)

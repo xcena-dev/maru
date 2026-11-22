@@ -46,6 +46,7 @@ def ms_handlers(ms: "MsService") -> dict[int, Callable[[Any, dict], Any]]:
     payload) and returns the response."""
     return {
         MessageType.NODE_OPEN.value: ms.node_open,
+        MessageType.NODE_ORPHANS.value: ms.node_orphans,
         MessageType.NODE_HEARTBEAT.value: ms.node_heartbeat,
         MessageType.NODE_CLOSE.value: ms.node_close,
         MessageType.NODE_RECOVER_LIST.value: ms.node_recover_list,

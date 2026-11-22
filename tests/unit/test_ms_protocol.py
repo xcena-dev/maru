@@ -46,7 +46,7 @@ MS_CODES = sorted(MS_MESSAGE_CLASSES)
 
 
 def test_codes_are_in_the_multi_storage_range_and_unique():
-    assert len(set(MS_CODES)) == len(MS_CODES) == 16
+    assert len(set(MS_CODES)) == len(MS_CODES) == 17
     assert all(0x40 <= code <= 0x5F for code in MS_CODES)
     # reserved (FINALIZE_MOVE) and retired (NODE_REREGISTER,
     # RELEASE_FINALIZER, REGION_REQUEST, REGION_RETURN): never reused
@@ -529,3 +529,41 @@ class TestAccessHints:
         hints = dataclasses.replace(AccessHints.pack(self.READS), **change)
         with pytest.raises(ValueError):
             list(hints.reads())
+
+
+@pytest.mark.parametrize(
+    "code,field,value",
+    [
+        (MessageType.NODE_OPEN, "pid_ns", True),
+        (MessageType.NODE_OPEN, "pid_ns", "101"),
+        (MessageType.NODE_ORPHANS, "cursor", 1),
+    ],
+)
+def test_orphan_requests_decode_strictly(code, field, value):
+    ser = Serializer()
+    payload = dataclasses.asdict(sample(MS_MESSAGE_CLASSES[code][0]))
+    payload[field] = value
+    with pytest.raises(MessageDecodeError):
+        ser.decode_request_payload(ser.encode(code, payload))
+
+
+def test_node_open_orphan_response_decodes_strictly_and_defaults_for_legacy():
+    ser = Serializer()
+    header, _ = ser.decode_request(
+        ser.encode(MessageType.NODE_OPEN, sample(NodeOpenRequest))
+    )
+    payload = dataclasses.asdict(sample(NodeOpenResponse))
+    payload["orphans"][0]["pid_ns"] = True
+    with pytest.raises(MessageDecodeError):
+        ser.decode_response(ser.encode_response(header, payload))
+    payload = dataclasses.asdict(sample(NodeOpenResponse))
+    payload["pool_registrations"]["p"] = True
+    with pytest.raises(MessageDecodeError):
+        ser.decode_response(ser.encode_response(header, payload))
+    del payload["orphans"], payload["next_cursor"], payload["pool_registrations"]
+    back = ser.decode_response(ser.encode_response(header, payload))[1]
+    assert back.orphans == [] and back.next_cursor is None
+    assert back.pool_registrations == {}
+    payload = dataclasses.asdict(sample(NodeOpenRequest))
+    del payload["pid_ns"]
+    assert ser.decode_request(ser.encode(MessageType.NODE_OPEN, payload))[1].pid_ns == 0

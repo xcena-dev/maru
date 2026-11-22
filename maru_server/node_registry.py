@@ -22,6 +22,7 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenRequest,
     NodeOpenResponse,
+    NodeOrphansResponse,
     NodeRecoverListResponse,
     RecoverItem,
     WorkerOpenRequest,
@@ -35,6 +36,7 @@ from maru_common.storage_types import (
     MS_PROTOCOL,
     POOL_KINDS,
     REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
     AccessHints,
     BlockRequest,
     CloseMode,
@@ -45,6 +47,7 @@ from maru_common.storage_types import (
     KeyLocation,
     Location,
     MissReason,
+    OrphanWorker,
     PoolInfo,
     PoolKind,
     PoolUsage,
@@ -60,7 +63,9 @@ from .pin_manager import PinManager
 logger = logging.getLogger(__name__)
 
 NODE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY})
+NODE_CAPABILITIES = frozenset(
+    {REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY, WORKER_RDMA_CAPABILITY}
+)
 # ended node_epochs kept per node, so a late old process cannot come back
 RETIRED_EPOCHS_KEPT = 4096
 # pages read kept per node (the first queued go first), and sent per heartbeat
@@ -106,6 +111,8 @@ class NodeSession:
     host_boot_id: str
     rm_domains: dict[str, frozenset[str]]  # device_ids by rm_domain
     deadline: float
+    pid_ns: int = 0
+    orphans: tuple[OrphanWorker, ...] = ()
     capabilities: tuple[str, ...] = ()
     closed_at: float | None = None  # NODE_CLOSE restart
     ended: bool = False  # renewed, replaced, left or given up
@@ -136,6 +143,9 @@ class _Block:
 @dataclass(eq=False)
 class NodeRecord:
     node_id: str
+    host_boot_id: str = ""
+    pid_ns: int = 0
+    worker_rdma: bool = False
     epoch_seq: int = 0  # the last one given
     node_epoch: str | None = None  # of the latest run
     session: NodeSession | None = None  # of the latest run, while it lasts
@@ -168,9 +178,12 @@ class WorkerSession:
     pid_start: int
     namespace: str
     deadline: float
+    host_boot_id: str = ""
+    pid_ns: int = 0
     closed: bool = False
-    # its node left or was given up; kept only for its CXL pins
+    # Its node run ended while it held departure pins.
     orphan: bool = False
+    orphan_since: float | None = None
 
     def valid(self, now: float) -> bool:
         return not self.closed and now < self.deadline
@@ -218,7 +231,7 @@ class NodeRegistry:
         # order first queued
         self._access: dict[str, OrderedDict[tuple[str, int, int], int]] = {}
         self._read_seq = itertools.count()
-        # holders whose pins are still to release (keeping CXL ones if True)
+        # Holders whose pins are still to release (keeping departure pins if True).
         self._pin_releases: deque[tuple[str, bool]] = deque()
         # ids of pins on a given-up node's locations, still to release
         self._pin_drops: deque[set[str]] = deque()
@@ -280,7 +293,9 @@ class NodeRegistry:
     def requester(self, worker: WorkerSession, now: float) -> Requester:
         return Requester(
             node_id=worker.node_id,
-            can_map=lambda pool: self.can_map(worker, pool),
+            can_map=lambda pool: (
+                self.can_map(worker, pool) or self.can_rdma(worker, pool, now)
+            ),
             can_fetch=lambda pool: self.can_fetch(worker.node_id, pool),
             online=lambda node_id: self.node_online(node_id, now),
         )
@@ -297,6 +312,24 @@ class NodeRegistry:
         if POOL_KINDS[pool.kind].run_scoped:
             return pool.since_epoch_seq == worker.node_epoch_seq
         return pool.since_epoch_seq <= worker.node_epoch_seq
+
+    def can_rdma(self, worker: WorkerSession, pool: PoolRecord, now: float) -> bool:
+        return (
+            WORKER_RDMA_CAPABILITY in self.capabilities_of(worker.node_id)
+            and MEMORY_CAPABILITY in self.capabilities_of(pool.node_id)
+            and pool.node_id != worker.node_id
+            and pool.state == PoolState.ACTIVE
+            and self.node_online(worker.node_id, now)
+            and self.node_online(pool.node_id, now)
+        )
+
+    @staticmethod
+    def keep_pin_on_departure(worker: WorkerSession, pool: PoolRecord) -> bool:
+        return not (
+            pool.node_id == worker.node_id
+            and POOL_KINDS[pool.kind].run_scoped
+            and pool.since_epoch_seq == worker.node_epoch_seq
+        )
 
     @staticmethod
     def _maps_shared_cxl(worker: WorkerSession, pool: PoolRecord) -> bool:
@@ -325,6 +358,16 @@ class NodeRegistry:
         self._check_node_open(req)
         self._check_other_nodes(req)
         node = self.nodes.get(req.node_id)
+        if WORKER_RDMA_CAPABILITY in req.capabilities and req.pid_ns <= 0:
+            raise OpenError(Status.REJECTED, "worker_rdma_v1 needs pid_ns")
+        if (
+            node is not None
+            and node.host_boot_id == req.host_boot_id
+            and node.pid_ns != req.pid_ns
+            and (node.worker_rdma or WORKER_RDMA_CAPABILITY in req.capabilities)
+        ):
+            logger.error("node %s changed pid_ns on the same boot", req.node_id)
+            raise OpenError(Status.REJECTED, "pid_ns changed on the same boot")
         if node is not None and req.node_epoch in node.retired_epochs:
             raise OpenError(
                 Status.REJECTED,
@@ -346,6 +389,8 @@ class NodeRegistry:
             raise OpenError(Status.REJECTED, f"bad node_id {req.node_id!r}")
         if not req.node_epoch or not req.host_boot_id:
             raise OpenError(Status.REJECTED, "node_epoch and host_boot_id are needed")
+        if req.pid_ns < 0:
+            raise OpenError(Status.REJECTED, "pid_ns must be nonnegative")
         if len(req.pools) > MAX_BATCH or len(req.rm_domains) > MAX_BATCH:
             raise OpenError(Status.REJECTED, f"more than {MAX_BATCH} pools or domains")
         domains = {d.rm_domain for d in req.rm_domains}
@@ -415,6 +460,8 @@ class NodeRegistry:
             )
         if old.host_boot_id != req.host_boot_id:
             raise OpenError(Status.REJECTED, "host_boot_id changed within a run")
+        if old.pid_ns != req.pid_ns:
+            raise OpenError(Status.REJECTED, "pid_ns changed within a run")
         to_register = []
         for info in req.pools:
             pool = self.catalog.pool(info.pool_id)
@@ -465,6 +512,8 @@ class NodeRegistry:
         for pool in adopt:
             pool.info = listed[pool.pool_id]  # as this run describes it
         node.epoch_seq += 1
+        for pool in adopt:
+            self.catalog.renew_registration(pool)
         node.node_epoch = req.node_epoch
         node.gone = False
         node.adopted = sorted(pool.pool_id for pool in adopt)
@@ -476,7 +525,7 @@ class NodeRegistry:
         session = self._new_session(node, req, now)
         logger.info(
             "node %s opened node_epoch %s (epoch_seq %d): %d pools adopted, %d "
-            "removed, pins of %d workers of earlier runs released",
+            "removed, %d earlier worker sessions processed",
             node.node_id,
             req.node_epoch,
             node.epoch_seq,
@@ -487,9 +536,7 @@ class NodeRegistry:
         return self._open_reply(node, session)
 
     def _release_earlier_workers(self, node: NodeRecord, node_epoch: str) -> int:
-        """Release every pin of the worker sessions attached to the node's
-        earlier runs: holds (CXL) and a new memfd (DRAM) keep the memory safe,
-        not those pins. Returns how many sessions held some."""
+        """Release pins on earlier workers' own run-scoped pools."""
         released = 0
         for worker in self._node_workers(node.node_id):
             if (
@@ -497,7 +544,8 @@ class NodeRegistry:
                 and worker.node_epoch != node_epoch
                 and self.pins.holds(worker.token)
             ):
-                self._release_pins(worker.token, 0)
+                self._mark_orphan(worker)
+                self._release_pins(worker.token, 0, keep_retained=True)
                 released += 1
         return released
 
@@ -531,6 +579,7 @@ class NodeRegistry:
             node_epoch=req.node_epoch,
             epoch_seq=node.epoch_seq,
             host_boot_id=req.host_boot_id,
+            pid_ns=req.pid_ns,
             rm_domains={d.rm_domain: frozenset(d.device_ids) for d in req.rm_domains},
             capabilities=tuple(
                 cap
@@ -539,11 +588,29 @@ class NodeRegistry:
             ),
             deadline=now + self.session_ttl_s,
         )
+        node.worker_rdma = WORKER_RDMA_CAPABILITY in session.capabilities or (
+            node.host_boot_id == req.host_boot_id and node.worker_rdma
+        )
+        node.host_boot_id = req.host_boot_id
+        node.pid_ns = req.pid_ns
         node.session = session
         self._node_sessions[session.token] = session
         return session
 
     def _open_reply(self, node: NodeRecord, session: NodeSession) -> NodeOpenResponse:
+        session.orphans = tuple(
+            OrphanWorker(w.incarnation, w.pid, w.pid_start, w.host_boot_id, w.pid_ns)
+            for w in self._node_workers(node.node_id)
+            if w.orphan and self.pins.holds_retained(w.token)
+        )
+        unwatchable = sum(
+            self._unwatchable(w.host_boot_id, w.pid_ns, node) for w in session.orphans
+        )
+        if unwatchable:
+            logger.error(
+                "node %s has %d unwatchable orphans", node.node_id, unwatchable
+            )
+        page = self.node_orphans(session, None)
         adopted = []
         for pool_id in node.adopted:
             pool = self.catalog.pool(pool_id)
@@ -558,6 +625,37 @@ class NodeRegistry:
             session_ttl_s=self.session_ttl_s,
             adopted=adopted,
             capabilities=list(session.capabilities),
+            orphans=page.orphans,
+            next_cursor=page.next_cursor,
+            pool_registrations={
+                p.pool_id: p.registration
+                for p in self.catalog.pools_of(node.node_id)
+                if p.state == PoolState.ACTIVE
+            },
+        )
+
+    def node_orphans(
+        self, session: NodeSession, cursor: str | None
+    ) -> NodeOrphansResponse:
+        position = 0
+        if cursor is not None:
+            token, _, offset = cursor.partition(":")
+            if (
+                token != session.token
+                or not offset.isascii()
+                or not offset.isdigit()
+                or len(offset) > 20
+                or not 0 <= int(offset) < len(session.orphans)
+            ):
+                return NodeOrphansResponse(status=Status.REJECTED, error="bad cursor")
+            position = int(offset)
+        end = position + MAX_BATCH
+        return NodeOrphansResponse(
+            status=Status.OK,
+            orphans=list(session.orphans[position:end]),
+            next_cursor=f"{session.token}:{end}"
+            if end < len(session.orphans)
+            else None,
         )
 
     def _end_run(
@@ -591,10 +689,12 @@ class NodeRegistry:
             (i.key, i.location) for b in node.blocks.values() for i in b.items
         }
 
-    def _release_pins(self, holder: str, inline: int, keep_cxl: bool = False) -> None:
-        self.pins.release_holder(holder, inline, keep_cxl)
-        if self.pins.holds(holder, cxl=not keep_cxl):
-            self._pin_releases.append((holder, keep_cxl))  # the rest in steps
+    def _release_pins(
+        self, holder: str, inline: int, keep_retained: bool = False
+    ) -> None:
+        self.pins.release_holder(holder, inline, keep_retained)
+        if self.pins.holds(holder, retained=not keep_retained):
+            self._pin_releases.append((holder, keep_retained))
 
     def _node_workers(self, node_id: str) -> list[WorkerSession]:
         tokens = set(self._workers_by_node.get(node_id, ()))
@@ -743,8 +843,8 @@ class NodeRegistry:
         if not req.incarnation:
             raise OpenError(Status.REJECTED, "empty incarnation")
         node_epoch_seq = 0
+        node = self.nodes.get(req.node_id)
         if req.role == SessionRole.WORKER:
-            node = self.nodes.get(req.node_id)
             if node is None:
                 raise OpenError(
                     Status.EPOCH,
@@ -796,11 +896,13 @@ class NodeRegistry:
             pid_start=req.pid_start,
             namespace=req.namespace,
             deadline=now + self.session_ttl_s,
+            host_boot_id=node.host_boot_id if node is not None else "",
+            pid_ns=node.pid_ns if node is not None else 0,
         )
         if previous is not None:
             if previous.node_epoch == session.node_epoch:
                 self.pins.move_holder(previous.token, session.token)
-            else:  # released when the node opened a later run
+            else:
                 self._release_pins(previous.token, 0)
             self._forget_worker(previous)
         self._workers[session.token] = session
@@ -827,15 +929,19 @@ class NodeRegistry:
     def _drop_worker(self, worker: WorkerSession) -> None:
         """A worker session of a run that left or was given up."""
         self.ledger.drop_origin(worker_origin(worker.incarnation), worker.node_id)
-        if self.pins.holds_cxl(worker.token):
-            # a live worker may still read mapped CXL: keep those pins
-            # (never released by time) so the region is not returned
-            worker.orphan = True
+        if self.pins.holds_retained(worker.token):
+            self._mark_orphan(worker)
             self._workers_by_node.setdefault(worker.node_id, set()).add(worker.token)
-            self._release_pins(worker.token, 0, keep_cxl=True)
+            self._release_pins(worker.token, 0, keep_retained=True)
         else:
             self._release_pins(worker.token, 0)
             self._forget_worker(worker)
+
+    def _mark_orphan(self, worker: WorkerSession) -> None:
+        if self.pins.holds_retained(worker.token):
+            worker.orphan = True
+            if worker.orphan_since is None:
+                worker.orphan_since = self._clock()
 
     def _forget_worker(self, session: WorkerSession) -> None:
         session.closed = True
@@ -988,19 +1094,21 @@ class NodeRegistry:
         return due
 
     def give_up(self, now: float, limit: int) -> int:
-        """Drop at most ``limit`` nodes due; returns how many. Every pin on
-        a given-up node's locations goes too (in maintain() steps), also on
-        CXL: nothing hands out its pages any more, and a reader's RM hold
-        keeps a region's bytes until it unmaps."""
+        """Drop due nodes; only a memory node's departure drops all pool pins."""
         due = self.give_up_due(now)[:limit]
         for node in due:
+            memory = (
+                node.session is not None
+                and MEMORY_CAPABILITY in node.session.capabilities
+            )
             pins = [
                 self.pins.take_pool(p.pool_id)
                 for p in self.catalog.pools_of(node.node_id)
+                if memory or POOL_KINDS[p.kind].run_scoped
             ]
             self._pin_drops.extend(s for s in pins if s)
             self._drop_node(
-                node, f"stayed away over {self.node_give_up_s}s", 0, force_cxl=True
+                node, f"stayed away over {self.node_give_up_s}s", 0, force_cxl=memory
             )
             logger.info(
                 "node %s given up: %d pins on its locations released",
@@ -1058,10 +1166,10 @@ class NodeRegistry:
             if not node.dropping:
                 self._dropping.popleft()
         while self._pin_releases and work < budget:
-            holder, keep_cxl = self._pin_releases[0]
-            released = self.pins.release_holder(holder, budget - work, keep_cxl)
+            holder, keep_retained = self._pin_releases[0]
+            released = self.pins.release_holder(holder, budget - work, keep_retained)
             work += max(released, 1)
-            if not self.pins.holds(holder, cxl=not keep_cxl):
+            if not self.pins.holds(holder, retained=not keep_retained):
                 self._pin_releases.popleft()
         while self._freeing and work < budget:
             container, per_unit = self._freeing[0]
@@ -1088,3 +1196,34 @@ class NodeRegistry:
 
     def orphan_sessions(self) -> int:
         return sum(1 for w in self._workers.values() if w.orphan)
+
+    @staticmethod
+    def _unwatchable(boot: str, pid_ns: int, node: NodeRecord) -> bool:
+        return (
+            not boot
+            or not node.host_boot_id
+            or (boot == node.host_boot_id and (not pid_ns or pid_ns != node.pid_ns))
+        )
+
+    def orphan_stats(self, now: float) -> dict:
+        workers = [w for w in self._workers.values() if w.orphan]
+        pins = [
+            p
+            for w in workers
+            for p in self.pins.held_by(w.token)
+            if p.keep_on_departure
+        ]
+        unwatchable = sum(
+            self._unwatchable(w.host_boot_id, w.pid_ns, self.nodes[w.node_id])
+            for w in workers
+        )
+        return {
+            "orphan_sessions": len(workers),
+            "orphan_pins": len(pins),
+            "orphan_bytes": sum(p.location.length for p in pins),
+            "orphan_oldest_s": max(
+                (now - w.orphan_since for w in workers if w.orphan_since is not None),
+                default=0.0,
+            ),
+            "orphan_unwatchable": unwatchable,
+        }

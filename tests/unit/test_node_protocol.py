@@ -51,7 +51,7 @@ def pair():
 
 
 def test_codes_are_unique_and_below_the_response_bit():
-    assert len(set(CODES)) == len(CODES) == 14
+    assert len(set(CODES)) == len(CODES) == 16
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
     assert 0x28 not in CODES  # DRAIN_ACK, retired: never reused
 
@@ -495,3 +495,45 @@ class TestProcessIdentity:
 
     def test_same_namespace(self):
         assert same_pid_namespace(os.getpid())
+
+
+@pytest.mark.parametrize(
+    "code,path,bad",
+    [
+        (NodeMessageType.READ_JOIN, ["agent_name"], 3),
+        (NodeMessageType.READ_JOIN, ["agent_metadata"], "not-bytes"),
+        (NodeMessageType.PEERS, ["peers", 0, "generation_known"], 1),
+        (NodeMessageType.PEERS, ["peers", 0, "conn_gen"], True),
+        (NodeMessageType.PEERS, ["peers", 0, "pools", 0, "pool_registration"], "1"),
+        (NodeMessageType.PEERS, ["peers", 0, "pools", 0, "metadata"], "not-bytes"),
+    ],
+)
+def test_direct_read_messages_decode_strictly(code, path, bad):
+    from maru_common.serializer import MessageDecodeError
+
+    payload = dataclasses.asdict(sample(NODE_MESSAGE_CLASSES[code][0]))
+    value = payload
+    for name in path[:-1]:
+        value = value[name]
+    value[path[-1]] = bad
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    with pytest.raises(MessageDecodeError):
+        ser.decode_request_payload(ser.encode(code, payload))
+
+
+def test_attach_defaults_to_no_peers_and_peers_notification_uses_sequence_zero():
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    header, _ = ser.decode_request(
+        ser.encode(
+            NodeMessageType.ATTACH,
+            sample(NODE_MESSAGE_CLASSES[NodeMessageType.ATTACH][0]),
+        )
+    )
+    payload = dataclasses.asdict(sample(AttachResponse))
+    del payload["peers"]
+    assert ser.decode_response(ser.encode_response(header, payload))[1].peers == []
+    peers = sample(NODE_MESSAGE_CLASSES[NodeMessageType.PEERS][0])
+    header, back = ser.decode_request(
+        ser.encode(NodeMessageType.PEERS, peers, seq=NOTIFY_SEQUENCE)
+    )
+    assert header.sequence == 0 and back == peers

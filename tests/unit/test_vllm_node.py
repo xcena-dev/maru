@@ -3131,6 +3131,7 @@ def test_one_step_of_32_chunks_is_stored_on_the_credit_it_asks_for(fake, monkeyp
     config = parse_node_config(
         {
             "node_id": "gpu-step",
+            "state_dir": sockdir,
             "socket": f"{sockdir}/node.sock",
             "server": fake.url,
             "page_size": PAGE,

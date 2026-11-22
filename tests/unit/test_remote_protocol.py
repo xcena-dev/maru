@@ -18,6 +18,8 @@ from maru_common.remote_protocol import (
     REMOTE_MESSAGE_CLASSES,
     REMOTE_WIRE_VERSION,
     CancelRequest,
+    FenceResult,
+    FenceWorkerResponse,
     HelloRefusal,
     HelloRequest,
     HelloResponse,
@@ -42,6 +44,7 @@ from maru_common.storage_types import (
     FETCH_CAPABILITY,
     MEMORY_CAPABILITY,
     REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
     HintAction,
     Key,
     Location,
@@ -49,6 +52,7 @@ from maru_common.storage_types import (
     PoolInfo,
     PoolKind,
     Status,
+    WriteDomain,
     make_generation,
 )
 from tests.unit.ms_samples import sample
@@ -79,7 +83,7 @@ def _write_done(end: TransferEnd = TransferEnd.DONE) -> RemoteWriteDoneRequest:
 
 
 def test_codes_are_unique_and_below_the_response_bit():
-    assert len(set(CODES)) == len(CODES) == len(RemoteMessageType) == 7
+    assert len(set(CODES)) == len(CODES) == len(RemoteMessageType) == 9
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
     # reserved (DROP, STAGE, UNSTAGE): never reused
     assert not {0x13, 0x18, 0x19} & set(CODES)
@@ -97,7 +101,12 @@ def test_ledger_ops_are_the_requests_with_an_op():
             assert hints["op"] is OpRef
             with_op.add(code)
     assert with_op == LEDGER_CODES
-    assert {_name(c) for c in LEDGER_CODES} == {"RESERVE", "WRITE_DONE", "CANCEL"}
+    assert {_name(c) for c in LEDGER_CODES} == {
+        "RESERVE",
+        "WRITE_DONE",
+        "CANCEL",
+        "FENCE_WORKER",
+    }
 
 
 def test_origin_names_the_peer_run():
@@ -106,8 +115,13 @@ def test_origin_names_the_peer_run():
 
 
 def test_capability_names():
-    names = (REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY)
-    assert names == ("remote_v1", "memory_v1", "fetch_v1")
+    names = (
+        REMOTE_CAPABILITY,
+        MEMORY_CAPABILITY,
+        FETCH_CAPABILITY,
+        WORKER_RDMA_CAPABILITY,
+    )
+    assert names == ("remote_v1", "memory_v1", "fetch_v1", "worker_rdma_v1")
 
 
 @pytest.mark.parametrize("minimal", [False, True], ids=["all-set", "optionals-empty"])
@@ -222,6 +236,14 @@ _BAD: list[tuple[RemoteMessageType, list, object]] = [
     (RemoteMessageType.HINT, ["action"], "read_soon"),
     (RemoteMessageType.HINT, ["ranges", 0, "generation"], _MISSING),
     (RemoteMessageType.HINT, ["request"], None),
+    (RemoteMessageType.AGENTS, ["add", 0, "agent_metadata"], "not-bytes"),
+    (RemoteMessageType.AGENTS, ["remove"], [1]),
+    (RemoteMessageType.FENCE_WORKER, ["domain"], None),
+    (RemoteMessageType.FENCE_WORKER, ["domain", "number"], True),
+    (RemoteMessageType.FENCE_WORKER, ["domain", "incarnation"], _MISSING),
+    (RemoteMessageType.RESERVE, ["domain", "number"], "1"),
+    (RemoteMessageType.WRITE_DONE, ["domain", "node_epoch"], 1),
+    (RemoteMessageType.CANCEL, ["domain", "number"], False),
 ]
 
 
@@ -283,7 +305,7 @@ class TestOpDigest:
         assert len(op_digest(request)) == 16
 
     def test_it_is_stable(self):
-        assert op_digest(_write_done()).hex() == "d98360ced34371b86a504d98b20b7749"
+        assert op_digest(_write_done()).hex() == "5e2a3dc6ce8d7f3e5e6ed547a4cadbf6"
 
     @pytest.mark.parametrize("code", LEDGER, ids=_name)
     def test_the_op_is_not_part_of_it(self, code):
@@ -366,7 +388,8 @@ class TestNodeOpenCapabilities:
         response = sample(NodeOpenResponse)
         _, back = old.decode_response(new.encode_response(header, response))
         fields = dataclasses.asdict(response)
-        del fields["capabilities"]
+        for name in ("capabilities", "orphans", "next_cursor", "pool_registrations"):
+            del fields[name]
         assert dataclasses.asdict(back) == fields
 
 
@@ -444,3 +467,51 @@ def test_write_hints_ride_on_reserve_and_read_hints_have_their_own_message():
     assert ser.decode_request(frame)[1] == hint
     end = RemoteHintRequest(HintAction.READ_HINT_END, "req-1")
     assert ser.decode_request(ser.encode(RemoteMessageType.HINT, end))[1] == end
+
+
+@pytest.mark.parametrize(
+    "code",
+    [RemoteMessageType.RESERVE, RemoteMessageType.WRITE_DONE, RemoteMessageType.CANCEL],
+)
+def test_write_domain_is_optional_for_legacy_and_part_of_the_op_digest(code):
+    request = sample(REMOTE_MESSAGE_CLASSES[code][0])
+    payload = dataclasses.asdict(request)
+    del payload["domain"]
+    decoded = _ser().decode_request_payload(_ser().encode(code, payload))
+    assert decoded.request.domain is None
+    assert op_digest(decoded.payload) == op_digest(payload)
+    changed = dataclasses.replace(
+        request,
+        domain=dataclasses.replace(request.domain, number=request.domain.number + 1),
+    )
+    assert op_digest(changed) != op_digest(request)
+
+
+def test_fence_worker_reports_registration_revocation_success_or_failure():
+    ser = _ser()
+    code = RemoteMessageType.FENCE_WORKER
+    header, _ = ser.decode_request(
+        ser.encode(code, sample(REMOTE_MESSAGE_CLASSES[code][0]))
+    )
+    for result in FenceResult:
+        response = FenceWorkerResponse(Status.OK, result=result)
+        assert ser.decode_response(ser.encode_response(header, response))[1] == response
+    with pytest.raises(MessageDecodeError):
+        ser.decode_response(
+            ser.encode_response(header, {"status": "OK", "result": "maybe"})
+        )
+
+
+def test_reserve_returns_the_domains_own_agent_registration():
+    response = sample(ReserveResponse)
+    assert isinstance(response.write_agent.domain, WriteDomain)
+    header, _ = _ser().decode_request(
+        _ser().encode(RemoteMessageType.RESERVE, sample(ReserveRequest))
+    )
+    assert (
+        _ser().decode_response(_ser().encode_response(header, response))[1] == response
+    )
+    payload = dataclasses.asdict(response)
+    payload["write_agent"]["pools"][0]["pool_registration"] = True
+    with pytest.raises(MessageDecodeError):
+        _ser().decode_response(_ser().encode_response(header, payload))
