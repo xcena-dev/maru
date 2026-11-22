@@ -19,6 +19,7 @@ The connector has two roles (instantiated separately by vLLM):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import inspect
@@ -675,6 +676,50 @@ class _LoadMissError(RuntimeError):
         super().__init__(
             f"{missing} of {total} {what} not readable: {reasons or 'no reason known'}"
         )
+
+
+@dataclass(eq=False)
+class _LeasedLoad:
+    """A leased load across its batches (``_load_leased``): what it loads,
+    and its batches whose copies may still run, oldest first, each
+    ``(event, reads, the range to recompute from it)``."""
+
+    req_meta: MaruReqMeta
+    layers: list[tuple[str, torch.Tensor, int]]
+    chunk_keys: list[str]
+    slot_mapping: torch.Tensor
+    attn_metadata: Any
+    stream: Any
+    handler: Any
+    pending: deque[tuple[Any, list[Any], MaruReqMeta]] = field(default_factory=deque)
+    batches: int = 0
+
+
+@dataclass(eq=False)
+class _LeasedBatch:
+    """One batch of a leased load: its chunk keys, the token range
+    ``[lo, hi)`` it writes, and the range to recompute from it."""
+
+    keys: list[str]
+    lo: int
+    hi: int
+    rest: MaruReqMeta
+
+
+@dataclass(eq=False)
+class _NodeFetch:
+    """A maru_node load whose last batch's FETCH is in flight: the loader
+    thread takes the answer later (``_finish_node_fetch``) and queues the
+    batch's copies then. The load's earlier batches stay in ``load``."""
+
+    load: _LeasedLoad
+    batch: _LeasedBatch
+    # The batch's retrieve: done() once the node answered
+    started: Any
+
+    @property
+    def req_meta(self) -> MaruReqMeta:
+        return self.load.req_meta
 
 
 class _CopyAhead:
@@ -2123,8 +2168,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             CXL slab (no staging) when available — load scatters a whole slab
             into the paged cache per chunk, store gathers one D2H per chunk —
             falling back to per-layer copies otherwise. A slab whose region
-            failed CUDA registration is staged through one chunk of GPU
-            memory and still placed by the kernel. See design note P6. A model
+            failed CUDA registration, and on maru_node a slab loaded off the
+            engine thread, is staged through one chunk of GPU memory and
+            still placed by the kernel. See design note P6. A model
             with several KV cache groups takes layerwise only when every
             group it stores is an MLA group (DeepSeek-V4.1): each layer of a
             (chunk, group) object is keyed <object key>_L<position in the
@@ -2154,6 +2200,10 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             bounding same-CUDA-context interference with model steps.
             Default: 0 (submit all loads immediately). Set a positive value
             to enable the cap as a fallback safety guard.
+        maru_load_fetch_depth: int - maru_node: parked loads whose FETCH the
+            loader thread keeps in flight at once; the next queued load sends
+            its LOOKUP and FETCH while the node reads. 1 takes each answer
+            before the next load starts (default: 2)
         maru_log_timing: bool - Emit per-request timing diagnostics to stderr:
             per-stage CPU times and a request timeline (REQ-TRACE,
             GPU-LOAD-QOS, STEP-TRACE and STEP-GPU lines) (default: false)
@@ -4282,6 +4332,21 @@ class MaruWorkerConnector:
         self._deferred_events: dict[str, torch.cuda.Event] = {}
         self._deferred_refs: dict[str, list[Any]] = {}
         self._deferred_done: set[str] = set()
+        # Parked maru_node loads whose batches are still copying: req_id ->
+        # (request, its (event, reads, range to recompute) batches oldest
+        # first, its chunk keys, batch count). Each batch's reads go back once
+        # its event completed, and the request is reported after its last one
+        # (_settle_parked_loads).
+        self._parked_loads: dict[
+            str,
+            tuple[MaruReqMeta, deque[tuple[Any, list[Any], Any]], list[str], int],
+        ] = {}
+        # maru_node loads whose last FETCH is in flight, oldest first (loader
+        # thread only), and the loader jobs queued or running
+        # (_submit_load_job): a load is left in flight only while another
+        # job follows, and the last job takes what is left.
+        self._node_fetches: deque[_NodeFetch] = deque()
+        self._loader_jobs = 0
         self._recv_only_finished_req_ids: set[str] = set()
         self._failed_load_blocks: set[int] = set()
         self._failed_recv_req_ids: set[str] = set()
@@ -4328,6 +4393,12 @@ class MaruWorkerConnector:
         self._load_copy_ahead = int(extra_config.get("maru_load_copy_ahead", 2))
         if self._load_copy_ahead < 0:
             raise ValueError("maru_load_copy_ahead must be 0 or more")
+        # maru_node: loads whose FETCH the loader thread keeps in flight at
+        # once, the one starting included; 1 takes each answer before the
+        # next load starts.
+        self._load_fetch_depth = int(extra_config.get("maru_load_fetch_depth", 2))
+        if self._load_fetch_depth < 1:
+            raise ValueError("maru_load_fetch_depth must be 1 or more")
         self._copy_ahead: dict[tuple[torch.device, int, int], _CopyAhead] = {}
         self._copy_ahead_lock = threading.Lock()
         # Overlap loads whose off-thread copy issue failed: the loader thread
@@ -5281,8 +5352,38 @@ class MaruWorkerConnector:
         self._checked(queued.record, torch.cuda.current_stream(device))
         with self._deferred_lock:
             self._inflight_deferred_req_ids.add(req_meta.req_id)
-        self._deferred_executor.submit(self._group_load_job, req_meta, device, queued)
+        self._submit_load_job(
+            req_meta.req_id, self._group_load_job, req_meta, device, queued
+        )
         return True
+
+    def _submit_load_job(self, req_id: str, job: Callable[..., None], *args) -> None:
+        """Queue ``job`` on the loader thread, counted until it ends."""
+        assert self._deferred_executor is not None
+        with self._deferred_lock:
+            self._loader_jobs += 1
+        try:
+            self._deferred_executor.submit(self._in_fetch_scope, req_id, job, *args)
+        except BaseException:
+            with self._deferred_lock:
+                self._loader_jobs -= 1
+            raise
+
+    def _in_fetch_scope(self, req_id: str, job: Callable[..., None], *args) -> None:
+        """Run a loader job whose retrieves may FETCH for ``req_id`` (only
+        the loader thread fetches; the engine thread never waits for one).
+        The last job queued takes the answers of the loads left in flight."""
+        handler = self._handler
+        scope = getattr(handler, "fetch_scope", None)
+        with scope(req_id) if scope is not None else contextlib.nullcontext():
+            try:
+                job(*args)
+            finally:
+                with self._deferred_lock:
+                    self._loader_jobs -= 1
+                    last = self._loader_jobs <= 0
+                if last:
+                    self._finish_node_fetches()
 
     def _group_load_job(
         self,
@@ -5296,7 +5397,9 @@ class MaruWorkerConnector:
         stream's work at submission; ``get_finished_loading`` reports the
         request once its own event fires, and vLLM resumes it then. A
         storage-session load waits for its copies here, batch by batch
-        (``_load_group_leased``), and is reported once it returns.
+        (``_load_group_leased``), and is reported once it returns; on
+        maru_node its last batch parks instead and is reported once its
+        copies end (``_settle_parked_loads``).
         """
         try:
             objects = None
@@ -5329,7 +5432,7 @@ class MaruWorkerConnector:
                     loaded = self._load_group_leased(
                         req_meta, device, stream, offthread=True
                     )
-                if loaded is not None:
+                if loaded is not None and not self._node_mode:
                     with self._deferred_lock:
                         self._deferred_done.add(req_meta.req_id)
                     logger.info(
@@ -5467,7 +5570,11 @@ class MaruWorkerConnector:
         batch that cannot be read or placed fails the request, and vLLM
         recomputes it over every block of the load. The leases of a batch
         whose copies cannot be waited for are kept, as a copy may still read
-        them.
+        them. On a maru_node loader thread the last batch is not waited for:
+        the request parks (``_parked_loads``), and its reads go back and it
+        is reported once its copies end (``_settle_parked_loads``); a batch
+        short of slots first waits for the parked loads' copies
+        (``_free_parked_slots``).
 
         Returns:
             ``(hit chunks, objects placed)``, or None after reporting the
@@ -5480,9 +5587,13 @@ class MaruWorkerConnector:
         handler = self._handler
         assert handler is not None
         route = self._route(req_meta)
+        park = offthread and self._node_mode
         start = 0
+        batches = 0
         while start < len(keys):
             if self._stopped is not None:
+                return None
+            if park and not self._free_parked_slots(handler, len(keys) - start):
                 return None
             n = min(
                 self._leased_batch_size(handler, len(keys) - start, offthread),
@@ -5492,7 +5603,9 @@ class MaruWorkerConnector:
                 self._fail_load(req_meta, RuntimeError("no staging slot free"))
                 return None
             batch = slice(start, start + n)
+            batches += 1
             infos: list[Any] = []
+            event: Any = None
             try:
                 infos = list(self._batch_retrieve_all(keys[batch], **route))
                 if self._stopped is not None:
@@ -5514,7 +5627,10 @@ class MaruWorkerConnector:
                     stage=offthread,
                 )
                 if stream is not None:
-                    stream.synchronize()
+                    if park and start + n == len(keys):
+                        event = stream.record_event()
+                    else:
+                        stream.synchronize()
             except Exception as e:
                 if self._stop_if_unconfirmed(e, infos, req_id=req_meta.req_id):
                     return None
@@ -5522,6 +5638,19 @@ class MaruWorkerConnector:
                     self._release(infos, handler)
                 self._fail_load(req_meta, e)
                 return None
+            if event is not None:
+                ct = self._kv_chunk_tokens
+                with self._deferred_lock:
+                    self._parked_loads[req_meta.req_id] = (
+                        req_meta,
+                        deque([(event, infos, req_meta)]),
+                        self._slice_chunk_keys(req_meta)[
+                            req_meta.load_start_token // ct : hit
+                        ],
+                        batches,
+                    )
+                self._settle_parked_loads()
+                break
             self._release(infos, handler)
             start += n
         return hit, len(keys)
@@ -5765,8 +5894,8 @@ class MaruWorkerConnector:
                 self._loaded_request_keys[req_meta.req_id] = (req_meta, set())
         if self._timing:
             self._trace_worker_req("retrieve_submit", req_meta.req_id)
-        self._deferred_executor.submit(
-            self._deferred_load_job, req_meta, layers, device
+        self._submit_load_job(
+            req_meta.req_id, self._deferred_load_job, req_meta, layers, device
         )
         return True
 
@@ -5824,6 +5953,8 @@ class MaruWorkerConnector:
                     stream=self._deferred_stream,
                 )
                 return
+            # Loads left with a FETCH in flight go first
+            self._finish_node_fetches()
             chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
@@ -6114,7 +6245,10 @@ class MaruWorkerConnector:
         except Exception as e:
             self._deferred_load_failed(req_meta, e, refs)
         finally:
-            self._deferred_load_accounted(req_meta.req_id)
+            # One left with a FETCH in flight is accounted for once its answer
+            # is taken (_finish_node_fetch)
+            if not any(f.req_meta is req_meta for f in self._node_fetches):
+                self._deferred_load_accounted(req_meta.req_id)
 
     def _deferred_load_failed(
         self, req_meta: MaruReqMeta, error: Exception, refs: list[Any]
@@ -6148,14 +6282,18 @@ class MaruWorkerConnector:
         """Block until fewer than the admission window of loads are in flight.
 
         Runs on the loader thread just before a request's GPU enqueue. Counts
-        the deferred loads whose completion event has not fired yet and, while
-        the count is at or above ``maru_load_admission_window``, waits on the
-        oldest one. The deferred stream is FIFO, so dict insertion order is
-        completion order and waiting on the oldest event is the shortest wait.
-        The gated GPU work is already enqueued and depends on nothing from
-        this thread, so the wait always terminates. A CUDA error from a query
-        or the wait stops the worker and ends the wait; what that load uses
-        stays in ``_deferred_refs``, which a stopped worker never empties.
+        the deferred loads whose completion event has not fired yet, the
+        parked maru_node loads whose copies have not all ended and those whose
+        FETCH is in flight, and, while the count is at or above
+        ``maru_load_admission_window``, waits on the oldest one (a parked
+        load's oldest batch first; with none parked, the oldest FETCH in
+        flight is taken and its copies queued). The deferred stream is FIFO,
+        so dict insertion order is completion order and waiting on the oldest
+        event is the shortest wait. The gated GPU work is already enqueued
+        and depends on nothing from this thread, so the wait always
+        terminates. A CUDA error from a query or the wait stops the worker
+        and ends the wait; what that load uses stays in ``_deferred_refs`` or
+        ``_parked_loads``, which a stopped worker never empties.
 
         Args:
             req_id: Request whose enqueue is being admitted (log label only).
@@ -6163,6 +6301,8 @@ class MaruWorkerConnector:
         wait_t0 = time.monotonic()
         waited = False
         while self._stopped is None:
+            if self._parked_loads:
+                self._settle_parked_loads()
             with self._deferred_lock:
                 pending: list[tuple[str, Any]] = []
                 try:
@@ -6176,9 +6316,17 @@ class MaruWorkerConnector:
                     if not self._stop_if_unconfirmed(e, held, req_id=queued_id):
                         raise
                     break
-            if len(pending) < self._load_admission_window:
+                parked = len(self._parked_loads)
+            fetching = len(self._node_fetches)
+            if len(pending) + parked + fetching < self._load_admission_window:
                 break
             waited = True
+            if fetching and not parked:
+                self._finish_node_fetch(self._node_fetches.popleft())
+                continue
+            if parked:
+                self._settle_parked_loads(wait=True)
+                continue
             oldest_id, oldest = pending[0]
             try:
                 oldest.synchronize()
@@ -6810,7 +6958,15 @@ class MaruWorkerConnector:
         that cannot be read or copied fails the request
         from that batch on, and the later batches are not read; vLLM
         recomputes those tokens. A deferred request is reported finished only
-        after its last batch, or with its failure.
+        after its last batch, or with its failure. On maru_node the loader
+        thread does not wait for the last batches but goes on to the next
+        load; their reads go back, and the request is reported, as their
+        copies end (``_settle_parked_loads``). Nor does it wait for the last
+        batch's FETCH while another loader job is queued: that job's LOOKUP
+        and FETCH go out while the node reads, with at most
+        ``maru_load_fetch_depth`` loads' FETCHes in flight, and the answer is
+        taken and its copies queued later (``_finish_node_fetches``), the
+        older loads' first.
 
         Args:
             layers: ``(name, kv_cache, layer index)`` per attention layer.
@@ -6836,7 +6992,17 @@ class MaruWorkerConnector:
         ct = self._kv_chunk_tokens
         start, end = self._cpu_load_range(req_meta)
         first = start // ct
-        step = self._leased_batch_size(handler, len(chunk_keys), stream is not None)
+        pipelined = stream is not None
+        if pipelined and not self._free_parked_slots(
+            handler, min(len(chunk_keys), _LOAD_PIPELINE_CHUNKS)
+        ):
+            return
+        # A pipelined load reads _LOAD_PIPELINE_CHUNKS at a time: it waits
+        # for no more slots than its first batch takes
+        wanted = len(chunk_keys)
+        if pipelined:
+            wanted = min(wanted, _LOAD_PIPELINE_CHUNKS)
+        step = self._leased_batch_size(handler, wanted, pipelined)
         if step <= 0:
             logger.warning(
                 "Maru: no staging slot free for req %s (recompute)", req_meta.req_id
@@ -6845,69 +7011,31 @@ class MaruWorkerConnector:
             return
         # A loader thread reads batch b+1 while batch b's copies run on its
         # stream; a batch's leases go back once an event says its copies ended.
-        pipelined = stream is not None
         if pipelined:
             step = min(step, _LOAD_PIPELINE_CHUNKS)
             # Pinned once here, not once per batch in _load_packed.
             slot_mapping = self._pin_slot_mapping_for_async_h2d(slot_mapping)
-        pending: deque[tuple[Any, list[Any], MaruReqMeta]] = deque()
-
-        def settle(block: bool, oldest: bool = False) -> MaruReqMeta | None:
-            """Give back the batches whose copies ended (all of them if
-            ``block``, only the oldest if ``oldest`` too). Returns the range to
-            recompute if waiting failed; the slots of the batches not
-            confirmed then stay taken."""
-            while pending:
-                event, held, from_here = pending[0]
-                try:
-                    if not block and not event.query():
-                        return None
-                    event.synchronize()
-                except Exception as e:
-                    if not self._stop_if_unconfirmed(
-                        e, list(pending), req_id=req_meta.req_id
-                    ):
-                        logger.error(
-                            "Maru: could not wait for queued load copies",
-                            exc_info=True,
-                        )
-                    pending.clear()
-                    return from_here
-                self._release(held, handler)
-                pending.popleft()
-                if oldest:
-                    return None
-            return None
-
-        def make_room(n: int) -> MaruReqMeta | None:
-            """Wait for the oldest batches until ``n`` slots are free or none
-            of this request's batches is left; same return as settle()."""
-            while pending:
-                capacity = handler.retrieve_capacity(n)
-                if capacity is None or capacity >= n:
-                    return None
-                if (unconfirmed := settle(True, oldest=True)) is not None:
-                    return unconfirmed
-            return None
-
-        def fail(rest: MaruReqMeta, error: Exception | None = None) -> None:
-            unconfirmed = settle(True)
-            if unconfirmed is not None:
-                self._fail_deferred_load(unconfirmed)
-            else:
-                self._fail_deferred_load(rest, error)
-
+        load = _LeasedLoad(
+            req_meta, layers, chunk_keys, slot_mapping, attn_metadata, stream, handler
+        )
+        pending = load.pending
+        # A maru_node loader thread may leave the last batch's FETCH in flight
+        fetches = pipelined and self._node_mode
         b = 0
-        batches = 0
         try:
             while b < len(chunk_keys):
                 if self._kept_if_stopped(list(pending)):
                     return
                 n = min(step, len(chunk_keys) - b)
+                if pipelined and not self._free_parked_slots(handler, n):
+                    self._kept_if_stopped(list(pending))
+                    return
                 if pending:
                     # The batches still copying hold their slots: wait for
                     # the oldest ones rather than read a short batch.
-                    unconfirmed = settle(False) or make_room(n)
+                    unconfirmed = self._settle_leased(load, False) or self._leased_room(
+                        load, n
+                    )
                     if unconfirmed is not None:
                         self._fail_deferred_load(unconfirmed)
                         return
@@ -6917,18 +7045,33 @@ class MaruWorkerConnector:
                         capacity = self._leased_batch_size(handler, n, True)
                     if capacity is not None and 0 < capacity < n:
                         n = capacity  # another load holds the rest
-                keys = chunk_keys[b : b + n]
-                lo = max(start, (first + b) * ct)
-                hi = min(end, (first + b + n) * ct)
-                rest = replace(req_meta, load_start_token=lo, load_end_token=end)
+                batch = _LeasedBatch(
+                    chunk_keys[b : b + n],
+                    max(start, (first + b) * ct),
+                    min(end, (first + b + n) * ct),
+                    replace(
+                        req_meta,
+                        load_start_token=max(start, (first + b) * ct),
+                        load_end_token=end,
+                    ),
+                )
                 b += n
-                batches += 1
+                load.batches += 1
                 try:
                     _t0 = time.monotonic()
-                    infos = self._batch_retrieve_all(keys, **route)
+                    if fetches:
+                        started = handler.start_retrieve(batch.keys, **route)
+                        if self._leave_in_flight(b >= len(chunk_keys)) and not (
+                            started.done()
+                        ):
+                            self._node_fetches.append(_NodeFetch(load, batch, started))
+                            return
+                        infos = list(started.result())
+                    else:
+                        infos = self._batch_retrieve_all(batch.keys, **route)
                     if self._timing:
                         _emit_timing(
-                            f"retrieve batch {len(keys)} keys = "
+                            f"retrieve batch {len(batch.keys)} keys = "
                             f"{(time.monotonic() - _t0) * 1000:.2f} ms "
                             f"(req {req_meta.req_id})"
                         )
@@ -6936,96 +7079,206 @@ class MaruWorkerConnector:
                     logger.error(
                         "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
                     )
-                    fail(rest)
+                    self._fail_leased(load, batch.rest)
                     return
-                if self._kept_if_stopped(infos, list(pending)):
-                    return  # never queued
-                queued = False
-                miss: _LoadMissError | None = None
-                try:
-                    if len(infos) != len(keys) or any(i is None for i in infos):
-                        # A miss (chunk gone since the scheduler's check) or a
-                        # truncated reply: never inject a partial batch.
-                        if self._node_mode and len(infos) == len(keys):
-                            # One line, with the reasons, from _fail_load
-                            miss = self._load_miss(infos, "chunks")
-                        else:
-                            logger.warning(
-                                "Maru load miss for req %s (%d of %d chunks) - "
-                                "recompute",
-                                req_meta.req_id,
-                                sum(i is not None for i in infos),
-                                len(keys),
-                            )
-                        failed = {req_meta.req_id}
-                    else:
-                        part = replace(
-                            req_meta,
-                            load_start_token=lo,
-                            load_end_token=hi,
-                            deferred_load=False,
-                        )
-                        try:
-                            failed = self._load_packed(
-                                layers,
-                                [(part, len(keys), slot_mapping, infos)],
-                                attn_metadata,
-                                stream=stream,
-                                wait=not pipelined,
-                            )
-                            if pipelined and not failed:
-                                pending.append((stream.record_event(), infos, rest))
-                                queued = True
-                            elif pipelined:
-                                # _load_packed logged it; copies of the batch's
-                                # first chunks may still be queued.
-                                raise _QueuedCopyError
-                        except Exception as e:
-                            if self._stop_if_unconfirmed(
-                                e, infos, list(pending), req_id=req_meta.req_id
-                            ):
-                                return
-                            # Copies may still be queued on the stream: the
-                            # slots go back only once they have finished.
-                            if not isinstance(e, _QueuedCopyError):
-                                logger.error(
-                                    "Maru load copy failed for req %s: %s",
-                                    req_meta.req_id,
-                                    e,
-                                )
-                            if not self._drain_load_stream(
-                                stream, infos, list(pending), req_id=req_meta.req_id
-                            ):
-                                # Keep the slots, as a copy may still read
-                                # them, and recompute from the first batch not
-                                # confirmed.
-                                infos = []
-                                if pending:
-                                    rest = pending[0][2]
-                                pending.clear()
-                            failed = {req_meta.req_id}
-                finally:
-                    if not queued:
-                        self._release(infos, handler)
-                if failed:
-                    # vLLM recomputes from this batch's first block, so the
-                    # later batches are not worth reading.
-                    fail(rest, miss)
+                if not self._issue_leased_batch(load, batch, infos):
                     return
-            unconfirmed = settle(True)
+            self._end_leased_load(load)
         except BaseException:
             # Whatever escaped, give back the batches whose copies ended; the
             # caller drains the stream and recomputes the request.
             try:
-                settle(True)
+                self._settle_leased(load, True)
             except Exception:
                 logger.error("Maru: could not release load batches", exc_info=True)
             raise
+
+    def _leave_in_flight(self, last: bool) -> bool:
+        """After a batch's FETCH went out on the loader thread: whether to
+        leave it in flight (the load's last batch while another loader job
+        is queued), having taken the older loads' answers first, room left
+        for this one if it stays."""
+        with self._deferred_lock:
+            queued = self._loader_jobs > 1
+        leave = last and queued and self._load_fetch_depth > 1
+        self._finish_node_fetches(self._load_fetch_depth - 2 if leave else 0)
+        return leave
+
+    def _settle_leased(
+        self, load: _LeasedLoad, block: bool, oldest: bool = False
+    ) -> MaruReqMeta | None:
+        """Give back the batches whose copies ended (all of them if
+        ``block``, only the oldest if ``oldest`` too).
+
+        Returns:
+            The range to recompute if waiting failed; the slots of the
+            batches not confirmed then stay taken. A CUDA error stops the
+            worker and keeps them.
+        """
+        pending = load.pending
+        while pending:
+            event, held, from_here = pending[0]
+            try:
+                if not block and not event.query():
+                    return None
+                event.synchronize()
+            except Exception as e:
+                if not self._stop_if_unconfirmed(
+                    e, list(pending), req_id=load.req_meta.req_id
+                ):
+                    logger.error(
+                        "Maru: could not wait for queued load copies", exc_info=True
+                    )
+                pending.clear()
+                return from_here
+            self._release(held, load.handler)
+            pending.popleft()
+            if oldest:
+                return None
+        return None
+
+    def _leased_room(self, load: _LeasedLoad, n: int) -> MaruReqMeta | None:
+        """Wait for the oldest batches until ``n`` slots are free or none of
+        the load's batches is left; same return as ``_settle_leased``."""
+        while load.pending:
+            capacity = load.handler.retrieve_capacity(n)
+            if capacity is None or capacity >= n:
+                return None
+            if (
+                unconfirmed := self._settle_leased(load, True, oldest=True)
+            ) is not None:
+                return unconfirmed
+        return None
+
+    def _fail_leased(
+        self, load: _LeasedLoad, rest: MaruReqMeta, error: Exception | None = None
+    ) -> None:
+        """Fail a leased load from ``rest`` once its batches ended, or from
+        the first batch not confirmed ended."""
+        unconfirmed = self._settle_leased(load, True)
+        if unconfirmed is not None:
+            self._fail_deferred_load(unconfirmed)
+        else:
+            self._fail_deferred_load(rest, error)
+
+    def _issue_leased_batch(
+        self, load: _LeasedLoad, batch: _LeasedBatch, infos: list[Any]
+    ) -> bool:
+        """Queue the copies of one leased batch whose reads are in hand.
+
+        Returns:
+            Whether the load goes on: False once it failed or the worker
+            stopped, which keeps what its batches use.
+        """
+        req_meta, pending, stream = load.req_meta, load.pending, load.stream
+        pipelined = stream is not None
+        if self._kept_if_stopped(infos, list(pending)):
+            return False  # never queued
+        rest = batch.rest
+        queued = False
+        miss: _LoadMissError | None = None
+        try:
+            if len(infos) != len(batch.keys) or any(i is None for i in infos):
+                # A miss (chunk gone since the scheduler's check) or a
+                # truncated reply: never inject a partial batch.
+                if self._node_mode and len(infos) == len(batch.keys):
+                    # One line, with the reasons, from _fail_load
+                    miss = self._load_miss(infos, "chunks")
+                else:
+                    logger.warning(
+                        "Maru load miss for req %s (%d of %d chunks) - recompute",
+                        req_meta.req_id,
+                        sum(i is not None for i in infos),
+                        len(batch.keys),
+                    )
+                failed = {req_meta.req_id}
+            else:
+                part = replace(
+                    req_meta,
+                    load_start_token=batch.lo,
+                    load_end_token=batch.hi,
+                    deferred_load=False,
+                )
+                try:
+                    failed = self._load_packed(
+                        load.layers,
+                        [(part, len(batch.keys), load.slot_mapping, infos)],
+                        load.attn_metadata,
+                        stream=stream,
+                        wait=not pipelined,
+                    )
+                    if pipelined and not failed:
+                        pending.append((stream.record_event(), infos, rest))
+                        queued = True
+                    elif pipelined:
+                        # _load_packed logged it; copies of the batch's
+                        # first chunks may still be queued.
+                        raise _QueuedCopyError
+                except Exception as e:
+                    if self._stop_if_unconfirmed(
+                        e, infos, list(pending), req_id=req_meta.req_id
+                    ):
+                        return False
+                    # Copies may still be queued on the stream: the slots go
+                    # back only once they have finished.
+                    if not isinstance(e, _QueuedCopyError):
+                        logger.error(
+                            "Maru load copy failed for req %s: %s", req_meta.req_id, e
+                        )
+                    if not self._drain_load_stream(
+                        stream, infos, list(pending), req_id=req_meta.req_id
+                    ):
+                        # Keep the slots, as a copy may still read them, and
+                        # recompute from the first batch not confirmed.
+                        infos = []
+                        if pending:
+                            rest = pending[0][2]
+                        pending.clear()
+                    failed = {req_meta.req_id}
+        finally:
+            if not queued:
+                self._release(infos, load.handler)
+        if failed:
+            # vLLM recomputes from this batch's first block, so the later
+            # batches are not worth reading.
+            self._fail_leased(load, rest, miss)
+            return False
+        return True
+
+    def _end_leased_load(self, load: _LeasedLoad) -> None:
+        """Finish a leased load whose every batch is queued: a maru_node
+        loader thread parks it until its copies end; otherwise its copies are
+        waited for here."""
+        req_meta = load.req_meta
+        if load.stream is not None and self._node_mode:
+            # The next parked load starts now; this one finishes as its
+            # copies end.
+            with self._deferred_lock:
+                self._parked_loads[req_meta.req_id] = (
+                    req_meta,
+                    deque(load.pending),
+                    load.chunk_keys,
+                    load.batches,
+                )
+            load.pending.clear()
+            self._settle_parked_loads()
+            return
+        unconfirmed = self._settle_leased(load, True)
         if unconfirmed is not None:
             self._fail_deferred_load(unconfirmed)
             return
-        # Every READ and GPU copy succeeded. Boundary chunks were loaded
-        # only in part; leave them eligible for the existing store path.
+        self._leased_load_done(req_meta, load.chunk_keys, load.batches)
+
+    def _leased_load_done(
+        self, req_meta: MaruReqMeta, chunk_keys: list[str], batches: int
+    ) -> None:
+        """Record a leased load whose every READ and GPU copy succeeded, and
+        report a deferred one finished."""
+        ct = self._kv_chunk_tokens
+        start, end = self._cpu_load_range(req_meta)
+        first = start // ct
+        # Boundary chunks were loaded only in part; leave them eligible for
+        # the existing store path.
         full_first = (start + ct - 1) // ct - first
         full_end = end // ct - first
         with self._deferred_lock:
@@ -7041,6 +7294,144 @@ class MaruWorkerConnector:
             )
             with self._deferred_lock:
                 self._deferred_done.add(req_meta.req_id)
+
+    def _free_parked_slots(self, handler: Any, n: int) -> bool:
+        """Give back the parked loads' batches whose copies ended and, while
+        fewer than ``n`` slots are free, wait for the oldest of them; with
+        none parked, take the oldest FETCH in flight (loader thread). False
+        once the worker stopped."""
+        if not (self._parked_loads or self._node_fetches):
+            return self._stopped is None
+        self._settle_parked_loads()
+        while (self._parked_loads or self._node_fetches) and self._stopped is None:
+            capacity = handler.retrieve_capacity(n)
+            if capacity is None or capacity >= n:
+                break
+            if not self._parked_loads:
+                self._finish_node_fetch(self._node_fetches.popleft())
+            elif not self._settle_parked_loads(wait=True):
+                break
+        return self._stopped is None
+
+    def _finish_node_fetches(self, keep: int = 0) -> None:
+        """Take the answers of the loads left with a FETCH in flight (loader
+        thread): those answered, then the oldest until ``keep`` are left."""
+        while self._node_fetches:
+            fetch = next((f for f in self._node_fetches if f.started.done()), None)
+            if fetch is None:
+                if len(self._node_fetches) <= keep:
+                    return
+                fetch = self._node_fetches[0]
+            self._node_fetches.remove(fetch)
+            self._finish_node_fetch(fetch)
+
+    def _finish_node_fetch(self, fetch: _NodeFetch) -> None:
+        """Run the rest of a load left with its FETCH in flight, as its loader
+        job would have: its copies are queued and it parks, or it fails. A
+        stopped worker keeps the fetch and its load's batches unread."""
+        load, batch = fetch.load, fetch.batch
+        req_meta = load.req_meta
+        try:
+            if self._kept_if_stopped(fetch):
+                return
+            try:
+                infos = list(fetch.started.result())
+            except Exception as e:
+                logger.error(
+                    "Maru batch_retrieve failed for req %s: %s", req_meta.req_id, e
+                )
+                self._fail_leased(load, batch.rest)
+                return
+            if self._issue_leased_batch(load, batch, infos):
+                self._end_leased_load(load)
+        except Exception as e:
+            try:
+                self._settle_leased(load, True)
+            except Exception:
+                logger.error("Maru: could not release load batches", exc_info=True)
+            self._deferred_load_failed(req_meta, e, [])
+        finally:
+            self._deferred_load_accounted(req_meta.req_id)
+
+    def _settle_parked_loads(self, wait: bool = False) -> bool:
+        """Give back the batches of parked loads whose copies ended, oldest
+        first, and report each request once its last batch has.
+
+        Args:
+            wait: Wait first for the oldest batch still copying.
+
+        Returns:
+            Whether a batch was waited for. A CUDA error from a wait or query
+            stops the worker, and every parked load keeps its batches; a
+            stopped worker gives none back.
+        """
+        if self._stopped is not None:
+            return False
+        waited = False
+        if wait:
+            with self._deferred_lock:
+                oldest = next(
+                    (
+                        (req_id, load[1][0])
+                        for req_id, load in self._parked_loads.items()
+                        if load[1]
+                    ),
+                    None,
+                )
+            if oldest is None:
+                return False
+            req_id, batch = oldest
+            try:
+                batch[0].synchronize()
+            except Exception as e:
+                self._parked_load_failed(req_id, e, batch)
+                return False
+            waited = True
+        released: list[Any] = []
+        finished = []
+        failed = None
+        with self._deferred_lock:
+            for req_id, load in list(self._parked_loads.items()):
+                pending = load[1]
+                try:
+                    while pending and self._stopped is None and pending[0][0].query():
+                        released.append(pending.popleft()[1])
+                except Exception as e:
+                    failed = (req_id, e, pending[0])
+                    break
+                if self._stopped is not None:
+                    break
+                if not pending:
+                    finished.append(self._parked_loads.pop(req_id))
+        self._release_reads(released)
+        for req_meta, _, chunk_keys, batches in finished:
+            self._leased_load_done(req_meta, chunk_keys, batches)
+        if failed is not None:
+            self._parked_load_failed(*failed)
+            return False
+        return waited
+
+    def _parked_load_failed(
+        self, req_id: str, error: BaseException, batch: tuple[Any, list[Any], Any]
+    ) -> None:
+        """A wait or query of a parked ``batch`` of ``req_id`` failed. A CUDA
+        error stops the worker: none of the parked loads is known to have
+        ended, and all keep their batches. Otherwise, as a leased batch's
+        failed wait, the load is recomputed from that batch and its batches
+        keep their slots."""
+        if self._stop_if_unconfirmed(error, batch, req_id=req_id):
+            return
+        logger.error(
+            "Maru: could not wait for queued load copies of req %s: %s", req_id, error
+        )
+        with self._deferred_lock:
+            load = self._parked_loads.pop(req_id, None)
+        if load is None:
+            return
+        req_meta, pending, *_ = load
+        rest = pending[0][2] if pending else req_meta
+        pending.clear()
+        self._fail_deferred_load(rest)
 
     def _leased_batch_size(self, handler: Any, chunks: int, offthread: bool) -> int:
         """Chunks the next leased batch may hold.
@@ -7460,6 +7851,8 @@ class MaruWorkerConnector:
         self._raise_if_stopped()
         # Also when no step loads: a read goes back once its copies end
         self._release_completed_load_refs()
+        self._settle_parked_loads()
+        self._raise_if_stopped()  # a parked load's query may have stopped it
         released: list[Any] = []
         with self._deferred_lock:
             # Also a stop made while this thread waited for the lock
@@ -7497,6 +7890,7 @@ class MaruWorkerConnector:
             active = (
                 self._inflight_deferred_req_ids
                 | self._deferred_events.keys()
+                | self._parked_loads.keys()
                 | self._deferred_done
             )
         stale = finished_req_ids - active
@@ -7898,7 +8292,12 @@ class MaruWorkerConnector:
                             # slab like the deferred path does, keeping one
                             # placement launch per chunk.
                             slab_src = slab_host
-                            if not slab_host.is_pinned():
+                            # A maru_node loader thread's kernel would hold
+                            # SMs for its whole read of host memory and
+                            # stall the forward beside it: the copy engine
+                            # moves the slab first, as the deferred path does.
+                            dma = stream is not None and self._node_mode
+                            if dma or not slab_host.is_pinned():
                                 slab_src = slab_host.to(dev, non_blocking=True)
                                 staged_chunks[req_meta.req_id] = (
                                     staged_chunks.get(req_meta.req_id, 0) + 1
@@ -10358,6 +10757,7 @@ class MaruWorkerConnector:
             [
                 self._active_load_refs,
                 self._deferred_refs,
+                [list(load[1]) for load in self._parked_loads.values()],
                 self._deferred_layerwise_loads,
             ]
         )
@@ -10367,6 +10767,7 @@ class MaruWorkerConnector:
             self._deferred_layerwise_events.clear()
             self._deferred_events.clear()
             self._deferred_refs.clear()
+            self._parked_loads.clear()
             self._deferred_done.clear()
             self._recv_only_finished_req_ids.clear()
             self._inflight_deferred_req_ids.clear()
