@@ -42,7 +42,11 @@ class Node:
         self.pause_s = pause_s
         self.max_pause_s = max_pause_s
         self._stop = threading.Event()
-        self._ownership = NodeOwnership(config.socket)
+        self._ownership = NodeOwnership(
+            config.state_dir,
+            config.node_id,
+            config.socket if config.role == "gpu" else None,
+        )
         self.service: NodeRun | None = None
         self.runs = 0
         # Why the last run ended on its own

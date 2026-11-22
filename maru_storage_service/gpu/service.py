@@ -51,7 +51,7 @@ class GpuNode:
         )
 
     def bind(self, run: NodeRun) -> None:
-        """Bind the workers' socket under the node's ownership lock."""
+        """Bind the worker socket with both ownership locks held."""
         config = run.config
         self.local = LocalServer(
             config.socket,

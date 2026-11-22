@@ -239,6 +239,7 @@ def _write_config(path: str, raw: dict) -> str:
 def _raw_config(fake, socket_path, hugepage=False, size=16 * PAGE):
     return {
         "node_id": "cli-node",
+        "state_dir": os.path.dirname(socket_path),
         "socket": socket_path,
         "server": fake.url,
         "page_size": PAGE,

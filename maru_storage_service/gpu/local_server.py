@@ -42,7 +42,7 @@ from maru_common.storage_types import (
     Status,
 )
 
-from ..ownership import LocalServerError, NodeOwnership
+from ..ownership import FileLock, LocalServerError, NodeOwnership
 from .worker_registry import AttachIdentity, WorkerRecord
 from .workers import WorkerOps
 
@@ -289,7 +289,7 @@ class LocalServer:
         self._lock = threading.Lock()
         self._conns: set[Connection] = set()
         self._sock: socket.socket | None = None
-        self._ownership = ownership or NodeOwnership(path)
+        self._ownership = ownership or FileLock(f"{path}.lock")
         self._owns_ownership = ownership is None
         self._bound: tuple[int, int] | None = None  # (st_dev, st_ino) we created
         self._accept: threading.Thread | None = None

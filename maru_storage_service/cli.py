@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""``maru-storage``: serve a node until SIGTERM/SIGINT, then NODE_CLOSE(restart).
-A run that ends on its own is followed by a new run in this process.
-``--check`` prints the resolved config."""
+"""Node commands, config checks and signal handling."""
 
 import argparse
 import dataclasses
@@ -17,7 +15,14 @@ from typing import Any
 
 from maru_common import gc_freeze
 
-from .config import NodeConfig, NodeConfigError, load_node_config
+from .config import (
+    GPU_KEYS,
+    MEMORY_KEYS,
+    WORKER_BUDGET_KEYS,
+    NodeConfig,
+    NodeConfigError,
+    load_node_config,
+)
 from .drivers.registry import TIERS
 
 EXIT_CONFIG = 2
@@ -66,12 +71,29 @@ def config_to_dict(config: NodeConfig) -> dict[str, Any]:
         for t in config.tiers
     ]
     out.pop("source", None)
+    out.pop("role")
+    if config.role == "memory":
+        for key in GPU_KEYS:
+            out.pop(key)
+        for key in WORKER_BUDGET_KEYS:
+            out["budgets"].pop(key)
+    else:
+        for key in MEMORY_KEYS:
+            out.pop(key)
     return out
 
 
 def main(argv: list[str] | None = None) -> int:
+    return _main(argv, "gpu", "maru-storage")
+
+
+def memory_main(argv: list[str] | None = None) -> int:
+    return _main(argv, "memory", "maru-memory-node")
+
+
+def _main(argv: list[str] | None, role: str, command: str) -> int:
     parser = argparse.ArgumentParser(
-        prog="maru-storage",
+        prog=command,
         description="StorageService: the pool manager of one maru node.",
     )
     parser.add_argument("--config", required=True, help="node config file (JSON)")
@@ -85,16 +107,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        config = load_node_config(args.config)
+        config = load_node_config(args.config, role=role)
     except NodeConfigError as e:
-        print(f"maru-storage: {e}", file=sys.stderr)
+        print(f"{command}: {e}", file=sys.stderr)
         return EXIT_CONFIG
     from .service import NotServableError, check_servable
 
     try:
         check_servable(config)
     except NotServableError as e:
-        print(f"maru-storage: {e}", file=sys.stderr)
+        print(f"{command}: {e}", file=sys.stderr)
         return EXIT_NOT_SERVING
     if args.check:
         print(json.dumps(config_to_dict(config), indent=2))
@@ -122,6 +144,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     from .server_client import NodeOpenError
     from .service import Node, NotServableError
 
+    command = "maru-memory-node" if config.role == "memory" else "maru-storage"
     logging.basicConfig(
         level=log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -129,7 +152,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     try:
         node = Node(config)
     except NotServableError as e:
-        print(f"maru-storage: {e}", file=sys.stderr)
+        print(f"{command}: {e}", file=sys.stderr)
         return EXIT_NOT_SERVING
 
     rfd, wfd = os.pipe()
@@ -163,16 +186,14 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
             NodeOpenError,
             OSError,
         ) as e:
-            print(f"maru-storage: cannot start: {e}", file=sys.stderr)
+            print(f"{command}: cannot start: {e}", file=sys.stderr)
             if node.failed is not None:
                 return EXIT_FAILED
             return EXIT_START
         if node.failed is not None:
-            print(
-                f"maru-storage: a run's teardown failed: {node.failed}", file=sys.stderr
-            )
+            print(f"{command}: a run's teardown failed: {node.failed}", file=sys.stderr)
             return EXIT_FAILED
-        print(f"maru-storage: stopped: {node.ended}", file=sys.stderr)
+        print(f"{command}: stopped: {node.ended}", file=sys.stderr)
         return EXIT_LOST
     finally:
         for sig, handler in previous.items():

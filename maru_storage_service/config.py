@@ -32,6 +32,7 @@ from .tiers import Level
 # node_id goes into pool ids such as dram:{node_id}:{node_epoch}
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ROLES = ("gpu", "memory")
+DEFAULT_STATE_DIR = "/run/maru"
 
 DEFAULT_HIGH_WATERMARK = 0.9
 DEFAULT_LOW_WATERMARK = 0.8
@@ -51,15 +52,20 @@ DEFAULT_FETCH_MAX_INFLIGHT = 4 << 30
 
 _TOP_KEYS = {
     "node_id",
-    "role",
-    "socket",
-    "socket_group",
+    "state_dir",
     "server",
     "page_size",
-    "local_pin",
     "tiers",
     "budgets",
-    "remote_server",
+}
+GPU_KEYS = {"socket", "socket_group", "local_pin"}
+MEMORY_KEYS = {"remote_server"}
+WORKER_BUDGET_KEYS = {
+    "credit_max_bytes",
+    "credit_refill_low",
+    "credit_refill_high",
+    "fetch_request_max_bytes",
+    "fetch_max_inflight_bytes",
 }
 _BUDGET_KEYS = {
     "credit_max_bytes",
@@ -119,6 +125,7 @@ class NodeConfig:
     local_pin: bool
     tiers: tuple[TierConfig, ...]
     budgets: Budgets
+    state_dir: str = DEFAULT_STATE_DIR
     remote_server: RemoteServerConfig | None = None
     # Group the socket is given to (mode 0660); None keeps the service's group
     socket_group: str | None = None
@@ -204,8 +211,11 @@ def _parse_tier(
     return TierConfig(**tier)
 
 
-def _parse_budgets(raw: Any, page_size: int, tiers: tuple[TierConfig, ...]) -> Budgets:
-    raw = _require_keys(raw if raw is not None else {}, _BUDGET_KEYS, "budgets")
+def _parse_budgets(
+    raw: Any, page_size: int, tiers: tuple[TierConfig, ...], role: str
+) -> Budgets:
+    keys = _BUDGET_KEYS if role == "gpu" else _BUDGET_KEYS - WORKER_BUDGET_KEYS
+    raw = _require_keys(raw if raw is not None else {}, keys, "budgets")
     top = tiers[0]
 
     def size_or(key: str, default: int | None, why: str = "") -> int:
@@ -348,15 +358,23 @@ def _parse_remote_server(raw: Any, budgets: Budgets) -> RemoteServerConfig:
     )
 
 
-def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
+def parse_node_config(raw: Any, source: str = "", *, role: str = "gpu") -> NodeConfig:
     """Check a decoded node config and fill its defaults."""
-    raw = _require_keys(raw, _TOP_KEYS, "config")
+    if role not in ROLES:
+        raise ValueError(f"unknown node role: {role!r}")
+    if isinstance(raw, dict) and "role" in raw:
+        raise NodeConfigError(
+            "config.role: run maru-storage for a GPU node or maru-memory-node for a memory node"
+        )
+    keys = _TOP_KEYS | (GPU_KEYS if role == "gpu" else MEMORY_KEYS)
+    raw = _require_keys(raw, keys, "config")
     node_id = _str(raw, "node_id", "config")
     if not _NODE_ID_RE.match(node_id):
         raise NodeConfigError(
             f"config.node_id: letters, digits, '.', '_' and '-' only, got {node_id!r}"
         )
     server = _str(raw, "server", "config")
+    state_dir = os.path.expanduser(_str(raw, "state_dir", "config", DEFAULT_STATE_DIR))
     socket_path = _str(raw, "socket", "config", DEFAULT_NODE_SOCKET)
     socket_group = None
     if raw.get("socket_group") is not None:
@@ -367,9 +385,6 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
             raise NodeConfigError(
                 f"config.socket_group: no group named {socket_group!r}"
             ) from None
-    role = raw.get("role", "gpu")
-    if role not in ROLES:
-        raise NodeConfigError(f"config.role: one of {list(ROLES)}, got {role!r}")
     if "page_size" not in raw:
         raise NodeConfigError("config.page_size: required")
     page_size = parse_size(raw["page_size"], "config.page_size")
@@ -393,13 +408,9 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
             f"config.tiers: a memory node cannot have a {tiers[0].store} tier"
         )
 
-    budgets = _parse_budgets(raw.get("budgets"), page_size, tiers)
+    budgets = _parse_budgets(raw.get("budgets"), page_size, tiers, role)
     remote_server = None
     if raw.get("remote_server") is not None:
-        if role != "memory":
-            raise NodeConfigError(
-                "config.remote_server: only a memory node serves other nodes"
-            )
         remote_server = _parse_remote_server(raw["remote_server"], budgets)
     return NodeConfig(
         node_id=node_id,
@@ -411,6 +422,7 @@ def parse_node_config(raw: Any, source: str = "") -> NodeConfig:
         local_pin=local_pin,
         tiers=tiers,
         budgets=budgets,
+        state_dir=state_dir,
         remote_server=remote_server,
         source=source,
     )
@@ -428,7 +440,7 @@ def _reject_constant(name: str) -> Any:
     raise NodeConfigError(f"{name} is not a valid number here")
 
 
-def load_node_config(path: str | Path) -> NodeConfig:
+def load_node_config(path: str | Path, *, role: str = "gpu") -> NodeConfig:
     """Read and check the node config file."""
     path = Path(path)
     try:
@@ -447,6 +459,6 @@ def load_node_config(path: str | Path) -> NodeConfig:
     except NodeConfigError as e:
         raise NodeConfigError(f"{path}: {e}") from None
     try:
-        return parse_node_config(raw, source=str(path))
+        return parse_node_config(raw, source=str(path), role=role)
     except NodeConfigError as e:
         raise NodeConfigError(f"{path}: {e}") from None

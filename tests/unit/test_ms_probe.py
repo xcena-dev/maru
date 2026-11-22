@@ -499,6 +499,7 @@ class TestStepCredit:
         config = parse_node_config(
             {
                 "node_id": "gpu-step",
+                "state_dir": sockdir,
                 "socket": f"{sockdir}/node.sock",
                 "server": fake.url,
                 "page_size": PAGE,

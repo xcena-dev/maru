@@ -8,9 +8,6 @@ from collections.abc import Callable
 from .config import NodeConfig
 from .config_fields import NotServableError as NotServableError
 from .drivers.cxl import DEFAULT_RENEW_S, CxlRegionPool, RegionSource
-from .gpu.service import GpuNode
-from .gpu.workers import DEFAULT_GPU_DRAIN_GRACE_S
-from .memory.service import MemoryNode
 from .node import NEW_RUN_PAUSE_MAX_S, NEW_RUN_PAUSE_S
 from .node import Node as CoreNode
 from .node_run import DEFAULT_UNMAP_TIMEOUT_S, NodeRun
@@ -30,7 +27,7 @@ class StorageService(NodeRun):
         config: NodeConfig,
         *,
         rpc_timeout_s: float = 2.0,
-        gpu_drain_grace_s: float = DEFAULT_GPU_DRAIN_GRACE_S,
+        gpu_drain_grace_s: float = 5.0,
         evict_interval_s: float = DEFAULT_EVICT_INTERVAL_S,
         kept_backoff_s: float = DEFAULT_KEPT_BACKOFF_S,
         host_boot_id: str | None = None,
@@ -42,7 +39,14 @@ class StorageService(NodeRun):
         transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
     ):
-        role = MemoryNode() if config.role == "memory" else GpuNode()
+        if config.role == "memory":
+            from .memory.service import MemoryNode
+
+            role = MemoryNode()
+        else:
+            from .gpu.service import GpuNode
+
+            role = GpuNode()
         super().__init__(
             config,
             role=role,

@@ -304,6 +304,7 @@ def test_a_registered_store_is_started_by_the_service(monkeypatch, caplog):
         config = parse_node_config(
             {
                 "node_id": "gpu-test",
+                "state_dir": sockdir,
                 "socket": f"{sockdir}/node.sock",
                 "server": server.url,
                 "page_size": NODE_PAGE,
@@ -346,6 +347,7 @@ def test_a_spec_that_misstates_leased_fails_the_start(monkeypatch):
         {
             "node_id": "gpu-test",
             "socket": "/tmp/maru-plugin.sock",
+            "state_dir": "/tmp/maru-plugin-state",
             "server": "tcp://localhost:1",
             "page_size": NODE_PAGE,
             "tiers": [{"store": "fake", "size": 16 * NODE_PAGE}],
@@ -490,6 +492,7 @@ def leased_config(server_url: str, sockdir: str):
         {
             "node_id": "gpu-test",
             "socket": f"{sockdir}/node.sock",
+            "state_dir": sockdir,
             "server": server_url,
             "page_size": NODE_PAGE,
             "tiers": [

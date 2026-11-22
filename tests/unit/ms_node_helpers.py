@@ -114,16 +114,19 @@ def node_config(
         }
     if role == "memory":
         tier.update(high_watermark=high, low_watermark=low)
+        for key in ("credit_max_bytes", "credit_refill_low", "credit_refill_high"):
+            defaults.pop(key, None)
     return parse_node_config(
         {
             "node_id": node_id,
-            "role": role,
-            "socket": socket_path,
+            "state_dir": os.path.dirname(socket_path),
+            **({"socket": socket_path} if role == "gpu" else {}),
             "server": server_url,
             "page_size": page_size,
             "tiers": [tier],
             "budgets": defaults,
-        }
+        },
+        role=role,
     )
 
 

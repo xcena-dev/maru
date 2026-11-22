@@ -132,7 +132,11 @@ class NodeRun:
         self.pools: PoolManager | None = None
         self.server: ServerClient | None = None
         self.store: NodeStore | None = None
-        self._ownership = NodeOwnership(config.socket)
+        self._ownership = NodeOwnership(
+            config.state_dir,
+            config.node_id,
+            config.socket if config.role == "gpu" else None,
+        )
         self._owns_ownership = True
         # Pools taken over from the run before: adopted or claimed from the RM
         self.adopted: list[str] = []

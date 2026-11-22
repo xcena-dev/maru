@@ -9,7 +9,13 @@ import json
 import pytest
 
 from maru_common.storage_types import PoolKind, Visibility
-from maru_storage_service.cli import EXIT_CONFIG, EXIT_NOT_SERVING, config_to_dict, main
+from maru_storage_service.cli import (
+    EXIT_CONFIG,
+    EXIT_NOT_SERVING,
+    config_to_dict,
+    main,
+    memory_main,
+)
 from maru_storage_service.config import (
     DEFAULT_RM,
     NodeConfigError,
@@ -35,7 +41,8 @@ GPU_NODE = {
     "tiers": [{"store": "dram", "size": "64G"}],
 }
 LOCAL_CXL_NODE = {**GPU_NODE, "tiers": [{"store": "local_cxl", "size": "256G"}]}
-MEMORY_NODE = {**LOCAL_CXL_NODE, "node_id": "mem-1", "role": "memory"}
+MEMORY_NODE = {k: v for k, v in LOCAL_CXL_NODE.items() if k != "socket"}
+MEMORY_NODE["node_id"] = "mem-1"
 
 
 def edit(base, **changes):
@@ -50,9 +57,9 @@ def with_tier(base, index, **changes):
     return raw
 
 
-def rejects(raw, match):
+def rejects(raw, match, role="gpu"):
     with pytest.raises(NodeConfigError, match=match):
-        parse_node_config(raw)
+        parse_node_config(raw, role=role)
 
 
 class TestSize:
@@ -198,15 +205,15 @@ class TestTierConfigCopies:
 
 
 @pytest.mark.parametrize(
-    "raw,store,kind",
+    "raw,role,store,kind",
     [
-        (GPU_NODE, "dram", PoolKind.DRAM),
-        (LOCAL_CXL_NODE, "local_cxl", PoolKind.CXL),
-        (MEMORY_NODE, "local_cxl", PoolKind.CXL),
+        (GPU_NODE, "gpu", "dram", PoolKind.DRAM),
+        (LOCAL_CXL_NODE, "gpu", "local_cxl", PoolKind.CXL),
+        (MEMORY_NODE, "memory", "local_cxl", PoolKind.CXL),
     ],
 )
-def test_single_store_examples(raw, store, kind):
-    c = parse_node_config(raw)
+def test_single_store_examples(raw, role, store, kind):
+    c = parse_node_config(raw, role=role)
     check_servable(c)
     assert len(c.tiers) == 1 and c.top.store == store
     assert c.traits()[store].kind is kind
@@ -222,9 +229,12 @@ def test_single_store_examples(raw, store, kind):
 @pytest.mark.parametrize("role", ["gpu", "memory"])
 @pytest.mark.parametrize("count", [0, 2, 3])
 def test_a_node_serves_one_store(role, count):
-    raw = edit(GPU_NODE, role=role, tiers=[{"store": "dram", "size": "64G"}] * count)
+    raw = edit(
+        GPU_NODE if role == "gpu" else MEMORY_NODE,
+        tiers=[{"store": "dram", "size": "64G"}] * count,
+    )
     with pytest.raises(NodeConfigError) as err:
-        parse_node_config(raw)
+        parse_node_config(raw, role=role)
     assert (
         str(err.value)
         == f"tiers: a node serves one store (dram, local_cxl or remote), got {count}"
@@ -268,12 +278,12 @@ def test_memory_watermarks(store, low, high):
             }
         ],
     )
-    rejects(raw, "watermark")
+    rejects(raw, "watermark", role="memory")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
 def test_watermarks_are_finite_numbers(value):
-    rejects(with_tier(MEMORY_NODE, 0, high_watermark=value), "finite")
+    rejects(with_tier(MEMORY_NODE, 0, high_watermark=value), "finite", role="memory")
 
 
 @pytest.mark.parametrize(
@@ -322,19 +332,23 @@ def test_local_cxl_without_size_needs_explicit_budgets():
         check_servable(c)
 
 
-@pytest.mark.parametrize("raw", [GPU_NODE, LOCAL_CXL_NODE, MEMORY_NODE])
-def test_budget_defaults_and_reserve_names(raw):
-    c = parse_node_config(raw)
+@pytest.mark.parametrize(
+    "raw,role", [(GPU_NODE, "gpu"), (LOCAL_CXL_NODE, "gpu"), (MEMORY_NODE, "memory")]
+)
+def test_budget_defaults_and_reserve_names(raw, role):
+    c = parse_node_config(raw, role=role)
     b, size = c.budgets, c.top.size
     assert b.credit_total_max_bytes == int(size * 0.25)
     assert b.commit_pending_max_bytes == b.credit_total_max_bytes
     assert b.transfer_reserve_bytes == {c.top.store: int(size * 0.05)}
     c = parse_node_config(
-        edit(raw, budgets={"transfer_reserve_bytes": {c.top.store: "1G"}})
+        edit(raw, budgets={"transfer_reserve_bytes": {c.top.store: "1G"}}), role=role
     )
     assert c.budgets.transfer_reserve_bytes == {c.top.store: G}
     rejects(
-        edit(raw, budgets={"transfer_reserve_bytes": {"other": "1G"}}), "no memory tier"
+        edit(raw, budgets={"transfer_reserve_bytes": {"other": "1G"}}),
+        "no memory tier",
+        role=role,
     )
 
 
@@ -401,15 +415,22 @@ def test_cli_and_start_refuse_unservable_config(tmp_path, capsys, check):
     assert "local_cxl tier needs a size" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("raw", [GPU_NODE, LOCAL_CXL_NODE, MEMORY_NODE])
-def test_check_prints_resolved_config(tmp_path, capsys, raw):
+@pytest.mark.parametrize(
+    "raw,role,command",
+    [
+        (GPU_NODE, "gpu", main),
+        (LOCAL_CXL_NODE, "gpu", main),
+        (MEMORY_NODE, "memory", memory_main),
+    ],
+)
+def test_check_prints_resolved_config(tmp_path, capsys, raw, role, command):
     path = tmp_path / "node.json"
     path.write_text(json.dumps(raw))
-    assert main(["--config", str(path), "--check"]) == 0
+    assert command(["--config", str(path), "--check"]) == 0
     c = json.loads(capsys.readouterr().out)
     assert c["tiers"][0]["store"] == raw["tiers"][0]["store"]
     assert c["page_size"] == 32 * M
-    assert parse_node_config(c) == load_node_config(path)
+    assert parse_node_config(c, role=role) == load_node_config(path, role=role)
 
 
 @pytest.mark.parametrize("key", ["stage_workers", "stage_queue"])
@@ -418,7 +439,7 @@ def test_remote_server_refuses_unserved_keys(key):
         MEMORY_NODE,
         remote_server={"listen": "localhost:5600", "key_file": "/tmp/key", key: 1},
     )
-    rejects(raw, "unknown keys")
+    rejects(raw, "unknown keys", role="memory")
 
 
 def test_remote_server_settings_are_not_silently_ignored():
@@ -426,7 +447,7 @@ def test_remote_server_settings_are_not_silently_ignored():
         MEMORY_NODE, remote_server={"listen": "localhost:5600", "key_file": "/tmp/key"}
     )
     with pytest.raises(NotServableError, match="remote_server is not served"):
-        check_servable(parse_node_config(raw))
+        check_servable(parse_node_config(raw, role="memory"))
 
 
 def test_a_registered_store_is_parsed_by_its_spec(monkeypatch):

@@ -386,8 +386,8 @@ def cxl_only_config(
     return parse_node_config(
         {
             "node_id": "gpu-test",
-            "role": role,
-            "socket": f"{sockdir}/node.sock",
+            "state_dir": sockdir,
+            **({"socket": f"{sockdir}/node.sock"} if role == "gpu" else {}),
             "server": fake.url,
             "page_size": PAGE,
             "tiers": [
@@ -403,14 +403,21 @@ def cxl_only_config(
                 }
             ],
             "budgets": {
-                "credit_max_bytes": 4 * PAGE,
                 "credit_total_max_bytes": 8 * PAGE,
-                "credit_refill_low": PAGE,
-                "credit_refill_high": 4 * PAGE,
+                **(
+                    {
+                        "credit_max_bytes": 4 * PAGE,
+                        "credit_refill_low": PAGE,
+                        "credit_refill_high": 4 * PAGE,
+                    }
+                    if role == "gpu"
+                    else {}
+                ),
                 "commit_pending_max_bytes": 4 * PAGE,
                 "transfer_reserve_bytes": PAGE,
             },
-        }
+        },
+        role=role,
     )
 
 

@@ -19,7 +19,6 @@ def test_one_tier_nodes_drop_as_before():
             config = parse_node_config(
                 {
                     "node_id": "n",
-                    "role": role,
                     "server": "tcp://localhost:5556",
                     "page_size": "1M",
                     "tiers": [
@@ -29,7 +28,8 @@ def test_one_tier_nodes_drop_as_before():
                             **({"region_size": "4M"} if store == "local_cxl" else {}),
                         }
                     ],
-                }
+                },
+                role=role,
             )
             traits = config.traits()[store]
             assert traits.credit
