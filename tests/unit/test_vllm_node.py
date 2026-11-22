@@ -1716,6 +1716,8 @@ def test_copies_that_cannot_be_asked_about_stop_the_worker(parked):
     worker._store_packed_slabs_write_behind = MagicMock()
     assert stopped(worker, "req r1" if parked else UNCONFIRMED)
     # Nor does a stopped worker issue the stores the step queued
+    with pytest.raises(_UnconfirmedCopyError):
+        worker.get_finished_saving({"r1"})
     worker._store_packed_slabs_write_behind.assert_not_called()
 
 
@@ -2312,7 +2314,7 @@ def group_loader(monkeypatch, slots: int | None = None):
         reads.extend(lease(key) for key in keys)
         return reads[-len(keys) :]
 
-    def place(meta, objects, device, stage):
+    def place(meta, objects, device, stage, refs):
         log.append(f"copy {meta.req_id}")
 
     worker._handler.batch_retrieve.side_effect = retrieve
@@ -2419,7 +2421,7 @@ def test_shutdown_gives_back_parked_group_reads_only_once_drained(monkeypatch, d
         handler.release_retrieved.assert_not_called()
         handler.close.assert_not_called()
         parked = worker._parked_loads["r1"][1]
-        assert [batch for _, batch, _ in parked] == [reads]
+        assert [batch[0] for _, batch, _ in parked] == [reads]
         assert is_kept(worker)
 
 
@@ -2496,8 +2498,9 @@ def submit(worker, *req_ids: str) -> list[MaruReqMeta]:
     """Queue the parked loads of ``req_ids`` as _try_submit_deferred_load
     does; run() runs them."""
     metas = [parked_meta(req_id) for req_id in req_ids]
-    with worker._deferred_lock:
+    with worker._loader_jobs_lock:
         worker._loader_jobs += len(metas)
+    with worker._deferred_lock:
         for meta in metas:
             worker._inflight_deferred_req_ids.add(meta.req_id)
             worker._loaded_request_keys[meta.req_id] = (meta, set())
@@ -2508,7 +2511,7 @@ def run(worker, *metas: MaruReqMeta) -> None:
     """Run queued loader jobs in order, on this thread."""
     for meta in metas:
         worker._in_fetch_scope(
-            meta.req_id,
+            meta,
             worker._deferred_load_job,
             meta,
             [("layer", torch.zeros(1), 0)],
@@ -2647,11 +2650,16 @@ def test_shutdown_takes_the_answer_of_a_fetch_in_flight_before_closing(monkeypat
         assert gate.wait(5)
 
     layers = [("layer", torch.zeros(1), 0)]
-    worker._submit_load_job("hold", hold.wait, 5)
+    meta = parked_meta("r1")
+    worker._submit_load_job(parked_meta("hold"), hold.wait, 5)
     worker._submit_load_job(
-        "r1", worker._deferred_load_job, parked_meta("r1"), layers, torch.device("cpu")
+        meta,
+        worker._deferred_load_job,
+        meta,
+        layers,
+        torch.device("cpu"),
     )
-    worker._submit_load_job("gate", held)
+    worker._submit_load_job(parked_meta("gate"), held)
     hold.set()
     assert waiting.wait(5)
     # r1's job ended with its FETCH in flight: the gate job follows it
