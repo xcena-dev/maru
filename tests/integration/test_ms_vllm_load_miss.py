@@ -326,7 +326,7 @@ def test_a_chunk_retired_after_the_probe_is_recomputed(engine, doomed):
     assert len(reported) == 1
     assert len(reported[0]) == (CHUNKS - first) * CHUNK // 16  # 16-token blocks
     assert engine.recving[recving:].count(rid) == 1
-    assert engine.worker._worker._load_stopped is None
+    assert engine.worker._worker._stopped is None
 
     # Nothing held: no read in either client, no pin in MaruServer
     engine.settle()

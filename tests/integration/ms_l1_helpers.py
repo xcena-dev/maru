@@ -52,6 +52,8 @@ def l1_config(server, socket, *, store="dram", **kwargs):
     raw["tiers"] = [
         {"store": store, "size": size, "region_size": region, "rm": address}
     ]
+    reserves = raw["budgets"]["transfer_reserve_bytes"]
+    raw["budgets"]["transfer_reserve_bytes"] = {store: reserves["dram"]}
     if config.role == "memory":
         raw["tiers"][0].update(
             high_watermark=config.top.high_watermark,
