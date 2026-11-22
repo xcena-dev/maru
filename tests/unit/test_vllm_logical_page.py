@@ -611,6 +611,103 @@ class TestPackedSlab:
         for layer in self._names():
             torch.testing.assert_close(dst[layer], src[layer])
 
+    @requires_kernel
+    @pytest.mark.parametrize("node", [True, False], ids=["maru_node", "other"])
+    def test_a_loader_thread_stages_pinned_slabs_on_maru_node(self, node):
+        """Off the engine thread a maru_node load moves each pinned slab to
+        the device with the copy engine before the kernel places it (a kernel
+        reading host memory holds SMs beside the forward); other backends'
+        loads read it in place."""
+        name = LAYOUTS[0]
+        k, v = self._kv()
+        src = dict(zip(self._names(), logical_pages(name, k, v, "cuda"), strict=True))
+        writer = self._worker(src, name)
+        stored: dict[str, torch.Tensor] = {}
+
+        def alloc(nbytes, **_):
+            slab = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+            return SimpleNamespace(buf=memoryview(slab.numpy()), slab=slab)
+
+        def batch_store(keys, handles):
+            stored.update({key: h.slab for key, h in zip(keys, handles, strict=True)})
+            return [True] * len(keys)
+
+        writer._handler = MagicMock()
+        writer._handler.alloc.side_effect = alloc
+        writer._handler.batch_store.side_effect = batch_store
+        meta = make_flash_attn_metadata()
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(self.NUM_BLOCKS)),
+            num_scheduled_tokens=self.PROMPT,
+        )
+        for layer, cache in src.items():
+            writer.save_kv_layer(layer, cache, meta, metadata)
+        chunks = len(_chunk_keys(token_ids, self.CHUNK))
+
+        zeros = [torch.zeros_like(t) for t in k]
+        dst = dict(
+            zip(self._names(), logical_pages(name, zeros, zeros, "cuda"), strict=True)
+        )
+        reader = self._worker(dst, name)
+        reader._handler = MagicMock()
+        reader._handler.storage_gpu_accessible.return_value = True
+        reader._handler.batch_retrieve.side_effect = lambda keys: [
+            SimpleNamespace(
+                view=memoryview(stored[key].numpy()), region_id=0, page_index=i
+            )
+            for i, key in enumerate(keys)
+        ]
+        handed: list[tuple[str, bool]] = []
+        build = reader._packed_load_kernel_ctx
+
+        def spying(*args):
+            ops, *rest = build(*args)
+
+            def transfer(slab, *a, **kw):
+                handed.append((slab.device.type, slab.is_pinned()))
+                return ops.multi_layer_kv_transfer(slab, *a, **kw)
+
+            spy = SimpleNamespace(
+                multi_layer_kv_transfer=transfer,
+                TransferDirection=ops.TransferDirection,
+            )
+            return (spy, *rest)
+
+        reader._packed_load_kernel_ctx = spying
+        loader = torch.cuda.Stream()
+        load = reader._load_packed
+
+        def as_loader(layers, prepared, attn):
+            """As a loader thread of the backend loads: on its own stream."""
+            reader._node_mode = reader._leased_mode = node
+            try:
+                return load(layers, prepared, attn, stream=loader, wait=True)
+            finally:
+                reader._node_mode = reader._leased_mode = False
+
+        reader._load_packed = as_loader
+        reader.start_load_kv(
+            SimpleNamespace(
+                no_compile_layers={
+                    layer: SimpleNamespace(kv_cache=t) for layer, t in dst.items()
+                },
+                attn_metadata=meta,
+            ),
+            deferred_metadata(
+                token_ids=token_ids,
+                block_ids=list(range(self.NUM_BLOCKS)),
+                num_matched_chunks=chunks,
+                deferred_load=False,
+            ),
+        )
+        torch.cuda.synchronize()
+        assert reader.take_failed_load_blocks() == set()
+        assert handed == [("cuda", False) if node else ("cpu", True)] * chunks
+        for layer in self._names():
+            torch.testing.assert_close(dst[layer], src[layer])
+
 
 @requires_kernel
 @pytest.mark.parametrize(
