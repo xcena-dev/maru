@@ -1263,9 +1263,7 @@ class MaruClient:
                 return reply
             if resend:
                 if code == NodeMessageType.FETCH:
-                    # The scope's time left; past it, 1 ms: its cancel went
-                    # first, so the node answers at once and the op resolves
-                    deadline = next(
+                    scope_deadline = next(
                         (
                             s.deadline
                             for s in self._fetch_scopes
@@ -1273,9 +1271,12 @@ class MaruClient:
                         ),
                         None,
                     )
-                    if deadline is not None:
-                        left = int((deadline - time.monotonic()) * 1000)
+                    if scope_deadline is not None:
+                        left = int((scope_deadline - time.monotonic()) * 1000)
                         request = dataclasses.replace(request, deadline_ms=max(1, left))
+                    if deadline is None:
+                        # Recovery sends have their own bounded I/O budget.
+                        deadline = time.monotonic() + self.rpc_timeout_s
                 if not ops.update(request):
                     reply.set_exception(StorageUnavailableError("already resolved"))
                     return reply
@@ -2199,7 +2200,7 @@ class MaruClient:
         return None
 
     def _release_fetch_leases(self, lease_ids, node_epoch):
-        """Send each return once; keep slots until OK or STALE is answered."""
+        """Queue each return once; keep slots until OK or STALE is answered."""
         with self._lock:
             if node_epoch != self.node_epoch:
                 return
@@ -2212,12 +2213,21 @@ class MaruClient:
                 )
             )
             self._fetch_releasing.update((node_epoch, lease) for lease in ids)
+        if ids:
+            self._post(lambda: self._send_fetch_releases(storage, ids, node_epoch))
+
+    def _send_fetch_releases(self, storage, ids, node_epoch):
+        with self._lock:
+            if node_epoch != self.node_epoch:
+                return
         if storage is None or storage.closed:
             return
         for i in range(0, len(ids), MAX_BATCH):
             batch = ids[i : i + MAX_BATCH]
             future = storage.submit(
-                NodeMessageType.FETCH_RELEASE, FetchReleaseRequest(batch)
+                NodeMessageType.FETCH_RELEASE,
+                FetchReleaseRequest(batch),
+                deadline=time.monotonic() + self.rpc_timeout_s,
             )
 
             def answered(f, batch=batch):

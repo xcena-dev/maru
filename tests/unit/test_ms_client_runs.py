@@ -448,6 +448,84 @@ def test_fetch_release_is_never_retried_after_lost_reply_or_reattach(leased):
     assert len(handler._cpu._fetch_releasing) == 1
 
 
+@pytest.mark.parametrize("unknown", ["send-lock", "lost-hit"])
+def test_expired_unknown_fetch_recovers_the_same_op_after_reconnect(leased, unknown):
+    from maru_common.node_protocol import FetchItem
+    from maru_common.storage_types import FetchPlan, ItemResult, Key
+    from tests.unit.ms_node_helpers import PAGE, wait_until
+
+    handler, service, _ = leased
+    client = handler._cpu
+    old, ops = client._storage, client._ops
+    location = Location("cxl:memory:1", "source", 1, 0, PAGE, PoolKind.CXL)
+    item = FetchItem(Key("ns", "unknown"), FetchPlan(location, "memory", PAGE))
+    scope = client._new_fetch_scope("expired", deadline_ms=80)
+    replies, errors = [], []
+
+    def load():
+        try:
+            replies.append(client._fetch(scope, [item], PAGE).result(1))
+        except BaseException as e:
+            errors.append(e)
+
+    locked = unknown == "send-lock"
+    if locked:
+        old._send_lock.acquire()
+    loader = threading.Thread(target=load, daemon=True)
+    loader.start()
+    try:
+        if not locked:
+            identity = wait_until(lambda: next(iter(service.fetches), None))
+            service.answer(identity, deliver=False)
+            assert len(service.leases) == 1
+        loader.join(0.6)
+        assert not loader.is_alive() and not errors
+        assert replies[0].items[0].result is ItemResult.MISS
+        assert scope.cancelled and len(scope.pending) == 1
+        request = ops.unresolved()[0][1]
+        identity = (request.op.origin, request.op.seq)
+    finally:
+        if locked:
+            old._send_lock.release()
+        loader.join(1)
+
+    for conn in service.node.local.connections():
+        conn.close()
+    wait_until(
+        lambda: client._storage is not None and client._storage is not old,
+        timeout=2,
+    )
+
+    expected = 1 if locked else 2
+
+    def received():
+        with service.lock:
+            requests = [
+                r for code, r in service.requests if code == NodeMessageType.FETCH
+            ]
+        return requests if len(requests) == expected else None
+
+    fetches = wait_until(received, timeout=2)
+    assert all(
+        (r.op.origin, r.op.seq, r.op.digest)
+        == (request.op.origin, request.op.seq, request.op.digest)
+        for r in fetches
+    )
+    assert fetches[-1].deadline_ms == 1
+    with service.lock:
+        codes = [code for code, _ in service.requests]
+    last_fetch = len(codes) - 1 - codes[::-1].index(NodeMessageType.FETCH)
+    assert NodeMessageType.FETCH_CANCEL in codes[:last_fetch]
+    if locked:
+        service.answer(identity)
+    wait_until(lambda: not ops.unresolved() and not scope.pending, timeout=2)
+    wait_until(lambda: not service.leases and not client._fetch_releasing, timeout=2)
+    assert len(service.releases) == 1
+    assert client._ops is ops and scope not in client._fetch_scopes
+    assert not client._reads and client._fetch_used() == 0
+    assert replies[0].items[0].result is ItemResult.MISS
+
+
 @pytest.mark.parametrize("timeout", [False, True])
 def test_late_hit_is_returned_without_a_gpu_read(leased, timeout):
     from maru_common.storage_types import MissReason
@@ -650,6 +728,199 @@ def test_fetch_send_obeys_the_scope_deadline_and_preserves_framing(client, block
             conn._send_lock.release()
         thread.join(1)
         peer.close()
+
+
+def test_partial_send_failure_notifies_after_closing_and_unlocking():
+    import socket
+
+    from maru_common.ms_rpc import PLACEHOLDER_OP
+    from maru_common.node_protocol import FetchItem, FetchRequest
+    from maru_common.storage_types import FetchPlan, Key, StorageUnavailableError
+    from maru_handler.client.storage_conn import StorageConn
+
+    sock, peer = socket.socketpair()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    observations = []
+
+    def observe(*_):
+        acquired = conn._send_lock.acquire(blocking=False)
+        observations.append((conn.closed, sock.fileno(), acquired))
+        if acquired:
+            conn._send_lock.release()
+
+    conn = StorageConn("unused", on_notify=lambda *_: None, on_lost=observe)
+    conn._sock = sock
+    plan = FetchPlan(Location("pool", "source", 1, 0, M, PoolKind.CXL), "memory", M)
+    request = FetchRequest(
+        PLACEHOLDER_OP, "session", [FetchItem(Key("ns", "small"), plan)], M, 1000
+    )
+    try:
+        pending = conn.fetch(request)
+        pending.add_done_callback(observe)
+        request.items = [FetchItem(Key("ns", "k" * (128 * 1024)), plan)]
+        failed = conn.fetch(request, deadline=time.monotonic() + 0.08)
+        assert isinstance(failed.exception(), StorageUnavailableError)
+        assert isinstance(pending.exception(), StorageUnavailableError)
+        assert observations == [(True, -1, True), (True, -1, True)]
+    finally:
+        conn.close()
+        peer.close()
+
+
+def test_partial_send_and_concurrent_read_release_do_not_deadlock():
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import socket
+        import threading
+        from types import SimpleNamespace
+
+        from maru_common.config import MaruConfig
+        from maru_common.node_protocol import AttachResponse, FetchItem, recv_frame
+        from maru_common.storage_types import (
+            FetchPlan, ItemResult, Key, Location, MissReason, PoolKind, StorageLocation, Status,
+        )
+        from maru_handler.client.maru_client import MaruClient, PinnedRead
+        from maru_handler.client.storage_conn import OpTracker, StorageConn
+
+        def make_client():
+            client = MaruClient(MaruConfig(
+                maru_node="unused", engine_id="worker", cache_namespace="ns",
+                auto_connect=False, pin_pools=False, load_only=True,
+            ))
+            sock, peer = socket.socketpair()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            conn = StorageConn(
+                "unused", on_notify=lambda *_: None, on_lost=client._on_lost
+            )
+            conn._sock = sock
+            client._storage = conn
+            client.node_epoch = "node"
+            client._ops = OpTracker(client.identity.incarnation, "node")
+            client._server = SimpleNamespace(
+                session="session", server_epoch="catalog", session_node_epoch="node"
+            )
+            client.attach_info = AttachResponse(
+                Status.OK, capabilities=["fetch_v1", "lease_v1"]
+            )
+            client._start_session_threads()
+            peer.settimeout(1)
+            return client, conn, peer
+
+        client, conn, peer = make_client()
+        other, other_conn, other_peer = make_client()
+        plan = FetchPlan(Location("pool", "source", 1, 0, 1, PoolKind.CXL), "memory", 1)
+        small = FetchItem(Key("ns", "small"), plan)
+        normal_scope = client._new_fetch_scope("normal", deadline_ms=5000)
+        normal = client._fetch(normal_scope, [small], 1)
+        recv_frame(peer)
+        held = []
+        for lease in (99, 100):
+            read = PinnedRead(
+                view=memoryview(bytearray(b"held")),
+                location=StorageLocation("pool", "allocation", 1, 0, 4),
+                _release=lambda: None, lease_id=lease, node_epoch="node", fetched=True,
+            )
+            client._reads.add(read)
+            held.append(read)
+        release_started = threading.Event()
+        submit = conn.submit
+
+        def observed_submit(code, request, **kwargs):
+            from maru_common.node_protocol import NodeMessageType
+            if code == NodeMessageType.FETCH_RELEASE:
+                release_started.set()
+            return submit(code, request, **kwargs)
+
+        conn.submit = observed_submit
+        scope = client._new_fetch_scope("partial", deadline_ms=300)
+        replies, errors = [], []
+
+        def load():
+            try:
+                item = FetchItem(Key("ns", "k" * (128 * 1024)), plan)
+                replies.append(client._fetch(scope, [item], 1).result(1))
+            except BaseException as error:
+                errors.append(error)
+
+        loader = threading.Thread(target=load, daemon=True)
+        loader.start()
+        assert peer.recv(1, socket.MSG_PEEK)
+        releaser = threading.Thread(
+            target=client.release_retrieved, args=([held[0]],), daemon=True
+        )
+        releaser.start()
+        assert release_started.wait(0.2)
+        releaser.join(0.05)
+        released_before_failure = not releaser.is_alive()
+        other_scope = other._new_fetch_scope("other", deadline_ms=350)
+        other_result = other._fetch(other_scope, [small], 1)
+        loader.join(0.6)
+        releaser.join(0.1)
+        if loader.is_alive() or releaser.is_alive():
+            import faulthandler
+            faulthandler.dump_traceback()
+            raise AssertionError("partial FETCH and release deadlocked")
+        assert released_before_failure, "lease return waited for the send lock"
+        assert not errors and conn.closed
+        assert replies[0].items[0].result is ItemResult.MISS
+        assert normal.result(0.1).items[0].reason is MissReason.IO_ERROR
+        assert other_result.result(0.6).items[0].reason is MissReason.TIMEOUT
+        assert not conn._send_lock.locked()
+        assert scope.cancelled and normal_scope.cancelled and other_scope.cancelled
+        assert len(client._ops.unresolved()) == 2
+        assert len(scope.pending) == len(normal_scope.pending) == 1
+        assert held[0]._released and held[0] not in client._reads
+        assert ("node", 99) in client._fetch_releasing
+        assert not held[1]._released and bytes(held[1].view) == b"held"
+        assert held[1] in client._reads and ("node", 100) not in client._fetch_releasing
+        received = bytearray()
+        while chunk := peer.recv(4096):
+            received.extend(chunk)
+        request = scope.pending[next(iter(scope.pending))][0]
+        from maru_common.node_protocol import NodeMessageType
+        assert 0 < len(received) < len(conn._serializer.encode(NodeMessageType.FETCH, request))
+        assert peer.recv(1) == b""
+        conn.close()
+        other_conn.close()
+        peer.close()
+        other_peer.close()
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=8
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pr0_stopped_gate_keeps_a_delivered_lease_across_reconnect(leased, monkeypatch):
+    from maru_vllm import connector
+    from tests.unit.ms_node_helpers import wait_until
+
+    handler, service, _ = leased
+    pending, seq = start_fetch(handler, service)
+    service.answer(seq)
+    reads = pending.result()
+    read = reads[0]
+    original = bytes(read.view)
+    kept = []
+    monkeypatch.setattr(connector, "_KEPT_UNTIL_EXIT", kept)
+    worker = object.__new__(connector.MaruWorkerConnector)
+    worker._stopped = "unconfirmed copy"
+    worker._handler = handler
+    worker._release(reads)
+    old = handler._cpu._storage
+    for conn in service.node.local.connections():
+        conn.close()
+    wait_until(
+        lambda: handler._cpu._storage is not None and handler._cpu._storage is not old
+    )
+    worker._release(reads)
+    handler.close()
+    assert not read._released and bytes(read.view) == original
+    assert service.leases == {read.lease_id} and not service.releases
+    assert read in handler._cpu._reads and len(kept) == 2
 
 
 def test_catalog_sockets_of_finished_read_threads_are_reaped(leased):

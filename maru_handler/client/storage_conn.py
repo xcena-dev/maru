@@ -208,16 +208,22 @@ class StorageConn:
             sock = self._sock
         sent = 0
         acquired = False
+        pending = None
+        failed = None
+        reason = ""
         try:
-            if deadline is None:
-                with self._send_lock:
-                    send_frame(sock, frame)
-            else:
-                acquired = self._send_lock.acquire(
+            acquired = (
+                self._send_lock.acquire()
+                if deadline is None
+                else self._send_lock.acquire(
                     timeout=max(0.0, deadline - time.monotonic())
                 )
-                if not acquired:
-                    raise TimeoutError("send lock deadline")
+            )
+            if not acquired:
+                raise TimeoutError("send lock deadline")
+            if deadline is None:
+                send_frame(sock, frame)
+            else:
                 view = memoryview(frame)
                 while sent < len(frame):
                     left = deadline - time.monotonic()
@@ -237,18 +243,24 @@ class StorageConn:
                         continue
                     sent += count
         except TimeoutError as e:
+            reason = f"send failed: {e}"
             if sent:
-                self._fail(f"partial send failed: {e}")
+                pending = self._disconnect()
             else:
                 with self._lock:
                     entry = self._pending.pop(seq, None)
                 if entry is not None:
-                    future.set_exception(StorageUnavailableError(str(e)))
+                    failed = entry[1]
         except (OSError, ValueError) as e:
-            self._fail(f"send failed: {e}")
+            reason = f"send failed: {e}"
+            pending = self._disconnect()
         finally:
             if acquired:
                 self._send_lock.release()
+        if pending is not None:
+            self._finish_failure(pending, reason)
+        if failed is not None:
+            failed.set_exception(StorageUnavailableError(reason))
         return future
 
     def request(
@@ -331,9 +343,15 @@ class StorageConn:
                 logger.exception("handling NOTIFY %s failed", notify.kind)
 
     def _fail(self, reason: str, notify: bool = True) -> None:
+        pending = self._disconnect()
+        if pending is not None:
+            self._finish_failure(pending, reason, notify)
+
+    def _disconnect(self) -> list[tuple[int, Future]] | None:
+        """Close the stream before another sender can use it."""
         with self._lock:
             if self._closed.is_set():
-                return
+                return None
             self._closed.set()
             pending = list(self._pending.values())
             self._pending.clear()
@@ -344,6 +362,12 @@ class StorageConn:
             except OSError:
                 pass
             sock.close()
+        return pending
+
+    def _finish_failure(
+        self, pending: list[tuple[int, Future]], reason: str, notify: bool = True
+    ) -> None:
+        """Notify callers without holding the send lock."""
         for _, future in pending:
             if not future.done():
                 future.set_exception(StorageUnavailableError(reason))
