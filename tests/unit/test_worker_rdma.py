@@ -196,6 +196,78 @@ def test_hit_decision_obeys_the_same_gate(env):
     assert env.reader.capacity() == 4
 
 
+def test_engine_release_does_not_wait_for_read_post_gate(env, client):
+    pending = client.start_retrieve(["key"])
+    env.reader.progress()
+    reads = pending.result()
+    assert reads[0] is not None
+    entered, finished = threading.Event(), threading.Event()
+
+    def release():
+        entered.set()
+        client.release_retrieved(reads)
+        finished.set()
+
+    env.reader.gate.acquire()
+    releasing = threading.Thread(target=release)
+    try:
+        releasing.start()
+        assert entered.wait(1)
+        returned_without_gate = finished.wait(0.1)
+    finally:
+        env.reader.gate.release()
+        releasing.join(1)
+    assert not releasing.is_alive()
+    assert returned_without_gate
+    assert not reads[0]._released
+    assert reads[0] in reads[0].flight.consumers
+    assert bytes(reads[0].view) == b"a" * PAGE
+    assert env.reader.capacity() == 3
+    env.reader.progress()
+    assert reads[0]._released
+    assert env.reader.capacity() == 4
+
+
+@pytest.mark.parametrize("ending", ["progress", "stop", "close"])
+def test_deferred_release_keeps_joined_consumers_safe(env, ending):
+    env.agent.stall = True
+    first, second = env.start(), env.start()
+    env.agent.finish_stalled()
+    env.reader.progress()
+    a, b = first.result(), second.result()
+    assert a.flight is b.flight
+    with env.reader.gate:
+        a.release()
+        a.release()
+    assert not a._released and not b._released
+    assert env.reader.capacity() == 3
+    if ending == "stop":
+        unpins = list(env.unpins)
+        env.reader.stop()
+        env.reader.progress()
+        b.release()
+        assert not a._released and not b._released
+        assert a.flight.consumers == {a, b}
+        assert bytes(a.view) == bytes(b.view) == b"a" * PAGE
+        assert env.unpins == unpins
+        assert not env.reader.close()
+    elif ending == "close":
+        assert not env.reader.close()
+        assert env.reader in _KEPT_UNTIL_EXIT
+        assert env.reader.transport._registrations
+        assert not a._released and not b._released
+        assert bytes(a.view) == bytes(b.view) == b"a" * PAGE
+    else:
+        env.reader.progress()
+        assert a._released and not b._released
+        assert bytes(b.view) == b"a" * PAGE
+        assert env.reader.capacity() == 3
+        b.release()
+        env.reader.progress()
+        assert env.reader.capacity() == 4
+        assert len(set(env.reader._free)) == 4
+
+
 def test_post_holds_the_gate_lock_from_check_to_post(env, monkeypatch):
     entered, leave = threading.Event(), threading.Event()
     original = env.agent.transfer
@@ -259,6 +331,51 @@ def test_peer_notice_misses_a_done_but_undecided_read(env, notice):
     assert request.result() is None
     assert env.reader.capacity() == 4
     assert env.unpins == [request.outcome.pin_id]
+
+
+@pytest.mark.parametrize("boundary", ["check", "view"])
+@pytest.mark.parametrize("recover", [False, True])
+def test_notice_between_hit_check_and_handoff_is_a_miss(
+    env, monkeypatch, boundary, recover
+):
+    request = env.start(deadline=time.monotonic() + 2)
+    env.reader.progress()
+    owner, method = (
+        (env.reader, "_valid") if boundary == "check" else (env.reader.staging, "view")
+    )
+    original = getattr(owner, method)
+    checked, resume = threading.Event(), threading.Event()
+    results = []
+
+    def pause_after_check(*args):
+        result = original(*args)
+        checked.set()
+        assert resume.wait(1)
+        return result
+
+    monkeypatch.setattr(owner, method, pause_after_check)
+    finishing = threading.Thread(target=lambda: results.append(request.result()))
+    finishing.start()
+    try:
+        assert checked.wait(1)
+        assert not request.decided and not request.flight.consumers
+        env.reader.notify_peers([dataclasses.replace(env.peer, generation_known=False)])
+        if recover:
+            env.reader.notify_peers([env.peer])
+    finally:
+        resume.set()
+        finishing.join(1)
+    assert not finishing.is_alive()
+    read = results[0]
+    try:
+        assert read is None
+        assert request.reason == "generation"
+        assert not request.flight.consumers
+        assert env.reader.capacity() == 4
+        assert env.unpins == [request.outcome.pin_id]
+    finally:
+        if read is not None:
+            read.release()
 
 
 def test_notice_between_check_and_post_cannot_be_lost(env, monkeypatch):

@@ -56,6 +56,7 @@ class ReadRequest:
     flight: Flight | None = None
     reason: str = ""
     decided: bool = False
+    _decision: dict[str, str] = field(default_factory=dict, repr=False)
     ready: threading.Event = field(default_factory=threading.Event)
 
     def done(self) -> bool:
@@ -131,6 +132,7 @@ class WorkerRdma:
         self._free = deque(range(self.staging.count))
         self._flights: set[Flight] = set()
         self._joining: dict[tuple, Flight] = {}
+        self._releases: deque[RemoteRead] = deque()
         self._peers: dict[str, PeerAccess] = {}
         self._ready_peers: dict[str, PeerAccess] = {}
         self._peer_lock = threading.Lock()
@@ -274,6 +276,15 @@ class WorkerRdma:
                 else:
                     entries[pool.pool_id] = old if old == access else access
         self._peers = entries
+        for flight in tuple(self._flights):
+            if entries.get(flight.location.pool_id) is flight.peer:
+                continue
+            for request in tuple(flight.waiters):
+                if not request.decided:
+                    request.reason = request._decision.setdefault(
+                        "reason", "generation"
+                    )
+                    request.ready.set()
         self._wake.set()
         ready = {}
         with self._peer_lock:
@@ -417,6 +428,8 @@ class WorkerRdma:
         if self.stopped.is_set() or not self.gate.acquire(False):
             return
         try:
+            for _ in range(len(self._releases)):
+                self._release_read(self._releases.popleft())
             for flight in list(self._flights):
                 if flight.pending is not None and not flight.pending.finished:
                     self.transport.poll_nowait(flight.pending)
@@ -469,7 +482,7 @@ class WorkerRdma:
             return None
         result = None
         if not self.gate.acquire(False):
-            request.reason = "gate_busy"
+            request.reason = request._decision.setdefault("reason", "gate_busy")
             request.decided = True
         else:
             try:
@@ -486,7 +499,6 @@ class WorkerRdma:
                     or not flight.pending.completed
                 ):
                     request.reason = "timeout"
-                request.decided = True
                 if not request.reason:
                     loc = flight.location
                     result = RemoteRead(
@@ -504,10 +516,18 @@ class WorkerRdma:
                         flight=flight,
                     )
                     flight.consumers.add(result)
-                    self._remove_join(flight)
-                    # A stop may arrive without taking this gate.
-                    if self.stopped.is_set():
-                        return None
+                # One setdefault orders peer invalidation and the HIT decision.
+                request.reason = request._decision.setdefault("reason", request.reason)
+                request.decided = True
+                if self.stopped.is_set():
+                    return None
+                if result is not None:
+                    if request.reason:
+                        result.view.release()
+                        flight.consumers.discard(result)
+                        result = None
+                    else:
+                        self._remove_join(flight)
                 if flight is not None:
                     self._reclaim(flight)
             finally:
@@ -517,13 +537,24 @@ class WorkerRdma:
         return None if self.stopped.is_set() else result
 
     def release(self, read):
-        with self.gate:
-            if self.stopped.is_set() or read._released:
-                return
-            read._released = True
-            read.view.release()
-            read.flight.consumers.discard(read)
-            self._reclaim(read.flight)
+        if self.stopped.is_set() or read._released:
+            return
+        if not self.gate.acquire(False):
+            self._releases.append(read)
+            self._wake.set()
+            return
+        try:
+            self._release_read(read)
+        finally:
+            self.gate.release()
+
+    def _release_read(self, read):
+        if self.stopped.is_set() or read._released:
+            return
+        read._released = True
+        read.view.release()
+        read.flight.consumers.discard(read)
+        self._reclaim(read.flight)
 
     def bind_credits(self, credits, agent, node_id, node_epoch):
         agent = copy.deepcopy(agent)
