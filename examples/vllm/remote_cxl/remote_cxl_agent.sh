@@ -30,7 +30,7 @@ fi
 # them (the same file serves every memory node of the pool).
 if [[ ! -e "$MARU_REMOTE_CXL_AGENT_KEY_FILE" ]]; then
     mkdir -p "$(dirname "$MARU_REMOTE_CXL_AGENT_KEY_FILE")"
-    python -c "import sys; from maru_remote.region_map import write_key; write_key(sys.argv[1])" \
+    python -c "import sys; from maru_remote.auth import write_key; write_key(sys.argv[1])" \
         "$MARU_REMOTE_CXL_AGENT_KEY_FILE"
     echo "Created the remote CXL agent key $MARU_REMOTE_CXL_AGENT_KEY_FILE"
 fi

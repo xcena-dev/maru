@@ -7,7 +7,8 @@ import logging
 import signal
 from threading import RLock
 
-from maru_remote.region_map import DEFAULT_COPY_FILE, KeyFileError, load_key
+from maru_remote.auth import KeyFileError, load_key
+from maru_remote.region_map import DEFAULT_COPY_FILE
 from maru_shm.types import MaruHandle
 
 from .allocation_manager import AllocationManager

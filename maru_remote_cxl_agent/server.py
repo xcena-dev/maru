@@ -15,33 +15,20 @@ proves the key back to the client.
 from __future__ import annotations
 
 import errno
-import hmac
 import itertools
 import logging
-import resource
-import secrets
 import socket
 import threading
 import time
 from dataclasses import dataclass
 
-from maru_remote.region_map import NONCE_BYTES, prove, recv_frame, send_frame
+from maru_remote import auth as remote_auth
+from maru_remote.framing import recv_frame, send_frame
 
 from .service import MapDenied, NotMapped, RegionMapService
 
 logger = logging.getLogger(__name__)
 
-# TCP keepalive: probe after 10 s idle, every 5 s, give up after 3 misses.
-_KEEPALIVE = (10, 5, 3)
-# A connection must prove the key within this long; a proven one may idle.
-AUTH_TIMEOUT_S = 10.0
-# Connections served at once (each holds a thread and a file descriptor), and
-# connections from one source address that have not proved the key yet; more
-# are closed at accept. The first limit is also kept below the process's
-# file-descriptor limit, minus what the agent itself uses.
-MAX_CONNECTIONS = 1024
-MAX_PER_SOURCE = 64
-FD_RESERVE = 64
 # How often a turned-away connection is logged
 FULL_WARN_INTERVAL_S = 60.0
 # Longest NIXL agent name a map request may give (a worker's name is
@@ -52,61 +39,11 @@ MAX_NIXL_AGENT_NAME = 512
 _LISTENER_BROKEN = {errno.EBADF, errno.EINVAL, errno.ENOTSOCK}
 
 
-def _set_keepalive(sock: socket.socket) -> None:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    idle, interval, count = _KEEPALIVE
-    for name, value in (
-        ("TCP_KEEPIDLE", idle),
-        ("TCP_KEEPINTVL", interval),
-        ("TCP_KEEPCNT", count),
-    ):
-        option = getattr(socket, name, None)
-        if option is not None:
-            sock.setsockopt(socket.IPPROTO_TCP, option, value)
-
-
-class ConnectionAuth:
-    """Whether one connection proved the remote CXL agent key."""
-
-    def __init__(self, key: bytes | None) -> None:
-        """Start a connection.
-
-        Args:
-            key: Remote CXL agent key; None runs without one (every request is
-                accepted).
-        """
-        self.key = key
-        self.nonce = secrets.token_bytes(NONCE_BYTES) if key is not None else b""
-        self.proved = key is None
-
-    def check(self, message: dict) -> dict:
-        """Check an ``auth`` request and build its reply."""
-        if self.key is None:
-            return {
-                "ok": False,
-                "error": "this remote CXL agent runs without a key",
-                "code": "invalid",
-            }
-        proof, nonce = message.get("proof"), message.get("nonce")
-        if (
-            not isinstance(proof, bytes)
-            or not isinstance(nonce, bytes)
-            or not (hmac.compare_digest(proof, prove(self.key, "handler", self.nonce)))
-        ):
-            return {
-                "ok": False,
-                "error": "wrong remote CXL agent key",
-                "code": "denied",
-            }
-        self.proved = True
-        return {"ok": True, "proof": prove(self.key, "agent", nonce)}
-
-
 def handle_request(
     service: RegionMapService,
     conn: int,
     message: dict,
-    auth: ConnectionAuth | None = None,
+    auth: remote_auth.ConnectionAuth | None = None,
 ) -> dict:
     """Run one request and build its reply.
 
@@ -119,7 +56,7 @@ def handle_request(
     Returns:
         The reply map (``ok`` and the result, or ``error`` and ``code``).
     """
-    auth = auth or ConnectionAuth(None)
+    auth = auth or remote_auth.ConnectionAuth(None)
     op = message.get("op")
     try:
         if op == "hello":
@@ -176,7 +113,7 @@ def serve_connection(
     conn: int,
     sock: socket.socket,
     key: bytes | None = None,
-    auth: ConnectionAuth | None = None,
+    auth: remote_auth.ConnectionAuth | None = None,
 ) -> None:
     """Serve one Handler connection until it ends, then drop its holds.
 
@@ -188,7 +125,7 @@ def serve_connection(
         auth: Key state of the connection (the server checks its deadline);
             a new one for ``key`` if None.
     """
-    auth = auth or ConnectionAuth(key)
+    auth = auth or remote_auth.ConnectionAuth(key)
     try:
         while True:
             message = recv_frame(sock)
@@ -209,17 +146,9 @@ def serve_connection(
 class _Connection:
     sock: socket.socket
     source: str
-    auth: ConnectionAuth
+    auth: remote_auth.ConnectionAuth
     started: float
     cut: bool = False
-
-
-def _connection_limit() -> int:
-    """Connections the file-descriptor limit leaves room for."""
-    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft == resource.RLIM_INFINITY:
-        return MAX_CONNECTIONS
-    return max(1, min(MAX_CONNECTIONS, soft - FD_RESERVE))
 
 
 class RegionMapServer:
@@ -250,7 +179,7 @@ class RegionMapServer:
         self._threads: list[threading.Thread] = []
         self._clients: dict[int, _Connection] = {}
         self._clients_lock = threading.Lock()
-        self._limit = _connection_limit()
+        self._limit = remote_auth.connection_limit()
         self._full_warned_at = float("-inf")
 
     def serve_forever(self) -> None:
@@ -281,7 +210,7 @@ class RegionMapServer:
                     c.source == source and not c.auth.proved
                     for c in self._clients.values()
                 )
-            if total >= self._limit or mine >= MAX_PER_SOURCE:
+            if total >= self._limit or mine >= remote_auth.MAX_PER_SOURCE:
                 self._warn_full(
                     f"{total} connections open ({mine} unproven from {source}); closing "
                     "new ones until some end"
@@ -289,11 +218,11 @@ class RegionMapServer:
                 client.close()
                 continue
             client.settimeout(None)
-            _set_keepalive(client)
+            remote_auth.set_keepalive(client)
             conn = next(self._ids)
             logger.info("connection %d from %s:%d", conn, *peer[:2])
             record = _Connection(
-                client, source, ConnectionAuth(self._key), time.monotonic()
+                client, source, remote_auth.ConnectionAuth(self._key), time.monotonic()
             )
             with self._clients_lock:
                 self._clients[conn] = record
@@ -320,7 +249,9 @@ class RegionMapServer:
             late = [
                 (conn, c)
                 for conn, c in self._clients.items()
-                if not c.auth.proved and not c.cut and now - c.started > AUTH_TIMEOUT_S
+                if not c.auth.proved
+                and not c.cut
+                and now - c.started > remote_auth.AUTH_TIMEOUT_S
             ]
             for _, c in late:
                 c.cut = True

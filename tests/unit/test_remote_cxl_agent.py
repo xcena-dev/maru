@@ -10,20 +10,17 @@ import time
 
 import pytest
 
+from maru_remote.auth import prove
 from maru_remote.region_map import (
-    KeyFileError,
     RegionMapClient,
     RegionMapError,
     RegionMapUnavailable,
-    load_key,
-    prove,
     read_handle,
-    write_key,
 )
 from maru_remote.transport import NixlTransport
 from maru_remote_cxl_agent import cli
 from maru_remote_cxl_agent.mapper import DaxRegionMapper
-from maru_remote_cxl_agent.server import ConnectionAuth, handle_request
+from maru_remote_cxl_agent.server import handle_request
 from maru_remote_cxl_agent.service import MapDenied, NotMapped, RegionMapService
 from maru_shm.types import MaruHandle
 from tests.unit.remote_fakes import (
@@ -406,7 +403,7 @@ def _raw(mem):
     """A connection that speaks the protocol by hand."""
     import socket
 
-    from maru_remote.region_map import recv_frame, send_frame
+    from maru_remote.framing import recv_frame, send_frame
 
     sock = socket.create_connection(("127.0.0.1", int(mem.address.split(":")[1])))
 
@@ -473,9 +470,9 @@ def test_a_client_with_another_key_cannot_map():
 
 
 def test_a_connection_that_never_proves_the_key_is_closed(monkeypatch):
-    import maru_remote_cxl_agent.server as server
+    import maru_remote.auth as auth
 
-    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(auth, "AUTH_TIMEOUT_S", 0.3)
     mem = FakeMemoryNode(FakeCxl())
     sock, ask = _raw(mem)
     try:
@@ -491,7 +488,7 @@ def test_a_connection_that_never_proves_the_key_is_closed(monkeypatch):
 
 
 def test_a_proven_connection_may_stay_idle(monkeypatch):
-    import maru_remote_cxl_agent.server as server
+    import maru_remote.auth as auth
 
     mem = FakeMemoryNode(FakeCxl())
     sock, ask = _raw(mem)
@@ -501,7 +498,7 @@ def test_a_proven_connection_may_stay_idle(monkeypatch):
         assert ask({"op": "auth", "proof": proof, "nonce": b"n" * 16})["ok"]
         # Proven within the default deadline (a loaded runner can take longer
         # than a short one to get here); from now on every deadline has passed.
-        monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(auth, "AUTH_TIMEOUT_S", 0.0)
         time.sleep(0.6)  # past the accept loop's next check (every 0.5 s)
         assert ask({"op": "hello"})["ok"]
     finally:
@@ -510,9 +507,9 @@ def test_a_proven_connection_may_stay_idle(monkeypatch):
 
 def test_a_connection_that_only_says_hello_is_closed_at_its_deadline(monkeypatch):
     # The deadline counts from the connection, not from its last request.
-    import maru_remote_cxl_agent.server as server
+    import maru_remote.auth as auth
 
-    monkeypatch.setattr(server, "AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(auth, "AUTH_TIMEOUT_S", 0.3)
     mem = FakeMemoryNode(FakeCxl())
     sock, ask = _raw(mem)
     try:
@@ -530,9 +527,9 @@ def test_a_connection_that_only_says_hello_is_closed_at_its_deadline(monkeypatch
 
 
 def test_connections_beyond_the_limit_from_one_source_are_closed(monkeypatch):
-    import maru_remote_cxl_agent.server as server
+    import maru_remote.auth as auth
 
-    monkeypatch.setattr(server, "MAX_PER_SOURCE", 2)
+    monkeypatch.setattr(auth, "MAX_PER_SOURCE", 2)
     mem = FakeMemoryNode(FakeCxl())
     socks = [_raw(mem) for _ in range(3)]
     try:
@@ -573,9 +570,9 @@ def test_running_out_of_file_descriptors_does_not_stop_the_agent():
 
 
 def test_connections_beyond_the_limit_are_closed(monkeypatch):
-    import maru_remote_cxl_agent.server as server
+    import maru_remote.auth as auth
 
-    monkeypatch.setattr(server, "MAX_CONNECTIONS", 2)
+    monkeypatch.setattr(auth, "MAX_CONNECTIONS", 2)
     mem = FakeMemoryNode(FakeCxl())
     socks = [_raw(mem) for _ in range(3)]
     try:
@@ -604,49 +601,10 @@ def test_the_client_checks_that_the_remote_cxl_agent_holds_the_key():
         keyless.stop()
 
 
-def test_an_auth_reply_with_another_proof_is_refused():
-    auth = ConnectionAuth(b"k" * 32)
-    reply = auth.check(
-        {
-            "op": "auth",
-            "proof": prove(b"k" * 32, "handler", auth.nonce),
-            "nonce": b"c" * 16,
-        }
-    )
-    assert reply["ok"] and auth.proved
-    assert reply["proof"] != prove(b"other" * 7, "agent", b"c" * 16)
-
-
-def test_the_key_file_must_hold_a_key_and_stay_private(tmp_path):
-    path = tmp_path / "key"
-    write_key(str(path))
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert len(load_key(str(path))) == 32
-    with pytest.raises(FileExistsError):
-        write_key(str(path))  # an existing key is never replaced
-    path.chmod(0o644)
-    with pytest.raises(KeyFileError, match="readable by every user"):
-        load_key(str(path))
-    path.chmod(0o640)
-    assert len(load_key(str(path))) == 32
-    bad = tmp_path / "bad"
-    bad.write_text("not hex\n")
-    bad.chmod(0o600)
-    with pytest.raises(KeyFileError, match="does not hold"):
-        load_key(str(bad))
-    with pytest.raises(KeyFileError, match="cannot read"):
-        load_key(str(tmp_path / "missing"))
-
-
-def test_writing_a_key_leaves_no_temporary_file(tmp_path):
-    write_key(str(tmp_path / "key"))
-    assert [p.name for p in tmp_path.iterdir()] == ["key"]
-
-
 def test_a_proof_that_is_not_bytes_is_refused():
     import socket
 
-    from maru_remote.region_map import recv_frame, send_frame
+    from maru_remote.framing import recv_frame, send_frame
 
     ours, theirs = socket.socketpair()
 
@@ -1021,7 +979,8 @@ def test_workers_read_a_key_copy_in_their_home_by_default(tmp_path, monkeypatch)
     """A worker installed with the agent gets its own key in /etc/maru, which
     is not the deployment's; workers and MaruServer read their copy."""
     from maru_common.config import MaruConfig
-    from maru_remote.region_map import DEFAULT_COPY_FILE, load_key
+    from maru_remote.auth import load_key
+    from maru_remote.region_map import DEFAULT_COPY_FILE
 
     monkeypatch.setenv("HOME", str(tmp_path))
     key = tmp_path / ".maru" / "remote-cxl-agent.key"

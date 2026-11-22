@@ -103,7 +103,7 @@ def test_default_settings_listen_on_the_rdma_network_and_require_the_key():
 
 
 def test_install_creates_the_key_once_readable_by_root_only(tmp_path, monkeypatch):
-    from maru_remote.region_map import load_key
+    from maru_remote.auth import load_key
 
     _install(tmp_path, monkeypatch)
     key_file = tmp_path / "etc" / "maru" / "remote-cxl-agent.key"

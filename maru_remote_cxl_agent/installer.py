@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from maru_remote.region_map import DEFAULT_KEY_FILE, write_key
+from maru_remote.auth import DEFAULT_KEY_FILE, write_key
 
 SERVICE_NAME = "maru-remote-cxl-agent.service"
 RM_SERVICE_NAME = "maru-resource-manager.service"

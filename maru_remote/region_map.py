@@ -16,7 +16,7 @@ big-endian length followed by a MessagePack map. Requests carry ``op``:
   then carries the memory's generation), ``nonce`` on every connection. An agent with a region
   extension adds ``region_extension`` (see :func:`hint_actions`).
 - ``auth`` with ``proof`` and ``nonce``: the client proves it holds the
-  remote CXL agent key (:func:`prove` over the connection's nonce) and the reply
+  remote CXL agent key (:func:`maru_remote.auth.prove` over the connection's nonce) and the reply
   proves the same over the client's nonce. A connection does nothing else
   until it has proved the key, so only processes that can read the key file
   map regions, as only users who can open the DAX device map them on a
@@ -52,30 +52,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import os
 import secrets
 import socket
-import struct
-import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import msgpack
+from . import auth, framing
 
 logger = logging.getLogger(__name__)
 
-MAX_FRAME = 16 * 1024 * 1024
-_LEN = struct.Struct("!I")
-# The key the installer creates on a memory node, read by its remote CXL agent;
-# shared by the remote CXL agents of a deployment.
-DEFAULT_KEY_FILE = "/etc/maru/remote-cxl-agent.key"
 # The copy that workers and MaruServers read, readable only by their user. A
 # node apart from it: a worker installed with the agent gets its own key in
-# DEFAULT_KEY_FILE, which is not the deployment's.
+# auth.DEFAULT_KEY_FILE, which is not the deployment's.
 DEFAULT_COPY_FILE = "~/.maru/remote-cxl-agent.key"
-NONCE_BYTES = 16
 # Read hint messages a region extension may take (``op: extension``), and the
 # version of their protocol an agent advertises in its hello
 HINT_ACTIONS = (
@@ -170,91 +161,6 @@ def hint_actions(advertised: Any) -> frozenset[str]:
     return frozenset(a for a in actions if a in HINT_ACTIONS)
 
 
-class KeyFileError(ValueError):
-    """The remote CXL agent key file is missing, malformed or open to everyone."""
-
-
-def new_key() -> str:
-    """A new remote CXL agent key: 32 random bytes as hex."""
-    return secrets.token_hex(32)
-
-
-def load_key(path: str) -> bytes:
-    """Read the remote CXL agent key.
-
-    Args:
-        path: Key file; one line of hex digits (at least 32). ``~`` is the
-            user's home.
-
-    Returns:
-        The key bytes.
-
-    Raises:
-        KeyFileError: if the file cannot be read, is readable by every user,
-            or does not hold a key.
-    """
-    path = os.path.expanduser(path)
-    try:
-        with open(path) as f:
-            mode = os.fstat(f.fileno()).st_mode
-            text = f.read().strip()
-    except OSError as exc:
-        raise KeyFileError(
-            f"cannot read the remote CXL agent key {path}: {exc}"
-        ) from exc
-    if mode & 0o004:
-        raise KeyFileError(
-            f"the remote CXL agent key {path} is readable by every user; chmod o-r {path}"
-        )
-    try:
-        key = bytes.fromhex(text)
-    except ValueError:
-        key = b""
-    if len(key) < 16:
-        raise KeyFileError(
-            f"{path} does not hold a remote CXL agent key (at least 32 hex digits)"
-        )
-    return key
-
-
-def write_key(path: str) -> None:
-    """Create a key file readable by its owner only; an existing one stays.
-
-    The key is written to a temporary file that is then linked into place,
-    so an interrupted write never leaves an empty key behind.
-
-    Args:
-        path: Key file to create.
-
-    Raises:
-        FileExistsError: if the file exists.
-    """
-    directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(prefix=".remote-cxl-agent-key-", dir=directory)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(new_key() + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.link(tmp, path)
-    finally:
-        os.unlink(tmp)
-
-
-def prove(key: bytes, role: str, nonce: bytes) -> bytes:
-    """Proof that ``role`` holds ``key``, bound to the peer's ``nonce``.
-
-    Args:
-        key: Remote CXL agent key.
-        role: ``"handler"`` for a client, ``"agent"`` for the remote CXL agent.
-        nonce: The nonce the other side chose for this connection.
-
-    Returns:
-        HMAC-SHA256 digest.
-    """
-    return hmac.new(key, role.encode() + b"|" + bytes(nonce), hashlib.sha256).digest()
-
-
 class RegionMapError(RuntimeError):
     """The remote CXL agent refused a request.
 
@@ -269,62 +175,6 @@ class RegionMapError(RuntimeError):
 
 class RegionMapUnavailable(ConnectionError):  # noqa: N818 (a ConnectionError)
     """The remote CXL agent could not be reached or the connection broke."""
-
-
-def send_frame(sock: socket.socket, message: dict) -> None:
-    """Send one length-prefixed MessagePack message.
-
-    Args:
-        sock: Connected socket.
-        message: Map to send.
-
-    Raises:
-        ValueError: if the encoded message exceeds :data:`MAX_FRAME`.
-        OSError: if the socket fails.
-    """
-    data = msgpack.packb(message, use_bin_type=True)
-    if len(data) > MAX_FRAME:
-        raise ValueError(f"region map message of {len(data)} bytes is too large")
-    sock.sendall(_LEN.pack(len(data)) + data)
-
-
-def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
-    chunks = []
-    while n:
-        chunk = sock.recv(n)
-        if not chunk:
-            return None
-        chunks.append(chunk)
-        n -= len(chunk)
-    return b"".join(chunks)
-
-
-def recv_frame(sock: socket.socket) -> dict | None:
-    """Receive one message; None when the peer closed the connection.
-
-    Args:
-        sock: Connected socket.
-
-    Returns:
-        The decoded map, or None at end of stream.
-
-    Raises:
-        ValueError: if the frame is too large or not a map.
-        OSError: if the socket fails.
-    """
-    head = _recv_exact(sock, _LEN.size)
-    if head is None:
-        return None
-    (length,) = _LEN.unpack(head)
-    if length > MAX_FRAME:
-        raise ValueError(f"region map frame of {length} bytes is too large")
-    body = _recv_exact(sock, length)
-    if body is None:
-        return None
-    message = msgpack.unpackb(body, raw=False)
-    if not isinstance(message, dict):
-        raise ValueError("region map message must be a map")
-    return message
 
 
 @dataclass(frozen=True)
@@ -350,24 +200,6 @@ class MapReply:
     epoch: str
     boot: str = ""
     generation: int = 0
-
-
-def parse_address(address: str) -> tuple[str, int]:
-    """Split ``host:port``.
-
-    Args:
-        address: Remote CXL agent address.
-
-    Returns:
-        ``(host, port)``.
-
-    Raises:
-        ValueError: if the address has no port.
-    """
-    host, sep, port = address.rpartition(":")
-    if not sep or not host or not port.isdigit():
-        raise ValueError(f"remote CXL agent address must be host:port, got {address!r}")
-    return host, int(port)
 
 
 class RegionMapClient:
@@ -398,13 +230,13 @@ class RegionMapClient:
             connect_timeout_s: Timeout for connecting; ``timeout_s`` if None.
             connect: Socket factory ``(address, timeout) -> socket``
                 (tests inject an in-process pair).
-            key: Remote CXL agent key (:func:`load_key`). Each connection
+            key: Remote CXL agent key (:func:`maru_remote.auth.load_key`). Each connection
                 proves it and checks that the remote CXL agent proves it too;
                 None only for a remote CXL agent that runs without a key.
         """
         self.address = address
         self._key = key
-        self._endpoint = parse_address(address)
+        self._endpoint = framing.parse_address(address)
         self._timeout_s = timeout_s
         self._connect_timeout_s = (
             timeout_s if connect_timeout_s is None else connect_timeout_s
@@ -599,24 +431,24 @@ class RegionMapClient:
             return
         if nonce is None:
             raise RegionMapUnavailable("it runs without a key and cannot prove one")
-        mine = secrets.token_bytes(NONCE_BYTES)
+        mine = secrets.token_bytes(auth.NONCE_BYTES)
         ack = self._request(
             {
                 "op": "auth",
-                "proof": prove(self._key, "handler", bytes(nonce)),
+                "proof": auth.prove(self._key, "handler", bytes(nonce)),
                 "nonce": mine,
             }
         )
         proof = ack.get("proof")
         if not isinstance(proof, bytes) or not hmac.compare_digest(
-            proof, prove(self._key, "agent", mine)
+            proof, auth.prove(self._key, "agent", mine)
         ):
             raise RegionMapUnavailable("it proved another key")
 
     def _request(self, message: dict) -> dict:
         try:
-            send_frame(self._sock, message)
-            reply = recv_frame(self._sock)
+            framing.send_frame(self._sock, message)
+            reply = framing.recv_frame(self._sock)
         except (OSError, ValueError) as exc:
             self._drop()
             raise RegionMapUnavailable(

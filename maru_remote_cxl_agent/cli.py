@@ -33,7 +33,7 @@ from collections.abc import Callable, MutableMapping
 from pathlib import Path
 
 from maru_common.logging_setup import setup_package_logging
-from maru_remote.region_map import DEFAULT_KEY_FILE, load_key
+from maru_remote.auth import DEFAULT_KEY_FILE, load_key
 
 from .mapper import DaxRegionMapper
 from .server import RegionMapServer
@@ -365,7 +365,7 @@ def raise_file_limit() -> None:
     """Raise the soft file-descriptor limit to the hard one.
 
     Every Handler connection holds a descriptor; the server keeps its
-    connection limit below the soft limit (``server._connection_limit``).
+    connection limit below the soft limit (``maru_remote.auth.connection_limit``).
     """
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

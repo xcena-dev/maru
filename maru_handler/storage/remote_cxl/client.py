@@ -345,7 +345,7 @@ class RemoteCxlStorageClient(RegionLifecycle):
         if self._hint_key is None:
             key = self._data.key
             if key is None:
-                from maru_remote.region_map import load_key
+                from maru_remote.auth import load_key
 
                 key = load_key(self.config.remote_cxl_agent_key_file)
             self._hint_key = key

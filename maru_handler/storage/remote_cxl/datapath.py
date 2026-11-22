@@ -136,7 +136,7 @@ class RdmaDataPath:
                 )
             return
         if self._needs_key and self._key is None:
-            from maru_remote.region_map import KeyFileError, load_key
+            from maru_remote.auth import KeyFileError, load_key
 
             try:
                 self._key = load_key(self.config.remote_cxl_agent_key_file)

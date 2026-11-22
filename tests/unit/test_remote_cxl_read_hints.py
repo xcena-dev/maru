@@ -688,7 +688,7 @@ def test_a_store_whose_wait_cannot_connect_still_stores():
     # The reviewer's case: a write wait's connection raises (say the key file
     # changed after start). The store goes on, its transfer ends, and close
     # does not wait for an unfinished transfer.
-    from maru_remote.region_map import KeyFileError
+    from maru_remote.auth import KeyFileError
 
     ext = WriteWaitExtension()
     w = World(extension=ext)
@@ -772,7 +772,7 @@ def test_an_agent_whose_wait_timed_out_is_not_asked_again_for_a_while():
 
 def test_a_wait_connection_that_raises_backs_off_instead_of_raising():
     from maru_handler.storage.remote_cxl.waits import MemoryWaits
-    from maru_remote.region_map import KeyFileError
+    from maru_remote.auth import KeyFileError
 
     calls = []
 

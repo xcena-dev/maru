@@ -424,7 +424,7 @@ def key_file() -> str:
         import os
         import tempfile
 
-        from maru_remote.region_map import write_key
+        from maru_remote.auth import write_key
 
         path = os.path.join(tempfile.mkdtemp(prefix="maru-test-key-"), "key")
         write_key(path)
@@ -434,7 +434,7 @@ def key_file() -> str:
 
 def shared_key() -> bytes:
     """The key in :func:`key_file`."""
-    from maru_remote.region_map import load_key
+    from maru_remote.auth import load_key
 
     return load_key(key_file())
 
