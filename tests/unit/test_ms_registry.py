@@ -11,9 +11,9 @@ import pytest
 from maru_common.protocol import MessageType
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
-    FETCH_CAPABILITY,
     MEMORY_CAPABILITY,
     REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
     CloseMode,
     KeptCause,
     MissReason,
@@ -73,13 +73,13 @@ class TestNodeOpen:
         node.capabilities = [
             REMOTE_CAPABILITY,
             "stage_v1",
-            FETCH_CAPABILITY,
+            WORKER_RDMA_CAPABILITY,
             "finalizer_v1",
             MEMORY_CAPABILITY,
             REMOTE_CAPABILITY,
         ]
-        response = node.open()
-        accepted = [REMOTE_CAPABILITY, FETCH_CAPABILITY, MEMORY_CAPABILITY]
+        response = node.open(pid_ns=101)
+        accepted = [REMOTE_CAPABILITY, WORKER_RDMA_CAPABILITY, MEMORY_CAPABILITY]
         assert response.status == Status.OK and response.capabilities == accepted
         assert service.registry.capabilities_of("n1") == tuple(accepted)
 
@@ -116,7 +116,6 @@ class TestNodeOpen:
         k = key("k")
         loc = node.loc(node.cxl(), 1)
         node.commit((k, loc))
-        node.source_pin((k, loc))
         old_token = node.token
         clock.advance(31)  # the session expired; the process is still there
         assert node.heartbeat().status == Status.EPOCH
@@ -124,7 +123,6 @@ class TestNodeOpen:
         assert response.status == Status.OK and response.epoch_seq == 1
         assert node.token != old_token
         # its pin moved to the new session and its op records stayed
-        assert service.pins.held_by(node.token)
         assert ("node", node.epoch) in service.ledger
         # the old token stays dead
         node.token, new = old_token, node.token
@@ -269,7 +267,6 @@ class TestEpochReplacement:
         node, worker, keys, locs = self._node(wire, service)
         # the worker reads DRAM and CXL; the node pins the CXL page too
         worker_pins = [i.pin_id for i in worker.lookup(keys["d"], keys["c"]).items]
-        source_pin = node.source_pin((keys["c"], locs["c"])).items[0].pin_id
         old_epoch, old_token, old_dram = node.epoch, node.token, node.dram_id
         node.restart()
         response = node.open(pools=self._pools(node))
@@ -280,7 +277,6 @@ class TestEpochReplacement:
         node.token, new_token = old_token, node.token
         assert node.heartbeat().status == Status.EPOCH
         node.token = new_token
-        assert service.pins.get(source_pin) is None
         assert old_epoch not in service.ledger
         # Only the worker's own run-scoped DRAM pin goes on departure.
         drain(service)
@@ -558,7 +554,6 @@ class TestNodeClose:
         node.commit((c, cxl), (d, node.loc(node.dram(), 1)))
         node_cxl = node.loc(node.cxl(), 2)
         node.commit((f, node_cxl))
-        node_pin = node.source_pin((f, node_cxl)).items[0].pin_id
         o = key("o")
         other_cxl = other.loc(other_pool, 1)
         other.commit((o, other_cxl))
@@ -579,10 +574,10 @@ class TestNodeClose:
         finally:
             log.removeHandler(caplog.handler)
         assert service.registry.nodes["n1"].gone
-        assert all(service.pins.get(p) is None for p in (cxl_pin, dram_pin, node_pin))
+        assert all(service.pins.get(p) is None for p in (cxl_pin, dram_pin))
         assert not service.catalog.locations(c) and not service.catalog.locations(f)
         assert service.catalog.pool(node.cxl().pool_id) is None
-        assert "n1 given up: 3 pins on its locations released" in caplog.text
+        assert "n1 given up: 2 pins on its locations released" in caplog.text
         # n2's location and every pin on it stay
         assert service.pins.get(other_pin) and service.pins.get(foreign)
         assert [e.location for e in service.catalog.locations(o)] == [other_cxl]
@@ -711,12 +706,13 @@ class TestNodeClose:
         k = key("k")
         loc = a.loc(a.cxl(), 1)
         a.commit((k, loc))
-        # another node pins it as a fetch source
-        pin = b.source_pin((k, loc)).items[0].pin_id
+        worker = FakeWorker(wire, a)
+        worker.open()
+        pin = worker.lookup(k).items[0].pin_id
         a.close(CloseMode.LEAVE)
         drain(service)
         assert service.catalog.pool(a.cxl().pool_id) is not None
-        assert b.unpin(pin).items[0].result == "OK"
+        assert worker.unpin(pin).items[0].result == "OK"
         assert service.catalog.pool(a.cxl().pool_id) is None
         assert not service.catalog.locations(k)
 
@@ -1065,36 +1061,6 @@ class TestHeartbeatQueues:
             reads[:4],
             [reads[i] for i in (0, 1, 2, 4)],
         ]
-
-    def test_a_fetch_plan_records_nothing_until_its_source_is_read(self, env):
-        _, service, wire = env
-        a, m = FakeNode(wire, "a"), FakeNode(wire, "m")
-        a.capabilities, m.capabilities = [REMOTE_CAPABILITY], [MEMORY_CAPABILITY]
-        a.open()
-        m.open()
-        k, source = key("k"), m.loc(m.dram(), 1)
-        m.commit((k, source))
-        worker = FakeWorker(wire, a)
-        worker.open()
-        (item,) = worker.lookup(k).items
-        assert item.result == "FETCH" and item.plan.source == source
-        assert heartbeat_reads(m) == []  # a plan, not a read
-        # a failed read gives its source pin back with logical_bytes 0
-        pin = a.source_pin((k, source)).items[0].pin_id
-        failed = a.fetch_complete((k, pin, 0))
-        assert failed.items[0].result == "OK"
-        assert service.pins.get(pin) is None
-        assert heartbeat_reads(m) == []
-        # nor does a copy, refused
-        pin = a.source_pin((k, source)).items[0].pin_id
-        refused = a.fetch_complete((k, pin), copy=a.loc(a.dram(), 1))
-        assert refused.items[0].result == "REJECTED"
-        assert heartbeat_reads(m) == []
-        pin = a.source_pin((k, source)).items[0].pin_id
-        done = a.fetch_complete((k, pin))
-        assert done.items[0].result == "OK"
-        assert heartbeat_reads(m) == [read_of(source)]
-        assert heartbeat_reads(a) == []
 
     def test_block_requests_until_the_node_retired_them(self, env):
         _, service, wire = env

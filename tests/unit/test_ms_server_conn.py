@@ -243,14 +243,8 @@ def test_only_foreground_calls_use_the_lookup_timeout():
     ]
 
 
-def test_a_late_or_malformed_lookup_gives_back_its_plans_source_pins():
-    from maru_common.storage_types import FetchPlan, Location, PoolKind
-
-    plan = FetchPlan(
-        Location("cxl:memory:1", "a", 1, 0, 8, PoolKind.CXL), "n", 8, "src"
-    )
-    answers = []
-    sent = []
+def test_a_late_or_malformed_lookup_unpins_without_reading():
+    answers, sent = [], []
 
     def call(code, request, timeout_s=None):
         sent.append(request)
@@ -263,29 +257,26 @@ def test_a_late_or_malformed_lookup_gives_back_its_plans_source_pins():
 
     conn = make_conn(call)
     try:
-        # late: the resolver unpins its HIT and its plan's source pin
-        assert conn.lookup_and_pin(KEYS * 2, pin_sources=True) is None
-        assert sent[-1].pin_sources is True
+        assert conn.lookup_and_pin(KEYS * 2) is None
         answers.append(
             LookupAndPinResponse(
                 status=Status.OK,
                 items=[
-                    ItemOutcome(ItemResult.HIT, pin_id="hit"),
-                    ItemOutcome(ItemResult.FETCH, plan=plan),
+                    ItemOutcome(ItemResult.HIT, pin_id="a"),
+                    ItemOutcome(ItemResult.HIT, pin_id="b"),
                 ],
             )
         )
         assert conn.heartbeat_once()
         conn._resolve_lookups()
-        assert conn.late_hits == 1 and conn._unpins == ["hit", "src"]
-        # malformed: one result for two keys
+        assert conn.late_hits == 2 and conn._unpins == ["a", "b"]
         conn._unpins.clear()
         answers.append(
             LookupAndPinResponse(
-                status=Status.OK, items=[ItemOutcome(ItemResult.FETCH, plan=plan)]
+                status=Status.OK, items=[ItemOutcome(ItemResult.HIT, pin_id="c")]
             )
         )
-        assert conn.lookup_and_pin(KEYS * 2, pin_sources=True) is None
-        assert conn._unpins == ["src"]
+        assert conn.lookup_and_pin(KEYS * 2) is None
+        assert conn._unpins == ["c"]
     finally:
         conn._rpc.close()

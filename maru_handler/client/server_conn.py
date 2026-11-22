@@ -60,11 +60,6 @@ class WorkerIdentity:
     namespace: str
 
 
-def plan_pins(outcomes) -> list[str]:
-    """The source pins of the FETCH plans among lookup ``outcomes``."""
-    return [o.plan.pin_id for o in outcomes if o.plan is not None and o.plan.pin_id]
-
-
 class NodeRunUnknownError(StorageUnavailableError):
     """A new MaruServer does not know the node run this worker is attached
     to yet; the session opens once the node opens its run there."""
@@ -109,6 +104,7 @@ class ServerConn:
         self._unresolved: dict[int, LookupAndPinRequest] = {}
         # Pins to unpin that MaruServer has not confirmed yet
         self._unpins: list[str] = []
+        self._frozen = threading.Event()
         self._stop = threading.Event()
         self._beat = threading.Event()  # wakes the heartbeat loop
         self._reopen = False
@@ -145,6 +141,8 @@ class ServerConn:
             self._open()
 
     def _open(self) -> None:
+        if self._frozen.is_set():
+            raise StorageUnavailableError("worker stopped")
         self.prepare_read_thread()
         if self._no_reopen:
             raise StorageUnavailableError("the session is not opened again")
@@ -246,6 +244,14 @@ class ServerConn:
             self._no_reopen = True
         self._beat.set()
 
+    def freeze(self):
+        """Keep pins and stop background ownership changes after CUDA failure."""
+        self._frozen.set()
+        self._no_reopen = True
+        self._stop.set()
+        self._wake.set()
+        self._beat.set()
+
     def close(self, goodbye: bool = True) -> bool:
         """Flush UNPINs and stop; with ``goodbye`` also WORKER_CLOSE (only after
         every GPU copy ended). Neither waits on a MaruServer that is down.
@@ -254,6 +260,9 @@ class ServerConn:
             Whether MaruServer holds nothing of the session: WORKER_CLOSE was
             answered OK, or no session was opened.
         """
+        if self._frozen.is_set():
+            self._rpc.close()
+            return False
         self._stop.set()
         self._wake.set()
         self._beat.set()
@@ -431,13 +440,12 @@ class ServerConn:
             raise StorageUnavailableError(f"read socket: {e}") from e
 
     def lookup_and_pin(
-        self, keys: list[Key], pin_sources: bool = False
+        self, keys: list[Key]
     ) -> tuple[list[ItemOutcome], str, str | None] | None:
         """One LOOKUP_AND_PIN: the outcomes, the server epoch whose pins they
         hold and the node run they were answered under; None when unknown or
         unavailable. One RPC at most: never resent, never waits for a reopen.
-        ``pin_sources``: FETCH plans come with source pins (plan_pins), which
-        the caller hands to a FETCH or UNPINs."""
+        """
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a lookup carries 1..{MAX_BATCH}")
         with self._lock:
@@ -456,7 +464,6 @@ class ServerConn:
                     server_epoch=self.server_epoch,
                     op=PLACEHOLDER_OP,
                     items=list(keys),
-                    pin_sources=pin_sources,
                 )
             )
         return self._send_lookup(origin, request, node_epoch, background=False)
@@ -472,6 +479,8 @@ class ServerConn:
         EPOCH and sends it again."""
         seq = request.op.seq
         for _ in range(2):
+            if self._frozen.is_set():
+                return None
             try:
                 response: LookupAndPinResponse = self._rpc.call(
                     MessageType.LOOKUP_AND_PIN,
@@ -537,7 +546,6 @@ class ServerConn:
                 if response.status == Status.OK:
                     self.unpin(
                         [o.pin_id for o in response.items if o.pin_id is not None]
-                        + plan_pins(response.items)
                     )
                 return None
             return response.items, request.server_epoch, node_epoch
@@ -549,7 +557,7 @@ class ServerConn:
 
     def _resolve_lookups(self) -> None:
         """Resend unresolved lookups with the same op, one at a time while
-        answers come back, and unpin their HITs and plans' source pins;
+        answers come back, and unpin their HITs;
         nobody reads them (not counted as hits)."""
         while not self._stop.is_set():
             with self._lock:
@@ -574,7 +582,6 @@ class ServerConn:
                 if o.result == ItemResult.HIT and o.pin_id is not None
             ]
             self.late_hits += len(pins)
-            pins += plan_pins(answered[0])
             if pins:
                 self.unpin(pins)
 
@@ -615,12 +622,14 @@ class ServerConn:
     def unpin(self, pin_ids: list[str]) -> None:
         """Queue pins for UNPIN; the resolver thread sends them at once, so
         the caller never waits on MaruServer."""
-        if pin_ids:
+        if pin_ids and not self._frozen.is_set():
             with self._lock:
                 self._unpins.extend(pin_ids)
             self._wake.set()
 
     def _flush_unpins(self) -> bool:
+        if self._frozen.is_set():
+            return False
         with self._lock:
             pins = list(self._unpins)
             session, epoch = self.session, self.server_epoch
@@ -629,6 +638,8 @@ class ServerConn:
         if session is None or epoch is None:
             return False  # not open: sent once it is
         for i in range(0, len(pins), MAX_BATCH):
+            if self._frozen.is_set():
+                return False
             batch = pins[i : i + MAX_BATCH]
             try:
                 response = self._rpc.call(

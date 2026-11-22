@@ -21,8 +21,6 @@ from maru_common.protocol import (
     AdminDeleteResponse,
     CommitRequest,
     CommitResponse,
-    FetchCompleteRequest,
-    FetchCompleteResponse,
     LookupAndPinRequest,
     LookupAndPinResponse,
     NodeCloseRequest,
@@ -39,8 +37,6 @@ from maru_common.protocol import (
     ProbeResponse,
     RetireRequest,
     RetireResponse,
-    SourcePinRequest,
-    SourcePinResponse,
     UnpinRequest,
     UnpinResponse,
     WorkerCloseRequest,
@@ -63,7 +59,7 @@ from maru_common.storage_types import (
     Status,
 )
 
-from .catalog import Catalog, PoolRecord
+from .catalog import Catalog
 from .node_registry import (
     NodeRegistry,
     NodeSession,
@@ -79,7 +75,7 @@ from .op_ledger import (
     OriginKey,
     Verdict,
 )
-from .pin_manager import HolderKind, Pin, PinManager
+from .pin_manager import HolderKind, PinManager
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +129,7 @@ def result_bytes(result: Any) -> int:
     size = 64
     for item in getattr(result, "items", ()):
         size += 48 + len(item.pin_id or "")
-        size += len(item.plan.pin_id or "") if item.plan else 0
-        for loc in (item.location, item.plan.source if item.plan else None):
+        for loc in (item.location,):
             if loc is not None:
                 size += 64 + len(loc.pool_id) + len(loc.allocation_id)
     return size
@@ -510,9 +505,7 @@ class MsService:
                 requester = self.registry.requester(session, self._clock())
                 batch.applying = True
                 for key in req.items:
-                    batch.outcomes.append(
-                        self._lookup_one(key, requester, session, req.pin_sources)
-                    )
+                    batch.outcomes.append(self._lookup_one(key, requester, session))
                 return LookupAndPinResponse(status=Status.OK, items=batch.outcomes)
 
             return self._run_op(
@@ -525,9 +518,7 @@ class MsService:
                 run,
             )
 
-    def _lookup_one(
-        self, key: Key, requester, session: WorkerSession, pin_sources: bool
-    ) -> ItemOutcome:
+    def _lookup_one(self, key: Key, requester, session: WorkerSession) -> ItemOutcome:
         selection = self.catalog.select(key, requester)
         entry = selection.entry
         if selection.result == ItemResult.HIT:
@@ -552,26 +543,10 @@ class MsService:
                 pin_id=pin_id,
                 pool_registration=entry.pool.registration,
             )
-        if selection.result == ItemResult.FETCH:
-            assert entry is not None
-            source_pin = None
-            if pin_sources:
-                # For the worker's node run to read under (FETCH_COMPLETE)
-                source_pin = self.pins.pin(
-                    key,
-                    entry.location,
-                    session.token,
-                    HolderKind.SOURCE,
-                    creator=(session.node_id, session.node_epoch),
-                )
-            plan = self.catalog.fetch_plan(entry, source_pin)
-            return ItemOutcome(ItemResult.FETCH, plan=plan)
         return ItemOutcome(ItemResult.MISS, reason=selection.reason)
 
     def unpin(self, req: UnpinRequest, payload: dict) -> UnpinResponse:
-        """Own pins; with ``worker_incarnation``, only that worker's source
-        pins for the node's run. Unknown ids are OK, others' pins
-        REJECTED."""
+        """Release only pins owned by the requesting session."""
         with self.lock:
             now = self._clock()
             error = self._epoch_error(req)
@@ -596,74 +571,13 @@ class MsService:
                 if pin is None:
                     items.append(ItemOutcome(ItemResult.OK))
                     continue
-                if req.worker_incarnation:
-                    mine = node is not None and self._own_source(
-                        node, pin, req.worker_incarnation
-                    )
-                else:
-                    # A node releases a worker's source pin only by naming
-                    # the worker
-                    mine = pin.holder == req.session
+                mine = pin.holder == req.session
                 if mine:
                     self.pins.unpin(pin_id)
                     items.append(ItemOutcome(ItemResult.OK))
                 else:
                     items.append(ItemOutcome(ItemResult.REJECTED))
             return UnpinResponse(status=Status.OK, items=items)
-
-    def source_pin(self, req: SourcePinRequest, payload: dict) -> SourcePinResponse:
-        digest = op_digest(payload)
-        with self.lock:
-            session = self._node_session(req, SourcePinResponse)
-            if not isinstance(session, NodeSession):
-                return session
-            rejected = self._too_many(req.items, SourcePinResponse, "items")
-            if rejected:
-                return rejected
-
-            def run(batch: _Batch) -> SourcePinResponse:
-                # Only a new op is checked: a resend gets its first answer,
-                # with the pins it made, also once the worker went
-                if req.worker_incarnation:
-                    worker = self.registry.known_worker(req.worker_session)
-                    error = self._not_bound(session, worker, req.worker_incarnation)
-                    if error is None and any(
-                        i.key.namespace != worker.namespace for i in req.items
-                    ):
-                        error = "a key is not in the worker's namespace"
-                    if error is not None:
-                        return SourcePinResponse(status=Status.REJECTED, error=error)
-                now = self._clock()
-
-                def online(node_id: str) -> bool:
-                    return self.registry.node_online(node_id, now)
-
-                def can_fetch(pool: PoolRecord) -> bool:
-                    return self.registry.can_fetch(session.node_id, pool)
-
-                batch.applying = True
-                for item in req.items:
-                    batch.outcomes.append(
-                        self.catalog.source_pin(
-                            session.node_id,
-                            session.token,
-                            item.key,
-                            item.location,
-                            online,
-                            can_fetch if req.worker_incarnation else None,
-                        )
-                    )
-                return SourcePinResponse(status=Status.OK, items=batch.outcomes)
-
-            return self._run_op(
-                req.op,
-                node_origin(session.node_epoch),
-                session.node_id,
-                digest,
-                SourcePinResponse,
-                len(req.items),
-                run,
-            )
 
     # =================================================== publish and remove
 
@@ -732,78 +646,6 @@ class MsService:
                 len(req.items),
                 run,
             )
-
-    def fetch_complete(
-        self, req: FetchCompleteRequest, payload: dict
-    ) -> FetchCompleteResponse:
-        digest = op_digest(payload)
-        with self.lock:
-            session = self._node_session(req, FetchCompleteResponse)
-            if not isinstance(session, NodeSession):
-                return session
-            rejected = self._too_many(req.items, FetchCompleteResponse, "items")
-            if rejected:
-                return rejected
-
-            def run(batch: _Batch) -> FetchCompleteResponse:
-                batch.applying = True
-                for item in req.items:
-                    source = self.pins.get(item.source_pin_id)
-                    owned = self._own_source(session, source, item.source_worker)
-                    outcome = self.catalog.fetch_complete(item, owned)
-                    batch.outcomes.append(outcome)
-                    # A read that succeeded, of the source the node pinned
-                    if (
-                        outcome.result == ItemResult.OK
-                        and item.logical_bytes > 0
-                        and source is not None
-                        and (pool := self.catalog.pool(source.location.pool_id))
-                        is not None
-                    ):
-                        self.registry.record_access(pool, source.location)
-                return FetchCompleteResponse(status=Status.OK, items=batch.outcomes)
-
-            return self._run_op(
-                req.op,
-                node_origin(session.node_epoch),
-                session.node_id,
-                digest,
-                FetchCompleteResponse,
-                len(req.items),
-                run,
-            )
-
-    @staticmethod
-    def _not_bound(
-        session: NodeSession, worker: WorkerSession | None, incarnation: str
-    ) -> str | None:
-        """Why ``worker`` is not the open session of the worker
-        ``incarnation`` on the node run of ``session``, or None."""
-        if worker is None:
-            return "the worker session is unknown or closed"
-        if (
-            worker.role != SessionRole.WORKER
-            or worker.node_id != session.node_id
-            or worker.node_epoch != session.node_epoch
-            or worker.incarnation != incarnation
-        ):
-            return "the worker session is not that worker's on this node run"
-        return None
-
-    def _own_source(
-        self, session: NodeSession, pin: Pin | None, source_worker: str
-    ) -> bool:
-        """``pin`` is one ``session`` reads under and releases: with
-        ``source_worker``, the source pin of that worker's FETCH plan for this
-        node run; else the session's own node pin."""
-        if pin is None:
-            return False
-        if not source_worker:
-            return pin.holder_kind == HolderKind.NODE and pin.holder == session.token
-        if pin.holder_kind != HolderKind.SOURCE or pin.creator != session.creator:
-            return False
-        holder = self.registry.known_worker(pin.holder)
-        return holder is not None and holder.incarnation == source_worker
 
     # =========================================================== admin
 

@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 from enum import IntEnum, unique
 
 from .protocol import HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION, MessageHeader
+from .remote_protocol import TransferEnd
 from .storage_types import (
     WORKER_RDMA_CAPABILITY,
-    FetchPlan,
     HintAction,
     ItemOutcome,
     Key,
@@ -33,6 +33,8 @@ from .storage_types import (
     SessionRole,
     Status,
     WaitLevel,
+    WriteAgent,
+    WriteDomain,
 )
 
 DEFAULT_NODE_SOCKET = "/run/maru/node.sock"
@@ -51,9 +53,7 @@ class NodeMessageType(IntEnum):
     CREDIT_RETURN = 0x11
     WRITE_DONE = 0x12
     ABORT = 0x13
-    FETCH = 0x18
-    FETCH_CANCEL = 0x19
-    FETCH_RELEASE = 0x1A
+    # 0x18, 0x19, 0x1A: reserved; never reuse
     HINT = 0x1B
     READ_JOIN = 0x1C
     LOCAL_PIN = 0x20
@@ -87,11 +87,6 @@ class Budgets:
     credit_refill_high: int
     commit_pending_max_bytes: int
     transfer_reserve_bytes: dict[str, int] = field(default_factory=dict)
-    # Page-rounded byte limit for one FETCH.
-    fetch_request_max_bytes: int = 0
-    # Node-wide TRANSFER and lent pages, counted until each page's last lease
-    # is returned by FETCH_RELEASE.
-    fetch_max_inflight_bytes: int = 0
 
 
 @dataclass
@@ -108,12 +103,8 @@ class WriteDoneItem:
     key: Key
     credit: Location
     logical_bytes: int
-
-
-@dataclass
-class FetchItem:
-    key: Key
-    plan: FetchPlan
+    domain: WriteDomain | None = None
+    end: TransferEnd = TransferEnd.DONE
 
 
 # =============================================================================
@@ -232,6 +223,7 @@ class CreditResponse:
     status: Status
     error: str | None = None
     credits: list[Location] = field(default_factory=list)
+    write_agent: WriteAgent | None = None
 
 
 @dataclass
@@ -275,77 +267,6 @@ class AbortRequest:
 
 @dataclass
 class AbortResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-
-
-@dataclass
-class FetchRequest:
-    """FETCH (0x18) - Only with fetch_v1 and lease_v1 agreed at ATTACH.
-
-    ``deadline_ms`` counts from the first receipt; a resend joins the same
-    fetch and does not extend it (it is not part of the op digest, so a
-    resend may carry the time left). A malformed request or one over
-    fetch_request_max_bytes is REJECTED, a full node before taking it is
-    BUSY. Items: HIT(location, lease_id), MISS(reason), REJECTED; MISS busy,
-    timeout or io_error once taken. From the reply on, the HIT's node page
-    is lent to the worker: it sends FETCH_RELEASE after its GPU reads. A
-    plan's source pin (pin_id) is the node's once it answers OK: it reads
-    under it or UNPINs it.
-    """
-
-    op: OpRef
-    worker_session: str
-    items: list[FetchItem]
-    max_bytes: int
-    deadline_ms: int
-
-
-@dataclass
-class FetchResponse:
-    """``window_bytes``: the worker's fetch window now (fetch_request_max_bytes
-    of its budgets), its share among the fetch_v1 workers attached at this
-    answer; 0 leaves it as it was (an older node, or a node without one)."""
-
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-    window_bytes: int = 0
-
-
-@dataclass
-class FetchCancelRequest:
-    """FETCH_CANCEL (0x19) - ``target`` is the op of the FETCH to cancel.
-
-    Means "no longer needed", never "GPU reads are done"; answered OK. Before
-    the FETCH reply the node cleans up and the FETCH may end MISS with no
-    reason. A HIT already answered stays lent; the worker releases it, after
-    its GPU reads if it submitted any. A cancel before its FETCH stops that
-    FETCH from running.
-    """
-
-    target: OpRef
-
-
-@dataclass
-class FetchCancelResponse:
-    status: Status
-    error: str | None = None
-
-
-@dataclass
-class FetchReleaseRequest:
-    """FETCH_RELEASE (0x1A) - Leases of FETCH HITs whose GPU reads are done
-    (or never started). No op: sending it again changes nothing. Items: OK,
-    or STALE (released already, another worker's, or of an earlier run).
-    A node never gives one lease_id twice, across its runs too."""
-
-    lease_ids: list[int]
-
-
-@dataclass
-class FetchReleaseResponse:
     status: Status
     error: str | None = None
     items: list[ItemOutcome] = field(default_factory=list)
@@ -443,9 +364,6 @@ NODE_MESSAGE_CLASSES = {
     NodeMessageType.CREDIT_RETURN: (CreditReturnRequest, CreditReturnResponse),
     NodeMessageType.WRITE_DONE: (WriteDoneRequest, WriteDoneResponse),
     NodeMessageType.ABORT: (AbortRequest, AbortResponse),
-    NodeMessageType.FETCH: (FetchRequest, FetchResponse),
-    NodeMessageType.FETCH_CANCEL: (FetchCancelRequest, FetchCancelResponse),
-    NodeMessageType.FETCH_RELEASE: (FetchReleaseRequest, FetchReleaseResponse),
     NodeMessageType.HINT: (HintRequest, HintResponse),
     NodeMessageType.LOCAL_PIN: (LocalPinRequest, LocalPinResponse),
     NodeMessageType.LOCAL_UNPIN: (LocalUnpinRequest, LocalUnpinResponse),

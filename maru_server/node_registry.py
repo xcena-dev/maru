@@ -30,7 +30,6 @@ from maru_common.protocol import (
 )
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
-    FETCH_CAPABILITY,
     MAX_BATCH,
     MEMORY_CAPABILITY,
     MS_PROTOCOL,
@@ -64,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 NODE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 NODE_CAPABILITIES = frozenset(
-    {REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY, WORKER_RDMA_CAPABILITY}
+    {REMOTE_CAPABILITY, MEMORY_CAPABILITY, WORKER_RDMA_CAPABILITY}
 )
 # ended node_epochs kept per node, so a late old process cannot come back
 RETIRED_EPOCHS_KEPT = 4096
@@ -296,7 +295,6 @@ class NodeRegistry:
             can_map=lambda pool: (
                 self.can_map(worker, pool) or self.can_rdma(worker, pool, now)
             ),
-            can_fetch=lambda pool: self.can_fetch(worker.node_id, pool),
             online=lambda node_id: self.node_online(node_id, now),
         )
 
@@ -335,21 +333,6 @@ class NodeRegistry:
     def _maps_shared_cxl(worker: WorkerSession, pool: PoolRecord) -> bool:
         """Another host's CXL region mapped directly: not supported yet."""
         return False
-
-    def can_fetch(self, node_id: str, pool: PoolRecord) -> bool:
-        """Own pools no worker maps, or active memory-node pools with remote
-        I/O agreed."""
-        if pool.node_id == node_id:
-            return not POOL_KINDS[pool.kind].mappable
-        if pool.state != PoolState.ACTIVE:
-            return False
-        requester = self.capabilities_of(node_id)
-        owner = self.capabilities_of(pool.node_id)
-        return (
-            REMOTE_CAPABILITY in requester
-            and MEMORY_CAPABILITY in owner
-            and POOL_KINDS[pool.kind].mappable
-        )
 
     # ============================================================ node open
 

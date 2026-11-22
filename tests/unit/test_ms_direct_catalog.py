@@ -298,8 +298,8 @@ def test_an_orphan_without_evidence_of_its_end_is_kept(env):
 
 @pytest.mark.parametrize("name", ["remote_dram", "remote_cxl"])
 def test_worker_rdma_hit_owns_a_worker_pin_and_pool_registration(env, name):
-    hit = env.worker.lookup(key(name), pin_sources=True).items[0]
-    assert hit.result == ItemResult.HIT and hit.plan is None
+    hit = env.worker.lookup(key(name)).items[0]
+    assert hit.result == ItemResult.HIT
     assert hit.location == env.targets[name]
     assert (
         hit.pool_registration
@@ -307,17 +307,6 @@ def test_worker_rdma_hit_owns_a_worker_pin_and_pool_registration(env, name):
     )
     pin = env.service.pins.get(hit.pin_id)
     assert pin.holder_kind == HolderKind.WORKER and pin.keep_on_departure
-
-
-def test_capability_absence_preserves_fetch(env):
-    env.gpu.capabilities = [REMOTE_CAPABILITY]
-    env.gpu.open(pools=[env.gpu.dram(), env.gpu.cxl()], pid_ns=101)
-    hit = env.worker.lookup(key("remote_dram"), pin_sources=True).items[0]
-    assert hit.result == ItemResult.FETCH and hit.pool_registration == 0
-    assert env.service.pins.get(hit.plan.pin_id).holder_kind == HolderKind.SOURCE
-    reopen(env)
-    drain(env.service)
-    assert env.service.pins.get(hit.plan.pin_id) is None
 
 
 def test_memory_role_is_required_for_direct_hit(env):
@@ -470,3 +459,9 @@ def test_same_pool_registration_never_repeats_when_its_owner_changes(env):
     assert hit.pool_registration != old.pool_registration
     assert hit.pool_registration == reply.pool_registrations[pool.pool_id]
     assert env.service.pins.get(old.pin_id) is not None
+
+
+def test_capability_absence_is_a_remote_miss(env):
+    env.gpu.capabilities = [REMOTE_CAPABILITY]
+    env.gpu.open(pools=[env.gpu.dram(), env.gpu.cxl()], pid_ns=101)
+    assert env.worker.lookup(key("remote_dram")).items[0].result == ItemResult.MISS

@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 RESPONSE_BIT = int(MessageType.RESPONSE)
 OP_DIGEST_SIZE = 16
 # Left out of op digests so a resend after reopening a session still matches;
-# a resent FETCH may carry less of its deadline (the first one stands)
-ENVELOPE_FIELDS = ("op", "session", "server_epoch", "worker_session", "deadline_ms")
+ENVELOPE_FIELDS = ("op", "session", "server_epoch", "worker_session")
 # The header sequence is 32 bits; 0 is kept for NOTIFY.
 _SEQ_MOD = 1 << 32
 

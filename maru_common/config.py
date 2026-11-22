@@ -125,14 +125,6 @@ class MaruConfig:
     load_only: bool = False
     # maru_node: objects this worker may store in one engine step (0: unknown)
     step_objects: int = 0
-    # maru_node: parked loads may fetch what only the node reads (a memory
-    # node's pool): asks for fetch_v1, and a scheduler probe counts such keys
-    # as found
-    fetch_loads: bool = False
-    # maru_node: a FETCH's deadline, max(base, pages x per page) ms; per
-    # page unset: the node page at 2 GB/s
-    fetch_deadline_ms: int = 250
-    fetch_deadline_per_page_ms: float | None = None
 
     @property
     def server_urls(self) -> list[str]:
@@ -161,13 +153,6 @@ class MaruConfig:
             )
         if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
             raise ValueError("lookup_timeout_ms must be a positive integer")
-        if type(self.fetch_deadline_ms) is not int or self.fetch_deadline_ms <= 0:
-            raise ValueError("fetch_deadline_ms must be a positive integer")
-        if (
-            self.fetch_deadline_per_page_ms is not None
-            and not self.fetch_deadline_per_page_ms >= 0
-        ):
-            raise ValueError("fetch_deadline_per_page_ms must not be negative")
         if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
             raise ValueError(
                 "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
@@ -240,7 +225,7 @@ class MaruConfig:
             )
         if "," in self.server_url and self.storage_backend != "remote_cxl":
             raise ValueError("Several MaruServer URLs require the remote_cxl backend")
-        if self.storage_backend == "remote_cxl":
+        if self.storage_backend == "remote_cxl" or self.maru_node:
             if self.rdma_timeout_s <= 0:
                 raise ValueError("rdma_timeout_s must be positive")
             if not 0 <= self.rdma_load_reserve < 1:

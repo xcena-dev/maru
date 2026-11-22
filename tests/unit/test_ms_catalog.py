@@ -11,7 +11,7 @@ import pytest
 
 from maru_common.storage_types import (
     MEMORY_CAPABILITY,
-    REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
     KeptCause,
     MissReason,
     PoolKind,
@@ -48,13 +48,13 @@ def open_node(wire, node_id, cxl=False, caps=()):
     pools = [node.dram()]
     if cxl:
         pools.append(node.cxl(region_id=region(node_id)))
-    assert node.open(pools=pools).status == Status.OK
+    assert node.open(pools=pools, pid_ns=101).status == Status.OK
     return node
 
 
 def gpu_and_memory(wire, cxl=False):
     """GPU node a, which reads memory nodes over RDMA, and memory node m."""
-    a = open_node(wire, "a", cxl=cxl, caps=[REMOTE_CAPABILITY])
+    a = open_node(wire, "a", cxl=cxl, caps=[WORKER_RDMA_CAPABILITY])
     m = open_node(wire, "m", caps=[MEMORY_CAPABILITY])
     return a, m
 
@@ -89,28 +89,22 @@ class TestLookupOrder:
         expected = [
             ("HIT", a_dram, a),  # node DRAM
             ("HIT", a_cxl, a),  # node CXL
-            ("FETCH", m_dram, m),  # a memory node's DRAM
+            ("HIT", m_dram, m),  # a memory node's DRAM
         ]
         for result, location, owner in expected:
             response = worker.lookup(k)
             item = response.items[0]
             assert item.result == result
-            if result == "HIT":
-                assert item.location == location and item.pin_id
-                worker.unpin(item.pin_id)
-            else:
-                assert item.plan.source == location
-                assert item.plan.source_node == owner.node_id
-                assert item.plan.bytes == location.length
-                assert item.pin_id is None
+            assert item.location == location and item.pin_id
+            worker.unpin(item.pin_id)
             # PROBE gives the same answer without pin or location
             hint = probe.probe(k).items[0]
             assert hint.result == result
-            assert hint.location is None and hint.pin_id is None and hint.plan is None
+            assert hint.location is None and hint.pin_id is None
             # with_locations names the location chosen, still with no pin
             named = probe.probe(k, with_locations=True).items[0]
             assert (named.result, named.location) == (result, location)
-            assert named.pin_id is None and named.plan is None
+            assert named.pin_id is None
             # retire the chosen one; the next one is chosen after it
             assert results(owner.retire((k, location))) == ["RETIRED"]
         miss = worker.lookup(k).items[0]
@@ -119,17 +113,6 @@ class TestLookupOrder:
         assert results(b.retire((k, b_dram), (k, b_cxl))) == ["RETIRED"] * 2
         miss = worker.lookup(k).items[0]
         assert miss.result == "MISS" and miss.reason == MissReason.ABSENT
-
-    def test_fetch_plan_names_source_node(self, env):
-        _, _, wire = env
-        a, m = gpu_and_memory(wire)
-        k = key("k")
-        m.commit((k, m.loc(m.dram(), 3), 100))
-        worker = FakeWorker(wire, a)
-        worker.open()
-        item = worker.lookup(k).items[0]
-        assert item.result == "FETCH"
-        assert item.plan.source_node == "m" and item.plan.bytes == 100
 
     def test_probe_session_gives_no_pins(self, env):
         _, service, wire = env
@@ -156,7 +139,7 @@ class TestMissReasons:
         worker = FakeWorker(wire, a)
         worker.open()
         assert worker.lookup(key("other")).items[0].reason == MissReason.ABSENT
-        assert worker.lookup(k).items[0].result == "FETCH"
+        assert worker.lookup(k).items[0].result == "HIT"
         # the sessions expire: no StorageService can send the bytes
         clock.advance(20)
         worker.heartbeat()
@@ -178,7 +161,7 @@ class TestMissReasons:
         # another GPU node's DRAM is never fetched
         assert results(worker.lookup(k_remote, k_memory, k_dram)) == [
             "MISS",
-            "FETCH",
+            "HIT",
             "HIT",
         ]
         # a's session expires while b and m stay up
@@ -208,28 +191,9 @@ class TestMissReasons:
         assert a.heartbeat().status == Status.EPOCH
 
 
-class TestFetchSources:
+class TestDirectSources:
     """A node fetches only memory nodes' pools, with remote I/O agreed:
     another GPU node serves no FETCH, so its copies are never a plan."""
-
-    def test_a_memory_nodes_copy_is_fetched_not_another_gpu_nodes(self, env):
-        _, _, wire = env
-        a, m = gpu_and_memory(wire)
-        b = open_node(wire, "b", cxl=True)
-        k = key("k")
-        # as cheap by cost as m's DRAM, but not fetchable by a
-        b.commit((k, b.loc(b.dram(), 1)))
-        b.commit((k, b.loc(b.cxl(region_id=region("b")), 1)))
-        source = m.loc(m.dram(), 1)
-        m.commit((k, source))
-        worker = FakeWorker(wire, a)
-        worker.open()
-        probe = FakeWorker(wire, a, role=SessionRole.PROBE)
-        probe.open()
-        item = worker.lookup(k).items[0]
-        assert item.result == "FETCH"
-        assert item.plan.source == source and item.plan.source_node == "m"
-        assert probe.probe(k).items[0].result == "FETCH"
 
     def test_only_another_gpu_nodes_copy_is_an_offline_miss(self, env):
         _, _, wire = env
@@ -246,7 +210,6 @@ class TestFetchSources:
         # copy the requester cannot reach
         item = worker.lookup(k).items[0]
         assert item.result == "MISS" and item.reason == MissReason.OFFLINE
-        assert item.plan is None
         assert probe.probe(k).items[0].reason == MissReason.OFFLINE
         # b's own worker still maps it
         b_probe = FakeWorker(wire, b, role=SessionRole.PROBE)
@@ -254,25 +217,6 @@ class TestFetchSources:
         assert b_probe.probe(k).items[0].result == "HIT"
         assert results(b.retire((k, b_dram), (k, b_cxl))) == ["RETIRED"] * 2
         assert worker.lookup(k).items[0].reason == MissReason.ABSENT
-
-    def test_can_fetch_is_only_memory_nodes_pools_with_remote_agreed(self, env):
-        _, service, wire = env
-        open_node(wire, "a", cxl=True, caps=[REMOTE_CAPABILITY])
-        open_node(wire, "b", cxl=True)
-        open_node(wire, "m", cxl=True, caps=[MEMORY_CAPABILITY])
-        pools = [p for n in "abm" for p in service.catalog.pools_of(n)]
-        assert len(pools) == 6
-
-        def fetchable(node_id):
-            return {
-                (p.node_id, p.kind)
-                for p in pools
-                if service.registry.can_fetch(node_id, p)
-            }
-
-        assert fetchable("a") == {("m", PoolKind.DRAM), ("m", PoolKind.CXL)}
-        # no remote_v1 (b), or only its own pools, which it maps (m)
-        assert fetchable("b") == fetchable("m") == set()
 
 
 class TestCommit:
@@ -488,241 +432,6 @@ class TestRetire:
         assert results(a.retire((k, loc))) == ["RETIRED"]
 
 
-class TestFetch:
-    def _setup(self, wire):
-        a, m = gpu_and_memory(wire)
-        worker = FakeWorker(wire, a)
-        worker.open()
-        k = key("k")
-        source = m.loc(m.dram(), 1)
-        m.commit((k, source))
-        return a, m, worker, k, source
-
-    def test_source_pin_and_fetch_complete(self, env):
-        _, service, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        plan = worker.lookup(k).items[0]
-        assert plan.result == "FETCH" and plan.plan.source == source
-        pinned = a.source_pin((k, plan.plan.source))
-        assert results(pinned) == ["HIT"]
-        source_pin = pinned.items[0].pin_id
-        # the source pin keeps the source from its node's retire
-        assert m.retire((k, source)).items[0].cause == KeptCause.PINNED
-        done = a.fetch_complete((k, source_pin))
-        assert results(done) == ["OK"]
-        assert done.items[0].location is None and done.items[0].pin_id is None
-        # the source pin went with it, and no copy came in
-        assert service.pins.get(source_pin) is None
-        assert [e.location for e in service.catalog.locations(k)] == [source]
-        assert results(m.retire((k, source))) == ["RETIRED"]
-
-    def test_a_fetched_copy_is_never_published(self, env):
-        _, service, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        pin = a.source_pin((k, source)).items[0].pin_id
-        copy = a.loc(a.dram(), 1)
-        done = a.fetch_complete((k, pin), copy=copy)
-        assert results(done) == ["REJECTED"]
-        assert done.items[0].location is None and done.items[0].pin_id is None
-        # the source pin goes all the same; the copy is no location
-        assert service.pins.get(pin) is None and len(service.pins) == 0
-        assert [e.location for e in service.catalog.locations(k)] == [source]
-        assert worker.lookup(k).items[0].result == "FETCH"
-
-    def test_fetch_complete_rejections(self, env):
-        _, service, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        # a source pin that is not there
-        done = a.fetch_complete((k, "nope"))
-        assert results(done) == ["REJECTED"]
-        assert service.catalog.entry_exact(k, source) is not None
-        # another node's source pin: neither read under nor released
-        b = open_node(wire, "b", caps=[REMOTE_CAPABILITY])
-        foreign = b.source_pin((k, source)).items[0].pin_id
-        assert results(a.fetch_complete((k, foreign))) == ["REJECTED"]
-        assert service.pins.get(foreign) is not None
-        # a pin of another key: refused, and released (it is the node's)
-        other, where = key("other"), m.loc(m.dram(), 2)
-        m.commit((other, where))
-        pin = a.source_pin((other, where)).items[0].pin_id
-        assert results(a.fetch_complete((k, pin))) == ["REJECTED"]
-        assert service.pins.get(pin) is None
-
-    def test_a_read_pin_is_not_a_source_pin(self, env):
-        _, service, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        hit = key("hit")
-        a.commit((hit, a.loc(a.dram(), 1)))
-        read = worker.lookup(hit).items[0].pin_id
-        done = a.fetch_complete((hit, read))
-        assert results(done) == ["REJECTED"]
-        assert service.pins.get(read) is not None
-
-    def test_source_pin_misses(self, env):
-        clock, _, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        gone = replace(source, generation=source.generation + 5)
-        response = a.source_pin((k, gone))
-        assert results(response) == ["MISS"]
-        assert response.items[0].reason == MissReason.ABSENT
-        clock.advance(20)
-        a.heartbeat()
-        clock.advance(15)
-        response = a.source_pin((k, source))
-        assert response.items[0].reason == MissReason.OFFLINE
-
-    def test_fetch_complete_resend_replays_its_first_answer(self, env):
-        _, service, wire = env
-        a, m, worker, k, source = self._setup(wire)
-        from maru_common.protocol import (
-            FetchCompleteItem,
-            FetchCompleteRequest,
-            MessageType,
-        )
-
-        pin = a.source_pin((k, source)).items[0].pin_id
-        request = a.build(
-            FetchCompleteRequest,
-            **a.envelope(),
-            items=[FetchCompleteItem(k, pin, PAGE)],
-        )
-        first = wire.call(MessageType.FETCH_COMPLETE, request)
-        assert results(first) == ["OK"]
-        # the reply was lost; the resend gets the same result, not REJECTED
-        assert wire.call(MessageType.FETCH_COMPLETE, request) == first
-
-
-class TestWorkerBinding:
-    """SOURCE_PIN for a named worker: only its own open session on this
-    node's run, with its namespace, gets a pin."""
-
-    def _setup(self, wire):
-        """A key on memory node m, as a's worker's fetch reads it; b is
-        another GPU node."""
-        a, m = gpu_and_memory(wire)
-        b = open_node(wire, "b")
-        worker = FakeWorker(wire, a)
-        worker.open()
-        k = key("k")
-        source = m.loc(m.dram(), 1)
-        m.commit((k, source))
-        return a, b, worker, k, source
-
-    def _bound_pin(self, a, worker, k, location):
-        from maru_common.protocol import MessageType, SourcePinRequest
-        from maru_common.storage_types import KeyLocation
-
-        return a.send(
-            MessageType.SOURCE_PIN,
-            a.build(
-                SourcePinRequest,
-                **a.envelope(),
-                items=[KeyLocation(k, location)],
-                worker_session=worker.token,
-                worker_incarnation=worker.incarnation,
-            ),
-        )
-
-    def test_a_workers_source_pin_is_only_on_pools_its_node_fetches(self, env):
-        _, service, wire = env
-        a, b, worker, _, _ = self._setup(wire)
-        k = key("on-b")
-        elsewhere = b.loc(b.dram(), 2)
-        b.commit((k, elsewhere))
-        assert results(self._bound_pin(a, worker, k, elsewhere)) == ["REJECTED"]
-        assert len(service.pins) == 0
-        # the node's own SOURCE_PIN, for no worker, is not limited
-        assert results(a.source_pin((k, elsewhere))) == ["HIT"]
-
-    def test_a_workers_source_pin_agrees_with_the_lookup(self, env):
-        _, _, wire = env
-        a, b, worker, k, source = self._setup(wire)
-        b_dram = b.loc(b.dram(), 2)
-        b.commit((k, b_dram))
-        # the lookup's source is pinned; another GPU node's DRAM is not
-        assert worker.lookup(k).items[0].plan.source == source
-        assert results(self._bound_pin(a, worker, k, source)) == ["HIT"]
-        assert results(self._bound_pin(a, worker, k, b_dram)) == ["REJECTED"]
-        # a copy in the node's own DRAM is pinned for its worker
-        copy = a.loc(a.dram(), 2)
-        a.commit((k, copy))
-        assert results(self._bound_pin(a, worker, k, copy)) == ["HIT"]
-
-    def test_source_pin_refuses_another_workers_session(self, env):
-        from maru_common.protocol import MessageType, SourcePinRequest
-        from maru_common.storage_types import KeyLocation
-
-        _, service, wire = env
-        a, b, worker, k, source = self._setup(wire)
-        other = FakeWorker(wire, a, tp_rank=1)
-        other.open()
-
-        def pin(session: str, incarnation: str, keyed=k):
-            return a.send(
-                MessageType.SOURCE_PIN,
-                a.build(
-                    SourcePinRequest,
-                    **a.envelope(),
-                    items=[KeyLocation(keyed, source)],
-                    worker_session=session,
-                    worker_incarnation=incarnation,
-                ),
-            )
-
-        refused = pin(other.token, worker.incarnation)
-        assert refused.status == Status.REJECTED and len(service.pins) == 0
-        assert pin("nope", worker.incarnation).status == Status.REJECTED
-        foreign = replace(k, namespace="other")
-        assert pin(worker.token, worker.incarnation, foreign).status == Status.REJECTED
-        assert results(pin(worker.token, worker.incarnation)) == ["HIT"]
-
-    def test_a_resend_after_the_worker_left_replays(self, env):
-        from maru_common.protocol import (
-            FetchCompleteItem,
-            FetchCompleteRequest,
-            MessageType,
-            SourcePinRequest,
-        )
-        from maru_common.storage_types import KeyLocation
-
-        _, service, wire = env
-        a, b, worker, k, source = self._setup(wire)
-        bound = {
-            "worker_session": worker.token,
-            "worker_incarnation": worker.incarnation,
-        }
-        pin_request = a.build(
-            SourcePinRequest,
-            **a.envelope(),
-            items=[KeyLocation(k, source)],
-            **bound,
-        )
-        pinned = wire.call(MessageType.SOURCE_PIN, pin_request)
-        assert results(pinned) == ["HIT"]
-        done_request = a.build(
-            FetchCompleteRequest,
-            **a.envelope(),
-            items=[FetchCompleteItem(k, pinned.items[0].pin_id, PAGE)],
-        )
-        worker.close()
-        # the replies were lost: the same pin comes back, none is added
-        assert wire.call(MessageType.SOURCE_PIN, pin_request) == pinned
-        assert len(service.pins) == 1
-        done = wire.call(MessageType.FETCH_COMPLETE, done_request)
-        assert done.status == Status.OK and len(service.pins) == 0
-        assert wire.call(MessageType.FETCH_COMPLETE, done_request) == done
-        # a new op for the worker that went is refused, and replays so
-        late = a.build(
-            SourcePinRequest,
-            **a.envelope(),
-            items=[KeyLocation(k, source)],
-            **bound,
-        )
-        refused = wire.call(MessageType.SOURCE_PIN, late)
-        assert refused.status == Status.REJECTED and len(service.pins) == 0
-        assert wire.call(MessageType.SOURCE_PIN, late) == refused
-
-
 class TestUnpin:
     def test_unknown_is_ok_foreign_is_rejected(self, env):
         _, service, wire = env
@@ -754,177 +463,3 @@ class TestUnpin:
         assert a.retire((k, loc)).items[0].cause == KeptCause.PINNED
         w.unpin(pins[1])
         assert results(a.retire((k, loc))) == ["RETIRED"]
-
-
-class TestPlanSourcePins:
-    """LOOKUP_AND_PIN with pin_sources: a FETCH plan carries a source pin,
-    held by the worker's session for its node run, which reads under it and
-    releases it in FETCH_COMPLETE or UNPIN."""
-
-    def _setup(self, wire):
-        """A key on memory node m, planned for a's worker; b is another GPU
-        node that reads m too."""
-        a, self.m = gpu_and_memory(wire)
-        b = open_node(wire, "b", caps=[REMOTE_CAPABILITY])
-        worker = FakeWorker(wire, a)
-        worker.open()
-        k = key("k")
-        source = self.m.loc(self.m.dram(), 1)
-        self.m.commit((k, source))
-        return a, b, worker, k, source
-
-    def _plan_pin(self, worker, k) -> str:
-        item = worker.lookup(k, pin_sources=True).items[0]
-        assert item.result == "FETCH" and item.plan.pin_id and item.pin_id is None
-        return item.plan.pin_id
-
-    def test_a_plan_has_a_source_pin_only_when_asked(self, env):
-        _, service, wire = env
-        a, _, worker, k, source = self._setup(wire)
-        assert worker.lookup(k).items[0].plan.pin_id is None
-        assert len(service.pins) == 0
-        pin_id = self._plan_pin(worker, k)
-        pin = service.pins.get(pin_id)
-        assert (pin.holder, pin.holder_kind) == (worker.token, "source")
-        assert pin.location == source and pin.creator == (a.node_id, a.epoch)
-        # it keeps the source from its node's retire, as a SOURCE_PIN does
-        assert self.m.retire((k, source)).items[0].cause == KeptCause.PINNED
-        # a HIT takes its read pin only
-        hit = key("hit")
-        a.commit((hit, a.loc(a.dram(), 2)))
-        assert worker.lookup(hit, pin_sources=True).items[0].plan is None
-        assert len(service.pins) == 2
-
-    def test_its_node_run_reads_under_it_and_fetch_complete_releases_it(self, env):
-        _, service, wire = env
-        a, _, worker, k, source = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        done = a.fetch_complete((k, pin_id, PAGE, source, worker.incarnation))
-        assert results(done) == ["OK"]
-        assert service.pins.get(pin_id) is None
-        assert results(self.m.retire((k, source))) == ["RETIRED"]
-        # the source read is reported to its node, as for a SOURCE_PIN
-        assert service.registry._access["m"]
-
-    def test_a_read_of_another_location_is_rejected_and_the_pin_released(self, env):
-        _, service, wire = env
-        a, _, worker, k, source = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        elsewhere = replace(source, allocation_id="a2", offset=source.offset + PAGE)
-        done = a.fetch_complete((k, pin_id, PAGE, elsewhere, worker.incarnation))
-        assert results(done) == ["REJECTED"]
-        assert service.pins.get(pin_id) is None
-        assert "m" not in service.registry._access
-
-    def test_only_the_workers_node_run_uses_or_releases_it(self, env):
-        _, service, wire = env
-        a, b, worker, k, source = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        named = worker.incarnation
-        done = b.fetch_complete((k, pin_id, PAGE, source, named))
-        assert results(done) == ["REJECTED"]
-        assert results(b.unpin(pin_id, worker_incarnation=named)) == ["REJECTED"]
-        # a's node releases it only naming the worker
-        assert results(a.unpin(pin_id)) == ["REJECTED"]
-        assert service.pins.get(pin_id) is not None
-        assert results(a.unpin(pin_id, worker_incarnation=named)) == ["OK"]
-        assert service.pins.get(pin_id) is None
-
-    def test_the_worker_unpins_a_plan_it_does_not_fetch(self, env):
-        _, service, wire = env
-        _, _, worker, k, _ = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        assert results(worker.unpin(pin_id)) == ["OK"]
-        assert len(service.pins) == 0
-
-    @pytest.mark.parametrize("end", ["close", "exit", "new_run"])
-    def test_it_goes_with_the_worker_session(self, env, end):
-        _, service, wire = env
-        a, _, worker, k, _ = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        if end == "close":
-            assert worker.close().status == Status.OK
-        elif end == "exit":
-            assert results(a.worker_exit(worker.ref())) == ["OK"]
-        else:
-            a.restart()
-            assert a.open(pools=[a.dram()]).status == Status.OK
-            service.maintain()  # earlier runs' worker pins go in steps
-        assert service.pins.get(pin_id) is None
-
-    def test_a_reopened_session_keeps_it_for_the_same_run(self, env):
-        _, service, wire = env
-        a, _, worker, k, source = self._setup(wire)
-        pin_id = self._plan_pin(worker, k)
-        old = worker.token
-        assert worker.open().status == Status.OK and worker.token != old
-        assert service.pins.get(pin_id).holder == worker.token
-        done = a.fetch_complete((k, pin_id, PAGE, source, worker.incarnation))
-        assert results(done) == ["OK"] and service.pins.get(pin_id) is None
-
-    def test_a_replayed_lookup_gives_the_same_pin(self, env):
-        from maru_common.protocol import LookupAndPinRequest, MessageType
-
-        _, service, wire = env
-        _, _, worker, k, _ = self._setup(wire)
-        request = worker.build(
-            LookupAndPinRequest, **worker.envelope(), items=[k], pin_sources=True
-        )
-        first = wire.call(MessageType.LOOKUP_AND_PIN, request)
-        again = wire.call(MessageType.LOOKUP_AND_PIN, request)
-        assert first.items[0].plan.pin_id == again.items[0].plan.pin_id
-        assert len(service.pins) == 1
-
-    def _others(self, wire, a, worker, k, source):
-        """Pins a node run must not release or read under for ``worker``:
-        another worker's plan pin and read pin, and the node's own pin."""
-        other = FakeWorker(wire, a, tp_rank=1)
-        other.open()
-        plan = self._plan_pin(other, k)
-        own = a.source_pin((k, source)).items[0].pin_id
-        k2 = key("k2")
-        a.commit((k2, a.loc(a.dram(), 2)))
-        read = other.lookup(k2).items[0].pin_id
-        assert own and read
-        return other, {"plan": plan, "read": read, "node": own}
-
-    def test_the_node_releases_only_the_named_workers_source_pins(self, env):
-        _, service, wire = env
-        a, _, worker, k, source = self._setup(wire)
-        mine = self._plan_pin(worker, k)
-        _, others = self._others(wire, a, worker, k, source)
-        named = worker.incarnation
-        response = a.unpin(*others.values(), mine, "gone", worker_incarnation=named)
-        assert results(response) == ["REJECTED"] * 3 + ["OK", "OK"]
-        assert all(service.pins.get(p) is not None for p in others.values())
-        assert service.pins.get(mine) is None
-        # without the worker: never a source pin, nor a worker's read pin
-        assert results(a.unpin(others["plan"])) == ["REJECTED"]
-        assert results(a.unpin(others["read"])) == ["REJECTED"]
-
-    @pytest.mark.parametrize("which", ["plan", "read", "node"])
-    def test_fetch_complete_reads_only_under_the_named_workers_pin(self, env, which):
-        _, service, wire = env
-        a, b, worker, k, source = self._setup(wire)
-        _, others = self._others(wire, a, worker, k, source)
-        pin_id = others[which]
-        named = worker.incarnation
-        done = a.fetch_complete((k, pin_id, PAGE, source, named))
-        assert results(done) == ["REJECTED"]
-        assert service.pins.get(pin_id) is not None
-        # nor does an item that names no worker read under a source pin
-        if which == "plan":
-            done = a.fetch_complete((k, pin_id, PAGE, source))
-            assert results(done) == ["REJECTED"]
-            assert service.pins.get(pin_id) is not None
-
-    def test_one_on_cxl_keeps_no_orphan_session(self):
-        from maru_common.storage_types import Key, Location
-        from maru_server.pin_manager import HolderKind, PinManager
-
-        pins = PinManager()
-        cxl = Location("cxl:m:rm1:7", "a1", 1, 0, PAGE, PoolKind.CXL)
-        pin_id = pins.pin(Key("ns", "k"), cxl, "w", HolderKind.SOURCE, ("n", "e"))
-        assert pins.holds("w") and not pins.holds_retained("w")
-        assert pins.release_holder("w", keep_retained=True) == 1
-        assert pins.get(pin_id) is None

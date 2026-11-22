@@ -58,10 +58,8 @@ def ms_handlers(ms: "MsService") -> dict[int, Callable[[Any, dict], Any]]:
         MessageType.PROBE.value: ms.probe,
         MessageType.LOOKUP_AND_PIN.value: ms.lookup_and_pin,
         MessageType.UNPIN.value: ms.unpin,
-        MessageType.SOURCE_PIN.value: ms.source_pin,
         MessageType.COMMIT.value: ms.commit,
         MessageType.RETIRE.value: ms.retire,
-        MessageType.FETCH_COMPLETE.value: ms.fetch_complete,
     }
 
 

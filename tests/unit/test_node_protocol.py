@@ -56,8 +56,9 @@ def pair():
 
 
 def test_codes_are_unique_and_below_the_response_bit():
-    assert len(set(CODES)) == len(CODES) == 16
+    assert len(set(CODES)) == len(CODES) == 13
     assert all(code & RESPONSE_BIT == 0 for code in CODES)
+    assert not {0x18, 0x19, 0x1A, 0x28} & set(CODES)
     assert 0x28 not in CODES  # DRAIN_ACK, retired: never reused
 
 
@@ -135,107 +136,6 @@ def test_attach_instance_decodes_strictly(instance):
     ser = Serializer(NODE_MESSAGE_CLASSES)
     with pytest.raises(MessageDecodeError, match="instance"):
         ser.decode_request_payload(ser.encode(NodeMessageType.ATTACH, payload))
-
-
-def test_fetch_contract_on_the_wire():
-    from maru_common.node_protocol import Budgets, FetchResponse
-    from maru_common.storage_types import (
-        FETCH_CAPABILITY,
-        ItemOutcome,
-        ItemResult,
-        MissReason,
-        Status,
-    )
-
-    ser = Serializer(NODE_MESSAGE_CLASSES)
-    assert FETCH_CAPABILITY == "fetch_v1"
-    request = sample(NODE_MESSAGE_CLASSES[NodeMessageType.ATTACH][0])
-    header, _ = ser.decode_request(ser.encode(NodeMessageType.ATTACH, request))
-    # an older node's reply has no capabilities, and an older batch cap
-    reply = dataclasses.asdict(sample(AttachResponse))
-    reply["capabilities"] = [FETCH_CAPABILITY]
-    _, back = ser.decode_response(ser.encode_response(header, reply))
-    assert back.capabilities == [FETCH_CAPABILITY]
-    del reply["capabilities"]
-    reply["budgets"]["fetch_max_batch_bytes"] = 1
-    _, back = ser.decode_response(ser.encode_response(header, reply))
-    assert back.capabilities == []
-    assert isinstance(back.budgets, Budgets)
-    # FETCH items: MISS once taken (busy, timeout, io_error), MISS with no
-    # reason for a cancel before the reply
-    header, _ = ser.decode_request(
-        ser.encode(
-            NodeMessageType.FETCH,
-            sample(NODE_MESSAGE_CLASSES[NodeMessageType.FETCH][0]),
-        )
-    )
-    items = [ItemOutcome(ItemResult.MISS, reason=r) for r in MissReason]
-    items.append(ItemOutcome(ItemResult.MISS))
-    response = FetchResponse(status=Status.OK, items=items)
-    _, back = ser.decode_response(ser.encode_response(header, response))
-    assert back == response
-    assert [i.reason for i in back.items] == [
-        "absent",
-        "offline",
-        "busy",
-        "timeout",
-        "io_error",
-        None,
-    ]
-    # The worker's window travels with each answer; an older node's answer
-    # has none (0: the worker keeps its window)
-    windowed = FetchResponse(status=Status.OK, items=items, window_bytes=3 << 20)
-    _, back = ser.decode_response(ser.encode_response(header, windowed))
-    assert back == windowed
-    older = dataclasses.asdict(windowed)
-    del older["window_bytes"]
-    _, back = ser.decode_response(ser.encode_response(header, older))
-    assert back.window_bytes == 0
-
-
-def test_a_fetch_hit_is_a_lease_given_back_by_fetch_release():
-    from maru_common.node_protocol import (
-        FetchReleaseRequest,
-        FetchReleaseResponse,
-        FetchResponse,
-    )
-    from maru_common.storage_types import (
-        LEASE_CAPABILITY,
-        ItemOutcome,
-        ItemResult,
-        Location,
-        PoolKind,
-        Status,
-    )
-
-    assert LEASE_CAPABILITY == "lease_v1"
-    assert NodeMessageType.FETCH_RELEASE == 0x1A
-    ser = Serializer(NODE_MESSAGE_CLASSES)
-    header, _ = ser.decode_request(
-        ser.encode(
-            NodeMessageType.FETCH,
-            sample(NODE_MESSAGE_CLASSES[NodeMessageType.FETCH][0]),
-        )
-    )
-    page = Location("dram:gpu:e", "a1", (3 << 40) | 7, 0, 8, PoolKind.DRAM)
-    lease_id = (3 << 40) | 9
-    hit = FetchResponse(
-        status=Status.OK,
-        items=[ItemOutcome(ItemResult.HIT, location=page, lease_id=lease_id)],
-    )
-    _, back = ser.decode_response(ser.encode_response(header, hit))
-    assert back == hit and back.items[0].pin_id is None
-    # a uint64 id, every item answered OK or STALE
-    release = FetchReleaseRequest(lease_ids=[lease_id, (1 << 64) - 1])
-    frame = ser.encode(NodeMessageType.FETCH_RELEASE, release)
-    header, decoded = ser.decode_request(frame)
-    assert decoded == release
-    reply = FetchReleaseResponse(
-        status=Status.OK,
-        items=[ItemOutcome(ItemResult.OK), ItemOutcome(ItemResult.STALE)],
-    )
-    _, back = ser.decode_response(ser.encode_response(header, reply))
-    assert back == reply
 
 
 def test_hints_on_the_wire():
@@ -606,3 +506,43 @@ def test_attach_defaults_to_no_peers_and_peers_notification_uses_sequence_zero()
         ser.encode(NodeMessageType.PEERS, peers, seq=NOTIFY_SEQUENCE)
     )
     assert header.sequence == 0 and back == peers
+
+
+@pytest.mark.parametrize("code", [0x18, 0x19, 0x1A])
+def test_retired_read_codes_are_rejected(code):
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    with pytest.raises(MessageDecodeError) as error:
+        ser.decode_request_payload(ser.encode(code, {}, seq=17))
+    assert error.value.header.sequence == 17
+
+
+def test_credit_and_write_report_carry_the_same_instance_domain():
+    from maru_common.node_protocol import (
+        CreditResponse,
+        WriteDoneItem,
+        WriteDoneRequest,
+    )
+    from maru_common.remote_protocol import TransferEnd
+    from maru_common.storage_types import WriteAgent, WriteDomain
+
+    domain = sample(WriteDomain)
+    agent = dataclasses.replace(sample(WriteAgent), domain=domain)
+    response = dataclasses.replace(sample(CreditResponse), write_agent=agent)
+    item = dataclasses.replace(
+        sample(WriteDoneItem), domain=domain, end=TransferEnd.UNKNOWN
+    )
+    request = dataclasses.replace(sample(WriteDoneRequest), items=[item])
+    ser = Serializer(NODE_MESSAGE_CLASSES)
+    header, decoded = ser.decode_request(
+        ser.encode(NodeMessageType.WRITE_DONE, request)
+    )
+    assert decoded.items[0].domain == domain
+    assert decoded.items[0].end == TransferEnd.UNKNOWN
+    credit_header, _ = ser.decode_request(
+        ser.encode(
+            NodeMessageType.CREDIT,
+            sample(NODE_MESSAGE_CLASSES[NodeMessageType.CREDIT][0]),
+        )
+    )
+    _, credit = ser.decode_response(ser.encode_response(credit_header, response))
+    assert credit.write_agent.domain == decoded.items[0].domain

@@ -40,16 +40,15 @@ from maru_common.protocol import (
 )
 from maru_common.serializer import MessageDecodeError, Serializer, op_digest
 from maru_common.storage_types import (
-    FETCH_CAPABILITY,
     MAX_BATCH,
     MEMORY_CAPABILITY,
     MS_PROTOCOL,
     POOL_KINDS,
     REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
     AccessHints,
     BlockRequest,
     CloseMode,
-    FetchPlan,
     ItemOutcome,
     ItemResult,
     KeptCause,
@@ -68,10 +67,8 @@ from maru_server.ms_service import result_bytes  # MsService's op_bytes_max esti
 
 OP_CODES = {
     MessageType.LOOKUP_AND_PIN,
-    MessageType.SOURCE_PIN,
     MessageType.COMMIT,
     MessageType.RETIRE,
-    MessageType.FETCH_COMPLETE,
     MessageType.WORKER_EXIT,
 }
 NODE_CODES = {
@@ -79,10 +76,8 @@ NODE_CODES = {
     MessageType.NODE_CLOSE,
     MessageType.NODE_RECOVER_LIST,
     MessageType.WORKER_EXIT,
-    MessageType.SOURCE_PIN,
     MessageType.COMMIT,
     MessageType.RETIRE,
-    MessageType.FETCH_COMPLETE,
 }
 WORKER_CODES = {
     MessageType.WORKER_HEARTBEAT,
@@ -98,7 +93,9 @@ def loc_id(location: Location) -> tuple[str, str, int]:
 
 
 # The node capabilities MaruServer knows
-NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY})
+NODE_CAPABILITIES = frozenset(
+    {REMOTE_CAPABILITY, MEMORY_CAPABILITY, WORKER_RDMA_CAPABILITY}
+)
 
 
 @dataclass
@@ -785,28 +782,23 @@ class FakeMaruServer:
         requester = self.nodes.get(worker.node_id)
         fetchable = (
             requester is not None
-            and REMOTE_CAPABILITY in requester.capabilities
+            and WORKER_RDMA_CAPABILITY in requester.capabilities
             and node is not None
             and MEMORY_CAPABILITY in node.capabilities
             and POOL_KINDS[entry.location.kind].mappable
         )
         if not fetchable or node is None or not node.online or not requester.online:
             return "offline", None
-        return "fetch", entry
+        return "hit", entry
 
     def _find(self, key: Key, worker: WorkerRec):
-        best = None
         offline = False
         for entry in self.catalog.get(key, []):
             how, found = self._visible(entry, worker)
             if how == "hit":
                 return ItemResult.HIT, found
-            if how == "fetch" and best is None:
-                best = found
             if how in ("offline", "hidden"):
                 offline = True
-        if best is not None:
-            return ItemResult.FETCH, best
         if offline:
             return ItemResult.MISS, MissReason.OFFLINE
         return ItemResult.MISS, MissReason.ABSENT
@@ -842,25 +834,6 @@ class FakeMaruServer:
                 self.access[found.node_id][target] = None
                 items.append(
                     ItemOutcome(ItemResult.HIT, location=found.location, pin_id=pin_id)
-                )
-            elif result == ItemResult.FETCH:
-                source_pin = None
-                if req.pin_sources:
-                    source_pin = uuid.uuid4().hex
-                    self.pins[source_pin] = Pin(
-                        source_pin, f"worker:{worker.incarnation}", key, found.location
-                    )
-                    self.loc_pins[loc_id(found.location)].add(source_pin)
-                items.append(
-                    ItemOutcome(
-                        ItemResult.FETCH,
-                        plan=FetchPlan(
-                            source=found.location,
-                            source_node=found.node_id,
-                            bytes=found.logical_bytes,
-                            pin_id=source_pin,
-                        ),
-                    )
                 )
             else:
                 items.append(ItemOutcome(ItemResult.MISS, reason=found))

@@ -50,13 +50,12 @@ def test_another_nodes_memory_copy_is_not_a_fetch_source(server):
 
 def test_remote_fetch_requires_the_workers_node_capability(server):
     from maru_common.storage_types import (
-        FETCH_CAPABILITY,
         MEMORY_CAPABILITY,
-        REMOTE_CAPABILITY,
+        WORKER_RDMA_CAPABILITY,
     )
 
     add(server, "b", "cxl:memory:1", PoolKind.CXL)
-    server.nodes["a"].capabilities = [FETCH_CAPABILITY, REMOTE_CAPABILITY]
+    server.nodes["a"].capabilities = [WORKER_RDMA_CAPABILITY]
     server.nodes["b"].capabilities = [MEMORY_CAPABILITY]
     result, found = server._find(KEY, worker())
-    assert result == ItemResult.FETCH and found.node_id == "b"
+    assert result == ItemResult.HIT and found.node_id == "b"

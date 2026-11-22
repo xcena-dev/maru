@@ -41,7 +41,6 @@ from maru_common.serializer import (
     op_digest,
 )
 from maru_common.storage_types import (
-    FETCH_CAPABILITY,
     MEMORY_CAPABILITY,
     REMOTE_CAPABILITY,
     WORKER_RDMA_CAPABILITY,
@@ -119,10 +118,9 @@ def test_capability_names():
     names = (
         REMOTE_CAPABILITY,
         MEMORY_CAPABILITY,
-        FETCH_CAPABILITY,
         WORKER_RDMA_CAPABILITY,
     )
-    assert names == ("remote_v1", "memory_v1", "fetch_v1", "worker_rdma_v1")
+    assert names == ("remote_v1", "memory_v1", "worker_rdma_v1")
 
 
 @pytest.mark.parametrize("minimal", [False, True], ids=["all-set", "optionals-empty"])
@@ -359,7 +357,7 @@ class TestNodeOpenCapabilities:
         ser = Serializer()
         header = self._header(ser)
         response = NodeOpenResponse(
-            status=Status.OK, capabilities=[REMOTE_CAPABILITY, FETCH_CAPABILITY]
+            status=Status.OK, capabilities=[REMOTE_CAPABILITY, WORKER_RDMA_CAPABILITY]
         )
         _, back = ser.decode_response(ser.encode_response(header, response))
         assert back == response

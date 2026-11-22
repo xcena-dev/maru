@@ -94,10 +94,10 @@ class MessageType(IntEnum):
     PROBE = 0x50
     LOOKUP_AND_PIN = 0x51
     UNPIN = 0x52
-    SOURCE_PIN = 0x53
+    # 0x53: reserved; never reuse
     COMMIT = 0x58
     RETIRE = 0x59
-    FETCH_COMPLETE = 0x5B
+    # 0x5B: reserved; never reuse
     # 0x5A: reserved (FINALIZE_MOVE)
     # 0x43, 0x5C, 0x5E, 0x5F: retired (NODE_REREGISTER, RELEASE_FINALIZER,
     # REGION_REQUEST, REGION_RETURN); never reuse them
@@ -640,22 +640,6 @@ class CommitItem:
 
 
 @dataclass
-class FetchCompleteItem:
-    key: Key
-    source_pin_id: str
-    # Above 0: the read succeeded (the source counts as read for its LRU)
-    logical_bytes: int
-    # A fetched copy to publish: never taken, the item is REJECTED
-    copy: Location | None = None
-    # The location read; when set, the source pin must be on it
-    source: Location | None = None
-    # A source pin a worker's FETCH plan brought: that worker's incarnation.
-    # Then only its source pin for this node run is used; else only a node
-    # pin of this session
-    source_worker: str = ""
-
-
-@dataclass
 class NodeOpenRequest:
     """NODE_OPEN (0x40) - A StorageService opens its node session."""
 
@@ -849,7 +833,7 @@ class WorkerCloseResponse:
 @dataclass
 class ProbeRequest:
     """PROBE (0x50) - Hit hints for the scheduler; no pin. With
-    ``with_locations`` a HIT or FETCH item names the location it found (a
+    ``with_locations`` a HIT item names the location it found (a
     read hint's range), else none does."""
 
     session: str
@@ -867,21 +851,12 @@ class ProbeResponse:
 
 @dataclass
 class LookupAndPinRequest:
-    """LOOKUP_AND_PIN (0x51).
-
-    With ``pin_sources`` each FETCH plan carries a pin on its source
-    (``FetchPlan.pin_id``), held by the worker session with its node run as
-    creator. A FETCH the node runs hands the pin over: the node reads under
-    it and releases it, naming the worker (FETCH_COMPLETE source_worker,
-    UNPIN worker_incarnation). The worker UNPINs the pin of a plan it does
-    not FETCH, or whose FETCH is answered other than OK.
-    """
+    """LOOKUP_AND_PIN (0x51)."""
 
     session: str
     server_epoch: str
     op: OpRef
     items: list[Key]
-    pin_sources: bool = False
 
 
 @dataclass
@@ -893,45 +868,15 @@ class LookupAndPinResponse:
 
 @dataclass
 class UnpinRequest:
-    """UNPIN (0x52) - Idempotent by pin_id, so it carries no op.
-
-    A node session sets ``worker_incarnation`` to release source pins that
-    worker's FETCH plans brought: only that worker's source pins for the
-    node's run go; any other pin is REJECTED.
-    """
+    """UNPIN (0x52) - Idempotent by pin_id."""
 
     session: str
     server_epoch: str
     pin_ids: list[str]
-    worker_incarnation: str = ""
 
 
 @dataclass
 class UnpinResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-
-
-@dataclass
-class SourcePinRequest:
-    """SOURCE_PIN (0x53) - A StorageService pins a fetch source.
-
-    With ``worker_incarnation`` the fetch is for that worker: unless
-    ``worker_session`` is its open session on this node's run, with the
-    items' namespace, the request is REJECTED and pins nothing.
-    """
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    items: list[KeyLocation]
-    worker_session: str = ""
-    worker_incarnation: str = ""
-
-
-@dataclass
-class SourcePinResponse:
     status: Status
     error: str | None = None
     items: list[ItemOutcome] = field(default_factory=list)
@@ -967,27 +912,6 @@ class RetireRequest:
 
 @dataclass
 class RetireResponse:
-    status: Status
-    error: str | None = None
-    items: list[ItemOutcome] = field(default_factory=list)
-
-
-@dataclass
-class FetchCompleteRequest:
-    """FETCH_COMPLETE (0x5B) - The node's reads of fetch sources ended:
-    releases each item's source pin and records a successful read for the
-    source's LRU. Items: OK, or REJECTED (a source pin that is not the
-    node's for the item, or a copy to publish; an owned pin goes either
-    way)."""
-
-    session: str
-    server_epoch: str
-    op: OpRef
-    items: list[FetchCompleteItem]
-
-
-@dataclass
-class FetchCompleteResponse:
     status: Status
     error: str | None = None
     items: list[ItemOutcome] = field(default_factory=list)
@@ -1045,10 +969,8 @@ MS_MESSAGE_CLASSES = {
     MessageType.PROBE: (ProbeRequest, ProbeResponse),
     MessageType.LOOKUP_AND_PIN: (LookupAndPinRequest, LookupAndPinResponse),
     MessageType.UNPIN: (UnpinRequest, UnpinResponse),
-    MessageType.SOURCE_PIN: (SourcePinRequest, SourcePinResponse),
     MessageType.COMMIT: (CommitRequest, CommitResponse),
     MessageType.RETIRE: (RetireRequest, RetireResponse),
-    MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
 }
 _overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
 if _overlap:

@@ -17,11 +17,6 @@ from maru_common.storage_types import Key, Location
 @unique
 class HolderKind(StrEnum):
     WORKER = "worker"  # LOOKUP_AND_PIN
-    NODE = "node"  # SOURCE_PIN
-    # LOOKUP_AND_PIN with pin_sources: a FETCH source, held by the worker
-    # session; its node run (creator) reads under it and releases it for
-    # that worker's FETCH only
-    SOURCE = "source"
 
 
 @dataclass(frozen=True)
@@ -31,8 +26,6 @@ class Pin:
     location: Location
     holder: str  # session token
     holder_kind: HolderKind
-    # (node_id, node_epoch) whose FETCH uses a source pin; it may UNPIN it
-    creator: tuple[str, str] | None = None
     keep_on_departure: bool = True
 
 
@@ -60,7 +53,6 @@ class PinManager:
         location: Location,
         holder: str,
         holder_kind: HolderKind,
-        creator: tuple[str, str] | None = None,
         *,
         keep_on_departure: bool = True,
     ) -> str:
@@ -71,7 +63,6 @@ class PinManager:
             location,
             holder,
             holder_kind,
-            creator,
             keep_on_departure and holder_kind == HolderKind.WORKER,
         )
         self._pins[pin_id] = pin

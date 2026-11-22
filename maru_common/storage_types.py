@@ -47,12 +47,6 @@ class StorageUnavailableError(ConnectionError):
 # =============================================================================
 
 MS_PROTOCOL = "ms1"
-# ATTACH: the worker can run FETCH, the node serves it. NODE_OPEN: the server
-# takes FETCH_COMPLETE without a copy
-FETCH_CAPABILITY = "fetch_v1"
-# ATTACH capabilities: a FETCH HIT lends a node page by lease (FETCH_RELEASE);
-# the node passes HINT on
-LEASE_CAPABILITY = "lease_v1"
 HINT_CAPABILITY = "hint_v1"
 # NODE_OPEN capabilities: the node reads and writes memory nodes' pools over
 # RDMA; it is a memory node
@@ -141,7 +135,6 @@ class ItemResult(StrEnum):
 
     OK = "OK"
     HIT = "HIT"
-    FETCH = "FETCH"
     MISS = "MISS"
     ADDED = "ADDED"
     DUPLICATE = "DUPLICATE"
@@ -164,7 +157,6 @@ class KeptCause(StrEnum):
 class MissReason(StrEnum):
     ABSENT = "absent"
     OFFLINE = "offline"
-    # FETCH only: no room after it was taken, past its deadline, a failed read
     BUSY = "busy"
     TIMEOUT = "timeout"
     IO_ERROR = "io_error"
@@ -366,29 +358,16 @@ class WriteAgent:
 
 
 @dataclass(frozen=True)
-class FetchPlan:
-    source: Location
-    source_node: str
-    bytes: int
-    # LOOKUP_AND_PIN with pin_sources: a pin on ``source`` held by the
-    # worker's session for its node run; the FETCH hands it to the node
-    pin_id: str | None = None
-
-
-@dataclass(frozen=True)
 class ItemOutcome:
     """The result of one item. Only the fields its result uses are set."""
 
     result: ItemResult
     location: Location | None = None
     pin_id: str | None = None  # a read pin (HIT)
-    plan: FetchPlan | None = None
     reason: MissReason | None = None
     cause: KeptCause | None = None
     # KEPT(MOVED): the key of the location now occupying the page
     key: Key | None = None
-    # A FETCH HIT: the node page is lent until FETCH_RELEASE of this id
-    lease_id: int | None = None
     # Registration of the HIT location's pool in its owning node run.
     pool_registration: int = 0
 

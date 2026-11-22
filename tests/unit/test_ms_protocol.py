@@ -7,22 +7,16 @@ import itertools
 
 import pytest
 
-from maru_common.node_protocol import (
-    NODE_MESSAGE_CLASSES,
-    FetchRequest,
-    NodeMessageType,
-)
 from maru_common.protocol import (
     MESSAGE_CLASSES,
     MS_MESSAGE_CLASSES,
     CommitItem,
     CommitRequest,
-    FetchCompleteRequest,
+    LookupAndPinRequest,
     MessageType,
     NodeOpenRequest,
     NodeOpenResponse,
     ProbeRequest,
-    SourcePinRequest,
 )
 from maru_common.serializer import (
     RESPONSE_BIT,
@@ -46,11 +40,13 @@ MS_CODES = sorted(MS_MESSAGE_CLASSES)
 
 
 def test_codes_are_in_the_multi_storage_range_and_unique():
-    assert len(set(MS_CODES)) == len(MS_CODES) == 17
+    assert len(set(MS_CODES)) == len(MS_CODES) == 15
     assert all(0x40 <= code <= 0x5F for code in MS_CODES)
     # reserved (FINALIZE_MOVE) and retired (NODE_REREGISTER,
     # RELEASE_FINALIZER, REGION_REQUEST, REGION_RETURN): never reused
-    assert not {0x43, 0x5A, 0x5C, 0x5E, 0x5F} & {int(code) for code in MessageType}
+    assert not {0x43, 0x53, 0x5A, 0x5B, 0x5C, 0x5E, 0x5F} & {
+        int(code) for code in MessageType
+    }
     # the response code keeps the request code below the response bit
     assert all(code & RESPONSE_BIT == 0 for code in MS_CODES)
 
@@ -302,33 +298,19 @@ def test_unknown_code_keeps_the_header():
 class TestDigestAcrossVersions:
     def test_receiver_uses_the_raw_payload(self):
         ser = Serializer()
-        sent = dataclasses.asdict(sample(FetchCompleteRequest))
+        sent = dataclasses.asdict(sample(ProbeRequest))
         sent["added_later"] = [1, 2]  # a field this receiver does not know
-        del sent["items"][0]["source_worker"]  # an older sender leaves a default out
-        frame = ser.encode(MessageType.FETCH_COMPLETE, sent)
+        del sent["with_locations"]  # an older sender leaves a default out
+        frame = ser.encode(MessageType.PROBE, sent)
         decoded = ser.decode_request_payload(frame)
         assert op_digest(decoded.payload) == op_digest(sent)
         # the dataclass lost the unknown field and gained the default
         assert op_digest(decoded.request) != op_digest(sent)
 
     def test_envelope_fields_are_left_out(self):
-        request = sample(SourcePinRequest)
-        reopened = dataclasses.replace(
-            request, session="new", server_epoch="new", worker_session="new"
-        )
+        request = sample(LookupAndPinRequest)
+        reopened = dataclasses.replace(request, session="new", server_epoch="new")
         assert op_digest(request) == op_digest(reopened)
-
-    def test_a_resent_fetch_may_carry_less_of_its_deadline(self):
-        ser = Serializer(NODE_MESSAGE_CLASSES)
-        request = sample(FetchRequest)
-        later = dataclasses.replace(request, deadline_ms=request.deadline_ms // 2 + 1)
-        decoded = ser.decode_request_payload(ser.encode(NodeMessageType.FETCH, later))
-        assert decoded.request == later
-        assert op_digest(decoded.payload) == op_digest(request)
-        # what it fetches is still part of the op
-        assert op_digest(dataclasses.replace(request, max_bytes=1)) != op_digest(
-            request
-        )
 
 
 def test_header_sequence_wraps_and_skips_zero():
@@ -354,37 +336,6 @@ def test_fields_this_side_does_not_serve_stay_in_the_raw_payload():
     decoded = ser.decode_request_payload(ser.encode(MessageType.COMMIT, commit))
     assert not hasattr(decoded.request.items[0], "finalizer")
     assert decoded.payload["items"][0]["finalizer"] is True
-    done = dataclasses.asdict(sample(FetchCompleteRequest))
-    done["items"][0]["hold_copy"] = True
-    frame = ser.encode(MessageType.FETCH_COMPLETE, done)
-    assert ser.decode_request_payload(frame).payload["items"][0]["hold_copy"]
-
-
-def test_fetch_complete_names_no_copy_by_default():
-    from maru_common.protocol import FetchCompleteItem, FetchCompleteResponse
-    from maru_common.storage_types import ItemOutcome, ItemResult, Status
-
-    ser = Serializer()
-    item = FetchCompleteItem(Key("ns", "k"), "src", 8)
-    assert item.copy is None and item.source is None and item.source_worker == ""
-    request = FetchCompleteRequest("s", "e", OpRef("o", 1, b"d" * 16, 0), [item])
-    frame = ser.encode(MessageType.FETCH_COMPLETE, request)
-    assert ser.decode_request(frame)[1] == request
-    # a copy is carried (the server refuses it) and is part of the op
-    copy = Location("dram:n:e", "a1", make_generation(3, 7), 0, 8, PoolKind.DRAM)
-    named = dataclasses.replace(request, items=[dataclasses.replace(item, copy=copy)])
-    assert ser.decode_request(ser.encode(MessageType.FETCH_COMPLETE, named))[1] == named
-    assert op_digest(named) != op_digest(request)
-    # a failed read: logical_bytes 0
-    failed = dataclasses.replace(item, logical_bytes=0)
-    assert op_digest(dataclasses.replace(request, items=[failed])) != op_digest(request)
-    reply = FetchCompleteResponse(
-        status=Status.OK,
-        items=[ItemOutcome(ItemResult.OK), ItemOutcome(ItemResult.REJECTED)],
-    )
-    request_header, _ = ser.decode(frame)
-    _, back = ser.decode_response(ser.encode_response(request_header, reply))
-    assert back == reply
 
 
 def test_probe_names_locations_only_when_asked():
@@ -403,76 +354,13 @@ def test_probe_names_locations_only_when_asked():
     reply = ProbeResponse(
         status=Status.OK,
         items=[
-            ItemOutcome(ItemResult.FETCH, location=where),
+            ItemOutcome(ItemResult.HIT, location=where),
             ItemOutcome(ItemResult.MISS),
         ],
     )
     request_header, _ = ser.decode(frame)
     _, back = ser.decode_response(ser.encode_response(request_header, reply))
     assert back == reply
-
-
-def test_plan_source_pin_fields_round_trip_and_default_off():
-    from maru_common.protocol import (
-        FetchCompleteItem,
-        LookupAndPinRequest,
-        LookupAndPinResponse,
-        UnpinRequest,
-    )
-    from maru_common.storage_types import FetchPlan, ItemOutcome, ItemResult, Status
-
-    source = Location("dram:m:e", "a1", make_generation(3, 7), 0, 8, PoolKind.DRAM)
-    ser = Serializer()
-    lookup = LookupAndPinRequest(
-        "s", "e", OpRef("o", 1, b"d" * 16, 0), [Key("ns", "k")], pin_sources=True
-    )
-    frame = ser.encode(MessageType.LOOKUP_AND_PIN, lookup)
-    assert ser.decode_request(frame)[1] == lookup
-    # part of the op; an older sender leaves it out: no source pins
-    assert op_digest(dataclasses.replace(lookup, pin_sources=False)) != op_digest(
-        lookup
-    )
-    payload = dataclasses.asdict(lookup)
-    del payload["pin_sources"]
-    _, decoded = ser.decode_request(ser.encode(MessageType.LOOKUP_AND_PIN, payload))
-    assert decoded.pin_sources is False
-    plan = FetchPlan(source, "n", 8, pin_id="src")
-    reply = LookupAndPinResponse(
-        status=Status.OK, items=[ItemOutcome(ItemResult.FETCH, plan=plan)]
-    )
-    request_header, _ = ser.decode(frame)
-    raw = ser.encode_response(request_header, reply)
-    assert ser.decode_response(raw)[1] == reply
-    payload = dataclasses.asdict(reply)
-    del payload["items"][0]["plan"]["pin_id"]
-    _, back = ser.decode_response(ser.encode_response(request_header, payload))
-    assert back.items[0].plan.pin_id is None
-    # FETCH_COMPLETE names the location read; an older sender does not
-    request = FetchCompleteRequest(
-        session="s",
-        server_epoch="e",
-        op=OpRef("o", 2, b"d" * 16, 1),
-        items=[
-            FetchCompleteItem(
-                Key("ns", "k"), "src", 8, source=source, source_worker="inc"
-            )
-        ],
-    )
-    frame = ser.encode(MessageType.FETCH_COMPLETE, request)
-    assert ser.decode_request(frame)[1] == request
-    payload = dataclasses.asdict(request)
-    del payload["items"][0]["source"]
-    del payload["items"][0]["source_worker"]
-    _, decoded = ser.decode_request(ser.encode(MessageType.FETCH_COMPLETE, payload))
-    assert decoded.items[0].source is None and decoded.items[0].source_worker == ""
-    # a node's UNPIN names the worker whose plans brought the source pins
-    unpin = UnpinRequest("s", "e", ["src"], worker_incarnation="inc")
-    frame = ser.encode(MessageType.UNPIN, unpin)
-    assert ser.decode_request(frame)[1] == unpin
-    payload = dataclasses.asdict(unpin)
-    del payload["worker_incarnation"]
-    _, decoded = ser.decode_request(ser.encode(MessageType.UNPIN, payload))
-    assert decoded.worker_incarnation == ""
 
 
 class TestAccessHints:
@@ -567,3 +455,11 @@ def test_node_open_orphan_response_decodes_strictly_and_defaults_for_legacy():
     payload = dataclasses.asdict(sample(NodeOpenRequest))
     del payload["pid_ns"]
     assert ser.decode_request(ser.encode(MessageType.NODE_OPEN, payload))[1].pid_ns == 0
+
+
+@pytest.mark.parametrize("code", [0x53, 0x5B])
+def test_retired_catalog_read_codes_are_rejected(code):
+    ser = Serializer()
+    with pytest.raises(MessageDecodeError) as error:
+        ser.decode_request_payload(ser.encode(code, {}, seq=29))
+    assert error.value.header.sequence == 29

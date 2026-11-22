@@ -14,8 +14,6 @@ from maru_common.protocol import (
     AdminDeleteRequest,
     CommitItem,
     CommitRequest,
-    FetchCompleteItem,
-    FetchCompleteRequest,
     LookupAndPinRequest,
     MessageType,
     NodeCloseRequest,
@@ -24,7 +22,6 @@ from maru_common.protocol import (
     NodeRecoverListRequest,
     ProbeRequest,
     RetireRequest,
-    SourcePinRequest,
     UnpinRequest,
     WorkerCloseRequest,
     WorkerExitRequest,
@@ -314,38 +311,6 @@ class FakeNode(_OpSender):
             ),
         )
 
-    def source_pin(self, *items):
-        return self.send(
-            MessageType.SOURCE_PIN,
-            self.build(
-                SourcePinRequest,
-                **self.envelope(),
-                items=[KeyLocation(k, loc) for k, loc in items],
-            ),
-        )
-
-    def fetch_complete(self, *items, copy: Location | None = None):
-        """fetch_complete((key, source_pin_id[, logical_bytes[, source[,
-        source_worker]]]), ...); logical_bytes PAGE by default, 0 for a
-        failed read."""
-        fetched = []
-        for k, pin, *rest in items:
-            logical_bytes, source, source_worker = rest + [PAGE, None, ""][len(rest) :]
-            fetched.append(
-                FetchCompleteItem(
-                    key=k,
-                    source_pin_id=pin,
-                    logical_bytes=logical_bytes,
-                    copy=copy,
-                    source=source,
-                    source_worker=source_worker,
-                )
-            )
-        return self.send(
-            MessageType.FETCH_COMPLETE,
-            self.build(FetchCompleteRequest, **self.envelope(), items=fetched),
-        )
-
     def worker_exit(self, *workers, cause: ExitCause = ExitCause.EXIT):
         return self.send(
             MessageType.WORKER_EXIT,
@@ -354,13 +319,12 @@ class FakeNode(_OpSender):
             ),
         )
 
-    def unpin(self, *pin_ids, worker_incarnation: str = ""):
+    def unpin(self, *pin_ids):
         return self.wire.call(
             MessageType.UNPIN,
             UnpinRequest(
                 **self.envelope(),
                 pin_ids=list(pin_ids),
-                worker_incarnation=worker_incarnation,
             ),
         )
 
@@ -445,14 +409,13 @@ class FakeWorker(_OpSender):
             ),
         )
 
-    def lookup(self, *keys, pin_sources: bool = False):
+    def lookup(self, *keys):
         return self.send(
             MessageType.LOOKUP_AND_PIN,
             self.build(
                 LookupAndPinRequest,
                 **self.envelope(),
                 items=list(keys),
-                pin_sources=pin_sources,
             ),
         )
 

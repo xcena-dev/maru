@@ -11,10 +11,9 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum, unique
 
-from maru_common.protocol import CommitItem, FetchCompleteItem
+from maru_common.protocol import CommitItem
 from maru_common.storage_types import (
     POOL_KINDS,
-    FetchPlan,
     ItemOutcome,
     ItemResult,
     KeptCause,
@@ -26,7 +25,7 @@ from maru_common.storage_types import (
     generation_epoch_seq,
 )
 
-from .pin_manager import HolderKind, PinManager
+from .pin_manager import PinManager
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +91,12 @@ class Requester:
 
     node_id: str
     can_map: Callable[[PoolRecord], bool]
-    can_fetch: Callable[[PoolRecord], bool]
     online: Callable[[str], bool]
 
 
 @dataclass
 class Selection:
-    result: ItemResult  # HIT, FETCH or MISS
+    result: ItemResult  # HIT or MISS
     entry: Entry | None = None
     reason: MissReason | None = None
 
@@ -436,72 +434,18 @@ class Catalog:
         self.remove_location(entry)
         return ItemOutcome(ItemResult.RETIRED)
 
-    # ------------------------------------------------------ fetch_complete
-
-    def fetch_complete(self, item: FetchCompleteItem, own_source: bool) -> ItemOutcome:
-        """The node's read under the item's source pin ended. ``own_source``:
-        the pin is one the node reads under for this item (MsService
-        checks); every outcome releases it then, and none is valid without
-        it. A fetched copy is never published: an item naming one is
-        REJECTED."""
-        source_pin = self.pins.get(item.source_pin_id)
-        try:
-            if (
-                item.copy is not None
-                or source_pin is None
-                or not own_source
-                or source_pin.key != item.key
-                or (item.source is not None and source_pin.location != item.source)
-            ):
-                return ItemOutcome(ItemResult.REJECTED)
-            return ItemOutcome(ItemResult.OK)
-        finally:
-            if own_source:
-                self.pins.unpin(item.source_pin_id)
-
     # --------------------------------------------------------- source pin
-
-    def source_pin(
-        self,
-        node_id: str,
-        holder: str,
-        key: Key,
-        location: Location,
-        online: Callable[[str], bool],
-        can_fetch: Callable[[PoolRecord], bool] | None = None,
-    ) -> ItemOutcome:
-        """A NODE pin on the exact location. With ``can_fetch`` (for a
-        worker's fetch): another node's pool only if the node can fetch it."""
-        entry = self.entry_exact(key, location)
-        if entry is None or entry.pool.state == PoolState.REMOVING:
-            return ItemOutcome(ItemResult.MISS, reason=MissReason.ABSENT)
-        if (
-            can_fetch is not None
-            and entry.pool.node_id != node_id
-            and not can_fetch(entry.pool)
-        ):
-            return ItemOutcome(ItemResult.REJECTED)
-        if entry.pool.state == PoolState.HIDDEN:
-            return ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
-        if entry.pool.node_id != node_id and not online(entry.pool.node_id):
-            return ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
-        pin_id = self.pins.pin(key, location, holder, HolderKind.NODE)
-        return ItemOutcome(ItemResult.HIT, pin_id=pin_id)
 
     # ------------------------------------------------------------- lookup
 
     def select(self, key: Key, requester: Requester) -> Selection:
-        """The cheapest directly readable location is a HIT (no StorageService
-        needed); else the cheapest one the requester's node can fetch, with
-        both StorageServices up; else MISS, offline if the key still has a
-        location, absent if not."""
+        """Choose the cheapest directly readable location."""
         entries = self._by_key.get(key)
         if not entries:
             return Selection(ItemResult.MISS, reason=MissReason.ABSENT)
-        best_hit = best_fetch = None
-        hit_cost = fetch_cost = 0
+        best_hit = None
+        hit_cost = 0
         present = False
-        requester_online = None
         for entry in entries.values():
             pool = entry.pool
             if pool.state == PoolState.REMOVING:
@@ -514,20 +458,8 @@ class Catalog:
                 if best_hit is None or cost < hit_cost:
                     best_hit, hit_cost = entry, cost
                 continue
-            if not requester.can_fetch(pool):
-                continue
-            if requester_online is None:
-                requester_online = requester.online(requester.node_id)
-            if not requester_online:
-                continue
-            if pool.node_id != requester.node_id and not requester.online(pool.node_id):
-                continue
-            if best_fetch is None or cost < fetch_cost:
-                best_fetch, fetch_cost = entry, cost
         if best_hit is not None:
             return Selection(ItemResult.HIT, entry=best_hit)
-        if best_fetch is not None:
-            return Selection(ItemResult.FETCH, entry=best_fetch)
         reason = MissReason.OFFLINE if present else MissReason.ABSENT
         return Selection(ItemResult.MISS, reason=reason)
 
@@ -537,13 +469,4 @@ class Catalog:
             e
             for e in self._by_key.get(key, {}).values()
             if e.pool.state == PoolState.ACTIVE
-        )
-
-    @staticmethod
-    def fetch_plan(entry: Entry, pin_id: str | None = None) -> FetchPlan:
-        return FetchPlan(
-            source=entry.location,
-            source_node=entry.pool.node_id,
-            bytes=entry.logical_bytes,
-            pin_id=pin_id,
         )

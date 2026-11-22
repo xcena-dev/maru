@@ -26,9 +26,6 @@ from maru_common.node_protocol import (
     NOTIFY_SEQUENCE,
     AttachRequest,
     AttachResponse,
-    FetchCancelRequest,
-    FetchReleaseRequest,
-    FetchRequest,
     NodeMessageType,
     Notify,
     recv_frame,
@@ -38,9 +35,6 @@ from maru_common.node_protocol import (
 from maru_common.protocol import HEADER_SIZE, MessageHeader
 from maru_common.serializer import RESPONSE_BIT, MessageDecodeError, Serializer
 from maru_common.storage_types import (
-    FETCH_CAPABILITY,
-    LEASE_CAPABILITY,
-    OpRef,
     Status,
     StorageUnavailableError,
 )
@@ -138,11 +132,6 @@ class StorageConn:
                 raise AttachRefusedError(
                     f"ATTACH refused: {response.status} {response.error}"
                 )
-            if (
-                FETCH_CAPABILITY in response.capabilities
-                and LEASE_CAPABILITY not in response.capabilities
-            ):
-                raise AttachRefusedError("ATTACH fetch_v1 requires lease_v1")
             wanted = sorted(d.memfd for d in response.pools if d.memfd is not None)
             if wanted != list(range(len(fds))):
                 raise StorageUnavailableError(
@@ -269,22 +258,6 @@ class StorageConn:
         """Send and wait for the response."""
         return self.submit(code, request).result(timeout)
 
-    def fetch(self, request: FetchRequest, *, deadline: float | None = None) -> Future:
-        """Send FETCH; its late reply remains matched to this future."""
-        if deadline is None:
-            deadline = time.monotonic() + request.deadline_ms / 1000
-        return self.submit(NodeMessageType.FETCH, request, deadline=deadline)
-
-    def fetch_cancel(self, target: OpRef) -> Future:
-        """Cancel interest in a fetch; this does not release answered leases."""
-        return self.submit(NodeMessageType.FETCH_CANCEL, FetchCancelRequest(target))
-
-    def fetch_release(self, lease_ids: list[int]) -> Future:
-        """Return leases once, after the caller's final GPU read."""
-        return self.submit(
-            NodeMessageType.FETCH_RELEASE, FetchReleaseRequest(lease_ids)
-        )
-
     # -------------------------------------------------------------- receiving
 
     def _receive_loop(self) -> None:
@@ -298,7 +271,10 @@ class StorageConn:
                 frame, _ = got
                 header = MessageHeader.unpack(frame[:HEADER_SIZE])
                 if header.sequence == NOTIFY_SEQUENCE:
-                    if header.msg_type != NodeMessageType.NOTIFY:
+                    if header.msg_type not in (
+                        NodeMessageType.NOTIFY,
+                        NodeMessageType.PEERS,
+                    ):
                         reason = f"message 0x{header.msg_type:02X} with sequence 0"
                         break
                     _, notify = self._serializer.decode_request(frame)
@@ -340,7 +316,7 @@ class StorageConn:
             try:
                 self._on_notify(notify, self)
             except Exception:
-                logger.exception("handling NOTIFY %s failed", notify.kind)
+                logger.exception("handling node notification failed")
 
     def _fail(self, reason: str, notify: bool = True) -> None:
         pending = self._disconnect()

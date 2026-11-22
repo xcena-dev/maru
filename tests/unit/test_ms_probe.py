@@ -416,14 +416,14 @@ class TestRankIdentity:
 
 
 class TestOutcomeCounters:
-    def test_unavailable_not_found_and_fetch_are_counted_apart(
+    def test_unavailable_not_found_and_read_errors_are_counted_apart(
         self, fake, node, handlers
     ):
         handler = handlers()
         assert put(handler, "here")
 
         def offline(response):
-            response.items[2] = ItemOutcome(ItemResult.FETCH)
+            response.items[2] = ItemOutcome(ItemResult.MISS, reason=MissReason.IO_ERROR)
             response.items[-1] = ItemOutcome(ItemResult.MISS, reason=MissReason.OFFLINE)
             return response
 
@@ -434,7 +434,7 @@ class TestOutcomeCounters:
         stats = handler.get_stats()["maru_node"]["counters"]
         assert stats["retrieve_hit"] == 1
         assert stats["retrieve_not_found"] == 1
-        assert stats["retrieve_fetch"] == 1
+        assert stats["retrieve_io_error"] == 1
         assert stats["retrieve_unavailable"] == 1
         assert stats["retrieve_unavailable_offline"] == 1
 
