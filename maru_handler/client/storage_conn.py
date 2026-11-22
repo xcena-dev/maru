@@ -3,7 +3,8 @@
 """StorageConn: the UDS connection to the node's StorageService.
 
 Several requests may be in flight, matched by header sequence; NOTIFY is
-handled on its own thread.
+handled on its own thread. OpTracker keeps unresolved ops for a resend after
+reconnecting to the same run.
 """
 
 import collections
@@ -16,12 +17,16 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+from maru_common.ms_rpc import OpOrigin
 from maru_common.node_protocol import (
     MAX_NODE_FDS,
     NODE_MESSAGE_CLASSES,
     NOTIFY_SEQUENCE,
     AttachRequest,
     AttachResponse,
+    FetchCancelRequest,
+    FetchReleaseRequest,
+    FetchRequest,
     NodeMessageType,
     Notify,
     recv_frame,
@@ -29,7 +34,13 @@ from maru_common.node_protocol import (
 )
 from maru_common.protocol import HEADER_SIZE, MessageHeader
 from maru_common.serializer import RESPONSE_BIT, MessageDecodeError, Serializer
-from maru_common.storage_types import Status, StorageUnavailableError
+from maru_common.storage_types import (
+    FETCH_CAPABILITY,
+    LEASE_CAPABILITY,
+    OpRef,
+    Status,
+    StorageUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +135,11 @@ class StorageConn:
                 raise AttachRefusedError(
                     f"ATTACH refused: {response.status} {response.error}"
                 )
+            if (
+                FETCH_CAPABILITY in response.capabilities
+                and LEASE_CAPABILITY not in response.capabilities
+            ):
+                raise AttachRefusedError("ATTACH fetch_v1 requires lease_v1")
             wanted = sorted(d.memfd for d in response.pools if d.memfd is not None)
             if wanted != list(range(len(fds))):
                 raise StorageUnavailableError(
@@ -196,6 +212,20 @@ class StorageConn:
     ) -> Any:
         """Send and wait for the response."""
         return self.submit(code, request).result(timeout)
+
+    def fetch(self, request: FetchRequest) -> Future:
+        """Send FETCH; its late reply remains matched to this future."""
+        return self.submit(NodeMessageType.FETCH, request)
+
+    def fetch_cancel(self, target: OpRef) -> Future:
+        """Cancel interest in a fetch; this does not release answered leases."""
+        return self.submit(NodeMessageType.FETCH_CANCEL, FetchCancelRequest(target))
+
+    def fetch_release(self, lease_ids: list[int]) -> Future:
+        """Return leases once, after the caller's final GPU read."""
+        return self.submit(
+            NodeMessageType.FETCH_RELEASE, FetchReleaseRequest(lease_ids)
+        )
 
     # -------------------------------------------------------------- receiving
 
@@ -276,3 +306,37 @@ class StorageConn:
         logger.info("StorageService connection closed: %s", reason)
         if notify:
             self._on_lost(self)
+
+
+class OpTracker:
+    """Unresolved ops of one StorageService run."""
+
+    def __init__(self, incarnation: str, node_epoch: str):
+        self.origin = OpOrigin(incarnation)
+        self.node_epoch = node_epoch
+        self._lock = threading.Lock()
+        self._unresolved: dict[int, tuple[NodeMessageType, Any, Callable]] = {}
+
+    def track(self, code: NodeMessageType, request: Any, on_result: Callable) -> None:
+        with self._lock:
+            self._unresolved[request.op.seq] = (code, request, on_result)
+
+    def update(self, request: Any) -> bool:
+        """Store a refreshed copy for a resend; False if already resolved."""
+        with self._lock:
+            entry = self._unresolved.get(request.op.seq)
+            if entry is None:
+                return False
+            self._unresolved[request.op.seq] = (entry[0], request, entry[2])
+            return True
+
+    def resolved(self, seq: int) -> bool:
+        """Mark ``seq`` resolved; True only for the first result."""
+        with self._lock:
+            first = self._unresolved.pop(seq, None) is not None
+        self.origin.resolved(seq)
+        return first
+
+    def unresolved(self) -> list[tuple[NodeMessageType, Any, Callable]]:
+        with self._lock:
+            return list(self._unresolved.values())

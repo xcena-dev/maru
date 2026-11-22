@@ -2,12 +2,18 @@
 # Copyright 2026 XCENA Inc.
 """Node configs and a worker speaking the node protocol directly."""
 
+import itertools
+import json
 import os
+import select
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin
 from maru_common.node_protocol import (
@@ -20,6 +26,7 @@ from maru_common.node_protocol import (
     process_start_time,
 )
 from maru_common.storage_types import MS_PROTOCOL, Key, Location
+from maru_handler.client.storage_conn import StorageConn, close_fds
 from maru_server.node_rpc import NodeRpcServer
 from maru_server.node_server import NodeServer
 from maru_shm.types import (
@@ -31,7 +38,6 @@ from maru_shm.types import (
 )
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.service import StorageService
-from tests.unit.ms_storage_conn import StorageConn, close_fds
 
 KIB = 1 << 10
 PAGE = 64 * KIB
@@ -424,3 +430,231 @@ class MetadataServer:
         self.thread.join(5)
         self.server.close()
         assert not self.thread.is_alive()
+
+
+WORKTREE = str(Path(__file__).resolve().parents[2])
+AGENT = str(Path(__file__).resolve().parent / "ms_worker_agent.py")
+
+
+class Agent:
+    """A MaruHandler in a separate worker process."""
+
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        engine: str = "eng",
+        namespace: str = "ns",
+        chunk: int = PAGE,
+        log_dir: str | None = None,
+        read_only: bool = False,
+        store_timeout_s: float | None = None,
+        cxl_paths: dict[int, str] | None = None,
+    ):
+        """``cxl_paths``: files standing in for CXL regions, by region id."""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = WORKTREE + os.pathsep + env.get("PYTHONPATH", "")
+        if read_only:
+            env["AGENT_READ_ONLY"] = "1"
+        if cxl_paths:
+            env["AGENT_CXL_PATHS"] = json.dumps(
+                {str(k): v for k, v in cxl_paths.items()}
+            )
+        if store_timeout_s is not None:
+            env["AGENT_STORE_TIMEOUT_S"] = str(store_timeout_s)
+        self.log_path = os.path.join(
+            log_dir or tempfile.gettempdir(), f"agent-{os.urandom(4).hex()}.log"
+        )
+        self._log = open(self.log_path, "wb")
+        self.proc = subprocess.Popen(
+            [sys.executable, AGENT, socket_path, engine, namespace, str(chunk)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._log,
+            env=env,
+            cwd=WORKTREE,
+        )
+        self.pid = self.proc.pid
+        self.incarnation = None
+
+    def call(self, op: str, timeout: float = 30.0, **args):
+        self.proc.stdin.write((json.dumps({"op": op, **args}) + "\n").encode())
+        self.proc.stdin.flush()
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not ready:
+            raise AssertionError(f"agent {self.pid}: no answer to {op} ({self.log()})")
+        line = self.proc.stdout.readline()
+        if not line:
+            raise AssertionError(f"agent {self.pid} ended ({self.log()})")
+        reply = json.loads(line)
+        if not reply["ok"]:
+            raise AgentError(reply["error"])
+        return reply["result"]
+
+    def connect(self):
+        info = self.call("connect")
+        self.incarnation = info["incarnation"]
+        assert info["module"].startswith(WORKTREE), info["module"]
+        return info
+
+    def log(self) -> str:
+        self._log.flush()
+        try:
+            with open(self.log_path, "rb") as f:
+                return f.read()[-4000:].decode(errors="replace")
+        except OSError:
+            return ""
+
+    def kill(self) -> None:
+        self.proc.kill()
+        self.proc.wait(10)
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            try:
+                self.call("exit", timeout=10)
+            except (AssertionError, AgentError, OSError, ValueError):
+                pass
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(10)
+        self._log.close()
+        try:
+            os.unlink(self.log_path)
+        except OSError:
+            pass
+
+
+class AgentError(RuntimeError):
+    """The agent's operation raised."""
+
+
+class FakeFetchService:
+    """Lease FETCH replies over a node's real UDS endpoint."""
+
+    def __init__(self, node, capabilities=None):
+        from maru_common.storage_types import FETCH_CAPABILITY, LEASE_CAPABILITY
+
+        self.node = node
+        node.local.capabilities = frozenset(
+            [FETCH_CAPABILITY, LEASE_CAPABILITY]
+            if capabilities is None
+            else capabilities
+        )
+        self._dispatch = node.local.dispatch
+        node.local.dispatch = self.dispatch
+        self.lock = threading.RLock()
+        self.fetches = {}
+        self._next_lease = itertools.count(1)
+        self.busy_fetches = 0
+        self.leases = set()
+        self.requests = []
+        self.releases = []
+        self.drop_release_reply = False
+        self.release_gate = None
+        self.release_results = []
+
+    def dispatch(self, conn, decoded):
+        from maru_common.node_protocol import (
+            FetchCancelResponse,
+            FetchReleaseResponse,
+            FetchResponse,
+        )
+        from maru_common.storage_types import ItemOutcome, ItemResult, Status
+
+        code, request = NodeMessageType(decoded.header.msg_type), decoded.request
+        with self.lock:
+            self.requests.append((code, request))
+            if code == NodeMessageType.FETCH:
+                key = (request.op.origin, request.op.seq)
+                entry = self.fetches.setdefault(
+                    key,
+                    {
+                        "request": request,
+                        "waiters": [],
+                        "response": None,
+                        "cancelled": False,
+                    },
+                )
+                assert entry["request"].op.digest == request.op.digest
+                if self.busy_fetches:
+                    self.busy_fetches -= 1
+                    conn.respond(decoded.header, FetchResponse(Status.BUSY))
+                    return
+                entry["waiters"].append((conn, decoded.header))
+                if entry["response"] is not None:
+                    conn.respond(decoded.header, entry["response"])
+                elif entry["cancelled"]:
+                    self.answer(key)
+                return
+            if code == NodeMessageType.FETCH_CANCEL:
+                entry = self.fetches.get((request.target.origin, request.target.seq))
+                if entry is not None and entry["response"] is None:
+                    entry["cancelled"] = True
+                conn.respond(decoded.header, FetchCancelResponse(Status.OK))
+                return
+            if code == NodeMessageType.FETCH_RELEASE:
+                outcomes = []
+                for lease in request.lease_ids:
+                    outcomes.append(
+                        ItemOutcome(
+                            ItemResult.OK if lease in self.leases else ItemResult.STALE
+                        )
+                    )
+                    self.leases.discard(lease)
+                self.releases.extend(request.lease_ids)
+                self.release_results.append(outcomes)
+                if self.drop_release_reply:
+                    return
+                if self.release_gate is not None:
+                    # Tests control this response without blocking UDS reception.
+                    self.release_gate.append(
+                        (
+                            conn,
+                            decoded.header,
+                            FetchReleaseResponse(Status.OK, items=outcomes),
+                        )
+                    )
+                else:
+                    conn.respond(
+                        decoded.header, FetchReleaseResponse(Status.OK, items=outcomes)
+                    )
+                return
+        self._dispatch(conn, decoded)
+
+    def answer(self, seq, *, deliver=True, timeout=False):
+        from maru_common.node_protocol import FetchResponse
+        from maru_common.storage_types import ItemOutcome, ItemResult, MissReason
+
+        with self.lock:
+            entry = self.fetches[seq]
+            if entry["response"] is None:
+                items = []
+                for i, _ in enumerate(entry["request"].items):
+                    if entry["cancelled"] or timeout:
+                        items.append(
+                            ItemOutcome(
+                                ItemResult.MISS,
+                                reason=MissReason.TIMEOUT if timeout else None,
+                            )
+                        )
+                    else:
+                        lease = next(self._next_lease)
+                        self.leases.add(lease)
+                        pool = self.node.local.pools[0][0].pool
+                        location = Location(
+                            pool.pool_id, "buffer", 1, i * PAGE, PAGE, pool.kind
+                        )
+                        items.append(
+                            ItemOutcome(
+                                ItemResult.HIT, location=location, lease_id=lease
+                            )
+                        )
+                entry["response"] = FetchResponse("OK", items=items)
+            if deliver:
+                for conn, header in entry["waiters"]:
+                    conn.respond(header, entry["response"])
+                entry["waiters"].clear()
+            return entry["response"]

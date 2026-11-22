@@ -5,6 +5,7 @@
 import fcntl
 import mmap
 import os
+import threading
 import time
 
 import pytest
@@ -19,6 +20,7 @@ from maru_storage_service.op_ledger import OpLedger, Verdict
 from maru_storage_service.placement import PlacementPolicy
 from maru_storage_service.pool_manager import PageRef
 from tests.unit.ms_fake_server import FakeMaruServer
+from tests.unit.ms_node_helpers import wait_until
 
 M = 1 << 20
 
@@ -346,3 +348,327 @@ def _open() -> NodeOpenRequest:
     return NodeOpenRequest(
         node_id="n", node_epoch="e", host_boot_id="b", protocol="ms1"
     )
+
+
+class TestPoolMaps:
+    def test_maps_checks_and_page_locks_a_memfd(self):
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import LocationError, PoolMaps
+
+        torch = pytest.importorskip("torch")
+        pool = dram.create_dram_pool("n", "e", 4 * M, M, hugepage=False)
+        maps = PoolMaps(pin_pools=True)
+        try:
+            mapped = maps.add(
+                PoolDescriptor(pool=pool.info(), memfd=0), os.dup(pool.fd), "e"
+            )
+            # the #128 page-lock path registers the shared mapping with CUDA
+            assert mapped.mapping.cuda_registered == torch.cuda.is_available()
+            loc = Location(pool.pool_id, "a", 1, M, 10, PoolKind.DRAM)
+            view = maps.view(loc)
+            view[:3] = b"abc"
+            other = mmap.mmap(pool.fd, pool.capacity)
+            assert other[M : M + 3] == b"abc"
+            other.close()
+            view.release()
+            for bad in (
+                Location("dram:other", "a", 1, 0, 10, PoolKind.DRAM),
+                Location(pool.pool_id, "a", 1, 4 * M, 10, PoolKind.DRAM),
+                Location(pool.pool_id, "a", 1, 3 * M, M + 1, PoolKind.DRAM),
+                Location(pool.pool_id, "a", 1, 10, 10, PoolKind.DRAM),
+                Location(pool.pool_id, "a", 1, 0, 10, PoolKind.CXL),
+                Location(pool.pool_id, "a", 1, -M, 10, PoolKind.DRAM),
+            ):
+                with pytest.raises(LocationError):
+                    maps.view(bad)
+        finally:
+            maps.close()
+            pool.close()
+
+    def test_removal_waits_for_every_view(self):
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import LocationError, PoolMaps
+
+        torch = pytest.importorskip("torch")
+        pool = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        maps = PoolMaps(pin_pools=True)
+        try:
+            mapped = maps.add(
+                PoolDescriptor(pool=pool.info(), memfd=0), os.dup(pool.fd), "e"
+            )
+            registered = mapped.mapping.cuda_registered
+            loc = Location(pool.pool_id, "a", 1, 0, 8, PoolKind.DRAM)
+            view = maps.view(loc)
+            part = view[:4]  # a slice keeps the view's buffer alive
+            view.release()
+            assert maps.views(pool.pool_id) == 1
+            assert not maps.remove(pool.pool_id)
+            # nothing was touched: still mapped and registered
+            assert (
+                mapped.mapping.cuda_registered
+                == registered
+                == torch.cuda.is_available()
+            )
+            part[:2] = b"ok"
+            del part
+            assert maps.views(pool.pool_id) == 0
+            assert maps.remove(pool.pool_id)
+            with pytest.raises(LocationError):
+                maps.view(loc)
+        finally:
+            maps.close()
+            pool.close()
+
+    def test_mapping_again_releases_the_old_one_after_its_views(self):
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import PoolMaps
+
+        torch = pytest.importorskip("torch")
+        pool = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        descriptor = PoolDescriptor(pool=pool.info(), memfd=0)
+        maps = PoolMaps(pin_pools=True)
+        try:
+            first = maps.add(descriptor, os.dup(pool.fd), "e")
+            view = maps.view(Location(pool.pool_id, "a", 1, 0, 8, PoolKind.DRAM))
+            second = maps.add(descriptor, os.dup(pool.fd), "e")
+            assert maps.get(pool.pool_id) is second
+            # a view of the old mapping is held: it stays mapped and registered
+            assert not first.mapping._closed
+            assert first.mapping.cuda_registered == torch.cuda.is_available()
+            view[:2] = b"ok"
+            view.release()  # the last view has it unmapped
+            assert maps.flush(5)
+            assert first.mapping._closed and not first.mapping.cuda_registered
+            # no view held: the old mapping goes at once
+            third = maps.add(descriptor, os.dup(pool.fd), "e")
+            assert maps.flush(5)
+            assert second.mapping._closed and maps.get(pool.pool_id) is third
+            assert maps.views(pool.pool_id) == 0
+        finally:
+            maps.close()
+            pool.close()
+
+    def test_close_keeps_the_pools_asked_for(self):
+        from maru_common.storage_types import PoolDescriptor
+        from maru_handler.client import pool_maps
+
+        torch = pytest.importorskip("torch")
+        kept_pool = dram.create_dram_pool("n", "e1", 2 * M, M, hugepage=False)
+        other_pool = dram.create_dram_pool("n", "e2", 2 * M, M, hugepage=False)
+        maps = pool_maps.PoolMaps(pin_pools=True)
+        kept = maps.add(
+            PoolDescriptor(pool=kept_pool.info(), memfd=0), os.dup(kept_pool.fd), "e1"
+        )
+        other = maps.add(
+            PoolDescriptor(pool=other_pool.info(), memfd=0),
+            os.dup(other_pool.fd),
+            "e2",
+        )
+        try:
+            maps.close(keep={kept_pool.pool_id})
+            assert maps.pool_ids() == []
+            assert kept in pool_maps._KEPT_UNTIL_EXIT and not kept.mapping._closed
+            assert kept.mapping.cuda_registered == torch.cuda.is_available()
+            assert other.mapping._closed and not other.mapping.cuda_registered
+        finally:
+            pool_maps._KEPT_UNTIL_EXIT.remove(kept)
+            kept.mapping.close()
+            kept_pool.close()
+            other_pool.close()
+
+    def test_a_release_never_closes_a_mapping_inline(self):
+        """Unregister and unmap run on the closer thread, not on the thread
+        that released the last view (a load thread)."""
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client.pool_maps import PoolMaps
+
+        gate, closed = threading.Event(), []
+
+        class Mapping:
+            cuda_registered = False
+
+            def view(self, offset, length):
+                return memoryview(bytearray(length))
+
+            def page_lock(self):
+                pass
+
+            def close(self):
+                assert gate.wait(5)
+                closed.append(threading.current_thread().name)
+
+        info = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        maps = PoolMaps(pin_pools=False, map_memfd=lambda i, fd: Mapping())
+        try:
+            descriptor = PoolDescriptor(pool=info.info(), memfd=0)
+            maps.add(descriptor, os.dup(info.fd), "e1")
+            view = maps.view(Location(info.pool_id, "a", 1, 0, 8, PoolKind.DRAM))
+            maps.add(descriptor, os.dup(info.fd), "e2")  # retires the first
+            view.release()  # returns while the close waits
+            assert maps.remove(info.pool_id)  # nor does a remove wait
+            assert not closed and not maps.wait_closed(info.pool_id, 0.05)
+            gate.set()
+            assert maps.wait_closed(info.pool_id, 5)
+            assert closed == ["maru-pool-close"] * 2
+        finally:
+            gate.set()
+            maps.close()
+            info.close()
+
+    def test_close_keeps_a_detached_pool_whose_view_is_held(self):
+        """A lost connection detaches the pool while a writer holds a view;
+        close(keep) keeps it, and releasing the view never closes it."""
+        from maru_common.storage_types import Location, PoolDescriptor, PoolKind
+        from maru_handler.client import pool_maps
+
+        maps, closed, info = self._fake_maps()
+        try:
+            maps.add(PoolDescriptor(pool=info.info(), memfd=0), os.dup(info.fd), "e")
+            view = maps.view(Location(info.pool_id, "a", 1, 0, 8, PoolKind.DRAM))
+            assert maps.remove_all() == [info.pool_id]
+            mapped = next(iter(maps._detached))
+            assert mapped.retired and not closed
+            maps.close(keep={info.pool_id})
+            assert mapped in pool_maps._KEPT_UNTIL_EXIT and not mapped.retired
+            view.release()
+            assert maps.flush(1) and not closed
+            assert maps.wait_closed(info.pool_id, 0.5)  # nothing is waiting
+        finally:
+            if mapped in pool_maps._KEPT_UNTIL_EXIT:
+                pool_maps._KEPT_UNTIL_EXIT.remove(mapped)
+            info.close()
+
+    def test_close_keeps_a_detached_pool_queued_for_the_closer(self):
+        from maru_common.storage_types import PoolDescriptor
+        from maru_handler.client import pool_maps
+
+        maps, closed, info = self._fake_maps()
+        gate = threading.Event()
+        blocker = pool_maps.MappedPool(
+            info=info.info(), node_epoch="x", mapping=_Blocking(gate)
+        )
+        try:
+            descriptor = PoolDescriptor(pool=info.info(), memfd=0)
+            # the closer is busy with the blocker, so the next close queues
+            with maps._lock:
+                maps._detached.add(blocker)
+                maps._queue_close(blocker)
+            wait_until(lambda: maps._closing is blocker, what="the closer")
+            maps.add(descriptor, os.dup(info.fd), "e")
+            queued = maps.get(info.pool_id)
+            assert maps.remove(info.pool_id)
+            assert queued in maps._closes
+            maps.close(keep={info.pool_id}, timeout=0.05)
+            assert queued in pool_maps._KEPT_UNTIL_EXIT
+            assert queued not in maps._closes and queued not in maps._detached
+            gate.set()
+            assert maps.flush(5)
+            assert not closed
+        finally:
+            gate.set()
+            if queued in pool_maps._KEPT_UNTIL_EXIT:
+                pool_maps._KEPT_UNTIL_EXIT.remove(queued)
+            info.close()
+
+    def test_a_failed_close_is_not_a_closed_pool(self):
+        from maru_common.storage_types import PoolDescriptor
+
+        maps, closed, info = self._fake_maps(fail=True)
+        try:
+            maps.add(PoolDescriptor(pool=info.info(), memfd=0), os.dup(info.fd), "e")
+            assert maps.remove(info.pool_id)
+            assert maps.flush(5)
+            start = time.monotonic()
+            assert not maps.wait_closed(info.pool_id, 5)
+            assert time.monotonic() - start < 2  # said at once, not at the timeout
+        finally:
+            info.close()
+
+    def test_the_closer_ends_when_the_queue_is_empty(self):
+        from maru_common.storage_types import PoolDescriptor
+
+        maps, closed, info = self._fake_maps()
+        try:
+            descriptor = PoolDescriptor(pool=info.info(), memfd=0)
+            maps.add(descriptor, os.dup(info.fd), "e")
+            assert maps.remove(info.pool_id)
+            closer = maps._closer
+            assert maps.wait_closed(info.pool_id, 5)
+            wait_until(lambda: maps._closer is None, what="the closer to end")
+            if closer is not None:
+                closer.join(5)
+                assert not closer.is_alive()
+            # a later close starts a new thread
+            maps.add(descriptor, os.dup(info.fd), "e")
+            assert maps.remove(info.pool_id) and maps.wait_closed(info.pool_id, 5)
+            assert len(closed) == 2
+        finally:
+            info.close()
+
+    def test_shared_prefault_never_writes(self, monkeypatch):
+        import errno
+
+        from maru_handler.memory import mapper
+        from maru_handler.storage.cpu import CpuPool
+
+        monkeypatch.setattr(mapper, "_PREFAULT_ENABLED", True)
+        writes = []
+
+        class Recording(mmap.mmap):
+            def madvise(self, *args):
+                raise OSError(errno.EINVAL, "old kernel")  # take the fallback
+
+            def __setitem__(self, index, value):
+                writes.append(index)
+                super().__setitem__(index, value)
+
+        pool = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        try:
+            for shared, expect_writes in ((True, False), (False, True)):
+                writes.clear()
+                mapping = Recording(pool.fd, pool.capacity)
+                cpu = CpuPool(
+                    "p", pool.capacity, M, medium="dram", mapping=mapping, shared=shared
+                )
+                assert cpu._prefault("shared", None)
+                assert bool(writes) == expect_writes
+                cpu.close()
+        finally:
+            pool.close()
+
+    @staticmethod
+    def _fake_maps(fail=False):
+        """PoolMaps over fake mappings; returns (maps, closed list, info)."""
+        from maru_handler.client.pool_maps import PoolMaps
+
+        closed = []
+
+        class Mapping:
+            cuda_registered = False
+
+            def view(self, offset, length):
+                return memoryview(bytearray(length))
+
+            def page_lock(self):
+                pass
+
+            def close(self):
+                if fail:
+                    raise OSError("unmap failed")
+                closed.append(self)
+
+        info = dram.create_dram_pool("n", "e", 2 * M, M, hugepage=False)
+        maps = PoolMaps(pin_pools=False, map_memfd=lambda i, fd: Mapping())
+        return maps, closed, info
+
+
+class _Blocking:
+    """A mapping whose close waits for ``gate``."""
+
+    cuda_registered = False
+
+    def __init__(self, gate):
+        self.gate = gate
+
+    def close(self):
+        self.gate.wait(5)

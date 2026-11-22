@@ -32,6 +32,7 @@ from maru_common.protocol import MessageType
 from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import (
     FETCH_CAPABILITY,
+    LEASE_CAPABILITY,
     MAX_BATCH,
     ItemResult,
     Key,
@@ -161,13 +162,13 @@ class TestAttach:
             finally:
                 w.close()
 
-        asked = [FETCH_CAPABILITY, "later_v9"]
+        asked = [FETCH_CAPABILITY, LEASE_CAPABILITY, "later_v9"]
         assert attach(capabilities=asked) == []  # this node serves no FETCH
-        node.local.capabilities = frozenset({FETCH_CAPABILITY})
-        assert attach(capabilities=asked) == [FETCH_CAPABILITY]
+        node.local.capabilities = frozenset({FETCH_CAPABILITY, LEASE_CAPABILITY})
+        assert attach(capabilities=asked) == [FETCH_CAPABILITY, LEASE_CAPABILITY]
         assert attach() == []
         probe = attach(capabilities=asked, role=SessionRole.PROBE, groups=[])
-        assert probe == [FETCH_CAPABILITY]
+        assert probe == [FETCH_CAPABILITY, LEASE_CAPABILITY]
 
     def test_requests_need_an_attach(self, worker):
         ser = Serializer(NODE_MESSAGE_CLASSES)

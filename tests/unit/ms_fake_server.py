@@ -40,6 +40,7 @@ from maru_common.protocol import (
 )
 from maru_common.serializer import MessageDecodeError, Serializer, op_digest
 from maru_common.storage_types import (
+    FETCH_CAPABILITY,
     MAX_BATCH,
     MEMORY_CAPABILITY,
     MS_PROTOCOL,
@@ -97,7 +98,7 @@ def loc_id(location: Location) -> tuple[str, str, int]:
 
 
 # The node capabilities MaruServer knows
-NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY})
+NODE_CAPABILITIES = frozenset({REMOTE_CAPABILITY, MEMORY_CAPABILITY, FETCH_CAPABILITY})
 
 
 @dataclass
@@ -781,12 +782,15 @@ class FakeMaruServer:
         )
         if mappable:
             return "hit", entry
-        # As MaruServer: a node fetches only from its own L2 pools
+        requester = self.nodes.get(worker.node_id)
         fetchable = (
-            entry.node_id == worker.node_id
-            and not POOL_KINDS[entry.location.kind].mappable
+            requester is not None
+            and REMOTE_CAPABILITY in requester.capabilities
+            and node is not None
+            and MEMORY_CAPABILITY in node.capabilities
+            and POOL_KINDS[entry.location.kind].mappable
         )
-        if not fetchable or node is None or not node.online:
+        if not fetchable or node is None or not node.online or not requester.online:
             return "offline", None
         return "fetch", entry
 
@@ -814,7 +818,11 @@ class FakeMaruServer:
             if result == ItemResult.MISS:
                 items.append(ItemOutcome(ItemResult.MISS, reason=found))
             else:
-                items.append(ItemOutcome(result))
+                items.append(
+                    ItemOutcome(
+                        result, location=found.location if req.with_locations else None
+                    )
+                )
         return ProbeResponse(status=Status.OK, items=items)
 
     def _lookup_and_pin(self, worker: WorkerRec, req):
@@ -836,6 +844,13 @@ class FakeMaruServer:
                     ItemOutcome(ItemResult.HIT, location=found.location, pin_id=pin_id)
                 )
             elif result == ItemResult.FETCH:
+                source_pin = None
+                if req.pin_sources:
+                    source_pin = uuid.uuid4().hex
+                    self.pins[source_pin] = Pin(
+                        source_pin, f"worker:{worker.incarnation}", key, found.location
+                    )
+                    self.loc_pins[loc_id(found.location)].add(source_pin)
                 items.append(
                     ItemOutcome(
                         ItemResult.FETCH,
@@ -843,6 +858,7 @@ class FakeMaruServer:
                             source=found.location,
                             source_node=found.node_id,
                             bytes=found.logical_bytes,
+                            pin_id=source_pin,
                         ),
                     )
                 )
