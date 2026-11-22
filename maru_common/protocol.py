@@ -14,9 +14,27 @@ See docs/protocol.md for full specification.
 
 import struct
 from dataclasses import dataclass, field
-from enum import IntEnum, IntFlag
+from enum import IntEnum, IntFlag, unique
 
 from maru_shm.types import MaruHandle
+
+from .storage_types import (
+    AccessHints,
+    BlockRequest,
+    CloseMode,
+    ExitCause,
+    ItemOutcome,
+    Key,
+    KeyLocation,
+    Location,
+    OpRef,
+    PoolInfo,
+    PoolUsage,
+    RmDomain,
+    SessionRole,
+    Status,
+    WorkerRef,
+)
 
 # =============================================================================
 # Protocol Constants
@@ -34,6 +52,7 @@ HEADER_FORMAT = "!HBBBBBBII"  # network byte order, big-endian
 # =============================================================================
 
 
+@unique
 class MessageType(IntEnum):
     """Message type codes for the protocol."""
 
@@ -59,6 +78,27 @@ class MessageType(IntEnum):
 
     # Opt-in storage directory, independent of legacy CXL key semantics.
     STORAGE = 0x30
+
+    # Multi-storage (0x40 - 0x5F)
+    NODE_OPEN = 0x40
+    NODE_HEARTBEAT = 0x41
+    NODE_CLOSE = 0x42
+    NODE_RECOVER_LIST = 0x44
+    WORKER_EXIT = 0x45
+    ADMIN_DELETE = 0x46
+    WORKER_OPEN = 0x48
+    WORKER_HEARTBEAT = 0x49
+    WORKER_CLOSE = 0x4A
+    PROBE = 0x50
+    LOOKUP_AND_PIN = 0x51
+    UNPIN = 0x52
+    SOURCE_PIN = 0x53
+    COMMIT = 0x58
+    RETIRE = 0x59
+    FETCH_COMPLETE = 0x5B
+    # 0x5A: reserved (FINALIZE_MOVE)
+    # 0x43, 0x5C, 0x5E, 0x5F: retired (NODE_REREGISTER, RELEASE_FINALIZER,
+    # REGION_REQUEST, REGION_RETURN); never reuse them
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -576,6 +616,361 @@ class ShutdownResponse:
 
 
 # =============================================================================
+# Multi-storage Messages (0x40 - 0x5F)
+# =============================================================================
+# Session requests carry ``session`` and ``server_epoch``; state changes carry
+# ``op`` (see OpRef). Response ``items`` follow the request's order.
+
+
+@dataclass
+class RecoverItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+    pinned: bool
+
+
+@dataclass
+class CommitItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+
+
+@dataclass
+class FetchCompleteItem:
+    key: Key
+    source_pin_id: str
+    # Above 0: the read succeeded (the source counts as read for its LRU)
+    logical_bytes: int
+    # A fetched copy to publish: never taken, the item is REJECTED
+    copy: Location | None = None
+    # The location read; when set, the source pin must be on it
+    source: Location | None = None
+    # A source pin a worker's FETCH plan brought: that worker's incarnation.
+    # Then only its source pin for this node run is used; else only a node
+    # pin of this session
+    source_worker: str = ""
+
+
+@dataclass
+class NodeOpenRequest:
+    """NODE_OPEN (0x40) - A StorageService opens its node session."""
+
+    node_id: str
+    node_epoch: str
+    host_boot_id: str
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+    pools: list[PoolInfo] = field(default_factory=list)
+    rm_domains: list[RmDomain] = field(default_factory=list)
+
+
+@dataclass
+class NodeOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    node_session: str = ""
+    epoch_seq: int = 0
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+    adopted: list[PoolInfo] = field(default_factory=list)
+    # Those of the request MaruServer accepted; none from an older server
+    capabilities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NodeHeartbeatRequest:
+    """NODE_HEARTBEAT (0x41)."""
+
+    session: str
+    server_epoch: str
+    usage: list[PoolUsage] = field(default_factory=list)
+
+
+@dataclass
+class NodeHeartbeatResponse:
+    status: Status
+    error: str | None = None
+    access: AccessHints = field(default_factory=AccessHints)
+    blocks: list[BlockRequest] = field(default_factory=list)
+    policy_version: int = 0
+
+
+@dataclass
+class NodeCloseRequest:
+    """NODE_CLOSE (0x42)."""
+
+    session: str
+    server_epoch: str
+    mode: CloseMode
+
+
+@dataclass
+class NodeCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class NodeRecoverListRequest:
+    """NODE_RECOVER_LIST (0x44) - Committed locations of an adopted pool."""
+
+    session: str
+    server_epoch: str
+    pool_id: str
+    cursor: str | None = None
+
+
+@dataclass
+class NodeRecoverListResponse:
+    status: Status
+    error: str | None = None
+    items: list[RecoverItem] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass
+class WorkerExitRequest:
+    """WORKER_EXIT (0x45) - A node reports workers it saw end."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    workers: list[WorkerRef]
+    cause: ExitCause
+
+
+@dataclass
+class WorkerExitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class AdminDeleteRequest:
+    """ADMIN_DELETE (0x46) - Remove keys through block requests to their
+    nodes; idempotent, so no session or op."""
+
+    items: list[Key]
+
+
+@dataclass
+class AdminDeleteResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenRequest:
+    """WORKER_OPEN (0x48).
+
+    ``pid``/``pid_start`` are the node-view values from the ATTACH reply.
+    """
+
+    node_id: str
+    node_epoch: str
+    engine_id: str
+    dp_index: int
+    tp_rank: int
+    pid: int
+    pid_start: int
+    incarnation: str
+    namespace: str
+    role: SessionRole
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    worker_session: str = ""
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+
+
+@dataclass
+class WorkerHeartbeatRequest:
+    """WORKER_HEARTBEAT (0x49)."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerHeartbeatResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class WorkerCloseRequest:
+    """WORKER_CLOSE (0x4A) - Ends the session and releases its pins."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class ProbeRequest:
+    """PROBE (0x50) - Hit hints for the scheduler; no pin. With
+    ``with_locations`` a HIT or FETCH item names the location it found (a
+    read hint's range), else none does."""
+
+    session: str
+    server_epoch: str
+    items: list[Key]
+    with_locations: bool = False
+
+
+@dataclass
+class ProbeResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class LookupAndPinRequest:
+    """LOOKUP_AND_PIN (0x51).
+
+    With ``pin_sources`` each FETCH plan carries a pin on its source
+    (``FetchPlan.pin_id``), held by the worker session with its node run as
+    creator. A FETCH the node runs hands the pin over: the node reads under
+    it and releases it, naming the worker (FETCH_COMPLETE source_worker,
+    UNPIN worker_incarnation). The worker UNPINs the pin of a plan it does
+    not FETCH, or whose FETCH is answered other than OK.
+    """
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[Key]
+    pin_sources: bool = False
+
+
+@dataclass
+class LookupAndPinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class UnpinRequest:
+    """UNPIN (0x52) - Idempotent by pin_id, so it carries no op.
+
+    A node session sets ``worker_incarnation`` to release source pins that
+    worker's FETCH plans brought: only that worker's source pins for the
+    node's run go; any other pin is REJECTED.
+    """
+
+    session: str
+    server_epoch: str
+    pin_ids: list[str]
+    worker_incarnation: str = ""
+
+
+@dataclass
+class UnpinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class SourcePinRequest:
+    """SOURCE_PIN (0x53) - A StorageService pins a fetch source.
+
+    With ``worker_incarnation`` the fetch is for that worker: unless
+    ``worker_session`` is its open session on this node's run, with the
+    items' namespace, the request is REJECTED and pins nothing.
+    """
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+    worker_session: str = ""
+    worker_incarnation: str = ""
+
+
+@dataclass
+class SourcePinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class CommitRequest:
+    """COMMIT (0x58) - An item that asks for a finalizer is REJECTED (none
+    is kept here)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[CommitItem]
+
+
+@dataclass
+class CommitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class RetireRequest:
+    """RETIRE (0x59)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+
+
+@dataclass
+class RetireResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class FetchCompleteRequest:
+    """FETCH_COMPLETE (0x5B) - The node's reads of fetch sources ended:
+    releases each item's source pin and records a successful read for the
+    source's LRU. Items: OK, or REJECTED (a source pin that is not the
+    node's for the item, or a copy to publish; an owned pin goes either
+    way)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[FetchCompleteItem]
+
+
+@dataclass
+class FetchCompleteResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+# =============================================================================
 # Message Type Mapping
 # =============================================================================
 
@@ -610,3 +1005,28 @@ MESSAGE_CLASSES = {
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }
+
+# Multi-storage messages, served by maru-node-server; the legacy table knows
+# their codes too
+MS_MESSAGE_CLASSES = {
+    MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),
+    MessageType.NODE_HEARTBEAT: (NodeHeartbeatRequest, NodeHeartbeatResponse),
+    MessageType.NODE_CLOSE: (NodeCloseRequest, NodeCloseResponse),
+    MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),
+    MessageType.WORKER_EXIT: (WorkerExitRequest, WorkerExitResponse),
+    MessageType.ADMIN_DELETE: (AdminDeleteRequest, AdminDeleteResponse),
+    MessageType.WORKER_OPEN: (WorkerOpenRequest, WorkerOpenResponse),
+    MessageType.WORKER_HEARTBEAT: (WorkerHeartbeatRequest, WorkerHeartbeatResponse),
+    MessageType.WORKER_CLOSE: (WorkerCloseRequest, WorkerCloseResponse),
+    MessageType.PROBE: (ProbeRequest, ProbeResponse),
+    MessageType.LOOKUP_AND_PIN: (LookupAndPinRequest, LookupAndPinResponse),
+    MessageType.UNPIN: (UnpinRequest, UnpinResponse),
+    MessageType.SOURCE_PIN: (SourcePinRequest, SourcePinResponse),
+    MessageType.COMMIT: (CommitRequest, CommitResponse),
+    MessageType.RETIRE: (RetireRequest, RetireResponse),
+    MessageType.FETCH_COMPLETE: (FetchCompleteRequest, FetchCompleteResponse),
+}
+_overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
+if _overlap:
+    raise RuntimeError(f"message codes defined twice: {sorted(_overlap)}")
+MESSAGE_CLASSES.update(MS_MESSAGE_CLASSES)

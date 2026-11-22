@@ -55,6 +55,7 @@ class MaruConfig:
     chunk_size_bytes: int = 1024 * 1024  # 1MB default
     auto_connect: bool = True
     timeout_ms: int = 2000  # Socket timeout in milliseconds
+    lookup_timeout_ms: int = 100  # Foreground PROBE and LOOKUP_AND_PIN timeout
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
@@ -108,6 +109,30 @@ class MaruConfig:
     # hinted), the memory side hears that this request is loading now (the
     # same receivers as read hints).
     read_promotes: bool = False
+    # UDS of this node's StorageService; set, the handler uses MaruClient
+    maru_node: str | None = None
+    # maru_node: how long store/batch_store wait for publication
+    store_timeout_s: float = 10.0
+    # maru_node: how long a step's stores wait in all for the credit the
+    # step asked for when it started (0: never)
+    credit_wait_s: float = 0.0
+    # maru_node: how long the first connect waits for the node to listen
+    node_connect_timeout_s: float = 30.0
+    # maru_node: this worker's data-parallel index and tensor-parallel rank
+    dp_index: int = 0
+    tp_rank: int = 0
+    # maru_node: a worker that never stores asks no credit
+    load_only: bool = False
+    # maru_node: objects this worker may store in one engine step (0: unknown)
+    step_objects: int = 0
+    # maru_node: parked loads may fetch what only the node reads (a memory
+    # node's pool): asks for fetch_v1, and a scheduler probe counts such keys
+    # as found
+    fetch_loads: bool = False
+    # maru_node: a FETCH's deadline, max(base, pages x per page) ms; per
+    # page unset: the node page at 2 GB/s
+    fetch_deadline_ms: int = 250
+    fetch_deadline_per_page_ms: float | None = None
 
     @property
     def server_urls(self) -> list[str]:
@@ -134,6 +159,15 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
+        if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
+            raise ValueError("lookup_timeout_ms must be a positive integer")
+        if type(self.fetch_deadline_ms) is not int or self.fetch_deadline_ms <= 0:
+            raise ValueError("fetch_deadline_ms must be a positive integer")
+        if (
+            self.fetch_deadline_per_page_ms is not None
+            and not self.fetch_deadline_per_page_ms >= 0
+        ):
+            raise ValueError("fetch_deadline_per_page_ms must not be negative")
         if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
             raise ValueError(
                 "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
@@ -172,6 +206,21 @@ class MaruConfig:
                 and self.pool_size // self.chunk_size_bytes > 1_000_000
             ):
                 raise ValueError("CPU pool supports at most 1000000 pages")
+        if self.maru_node is not None:
+            if not isinstance(self.maru_node, str) or not self.maru_node:
+                raise ValueError("maru_node must be the path of the node socket")
+            if not self.engine_id or not self.cache_namespace:
+                raise ValueError("maru_node requires engine_id and cache_namespace")
+            for name in ("dp_index", "tp_rank", "step_objects"):
+                value = getattr(self, name)
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"{name} must be an integer >= 0")
+            if not 0 < self.store_timeout_s < float("inf"):
+                raise ValueError("store_timeout_s must be a positive number")
+            if not 0 <= self.credit_wait_s < float("inf"):
+                raise ValueError("credit_wait_s must be a number >= 0")
+            if not 0 <= self.node_connect_timeout_s < float("inf"):
+                raise ValueError("node_connect_timeout_s must be a number >= 0")
         if self.read_hints and self.storage_backend not in _HINT_BACKENDS:
             raise ValueError(
                 "read_hints is supported by the remote_cxl and cxl backends"
@@ -210,7 +259,12 @@ class MaruConfig:
             raise ValueError("RDMA settings require the remote_cxl storage backend")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
-        if not self.metadata_only and self.pool_size < self.chunk_size_bytes:
+        # maru_node: the StorageService sizes the pool
+        if (
+            not self.metadata_only
+            and self.maru_node is None
+            and self.pool_size < self.chunk_size_bytes
+        ):
             raise ValueError(
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"
