@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 XCENA Inc.
+"""The collector setup of the service processes."""
+
+import gc
+import threading
+import time
+import weakref
+
+# bound before the autouse fixture replaces it for every other test
+from maru_common.gc_freeze import reclaim, start_freezer
+
+
+class _Cycle:
+    def __init__(self):
+        self.me = self
+
+
+def _frozen(obj) -> bool:
+    """Tracked, but in none of the generations a collection walks."""
+    return gc.is_tracked(obj) and not any(
+        o is obj for generation in range(3) for o in gc.get_objects(generation)
+    )
+
+
+def test_the_freezer_collects_garbage_and_freezes_the_rest():
+    kept = _Cycle()
+    dropped = weakref.ref(_Cycle())  # garbage only a collection frees
+    stop = start_freezer(interval_s=0.01)
+    try:
+        deadline = time.monotonic() + 5
+        while dropped() is not None or not _frozen(kept):
+            assert time.monotonic() < deadline, "not collected or not frozen"
+            time.sleep(0.01)
+        # objects created later are frozen on a later pass
+        later = _Cycle()
+        while not _frozen(later):
+            assert time.monotonic() < deadline, "not frozen on a later pass"
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for thread in threading.enumerate():
+            if thread.name == "maru-gc-freeze":
+                thread.join(5)
+        gc.unfreeze()
+    assert not any(t.name == "maru-gc-freeze" for t in threading.enumerate())
+
+
+def test_reclaim_collects_cycles_frozen_while_alive():
+    kept = _Cycle()
+    ref = weakref.ref(kept)
+    gc.collect()
+    gc.freeze()
+    try:
+        del kept
+        gc.collect()
+        assert ref() is not None  # frozen: no collection walks it
+        reclaim()
+        assert ref() is None
+    finally:
+        gc.unfreeze()
+
+
+def test_the_freezer_reclaims_every_reclaim_s():
+    kept = _Cycle()
+    ref = weakref.ref(kept)
+    gc.collect()
+    gc.freeze()
+    del kept
+    stop = start_freezer(interval_s=0.01, reclaim_s=0.05)
+    try:
+        deadline = time.monotonic() + 5
+        while ref() is not None:
+            assert time.monotonic() < deadline, "a frozen cycle never reclaimed"
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for thread in threading.enumerate():
+            if thread.name == "maru-gc-freeze":
+                thread.join(5)
+        gc.unfreeze()
+
+
+def test_reclaim_freezes_the_survivors_only_while_a_freezer_runs():
+    import maru_common.gc_freeze as gc_freeze
+
+    reclaim()
+    base = gc.get_freeze_count()  # what the interpreter keeps frozen
+    kept = [_Cycle() for _ in range(100)]
+    reclaim()
+    assert gc.get_freeze_count() == base  # no freezer: nothing more frozen
+    stop = start_freezer(interval_s=10)
+    try:
+        assert gc_freeze._freezing
+        reclaim()
+        assert gc.get_freeze_count() >= base + len(kept)
+    finally:
+        stop.set()
+        for thread in threading.enumerate():
+            if thread.name == "maru-gc-freeze":
+                thread.join(5)
+        gc.unfreeze()
+    assert not gc_freeze._freezing
