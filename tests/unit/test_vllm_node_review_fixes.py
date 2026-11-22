@@ -485,19 +485,59 @@ def test_deepseek_step_credit_counts_only_stored_layers_and_markers(bounded, lay
     worker._handler.want_credit.assert_called_once_with(expected)
 
 
-def test_group_load_asks_only_for_the_next_batchs_free_slots(monkeypatch):
-    worker, stream, log, _ = group_loader(monkeypatch, slots=3)
+@pytest.mark.parametrize("slots", range(1, 8))
+def test_group_load_uses_free_slots_before_waiting_for_parked_copies(
+    monkeypatch, slots
+):
+    worker, stream, log, reads = group_loader(
+        monkeypatch, slots=max(2, slots), pipeline=None
+    )
+    assert connector_module._LOAD_PIPELINE_CHUNKS == 8
     park_group(worker, "r1")
     first = stream.events[0]
+    assert log == ["read 0", "copy r1"]
+    worker._handler.retrieve_capacity.side_effect = lambda _wanted=None: (
+        slots - len(reads) + len(released(worker))
+    )
     worker._group_load_plan = lambda _: (
         1,
         [(None, i, None) for i in range(5)],
         list("abcde"),
     )
     park_group(worker, "r2")
-    assert log[2] == "read 2"  # one free slot, without waiting for r1 first
-    assert log.index("read 2") < log.index("wait e0")
-    assert first.ended
+    if slots > 2:
+        assert log[2:4] == ["read 2", "copy r2"]
+        assert len(worker._handler.batch_retrieve.call_args_list[1].args[0]) == min(
+            5, slots - 2
+        )
+        if slots < 7:
+            assert log.index("read 2") < log.index("wait e0")
+        else:
+            assert not first.ended
+    else:
+        assert log[2:4] == ["wait e0", "release [0, 1]"]
+        assert log.index("wait e0") < log.index("read 2")
+    if slots == 3:
+        assert log == [
+            "read 0",
+            "copy r1",
+            "read 2",
+            "copy r2",
+            "wait e0",
+            "release [2]",
+            "release [0, 1]",
+            "read 3",
+            "copy r2",
+            "wait e0",
+            "release [3, 4, 5]",
+            "read 6",
+            "copy r2",
+        ]
+    for event in stream.events:
+        event.ended = True
+    assert worker.get_finished_loading() == {"r1", "r2"}
+    assert len(reads) == 7
+    assert sorted(map(id, released(worker))) == sorted(map(id, reads))
 
 
 def test_a_queued_copy_error_is_logged_without_a_second_drain(monkeypatch, caplog):

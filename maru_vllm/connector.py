@@ -5637,9 +5637,13 @@ class MaruWorkerConnector:
         while start < len(keys):
             if self._stopped is not None:
                 return None
-            wanted = min(len(keys) - start, _LOAD_PIPELINE_CHUNKS)
-            if park and not self._free_parked_slots(handler, wanted):
-                return None
+            if park:
+                wanted = min(
+                    self._leased_batch_size(handler, len(keys) - start, False),
+                    len(keys) - start,
+                )
+                if not self._free_parked_slots(handler, max(1, wanted)):
+                    return None
             n = min(
                 self._leased_batch_size(handler, len(keys) - start, offthread),
                 len(keys) - start,

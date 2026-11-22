@@ -1985,15 +1985,18 @@ class LoaderStream:
             event.synchronize()
 
 
-def parked_loader(monkeypatch, slots: int | None = None, window: int = 0):
-    """A maru_node worker whose loader thread reads one chunk per batch and
-    copies it on a fake stream; ``slots`` bounds the reads it may hold, and
-    ``window`` is its ``maru_load_admission_window``.
+def parked_loader(
+    monkeypatch, slots: int | None = None, window: int = 0, pipeline: int | None = 1
+):
+    """A maru_node worker with fake copies; ``slots`` bounds its held reads,
+    ``window`` is its admission window, and ``pipeline=None`` keeps the
+    default batch limit.
 
     Returns:
         The worker, its loader stream, the log, and every read in order.
     """
-    monkeypatch.setattr(connector_module, "_LOAD_PIPELINE_CHUNKS", 1)
+    if pipeline is not None:
+        monkeypatch.setattr(connector_module, "_LOAD_PIPELINE_CHUNKS", pipeline)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     log: list[str] = []
     stream = LoaderStream(log)
@@ -2300,10 +2303,12 @@ def test_a_failed_parked_batch_keeps_the_reads_of_the_loads_behind_it(monkeypatc
 # =============================================================================
 
 
-def group_loader(monkeypatch, slots: int | None = None):
+def group_loader(monkeypatch, slots: int | None = None, pipeline: int | None = 1):
     """``parked_loader``'s worker on a model with several groups: a load
     reads two objects, in one batch unless ``slots`` are short."""
-    worker, stream, log, reads = parked_loader(monkeypatch, slots=slots)
+    worker, stream, log, reads = parked_loader(
+        monkeypatch, slots=slots, pipeline=pipeline
+    )
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     stream.wait_event = lambda event: None
     plan = [(None, 0, None), (None, 1, None)]
