@@ -19,7 +19,7 @@ from maru_common.storage_types import (
     RmDomain,
     Visibility,
 )
-from maru_storage_service import service as service_module
+from maru_storage_service import node_run as service_module
 from maru_storage_service.config import parse_node_config
 from maru_storage_service.config_fields import TierSpec
 from maru_storage_service.drivers.registry import TIERS

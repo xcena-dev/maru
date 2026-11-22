@@ -15,11 +15,13 @@ import pytest
 
 from maru_common.protocol import MessageType
 from maru_shm.types import StaleNodeEpochError
+from maru_storage_service import node as node_module
+from maru_storage_service import node_run as run_module
 from maru_storage_service import service as service_module
 from maru_storage_service.cli import EXIT_FAILED, _signal_handler, serve
 from maru_storage_service.drivers import dram
 from maru_storage_service.drivers.dram import DramDriver, DramPoolError
-from maru_storage_service.local_server import LocalServerError
+from maru_storage_service.gpu.local_server import LocalServerError
 from maru_storage_service.ports import NodeOpenError, ServerStopped
 from maru_storage_service.service import Node, StorageService
 from tests.unit.ms_fake_server import FakeMaruServer
@@ -121,7 +123,7 @@ def test_the_ended_run_is_dropped_and_reclaimed_before_the_next(monkeypatch):
     seen = []
     node = fake_node([FakeRun("x"), FakeRun("x")], pause_s=0.01, max_pause_s=0.01)
     monkeypatch.setattr(
-        service_module.gc_freeze, "reclaim", lambda: seen.append(node.service)
+        node_module.gc_freeze, "reclaim", lambda: seen.append(node.service)
     )
     thread = threading.Thread(target=node.run)
     thread.start()
@@ -142,7 +144,7 @@ def test_the_pause_between_runs_grows_and_a_long_run_resets_it(caplog, monkeypat
         thread.join(10)
         assert pauses(caplog) == [0.1, 0.2, 0.3, 0.3]
         caplog.clear()
-        monkeypatch.setattr(service_module, "NEW_RUN_RESET_S", 0.0)  # all long
+        monkeypatch.setattr(node_module, "NEW_RUN_RESET_S", 0.0)  # all long
         node = fake_node([FakeRun("x") for _ in range(3)], pause_s=0.1, max_pause_s=0.3)
         thread = threading.Thread(target=node.run)
         thread.start()
@@ -161,7 +163,7 @@ def test_a_failed_teardown_ends_the_node():
 
 
 def test_a_teardown_that_never_ends_does_not_hold_up_a_stop(monkeypatch):
-    monkeypatch.setattr(service_module, "STOP_WAIT_S", 0.2)
+    monkeypatch.setattr(node_module, "STOP_WAIT_S", 0.2)
     run = FakeRun(finishes=False)
     node = fake_node([run])
     thread = threading.Thread(target=node.run)
@@ -372,7 +374,7 @@ def test_node_keeps_ownership_between_runs(fake, runs, monkeypatch, role):
         paused.set()
         assert resume.wait(10)
 
-    monkeypatch.setattr(service_module.gc_freeze, "reclaim", reclaim)
+    monkeypatch.setattr(node_module.gc_freeze, "reclaim", reclaim)
     node = runs(role=role)
     try:
         wait_until(lambda: fake.requests(MessageType.NODE_HEARTBEAT))
@@ -402,7 +404,7 @@ def test_node_keeps_ownership_between_runs(fake, runs, monkeypatch, role):
 @pytest.fixture
 def short_dram(monkeypatch):
     """DramDriver.create fails as memory short ``fails[0]`` times."""
-    monkeypatch.setattr(service_module, "DRAM_RETRY_S", 0.02)
+    monkeypatch.setattr(run_module, "DRAM_RETRY_S", 0.02)
     real = DramDriver.create
     fails = [0]
 
@@ -456,8 +458,8 @@ class OldMapping:
 def dram_service(monkeypatch):
     """A later run's service whose DRAM allocation fails while the old
     mapping is held; (service, old mapping, creates made)."""
-    monkeypatch.setattr(service_module, "DRAM_RETRY_S", 0.1)
-    monkeypatch.setattr(service_module, "DRAM_RETRY_MAX_S", 0.5)
+    monkeypatch.setattr(run_module, "DRAM_RETRY_S", 0.1)
+    monkeypatch.setattr(run_module, "DRAM_RETRY_MAX_S", 0.5)
     old, creates = OldMapping(), []
 
     def create(self, tier, **kwargs):
@@ -504,7 +506,7 @@ def test_a_stop_ends_the_wait_in_the_middle_of_it(dram_service):
 
 def test_a_stop_during_a_long_wait_returns_at_once(dram_service, monkeypatch):
     service, old, creates = dram_service
-    monkeypatch.setattr(service_module, "DRAM_RETRY_S", 30.0)
+    monkeypatch.setattr(run_module, "DRAM_RETRY_S", 30.0)
     tier = service._make(service.config.top)
     threading.Timer(0.1, service.interrupt).start()
     start = time.monotonic()

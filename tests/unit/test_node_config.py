@@ -20,7 +20,7 @@ from maru_storage_service.config import (
 )
 from maru_storage_service.config_fields import TierSpec
 from maru_storage_service.drivers.registry import TIERS
-from maru_storage_service.service import SERVED_TIERS, NotServableError, check_servable
+from maru_storage_service.node_run import SERVED_TIERS, NotServableError, check_servable
 from maru_storage_service.tiers import Level
 
 M = 1 << 20

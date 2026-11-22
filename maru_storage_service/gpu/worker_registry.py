@@ -19,11 +19,11 @@ from typing import TypeVar, cast
 from maru_common.node_protocol import DetachResponse
 from maru_common.storage_types import SessionRole, Status, WorkerRef
 
-from .op_ledger import OpLedger
-from .pool_manager import PoolManager, holder_tag
-from .ports import ProcessWatcher, WorkerEndpoint
+from ..op_ledger import OpLedger
+from ..pool_manager import PoolManager, holder_tag
+from ..ports import ProcessWatcher, WorkerEndpoint
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("maru_storage_service.worker_registry")
 
 R = TypeVar("R")
 

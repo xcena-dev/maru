@@ -14,7 +14,7 @@ from collections.abc import Callable
 
 from maru_common.node_protocol import process_start_time
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("maru_storage_service.peer_watcher")
 
 
 class PeerWatcher:

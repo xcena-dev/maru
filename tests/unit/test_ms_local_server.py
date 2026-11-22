@@ -44,7 +44,7 @@ from maru_common.storage_types import (
     StorageUnavailableError,
     make_generation,
 )
-from maru_storage_service import local_server
+from maru_storage_service.gpu import local_server
 from maru_storage_service.pool_manager import PageState
 from tests.unit.ms_fake_server import FakeMaruServer
 from tests.unit.ms_node_helpers import (

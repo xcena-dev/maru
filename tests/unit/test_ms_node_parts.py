@@ -15,7 +15,7 @@ from maru_common.protocol import LookupAndPinRequest, MessageType, NodeOpenReque
 from maru_common.serializer import op_digest
 from maru_common.storage_types import KeptCause, Key, OpRef
 from maru_storage_service.drivers import dram
-from maru_storage_service.local_pin import LocalPins
+from maru_storage_service.gpu.local_pin import LocalPins
 from maru_storage_service.op_ledger import OpLedger, Verdict
 from maru_storage_service.placement import PlacementPolicy
 from maru_storage_service.pool_manager import PageRef

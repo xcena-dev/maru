@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""What the StorageManager needs of MaruServer, worker connections and the
-process watcher; ServerClient, LocalServer connections and PeerWatcher
-implement them."""
+"""Ports for node stores, roles, metadata and workers."""
 
-from collections.abc import Callable
-from typing import Protocol
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Protocol
 
 from maru_common.node_protocol import Notify
 from maru_common.protocol import (
@@ -15,7 +15,59 @@ from maru_common.protocol import (
     RetireResponse,
     WorkerExitResponse,
 )
-from maru_common.storage_types import ExitCause, KeyLocation, PoolUsage, WorkerRef
+from maru_common.storage_types import (
+    ExitCause,
+    KeptCause,
+    KeyLocation,
+    PoolUsage,
+    WorkerRef,
+)
+
+if TYPE_CHECKING:
+    from .config import TierTraits
+    from .node_run import NodeRun
+    from .node_store import NodeStore
+    from .placement import PlacementPolicy
+    from .pool_manager import PageRef
+    from .tiers import L1Pool, Leased
+
+
+class LocalPinPort(Protocol):
+    """Local-reader state used when removing pages."""
+
+    def block(self, refs: Iterable[PageRef]) -> None: ...
+
+    def unblock(self, refs: Iterable[PageRef]) -> None: ...
+
+    def after_kept(self, ref: PageRef, cause: KeptCause) -> None: ...
+
+    def forget(self, ref: PageRef) -> None: ...
+
+    def readers(self, ref: PageRef) -> int: ...
+
+
+class NodeRole(Protocol):
+    """Role phases called in a node run's lifecycle order."""
+
+    name: str
+
+    def capabilities(self) -> list[str]: ...
+
+    def bind(self, run: NodeRun) -> None: ...
+
+    def make_store(
+        self, run: NodeRun, placement: PlacementPolicy, traits: dict[str, TierTraits]
+    ) -> NodeStore: ...
+
+    def serve(self, run: NodeRun) -> None: ...
+
+    def unmap_leased(
+        self, run: NodeRun, tiers: Sequence[Leased], pools: Sequence[L1Pool]
+    ) -> set[str]: ...
+
+    def stop_workers(self) -> None: ...
+
+    def worker_settled(self, run: NodeRun, incarnation: str) -> None: ...
 
 
 class ServerStopped(Exception):  # noqa: N818 - a state, not a failure

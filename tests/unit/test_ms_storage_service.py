@@ -42,7 +42,7 @@ from maru_common.storage_types import (
 )
 from maru_handler import MaruHandler
 from maru_handler.client import CreditUnavailableError
-from maru_storage_service.local_server import LocalServerError
+from maru_storage_service.gpu.local_server import LocalServerError
 from maru_storage_service.pool_manager import PageState
 from maru_storage_service.service import StorageService
 from tests.unit.ms_fake_server import FakeMaruServer
@@ -273,7 +273,7 @@ class TestConfig:
 
 
 def test_kept_cause_reopen_table():
-    from maru_storage_service.local_pin import REOPEN_ON_KEPT
+    from maru_storage_service.gpu.local_pin import REOPEN_ON_KEPT
 
     assert REOPEN_ON_KEPT == {
         KeptCause.PINNED: True,
@@ -1445,6 +1445,33 @@ def test_second_start_leaves_the_running_node_alone(sockdir, monkeypatch, role, 
         metadata.close()
 
 
+def test_memory_role_creates_no_worker_objects(nodes, monkeypatch):
+    from maru_storage_service.gpu.local_pin import LocalPins
+    from maru_storage_service.gpu.local_server import LocalServer
+    from maru_storage_service.gpu.peer_watcher import PeerWatcher
+    from maru_storage_service.gpu.worker_registry import WorkerRegistry
+    from maru_storage_service.node_store import NodeStore
+    from maru_storage_service.op_ledger import OpLedger
+    from tests.unit.ms_node_helpers import publish
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("memory role constructed a worker object")
+
+    for cls in (LocalServer, WorkerRegistry, PeerWatcher, OpLedger, LocalPins):
+        monkeypatch.setattr(cls, "__init__", unexpected)
+    node = nodes(role="memory")
+    assert type(node.store) is NodeStore
+    assert node.local is None and not os.path.exists(node.config.socket)
+    assert not any(
+        hasattr(node.store, name) for name in ("workers", "watcher", "ledger")
+    )
+    assert [thread.name for thread in node.store._threads] == [
+        "maru-commit",
+        "maru-evict",
+    ]
+    assert publish(node, "memory-page").result is ItemResult.ADDED
+
+
 def test_maruserver_stopped_reaches_the_cap_and_comes_back(fake, nodes):
     node = nodes(budgets={"commit_pending_max_bytes": 2 * PAGE})
     worker = RawWorker(node.config.socket)
@@ -2234,7 +2261,7 @@ class TestMaruServerDown:
 
 class TestFirstConnect:
     def test_waits_for_a_node_that_is_starting(self, fake, sockdir):
-        from maru_storage_service.local_server import LocalServer
+        from maru_storage_service.gpu.local_server import LocalServer
 
         path = f"{sockdir}/late.sock"
         handler = self._handler(path, 20.0)

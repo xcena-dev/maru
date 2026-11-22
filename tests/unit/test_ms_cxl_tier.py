@@ -551,8 +551,8 @@ def test_leave_gives_back_every_region_and_holds_keep_mapped_ones(fake, sockdir)
 def test_an_ended_worker_counts_as_unmapped_only_after_the_gpu_grace():
     import time
 
+    from maru_storage_service.gpu.worker_registry import WorkerRegistry
     from maru_storage_service.op_ledger import OpLedger
-    from maru_storage_service.worker_registry import WorkerRegistry
 
     registry = WorkerRegistry(
         node_epoch="e1",
@@ -726,8 +726,8 @@ def test_a_hold_name_fits_the_rm():
 
 
 def test_a_forgotten_detached_worker_counts_as_settled():
+    from maru_storage_service.gpu.worker_registry import WorkerRegistry
     from maru_storage_service.op_ledger import OpLedger
-    from maru_storage_service.worker_registry import WorkerRegistry
 
     registry = WorkerRegistry(
         node_epoch="e1",

@@ -9,7 +9,7 @@ from collections.abc import Iterable
 
 from maru_common.storage_types import KeptCause
 
-from .pool_manager import PageRef
+from ..pool_manager import PageRef
 
 # Reopen after KEPT, by cause; UNKNOWN stays blocked
 REOPEN_ON_KEPT = {

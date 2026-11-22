@@ -118,7 +118,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     """Run the node until SIGTERM or SIGINT."""
     from .drivers.cxl import CxlTierError
     from .drivers.dram import DramPoolError
-    from .local_server import LocalServerError
+    from .ownership import LocalServerError
     from .server_client import NodeOpenError
     from .service import Node, NotServableError
 
