@@ -25,8 +25,8 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
    | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | gpt-oss-20b         |
    | attention                      |                                    |                 |                 |                     |
    +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢              | 🟢              | Qwen3.5-0.8B        |
-   | full attention                 | Qwen3-Next                         |                 |                 |                     |
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8 (except  | 🟢              | 🟢              | Qwen3.5-0.8B        |
+   | full attention                 | Flash-Next), Qwen3-Next            |                 |                 |                     |
    +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
    | Sliding-window MLA +           | DeepSeek-V4.1-Flash                | 🟢              | 🟢              | DeepSeek-V4.1-Flash |
    | compressed MLA latent and      |                                    |                 |                 |                     |
