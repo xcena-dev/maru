@@ -30,7 +30,7 @@ The diagram shows `remote`. For `dram` and `local_cxl`, workers map the node-own
 
 For a local store, the worker obtains credit, fills its page, and reports write completion. The service publishes the key through Catalog COMMIT after the payload write completes. A local read pins the Catalog location and uses the mapped page until its GPU copy completes.
 
-For a remote store, the GPU service reserves memory-node pages and obtains the instance's write registration. The worker copies GPU bytes into its registered staging, issues RDMA WRITE to those pages, and reports completion. The memory node publishes the key with Catalog COMMIT. A staging write or an RDMA completion alone does not publish a key.
+For a remote store, the GPU service reserves memory-node pages and obtains the instance's write registration for that GPU-node run. The worker copies GPU bytes into its registered staging, issues RDMA WRITE to those pages, and reports completion. The memory node publishes the key with Catalog COMMIT. A staging write or an RDMA completion alone does not publish a key.
 
 For a remote read, the worker performs LOOKUP_AND_PIN and validates the pool registration and generation. It issues RDMA READ directly into its staging, then copies the bytes to the GPU. The source pin protects the memory-node page during the READ; staging stays owned until the GPU copy finishes. Reads already in progress for the same location can be joined within one worker. Different workers use separate staging and READs. Read bytes are never published or retained as cached copies.
 
@@ -55,7 +55,7 @@ Memory-node eviction covers all writers using that memory node, rather than a pe
 | Orphan source pin after a GPU-service run change | The old worker releases it or its exit is verified |
 | CXL region hold | Its mapping or NIC registration is safely removed |
 
-The memory node maintains a separate write domain for each vLLM instance. Ranks of that instance share the domain. A worker exit, stopped worker, uncertain write, lost control connection or expired credit triggers revocation of that domain's write registration before unconfirmed pages are reclaimed. Other instances have separate write registrations. Workers share the memory node's read registration, which is independent of write-domain revocation.
+The memory node maintains a separate write domain for each vLLM instance within a GPU-node run. Only ranks of that instance attached to the same GPU-node run share the domain; another GPU node or run has a separate domain. A worker exit, stopped worker, uncertain write, lost control connection or expired credit triggers revocation of that domain's write registration before unconfirmed pages are reclaimed. Fencing affects only the specified domain. Workers share the memory node's read registration, which is independent of write-domain revocation.
 
 Time alone is not a fence. If revocation fails, unconfirmed pages remain quarantined; at the configured limit that GPU node receives no new credit. A confirmed revocation or a verified memory-node restart can recover those pages. An uncertain or failed native transfer keeps its worker staging out of reuse until the vLLM processes exit. Failed service teardown retains mappings and prevents another run in that process.
 

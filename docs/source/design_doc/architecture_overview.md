@@ -49,7 +49,7 @@ The CXL pool can span hosts attached through a CXL switch. Host-cache visibility
 
 `maru-storage` owns one GPU-node store. Workers attach over its local socket and receive pool descriptors, page size, credit and transfer settings. The Catalog tracks published objects and source pins. A worker with `dram` or `local_cxl` maps the node pool; a worker with `remote` directly accesses memory-node pages through RDMA staging.
 
-`maru-memory-node` owns DRAM or local CXL pages and their read and write registrations. Write registration is per vLLM instance. The service revokes that registration before reclaiming unconfirmed writes; source pins protect pages being read. Memory-node extension hooks provide advisory hints and memory-generation checks.
+`maru-memory-node` owns DRAM or local CXL pages and their read and write registrations. Write registration is per vLLM instance within a GPU-node run. The service revokes only that domain's registration before reclaiming its unconfirmed writes; source pins protect pages being read. Memory-node extension hooks provide advisory hints and memory-generation checks.
 
 Node-local sharing is limited to workers that can map that node's pools. Remote sharing uses a common memory node, Catalog and compatible namespace. A GPU service accepts one memory endpoint; memory nodes own separate regions.
 

@@ -53,9 +53,7 @@ uv venv --python 3.12 .venv
 source .venv/bin/activate
 ```
 
-> Pass `--python 3.12` explicitly so the interpreter matches the one your LLM
-> engine (vLLM, SGLang) was built against. Without it, uv may pick any
-> interpreter satisfying `requires-python >= 3.12`.
+> Pass `--python 3.12` explicitly so the interpreter matches the one your LLM engine (vLLM, SGLang) was built against. Without it, uv may pick any interpreter satisfying `requires-python >= 3.12`.
 
 (nixl-stack)=
 

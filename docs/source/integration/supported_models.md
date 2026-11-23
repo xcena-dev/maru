@@ -6,44 +6,22 @@ Whether MaruKVConnector can store and reuse a model's KV cache in vLLM depends o
 
 The structure table describes the native connector; node store restrictions are listed below:
 
-```{eval-rst}
-.. table::
-   :class: maru-supported-models
-   :widths: auto
+```{table}
+:class: maru-supported-models
 
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | KV cache structure             | Models                             | Supported status                  | Tested with         |
-   |                                |                                    +-----------------+-----------------+                     |
-   |                                |                                    | Single GPU      | Tensor parallel |                     |
-   +================================+====================================+=================+=================+=====================+
-   | Full attention (MHA, GQA), one | Qwen3 (dense and MoE), GLM-4.5,    | 🟢              | 🟢              | Llama-3.1-8B        |
-   | KV cache group                 | GLM-4.6                            |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | gpt-oss-20b         |
-   | attention                      |                                    |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8,         | 🟢              | 🟢              | Qwen3.5-0.8B        |
-   | full attention                 | Qwen3-Next                         |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Sliding-window MLA +           | DeepSeek-V4.1-Flash                | 🟢              | 🟢              | DeepSeek-V4.1-Flash |
-   | compressed MLA latent and      |                                    |                 |                 |                     |
-   | indexer cache                  |                                    |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |                     |
-   | heads differ in count or size  |                                    |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |                     |
-   | cache                          |                                    |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Kimi Delta Attention           | GLM-5.3-Flash                      | ❌              | ❌              |                     |
-   | (Mamba-type) + DSA             |                                    |                 |                 |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-   | Chunked local + full attention | Llama 4                            | ❌              | ❌              |                     |
-   +--------------------------------+------------------------------------+-----------------+-----------------+---------------------+
-
+| KV cache structure | Models | Single GPU | Tensor parallel |
+|---|---|---|---|
+| Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | 🟢 | 🟢 |
+| Sliding window + full attention | gpt-oss | 🟢 | 🟢 |
+| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | 🟢 | 🟢 |
+| Sliding-window MLA + compressed MLA latent and indexer cache | DeepSeek-V4.1-Flash | 🟢 | 🟢 |
+| Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2 | ❌ | ❌ |
+| DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | ❌ | ❌ |
+| Kimi Delta Attention (Mamba-type) + DSA | GLM-5.3-Flash | ❌ | ❌ |
+| Chunked local + full attention | Llama 4 | ❌ | ❌ |
 ```
 
-🟢 means that Maru stores and loads the KV cache of such models, and ❌ that the connector refuses them at startup. Models other than the one in "Tested with" share their row's KV cache structure but have not been run. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
+🟢 means that Maru stores and loads the KV cache structure, and ❌ that the connector refuses it at startup. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at startup. See {ref}`vllm-tensor-parallelism` for how each rank stores its part of the KV cache.
 

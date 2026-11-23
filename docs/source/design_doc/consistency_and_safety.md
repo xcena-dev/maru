@@ -129,12 +129,11 @@ Process exit, session expiry and network loss are different events. The legacy `
 | Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until deregistration is confirmed |
 | Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
 | Node Catalog | Worker/run identity and source pins | Keeps orphan pins while old workers can still read |
-| Memory node | Worker loss, uncertain write, lost connection or credit expiry | Revokes the instance write registration before reclaiming pages; failed revocation quarantines them |
+| Memory node | Worker loss, uncertain write, lost connection or credit expiry | Revokes the instance's write registration within its GPU-node run before reclaiming that domain's pages; failed revocation quarantines them |
 
 The reaper defends against PID reuse by caching each client's process start time at allocation time. If the PID is recycled by the OS, the start-time mismatch triggers reclamation.
 
-> **See also:** [MaruResourceManager Architecture](maru_resource_manager.md),
-> [MaruServer Architecture](maru_server.md)
+> **See also:** [MaruResourceManager Architecture](maru_resource_manager.md), [MaruServer Architecture](maru_server.md)
 
 ---
 

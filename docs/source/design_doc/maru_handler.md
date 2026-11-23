@@ -234,4 +234,4 @@ sequenceDiagram
 
 Set `maru_node` to the local GPU service's socket and supply `engine_id` and `cache_namespace`. `MaruClient` handles attachment, credit, Catalog lookups and read-result ownership. The node's configuration sets capacity and page size.
 
-For remote storage the worker owns its registered staging and directly issues RDMA READ and WRITE. The memory node commits writes and fences each vLLM instance's write registration before reclaiming uncertain pages. Keep each read result until all GPU copies using it finish, then call `release_retrieved`. See {doc}`node_storage_service` and {doc}`../api_reference/api`.
+For remote storage the worker owns its registered staging and directly issues RDMA READ and WRITE. The memory node commits writes and fences the instance's write registration within its GPU-node run before reclaiming that domain's uncertain pages. Keep each read result until all GPU copies using it finish, then call `release_retrieved`. See {doc}`node_storage_service` and {doc}`../api_reference/api`.

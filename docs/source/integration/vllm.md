@@ -8,7 +8,7 @@ This is an interface minimum. Check the selected store's model and transfer rest
 
 **Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
-**vLLM v0.29+** resolves one KV cache layout per model in the engine core (`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC` and `LBHNC`) and hands every layer the logical page `[blocks, KV heads, tokens, K|V]`, whatever the physical order. Maru reads the resolved layout from the engine and splits each head's row into its K and V halves, so for dense attention a chunk object holds the same K/V-major bytes as a rank-5 cache of vLLM v0.25 and earlier. Chunk transfers place these pages with a `maru_kv_ops` kernel that reads the page's strides, so every physical order takes the kernel path. Pages whose content does not split into two heads (MLA, uneven K/V widths, inline quantization scales) use per-layer copies. Tested with v0.32.
+**vLLM v0.29+** resolves one KV cache layout per model in the engine core (`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC` and `LBHNC`) and hands every layer the logical page `[blocks, KV heads, tokens, K|V]`, whatever the physical order. Maru reads the resolved layout from the engine and splits each head's row into its K and V halves, so for dense attention a chunk object holds the same K/V-major bytes as a rank-5 cache of vLLM v0.25 and earlier. Chunk transfers place these pages with a `maru_kv_ops` kernel that reads the page's strides, so every physical order takes the kernel path. Pages whose content does not split into two heads (MLA, uneven K/V widths, inline quantization scales) use per-layer copies.
 
 **Storing a hybrid model as several KV cache groups requires vLLM v0.30.0+.** A model whose layers keep different kinds of KV cache, such as sliding-window or Mamba-type layers next to full attention, has several KV cache groups; see {ref}`vllm-hybrid-models`. On older versions the connector does not declare hybrid support: vLLM then runs sliding-window models as one KV cache group and refuses Mamba hybrids at startup.
 
@@ -251,7 +251,7 @@ For remote storage, start `maru-memory-node --config memory.json` on the memory 
 
 Both node transfer defaults are `false`. Async scheduling automatically enables deferred loads; an explicit `maru_async_load=false` then requires `--no-async-scheduling`. TP>1 and multiple KV groups always require deferred loads. Store credit waits default to zero (`maru_credit_wait_ms`), and lookup timeout defaults to 100 ms (`maru_lookup_timeout_ms`). `maru_load_read_depth` defaults to 2 and must be at least 1.
 
-A full GPU-local store skips writes. Memory nodes evict unpinned keys through one shared LRU. Remote publication occurs only after memory-node COMMIT; read copies are not cached. Missing or stale data is recomputed. An in-progress READ can be joined only within its worker. Instance write registrations are revoked before uncertain pages are reused.
+A full GPU-local store skips writes. Memory nodes evict unpinned keys through one shared LRU. Remote publication occurs only after memory-node COMMIT; read copies are not cached. Missing or stale data is recomputed. An in-progress READ can be joined only within its worker. Write registrations are per instance within a GPU-node run; the affected domain's registration is revoked before its uncertain pages are reused.
 
 See {doc}`../design_doc/node_storage_service` for complete JSON examples, defaults and validation, {doc}`../design_doc/memory_node` for memory-node recovery, and {doc}`../getting_started/migrating_to_maru_node` for process, setting and support tables.
 
@@ -430,7 +430,7 @@ Each worker process connects its own MaruHandler:
 
 - `maru_pool_size` applies to each TP rank that stores. Without replicated KV heads a rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as many tokens as a single TP=1 worker with `P`. A rank that only loads replicated heads or an MLA latent stores none of them, only its own part of each Mamba-type state. A rank that stores nothing at all, such as every rank but rank 0 of an MLA model, takes one page when it connects instead of `maru_pool_size`.
 - A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server sees each rank as its own owner. With data parallelism, replica `d` > 0 adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving the id unset already gives every process its own UUID.
-- On the node path, ranks share `maru_engine_id` and attach with their TP rank and DP index. Remote workers each have dedicated staging; all ranks of one vLLM instance share its memory-node write domain.
+- On the node path, ranks share `maru_engine_id` and attach with their TP rank and DP index. Remote workers each have dedicated staging. Only ranks of the same vLLM instance attached to the same GPU-node run share a memory-node write domain; another GPU node or run has a separate domain.
 
 Under TP the scheduler's process loads no model, and a model can change its config where a worker loads it, as vLLM's Transformers backend does with the dtype. On the node path the scheduler looks keys up in the cache namespace that the workers report through vLLM's KV connector handshake. vLLM's `MultiConnector` passes the first handshake that any sub-connector returns to all of them, and `NixlConnector` refuses any but its own: above TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps the namespace it computes itself, and a model that changes its config where the workers load it misses every lookup.
 
@@ -532,13 +532,13 @@ A load that fails after copies were queued is reported only after those copies e
 
 Once stopped by a CUDA error, a worker issues no new read, copy, store or hint, including during shutdown. It returns no resources that a copy may still use, even if a later wait succeeds. Store pages, read views or staging, GPU buffers and affected request blocks remain held until process exit. A synchronous store with unconfirmed copies publishes no objects and raises. Restart the complete vLLM instance and verify its old workers have exited.
 
-Remote RDMA failure produces a MISS or skipped store. Unknown or failed transfers keep staging out of reuse; memory nodes revoke the instance's write registration before reclaiming uncertain writes. A timeout alone is not a fence. Persistent errors require the same full-instance restart. See {doc}`../design_doc/node_storage_service`.
+Remote RDMA failure produces a MISS or skipped store. Unknown or failed transfers keep staging out of reuse; memory nodes revoke the instance's write registration within its GPU-node run before reclaiming that domain's uncertain writes. A timeout alone is not a fence. Persistent errors require the same full-instance restart. See {doc}`../design_doc/node_storage_service`.
 
 (vllm-hybrid-one-group)=
 
 ### Running a hybrid model as one group
 
-A model whose extra groups are sliding-window or chunked-local attention can run as one KV cache group with `--disable-hybrid-kv-cache-manager`; the connector's refusal messages suggest it. vLLM then keeps those layers' KV for every token, as for full attention, and Maru stores the model as it stores any one-group model. Mamba-type groups cannot be merged this way. This path is tested with gpt-oss, not with Llama 4.
+A model whose extra groups are sliding-window or chunked-local attention can run as one KV cache group with `--disable-hybrid-kv-cache-manager`; the connector's refusal messages suggest it. vLLM then keeps those layers' KV for every token, as for full attention, and Maru stores the model as it stores any one-group model. Mamba-type groups cannot be merged this way.
 
 - If some layers use a sliding window and others do not, as in gpt-oss, FlashInfer (vLLM 0.30's choice for gpt-oss on Blackwell) refuses the single group. Add `--attention-backend TRITON_ATTN`.
 - On vLLM 0.30 a one-group model stores misses layer by layer during the forward; several-group storage runs after the forward.
@@ -590,7 +590,7 @@ TypeError: Got unsupported ScalarType BFloat16
 RuntimeError: can't convert bfloat16 to numpy
 ```
 
-BFloat16 models (e.g., Llama 3) fail with numpy-based serialization because numpy has no bfloat16 dtype. The connector handles this by using `torch.Tensor.contiguous()` and raw byte views instead of `.numpy()`. If you see this error, ensure you are using the connector from this PR or later — older versions may use numpy conversion paths.
+The connector serializes BFloat16 tensors with `torch.Tensor.contiguous()` and raw byte views because NumPy has no bfloat16 dtype.
 
 ### Garbage Output on Second Instance
 
@@ -598,6 +598,4 @@ KV cache data corruption usually means chunks were concatenated as 1D bytes inst
 
 For runnable examples, see [vLLM Examples](../getting_started/examples/vllm/index.md).
 
-> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
-> [MaruHandler Design](../design_doc/maru_handler.md),
-> [LMCache](./lmcache.md)
+> **See also:** [Architecture Overview](../design_doc/architecture_overview.md), [MaruHandler Design](../design_doc/maru_handler.md), [LMCache](./lmcache.md)

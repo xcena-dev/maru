@@ -96,7 +96,7 @@ stateDiagram-v2
 |---|---|---|
 | Catalog source pin | Stored page during a read | READ completes or unused work is safely discarded |
 | Worker read-result ownership | Local mapping or remote staging used by GPU copies | Final copy completes |
-| Instance write registration | Memory-node pages reserved for remote writes | Registration revoked before uncertain pages are reused |
+| Write-domain registration | Memory-node pages reserved by one instance within one GPU-node run | That domain's registration revoked before uncertain pages are reused |
 | RM hold | CXL range mapped or registered with a NIC | Mapping or registration safely removed |
 
 A GPU-service run change preserves source pins for live old readers. Neither a deadline nor session expiry proves that RDMA or a GPU copy has ended. See {doc}`node_storage_service` for restart and quarantine rules.

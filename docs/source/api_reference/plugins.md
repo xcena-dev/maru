@@ -54,12 +54,8 @@ With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM con
 
 ```{admonition} Contract — do not break without deprecation
 :class: warning
-The following `MaruHandler` methods, together with the hook signatures
-above, are the **public, stable plugin API**. Plugins live in separate
-packages on independent release cycles, so renaming, removing, or changing the
-behaviour of any of these is a breaking change for every plugin in the field
-and must go through a deprecation cycle. `tests/unit/test_plugin_loader.py`
-contains a contract test that fails CI if this surface drifts.
+
+The following `MaruHandler` methods and the hook signatures above are the **public, stable plugin API**. Renaming, removing or changing them requires a deprecation cycle because plugins ship as separate packages.
 ```
 
 Everything a plugin needs about a *batch* arrives through the `on_batch_retrieve` arguments. These two methods cover the region-mapping state that is not in those arguments:
@@ -70,14 +66,7 @@ Everything a plugin needs about a *batch* arrives through the `on_batch_retrieve
 | `MaruHandler.get_region_dax_path(region_id: int) -> str \| None` | the DAX device path for a mapped region |
 
 ```{note}
-`on_batch_retrieve` fires for every *found* entry whose region is mapped —
-and **both** owned regions (this handler's own allocations) and shared regions
-(mmap'd from another instance) are registered in the mapper. So a handler that
-stores and then retrieves its own keys will invoke the hook on those owned
-regions too; the region-mapping accessors do not distinguish owned from shared.
-A plugin that should act only on shared regions must filter them itself — the
-public `get_owned_region_ids()` lists the owned ones (note it is outside the
-minimal stable accessor contract above).
+`on_batch_retrieve` fires for found entries in both owned and shared mapped regions. The region-mapping accessors do not distinguish them. Plugins that act only on shared regions must filter out the IDs returned by `get_owned_region_ids()`, which is outside the stable accessor contract above.
 ```
 
 ## Writing a plugin

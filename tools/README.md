@@ -27,12 +27,7 @@ The default screen is an `htop`-style curses TUI — the analog of `pxltop`'s DE
 **Overview** (default):
 
 - **DEVICES** — physical DAX pools from the Resource Manager (`:9850`).
-- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge under each instance (which device its regions landed on, and how much of that device it holds). With no `-p`/`--host`, the local `maru-server` processes are
-  **auto-discovered** (by scanning `/proc` for their `--port`) and all polled,
-  each under a `── server :PORT (pid N) ──` block — so multiple servers are
-  covered without knowing their ports. Pass `-p`/`--host` to pin a single
-  (possibly remote) server instead.
-  This view reports the `cxl` registry. For node stores, inspect service errors and the worker's read and store outcome logs. `maru-node-server` is a separate Catalog endpoint.
+- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge under each instance (which device its regions landed on, and how much of that device it holds). With no `-p`/`--host`, the local `maru-server` processes are **auto-discovered** (by scanning `/proc` for their `--port`) and all polled, each under a `── server :PORT (pid N) ──` block — so multiple servers are covered without knowing their ports. Pass `-p`/`--host` to pin a single (possibly remote) server instead. This view reports the `cxl` registry. For node stores, inspect service errors and the worker's read and store outcome logs. `maru-node-server` is a separate Catalog endpoint.
 
 **STATS view** (select an instance + `enter`): a full per-instance dashboard — an op table (count / delta / avg / min / max latency + an activity sparkline), a detail box for the `↑↓`-selected op (hit-rate bar, throughput), and a min/avg/max latency graph over time. Populated only when clients run with `MARU_STAT=1` (else a hint). `esc`/`←` returns to the overview. `marutop stats` remains for a directly port-pinned dashboard.
 
@@ -120,11 +115,7 @@ Options:
   Pool (shared): 229.0G free / 242.8G total  [##----------------------------] 5.7%
 ```
 
-> **Note:** `instance_id` identifies one `MaruBackend` = one process/worker
-> (TP/DP runs one per worker), and the default is a random UUID per process.
-> Set `maru_instance_id` in the integration's `extra_config` for stable,
-> readable rows. Requires a MaruServer that supports the `GET_USAGE` RPC; against
-> an older server the tool reports a connection error rather than an empty table.
+> **Note:** `instance_id` identifies one `MaruBackend` = one process/worker (TP/DP runs one per worker), and the default is a random UUID per process. Set `maru_instance_id` in the integration's `extra_config` for stable, readable rows. Requires a MaruServer that supports the `GET_USAGE` RPC; against an older server the tool reports a connection error rather than an empty table.
 
 ## `marutop stats`
 

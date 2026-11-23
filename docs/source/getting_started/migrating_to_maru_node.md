@@ -86,7 +86,7 @@ Keys in the first column describe old configurations. Use only the current colum
 | `maru_auto_expand` | No equivalent | Size the node store explicitly |
 | `maru_instance_id`, `maru_node_id` | Node `node_id` | Node identity belongs to the service |
 | `maru_engine_id`, `maru_cache_namespace` | Same connector keys, both required | Engine/rank identity is separate from the sharing namespace |
-| `maru_pin_pools`, `maru_eager_map` | Omit from connector | Node pools are page-locked; `dram.hugepage` defaults to `true` and can be `false` |
+| `maru_pin_pools`, `maru_eager_map` | Omit from connector | Workers attempt CUDA registration of local node pools; failed registration uses pageable copies. `dram.hugepage` defaults to `true` and can be `false`; it does not guarantee CUDA registration |
 | `maru_rdma_staging_size` | GPU `remote.staging_size` | Per-worker size; default `max(1GiB, 64 * page_size)`; use `staging_max_bytes` for the node total |
 | `rdma_load_reserve` | No equivalent | Worker staging and credit have fixed ownership rules; local-store `budgets.transfer_reserve_bytes` is not a remote load reserve |
 | `rdma_nonblocking_alloc` | No equivalent | Credit is prepared outside the read path; unavailable capacity causes skip or MISS |
@@ -144,4 +144,4 @@ A full GPU `dram` or `local_cxl` store skips new stores. A full memory-node stor
 
 A Catalog restart loses all keys. Service runs using DRAM lose their pools. Local CXL reuse requires matching Catalog, boot and memory generation plus safe region adoption. A memory reset invalidates that memory node's old keys.
 
-The memory node fences writes per vLLM instance, revoking its write registration before reclaiming unconfirmed credit. A deadline alone does not free memory. Failed fencing retains quarantined pages; uncertain worker transfers retain staging until the vLLM instance exits. Restart the entire affected instance and verify old workers have exited. See {doc}`../design_doc/memory_node` and {ref}`vllm-load-failures`.
+The memory node fences writes per vLLM instance within a GPU-node run, revoking only that domain's write registration before reclaiming its unconfirmed credit. Ranks on another GPU node or run have a separate domain. A deadline alone does not free memory. Failed fencing retains quarantined pages; uncertain worker transfers retain staging until the vLLM instance exits. Restart the entire affected instance and verify old workers have exited. See {doc}`../design_doc/memory_node` and {ref}`vllm-load-failures`.

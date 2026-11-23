@@ -14,7 +14,7 @@ When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3
 
 ## Prerequisites
 
-**SGLang** — install from main (required until the write-through idle fix [`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd) is included in a release):
+**SGLang** — requires the write-through idle fix [`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd). Install from main:
 
 ```bash
 uv pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirectory=python"
@@ -22,10 +22,7 @@ uv pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirec
 
 See [SGLang installation docs](https://docs.sglang.ai/start/install.html) for GPU-specific options.
 
-> **Why main?** The write-through idle fix
-> ([#20560](https://github.com/sgl-project/sglang/pull/20560)) is required
-> for L3 store to work — without it, write-through events are not processed
-> when the scheduler is idle, so KV pages never reach L3 storage.
+> The write-through idle fix ([#20560](https://github.com/sgl-project/sglang/pull/20560)) is required for L3 stores. Without it, write-through events are not processed when the scheduler is idle, so KV pages never reach L3 storage.
 
 ## Configuration
 
@@ -49,9 +46,7 @@ sglang serve \
     }'
 ```
 
-> **Important:** `interface_v1` must be set to `1` for the V1 API path
-> (`batch_get_v1`/`batch_set_v1`) to be used. Without it, SGLang falls back to
-> the legacy API which does not support `page_first_direct` layout.
+> **Important:** `interface_v1` must be set to `1` for the V1 API path (`batch_get_v1`/`batch_set_v1`) to be used. Without it, SGLang falls back to the legacy API which does not support `page_first_direct` layout.
 
 ### HiCache parameters
 
@@ -107,7 +102,7 @@ sequenceDiagram
     MHS-->>SG: [True, ...]
 ```
 
-The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch operations.  For MLA models (1 chunk/key), host pages are passed directly as memoryviews.  For non-MLA models (K+V in separate buffer pools), K and V are concatenated into a contiguous buffer before passing to `batch_store` (see `TODO(KV-split-pool)` in `maru_storage.py`).
+The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch operations. For MLA models (1 chunk/key), host pages are passed directly as memoryviews. For non-MLA models (K+V in separate buffer pools), K and V are concatenated into a contiguous buffer before passing to `batch_store`.
 
 ## Quick Start: Single Instance
 
@@ -152,6 +147,4 @@ See [examples/sglang/p2p_sharing/README.md](https://github.com/xcena-dev/maru/bl
 | `ImportError: maru_sglang` | Package not installed | Run `uv pip install -e .` from `maru/` root |
 | Cache hits without a TTFT improvement | Transfer, prompt length, scheduling or compute costs can dominate | Check the actual restore path and compare matching requests before attributing the cause |
 
-> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
-> [LMCache](lmcache.md),
-> [Python API Reference](../api_reference/api.md)
+> **See also:** [Architecture Overview](../design_doc/architecture_overview.md), [LMCache](lmcache.md), [Python API Reference](../api_reference/api.md)

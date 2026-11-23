@@ -203,9 +203,7 @@ maru-resource-manager --host 127.0.0.1 --port 9850 \
                       --log-level debug
 ```
 
-> **Security note:** The default bind address is `127.0.0.1` (local-only). When binding to
-> `0.0.0.0` for multi-node deployments, auth tokens and device paths are transmitted in
-> plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) to protect the traffic.
+> **Security note:** The default bind address is `127.0.0.1` (local-only). When binding to `0.0.0.0` for multi-node deployments, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) to protect the traffic.
 
 ### RM address propagation
 
