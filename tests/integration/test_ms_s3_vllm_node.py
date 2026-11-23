@@ -41,6 +41,7 @@ from tests.unit.test_vllm_tp import (
     rank_kv,
 )
 from tests.unit.vllm_connector_helpers import (
+    fake_scheduler_output,
     make_flash_attn_metadata,
     make_scheduler,
     make_worker,
@@ -131,19 +132,26 @@ def store(worker, kv) -> None:
     worker._wait_node_stores(10)
 
 
+def probe_pass(sched, tokens) -> int:
+    """Probe and finish a scheduling pass with no admitted requests."""
+    matched = sched._count_matched_chunks(tokens)
+    sched.build_connector_meta(fake_scheduler_output())
+    return matched
+
+
 def test_scheduler_probe_and_workers_share_one_node(engine):
     server, node, worker, scheduler = engine
     writer, reader = worker(), worker()
     sched = scheduler()
     tokens = list(range(PROMPT))
-    assert sched._count_matched_chunks(tokens) == 0
+    assert probe_pass(sched, tokens) == 0
     probe = sched._handler._cpu
     assert probe.role == SessionRole.PROBE and probe.pools.pool_ids() == []
     assert len(node.manager.workers.probes()) == 1
 
     kv = rank_kv(1, 2)
     store(writer, kv)
-    assert sched._count_matched_chunks(tokens) == 2
+    assert probe_pass(sched, tokens) == 2
     dst = [torch.zeros_like(layer) for layer in kv]
     load_into(reader, dst, make_flash_attn_metadata())
     assert_same_kv(dst, kv)
@@ -198,10 +206,10 @@ def test_a_stopped_maruserver_is_unavailable_then_hits_again(engine):
     kv = rank_kv(1, 2)
     store(writer, kv)
     tokens = list(range(PROMPT))
-    assert sched._count_matched_chunks(tokens) == 2  # opens the probe
+    assert probe_pass(sched, tokens) == 2
     server.pause()
     try:
-        assert sched._count_matched_chunks(tokens) == 0
+        assert probe_pass(sched, tokens) == 0
         load_into(reader, [torch.zeros_like(layer) for layer in kv], None)
         assert reader.take_failed_load_blocks() == set(range(NUM_BLOCKS))
     finally:
@@ -211,7 +219,7 @@ def test_a_stopped_maruserver_is_unavailable_then_hits_again(engine):
     worker_counters = reader._handler.get_stats()["maru_node"]["counters"]
     assert worker_counters["retrieve_unavailable"] >= 1
     wait_until(
-        lambda: sched._count_matched_chunks(tokens) == 2,
+        lambda: probe_pass(sched, tokens) == 2,
         timeout=30,
         what="hits after MaruServer resumed",
     )
