@@ -1,48 +1,26 @@
 # vLLM Examples
 
-Runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`),
-which accesses the selected Maru backend without LMCache in the serving path.
-The single-instance and P2P launchers below use directly mapped `cxl`.
-Examples live under `examples/vllm/`:
+Runnable examples of the Maru-vLLM direct connector (`MaruKVConnector`), which accesses the selected Maru backend without LMCache in the serving path. The single-instance and P2P launchers below use directly mapped `cxl`. Examples live under `examples/vllm/`:
 
 | Example | Directory | What it shows |
 |---------|-----------|---------------|
 | Single-instance verification | `examples/vllm/single/` | One instance stores KV and reuses it on a repeat request — the cheapest connector check |
 | P2P KV cache sharing | `examples/vllm/p2p_sharing/` | Two instances share KV cache, so the second skips prefill |
-| CXL on memory nodes over RDMA | `examples/vllm/remote_cxl/` | Engines on nodes without CXL share KV in a memory node's CXL pool over RDMA |
-| Worker-private CPU cache | `examples/vllm/cpu/` | GPU inference with CPU DRAM storage; no CXL or RM |
-| Worker-private CPU + CXL cache | `examples/vllm/mixed/` | Fixed private pools; cross-worker sharing is not implemented |
 
-For a CXL-attached worker, start with the single-instance example. For a worker
-without CXL, choose remote CXL or CPU storage instead. The
-[CPU](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md) and
-[mixed](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
-guides specify their capacity, layout and lifetime restrictions.
+For node-owned DRAM, local CXL or remote storage, use the complete service and connector examples in {doc}`../../../integration/vllm` and {doc}`../../../design_doc/node_storage_service`.
 
 ## Prerequisites
 
-These prerequisites describe the default `cxl` single-instance/P2P launchers.
-The remote CXL, CPU and mixed examples have their own environment requirements.
+These prerequisites describe the default `cxl` single-instance/P2P launchers. Node remote stores additionally require NIXL/UCX and RDMA NICs.
 
 - 1 GPU for the single-instance example, 2+ for P2P
-- Maru installed with its KV placement kernels: `./install.sh` from the Maru
-  source tree, or `uv pip install -e /path/to/maru --no-build-isolation` in an
-  environment that already has PyTorch and the CUDA toolkit. The connector
-  carries its own CUDA kernels for the coalesced multi-layer transfers and
-  falls back to a transfer per layer without them, which is materially slower.
-  `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks
-  importability only. The engine's layout and transfer logs determine the
-  actual path. Logical pages can use the stride-based placement bindings;
-  unsupported layouts or unavailable bindings use per-layer copies.
+- Maru installed with its KV placement kernels: `./install.sh` from the Maru source tree, or `uv pip install -e /path/to/maru --no-build-isolation` in an environment that already has PyTorch and the CUDA toolkit. The connector carries its own CUDA kernels for the coalesced multi-layer transfers and falls back to a transfer per layer without them, which is materially slower. `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks importability only. The engine's layout and transfer logs determine the actual path. Logical pages can use the stride-based placement bindings; unsupported layouts or unavailable bindings use per-layer copies.
 - vLLM v0.14+ installed
 - `maru-server` binary available
 
 ## Single-instance verification
 
-One vLLM instance stores KV to Maru on the first request and loads it back on
-a repeat. vLLM's own prefix cache is disabled in the launcher so that Maru is
-the only cache source — otherwise the repeated prompt would be served from the
-GPU-resident prefix cache and neither connector path would run.
+One vLLM instance stores KV to Maru on the first request and loads it back on a repeat. vLLM's own prefix cache is disabled in the launcher so that Maru is the only cache source — otherwise the repeated prompt would be served from the GPU-resident prefix cache and neither connector path would run.
 
 ```
             vLLM (GPU 0, prefix cache OFF)
@@ -65,11 +43,7 @@ cd examples/vllm/single
 ./single_example.sh --model meta-llama/Llama-3-8B
 ```
 
-The script starts `maru-server` and one vLLM instance, then sends the same
-prompt twice. Check the hit and the worker's completed restore, and compare
-generated output with recompute. TTFT alone does not prove a correct restore.
-The script exits non-zero on a cache miss; check `single.log` for errors (a
-missing `Maru: loaded N layers` message means the worker load path failed).
+The script starts `maru-server` and one vLLM instance, then sends the same prompt twice. Check the hit and the worker's completed restore, and compare generated output with recompute. TTFT alone does not prove a correct restore. The script exits non-zero on a cache miss; check `single.log` for errors (a missing `Maru: loaded N layers` message means the worker load path failed).
 
 ### Step-by-step
 
@@ -90,8 +64,7 @@ maru-server --port $MARU_SERVER_PORT
 
 ### Configuration
 
-Settings live in `examples/vllm/single/env.sh` and can be overridden through
-the environment:
+Settings live in `examples/vllm/single/env.sh` and can be overridden through the environment:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -103,8 +76,7 @@ the environment:
 
 ## P2P KV cache sharing
 
-Two vLLM instances share KV cache through CXL shared memory. The first stores
-the prefix, the second loads it and skips prefill.
+Two vLLM instances share KV cache through CXL shared memory. The first stores the prefix, the second loads it and skips prefill.
 
 ```
 Instance 1 (GPU 0)                    Instance 2 (GPU 1)
@@ -127,8 +99,7 @@ cd examples/vllm/p2p_sharing
 ./p2p_example.sh meta-llama/Llama-3-8B
 ```
 
-The script starts `maru-server`, launches both instances, runs the sharing
-test, and cleans up every process it started.
+The script starts `maru-server`, launches both instances, runs the sharing test, and cleans up every process it started.
 
 ### Step-by-step
 
@@ -148,8 +119,7 @@ maru-server --port $MARU_SERVER_PORT
 ./run_benchmark.sh --model Qwen/Qwen2.5-0.5B     # TTFT measurement
 ```
 
-Instance 2 should report a lower TTFT and `Cache Hit: Yes`, because it loads
-the KV cache from CXL instead of recomputing prefill.
+Instance 2 should report a lower TTFT and `Cache Hit: Yes`, because it loads the KV cache from CXL instead of recomputing prefill.
 
 ### Configuration
 
@@ -164,40 +134,14 @@ Settings live in `examples/vllm/p2p_sharing/env.sh`:
 | `MARU_KV_CHUNK_TOKENS` | `256` | Tokens per KV cache chunk |
 | `GPU_MEM_UTIL` | `0.1` | vLLM GPU memory utilization |
 
-The two examples use different instance ports, so they do not collide when run
-on the same machine.
+The two examples use different instance ports, so they do not collide when run on the same machine.
 
 ### Troubleshooting
 
-**Instance 2 TTFT is not faster.** Check the Instance 2 log for
-`Maru: loaded N layers`. If it is absent, confirm `maru-server` is running and
-that both instances connect to it. For very small models with short prompts the
-CXL retrieve overhead can exceed the prefill it saves.
+**Instance 2 TTFT is not faster.** Check the Instance 2 log for `Maru: loaded N layers`. If it is absent, confirm `maru-server` is running and that both instances connect to it. For very small models with short prompts the CXL retrieve overhead can exceed the prefill it saves.
 
-**Garbage output on Instance 2.** KV cache corruption — confirm the load is
-using per-chunk injection rather than a concatenated 1D load.
-
-## CXL on memory nodes over RDMA
-
-Engines on nodes without CXL keep KV in the CXL pool of memory nodes and move
-it over RDMA (`maru_storage_backend="remote_cxl"`). Each memory node runs a remote CXL
-agent that maps and registers regions for the workers; maru-server allocates
-the regions as for local CXL.
-
-```bash
-cd examples/vllm/remote_cxl
-# One host with 2 GPUs, an RDMA NIC, a CXL/DAX device, the resource manager
-# running (sudo systemctl start maru-resource-manager) and the constrained NIXL stack
-MARU_DAX_PATH=/dev/dax0.0 MARU_AGENT_UCX_DEVICE=mlx5_0:1 \
-MARU_WORKER_UCX_DEVICE=mlx5_0:1 ./remote_cxl_example.sh
-```
-
-`Pool hit: Yes` and `Same answer: Yes` confirm that the second instance loaded
-the first one's KV from the pool. See `examples/vllm/remote_cxl/README.md` for
-running the memory node, maru-server and workers on separate nodes.
+**Garbage output on Instance 2.** KV cache corruption — confirm the load is using per-chunk injection rather than a concatenated 1D load.
 
 ## Further reading
 
-Each example directory has a README with its full file listing. For connector
-configuration — including the asynchronous load and store settings — see
-[vLLM](../../../integration/vllm.md).
+Each example directory has a README with its full file listing. For connector configuration — including the asynchronous load and store settings — see [vLLM](../../../integration/vllm.md).

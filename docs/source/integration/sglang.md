@@ -2,8 +2,7 @@
 
 ## Overview
 
-Maru integrates with SGLang's **Hierarchical Cache (HiCache)** as an L3 storage
-backend. HiCache organizes KV cache in three tiers:
+Maru integrates with SGLang's **Hierarchical Cache (HiCache)** as an L3 storage backend. HiCache organizes KV cache in three tiers:
 
 | Tier | Storage | Managed by |
 |------|---------|------------|
@@ -11,26 +10,17 @@ backend. HiCache organizes KV cache in three tiers:
 | L2 | Host DRAM | SGLang |
 | **L3** | **CXL Shared Memory** | **Maru** |
 
-When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3.
-On cache hit, pages flow back up. In this guide the Maru adapter uses the
-directly mapped `cxl` backend, so SGLang instances on the same node can reuse
-the shared L3 without a P2P network payload transfer. Cache hits still copy
-bytes from CXL to host DRAM and then to GPU memory. This configuration does
-not select the `remote_cxl` backend; see the {doc}`vLLM guide <vllm>` for that
-backend's staging and RDMA path.
+When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3. On cache hit, pages flow back up. In this guide the Maru adapter uses the directly mapped `cxl` backend, so SGLang instances on the same node can reuse the shared L3 without a P2P network payload transfer. Cache hits still copy bytes from CXL to host DRAM and then to GPU memory. This configuration does not select `maru_node`; see the {doc}`vLLM guide <vllm>` for node stores and their remote path.
 
 ## Prerequisites
 
-**SGLang** — install from main (required until the write-through idle fix
-[`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd)
-is included in a release):
+**SGLang** — install from main (required until the write-through idle fix [`079a1fd`](https://github.com/sgl-project/sglang/commit/079a1fd) is included in a release):
 
 ```bash
 uv pip install "sglang[all] @ git+https://github.com/sgl-project/sglang#subdirectory=python"
 ```
 
-See [SGLang installation docs](https://docs.sglang.ai/start/install.html)
-for GPU-specific options.
+See [SGLang installation docs](https://docs.sglang.ai/start/install.html) for GPU-specific options.
 
 > **Why main?** The write-through idle fix
 > ([#20560](https://github.com/sgl-project/sglang/pull/20560)) is required
@@ -39,9 +29,7 @@ for GPU-specific options.
 
 ## Configuration
 
-SGLang loads Maru via the `--hicache-storage-backend dynamic` flag. All Maru
-settings are passed through `--hicache-storage-backend-extra-config` as a JSON
-string with `maru_`-prefixed keys.
+SGLang loads Maru via the `--hicache-storage-backend dynamic` flag. All Maru settings are passed through `--hicache-storage-backend-extra-config` as a JSON string with `maru_`-prefixed keys.
 
 ```bash
 sglang serve \
@@ -119,11 +107,7 @@ sequenceDiagram
     MHS-->>SG: [True, ...]
 ```
 
-The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch
-operations.  For MLA models (1 chunk/key), host pages are passed directly
-as memoryviews.  For non-MLA models (K+V in separate buffer pools),
-K and V are concatenated into a contiguous buffer before passing to
-`batch_store` (see `TODO(KV-split-pool)` in `maru_storage.py`).
+The V1 API uses `batch_store` / `batch_retrieve` for single-RPC batch operations.  For MLA models (1 chunk/key), host pages are passed directly as memoryviews.  For non-MLA models (K+V in separate buffer pools), K and V are concatenated into a contiguous buffer before passing to `batch_store` (see `TODO(KV-split-pool)` in `maru_storage.py`).
 
 ## Quick Start: Single Instance
 
@@ -138,8 +122,7 @@ bash run_simple_query.sh
 bash run_benchmark.sh
 ```
 
-See [examples/sglang/single/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/single/README.md)
-for details.
+See [examples/sglang/single/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/single/README.md) for details.
 
 ## P2P Sharing: Two Instances
 
@@ -158,8 +141,7 @@ bash run_benchmark.sh     # TTFT measurement
 - Instance 2 logs show `batch_get_v1 result: N/N hits` (100% cache hit)
 - Compare outputs with a recompute baseline and record TTFT under the actual model, prompt and hardware configuration. A fixed speedup is not a correctness condition.
 
-See [examples/sglang/p2p_sharing/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/p2p_sharing/README.md)
-for details on the write-through flush mechanism.
+See [examples/sglang/p2p_sharing/README.md](https://github.com/xcena-dev/maru/blob/main/examples/sglang/p2p_sharing/README.md) for details on the write-through flush mechanism.
 
 ## Troubleshooting
 

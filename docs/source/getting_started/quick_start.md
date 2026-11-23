@@ -1,34 +1,29 @@
 # Quick Start
 
-Choose the storage path first. The Python producer/consumer below exercise
-the default **`cxl` backend**, using direct DAX mappings; they require no GPU
-or inference engine. They are not an RDMA worker setup.
+Choose the storage path first. The Python producer/consumer below exercise the default **`cxl` backend**, using direct DAX mappings; they require no GPU or inference engine. They are not an RDMA worker setup.
 
 | Intended setup | Start here |
 |---|---|
 | Directly mapped CXL, one or several hosts | The producer/consumer instructions below |
-| GPU workers without CXL sharing memory-node CXL over RDMA | {doc}`vLLM examples <examples/vllm/index>` and the [remote CXL launch guide](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md) |
-| Worker-private CPU DRAM cache, without CXL or RM | [CPU example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md) |
-| Worker-private CPU and CXL pools together | [Mixed example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md) |
+| Node-owned DRAM without CXL or RM | {doc}`Native vLLM setup <../integration/vllm>` with GPU `dram` |
+| Node-owned local CXL | {doc}`Node StorageService <../design_doc/node_storage_service>` with `local_cxl` |
+| GPU workers using memory-node DRAM or CXL over RDMA | {doc}`Node StorageService <../design_doc/node_storage_service>` with GPU `remote` |
 
-CPU storage still serves a model running on a GPU; it does not mean CPU model
-execution. These backends have different lease, sharing and capacity rules;
-see {doc}`../design_doc/memory_model`.
+Node store configuration and migration are described in {doc}`migrating_to_maru_node`. The producer/consumer commands below use `cxl`.
 
 | Setup | Required environment | Where the clients run |
 |-------|----------------------|-----------------------|
 | {ref}`Single-host <quickstart-single-host>` | One x86 host with a CXL DEV_DAX device | Two terminals on the same host |
 | {ref}`Multi-host <quickstart-multi-host>` | Two x86 hosts connected to shared CXL memory through a CXL switch/fabric | Producer on Node A, consumer on Node B |
 
-For the CXL producer/consumer, complete {doc}`bios_setup` and {doc}`installation` first. Activate the Maru
-Python environment in each terminal. Both setups use port `9850` for the
-Resource Manager and `5555` for MaruServer.
+For the CXL producer/consumer, complete {doc}`bios_setup` and {doc}`installation` first. Activate the Maru Python environment in each terminal. Both setups use port `9850` for the Resource Manager and `5555` for MaruServer.
 
 ## 1. Start the services
 
 Choose one setup below. Keep the services running while using the clients.
 
 (quickstart-single-host)=
+
 ### Single-host
 
 Start the Resource Manager as a systemd service:
@@ -58,10 +53,10 @@ export MARU_SERVER_URL=tcp://127.0.0.1:5555
 Continue to {ref}`the producer and consumer <quickstart-clients>`.
 
 (quickstart-multi-host)=
+
 ### Multi-host
 
-This example runs both services and the producer on **Node A**, with the
-consumer on **Node B**:
+This example runs both services and the producer on **Node A**, with the consumer on **Node B**:
 
 ```mermaid
 flowchart TB
@@ -80,16 +75,11 @@ flowchart TB
     Switch --- Memory[("Shared CXL memory")]
 ```
 
-Dashed lines are TCP connections to the services on Node A. Solid lines show
-each host's direct access to the shared memory through its local DEV_DAX device
-and the CXL fabric.
+Dashed lines are TCP connections to the services on Node A. Solid lines show each host's direct access to the shared memory through its local DEV_DAX device and the CXL fabric.
 
-Both hosts must have read/write access to the **same physical CXL memory at
-matching device offsets**. Install Maru with `./install.sh` on Node A and
-`./install.sh --no-rm` on Node B.
+Both hosts must have read/write access to the **same physical CXL memory at matching device offsets**. Install Maru with `./install.sh` on Node A and `./install.sh --no-rm` on Node B.
 
-Replace `192.0.2.10` with Node A's reachable IP. Node B must be able to reach
-Node A on TCP ports `5555` and `9850`.
+Replace `192.0.2.10` with Node A's reachable IP. Node B must be able to reach Node A on TCP ports `5555` and `9850`.
 
 Run one Resource Manager for the shared pool on **Node A**. Stop the systemd service first: a service still bound to `127.0.0.1:9850` does not conflict with a second Resource Manager on `192.0.2.10:9850`, and the two would manage the same devices and state directory. Then start it in a dedicated terminal:
 
@@ -108,9 +98,7 @@ maru-server --host 192.0.2.10 --port 5555 \
     --dax-path /dev/dax0.0
 ```
 
-Replace `/dev/dax0.0` with the shared device's path on Node A. Local device
-names may differ on Node B; Maru resolves them by UUID. The advertised
-`--rm-address` must be reachable from Node B, so use Node A's IP here.
+Replace `/dev/dax0.0` with the shared device's path on Node A. Local device names may differ on Node B; Maru resolves them by UUID. The advertised `--rm-address` must be reachable from Node B, so use Node A's IP here.
 
 In **both client terminals** (one on each host), set the same server address:
 
@@ -121,11 +109,10 @@ export MARU_SERVER_URL=tcp://192.0.2.10:5555
 Continue to {ref}`the producer and consumer <quickstart-clients>`.
 
 (quickstart-clients)=
+
 ## 2. Run the producer and consumer
 
-Use these same snippets for either setup. Keep `MARU_SERVER_URL` set as shown
-above in each client terminal. For single-host, run both clients on the same
-host; for multi-host, run the producer on Node A and the consumer on Node B.
+Use these same snippets for either setup. Keep `MARU_SERVER_URL` set as shown above in each client terminal. For single-host, run both clients on the same host; for multi-host, run the producer on Node A and the consumer on Node B.
 
 ### Producer: write and store
 
@@ -182,14 +169,11 @@ with MaruHandler(config) as handler:
     print("Success: read the producer's data from shared CXL memory")
 ```
 
-The consumer should print `Success: read the producer's data from shared CXL memory`.
-The `flush_range` calls make CPU writes and reads visible across hosts and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
+The consumer should print `Success: read the producer's data from shared CXL memory`. The `flush_range` calls make CPU writes and reads visible across hosts and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
 
 ## 3. Stop the example
 
-Press Enter in the producer terminal to exit. Stop MaruServer, then stop the
-Resource Manager if you started it for this example. Use Ctrl+C for foreground
-processes, or `sudo systemctl stop maru-resource-manager` for the systemd service.
+Press Enter in the producer terminal to exit. Stop MaruServer, then stop the Resource Manager if you started it for this example. Use Ctrl+C for foreground processes, or `sudo systemctl stop maru-resource-manager` for the systemd service.
 
 ## Next steps
 

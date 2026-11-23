@@ -1,10 +1,6 @@
 # Tools — `marutop`
 
-All maru monitoring and device-admin tooling is exposed through a single
-`marutop` command (installed as a console script with the `maru` package, the
-way XCENA's `pxl` SDK ships `pxltop`). The implementation lives in the
-[`maru_tools`](../maru_tools/) package; the `tools/*.py` files here are thin
-backward-compat shims (see [Legacy invocation](#legacy-invocation)).
+All maru monitoring and device-admin tooling is exposed through a single `marutop` command (installed as a console script with the `maru` package, the way XCENA's `pxl` SDK ships `pxltop`). The implementation lives in the [`maru_tools`](../maru_tools/) package; the `tools/*.py` files here are thin backward-compat shims (see [Legacy invocation](#legacy-invocation)).
 
 ```bash
 marutop                    # unified live view (default) — DEVICES + INSTANCES
@@ -14,8 +10,7 @@ marutop stats  [...]       # per-operation latency/throughput dashboard
 marutop device init|show|clear <dax-path>
 ```
 
-The subcommands sit at three layers and complement rather than overlap (the
-only shared figure is pool free):
+The subcommands sit at three layers and complement rather than overlap (the only shared figure is pool free):
 
 | Command | Layer | Source | Answers |
 |---|---|---|---|
@@ -27,34 +22,21 @@ only shared figure is pool free):
 
 ## `marutop` (unified live view)
 
-The default screen is an `htop`-style curses TUI — the analog of `pxltop`'s
-DEVICES + PROCESSES layout, with colored gauges (green < 60% < yellow < 85% <
-red). It has two screens you switch between:
+The default screen is an `htop`-style curses TUI — the analog of `pxltop`'s DEVICES + PROCESSES layout, with colored gauges (green < 60% < yellow < 85% < red). It has two screens you switch between:
 
 **Overview** (default):
 
 - **DEVICES** — physical DAX pools from the Resource Manager (`:9850`).
-- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge
-  under each instance (which device its regions landed on, and how much of that
-  device it holds). With no `-p`/`--host`, the local `maru-server` processes are
+- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge under each instance (which device its regions landed on, and how much of that device it holds). With no `-p`/`--host`, the local `maru-server` processes are
   **auto-discovered** (by scanning `/proc` for their `--port`) and all polled,
   each under a `── server :PORT (pid N) ──` block — so multiple servers are
   covered without knowing their ports. Pass `-p`/`--host` to pin a single
   (possibly remote) server instead.
-  Each region of a `remote_cxl` worker is a row of its own, named
-  `remote_cxl:<id>`; `marutop usage` lists those regions under their worker's
-  engine id in its L1 storage pools table.
+  This view reports the `cxl` registry. For node stores, inspect service errors and the worker's read and store outcome logs. `maru-node-server` is a separate Catalog endpoint.
 
-**STATS view** (select an instance + `enter`): a full per-instance dashboard —
-an op table (count / delta / avg / min / max latency + an activity sparkline),
-a detail box for the `↑↓`-selected op (hit-rate bar, throughput), and a
-min/avg/max latency graph over time. Populated only when clients run with
-`MARU_STAT=1` (else a hint). `esc`/`←` returns to the overview. `marutop stats`
-remains for a directly port-pinned dashboard.
+**STATS view** (select an instance + `enter`): a full per-instance dashboard — an op table (count / delta / avg / min / max latency + an activity sparkline), a detail box for the `↑↓`-selected op (hit-rate bar, throughput), and a min/avg/max latency graph over time. Populated only when clients run with `MARU_STAT=1` (else a hint). `esc`/`←` returns to the overview. `marutop stats` remains for a directly port-pinned dashboard.
 
-Backends are polled on a background thread, so the UI stays smooth and keys stay
-responsive even when a server is slow or unreachable (its block just shows
-`(unavailable: ...)`).
+Backends are polled on a background thread, so the UI stays smooth and keys stay responsive even when a server is slow or unreachable (its block just shows `(unavailable: ...)`).
 
 ```bash
 marutop                    # auto-discover local servers + RM; refresh every 1s
@@ -64,9 +46,7 @@ marutop --once             # single plain-text snapshot then exit (scriptable)
 marutop --host 10.0.0.1 -p 5556 --address 10.0.0.1:9850
 ```
 
-Keys — overview: `↑↓` select instance · `enter` open STATS · `s` sort · `i`
-interval · `q` quit.  STATS view: `↑↓` select op · `esc`/`←` back · `i`
-interval · `q` quit.
+Keys — overview: `↑↓` select instance · `enter` open STATS · `s` sort · `i` interval · `q` quit.  STATS view: `↑↓` select op · `esc`/`←` back · `i` interval · `q` quit.
 
 ## `marutop pool`
 
@@ -100,15 +80,11 @@ timestamp,dax_path,dax_type,total_bytes,free_bytes,used_bytes,usage_pct
 2026-03-11T14:30:05,/dev/dax0.0,DEV_DAX,260717199360,245861867520,14855331840,5.70
 ```
 
-Options: `-w/--watch`, `-c/--count`, `--csv`, `--scroll`,
-`--address` (resource manager `host:port`, default `127.0.0.1:9850`).
+Options: `-w/--watch`, `-c/--count`, `--csv`, `--scroll`, `--address` (resource manager `host:port`, default `127.0.0.1:9850`).
 
 ## `marutop usage`
 
-Per-instance CXL usage. Shows, for each client instance (`owner_instance_id`),
-how much CXL memory it reserved (**allocated**) versus how much is live KV data
-(**used**), the difference (**slack**), and the shared pool free space. Queries
-MaruServer over the `GET_USAGE` RPC — no `MARU_STAT` required.
+Per-instance CXL usage. Shows, for each client instance (`owner_instance_id`), how much CXL memory it reserved (**allocated**) versus how much is live KV data (**used**), the difference (**slack**), and the shared pool free space. Queries MaruServer over the `GET_USAGE` RPC — no `MARU_STAT` required.
 
 ```bash
 marutop usage                  # one-shot snapshot
@@ -152,22 +128,18 @@ Options:
 
 ## `marutop stats`
 
-Interactive TUI for real-time handler operation metrics — latency, throughput,
-hit/miss rates, and per-instance comparison. Polls `GET_STATS` RPC and renders
-a curses dashboard with sparkline latency graphs.
+Interactive TUI for real-time handler operation metrics — latency, throughput, hit/miss rates, and per-instance comparison. Polls `GET_STATS` RPC and renders a curses dashboard with sparkline latency graphs.
 
 ### Enable stats collection
 
-Stats reporting is **off by default** (zero overhead). Enable on the client
-side via either:
+Stats reporting is **off by default** (zero overhead). Enable on the client side via either:
 
 ```bash
 export MARU_STAT=1                              # per-run environment variable
 # or in MaruConfig:  MaruConfig(..., enable_stats=True)
 ```
 
-When enabled, each `MaruHandler` spawns a daemon thread that batches stats
-into 1-second `REPORT_STATS` RPC flushes.
+When enabled, each `MaruHandler` spawns a daemon thread that batches stats into 1-second `REPORT_STATS` RPC flushes.
 
 ### Run the dashboard
 
@@ -178,8 +150,7 @@ marutop stats --host 10.0.0.1 -p 5556
 marutop stats -i 0.5               # 0.5s refresh
 ```
 
-Options: `--host` (default `127.0.0.1`), `-p/--port` (default `5555`),
-`-i/--interval` (default `1.0`).
+Options: `--host` (default `127.0.0.1`), `-p/--port` (default `5555`), `-i/--interval` (default `1.0`).
 
 ### Key bindings
 
@@ -191,16 +162,11 @@ Options: `--host` (default `127.0.0.1`), `-p/--port` (default `5555`),
 
 ### Metrics shown
 
-Per `(client_id, op_type)` the server tracks cumulative (count, total bytes,
-avg/min/max latency since connect) and interval (reset each poll — live view)
-figures, plus `hit`/`partial`/`miss` classification for retrieve/exists ops.
-Operations covered: `alloc`, `free`, `store`, `retrieve`, `exists`, `pin`,
-`unpin`, `delete`, and their `batch_*` variants.
+Per `(client_id, op_type)` the server tracks cumulative (count, total bytes, avg/min/max latency since connect) and interval (reset each poll — live view) figures, plus `hit`/`partial`/`miss` classification for retrieve/exists ops. Operations covered: `alloc`, `free`, `store`, `retrieve`, `exists`, `pin`, `unpin`, `delete`, and their `batch_*` variants.
 
 ## `marutop device`
 
-Write/show/clear the UUID header the Resource Manager uses to identify a
-DEV_DAX device across reboots.
+Write/show/clear the UUID header the Resource Manager uses to identify a DEV_DAX device across reboots.
 
 ```bash
 marutop device init /dev/dax0.0          # write UUID header
@@ -213,8 +179,7 @@ marutop device clear --yes /dev/dax0.0   # clear without prompt
 
 ## Legacy invocation
 
-The old module invocations still work from the repo root via thin shims that
-forward to `maru_tools`:
+The old module invocations still work from the repo root via thin shims that forward to `maru_tools`:
 
 ```bash
 python -m tools.pool_monitor -w 1     # → marutop pool -w 1

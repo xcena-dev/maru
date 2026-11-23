@@ -63,7 +63,7 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes handle + device path |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
 | `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
-| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold: a remote CXL agent holds every region it registers with its NIC (§5) |
+| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold: a memory-node service holds every CXL region it registers with its NIC (§5) |
 | `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | The holder deregistered the region (requires the handle) |
 | `RESET_HOLDS_REQ` / `RESET_HOLDS_RESP` | client ↔ server | A restarted holder drops the holds of its earlier process |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
@@ -153,7 +153,7 @@ The server also monitors TCP connection state, for local and remote clients alik
 
 Local vs. remote is determined by comparing the client's hostname (from `client_id`) against the server's hostname. TCP keepalive (idle 10s, interval 5s, count 3) detects dead connections in ~25 seconds, after which the grace period starts — so a crashed remote client's allocations are reclaimed after ~55 seconds total.
 
-**Held regions.** A remote CXL agent registers the regions it maps with its node's NIC, and a late RDMA WRITE through such a registration would land in whatever region next gets the range. So the agent holds each region it registers (`HOLD`, named by its node and process instance) and unholds it once deregistered. A region freed while held, by its owner, the reaper, `maru-rm-ctl release` or recovery, becomes *draining*: it is freed for its owner and `GET_ACCESS` refuses it, but its range stays out of the free list until the last holder unholds it. A restarted agent drops the holds of its earlier process (`RESET_HOLDS`), whose registrations ended with it. Holds and draining marks are kept in `holds` in the state directory (rewritten atomically on every change), so a restart keeps the range out of use too. A pool with a held region is never reset by recovery. If a memory node is gone for good, `maru-rm-ctl drop-holds NODE --confirm` drops its holds. The RM trusts its network for `RESET_HOLDS`, as for `ALLOC`.
+**Held regions.** A node service or worker holds CXL regions while mappings or NIC registrations can access them. Returning an allocation does not override a hold: the region becomes *draining*, `GET_ACCESS` refuses it, and its range stays out of the free list until the final hold ends. Services remove NIC registrations before releasing their holds, so late RDMA writes cannot target reused ranges. Node ownership and process identity protect restart adoption; a live old worker can keep an earlier run's range held. Holds survive Resource Manager restart. If a holder is gone permanently, `maru-rm-ctl drop-holds HOLDER --confirm` removes its holds. See {doc}`node_storage_service` for source pins and write-domain fencing.
 
 ---
 

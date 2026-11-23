@@ -1,213 +1,129 @@
 # Configuration
 
+The native vLLM connector selects a node store with `maru_node`, or directly mapped `cxl` with its default configuration. Node capacity, page size, Catalog address and RDMA settings belong to service JSON. See {doc}`../getting_started/migrating_to_maru_node` for setting replacements.
+
+## Node services
+
+| Command | Purpose | Defaults and options |
+|---|---|---|
+| `maru-node-server` | Catalog | `--host 127.0.0.1`, `--port 5556`, `--log-level INFO` |
+| `maru-storage --config gpu.json` | GPU service | Required JSON; `--check` prints resolved defaults; `--log-level INFO` |
+| `maru-memory-node --config memory.json` | Memory service | Required JSON; same check and logging options |
+
+Catalog options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--host`, `--port` | `127.0.0.1`, `5556` | Bind address and port |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `--session-ttl-s` | `30` | Positive node/worker session TTL; source pins do not expire with it |
+| `--heartbeat-s` | Session TTL / 3 | Positive interval below the session TTL |
+| `--node-give-up-s` | `600` | Positive time before an expired node's locations are removed |
+| `--op-window` | `65536` | Unacknowledged operation results retained per origin |
+| `--op-bytes-max` | `67108864` | Byte limit for those results |
+| `--policy-file` | None | JSON preserve policy, reloaded on changes |
+
+The command selects the role. JSON rejects `role`, unknown keys and duplicate keys. `--check` validates configuration and store support without allocating pools, loading the extension or starting RDMA. It does not check that a key file, device or endpoint can be used at runtime.
+
+| Configuration | Required | Main optional settings |
+|---|---|---|
+| Common | `node_id`, `server`, `page_size`, exactly one `tiers` entry | `state_dir` (`/run/maru`), `budgets` |
+| GPU service | Store `dram`, `local_cxl` or `remote` | `socket` (`/run/maru/node.sock`), `socket_group`, `local_pin` (only `false`) |
+| Memory service | Store `dram` or `local_cxl` | `remote_server`, `region_extension` |
+| `dram` | `size` | `hugepage` (`true`) |
+| `local_cxl` | `size` to serve | `region_size` (`1GiB`), `rm` (`127.0.0.1:9850`), `visibility` (`coherent` or `flush`) |
+| `remote` | One `url`, `key_file` | `rdma_device` (empty), `timeout_s` (`30`), `staging_size`, `staging_max_bytes`, `quarantine_max`, `write_hints` (`false`), `write_wait_ms` (`50`) |
+| `remote_server` | `listen`, `key_file` | `rdma_device`, `reserve_ttl_s` (`60`), `peer_quarantine_max`, `quarantine_max` |
+| `region_extension` | `name`; memory `local_cxl` only | `config` (empty), `generation_poll_s` (`0.1`), `generation_grace_s` (`2.0`), `hint_requests_max` (`4096`) |
+
+`high_watermark` (`0.9`) and `low_watermark` (`0.8`) are memory-store options only. Remote `staging_size` defaults to `max(1GiB, 64 * page_size)` per worker; `staging_max_bytes` defaults to that same amount for the whole GPU node. Increase the total for simultaneous workers.
+
+See {doc}`../design_doc/node_storage_service` for every store and budget validation rule, derived defaults and complete JSON examples. See {doc}`../design_doc/read_hints` for extension hooks and memory generations.
+
+## vLLM node configuration
+
+```json
+{
+  "kv_connector": "MaruKVConnector",
+  "kv_connector_module_path": "maru_vllm",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "maru_node": "/run/maru/node.sock",
+    "maru_engine_id": "engine-1",
+    "maru_cache_namespace": "model-immutable-revision",
+    "maru_async_load": true
+  }
+}
+```
+
+| Connector key | Default | Meaning |
+|---|---|---|
+| `maru_node` | Required for node stores | GPU service socket path |
+| `maru_engine_id` | Required | Engine identity; ranks share it |
+| `maru_cache_namespace` | Required | Immutable weights revision; connector binds it to KV geometry |
+| `maru_kv_chunk_tokens` | `256` | Tokens per stored chunk, aligned to vLLM blocks |
+| `maru_async_load` | Node advice (`false`) | Deferred load; forced on for async scheduling, TP>1 and multiple KV groups |
+| `maru_async_store` | Node advice (`false`) | Asynchronous store completion |
+| `maru_lookup_timeout_ms` | `100` | Foreground Catalog lookup timeout |
+| `maru_credit_wait_ms` | `0` | Engine-thread store credit wait budget per step |
+| `maru_load_read_depth` | `2` | Deferred reads in flight; minimum `1` |
+| `maru_read_hints` | `false` | Advisory scheduler read hints to remote extensions |
+| `maru_read_hint_on_arrival` | `false` | Hint on request arrival with the compatible vLLM hook |
+
+`kv_load_failure_policy` must be `recompute`. Remote stores reject `maru_use_layerwise` and `maru_overlap_load_with_compute`. Synchronous loads require TP=1, one KV group and async scheduling off. See {doc}`../integration/vllm` for transfer modes and model restrictions.
+
+Do not combine `maru_node` with connector-side capacity, page-size, server-address, instance-id, backend, pinning, eager-mapping or write-hint settings. The service owns those settings; the connector rejects them by name.
+
 ## MaruConfig
 
-Selected fields of the client-side configuration dataclass. The complete
-definition is `maru_common.config.MaruConfig`; behavior depends on the backend.
+The Python client configuration is `maru_common.MaruConfig`:
 
 ```python
-from maru import MaruConfig
-```
+from maru import MaruConfig, MaruHandler
 
-```python
-@dataclass
-class MaruConfig:
-    server_url: str = "tcp://localhost:5555"
-    instance_id: str | None = None
-    pool_size: int = 104_857_600  # 100MB
-    chunk_size_bytes: int = 1_048_576  # 1MB
-    auto_connect: bool = True
-    timeout_ms: int = 2000
-    use_async_rpc: bool = True
-    max_inflight: int = 64
-    eager_map: bool = True
-    storage_backend: str = "cxl"  # "cpu", "cxl", "mixed" or "remote_cxl"
-    engine_id: str | None = None
-    cache_namespace: str | None = None
-    rdma_device: str = ""
-    rdma_staging_size: int | None = None
-    rdma_timeout_s: float = 30.0
-    rdma_load_reserve: float = 0.0
-    remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
-    read_hints: bool = False
-    write_hints: bool = False
-    write_wait_ms: int = 50
-    read_promotes: bool = False
-```
-
-### Parameters
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `server_url` | `str` | `"tcp://localhost:5555"` | ZeroMQ endpoint of MaruServer. With `storage_backend="remote_cxl"`, a comma-separated list of endpoints, one maru-server per pool |
-| `instance_id` | `str \| None` | `None` (auto-generated UUID) | Unique client identifier |
-| `pool_size` | `int` | `104_857_600` (100MB) | Region size for `cxl`/`remote_cxl`; storage-session private-pool settings have different capacity rules (see the memory model) |
-| `chunk_size_bytes` | `int` | `1_048_576` (1MB) | Page size for paged allocation (bytes) |
-| `auto_connect` | `bool` | `True` | Connect on context-manager entry; construction alone does not connect |
-| `timeout_ms` | `int` | `2000` | RPC socket timeout in milliseconds |
-| `use_async_rpc` | `bool` | `True` | Use async DEALER-ROUTER RPC client |
-| `max_inflight` | `int` | `64` | Max concurrent in-flight async RPC requests |
-| `eager_map` | `bool` | `True` | Pre-map all shared regions on connect (can be overridden by `MARU_EAGER_MAP` env var) |
-| `storage_backend` | `str` | `"cxl"` | Where KV lives: `"cxl"` (CXL shared memory mapped on this node), `"cpu"`, `"mixed"`, or `"remote_cxl"` (CXL memory of memory nodes over RDMA) |
-| `engine_id` | `str \| None` | `None` | Engine identity of a storage session; required for `cpu`, `mixed` and `remote_cxl` |
-| `cache_namespace` | `str \| None` | `None` | Namespace whose keys a storage session shares; required for `cpu`, `mixed` and `remote_cxl` |
-| `rdma_device` | `str` | `""` (UCX default) | `remote_cxl` only: RDMA NIC for NIXL/UCX, e.g. `"mlx5_0:1"` |
-| `rdma_staging_size` | `int \| None` | `None` (derived) | `remote_cxl` host staging budget in bytes; `None` uses the larger of 64 pages and 1 GiB. Separate from the CXL region budget |
-| `rdma_timeout_s` | `float` | `30.0` | `remote_cxl` only: deadline of one RDMA batch in seconds |
-| `rdma_load_reserve` | `float` | `0.0` | `remote_cxl` only: share of staging slots, in `[0, 1)`, that stores leave free for loads; set when loads and stores run on separate threads |
-| `remote_cxl_agent_key_file` | `str` | `"~/.maru/remote-cxl-agent.key"` | `remote_cxl` only: copy of the memory nodes' remote CXL agent key, readable by the worker's user only |
-| `read_hints` | `bool` | `False` | `remote_cxl` and `cxl`: send [read hints](../design_doc/read_hints.md) to agents whose region extension takes them (`remote_cxl`), or give them to the handler plugins that take them (`cxl`, [Handler Plugins](plugins.md)). A metadata-only client sends what `MaruHandler.hint_read` names; a client that loads hints each load as its READs start |
-| `read_promotes` | `bool` | `False` | `remote_cxl` and `cxl` (the same receivers as `read_hints`): tell agents whose region extension takes it when the load of a request another process hinted starts (`MaruHandler.promote_read`), so the memory side brings that request's bytes in first; see [Read and write hints](../design_doc/read_hints.md) |
-| `write_hints` | `bool` | `False` | `remote_cxl` only: send a write hint for each store's pages before its WRITEs to agents whose region extension takes them; see [Read and write hints](../design_doc/read_hints.md) |
-| `write_wait_ms` | `int` | `50` | With `write_hints`: how long a store waits for an agent whose region extension takes `write_wait` to prepare its pages before posting its WRITEs, which go either way; `0` never waits (0 to 10000) |
-
-### Examples
-
-**Default configuration:**
-
-```python
-config = MaruConfig()
-with MaruHandler(config) as handler:
-    ...
-```
-
-**Custom configuration:**
-
-```python
 config = MaruConfig(
-    server_url="tcp://10.0.0.1:5555",
-    instance_id="worker-0",
-    pool_size=1024 * 1024 * 1024,  # 1GB
-    chunk_size_bytes=2 * 1024 * 1024,  # 2MB pages
-    timeout_ms=5000,
+    maru_node="/run/maru/node.sock",
+    engine_id="engine-1",
+    cache_namespace="model-immutable-revision",
 )
 ```
 
-**Synchronous RPC (for debugging):**
+| Field | Default | Meaning |
+|---|---|---|
+| `maru_node` | `None` | Set to use a node service |
+| `engine_id`, `cache_namespace` | `None` | Required when using a node service |
+| `server_url` | `tcp://localhost:5555` | `cxl` metadata server; node services supply the Catalog address |
+| `instance_id` | Generated UUID | `cxl` client identity |
+| `pool_size` | `100MiB` | Initial `cxl` region allocation |
+| `chunk_size_bytes` | `1MiB` | Required object/page size on the Python interface |
+| `auto_connect` | `True` | Connect on context-manager entry |
+| `auto_expand` | `True` | Expand `cxl` allocation when full |
+| `timeout_ms` | `2000` | Metadata socket timeout |
+| `lookup_timeout_ms` | `100` | Node foreground lookup timeout |
+| `use_async_rpc` | `True` | Async DEALER/ROUTER RPC |
+| `max_inflight` | `64` | Maximum in-flight async RPCs |
+| `eager_map` | `True` | Premap shared `cxl` regions |
+| `rm_address` | `127.0.0.1:9850` | Resource Manager address |
+| `store_timeout_s` | `10` | Python store publication wait on node stores |
+| `credit_wait_s` | `0` | Node store credit wait budget |
+| `node_connect_timeout_s` | `30` | Initial node connection wait |
+| `read_hints`, `read_promotes` | `False` | Advisory hints; see {doc}`plugins` and {doc}`../design_doc/read_hints` |
 
-```python
-config = MaruConfig(
-    use_async_rpc=False,
-    timeout_ms=10000,
-)
-```
+`MARU_EAGER_MAP` and `MARU_STAT` override eager mapping and handler statistics respectively. Boolean environment values accept `1/0`, `true/false`, `yes/no` and `on/off`.
 
----
+## Direct CXL configuration
 
-## MaruServer Configuration
+`maru-server` serves the `cxl` backend:
 
-The MaruServer is configured via CLI arguments.
-
-```bash
-maru-server [OPTIONS]
-```
-
-| Option | Default | Description |
-| --- | --- | --- |
+| Option | Default | Meaning |
+|---|---|---|
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `5555` | Bind port |
-| `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-| `--dax-path` | any pool | DAX device path for allocation. Repeat for multiple pools (fill-first fallback). |
-| `--remote-cxl-agent` | none | Remote CXL agent (`host:port`) of a memory node of this pool, for `remote_cxl` workers. Repeat or separate with commas for every memory node of a shared pool |
-| `--remote-cxl-agent-key-file` | `~/.maru/remote-cxl-agent.key` | Copy of the remote CXL agent key; read when `--remote-cxl-agent` is given |
+| `--log-level` | `INFO` | Logging level |
+| `--rm-address` | `127.0.0.1:9850` | Resource Manager address |
+| `--dax-path` | Any pool | Repeat for multiple DAX pools |
 
-### Examples
+The native vLLM `cxl` configuration uses `maru_server_url` (`tcp://localhost:5555`), `maru_pool_size` (`1G`), `maru_chunk_size` (`4M` unless sized from the model), `maru_instance_id` (generated) and `maru_eager_map` (`true`). These are separate from service JSON.
 
-```bash
-# Default (any available pool)
-maru-server
-
-# Pin to a specific DAX device
-maru-server --dax-path /dev/dax0.0
-
-# Multiple pools (fill-first fallback)
-maru-server --dax-path /dev/dax0.0 --dax-path /dev/dax1.0
-
-# Production
-maru-server --host 0.0.0.0 --port 5555 --log-level WARNING
-
-# Debug
-maru-server --host 127.0.0.1 --port 5556 --log-level DEBUG
-```
-
----
-
-## vLLM KV Connector Configuration
-
-When using MaruKVConnector with vLLM, configuration is passed via `kv_connector_extra_config` in the `--kv-transfer-config` JSON:
-
-```bash
-vllm serve <model> --kv-transfer-config '{
-    "kv_connector": "MaruKVConnector",
-    "kv_connector_module_path": "maru_vllm",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-        "maru_server_url": "tcp://localhost:5555",
-        "maru_pool_size": "4G"
-    }
-}'
-```
-
-### Parameters
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `maru_server_url` | `str` | `tcp://localhost:5555` | MaruServer address. With `remote_cxl`, a comma-separated list, one maru-server per pool |
-| `maru_pool_size` | `str \| int` | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, or integer bytes): its first allocation, and each further one when its memory is full. Required with `remote_cxl`, where each allocation is one region; `cpu` and `mixed` use `maru_cpu_pool_size` and `maru_cxl_pool_size` |
-| `maru_auto_expand` | `bool` | `true` | Allow the handler to acquire additional regions when its current allocation fills. Set `false` to keep the existing capacity; the backend's full-pool policy then applies (`remote_cxl` evicts, `cxl` can fail allocation) |
-| `maru_chunk_size` | `str \| int` | `4M` | Maru page size (CXL allocation unit) |
-| `maru_instance_id` | `str` | auto-generated UUID | Unique client instance identifier |
-| `maru_eager_map` | `bool` | `true` | Pre-map other instances' CXL regions on connect |
-| `maru_kv_chunk_tokens` | `int` | `256` | KV cache chunk granularity (in tokens). Auto-aligned to vLLM `block_size` |
-
-For full architecture and data path details, see [vLLM](../integration/vllm.md#configuration).
-
-### Remote CXL (`maru_storage_backend: "remote_cxl"`)
-
-Engines on nodes without CXL keep KV in the CXL memory of memory nodes and move
-it over RDMA (see the [vLLM guide](../integration/vllm.md)). These settings
-apply to that backend only:
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `maru_storage_backend` | `str` | `cxl` | `remote_cxl` selects the backend |
-| `maru_engine_id` | `str` | required | Names the engine's storage session; unique among the engines of one maru-server. Under tensor parallelism each rank's session is `<id>-tp<rank>`, and data-parallel replica `d` > 0 adds `-dp<d>` (`<id>-dp<d>-tp<rank>`, or `<id>-dp<d>` at TP=1) |
-| `maru_cache_namespace` | `str` | required | Must identify the exact immutable weights revision. Sharing also requires compatible schema/layout and the same pool; model shape alone is insufficient |
-| `maru_pool_size` | `str \| int` | required | CXL memory the engine gets at a time, as with `cxl`: its first region, and one more of this size whenever its regions are full |
-| `maru_remote_cxl_agent_key_file` | `str` | `~/.maru/remote-cxl-agent.key` | Copy of the memory nodes' remote CXL agent key, readable only by the engine's user |
-| `maru_rdma_device` | `str` | UCX default | The engine's RDMA NIC, e.g. `mlx5_0:1` |
-| `maru_rdma_staging_size` | `str \| int` | two `max_model_len` requests, at least 1 GiB | Host staging buffer registered with the NIC and CUDA |
-| `maru_rdma_timeout_s` | `float` | `30` | Deadline of one RDMA batch |
-| `maru_read_hints` | `bool` | `false` | The scheduler sends advisory read ranges before each load, and the worker announces its load start; see [Read and write hints](../design_doc/read_hints.md). Needs `maru_async_load` (no hints with a warning otherwise). The `cxl` backend delivers these messages to [handler plugins](plugins.md). Scheduler hints currently apply at TP = 1 with one KV cache group ({ref}`read-hint-scope`) |
-| `maru_write_hints` | `bool` | `maru_read_hints` | The worker names each store's pages to the memory nodes before it writes them, so such a device can prepare them instead of filling each from slower media on its first write. Follows `maru_read_hints` unless set; `remote_cxl` only |
-| `maru_write_wait_ms` | `int` | `50` | How long a store waits for the memory node to prepare its pages before writing them (with write hints, where the region extension takes it); `0` never waits |
-| `maru_read_hint_on_arrival` | `bool` | `false` | Send the read hint when vLLM receives a request, not when the scheduler first looks it up; needs `maru_async_load` (off with a warning otherwise) |
-
-### Remote CXL agent (`maru-remote-cxl-agent`)
-
-One per memory node, installed as `maru-remote-cxl-agent.service` with NIXL. An
-option with an environment variable in parentheses also takes its value from
-it, and the service reads these variables from `/etc/maru/remote-cxl-agent.env`.
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `--rm-address` (`MARU_RM_ADDRESS`) | `127.0.0.1:9850` | Resource manager of the pool |
-| `--ucx-device` (`MARU_REMOTE_CXL_AGENT_UCX_DEVICE`) | UCX default | RDMA NIC to register regions with, e.g. `mlx5_1:1` |
-| `--host` (`MARU_REMOTE_CXL_AGENT_HOST`) | `127.0.0.1`; the service: empty | Bind address; empty means the address of the `--ucx-device` interface |
-| `--port` (`MARU_REMOTE_CXL_AGENT_PORT`) | `9860` | Bind port |
-| `--key-file` (`MARU_REMOTE_CXL_AGENT_KEY_FILE`) | `/etc/maru/remote-cxl-agent.key` | Key every connection must prove; the installer creates it |
-| `--node-id` | hostname | Name of the memory node; names the default lock file |
-| `--lock-file` (`MARU_REMOTE_CXL_AGENT_LOCK_FILE`) | `/run/maru/remote-cxl-agent-<node>.lock` | Keeps one remote CXL agent per node |
-| `--region-extension` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION`) | none | Name of an installed region extension (entry point in `maru.region_extensions`) that takes read and write hints and hears region maps; see [Read and write hints](../design_doc/read_hints.md). A package that provides one can set it for the service with a drop-in on `maru-remote-cxl-agent.service` |
-| `--region-extension-config` (`MARU_REMOTE_CXL_AGENT_REGION_EXTENSION_CONFIG`) | empty | Opaque string given to that extension |
-| `--max-hint-requests` | `4096` | Read hint requests one connection may keep open; more are refused |
-| `--memory-generation-poll-s` | `0.1` | How often the extension's memory generation is read; a reset is acted on within the extension's detection time plus this |
-| `--memory-generation-grace-s` | `2.0` | How long the memory generation may go unanswered before every region is released and maps are refused until it answers |
-| `--allow-unchecked-transport` | off | Accept UCX transports that do not check remote keys (tests on one host only) |
-| `--log-level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-
----
-
-## LMCache Configuration
-
-For LMCache YAML configuration (plugin settings, `extra_config` parameters), see [LMCache](../integration/lmcache.md#configuration).
+For LMCache YAML settings, see {doc}`../integration/lmcache`.

@@ -4,26 +4,11 @@
 
 **vLLM v0.14+** — required for `KVConnectorBase_V1` support.
 
-This is an interface minimum, not validation of every version, model and
-backend combination. Check the selected backend's restrictions below. The
-remote CXL example has its own validated engine/Torch/CUDA/NIXL constraints;
-see {ref}`nixl-stack`. CPU/mixed pools, shared CXL and RDMA paths have different
-sharing and transfer contracts.
+This is an interface minimum. Check the selected store's model and transfer restrictions below. Node remote stores also need a compatible NIXL/UCX runtime; see {ref}`nixl-stack`.
 
 **Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
-**vLLM v0.29+** resolves one KV cache layout per model in the engine core
-(`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC`
-and `LBHNC`) and hands every layer the logical page
-`[blocks, KV heads, tokens, K|V]`, whatever the physical order. Maru reads the
-resolved layout from the engine and splits each head's row into its K and V
-halves, so for dense attention a chunk object holds the same K/V-major bytes as
-a rank-5 cache of vLLM v0.25 and earlier, and the CPU and mixed backends accept
-these pages. Chunk transfers place these pages with a `maru_kv_ops` kernel that
-reads the page's strides, so every physical order takes the kernel path. Pages
-whose content does not split into two heads (MLA, uneven K/V widths, inline
-quantization scales) use per-layer copies. Tested with
-v0.32.
+**vLLM v0.29+** resolves one KV cache layout per model in the engine core (`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC` and `LBHNC`) and hands every layer the logical page `[blocks, KV heads, tokens, K|V]`, whatever the physical order. Maru reads the resolved layout from the engine and splits each head's row into its K and V halves, so for dense attention a chunk object holds the same K/V-major bytes as a rank-5 cache of vLLM v0.25 and earlier. Chunk transfers place these pages with a `maru_kv_ops` kernel that reads the page's strides, so every physical order takes the kernel path. Pages whose content does not split into two heads (MLA, uneven K/V widths, inline quantization scales) use per-layer copies. Tested with v0.32.
 
 **Storing a hybrid model as several KV cache groups requires vLLM v0.30.0+.** A model whose layers keep different kinds of KV cache, such as sliding-window or Mamba-type layers next to full attention, has several KV cache groups; see {ref}`vllm-hybrid-models`. On older versions the connector does not declare hybrid support: vLLM then runs sliding-window models as one KV cache group and refuses Mamba hybrids at startup.
 
@@ -31,20 +16,15 @@ v0.32.
 uv pip install vllm
 ```
 
-See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-for GPU-specific options.
+See [vLLM installation docs](https://docs.vllm.ai/en/latest/getting_started/installation.html) for GPU-specific options.
 
 ## Model support
 
-{doc}`supported_models` lists the KV cache structures and models the connector
-stores, the structures it refuses at startup, and the models that the CPU,
-mixed and remote_cxl backends take.
+{doc}`supported_models` lists the KV cache structures and models the connector stores and the structures it refuses at startup. Node remote stores use chunkwise objects and reject layerwise format and overlap.
 
 ## Integration Architecture
 
-MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing
-between vLLM instances — **without any middleware**. With the default `cxl`
-backend, the KV moves through CXL shared memory.
+MaruKVConnector is a native vLLM KV connector that enables direct KV cache sharing between vLLM instances — **without any middleware**. With the default `cxl` backend, the KV moves through CXL shared memory.
 
 ```mermaid
 flowchart LR
@@ -58,7 +38,7 @@ flowchart LR
     subgraph direct["Direct (this connector)"]
         direction TB
         V2["vLLM"] --> MKV["MaruKVConnector"]
-        MKV --> MH2["MaruHandler"] --> PATH2["Selected storage path<br/>cxl: mapped CXL<br/>remote_cxl: CPU staging + RDMA"]
+        MKV --> MH2["MaruHandler"] --> PATH2["Selected storage path<br/>cxl: mapped CXL<br/>maru_node: local pool or worker RDMA"]
     end
 
     prev --> direct
@@ -66,9 +46,9 @@ flowchart LR
 
 The direct connector supports the following integration and data paths:
 
-- **Fewer dependencies** — only vLLM + Maru (the `remote_cxl` backend also needs NIXL)
+- **Fewer dependencies** — only vLLM + Maru (node remote stores also need NIXL)
 - **Mapped CXL transfers** (`cxl` backend) — GPU ↔ mapped CXL copies. CUDA registration, cache layout and the available placement kernels determine the copy or fallback path; GPU bytes still move.
-- **RDMA transfers** (`remote_cxl` backend) — GPU ↔ worker CPU DRAM staging copies, then staging ↔ memory-node CXL transfers over one-sided RDMA. This path needs a host staging buffer.
+- **Node stores** (`maru_node`) — GPU ↔ mapped node DRAM or local CXL, or GPU ↔ worker-owned staging ↔ direct RDMA ↔ memory-node DRAM/CXL. Services control ownership and publication.
 - **Raw KV payloads** — no `MemoryObj` conversion in this connector; metadata RPC still serializes control information
 
 ### Component Roles
@@ -84,7 +64,7 @@ The scheduler uses a metadata-only Handler; the worker's Handler owns the payloa
 
 ## Data Path
 
-The following store/load sequences illustrate the default `cxl` backend. See "CXL on memory nodes over RDMA" below for `remote_cxl` and its staging buffer.
+The following store/load sequences illustrate the default `cxl` backend. See the node setup below and {doc}`../design_doc/node_storage_service` for local node stores and remote worker staging.
 
 ### Store Path (GPU → CXL)
 
@@ -108,9 +88,7 @@ sequenceDiagram
     end
 ```
 
-The save path uses `handler.alloc()` to get a pre-mapped CXL buffer, then copies GPU tensor
-data directly into it via `torch.Tensor.copy_()`. The subsequent `store(handle=)` call
-only registers the key in the metadata server — no additional data copy occurs.
+The save path uses `handler.alloc()` to get a pre-mapped CXL buffer, then copies GPU tensor data directly into it via `torch.Tensor.copy_()`. The subsequent `store(handle=)` call only registers the key in the metadata server — no additional data copy occurs.
 
 ### Load Path (CXL → GPU)
 
@@ -138,9 +116,7 @@ sequenceDiagram
     MKV->>MKV: Inject into KV cache layer via slot mapping
 ```
 
-The CXL mmap region is pinned via `cudaHostRegister` by MaruHandler's DaxMapper,
-so `.to(device)` triggers a direct DMA transfer from CXL to GPU memory without
-any intermediate CPU copy.
+The CXL mmap region is pinned via `cudaHostRegister` by MaruHandler's DaxMapper, so `.to(device)` triggers a direct DMA transfer from CXL to GPU memory without any intermediate CPU copy.
 
 If CUDA registration fails for a region, the packed connector checks each slab's actual pin status before passing a host pointer to the placement kernel. Inline loads copy an unpinned slab to the GPU and run the placement kernel on that copy, as deferred loads already do for every slab. Stores gather into one reusable GPU slab and copy it to CXL before publishing the keys. Pinned slabs keep the direct kernel path, including in batches that also contain unpinned slabs. This preserves caching when pinning fails, at reduced transfer performance.
 
@@ -153,8 +129,7 @@ Prompt: [tok0..tok255 | tok256..tok511 | tok512..tok767 | tok768..tok900]
          chunk 0        chunk 1          chunk 2          (incomplete, not stored)
 ```
 
-Each chunk key = `kv_{hash(tok0..end)}_L{layer}` — a rolling prefix hash that
-encodes the full context up to that chunk, enabling partial prefix reuse.
+Each chunk key = `kv_{hash(tok0..end)}_L{layer}` — a rolling prefix hash that encodes the full context up to that chunk, enabling partial prefix reuse.
 
 ### Partial Prefix Reuse
 
@@ -171,31 +146,17 @@ Instance B:
 
 ### GPU prefix caching and external stores
 
-A vLLM prefix-cache hit does not mean that the same KV exists in Maru. In a
-multi-turn conversation, a previous turn's generated tokens may be present
-only in the GPU cache. For caches retaining the full prefix, the first store of the
-next turn starts at the end of the prefix found in Maru, copying those
-missing chunks together with the new prompt suffix. A later lookup can
-then reuse them after vLLM evicts the conversation.
+A vLLM prefix-cache hit does not mean that the same KV exists in Maru. In a multi-turn conversation, a previous turn's generated tokens may be present only in the GPU cache. For caches retaining the full prefix, the first store of the next turn starts at the end of the prefix found in Maru, copying those missing chunks together with the new prompt suffix. A later lookup can then reuse them after vLLM evicts the conversation.
 
-Synchronous stores include the missing cached prefix on the admission
-step; later prefill steps store only their new chunks. Asynchronous stores
-retain the original start until the prompt finishes. Full Maru hits still
-avoid storing already present chunks, including a held-back compute block.
+Synchronous stores include the missing cached prefix on the admission step; later prefill steps store only their new chunks. Asynchronous stores retain the original start until the prompt finishes. Full Maru hits still avoid storing already present chunks, including a held-back compute block.
 
-The repair applies when every stored group retains all prefix blocks:
-full-attention groups (including promoted groups with a `sliding_window`
-field) and non-windowed MLA groups. Bounded-replay and other skipped groups
-do not store KV and do not restrict the repair. Replaying a window before a
-confirmed Maru hit preserves the hit's store boundary.
+The repair applies when every stored group retains all prefix blocks: full-attention groups (including promoted groups with a `sliding_window` field) and non-windowed MLA groups. Bounded-replay and other skipped groups do not store KV and do not restrict the repair. Replaying a window before a confirmed Maru hit preserves the hit's store boundary.
 
-Mamba and stored sliding-window groups keep their existing store rules
-because historical states or blocks may already be gone; missing history
-in those groups can still require recomputation.
+Mamba and stored sliding-window groups keep their existing store rules because historical states or blocks may already be gone; missing history in those groups can still require recomputation.
 
 ### Requests Maru does not cache
 
-Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and vLLM's own prefix cache, when enabled (the default), still applies to them because it hashes these inputs. Keying such requests so they can hit is tracked in [#116](https://github.com/xcena-dev/maru/issues/116).
+Maru keys a chunk by its token ids alone. A request whose KV also depends on something else neither loads from nor stores to Maru, on any backend: requests with images or other multimodal inputs, a LoRA adapter, a `cache_salt`, or prompt embeddings. vLLM computes them as usual, and vLLM's own prefix cache, when enabled (the default), still applies to them because it hashes these inputs.
 
 ## Setup
 
@@ -203,7 +164,7 @@ Maru keys a chunk by its token ids alone. A request whose KV also depends on som
 
 ```bash
 maru-server
-# Listens on tcp://0.0.0.0:5555 by default
+# Listens on tcp://127.0.0.1:5555 by default
 ```
 
 **Launch vLLM with MaruKVConnector (dynamic loading):**
@@ -221,8 +182,7 @@ vllm serve <model> \
     }'
 ```
 
-The `kv_connector_module_path` tells vLLM to dynamically import `MaruKVConnector`
-from the `maru_vllm` package. No vLLM source code changes are required.
+The `kv_connector_module_path` tells vLLM to dynamically import `MaruKVConnector` from the `maru_vllm` package. No vLLM source code changes are required.
 
 **Second instance (same node):**
 
@@ -242,211 +202,69 @@ vllm serve <model> \
 
 ## Configuration
 
-### CPU DRAM cache (M1)
+### Node StorageService (maru_node)
 
-Opt in with `maru_storage_backend="cpu"` to store KV in the worker's local DRAM.
-Start the server with `maru-server --cpu-only`; this avoids all CXL/RM
-initialization. The default backend remains CXL.
+Set `maru_node` to the GPU service's socket path. Each node serves one store: GPU nodes choose `dram`, `local_cxl` or `remote`; memory nodes choose `dram` or `local_cxl`. The Catalog runs separately from `maru-server`.
 
-CPU mode requires `maru_cpu_pool_size`, a unique `maru_engine_id` per engine,
-an explicit immutable-weights `maru_cache_namespace`, `--enforce-eager`, and
-`kv_load_failure_policy="recompute"` in the KV transfer configuration. It supports
-one worker, homogeneous unquantized KV layers and synchronous chunkwise transfers.
-The worker faults the pool in and registers it with CUDA when it opens, as the
-`cxl` backend's regions are, so that GPU copies run at the DMA rate and stores
-do not fault in fresh pages. This locks the whole pool in memory and adds seconds
-to startup for tens of GB. A pool larger than the memory available stays
-pageable, and `maru_pin_pools=false` keeps any pool pageable. The worker opens
-the pool in `register_kv_caches`; if that fails, the first request that loads or
-stores opens it and waits for the page-lock, as the `cxl` backend's first
-request waits for its region mapping.
-A full pool skips new stores. Sharing, eviction and async/layerwise CPU transfers
-are not enabled in M1.
+Start one Catalog:
 
-The server tracks process-local CPU replicas and capacity. The scheduler uses a
-metadata-only connection and cannot read CPU payloads. `marutop usage` displays
-CPU pool usage. Expired sessions stop producing hits; M1 requires restarting
-CPU workers after a metadata server restart.
-
-See the [CPU example and lifecycle notes](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md)
-for the complete launch configuration, limits and handler read-lease API.
-
-### CPU and CXL together (M2a)
-
-Set `maru_storage_backend="mixed"`, provide both `maru_cpu_pool_size` and
-`maru_cxl_pool_size`, and run a CXL-enabled server (without `--cpu-only`). Both
-pools belong to the same worker; one prefix can span both media. The CPU mode's
-single-worker, eager and synchronous-transfer requirements also apply.
-
-`maru_write_order=["cpu", "cxl"]` fills CPU first and falls back to CXL when full.
-Reverse the list for CXL-first placement. `maru_read_order` independently selects
-an existing replica; its default is also `["cpu", "cxl"]`. Both pools are fixed:
-when both are full, new stores are skipped. The directory records and reports
-CPU/CXL pools separately through `l1_storage` and `marutop usage`.
-
-This stage scopes both pools to the owning worker and isolates typed CXL keys
-from the legacy shared cache. Cross-engine CXL access, automatic replication,
-eviction and SSD are later milestones. See the
-[mixed-mode example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md)
-for launch configuration, memory lifetime and validation instructions.
-
-### CXL on memory nodes over RDMA
-
-Set `maru_storage_backend="remote_cxl"` to run engines on nodes without CXL. The KV
-stays in the CXL memory of memory nodes and moves over RDMA: the worker reads
-and writes it with one-sided RDMA, and only control messages go to maru-server
-and to the memory node. Provide `maru_server_url`, `maru_pool_size` (the CXL
-memory the engine gets at a time, as with `cxl`), a unique `maru_engine_id`
-(each TP rank adds `-tp<rank>`, and data-parallel replica `d` > 0 adds
-`-dp<d>`; see {ref}`vllm-tensor-parallelism`), an
-immutable-weights `maru_cache_namespace`,
-`maru_remote_cxl_agent_key_file` (a copy of the memory nodes' remote CXL agent key,
-default `~/.maru/remote-cxl-agent.key`) and, optionally, `maru_rdma_device` (the
-worker's RDMA NIC, e.g. `mlx5_0:1`).
-
-The region mapping and reclamation sequence is shown below. A normal worker
-close can hand registered regions to MaruServer's keeper; it does not always
-free them. Repeated reads and stores reuse the established mapping.
-
-```mermaid
-sequenceDiagram
-    participant W as Worker Handler
-    participant S as MaruServer
-    participant R as Resource Manager
-    participant A as Memory-node agent
-    W->>S: open session / expand
-    S->>R: ALLOC region
-    R-->>S: owner handle
-    S-->>W: region handle
-    W->>A: map(handle)
-    A->>R: HOLD(handle, agent generation)
-    R-->>A: device range + retained allocation
-    A->>A: mmap + NIC registration
-    A-->>W: RDMA address + remote key
-    Note over W,A: Payload: GPU ↔ worker CPU staging ↔ RDMA ↔ CXL
-    Note over S,A: Later: region selected for reclamation
-    S->>A: release(owner handle)
-    A->>A: NIC deregistration
-    A->>R: UNHOLD
-    A-->>S: released
-    S->>R: FREE
-    Note over S,R: RM also defers reuse while a HOLD remains
+```bash
+maru-node-server --host 127.0.0.1 --port 5556
 ```
 
-Keeper reclamation can invalidate outstanding server read leases rather than
-wait for readers. A failed READ or final lease check must become a cache miss;
-the connector must not restore those bytes to the GPU.
+A GPU DRAM configuration (`gpu.json`) needs no CXL or Resource Manager:
 
-Resources flow as for the cxl backend: the resource manager gives regions to
-maru-server and maru-server gives them to the worker, one region when its
-storage session opens and one more each time its regions are full. Only the
-step that maps a region moves, from the Handler to the memory node.
+```json
+{
+  "node_id": "gpu-1",
+  "server": "tcp://127.0.0.1:5556",
+  "page_size": "32MiB",
+  "tiers": [{"store": "dram", "size": "16GiB", "hugepage": false}]
+}
+```
 
-![Components of the remote_cxl backend. Worker nodes: MaruKVConnector calls MaruHandler, whose PoolRouter (with several pools) picks a request's pool and hands it to that pool's RemoteCxlStorageClient; all clients share one RdmaDataPath (RegionMapClient, StagingBuffer, NIXL). Metadata node: MaruServer with ReplicaDirectory (storage sessions), AllocationManager (resource manager requests) and RegionKeeper. Memory nodes of a shared CXL pool: the resource manager, and on every node a remote CXL agent whose RegionMapServer takes connections for RegionMapService, which holds the region at the resource manager (HOLD, checking its handle; UNHOLD after deregistering), maps it with DaxRegionMapper and registers it with NIXL](../image/remote_cxl_sw_structure.png)
+```bash
+maru-storage --config gpu.json --check
+maru-storage --config gpu.json
+```
 
-Each memory
-node runs a remote CXL agent (`maru-remote-cxl-agent`), a service shared by every app:
-it maps the regions Handlers ask for and registers them with the node's NIC.
-With NIXL installed, `./install.sh` sets it up as `maru-remote-cxl-agent.service`,
-which starts and stops with the resource manager; its settings (NIC, port 9860,
-key file) are in `/etc/maru/remote-cxl-agent.env`. It listens on the NIC's address
-on the RDMA network, and every worker and maru-server proves the remote CXL agent
-key (`/etc/maru/remote-cxl-agent.key`, created by the installer) on each
-connection, so only processes that can read a copy of the key map regions, as
-only users that can open the DAX device map them on a CXL-attached node. The
-protocol itself is not encrypted, like the resource manager's, so keep the
-RDMA network to the hosts of the deployment.
-A memory node of a shared pool that runs no resource manager installs the
-service alone (`install-maru-remote-cxl-agent --standalone`, which starts it at
-boot on its own) and sets `MARU_RM_ADDRESS` to the node that does; the resource manager then listens on a network address, as in
-the {ref}`multi-node configuration <installation-multi-node-config>`.
-maru-server takes the pool's remote CXL agents with `--remote-cxl-agent host:port`
-(one per memory node) and `--remote-cxl-agent-key-file`, and hands the list to
-the workers. Engines read each other's keys under a server lease; a reader
-gets a read handle, which maps a region but cannot release it. When a worker
-stops, maru-server keeps its regions that hold keys and holds their mapping,
-so the keys stay readable as a stopped cxl Handler's keys do; it gives a kept
-region back when the resource manager is full. A region goes back only after
-its remote CXL agent deregistered it, so a late RDMA WRITE fails at the NIC
-instead of landing in the next owner's KV.
+Launch vLLM in a separate process:
 
-The backend stores KV chunkwise and needs `--enforce-eager` and
-`kv_load_failure_policy="recompute"`; {doc}`supported_models` lists the models
-and parallel settings it takes. It turns on
-`maru_async_load` and `maru_async_store` unless they are set: loads run
-between steps and stores after the forward, so an RDMA transfer that waits for
-a slow memory node does not hold up the engine, and asynchronous loads run with
-vLLM's asynchronous scheduling on. Asynchronous loads need vLLM 0.16 or later,
-and an explicit `maru_rdma_staging_size` must then hold two requests (one for
-loads, one for stores). Setting them to `false` runs loads and stores on the
-engine thread; synchronous loads also need `--no-async-scheduling`. With
-asynchronous stores the engine thread takes only a staging slot for a chunk,
-waiting on no lock and no network; the thread that sends the store gives each
-chunk its remote page, and a background thread asks for a new region or
-evicts before the free pages run out, so that thread rarely waits. RDMA
-transfers run outside the client's lock. The worker's staging buffer is
-registered with CUDA when supported. A built placement extension, a supported
-layout and suitable buffers are all needed for the packed copy path; otherwise
-transfers fall back to per-layer copies. Async settings do not make an
-unsupported layout use the packed kernel. NIXL is required; use the
-{ref}`matched NIXL stack <nixl-stack>` rather than selecting its version in
-isolation from the engine and Torch.
-See the [remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
-for one-host and multi-node launch steps.
+```bash
+vllm serve <model> --kv-transfer-config '{
+  "kv_connector": "MaruKVConnector",
+  "kv_connector_module_path": "maru_vllm",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "maru_node": "/run/maru/node.sock",
+    "maru_engine_id": "engine-1",
+    "maru_cache_namespace": "model-immutable-revision",
+    "maru_async_load": true
+  }
+}'
+```
 
-#### Transfer errors and worker recovery
+Choose a page size that holds the largest chunk or group object. Store capacity, page size, Catalog address and RDMA/write-hint settings belong to service JSON. The connector rejects its capacity, page-size, server-address and write-hint equivalents. `maru_engine_id` and `maru_cache_namespace` are required. The namespace must identify the exact immutable weights revision; the connector binds it to model and KV geometry. All ranks share the engine name and attach with separate TP and DP indices.
 
-A timeout or a native NIXL status-query error does not establish that the NIC
-has stopped accessing memory. Maru keeps the affected transfer handle and its
-staging slots registered until completion and handle release are confirmed.
-Other peers' completed or unposted READ slots are returned. Failed stores are
-not published, and failed loads follow the configured recompute policy.
+For remote storage, start `maru-memory-node --config memory.json` on the memory host and configure GPU `remote.url` and `key_file`. Workers READ and WRITE directly through their own registered staging. `staging_size` defaults to `max(1GiB, 64 * page_size)` per worker; `staging_max_bytes` defaults to that amount for the node. Increase the total for multiple workers. Remote nodes reject layerwise format and overlapped loads. Workers and the GPU service must share a PID namespace.
 
-Persistent native errors can retain those slots for the lifetime of the worker.
-Repeated errors can exhaust its staging capacity, causing stores to be skipped
-and loads to miss. Look for `RDMA READ not confirmed`, `RDMA WRITE not confirmed`
-and `RDMA transfers still own staging memory` in the worker log. Closing or
-reconnecting the Handler alone may leave the registered memory retained.
+Both node transfer defaults are `false`. Async scheduling automatically enables deferred loads; an explicit `maru_async_load=false` then requires `--no-async-scheduling`. TP>1 and multiple KV groups always require deferred loads. Store credit waits default to zero (`maru_credit_wait_ms`), and lookup timeout defaults to 100 ms (`maru_lookup_timeout_ms`). `maru_load_read_depth` defaults to 2 and must be at least 1.
 
-To recover capacity, stop and restart the entire vLLM engine that owns the
-affected worker. Confirm that its old worker processes have exited before
-starting replacements; terminating only the HTTP frontend is insufficient if
-the workers remain alive. The replacement creates a fresh NIXL agent and staging
-buffer. Retired regions can become cold misses, so allow recomputation and cache
-warm-up. Restarting only the memory-node agent does not establish that a live
-worker's uncertain transfers have been reclaimed. Do not force-return their
-slots or drop live RM holds to recover capacity. Safe automatic reclamation
-inside a running worker remains follow-up work.
+A full GPU-local store skips writes. Memory nodes evict unpinned keys through one shared LRU. Remote publication occurs only after memory-node COMMIT; read copies are not cached. Missing or stale data is recomputed. An in-progress READ can be joined only within its worker. Instance write registrations are revoked before uncertain pages are reused.
 
-#### Several memory nodes and pools
-
-**Shared pool.** Several memory nodes can share one CXL memory, as hosts on a
-CXL switch do. Each of them runs a remote CXL agent; maru-server takes all of
-them, with `--remote-cxl-agent` repeated or comma separated, and hands the list to
-the workers. Each region is served by one memory node, picked by a hash of the
-region number over that list, so the region's owner and its readers map it at
-the same node and move its KV through that node's NIC. The memory nodes use the
-same remote CXL agent key and the multi-host settings of
-{doc}`System Setup <../getting_started/bios_setup>`.
-
-![A shared pool of two memory nodes, each running a remote CXL agent. Each region is mapped by one node, the remote CXL agent m with the largest hash of m and the region number: node 1 maps R1 and R3, node 2 maps R2. The worker node of R2's owner maps R2 at memory node 2 and writes it by RDMA through that node; the worker node of a reader maps R2 at the same node and reads it by RDMA](../image/remote_cxl_shared_pool.png)
-
-**Several pools.** Each pool has its own maru-server. List them in
-`maru_server_url`, comma separated (`"tcp://10.0.0.2:5555,tcp://10.0.0.3:5555"`):
-the worker opens a storage session with each, and sends each request to one
-pool, picked by a hash of the request's first chunk key, so all chunks of a
-request stay in one pool. A pool whose maru-server does not answer when the
-worker starts only makes its prefixes miss; the worker connects to it once it
-answers.
+See {doc}`../design_doc/node_storage_service` for complete JSON examples, defaults and validation, {doc}`../design_doc/memory_node` for memory-node recovery, and {doc}`../getting_started/migrating_to_maru_node` for process, setting and support tables.
 
 ### Connector settings
+
+The deployment keys below describe `cxl`. Use the node configuration above for `maru_node`; its transfer knobs follow the store restrictions.
 
 Settings in `kv_connector_extra_config`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_server_url` | str | `tcp://localhost:5555` | MaruServer address; with `remote_cxl`, a comma-separated list, one maru-server per pool |
-| `maru_pool_size` | str/int | `1G` | CXL memory an engine gets at a time (`4G`, `500M`, etc.): its first allocation, and each further one when its memory is full; required with `remote_cxl`, where each allocation is one region |
+| `maru_server_url` | str | `tcp://localhost:5555` | `cxl` MaruServer address; node stores set `server` in service JSON |
+| `maru_pool_size` | str/int | `1G` | `cxl` allocation size; node stores set `size` in service JSON |
 | `maru_chunk_size` | str/int | `4M` | Maru page size (CXL allocation unit) |
 | `maru_instance_id` | str | auto | Unique instance ID (default: auto-generated UUID) |
 | `maru_eager_map` | bool | `true` | Pre-map other instances' CXL regions on connect |
@@ -456,8 +274,8 @@ Asynchronous transfer settings, all opt-in:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_async_load` | bool | `false` (`true` for `remote_cxl`, for models with several KV cache groups, and above TP=1) | Load cache hits on a background thread between steps instead of inside the forward pass |
-| `maru_async_store` | bool | `false` (`true` for `remote_cxl`) | Complete the store after the forward pass instead of on the last attention layer |
+| `maru_async_load` | bool | `false` (`true` for async scheduling on node stores, multiple KV groups and TP>1) | Load cache hits on a background thread between steps instead of inside the forward pass |
+| `maru_async_store` | bool | `false` | Complete the store after the forward pass instead of on the last attention layer |
 | `maru_overlap_load_with_compute` | bool | `false` | Overlap an async load's per-layer transfers with attention compute (either storage format) |
 | `maru_overlap_release_after_layers` | int | `1` | Layers that must be copied before an overlapped load is reported complete and vLLM may schedule the request; requires `maru_overlap_load_with_compute` |
 
@@ -467,20 +285,17 @@ Storage format — how a request's KV is grouped into CXL objects:
 |-----------|------|---------|-------------|
 | `maru_use_layerwise` | bool | `false` | `false` = chunkwise: one object per chunk holding every layer. `true` = layerwise: one object per (chunk, layer) |
 
-Diagnostics and fallback guards — leave these at their defaults in normal
-operation:
+Diagnostics and fallback guards — leave these at their defaults in normal operation:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `maru_pin_pools` | bool | `true` | `cpu` and `mixed`: fault the pools in and register them with CUDA when they open, unless a CPU pool is larger than the memory available; `false` keeps them pageable |
 | `maru_load_copy_ahead` | int | `2` | Chunk slabs a fallback load copies to the GPU ahead of its per-layer injects, on a side stream; `0` copies each slab in line. Each thread and stream that loads keeps this many slabs of GPU memory for the life of the worker, each `2 × layers × chunk tokens × KV hidden size × dtype size` (32 MiB for Llama 3.1 8B at 256-token chunks). They are allocated on the first load, after vLLM has sized its KV cache, so `gpu_memory_utilization` does not account for them |
 | `maru_load_admission_window` | int | `0` | Cap on asynchronous loads in flight; `0` submits all |
 | `maru_log_timing` | bool | `false` | Emit per-request CPU timing and request timeline logs to stderr |
 
 #### Renamed parameters
 
-These three knobs were renamed to name the axis a deployer chooses. The
-former names are still accepted and log a deprecation warning:
+These three knobs were renamed to name the axis a deployer chooses. The former names are still accepted and log a deprecation warning:
 
 | Former name | Current name |
 |-------------|--------------|
@@ -488,55 +303,27 @@ former names are still accepted and log a deprecation warning:
 | `maru_enable_write_behind` | `maru_async_store` |
 | `maru_enable_layerwise_overlap` | `maru_overlap_load_with_compute` |
 
-`maru_enable_async_loading` and `maru_enable_fused_load` were removed. They
-gated a load path that the packed storage layout never entered, and no
-measurement ever exercised it.
+`maru_enable_async_loading` and `maru_enable_fused_load` were removed. They gated a load path that the packed storage layout never entered, and no measurement ever exercised it.
 
 ### Asynchronous load and store
 
-By default both the cache-hit load and the populate store run to completion
-inside the model worker's forward pass. The two settings below move that work
-off the critical path; they are independent and can be enabled separately.
+By default both the cache-hit load and the populate store run to completion inside the model worker's forward pass. The two settings below move that work off the critical path; they are independent and can be enabled separately.
 
-`maru_async_load` parks a cache-hit request while a background thread
-performs the Maru lookup and the CXL→GPU transfer, then reports completion
-through a CUDA event. The forward pass no longer waits on the retrieve RPC.
-This is the mechanism vLLM itself calls an asynchronous load: the request
-waits in `WAITING_FOR_REMOTE_KVS`.
+`maru_async_load` parks a cache-hit request while a background thread performs the Maru lookup and the CXL→GPU transfer, then reports completion through a CUDA event. The forward pass no longer waits on the retrieve RPC. This is the mechanism vLLM itself calls an asynchronous load: the request waits in `WAITING_FOR_REMOTE_KVS`.
 
-A parked request initially holds blocks for its loaded prefix. It needs room
-for the rest of its prompt and any speculative lookahead before it can run.
-On vLLM < 0.23, Maru budgets this full requirement for parked requests and
-earlier waiters, capped at the model's maximum length. A request that does not
-fit stays in `WAITING` and keeps its place until vLLM gives it blocks. The
-first request in line is admitted on its own; vLLM sizes the cache to fit one
-maximum-length request.
+A parked request initially holds blocks for its loaded prefix. It needs room for the rest of its prompt and any speculative lookahead before it can run. On vLLM < 0.23, Maru budgets this full requirement for parked requests and earlier waiters, capped at the model's maximum length. A request that does not fit stays in `WAITING` and keeps its place until vLLM gives it blocks. The first request in line is admitted on its own; vLLM sizes the cache to fit one maximum-length request.
 
-On vLLM 0.23+ without speculative lookahead, Maru uses vLLM's reservation for
-in-flight prefills without adding its own block budget. This allows loads to
-overlap when their initial allocations fit, even if their complete prompts
-would not all fit at once. With speculative lookahead (for example, draft-model
-or EAGLE decoding), Maru retains its budget: the upstream reservation counts
-prompt tails but can leave too little room for the oldest request's lookahead.
-Methods without lookahead slots, such as ngram, use the ordinary version rule.
-vLLM 0.31+ reserves the draft slots of every speculative method itself, so a
-load Maru admits can still wait for vLLM's own reservation.
+On vLLM 0.23+ without speculative lookahead, Maru uses vLLM's reservation for in-flight prefills without adding its own block budget. This allows loads to overlap when their initial allocations fit, even if their complete prompts would not all fit at once. With speculative lookahead (for example, draft-model or EAGLE decoding), Maru retains its budget: the upstream reservation counts prompt tails but can leave too little room for the oldest request's lookahead. Methods without lookahead slots, such as ngram, use the ordinary version rule. vLLM 0.31+ reserves the draft slots of every speculative method itself, so a load Maru admits can still wait for vLLM's own reservation.
 
-This budget counts GPU blocks; `maru_load_admission_window` below counts loads
-in flight.
+This budget counts GPU blocks; `maru_load_admission_window` below counts loads in flight.
 
-`maru_async_store` lets the store finish after the forward pass returns, so
-the first token of the current step is not delayed by the GPU→CXL copy and
-the metadata registration.
+`maru_async_store` lets the store finish after the forward pass returns, so the first token of the current step is not delayed by the GPU→CXL copy and the metadata registration.
 
-`maru_load_admission_window` bounds how many asynchronous loads may be in
-flight at once. The default `0` submits every load immediately. Set a
-positive value only if you need request-level backpressure.
+`maru_load_admission_window` bounds how many asynchronous loads may be in flight at once. The default `0` submits every load immediately. Set a positive value only if you need request-level backpressure.
 
 ### Storage granularity and overlap
 
-`maru_use_layerwise` selects how a request's KV is grouped into CXL objects.
-The two layouts differ throughout the store and load paths:
+`maru_use_layerwise` selects how a request's KV is grouped into CXL objects. The two layouts differ throughout the store and load paths:
 
 | | chunkwise (`false`, default) | layerwise (`true`) |
 |---|---|---|
@@ -548,78 +335,30 @@ The two layouts differ throughout the store and load paths:
 | Store | one gathered D2H per chunk | one write per layer |
 | Load | whole slab per chunk, contiguous pages coalesced | one retrieve per (layer, chunk) |
 
-The key count is the practical difference: layerwise resolves one key per
-(chunk, layer) instead of one per chunk, so both the key count and the
-retrieve metadata RPC volume grow by the model's layer count. Chunkwise is
-the default for that reason; layerwise remains available for deployments that
-need per-layer object granularity.
+The key count is the practical difference: layerwise resolves one key per (chunk, layer) instead of one per chunk, so both the key count and the retrieve metadata RPC volume grow by the model's layer count. Chunkwise is the default for that reason; layerwise remains available for deployments that need per-layer object granularity.
 
-Both layouts store MLA models. A chunkwise MLA object holds one latent plane
-per layer where other models hold a K and a V plane, and moves through the
-per-layer copies rather than the gather kernel.
+Both layouts store MLA models. A chunkwise MLA object holds one latent plane per layer where other models hold a K and a V plane, and moves through the per-layer copies rather than the gather kernel.
 
-`maru_overlap_load_with_compute` works with either storage layout and
-requires `maru_async_load`; it pipelines a request's per-layer transfers
-against attention compute. Under the chunkwise layout each layer is sliced
-out of the chunkwise slabs; under the layerwise layout each layer's own chunk
-objects are gathered directly. Every (chunk, layer) key is still resolved
-before the request is released, so the layerwise layout pays its full
-metadata RPC volume up front — only the transfers overlap compute. The
-connector logs a warning and disables the knob when `maru_async_load` is
-off.
+`maru_overlap_load_with_compute` works with either storage layout and requires `maru_async_load`; it pipelines a request's per-layer transfers against attention compute. Under the chunkwise layout each layer is sliced out of the chunkwise slabs; under the layerwise layout each layer's own chunk objects are gathered directly. Every (chunk, layer) key is still resolved before the request is released, so the layerwise layout pays its full metadata RPC volume up front — only the transfers overlap compute. The connector logs a warning and disables the knob when `maru_async_load` is off.
 
 ![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
-The loader thread queues the per-layer copies while the request is still
-parked. The load is reported complete — which is what lets vLLM schedule the
-request — once `maru_overlap_release_after_layers` of them have landed, one
-layer by default, so the request's prefill compute runs while the remaining
-layers arrive rather than after them.
-A cache-hit request computes only the tokens left over past its cached chunks,
-so one layer of compute is shorter than one layer of transfer: the compute
-fits inside the transfer and the transfer time is what sets time to first
-token. All parked-request transfers share one stream. That keeps each at full
-CXL bandwidth — splitting them across streams makes each transfer take as many
-times longer as there are loading requests, raising that floor — and it means
-a later request's first layer only lands once the earlier one has finished, so
-requests take their turn without any extra admission mechanism.
+The loader thread queues the per-layer copies while the request is still parked. The load is reported complete — which is what lets vLLM schedule the request — once `maru_overlap_release_after_layers` of them have landed, one layer by default, so the request's prefill compute runs while the remaining layers arrive rather than after them. A cache-hit request computes only the tokens left over past its cached chunks, so one layer of compute is shorter than one layer of transfer: the compute fits inside the transfer and the transfer time is what sets time to first token. All parked-request transfers share one stream. That keeps each at full CXL bandwidth — splitting them across streams makes each transfer take as many times longer as there are loading requests, raising that floor — and it means a later request's first layer only lands once the earlier one has finished, so requests take their turn without any extra admission mechanism.
 
-The knob therefore applies at any concurrency. On a 16k prompt it lowered
-cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and
-raised throughput throughout; per-token generation time rose 4-5% at 4 and 8
-concurrent requests, which is the cost of every request starting earlier.
+The knob therefore applies at any concurrency. On a 16k prompt it lowered cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and raised throughput throughout; per-token generation time rose 4-5% at 4 and 8 concurrent requests, which is the cost of every request starting earlier.
 
 #### Choosing the release point
 
-`maru_overlap_release_after_layers` sets how many layers must be copied
-before the load is reported complete. The layers still in flight at that
-point are waited for inside the request's own forward pass, and those waits
-are taken on the model stream, which carries the whole batched step — so
-reporting early charges one request's remaining load time to every request
-scheduled alongside it.
+`maru_overlap_release_after_layers` sets how many layers must be copied before the load is reported complete. The layers still in flight at that point are waited for inside the request's own forward pass, and those waits are taken on the model stream, which carries the whole batched step — so reporting early charges one request's remaining load time to every request scheduled alongside it.
 
-Waiting for more layers first keeps that cost out of the batch: while the
-request is unscheduled it is the only thing waiting on its own load. It does
-not delay the request's own first token either, which needs the last layer no
-matter when the request was scheduled — the hold is free while it stays inside
-the delay the scheduler takes to re-admit the request anyway, and only past
-that does the count begin costing time to first token.
+Waiting for more layers first keeps that cost out of the batch: while the request is unscheduled it is the only thing waiting on its own load. It does not delay the request's own first token either, which needs the last layer no matter when the request was scheduled — the hold is free while it stays inside the delay the scheduler takes to re-admit the request anyway, and only past that does the count begin costing time to first token.
 
-Which way to err depends on whether a layer's copy or a layer's compute takes
-longer:
+Which way to err depends on whether a layer's copy or a layer's compute takes longer:
 
-- **Compute slower than the copy** — the forward pass never catches up, there
-  is nothing left to wait on, and the default of `1` is already right.
-- **Copy slower than compute** — the forward pass catches up almost at once
-  and blocks on layers still in flight. Raising the count trades those blocks
-  away.
+- **Compute slower than the copy** — the forward pass never catches up, there is nothing left to wait on, and the default of `1` is already right.
+- **Copy slower than compute** — the forward pass catches up almost at once and blocks on layers still in flight. Raising the count trades those blocks away.
 
-Longer prompts and more concurrent loads both push a deployment toward the
-second case. The value is an absolute layer count, not a fraction of model
-depth, so one tuned on a 32-layer model does not carry to an 80-layer one,
-and a value at or above a model's KV-layer count reports the load only after
-the last layer — the overlap turned off in all but name. Sweep it per
-deployment.
+Longer prompts and more concurrent loads both push a deployment toward the second case. The value is an absolute layer count, not a fraction of model depth, so one tuned on a 32-layer model does not carry to an 80-layer one, and a value at or above a model's KV-layer count reports the load only after the last layer — the overlap turned off in all but name. Sweep it per deployment.
 
 ```bash
 vllm serve <model> \
@@ -637,12 +376,7 @@ vllm serve <model> \
     }'
 ```
 
-The count is read only by the overlap path, so `maru_overlap_load_with_compute`
-must be on for it to mean anything — along with the overlap's own
-prerequisite, `maru_async_load` enabled. Either storage format can use the
-overlap, so `maru_use_layerwise` does not constrain this count. Raising the
-count on its own changes nothing; the connector logs a warning saying so, and
-a separate warning if the overlap was requested but its prerequisite is unmet.
+The count is read only by the overlap path, so `maru_overlap_load_with_compute` must be on for it to mean anything — along with the overlap's own prerequisite, `maru_async_load` enabled. Either storage format can use the overlap, so `maru_use_layerwise` does not constrain this count. Raising the count on its own changes nothing; the connector logs a warning saying so, and a separate warning if the overlap was requested but its prerequisite is unmet.
 
 ### maru_kv_chunk_tokens
 
@@ -655,13 +389,7 @@ Controls how many tokens per chunk when storing KV cache:
 
 ### maru_pool_size
 
-CXL memory an instance gets at a time: its first allocation, and each further
-one when its memory is full. The `cxl` and `remote_cxl` backends use it the same
-way; with `remote_cxl` each allocation is one region. (`cpu` and `mixed` take
-fixed budgets instead: `maru_cpu_pool_size`, `maru_cxl_pool_size`.) The estimate
-below sizes one allocation. Under tensor parallelism it applies to each rank
-that stores, and `num_kv_heads` is one rank's share: the model's KV heads
-divided by the TP size, and at least 1 (see {ref}`vllm-tensor-parallelism`):
+For `cxl`, memory an instance gets at a time: its first allocation and each expansion when full. Node stores instead use service `size`; remote capacity belongs to the memory node. The estimate below sizes one `cxl` allocation. Under TP it applies to each rank that stores, and `num_kv_heads` is one rank's share: the model's KV heads divided by the TP size, and at least 1 (see {ref}`vllm-tensor-parallelism`):
 
 ```
 pool_size ≈ num_layers × kv_head_dim × num_kv_heads × 2(K+V) × max_cached_tokens × dtype_bytes
@@ -673,14 +401,10 @@ Example (Llama 7B, fp16):
 ```
 
 (vllm-tensor-parallelism)=
+
 ## Tensor parallelism
 
-The CXL and remote_cxl backends support tensor parallelism for the KV cache
-structures listed in {ref}`Supported Models <vllm-model-support>`. vLLM starts
-one connector per TP worker, and each worker stores and loads only the KV it
-holds. Every rank hashes a prompt to the same chunk keys, so a key must also
-name the slice: if all ranks registered their heads under one key, the server
-would keep the first and every other rank would load heads that are not its own.
+The `cxl` and node paths support tensor parallelism for the KV cache structures listed in {ref}`Supported Models <vllm-model-support>`. vLLM starts one connector per TP worker, and each worker stores and loads only the KV it holds. Every rank hashes a prompt to the same chunk keys, so a key must also name the slice: if all ranks registered their heads under one key, the server would keep the first and every other rank would load heads that are not its own.
 
 Chunk keys therefore name a slice by what it holds:
 
@@ -690,106 +414,30 @@ Chunk keys therefore name a slice by what it holds:
 | KV heads `[a, b)` | `kv_<hash>_h<a>-<b>` | Llama-3.1-8B (8 KV heads) at TP=2: `_h0-4` on rank 0, `_h4-8` on rank 1 |
 | Rank `r`'s part of a slice named by rank: each Mamba-type state, and the attention KV of sliding-window and full layers when TP exceeds the KV heads (below) | `kv_<hash>_tp<TP>_r<r>`, then `_c<chunk_tokens>_g<group_id>` with several KV cache groups | Qwen3.5-0.8B at TP=2: `_tp2_r0_c544_g0` on rank 0 |
 
-The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the
-slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`)
-appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by
-`_b<block_size>`, since its objects keep vLLM's block layout (see
-{ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full
-or sliding window, as above: Qwen3.5-0.8B at TP=2 stores
-`kv_<hash>_h0-1_c544_g3` on rank 0.
+The layerwise format appends its `_L<layer>` and `_DONE` suffixes after the slice. A model with several KV cache groups (see {ref}`vllm-hybrid-models`) appends `_c<chunk_tokens>_g<group_id>`, followed for an MLA group by `_b<block_size>`, since its objects keep vLLM's block layout (see {ref}`vllm-deepseek-v41`). It names the KV heads of each attention group, full or sliding window, as above: Qwen3.5-0.8B at TP=2 stores `kv_<hash>_h0-1_c544_g3` on rank 0.
 
-Ranks that hold identical KV share one slice name: the MLA latent, and the
-heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads
-at TP=8 put each head on two ranks). The lowest of those ranks stores the
-slice and the others only load it. A Mamba-type state is named by rank
-instead: vLLM divides every state evenly over the ranks, and a rank's Gated
-DeltaNet conv state gathers its share of the q, k and v channels, which no
-head range describes. No two ranks hold the same part, so every rank stores
-its own, including a rank that only loads replicated heads. A model with
-several attention groups, such as gpt-oss, names its attention KV by rank as
-well at a tensor parallel size above its KV heads: vLLM then replicates each
-group's heads by that group's own count, which the connector cannot tell
-from the model's. Every rank then stores its own copy of its heads. So does
-a model whose sliding-window and full-attention layers vLLM keeps in one
-group, as it does with its hybrid KV cache manager off
-(`--disable-hybrid-kv-cache-manager`, or vLLM before 0.30): one rank's object
-holds both kinds of layer, and two ranks that share a full-attention head can
-hold different sliding-window heads.
+Ranks that hold identical KV share one slice name: the MLA latent, and the heads vLLM replicates when there are more TP ranks than KV heads (4 KV heads at TP=8 put each head on two ranks). The lowest of those ranks stores the slice and the others only load it. A Mamba-type state is named by rank instead: vLLM divides every state evenly over the ranks, and a rank's Gated DeltaNet conv state gathers its share of the q, k and v channels, which no head range describes. No two ranks hold the same part, so every rank stores its own, including a rank that only loads replicated heads. A model with several attention groups, such as gpt-oss, names its attention KV by rank as well at a tensor parallel size above its KV heads: vLLM then replicates each group's heads by that group's own count, which the connector cannot tell from the model's. Every rank then stores its own copy of its heads. So does a model whose sliding-window and full-attention layers vLLM keeps in one group, as it does with its hybrid KV cache manager off (`--disable-hybrid-kv-cache-manager`, or vLLM before 0.30): one rank's object holds both kinds of layer, and two ranks that share a full-attention head can hold different sliding-window heads.
 
-Because keys name heads rather than ranks, engines of different TP sizes
-share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and
-TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A
-slice is never read as a different set of heads. Mamba-type states differ
-for every TP size, so a model with such a group hits only on chunks that an
-engine of the same TP size stored. On the remote_cxl backend engines of
-different TP sizes share nothing: the TP size enters the cache namespace, as
-maru-server lets the sessions of a namespace read each other's regions only
-when their objects have one size and layout.
+Because keys name heads rather than ranks, engines of different TP sizes share exactly the slices that hold the same heads. With 8 KV heads, TP=8 and TP=16 engines share every slice, while TP=2 and TP=4 engines share none. A slice is never read as a different set of heads. Mamba-type states differ for every TP size, so a model with such a group hits only on chunks that an engine of the same TP size stored. On the node path, the namespace includes TP size, so engines of different TP sizes do not share keys.
 
-The scheduler reports a chunk as cached only when every slice that the hit
-needs is stored, so no rank is asked to load a slice the lookup did not
-find. It has no rank of its own, but it knows the TP size and the model's KV
-heads, so it lists every slice itself and checks all of them in one
-`batch_exists`.
+The scheduler reports a chunk as cached only when every slice that the hit needs is stored, so no rank is asked to load a slice the lookup did not find. It has no rank of its own, but it knows the TP size and the model's KV heads, so it lists every slice itself and checks all of them in one `batch_exists`.
 
-The ranks do not talk to each other. vLLM sends every worker the same
-metadata and treats a load or store as finished only once every worker
-reports it. A load that fails on any rank is handled for the whole request by
-`kv_load_failure_policy`: under vLLM's default `"fail"` the request fails;
-under `"recompute"` vLLM recomputes it from the first block any worker
-reports as failed, or from its first token for a model with several KV cache
-groups (see {ref}`vllm-load-failures`).
+The ranks do not talk to each other. vLLM sends every worker the same metadata and treats a load or store as finished only once every worker reports it. A load that fails on any rank is handled for the whole request by `kv_load_failure_policy`: under vLLM's default `"fail"` the request fails; under `"recompute"` vLLM recomputes it from the first block any worker reports as failed, or from its first token for a model with several KV cache groups (see {ref}`vllm-load-failures`).
 
-Above TP=1 every load is parked (`maru_async_load=true`, which needs vLLM
-0.16+). The connector turns it on unless it is set, and refuses
-`maru_async_load=false`. A parked load finishes on every rank, and vLLM
-merges every rank's result, before the request computes. An inline load runs
-in the step that computes its request, and a rank whose load fails is the
-only one that knows: the all-reduce in every layer would spread its unfilled
-KV to every rank, and the other ranks would store what they computed from it
-([#135](https://github.com/xcena-dev/maru/issues/135)). For the same reason, a
-layerwise-overlap load (`maru_overlap_load_with_compute`) whose per-layer
-copies the loader thread cannot queue fails while the request is parked,
-instead of having the forward issue them as it does at TP=1.
+Above TP=1 every load is parked (`maru_async_load=true`, which needs vLLM 0.16+). The connector turns it on unless it is set, and refuses `maru_async_load=false`. A parked load finishes on every rank, and vLLM merges every rank's result, before the request computes. An inline load runs in the step that computes its request, and a rank whose load fails is the only one that knows: the all-reduce in every layer would spread its unfilled KV to every rank, and the other ranks would store what they computed from it ([#135](https://github.com/xcena-dev/maru/issues/135)). For the same reason, a layerwise-overlap load (`maru_overlap_load_with_compute`) whose per-layer copies the loader thread cannot queue fails while the request is parked, instead of having the forward issue them as it does at TP=1.
 
 Each worker process connects its own MaruHandler:
 
-- `maru_pool_size` applies to each TP rank that stores. Without replicated KV
-  heads a rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as
-  many tokens as a single TP=1 worker with `P`. A rank that only loads
-  replicated heads or an MLA latent stores none of them, only its own part of
-  each Mamba-type state. A rank that stores nothing at all, such as every
-  rank but rank 0 of an MLA model, takes one page when it connects instead of
-  `maru_pool_size`.
-- A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server
-  sees each rank as its own owner. With data parallelism, replica `d` > 0
-  adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving
-  the id unset already gives every process its own UUID.
-- On the remote_cxl backend each rank opens its own storage session, with
-  its own RDMA staging buffer, and `maru_engine_id` becomes
-  `<id>-tp<rank>` (`<id>-dp<d>-tp<rank>` on replica `d` > 0) the same way:
-  maru-server keeps one open session per engine id. Every session of the
-  namespace reads the regions of the others, so a rank that only loads
-  replicated heads reads them from the rank that stored them, and a replica
-  reads what the other replicas stored. The scheduler looks keys up as rank
-  0's session of its replica (`<id>-tp0`, or `<id>-dp<d>-tp0`).
+- `maru_pool_size` applies to each TP rank that stores. Without replicated KV heads a rank stores 1/TP of every chunk, so ranks with `P / TP` each hold as many tokens as a single TP=1 worker with `P`. A rank that only loads replicated heads or an MLA latent stores none of them, only its own part of each Mamba-type state. A rank that stores nothing at all, such as every rank but rank 0 of an MLA model, takes one page when it connects instead of `maru_pool_size`.
+- A configured `maru_instance_id` becomes `<id>-tp<rank>`, so that the server sees each rank as its own owner. With data parallelism, replica `d` > 0 adds its index, as `<id>-dp<d>-tp<rank>` (`<id>-dp<d>` at TP=1). Leaving the id unset already gives every process its own UUID.
+- On the node path, ranks share `maru_engine_id` and attach with their TP rank and DP index. Remote workers each have dedicated staging; all ranks of one vLLM instance share its memory-node write domain.
 
-Under TP the scheduler's process loads no model, and a model can change its
-config where a worker loads it, as vLLM's Transformers backend does with the
-dtype. So on the remote_cxl backend the scheduler looks keys up in the cache
-namespace that the workers report through vLLM's KV connector handshake.
-vLLM's `MultiConnector` passes the first handshake that any sub-connector
-returns to all of them, and `NixlConnector` refuses any but its own: above
-TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps
-the namespace it computes itself, and a model that changes its config where
-the workers load it misses every lookup.
+Under TP the scheduler's process loads no model, and a model can change its config where a worker loads it, as vLLM's Transformers backend does with the dtype. On the node path the scheduler looks keys up in the cache namespace that the workers report through vLLM's KV connector handshake. vLLM's `MultiConnector` passes the first handshake that any sub-connector returns to all of them, and `NixlConnector` refuses any but its own: above TP=1, list `MaruKVConnector` after `NixlConnector`. The scheduler then keeps the namespace it computes itself, and a model that changes its config where the workers load it misses every lookup.
 
-Pipeline parallelism and decode or prefill context parallelism are refused at
-startup: a pipeline stage would have to address its layers locally in the
-slab and the placement kernel, which index them globally. The CPU and mixed
-backends still require TP=1.
+Pipeline parallelism and decode or prefill context parallelism are refused at startup: a pipeline stage would have to address its layers locally in the slab and the placement kernel, which index them globally.
 
 (vllm-hybrid-models)=
+
 ## Hybrid models
 
 vLLM puts layers that keep different kinds of KV cache into separate KV cache groups, for example sliding-window and full-attention layers, or Gated DeltaNet (Mamba-type) and full-attention layers. On vLLM 0.30+ the connector stores each group's part of a chunk as its own CXL object, keyed `<chunk_key>_c<chunk_tokens>_g<group_id>`, and reports a hit only for chunks that every group can resume from. A model with one group is stored as before.
@@ -802,14 +450,14 @@ The key names the chunk length because a chunk key hashes the prompt only up to 
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1.
+- Use `cxl` (the default) or `maru_node`. Remote nodes require chunkwise storage and reject overlap.
 - `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
 - Speculative decoding is off.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
-- `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
+- On `cxl`, `maru_chunk_size`, if set, holds the largest (chunk, group) object. On node stores, service `page_size` must hold it.
 - Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
 
 ```bash
@@ -837,6 +485,7 @@ vllm serve Qwen/Qwen3.5-0.8B \
 - **CXL space.** All groups share one pool and one page size, that of the largest (chunk, group) object. A chunk takes one page per attention group, plus one page per Mamba-type group at chunks where a prefill step ended. For gpt-oss-20b that is two 12-layer pages instead of one 24-layer page, so `maru_pool_size` estimates stay about the same. For Qwen3.5-0.8B a step-end chunk takes four pages, because its three Gated DeltaNet groups hold three times the chunk's attention KV; other chunks take one.
 
 (vllm-deepseek-v41)=
+
 ### DeepSeek-V4.1-Flash
 
 Use vLLM 0.33.0. On SM120 GPUs such as the RTX PRO 6000, vLLM 0.33.0 cannot start the model without [vllm-project/vllm#65356](https://github.com/vllm-project/vllm/pull/65356).
@@ -847,7 +496,7 @@ vLLM splits the model's KV cache into several groups, how many depending on the 
 - **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
 - **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
 
-Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding, which runs the DSpark draft layers in the model's checkpoint, is not supported yet, as for any model with several groups.
+Both formats work on `cxl` and node-local stores; remote stores use chunkwise format. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding, which runs the DSpark draft layers in the model's checkpoint, is unsupported, as for any model with several groups.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
@@ -865,6 +514,7 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 ```
 
 (vllm-load-failures)=
+
 ### Load failures
 
 vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load fails:
@@ -872,23 +522,26 @@ vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load 
 - `fail` (vLLM's default) ends the request with an error.
 - `recompute` computes the request again; with several groups vLLM restarts it from the first token.
 
-With several groups every load is parked, and Maru reports a failed parked load by its request. An inline load could be reported only by its blocks: vLLM 0.31 and later stop the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group ([#126](https://github.com/xcena-dev/maru/issues/126)), and under `recompute` vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)). The connector therefore turns `maru_async_load` on for such a model and refuses `maru_async_load=false`. Upstream changes that would allow inline loads again are tracked in [#127](https://github.com/xcena-dev/maru/issues/127).
+With several groups every load is parked, and Maru reports a failed parked load by its request. An inline load could be reported only by its blocks: vLLM 0.31 and later stop the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group ([#126](https://github.com/xcena-dev/maru/issues/126)), and under `recompute` vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)). The connector therefore turns `maru_async_load` on for such a model and refuses `maru_async_load=false`.
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
 A CUDA error from a GPU copy of a load or a store, or from recording, waiting on or querying a stream or event queued after it (with `maru_log_timing`, the timing events too), stops the worker: such a copy may still be running, and vLLM would reuse the blocks it writes or reads. The connector call that met the error raises, or else the next one vLLM makes, and vLLM fails the engine. The load is not reported as failed. An error that is not a CUDA error, such as running out of GPU memory, a rejected cache layout or a miss, does not stop the worker. Depending on the path, a load is reported and recomputed or falls back to another way of loading, a store skips the chunk, or the error propagates out of the hook.
 
-A load that fails after some of its copies were queued is reported only once those copies have ended: until then vLLM gets neither its failed blocks nor its completion. Copies queued on the forward's own stream are the exception: those of loads without the placement kernel on `cpu`, `mixed` and `remote_cxl` (on `remote_cxl`, for example an MLA model or a staging buffer CUDA could not register), of loads under `maru_use_layerwise` that are inline or whose layers span several devices, and of layerwise-overlap loads whose layers span several devices. Such a failure is reported at once, as those copies are already ordered before vLLM's recompute on that stream.
+A load that fails after copies were queued is reported only after those copies end. Copies already ordered on the forward's stream can be reported immediately because recomputation follows them on that stream. Read results, source pins and staging remain owned until their consumers finish.
 
-Once the worker has seen the stop it issues no new read, copy, store or hint, also at shutdown. A call already past that check finishes its one issue, and what that issue uses is kept. The worker gives nothing back: it frees, releases and closes nothing a copy may still use, even if a later wait succeeds. For a load that is its CXL views or storage-session read leases (on `remote_cxl`, staging slots) and the device buffers in use at the failure; for a store, its pages, the device staging and the requests' GPU blocks, so a write-behind store's requests never finish. A per-copy device buffer released before the failure has gone back to PyTorch's caching allocator, which reuses it only after the copies queued before it on its stream. The Handler stays open. All of it stays held until the process ends. A synchronous store whose copies cannot be confirmed registers none of their objects and raises in that step, and so does a preemption while store copies may still read the preempted request's blocks. To recover, restart the whole vLLM engine and confirm its old worker processes have exited, as after persistent RDMA transfer errors.
+Once stopped by a CUDA error, a worker issues no new read, copy, store or hint, including during shutdown. It returns no resources that a copy may still use, even if a later wait succeeds. Store pages, read views or staging, GPU buffers and affected request blocks remain held until process exit. A synchronous store with unconfirmed copies publishes no objects and raises. Restart the complete vLLM instance and verify its old workers have exited.
+
+Remote RDMA failure produces a MISS or skipped store. Unknown or failed transfers keep staging out of reuse; memory nodes revoke the instance's write registration before reclaiming uncertain writes. A timeout alone is not a fence. Persistent errors require the same full-instance restart. See {doc}`../design_doc/node_storage_service`.
 
 (vllm-hybrid-one-group)=
+
 ### Running a hybrid model as one group
 
 A model whose extra groups are sliding-window or chunked-local attention can run as one KV cache group with `--disable-hybrid-kv-cache-manager`; the connector's refusal messages suggest it. vLLM then keeps those layers' KV for every token, as for full attention, and Maru stores the model as it stores any one-group model. Mamba-type groups cannot be merged this way. This path is tested with gpt-oss, not with Llama 4.
 
 - If some layers use a sliding window and others do not, as in gpt-oss, FlashInfer (vLLM 0.30's choice for gpt-oss on Blackwell) refuses the single group. Add `--attention-backend TRITON_ATTN`.
-- On vLLM 0.30 a one-group model stores each miss layer by layer during the forward, which is much slower than the several-group store. For gpt-oss-20b with TRITON_ATTN (2,100-token prompts, 8 concurrent requests, vLLM prefix caching off, one RTX PRO 6000), mean miss TTFT was 3.3 s as one group and 0.44 s as several groups, against 0.31 s without Maru ([#113](https://github.com/xcena-dev/maru/issues/113)).
+- On vLLM 0.30 a one-group model stores misses layer by layer during the forward; several-group storage runs after the forward.
 
 ## Comparison with LMCache Path
 
@@ -899,7 +552,7 @@ A model whose extra groups are sliding-window or chunked-local attention can run
 | Serialization | LMCache MemoryObj conversion | torch tensor ↔ bytes direct |
 | Prefix matching | LMCache CacheEngineKey hashing | vLLM token prefix hashing |
 | Configuration | LMCACHE_CONFIG_FILE YAML | kv_connector_extra_config JSON |
-| Storage backends | `cxl` | `cxl`, `cpu`, `mixed`, `remote_cxl` |
+| Storage paths | `cxl` | `cxl`, `maru_node` (`dram`, `local_cxl`, `remote`) |
 | Save path (`cxl` backend) | GPU → CPU → bytes → alloc + memcpy → CXL | GPU → CXL (single DMA via alloc) |
 | Load path (`cxl` backend) | CXL → clone → CPU → GPU | CXL → GPU (single DMA, pinned) |
 
@@ -937,19 +590,13 @@ TypeError: Got unsupported ScalarType BFloat16
 RuntimeError: can't convert bfloat16 to numpy
 ```
 
-BFloat16 models (e.g., Llama 3) fail with numpy-based serialization because numpy
-has no bfloat16 dtype. The connector handles this by using `torch.Tensor.contiguous()`
-and raw byte views instead of `.numpy()`. If you see this error, ensure you are using
-the connector from this PR or later — older versions may use numpy conversion paths.
+BFloat16 models (e.g., Llama 3) fail with numpy-based serialization because numpy has no bfloat16 dtype. The connector handles this by using `torch.Tensor.contiguous()` and raw byte views instead of `.numpy()`. If you see this error, ensure you are using the connector from this PR or later — older versions may use numpy conversion paths.
 
 ### Garbage Output on Second Instance
 
-KV cache data corruption usually means chunks were concatenated as 1D bytes
-instead of being injected per-chunk. Ensure per-chunk injection is used
-(the current connector handles this correctly).
+KV cache data corruption usually means chunks were concatenated as 1D bytes instead of being injected per-chunk. Ensure per-chunk injection is used (the current connector handles this correctly).
 
-For runnable examples, see
-[vLLM Examples](../getting_started/examples/vllm/index.md).
+For runnable examples, see [vLLM Examples](../getting_started/examples/vllm/index.md).
 
 > **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
 > [MaruHandler Design](../design_doc/maru_handler.md),

@@ -4,21 +4,9 @@ This document describes how to build and install Maru.
 
 ## System Components
 
-Maru consists of two server components and a client library. A deployment with GPU nodes without CXL (the `remote_cxl` backend) adds a remote CXL agent on each memory node:
+Node deployments run one Catalog (`maru-node-server`), a GPU-host service (`maru-storage`) and vLLM workers. A remote store adds `maru-memory-node`, which owns DRAM or local CXL and its RDMA registrations. The Resource Manager is needed for CXL stores, not for DRAM.
 
-| Component | Role | Package |
-|-----------|------|---------|
-| **Resource Manager** | Manages the CXL memory of a memory pool | `maru-resource-manager` (C++) |
-| **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
-| **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
-| **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |
-
-In a single-node setup, all components run on the same machine. In a multi-node setup, designate one node as the orchestrator to run the Resource Manager and Metadata Server. Other nodes run LLM instances with MaruHandler. With the default `cxl` backend, MaruHandler connects to both the Resource Manager and Metadata Server over the network. With the `remote_cxl` backend, it connects to the Metadata Server and to the remote CXL agent of each memory node instead; the remote CXL agents reach the Resource Manager, which runs on a memory node.
-
-The native worker-private `cpu` backend is different: `maru-server --cpu-only`
-needs neither CXL nor the Resource Manager. `mixed` needs local CXL and CPU
-pools. Use the {doc}`quick-start path selection <quick_start>` before applying
-the CXL/RDMA platform-service instructions below.
+The `cxl` backend uses `maru-server`, the Resource Manager and CXL-attached clients. LMCache and SGLang use this directly mapped path. See {doc}`quick_start` to choose a path and {doc}`../design_doc/node_storage_service` for node configuration.
 
 ## Prerequisites
 
@@ -28,9 +16,8 @@ the CXL/RDMA platform-service instructions below.
 - cmake: 3.28.3+
 - git
 - [uv](https://docs.astral.sh/uv/) — recommended Python package installer
-- CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
-  - **Multi-node:** All nodes that share the pool over CXL must be connected to the shared CXL memory pool (e.g., via CXL switch). GPU nodes without CXL reach it over RDMA instead (`remote_cxl` backend).
-- For `remote_cxl`: an RDMA NIC on every worker and memory node, a route from maru-server to the memory-node agents, and a compatible NIXL stack before `./install.sh` (see {ref}`nixl-stack`)
+- For CXL stores: a CXL DAX device (`/dev/dax*`) or emulation environment on hosts that map the memory
+- For remote stores: an RDMA NIC and compatible NIXL/UCX runtime on GPU workers and memory nodes
 
 See {doc}`bios_setup` for platform BIOS settings and DEV_DAX verification, and {doc}`../design_doc/consistency_and_safety` for the cache-visibility requirements of cross-host sharing.
 
@@ -48,6 +35,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 <br/>
 
 ## 1. Installation from Source Code
+
 ### 1.1 Getting the Source
 The Maru source code for released versions can be obtained from our GitHub repository: [https://github.com/xcena-dev/maru](https://github.com/xcena-dev/maru)
 ```bash
@@ -70,30 +58,16 @@ source .venv/bin/activate
 > interpreter satisfying `requires-python >= 3.12`.
 
 (nixl-stack)=
+
 #### NIXL stack
 
-For `remote_cxl`, select the engine, Torch, CUDA and NIXL wheels together.
-Installing the latest NIXL alone does not validate the serving stack. From
-the Maru source root, the provided **vLLM 0.22.1 / Torch 2.11.0 / CUDA 13**
-example uses this command on GPU workers:
+For a node remote store, install compatible NIXL, Torch and CUDA runtimes on GPU workers and memory nodes. Maru requires NIXL `>=1.2.0,<2` with its public native APIs. Select the wheels together with the serving engine; the NIXL version alone does not establish Torch/CUDA compatibility.
 
 ```bash
-uv pip install -c examples/vllm/remote_cxl/constraints-vllm022.txt \
-    "vllm==0.22.1" nixl
+uv pip install 'nixl>=1.2.0,<2'
 ```
 
-Memory nodes that do not run vLLM install the constrained runtime only:
-
-```bash
-uv pip install -c examples/vllm/remote_cxl/constraints-vllm022.txt nixl
-```
-
-Use `pip install` instead of `uv pip install` without uv. These constraints
-select NIXL 1.2.0 for that particular serving example, not every Torch/CUDA
-version. Newer NIXL API/transfer checks do not prove that its optional plugins
-import with an older Torch. See the
-[example's compatibility notes](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md#requirements)
-before changing the stack.
+Remote processes use `UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n` by default. Explicit settings must use key-checked RC/DC transports and disable registration caching. `cuda_copy` is a local CUDA helper, not the remote payload transport. TCP, shared-memory transports and the broad `cuda` alias are rejected.
 
 Install all components (Python package + Resource Manager):
 
@@ -101,43 +75,15 @@ Install all components (Python package + Resource Manager):
 ./install.sh
 ```
 
-To install **without the Resource Manager** (e.g., on nodes that only run LLM instances with MaruHandler, and always on `remote_cxl` worker nodes, which would otherwise get a remote CXL agent and a key of their own):
+To install the Python package without building the Resource Manager, such as on a GPU host using a remote store:
 
 ```bash
 ./install.sh --no-rm
 ```
 
-> **Note:** With the default `cxl` backend, client nodes still require CXL device access (`/dev/dax*`) for direct mmap. The `--no-rm` flag skips building the Resource Manager binary — the `maru` Python package (including MaruHandler) is still installed and will connect to the remote Resource Manager. Workers that use the `remote_cxl` backend need no CXL device: they reach the CXL memory of the memory nodes over RDMA.
+A directly mapped `cxl` client still needs DAX access and connectivity to its Resource Manager. A remote worker needs no CXL device; the memory node owns its store and registrations.
 
-With a compatible NIXL runtime installed before `./install.sh`, the
-installer also sets up the remote CXL agent as `maru-remote-cxl-agent.service`, which
-starts and stops with the Resource Manager, and creates the remote CXL agent key
-`/etc/maru/remote-cxl-agent.key`. Set the node's RDMA NIC in
-`/etc/maru/remote-cxl-agent.env` (`MARU_REMOTE_CXL_AGENT_UCX_DEVICE`): the service
-listens on that NIC's address. Workers and maru-server need a copy of the key,
-readable only by the users that run them; they read
-`~/.maru/remote-cxl-agent.key` by default. The
-[remote CXL example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md)
-walks through a deployment.
-
-The installer checks for NIXL, not for an RDMA NIC, when selecting this service.
-It enables the unit without starting it immediately. Starting the Resource
-Manager later also starts the agent; with the default empty NIC and listen
-address, the agent fails to start until its RDMA interface is configured. The
-unit stops retrying after five failed starts in a minute. This agent failure
-does not stop the Resource Manager.
-
-A memory node used only for the local `cxl` backend does not need the agent.
-Without NIXL the installer skips its service. If NIXL is installed for another
-purpose on such a node, disable only the unused agent:
-
-```bash
-sudo systemctl disable --now maru-remote-cxl-agent.service
-```
-
-Reinstalling with NIXL enables the unit again. `./install.sh --no-rm` skips both
-platform services, so it is the worker-node installation path rather than a
-way to keep the Resource Manager without its agent on a memory node.
+Start `maru-storage` and `maru-memory-node` explicitly with their JSON configurations. Create and distribute the deployment key as described in {doc}`migrating_to_maru_node`; set `key_file` explicitly on both services. The Catalog does not require the key. See {doc}`../integration/vllm` for launch commands.
 
 <br/>
 
@@ -160,12 +106,7 @@ Check the result at any time:
 python -c "import maru_kv_ops; print(maru_kv_ops.is_available(), maru_kv_ops.import_error())"
 ```
 
-`True None` means the extension can be imported, not that every request uses
-its packed kernel. The resolved KV layout, chunk completeness and buffer
-registration also select the path. vLLM 0.29+ logical pages use the stride-based
-placement bindings when available; otherwise transfers use per-layer copies.
-Check the engine's transfer-path logs as well. Other output reports the import failure;
-`MARU_SKIP_KV_OPS=1` skips the build explicitly.
+`True None` means the extension can be imported, not that every request uses its packed kernel. The resolved KV layout, chunk completeness and buffer registration also select the path. vLLM 0.29+ logical pages use the stride-based placement bindings when available; otherwise transfers use per-layer copies. Check the engine's transfer-path logs as well. Other output reports the import failure; `MARU_SKIP_KV_OPS=1` skips the build explicitly.
 
 <br/>
 
@@ -199,9 +140,7 @@ Then run the unit tests (these need neither a CXL device nor a running service):
 pytest -m "not integration"
 ```
 
-To reproduce the lint job exactly, run the hooks against the whole tree. This
-uses the ruff version pinned in `.pre-commit-config.yaml` — the same version CI
-runs:
+To reproduce the lint job exactly, run the hooks against the whole tree. This uses the ruff version pinned in `.pre-commit-config.yaml` — the same version CI runs:
 
 ```bash
 pre-commit run --all-files
@@ -210,6 +149,7 @@ pre-commit run --all-files
 <br/>
 
 (installation-verify)=
+
 ## 2. Verify Installation
 
 Verify that the Maru Python package is installed:
@@ -234,8 +174,7 @@ which maru-resource-manager
 
 Once the Resource Manager runs, `sudo maru-rm-ctl status` shows the devices it serves and why any other device is not served. See [`maru-rm-ctl`](../api_reference/maru_rm_ctl.md).
 
-Once installation is verified, choose the single-host or multi-host setup in
-{doc}`quick_start` to start services and verify KV sharing.
+Once installation is verified, choose the single-host or multi-host setup in {doc}`quick_start` to start services and verify KV sharing.
 
 <br/>
 
@@ -259,6 +198,7 @@ In a multi-node deployment, the Resource Manager, Metadata Server, and MaruHandl
 > `maru-server` and `maru-resource-manager` do not need to run on the same node. The diagram above shows the simplest configuration; each can be deployed independently as long as MaruHandler can reach both over the network.
 
 (installation-multi-node-config)=
+
 ### Configuration
 
 Multi-node requires changing default bind addresses from `127.0.0.1` to a network-accessible address:
@@ -266,7 +206,7 @@ Multi-node requires changing default bind addresses from `127.0.0.1` to a networ
 - **Resource Manager**: change `--host` to accept remote connections
 - **Metadata Server**: change `--host` and set `--rm-address` to the Resource Manager's externally reachable address
 - **MaruHandler**: set `server_url` to the Metadata Server's address. The Resource Manager address is received automatically via handshake.
-- **Remote CXL Agent** (`remote_cxl` backend): set `MARU_RM_ADDRESS` in `/etc/maru/remote-cxl-agent.env` to the address the Resource Manager listens on; a Resource Manager bound to a network address answers only there.
+- **Node services**: set `server` to the Catalog URL, GPU `remote.url` to the memory endpoint and memory `remote_server.listen` to its reachable bind address. Set `local_cxl.rm` to the Resource Manager of that store. Workers and their GPU service must share a PID namespace.
 
 To run the Resource Manager as the systemd service on a network address, override its command line:
 
@@ -286,5 +226,4 @@ sudo systemctl restart maru-resource-manager
 
 > **Security:** When binding to a non-loopback address, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
 
-Follow the {ref}`multi-host quickstart <quickstart-multi-host>` to start the
-services and share data between a Python producer and consumer on two hosts.
+Follow the {ref}`multi-host quickstart <quickstart-multi-host>` to start the services and share data between a Python producer and consumer on two hosts.

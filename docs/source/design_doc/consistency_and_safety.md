@@ -2,11 +2,9 @@
 
 ## 1. Data Visibility
 
-The sequence and CPU cache-flush steps below describe directly mapped `cxl` memory. With `remote_cxl`, the caller first fills worker-side staging, and the storage client completes the RDMA WRITE into the remote region before publishing its key. Writing staging alone does not make the remote payload visible. See the {doc}`remote CXL Handler design <maru_handler>` for its transfer and lease lifetimes.
+The sequence and cache-flush steps below describe directly mapped `cxl`. Node remote workers fill their own staging and issue RDMA WRITE; the memory node publishes keys only after Catalog COMMIT. Staging writes alone do not publish data. See {doc}`node_storage_service` for node protections.
 
-Maru publishes an object's location after the writer finishes writing its
-payload. Once `store()` returns successfully, other instances can look up that
-location through the metadata server.
+Maru publishes an object's location after the writer finishes writing its payload. Once `store()` returns successfully, other instances can look up that location through the metadata server.
 
 This relies on **write-then-register** ordering. Every store completes these steps in sequence:
 
@@ -33,11 +31,10 @@ sequenceDiagram
     Note over R: Complete data
 ```
 
-The visibility point is when `register_kv` RPC completes. The server holds the
-key in an in-memory registry protected by a lock, ensuring that concurrent
-lookups always see a fully committed entry or no entry at all.
+The visibility point is when `register_kv` RPC completes. The server holds the key in an in-memory registry protected by a lock, ensuring that concurrent lookups always see a fully committed entry or no entry at all.
 
 (cross-host-visibility)=
+
 ### Cross-Host Visibility
 
 The ordering above assumes that writes reach the shared memory device and readers cannot consume stale host-cache copies. On a non-coherent multi-host CXL platform, metadata ordering alone does not establish those conditions. See {doc}`../getting_started/bios_setup` for the platform settings that GPU DMA writes depend on.
@@ -53,18 +50,7 @@ The {doc}`../getting_started/quick_start` producer and consumer follow this patt
 
 For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 
-For `remote_cxl`, the remote agent defaults to
-`UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`. RC/DC remains the remote
-DRAM payload path whose NIC checks the remote key. `cuda_copy` enables local
-CUDA memory-type support required by NIXL 1.5 on NVIDIA GPU hosts, including
-hosts where Maru registers only DRAM. Its UCX interface requires its own
-interface identity and does not support host-to-host copies; it is not an
-alternative cross-process payload route. The CLI accepts it only alongside
-a primary RC/DC transport. It still rejects the broader `cuda` alias,
-`cuda_ipc`, TCP and shared-memory transports. Explicit UCX filters on worker
-processes also need `cuda_copy` on such hosts. Verify actual RC/DC selection
-and late-WRITE rejection on the deployed NIXL/UCX version; allowing the local
-helper is not evidence that the device validation passed.
+Remote node processes default to `UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`. RC/DC checks remote registration keys. `cuda_copy` supplies local CUDA memory-type support; it does not carry the remote payload. Explicit settings must retain checked transports and disable registration caching so revocation fences late writes.
 
 > **See also:** [MaruHandler Architecture](maru_handler.md)
 
@@ -72,10 +58,7 @@ helper is not evidence that the device validation passed.
 
 ## 2. Concurrency
 
-The following lock diagram describes the legacy `cxl` Handler and registry.
-Storage-session clients have their own locks, leases and transfer completion
-rules; remote CXL transfers can run outside the client lock while staging
-remains owned until completion.
+The following lock diagram describes the legacy `cxl` Handler and registry. Node clients use Catalog pins and explicit staging ownership. Remote transfers can run outside the client lock while their resources remain owned until completion.
 
 ```mermaid
 flowchart LR
@@ -99,14 +82,10 @@ flowchart LR
     style RB fill:#e8f5e9,stroke:#4a9
 ```
 
-- **Client**: `_write_lock` serializes all writes (store, delete) within a
-  single handler instance. Retrieval does not take that write lock, but can
-  still wait on RPC, mapping and other synchronization.
-- **Server**: A single `RLock` serializes all metadata mutations (register,
-  delete, ref-count updates) across instances.
+- **Client**: `_write_lock` serializes all writes (store, delete) within a single handler instance. Retrieval does not take that write lock, but can still wait on RPC, mapping and other synchronization.
+- **Server**: A single `RLock` serializes all metadata mutations (register, delete, ref-count updates) across instances.
 
-These two locks, combined with write-then-register ordering (Section 1),
-produce the following guarantees:
+These two locks, combined with write-then-register ordering (Section 1), produce the following guarantees:
 
 | Scenario | Behavior |
 |----------|----------|
@@ -120,10 +99,7 @@ produce the following guarantees:
 
 ## 3. Crash Recovery
 
-RM allocation metadata can be reconstructed from its checkpoint and WAL.
-MaruServer's key/session directory is in memory; RM recovery does not restore
-it or make CXL DRAM payloads durable. Cache availability after a failure depends
-on the component and backend.
+RM allocation metadata can be reconstructed from its checkpoint and WAL. Both the `cxl` registry and node Catalog are in memory. RM recovery does not restore lost keys or make CXL DRAM payloads durable. Cache availability after a failure depends on the component and backend.
 
 ### 3.1 Recovery Sequence
 
@@ -146,22 +122,16 @@ sequenceDiagram
 
 ### 3.2 Client Crash Recovery
 
-Process exit, session expiry and network loss are different events. The legacy
-`cxl` region owner tracked by the RM is usually MaruServer, not each GPU worker.
-Local owners can be checked by PID/start time; remote owners use connection
-state and a grace period. A timeout alone does not prove that NIC access or a
-worker's exported views have ended.
+Process exit, session expiry and network loss are different events. The legacy `cxl` region owner tracked by the RM is usually MaruServer, not each GPU worker. Local owners can be checked by PID/start time; remote owners use connection state and a grace period. A timeout alone does not prove that NIC access or a worker's exported views have ended.
 
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
 | Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until deregistration is confirmed |
 | Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
-| `remote_cxl` directory | Session close/expiry, region and agent status | Can keep regions with valid keys; agent release precedes normal region return |
-| `cpu`, current `mixed` | Worker session and read leases | Hides inaccessible replicas; expiry alone does not reclaim buffers or uncertain grants |
+| Node Catalog | Worker/run identity and source pins | Keeps orphan pins while old workers can still read |
+| Memory node | Worker loss, uncertain write, lost connection or credit expiry | Revokes the instance write registration before reclaiming pages; failed revocation quarantines them |
 
-The reaper defends against PID reuse by caching each client's process start
-time at allocation time. If the PID is recycled by the OS, the start-time
-mismatch triggers reclamation.
+The reaper defends against PID reuse by caching each client's process start time at allocation time. If the PID is recycled by the OS, the start-time mismatch triggers reclamation.
 
 > **See also:** [MaruResourceManager Architecture](maru_resource_manager.md),
 > [MaruServer Architecture](maru_server.md)
@@ -172,13 +142,10 @@ mismatch triggers reclamation.
 
 | Failure | Impact | Recovery boundary |
 |---|---|---|
-| Worker exit | Private CPU/mixed replicas become inaccessible; remote CXL keys may remain in kept regions | Recompute unavailable keys and create a fresh worker/session as required by the backend |
-| MaruServer restart | Volatile key/session metadata is lost | Restart affected storage-session workers and allow cache warm-up; RM WAL does not restore those keys |
+| Worker exit | Node-owned committed keys can remain; in-flight writes need fencing | Recompute unavailable keys; restart affected vLLM instances after confirming old worker exit |
+| Metadata server restart | Volatile key metadata is lost | Node services and workers open new sessions; recompute and repopulate the cache |
 | Resource Manager restart | Allocation operations pause while the ledger and holds are recovered | Restore allocation metadata and revalidate devices; this does not establish payload durability |
 | Network partition or uncertain native transfer | Reads can miss and unknown NIC accesses can retain staging | Use recompute; recover a persistently affected worker by stopping its whole engine and confirming process exit |
 | Memory-node reboot or device failure | Cached bytes can be lost or invalid | Invalidate affected regions and recompute; this implementation does not promise automatic cross-device replication |
 
-See the {doc}`vLLM recovery procedure <../integration/vllm>` for persistent native
-errors and {doc}`memory_model` for the distinct local read lease, server read
-lease and RM hold lifetimes. A successful metadata heartbeat is not a device
-read, a GPU-ready result or proof that a cache survived a restart.
+See the {doc}`vLLM recovery procedure <../integration/vllm>` for persistent native errors and {doc}`memory_model` for source-pin, staging and RM-hold lifetimes. A successful metadata heartbeat is not a device read, a GPU-ready result or proof that a cache survived a restart.

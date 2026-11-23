@@ -2,28 +2,25 @@
 
 ## Overview
 
-This benchmark compares Maru's directly mapped **`cxl` backend** with the LMCache P2P backend in the **single-node** configuration listed below. The P2P baseline is configured with NIXL/UCX and TCP loopback (`UCX_TLS=cuda_ipc,cuda_copy,tcp`). It is not an RDMA P2P comparison or a measurement of Maru's `remote_cxl` backend.
+This benchmark compares Maru's directly mapped **`cxl` backend** with the LMCache P2P backend in the **single-node** configuration listed below. The P2P baseline is configured with NIXL/UCX and TCP loopback (`UCX_TLS=cuda_ipc,cuda_copy,tcp`). It is not an RDMA P2P comparison or a measurement of Maru's node remote storage backend.
 
-The two configurations use different storage tiers and payload paths: CPU DRAM with P2P transfers, and a directly mapped CXL pool with Maru metadata RPC. GPU loads and stores still copy bytes in the CXL configuration. Maru's separate `remote_cxl` backend uses worker-side CPU staging and RDMA; its transport, buffer and registration costs require their own measurements. All "Maru" results on this page refer to the reported `cxl` configuration and software versions, not every Maru backend or current connector version.
+The two configurations use different storage tiers and payload paths: CPU DRAM with P2P transfers, and a directly mapped CXL pool with Maru metadata RPC. GPU loads and stores still copy bytes in the CXL configuration. Maru's node remote store uses worker-side DRAM staging and RDMA; its transport, buffer and registration costs require their own measurements. All "Maru" results on this page refer to the reported `cxl` configuration and software versions, not every Maru backend or current connector version.
 
-![Figure 1: TTFT P50 comparison](image/ttft_p50_comparison.png)
-*Figure 1: TTFT (P50) comparison between Maru and the LMCache p2p backend across context sizes during warmup (first KV transfer) and query (KV reuse). Maru consistently achieves lower latency, with larger gains for bigger KV cache sizes.*
+![Figure 1: TTFT P50 comparison](image/ttft_p50_comparison.png) *Figure 1: TTFT (P50) comparison between Maru and the LMCache p2p backend across context sizes during warmup (first KV transfer) and query (KV reuse). Maru consistently achieves lower latency, with larger gains for bigger KV cache sizes.*
 
-Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). The reported `cxl` configuration has lower TTFT across the plotted context sizes. The figure compares those complete configurations; it does not isolate a transport-only effect or evaluate `remote_cxl`.
+Figure 1 shows the TTFT (Time To First Token) P50 during the warmup phase (first KV transfer) and the query phase (subsequent KV reuse). The reported `cxl` configuration has lower TTFT across the plotted context sizes. The figure compares those complete configurations; it does not isolate a transport-only effect or evaluate node remote storage.
 
 ## Concurrency Scaling
 
-![Figure 2: Cache-hit TTFT under concurrency](image/ttft_concurrency_scaling.png)
-*Figure 2: Cache-hit TTFT (P50) under different concurrency levels. Maru maintains 2.7×–4.2× lower latency compared to the LMCache p2p backend while scaling to higher request concurrency.*
+![Figure 2: Cache-hit TTFT under concurrency](image/ttft_concurrency_scaling.png) *Figure 2: Cache-hit TTFT (P50) under different concurrency levels. Maru maintains 2.7×–4.2× lower latency compared to the LMCache p2p backend while scaling to higher request concurrency.*
 
 To further evaluate scalability, we measured cache-hit TTFT under different concurrency levels (Figure 2). Even as concurrency increases, Maru maintains significantly lower latency. Depending on the context size and concurrency level, Maru reduces TTFT by approximately **2.7×–4.2×** compared to the p2p backend.
 
-These measurements show the scaling behavior of the two tested configurations at the plotted context sizes and concurrency levels. They do not establish the same ratios for multi-node serving, an RDMA P2P baseline or `remote_cxl`.
+These measurements show the scaling behavior of the two tested configurations at the plotted context sizes and concurrency levels. They do not establish the same ratios for multi-node serving, an RDMA P2P baseline or node remote storage.
 
 ## Power Efficiency
 
-![Figure 3: Reported retrieval-phase duration and energy](image/retrieval_phase_summary.svg)
-*Figure 3: Historical retrieval-phase totals for the reported single-node 128K-context configuration. Duration is 103 s for LMCache P2P and 53 s for Maru cxl; energy is 36.1 Wh and 20.1 Wh respectively. Lower is better. The figure is redrawn from previously reported values, with no new measurements.*
+![Figure 3: Reported retrieval-phase duration and energy](image/retrieval_phase_summary.svg) *Figure 3: Historical retrieval-phase totals for the reported single-node 128K-context configuration. Duration is 103 s for LMCache P2P and 53 s for Maru cxl; energy is 36.1 Wh and 20.1 Wh respectively. Lower is better. The figure is redrawn from previously reported values, with no new measurements.*
 
 Figure 3 summarizes the reported retrieval phase. The [original annotated power trace](image/128k_power_comparison.png) is preserved as historical source material. Its old "zero-copy mmap, no wait" annotation should be read using the current path definition above: GPU copies and metadata RPC remain. Its "49% faster" label denotes the shorter phase duration, not a measured throughput increase. The two reductions are approximately 49% in duration and 44% in energy, calculated from the reported totals. The [plot source](https://github.com/xcena-dev/maru/blob/main/docs/source/performance/plot_retrieval_summary.py) reproduces this display.
 
@@ -46,7 +43,7 @@ The shorter measured phase reduces energy for this workload. Throughput and ener
 
 *Table 1: Tokens per joule (active energy) at the listed context lengths in this setup. The reported Maru / LMCache P2P ratios range from 1.18 to 1.57; the 128K ratio is 1.43.*
 
-In these measurements, Maru `cxl` rises from 59.8 to 173.7 tokens/J and the P2P backend from 50.7 to 121.7, while recompute falls from 19.7 to 13.6. The relative ratio peaks at 1.57 for 64K and is 1.43 at 128K. These are observed energy results for the listed configurations; they do not establish the cause of each difference or an energy advantage for `remote_cxl` or over RDMA-based systems.
+In these measurements, Maru `cxl` rises from 59.8 to 173.7 tokens/J and the P2P backend from 50.7 to 121.7, while recompute falls from 19.7 to 13.6. The relative ratio peaks at 1.57 for 64K and is 1.43 at 128K. These are observed energy results for the listed configurations; they do not establish the cause of each difference or an energy advantage for node remote storage or over RDMA-based systems.
 
 ---
 

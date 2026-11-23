@@ -4,7 +4,7 @@ This example demonstrates how to share KV cache across multiple vLLM instances u
 
 ## Overview
 
-When multiple vLLM instances serve the same or similar prompts, they can reuse cached prefix KV. This example uses the directly mapped `cxl` backend: Instance 2 loads the KV that Instance 1 stored in shared CXL memory. GPU loads still copy bytes. For workers without CXL, the native vLLM `remote_cxl` example uses CPU staging and RDMA instead; this LMCache configuration does not select that backend.
+When multiple vLLM instances serve the same or similar prompts, they can reuse cached prefix KV. This example uses the directly mapped `cxl` backend: Instance 2 loads the KV that Instance 1 stored in shared CXL memory. GPU loads still copy bytes. For workers without CXL, the native vLLM node path provides DRAM or direct RDMA storage. This LMCache configuration uses `cxl`.
 
 ## Prerequisites
 

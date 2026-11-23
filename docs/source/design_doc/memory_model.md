@@ -2,23 +2,16 @@
 
 ## Backend and buffer ownership
 
-The storage backend determines which process maps or owns the bytes. The GPU's
-execution KV cache is separate from all storage pools below.
+The storage backend determines which process maps or owns the bytes. The GPU's execution KV cache is separate from all storage pools below.
 
 | Backend | Storage bytes | Worker-facing read result | Sharing scope |
 |---|---|---|---|
 | `cxl` | CXL mapped on the worker | `MemoryInfo` over the mapping | Legacy CXL registry; workers can map the same pool |
-| `remote_cxl` | CXL mapped and NIC-registered by the memory-node agent | A lease over worker CPU staging filled by RDMA | Compatible sessions in the same namespace and pool |
-| `cpu` | Worker-local CPU DRAM | A read lease | Owning worker only |
-| `mixed` | Worker-local CPU DRAM and typed CXL pools | A read lease over the selected local medium | Owning worker only in this version; separate from legacy CXL sharing |
+| `maru_node`, `dram` | Node-owned DRAM | A pinned read result over the local mapping | Compatible workers on that node |
+| `maru_node`, `local_cxl` | Node-owned CXL regions | A pinned read result over the local mapping | Compatible workers that can map the pool |
+| `maru_node`, `remote` | Memory-node DRAM or CXL | Worker-owned staging filled by direct RDMA READ | Compatible workers using the same memory node and Catalog |
 
-Remote CXL staging is a worker-owned transfer buffer, shared by that worker's
-pool clients. It must outlive the last NIC access and CPU/GPU copy. A worker
-without CXL does not mmap the remote DAX region. See {doc}`maru_handler`.
-
-The numbered sections below describe legacy `cxl` unless a `remote_cxl`
-distinction is explicit. They do not describe the fixed private `cpu` and
-`mixed` pools.
+Remote staging must outlive NIC access and every GPU copy. It is not a cache. See {doc}`node_storage_service` for source pins, write domains and orphan-worker protection. The numbered sections below describe `cxl`.
 
 ## 1. Memory Hierarchy
 
@@ -63,10 +56,7 @@ graph TB
 
 ## 2. Region Lifecycle
 
-The diagram illustrates legacy `cxl` mapping and ownership states. MaruServer
-tracks owner connection and registered-key references, not every live mapped
-view or GPU copy. `SharedRead` below describes a client mapping, not a server
-read lease.
+The diagram illustrates legacy `cxl` mapping and ownership states. MaruServer tracks owner connection and registered-key references, not every live mapped view or GPU copy. `SharedRead` below describes a client mapping, not a server read lease.
 
 ```mermaid
 stateDiagram-v2
@@ -100,55 +90,22 @@ stateDiagram-v2
 
 **Freed** — In legacy `cxl`, the owner has disconnected and the KV reference count is zero, so the region can be returned to the Resource Manager.
 
-### Remote CXL regions and three different protections
+### Node-store protections
 
-`remote_cxl` does not use the legacy `owner_connected` / KV-ref-count state
-machine. MaruServer can keep a region with keys after its owner leaves. Normal
-return deregisters it at the agent first; the RM keeps a freed-but-held range
-in *draining* until its final hold ends.
-
-| Protection | Resource protected | When it ends |
+| Protection | Resource protected | End condition |
 |---|---|---|
-| Server read lease (`acquire` / `release`) | Remote CXL object during RDMA | After the READ completes and the directory confirms the lease held |
-| Local read lease (`release_retrieved`) | Worker staging slot | After the last CPU read or GPU copy |
-| RM hold (`HOLD` / `UNHOLD`) | CXL range registered with a memory-node NIC | After deregistration; freeing the allocation alone does not end it |
+| Catalog source pin | Stored page during a read | READ completes or unused work is safely discarded |
+| Worker read-result ownership | Local mapping or remote staging used by GPU copies | Final copy completes |
+| Instance write registration | Memory-node pages reserved for remote writes | Registration revoked before uncertain pages are reused |
+| RM hold | CXL range mapped or registered with a NIC | Mapping or registration safely removed |
 
-The server lease may end before the GPU copy: the bytes are now in local
-staging, whose own read lease still owns the slot. Uncertain native transfers
-can retain staging after Handler close. See the recovery boundary in the
-{doc}`vLLM guide <../integration/vllm>`.
-
-Server leases are revocable when a region is invalidated or reclaimed by the
-keeper. A completed READ is not enough: if the final directory check says the
-lease was lost, discard the staged result and report a miss.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Owned
-    Owned --> Kept: owner leaves, keys remain
-    Owned --> Releasing: normal region return
-    Kept --> Releasing: pressure or invalid region
-    Releasing --> Pending: agent release unconfirmed
-    Pending --> Releasing: retry
-    Releasing --> Returned: agent deregisters, then RM free
-    Returned --> Draining: another RM hold remains
-    Returned --> Free: no RM holds
-    Draining --> Free: final hold removed
-    Free --> [*]
-```
-
-This is the normal Handler/keeper return path. RM reaping or an admin free can
-end allocation ownership earlier; RM holds still keep the range out of reuse.
-See {doc}`maru_resource_manager` for draining and {doc}`maru_server` for keeper
-invalidation.
-
-> See also: [MaruServer — Allocation Management](maru_server.md#2-allocation-management), [MaruResourceManager — Reaper](maru_resource_manager.md#5-reaper)
+A GPU-service run change preserves source pins for live old readers. Neither a deadline nor session expiry proves that RDMA or a GPU copy has ended. See {doc}`node_storage_service` for restart and quarantine rules.
 
 ---
 
 ## 3. Page Allocation
 
-Legacy `cxl` uses `PagedMemoryAllocator` and a free list. A `remote_cxl` client also allocates pages in its owned regions, with a separate worker staging budget and load reserve. The current `cpu` and `mixed` pools have fixed capacities.
+The `cxl` backend uses `PagedMemoryAllocator` and a free list. Node stores allocate from service-owned pools and give workers explicit credit.
 
 ### Multi-Region Allocation Strategy
 
@@ -199,17 +156,11 @@ Every allocation receives a **capability-based handle** containing a cryptograph
 - Map a region's shared memory for direct access
 - Free an allocation
 
-The Resource Manager associates allocations with a reported client identity.
-That ownership record is distinct from network authentication and from the
-OS permissions needed to open a DAX device.
+The Resource Manager associates allocations with a reported client identity. That ownership record is distinct from network authentication and from the OS permissions needed to open a DAX device.
 
 ### Trust Boundary
 
-Applications must respect allocation ownership and immutable-payload rules.
-Region handles, local DAX permissions and the remote agent's connection/read
-handle checks serve different purposes; they do not by themselves establish
-general multi-tenant isolation. See the backend-specific access description
-in {doc}`architecture_overview`.
+Applications must respect allocation ownership and immutable-payload rules. Region authorization, local DAX permissions and remote deployment-key authentication serve different purposes. They do not establish general tenant isolation. See the backend-specific access description in {doc}`architecture_overview`.
 
 > See also: [MaruResourceManager — Security](maru_resource_manager.md#6-security)
 
@@ -217,8 +168,7 @@ in {doc}`architecture_overview`.
 
 ## 5. GC and Cleanup
 
-The following summarizes legacy CXL allocation cleanup. Storage-session and
-RDMA cleanup follow the additional lease/hold rules above.
+The following summarizes `cxl` allocation cleanup. Node-store cleanup follows the pin, staging and registration rules above.
 
 | Concern | Strategy |
 |---------|----------|
@@ -229,4 +179,3 @@ RDMA cleanup follow the additional lease/hold rules above.
 | **Crash recovery** | Resource Manager replays write-ahead log on restart to reconstruct allocation state |
 
 > See also: [MaruServer — Allocation Management](maru_server.md#2-allocation-management), [MaruResourceManager — Reaper](maru_resource_manager.md#5-reaper)
-

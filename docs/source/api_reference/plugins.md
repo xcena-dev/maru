@@ -1,19 +1,8 @@
 # Handler Plugins
 
-Maru core is **vendor-neutral**. Hardware- or vendor-specific behaviour — for
-example a CXL device's prefetch/pin hints — does not live in the Maru tree.
-Instead it ships as a **separate package** that registers a
-`maru.handler_plugins` [entry point](https://packaging.python.org/en/latest/specifications/entry-points/).
-`MaruHandler` discovers those packages when it is constructed and calls them at
-a few lifecycle seams. DAX mapping hooks describe the legacy `cxl` path;
-storage-session backends do not provide the same mapping callbacks.
+Maru core is **vendor-neutral**. Hardware- or vendor-specific behaviour — for example a CXL device's prefetch/pin hints — does not live in the Maru tree. Instead it ships as a **separate package** that registers a `maru.handler_plugins` [entry point](https://packaging.python.org/en/latest/specifications/entry-points/). `MaruHandler` discovers those packages when it is constructed and calls them at a few lifecycle seams. DAX mapping hooks describe the `cxl` path; node stores do not provide the same mapping callbacks.
 
-The model deliberately follows [vLLM's plugin system](https://blog.vllm.ai/2025/05/12/hardware-plugin.html)
-(soft-fail) rather than PyTorch's device-backend autoload (hard-fail): a Maru
-plugin is an *optional optimization*. A plugin that fails to load — or whose
-hook raises an ordinary exception — is logged and skipped. Plugins still run
-inside the Handler process and must respect buffer lifetimes and execution
-costs; exception handling does not make arbitrary plugin behavior harmless.
+The model deliberately follows [vLLM's plugin system](https://blog.vllm.ai/2025/05/12/hardware-plugin.html) (soft-fail) rather than PyTorch's device-backend autoload (hard-fail): a Maru plugin is an *optional optimization*. A plugin that fails to load — or whose hook raises an ordinary exception — is logged and skipped. Plugins still run inside the Handler process and must respect buffer lifetimes and execution costs; exception handling does not make arbitrary plugin behavior harmless.
 
 ## Registering a plugin
 
@@ -24,8 +13,7 @@ In the plugin package's `pyproject.toml`:
 my_plugin = "my_pkg.plugin:MyPlugin"
 ```
 
-The entry-point value is a zero-argument callable (a class or factory) that
-returns an object implementing any subset of `MaruHandlerPlugin`.
+The entry-point value is a zero-argument callable (a class or factory) that returns an object implementing any subset of `MaruHandlerPlugin`.
 
 ## Selecting plugins at runtime
 
@@ -36,37 +24,23 @@ MARU_PLUGINS=my_plugin,other   # load only these names
 
 ## The `MaruHandlerPlugin` interface
 
-Every hook is **optional** — a plugin implements only the ones it needs, and
-`MaruHandler` skips any that are absent. All hooks are best-effort: an
-exception raised inside one is logged and swallowed.
+Every hook is **optional** — a plugin implements only the ones it needs, and `MaruHandler` skips any that are absent. All hooks are best-effort: an exception raised inside one is logged and swallowed.
 
 | Hook | When it runs | Purpose |
 |------|--------------|---------|
 | `on_init(handler)` | end of `MaruHandler.__init__` (not yet connected — `mapper` is `None`) | cheap setup only |
-| `on_batch_retrieve(handler, keys, batch_resp)` | legacy `cxl` batch path, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
-| `on_close(handler)` | connected legacy `cxl` close, while regions are mapped and RPC is live (a metadata-only handler maps none) | release resources tied to mapped memory or to hinted requests |
+| `on_batch_retrieve(handler, keys, batch_resp)` | `cxl` batch path, after regions are mapped | issue hints against live mapped memory; runs on the hot path |
+| `on_close(handler)` | connected `cxl` close, while regions are mapped and RPC is live (a metadata-only handler maps none) | release resources tied to mapped memory or to hinted requests |
 | `on_memory_hint(handler, message)` | on the handler's hint thread, for each read hint, read hint end and read promote of the `cxl` backend whose action the plugin's `hint_actions` names | prepare the bytes a load will read before it starts |
 | `contribute_stats() -> dict \| None` | during `get_stats` | returns a dict merged under `stats["plugins"][<PluginClassName>]` |
 
-In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A
-found entry exposes a `handle` (region/offset) whose region is already mapped,
-so a plugin can act on real memory addresses.
+In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A found entry exposes a `handle` (region/offset) whose region is already mapped, so a plugin can act on real memory addresses.
 
-`cpu`, `mixed` and `remote_cxl` delegate retrieval and close to storage clients
-before the DAX hooks `on_batch_retrieve` and `on_close`. `on_init` still runs at construction and stats
-contributions can run in `get_stats`; keep initialization cheap and do not
-assume that a DAX close callback will follow for every backend. In particular,
-a remote CXL staging buffer is not the worker's mapping of the memory node's
-DAX device. Device hints on that remote CXL range need an integration on the
-memory node; this plugin API does not provide one automatically.
+The node path delegates retrieval and close to `MaruClient` before the DAX hooks. `on_init` and statistics contributions still apply, but a plugin must not assume that DAX mapping or close callbacks follow for every path. Remote device hooks run on the memory node through `region_extension`; see {doc}`../design_doc/read_hints`.
 
 ### Memory hints of the `cxl` backend
 
-With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM
-connector) or `read_promotes` (a vLLM worker's handler with
-`maru_async_load`), a handler of the `cxl` backend gives the plugins the hint
-messages that the `remote_cxl` backend sends to a remote CXL agent's region
-extension ({doc}`../design_doc/read_hints`), in the same form:
+With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM connector) or `read_promotes` (a vLLM worker's handler with `maru_async_load`), a handler of the `cxl` backend gives the plugins the hint messages that remote node stores send through GPU StorageService to a memory-node region extension ({doc}`../design_doc/read_hints`), in the same form:
 
 | `message["action"]` | Sent when | `message["ranges"]` |
 |------|------|------|
@@ -74,15 +48,7 @@ extension ({doc}`../design_doc/read_hints`), in the same form:
 | `read_hint_end` | the load ended, or the request finished first | empty |
 | `read_promote` | the worker starts the load of a request its scheduler hinted | empty |
 
-`message["request"]` is vLLM's request id; the worker's promote names the id
-the scheduler hinted. A plugin takes hints by naming their actions in a class
-attribute `hint_actions` (for example `("read_hint", "read_hint_end",
-"read_promote")`) and implementing `on_memory_hint`. The hook runs on one
-background thread in the order the hints were given; it never delays a load,
-and a slow hook only delays the next hints. When the handler closes, every
-request it hinted and did not end gets its `read_hint_end`, and then
-`on_close` runs, on a scheduler's metadata-only handler too. Write hints stay
-with the `remote_cxl` backend.
+`message["request"]` is vLLM's request id; the worker's promote names the id the scheduler hinted. A plugin takes hints by naming their actions in a class attribute `hint_actions` (for example `("read_hint", "read_hint_end", "read_promote")`) and implementing `on_memory_hint`. The hook runs on one background thread in the order the hints were given; it never delays a load, and a slow hook only delays the next hints. When the handler closes, every request it hinted and did not end gets its `read_hint_end`, and then `on_close` runs, on a scheduler's metadata-only handler too. Write hints are configured on GPU remote stores and delivered during memory-node reservation.
 
 ## Stable accessor surface
 
@@ -96,9 +62,7 @@ and must go through a deprecation cycle. `tests/unit/test_plugin_loader.py`
 contains a contract test that fails CI if this surface drifts.
 ```
 
-Everything a plugin needs about a *batch* arrives through the
-`on_batch_retrieve` arguments. These two methods cover the region-mapping state
-that is not in those arguments:
+Everything a plugin needs about a *batch* arrives through the `on_batch_retrieve` arguments. These two methods cover the region-mapping state that is not in those arguments:
 
 | Method | Returns |
 |--------|---------|
@@ -118,8 +82,4 @@ minimal stable accessor contract above).
 
 ## Writing a plugin
 
-A hardware/vendor plugin typically implements `on_batch_retrieve` to issue
-device hints (prefetch/pin) against the mapped regions of a batch, and
-`on_close` to release any device resources before regions are unmapped. See
-[`maru_handler/plugin.py`](https://github.com/xcena-dev/maru/blob/main/maru_handler/plugin.py)
-for the full interface definition.
+A hardware/vendor plugin typically implements `on_batch_retrieve` to issue device hints (prefetch/pin) against the mapped regions of a batch, and `on_close` to release any device resources before regions are unmapped. See [`maru_handler/plugin.py`](https://github.com/xcena-dev/maru/blob/main/maru_handler/plugin.py) for the full interface definition.

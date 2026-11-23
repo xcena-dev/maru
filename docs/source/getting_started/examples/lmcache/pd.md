@@ -4,7 +4,7 @@ This example demonstrates how to run disaggregated prefill with vLLM and LMCache
 
 ## Overview
 
-Disaggregated prefill separates the compute-intensive **prefill** phase from the memory-intensive **decode** phase across different GPU instances. This example uses Maru's directly mapped `cxl` backend: the prefiller stores KV in CXL, and the decoder loads from the same pool. It avoids a prefiller-to-decoder network payload transfer, while GPU copies and metadata RPC remain. It does not select `remote_cxl`, which transfers KV over RDMA through worker-side staging.
+Disaggregated prefill separates the compute-intensive **prefill** phase from the memory-intensive **decode** phase across different GPU instances. This example uses Maru's directly mapped `cxl` backend: the prefiller stores KV in CXL, and the decoder loads from the same pool. It avoids a prefiller-to-decoder network payload transfer, while GPU copies and metadata RPC remain. For memory-node RDMA through worker staging, use the native vLLM node path.
 
 ## Prerequisites
 
