@@ -237,16 +237,16 @@ def test_only_a_cuda_error_leaves_copies_unconfirmed(error, unconfirmed):
 # =============================================================================
 
 
-@pytest.mark.parametrize("parked", [True, False], ids=["parked", "layerwise"])
-def test_copies_that_cannot_be_asked_about_stop_the_worker(parked):
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "layerwise"])
+def test_copies_that_cannot_be_asked_about_stop_the_worker(is_async):
     worker = worker_of("cxl")
     held = views("a")
-    if parked:
-        worker._deferred_events["r1"] = FailedQuery()
-        worker._deferred_refs["r1"] = [held]
+    if is_async:
+        worker._async_load_events["r1"] = FailedQuery()
+        worker._async_load_refs["r1"] = [held]
         with pytest.raises(_UnconfirmedCopyError):
             worker.get_finished_loading()
-        assert worker._deferred_refs["r1"] == [held]
+        assert worker._async_load_refs["r1"] == [held]
     else:
         worker._active_load_refs = [(FailedQuery(), [held])]
         with pytest.raises(_UnconfirmedCopyError):
@@ -255,7 +255,7 @@ def test_copies_that_cannot_be_asked_about_stop_the_worker(parked):
     worker._write_behind = True
     worker._queued_store_batches = [("kernel", MaruConnectorMetadata())]
     worker._store_packed_slabs_write_behind = MagicMock()
-    assert stopped(worker, "req r1" if parked else UNCONFIRMED)
+    assert stopped(worker, "req r1" if is_async else UNCONFIRMED)
     # Nor does a stopped worker issue the stores the step queued
     worker._store_packed_slabs_write_behind.assert_not_called()
 
@@ -266,12 +266,12 @@ def test_an_undrained_copy_into_reclaimed_blocks_stops_the_worker():
     worker = worker_of("cxl")
     worker._layerwise_overlap = True
     held = views("a")
-    worker._deferred_layerwise_events["r1"] = {LAYER: FailedWait()}
-    worker._deferred_events["r1"] = Pending()
-    worker._deferred_refs["r1"] = [held]
+    worker._async_layerwise_events["r1"] = {LAYER: FailedWait()}
+    worker._async_load_events["r1"] = Pending()
+    worker._async_load_refs["r1"] = [held]
     with pytest.raises(_UnconfirmedCopyError, match="req r1"):
         worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
-    assert "r1" not in worker._deferred_done
+    assert "r1" not in worker._async_load_done
     assert holds(worker, held[0])
     assert stopped(worker, "req r1")
 
@@ -298,45 +298,45 @@ def test_a_group_batch_wait_that_fails_once_stops_the_worker(monkeypatch):
 
 @pytest.mark.parametrize("fails", ["query", "wait"])
 def test_an_admission_wait_that_fails_once_stops_the_worker(monkeypatch, fails):
-    """The admitted load queues nothing and is not reported; the parked load
+    """The admitted load queues nothing and is not reported; the async load
     waited for keeps its reads."""
     worker = worker_of("cxl")
     worker._load_admission_window = 1
-    worker._deferred_stream = Done()
-    worker._deferred_stream_device = torch.device("cpu")
+    worker._async_load_stream = Done()
+    worker._async_load_stream_device = torch.device("cpu")
     worker._inject_slab_layers = MagicMock()
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
     held = views("o")
-    worker._deferred_events["other"] = FailsOnce(query=fails == "query")
-    worker._deferred_refs["other"] = held
+    worker._async_load_events["other"] = FailsOnce(query=fails == "query")
+    worker._async_load_refs["other"] = held
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(worker, "_pin_slot_mapping_for_async_h2d", lambda slots: slots)
     worker._batch_retrieve_all = lambda keys, **route: views(keys)
-    worker._deferred_load_job(
-        load_meta(deferred_load=True), [(LAYER, torch.zeros(1), 0)], torch.device("cpu")
+    worker._async_load_job(
+        load_meta(async_load=True), [(LAYER, torch.zeros(1), 0)], torch.device("cpu")
     )
     worker._inject_slab_layers.assert_not_called()
-    assert "r1" not in worker._deferred_events and not worker._deferred_done
+    assert "r1" not in worker._async_load_events and not worker._async_load_done
     assert not worker._failed_load_blocks
-    assert worker._deferred_refs["other"] is held
+    assert worker._async_load_refs["other"] is held
     assert stopped(worker)
 
 
-def test_vllms_poll_then_admission_on_parked_loads():
+def test_vllms_poll_then_admission_on_async_loads():
     """In turn: a query that succeeds may give back its load's reads; one
     that fails stops the worker, and nothing is given back after."""
     worker = worker_of("cxl")
     worker._load_admission_window = 1
     ended, unknown = views("e"), views("u")
-    worker._deferred_events.update(ended=Done(), unknown=FailedQuery())
-    worker._deferred_refs.update(ended=[ended], unknown=[unknown])
+    worker._async_load_events.update(ended=Done(), unknown=FailedQuery())
+    worker._async_load_refs.update(ended=[ended], unknown=[unknown])
     # vLLM's poll asks first: the ended load goes, the other one stops it
     with pytest.raises(_UnconfirmedCopyError):
         worker.get_finished_loading()
-    assert "ended" not in worker._deferred_refs
-    assert worker._deferred_refs["unknown"] == [unknown]
+    assert "ended" not in worker._async_load_refs
+    assert worker._async_load_refs["unknown"] == [unknown]
     worker._wait_for_load_admission("r1")  # the loader thread then finds it
-    assert worker._deferred_refs["unknown"] == [unknown]
+    assert worker._async_load_refs["unknown"] == [unknown]
     assert stopped(worker)
 
 
@@ -362,8 +362,8 @@ def test_admission_stops_before_vllms_poll_can_report_its_load(fails):
         def synchronize(self):
             raise cuda_error()
 
-    worker._deferred_events["r1"] = Racing()
-    worker._deferred_refs["r1"] = [held]
+    worker._async_load_events["r1"] = Racing()
+    worker._async_load_refs["r1"] = [held]
     stop = worker._stop_if_unconfirmed
 
     def stop_after_the_poll(*args, **kwargs):
@@ -388,7 +388,7 @@ def test_admission_stops_before_vllms_poll_can_report_its_load(fails):
     loader.join(5)
     poller.join(5)
     assert outcome == ["raised"]
-    assert worker._deferred_refs["r1"] == [held] and holds(worker, held[0])
+    assert worker._async_load_refs["r1"] == [held] and holds(worker, held[0])
     assert stopped(worker, "req r1")
 
 
@@ -413,14 +413,14 @@ def test_an_overlap_issue_failing_stops_on_a_cuda_error(monkeypatch, error, drai
         cuda_error() if error == "cuda" else None
     )
     worker._batch_retrieve_all = lambda keys, **route: views(keys)
-    worker._inflight_deferred_req_ids.add("r1")
-    meta = load_meta(deferred_load=True, layerwise_load=True)
-    worker._deferred_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
+    worker._inflight_async_load_req_ids.add("r1")
+    meta = load_meta(async_load=True, layerwise_load=True)
+    worker._async_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
     if error == "other" and drained:
-        assert worker._deferred_done == {"r1"} and worker._failed_load_blocks
+        assert worker._async_load_done == {"r1"} and worker._failed_load_blocks
         assert worker._stopped is None
     else:
-        assert not worker._deferred_done and not worker._failed_load_blocks
+        assert not worker._async_load_done and not worker._failed_load_blocks
         assert stopped(worker, "req r1")
 
 
@@ -438,10 +438,10 @@ def test_a_slot_mapping_that_cannot_be_pinned_fails_as_on_main(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "pin_memory", pin_memory)
     worker._batch_retrieve_all = lambda keys, **route: views(keys)
-    worker._inflight_deferred_req_ids.add("r1")
-    meta = load_meta(deferred_load=True, layerwise_load=True)
-    worker._deferred_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
-    assert worker._deferred_done == {"r1"}
+    worker._inflight_async_load_req_ids.add("r1")
+    meta = load_meta(async_load=True, layerwise_load=True)
+    worker._async_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
+    assert worker._async_load_done == {"r1"}
     assert worker.take_failed_load_blocks() == set(meta.block_ids)
     assert worker._stopped is None
 
@@ -454,11 +454,11 @@ def test_an_overlap_activation_failing_stops_on_a_cuda_error(
     worker = worker_of("cxl")
     device = fake_cuda(monkeypatch, worker, Done() if drained else FailedWait())
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock())  # not created again
-    meta = load_meta(deferred_load=True, layerwise_load=True)
+    meta = load_meta(async_load=True, layerwise_load=True)
     slots = failing_slots(cuda_error() if error == "cuda" else None)
-    worker._deferred_layerwise_loads["r1"] = (meta, 2, slots, views("ab"))
+    worker._async_layerwise_loads["r1"] = (meta, 2, slots, views("ab"))
     layers = [(LAYER, SimpleNamespace(device=device), 0)]
-    worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+    worker._schedule_async_layerwise_loads(layers, {"r1"}, None)
     if error == "other" and drained:
         assert worker.take_failed_load_blocks() == set(meta.block_ids)
     else:
@@ -468,44 +468,42 @@ def test_an_overlap_activation_failing_stops_on_a_cuda_error(
 
 @pytest.mark.parametrize("error", ["cuda", "other"])
 @pytest.mark.parametrize("drained", [True, False])
-def test_a_failed_parked_load_is_reported_only_once_drained(
-    monkeypatch, error, drained
-):
-    """The layerwise-format parked loads of the step's load stream."""
+def test_a_failed_async_load_is_reported_only_once_drained(monkeypatch, error, drained):
+    """The layerwise-format async loads of the step's load stream."""
     worker = worker_of("cxl")
     log: list = []
     device = fake_cuda(monkeypatch, worker, Drains(log) if drained else FailedWait())
     report = worker._fail_load
     worker._fail_load = lambda meta, e: log.append("report") or report(meta, e)
-    meta = load_meta(deferred_load=True)
+    meta = load_meta(async_load=True)
     slots = failing_slots(cuda_error() if error == "cuda" else None)
     layers = [(LAYER, SimpleNamespace(device=device), 0)]
-    worker._schedule_deferred_loads(layers, [(meta, 2, slots, [])])
+    worker._schedule_async_loads(layers, [(meta, 2, slots, [])])
     if error == "other" and drained:
         assert log == ["drain", "report"]
         assert worker.take_failed_load_blocks() == set(meta.block_ids)
-        assert worker._deferred_done == {"r1"}
+        assert worker._async_load_done == {"r1"}
     else:
-        assert not worker._failed_load_blocks and not worker._deferred_done
+        assert not worker._failed_load_blocks and not worker._async_load_done
         assert stopped(worker, "req r1")
 
 
 @pytest.mark.parametrize("drained", [True, False])
 def test_an_overlap_load_failing_after_its_copies_drains_them_first(drained):
-    """On cxl too: a parked load that fails once its layer copies are queued
+    """On cxl too: an async load that fails once its layer copies are queued
     is reported only after them."""
     worker = worker_of("cxl")
     worker._batch_retrieve_all = lambda keys, **route: views(keys)
     worker._issue_layerwise_copies_offthread = lambda *a: {LAYER: Done()}
-    worker._unpark_gate_event = MagicMock(side_effect=RuntimeError("no gate"))
+    worker._async_load_gate_event = MagicMock(side_effect=RuntimeError("no gate"))
     worker._layerwise_streams = [Done() if drained else FailedWait()]
-    worker._inflight_deferred_req_ids.add("r1")
-    meta = load_meta(deferred_load=True, layerwise_load=True)
-    worker._deferred_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
+    worker._inflight_async_load_req_ids.add("r1")
+    meta = load_meta(async_load=True, layerwise_load=True)
+    worker._async_load_job(meta, [(LAYER, None, 0)], torch.device("cpu"))
     if drained:
-        assert worker._deferred_done == {"r1"} and worker._failed_load_blocks
+        assert worker._async_load_done == {"r1"} and worker._failed_load_blocks
     else:
-        assert not worker._deferred_done and not worker._failed_load_blocks
+        assert not worker._async_load_done and not worker._failed_load_blocks
         assert stopped(worker, "req r1")
 
 
@@ -564,7 +562,7 @@ def test_a_group_batch_whose_copies_cannot_be_waited_for_keeps_its_reads(
 
 
 @pytest.mark.parametrize("drained", [True, False])
-def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
+def test_a_failed_async_group_load_is_recomputed_only_once_drained(
     monkeypatch, drained
 ):
     """A load that failed before its copies, or whose copies ended, is a plain
@@ -572,18 +570,18 @@ def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
     worker = worker_of("cpu")
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
-    worker._deferred_stream = Done() if drained else FailedWait()
-    worker._deferred_stream.wait_event = lambda event: None
-    worker._deferred_stream_device = torch.device("cpu")
+    worker._async_load_stream = Done() if drained else FailedWait()
+    worker._async_load_stream.wait_event = lambda event: None
+    worker._async_load_stream_device = torch.device("cpu")
     worker._load_group_leased = MagicMock(side_effect=RuntimeError("copy failed"))
-    meta = group_meta(deferred_load=True)
+    meta = group_meta(async_load=True)
     worker._group_load_job(meta, torch.device("cpu"), Done())
     if drained:
         assert worker._failed_recv_req_ids == {"r1"}
-        assert worker._deferred_done == {"r1"}
+        assert worker._async_load_done == {"r1"}
         assert worker._stopped is None
     else:
-        assert not worker._failed_recv_req_ids and not worker._deferred_done
+        assert not worker._failed_recv_req_ids and not worker._async_load_done
         assert stopped(worker, "req r1")
 
 
@@ -840,10 +838,10 @@ def test_a_layerwise_batch_without_its_event_stops_the_worker(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", Event)
     slots, slots_dev = MagicMock(), MagicMock()
     slots.to.return_value = slots_dev
-    meta = load_meta(deferred_load=True, layerwise_load=True)
+    meta = load_meta(async_load=True, layerwise_load=True)
     reads = views("ab")
-    worker._deferred_layerwise_loads["r1"] = (meta, 2, slots, reads)
-    worker._schedule_deferred_layerwise_loads(
+    worker._async_layerwise_loads["r1"] = (meta, 2, slots, reads)
+    worker._schedule_async_layerwise_loads(
         [(LAYER, SimpleNamespace(device=device), 0)], {"r1"}, None
     )
     assert not worker._active_load_refs
@@ -952,18 +950,18 @@ def test_a_queued_load_job_reads_nothing_once_the_worker_stopped(backend):
     worker._retrieve_group_objects = MagicMock()
     worker._load_group_leased = MagicMock()
     worker._load_leased_request = MagicMock()
-    worker._inflight_deferred_req_ids.add("r1")
-    worker._deferred_load_job(
-        load_meta(deferred_load=True), [(LAYER, None, 0)], torch.device("cpu")
+    worker._inflight_async_load_req_ids.add("r1")
+    worker._async_load_job(
+        load_meta(async_load=True), [(LAYER, None, 0)], torch.device("cpu")
     )
-    worker._group_load_job(group_meta(deferred_load=True), torch.device("cpu"), Done())
+    worker._group_load_job(group_meta(async_load=True), torch.device("cpu"), Done())
     worker._batch_retrieve_all.assert_not_called()
     worker._retrieve_group_objects.assert_not_called()
     worker._load_group_leased.assert_not_called()
     worker._load_leased_request.assert_not_called()
     # Nor does the memory side hear of a load (a read promote)
     worker._handler.promote_read.assert_not_called()
-    assert not worker._inflight_deferred_req_ids and not worker._deferred_done
+    assert not worker._inflight_async_load_req_ids and not worker._async_load_done
 
 
 def test_a_stopped_leased_load_sends_no_read_promote():
@@ -1021,10 +1019,10 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
     worker = worker_of("cxl")
     worker._load_admission_window = 1
     worker._packed_store_kernel_ctx = lambda attn: None
-    worker._deferred_stream = Done()
-    worker._deferred_stream_device = torch.device("cpu")
+    worker._async_load_stream = Done()
+    worker._async_load_stream_device = torch.device("cpu")
     worker._inject_slab_layers = MagicMock()
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
     entered, resume = threading.Event(), threading.Event()
 
     class Admission:
@@ -1038,7 +1036,7 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
             assert resume.wait(5)
             self.ended = True
 
-    worker._deferred_events["other"] = Admission()
+    worker._async_load_events["other"] = Admission()
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
     event = MagicMock()
@@ -1054,8 +1052,8 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
     monkeypatch.setattr(worker, "_batch_retrieve_all", retrieve)
     with ThreadPoolExecutor(max_workers=1) as executor:
         load = executor.submit(
-            worker._deferred_load_job,
-            load_meta(deferred_load=True),
+            worker._async_load_job,
+            load_meta(async_load=True),
             [(LAYER, torch.zeros(1), 0)],
             torch.device("cpu"),
         )
@@ -1069,28 +1067,28 @@ def test_a_cxl_load_stopped_during_admission_releases_without_submitting(monkeyp
     assert worker._stopped is not None and holds(worker, reads[0])
     worker._inject_slab_layers.assert_not_called()
     event.assert_not_called()
-    assert "r1" not in worker._deferred_events and "r1" not in worker._deferred_refs
-    assert not worker._inflight_deferred_req_ids and not worker._deferred_done
+    assert "r1" not in worker._async_load_events and "r1" not in worker._async_load_refs
+    assert not worker._inflight_async_load_req_ids and not worker._async_load_done
     assert not worker._failed_load_blocks and not worker._failed_recv_req_ids
 
 
 @pytest.mark.parametrize("failure", ["miss", "truncated"])
-def test_a_parked_load_failing_before_its_copies_is_recomputed(failure):
+def test_an_async_load_failing_before_its_copies_is_recomputed(failure):
     """Whatever the streams: no copy was queued."""
     worker = worker_of("cxl")
-    worker._deferred_stream = FailedWait()
+    worker._async_load_stream = FailedWait()
     worker._layerwise_streams = [FailedWait()]
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
 
     def retrieve(keys, **route):
         infos = views(keys)
         return infos[:-1] if failure == "truncated" else [None, *infos[1:]]
 
     worker._batch_retrieve_all = retrieve
-    meta = load_meta(deferred_load=True)
-    worker._deferred_load_job(meta, [(LAYER, torch.zeros(1), 0)], torch.device("cpu"))
+    meta = load_meta(async_load=True)
+    worker._async_load_job(meta, [(LAYER, torch.zeros(1), 0)], torch.device("cpu"))
     assert worker.take_failed_load_blocks() == set(meta.block_ids)
-    assert worker._deferred_done == {"r1"}
+    assert worker._async_load_done == {"r1"}
     assert worker._stopped is None
 
 
@@ -1384,30 +1382,30 @@ def test_an_activation_without_a_common_stream_stops_only_on_a_cuda_error(error)
     worker._inject_kv_into_layer = MagicMock(
         side_effect=cuda_error() if error == "cuda" else RuntimeError("bad layout")
     )
-    meta = load_meta(deferred_load=True, layerwise_load=True)
+    meta = load_meta(async_load=True, layerwise_load=True)
     reads, slots = views("ab"), torch.arange(PROMPT)
-    worker._deferred_layerwise_loads["r1"] = (meta, 2, slots, reads)
+    worker._async_layerwise_loads["r1"] = (meta, 2, slots, reads)
     layers = [(LAYER, torch.zeros(4, 2, 4, 1, 1), 0)]
     if error == "stopped meanwhile":
         other = dataclasses.replace(meta, req_id="r2")
         later = views("cd")
-        worker._deferred_layerwise_loads["r2"] = (other, 2, slots, later)
+        worker._async_layerwise_loads["r2"] = (other, 2, slots, later)
         worker._inject_kv_into_layer.side_effect = lambda *a: (
             worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
         )
-        worker._schedule_deferred_layerwise_loads(layers, {"r1", "r2"}, None)
+        worker._schedule_async_layerwise_loads(layers, {"r1", "r2"}, None)
         assert worker._inject_kv_into_layer.call_count == 2  # one request's chunks
         assert holds(worker, reads[0]) and holds(worker, later[0])  # both entries
         assert not worker._failed_load_blocks
         assert stopped(worker, "req r0")
         return
     if error == "other":
-        worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+        worker._schedule_async_layerwise_loads(layers, {"r1"}, None)
         assert worker.take_failed_load_blocks() == set(meta.block_ids)
         assert worker._stopped is None
         return
     with pytest.raises(_UnconfirmedCopyError, match="req r1"):
-        worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+        worker._schedule_async_layerwise_loads(layers, {"r1"}, None)
     assert holds(worker, reads[0]) and holds(worker, slots)
     assert not worker._failed_load_blocks
     assert stopped(worker, "req r1")
@@ -1464,7 +1462,7 @@ def test_a_hook_whose_timing_event_raises_raises(monkeypatch, hook):
         connector._worker = worker
         call = connector.finish_forward
     elif hook.startswith("poll"):
-        worker._deferred_events["r1"] = Done()  # its own copies ended
+        worker._async_load_events["r1"] = Done()  # its own copies ended
         if hook == "poll (load)":
             poller._loads.append(
                 _LoadTiming("r0", Done(), FailedQuery(), FailedQuery(), 0, 0, 0)
@@ -1539,14 +1537,14 @@ def test_a_timing_clock_whose_event_raises_stops_the_hook(monkeypatch, clock, fa
         monkeypatch.setattr(
             torch.cuda, "current_stream", lambda device=None: SimpleNamespace(device=0)
         )
-        worker._deferred_layerwise_events["r1"] = {LAYER: Done()}
+        worker._async_layerwise_events["r1"] = {LAYER: Done()}
         metadata = MaruConnectorMetadata(layerwise_load_req_ids={"r1"})
         call = functools.partial(worker.start_load_kv, forward(), metadata)
     else:
         stale = _GpuClock.__new__(_GpuClock)
         stale.device, stale.mono = 0, 0.0  # older than its refresh period
         worker._trace_poller._clock = stale
-        worker._deferred_events["r1"] = Done()
+        worker._async_load_events["r1"] = Done()
         call = worker.get_finished_loading
     with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
         call()
@@ -1585,7 +1583,7 @@ def test_a_timing_clock_that_cannot_be_set_up_is_dropped_as_on_main(monkeypatch,
 
 
 def kernel_load(monkeypatch, worker, stream):
-    """A cxl worker whose inline packed load takes the placement kernel on
+    """A cxl worker whose sync packed load takes the placement kernel on
     ``stream`` (a fake CUDA stream on the CPU); returns the kernel's ops."""
     stream.wait_stream = getattr(stream, "wait_stream", lambda other: None)
     worker._load_stream, worker._load_stream_device = stream, torch.device("cpu")
@@ -1655,12 +1653,12 @@ def test_a_load_stream_that_cannot_wait_stops_before_any_copy(monkeypatch):
     assert stopped(worker)
 
 
-@pytest.mark.parametrize("path", ["parked", "inline"])
+@pytest.mark.parametrize("path", ["async", "sync"])
 def test_a_pinned_slot_mapping_is_kept_if_its_own_copy_raises(monkeypatch, path):
     """The pinned copy is in the load's refs before its H2D is issued."""
     worker = worker_of("cxl")
     pinned = failing_slots(cuda_error())  # a tensor other than the caller's
-    if path == "inline":
+    if path == "sync":
         kernel_load(monkeypatch, worker, Done())
         worker._pin_slot_mapping_for_async_h2d = lambda m: pinned
         with pytest.raises(_UnconfirmedCopyError, match="req r1"):
@@ -1671,9 +1669,9 @@ def test_a_pinned_slot_mapping_is_kept_if_its_own_copy_raises(monkeypatch, path)
         monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
         worker._pin_slot_mapping_for_async_h2d = lambda m: pinned
         worker._batch_retrieve_all = lambda keys, **route: views(keys)
-        worker._inflight_deferred_req_ids.add("r1")
-        meta = load_meta(deferred_load=True)
-        worker._deferred_load_job(meta, [(LAYER, torch.zeros(1), 0)], "cpu")
+        worker._inflight_async_load_req_ids.add("r1")
+        meta = load_meta(async_load=True)
+        worker._async_load_job(meta, [(LAYER, torch.zeros(1), 0)], "cpu")
     assert holds(worker, pinned)
     assert not worker._failed_load_blocks
     assert stopped(worker, "req r1")
@@ -1686,11 +1684,11 @@ def test_a_group_submit_whose_event_cannot_be_recorded_stops_the_worker(
     device = fake_cuda(monkeypatch, worker, Done())
     worker._group_caches = [SimpleNamespace(tensors=[SimpleNamespace(device=device)])]
     monkeypatch.setattr(torch.cuda, "Event", FailedRecord)
-    worker._deferred_executor = MagicMock()
+    worker._async_load_executor = MagicMock()
     with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
-        worker._try_submit_group_load(group_meta(deferred_load=True))
-    worker._deferred_executor.submit.assert_not_called()
-    assert "r1" not in worker._inflight_deferred_req_ids
+        worker._try_submit_group_load(group_meta(async_load=True))
+    worker._async_load_executor.submit.assert_not_called()
+    assert "r1" not in worker._inflight_async_load_req_ids
     assert stopped(worker)
 
 
@@ -1701,11 +1699,11 @@ def test_an_activation_stream_that_cannot_wait_keeps_its_reads(monkeypatch):
     stream.wait_stream = MagicMock(side_effect=cuda_error())
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock())  # not created again
     reads = views("ab")
-    meta = load_meta(deferred_load=True, layerwise_load=True)
-    worker._deferred_layerwise_loads["r1"] = (meta, 2, torch.arange(PROMPT), reads)
+    meta = load_meta(async_load=True, layerwise_load=True)
+    worker._async_layerwise_loads["r1"] = (meta, 2, torch.arange(PROMPT), reads)
     layers = [(LAYER, SimpleNamespace(device=device), 0)]
     with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
-        worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+        worker._schedule_async_layerwise_loads(layers, {"r1"}, None)
     assert holds(worker, reads[0])
     assert stopped(worker)
 
@@ -1740,12 +1738,12 @@ def test_the_helpers_give_nothing_back_once_stopped():
     worker._handler.alloc.assert_not_called()
     worker._handler.batch_store.assert_not_called()
     entry = (load_meta(), 2, torch.arange(PROMPT), views(range(2)))
-    worker._deferred_layerwise_loads["r1"] = entry
+    worker._async_layerwise_loads["r1"] = entry
     worker._inject_kv_into_layer = MagicMock()
     layers = [(LAYER, torch.zeros(4, 2, 4, 1, 1), 0)]
-    worker._schedule_deferred_layerwise_loads(layers, {"r1"}, None)
+    worker._schedule_async_layerwise_loads(layers, {"r1"}, None)
     worker._inject_kv_into_layer.assert_not_called()
-    assert worker._deferred_layerwise_loads["r1"] is entry
+    assert worker._async_layerwise_loads["r1"] is entry
 
 
 def test_a_done_marker_taken_as_the_worker_stops_is_kept():
@@ -1803,7 +1801,7 @@ def test_a_queued_store_failing_at_shutdown_lets_shutdown_go_on(error):
     worker._store_packed_slabs_write_behind = MagicMock(
         side_effect=cuda_error() if error == "cuda" else RuntimeError("bad batch")
     )
-    loader = worker._deferred_executor = MagicMock()
+    loader = worker._async_load_executor = MagicMock()
     worker._load_stream = load = MagicMock()
     worker.shutdown()
     loader.shutdown.assert_called_once_with(wait=True)

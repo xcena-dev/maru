@@ -12,9 +12,9 @@ import torch
 
 from maru_vllm.connector import MaruConnectorMetadata, _chunk_keys
 from tests.unit.vllm_connector_helpers import (
+    async_load_req_meta,
     attach_capturing_handler,
     capture_float32,
-    deferred_req_meta,
     make_flash_attn_metadata,
     make_worker,
     store_req_meta,
@@ -47,12 +47,12 @@ def test_inline_retrieve_failure_is_reported_and_only_failed_stores_are_dropped(
     hit_tokens, cold_tokens = list(range(100, 164)), list(range(64))
     metadata = MaruConnectorMetadata(
         requests=[
-            deferred_req_meta(
+            async_load_req_meta(
                 token_ids=hit_tokens,
                 block_ids=list(range(16)),
                 num_matched_chunks=2,
                 req_id="hit",
-                deferred_load=False,
+                async_load=False,
             ),
             store_req_meta(
                 token_ids=hit_tokens,

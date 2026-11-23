@@ -172,7 +172,7 @@ def test_real_scheduler_preserves_other_request_sharing_prefix(
         load_start_token=4,
         load_end_token=12,
     )
-    worker._fail_deferred_load(meta)
+    worker._fail_async_load(meta)
     affected, _, _ = engine._update_requests_with_invalid_blocks(
         [decoding, loading] if other_running else [loading],
         worker.take_failed_load_blocks(),

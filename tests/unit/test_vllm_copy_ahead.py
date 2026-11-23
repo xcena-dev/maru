@@ -6,8 +6,8 @@ Such a load copies each chunk slab to the GPU and injects it layer by layer.
 ``_CopyAhead`` runs the copies on a side stream into a small ring of device
 slabs, so that the next chunk's copy overlaps this chunk's injects. These tests
 check which slabs take it, that a slab in the ring is never overwritten before
-its reader has run, and that loads through it restore every layer, inline and
-deferred.
+its reader has run, and that loads through it restore every layer, sync and
+async.
 """
 
 import threading
@@ -25,8 +25,8 @@ import torch
 from maru_vllm.connector import _chunk_keys, _CopyAhead
 from tests.unit.test_vllm_logical_page import logical_pages
 from tests.unit.vllm_connector_helpers import (
+    async_load_metadata,
     attach_capturing_handler,
-    deferred_metadata,
     make_flash_attn_metadata,
     make_worker,
     store_metadata,
@@ -252,10 +252,10 @@ class TestLoadRoundtrip:
             writer.save_kv_layer(name, cache, attn_metadata, metadata)
         return src, stored, token_ids
 
-    @pytest.mark.parametrize("deferred", [False, True], ids=["inline", "deferred"])
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
     @pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "pageable"])
     @pytest.mark.parametrize("depth", [0, 1, 2])
-    def test_load_restores_every_layer(self, depth, pinned, deferred):
+    def test_load_restores_every_layer(self, depth, pinned, is_async):
         src, stored, token_ids = self._stored()
         # Host slabs as a pool hands them out: page-locked or not
         host = {
@@ -289,15 +289,15 @@ class TestLoadRoundtrip:
         )
         reader.start_load_kv(
             forward_context,
-            deferred_metadata(
+            async_load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
-                deferred_load=deferred,
+                async_load=is_async,
             ),
         )
-        if deferred:
-            # On CUDA a deferred load runs on the background loader thread.
+        if is_async:
+            # On CUDA an async load runs on the background loader thread.
             deadline = time.monotonic() + 30.0
             finished = None
             while finished is None and time.monotonic() < deadline:

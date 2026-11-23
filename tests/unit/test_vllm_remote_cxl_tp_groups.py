@@ -37,7 +37,7 @@ from tests.unit.test_vllm_cpu_config import extra as cpu_extra
 from tests.unit.test_vllm_kv_groups import (
     _FORWARD,
     B_BLOCKS,
-    FAILED_PARKED,
+    FAILED_ASYNC,
     QWEN_BLOCKS,
     TINY_BLOCK,
     _HeldExecutor,
@@ -347,7 +347,7 @@ def test_remote_cxl_takes_several_kv_cache_groups():
         remote_vllm_config(block_size=16), KVConnectorRole.SCHEDULER, gpt_oss_config()
     )
     assert connector._scheduler._multi_group
-    assert connector._scheduler._deferred_loading
+    assert connector._scheduler._async_loading
 
 
 def test_cpu_storage_still_takes_one_kv_cache_group():
@@ -543,14 +543,14 @@ def test_a_group_load_reads_what_staging_holds_and_releases_it(slots):
     assert server.routes == {_chunk_keys(tokens, TINY_BLOCK)[0]}
 
 
-def test_a_missing_group_object_fails_the_parked_load_and_frees_its_slots():
+def test_a_missing_group_object_fails_the_async_load_and_frees_its_slots():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
     del store[group_object_key(k1, 2, TINY_BLOCK)]
     worker, target = session_group_worker(SessionServer(store), 64)
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
-    assert _reported_failures(worker) == FAILED_PARKED
+    assert _reported_failures(worker) == FAILED_ASYNC
     assert worker._handler.free_slots == 64
 
 

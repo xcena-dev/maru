@@ -113,7 +113,7 @@ def test_sync_remote_cxl_loads_need_vllm_async_scheduling_off():
         _cpu_engine_config(extra(maru_async_load=False), _engine(True))
     sync = extra(maru_async_load=False)
     assert _cpu_engine_config(sync, _engine(False))["maru_cache_namespace"]
-    # An asynchronous load reports its failure while the request is parked.
+    # An async load reports its failure while the request still waits for it.
     assert _cpu_engine_config(extra(maru_async_load=True), _engine(True))
 
 

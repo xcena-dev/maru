@@ -17,28 +17,28 @@ import torch
 
 from maru_vllm import trace
 from maru_vllm.connector import MaruKVConnector, _CopyAhead
-from tests.unit.vllm_connector_helpers import deferred_req_meta, make_worker
+from tests.unit.vllm_connector_helpers import async_load_req_meta, make_worker
 
 
 def request():
-    return deferred_req_meta(
+    return async_load_req_meta(
         token_ids=list(range(8)), block_ids=[1, 2], num_matched_chunks=1
     )
 
 
 @pytest.mark.parametrize("error", [errno.EAGAIN, errno.EPIPE, errno.ENOSPC])
-def test_broken_stderr_does_not_strand_a_deferred_request(monkeypatch, error):
+def test_broken_stderr_does_not_strand_an_async_load_request(monkeypatch, error):
     worker = make_worker(4, 8, {"maru_log_timing": True, "maru_async_load": True})
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
     broken = MagicMock()
     broken.write.side_effect = OSError(error, "stderr unavailable")
     monkeypatch.setattr(trace.sys, "stderr", broken)
 
-    worker._deferred_load_job(request(), [], torch.device("cpu"))
+    worker._async_load_job(request(), [], torch.device("cpu"))
 
     assert worker.get_finished_loading() == {"r1"}
     assert worker.take_failed_load_blocks() == {1, 2}
-    assert not worker._inflight_deferred_req_ids
+    assert not worker._inflight_async_load_req_ids
 
 
 def test_trace_backend_failure_preserves_pending_layerwise_copies(monkeypatch):
@@ -69,7 +69,7 @@ def test_trace_backend_failure_preserves_pending_layerwise_copies(monkeypatch):
     req = request()
     req.layerwise_load = True
 
-    worker._deferred_load_job(
+    worker._async_load_job(
         req,
         [("l0", torch.zeros(2, 2, 4, 1), 0), ("l1", torch.zeros(2, 2, 4, 1), 1)],
         torch.device("cpu"),
@@ -77,7 +77,7 @@ def test_trace_backend_failure_preserves_pending_layerwise_copies(monkeypatch):
 
     assert worker.get_finished_loading() is None
     assert not worker.take_failed_load_blocks()
-    assert worker._deferred_layerwise_events["r1"] is events
+    assert worker._async_layerwise_events["r1"] is events
     for event in events.values():
         event.query.return_value = True
     assert worker.get_finished_loading() == {"r1"}
@@ -102,8 +102,8 @@ def test_failed_loads_are_explicit_and_preserve_attempt(monkeypatch, capsys):
     req = request()
     req.trace_attempt = 3
     worker._trace_attempts["r1"] = 3
-    worker._fail_deferred_load(req)
-    worker._fail_deferred_load(req)
+    worker._fail_async_load(req)
+    worker._fail_async_load(req)
     assert worker.get_finished_loading() == {"r1"}
     lines = capsys.readouterr().err.splitlines()
     failed = [line for line in lines if line.startswith("REQ-TRACE load_failed")]
@@ -167,7 +167,7 @@ def test_finished_trace_state_is_bounded_but_pending_receives_keep_their_attempt
     worker._trace_attempts.update(done=2, pending=3)
     event = MagicMock()
     event.query.return_value = False
-    worker._deferred_events["pending"] = event
+    worker._async_load_events["pending"] = event
 
     worker.get_finished_saving({"done", "pending"})
     assert worker._trace_attempts == {"pending": 3}

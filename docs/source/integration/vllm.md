@@ -10,7 +10,7 @@ remote CXL example has its own validated engine/Torch/CUDA/NIXL constraints;
 see {ref}`nixl-stack`. CPU/mixed pools, shared CXL and RDMA paths have different
 sharing and transfer contracts.
 
-**Deferred loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects deferred loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
+**Async loading requires vLLM v0.16.0+** (`maru_async_load`, also named `maru_enable_deferred_loading` in older configurations). Older versions do not retain GPU blocks when a request is cancelled while waiting for a KV load. Maru rejects async loading during initialization on those versions; upgrade vLLM or disable that option. Synchronous loading remains available on v0.14+.
 
 **vLLM v0.29+** resolves one KV cache layout per model in the engine core
 (`VLLM_KV_CACHE_LAYOUT` selects it; `NHD` and `HND` are aliases for `LBNHC`
@@ -142,7 +142,7 @@ The CXL mmap region is pinned via `cudaHostRegister` by MaruHandler's DaxMapper,
 so `.to(device)` triggers a direct DMA transfer from CXL to GPU memory without
 any intermediate CPU copy.
 
-If CUDA registration fails for a region, the packed connector checks each slab's actual pin status before passing a host pointer to the placement kernel. Inline loads copy an unpinned slab to the GPU and run the placement kernel on that copy, as deferred loads already do for every slab. Stores gather into one reusable GPU slab and copy it to CXL before publishing the keys. Pinned slabs keep the direct kernel path, including in batches that also contain unpinned slabs. This preserves caching when pinning fails, at reduced transfer performance.
+If CUDA registration fails for a region, the packed connector checks each slab's actual pin status before passing a host pointer to the placement kernel. Sync loads copy an unpinned slab to the GPU and run the placement kernel on that copy, as async loads already do for every slab. Stores gather into one reusable GPU slab and copy it to CXL before publishing the keys. Pinned slabs keep the direct kernel path, including in batches that also contain unpinned slabs. This preserves caching when pinning fails, at reduced transfer performance.
 
 ### Chunk-Based Storage
 
@@ -498,15 +498,15 @@ By default both the cache-hit load and the populate store run to completion
 inside the model worker's forward pass. The two settings below move that work
 off the critical path; they are independent and can be enabled separately.
 
-`maru_async_load` parks a cache-hit request while a background thread
+`maru_async_load` holds a cache-hit request in WAITING_FOR_REMOTE_KVS while a background thread
 performs the Maru lookup and the CXL→GPU transfer, then reports completion
 through a CUDA event. The forward pass no longer waits on the retrieve RPC.
 This is the mechanism vLLM itself calls an asynchronous load: the request
 waits in `WAITING_FOR_REMOTE_KVS`.
 
-A parked request initially holds blocks for its loaded prefix. It needs room
+An async-loading request initially holds blocks for its loaded prefix. It needs room
 for the rest of its prompt and any speculative lookahead before it can run.
-On vLLM < 0.23, Maru budgets this full requirement for parked requests and
+On vLLM < 0.23, Maru budgets this full requirement for async-loading requests and
 earlier waiters, capped at the model's maximum length. A request that does not
 fit stays in `WAITING` and keeps its place until vLLM gives it blocks. The
 first request in line is admitted on its own; vLLM sizes the cache to fit one
@@ -570,15 +570,15 @@ off.
 
 ![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
-The loader thread queues the per-layer copies while the request is still
-parked. The load is reported complete — which is what lets vLLM schedule the
+The loader thread queues the per-layer copies while the request still
+waits for its async load. The load is reported complete — which is what lets vLLM schedule the
 request — once `maru_overlap_release_after_layers` of them have landed, one
 layer by default, so the request's prefill compute runs while the remaining
 layers arrive rather than after them.
 A cache-hit request computes only the tokens left over past its cached chunks,
 so one layer of compute is shorter than one layer of transfer: the compute
 fits inside the transfer and the transfer time is what sets time to first
-token. All parked-request transfers share one stream. That keeps each at full
+token. All async-loading request transfers share one stream. That keeps each at full
 CXL bandwidth — splitting them across streams makes each transfer take as many
 times longer as there are loading requests, raising that floor — and it means
 a later request's first layer only lands once the earlier one has finished, so
@@ -740,16 +740,16 @@ under `"recompute"` vLLM recomputes it from the first block any worker
 reports as failed, or from its first token for a model with several KV cache
 groups (see {ref}`vllm-load-failures`).
 
-Above TP=1 every load is parked (`maru_async_load=true`, which needs vLLM
+Above TP=1 every load is async (`maru_async_load=true`, which needs vLLM
 0.16+). The connector turns it on unless it is set, and refuses
-`maru_async_load=false`. A parked load finishes on every rank, and vLLM
-merges every rank's result, before the request computes. An inline load runs
+`maru_async_load=false`. An async load finishes on every rank, and vLLM
+merges every rank's result, before the request computes. A sync load runs
 in the step that computes its request, and a rank whose load fails is the
 only one that knows: the all-reduce in every layer would spread its unfilled
 KV to every rank, and the other ranks would store what they computed from it
 ([#135](https://github.com/xcena-dev/maru/issues/135)). For the same reason, a
 layerwise-overlap load (`maru_overlap_load_with_compute`) whose per-layer
-copies the loader thread cannot queue fails while the request is parked,
+copies the loader thread cannot queue fails while the request waits for its async load,
 instead of having the forward issue them as it does at TP=1.
 
 Each worker process connects its own MaruHandler:
@@ -810,7 +810,7 @@ The connector refuses to start a model with several groups unless:
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
-- Loads are parked (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed inline load of such a model correctly; see {ref}`vllm-load-failures`.
+- Loads are async (`maru_async_load=true`). The connector turns it on for a model with several groups unless it is set, and refuses `maru_async_load=false`: vLLM cannot take a failed sync load of such a model correctly; see {ref}`vllm-load-failures`.
 
 ```bash
 vllm serve Qwen/Qwen3.5-0.8B \
@@ -872,13 +872,13 @@ vLLM's `kv_load_failure_policy` decides what happens to a request whose KV load 
 - `fail` (vLLM's default) ends the request with an error.
 - `recompute` computes the request again; with several groups vLLM restarts it from the first token.
 
-With several groups every load is parked, and Maru reports a failed parked load by its request. An inline load could be reported only by its blocks: vLLM 0.31 and later stop the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group ([#126](https://github.com/xcena-dev/maru/issues/126)), and under `recompute` vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)). The connector therefore turns `maru_async_load` on for such a model and refuses `maru_async_load=false`. Upstream changes that would allow inline loads again are tracked in [#127](https://github.com/xcena-dev/maru/issues/127).
+With several groups every load is async, and Maru reports a failed async load by its request. A sync load could be reported only by its blocks: vLLM 0.31 and later stop the engine on a block-level failure of a model with several groups, whatever the policy, since block ids are unique only within a group ([#126](https://github.com/xcena-dev/maru/issues/126)), and under `recompute` vLLM 0.30's V2 model runner resumes the recomputed request from the wrong position and can return wrong output ([vllm-project/vllm#49250](https://github.com/vllm-project/vllm/issues/49250)). The connector therefore turns `maru_async_load` on for such a model and refuses `maru_async_load=false`. Upstream changes that would allow sync loads again are tracked in [#127](https://github.com/xcena-dev/maru/issues/127).
 
 After a failure is reported, the scheduler checks keys with MaruServer again instead of trusting earlier lookups. When vLLM asks again about a request whose load failed, the request is computed without Maru, with every backend.
 
 A CUDA error from a GPU copy of a load or a store, or from recording, waiting on or querying a stream or event queued after it (with `maru_log_timing`, the timing events too), stops the worker: such a copy may still be running, and vLLM would reuse the blocks it writes or reads. The connector call that met the error raises, or else the next one vLLM makes, and vLLM fails the engine. The load is not reported as failed. An error that is not a CUDA error, such as running out of GPU memory, a rejected cache layout or a miss, does not stop the worker. Depending on the path, a load is reported and recomputed or falls back to another way of loading, a store skips the chunk, or the error propagates out of the hook.
 
-A load that fails after some of its copies were queued is reported only once those copies have ended: until then vLLM gets neither its failed blocks nor its completion. Copies queued on the forward's own stream are the exception: those of loads without the placement kernel on `cpu`, `mixed` and `remote_cxl` (on `remote_cxl`, for example an MLA model or a staging buffer CUDA could not register), of loads under `maru_use_layerwise` that are inline or whose layers span several devices, and of layerwise-overlap loads whose layers span several devices. Such a failure is reported at once, as those copies are already ordered before vLLM's recompute on that stream.
+A load that fails after some of its copies were queued is reported only once those copies have ended: until then vLLM gets neither its failed blocks nor its completion. Copies queued on the forward's own stream are the exception: those of loads without the placement kernel on `cpu`, `mixed` and `remote_cxl` (on `remote_cxl`, for example an MLA model or a staging buffer CUDA could not register), of loads under `maru_use_layerwise` that are sync or whose layers span several devices, and of layerwise-overlap loads whose layers span several devices. Such a failure is reported at once, as those copies are already ordered before vLLM's recompute on that stream.
 
 Once the worker has seen the stop it issues no new read, copy, store or hint, also at shutdown. A call already past that check finishes its one issue, and what that issue uses is kept. The worker gives nothing back: it frees, releases and closes nothing a copy may still use, even if a later wait succeeds. For a load that is its CXL views or storage-session read leases (on `remote_cxl`, staging slots) and the device buffers in use at the failure; for a store, its pages, the device staging and the requests' GPU blocks, so a write-behind store's requests never finish. A per-copy device buffer released before the failure has gone back to PyTorch's caching allocator, which reuses it only after the copies queued before it on its stream. The Handler stays open. All of it stays held until the process ends. A synchronous store whose copies cannot be confirmed registers none of their objects and raises in that step, and so does a preemption while store copies may still read the preempted request's blocks. To recover, restart the whole vLLM engine and confirm its old worker processes have exited, as after persistent RDMA transfer errors.
 

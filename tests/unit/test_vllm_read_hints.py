@@ -534,9 +534,9 @@ def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
     worker._retrieve_group_objects = lambda meta: calls.append(("read",))
     worker._load_group_leased = lambda *a, **k: calls.append(("read",))
     worker._fail_load = lambda meta, exc: calls.append(("failed",))
-    worker._deferred_stream = None
-    worker._deferred_lock = threading.Lock()
-    worker._inflight_deferred_req_ids = set()
+    worker._async_load_stream = None
+    worker._async_load_lock = threading.Lock()
+    worker._inflight_async_load_req_ids = set()
     worker._abandoned_req_ids = set()
     meta = SimpleNamespace(req_id="r1")
     # The storage-session path goes on to CUDA, which this test has none of.

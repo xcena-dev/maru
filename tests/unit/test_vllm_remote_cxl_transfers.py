@@ -155,35 +155,35 @@ def test_no_free_staging_slot_recomputes_the_request():
     worker._batch_retrieve_all.assert_not_called()
 
 
-def test_a_deferred_load_unparks_only_after_its_last_batch():
+def test_an_async_load_resumes_only_after_its_last_batch():
     worker, cache = _worker(1)
     worker._last_attn_metadata = make_flash_attn_metadata()
-    meta = _load_meta(deferred_load=True)
+    meta = _load_meta(async_load=True)
     seen_done = []
 
     def retrieve(requested, route_key=None):
-        seen_done.append("load" in worker._deferred_done)
+        seen_done.append("load" in worker._async_load_done)
         return [_view(_slab())]
 
     worker._batch_retrieve_all = retrieve
     worker._load_leased_request([("layer", cache, 0)], meta, worker._last_attn_metadata)
-    assert seen_done == [False, False, False]  # never unparked between batches
-    assert worker._deferred_done == {"load"}
+    assert seen_done == [False, False, False]  # never resumed between batches
+    assert worker._async_load_done == {"load"}
     assert not worker.take_failed_load_blocks()
     assert worker._handler.release_retrieved.call_count == 3
     torch.testing.assert_close(cache[0, :, 0, 0, 0], _slab()[:, 0, 0, 0])
 
 
-def test_a_failed_deferred_batch_unparks_for_recompute():
+def test_a_failed_async_load_batch_resumes_for_recompute():
     worker, cache = _worker(1)
     worker._last_attn_metadata = make_flash_attn_metadata()
-    meta = _load_meta(deferred_load=True)
+    meta = _load_meta(async_load=True)
     keys = _req_chunk_keys(meta, 8, "")
     worker._batch_retrieve_all = lambda req, route_key=None: (
         [None] if req[0] == keys[1] else [_view(_slab())]
     )
     worker._load_leased_request([("layer", cache, 0)], meta, worker._last_attn_metadata)
-    assert worker._deferred_done == {"load"}
+    assert worker._async_load_done == {"load"}
     assert worker.take_failed_load_blocks() == {2, 3, 4, 5}  # chunk 1 onward
 
 
@@ -197,14 +197,14 @@ def test_the_loader_thread_takes_the_batched_path_on_its_own_stream(monkeypatch)
         lambda device=None, priority=0: streams.append(_FakeStream()) or streams[-1],
     )
     worker._load_leased_request = MagicMock()
-    meta = _load_meta(deferred_load=True)
+    meta = _load_meta(async_load=True)
     layers = [("layer", cache, 0)]
-    worker._inflight_deferred_req_ids.add("load")
-    worker._deferred_load_job(meta, layers, torch.device("cpu"))
+    worker._inflight_async_load_req_ids.add("load")
+    worker._async_load_job(meta, layers, torch.device("cpu"))
     worker._load_leased_request.assert_called_once_with(
         layers, meta, worker._last_attn_metadata, stream=streams[0]
     )
-    assert "load" not in worker._inflight_deferred_req_ids
+    assert "load" not in worker._inflight_async_load_req_ids
 
 
 class _FakeStream:
@@ -317,7 +317,7 @@ def _pipelined(
     chunks=1,
     slots=None,
     done=False,
-    deferred=False,
+    is_async=False,
     setup=None,
 ):
     """A loader-thread load of 3 chunks, read ``chunks`` chunks per batch.
@@ -331,7 +331,7 @@ def _pipelined(
 
     monkeypatch.setattr(connector, "_LOAD_PIPELINE_CHUNKS", chunks)
     worker, cache, meta, ops = _kernel_worker(monkeypatch, log)
-    meta.deferred_load = deferred
+    meta.async_load = is_async
     keys = _req_chunk_keys(meta, 8, "")
     held = [0]
 
@@ -346,8 +346,8 @@ def _pipelined(
     def release(infos):
         held[0] -= len(infos)
         log.append(f"release {len(infos)}")
-        if deferred:
-            log.append(f"done {'load' in worker._deferred_done}")
+        if is_async:
+            log.append(f"done {'load' in worker._async_load_done}")
 
     worker._handler.release_retrieved.side_effect = release
     if slots is not None:
@@ -414,15 +414,15 @@ def _stopped(worker):
     return True
 
 
-@pytest.mark.parametrize("deferred", [False, True])
-def test_unconfirmed_pipelined_copies_stop_the_worker(monkeypatch, deferred):
+@pytest.mark.parametrize("is_async", [False, True])
+def test_unconfirmed_pipelined_copies_stop_the_worker(monkeypatch, is_async):
     # Waiting on a batch's event failed: its copies may still write the
     # request's blocks, so it is not recomputed into them; nor are the slots
     # they read given back.
     log = []
-    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, deferred=deferred)
+    worker, _ = _pipelined(monkeypatch, log, stream_fails=True, is_async=is_async)
     assert "release 1" not in log
-    assert "load" not in worker._deferred_done
+    assert "load" not in worker._async_load_done
     assert not worker._failed_load_blocks
     assert not worker._loaded_request_keys["load"][1]
     assert kept_by(worker)
@@ -457,11 +457,11 @@ def test_batches_whose_copies_ended_go_back_before_the_next_read(monkeypatch):
     assert not worker.take_failed_load_blocks()
 
 
-def test_a_deferred_load_is_done_only_after_its_last_batch(monkeypatch):
+def test_an_async_load_is_done_only_after_its_last_batch(monkeypatch):
     log = []
-    worker, keys = _pipelined(monkeypatch, log, deferred=True)
+    worker, keys = _pipelined(monkeypatch, log, is_async=True)
     assert log.count("release 1") == 3 and "done True" not in log
-    assert worker._deferred_done == {"load"}
+    assert worker._async_load_done == {"load"}
     assert not worker.take_failed_load_blocks()
     assert worker._loaded_request_keys["load"][1] == set(keys)
 
@@ -707,7 +707,7 @@ def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
     monkeypatch.setattr(worker, "_pin_slot_mapping_for_async_h2d", lambda m: m)
     capacities = itertools.chain([0, 0], itertools.repeat(3))
     worker._handler.retrieve_capacity.side_effect = lambda: next(capacities)
-    meta = _load_meta(deferred_load=True)
+    meta = _load_meta(async_load=True)
     worker._batch_retrieve_all = lambda req, route_key=None: [
         _view(_slab()) for _ in req
     ]
@@ -716,13 +716,13 @@ def test_the_loader_thread_waits_briefly_for_a_slot(monkeypatch):
         [("layer", cache, 0)], meta, worker._last_attn_metadata, stream=_FakeStream()
     )
     assert not worker.take_failed_load_blocks()
-    assert worker._deferred_done == {"load"}
+    assert worker._async_load_done == {"load"}
 
 
 def test_a_failed_async_load_is_recomputed_instead_of_retried():
     scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
     scheduler._count_matched_chunks = lambda tokens: 2
-    request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
+    request = SimpleNamespace(request_id="async", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)
     blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
     scheduler.update_state_after_alloc(request, blocks, 12)
@@ -757,11 +757,11 @@ def test_a_preempted_request_gets_its_hit_again():
 
 
 def test_an_async_load_carries_its_external_token_range():
-    """Blocks before the range are vLLM's own prefix cache: a deferred load
-    must leave them alone, as an inline load does."""
+    """Blocks before the range are vLLM's own prefix cache: an async load
+    must leave them alone, as a sync load does."""
     scheduler = make_scheduler(4, 8, remote_cxl_extra(maru_async_load=True))
     scheduler._count_matched_chunks = lambda tokens: 2
-    request = SimpleNamespace(request_id="parked", prompt_token_ids=list(range(16)))
+    request = SimpleNamespace(request_id="async", prompt_token_ids=list(range(16)))
     assert scheduler.get_num_new_matched_tokens(request, 4) == (8, True)
     blocks = SimpleNamespace(get_block_ids=lambda: [[0, 1, 2]])
     scheduler.update_state_after_alloc(request, blocks, 8)
@@ -776,7 +776,7 @@ def test_an_async_load_carries_its_external_token_range():
     )
     meta = scheduler.build_connector_meta(output)
     (load,) = meta.requests
-    assert load.deferred_load
+    assert load.async_load
     assert (load.load_start_token, load.load_end_token) == (4, 12)
 
 
@@ -1193,11 +1193,11 @@ def test_aborting_a_queued_loader_prevents_late_store_skip_state(monkeypatch):
     worker, _, _, load, _ = _loaded_store_worker(monkeypatch, tokens=16)
     cache = next(iter(worker._kv_caches.values()))
     # Capture the real submit gate before its queued job can start.
-    worker._deferred_executor = SimpleNamespace(submit=Mock())
+    worker._async_load_executor = SimpleNamespace(submit=Mock())
     worker._kv_caches = {"layer": SimpleNamespace(device=torch.device("cuda"))}
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    assert worker._try_submit_deferred_load(load)
-    assert load.req_id in worker._inflight_deferred_req_ids
+    assert worker._try_submit_async_load(load)
+    assert load.req_id in worker._inflight_async_load_req_ids
     worker.handle_preemptions(
         MaruConnectorMetadata(recv_only_finished_req_ids={load.req_id})
     )
@@ -1206,5 +1206,5 @@ def test_aborting_a_queued_loader_prevents_late_store_skip_state(monkeypatch):
     worker._load_leased_request([("layer", cache, 0)], load, make_flash_attn_metadata())
     assert not worker.take_failed_load_blocks()
     assert not worker._loaded_request_keys
-    worker._deferred_executor = None
+    worker._async_load_executor = None
     worker.shutdown()

@@ -16,7 +16,7 @@ from tests.unit.vllm_connector_helpers import make_bare_worker, make_flash_attn_
 
 
 class TestInjectPartialLastChunk:
-    """The deferred and layerwise loads can need fewer tokens than they read.
+    """The async and layerwise loads can need fewer tokens than they read.
 
     For a fully cached prompt whose length is an exact multiple of the chunk
     size, one block is held back for the engine to compute (see

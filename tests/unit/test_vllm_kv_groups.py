@@ -280,7 +280,7 @@ def _check_dsv41(config):
         block_size=DSV41_BLOCK,
         use_layerwise=False,
         speculative=False,
-        inline_loads=False,
+        sync_loads=False,
     )
 
 
@@ -301,7 +301,7 @@ def test_dsv41_passes_the_support_check_in_the_layerwise_format():
         block_size=DSV41_BLOCK,
         use_layerwise=True,
         speculative=False,
-        inline_loads=False,
+        sync_loads=False,
     )
 
 
@@ -382,7 +382,7 @@ def test_dsv41_without_bounded_replay_passes_the_support_check(layerwise):
         block_size=DSV41_BLOCK // 4,
         use_layerwise=layerwise,
         speculative=False,
-        inline_loads=False,
+        sync_loads=False,
     )
 
 
@@ -910,15 +910,15 @@ def _dsv41_loading_worker(store, chunk=2 * DSV41_BLOCK, **kwargs):
 
 @DSV41_FORMATS
 @pytest.mark.parametrize("per", [1, 2, 4], ids=["1-block", "2-blocks", "4-blocks"])
-def test_dsv41_parked_load_restores_the_blocks(per, extra):
+def test_dsv41_async_load_restores_the_blocks(per, extra):
     chunk = per * DSV41_BLOCK
     stored, store = _dsv41_stored(chunk, extra_config=extra)
     assert set(store) == _dsv41_keys(list(range(80)), chunk, 64 // chunk, bool(extra))
     worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
     meta = _load_meta(
-        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, async_load=True
     )
-    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads inline
+    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads synchronously
     for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
         assert _block_bytes(worker, b) == _block_bytes(stored, a)
     assert worker.take_failed_load_blocks() == set()
@@ -939,7 +939,7 @@ def test_dsv41_load_skips_blocks_vllms_cache_holds(per, extra):
         _dsv41_blocks(DSV41_BLOCKS_B),
         64 // chunk,
         computed=16,
-        deferred_load=True,
+        async_load=True,
         load_start_token=16,
     )
     worker.start_load_kv(_FORWARD, meta)
@@ -961,11 +961,11 @@ def test_dsv41_load_fails_when_it_starts_inside_a_block(extra):
         _dsv41_blocks(DSV41_BLOCKS_B),
         64 // chunk,
         computed=8,
-        deferred_load=True,
+        async_load=True,
         load_start_token=8,
     )
     worker.start_load_kv(_FORWARD, meta)
-    # A parked load of several groups fails by its request, not its blocks.
+    # An async load of several groups fails by its request, not its blocks.
     assert _reported_failures(worker) == (set(), {"b"}, {"b"})
 
 
@@ -983,7 +983,7 @@ def test_dsv41_load_fails_on_an_object_of_another_size(change, extra):
         store[key] = data[:change] if change < 0 else data + bytes(change)
     worker = _dsv41_loading_worker(store, chunk, extra_config=extra)
     meta = _load_meta(
-        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, deferred_load=True
+        list(range(80)), _dsv41_blocks(DSV41_BLOCKS_B), 64 // chunk, async_load=True
     )
     worker.start_load_kv(_FORWARD, meta)
     assert _reported_failures(worker) == (set(), {"b"}, {"b"})
@@ -1016,7 +1016,7 @@ def test_dsv41_every_rank_loads_the_writers_blocks(extra):
             chunk,
             extra_config=extra,
         )
-        meta = _load_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_B), 2, deferred_load=True)
+        meta = _load_meta(tokens, _dsv41_blocks(DSV41_BLOCKS_B), 2, async_load=True)
         worker.start_load_kv(_FORWARD, meta)
         assert worker.take_failed_load_blocks() == set()
         for a, b in zip(DSV41_BLOCKS_A, DSV41_BLOCKS_B, strict=True):
@@ -1260,7 +1260,7 @@ def test_dsv41_unbounded_load_restores_the_window_at_the_hit_end(extra):
     _serve(worker, store)
     held = [0] * 14 + [17, 18]
     meta = _load_meta(
-        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, async_load=True
     )
     worker.start_load_kv(_FORWARD, meta)
     assert _reported_failures(worker) == (set(), {"b"}, set())
@@ -1292,7 +1292,7 @@ def test_dsv41_unbounded_load_skips_blocks_a_long_window_left_behind(extra):
     _serve(worker, store)
     held = [0] * 6 + [17, 18, 19, 1, 2, 5, 7, 9, 10, 11]
     meta = _load_meta(
-        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+        list(range(80)), _unbounded_blocks(DSV41_BLOCKS_B, held), 2, async_load=True
     )
     worker.start_load_kv(_FORWARD, meta)
     assert _reported_failures(worker) == (set(), {"b"}, set())
@@ -1340,7 +1340,7 @@ def test_dsv41_unbounded_every_rank_loads_the_writers_windows(extra):
         assert _registered_keys(worker) == set()
         held = [0] * 14 + [17, 18]
         meta = _load_meta(
-            tokens, _unbounded_blocks(DSV41_BLOCKS_B, held), 2, deferred_load=True
+            tokens, _unbounded_blocks(DSV41_BLOCKS_B, held), 2, async_load=True
         )
         worker.start_load_kv(_FORWARD, meta)
         assert _reported_failures(worker) == (set(), {"b"}, set())
@@ -1380,14 +1380,14 @@ def test_dsv41_unbounded_lookup_needs_each_windows_chunk_at_the_hit_end():
 
 
 def _check(
-    groups, block_size, use_layerwise=False, speculative=False, inline_loads=False
+    groups, block_size, use_layerwise=False, speculative=False, sync_loads=False
 ):
     check_multi_group_support(
         groups,
         block_size=block_size,
         use_layerwise=use_layerwise,
         speculative=speculative,
-        inline_loads=inline_loads,
+        sync_loads=sync_loads,
     )
 
 
@@ -1615,7 +1615,7 @@ def _one_group_config():
 
 
 @pytest.mark.parametrize(
-    ("kv_cache_config", "extra", "parked"),
+    ("kv_cache_config", "extra", "is_async"),
     [
         (gpt_oss_config, {}, True),
         (gpt_oss_config, {"maru_async_load": True}, True),
@@ -1624,18 +1624,18 @@ def _one_group_config():
         (_one_group_config, {}, False),
     ],
 )
-def test_several_groups_park_every_load(kv_cache_config, extra, parked):
-    """vLLM 0.31+ stops the engine on a failed inline load of a model with
+def test_several_groups_load_every_hit_async(kv_cache_config, extra, is_async):
+    """vLLM 0.31+ stops the engine on a failed sync load of a model with
     several groups (#126), and vLLM 0.30 recomputes one into wrong output
-    under "recompute" (vllm-project/vllm#49250). Such a model parks its
-    loads unless told otherwise, and inline loads are refused; one group
-    keeps the inline default."""
+    under "recompute" (vllm-project/vllm#49250). Such a model loads
+    every hit async unless told otherwise, and sync loads are refused; one group
+    keeps the sync default."""
     config = _connector_config(16, **extra)
-    if parked is not None:
+    if is_async is not None:
         connector = MaruKVConnector(
             config, KVConnectorRole.SCHEDULER, kv_cache_config()
         )
-        assert connector._scheduler._deferred_loading is parked
+        assert connector._scheduler._async_loading is is_async
         return
     for role in (KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER):
         with pytest.raises(ValueError, match="maru_async_load=false") as refusal:
@@ -1671,10 +1671,10 @@ def test_request_finished_all_groups_answers_per_request():
         True,
         None,
     )
-    # A parked request: vLLM already keeps its blocks for the receive.
-    connector._scheduler._awaiting_deferred_recv.add("r2")
-    parked = SimpleNamespace(request_id="r2")
-    assert connector.request_finished_all_groups(parked, ([5], [6])) == (False, None)
+    # An async-loading request: vLLM already keeps its blocks for the receive.
+    connector._scheduler._awaiting_async_load_recv.add("r2")
+    is_async = SimpleNamespace(request_id="r2")
+    assert connector.request_finished_all_groups(is_async, ([5], [6])) == (False, None)
 
 
 # =============================================================================
@@ -1705,7 +1705,7 @@ def _step(sched, scheduled, **kwargs):
 
 
 def _load_and_store(sched, scheduled, **kwargs):
-    """The load and the store metadata of a step that loads ``r1`` inline."""
+    """The load and the store metadata of a step that loads ``r1`` synchronously."""
     meta = sched.build_connector_meta(
         fake_scheduler_output(num_scheduled_tokens={"r1": scheduled}, **kwargs)
     )
@@ -1760,7 +1760,7 @@ def test_single_group_leaves_group_block_ids_empty():
     assert req.group_block_ids == ()
 
 
-def test_deferred_load_carries_every_group():
+def test_async_load_carries_every_group():
     sched = _two_group_scheduler({"maru_async_load": True})
     request = SimpleNamespace(request_id="r1", prompt_token_ids=list(range(64)))
     blocks = MagicMock()
@@ -1768,7 +1768,7 @@ def test_deferred_load_carries_every_group():
     sched.update_state_after_alloc(request, blocks, 32)
 
     req = sched.build_connector_meta(fake_scheduler_output()).requests[0]
-    assert req.deferred_load
+    assert req.async_load
     assert req.block_ids == [1, 2]
     assert req.group_block_ids == ([1, 2], [11, 12])
 
@@ -2018,7 +2018,7 @@ def test_a_later_request_asks_maru_again_only_after_a_reported_failure(report):
     """Under the default "fail" the failed request ends in an error and vLLM
     never asks about it again; a later request with the prefix must not get
     the same failing hit. A failure comes by its blocks, or by its request
-    for a parked load of several groups. Without one the known keys stand."""
+    for an async load of several groups. Without one the known keys stand."""
     a = list(range(1200))
     sched = _qwen35_scheduler(_stored_by(a, QWEN35_BLOCK, [3], [0, 1, 2], [1]))
     first = SimpleNamespace(request_id="b", prompt_token_ids=a)
@@ -2082,8 +2082,8 @@ def test_a_request_waiting_for_blocks_asks_maru_once():
     assert len(sched._handler.queries) == 2
 
 
-def test_a_failed_parked_load_computes_without_maru():
-    """vLLM calls update_state_after_alloc again, with no tokens, when a parked
+def test_a_failed_async_load_computes_without_maru():
+    """vLLM calls update_state_after_alloc again, with no tokens, when an async-loading
     load is done; that call does not hide a failure vLLM asks about later."""
     a = list(range(1200))
     sched = make_scheduler(
@@ -2125,7 +2125,7 @@ def test_cpu_mode_computes_without_maru_after_a_failed_load():
 
 
 def test_a_failed_layerwise_overlap_load_is_not_activated():
-    """A parked layerwise-overlap load that failed has nothing to activate when
+    """An async layerwise-overlap load that failed has nothing to activate when
     the request is given blocks to compute."""
     a = list(range(1200))
     sched = make_scheduler(
@@ -2138,12 +2138,12 @@ def test_a_failed_layerwise_overlap_load_is_not_activated():
     blocks = SimpleNamespace(get_block_ids=lambda: (list(range(1, 76)),))
     sched.update_state_after_alloc(request, blocks, matched)
     sched.build_connector_meta(fake_scheduler_output())
-    assert "b" in sched._deferred_layerwise_waiting
+    assert "b" in sched._async_layerwise_waiting
     sched._handler.keys.clear()
     _report_failure(sched)
     assert sched.get_num_new_matched_tokens(request, 0)[0] == 0
     sched.update_state_after_alloc(request, MagicMock(), 0)
-    assert "b" not in sched._deferred_layerwise_ready
+    assert "b" not in sched._async_layerwise_ready
 
 
 def test_a_single_group_request_asks_maru_again_after_a_failure():
@@ -3166,12 +3166,12 @@ def test_a_load_fills_split_kernel_blocks(version):
             )
 
 
-def test_a_parked_load_writes_the_state_only_where_the_hit_ends():
+def test_an_async_load_writes_the_state_only_where_the_hit_ends():
     """vLLM copies it on to the step's block when the request resumes."""
     source, _, store = _stored_qwen()
     worker, target = _loading_worker(store)
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
-    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads inline
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
+    worker.start_load_kv(_FORWARD, meta)  # no CUDA here: loads synchronously
     for g in range(3):
         assert torch.equal(
             _state(target, 0, B_BLOCKS[g][1]), _state(source, 0, QWEN_BLOCKS[g][1])
@@ -3207,7 +3207,7 @@ def test_a_sliding_window_load_writes_only_the_window():
 
 def _reported_failures(worker):
     """What one report tells vLLM of failed loads: the failed blocks, the
-    parked loads that finished, and the failed ones among them."""
+    async loads that finished, and the failed ones among them."""
     finished = worker.get_finished_loading() or set()
     return (
         worker.take_failed_load_blocks(),
@@ -3219,26 +3219,26 @@ def _reported_failures(worker):
 # Every group's real blocks over tokens 0-31: the states where the hit ends
 # (1, 3, 5) and attention 7, 8. Not the null block, nor the blocks the step
 # computes (2, 4, 6, 9).
-FAILED_INLINE = ({1, 3, 5, 7, 8}, set(), set())
+FAILED_SYNC = ({1, 3, 5, 7, 8}, set(), set())
 # vLLM 0.32 stops the engine on a block-level failure with several groups,
-# whose block ids are unique only within a group: a parked load is reported
+# whose block ids are unique only within a group: an async load is reported
 # by its request, with its completion.
-FAILED_PARKED = (set(), {"b"}, {"b"})
+FAILED_ASYNC = (set(), {"b"}, {"b"})
 
 
-def test_a_failed_parked_load_is_reported_by_its_request():
+def test_a_failed_async_load_is_reported_by_its_request():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
     del store[group_object_key(k1, 2, TINY_BLOCK)]
     worker, target = _loading_worker(store)
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
-    assert _reported_failures(worker) == FAILED_PARKED
+    assert _reported_failures(worker) == FAILED_ASYNC
     assert _reported_failures(worker) == (set(), set(), set())
     assert not target.any()
 
 
-def test_connector_reports_failed_parked_loads_with_their_completion():
+def test_connector_reports_failed_async_loads_with_their_completion():
     if not hasattr(KVConnectorBase_V1, "get_transfer_results"):
         pytest.skip("this vLLM reports load failures by block only")
     _, _, store = _stored_qwen()
@@ -3248,7 +3248,7 @@ def test_connector_reports_failed_parked_loads_with_their_completion():
     worker, _ = _loading_worker(store)
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._worker = worker
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
     results = connector.get_transfer_results(set())
     assert results.finished_recving == {"b"}
@@ -3290,15 +3290,15 @@ def test_loads_of_several_groups_carry_where_vllms_cache_ends():
     assert (req.load_start_token, req.load_end_token) == (32, 96)
 
 
-def test_nothing_to_load_unparks_the_request():
+def test_nothing_to_load_resumes_the_request():
     worker, _ = _loading_worker({})
-    meta = _load_meta(list(range(40)), B_BLOCKS, 0, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 0, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
     assert worker.get_finished_loading() == {"b"}
     worker._handler.batch_retrieve.assert_not_called()
 
 
-def test_inline_loads_of_several_groups_carry_their_step():
+def test_sync_loads_of_several_groups_carry_their_step():
     sched = _two_group_scheduler()
     request = SimpleNamespace(request_id="r1", prompt_token_ids=list(range(64)))
     sched.update_state_after_alloc(request, MagicMock(), 32)
@@ -3361,13 +3361,13 @@ def test_kernel_load_restores_every_group(version):
 
 
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
-def test_a_parked_load_runs_on_the_loader_thread(version):
+def test_an_async_load_runs_on_the_loader_thread(version):
     stored, store, source = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     worker, target = _cuda_loading_worker(store, version)
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
-    worker._deferred_executor.shutdown(wait=True)
+    worker._async_load_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert worker.get_finished_loading() == {"b"}
     assert worker.take_failed_load_blocks() == set()
@@ -3440,11 +3440,11 @@ def test_vllm_scheduler_hands_every_group_to_the_connector(tmp_path):
 
     engine.add_request(Request("b", tokens, SamplingParams(max_tokens=1), None))
     output = engine.schedule()
-    # 3 whole chunks short of the last token: 96 tokens hit, parked while
-    # they load (several groups park every load).
+    # 3 whole chunks short of the last token: 96 tokens hit, waiting while
+    # they load (several groups load every hit async).
     assert "b" not in output.num_scheduled_tokens
     (req,) = output.kv_connector_metadata.requests
-    assert not req.is_store and req.deferred_load and req.num_matched_chunks == 3
+    assert not req.is_store and req.async_load and req.num_matched_chunks == 3
     assert (req.load_start_token, req.load_end_token) == (0, 96)
     swa, full = req.group_block_ids
     # vLLM gives the hit's window (tokens 64-95) real blocks, and nothing
@@ -3487,27 +3487,27 @@ def _spy_kernel_sources(worker):
 
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
 @pytest.mark.parametrize(
-    ("parked", "source"), [(False, "cpu"), (True, "cuda")], ids=["inline", "parked"]
+    ("is_async", "source"), [(False, "cpu"), (True, "cuda")], ids=["sync", "async"]
 )
-def test_only_a_parked_load_stages_slabs_before_the_kernel(parked, source, version):
-    """Inline: the kernel reads pinned CXL in place. Parked: the copy engine
+def test_only_an_async_load_stages_slabs_before_the_kernel(is_async, source, version):
+    """Sync: the kernel reads pinned CXL in place. Async: the copy engine
     moves the slab first, so the kernel does not hold SMs during the read."""
     stored, store, original = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     worker, target = _cuda_loading_worker(store, version)
     _serve_pinned(worker, store)
     sources = _spy_kernel_sources(worker)
-    if parked:
-        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    if is_async:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     else:
         meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
     worker.start_load_kv(_FORWARD, meta)
-    if parked:
-        worker._deferred_executor.shutdown(wait=True)
+    if is_async:
+        worker._async_load_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert sources == [source, source]
     _check_loaded(
-        stored, worker, original, target, in_place=not parked, version=version
+        stored, worker, original, target, in_place=not is_async, version=version
     )
 
 
@@ -3566,7 +3566,7 @@ def test_connector_hands_the_models_layers_to_the_worker():
 
 
 @pytest.mark.parametrize("version", KERNEL_VERSIONS)
-def test_the_first_parked_load_uses_the_kernel_before_any_forward(version):
+def test_the_first_async_load_uses_the_kernel_before_any_forward(version):
     stored, store, original = _kernel_worker(version=version)
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     target = torch.zeros_like(_shared()).cuda()
@@ -3579,9 +3579,9 @@ def test_the_first_parked_load_uses_the_kernel_before_any_forward(version):
     _serve_pinned(worker, store)
     sources = _spy_kernel_sources(worker)
     worker.start_load_kv(
-        _FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+        _FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     )
-    worker._deferred_executor.shutdown(wait=True)
+    worker._async_load_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert sources == ["cuda", "cuda"]
     _check_loaded(stored, worker, original, target, in_place=False, version=version)
@@ -3640,16 +3640,16 @@ def _add_hit_request(engine, tokens):
 
 
 @pytest.mark.parametrize("extra", [None, {"maru_async_load": True}])
-def test_vllm_scheduler_gives_a_parked_mamba_load_the_hits_last_block(tmp_path, extra):
-    """Parked by default with several groups, or when asked for."""
+def test_vllm_scheduler_gives_an_async_mamba_load_the_hits_last_block(tmp_path, extra):
+    """Async by default with several groups, or when asked for."""
     from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
     engine = _mamba_engine(tmp_path, extra)
     _add_hit_request(engine, list(range(100)))
     output = engine.schedule()
-    assert "b" not in output.num_scheduled_tokens  # parked while it loads
+    assert "b" not in output.num_scheduled_tokens  # waits while it loads
     (req,) = output.kv_connector_metadata.requests
-    assert req.deferred_load and req.num_matched_chunks == 6
+    assert req.async_load and req.num_matched_chunks == 6
     assert req.num_scheduled_tokens == 0  # no step to write a second block for
     mamba, full = req.group_block_ids
     assert mamba[:5] == [0] * 5 and mamba[5] and len(mamba) == 6
@@ -3717,29 +3717,29 @@ def test_kernel_sliding_window_round_trip_skips_null_blocks(version):
             )
 
 
-@pytest.mark.parametrize("parked", [False, True], ids=["inline", "parked"])
-def test_a_failure_while_placing_is_reported(parked):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_failure_while_placing_is_reported(is_async):
     _, _, store = _stored_qwen()
     worker, _ = _loading_worker(store)
     worker._place_state = MagicMock(side_effect=RuntimeError("copy failed"))
-    if parked:
-        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    if is_async:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     else:
         meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
     worker.start_load_kv(_FORWARD, meta)
-    assert _reported_failures(worker) == (FAILED_PARKED if parked else FAILED_INLINE)
+    assert _reported_failures(worker) == (FAILED_ASYNC if is_async else FAILED_SYNC)
 
 
-@pytest.mark.parametrize("parked", [False, True], ids=["inline", "parked"])
-def test_an_unavailable_handler_fails_the_loads(parked):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_an_unavailable_handler_fails_the_loads(is_async):
     """The worker has no MaruHandler (it got no CXL region, say) while the
     scheduler reported a hit: nothing fills the blocks, so they are reported."""
     _, _, store = _stored_qwen()
     worker, target = _loading_worker(store)
     worker._handler = None
     worker._handler_retry_after = time.monotonic() + 60.0
-    if parked:
-        meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    if is_async:
+        meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     else:
         meta = _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8)
     # A store in the same step is not a failed load.
@@ -3747,7 +3747,7 @@ def test_an_unavailable_handler_fails_the_loads(parked):
         list(range(40)), QWEN_BLOCKS, 0, 32, req_ids=("a",)
     ).requests
     worker.start_load_kv(_FORWARD, meta)
-    assert _reported_failures(worker) == (FAILED_PARKED if parked else FAILED_INLINE)
+    assert _reported_failures(worker) == (FAILED_ASYNC if is_async else FAILED_SYNC)
     assert not target.any()
 
 
@@ -3757,41 +3757,41 @@ def test_an_inline_load_of_a_missing_object_is_reported():
     del store[group_object_key(k1, 0, TINY_BLOCK)]
     worker, target = _loading_worker(store)
     worker.start_load_kv(_FORWARD, _load_meta(list(range(40)), B_BLOCKS, 2, 32, 8))
-    assert _reported_failures(worker) == FAILED_INLINE
+    assert _reported_failures(worker) == FAILED_SYNC
     assert not target.any()
 
 
-def test_a_failure_on_the_loader_thread_unparks_and_is_reported():
+def test_a_failure_on_the_loader_thread_resumes_and_is_reported():
     stored, store, _ = _kernel_worker()
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     worker, _ = _cuda_loading_worker(store)
     worker._place_state = MagicMock(side_effect=RuntimeError("copy failed"))
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
     worker.start_load_kv(_FORWARD, meta)
-    worker._deferred_executor.shutdown(wait=True)
-    assert _reported_failures(worker) == FAILED_PARKED
+    worker._async_load_executor.shutdown(wait=True)
+    assert _reported_failures(worker) == FAILED_ASYNC
 
 
-def test_a_parked_load_lands_after_work_queued_before_it():
+def test_an_async_load_lands_after_work_queued_before_it():
     """Work vLLM queued on the compute stream for these blocks before the
     load (a copy-on-write, say) must not overwrite it, however late it runs."""
     stored, store, source = _kernel_worker()
     stored.wait_for_save(_store_meta(list(range(40)), QWEN_BLOCKS, 0, 32))
     worker, target = _cuda_loading_worker(store)
     _serve_pinned(worker, store)  # as CXL is: pinned copies are truly async
-    meta = _load_meta(list(range(40)), B_BLOCKS, 2, deferred_load=True)
+    meta = _load_meta(list(range(40)), B_BLOCKS, 2, async_load=True)
 
-    def parked_load():
+    def async_load():
         worker.start_load_kv(_FORWARD, meta)
-        worker._deferred_executor.shutdown(wait=True)
-        worker._deferred_executor = None
+        worker._async_load_executor.shutdown(wait=True)
+        worker._async_load_executor = None
         torch.cuda.synchronize()
         assert worker.get_finished_loading() == {"b"}
 
     # Warm up as a running server is: a first kernel launch or cudaMalloc
     # synchronizes the device and would hide a missing wait.
     target.fill_(0)
-    parked_load()
+    async_load()
     # The compute stream is busy, then overwrites every block. A stream of its
     # own, since the legacy default stream would order the load implicitly.
     compute = torch.cuda.Stream()
@@ -3799,7 +3799,7 @@ def test_a_parked_load_lands_after_work_queued_before_it():
         torch.cuda._sleep(1_500_000_000)
         target.fill_(7)
         worker.start_load_kv(_FORWARD, meta)
-    worker._deferred_executor.shutdown(wait=True)
+    worker._async_load_executor.shutdown(wait=True)
     torch.cuda.synchronize()
     assert worker.get_finished_loading() == {"b"}
     _check_loaded(stored, worker, source, target, in_place=False)
