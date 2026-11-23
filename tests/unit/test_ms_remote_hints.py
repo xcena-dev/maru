@@ -12,6 +12,7 @@ import maru_handler.hints as hints_module
 from maru_common.config import MaruConfig
 from maru_common.node_protocol import HintRequest, NodeMessageType
 from maru_common.remote_protocol import (
+    PingRequest,
     RemoteHintRequest,
     RemoteMessageType,
     ReserveRequest,
@@ -677,6 +678,55 @@ def test_slow_read_hint_does_not_delay_the_ack_or_worker_read(world):
         assert response.status == Status.OK and entered.wait(1)
         assert read(worker, ["k0"]) == [b"\x01" * PAGE]
         assert not release.is_set()
+    finally:
+        release.set()
+        drain(w, scheduler)
+
+
+@pytest.mark.parametrize("explicit_ping", [False, True])
+def test_slow_read_hint_keeps_control_and_the_run_alive(
+    world, monkeypatch, explicit_ping
+):
+    w = world()
+    worker = w.client()
+    put(worker, ["k0"])
+    scheduler = w.client(metadata_only=True, read_hints=True)
+    remote = w.gpu.store.remote
+    entered, release, pinged = (threading.Event() for _ in range(3))
+    original = remote.call
+    pings = []
+
+    def call(code, *args, **kwargs):
+        answer = original(code, *args, **kwargs)
+        if entered.is_set() and code == RemoteMessageType.PING:
+            pings.append(answer.status)
+            if len(pings) >= 2:
+                pinged.set()
+        return answer
+
+    def hint(*args):
+        entered.set()
+        release.wait(10)
+
+    monkeypatch.setattr(remote, "call", call)
+    monkeypatch.setattr(w.ext, "hint", hint)
+    try:
+        scheduler.hint_read("r", ["k0"])
+        assert entered.wait(1)
+        if explicit_ping:
+            with remote.lock:
+                assert (
+                    remote.call(RemoteMessageType.PING, PingRequest()).status
+                    == Status.OK
+                )
+        assert pinged.wait(4)
+        assert pings == [Status.OK] * len(pings)
+        assert read(worker, ["k0"]) == [b"\x01" * PAGE]
+        writer = w.client("writer")
+        put(writer, ["k1"])
+        assert read(writer, ["k1"]) == [b"\x01" * PAGE]
+        assert not release.is_set()
+        assert not remote.connection.closed and w.gpu.ended is None
     finally:
         release.set()
         drain(w, scheduler)

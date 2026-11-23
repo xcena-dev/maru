@@ -13,6 +13,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Protocol
 
 from maru_common.node_protocol import recv_frame, send_frame
@@ -72,6 +73,7 @@ from .op_ledger import LedgerEntry, OpLedger, Verdict
 logger = logging.getLogger(__name__)
 _JOIN_TIMEOUT_S = 2.0
 _ACCEPT_POLL_S = 0.05
+_MAX_PENDING_HINTS = 64
 
 
 class RemoteOps(Protocol):
@@ -138,7 +140,7 @@ class RemoteServer(ABC):
 
 
 class _Connection:
-    """A proof reader and independent response writer for one stream."""
+    """A control reader, response writer and bounded hint worker for one stream."""
 
     def __init__(self, server: TcpRemoteServer, sock: socket.socket, source: str):
         self.server, self.sock, self.source = server, sock, source
@@ -150,6 +152,7 @@ class _Connection:
         self.closed = threading.Event()
         self.draining = False
         self._outbox: collections.deque[tuple[bytes, bool]] = collections.deque()
+        self._hints: collections.deque[DecodedRequest] = collections.deque()
         self._cv = threading.Condition()
         self._reader = threading.Thread(
             target=self._read_loop, name="maru-remote-read", daemon=True
@@ -157,6 +160,7 @@ class _Connection:
         # Made once proven: a thread never started keeps its target, a
         # cycle with this connection
         self._writer: threading.Thread | None = None
+        self._hint_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._reader.start()
@@ -170,7 +174,25 @@ class _Connection:
                 return
             self.draining = close
             self._outbox.append((frame, close))
-            self._cv.notify()
+            self._cv.notify_all()
+
+    def enqueue_hint(self, decoded: DecodedRequest) -> None:
+        with self._cv:
+            if self.closed.is_set() or self.draining:
+                return
+            if len(self._hints) >= _MAX_PENDING_HINTS:
+                self.post_response(
+                    decoded.header,
+                    RemoteHintResponse(Status.BUSY, error="hint queue full"),
+                )
+                return
+            self._hints.append(decoded)
+            if self._hint_thread is None:
+                self._hint_thread = threading.Thread(
+                    target=self._hint_loop, name="maru-remote-hint", daemon=True
+                )
+                self._hint_thread.start()
+            self._cv.notify_all()
 
     def close(self) -> None:
         with self._cv:
@@ -178,6 +200,7 @@ class _Connection:
                 return
             self.closed.set()
             self._outbox.clear()
+            self._hints.clear()
             self._cv.notify_all()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -187,7 +210,7 @@ class _Connection:
         self.server._connection_closed(self)
 
     def join(self, deadline: float) -> None:
-        for thread in (self._reader, self._writer):
+        for thread in (self._reader, self._writer, self._hint_thread):
             if (
                 thread is not None
                 and thread.is_alive()
@@ -260,6 +283,21 @@ class _Connection:
             logger.debug("remote response failed", exc_info=True)
         finally:
             self.close()
+
+    def _hint_loop(self) -> None:
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: self._hints or self.closed.is_set())
+                if self.closed.is_set():
+                    return
+                decoded = self._hints.popleft()
+            done = partial(self.post_response, decoded.header)
+            self.server._invoke(
+                self.server.extension_hint,
+                (self.extension_id, decoded.request, done, self.closed.is_set),
+                RemoteHintResponse,
+                done,
+            )
 
 
 @dataclass
@@ -517,17 +555,7 @@ class TcpRemoteServer(RemoteServer):
             and conn.hello is not None
             and self.extension_hint is not None
         ):
-            self._invoke(
-                self.extension_hint,
-                (
-                    conn.extension_id,
-                    decoded.request,
-                    lambda reply: conn.post_response(header, reply),
-                    conn.closed.is_set,
-                ),
-                RemoteHintResponse,
-                lambda reply: conn.post_response(header, reply),
-            )
+            conn.enqueue_hint(decoded)
             return
         with self._cv:
             if self._stopped.is_set() or conn.closed.is_set():

@@ -32,6 +32,7 @@ from maru_common.remote_protocol import (
     HelloRefusal,
     HelloRequest,
     PingRequest,
+    RemoteHintRequest,
     RemoteHintResponse,
     RemotePool,
     RemoteWriteDoneRequest,
@@ -51,6 +52,7 @@ from maru_common.storage_types import (
     MEMORY_CAPABILITY,
     REMOTE_CAPABILITY,
     WORKER_RDMA_CAPABILITY,
+    HintAction,
     ItemOutcome,
     ItemResult,
     Key,
@@ -318,6 +320,78 @@ def test_ready_and_registered_metadata_and_progress(make_server):
     h.progress.drain.reset_mock()
     assert (ping(conn).room, ping(conn).limit) == h.ops.available
     h.progress.drain.assert_called()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_slow_hints_keep_a_bounded_ordered_queue(make_server, monkeypatch, fails):
+    monkeypatch.setattr(remote_server, "_MAX_PENDING_HINTS", 1)
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def hint(conn_id, req, done, is_closed):
+        seen.append(req.request)
+        if req.request == "active":
+            entered.set()
+            assert release.wait(WAIT)
+            if fails:
+                raise RuntimeError("hint failed")
+        done(RemoteHintResponse(Status.OK))
+
+    h = make_server(extension_hint=hint)
+    conn, _ = h.open()
+    try:
+        active = submit(
+            conn, Code.HINT, RemoteHintRequest(HintAction.READ_HINT, "active")
+        )
+        assert entered.wait(WAIT)
+        queued = submit(
+            conn, Code.HINT, RemoteHintRequest(HintAction.READ_HINT_END, "queued")
+        )
+        overflow = submit(
+            conn, Code.HINT, RemoteHintRequest(HintAction.READ_PROMOTE, "overflow")
+        )
+        assert overflow.get().status == Status.BUSY
+        assert ping(conn).status == Status.OK
+        assert not active.event.is_set() and not queued.event.is_set()
+    finally:
+        release.set()
+    assert active.get().status == (Status.REJECTED if fails else Status.OK)
+    assert queued.get().status == Status.OK
+    assert seen == ["active", "queued"]
+
+
+def test_connection_close_discards_queued_hints(make_server):
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def hint(conn_id, req, done, is_closed):
+        seen.append(req.request)
+        entered.set()
+        assert release.wait(WAIT)
+        done(RemoteHintResponse(Status.OK))
+
+    h = make_server(extension_hint=hint)
+    conn, _ = h.open()
+    with h.server._cv:
+        server_conn = next(iter(h.server._connections))
+    try:
+        active = submit(
+            conn, Code.HINT, RemoteHintRequest(HintAction.READ_HINT, "active")
+        )
+        assert entered.wait(WAIT)
+        queued = submit(
+            conn, Code.HINT, RemoteHintRequest(HintAction.READ_HINT_END, "queued")
+        )
+        assert ping(conn).status == Status.OK
+        conn.close()
+        assert server_conn.closed.wait(WAIT)
+        assert isinstance(active.get(), ConnectionError)
+        assert isinstance(queued.get(), ConnectionError)
+    finally:
+        release.set()
+        server_conn.join(time.monotonic() + WAIT)
+    assert not server_conn._hint_thread.is_alive()
+    assert seen == ["active"]
 
 
 @pytest.mark.parametrize(
