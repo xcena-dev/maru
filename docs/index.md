@@ -141,6 +141,7 @@ Examples <source/getting_started/examples/index>
 
 Architecture Overview <source/design_doc/architecture_overview>
 Memory Model <source/design_doc/memory_model>
+Memory Node Service <source/design_doc/memory_node>
 KV Cache Management <source/design_doc/kv_cache_management>
 Consistency and Safety <source/design_doc/consistency_and_safety>
 Prefetch Hints (Read and Write) <source/design_doc/read_hints>

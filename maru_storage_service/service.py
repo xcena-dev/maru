@@ -4,6 +4,7 @@
 
 import mmap
 from collections.abc import Callable
+from typing import Any
 
 from .config import NodeConfig
 from .config_fields import NotServableError as NotServableError
@@ -38,7 +39,9 @@ class StorageService(NodeRun):
         unmap_timeout_s: float = DEFAULT_UNMAP_TIMEOUT_S,
         transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
+        make_transport: Callable[[str, str], Any] | None = None,
     ):
+        self.make_transport = make_transport
         if config.role == "memory":
             from .memory.service import MemoryNode
 

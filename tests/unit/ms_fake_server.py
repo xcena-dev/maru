@@ -588,6 +588,9 @@ class FakeMaruServer:
             session_ttl_s=self.session_ttl_s,
             adopted=adopted,
             capabilities=list(node.capabilities),
+            pool_registrations={
+                p: node.epoch_seq * 1000 + i for i, p in enumerate(node.pools, 1)
+            },
         )
 
     def _node_heartbeat(self, node: NodeRec, req):

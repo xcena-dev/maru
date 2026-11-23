@@ -71,8 +71,6 @@ def check_servable(config: NodeConfig) -> None:
         raise NotServableError(
             f"serving the tiers {stores} is not implemented: only {served} are served"
         )
-    if config.remote_server is not None:
-        raise NotServableError("remote_server is not served")
     for t in config.tiers:
         TIERS[t.store].check_servable(t)
 
@@ -297,6 +295,7 @@ class NodeRun:
                 f"MaruServer {config.server} does not accept {sorted(refused)}: "
                 f"it cannot serve a {config.role} node"
             )
+        self.pool_registrations = dict(opened.pool_registrations)
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}
         for info in opened.adopted:
@@ -504,6 +503,10 @@ class NodeRun:
                 stats["retire_results"],
                 stats["credit_short_bytes"],
             )
+        self.role.close_exports()
+        if self.config.role == "memory":
+            for lease in leases:
+                lease.after_transfers_closed()
         kept: set[str] = set()
         if self.transfers is not None:
             kept = self.transfers.close()  # unmapped before the regions may go back

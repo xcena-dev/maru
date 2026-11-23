@@ -445,8 +445,7 @@ def test_remote_server_settings_are_not_silently_ignored():
     raw = edit(
         MEMORY_NODE, remote_server={"listen": "localhost:5600", "key_file": "/tmp/key"}
     )
-    with pytest.raises(NotServableError, match="remote_server is not served"):
-        check_servable(parse_node_config(raw, role="memory"))
+    check_servable(parse_node_config(raw, role="memory"))
 
 
 def test_a_registered_store_is_parsed_by_its_spec(monkeypatch):

@@ -122,3 +122,6 @@ class GpuNode:
     def stop_workers(self) -> None:
         if self.local is not None:
             self.local.stop()
+
+    def close_exports(self) -> None:
+        pass

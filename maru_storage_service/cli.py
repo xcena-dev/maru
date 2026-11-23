@@ -138,6 +138,9 @@ def _signal_handler(wfd: int):
 
 def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     """Run the node until SIGTERM or SIGINT."""
+    from maru_remote.auth import KeyFileError
+    from maru_remote.checked import UncheckedTransportError
+
     from .drivers.cxl import CxlTierError
     from .drivers.dram import DramPoolError
     from .ownership import LocalServerError
@@ -181,6 +184,8 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
                 return 0
         except (
             CxlTierError,
+            KeyFileError,
+            UncheckedTransportError,
             DramPoolError,
             LocalServerError,
             NodeOpenError,

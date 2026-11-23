@@ -105,7 +105,7 @@ class RemoteServerConfig:
     peer_quarantine_max: int
     quarantine_max: int | None = None  # None: 1/8 of the registered L1 bytes
     rdma_device: str = ""  # UCX device of the NIC; empty for UCX's choice
-    # A credited page whose WRITE_DONE has not come by then is quarantined
+    # Credit expiry triggers revocation of its write domain.
     reserve_ttl_s: float = DEFAULT_RESERVE_TTL_S
 
 
